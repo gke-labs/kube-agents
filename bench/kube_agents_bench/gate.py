@@ -32,7 +32,16 @@ baseline it is judged against and may never move it.
 EXIT CODES. ``case`` exits 0 whenever it produced a verdict, including a
 blocking one: the loop must keep going so the summary covers every task, and
 the blocking flag rides in the JSON. It exits 2 when it could not grade at all
-(an unreadable task file, a bad flag). ``suite`` exits 0 green, 1 red.
+(an unreadable task file, a bad flag). ``suite`` exits 0 green, 1 red, and 2
+when the run could not be evaluated: an admitted case lost every repetition
+to infrastructure, or every case did, so the run cannot certify green and
+has no finding against the change either. That is the same code ``case``
+uses for "could not grade", and for the same reason -- could not check is
+not a pass -- and it is distinct from 1 so the shell, the artifact and the
+dashboards can say "rerun when the environment is healthy" instead of
+"debug the change". ``suite`` also exits 1 on what it cannot read -- a case
+result the loop never wrote, a store that will not parse -- because those
+are the job's failures, not the environment's, and must not read as weather.
 ``record`` exits 0 unless it was asked to write somewhere it cannot — it is
 bookkeeping, and bookkeeping must never be the reason a merge to main reds.
 """
@@ -69,6 +78,9 @@ from kube_agents_bench.scoring import (
     DEFAULT_JUDGED_MARGIN,
     DEFAULT_JUDGED_METRICS,
     MISSING,
+    SUITE_OUTCOME_GREEN,
+    SUITE_OUTCOME_NOT_EVALUATED,
+    SUITE_OUTCOME_RED,
     Rung,
     grade_case,
     grade_suite,
@@ -78,6 +90,19 @@ from kube_agents_bench.scoring import (
 __all__ = ["main"]
 
 _DEFAULT_BASELINE_DIR = "baselines"
+
+#: What ``suite`` exits when the run could not be evaluated (see the module
+#: docstring's EXIT CODES): the code ``case`` uses for "could not grade",
+#: and what ``hack/ci-eval-pr.sh`` branches on before it announces the
+#: verdict. 0 green and 1 red are the literals they have always been.
+SUITE_EXIT_NOT_EVALUATED = 2
+
+#: The verdict headline per outcome, the first thing the markdown says.
+SUITE_HEADLINES = {
+    SUITE_OUTCOME_GREEN: "GREEN",
+    SUITE_OUTCOME_RED: "RED",
+    SUITE_OUTCOME_NOT_EVALUATED: "NOT EVALUATED",
+}
 
 #: Set to one of these (case-insensitive) and the suite aggregate may red the
 #: job. Unset, the aggregate rule still runs and is still reported -- it just
@@ -425,12 +450,26 @@ def _record_says(case: dict[str, Any]) -> str:
 def _markdown(
     verdict: Any, cases: list[dict[str, Any]], *, admission_column: bool = False
 ) -> str:
+    not_evaluated = verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED
     lines = [
         "## Evaluation verdict",
         "",
-        f"**{'GREEN' if verdict.green else 'RED'}**",
+        f"**{SUITE_HEADLINES[verdict.outcome]}**",
         "",
     ]
+    if not_evaluated:
+        # The banner says what to do, because the headline alone invites the
+        # wrong action: a pull request author who sees a red job debugs the
+        # change, and there is nothing in this run about the change to debug.
+        named = ", ".join(f"`{case_id}`" for case_id in verdict.not_evaluated)
+        lines += [
+            "> **NOT EVALUATED — rerun when the environment is healthy.** "
+            f"{named}: every repetition was excluded as infrastructure, so this "
+            "run evaluated nothing about the case and cannot certify green. "
+            "This is not a finding against the change under test: do not debug "
+            "the change for it; rerun once the eval environment is healthy.",
+            "",
+        ]
     if verdict.pass_rate is not None:
         rate = f"{verdict.pass_rate:.1%}"
         if verdict.baseline_rate is not None:
@@ -441,7 +480,8 @@ def _markdown(
     for note in getattr(verdict, "notes", None) or []:
         lines += [f"_{note}_", ""]
     if verdict.reasons:
-        lines += ["### Why it is red", ""]
+        heading = "Why it cannot report green" if not_evaluated else "Why it is red"
+        lines += [f"### {heading}", ""]
         lines += [f"- {r}" for r in verdict.reasons]
         lines += [""]
     extra_header = f" {ADMISSION_COLUMN} | {RECORD_COLUMN} |" if admission_column else ""
@@ -618,6 +658,8 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(verdict.to_dict(), indent=2) + "\n", encoding="utf-8")
 
+    if verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED:
+        return SUITE_EXIT_NOT_EVALUATED
     return 0 if verdict.green else 1
 
 

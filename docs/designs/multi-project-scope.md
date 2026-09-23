@@ -1,7 +1,6 @@
 # An Opt-In Multi-Project Scope for the Platform Agent
 
-> **STATUS — design of record; not implemented.** Nothing below ships today. The Platform Agent
-> discovers clusters in one GCP project, its service account holds roles in one project, and the
+> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 1's IAM bindings, installer path and `platform_mcp_server.py` change, and steps 2 to 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
 > architecture documents define it as one agent per project. This document proposes replacing that
 > single project with a declared scope, and gives the order the change has to land in. Each section
 > says what is true on `main` now and what the design changes.
@@ -97,8 +96,8 @@ boundary.
 ## 3. The scope model
 
 A new block on `PlatformAgent`, `spec.scope`, declares an opt-in set. The name is provisional; there
-is no `spec.fleet` or similar today; the top-level spec has `harness`, `integration`, `mode`,
-`deployment`, `security`, `telemetry`, and `networkPolicy`.
+is no `spec.fleet` or similar today; the top-level spec has `harness`, `integration`, `mode`, `deployment`, `security`, `telemetry`,
+`networkPolicy`, and now `scope`.
 
 ```yaml
 spec:
@@ -403,6 +402,7 @@ works. Each is listed with whether it blocks the first phase or follows it.
 | `agents/platform/scripts/session_kv_server.py:1155`                                                                                                                                                                                                                              | `GCP_PROJECT_ID` is the project for every event's console links                                                                                                                                                                                                 | 1     |
 | `agents/platform/scripts/platform_mcp_server.py:275-300`                                                                                                                                                                                                                         | `get_project_id()` reads one `project:` line from `USER.md`                                                                                                                                                                                                     | 1     |
 | `agents/platform/skills/cluster-agent-lifecycle/SKILL.md`                                                                                                                                                                                                                        | Delegation needs `--project` from the requester; #953 asks for enumeration first                                                                                                                                                                                | 1     |
+| `k8s-operator/cmd/drift-detector`                                                                                                                                                                                                                                                | The `managedFields` join drops every Cluster Agent profile whose cluster is outside `--project`, so a cross-project fleet's clusters are discarded at discovery                                                                                                 | 2     |
 | `terraform/modules/drift-pubsub`                                                                                                                                                                                                                                                 | One log sink in `var.project_id`; other projects' audit logs need a sink each into the host topic                                                                                                                                                               | 2     |
 | Fleet-audit SOPs and the cost, recommender, and compliance skills                                                                                                                                                                                                                | Query "the project" for quotas, recommendations, and IAM; need to iterate the snapshot                                                                                                                                                                          | 2     |
 | `docs/site/src/content/docs/concepts/cluster-agents.md:24`                                                                                                                                                                                                                       | "sweeps the project"                                                                                                                                                                                                                                            | docs  |

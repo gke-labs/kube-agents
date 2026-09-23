@@ -106,6 +106,7 @@ import yaml
 
 try:
     from . import classify, nightly, post_health, tiers, trend
+    from .health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import classify
@@ -113,6 +114,7 @@ except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
     import post_health
     import tiers
     import trend
+    from health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED
 
 HERE = pathlib.Path(__file__).resolve().parent
 PAGE_TEMPLATE = HERE / "template" / "page.html.tmpl"
@@ -168,6 +170,9 @@ PUBLISHED_SITE = post_health.DASHBOARD_SITE
 # The three states health.json can carry. The pages announce a state with
 # a glyph and the word, never with colour alone.
 HEALTH_STATES = ("GREEN", "DEGRADED", "OUTAGE")
+# The pool note's breached day, as pool_pressure.py buckets it: a UTC calendar
+# date. The page prints it verbatim, so it is shape-checked here.
+POOL_DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 # brief.json carries the runs started inside this many days of the data's
 # generated_at -- the depth the collector keeps current (SCHEMA.md,
 # --since-days 14) -- and run.html says so when a build id is not in it.
@@ -526,6 +531,10 @@ def normalize_health(raw) -> dict | None:
     # The slow-gate note (health.py rule 7): the fields the Brief's one
     # sentence reads; the rest of the note stays in health.json.
     slow = raw.get("slow") if isinstance(raw.get("slow"), dict) else None
+    # The pool note (health.py rule 8), same treatment. The verdict is checked
+    # against the three health.py writes rather than passed through: it picks
+    # the page's sentence, so an unknown string would render as none of them.
+    pool = raw.get("pool") if isinstance(raw.get("pool"), dict) else None
     return {
         "state": state,
         "condition": raw["condition"] if isinstance(raw.get("condition"), str) else None,
@@ -550,6 +559,30 @@ def normalize_health(raw) -> dict | None:
             "baseline_p50_s": slow.get("baseline_p50_s") if is_count(slow.get("baseline_p50_s")) else None,
             "baseline_days": slow.get("baseline_days") if is_count(slow.get("baseline_days")) else None,
         } if slow else None,
+        "pool": {
+            "verdict": pool.get("verdict") if pool.get("verdict") in (POOL_BREACH, POOL_UNMEASURED, POOL_STALE) else None,
+            "since": pool.get("since") if iso_ms(pool.get("since")) is not None else None,
+            "measured_at": pool.get("measured_at") if iso_ms(pool.get("measured_at")) is not None else None,
+            # `day` is rendered into the sentence, so it is checked for shape
+            # and not only for being a string.
+            "day": pool.get("day") if isinstance(pool.get("day"), str) and POOL_DAY_RE.fullmatch(pool["day"]) else None,
+            # Which stretch p50_s/p95_s cover: set when they come from the
+            # recent window, null when they are the worst breached day's.
+            "window_hours": pool.get("window_hours") if is_count(pool.get("window_hours")) else None,
+            "p50_s": pool.get("p50_s") if is_count(pool.get("p50_s")) else None,
+            "p95_s": pool.get("p95_s") if is_count(pool.get("p95_s")) else None,
+            # Tri-state, so it is passed through only when it is a real bool:
+            # the page reads null as "Deck was not read" and must not get that
+            # answer from a malformed field.
+            "waiting_now": pool.get("waiting_now") if isinstance(pool.get("waiting_now"), bool) else None,
+            # The backlog's own start, set only while there is one; the
+            # sentence dates a present-tense jam from this and the episode
+            # from `since`.
+            "waiting_since": pool.get("waiting_since") if iso_ms(pool.get("waiting_since")) is not None else None,
+            "over_threshold": pool.get("over_threshold") if is_count(pool.get("over_threshold")) else None,
+            "threshold_p50_s": pool.get("threshold_p50_s") if is_count(pool.get("threshold_p50_s")) else None,
+            "threshold_p95_s": pool.get("threshold_p95_s") if is_count(pool.get("threshold_p95_s")) else None,
+        } if pool else None,
         "tick": raw["tick"] if iso_ms(raw.get("tick")) is not None else None,
     }
 
@@ -805,6 +838,7 @@ def compact_run(run: dict, verdict: dict, at: dict | None) -> dict:
         "matches_incident": verdict["matches_incident"],
         "setup_death": verdict.get("setup_death", False),
         "storm_reps": verdict.get("storm_reps", 0),
+        "ceiling_reps": verdict.get("ceiling_reps", 0),
         "do": verdict.get("do", ""),
         "cases": verdict["cases"],
         "health_at": at,

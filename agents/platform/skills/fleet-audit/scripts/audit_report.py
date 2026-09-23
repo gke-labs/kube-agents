@@ -18,6 +18,7 @@ Two-command lifecycle, plus three on-demand commands:
 
     audit_report.py start     --audit <audit-id>
     audit_report.py finish    --audit <audit-id> --findings-file <path> [--dry-run]
+                          [--manifest-file <path> | --no-collector-manifest <why>]
     audit_report.py remediate --audit <audit-id> --findings-file <path>
                           --finding <id> [--finding <id>...] [--dry-run]
     audit_report.py fetch     --audit <audit-id> --path <repo-path> [--path ...]
@@ -104,6 +105,20 @@ class AuditSpec(NamedTuple):
     standing example: it fires when a cluster is an outlier on six or more
     facets, which is not something you can run against a cluster in isolation.
 
+    `scopes` partitions the roster by the *kind* of target a check runs against,
+    for a stream whose SOP enumerates more than clusters: a `project/<id>` entry
+    carries the checks that read project-level GCP objects, and a networking
+    stream can give every subnet its own entry. Without the partition the
+    denominator is the whole roster for every target, so a project entry is
+    charged with the cluster checks it was never meant to run and each cluster
+    with the project ones, and the stream reads `partial` forever on the
+    strength of it. A slug may appear under two kinds when the SOP defines a
+    form of the check for each. Empty measures every target against the whole
+    roster, which is what every stream does until its SOP declares otherwise;
+    `test_scopes_partition_the_roster` asserts the union across kinds is exactly
+    `checks`, so a check cannot land on a partitioned roster without an owning
+    kind — it would otherwise be a check the harness silently stops requiring.
+
     `declarable` names the checks a repository declaration may move out of
     `findings` into `declared`: the stream's *posture* checks, the ones whose
     flagged shape an owner can have chosen on purpose. Empty for a stream whose
@@ -120,6 +135,7 @@ class AuditSpec(NamedTuple):
     sop: str
     checks: tuple[str, ...]
     derived: tuple[str, ...] = ()
+    scopes: tuple[tuple[str, tuple[str, ...]], ...] = ()
     declarable: tuple[str, ...] = ()
 
 
@@ -226,6 +242,9 @@ AUDITS: dict[str, AuditSpec] = {
             "label-keys",
             "image-type",
             "database-encryption",
+            # §4.14, the one check that runs outside a cohort. Last because
+            # the roster is the SOP's `####` heading order.
+            "no-environment-label",
         ),
         # §3 step 6's split-cluster guard: a cluster that is an outlier on six
         # or more facets is a different kind of cluster, not a drifting one, so
@@ -419,7 +438,18 @@ DELTA_RE = re.compile(
 # ids move, but the stamp is per-document and cannot say which — and the cost
 # of bumping is one run of withheld `resolved`, against announcing a
 # re-spelled finding as fixed.
-ID_SCHEME = 2
+#
+# 3: the fleet-consistency-drift collector qualifies every cluster name as
+# `<project>/<location>/<name>`, and the `cluster` segment is the second of
+# the four `derive_finding_id` joins — so every finding that stream already
+# carries is spelled differently from its first run on the new procedure.
+# `derive_finding_id` itself did not change, which is precisely why the stamp
+# rather than the function's shape is what this guards: the ids move because
+# their input moved. The bump is global because the stamp is, so every other
+# stream pays one run of withheld `resolved` for a rename in this one; a
+# per-stream stamp would be the alternative, and it is a bigger change than
+# the single run it would save.
+ID_SCHEME = 3
 ID_SCHEME_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-id-scheme:[ \t]*(\d+)[ \t]*-->[ \t]*$", re.M
 )
@@ -432,6 +462,33 @@ FINDING_MARKER_RE = re.compile(
 # cluster, the namespace (or the cluster-scoped placeholder) and the object.
 # Read back by `parse_finding_locations` so a later run can ask whether it
 # looked at the same object again. `_ident` keeps a backtick out of all three.
+# The heading the ledger body carries its collector-held rows under, and the
+# detail line each row may carry. `parse_held_rows` reads them back on a run
+# that passed no manifest, so those rows survive a run that cannot re-evaluate
+# them; the identity lines themselves are the same shape as a finding's.
+HELD_SECTION_HEADING = "## Held by the collector"
+# The renderer brackets the held section with these two comments, and the
+# readers key on them rather than on Markdown headings: a model-written line
+# beginning `## `, or an unbalanced fence, in any free-text field would end a
+# heading-sliced section early and turn every later finding into a phantom
+# hold. A body main wrote carries neither comment, so all of its finding
+# markers read as rendered. Unlike the `<!-- finding:id -->` markers, these
+# are not extended to the document on trust: `_held_span` reads them only on
+# a line of their own and carries nothing when the body holds more than one
+# of either, and `publishable_text` keeps free text from spelling the opener.
+HELD_SECTION_BEGIN = "<!-- audit-held:begin -->"
+HELD_SECTION_END = "<!-- audit-held:end -->"
+# Inside that span every tier writes the held ids as a list the renderer owns,
+# so a run that passes no manifest carries exactly what the renderer recorded
+# as held — never an inference from which headings the body happens to
+# render. A heading is model-written text (a title may hold a newline that
+# moves the finding marker to a line the heading regex never matches), and an
+# inference from it manufactured holds on streams that never had a manifest.
+HELD_IDS_COMMENT = "audit-held-ids"
+HELD_IDS_RE = re.compile(rf"<!--[ \t]*{HELD_IDS_COMMENT}:[ \t]*(\[.*?\])[ \t]*-->", re.S)
+HELD_CHECK_LINE_RE = re.compile(
+    r"^- \*\*Check:\*\* `([^`\n]*)` — the collector ran `([^`\n]*)` there", re.M
+)
 WHERE_LINE_RE = re.compile(
     r"^- \*\*Where:\*\* `([^`\n]*)`"
     r"(?: / `([^`\n]*)`| / _cluster-scoped_)"
@@ -634,6 +691,16 @@ DECLARED_INTENT_UNSEARCHED_KEY = "declared_intent_unsearched"
 REFUSED_REF_KEY = "refused_ref"
 RUN_RECORD_SEARCHED_KEY = "searched"
 RUN_RECORD_SOURCES_KEY = "sources"
+# When `start` opened this run. The collector manifest is the one input
+# `finish` takes from outside the run and the one `start` cannot scrub: its
+# path lives in the SOP's text rather than in code, so `start` does not know
+# what to unlink. A run whose worker never launched the collector therefore
+# finds last week's manifest at the same fixed path and publishes against it.
+# Comparing the manifest's `finished_at` with this is what makes that loud.
+RUN_RECORD_STARTED_KEY = "started_at"
+# The collector's own format (`fleet_drift.py`'s `TIMESTAMP_FORMAT`), so the
+# two stamps compare without either side guessing at the other's shape.
+RUN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 FRONTMATTER_DELIMITER = "---"
 # U+FEFF: what an editor that writes a UTF-8 byte-order mark puts before the
 # first `---`. `str.strip()` does not remove it (it is not whitespace), so it
@@ -714,6 +781,76 @@ MAX_PR_PAGE = 1000
 # `/remediate` bypasses it: a human asked for that one by name.
 AUTO_PROMOTION_CAP = 5
 
+# The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
+# `finish` reads it when `--manifest-file` names one; every constant below is
+# unused on a run without it.
+#
+# The three kinds a `scope.clusters` name can resolve to, and the prefix that
+# marks the project-scoped one. `AuditSpec.scopes` is keyed by these.
+TARGET_KIND_CLUSTER = "cluster"
+TARGET_KIND_PROJECT = "project"
+TARGET_KIND_SUBNET = "subnet"
+PROJECT_TARGET_PREFIX = "project/"
+TARGET_KINDS = frozenset({TARGET_KIND_CLUSTER, TARGET_KIND_PROJECT, TARGET_KIND_SUBNET})
+# The one manifest `outcome` under which the collector vouches for a cluster's
+# `checks_run`; every other outcome leaves the cluster to the manual fallback —
+# except `out-of-scope`, the collector saying the target is not this audit's,
+# which is neither cross-checked nor owed by the document.
+# The collector's wall-clock stop. Carried, not read, everywhere except the
+# staleness guard in `load_manifest`.
+MANIFEST_FINISHED_KEY = "finished_at"
+MANIFEST_OUTCOME_COLLECTED = "collected"
+MANIFEST_OUTCOME_OUT_OF_SCOPE = "out-of-scope"
+# How much of a collector's `error` a refusal quotes back.
+MANIFEST_ERROR_EXCERPT = 200
+# How many finding ids a log line names before eliding the rest.
+MANIFEST_LOG_IDS = 5
+# What the held comment shows as the collector's command when the manifest
+# recorded a candidate for a check and no `rc == 0` command on that target.
+COLLECTOR_COMMAND_UNRECORDED = "(the collector recorded no command for this check here)"
+# How many collector-held previous findings get their detail lines (the check
+# and the collector's command) in the ledger body. Every held finding renders
+# its identity — anchor, heading, `Where:` line — because that is what the next
+# run reads its location from; only the detail is capped.
+MAX_HELD_DETAIL_ROWS = 50
+# How many collector-held ids a ledger carries at once. The ids are a
+# monotone term in the hidden marker that no SOP-side edit can shrink, so
+# unbounded they could push a body past GitHub's limit on every run; kept in
+# sorted order so which ones survive the cap is deterministic, with the
+# overflow logged and stated in the body.
+MAX_HELD_IDS = 200
+# The coverage gap a run files when it has a manifest and could not read the
+# ledger it would otherwise rewrite. Branch-neutral: on a clean run nothing is
+# carried, and on a findings run the body is left as it was.
+UNREADABLE_LEDGER_GAP = (
+    "the ledger body could not be read, or its ids were minted under another "
+    "identity scheme, and it was left as it was; the collector's manifest is what "
+    "protects its still-flagged findings this run"
+)
+# The width of a coverage hold rendered on a line of its own — the waiver's
+# reason in the Scope section and the delta comment. Wide enough for the
+# sentence an operator typed; `_cell`'s table width left a third of one.
+MAX_HOLD_LINE_CHARS = 500
+# The JSON-line keys that ride the `finish` payload when a manifest was given.
+UNPUBLISHED_CANDIDATES_KEY = "unpublished_candidates"
+WHOLLY_UNPUBLISHED_CHECKS_KEY = "wholly_unpublished_checks"
+UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
+# `needs_triage` markers whose findings the automatic sweep will not promote,
+# whatever their grade. A filter that is not about the finding's strength:
+# these are findings a collector fully corroborated whose *fix* has a failure
+# mode the collector cannot rule out.
+#
+# One marker so far. A cost collector sets `service-fronted` on an idle
+# controller some Service selects, because that remediation is
+# `spec.replicas: 0` and the Service loses its endpoints with the pods. The
+# check measures CPU and memory; nothing in it measures a caller. On
+# 2026-09-07 three findings without this gate merged unattended and stood down
+# three Deployments, two of them behind forwarding rules metering hundreds of
+# thousands of packets a week. `/remediate <id>` is unaffected and is the
+# point: a person who reads the finding and asks for it by name has supplied
+# the judgement the collector could not.
+NO_SWEEP_TRIAGE = frozenset({"service-fronted"})
+
 # `authorAssociation` values that imply write access, and therefore the standing
 # to issue `/remediate`.
 WRITE_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
@@ -760,6 +897,17 @@ def normalise_newlines(text: str | None) -> str:
 
 
 REDACTED = "[redacted by audit_report.py]"
+
+# Every hidden marker this harness reads — the delta block, the id scheme, the
+# finding markers, the held-section brackets — is an HTML comment, so a `<!--`
+# arriving inside model- or fleet-authored free text is an attempt, deliberate
+# or accidental, to write one of them. `publishable_text` spends the opener on
+# the way out; `&lt;!--` renders as the four characters the author wrote
+# everywhere except inside a fenced block, where the entity is shown literally
+# and the author sees `&lt;!--` — the cost of the escape, paid where the text
+# is already being displayed as raw output rather than read as prose.
+COMMENT_OPENER = "<!--"
+COMMENT_OPENER_ESCAPED = "&lt;!--"
 
 # Field names whose value is a credential often enough that publishing it to a
 # GitHub issue is never worth the convenience. Shared with the environment-pair
@@ -1090,6 +1238,29 @@ def redact_secrets(text: str | None) -> str:
     return _TOKEN_SHAPE_RE.sub(REDACTED, out)
 
 
+def publishable_text(text: str | None) -> str:
+    """Redact, then take the comment opener out of text bound for a published body.
+
+    The one gate every piece of model- or fleet-authored text passes on its
+    way into an issue body or a comment: titles and impacts through
+    `clip_text`, table cells through `_cell`, identity rows through `_ident`,
+    evidence through `trim_excerpt` and `trim_command`, and the coverage-gap
+    sentences, which redact early because they leave by the run-summary JSON
+    as well — that line is relayed into chat, which renders Markdown too, so
+    the escape is right on both doors.
+
+    Redaction alone was not enough once the held section existed. A hidden
+    comment forged inside free text could at worst confuse one run's read of
+    one body before; between the held-section brackets it becomes an id list
+    that every later run carries forward and no later run can clear, because
+    a run without a manifest has no evidence to contradict it with. Own-line
+    marker matching in `_held_span` narrows that to a multi-line title
+    carrying a whole begin/list/end trio; this closes it, and is why a title
+    cannot spell `<!--` in the rendered body at all.
+    """
+    return redact_secrets(text).replace(COMMENT_OPENER, COMMENT_OPENER_ESCAPED)
+
+
 def clip_text(text: str | None, limit: int) -> str:
     """Redact, then clip a free-text schema field to `limit` characters.
 
@@ -1099,7 +1270,7 @@ def clip_text(text: str | None, limit: int) -> str:
     renders, a single oversized field could push the body past GitHub's limit
     and publish nothing at all.
     """
-    value = redact_secrets(text).strip()
+    value = publishable_text(text).strip()
     if len(value) <= limit:
         return value
     return value[:limit].rstrip() + " …(truncated)"
@@ -1131,6 +1302,40 @@ def audit_checks(audit_id: str) -> tuple[str, ...]:
     """
     spec = AUDITS.get(audit_id)
     return spec.checks if spec else ()
+
+
+def target_kind(name: str) -> str:
+    """Which kind of thing a `scope.clusters` entry names.
+
+    The SOPs already encode this in the name they ask for, so nothing new has to
+    be carried per entry: `project/<id>` is the project-scoped entry, a name with
+    a `/` in it is a `<project>/<region>/<subnet>` target, and a bare name is a
+    cluster.
+    """
+    if name.startswith(PROJECT_TARGET_PREFIX):
+        return TARGET_KIND_PROJECT
+    return TARGET_KIND_SUBNET if "/" in name else TARGET_KIND_CLUSTER
+
+
+def audit_target_checks(audit_id: str, target_name: str) -> tuple[str, ...]:
+    """The roster subset `target_name` is answerable for.
+
+    The whole roster for an unpartitioned stream, and for a target whose kind a
+    partitioned stream does not declare. That second case is deliberate: an
+    unexpected target reads as answerable for everything and so shows up as a
+    coverage gap, which is the loud failure. Narrowing it to nothing would
+    excuse the target from the audit and report the result as complete.
+    """
+    spec = AUDITS.get(audit_id)
+    if not spec:
+        return ()
+    if not spec.scopes:
+        return spec.checks
+    kind = target_kind(str(target_name).strip())
+    for declared, checks in spec.scopes:
+        if declared == kind:
+            return checks
+    return spec.checks
 
 
 def audit_finding_checks(audit_id: str) -> frozenset[str]:
@@ -2319,9 +2524,12 @@ def coverage_gaps(data: dict) -> list[str]:
     the roster for that cluster rather than counting as unread. Without that,
     "this check cannot exist here" and "nobody looked" were the same state, and
     two Autopilot clusters were enough to keep a stream partial in perpetuity.
+
+    The roster is per target, not per stream, because SOPs may enumerate
+    project and subnet entries alongside clusters — see `AuditSpec.scopes`.
     """
     scope = data.get("scope") or {}
-    roster = audit_checks(str(data.get("audit") or ""))
+    audit_id = str(data.get("audit") or "")
     gaps: list[str] = []
     for entry in scope.get("skipped") or []:
         cluster = str(entry.get("cluster", "")).strip() or "(unnamed)"
@@ -2329,17 +2537,18 @@ def coverage_gaps(data: dict) -> list[str]:
         # model-authored text. These strings leave by two doors: the renderer,
         # which redacts, and the run-summary JSON on stdout — which the agent
         # reads back and relays into chat, and which never sees a cell.
-        reason = redact_secrets(entry.get("reason", "no reason given"))
+        reason = publishable_text(entry.get("reason", "no reason given"))
         gaps.append(f"{cluster}: not audited — {reason}")
     for cluster in scope.get("clusters") or []:
-        limitation = redact_secrets(cluster.get("limitations", "")).strip()
+        limitation = publishable_text(cluster.get("limitations", "")).strip()
+        name = str(cluster.get("name", "")).strip() or "(unnamed)"
         ran = set(checks_ran(cluster))
         na = set(checks_na(cluster))
+        roster = audit_target_checks(audit_id, name)
         applicable = [check for check in roster if check not in na]
         missing = [check for check in applicable if check not in ran]
         if not limitation and not missing:
             continue
-        name = str(cluster.get("name", "")).strip() or "(unnamed)"
         # One line per cluster, not one per gap: the same cluster explaining
         # itself twice reads as two broken clusters in the ledger comment.
         reasons: list[str] = []
@@ -2351,6 +2560,9 @@ def coverage_gaps(data: dict) -> list[str]:
         if limitation:
             reasons.append(limitation)
         gaps.append(f"{name}: partially audited — {'; '.join(reasons)}")
+    # A kind nobody enumerated is nobody's gap in particular: the checks it
+    # stranded ran against no target at all, so the gap covers the stream.
+    gaps.extend(_unenumerated_kind_gaps(audit_id, scope.get("clusters") or []))
     # The fourth representation of "did not look": posture checks that ran with
     # no record of the declaration search the SOP puts in front of them. Filed
     # on the document by `withhold_unsearched_postures`, so this reads it back
@@ -2360,6 +2572,854 @@ def coverage_gaps(data: dict) -> list[str]:
     if declared_gap:
         gaps.append(declared_gap)
     return gaps
+
+
+def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
+    """A target kind the run enumerated none of, and the checks it stranded.
+
+    Scoping the denominator per target (`AuditSpec.scopes`) opens a hole that
+    the whole-roster denominator did not have: a check owed only by subnets is
+    owed by nobody in a run that produced no subnet entries, so it drops out of
+    every count and the report reads as complete without it having run anywhere.
+
+    An empty `scope.clusters` is left alone. That run has bigger problems and
+    `validate_findings` already speaks to them; naming every kind here as well
+    would bury the real error under a gap per kind.
+    """
+    spec = AUDITS.get(audit_id)
+    if not spec or not spec.scopes or not targets:
+        return []
+    seen = {target_kind(str(t.get("name", "")).strip()) for t in targets if isinstance(t, dict)}
+    gaps = []
+    for kind, checks in spec.scopes:
+        if kind in seen:
+            continue
+        gaps.append(
+            f"no {kind} targets were audited — {len(checks)} check(s) ran "
+            f"against nothing ({', '.join(checks)})"
+        )
+    return gaps
+
+
+# --------------------------------------------------------------------------- #
+# The collector manifest — docs/designs/fleet-audit-collector-manifest.md.
+#
+# A per-stream collector script reads the fleet deterministically and writes
+# one JSON document saying which commands it ran where, how each ended, and
+# what it would flag. `finish` takes that document through `--manifest-file`
+# and holds the findings document to it: a cluster the collector read must be
+# reported, a check the collector did not run cannot be claimed, the evidence
+# a finding cites is the collector's rather than the model's retyping of it,
+# and a finding the collector still emits a candidate for is not announced as
+# fixed. Every function here answers "nothing" for a missing manifest, so a
+# stream without a collector publishes exactly as it did before the flag.
+# --------------------------------------------------------------------------- #
+
+
+def manifest_predates_run(manifest: dict, audit_id: str) -> tuple[str, str] | None:
+    """`(finished_at, started_at)` when this manifest was written before the run opened.
+
+    `--manifest-file` is the one input `finish` takes from outside the run, and
+    the collectors write it to a fixed path the SOP names in prose rather than
+    one the harness derives from the audit id — so `start` cannot scrub it the
+    way it scrubs the findings file. A run whose worker skipped the collector,
+    or whose collector died before writing, therefore finds last week's
+    manifest sitting at that path and cross-checks against it: a corroboration
+    that vouches for a fleet as it stood a week ago, which is worse than none,
+    because the run publishes with the manifest's authority behind it.
+
+    Both stamps unknown-by-default: a run record from a `start` older than
+    `RUN_RECORD_STARTED_KEY`, or a manifest from a collector that writes no
+    `finished_at`, reads as "cannot tell" and lets the manifest through. That
+    is `parse_gh_timestamp`'s rule — a missing timestamp is evidence about the
+    writer, never about the past — and it is what keeps this from failing every
+    run that straddles the upgrade.
+    """
+    record = read_run_record(audit_id)
+    if not isinstance(record, dict):
+        return None
+    started_raw = record.get(RUN_RECORD_STARTED_KEY)
+    finished_raw = manifest.get(MANIFEST_FINISHED_KEY)
+    started = parse_gh_timestamp(started_raw)
+    finished = parse_gh_timestamp(finished_raw)
+    if started is None or finished is None or finished >= started:
+        return None
+    return str(finished_raw), str(started_raw)
+
+
+def load_manifest(path: str, audit_id: str | None = None) -> dict:
+    """The collector manifest at `path`, or a ValidationError naming why not.
+
+    Only the envelope is checked here — an object, with `clusters` a list when
+    present, and `audit` naming this stream when present, the way
+    `load_findings` holds the document to `--audit`: a manifest from another
+    stream would cross-check every cluster against the wrong roster and
+    corroborate nothing true. Everything inside it is read defensively by the
+    functions below, because a malformed cluster entry is the collector's
+    defect and should degrade to "this cluster is not cross-checked" rather
+    than fail the run the document is otherwise entitled to.
+
+    The one check that is not about the envelope's shape is staleness:
+    `manifest_predates_run` refuses a manifest the collector finished before
+    this run's `start` wrote its record.
+    """
+    manifest_path = Path(path)
+    if not manifest_path.is_file():
+        raise ValidationError(f"--manifest-file: {path} does not exist")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"--manifest-file: {path} is not valid JSON: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise ValidationError(f"--manifest-file: {path} must hold a JSON object")
+    clusters = manifest.get("clusters")
+    if clusters is not None and not isinstance(clusters, list):
+        raise ValidationError(f"--manifest-file: {path}: `clusters` must be a list")
+    declared_audit = manifest.get("audit")
+    if audit_id and declared_audit is not None and str(declared_audit) != audit_id:
+        raise ValidationError(
+            f"--manifest-file: {path} was written for audit {str(declared_audit)!r}, "
+            f"not {audit_id!r}; a manifest cross-checks the document against its own "
+            "stream's roster and corroborates nothing about another's."
+        )
+    if audit_id:
+        stale = manifest_predates_run(manifest, audit_id)
+        if stale:
+            finished, started = stale
+            raise ValidationError(
+                f"--manifest-file: {path} finished at {finished}, before this run started "
+                f"at {started}; it is a previous run's collection and corroborates nothing "
+                "about the fleet as it stands. Re-run the collector, or pass "
+                "--no-collector-manifest to publish without one and take the coverage gap."
+            )
+    return manifest
+
+
+def waiver_gap(waiver: str) -> str:
+    """The coverage gap a waived collector manifest contributes.
+
+    A waiver is the one hold-open that is not derivable from the document, so
+    both the real run and `--dry-run` have to append it themselves. They have
+    to word it identically: the preview exists to show the comment the run
+    would publish, and one that phrased the hold-open differently would be
+    reporting on a run that does not exist.
+    """
+    # Redacted here, where `coverage_gaps` redacts a skipped reason: the string
+    # leaves by the run-summary JSON as well as the renderer.
+    return f"the collector manifest was waived — {publishable_text(waiver).strip()}"
+
+
+def _manifest_clusters(manifest: dict | None) -> list[dict]:
+    """The manifest's cluster entries that are shaped like one; `[]` without a manifest."""
+    if not manifest:
+        return []
+    return [c for c in manifest.get("clusters") or [] if isinstance(c, dict)]
+
+
+def _collector_error(entry: dict) -> str:
+    """` (<error>)` for a refusal, redacted and clipped, or nothing when the entry carries none.
+
+    Redacted like every other free-text string that reaches a rejection: the
+    collector's `error` is a subprocess's stderr, which is where a credential
+    in a command line comes back.
+    """
+    error = entry.get("error")
+    return f" ({publishable_text(str(error))[:MANIFEST_ERROR_EXCERPT]})" if error else ""
+
+
+def _vouching_clusters(manifest: dict) -> dict[str, dict]:
+    """The manifest's cluster entries by name, skipping any without a usable outcome.
+
+    The cross-check reads `outcome` on every path, so an entry with a name and
+    no outcome has nothing for it to reason from. `load_manifest` promises
+    such an entry degrades to "this cluster is not cross-checked" rather than
+    failing the run; the WARNING is what keeps the degradation visible.
+    """
+    out: dict[str, dict] = {}
+    for entry in _manifest_clusters(manifest):
+        name = str(entry.get("name") or "")
+        if not name:
+            continue
+        outcome = entry.get("outcome")
+        if not isinstance(outcome, str) or not outcome.strip():
+            log(
+                f"WARNING: the collector manifest's entry for {name!r} carries no "
+                "outcome, so the document's claims about it are not cross-checked."
+            )
+            continue
+        if outcome == MANIFEST_OUTCOME_OUT_OF_SCOPE:
+            # The collector enumerated it and ruled it out of this audit — a
+            # cluster mid-provision, an alpha cluster no upgrade check applies
+            # to. Not this audit's target: nothing to cross-check, nothing the
+            # document owes, no gap of its own.
+            log(
+                f"INFO: the collector manifest marks {name!r} out of scope for this "
+                "audit; it is not cross-checked and the document need not list it."
+            )
+            continue
+        out[name] = entry
+    return out
+
+
+def cross_check_manifest(data: dict, manifest: dict) -> None:
+    """Raise if the document claims what the manifest says did not happen.
+
+    Scoped per cluster, not per stream: a manifest cluster marked `collected`
+    is cross-checked in full — every `checks_run` entry for it must name a
+    (check, cluster) pair the manifest recorded at `rc == 0` — but a cluster
+    the manifest marks anything else is left to the SOP's ordinary attestation
+    rules, because the collector could not cover it and a human may have
+    hand-collected it instead. The two regimes never mix within one cluster:
+    a `collected` cluster's entries are all manifest-checked, so a fabricated
+    extra check cannot hide behind a real manual fallback on the same cluster.
+
+    Absent-from-the-manifest is silent: a cluster in `checks_run` that the
+    manifest never enumerated is not this function's business (a stream only
+    partially converted to a collector, or a manifest built for a narrower
+    scope) — `coverage_gaps` and the ordinary roster checks already govern
+    clusters the manifest says nothing about.
+
+    The reverse is not silent, and that asymmetry is the point. Everything
+    above reads the document and asks the manifest to confirm it, which cannot
+    see a cluster the document simply left out. On 2026-08-29 a patch collector
+    read all four clusters and recorded nine successful checks against each;
+    the findings document named one, and a document-first check had nothing to
+    say about the other three. The run published "0 findings across 1 audited
+    cluster(s)", declared itself CLEAN, and closed the ledger — a full-fleet
+    all-clear off a quarter of the fleet, with no gap reported anywhere. So a
+    `collected` cluster missing from `scope.clusters` is a rejection rather
+    than a coverage gap: the collector already proved the cluster readable, so
+    its absence is a defect in the document and not a condition of the fleet.
+
+    A target the collector could *not* read is missing just as loudly. The
+    rule that an unreadable target claiming checks must carry `limitations`
+    only reaches a target the document mentions, and omitting it entirely
+    evades that as thoroughly as it evades everything else. A collector failure
+    is also the likeliest place for a finding to be hiding, so of the two ways
+    to lose a target this is the worse one to lose silently. `scope.skipped` is
+    the other honest home for it, and the better one when nobody checked it by
+    hand: `coverage_gaps` already turns a skipped entry into a gap.
+
+    `checks_not_applicable` is the one field that used to be uncontradictable
+    — free text, outside the coverage denominator, and a check moved into it
+    turns a partial run clean. The rule is corroboration, not prohibition: a
+    slug is inapplicable if the collector said so, or if the collector never
+    claimed a successful command for it. Only the contradiction is rejected,
+    in both directions — the manifest recording a check as run and clean while
+    the document takes it out of the denominator, and the document claiming a
+    check ran where the collector declared it inapplicable. The second matters
+    because a `commands` entry records that a *command* ran, and one command
+    is routinely recorded against every slug it feeds, so the rc=0 match alone
+    would corroborate a claim the collector itself denies.
+    """
+    audit_id = str(data.get("audit") or "")
+    manifest_clusters = _vouching_clusters(manifest)
+    scope = data.get("scope") or {}
+    documented = {
+        str(c.get("name", "")) for c in scope.get("clusters") or [] if isinstance(c, dict)
+    }
+    undocumented = [
+        (name, c) for name, c in sorted(manifest_clusters.items()) if name not in documented
+    ]
+    missing = [
+        name for name, c in undocumented if c.get("outcome") == MANIFEST_OUTCOME_COLLECTED
+    ]
+    if missing:
+        raise ValidationError(
+            f"scope.clusters omits {', '.join(repr(n) for n in missing)}, which the "
+            f"collector manifest for {audit_id} marks '{MANIFEST_OUTCOME_COLLECTED}'. "
+            "Every cluster the collector read must appear in the document — a run "
+            "that drops one publishes as an all-clear over a fleet it did not report "
+            "on. Add the cluster with its checks_run, or re-run the collector if the "
+            "manifest is from a different scope."
+        )
+    skipped = {
+        str(entry.get("cluster", ""))
+        for entry in scope.get("skipped") or []
+        if isinstance(entry, dict)
+    }
+    unread = [
+        (name, c)
+        for name, c in undocumented
+        if c.get("outcome") != MANIFEST_OUTCOME_COLLECTED and name not in skipped
+    ]
+    if unread:
+        detail = "; ".join(
+            f"{name}: {str(c.get('outcome'))}{_collector_error(c)}" for name, c in unread
+        )
+        raise ValidationError(
+            f"scope.clusters omits {', '.join(repr(n) for n, _ in unread)}, which the "
+            f"collector manifest for {audit_id} enumerated but did not audit "
+            f"({detail}). A target the collector failed on is the one this document "
+            "least gets to be quiet about: nothing else in the run mentions it, so "
+            "leaving it out reports the fleet as covered without it. Put it in "
+            "scope.skipped with the reason if nobody covered it, or in scope.clusters "
+            "with `limitations` naming what the collector could not read and what you "
+            "checked by hand — either way the run reports the gap."
+        )
+    for cluster in scope.get("clusters") or []:
+        if not isinstance(cluster, dict):
+            continue
+        name = str(cluster.get("name", ""))
+        manifest_cluster = manifest_clusters.get(name)
+        if not manifest_cluster:
+            continue
+        claimed = checks_ran(cluster)
+        if manifest_cluster.get("outcome") != MANIFEST_OUTCOME_COLLECTED:
+            # The collector could not read this target, and the document says
+            # it was checked anyway. That is allowed — falling back to manual
+            # commands is what an agent is supposed to do with a gate-failed
+            # target — but it cannot be reported as an ordinary full read,
+            # because nothing corroborates it. Requiring `limitations` rather
+            # than refusing keeps the fallback legal and makes it visible:
+            # `coverage_gaps` turns the limitation into a gap, so the run
+            # reports itself partial and names the target whose coverage rests
+            # on work the manifest cannot check.
+            if claimed and not str(cluster.get("limitations", "")).strip():
+                raise ValidationError(
+                    f"scope.clusters: {name!r} claims {len(claimed)} check(s) ran, "
+                    f"but the collector manifest for {audit_id} marks it "
+                    f"{str(manifest_cluster.get('outcome'))!r}"
+                    f"{_collector_error(manifest_cluster)}. A target the collector "
+                    "could not read may still be checked by hand, but it cannot be "
+                    "reported as a clean full read: nothing corroborates those "
+                    "checks. Put what you ran and what the collector could not into "
+                    "this target's `limitations`, so the run reports the gap instead "
+                    "of publishing over it."
+                )
+            continue
+        ok_checks = {
+            str(entry.get("check"))
+            for entry in manifest_cluster.get("commands") or []
+            if isinstance(entry, dict) and entry.get("rc") == 0
+        }
+        collector_not_applicable = {
+            str(entry.get("check"))
+            for entry in manifest_cluster.get("checks_not_applicable") or []
+            if isinstance(entry, dict)
+        }
+        for slug in claimed:
+            if slug not in ok_checks:
+                raise ValidationError(
+                    f"scope.clusters: {name!r}.checks_run names {slug!r}, but the "
+                    f"collector manifest for {audit_id} marks {name!r} "
+                    f"'{MANIFEST_OUTCOME_COLLECTED}' and records no successful "
+                    "command for that check there. A collected cluster's checks_run "
+                    "must match the manifest that collected it — see "
+                    "cross_check_manifest."
+                )
+            if slug in collector_not_applicable:
+                raise ValidationError(
+                    f"scope.clusters: {name!r}.checks_run names {slug!r}, but the "
+                    f"collector manifest for {audit_id} declares {slug!r} not "
+                    f"applicable on {name!r}. The collector knows this target's "
+                    "shape and already said the check has nothing to run against "
+                    "there; a command recorded for it covers some other target the "
+                    "same call served. Reporting it as run counts coverage this "
+                    "run does not have — carry the collector's disposition into "
+                    "checks_not_applicable instead."
+                )
+        for slug in checks_na(cluster):
+            if slug in ok_checks and slug not in collector_not_applicable:
+                raise ValidationError(
+                    f"scope.clusters: {name!r} reports {slug!r} as not applicable, "
+                    f"but the collector manifest for {audit_id} records a "
+                    f"successful command for it on {name!r} and does not itself "
+                    "declare it inapplicable. A check the collector ran and "
+                    "completed was covered, so moving it out of the coverage "
+                    "denominator reports the cluster as more fully audited than "
+                    "it was. If the check genuinely cannot apply to this target, "
+                    "the collector is where that belongs — it is the same answer "
+                    "on every run. If it applies but you could not evaluate it, "
+                    "that is this target's `limitations`, which becomes a "
+                    "coverage gap."
+                )
+
+
+def _candidate_identity(entry: dict, candidate: dict) -> str:
+    """The full derived id of a manifest candidate, before shortening.
+
+    The cluster comes from the enclosing entry when the candidate carries none.
+    Only a collector that writes per-cluster check tables puts `cluster` on the
+    candidate itself; one that builds the name into `object` omits it, and an
+    id derived from such a candidate alone reads `check._._.object` and matches
+    nothing. Reading the name from the entry is true of both shapes.
+
+    Two spellings of one identity are in play here, and each join below says
+    which it uses. This is the *full* one, and it matches
+    `derive_finding_id(finding)` on a document finding: `adopt_collector_evidence`,
+    `adopt_arm_impact`, `uncorroborated_findings` and `triage_marked_findings`
+    join full-to-full. The ledger spells a finding by `published_id`, clipped
+    at `MAX_FINDING_ID`, and anything compared against ledger ids or printed
+    beside them — `collector_flagged_ids`, the held entries, the candidate
+    rows on the JSON line — is clipped the same way, or a long-named object
+    never matches and the line shows an id nothing else uses.
+    """
+    keyed = {**candidate, "cluster": str(candidate.get("cluster") or entry.get("name") or "")}
+    return derive_finding_id(keyed)
+
+
+def published_id(finding: dict) -> str:
+    """The id the ledger spells a finding by: derived, then clipped.
+
+    `validate_findings` stamps exactly this onto each finding, so it is what
+    the hidden delta block records and what `previous_ids` reads back. Any
+    set that is compared against ledger ids is built with this, not with
+    `derive_finding_id` alone.
+    """
+    return _shorten_id(derive_finding_id(finding))
+
+
+def _flagged_identities(manifest: dict | None) -> set[str]:
+    """Every candidate's full derived id — the spelling document findings join on."""
+    return {_candidate_identity(entry, candidate) for entry, candidate in _candidates(manifest)}
+
+
+def _candidates(manifest: dict | None):
+    """Every well-formed `(entry, candidate)` pair in the manifest."""
+    for entry in _manifest_clusters(manifest):
+        for candidate in entry.get("candidates") or []:
+            if isinstance(candidate, dict):
+                yield entry, candidate
+
+
+def adopt_collector_evidence(findings: list[dict], manifest: dict | None) -> list[str]:
+    """Replace each finding's `evidence` with what the collector recorded for
+    the same identity. Returns the ids changed.
+
+    `evidence` is the one part of the document that claims to be *observed* —
+    a command, and the output it produced — and the model wrote both. It is
+    not usually wrong; what it does is retype the excerpt differently every
+    run, and lose detail while it does, so nothing downstream can tell an
+    unchanged fleet from one that moved. The collector computed the same
+    excerpt deterministically, so take it from there and treat the model's as
+    a draft.
+
+    The command has to come with it. In isolation the model's is often the
+    *better* string — a narrow `describe --format="json(maintenancePolicy)"`
+    against the collector's one broad `clusters list` — but the two fields are
+    one claim. Once the excerpt is the collector's computed line, a narrow
+    command beside it no longer produces what it sits above, so both fields
+    move together or neither does. A candidate may name the command that
+    produced *it*, and where it does that beats the per-slug record: `commands`
+    holds one record per check per target, so a check issuing one command per
+    sub-target can record only one of them.
+
+    Nothing is invented. A finding with no matching candidate keeps what it
+    arrived with, which is what keeps the manual fallback working: a target
+    the collector could not read yields no candidates, and the agent's
+    hand-run command is then the only evidence there is.
+    """
+    by_id: dict[str, tuple[dict, str]] = {}
+    for entry, candidate in _candidates(manifest):
+        commands = {
+            str(command.get("check")): str(command.get("command") or "")
+            for command in entry.get("commands") or []
+            if isinstance(command, dict)
+            and command.get("rc") == 0
+            and str(command.get("command") or "").strip()
+        }
+        by_id[_candidate_identity(entry, candidate)] = (
+            candidate,
+            str(candidate.get("command") or "").strip()
+            or commands.get(str(candidate.get("check")), ""),
+        )
+
+    adopted = []
+    for finding in findings:
+        match = by_id.get(derive_finding_id(finding))
+        evidence = finding.get("evidence")
+        if match is None or not isinstance(evidence, dict):
+            continue
+        candidate, command = match
+        excerpt = str(candidate.get("excerpt") or "").strip()
+        # All of it or none of it: a collector-computed excerpt under a
+        # model-written command is the mismatch this exists to remove, so a
+        # candidate missing either half is left alone entirely.
+        if not excerpt or not command:
+            continue
+        changed = False
+        if evidence.get("excerpt") != excerpt:
+            evidence["excerpt"] = excerpt
+            changed = True
+        if evidence.get("command") != command:
+            evidence["command"] = command
+            changed = True
+        if changed:
+            adopted.append(str(finding.get("id") or ""))
+    return adopted
+
+
+def adopt_arm_impact(findings: list[dict], manifest: dict | None) -> list[str]:
+    """Take the collector's `impact` for a candidate that marked it arm-specific.
+
+    Deliberately narrower than `adopt_collector_evidence`. Most checks mean one
+    thing, their `impact` is a constant, and the model's rewrite of it is
+    usually *better* than the constant — it names the actual ResourceQuota and
+    the headroom it strands where the constant can only speak in general.
+    Adopting the table everywhere would delete that.
+
+    A check with more than one arm is the exception, and the collector marks
+    those with `impact_authoritative`. There the sentence is not prose about
+    consequence but a report of *which arm fired*, which the model has to
+    infer from an excerpt and repeatedly infers wrong: "locked to a single
+    zone or near its scaling ceiling" published over a pool that is
+    zone-locked and at half its ceiling.
+    """
+    authoritative: dict[str, str] = {}
+    for entry, candidate in _candidates(manifest):
+        if not candidate.get("impact_authoritative"):
+            continue
+        impact = str(candidate.get("impact") or "").strip()
+        if impact:
+            authoritative[_candidate_identity(entry, candidate)] = impact
+
+    adopted = []
+    for finding in findings:
+        impact = authoritative.get(derive_finding_id(finding))
+        if impact and finding.get("impact") != impact:
+            finding["impact"] = impact
+            adopted.append(str(finding.get("id") or ""))
+    return adopted
+
+
+def collector_flagged_ids(manifest: dict | None) -> set[str]:
+    """Every finding id the collector still emits a candidate for.
+
+    `compute_delta` reads a finding's absence from this run's document as
+    proof it was fixed, because for most of the document that is the only
+    evidence there is. It is not the only evidence for a check a collector
+    owns: the collector re-derives its candidates from the live API every
+    run, and a candidate it still emits is the condition still holding. Where
+    the two disagree, the collector is the one that looked. A patch stream
+    published 31 findings for eleven runs, then 29 for four — two
+    `no-maintenance-window` findings vanished from the document while the
+    manifest went on recording them and neither cluster had acquired a
+    window — and the delta announced both resolved, which closes their ledger
+    rows and any remediation pull request open against them.
+
+    `cross_check_manifest` guards the same failure one level up, a whole
+    cluster dropped from `scope.clusters`, and stops there because a candidate
+    is a candidate: the model is *supposed* to be able to reject one as a
+    false positive, so a missing finding cannot be a rejection the way a
+    missing cluster can. That is why this returns a set to subtract from
+    `resolved_ids` rather than raising. A dropped candidate stops being
+    announced as fixed; it does not stop the run.
+
+    Spelled as the ledger spells them (`published_id`), because every id this
+    set is subtracted from — `resolved_ids`, `previous_ids`, a pull request's
+    hidden block — was read off a ledger body, and a derived id over
+    `MAX_FINDING_ID` characters is clipped there. Compared unclipped, any
+    long-named object slipped through the hold.
+    """
+    return {
+        _shorten_id(_candidate_identity(entry, candidate))
+        for entry, candidate in _candidates(manifest)
+    }
+
+
+def _declared_ids(data: dict) -> set[str]:
+    """The ledger ids of every entry the document moved under `declared`."""
+    return {
+        published_id(entry)
+        for entry in data.get("declared") or []
+        if isinstance(entry, dict)
+    }
+
+
+def still_flagged_ids(manifest: dict | None, data: dict) -> set[str]:
+    """The finding ids the collector still flags that the document has not declared.
+
+    The one set both `finish` branches subtract, built from the manifest and
+    the document together. A candidate the collector still emits is the
+    condition still holding — but a posture the document moved under
+    `declared` is accounted for: an owner chose that shape on purpose, the
+    ledger design retires it that way, and the collector, which reads the
+    fleet and not the repository, will go on emitting it for as long as the
+    declaration stands. Held, such a finding would keep its ledger open and
+    its pull request unretired forever. A `resolved_because` entry does not
+    release a still-flagged finding: that entry claims the object is gone, and
+    the collector says it is not.
+    """
+    return collector_flagged_ids(manifest) - _declared_ids(data)
+
+
+def collector_held_entries(
+    manifest: dict | None,
+    data: dict,
+    *,
+    exclude: set[str],
+    previous_body: str | None,
+    preview_from_candidates: bool = False,
+) -> list[dict]:
+    """The findings the collector still flags that this run must carry, sorted by id.
+
+    Computed once per `finish`, for both branches. `exclude` is the one
+    definition of "the document carries it": its own finding ids and the
+    postures `finish` withheld this run, which are the model's findings taken
+    out for want of a search and enter no delta block by the standing rule.
+
+    The held set is (the previous body's marker ids) ∩ `still_flagged_ids`,
+    less `exclude`. Keyed on the hidden marker, not on the `####` headings:
+    the marker carries every held id under every rendering tier, while a
+    heading is what a body under budget pressure drops first, and a hold keyed
+    on headings forgot the finding the moment its row was squeezed out — a run
+    with 400 findings and ten held closed the ledger on the next clean pass
+    with ten pull requests still open. A ledger this run could not read is not
+    this function's case: `finish` then leaves the body as it was and holds
+    nothing, rather than deriving a set from the manifest alone (which would
+    turn every candidate the model has been rejecting into a hold).
+
+    `preview_from_candidates` is the dry run's: it fetches no ledger, so the
+    preview is the still-flagged set less `exclude`, whole, with the caveat
+    the dry run prints that the real run keeps only what the marker carries.
+
+    The identity of each held entry comes from the manifest candidate that
+    still emits it — check, cluster, namespace, object, and the command that
+    produced it — because that candidate is what the collector vouches for.
+    The title is the previous body's when its heading survived and otherwise
+    built from the check and the object.
+
+    This is the clean-run counterpart of the `still_flagged_ids` subtraction
+    and the source of the findings branch's carried rows. A zero-finding
+    document can name a previous finding under `resolved_because` and pass
+    `unaccounted_previous_findings`; if the manifest for the same run still
+    carries that finding's candidate, the explanation contradicts the one
+    thing in the run that looked, so the finding is unaccounted for the
+    purposes of the close whatever the document says. `data` is what releases
+    one: an entry under `declared`, per `still_flagged_ids`.
+    """
+    flagged = still_flagged_ids(manifest, data) - set(exclude)
+    if not flagged:
+        return []
+    if preview_from_candidates:
+        held_ids = sorted(flagged)
+        titles: dict[str, str] = {}
+    else:
+        marker_ids, _ = previous_marker_ids(previous_body)
+        held_ids = [fid for fid in marker_ids if fid in flagged]
+        respelled = _respelled_rows(previous_body)
+        # Titles from the rows that recorded a location, not from every
+        # heading. `held_row_from_id` renders a heading too -- "<id> (carried
+        # by id; location not recorded on the previous ledger)" -- and it is a
+        # placeholder for the one thing this branch already has: the candidate
+        # the collector still emits, with the real cluster and object on it.
+        # Reading it back pinned that sentence over a row whose `Where:` line
+        # names the location it says was not recorded, on every run after, and
+        # sent it out again as the finding's name in the delta comment and in
+        # the stale-close pass. A row with no `Where:` line has no title worth
+        # carrying, so the fallback below builds one from the candidate.
+        titles = {
+            respelled.get(raw, raw): where["title"]
+            for raw, where in parse_finding_locations(previous_body).items()
+        }
+    if not held_ids:
+        return []
+    by_ledger_id: dict[str, dict] = {}
+    for entry, candidate in _candidates(manifest):
+        fid = _shorten_id(_candidate_identity(entry, candidate))
+        if fid in by_ledger_id:
+            continue
+        commands = {
+            str(command.get("check")): str(command.get("command") or "")
+            for command in entry.get("commands") or []
+            if isinstance(command, dict) and command.get("rc") == 0
+        }
+        check = str(candidate.get("check") or "")
+        command = (
+            str(candidate.get("command") or "").strip() or commands.get(check, "").strip()
+        )
+        by_ledger_id[fid] = {
+            "check": check,
+            "cluster": str(candidate.get("cluster") or entry.get("name") or ""),
+            "namespace": str(candidate.get("namespace") or ""),
+            "object": str(candidate.get("object") or ""),
+            "commands": [command or COLLECTOR_COMMAND_UNRECORDED],
+        }
+    held: list[dict] = []
+    for fid in held_ids:
+        identity = by_ledger_id.get(fid)
+        if identity is None:
+            continue
+        title = titles.get(fid) or f"{identity['check']} on {identity['object']}"
+        held.append({"id": fid, "title": title, **identity})
+    return sorted(held, key=lambda entry: entry["id"])
+
+
+def cap_held_entries(entries: list[dict]) -> tuple[list[dict], list[dict]]:
+    """The first `MAX_HELD_IDS` held entries by id, and the ones the ledger stops tracking.
+
+    The held ids ride the hidden marker, charged to the body budget ahead of
+    the findings so the body cannot raise over them — which is only a bound if
+    their number is. Sorted input, so the same fleet keeps the same ids under
+    the cap from one run to the next. An entry past the cap leaves the marker
+    and does not come back through it: the ledger stops tracking it, and it
+    stays on the JSON line as an unpublished candidate for as long as the
+    collector flags it, with its pull request protected by the still-flagged
+    set as before.
+    """
+    return entries[:MAX_HELD_IDS], entries[MAX_HELD_IDS:]
+
+
+def uncorroborated_findings(findings: list[dict], manifest: dict | None) -> set[str]:
+    """Findings published under a slug the collector ran and did not flag them for.
+
+    The inverse of `unpublished_candidates`, and the direction nothing was
+    watching. That one asks what the collector saw and the document did not
+    repeat; this asks what the document says the collector saw and it did not.
+    A check whose command the collector ran to `rc == 0` on a cluster is
+    exhaustive over that cluster — it derives its candidates from the live
+    API, so an object it did not emit is an object it looked at and passed. A
+    finding published under that slug for that object is a verdict attributed
+    to a collector that returned the opposite one.
+
+    A cost stream did that on 2026-09-07 and it cost two live Deployments: two
+    findings filed under `idle-workload` for objects the idle check had
+    declined to flag (they were half the minimum age), graded `major`, with
+    `Set spec.replicas: 0` as the fix and an excerpt no format string in the
+    collector produces. Both opened as pull requests and auto-merged nineteen
+    seconds later.
+
+    What this returns is used to withhold *auto*-promotion, not to drop the
+    finding. Publishing it is right: the model may well have seen something,
+    and the operator is the one who should hear about it. Opening a pull
+    request on it with no human in the loop is the part that cannot be
+    justified. `/remediate <id>` still works, and should.
+
+    Silent on everything else. A check the collector never ran, ran to a
+    non-zero `rc`, or declared not applicable corroborates nothing either way,
+    and the model's own inspection is then the only reading there is — that is
+    the manual fallback every stream depends on, and this must not touch it.
+    Neither does a target the collector did not mark `collected`: an `rc == 0`
+    command on a `gate-failed` entry is a command that ran before the read
+    failed, and the SOP's manual fallback — the finding the agent collected by
+    hand — is exactly what such a target carries. Only a `collected` target
+    vouches, the same line `cross_check_manifest` draws.
+
+    Full ids on both sides: `_flagged_identities` against `derive_finding_id`.
+    """
+    ran: dict[str, set[str]] = {}
+    for entry in _manifest_clusters(manifest):
+        if entry.get("outcome") != MANIFEST_OUTCOME_COLLECTED:
+            continue
+        ran.setdefault(str(entry.get("name") or ""), set()).update(
+            str(command.get("check") or "")
+            for command in entry.get("commands") or []
+            if isinstance(command, dict) and command.get("rc") == 0
+        )
+    flagged = _flagged_identities(manifest)
+    return {
+        str(finding.get("id") or "")
+        for finding in findings
+        if str(finding.get("check") or "") in ran.get(str(finding.get("cluster") or ""), set())
+        and derive_finding_id(finding) not in flagged
+    }
+
+
+def triage_marked_findings(
+    findings: list[dict],
+    manifest: dict | None,
+    markers: frozenset[str] = NO_SWEEP_TRIAGE,
+) -> set[str]:
+    """Findings whose candidate carries a `needs_triage` marker in `markers`.
+
+    The one thing that stops the sweep without being a doubt about the
+    finding. `uncorroborated_findings` catches a finding the collector
+    declined to make; the cap catches volume; severity catches grade. This
+    catches a finding the collector made, meant, and graded, whose
+    *remediation* can break something the collector never looked at. See
+    `NO_SWEEP_TRIAGE` for the one marker that qualifies.
+
+    Read off the manifest rather than the finding, because `needs_triage` is
+    not a findings-schema field: the candidate is the only place it exists.
+    Which also means this is silent on a stream that ran without a collector.
+    """
+    marked = {
+        _candidate_identity(entry, candidate)
+        for entry, candidate in _candidates(manifest)
+        if str(candidate.get("needs_triage") or "") in markers
+    }
+    return {
+        str(finding.get("id") or "")
+        for finding in findings
+        if derive_finding_id(finding) in marked
+    }
+
+
+def _candidate_rows(manifest: dict | None) -> list[dict]:
+    """Every collector candidate, keyed and labelled the way a finding is.
+
+    `id` is the ledger spelling (`published_id`), because these rows go out on
+    the JSON line beside every other id the harness prints, and the two
+    callers compare them with `published_id(finding)`.
+    """
+    rows = []
+    for entry, candidate in _candidates(manifest):
+        rows.append(
+            {
+                "id": _shorten_id(_candidate_identity(entry, candidate)),
+                "check": str(candidate.get("check") or ""),
+                "cluster": str(candidate.get("cluster") or entry.get("name") or ""),
+                "object": str(candidate.get("object") or ""),
+            }
+        )
+    return rows
+
+
+def unpublished_candidates(findings: list[dict], manifest: dict | None) -> list[dict]:
+    """Every collector candidate this run's document never accounted for.
+
+    A candidate is not a finding, and `collector_flagged_ids` says why it must
+    not become one by force: the model is supposed to be able to look at what
+    the collector flagged and reject it, so a candidate that does not reach
+    the document is an ordinary outcome rather than an error. What it is not
+    entitled to be is invisible. Without this the run went on recording the
+    check as having run, `coverage_gaps` stayed empty and `partial` stayed
+    false, so a check whose entire output the model dropped published as a
+    check that ran and found nothing — the one failure the payload cannot
+    otherwise distinguish from health. A cost stream did exactly that: the
+    collector emitted nineteen candidates, the document carried twelve, and the
+    seven missing were every `unsized-workload` on one cluster.
+
+    Disclosed, never forced. These rows say what the collector saw and the
+    document did not repeat, and leave the judgement where the SOP puts it.
+    """
+    published = {published_id(f) for f in findings}
+    seen: set[str] = set()
+    rows = []
+    for row in _candidate_rows(manifest):
+        if row["id"] in published or row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        rows.append(row)
+    return sorted(rows, key=lambda r: r["id"])
+
+
+def wholly_unpublished_checks(findings: list[dict], manifest: dict | None) -> list[dict]:
+    """The (cluster, check) pairs whose *every* candidate went unpublished.
+
+    `unpublished_candidates` is the honest total and is too blunt to act on: a
+    model rejecting one candidate of six as a false positive is the mechanism
+    working, and a reader who has to sort those out by hand every morning
+    stops reading. A check that emitted candidates on a cluster and published
+    not one of them is the narrower thing — the shape a systematic drop
+    makes. It is still not proof of a mistake; a check with a single candidate
+    that deserved rejecting lands here too. It is the subset worth a human's
+    attention.
+    """
+    published = {published_id(f) for f in findings}
+    totals: dict[tuple[str, str], int] = {}
+    dropped: dict[tuple[str, str], list[str]] = {}
+    for row in _candidate_rows(manifest):
+        key = (row["cluster"], row["check"])
+        totals[key] = totals.get(key, 0) + 1
+        if row["id"] not in published:
+            dropped.setdefault(key, []).append(row["object"])
+    return [
+        {"cluster": cluster, "check": check, "objects": sorted(set(dropped[(cluster, check)]))}
+        for cluster, check in sorted(dropped)
+        if len(dropped[(cluster, check)]) == totals[(cluster, check)]
+    ]
 
 
 def declared_intent_applies(data: dict) -> bool:
@@ -2477,7 +3537,7 @@ def _declared_intent_gap(data: dict) -> str | None:
     if findings:
         # Redacted here for the reason the skip reasons above are: this string
         # leaves by the JSON line as well as the renderer.
-        named = redact_secrets(
+        named = publishable_text(
             ", ".join(
                 f"{f.get('check', '')} on {f.get('cluster', '')}/"
                 f"{f.get('namespace') or '(cluster)'}/{f.get('object', '')}"
@@ -3180,6 +4240,228 @@ def parse_finding_locations(body: str | None) -> dict[str, dict[str, str]]:
     return out
 
 
+def parse_held_rows(body: str | None) -> list[dict]:
+    """The collector-held rows a previous body carries, in `collector_held_entries`' shape.
+
+    Read from the span between the held-section marker comments alone, with
+    the same readers a finding's heading and `Where:` line have, plus the
+    row's own `Check:` line for the check and the collector's command where
+    the body had room for it. A body main ever wrote has no such span and
+    parses to nothing, which is what keeps the manifest-less run byte for
+    byte what it was; see the note in `handle_finish` where these rows are
+    carried.
+    """
+    body = normalise_newlines(body)
+    span = _held_span(body) if body else None
+    if span is None:
+        return []
+    section = body[span[0] : span[1]]
+    markers = list(FINDING_MARKER_RE.finditer(section))
+    locations = parse_finding_locations(section)
+    rows: list[dict] = []
+    for index, match in enumerate(markers):
+        fid = match.group(2)
+        where = locations.get(fid)
+        if where is None:
+            continue
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(section)
+        detail = HELD_CHECK_LINE_RE.search(section, match.end(), end)
+        check = detail.group(1) if detail else fid.split(".", 1)[0]
+        command = detail.group(2) if detail else COLLECTOR_COMMAND_UNRECORDED
+        rows.append({"id": fid, "check": check, **where, "commands": [command]})
+    return sorted(rows, key=lambda row: row["id"])
+
+
+def _held_span(body: str) -> tuple[int, int] | None:
+    """The character span of the held section, by its marker comments, or None.
+
+    A marker counts only on a line that is exactly that marker once stripped,
+    the discipline `DELTA_RE` and every other hidden-block pattern here
+    already keep: the renderer writes each bracket alone on its own line, and
+    free text renders inside a heading, a cell or a fence, so a bracket found
+    mid-line is someone else's and not this renderer's.
+
+    Ambiguity carries nothing. Two begins, two ends, or an end ahead of its
+    begin is not a shape this renderer emits, and picking one span out of it
+    would let forged text decide which ids a later run holds — a hold no
+    later run can clear, since a run without a manifest has no evidence to
+    contradict the list with. `publishable_text` is what stops the text
+    spelling a bracket in the first place; these two rules are the fallback
+    for a body written before it, or edited by hand since.
+
+    An opening marker with no closing one still runs to the end of the body,
+    the way an unterminated fence does: the renderer always writes both, so a
+    missing close is a truncated body, and reading its tail as held is the
+    conservative side.
+    """
+    begins: list[int] = []
+    ends: list[int] = []
+    offset = 0
+    for line in body.split("\n"):
+        stripped = line.strip()
+        if stripped == HELD_SECTION_BEGIN:
+            begins.append(offset)
+        elif stripped == HELD_SECTION_END:
+            ends.append(offset)
+        offset += len(line) + 1
+    if len(begins) != 1 or len(ends) > 1:
+        return None
+    if ends and ends[0] < begins[0]:
+        return None
+    return begins[0], (ends[0] if ends else len(body))
+
+
+def held_ids_comment(ids: list[str]) -> str:
+    """The renderer-owned list of held ids, written inside the held span by every tier."""
+    return f"<!-- {HELD_IDS_COMMENT}: {json.dumps(list(ids))} -->"
+
+
+def parse_held_ids(body: str | None) -> list[str]:
+    """The held ids the previous body recorded, from the list inside its held span.
+
+    The one source a run without a manifest carries from. Empty for a body
+    with no held span — every body main wrote — so nothing about such a body
+    is read differently and the manifest-less run needs no premise about
+    what its headings render.
+
+    Every entry must be spelled the way this harness spells a finding id
+    (`FINDING_ID_RE`, which `validate_findings` already holds every published
+    id to, clipped ones included — `_shorten_id` ends on a hex digest and so
+    passes). The list is the one input to the carry, a carried id is durable,
+    and nothing downstream re-checks it: it becomes a `/remediate` deferral,
+    a stale-close protection and a line in the next marker. A string that is
+    not an id cannot be any of those, so it is dropped and said out loud
+    rather than thinned away silently.
+    """
+    body = normalise_newlines(body)
+    span = _held_span(body) if body else None
+    if span is None:
+        return []
+    match = HELD_IDS_RE.search(body, span[0], span[1])
+    if not match:
+        return []
+    try:
+        ids = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return []
+    kept: list[str] = []
+    dropped: list[str] = []
+    for raw in ids:
+        if not isinstance(raw, str) or not raw:
+            continue
+        (kept if FINDING_ID_RE.match(raw) else dropped).append(raw)
+    if dropped:
+        log(
+            f"WARNING: {len(dropped)} item(s) in the ledger's held list are not "
+            "spelled like a finding id; they are dropped rather than carried, so "
+            "nothing defers a `/remediate` or holds a close on them: "
+            + ", ".join(repr(fid) for fid in dropped)
+        )
+    return kept
+
+
+def _respelled_rows(body: str | None) -> dict[str, str]:
+    """{id as the previous body spelled it: id under the current scheme}, per rendered row.
+
+    A row's `Where:` line and the check in its id are the fields identity is
+    derived from, so a row can be re-spelled under whatever scheme this
+    harness runs — which is what a marker cannot be. The check slug is read
+    off the id: `_shorten_id` never touches it, and `unaccounted_previous_findings`
+    already relies on the same.
+    """
+    return {
+        raw: published_id(
+            {
+                "check": raw.split(".", 1)[0],
+                "cluster": where["cluster"],
+                "namespace": where["namespace"],
+                "object": where["object"],
+            }
+        )
+        for raw, where in parse_finding_locations(body).items()
+    }
+
+
+def previous_marker_ids(body: str | None) -> tuple[list[str], int]:
+    """The previous marker's ids under the current scheme, and the residual.
+
+    Under the current scheme the marker is read as it stands. Under another,
+    every id the marker names that has a rendered row is re-derived from that
+    row, so a hold survives an identity-scheme bump instead of matching no
+    marker id, dropping out of the bump run's marker and leaving the ledger
+    unannounced; held ids with no row — the note and empty tiers write none —
+    are the residual, which the caller reports and which the bump loses.
+    """
+    marker = parse_delta_block(body)
+    if not marker or parse_id_scheme(body) == ID_SCHEME:
+        return marker, 0
+    respelled = _respelled_rows(body)
+    # The residual is counted over the held list, not the whole marker: a
+    # rendered finding with no row is main's cost of a bump, not a hold lost.
+    return [respelled[fid] for fid in marker if fid in respelled], sum(
+        1 for fid in parse_held_ids(body) if fid not in respelled
+    )
+
+
+def held_row_from_id(fid: str) -> dict:
+    """A held entry for an id the previous body carried in its marker and nowhere else.
+
+    The body had no room for the row (the note or empty tier), so the entry
+    carries the id and nothing else: no location is derived from the id's
+    segments, because those are sanitised — and, past `MAX_FINDING_ID`,
+    clipped and digest-suffixed — spellings that no shape test tells apart
+    from a real object name, and a `Where:` line built from them would be read
+    back next run as the finding's identity. The marker id is what persists;
+    a rebuilt location adds nothing the next run needs. The check slug is the
+    one segment `_shorten_id` never touches.
+    """
+    return {
+        "id": fid,
+        "title": f"{fid} (carried by id; location not recorded on the previous ledger)",
+        "check": fid.split(".", 1)[0],
+        "cluster": "",
+        "namespace": "",
+        "object": "",
+        "commands": [COLLECTOR_COMMAND_UNRECORDED],
+        "location_unrecorded": True,
+    }
+
+
+def carried_held_entries(previous_body: str | None, *, exclude: set[str]) -> list[dict]:
+    """The held set a run without a manifest carries: what the renderer recorded as held.
+
+    (the previous held-id list, `parse_held_ids`) − `exclude` (the document's
+    ids, the withheld postures, the declared entries). Nothing is inferred
+    from the marker or from which headings the body renders: the manifest
+    path intersects the marker with the still-flagged set because the
+    collector is there to vouch, and this path has no collector, so it may
+    carry only what a previous run wrote down as held. Each id renders with
+    the identity its held row had where the previous body had one
+    (`parse_held_rows`) and as an id-only row otherwise (`held_row_from_id`).
+    Under another identity scheme the rows with a location are re-spelled and
+    ids without one are the residual the bump loses (`previous_marker_ids`).
+    """
+    held_raw = parse_held_ids(previous_body)
+    if not held_raw:
+        return []
+    stale = parse_id_scheme(previous_body) != ID_SCHEME
+    respelled = _respelled_rows(previous_body) if stale else {}
+    if stale:
+        held_ids = [respelled[fid] for fid in held_raw if fid in respelled]
+    else:
+        held_ids = list(held_raw)
+    held_ids = [fid for fid in held_ids if fid not in exclude]
+    if not held_ids:
+        return []
+    rows = {}
+    for row in parse_held_rows(previous_body):
+        current = respelled.get(row["id"], row["id"])
+        rows[current] = {**row, "id": current}
+    return sorted(
+        (rows.get(fid) or held_row_from_id(fid) for fid in held_ids), key=lambda e: e["id"]
+    )
+
+
 def unaccounted_previous_findings(previous_body: str | None, data: dict) -> list[dict]:
     """Previous findings this run checked again, dropped, and did not explain.
 
@@ -3616,6 +4898,43 @@ def is_machine_author(comment: dict) -> bool:
     )
 
 
+def collector_hold_reason(target: str) -> str:
+    """Why a `/remediate` on a collector-held finding is neither refused nor acted on.
+
+    The finding is on the ledger under _Held by the collector_ and absent from
+    the document by construction, so read against the document alone it is
+    "not a finding in the current report" — a refusal with a false reason and
+    the permanent marker, never revisited. Deferred instead, the way a withheld
+    posture is: the request stands until the finding returns to a document.
+    """
+    return (
+        f"`{target}` rides this ledger's hidden block because the collector still "
+        "emits a candidate for it and this run's document did not carry it; it is "
+        "released when the collector stops emitting it or a `declared` entry "
+        "covers it. There is no finding in the document to open a pull request "
+        "from. The request stands: the first run whose document carries the "
+        "finding acts on it, and one where the collector no longer sees it says so"
+    )
+
+
+def collector_candidate_reason(target: str) -> str:
+    """Why a `/remediate` on a still-flagged id that was never on the ledger is deferred.
+
+    The sibling of `collector_hold_reason` for an id the collector emits and
+    no body has carried: there is no _Held by the collector_ row to point at,
+    only the run's JSON line, and saying otherwise sends the requester to a
+    section that does not name it.
+    """
+    return (
+        f"`{target}` is not in this run's document, but the collector emits it "
+        "as a candidate this run's document did not carry; it is listed under "
+        "`unpublished_candidates` on the run's JSON line. There is no finding in "
+        "the document to open a pull request from. The request stands: the first "
+        "run whose document carries the finding acts on it, and one where the "
+        "collector no longer sees it says so"
+    )
+
+
 def deferral_reason(target: str) -> str:
     """Why a `/remediate` on a withheld posture is neither refused nor acted on."""
     return (
@@ -3670,17 +4989,24 @@ def parse_remediate_commands(
     findings: list[dict],
     withheld: list[dict] | None = None,
     declared: list[dict] | None = None,
+    collector_held: set[str] | None = None,
+    collector_flagged: set[str] | None = None,
 ) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
 
     A refusal is one entry per comment, not per bad target, because the reply is
     posted once per comment and marked with that comment's node id. An entry
     carrying `deferred: True` is not a refusal: it names a posture `finish`
-    withheld this run, and `reply_to_refusals` answers it on the deferred
-    marker, which nothing reads as "answered", so the request stands. A
-    target in `declared` — a posture a repository declaration covers, listed
-    on the ledger under Declared intent — is refused with that file named,
-    never as a typo.
+    withheld this run, or an id the collector still flags that the document
+    does not carry — `collector_held` for the ids the ledger carries under
+    _Held by the collector_, `collector_flagged` for the rest of the
+    still-flagged set, which only the JSON line names; no coverage state
+    enters either — and `reply_to_refusals` answers it on the deferred marker,
+    which nothing reads as "answered", so the request stands. A target in
+    `declared` — a posture a repository declaration covers, listed on the
+    ledger under Declared intent — is refused with that file named, never as
+    a typo; the still-flagged set has the declared ids taken out of it
+    already (`still_flagged_ids`), so the two never name the same target.
 
     `accepted_by_comment` exists so a request that *worked* gets an answer too.
     A command that silently succeeds is indistinguishable from one that was
@@ -3712,6 +5038,8 @@ def parse_remediate_commands(
     # on the permanent marker, unlike a withheld one, because a declaration is
     # an owner's standing choice rather than a gap the next run fills.
     covered = declared_by_id(declared)
+    held_ids = set(collector_held or ())
+    flagged_ids = set(collector_flagged or ()) - held_ids
 
     targets: set[str] = set()
     refusals: list[dict] = []
@@ -3812,6 +5140,15 @@ def parse_remediate_commands(
             if target in withheld_ids:
                 deferred.append(deferral_reason(target))
                 continue
+            if target in held_ids:
+                deferred.append(collector_hold_reason(target))
+                continue
+            if target in flagged_ids:
+                deferred.append(collector_candidate_reason(target))
+                continue
+            # After the two deferrals, for the reason `handle_finish` gives on
+            # the clean branch: a deferral's marker is not an answer and this
+            # refusal's is. The sets are disjoint either way.
             if target in covered:
                 reasons.append(declared_reason(target, covered[target]))
                 continue
@@ -4075,6 +5412,17 @@ class PromotionPlan(NamedTuple):
     withheld: list[str]
     already_open: list[str]
     superseded: list[str] = []
+    # Manifest findings the sweep passed over because the collector ran their
+    # check and did not flag them. Reported apart from `withheld` because the
+    # answer differs: the cap invites `/remediate` on a fix everyone agrees on,
+    # this invites a human to check whether the finding is real first.
+    uncorroborated: list[str] = []
+    # Manifest findings the sweep passed over because the collector marked the
+    # *remediation* as needing a judgement it could not make. Not
+    # `uncorroborated`: that block's text says the collector declined to flag
+    # the object, and here it flagged it and stands behind it. See
+    # `NO_SWEEP_TRIAGE`.
+    needs_triage: list[str] = []
 
 
 def promotion_candidates(
@@ -4084,6 +5432,8 @@ def promotion_candidates(
     cap: int = AUTO_PROMOTION_CAP,
     requested_at: dict[str, str] | None = None,
     auto_promote: bool = True,
+    uncorroborated: set[str] | None = None,
+    triage_marked: set[str] | None = None,
 ) -> PromotionPlan:
     """Decide which findings become pull requests this run.
 
@@ -4091,6 +5441,16 @@ def promotion_candidates(
     live pull request on its branch — and capped, so one bad night cannot bury
     the repository in generated pull requests. An explicit `/remediate` bypasses
     the cap: a human asked for that one by name.
+
+    `uncorroborated` and `triage_marked` are the two filters here that are not
+    about volume. Everything else in the sweep asks whether this fix is worth
+    opening unattended; those ask whether a deterministic collector agreed the
+    problem exists, and whether it vouched for the fix — the only grounds on
+    which opening one unattended is defensible at all. `uncorroborated_findings`
+    and `triage_marked_findings` compute the sets and give the Deployments they
+    were written for. Both gate the sweep and nothing else: an explicit
+    `/remediate` is handled in the loop above and never consults them. Both are
+    empty on a run without a collector manifest.
 
     `auto_promote=False` turns the sweep off entirely and is what the `remediate`
     subcommand passes. That command is a person naming ids, and a person who
@@ -4148,6 +5508,10 @@ def promotion_candidates(
         promote.append(fid)
 
     auto: list[str] = []
+    unbacked: list[str] = []
+    triaged: list[str] = []
+    uncorroborated_set = uncorroborated or set()
+    triage_set = triage_marked or set()
     for finding in sort_findings(findings) if auto_promote else []:
         fid = str(finding.get("id", ""))
         if fid in requested_set:
@@ -4159,10 +5523,23 @@ def promotion_candidates(
         pr = pr_by_finding.get(fid)
         if pr is not None and not pr_closed_by_harness(pr):
             continue
+        # Last, after every test the sweep already applied, so these two lists
+        # name only what the sweep would otherwise have opened: a `gcloud` fix
+        # or a finding with a live pull request must not land in a block that
+        # invites `/remediate` on it. Triage ahead of corroboration because the
+        # two cannot both be true of one finding — a marker only exists on a
+        # candidate, and a candidate is exactly what an uncorroborated finding
+        # lacks — and testing it first keeps that readable rather than relied on.
+        if fid in triage_set:
+            triaged.append(fid)
+            continue
+        if fid in uncorroborated_set:
+            unbacked.append(fid)
+            continue
         auto.append(fid)
 
     promote.extend(auto[:cap])
-    return PromotionPlan(promote, auto[cap:], already_open, superseded)
+    return PromotionPlan(promote, auto[cap:], already_open, superseded, unbacked, triaged)
 
 
 # --------------------------------------------------------------------------- #
@@ -4267,7 +5644,7 @@ def _cell(text: str, limit: int = MAX_CELL_CHARS) -> str:
     accounted for honestly — see `_render_check_evidence`.
     """
     value = (
-        redact_secrets(text)
+        publishable_text(text)
         .replace("`", "'")
         .replace("|", "\\|")
         .replace("\n", " ")
@@ -4298,7 +5675,7 @@ def _ident(value: str) -> str:
     rendered as Markdown in the reader's browser, and these fields arrive
     verbatim from the model's document.
     """
-    text = " ".join(redact_secrets(value).replace("`", "'").split())
+    text = " ".join(publishable_text(value).replace("`", "'").split())
     if len(text) <= MAX_IDENT_CHARS:
         return text
     return text[:MAX_IDENT_CHARS].rstrip() + " …(truncated)"
@@ -4338,7 +5715,7 @@ def _clip_comment(text: str) -> str:
 
 def trim_excerpt(excerpt: str) -> str:
     """Redact, then clip evidence output so one noisy finding cannot blow the body limit."""
-    text = redact_secrets(normalise_newlines(excerpt)).strip("\n").rstrip()
+    text = publishable_text(normalise_newlines(excerpt)).strip("\n").rstrip()
     if not text:
         return ""
     lines = text.splitlines()
@@ -4363,7 +5740,7 @@ def trim_command(command: str) -> str:
     that grows without bound. A truncated command is still a usable pointer;
     an unpublishable body is not.
     """
-    text = redact_secrets(normalise_newlines(command)).strip()
+    text = publishable_text(normalise_newlines(command)).strip()
     if len(text) <= MAX_COMMAND_CHARS:
         return text
     return (
@@ -4457,25 +5834,16 @@ def render_finding(
     # field on that one finding could push the description past GitHub's limit
     # and publish nothing at all — the noisiest possible failure for the least
     # important reason.
-    title = clip_text(finding.get("title", ""), MAX_TITLE_CHARS)
-    cluster = _ident(str(finding.get("cluster", "")))
-    namespace = _ident(str(finding.get("namespace", "")))
-    obj = _ident(str(finding.get("object", "")))
-    where = f"`{cluster}`"
-    where += f" / `{namespace}`" if namespace else " / _cluster-scoped_"
-
-    # The anchor is a line of its own *above* the heading rather than markup
-    # appended to it. FINDING_MARKER_RE matches the heading through to end of
-    # line, so anything after the comment stops it matching — and that regex is
-    # how a resolved finding's title is recovered from the previous body once
-    # the finding is gone from findings.json.
-    lines = [
-        f'<a id="{_anchor_id(fid)}"></a>',
-        "",
-        f"#### {title} <!-- finding:{fid} -->",
-        "",
-    ]
-    lines.append(f"- **Where:** {where} — `{obj}`")
+    # The identity lines are shared with the carried rows, because two readers
+    # recover the id, title and location from their exact shape — see
+    # `_finding_identity_lines`.
+    lines = _finding_identity_lines(
+        fid,
+        str(finding.get("title", "")),
+        str(finding.get("cluster", "")),
+        str(finding.get("namespace", "")),
+        str(finding.get("object", "")),
+    )
     lines.append(f"- **Impact:** {clip_text(finding.get('impact', ''), MAX_TEXT_CHARS)}")
     # The id is repeated here, not left to the index alone: it is the string
     # `/remediate` takes, and the decision to ask for a fix is made at the
@@ -4650,6 +6018,7 @@ def _render_scope(
     skipped: list[dict],
     generated_at: datetime,
     audit_id: str = "",
+    extra_gaps: list[str] | None = None,
 ) -> list[str]:
     """The scope tables, row-capped.
 
@@ -4682,14 +6051,18 @@ def _render_scope(
             f"| `{_cell(cluster.get('project', ''))}` "
         )
         if roster:
+            # Per target, not per stream: a `project/<id>` row is answerable for
+            # the project-scoped checks alone, and rating it against the whole
+            # roster prints "2/12 ⚠" beside a row that ran everything it owed.
+            owed = set(audit_target_checks(audit_id, str(cluster.get("name", ""))))
             ran = set(checks_ran(cluster))
-            na = set(checks_na(cluster)) & set(roster)
+            na = set(checks_na(cluster)) & owed
             # The denominator is what *could* have run here, so the ⚠ means
             # "unread", not "inapplicable". The n/a count stays visible beside
             # it: a cluster excusing itself from half the roster is something a
             # reader should see, even when its coverage is technically complete.
-            applicable = len(roster) - len(na)
-            complete = len(ran & set(roster))
+            applicable = len(owed) - len(na)
+            complete = len(ran & owed)
             flag = "" if complete >= applicable else " ⚠"
             note = f" ({len(na)} n/a)" if na else ""
             row += f"| {complete}/{applicable}{note}{flag} "
@@ -4718,6 +6091,29 @@ def _render_scope(
             )
         if len(skipped) > MAX_SCOPE_ROWS:
             out.append(f"| _…and {len(skipped) - MAX_SCOPE_ROWS} more_ |  |")
+
+    # A gap the document itself cannot express has no row above to show it —
+    # a waived collector manifest, or a ledger body the run could not read and
+    # left as it was — so it is listed here, in the section a reader consults
+    # for what the run did not cover. Without this a findings run with a
+    # waiver published a Scope table reading as full coverage and the reason
+    # reached no page anyone opens.
+    extra = list(extra_gaps or [])
+    if extra:
+        out += [
+            "",
+            "### Coverage",
+            "",
+            f"**Coverage is partial.** {len(extra)} hold(s) this run declared beside "
+            "the tables above, so a finding's absence is not evidence of a fix and "
+            "this ledger does not close on it:",
+            "",
+        ]
+        # A line of its own, not a cell: the reason is a sentence an operator
+        # typed, and the table width left a third of it.
+        out += [f"- {clip_text(gap, MAX_HOLD_LINE_CHARS)}" for gap in extra[:MAX_SCOPE_ROWS]]
+        if len(extra) > MAX_SCOPE_ROWS:
+            out.append(f"- _…and {len(extra) - MAX_SCOPE_ROWS} more_")
     return out
 
 
@@ -4899,29 +6295,311 @@ def _render_footer(
     ]
 
 
-def _render_withheld(withheld: list[str], findings: list[dict]) -> list[str]:
-    """Name the findings eligible for a pull request that the cap held back.
+def _code_span(text: str, limit: int = MAX_COMMAND_CHARS) -> str:
+    """A command for an inline code span: redacted, clipped, and nothing else.
 
-    A cap that silently drops work reads as "nothing more to do". Naming them,
-    with the command to ask for one, is what keeps the cap honest.
+    Not `_cell`: that escapes `|` for a table cell, and inside backticks in a
+    bullet the backslash renders literally — on SOP commands, which are
+    pipelines, on every line. Two things a code span cannot hold: a newline,
+    which ends it and renders the rest as Markdown, so whitespace is flattened
+    first; and a backtick, replaced the way `_ident` replaces it.
+
+    New lines only. The manifest-less held comment keeps `_cell` on its
+    command, because that line predates this contract and is held byte for
+    byte; its rendering is a follow-up.
     """
-    if not withheld:
+    return clip_text(" ".join(str(text).split()), limit).replace("`", "'")
+
+
+def _finding_identity_lines(fid: str, title: str, cluster: str, namespace: str, obj: str) -> list[str]:
+    """The anchor, heading and `Where:` line a finding is known by on the ledger.
+
+    One composition for both writers — `render_finding` for the document's
+    findings and `_render_collector_held` for the carried ones — because two
+    readers depend on its exact shape: `FINDING_MARKER_RE` recovers the id and
+    title from the heading and `WHERE_LINE_RE` the location from the line under
+    it. A carried row that drifted from this shape by one character would be
+    forgotten by the next run, silently, which is the failure the carry exists
+    to prevent.
+
+    The anchor is a line of its own *above* the heading rather than markup
+    appended to it: the marker regex matches the heading through to end of
+    line, so anything after the comment stops it matching.
+    """
+    # Tested after `_ident`, as the original composition did: a whitespace-only
+    # namespace is cluster-scoped, not an empty code span.
+    identified_namespace = _ident(namespace)
+    where = f"`{_ident(cluster)}`"
+    where += f" / `{identified_namespace}`" if identified_namespace else " / _cluster-scoped_"
+    return [
+        f'<a id="{_anchor_id(fid)}"></a>',
+        "",
+        f"#### {clip_text(title, MAX_TITLE_CHARS)} <!-- finding:{fid} -->",
+        "",
+        f"- **Where:** {where} — `{_ident(obj)}`",
+    ]
+
+
+def _render_held_overflow(overflow: int) -> list[str]:
+    """The line every tier ends with when `MAX_HELD_IDS` left held findings out."""
+    if not overflow:
+        return []
+    return [
+        "",
+        f"_The collector still flags {overflow} more that this ledger has stopped "
+        f"tracking: it holds at most {MAX_HELD_IDS} at once, lowest ids first. They "
+        "stay on each run's JSON line as `unpublished_candidates` while the collector "
+        "flags them, and their pull requests stay open._",
+    ]
+
+
+def _render_collector_held(
+    held: list[dict],
+    *,
+    detail: bool = True,
+    overflow: int = 0,
+    preview: bool = False,
+    carried: bool = False,
+) -> list[str]:
+    """The previous findings this run carries forward because the collector still flags them.
+
+    The ledger body is the harness's only memory between runs: `previous_ids`
+    is read back out of the hidden block and a finding's location out of its
+    `####` heading. A body rewritten from a document that dropped a finding
+    forgets it, so a hold that only kept the id out of `resolved` lasted one
+    run — the next run's previous body no longer named it, and a clean run
+    closed the ledger over it with its pull request still open. These rows are
+    the persistence: every held finding gets the identity lines
+    `_finding_identity_lines` writes, so `parse_finding_locations` and
+    `parse_finding_titles` read it next run like any other, until the collector
+    stops emitting it or a `declared` entry releases it. Only the detail —
+    the check and the collector's command — is capped, at
+    `MAX_HELD_DETAIL_ROWS`, and dropped altogether when `detail` is off, which
+    is how `render_issue_body` degrades the section under budget pressure.
+
+    Kept out of `## Findings` on purpose. These are not this run's findings —
+    the document did not carry them — so they are not `new`, the sweep never
+    sees them, and the heading says whose word they stand on.
+    """
+    if not held:
+        return []
+    noun = "finding" if len(held) == 1 else "findings"
+    out = ["", HELD_SECTION_BEGIN, HELD_SECTION_HEADING, ""]
+    if carried:
+        # No collector ran this run, so nothing here may read as this run's
+        # observation: the rows are held from a previous run's manifest, and
+        # the command line, where there is one, is the last one recorded.
+        out.append(
+            f"{len(held)} previous {noun} held from a previous run's manifest; this run "
+            "passed none and cannot release them. Each stays until a manifest run no "
+            "longer emits it or a `declared` entry covers it; a `resolved_because` "
+            "entry does not release it. The automatic sweep passes over these; a "
+            "`/remediate <finding-id>` on one is held, not refused, until a document "
+            "carries the finding again."
+        )
+    elif preview:
+        # The dry run fetches no ledger: what it shows is every uncarried
+        # candidate, and the heading has to say the real run keeps fewer.
+        out.append(
+            f"{len(held)} candidate(s) the real run holds only if the ledger's hidden "
+            "marker carries them — the collector still emits each and this document "
+            "does not carry it. Shown from the manifest; the real run intersects with "
+            "the marker it reads back."
+        )
+    else:
+        out.append(
+            f"{len(held)} previous {noun} this run's document did not carry, kept on "
+            "the ledger because the collector still emits a candidate for each: the "
+            "condition is still observed, so it is not resolved. Each stays until the "
+            "collector stops emitting it or a `declared` entry covers it; a "
+            "`resolved_because` entry does not release it. The automatic sweep passes "
+            "over these; a `/remediate <finding-id>` on one is held, not refused, "
+            "until a document carries the finding again."
+        )
+    for index, entry in enumerate(held):
+        fid = str(entry.get("id", ""))
+        out.append("")
+        if entry.get("location_unrecorded"):
+            # Carried by id alone: the previous body had no row. The heading
+            # keeps the marker reader joined; the location line says what is
+            # missing rather than inventing one from the id's segments.
+            out += [
+                f'<a id="{_anchor_id(fid)}"></a>',
+                "",
+                f"#### {clip_text(str(entry.get('title', '')), MAX_TITLE_CHARS)} <!-- finding:{fid} -->",
+                "",
+                "- **Where:** not recorded on the previous ledger; carried by id.",
+            ]
+        else:
+            out += _finding_identity_lines(
+                fid,
+                str(entry.get("title", "")),
+                str(entry.get("cluster", "")),
+                str(entry.get("namespace", "")),
+                str(entry.get("object", "")),
+            )
+        if not detail or index >= MAX_HELD_DETAIL_ROWS:
+            continue
+        commands = [c for c in entry.get("commands") or [] if c != COLLECTOR_COMMAND_UNRECORDED]
+        if carried:
+            if commands:
+                out.append(
+                    f"- **Last recorded:** `{_ident(str(entry.get('check', '')))}` — "
+                    f"`{_code_span(commands[0])}`"
+                )
+        else:
+            out.append(
+                f"- **Check:** `{_ident(str(entry.get('check', '')))}` — the collector ran "
+                f"`{_code_span(commands[0]) if commands else COLLECTOR_COMMAND_UNRECORDED}` "
+                "there this run and still flags this object."
+            )
+        out.append(f"- **Finding id:** `{fid}`")
+    return out + _render_held_overflow(overflow) + _held_span_close(held)
+
+
+def _render_held_note(
+    held: list[dict], *, overflow: int = 0, preview: bool = False, carried: bool = False
+) -> list[str]:
+    """The third tier for the held section: the count, and where the ids are.
+
+    Rendered only when not even the identity lines fit beside the document's
+    findings. The ids still ride the hidden block and the held-id list, which
+    is what the next run keys on under every tier — a manifest run intersects
+    the marker with the still-flagged set, a manifest-less run carries the
+    held list — so the hold on `resolved` and the stale-close pass survives.
+    What is lost until a smaller body is the title and location a row would
+    have given: a manifest run recovers the identity from the candidate, a
+    manifest-less run carries the id alone. The fourth tier, when not even
+    this fits, is the span and the list with nothing visible.
+
+    The three spellings are the row tiers': a squeezed body says no more than
+    a roomy one did, so a carry over a run that passed no manifest does not
+    claim a collector observed anything this run, and a dry run does not claim
+    the ledger holds what it is only previewing.
+    """
+    if not held:
+        return []
+    if carried:
+        opening = (
+            f"{len(held)} previous finding(s) held from a previous run's manifest; this "
+            "run passed none and cannot release them. The body had no room for their "
+            "rows; their ids are in the hidden block below, which is what the next run "
+            "reads them back from, and each stays until a manifest run no longer emits "
+            "it or a `declared` entry covers it."
+        )
+    elif preview:
+        opening = (
+            f"{len(held)} candidate(s) the real run holds only if the ledger's hidden "
+            "marker carries them — the collector still emits each and this document does "
+            "not carry it. The body had no room for their rows; they are shown from the "
+            "manifest, and the real run intersects them with the marker it reads back."
+        )
+    else:
+        opening = (
+            f"{len(held)} previous finding(s) this run's document did not carry are "
+            "kept on this ledger because the collector still emits a candidate for "
+            "each. The body had no room for their rows; their ids are in the hidden "
+            "block below, which is what the next run reads them back from, and each "
+            "stays held until the collector stops emitting it or a `declared` entry "
+            "covers it."
+        )
+    return [
+        "",
+        HELD_SECTION_BEGIN,
+        HELD_SECTION_HEADING,
+        "",
+        opening,
+    ] + _render_held_overflow(overflow) + _held_span_close(held)
+
+
+def _held_span_close(held: list[dict]) -> list[str]:
+    """The held-id list and the closing comment every tier ends with."""
+    return ["", held_ids_comment([str(e.get("id", "")) for e in held]), HELD_SECTION_END]
+
+
+def _render_held_ids_only(held: list[dict]) -> list[str]:
+    """The fourth tier: the span, the id list, and nothing visible.
+
+    Charged to the budget ahead of the findings, so it always fits; the hold
+    survives a body with no room for even the note, because the next run
+    reads the list and not the rows.
+    """
+    if not held:
+        return []
+    return ["", HELD_SECTION_BEGIN] + _held_span_close(held)
+
+
+def _render_withheld(
+    withheld: list[str],
+    findings: list[dict],
+    uncorroborated: list[str] | None = None,
+    needs_triage: list[str] | None = None,
+) -> list[str]:
+    """Name the manifest fixes the automatic sweep opened no pull request for.
+
+    A filter that silently drops work reads as "nothing more to do". Naming
+    what it dropped, with the command to ask for one, is what keeps it honest.
+
+    Three filters, each in its own block, because the answer to them differs.
+    The cap clears itself on the next run. The other two come from the
+    collector manifest and are not invitations at all, and they are not the
+    same refusal: a finding the collector ran the check for and declined to
+    flag is one to read before asking for anything — see
+    `uncorroborated_findings` for the two Deployments that cost — while a
+    finding it flagged and marked `needs_triage` is the opposite case: the
+    observation is sound and the *fix* is what nobody has judged. See
+    `NO_SWEEP_TRIAGE` for the three that cost.
+    """
+    unbacked = list(uncorroborated or [])
+    triaged = list(needs_triage or [])
+    if not withheld and not unbacked and not triaged:
         return []
     by_id = {str(f.get("id", "")): f for f in findings}
-    out = [
-        "",
-        "## Awaiting `/remediate`",
-        "",
-        f"{len(withheld)} finding(s) qualify for an automatic remediation pull "
-        f"request but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
-        "one bad night cannot bury this repository in generated pull requests. "
-        "Comment `/remediate <finding-id>` to open any of them now — an explicit "
-        "request is not capped.",
-        "",
-    ]
-    for fid in withheld:
-        finding = by_id.get(fid) or {}
-        out.append(f"- `{fid}` — {_cell(finding.get('title', ''))}")
+
+    def rows(ids: list[str]) -> list[str]:
+        return [
+            f"- `{fid}` — {_cell((by_id.get(fid) or {}).get('title', ''))}"
+            for fid in ids
+        ]
+
+    out = ["", "## Awaiting `/remediate`"]
+    if withheld:
+        out += [
+            "",
+            f"{len(withheld)} finding(s) qualify for an automatic remediation pull "
+            f"request but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
+            "one bad night cannot bury this repository in generated pull requests. "
+            "Comment `/remediate <finding-id>` to open any of them now — an explicit "
+            "request is not capped.",
+            "",
+            *rows(withheld),
+        ]
+    if unbacked:
+        out += [
+            "",
+            f"**Read these before asking.** {len(unbacked)} finding(s) carry a "
+            "manifest remediation the sweep did not open: the collector ran the "
+            "check each one is filed under and did not flag that object, so what "
+            "stands behind the rest of this ledger — a deterministic re-derivation "
+            "from the live API — does not stand behind these. "
+            "`/remediate <finding-id>` still opens one, and is your judgement "
+            "rather than the collector's:",
+            "",
+            *rows(unbacked),
+        ]
+    if triaged:
+        out += [
+            "",
+            f"**The finding is corroborated; its fix is what needs a decision.** "
+            f"{len(triaged)} finding(s) carry a manifest remediation the sweep did "
+            "not open: the collector flagged each of these and stands behind it, "
+            "but the change it proposes has a consequence the collector could not "
+            "measure, so it leaves the fix to a reader. What that consequence is, "
+            "for each one, is in the finding's own evidence and recommendation. "
+            "`/remediate <finding-id>` opens them normally:",
+            "",
+            *rows(triaged),
+        ]
     return out
 
 
@@ -5102,14 +6780,35 @@ def render_issue_body(
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
     withheld: list[str] | None = None,
+    gaps: list[str] | None = None,
+    uncorroborated: list[str] | None = None,
+    needs_triage: list[str] | None = None,
+    held: list[dict] | None = None,
+    held_overflow: int = 0,
+    held_preview: bool = False,
+    held_carried: bool = False,
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
+
+    `held` is the findings the collector still flags that this document did
+    not carry, already filtered and capped by the caller
+    (`collector_held_entries`, `cap_held_entries`; `held_overflow` is what the
+    cap left out); they render under their own heading and their ids join the
+    hidden block, so the next run reads them back — see
+    `_render_collector_held`. `rendered_ids` stays the document's own, because
+    that is what `new` is measured against.
 
     Everything but the findings renders and is measured first; whatever is left
     of BODY_BUDGET is the findings budget. The hidden delta block carries the
     ids the body actually **rendered**, not the full finding set — otherwise the
     next run would read a truncated finding as resolved and announce a fix that
     never happened.
+
+    `gaps` is the caller's list for the reason `render_clean_comment` takes
+    one: a waived collector manifest is a gap the document cannot express, and
+    a body that recomputed the list would open a ledger titled *coverage
+    incomplete* whose text says every cluster was read. `None` reads the
+    document, which is right for every caller without a waiver.
     """
     audit_id = audit_id or str(data.get("audit", ""))
     findings = list(data.get("findings") or [])
@@ -5118,21 +6817,38 @@ def render_issue_body(
     skipped = list(scope.get("skipped") or [])
     states = states or {}
     pr_urls = pr_urls or {}
+    document_gaps = coverage_gaps(data)
+    gaps = document_gaps if gaps is None else list(gaps)
+    # Whatever the caller added that the document does not say — the Scope
+    # table already shows every gap the document authored.
+    extra_gaps = [gap for gap in gaps if gap not in document_gaps]
 
     fixed: list[str] = _render_header(audit_id)
-    fixed += _render_scope(clusters, skipped, generated_at, audit_id)
+    fixed += _render_scope(clusters, skipped, generated_at, audit_id, extra_gaps=extra_gaps)
     fixed += _render_declared_intent_search(data)
-    withheld_section = _render_withheld(list(withheld or []), findings)
+    withheld_section = _render_withheld(
+        list(withheld or []),
+        findings,
+        uncorroborated=list(uncorroborated or []),
+        needs_triage=list(needs_triage or []),
+    )
     # Measured with the fixed sections, not against what the findings leave:
     # the table is row-capped and says what it saw, and a declaration that
     # silently fell off the body would put the posture back in the reader's
     # mind as unexplained.
     declared_section = _render_declared(list(data.get("declared") or []))
+    held_entries = list(held or [])
+    held_ids = [str(entry.get("id", "")) for entry in held_entries]
 
-    # Measure the footer with an empty delta block: each finding is separately
-    # charged for its own id slot inside select_rendered_findings.
+    # Measure the footer with the held ids in the block and an empty rendered
+    # set: each finding is separately charged for its own id slot inside
+    # select_rendered_findings. The held *rows* are not charged here — they
+    # are measured after the findings, below, so they can never displace one.
     overhead = len("\n".join(fixed + declared_section + withheld_section))
-    overhead += len("\n".join(_render_footer(audit_id, generated_at, [])))
+    overhead += len("\n".join(_render_footer(audit_id, generated_at, held_ids)))
+    # And the held span's smallest form, so the list the next run carries
+    # from is never the thing the findings squeeze out.
+    overhead += len("\n".join(_render_held_ids_only(held_entries)))
     overhead += len("\n".join(["", "## Findings", "", ""])) + 400  # section chrome
     if states:
         # The state index is one row per rendered finding, capped, and is not
@@ -5144,22 +6860,59 @@ def render_issue_body(
         max(BODY_BUDGET - overhead, 0),
         states=states,
         pr_urls=pr_urls,
-        gaps=coverage_gaps(data),
+        gaps=gaps,
     )
     omitted_ids = {str(f.get("id", "")) for f in omitted}
     rendered_ids = [fid for fid in finding_ids(findings) if fid not in omitted_ids]
 
-    footer = _render_footer(audit_id, generated_at, rendered_ids)
+    # The held ids ride the block after the rendered ones: that is what makes
+    # the next run's `previous_ids` remember them.
+    footer = _render_footer(audit_id, generated_at, rendered_ids + held_ids)
+    # The held rows come out of whatever the document's findings left, ahead
+    # of the evidence appendix and never ahead of a finding: full rows, then
+    # identity lines alone, then a one-line note, then the span and its id
+    # list alone. Fifty rows at field caps run near the whole budget, and a
+    # body that raised over them would fail the run with an input the SOP
+    # cannot fix. Under every tier the ids ride the block above and the held
+    # list, and the last tier was charged before the findings, so it fits.
+    spent = len("\n".join(fixed + findings_lines + declared_section + withheld_section + footer))
+    # The fourth tier is the default, not a candidate: it was charged before
+    # the findings were selected, so it is written whatever they left — the
+    # first finding renders whatever it costs, and a tier that had to compete
+    # for the remainder could lose to it and drop the hold.
+    held_section: list[str] = _render_held_ids_only(held_entries)
+    for candidate_section in (
+        _render_collector_held(
+            held_entries, overflow=held_overflow, preview=held_preview, carried=held_carried
+        ),
+        _render_collector_held(
+            held_entries,
+            detail=False,
+            overflow=held_overflow,
+            preview=held_preview,
+            carried=held_carried,
+        ),
+        _render_held_note(
+            held_entries, overflow=held_overflow, preview=held_preview, carried=held_carried
+        ),
+    ):
+        if len("\n".join(candidate_section)) <= max(BODY_BUDGET - spent, 0):
+            held_section = candidate_section
+            break
+    spent += len("\n".join(held_section))
     # Whatever the findings did not need. The evidence appendix is the last
     # claim on the budget, never a competitor for it — a run with 400 findings
     # publishes the findings and drops the appendix, not the reverse.
-    spent = len(
-        "\n".join(fixed + findings_lines + declared_section + withheld_section + footer)
-    )
     evidence = _render_check_evidence(clusters, audit_id, max(BODY_BUDGET - spent, 0))
 
     body = "\n".join(
-        fixed + findings_lines + declared_section + withheld_section + evidence + footer
+        fixed
+        + findings_lines
+        + held_section
+        + declared_section
+        + withheld_section
+        + evidence
+        + footer
     )
     if len(body) > MAX_BODY_CHARS:
         raise BodyTooLargeError(
@@ -5193,8 +6946,16 @@ def render_delta_comment(
     generated_at: datetime,
     *,
     omitted: int = 0,
+    gaps: list[str] | None = None,
 ) -> str | None:
-    """The delta comment, or None when nothing changed (silence beats noise)."""
+    """The delta comment, or None when nothing changed (silence beats noise).
+
+    `gaps` is for a hold the document cannot express — a waived collector
+    manifest — and is rendered only when the comment is emitted at all: the
+    ledger body carries the same list in its Scope section, so silence on an
+    unchanged ledger stays silence. Document-authored gaps are not passed
+    here; the Scope table is where those have always been read.
+    """
     if not new_ids and not resolved_ids and not omitted:
         return None
 
@@ -5251,15 +7012,37 @@ def render_delta_comment(
             "or below. They are still counted in the title. Resolve some findings, "
             "or narrow the audit's scope, to see them.",
         ]
+    if gaps:
+        out += [
+            "",
+            f"**Coverage of this run is partial** ({len(gaps)} hold(s) declared "
+            "beside the document), so nothing above is reported as resolved and no "
+            "remediation pull request was retired:",
+            "",
+        ]
+        out += [f"- {clip_text(gap, MAX_HOLD_LINE_CHARS)}" for gap in gaps[:MAX_DELTA_ROWS]]
+        if len(gaps) > MAX_DELTA_ROWS:
+            out.append(f"- _…and {len(gaps) - MAX_DELTA_ROWS} more_")
     # Capping the body made this path reachable: previously the body failed
     # first at ~67 findings, so a delta this large could never be produced.
     return _clip_comment("\n".join(out))
 
 
 def render_clean_comment(
-    audit_id: str, data: dict, generated_at: datetime
+    audit_id: str,
+    data: dict,
+    generated_at: datetime,
+    *,
+    gaps: list[str] | None = None,
 ) -> str:
     """Comment posted when an audit that previously had findings comes back clean.
+
+    `gaps` is the caller's list when the caller has one. A waived collector
+    manifest is a coverage gap `handle_finish` appends by hand, and
+    `coverage_gaps(data)` — which reads only the document — cannot see it; a
+    comment that recomputed the list would tell a waived run it was an
+    all-clear and omit the reason the ledger stayed open. Left as `None` the
+    comment reads the document, which is every caller that has no waiver.
 
     Two comments, really, because a clean run has two very different endings and
     saying the wrong one is worse than saying nothing. Over complete coverage the
@@ -5278,7 +7061,7 @@ def render_clean_comment(
     """
     scope = data.get("scope") or {}
     clusters = list(scope.get("clusters") or [])
-    gaps = coverage_gaps(data)
+    gaps = coverage_gaps(data) if gaps is None else list(gaps)
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     shown = clusters[:MAX_SCOPE_ROWS]
     names = ", ".join(f"`{c.get('name', '')}`" for c in shown)
@@ -5411,7 +7194,14 @@ def _comment_evidence(audit_id: str, clusters: list[dict], out: list[str]) -> li
 
 
 def render_held_comment(
-    audit_id: str, data: dict, held: list[dict], generated_at: datetime
+    audit_id: str,
+    data: dict,
+    held: list[dict],
+    generated_at: datetime,
+    *,
+    collector: list[str] | None = None,
+    carried: list[str] | None = None,
+    gaps: list[str] | None = None,
 ) -> str:
     """Comment posted when a clean run is refused its close (`HELD`).
 
@@ -5421,7 +7211,21 @@ def render_held_comment(
     reports nor explains. The comment has to say what would let the ledger
     close, because the run that reads it next is the same worker with the same
     SOP, and "stays open" alone teaches it nothing.
+
+    `collector` names the entries in `held` the collector manifest still
+    flags (`collector_held_entries`). Those are held whatever the document
+    says — a `resolved_because` does not release them — so the comment says
+    so, or the worker would write the entry it was just told to write and be
+    held again tomorrow. `gaps` is the run's coverage list when the hold sits
+    on a partial run: status and comment then agree, the finding is named as
+    held and the shortfall listed under it, rather than the coverage comment
+    going out alone and naming no finding.
     """
+    collector_held = set(collector or [])
+    # `carried`: held from a previous run's manifest by a run that passed none
+    # and so cannot release them — said apart from `collector`, whose sentence
+    # claims this run's manifest carries the candidate.
+    carried_held = set(carried or [])
     scope = data.get("scope") or {}
     clusters = list(scope.get("clusters") or [])
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
@@ -5448,6 +7252,24 @@ def render_held_comment(
         "under `carried`.",
         "",
     ]
+    if carried_held:
+        out += [
+            f"{len(carried_held)} of these are held from a previous run's collector "
+            "manifest, and this run passed no manifest, so it cannot release them: "
+            "only a manifest run that no longer emits the id, a `declared` entry, or "
+            "a document that carries the finding does.",
+            "",
+        ]
+    if collector_held:
+        out += [
+            f"{len(collector_held)} of these the collector itself still flags: this "
+            "run's manifest carries a candidate for each, so the condition is still "
+            "observed whatever the document says about it. A `resolved_because` "
+            "entry does not release one of these; the collector no longer emitting "
+            "it does, and so does an entry under `declared` where the shape is the "
+            "owner's choice.",
+            "",
+        ]
     for entry in held[:MAX_DELTA_ROWS]:
         namespace = str(entry.get("namespace", ""))
         place = f"`{_cell(str(entry.get('cluster', '')))}`"
@@ -5462,9 +7284,18 @@ def render_held_comment(
         )
         if others:
             line += f" _(and {others} more)_"
+        if str(entry.get("id", "")) in collector_held:
+            line += " — _still flagged by the collector_"
+        if str(entry.get("id", "")) in carried_held:
+            line += " — _held from a previous manifest run_"
         out.append(line)
     if len(held) > MAX_DELTA_ROWS:
         out.append(f"- _…and {len(held) - MAX_DELTA_ROWS} more_")
+    if gaps:
+        out += ["", f"Not covered by this run ({len(gaps)}):", ""]
+        out += [f"- {clip_text(gap, MAX_HOLD_LINE_CHARS)}" for gap in gaps[:MAX_SCOPE_ROWS]]
+        if len(gaps) > MAX_SCOPE_ROWS:
+            out.append(f"- _…and {len(gaps) - MAX_SCOPE_ROWS} more_")
     out += _comment_resolved(data)
     out += _comment_declared(data)
     out += _comment_evidence(audit_id, clusters, out)
@@ -7003,6 +8834,10 @@ def write_run_record(
     `start` read completely, as `owner/name@sha` — and `sources` says where
     in each it looked. `finish` folds the first into the document; the second
     is the record of the bound that was applied.
+
+    The stamp under `RUN_RECORD_STARTED_KEY` is what `load_manifest` compares a
+    collector manifest's `finished_at` against, so this is also the moment the
+    run becomes able to tell its own collection from the last one's.
     """
     path = run_record_path_for(audit_id)
     Path(path).write_text(
@@ -7013,6 +8848,7 @@ def write_run_record(
                 "context_repos": list(context),
                 RUN_RECORD_SEARCHED_KEY: list(searched or []),
                 RUN_RECORD_SOURCES_KEY: list(sources or []),
+                RUN_RECORD_STARTED_KEY: datetime.now(timezone.utc).strftime(RUN_TIMESTAMP_FORMAT),
             }
         ),
         encoding="utf-8",
@@ -7078,9 +8914,14 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
         return None
     searched = data.get(RUN_RECORD_SEARCHED_KEY)
     sources = data.get(RUN_RECORD_SOURCES_KEY)
+    started = data.get(RUN_RECORD_STARTED_KEY)
     return {
         "repo": recorded,
         "context_repos": [str(slug) for slug in context],
+        # Empty on a record an older `start` wrote. `manifest_predates_run` is
+        # the only reader and treats that as "cannot tell when this run
+        # opened", never as "the manifest is current".
+        RUN_RECORD_STARTED_KEY: started if isinstance(started, str) else "",
         # Absent on a record an older `start` wrote, which is a run that
         # searched nothing on the harness's behalf.
         RUN_RECORD_SEARCHED_KEY: (
@@ -7981,7 +9822,14 @@ def handle_grep(args: argparse.Namespace) -> None:
     )
 
 
-def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime, repo: str | None = None) -> None:
+def _handle_finish_dry_run(
+    audit_id: str,
+    data: dict,
+    now: datetime,
+    repo: str | None = None,
+    manifest: dict | None = None,
+    waiver: str = "",
+) -> None:
     findings = list(data["findings"])
 
     log("DRY RUN: validated findings; nothing will be committed, pushed, or published.")
@@ -8001,8 +9849,34 @@ def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime, repo: str |
     paths = manifest_paths(findings)
 
     gaps = coverage_gaps(data)
+    # The preview exists to show the run the real call would make, and the
+    # waiver's gap is the one hold-open the document itself cannot express, so
+    # the preview appends it the same way `handle_finish` does. Without this a
+    # waived preview announces a closure the real run then declines.
+    if waiver:
+        gaps.append(waiver_gap(waiver))
     for gap in gaps:
         log(f"COVERAGE GAP: {gap}")
+    # The same accounting the real run does: what the model published, plus
+    # what the harness withheld and what the document declared.
+    accounted = (
+        findings
+        + postures_withheld(data)
+        + [d for d in data.get("declared") or [] if isinstance(d, dict)]
+    )
+    unpublished = unpublished_candidates(accounted, manifest)
+    if unpublished:
+        log(
+            f"NOTE: {len(unpublished)} collector candidate(s) are absent from this "
+            "run's document. Rejecting a candidate is the model's to do, so this "
+            f"is recorded, not corrected. {', '.join(r['id'] for r in unpublished)}"
+        )
+    for group in wholly_unpublished_checks(accounted, manifest):
+        log(
+            f"DRY RUN: every candidate for check '{group['check']}' on cluster "
+            f"'{group['cluster']}' is absent from this document "
+            f"({len(group['objects'])} object(s)). {', '.join(group['objects'])}"
+        )
 
     declared = list(data.get("declared") or [])
     if declared:
@@ -8011,7 +9885,45 @@ def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime, repo: str |
             "declaration and not reported as findings."
         )
 
+    # The hold the manifest implies, previewed from the candidates alone: the
+    # real run intersects this with the ledger's hidden marker, which the
+    # preview does not fetch, so it can name a candidate the ledger never
+    # carried. The identity is the manifest's; no title lookup is possible.
+    preview_exclude = set(finding_ids(findings)) | set(finding_ids(postures_withheld(data)))
+    preview_held, _ = cap_held_entries(
+        collector_held_entries(
+            manifest,
+            data,
+            exclude=preview_exclude,
+            previous_body=None,
+            preview_from_candidates=True,
+        )
+    )
+    if preview_held:
+        log(
+            f"DRY RUN: the collector still flags {len(preview_held)} finding(s) this "
+            "document does not carry; shown from the manifest's candidates. The real "
+            "run holds only those the ledger's hidden marker already carries."
+        )
+
     if not findings:
+        if preview_held:
+            log(
+                f"STATUS: would be HELD if the ledger's marker carries any of the "
+                f"{len(preview_held)} still-flagged candidate(s); CLEAN otherwise. The "
+                "held comment below is what a HELD run would post."
+            )
+            print(
+                render_held_comment(
+                    audit_id,
+                    data,
+                    preview_held,
+                    now,
+                    collector=[entry["id"] for entry in preview_held],
+                    gaps=gaps,
+                )
+            )
+            return
         if gaps:
             log(
                 "STATUS: CLEAN but coverage is partial — the ledger would be "
@@ -8019,11 +9931,16 @@ def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime, repo: str |
             )
         else:
             log("STATUS: CLEAN — 0 findings; the open ledger (if any) would be closed.")
-        print(render_clean_comment(audit_id, data, now))
+        print(render_clean_comment(audit_id, data, now, gaps=gaps))
         return
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
-    plan = promotion_candidates(findings, {})
+    plan = promotion_candidates(
+        findings,
+        {},
+        uncorroborated=uncorroborated_findings(findings, manifest),
+        triage_marked=triage_marked_findings(findings, manifest),
+    )
 
     # Groups over the whole finding set, filtered to those holding a promoted
     # id — identical to `_open_promoted_prs`. Grouping the promoted subset in
@@ -8049,10 +9966,25 @@ def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime, repo: str |
     )
     if plan.withheld:
         log(f"WITHHELD BY THE CAP: {', '.join(plan.withheld)}")
+    if plan.uncorroborated:
+        log(
+            "THE COLLECTOR RAN THIS CHECK AND DID NOT FLAG THESE "
+            f"({len(plan.uncorroborated)}): {', '.join(plan.uncorroborated)}"
+        )
+    if plan.needs_triage:
+        log(
+            "THE COLLECTOR MARKED THESE FIXES AS NEEDING A READER'S JUDGEMENT "
+            f"({len(plan.needs_triage)}): {', '.join(plan.needs_triage)}"
+        )
     rendered = render_issue_body(
         data,
         generated_at=now,
         audit_id=audit_id,
+        gaps=gaps,
+        uncorroborated=plan.uncorroborated,
+        needs_triage=plan.needs_triage,
+        held=preview_held,
+        held_preview=True,
         states=states,
         withheld=plan.withheld,
     )
@@ -8253,6 +10185,34 @@ def handle_remediate(args: argparse.Namespace) -> None:
         )
 
     by_id = {str(f.get("id", "")): f for f in findings}
+    # The same hold `finish` applies from the collector manifest, when the
+    # caller has one. An id the document lacks and the collector still flags
+    # is held on the ledger, not a typo, and the answer says which.
+    manifest_file = getattr(args, "manifest_file", None)
+    if manifest_file is not None and not str(manifest_file).strip():
+        # The same refusal `finish` gives: an empty path is a flag the caller
+        # meant to pass, not the absence of one.
+        raise ValidationError(
+            "--manifest-file: give the path of the manifest the collector "
+            "wrote; an empty path is not the same as running without one."
+        )
+    still_flagged = (
+        still_flagged_ids(load_manifest(manifest_file, audit_id), data)
+        if manifest_file is not None
+        else set()
+    )
+    collector_held = [fid for fid in args.finding if fid not in by_id and fid in still_flagged]
+    if collector_held:
+        # This command reads no ledger body, so it cannot say whether the
+        # ledger's hidden block carries the id or only the JSON line names it;
+        # it says what it knows.
+        raise ValidationError(
+            f"--finding: {', '.join(collector_held)} not in {args.findings_file}, but "
+            "the collector manifest still emits a candidate for each, so finish does "
+            "not resolve it; there is no finding here to open a pull request from. A "
+            "run whose document carries it releases it: report it in the document "
+            "and run finish, then ask again"
+        )
     unknown = [fid for fid in args.finding if fid not in by_id]
     if unknown:
         raise ValidationError(
@@ -8420,6 +10380,53 @@ def handle_remediate(args: argparse.Namespace) -> None:
 def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
+    # The collector's side of the run, when there is one. Both flags are
+    # optional: a stream whose SOP has no collector yet publishes on the
+    # document's own attestation, exactly as before either flag existed. See
+    # docs/designs/fleet-audit-collector-manifest.md for what each does.
+    manifest = None
+    manifest_file = getattr(args, "manifest_file", None)
+    if manifest_file is not None:
+        # Given is not the same as usable: `--manifest-file ""` is a flag the
+        # caller meant to pass and a path nothing can open, and reading it as
+        # "no flag" would publish an unchecked document under a command line
+        # that says it was checked.
+        if not str(manifest_file).strip():
+            raise ValidationError(
+                "--manifest-file: give the path of the manifest the collector "
+                "wrote; an empty path is not the same as running without one."
+            )
+        manifest = load_manifest(manifest_file, audit_id)
+        cross_check_manifest(data, manifest)
+        # Before anything reads `evidence` — the dry-run preview and the ledger
+        # body both do — so what renders is what the collector observed.
+        adopted = adopt_collector_evidence(data["findings"], manifest)
+        if adopted:
+            shown = ", ".join(adopted[:MANIFEST_LOG_IDS])
+            if len(adopted) > MANIFEST_LOG_IDS:
+                shown += ", …"
+            log(
+                f"evidence: adopted the collector's command and excerpt for "
+                f"{len(adopted)} of {len(data['findings'])} finding(s) — {shown}"
+            )
+        # A pass that reuses the previous run's wording when evidence is
+        # unchanged is planned for this spot, and this adoption has to stay
+        # below it when it lands: such a carry triggers on byte-identical
+        # evidence, evidence adoption exists to make evidence byte-identical,
+        # and between them a corrected arm sentence would never reach a
+        # finding already on the ledger.
+        for fid in adopt_arm_impact(data["findings"], manifest):
+            log(
+                f"{fid}: impact taken from the collector, which knows which arm "
+                "of the check fired."
+            )
+    waiver_given = getattr(args, "no_collector_manifest", None)
+    waiver = str(waiver_given or "").strip()
+    if waiver_given is not None and not waiver:
+        raise ValidationError(
+            "--no-collector-manifest: give the reason the collector produced no "
+            "manifest; it is published as this run's coverage gap."
+        )
     opt_repo = getattr(args, "repo", None)
     # Once, here, ahead of the dry-run split: both paths then see the same
     # document, and `coverage_gaps` reads the gap back off it wherever it is
@@ -8445,7 +10452,9 @@ def handle_finish(args: argparse.Namespace) -> None:
     now = datetime.now(timezone.utc)
 
     if args.dry_run:
-        _handle_finish_dry_run(audit_id, data, now, repo=opt_repo)
+        _handle_finish_dry_run(
+            audit_id, data, now, repo=opt_repo, manifest=manifest, waiver=waiver
+        )
         return
 
     repo = repo_hint
@@ -8465,9 +10474,79 @@ def handle_finish(args: argparse.Namespace) -> None:
     # looked. When it could not, resolution is unknowable — so nothing is
     # announced as resolved, no remediation pull request is retired, and the
     # ledger is not closed.
-    gaps = coverage_gaps(data)
+    # A waived run is a run whose scope nothing checked, which is the same
+    # thing a coverage gap already describes: the audit cannot fully vouch for
+    # what it saw. Carrying it as a gap rather than a quiet flag is what stops
+    # it closing a ledger or retiring a remediation pull request on the
+    # strength of an absence. Kept apart from the document's own gaps as well,
+    # because the renderers show those through the Scope table's rows and this
+    # one has no row: the body's Coverage list and the delta comment take it
+    # separately.
+    collector_gaps = [waiver_gap(waiver)] if waiver else []
+    gaps = coverage_gaps(data) + collector_gaps
     for gap in gaps:
         log(f"COVERAGE GAP: {gap}")
+    # Computed before the branches split, because the CLEAN branch is the case
+    # that most needs it: a run that published nothing while the collector was
+    # still emitting candidates is a false clean, and every other field in the
+    # payload agrees the fleet is healthy. Derived from the document's findings
+    # rather than the rendered body's, so a finding held back for space still
+    # counts as accounted for — and so do a posture the harness itself withheld
+    # above, since the model did publish it, and an entry under `declared`,
+    # which the collector will go on emitting for as long as the declaration
+    # stands. All three are empty without a manifest, and the keys ride the
+    # JSON line only when one was given.
+    accounted = findings + withheld + [d for d in declared if isinstance(d, dict)]
+    unpublished = unpublished_candidates(accounted, manifest)
+    wholly_dropped = wholly_unpublished_checks(accounted, manifest)
+    # The one set both branches subtract, built once so the delta, the count,
+    # the stale-close pass on either branch and the clean close all read it.
+    # Spelled as the ledger spells ids, because that is what it is compared
+    # against, and already less what the document declared.
+    still_flagged = still_flagged_ids(manifest, data)
+    attested = {
+        str(cluster.get("name", "")): set(checks_ran(cluster))
+        for cluster in (data.get("scope") or {}).get("clusters") or []
+        if isinstance(cluster, dict)
+    }
+    # A dropped candidate is news, on the same footing as a coverage gap: the
+    # disclosure below is a WARNING a scheduled run is told to discard when the
+    # verdict is `[SILENT]`, so the verdict has to say it is not.
+    collector_speaks = bool(unpublished or wholly_dropped)
+
+    def collector_payload(uncorroborated: list[str]) -> dict:
+        """The three keys a manifest adds to the JSON line; nothing without one.
+
+        `uncorroborated` is the sweep's own list — what it would otherwise have
+        opened — so the line and the ledger's block name the same findings.
+        """
+        if manifest is None:
+            return {}
+        return {
+            UNPUBLISHED_CANDIDATES_KEY: unpublished,
+            WHOLLY_UNPUBLISHED_CHECKS_KEY: wholly_dropped,
+            UNCORROBORATED_FINDINGS_KEY: list(uncorroborated),
+        }
+
+    if unpublished:
+        log(
+            f"NOTE: {len(unpublished)} collector candidate(s) are absent from this "
+            "run's document. Rejecting a candidate is the model's to do, so this "
+            f"is recorded, not corrected. {', '.join(r['id'] for r in unpublished)}"
+        )
+    for group in wholly_dropped:
+        # "Reported as having run" only where `checks_run` says so; a cluster
+        # that admits the check did not run there has already declared the gap.
+        claimed = (
+            ", yet the check is reported as having run"
+            if group["check"] in attested.get(group["cluster"], set())
+            else ""
+        )
+        log(
+            f"WARNING: every candidate for check '{group['check']}' on cluster "
+            f"'{group['cluster']}' is absent from this run's document "
+            f"({len(group['objects'])} object(s)){claimed}. {', '.join(group['objects'])}"
+        )
 
     existing_issue, existing_url = find_existing_issue(repo, audit_id)
     previous_body = fetch_issue_body(repo, existing_issue) if existing_issue else ""
@@ -8498,6 +10577,113 @@ def handle_finish(args: argparse.Namespace) -> None:
     # would be closing a fix because the report ran out of room.
     current_ids = finding_ids(findings)
 
+    # The held set, once, for both branches: the findings the collector still
+    # flags that this document does not carry — carried on the ledger, held
+    # out of the close, and deferred on `/remediate`. "Carries" is the document's
+    # own ids plus the postures withheld above, which enter no delta block.
+    # When the ledger body could not be read the set comes from the manifest
+    # alone rather than from a memory this run does not have: the body is
+    # about to be rewritten, and a hold that waited for a readable body was
+    # dropped from the marker the one time it mattered.
+    held_exclude = set(current_ids) | set(finding_ids(withheld))
+    # The ledger is the persistence, and a run that cannot read it must not
+    # overwrite it. A body that failed to fetch gives this run no held set to
+    # intersect with; deriving one from the manifest alone would turn every
+    # candidate the model has been rejecting into a permanent hold on one
+    # transient `gh` failure, and rewriting the body would drop the ids the
+    # old marker carries. So the body, title, label and promotions wait for a
+    # run that can read the ledger, the run is reported partial for it, and
+    # the still-flagged set goes on protecting pull requests and refusing the
+    # close in the meantime — whatever flags this run passed, because a
+    # flagless run rewriting the body drops the held ids just the same. This
+    # is the one deliberate change to manifest-less behaviour in this slice:
+    # main rewrites the body over an unreadable one (a degraded path that
+    # already skips the delta comment), and the recorded transcripts do not
+    # cover it.
+    #
+    # A marker minted under another identity scheme is deliberately *not*
+    # this case. The stamp is refreshed only by the body rewrite, so freezing
+    # the body over it would freeze it for good — every later run partial,
+    # nothing held, nothing closed. A scheme bump rewrites the body as it
+    # always has; a re-spelled held id is lost for that one run, which is the
+    # accepted cost of a bump (rare, and operator-initiated).
+    hold_ledger_unreadable = not delta_known
+    # A run that cannot read the ledger and has no manifest cannot know the
+    # held set, so it must answer no `/remediate` at all: read against the
+    # document alone, a held id is "not a finding … may be a typo" under the
+    # permanent refused marker, and on the clean branch "no longer
+    # reproduces" under the acked marker. The next readable run answers them
+    # — `reply_to_deferrals` guards on the deferred marker alone, so nothing
+    # is lost by waiting. With a manifest the held set is known from the
+    # still-flagged set, and refusals and deferrals are answered as usual.
+    answers_remediate = not (hold_ledger_unreadable and manifest is None)
+    held_entries: list[dict] = []
+    held_dropped: list[dict] = []
+    # Whether this run carries held ids it cannot re-evaluate: it passed no
+    # manifest (no flag, or the waiver), and the previous body's held span
+    # lists ids a run with a manifest recorded as held. Such a run has no
+    # collector to release them with, so it carries exactly that list —
+    # nothing inferred from the marker or the headings — with identity from
+    # the previous held row where there was one and an id-only row otherwise.
+    # They stay out of `resolved`, in the stale-close protection, in the
+    # marker and in the list. Released only by a manifest run that no longer
+    # emits the id, a `declared` entry, or the document carrying it. A body
+    # main ever wrote has no held span, so this yields nothing there and the
+    # manifest-less run is byte for byte what it was.
+    carried_without_manifest = False
+    if manifest is not None and not hold_ledger_unreadable:
+        held_entries, held_dropped = cap_held_entries(
+            collector_held_entries(
+                manifest, data, exclude=held_exclude, previous_body=previous_body
+            )
+        )
+    elif manifest is None and not hold_ledger_unreadable:
+        held_entries, held_dropped = cap_held_entries(
+            carried_held_entries(previous_body, exclude=held_exclude | _declared_ids(data))
+        )
+        if held_entries:
+            carried_without_manifest = True
+            still_flagged = {entry["id"] for entry in held_entries}
+    held_overflow = len(held_dropped)
+    held_ids = {entry["id"] for entry in held_entries}
+    # The still-flagged ids the ledger does not carry: a `/remediate` on one is
+    # deferred too, with wording that points at the JSON line rather than at a
+    # section that does not name it.
+    candidate_only = (still_flagged - held_exclude) - held_ids
+    if hold_ledger_unreadable:
+        gaps.append(UNREADABLE_LEDGER_GAP)
+        collector_gaps.append(UNREADABLE_LEDGER_GAP)
+        log(f"COVERAGE GAP: {UNREADABLE_LEDGER_GAP}")
+    for entry in held_entries:
+        if carried_without_manifest:
+            log(
+                f"HELD: {entry['id']} is held on the ledger from a previous run's "
+                "collector manifest and this run passed none, so it is carried "
+                "unchanged. A hold is released only by a manifest run that no longer "
+                "emits the id, a `declared` entry, or the document carrying it."
+            )
+        else:
+            log(
+                f"HELD: {entry['id']} is on the ledger, absent from this document, and "
+                "the collector still emits a candidate for it; protected by the "
+                "manifest rather than resolved."
+            )
+    if stale_scheme and delta_known:
+        # A scheme bump re-spells every id; the rows were re-derived from their
+        # `Where:` lines (`previous_marker_ids`), and only ids with no row —
+        # the note and empty tiers write none — are lost by the bump.
+        _, residual = previous_marker_ids(previous_body)
+        if residual:
+            log(
+                f"WARNING: {residual} id(s) in the previous marker had no rendered row "
+                f"to re-derive under identity scheme {ID_SCHEME}; they leave the ledger "
+                "unheld with this rewrite, which is the cost of the scheme bump."
+            )
+    # The held comment says whose word a row stands on: this run's manifest,
+    # or a previous run's that this manifest-less run cannot re-evaluate.
+    held_collector_ids = [] if carried_without_manifest else [e["id"] for e in held_entries]
+    held_carried_ids = [e["id"] for e in held_entries] if carried_without_manifest else []
+
     remediation_prs = list_remediation_prs(repo, audit_id)
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
@@ -8512,7 +10698,37 @@ def handle_finish(args: argparse.Namespace) -> None:
             if existing_issue and delta_known and not gaps
             else []
         )
+        # And, on the same condition, every previous finding the collector
+        # still emits a candidate for: an explanation under `resolved_because`
+        # satisfies the rule above and contradicts the collector, and the
+        # collector is the one that looked. Held the same way, so the close,
+        # the pull-request retirement and the `resolved` count all stop.
+        # Whether or not the body was readable, and whether or not coverage
+        # is complete: the manifest is what knows, and a ledger carrying a
+        # finding the collector still flags is not closed over any gap.
+        collector_held = held_entries if existing_issue else []
+        collector_held_ids = [entry["id"] for entry in collector_held]
+        already_held = {entry["id"] for entry in unaccounted}
+        unaccounted = sorted(
+            unaccounted + [e for e in collector_held if e["id"] not in already_held],
+            key=lambda entry: entry["id"],
+        )
+        for fid in collector_held_ids:
+            if carried_without_manifest:
+                log(
+                    f"STILL HELD: {fid} is held on the ledger from a previous run's "
+                    "collector manifest and this run passed none, so it is not "
+                    "resolved whatever the document says; the ledger stays open."
+                )
+            else:
+                log(
+                    f"STILL FLAGGED: {fid} is on the ledger and the collector still "
+                    "emits a candidate for it, so it is not resolved whatever the "
+                    "document says; the ledger stays open."
+                )
         for entry in unaccounted:
+            if entry["id"] in collector_held_ids:
+                continue
             log(
                 f"UNACCOUNTED: {entry['id']} ({entry['object']} in "
                 f"{entry['cluster']}) is on the ledger and this run says "
@@ -8523,10 +10739,14 @@ def handle_finish(args: argparse.Namespace) -> None:
             []
             if gaps or unaccounted
             else close_stale_remediation_prs(
-                repo, audit_id, remediation_prs, set(), previous_titles, {}, now
+                # No finding is current, but one the collector still flags is
+                # not stale either: a pull request whose finding never reached
+                # a ledger body — opened by `/remediate`, or on a finding the
+                # body budget dropped — is still a fix for a live condition.
+                repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now
             )
         )
-        if existing_issue:
+        if existing_issue and answers_remediate:
             # A command standing on the ledger is answered *before* anything
             # closes. "Every /remediate gets exactly one answer" cannot have a
             # clean run as its exception: that is the one morning the issue
@@ -8545,8 +10765,16 @@ def handle_finish(args: argparse.Namespace) -> None:
             for request in unanswered_remediate_comments(clean_comments):
                 targets = request.get("targets") or []
                 held = [t for t in targets if t in withheld_ids]
+                # A request naming an id the collector still flags is not
+                # answered "no longer reproduces" either: the collector says it
+                # does. Tested against the still-flagged set itself, not the
+                # held entries, because those are gated on the close and this
+                # answer is owed on a run with a coverage gap too.
+                flagged = [
+                    t for t in targets if t in still_flagged and t not in withheld_ids
+                ]
                 covered = [t for t in targets if t in covered_by_id]
-                if held:
+                if held or flagged:
                     reply_to_deferrals(
                         repo,
                         existing_issue,
@@ -8554,7 +10782,13 @@ def handle_finish(args: argparse.Namespace) -> None:
                             {
                                 "comment_id": request.get("comment_id", ""),
                                 "author": request.get("author", "someone"),
-                                "reasons": [deferral_reason(t) for t in held],
+                                "reasons": [deferral_reason(t) for t in held]
+                                + [
+                                    collector_hold_reason(t)
+                                    if t in held_ids
+                                    else collector_candidate_reason(t)
+                                    for t in flagged
+                                ],
                             }
                         ],
                         clean_comments,
@@ -8594,13 +10828,31 @@ def handle_finish(args: argparse.Namespace) -> None:
         if existing_issue and gaps:
             # Zero findings over incomplete coverage is not an all-clear. The
             # ledger stays open and says why, so the stream self-heals the day
-            # the unreadable clusters come back.
-            post_comment(
-                repo,
-                existing_issue,
-                render_clean_comment(audit_id, data, now),
-                what="partial all-clear comment",
-            )
+            # the unreadable clusters come back. Over a held finding the held
+            # comment goes out with the shortfall under it, so the `HELD` on
+            # the JSON line and the comment on the issue name the same thing.
+            if unaccounted:
+                post_comment(
+                    repo,
+                    existing_issue,
+                    render_held_comment(
+                        audit_id,
+                        data,
+                        unaccounted,
+                        now,
+                        collector=held_collector_ids,
+                        carried=held_carried_ids,
+                        gaps=gaps,
+                    ),
+                    what="held-open comment over partial coverage",
+                )
+            else:
+                post_comment(
+                    repo,
+                    existing_issue,
+                    render_clean_comment(audit_id, data, now, gaps=gaps),
+                    what="partial all-clear comment",
+                )
             log(
                 f"Audit {audit_id} found nothing, but {len(gaps)} coverage gap(s) "
                 f"mean it cannot speak for the fleet; issue #{existing_issue} stays "
@@ -8615,7 +10867,14 @@ def handle_finish(args: argparse.Namespace) -> None:
             post_comment(
                 repo,
                 existing_issue,
-                render_held_comment(audit_id, data, unaccounted, now),
+                render_held_comment(
+                    audit_id,
+                    data,
+                    unaccounted,
+                    now,
+                    collector=held_collector_ids,
+                    carried=held_carried_ids,
+                ),
                 what="held-open comment",
             )
             log(
@@ -8628,7 +10887,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             post_comment(
                 repo,
                 existing_issue,
-                render_clean_comment(audit_id, data, now),
+                render_clean_comment(audit_id, data, now, gaps=gaps),
                 what="all-clear comment",
             )
             # Completed, not "not planned": a closed ledger means the fleet is
@@ -8655,7 +10914,9 @@ def handle_finish(args: argparse.Namespace) -> None:
             # is that a fifth happened to have a ledger open from the day
             # before. Open one: an audit that cannot speak for the fleet has
             # something to say, and it must land somewhere durable.
-            rendered = render_issue_body(data, generated_at=now, audit_id=audit_id)
+            rendered = render_issue_body(
+                data, generated_at=now, audit_id=audit_id, gaps=gaps
+            )
             res = gh(
                 [
                     "issue",
@@ -8716,7 +10977,9 @@ def handle_finish(args: argparse.Namespace) -> None:
                     # unconditionally: `resolved > 0` is the fleet getting
                     # better and is the best news this audit ever delivers, and
                     # a gap means it could not look rather than found nothing.
-                    "silent_ok": not (clean_resolved or gaps or prs_closed or unaccounted),
+                    "silent_ok": not (
+                        clean_resolved or gaps or prs_closed or unaccounted or collector_speaks
+                    ),
                     "partial": bool(gaps),
                     "coverage_gaps": gaps,
                     # How many postures a declaration kept off the ledger.
@@ -8733,6 +10996,8 @@ def handle_finish(args: argparse.Namespace) -> None:
                     # their ledger ids; the comment on the issue names each
                     # one with the check this run says it ran.
                     UNACCOUNTED_KEY: [entry["id"] for entry in unaccounted],
+                    # No findings, so no sweep and nothing for it to pass over.
+                    **collector_payload([]),
                 }
             )
         )
@@ -8751,14 +11016,60 @@ def handle_finish(args: argparse.Namespace) -> None:
         for f in findings
     }
 
-    ledger_comments = fetch_issue_comments(repo, existing_issue) if existing_issue else []
-    requests = parse_remediate_commands(ledger_comments, findings, withheld, declared)
+    # The previous findings the collector still flags and this document did
+    # not carry. The body is rewritten from the document, so without these
+    # rows the hold lasted one run: the next previous body no longer named the
+    # finding and a clean run closed the ledger over it. They render under
+    # their own heading and their ids join the hidden block — see
+    # `_render_collector_held` — so they are neither `new` nor swept, and the
+    # next run reads them back.
+    carried = held_entries
+    # Said here and not before the branch split: only this branch rewrites the
+    # marker, so only here does the ledger stop tracking anything. On a clean
+    # run the untouched marker still carries every id it had.
+    if held_dropped:
+        log(
+            f"WARNING: the ledger stops tracking {held_overflow} finding(s) the "
+            f"collector still flags — it holds at most {MAX_HELD_IDS} at once, lowest "
+            "ids first. They stay on the JSON line as unpublished_candidates while "
+            "the collector flags them and their pull requests stay open: "
+            f"{', '.join(entry['id'] for entry in held_dropped)}"
+        )
+
+    ledger_comments = (
+        fetch_issue_comments(repo, existing_issue)
+        if existing_issue and answers_remediate
+        else []
+    )
+    requests = parse_remediate_commands(
+        ledger_comments,
+        findings,
+        withheld,
+        declared=declared,
+        collector_held=held_ids,
+        collector_flagged=candidate_only,
+    )
     plan = promotion_candidates(
         findings,
         pr_by_finding,
         requests.targets,
         requested_at=requests.requested_at,
+        uncorroborated=uncorroborated_findings(findings, manifest),
+        triage_marked=triage_marked_findings(findings, manifest),
     )
+    for fid in plan.uncorroborated:
+        log(
+            f"{fid}: the collector ran this check on this cluster and emitted no "
+            "candidate for this object, so the sweep will not open a pull request "
+            f"on it. Comment `/remediate {fid}` if you have read it and want one."
+        )
+    for fid in plan.needs_triage:
+        log(
+            f"{fid}: the collector flagged this and stands behind it, and marked "
+            "the fix as needing a judgement it could not make, so the sweep will "
+            f"not open a pull request on it. Comment `/remediate {fid}` once you "
+            "have decided."
+        )
     for fid in plan.already_open:
         log(f"{fid} already has an open remediation pull request; not replacing it.")
     sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
@@ -8775,9 +11086,15 @@ def handle_finish(args: argparse.Namespace) -> None:
         data,
         generated_at=now,
         audit_id=audit_id,
+        gaps=gaps,
         states=states,
         pr_urls=pr_urls,
         withheld=plan.withheld,
+        uncorroborated=plan.uncorroborated,
+        needs_triage=plan.needs_triage,
+        held=carried,
+        held_overflow=held_overflow,
+        held_carried=carried_without_manifest,
     )
     if rendered.partial:
         log(
@@ -8794,6 +11111,30 @@ def handle_finish(args: argparse.Namespace) -> None:
     new_ids, resolved_ids = compute_delta(
         previous_ids, rendered.rendered_ids, current_ids
     )
+    # Held back again for the collector, on the same principle as the coverage
+    # rule one source further out: a candidate the collector still emits is the
+    # condition still holding, whatever this run's document did or did not say
+    # about it. Filtered here, once, so every reader of `resolved_ids` below —
+    # the delta comment, the count — agrees; the stale-close pass reads
+    # `still_flagged` whole. Empty without a manifest, so a stream without a
+    # collector is unchanged.
+    # Less the withheld postures: those are the document's, held back by the
+    # harness for want of a search, and already kept out of `resolved` by the
+    # gap they file — naming them here would blame the collector for it.
+    contradicted = [fid for fid in resolved_ids if fid in still_flagged - held_exclude]
+    if contradicted:
+        resolved_ids = [fid for fid in resolved_ids if fid not in still_flagged]
+        log(
+            f"WARNING: {len(contradicted)} finding(s) absent from this run's document "
+            "are NOT being announced as resolved: "
+            + (
+                "the ledger holds each from a previous run's collector manifest and "
+                "this run passed none. "
+                if carried_without_manifest
+                else "the collector still emits a candidate for each. "
+            )
+            + ", ".join(contradicted)
+        )
     if existing_issue is None:
         res = gh(
             [
@@ -8820,26 +11161,45 @@ def handle_finish(args: argparse.Namespace) -> None:
             tail = issue_url.rstrip("/").rsplit("/", 1)[-1]
             number = int(tail) if tail.isdigit() else None
     else:
-        gh(
-            [
-                "issue",
-                "edit",
-                str(existing_issue),
-                "-R",
-                repo,
-                "--title",
-                title,
-                "--body-file",
-                BODY_STDIN,
-            ],
-            stdin=rendered.body,
-        )
+        if hold_ledger_unreadable:
+            # The body is this run's only memory of what the collector holds,
+            # and this run could not read it. Left untouched, its marker and
+            # held ids survive to the next run that can; see the note where
+            # `hold_ledger_unreadable` is set. Everything that would describe a
+            # body this run did not write waits with it.
+            log(
+                f"The ledger body of #{existing_issue} could not be read this run, so "
+                "it was left as it was: body, title, label and promotions wait for a "
+                "run that can read the ledger. "
+                + (
+                    "Only /remediate refusals and deferrals are answered."
+                    if answers_remediate
+                    else "Without a manifest the held set is unknown too, so no "
+                    "/remediate is answered; the next readable run answers them."
+                )
+            )
+        else:
+            gh(
+                [
+                    "issue",
+                    "edit",
+                    str(existing_issue),
+                    "-R",
+                    repo,
+                    "--title",
+                    title,
+                    "--body-file",
+                    BODY_STDIN,
+                ],
+                stdin=rendered.body,
+            )
         status = "UPDATED"
         number = existing_issue
         issue_url = existing_url or fetch_issue_url(repo, existing_issue)
 
     if number is not None:
-        apply_severity_label(repo, number, findings)
+        if not hold_ledger_unreadable:
+            apply_severity_label(repo, number, findings)
         reply_to_refusals(repo, number, requests.refusals, ledger_comments, now)
 
     # A merged fix whose finding still reproduces is said once, on the pull
@@ -8860,7 +11220,12 @@ def handle_finish(args: argparse.Namespace) -> None:
             repo,
             audit_id,
             remediation_prs,
-            set(current_ids),
+            # Every finding the collector still flags is passed in as though
+            # it were current — the whole set, not only the ids the last body
+            # rendered, because a pull request can cover a finding that body
+            # never had room for. Its pull request is not stale while the
+            # condition is still observed, whatever the document left out.
+            set(current_ids) | still_flagged,
             previous_titles,
             {},
             now,
@@ -8871,15 +11236,19 @@ def handle_finish(args: argparse.Namespace) -> None:
             },
         )
 
-    prs_opened = _open_promoted_prs(
-        repo,
-        audit_id,
-        findings,
-        plan.promote,
-        pr_by_finding,
-        root=root,
-        issue_number=number,
-        generated_at=now,
+    prs_opened = (
+        []
+        if hold_ledger_unreadable
+        else _open_promoted_prs(
+            repo,
+            audit_id,
+            findings,
+            plan.promote,
+            pr_by_finding,
+            root=root,
+            issue_number=number,
+            generated_at=now,
+        )
     )
 
     if prs_opened:
@@ -8895,15 +11264,22 @@ def handle_finish(args: argparse.Namespace) -> None:
             )
             for f in findings
         }
-        # One extra edit is cheaper than making a reader wait a day.
-        if number is not None:
+        # One extra edit is cheaper than making a reader wait a day — unless
+        # this run may not write the body at all.
+        if number is not None and not hold_ledger_unreadable:
             relink = render_issue_body(
                 data,
                 generated_at=now,
                 audit_id=audit_id,
+                gaps=gaps,
                 states=states,
                 pr_urls=pr_urls,
                 withheld=plan.withheld,
+                uncorroborated=plan.uncorroborated,
+                needs_triage=plan.needs_triage,
+                held=carried,
+                held_overflow=held_overflow,
+                held_carried=carried_without_manifest,
             ).body
             gh(
                 ["issue", "edit", str(number), "-R", repo, "--body-file", BODY_STDIN],
@@ -8914,7 +11290,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     # A command that succeeds silently is indistinguishable from one that was
     # never read, so every accepted `/remediate` gets an answer naming what it
     # produced — once, on the requesting comment's node id.
-    if number is not None and requests.accepted_by_comment:
+    if number is not None and requests.accepted_by_comment and not hold_ledger_unreadable:
         ack_remediate_requests(
             repo,
             number,
@@ -8943,6 +11319,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 previous_titles,
                 now,
                 omitted=len(rendered.omitted),
+                gaps=collector_gaps,
             )
             if comment:
                 post_comment(repo, number, comment, what="delta comment")
@@ -8987,6 +11364,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                     or gaps
                     or prs_opened
                     or prs_closed
+                    or collector_speaks
                 ),
                 # Coverage, and only coverage: `partial` is true iff
                 # `coverage_gaps` is non-empty, on this branch and on the CLEAN
@@ -9014,6 +11392,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 # Only a clean run can be refused its close, so this is always
                 # empty here; carried so the line has one shape.
                 UNACCOUNTED_KEY: [],
+                **collector_payload(plan.uncorroborated),
             }
         )
     )
@@ -9082,6 +11461,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Validate and render to stdout; perform zero git/gh side effects.",
+    )
+    # One or the other, never both: a waiver says the collector produced no
+    # manifest, and a manifest beside it would make that sentence false.
+    collector = finish_parser.add_mutually_exclusive_group()
+    collector.add_argument(
+        "--manifest-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "The collector manifest for this run (docs/designs/"
+            "fleet-audit-collector-manifest.md). checks_run entries for a "
+            "cluster the manifest marks 'collected' are cross-checked against "
+            "the manifest's own rc=0 commands, a 'collected' cluster the "
+            "document omits is refused, and the collector's evidence replaces "
+            "the model's — see cross_check_manifest. Optional: without it the "
+            "document is published on its own attestation, as before."
+        ),
+    )
+    collector.add_argument(
+        "--no-collector-manifest",
+        default=None,
+        metavar="REASON",
+        help=(
+            "Publish without a manifest on a run where the collector produced "
+            "none and every check came from the manual fallback. REASON is "
+            "reported as a coverage gap, so the run is partial and closes no "
+            "ledger."
+        ),
     )
 
     fetch_parser = subparsers.add_parser(
@@ -9179,6 +11586,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Render the pull-request bodies to stdout; zero git/gh side effects.",
+    )
+    remediate_parser.add_argument(
+        "--manifest-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "The collector manifest finish was given. Optional; with it an id the "
+            "document lacks that the collector still flags is refused as held on "
+            "the ledger rather than as unknown."
+        ),
     )
     return parser
 

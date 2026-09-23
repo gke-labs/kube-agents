@@ -178,6 +178,10 @@ the case. It never binds at realistic history depths; when it does, the verdict
 says which case was capped and by how much, because a silent cap reads as "I
 considered everything" when it did not.
 
+One `cat` per case, and the cases run concurrently — at most
+`EVAL_BASELINE_CAT_WORKERS` (default 16) at once. A read costs one `gcloud`
+process startup per case and little else, so serially it grew with the matrix.
+
 A store that cannot be **reached** — no `gcloud`, a timeout, a 403, a 503 —
 degrades to advisory with a banner in the verdict, rather than redding the job.
 Nothing is admitted, so collapse and rung 6 do not evaluate and the aggregate

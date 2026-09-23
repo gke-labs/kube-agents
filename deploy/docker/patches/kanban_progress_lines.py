@@ -1,7 +1,8 @@
 """Mid-run progress lines for the kanban notifier.
 
 Installed into the image at ``/opt/hermes/gateway/kanban_progress_lines.py``
-and wired into ``gateway/kanban_watchers.py`` by
+and wired into ``gateway/kanban_watchers_notifier.py`` (the notifier's
+``_EVENT_FORMATTERS`` table and ``_KanbanNotification._send_event``) by
 ``deploy/docker/patches/apply_kanban_progress_lines.py``.
 
 **The problem.** A delegated card is silent from the moment it is claimed until
@@ -15,8 +16,9 @@ worker cold start, and a fresh worker context per stage. It makes the real
 number worse to improve the perceived one.
 
 **The unlock.** ``kanban_heartbeat(note=...)`` already writes a ``heartbeat``
-event carrying that note (``hermes_cli/kanban_db.py``); the notifier simply
-does not deliver that kind. Two properties make delivering it nearly free:
+event carrying that note (``hermes_cli/kanban_db_dispatch.py``); the notifier
+simply does not deliver that kind. Two properties make delivering it nearly
+free:
 
 1. The per-tool-call auto-heartbeats fired by ``tools/kanban_tools.py`` write
    ``payload=None``. All 2,107 heartbeat rows on the live board are noteless,
@@ -111,11 +113,12 @@ def progress_note(payload: object, limit: int = DEFAULT_NOTE_LIMIT) -> str:
 #: their own. Everything else the notifier reaches the send site with is
 #: terminal: it settles the rolling message and then posts separately.
 #:
-#: ``status`` is in here for correctness rather than for effect — no code path
-#: in hermes-agent v2026.8.3 writes an event of that kind, so the notifier's
-#: ``elif kind == "status":`` branch never runs today. Listing it means a card
-#: whose status transitions start being recorded folds them into the trail
-#: rather than resuming one-message-per-event.
+#: ``status`` was listed for correctness before any code path wrote the kind;
+#: since v2026.9.14 the dashboard's drag-drop path (``_set_status_direct`` in
+#: ``plugins/kanban/dashboard/plugin_api.py``) records one per move, and
+#: upstream's ``_EVENT_FORMATTERS["status"]`` renders it. Listing it here means
+#: such a move folds into the card's trail as ``→ <status>`` rather than
+#: posting upstream's ``🔄`` line as a message of its own.
 ROLLING_KINDS = ("heartbeat", "status")
 
 #: Leading marker on the rolling message. ``IN_PROGRESS`` while the card runs;

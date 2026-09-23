@@ -25,7 +25,7 @@ import tempfile
 import unittest
 import unittest.mock
 import urllib.parse
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 
 from eval_dashboard import render
 
@@ -50,6 +50,17 @@ SETUP_DEATHS_SINCE = "2026-09-07T15:00:00+00:00"
 SETUP_DEATH_BUILD = "2097273589702070272"
 SETUP_DEATH_LABEL = "PR #1274 at Tue 6:39 AM ET"
 HOSTILE_PR = "<<script>script>"
+
+
+# The scorer's marker-led reason for a delegation-ceiling repetition (#1874);
+# test_eval_dashboard_classify.py pins the literal against the scorer.
+CEILING_REASON = "KUBE_AGENTS_DELEGATION_CEILING: the harness's delegation wait ran out before any delegated card delivered a result, so the record holds the acknowledgement alone and nothing to grade (delegated tasks did not finish within 2700s: t_2282937f (running))"
+
+
+def health_module_advice():
+    from eval_dashboard import health as health_module
+
+    return health_module.ADVICE_CEILING
 
 
 def health_doc(state="OUTAGE", **overrides):
@@ -204,6 +215,31 @@ class HealthInputsTest(unittest.TestCase):
         )
         self.assertIsNone(render.normalize_health(health_doc("GREEN", slow={"median_s": "long"}))["slow"]["median_s"])
         self.assertIsNone(render.normalize_health(health_doc("GREEN", slow=[]))["slow"])
+        # The rule-8 note, same treatment: the fields the lede reads, and a
+        # verdict the page does not know about is dropped rather than shown.
+        self.assertIsNone(minimal["pool"])
+        note = {"since": "2026-09-08T12:00:00+00:00", "verdict": "BREACH", "measured_at": "2026-09-08T13:23:00+00:00",
+                "day": "2026-09-07", "p50_s": 1320, "p95_s": 3660, "waiting_now": True, "over_threshold": 2,
+                "threshold_p50_s": 900, "threshold_p95_s": 2700, "free": 0, "total": 30, "cause": "CAPACITY"}
+        self.assertEqual(
+            render.normalize_health(health_doc("GREEN", pool=note))["pool"],
+            {"verdict": "BREACH", "since": "2026-09-08T12:00:00+00:00", "measured_at": "2026-09-08T13:23:00+00:00",
+             "day": "2026-09-07", "window_hours": None, "p50_s": 1320, "p95_s": 3660, "waiting_now": True,
+             "waiting_since": None, "over_threshold": 2, "threshold_p50_s": 900, "threshold_p95_s": 2700},
+        )
+        # Dated like every other timestamp the page renders: a string that is
+        # not one drops rather than reaching `new Date`.
+        self.assertEqual("2026-09-08T16:45:00+00:00", render.normalize_health(health_doc("GREEN", pool=note | {"waiting_since": "2026-09-08T16:45:00+00:00"}))["pool"]["waiting_since"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"waiting_since": "this afternoon"}))["pool"]["waiting_since"])
+        # Tri-state: the page reads null as "Deck was not read", so a field that
+        # is not a real bool has to arrive as null rather than as a truthy string.
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"waiting_now": "yes"}))["pool"]["waiting_now"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"verdict": "WEDGED"}))["pool"]["verdict"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"p50_s": "ages"}))["pool"]["p50_s"])
+        # `day` is printed verbatim, so it is shape-checked and not merely
+        # type-checked.
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"day": "yesterday"}))["pool"]["day"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=[]))["pool"])
 
     def test_load_health_degrades_on_absent_or_broken_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -510,6 +546,73 @@ class BrowserTest(unittest.TestCase):
         out = render_to(pathlib.Path(self.tmp.name) / sub, self.data, health=health)
         return dom_text(out / "index.html")
 
+    def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):
+        """Ceiling reps sit under their own key in `reps` (#1874). The card's
+        totals must include them, or a three-rep case reads "all 0 reps lost
+        before grading" beside its delegation-ceiling tag."""
+        data = copy.deepcopy(self.data)
+        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
+        task["result"] = "infra"
+        task["reps"] = [{"n": n, "result": "infra", "reason": CEILING_REASON} for n in (1, 2, 3)]
+        mixed = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[1])
+        mixed["reps"] = [{"n": 1, "result": "pass", "reason": None}, {"n": 2, "result": "pass", "reason": None}, {"n": 3, "result": "infra", "reason": CEILING_REASON}]
+        mixed["result"] = "pass"
+        out = render_to(pathlib.Path(self.tmp.name) / "ceiling", data, health=health_doc())
+        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("all 3 reps hit the delegation ceiling with the worker still running", page)
+        self.assertIn('class="tag storm">delegation ceiling<', page)
+        self.assertIn(f"<span>{CRASHLOOP_TRIO[1]}</span>", page, "two passes and a ceiling rep is a pass, listed by name")
+        self.assertNotIn("all 0 reps", page)
+        self.assertNotIn("0 reps lost", page)
+
+    def test_a_delegation_ceiling_wave_has_its_own_brief_and_banner(self):
+        health = health_doc(
+            "DEGRADED", condition="delegation_ceiling", failing_cases=[], tracking_issues=[],
+            cause="delegation ceiling: 18 repetitions on 3 PRs ended with the worker still running 12:00–14:00 UTC",
+            since="2026-09-08T12:00:00+00:00", advice=health_module_advice(),
+            incident={"prs": [1, 2, 3], "runs": 3, "reps": 18, "window_start": "2026-09-08T12:00:00+00:00", "window_end": "2026-09-08T14:00:00+00:00"},
+        )
+        out = render_to(pathlib.Path(self.tmp.name) / "ceiling-brief", self.data, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn("DEGRADED · since Tue 8:00 AM ET", app)
+        self.assertIn("Workers aren't finishing: repetitions are ending at the harness's delegation wait", app)
+        self.assertIn("Why we think it's the workers, not the PRs", app)
+        self.assertIn("ended at the harness's delegation wait with the worker still running, across 0 PRs", app, "the fixture week has no ceiling reps; the fact still counts")
+        self.assertIn("#1879", app)
+        self.assertNotIn("quota storm", app.lower().replace("no shared break, storm", ""))
+        run_page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("Workers not finishing", run_page)
+        self.assertIn("those runs read not evaluated, not red", run_page)
+
+    def test_a_run_of_ceiling_hits_is_not_a_pass_in_the_brief_and_counts_in_the_storms_totals(self):
+        """A run whose every case ended at the ceiling passed nothing, so its row
+        cannot read "all gate cases passed"; and the storm brief's totals count
+        those repetitions among the ones that ran, as the run page does."""
+        data = copy.deepcopy(self.data)
+        run = max((r for r in data["runs"] if r.get("pr") is not None and r.get("tasks")), key=lambda r: r["finished"])
+        for task in run["tasks"]:
+            task["result"] = "infra"
+            task["reps"] = [{"n": n, "result": "infra", "reason": CEILING_REASON} for n in (1, 2, 3)]
+        finished = datetime.fromisoformat(run["finished"].replace("Z", "+00:00"))
+        since = (finished - timedelta(hours=1)).isoformat()
+        incident = {"prs": [1, 2, 3], "runs": 3, "window_start": since, "window_end": finished.isoformat()}
+        ceiling = health_doc("DEGRADED", condition="delegation_ceiling", failing_cases=[], tracking_issues=[], since=since,
+                             advice=health_module_advice(), incident=dict(incident, reps=18))
+        app = dom_text(render_to(pathlib.Path(self.tmp.name) / "ceiling-rows", data, health=ceiling) / "index.html")
+        row = re.search(rf'<a class="runrow[^"]*" href="run.html#build={run["build_id"]}">.*?</a>', app)
+        self.assertIsNotNone(row, "the run is listed in the wave's window")
+        self.assertIn("nothing graded", row.group(0))
+        self.assertIn(f"{3 * len(run['tasks'])} reps at the delegation ceiling", row.group(0))
+        self.assertNotIn("all gate cases passed", row.group(0))
+        storm = health_doc("DEGRADED", condition="storm", failing_cases=[], tracking_issues=[], since=since, incident=incident)
+        before = dom_text(render_to(pathlib.Path(self.tmp.name) / "storm-before", self.data, health=storm) / "index.html")
+        after = dom_text(render_to(pathlib.Path(self.tmp.name) / "storm-after", data, health=storm) / "index.html")
+        total = lambda page: int(re.search(r"of (\d+) repetitions</b> came back with no agent run", page).group(1))
+        # The reps were graded before and ceiling hits after; either way they
+        # ran, so the total is the same (the old sum dropped every one of them).
+        self.assertEqual(total(after), total(before), "ceiling reps are repetitions that ran")
+
     def test_outage_brief(self):
         app = dom_text(self.index)
         self.assertIn("OUTAGE · since Tue 5:00 AM ET", app)
@@ -666,6 +769,93 @@ class BrowserTest(unittest.TestCase):
         self.assertNotIn("PAST", linked.split('id="agent"', 1)[0], "the headline is the healthy one")
         control = dom_text(render_to(pathlib.Path(self.tmp.name) / "notslow", self.data, health=health_doc("GREEN")) / "index.html")
         self.assertNotIn("Runs are slow", control)
+
+    def test_brief_says_when_runs_are_waiting_to_start(self):
+        # health.py's rule-8 note, dated 8:00 AM ET on the page's Tuesday.
+        # Unlike 🐢 it also rides on an incident lede, so both are rendered.
+        note = {"since": "2026-09-08T12:00:00+00:00", "verdict": "BREACH", "measured_at": "2026-09-08T13:23:00+00:00",
+                "day": "2026-09-07", "p50_s": 1320, "p95_s": 3660, "waiting_now": True,
+                "threshold_p50_s": 900, "threshold_p95_s": 2700}
+        sentence = ("Runs are waiting to start since Tue 8:00 AM ET: on 2026-09-07 the median wait was 22 min against"
+                    " a 15 min limit, p95 61 min against 45. Runs still pass; /retest makes the queue longer.")
+        healthy = dom_text(render_to(pathlib.Path(self.tmp.name) / "pool", self.data, health=health_doc("GREEN", pool=note)) / "index.html")
+        self.assertIn("Smoke gate is healthy", healthy)
+        self.assertIn(sentence, healthy)
+        # During an incident it rides on the agent view, which is where the ⏳
+        # message's own link lands; the incident brief keeps its own lede.
+        out = render_to(pathlib.Path(self.tmp.name) / "poolred", self.data, health=health_doc("OUTAGE", pool=note))
+        self.assertIn(sentence, dom_text(out / "index.html", fragment="#view=agent"))
+        # The gate breaches on p50 or p95, so a p95-only breach carries an
+        # ordinary median -- sub-minute here, which whole minutes would print
+        # as "0 min". The sentence has to carry the half that breached; the
+        # median alone reads as a passing number offered as the evidence.
+        quick = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolquick", self.data,
+                                   health=health_doc("GREEN", pool=note | {"p50_s": 24})) / "index.html")
+        self.assertIn("on 2026-09-07 the median wait was 24s against a 15 min limit, p95 61 min against 45", quick)
+        # A day and the live queue can breach together, as the ⏳ message's two
+        # lines do; the lede has one sentence, so it joins them.
+        both = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolboth", self.data,
+                                  health=health_doc("GREEN", pool=note | {"over_threshold": 2})) / "index.html")
+        self.assertIn("p95 61 min against 45; 2 runs queued past the 45 min limit.", both)
+        # The usual case: the periodic judged the recent stretch, so the
+        # sentence names it rather than a day up to a week old.
+        recent = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolrecent", self.data,
+                                    health=health_doc("GREEN", pool=note | {"day": None, "window_hours": 3})) / "index.html")
+        self.assertIn("over the last 3h the median wait was 22 min against a 15 min limit", recent)
+        # A breach with no bad day in the week -- one run stuck past p95 right
+        # now -- has no median to quote and counts the queue instead.
+        live = dom_text(render_to(pathlib.Path(self.tmp.name) / "poollive", self.data,
+                                  health=health_doc("GREEN", pool=note | {"day": None, "p50_s": None, "over_threshold": 3})) / "index.html")
+        self.assertIn("Runs are waiting to start since Tue 8:00 AM ET: 3 runs queued past the 45 min limit.", live)
+        # A `day` that is not a date never reaches the sentence -- render.py
+        # drops it on shape, pages.js again on the way in -- and the live queue
+        # is what is left to quote.
+        junk = dom_text(render_to(pathlib.Path(self.tmp.name) / "pooljunk", self.data,
+                                  health=health_doc("GREEN", pool=note | {"day": "yesterday", "over_threshold": 3})) / "index.html")
+        self.assertIn("Runs are waiting to start since Tue 8:00 AM ET: 3 runs queued past the 45 min limit.", junk)
+        self.assertNotIn("yesterday", junk)
+        # The verdict lasts a week, so most renders of an episode find the queue
+        # already drained. The lede keeps the episode but stops claiming a jam.
+        drained = dom_text(render_to(pathlib.Path(self.tmp.name) / "pooldrained", self.data,
+                                     health=health_doc("GREEN", pool=note | {"waiting_now": False})) / "index.html")
+        self.assertIn("Runs were waiting to start since Tue 8:00 AM ET: on 2026-09-07 the median wait was 22 min", drained)
+        self.assertIn("p95 61 min against 45. No backlog right now.", drained)
+        self.assertNotIn("Runs are waiting", drained)
+        # Deck unread is not the same answer: past tense, because nothing
+        # measured a queue this tick, but no claim that it cleared either.
+        unread = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolunread", self.data,
+                                    health=health_doc("GREEN", pool=note | {"waiting_now": None})) / "index.html")
+        self.assertIn("Runs were waiting to start since Tue 8:00 AM ET", unread)
+        self.assertNotIn("No backlog", unread)
+        # A jam is dated from its own oldest queued run, not from the episode:
+        # the verdict spans a week, so "since Tue 8:00 AM" can sit over a jam
+        # that formed this afternoon and claim hours nothing measured.
+        dated = dom_text(render_to(pathlib.Path(self.tmp.name) / "pooldated", self.data,
+                                   health=health_doc("GREEN", pool=note | {"waiting_since": "2026-09-08T16:45:00+00:00"})) / "index.html")
+        self.assertIn("Runs are waiting to start since Tue 12:45 PM ET", dated)
+        self.assertNotIn("since Tue 8:00 AM ET", dated)
+        # Once it has drained there is no backlog to date, so the episode is
+        # what the past tense is about.
+        self.assertIn("Runs were waiting to start since Tue 8:00 AM ET", drained)
+        # A stopped periodic says so instead of quoting a reading hours old.
+        stale = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolstale", self.data,
+                                   health=health_doc("GREEN", pool={"verdict": "STALE", "measured_at": "2026-09-08T13:23:00+00:00"})) / "index.html")
+        self.assertIn("No pool numbers since Tue 9:23 AM ET: the hourly pool check has stopped reporting.", stale)
+        self.assertNotIn("median wait", stale)
+        # ... and a periodic that ran and published nothing has no reading to
+        # date, so the sentence drops the clause rather than printing a blank.
+        blind = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolblind", self.data,
+                                   health=health_doc("GREEN", pool={"verdict": "STALE"})) / "index.html")
+        self.assertIn("No pool numbers: the hourly pool check has stopped reporting.", blind)
+        # UNMEASURED is the periodic running and failing to sweep the window,
+        # which is a different sentence from the periodic going away.
+        unmeasured = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolunmeasured", self.data,
+                                        health=health_doc("GREEN", pool=note | {"verdict": "UNMEASURED"})) / "index.html")
+        self.assertIn("The queue wait is unknown: the hourly pool check ran but could not read"
+                      " how long recent runs waited.", unmeasured)
+        self.assertNotIn("median wait", unmeasured)
+        control = dom_text(render_to(pathlib.Path(self.tmp.name) / "notpool", self.data, health=health_doc("GREEN")) / "index.html")
+        self.assertNotIn("Runs are waiting to start", control)
 
     def test_healthy_brief_without_any_health_files(self):
         out = render_to(pathlib.Path(self.tmp.name) / "nohealth", self.data)

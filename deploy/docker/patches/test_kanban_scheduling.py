@@ -2,7 +2,8 @@
 
 Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches
 
-Four faults in ``hermes_cli/kanban_db.py``, one quartet, one test file:
+Four faults in ``hermes_cli/kanban_db.py`` -- since Hermes v2026.9.14 split
+across it and ``hermes_cli/kanban_db_dispatch.py`` -- one quartet, one test file:
 
   * the self-parenting dependency deadlock (``repair_inverted_dependencies``),
   * claims fenced to a process life, and the discriminator that decides which
@@ -58,13 +59,15 @@ from pathlib import Path
 from apply_kanban_scheduling import (
     BUILD_MARKER,
     CHARGE_ANCHOR,
-    CRASH_BIND_ANCHOR,
+    CHARGE_PATCHED,
+    DB_RELATIVE,
     DEPENDENCY_ANCHOR,
     DEPENDENCY_PATCHED,
+    DISPATCH_RELATIVE,
     EDITS,
     FENCE_ANCHOR,
-    RELATIVE,
-    SPAWN_BIND_ANCHOR,
+    SWEEP_FIELD_ANCHOR,
+    SWEEP_FIELD_PATCHED,
     TRIP_ANCHOR,
     WAITING_ANCHOR,
     apply,
@@ -75,6 +78,7 @@ from apply_kanban_wake_nudge import (
     UNBLOCK_ANCHOR as WAKE_UNBLOCK_ANCHOR,
 )
 import apply_kanban_scheduling
+
 import kanban_children_settled as children_settled
 from kanban_scheduling import (
     CHILDREN_TABLE,
@@ -103,6 +107,13 @@ from kanban_scheduling import (
 )
 import kanban_scheduling
 
+#: Either spelling is a board being opened outside ``fresh()``: ``KC`` is
+#: kanban_db_connect, where ``connect`` lives since the split; ``K`` (kanban_db)
+#: is the pre-split spelling, which the compat shim does not serve, so a stray
+#: one fails in the image run rather than here -- this guard is where it should
+#: fail first.
+BOARD_OPEN = re.compile(r"\b(?:K|KC)\.connect\(")
+
 POD = "platform-agent-gateway-75b5f6ddf6-7dkd7"
 OLD = f"{POD}:4"  # the dispatcher that took the bus error
 NEW = f"{POD}:9"  # the one that replaced it, same pod name
@@ -112,11 +123,12 @@ OTHER_POD = "platform-agent-gateway-595bbd777f-5vlzk:7"
 NOW = int(time.time())
 PRE_BOOT = NOW - 86_400
 
-# The fingerprint as ``hermes_cli/kanban_db.py`` ships it, and as this patch
-# deliberately leaves it. Mirrored rather than imported because kanban_db only
-# exists inside the image.
+# The fingerprint as ``hermes_cli/kanban_db_dispatch.py`` ships it at
+# v2026.9.14, and as this patch deliberately leaves it. Mirrored rather than
+# imported because the module only exists inside the image.
 UPSTREAM_FINGERPRINT_SOURCE = (
-    "def _error_fingerprint(error_text):\n"
+    "def _error_fingerprint(error_text: str) -> str:\n"
+    '    """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group."""\n'
     "    fp = re.sub(r'\\bpid \\d+\\b', 'pid N', error_text[:80])\n"
     "    fp = re.sub(r'\\b\\d{10,}\\b', '<TS>', fp)\n"
     "    return fp.lower().strip()\n"
@@ -1048,7 +1060,7 @@ class ReclaimDiscriminatorTest(unittest.TestCase):
 
 
 class ChargeReclaimedCardsTest(unittest.TestCase):
-    """``_record_task_failure`` lives in kanban_db, so record what it is handed."""
+    """``_record_task_failure`` lives in kanban_db_dispatch, so record what it is handed."""
 
     def setUp(self):
         self.calls = []
@@ -1358,7 +1370,8 @@ class ChildrenTableAgreementTest(unittest.TestCase):
             mutate(stage)
             target = Path(tmp) / "tree" / "hermes_cli"
             target.mkdir(parents=True)
-            (target / "kanban_db.py").write_text(pristine())
+            (target / "kanban_db.py").write_text(pristine_db())
+            (target / "kanban_db_dispatch.py").write_text(pristine_dispatch())
             return subprocess.run(
                 [sys.executable, str(stage / "apply_kanban_scheduling.py"),
                  str(Path(tmp) / "tree")],
@@ -1369,7 +1382,7 @@ class ChildrenTableAgreementTest(unittest.TestCase):
     def test_the_dockerfile_greps_for_the_markers_this_file_defines(self):
         """The grep strings live in two files and nothing else ties them.
 
-        Edit 7's marker especially: the Dockerfile's copy is a literal duplicate
+        Edit 6's marker especially: the Dockerfile's copy is a literal duplicate
         of a line inside WAITING_PATCHED, so editing the patch text silently
         stops the build gate checking anything.
         """
@@ -1381,8 +1394,8 @@ class ChildrenTableAgreementTest(unittest.TestCase):
         self.assertIn(apply_kanban_scheduling.WAITING_BUILD_MARKER, text)
 
     def test_the_edit_count_matches_what_the_prose_claims(self):
-        """Seven is written into ten comments and asserted nowhere else."""
-        self.assertEqual(len(apply_kanban_scheduling.EDITS), 7)
+        """Six is written into the docstrings and asserted nowhere else."""
+        self.assertEqual(len(apply_kanban_scheduling.EDITS), 6)
 
     def test_the_unmutated_applier_succeeds(self):
         """The control. Without it the three refusals below prove nothing: an
@@ -1436,86 +1449,88 @@ class ChildrenTableAgreementTest(unittest.TestCase):
 # Part 4: the applier
 # ---------------------------------------------------------------------------
 
-# A stand-in for block_task's dependency branch with the same indentation as
-# upstream, so the applier's ast.parse guard is exercised for real.
+# Stand-ins for the two upstream files, each carrying exactly one of every
+# anchor the applier expects in it, with the same indentation as upstream so
+# the applier's compile guard is exercised for real. Only the anchors matter,
+# but the surroundings keep the fixtures honest about the shapes the edits
+# splice into: the ``with`` block the sweep runs in, the dataclass the new
+# field joins, the below-threshold UPDATEs the floor must NOT touch.
+
+# ``block_task`` at v2026.9.14: one generic event call fed by ``_route_block``,
+# then upstream's own ``kind == "dependency"`` branch.
 BLOCK_TASK_PREAMBLE = (
     "def block_task(conn, task_id, kind, reason, expected_run_id=None):\n"
     "    with write_txn(conn):\n"
+    "        if conn.execute(SQL).rowcount != 1:\n"
+    "            return False\n"
+    "        run_id = _end_or_synthesize_run(conn, task_id)\n"
+)
+BLOCK_TASK_EPILOGUE = (
     '        if kind == "dependency":\n'
-    "            cur = conn.execute(SQL)\n"
-    "            if cur.rowcount != 1:\n"
-    "                return False\n"
-    "            run_id = _end_run(conn, task_id)\n"
+    "            _fire_task_hook(blocked_task, run_id)\n"
+    "            return True\n"
+    "    _fire_task_hook(blocked_task, run_id)\n"
+    "    return True\n"
 )
-BLOCK_TASK_EPILOGUE = "            )\n            return True\n"
 
-DETECT_CRASHED_PREAMBLE = (
-    "\n\ndef detect_crashed_workers(conn):\n    with write_txn(conn):\n"
+# ``_CrashSweep`` / ``_reclaim_dead_workers`` / ``_account_crashes`` /
+# ``detect_crashed_workers`` at v2026.9.14 (upstream e66429eb0a split the old
+# single function into these).
+CRASH_SWEEP_PREAMBLE = (
+    "@dataclass\n"
+    "class _CrashSweep:\n"
+    "    crashed: list[str] = field(default_factory=list)\n"
+    "    rate_limited: list[str] = field(default_factory=list)\n"
+    "    crash_details: list[tuple] = field(default_factory=list)\n"
 )
-DETECT_CRASHED_MIDDLE = "            pass\n    auto_blocked = []\n"
+RECLAIM_PREAMBLE = (
+    "\n\ndef _reclaim_dead_workers(conn):\n"
+    "    sweep = _CrashSweep()\n"
+    "    with _kb.write_txn(conn):\n"
+)
+RECLAIM_EPILOGUE = (
+    "            pass\n"
+    "    return sweep\n"
+    "\n\n"
+    "def _account_crashes(conn, crash_details):\n"
+    "    return []\n"
+    "\n\n"
+    "def detect_crashed_workers(conn):\n"
+)
 DETECT_CRASHED_EPILOGUE = (
     "    detect_crashed_workers._last_auto_blocked = auto_blocked\n"
-    "    return crashed\n\n"
+    "    return sweep.crashed\n\n\n"
 )
 
-# The shape of the region the breaker edits patch, reproduced from
-# hermes_cli/kanban_db.py at the pinned Hermes version. Only the anchors
-# matter, but the surroundings keep the fixture honest about indentation and
-# about the two sibling UPDATEs in the else-branch that must NOT be touched.
+# The shape of the region the breaker edit patches, reproduced from
+# hermes_cli/kanban_db_dispatch.py at the pinned Hermes version: ``error``
+# clipped up front, the below-threshold branch returning early with its two
+# raw-count binds, then the one merged trip UPDATE.
 RECORD_FAILURE_FIXTURE = '''\
 def _record_task_failure(conn, task_id, error, *, outcome, failure_limit=None,
                         force_trip=False, release_claim=False, end_run=False,
                         event_payload_extra=None):
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
-    blocked = False
-    with write_txn(conn):
+    error = error[:500]
+    with _kb.write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
+        retry_status = "review" if row["status"] == "review" else "ready"
         failures = int(row["consecutive_failures"]) + 1
-        task_override = (
-            row["max_retries"] if "max_retries" in row.keys() else None
-        )
-        if task_override is not None:
-            effective_limit = int(task_override)
-            limit_source = "task"
-        else:
-            effective_limit = int(failure_limit)
-            limit_source = "dispatcher"
 
-        if force_trip or failures >= effective_limit:
-            # Trip the breaker.
-            if release_claim:
-                # Spawn path: still running, also clear claim state.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], task_id),
-                )
-            else:
-                # Timeout/crash path: source phase already restored with claim
-                # cleared; just flip to blocked + update
-                # counter fields.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'review', 'running')",
-                    (failures, error[:500], task_id),
-                )
-            payload = {
-                "failures": failures,
-                "effective_limit": effective_limit,
-                "limit_source": limit_source,
-            }
-            blocked = True
+        # Per-task override wins over caller-supplied and default thresholds.
+        task_override = _kb._row_get(row, "max_retries")
+        if task_override is not None:
+            effective_limit, limit_source = int(task_override), "task"
         else:
-            # Below threshold. These two must keep binding the raw count.
+            effective_limit, limit_source = int(failure_limit), "dispatcher"
+
+        if not (force_trip or failures >= effective_limit):
             if release_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
                 conn.execute(
@@ -1523,40 +1538,56 @@ def _record_task_failure(conn, task_id, error, *, outcome, failure_limit=None,
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (retry_status, failures, error[:500], task_id),
+                    (retry_status, failures, error, task_id),
                 )
             else:
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
                     "last_failure_error = ? WHERE id = ?",
-                    (failures, error[:500], task_id),
+                    (failures, error, task_id),
                 )
-    return blocked
+            return False
+
+'''
+RECORD_FAILURE_EPILOGUE = '''\
+        payload = {
+            "failures": failures,
+            "effective_limit": effective_limit,
+            "limit_source": limit_source,
+        }
+        return True
 
 
 '''
 
-
-# Upstream's ``count_running_tasks``, verbatim around the anchor edit 7 replaces.
+# Upstream's ``count_running_tasks``, verbatim around the anchor edit 6 replaces.
 COUNT_RUNNING_PREAMBLE = '''\
 def count_running_tasks(conn):
-    """Return the number of tasks currently in ``status='running'``."""
+    """Number of tasks in ``status='running'``."""
 '''
 
 
-def pristine():
-    """A fake ``kanban_db.py`` carrying exactly one of each of the seven anchors."""
+def pristine_db():
+    """A fake ``kanban_db.py`` carrying exactly the one anchor expected there."""
+    return BLOCK_TASK_PREAMBLE + DEPENDENCY_ANCHOR + BLOCK_TASK_EPILOGUE
+
+
+def pristine_dispatch():
+    """A fake ``kanban_db_dispatch.py`` carrying exactly one of each of its five."""
     return (
-        "import re\n\n"
-        + BLOCK_TASK_PREAMBLE
-        + DEPENDENCY_ANCHOR
-        + BLOCK_TASK_EPILOGUE
-        + DETECT_CRASHED_PREAMBLE
+        "import re\n"
+        "from dataclasses import dataclass, field\n\n"
+        "DEFAULT_FAILURE_LIMIT = 2\n\n\n"
+        + CRASH_SWEEP_PREAMBLE
+        + SWEEP_FIELD_ANCHOR
+        + RECLAIM_PREAMBLE
         + FENCE_ANCHOR
-        + DETECT_CRASHED_MIDDLE
+        + RECLAIM_EPILOGUE
         + CHARGE_ANCHOR
         + DETECT_CRASHED_EPILOGUE
         + RECORD_FAILURE_FIXTURE
+        + TRIP_ANCHOR
+        + RECORD_FAILURE_EPILOGUE
         + COUNT_RUNNING_PREAMBLE
         + WAITING_ANCHOR
         + "\n\n"
@@ -1564,186 +1595,314 @@ def pristine():
     )
 
 
+PRISTINE = {DB_RELATIVE: pristine_db, DISPATCH_RELATIVE: pristine_dispatch}
+
+
 class ApplierTest(unittest.TestCase):
     """The applier is the thing that fails the build, so exercise it directly."""
 
-    def _tree(self, body):
+    def _tree(self, bodies=None):
+        """A tree holding both target files, optionally with one overridden."""
         root = Path(tempfile.mkdtemp())
-        target = root / RELATIVE
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(body)
-        return root, target
+        targets = {}
+        for relative, make in PRISTINE.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            body = (bodies or {}).get(relative)
+            target.write_text(make() if body is None else body)
+            targets[relative] = target
+        return root, targets
 
     def _applied(self):
-        root, target = self._tree(pristine())
+        root, targets = self._tree()
         apply(root)
-        return target.read_text()
+        return {relative: target.read_text() for relative, target in targets.items()}
 
-    def test_the_fixture_is_a_faithful_stand_in(self):
-        """Every anchor exactly once, and the whole thing parses as Python."""
-        source = pristine()
-        for label, anchor, _ in EDITS:
-            with self.subTest(anchor=label):
-                self.assertEqual(source.count(anchor), 1)
-        ast.parse(source)
+    def test_the_fixtures_are_faithful_stand_ins(self):
+        """Every anchor exactly once in the file it names, nowhere in the other,
+        and both fixtures parse as Python."""
+        for relative, make in PRISTINE.items():
+            source = make()
+            ast.parse(source)
+            for file, label, anchor, _ in EDITS:
+                with self.subTest(file=relative, anchor=label):
+                    self.assertEqual(source.count(anchor), 1 if file == relative else 0)
 
-    def test_all_seven_edits_land_and_the_result_parses(self):
+    def test_every_edit_names_a_file_the_applier_opens(self):
+        self.assertEqual({file for file, _, _, _ in EDITS}, set(PRISTINE))
+
+    def test_all_six_edits_land_and_both_results_parse(self):
         out = self._applied()
-        self.assertIn("_kanban_repair_inverted_deps(conn, task_id, reason)", out)
+        db, dispatch = out[DB_RELATIVE], out[DISPATCH_RELATIVE]
+        self.assertIn("_kanban_repair_inverted_deps(conn, task_id, reason)", db)
         self.assertIn(
             "_kanban_reclaimed = _kanban_release_dead_foreign_claims(\n"
-            "            conn, _kanban_claimer, _pid_alive, "
-            "_resolve_crash_grace_seconds\n        )",
-            out,
+            "            conn, _kanban_claimer, _kb._pid_alive, "
+            "_kb._resolve_crash_grace_seconds\n        )",
+            dispatch,
         )
-        self.assertIn("_kanban_claim_is_self(lock, _kanban_claimer)", out)
+        self.assertIn("_kanban_claim_is_self(lock, _kanban_claimer)", dispatch)
         self.assertIn(
             "_kanban_charge_reclaimed_cards(\n"
-            "            conn, _kanban_reclaimed.chargeable, _record_task_failure\n"
+            "            conn, sweep.reclaimed_chargeable, _record_task_failure\n"
             "        )",
-            out,
+            dispatch,
         )
-        self.assertIn(BUILD_MARKER, out)
-        self.assertIn(apply_kanban_scheduling.WAITING_BUILD_MARKER, out)
-        ast.parse(out)
+        self.assertIn(BUILD_MARKER, dispatch)
+        self.assertIn(apply_kanban_scheduling.WAITING_BUILD_MARKER, dispatch)
+        for text in out.values():
+            ast.parse(text)
 
-    def test_one_trailer_imports_everything_the_edits_call(self):
-        """Three appliers used to write two trailers between them."""
+    def test_each_file_gets_one_trailer_importing_exactly_what_it_calls(self):
+        """Three appliers used to write two trailers between them. Now there is
+        one file per module, and neither imports a name the other uses."""
         out = self._applied()
-        self.assertEqual(out.count("from hermes_cli.kanban_scheduling import"), 1)
+        for text in out.values():
+            self.assertEqual(text.count("from hermes_cli.kanban_scheduling import"), 1)
+        db, dispatch = out[DB_RELATIVE], out[DISPATCH_RELATIVE]
+        self.assertIn("as _kanban_repair_inverted_deps,", db)
         for name in (
             "_kanban_charge_reclaimed_cards",
             "_kanban_claim_is_self",
             "_kanban_count_waiting_on_children",
             "_kanban_release_dead_foreign_claims",
-            "_kanban_repair_inverted_deps",
         ):
             with self.subTest(name=name):
-                self.assertIn(f"as {name},", out)
+                self.assertIn(f"as {name},", dispatch)
+                self.assertNotIn(name, db)
+        self.assertNotIn("_kanban_repair_inverted_deps", dispatch)
+
+    def test_the_sweeps_verdict_rides_the_dataclass_out_of_the_transaction(self):
+        """``_reclaim_dead_workers`` returns a ``_CrashSweep``; the charge loop
+        in ``detect_crashed_workers`` reads the chargeable half off it."""
+        dispatch = self._applied()[DISPATCH_RELATIVE]
+        self.assertIn("reclaimed_chargeable: list[str] = field(default_factory=list)", dispatch)
+        self.assertIn("sweep.reclaimed_chargeable = _kanban_reclaimed.chargeable", dispatch)
+        self.assertLess(
+            dispatch.index("reclaimed_chargeable: list[str]"),
+            dispatch.index("sweep.reclaimed_chargeable = "),
+            "the field must be declared on the class before the sweep sets it",
+        )
 
     def test_only_the_chargeable_half_is_passed_to_the_charge_loop(self):
         """Passing the whole tuple would charge the forgiven cards as well."""
-        out = self._applied()
-        self.assertIn("_kanban_reclaimed.chargeable, _record_task_failure", out)
-        self.assertNotIn("conn, _kanban_reclaimed, _record_task_failure", out)
+        dispatch = self._applied()[DISPATCH_RELATIVE]
+        self.assertIn("sweep.reclaimed_chargeable, _record_task_failure", dispatch)
+        self.assertNotIn("_kanban_reclaimed, _record_task_failure", dispatch)
+        self.assertNotIn("sweep.reclaimed_chargeable = _kanban_reclaimed\n", dispatch)
 
-    def test_call_precedes_the_dependency_wait_event(self):
-        out = self._applied()
+    def test_call_precedes_the_block_event_and_is_guarded_by_kind(self):
+        db = self._applied()[DB_RELATIVE]
+        call = db.index("_kanban_repair_inverted_deps(conn, task_id, reason)")
         self.assertLess(
-            out.index("_kanban_repair_inverted_deps"),
-            out.index('"dependency_wait"'),
+            call,
+            db.index("_append_event(conn, task_id, event_kind, payload, run_id=run_id)"),
             "the repair must land before the event that reports the wait",
         )
+        # The event call is generic now; the guard is what keeps the repair off
+        # capability/transient/human blocks. Read it off the AST, so a call that
+        # drifted out of the guard's body (dedented, or moved below it) fails
+        # here rather than passing a text search.
+        guards = [
+            node
+            for node in ast.walk(ast.parse(db))
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "kind == 'dependency'"
+            and node.body
+            and "_kanban_repair_inverted_deps" in ast.unparse(node.body[0])
+        ]
+        self.assertEqual(1, len(guards), "the repair call is the first statement of exactly one dependency guard")
 
     def test_host_prefix_comparison_is_gone_from_the_crash_reaper(self):
-        self.assertNotIn("lock.startswith(host_prefix)", self._applied())
+        dispatch = self._applied()[DISPATCH_RELATIVE]
+        self.assertNotIn("lock.startswith(host_prefix)", dispatch)
+        self.assertNotIn("host_prefix = _kb._host_prefix()", dispatch)
 
     def test_the_fingerprint_is_left_exactly_as_upstream_wrote_it(self):
         """The regression this file used to carry, pinned so it cannot return."""
-        out = self._applied()
-        self.assertIn(UPSTREAM_FINGERPRINT_SOURCE, out)
-        self.assertNotIn("fp = error_text[:80]", out)
+        dispatch = self._applied()[DISPATCH_RELATIVE]
+        self.assertIn(UPSTREAM_FINGERPRINT_SOURCE, dispatch)
+        self.assertNotIn("fp = error_text[:80]", dispatch)
 
     def test_sweep_runs_before_the_rows_are_read(self):
-        out = self._applied()
+        dispatch = self._applied()[DISPATCH_RELATIVE]
         self.assertLess(
-            out.index("_kanban_release_dead_foreign_claims"),
-            out.index('"SELECT id, worker_pid, claim_lock, started_at, assignee "'),
+            dispatch.index("_kanban_release_dead_foreign_claims("),
+            dispatch.index('"SELECT id, worker_pid, claim_lock, started_at, assignee "'),
         )
+
+    def test_the_sweep_reads_liveness_from_the_same_late_bound_name(self):
+        """Upstream reaches ``_pid_alive`` and the grace resolver through
+        ``_kb`` so monkeypatching ``kanban_db.<name>`` keeps working; the
+        sweep must read them the same way or a test that patches one would
+        find the per-row loop and the sweep disagreeing about who is alive."""
+        dispatch = self._applied()[DISPATCH_RELATIVE]
+        self.assertIn("_kb._pid_alive, _kb._resolve_crash_grace_seconds", dispatch)
+        self.assertIn("_kanban_claimer = _kb._claimer_id()", dispatch)
 
     def test_the_charge_runs_after_the_sweeps_transaction_has_closed(self):
-        """``_record_task_failure`` opens its own txn, and ``write_txn`` cannot nest."""
-        out = self._applied()
-        charge = out.index("_kanban_charge_reclaimed_cards")
-        self.assertLess(out.index("with write_txn(conn):"), charge)
-        self.assertLess(charge, out.index("_last_auto_blocked"))
+        """``_record_task_failure`` opens its own txn, and ``write_txn`` cannot
+        nest; and the charge must follow the fingerprint pass so a burst of
+        identical reclaim texts never reads as systemic."""
+        dispatch = self._applied()[DISPATCH_RELATIVE]
+        charge = dispatch.index("_kanban_charge_reclaimed_cards(")
+        self.assertLess(dispatch.index("with _kb.write_txn(conn):"), charge)
+        self.assertLess(dispatch.index("    return sweep\n"), charge)
+        self.assertLess(dispatch.index("auto_blocked = _account_crashes("), charge)
+        self.assertLess(charge, dispatch.index("_last_auto_blocked"))
         # Nothing the charge does may sit at the transaction's indentation.
-        self.assertIn("\n    auto_blocked.extend(\n", out)
+        self.assertIn("\n    auto_blocked.extend(\n", dispatch)
 
     def test_floors_the_persisted_counter_on_the_trip_path_only(self):
-        patched = self._applied()
+        dispatch = self._applied()[DISPATCH_RELATIVE]
 
         # The floor landed, and it consults the per-task override.
-        self.assertIn(BUILD_MARKER, patched)
-        self.assertIn("if task_override is None:", patched)
-        self.assertIn("persisted_failures, DEFAULT_FAILURE_LIMIT", patched)
+        self.assertIn(BUILD_MARKER, dispatch)
+        self.assertIn("if task_override is None:", dispatch)
+        self.assertIn("persisted_failures, DEFAULT_FAILURE_LIMIT", dispatch)
 
-        # Both blocked-branch UPDATEs now bind the floored value...
-        self.assertEqual(
-            patched.count("(persisted_failures, error[:500], task_id),"), 2
-        )
+        # The one merged trip UPDATE binds the floored value...
+        self.assertEqual(dispatch.count("(persisted_failures, error, task_id),"), 1)
         # ...and the two below-threshold UPDATEs still bind the raw count. They
-        # differ in shape — v2026.8.13 gave the spawn path a ``retry_status``
-        # leading bind so it restores the phase it claimed from — so the raw
-        # count is counted once per shape rather than twice in one string.
-        self.assertEqual(patched.count("(failures, error[:500], task_id),"), 1)
-        self.assertEqual(
-            patched.count("(retry_status, failures, error[:500], task_id),"), 1
-        )
+        # differ in shape -- the spawn path restores the phase it claimed from
+        # with a leading ``retry_status`` bind -- so each is counted once.
+        self.assertEqual(dispatch.count("(failures, error, task_id),"), 1)
+        self.assertEqual(dispatch.count("(retry_status, failures, error, task_id),"), 1)
+        # Nothing binds the pre-v2026.9 spelling any more.
+        self.assertNotIn("error[:500], task_id", dispatch)
 
         # The gave_up payload keeps reporting the true attempt count, so the
         # audit trail does not silently change meaning.
-        self.assertIn('"failures": failures,', patched)
+        self.assertIn('"failures": failures,', dispatch)
 
-    def test_floor_is_computed_before_the_updates_that_use_it(self):
-        patched = self._applied()
-        assign = patched.index(BUILD_MARKER)
-        first_use = patched.index("(persisted_failures, error[:500], task_id),")
-        self.assertLess(assign, first_use)
+    def test_floor_is_computed_before_the_update_that_uses_it(self):
+        dispatch = self._applied()[DISPATCH_RELATIVE]
+        fn = next(
+            n for n in ast.parse(dispatch).body
+            if isinstance(n, ast.FunctionDef) and n.name == "_record_task_failure"
+        )
+        lines = dispatch.splitlines()
+        marker_line = next(i for i, l in enumerate(lines, 1) if BUILD_MARKER in l)
+        use_line = next(
+            i for i, l in enumerate(lines, 1) if "(persisted_failures, error, task_id)," in l
+        )
+        # The below-threshold branch: upstream's ``if not (force_trip or
+        # failures >= effective_limit):`` returns before the trip. The floor
+        # must be computed after that branch has ended -- so a retry never sees
+        # a floored value -- and before the UPDATE that stores it.
+        below = next(
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.If) and "force_trip" in ast.unparse(n.test)
+        )
+        self.assertTrue(
+            any(isinstance(n, ast.Return) for n in ast.walk(below)),
+            "the below-threshold branch no longer returns; re-derive this test",
+        )
+        self.assertLess(fn.lineno, below.lineno)
+        self.assertLess(below.end_lineno, marker_line)
+        self.assertLess(marker_line, use_line)
+        self.assertLess(use_line, fn.end_lineno + 1)
 
     def test_every_anchor_is_load_bearing(self):
-        """Remove any one of the six and the build must stop."""
-        for label, anchor, _ in EDITS:
+        """Remove any one of the six from its file and the build must stop."""
+        for relative, label, anchor, _ in EDITS:
             with self.subTest(anchor=label):
-                root, _ = self._tree(pristine().replace(anchor, "", 1))
+                body = PRISTINE[relative]().replace(anchor, "", 1)
+                root, _ = self._tree({relative: body})
                 with self.assertRaises(SystemExit):
                     apply(root)
 
-    def test_partial_apply_does_not_write(self):
-        """One anchor missing: leave the file exactly as it was found."""
-        body = pristine().replace(CHARGE_ANCHOR, "", 1)
-        root, target = self._tree(body)
+    def test_partial_apply_writes_neither_file(self):
+        """One anchor missing in the second file: leave BOTH exactly as found.
+
+        The dispatcher module is patched after the origin module, so this is
+        the case that would leave ``kanban_db.py`` patched on its own if the
+        applier committed file by file.
+        """
+        body = pristine_dispatch().replace(CHARGE_ANCHOR, "", 1)
+        root, targets = self._tree({DISPATCH_RELATIVE: body})
         with self.assertRaises(SystemExit):
             apply(root)
-        self.assertEqual(target.read_text(), body)
+        self.assertEqual(targets[DB_RELATIVE].read_text(), pristine_db())
+        self.assertEqual(targets[DISPATCH_RELATIVE].read_text(), body)
+
+    def test_a_result_that_does_not_compile_writes_neither_file(self):
+        """The applier compiles both before writing either. Break the second
+        file in a way only compile() catches -- the anchor still matches, the
+        splice still happens, and the module cannot be imported."""
+        body = pristine_dispatch().replace(
+            COUNT_RUNNING_PREAMBLE,
+            "def count_running_tasks(conn):\n    continue\n",
+            1,
+        )
+        root, targets = self._tree({DISPATCH_RELATIVE: body})
+        with self.assertRaises(SystemExit):
+            apply(root)
+        self.assertEqual(targets[DB_RELATIVE].read_text(), pristine_db())
+        self.assertEqual(targets[DISPATCH_RELATIVE].read_text(), body)
 
     def test_duplicate_anchor_fails_the_build(self):
-        for anchor in (FENCE_ANCHOR, TRIP_ANCHOR, SPAWN_BIND_ANCHOR,
-                       CRASH_BIND_ANCHOR):
-            with self.subTest(anchor=anchor.splitlines()[0]):
-                root, _ = self._tree(pristine() + anchor)
+        for relative, label, anchor, _ in EDITS:
+            with self.subTest(anchor=label):
+                root, _ = self._tree({relative: PRISTINE[relative]() + anchor})
                 with self.assertRaises(SystemExit):
                     apply(root)
 
     def test_a_missing_target_file_fails_the_build(self):
         with self.assertRaises(SystemExit):
             apply(Path(tempfile.mkdtemp()))
+        # Either file alone is not enough: the split is what this applier is
+        # anchored against.
+        root, targets = self._tree()
+        targets[DISPATCH_RELATIVE].unlink()
+        with self.assertRaises(SystemExit):
+            apply(root)
+        self.assertEqual(targets[DB_RELATIVE].read_text(), pristine_db())
 
     def test_the_patched_text_still_contains_the_anchor(self):
         """Which is exactly why counting the anchor cannot detect a re-run."""
         self.assertIn(DEPENDENCY_ANCHOR, DEPENDENCY_PATCHED)
+        self.assertIn(SWEEP_FIELD_ANCHOR, SWEEP_FIELD_PATCHED)
+        self.assertIn(CHARGE_ANCHOR, CHARGE_PATCHED)
 
     def test_a_second_run_is_refused_instead_of_stacking_the_call(self):
         """Replayed against the running gateway's kanban_db.py, the unguarded
         applier exited 0 three times in a row and left three copies of the call
         and three trailer imports behind.
         """
-        root, target = self._tree(pristine())
+        root, targets = self._tree()
         apply(root)
-        once = target.read_text()
+        once = {relative: target.read_text() for relative, target in targets.items()}
         with self.assertRaises(SystemExit):
             apply(root)
-        self.assertEqual(target.read_text(), once, "a refused run must not write")
+        for relative, target in targets.items():
+            with self.subTest(file=relative):
+                self.assertEqual(target.read_text(), once[relative], "a refused run must not write")
+
+    def test_a_half_patched_tree_is_refused(self):
+        """One file already carrying the patch and the other pristine is the
+        state a failed image layer or a hand edit leaves. Refuse it rather than
+        patching the pristine half on top."""
+        root, targets = self._tree()
+        apply(root)
+        patched_dispatch = targets[DISPATCH_RELATIVE].read_text()
+        targets[DB_RELATIVE].write_text(pristine_db())
+        with self.assertRaises(SystemExit):
+            apply(root)
+        self.assertEqual(targets[DB_RELATIVE].read_text(), pristine_db())
+        self.assertEqual(targets[DISPATCH_RELATIVE].read_text(), patched_dispatch)
 
 
 class WakeNudgeCompatibilityTest(unittest.TestCase):
-    """``apply_kanban_wake_nudge`` rewrites the same file, immediately after.
+    """``apply_kanban_wake_nudge`` rewrites ``kanban_db.py`` too, immediately after.
 
     Its three ``kanban_db.py`` anchors sit in ``create_task``,
-    ``complete_task`` and ``unblock_task`` — functions none of the seven edits
-    here touch. The coupling is invisible from either applier alone, so it is
-    asserted rather than left to inspection: a future edit that widens an anchor
-    into one of those functions fails here instead of in the image build.
+    ``complete_task`` and ``unblock_task`` — functions the one edit here in
+    that file (``block_task``) does not touch, and the other five edits are in
+    ``kanban_db_dispatch.py``, which it never opens. The coupling is invisible
+    from either applier alone, so it is asserted rather than left to
+    inspection: a future edit that widens an anchor into one of those functions
+    fails here instead of in the image build.
     """
 
     # Each anchor is an indented fragment, so it only parses inside the shape
@@ -1773,7 +1932,7 @@ class WakeNudgeCompatibilityTest(unittest.TestCase):
 
     def test_no_scheduling_anchor_overlaps_a_wake_nudge_anchor(self):
         for label, _, wake in self.WAKE_ANCHORS:
-            for edit_label, anchor, _ in EDITS:
+            for _file, edit_label, anchor, _ in EDITS:
                 with self.subTest(wake=label, edit=edit_label):
                     self.assertNotIn(anchor, wake)
                     self.assertNotIn(wake, anchor)
@@ -1781,15 +1940,18 @@ class WakeNudgeCompatibilityTest(unittest.TestCase):
     def test_no_replacement_text_emits_a_wake_nudge_anchor(self):
         """Emitting one would give wake_nudge two matches and fail its count."""
         for label, _, wake in self.WAKE_ANCHORS:
-            for edit_label, _, patched in EDITS:
+            for _file, edit_label, _, patched in EDITS:
                 with self.subTest(wake=label, edit=edit_label):
                     self.assertNotIn(wake, patched)
 
     def test_the_wake_anchors_survive_a_full_scheduling_apply(self):
         root = Path(tempfile.mkdtemp())
-        target = root / RELATIVE
-        target.parent.mkdir(parents=True, exist_ok=True)
-        body = pristine() + "".join(
+        for relative, make in PRISTINE.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(make())
+        target = root / DB_RELATIVE
+        body = pristine_db() + "".join(
             scaffold + wake for _, scaffold, wake in self.WAKE_ANCHORS
         )
         ast.parse(body)
@@ -1823,7 +1985,7 @@ class FreshBoardNamingTest(unittest.TestCase):
     "fresh" board after a certain point was reopening one file, so the sweep was
     correctly reporting a card an earlier section had left ``running``.
 
-    The trigger is not reproducible off-Linux: ``K.connect`` opens each board in
+    The trigger is not reproducible off-Linux: ``KC.connect`` opens each board in
     WAL mode, and whether closing the last connection unlinks the ``-wal`` and
     ``-shm`` sidecars depends on the SQLite build (it does in the image, it does
     not on macOS). So these tests do not try to reproduce WAL cleanup. They
@@ -1916,11 +2078,11 @@ class FreshBoardNamingTest(unittest.TestCase):
         connects = [
             line.strip()
             for line in source.splitlines()
-            if "K.connect(" in line and not line.lstrip().startswith("#")
+            if BOARD_OPEN.search(line) and not line.lstrip().startswith("#")
         ]
         self.assertEqual(
             connects,
-            ['conn = K.connect(TMP / f"kanban{next(_BOARDS)}.db")'],
+            ['conn = KC.connect(TMP / f"kanban{next(_BOARDS)}.db")'],
             "a board is being opened outside fresh()",
         )
 

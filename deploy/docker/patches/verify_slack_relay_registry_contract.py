@@ -138,7 +138,7 @@ UPSTREAM_SIGNATURES = {
     "SlackAdapter._stop_socket_mode_handler": "self",
     "SlackAdapter._ensure_socket_watchdog": "self",
     "SlackAdapter._download_slack_file": "self, url, ext, audio=..., team_id=...",
-    "SlackAdapter._download_slack_file_bytes": "self, url, team_id=...",
+    "SlackAdapter._download_slack_file_bytes": "self, url, team_id=..., *, html_label=...",
     "SlackAdapter.format_message": "self, content",
     "slack._standalone_send": (
         "pconfig, chat_id, message, *, thread_id=..., media_files=..., "
@@ -156,8 +156,8 @@ UPSTREAM_SIGNATURES = {
     "GatewayKanbanWatchersMixin._deliver_kanban_artifacts": (
         "self, *, adapter, chat_id, metadata, event_payload, task"
     ),
-    "BasePlatformAdapter.filter_local_delivery_paths": "file_paths",
-    "base._media_delivery_strict_mode": "",
+    "BasePlatformAdapter.filter_local_delivery_paths": "file_paths, session_key=...",
+    "media_policy.media_delivery_strict": "",
     "base._path_under_denied_prefix": "resolved",
 }
 
@@ -208,6 +208,7 @@ def upstream_callables() -> dict[str, Any]:
             )
 
     from gateway.platform_registry import PlatformRegistry
+    from gateway import media_policy
     from gateway.platforms import base as platforms_base
     from gateway.platforms.base import BasePlatformAdapter
     from plugins.platforms.google_chat import adapter as google_chat_adapter
@@ -220,7 +221,7 @@ def upstream_callables() -> dict[str, Any]:
         "BasePlatformAdapter.filter_local_delivery_paths": (
             BasePlatformAdapter.filter_local_delivery_paths
         ),
-        "base._media_delivery_strict_mode": platforms_base._media_delivery_strict_mode,
+        "media_policy.media_delivery_strict": media_policy.media_delivery_strict,
         "base._path_under_denied_prefix": platforms_base._path_under_denied_prefix,
         "PlatformRegistry.register": PlatformRegistry.register,
         "PlatformRegistry.create_adapter": PlatformRegistry.create_adapter,

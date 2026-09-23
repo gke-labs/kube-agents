@@ -46,9 +46,9 @@ For headless environments, AI Agents, or CI/CD automated deployments where an in
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --non-interactive \
-  --project-id="my-gcp-project" \
-  --cluster-name="platform-agent-host" \
-  --region="us-central1" \
+  --gcp-project-id="my-gcp-project" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
   --model-provider="gemini" \
   --permission-set="read-only"
 ```
@@ -105,6 +105,17 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
    The gateway logs errors while it starts up, and they do not mean the install failed. Repeated `Connection refused` from the Google Chat relay, and a one-off `slack connect timed out after 30s`, are ordering: both relays dial the credential broker before it is listening. They retry until it is, and on a fresh install the messages stopped on their own within about seven minutes. Treat them as a fault only if they are still arriving well after that, and inspect the `envoy-credential-proxy` container in the `platform-agent-credential-proxy` pod rather than the relay reporting the error.
 
+5. **Talk to the agent.**
+
+   With Google Chat or Slack enabled, DM the app. Both are opt-in and off by default, so an install that enabled neither talks to the agent over `kubectl exec` instead — the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes, with your cluster, region, project and namespace already filled in:
+
+   ```bash
+   gcloud container clusters get-credentials <CLUSTER_NAME> --location <REGION> --project <PROJECT_ID> --dns-endpoint
+   kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes -p platform
+   ```
+
+   Drop `--dns-endpoint` on a cluster that publishes no externally reachable DNS endpoint, where `gcloud` rejects it. `-p platform` reaches the Platform Agent directly; a bare `hermes` reaches the Planning Agent front door, which is where a chat message would have landed. [ChatOps](/kube-agents/concepts/chatops/#when-no-chat-platform-is-enabled) covers the difference and what a chat-less install does not exercise.
+
 </Steps>
 
 ## What just happened
@@ -119,12 +130,15 @@ Changing your mind later is the same engine: running the installer with `--menu`
 
 - `--generate-only` — writes `install.env` (when absent) and `terraform.tfvars`, runs pre-apply validation checks, prints out-of-Terraform prerequisites and `lifecycle.sh` commands, and exits 0 without applying. Those checks include the existing-cluster consent gates, so adopting a cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, exits 1 instead; [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md) is canonical for the mode.
 - `--dry-run` — always runs `terraform validate`, and adds a full `terraform plan` preview when Application Default Credentials exist (on an adopted cluster lacking Workload Identity, or lacking NetworkPolicy enforcement without `--accept-no-network-policy`, the plan is skipped with remediation commands); nothing is created, and state stays local. It writes no `install.env`: a dry run provisions nothing, so it has no install to record.
-- `--cluster-mode=autopilot|standard` — the shape of a cluster this run creates; `autopilot` unless you say otherwise, and the interactive installer asks when it is about to create one. Autopilot clusters are regional, and what a zonal `--region` does depends on who chose Autopilot: passing `--cluster-mode=autopilot` explicitly aborts at the interview, while leaving the flag unset builds Standard instead, since nothing asked for Autopilot there. An invalid mode value aborts the run whatever the target is. The chosen shape has no bearing on a cluster that already exists: the installer writes that cluster's probed shape instead, for the reason [`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md) gives.
+- `--gke-cluster-mode=autopilot|standard` — the shape of a cluster this run creates; `autopilot` unless you say otherwise, and the interactive installer asks when it is about to create one. Autopilot clusters are regional, and what a zonal `--gcp-region` does depends on who chose Autopilot: passing `--gke-cluster-mode=autopilot` explicitly aborts at the interview, while leaving the flag unset builds Standard instead, since nothing asked for Autopilot there. An invalid mode value aborts the run whatever the target is. The chosen shape has no bearing on a cluster that already exists: the installer writes that cluster's probed shape instead, for the reason [`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md) gives.
 - `--migrate-node-pools` — authorizes migrating existing node pools using the legacy GCE metadata server to `GKE_METADATA` when adopting a cluster (recreates nodes and restarts workloads; required on clusters with legacy pools, else the install aborts).
 - `--enable-network-policy` — authorizes enabling the legacy Calico NetworkPolicy addon and node enforcement when adopting a GKE Standard cluster without Dataplane V2 (may recreate nodes and restart workloads). One of two answers for such a cluster; with neither, the install aborts unchanged.
 - `--accept-no-network-policy` — the other answer: install onto that cluster without modifying it. Every NetworkPolicy the install ships is then inert, the agent sandbox's included, and the choice is recorded in the install report and on the `PlatformAgent`. [Installing without NetworkPolicy enforcement](/kube-agents/install/prerequisites/#installing-without-networkpolicy-enforcement) says exactly what that costs.
-- `--gvisor=false` — runs the agent on the standard container runtime. The default is `true`: the agent executes model-authored commands, so it runs under the `gvisor` RuntimeClass unless you say otherwise. Autopilot, the default shape, ships that RuntimeClass and needs no node pool, from GKE 1.27.4-gke.800 onwards — the installer stops before applying anything if an Autopilot cluster it is adopting is older than that. On a Standard cluster the sandbox needs a node pool of its own, which the run provisions (the `gke-cluster` module's `enable_gvisor_node_pool`).
+- `--enable-gvisor=false` — runs the agent on the standard container runtime. The default is `true`: the agent executes model-authored commands, so it runs under the `gvisor` RuntimeClass unless you say otherwise. Autopilot, the default shape, ships that RuntimeClass and needs no node pool, from GKE 1.27.4-gke.800 onwards — the installer stops before applying anything if an Autopilot cluster it is adopting is older than that. On a Standard cluster the sandbox needs a node pool of its own, which the run provisions (the `gke-cluster` module's `enable_gvisor_node_pool`).
 - `--enable-google-chat` — provisions the Google Chat Pub/Sub backend and enables the CR's `googleChat` integration.
+- `--enable-slack` — enables the CR's `slack` integration. It needs `--slack-bot-token` and `--slack-app-token`; a non-interactive run missing either aborts before applying, since the relay cannot open a socket without both. `--slack-allowed-users`, `--slack-home-channel`, and `--slack-home-channel-name` are optional, and an empty allowlist allows everyone.
+- `--agent-namespace=NAME` — the namespace the agent and operator are installed into; `kubeagents-system` unless you say otherwise.
+- `--enable-gke-backup-plan` — provisions the GKE Backup plan for the cluster. Left unset, the composition's own default decides.
 - `--gitops-org=ORG`, `--gitops-repo=REPO`, `--github-app-id=ID`, `--github-pem-path=PATH` — configures GitOps PR automation via the in-cluster GitHub token minter (Minty). When `--github-pem-path` is provided, `install.sh` imports the private key into Cloud KMS during install; alternatively, pre-provision the key AOT beforehand (see [Token minter](/kube-agents/deploy/token-minter/)).
 - `--memory=file|hindsight|off` — the agent's long-term memory store; `hindsight` deploys the Hindsight API and Postgres into the cluster.
 

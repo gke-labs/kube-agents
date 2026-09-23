@@ -1783,6 +1783,22 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         self.assertIn("project=test-project-id", query)
         self.assertNotIn("jayantid-gkedemos", query)
 
+    @patch.dict(os.environ, {"GCP_PROJECT_ID": "pod-project"})
+    def test_build_agent_query_prefers_the_events_own_project(self):
+        # With a scope declared the cluster's project is not always the pod's; the
+        # watcher stamps it on the event and the console links must follow it.
+        payload = {
+            "reason": "FailedMount",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "some message",
+            "project": "cluster-project",
+        }
+        query = session_kv_server._build_agent_query(payload)
+        self.assertIn("project=cluster-project", query)
+        self.assertNotIn("pod-project", query)
+
     @patch.dict(os.environ, {"GCP_PROJECT": "test-project-legacy"})
     def test_build_agent_query_with_legacy_project(self):
         payload = {

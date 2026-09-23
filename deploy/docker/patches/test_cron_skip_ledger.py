@@ -492,61 +492,65 @@ FAKE_EXECUTIONS = (
     + EXEC_CONSTANTS
     + "\n\ndef _initialize_schema(conn):\n"
     + EXEC_CREATE_TABLE
-    + '        "ON executions(job_id, claimed_at DESC, id DESC)"\n    )\n\n\n'
+    + '        conn, "executions", "handoff_pending",\n'
+    '        "handoff_pending INTEGER NOT NULL DEFAULT 0",\n    )\n'
+    "    conn.execute(\n"
+    '        "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "\n'
+    '        "ON executions(job_id, claimed_at DESC, id DESC)"\n    )\n\n\n'
     + EXEC_PRUNE
     + "\n\ndef recover_interrupted_executions() -> int:\n    return 0\n"
 )
 
-# tick as it stands after apply_cron_tick_lock_scope.py: _process_job and
-# _submit_with_guard are closures inside tick's try block, the flock guard is
-# that patch's insertion, and the create_execution except block (v2026.8.19)
-# releases the slot, the flock and the run claim before it logs.
+# The scheduler as it stands after apply_cron_tick_lock_scope.py, at the
+# v2026.9.14 shape: _process_due_job and _submit_with_guard are module-level,
+# the flock guard is that patch's insertion, and the create_execution except
+# block releases the slot, the flock and the run claim before it logs.
 FAKE_SCHEDULER = (
     SCHED_IMPORT
-    + "\n\n\ndef tick():\n    if True:\n"
-    "        def _process_job(job):\n"
-    "            claimed = claim_job_for_fire(job[\"id\"], return_job=True)\n"
-    "            if not claimed:\n"
+    + "\n\ndef _process_due_job(job, adapters, loop, verbose):\n"
+    "    claimed = claim_job_for_fire(job[\"id\"], return_job=True)\n"
     + SCHED_FIRE_CLAIM_LOST
-    + "            return run_one_job(claimed)\n\n"
-    "        def _submit_with_guard(job):\n"
-    "            job_id = job[\"id\"]\n"
+    + "    return run_one_job(claimed)\n\n\n"
+    "def _submit_with_guard(job, pool, process_job):\n"
+    "    job_id = job[\"id\"]\n"
+    "    job_label = job.get(\"name\", job_id)\n"
     + SCHED_SHUTDOWN_GUARD
     + SCHED_RUNNING_GUARD
     + SCHED_JOB_LOCK_GUARD
-    + "            try:\n"
-    "                execution = create_execution(job_id, source=\"builtin\")\n"
-    "            except Exception as execution_err:\n"
-    "                release_running_job(job_id)\n"
-    "                _job_lock.release()\n"
-    "                _clear_run_claim_best_effort()\n"
+    + "    try:\n"
+    "        execution = create_execution(job_id, source=\"builtin\")\n"
+    "    except Exception as execution_err:\n"
+    "        release_running_job(job_id)\n"
+    "        _job_lock.release()\n"
+    "        _clear_run_claim_best_effort()\n"
     + SCHED_CREATE_EXECUTION_ERR
-    + "            return execution\n"
-    "        return _submit_with_guard\n\n\n"
+    + "    return execution\n\n\n"
     "def run_one_job(job):\n    execution_id = \"x\"\n    for _ in (1,):\n"
     "        if not claim_dispatch(job[\"id\"]):\n"
     + SCHED_DISPATCH_CLAIM
     + "    return True\n"
 )
 
+# The catch-up decision as v2026.9.14 has it: a helper over a _DueJob record
+# whose ``return False`` is the fire-once-now fall-through.
 FAKE_JOBS = (
     "import logging\n\nlogger = logging.getLogger(__name__)\n\n\n"
-    "def get_due_jobs():\n    due = []\n    for job in ():\n"
-    "        if True:\n            if True:\n                if True:\n"
-    "                    if True:\n"
+    "def _fast_forward_missed_recurring(d, grace):\n"
+    "    if True:\n        return False\n"
     + JOBS_CATCH_UP
-    + "        due.append(job)\n    return due\n"
 )
 
 FAKE_HEALTH = (
     HEALTH_IMPORT
     + "\n\n"
     + HEALTH_STATUSES
+    + "\n"
+    + HEALTH_FLUSH
     + "\n\n\ndef project_execution_event(record, status=None):\n"
     "    return CronExecutionEvent(\n        status=status,\n"
     + HEALTH_ERROR_CLASS
-    + "    )\n\n\ndef _emit(event, target):\n    if target is not None:\n"
-    + HEALTH_FLUSH
+    + "    )\n\n\ndef _emit(event, target):\n"
+    "    if event.status in _TERMINAL_STATUSES:\n        target.flush(timeout=1.0)\n"
 )
 
 # _run_claimed_job as it stands *after* apply_cron_tick_lock_scope.py has run:
@@ -556,7 +560,8 @@ FAKE_HEALTH = (
 FAKE_CRONJOB_TOOLS = (
     "from cron.jobs import (\n"
     + TOOLS_IMPORT
-    + "\n\ndef _run_claimed_job(job):\n"
+    + "\n_ALREADY_RUNNING_ERROR = \"already running\"\n\n\n"
+    "def _run_claimed_job(job):\n"
     '    job_id = job["id"]\n'
     "    _registered = False\n"
     "    _run_lock = None\n"
@@ -568,11 +573,7 @@ FAKE_CRONJOB_TOOLS = (
     "            try_register_running_job,\n"
     "        )\n\n"
     + TOOLS_REGISTER_GUARD
-    + '                "claimed": True,\n'
-    '                "success": False,\n'
-    '                "error": "already running",\n'
-    "            }\n"
-    "        _registered = True\n"
+    + "        _registered = True\n"
     + TOOLS_LOCK_GUARD
     + '                "claimed": True,\n'
     '                "success": False,\n'
@@ -647,12 +648,13 @@ class ApplierTest(unittest.TestCase):
             "SKIP_FIRE_CLAIM_LOST",
         ):
             self.assertIn("reason=%s," % reason, scheduler)
-        self.assertNotIn("finish_execution(\n                execution_id,", scheduler)
+        self.assertNotIn("Dispatch claim rejected; execution was not started.\")", scheduler)
         self.assertNotIn('error="Fire claim lost', scheduler)
 
         self.assertIn("SKIP_MISSED_WINDOW", self.read("cron/jobs.py"))
         health = self.read("agent/monitoring/cron_health.py")
-        self.assertIn('"unknown", "skipped"}', health)
+        self.assertIn('_KNOWN_STATUSES = {"claimed", "running", "completed", "failed", "unknown", "skipped"}', health)
+        self.assertIn('_TERMINAL_STATUSES = {"completed", "failed", "unknown", "skipped"}', health)
         self.assertIn("_normalize_skip_reason(record.get(\"skip_reason\"))", health)
 
         tools = self.read("tools/cronjob_tools.py")
@@ -661,14 +663,16 @@ class ApplierTest(unittest.TestCase):
             self.assertIn("reason=%s" % reason.rstrip(","), tools)
 
     def test_both_dispatch_refusals_record_a_skip(self):
-        """Each guard in _run_claimed_job drops an occurrence, so each writes.
+        """Each guard in _run_claimed_job refuses a requested run, so each writes.
 
         The pair mirrors tick's: an in-process register refusal and a
         cross-process flock refusal, taking the same two reasons. What makes
         them recordable at all is that both sit after ``claim_job_for_fire`` has
-        advanced ``next_run_at`` — before v2026.8.13 the flock was taken ahead
-        of the claim and a refusal cost nothing, so recording one would have
-        manufactured a false skip.
+        been taken — before v2026.8.13 the flock was taken ahead of the claim
+        and a refusal cost nothing, so recording one would have manufactured a
+        false skip. (Since v2026.9.11 the claim is a manual one that stamps no
+        occurrence identity, so what the refusal loses is the run itself, not a
+        scheduled slot.)
         """
         apply_quietly(self.root)
         tools = self.read("tools/cronjob_tools.py")
@@ -754,6 +758,9 @@ class ApplierTest(unittest.TestCase):
 
     def test_a_lost_fire_claim_is_skipped_not_failed(self):
         """The worker's re-taken CAS losing is dispatch_claim_rejected again.
+
+        v2026.9.14 lifted this out of tick's ``_process_job`` closure into the
+        module-level ``_process_due_job``; the branch is otherwise the same.
 
         The row is still ``claimed`` when the CAS loses, so ``skip_execution``
         closes it in place; nothing else about the branch changes, and in

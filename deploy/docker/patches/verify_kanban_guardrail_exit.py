@@ -2,7 +2,7 @@
 """Build gate for the kanban guardrail-exit patch.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
-``apply_kanban_guardrail_exit.py``. The applier only proves its two anchors
+``apply_kanban_guardrail_exit.py``. The applier only proves its five anchors
 matched exactly once; that says nothing about whether the inserted code is
 reachable, whether it still composes with the upstream helpers it calls, or
 whether the board write it makes lands.
@@ -11,19 +11,24 @@ Six things are checked, and each one is a way the patch could match its anchor
 and still be useless:
 
 1. **The nudge is reachable and terminal.** Parsed out of the *patched*
-   ``agent/conversation_loop.py``: the insert has to sit inside the
-   guardrail-halt branch, ahead of the ``break`` it is there to pre-empt, and it
-   has to clear ``agent._tool_guardrail_halt_decision`` before ``continue`` —
-   ``reset_for_turn`` clears that once per turn, not per iteration, so leaving it
-   set sends the next iteration straight back into the branch and out through the
-   same ``break``. Also asserted: the insert never touches
-   ``_turn_web_search_count``, which would hand the model another 50 searches.
+   ``agent/turn_tool_round.py``: the insert has to sit inside the
+   guardrail-halt branch, ahead of the ``return _verdict("break")`` it is there
+   to pre-empt, it has to hand back ``_verdict("continue")``, and it has to
+   clear ``agent._tool_guardrail_halt_decision`` first — ``reset_for_turn``
+   clears that once per turn, not per round, so leaving it set sends the next
+   round straight back into the branch and out through the same return. The
+   locals it rebinds (``final_response``, ``_turn_exit_reason``) and mutates (``messages``)
+   must be fields of ``ToolRoundVerdict``, or the loop never sees them. Also
+   asserted: the insert never touches ``_turn_web_search_count``, which would
+   hand the model another 50 searches.
 2. **It still composes with upstream.** ``guardrail_halt_nudge`` is driven
    against the real ``agent.kanban_stop.build_kanban_stop_nudge`` — a signature
    change there is silent, because the patch swallows exceptions and falls back
    to the old exit path by design.
 3. **The backstop is inside the funnel.** The ``finalize_turn`` insert is checked
-   for placement within the function every ``break`` passes through.
+   for placement within the function every exit passes through, after the
+   budget fallback that records an exhausted budget itself and before the
+   ``completed`` determination.
 4. **The board write lands.** ``record_missing_terminal_call`` is driven against
    a real kanban database through the real ``_record_task_failure``: claim
    released, run closed, failure counted, exit reason legible in the event. Plus
@@ -36,11 +41,13 @@ and still be useless:
    exclusion actually defaults to is exercised.
 
 5. **The rate-limit sites are where the code says a 429 goes.** The stash in
-   ``agent/conversation_loop.py`` follows the classification it copies from,
-   inside the same handler; the ``cli.py`` block runs ahead of the exit-code
+   ``agent/turn_api_error.py`` follows the classification it copies from,
+   inside ``handle_api_error``; the ``cli.py`` block runs ahead of the exit-code
    decision it must not change, and that decision still routes ``rate_limit``
-   to ``KANBAN_RATE_LIMIT_EXIT_CODE``. ``transient`` is still a valid block
-   kind and ``rate_limit`` is still how ``FailoverReason`` spells a 429.
+   to ``KANBAN_RATE_LIMIT_EXIT_CODE``; the chat-render block sits in
+   ``_chat_render_turn`` ahead of the response panel. ``transient`` is still a
+   valid block kind and ``rate_limit`` is still how ``FailoverReason`` spells a
+   429.
 6. **The block lands.** Both sites are driven against a real board through the
    real ``block_task``: the card ends ``blocked`` with ``block_kind=transient``,
    the run closed ``blocked`` with the provider text as its summary, and no
@@ -80,16 +87,64 @@ HERMES = Path(os.environ.get("HERMES_ROOT", "/opt/hermes"))
 if str(HERMES) not in sys.path:
     sys.path.insert(0, str(HERMES))
 
+TOOL_ROUND = HERMES / "agent" / "turn_tool_round.py"
+FINALIZER = HERMES / "agent" / "turn_finalizer.py"
+API_ERROR = HERMES / "agent" / "turn_api_error.py"
+ITERATION_PREP = HERMES / "agent" / "turn_iteration_prep.py"
+CLI = HERMES / "cli.py"
+CHAT_MIXIN = HERMES / "hermes_cli" / "cli_chat_turn_mixin.py"
+
+#: ``ast.unparse`` normalises quoting; derive the spellings rather than guess.
+BREAK_VERDICT = ast.unparse(ast.parse('_verdict("break")', mode="eval").body)
+CONTINUE_VERDICT = ast.unparse(ast.parse('_verdict("continue")', mode="eval").body)
+#: The loop locals the nudge path rebinds (``final_response = None`` and
+#: ``_turn_exit_reason = "unknown"``) and the one it mutates in place
+#: (``append_message(messages, ...)``). All three reach the loop only through
+#: ``_verdict``, which must build the verdict from those same names; a verdict
+#: built from a copy taken earlier would drop the nudge on the floor with no
+#: error.
+REBOUND_LOCALS = ("final_response", "_turn_exit_reason")
+MUTATED_LOCALS = ("messages",)
+
+
+def _enclosing_block(tree, stmt):
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody", "handlers"):
+            block = getattr(node, field, None)
+            if isinstance(block, list) and stmt in block:
+                return block
+    return None
+
+
+def _assigns_to(block, target):
+    return [
+        s
+        for s in block
+        if isinstance(s, ast.Assign)
+        and any(ast.unparse(t) == target for t in s.targets)
+    ]
+
+
+def _def(tree, name):
+    return next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+        ),
+        None,
+    )
+
 
 # --- 1. The nudge is reachable, and it is the exit it claims to be ----------
-print("guardrail-halt nudge (agent/conversation_loop.py):")
+print("guardrail-halt nudge (agent/turn_tool_round.py):")
 
-loop_tree = ast.parse((HERMES / "agent" / "conversation_loop.py").read_text())
+round_tree = ast.parse(TOOL_ROUND.read_text())
 
 HALT_TEST = "agent._tool_guardrail_halt_decision is not None"
 halt_ifs = [
     node
-    for node in ast.walk(loop_tree)
+    for node in ast.walk(round_tree)
     if isinstance(node, ast.If) and ast.unparse(node.test) == HALT_TEST
 ]
 check(
@@ -99,7 +154,7 @@ check(
 )
 
 nudge_if = None
-halt_break = None
+halt_return = None
 if len(halt_ifs) == 1:
     halt = halt_ifs[0]
     nudge_ifs = [
@@ -107,19 +162,23 @@ if len(halt_ifs) == 1:
         for s in halt.body
         if isinstance(s, ast.If) and ast.unparse(s.test) == "_kanban_halt_nudge"
     ]
-    breaks = [s for s in halt.body if isinstance(s, ast.Break)]
+    returns = [
+        s
+        for s in halt.body
+        if isinstance(s, ast.Return) and s.value is not None and ast.unparse(s.value) == BREAK_VERDICT
+    ]
     check("the nudge sits inside the halt branch", len(nudge_ifs) == 1)
-    check("the halt branch still ends in a break", len(breaks) == 1)
+    check("the halt branch still ends in a break verdict", len(returns) == 1)
     if nudge_ifs:
         nudge_if = nudge_ifs[0]
-    if breaks:
-        halt_break = breaks[0]
+    if returns:
+        halt_return = returns[0]
 
-if nudge_if is not None and halt_break is not None:
+if nudge_if is not None and halt_return is not None:
     check(
-        "the nudge runs before the break it pre-empts",
-        nudge_if.lineno < halt_break.lineno,
-        f"nudge at {nudge_if.lineno}, break at {halt_break.lineno}",
+        "the nudge runs before the break verdict it pre-empts",
+        nudge_if.lineno < halt_return.lineno,
+        f"nudge at {nudge_if.lineno}, break verdict at {halt_return.lineno}",
     )
 
 if nudge_if is not None:
@@ -131,21 +190,23 @@ if nudge_if is not None:
         for t in s.targets
     }
 
+    last = body[-1]
     check(
-        "the nudge path continues the loop rather than falling through",
-        isinstance(body[-1], ast.Continue),
-        f"last statement is {type(body[-1]).__name__}",
+        "the nudge path hands back a continue verdict rather than falling through",
+        isinstance(last, ast.Return)
+        and last.value is not None
+        and ast.unparse(last.value) == CONTINUE_VERDICT,
+        f"last statement is {ast.unparse(last)[:80]}",
     )
     check(
         "the halt decision is cleared before continuing",
         assigns.get("agent._tool_guardrail_halt_decision") == "None",
-        "reset_for_turn clears it per turn, not per iteration — the next "
-        "iteration would re-enter this branch and break anyway",
+        "reset_for_turn clears it per turn, not per round — the next "
+        "round would re-enter this branch and break anyway",
     )
     check(
         "the halt text is withheld as this turn's answer",
-        assigns.get("final_response") == "None"
-        and "_pending_verification_response" in assigns,
+        assigns.get("final_response") == "None",
         f"assignments: {sorted(assigns)}",
     )
     check(
@@ -170,6 +231,45 @@ if nudge_if is not None:
         "_turn_web_search_count" not in nudge_src,
         "resetting it hands the model another full cap",
     )
+
+round_def = _def(round_tree, "run_tool_round")
+verdict_cls = next(
+    (n for n in round_tree.body if isinstance(n, ast.ClassDef) and n.name == "ToolRoundVerdict"),
+    None,
+)
+check(
+    "the nudge sits inside run_tool_round, the phase the loop copies verdicts back from",
+    round_def is not None and nudge_if is not None and nudge_if in list(ast.walk(round_def)),
+)
+verdict_fields = (
+    {
+        ast.unparse(s.target)
+        for s in verdict_cls.body
+        if isinstance(s, ast.AnnAssign)
+    }
+    if verdict_cls is not None
+    else set()
+)
+check(
+    "the locals the nudge rebinds or mutates are fields of ToolRoundVerdict",
+    all(name in verdict_fields for name in REBOUND_LOCALS + MUTATED_LOCALS),
+    f"verdict fields: {sorted(verdict_fields)}; the loop never sees a rebinding the verdict does not carry",
+)
+# Being a field is necessary, not sufficient: ``_verdict`` has to read the
+# loop's current binding of each name when it builds the verdict.
+verdict_def = _def(round_def, "_verdict") if round_def is not None else None
+verdict_kwargs = {}
+if verdict_def is not None:
+    for node in ast.walk(verdict_def):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ToolRoundVerdict":
+            verdict_kwargs = {
+                kw.arg: ast.unparse(kw.value) for kw in node.keywords if kw.arg
+            }
+check(
+    "_verdict builds the verdict from the loop's own bindings of those names",
+    all(verdict_kwargs.get(name) == name for name in REBOUND_LOCALS + MUTATED_LOCALS),
+    f"_verdict keywords: {verdict_kwargs}",
+)
 
 
 # --- 2. It still composes with the upstream helper it borrows ---------------
@@ -269,19 +369,11 @@ check(
 os.environ["HERMES_KANBAN_TASK"] = "t_verify"
 
 
-# --- 3. The backstop is inside the funnel every break passes through --------
+# --- 3. The backstop is inside the funnel every exit passes through ---------
 print("terminal-call backstop (agent/turn_finalizer.py):")
 
-finalizer_tree = ast.parse((HERMES / "agent" / "turn_finalizer.py").read_text())
-finalize = next(
-    (
-        n
-        for n in ast.walk(finalizer_tree)
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and n.name == "finalize_turn"
-    ),
-    None,
-)
+finalizer_tree = ast.parse(FINALIZER.read_text())
+finalize = _def(finalizer_tree, "finalize_turn")
 check("finalize_turn is still the funnel", finalize is not None)
 
 if finalize is not None:
@@ -304,6 +396,79 @@ if finalize is not None:
         "_turn_exit_reason" in ast.unparse(finalize),
         "without it the failure is as unexplained as the protocol violation "
         "it replaces",
+    )
+    body = finalize.body
+    budget = next(
+        (i for i, s in enumerate(body) if "_resolve_budget_fallback" in ast.unparse(s)), None
+    )
+    leak_check = next(
+        (
+            i
+            for i, s in enumerate(body)
+            if isinstance(s, ast.Try) and "_kanban_should_record_missing" in ast.unparse(s)
+        ),
+        None,
+    )
+    completed = next(
+        (i for i, s in enumerate(body) if _assigns_to([s], "completed")), None
+    )
+    check(
+        "the backstop runs after the budget fallback has recorded an exhausted budget",
+        budget is not None and leak_check is not None and budget < leak_check,
+        f"budget fallback at {budget}, backstop at {leak_check}",
+    )
+    check(
+        "and before the completed determination",
+        completed is not None and leak_check is not None and leak_check < completed,
+        f"backstop at {leak_check}, completed at {completed}",
+    )
+    # Upstream's predicate, read from the image's own _resolve_budget_fallback
+    # rather than from this patch's text, so a rewording upstream shows up here
+    # as a mismatch rather than being mirrored by a check that only knows the
+    # insert. ast.unparse normalises both sides' layout.
+    upstream_predicate = None
+    resolve = _def(finalizer_tree, "_resolve_budget_fallback")
+    if resolve is not None:
+        assign = next(
+            (
+                n
+                for n in ast.walk(resolve)
+                if isinstance(n, ast.Assign)
+                and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name)
+                and n.targets[0].id == "budget_exhausted"
+            ),
+            None,
+        )
+        if assign is not None:
+            upstream_predicate = ast.unparse(assign.value)
+    inserted_predicate = None
+    if leak_check is not None:
+        call = next(
+            (
+                n
+                for n in ast.walk(body[leak_check])
+                if isinstance(n, ast.Call)
+                and ast.unparse(n.func) == "_kanban_should_record_missing"
+            ),
+            None,
+        )
+        keyword = next(
+            (k for k in (call.keywords if call is not None else ()) if k.arg == "iteration_limit_fallback"),
+            None,
+        )
+        if keyword is not None:
+            inserted_predicate = ast.unparse(keyword.value)
+    check(
+        "the budget exclusion is upstream's budget_exhausted predicate, read from _resolve_budget_fallback",
+        upstream_predicate is not None and inserted_predicate == upstream_predicate,
+        f"upstream computes {upstream_predicate!r}; the insert passes {inserted_predicate!r}. "
+        "The budget path records timed_out itself; a different predicate double-counts or misses",
+    )
+    check(
+        "the recorder takes the split modules' connect and _record_task_failure",
+        "kanban_db_connect" in ast.unparse(finalize) and "kanban_db_dispatch" in ast.unparse(finalize),
+        "hermes_cli.kanban_db no longer defines either; an AttributeError here is swallowed",
     )
 
 # The seven ways out of the loop that leak. Each has to be legible in the
@@ -438,34 +603,18 @@ check(
 
 
 # --- 5. The rate-limit sites sit where a 429 actually goes ------------------
-print("rate-limit sites (agent/conversation_loop.py, cli.py):")
+print("rate-limit sites (agent/turn_api_error.py, cli.py, hermes_cli/cli_chat_turn_mixin.py):")
 
 STASH_TARGET = "agent._kube_last_api_failure"
 CLASSIFY_TARGET = "classified"
 CLI_MARKER = "_kube_block_rate_limited"
+CHAT_MARKER = "_kube_block_rate_limited_chat"
+PANEL_CALL = "self._chat_print_response_panel(turn, response)"
 
-
-def _enclosing_block(tree, stmt):
-    for node in ast.walk(tree):
-        for field in ("body", "orelse", "finalbody", "handlers"):
-            block = getattr(node, field, None)
-            if isinstance(block, list) and stmt in block:
-                return block
-    return None
-
-
-def _assigns_to(block, target):
-    return [
-        s
-        for s in block
-        if isinstance(s, ast.Assign)
-        and any(ast.unparse(t) == target for t in s.targets)
-    ]
-
-
+api_error_tree = ast.parse(API_ERROR.read_text())
 stashes = [
     node
-    for node in ast.walk(loop_tree)
+    for node in ast.walk(api_error_tree)
     if isinstance(node, ast.Assign)
     and any(ast.unparse(t) == STASH_TARGET for t in node.targets)
     and isinstance(node.value, ast.Tuple)
@@ -476,13 +625,13 @@ if len(stashes) == 1:
     stash_try = next(
         (
             node
-            for node in ast.walk(loop_tree)
+            for node in ast.walk(api_error_tree)
             if isinstance(node, ast.Try) and stash in node.body
         ),
         None,
     )
     check("the stash is wrapped so it cannot raise out of the handler", stash_try is not None)
-    block = _enclosing_block(loop_tree, stash_try) if stash_try is not None else None
+    block = _enclosing_block(api_error_tree, stash_try) if stash_try is not None else None
     check("the stash sits in a statement block", block is not None)
     if block is not None:
         classify = [
@@ -495,16 +644,12 @@ if len(stashes) == 1:
             len(classify) == 1 and block.index(classify[0]) < block.index(stash_try),
             "the stash would read a `classified` from somewhere else",
         )
-        handlers = [
-            node
-            for node in ast.walk(loop_tree)
-            if isinstance(node, ast.ExceptHandler)
-            and node.name == "api_error"
-            and stash_try in ast.walk(node)
-        ]
+        handler = _def(api_error_tree, "handle_api_error")
         check(
-            "and that handler is the retry loop's `except ... as api_error`",
-            len(handlers) >= 1,
+            "and that handler is handle_api_error, with the caught exception as api_error",
+            handler is not None
+            and stash_try in list(ast.walk(handler))
+            and "api_error" in {a.arg for a in handler.args.args + handler.args.kwonlyargs},
         )
     check(
         "the stash records the classified reason and the summarised error",
@@ -514,11 +659,10 @@ if len(stashes) == 1:
 
 check(
     "the retries-exhausted exit reason is still spelled the way the branch keys on",
-    f'_turn_exit_reason = "{RETRIES_EXHAUSTED_EXIT_REASON}"'
-    in (HERMES / "agent" / "conversation_loop.py").read_text(),
+    f'_turn_exit_reason = "{RETRIES_EXHAUSTED_EXIT_REASON}"' in ITERATION_PREP.read_text(),
 )
 
-cli_tree = ast.parse((HERMES / "cli.py").read_text())
+cli_tree = ast.parse(CLI.read_text())
 exit_inits = [
     node
     for node in ast.walk(cli_tree)
@@ -564,40 +708,44 @@ if len(exit_inits) == 1:
             and "KANBAN_RATE_LIMIT_EXIT_CODE" in ast.unparse(decision),
         )
 
-CHAT_MARKER = "_kube_block_rate_limited_chat"
-chat_defs = [
-    node
-    for node in ast.walk(cli_tree)
-    if isinstance(node, ast.FunctionDef) and node.name == "chat"
-    and CHAT_MARKER in ast.unparse(node)
-]
-check(
-    "the chat() site is inside a single def chat()",
-    len(chat_defs) == 1,
-    f"found {len(chat_defs)} chat() defs carrying the marker",
-)
-if len(chat_defs) == 1:
-    chat_src = ast.unparse(chat_defs[0])
-    billing = [
-        node
-        for node in ast.walk(chat_defs[0])
-        if isinstance(node, ast.If)
-        and "failure_reason" in ast.unparse(node.test)
-        and "billing" in ast.unparse(node.test)
+chat_tree = ast.parse(CHAT_MIXIN.read_text())
+render = _def(chat_tree, "_chat_render_turn")
+check("the chat-render site is inside _chat_render_turn", render is not None and CHAT_MARKER in ast.unparse(render))
+if render is not None:
+    chat_blockers = [
+        s
+        for s in render.body
+        if isinstance(s, ast.If) and CHAT_MARKER in ast.unparse(s)
+    ]
+    panel_calls = [
+        s
+        for s in render.body
+        if isinstance(s, ast.Expr) and ast.unparse(s) == PANEL_CALL
     ]
     check(
-        "the chat() site runs where the failed result is still in hand, "
-        "ahead of the billing call-to-action",
-        len(billing) == 1
-        and chat_src.index(CHAT_MARKER) < chat_src.index(ast.unparse(billing[0].test)),
+        "the chat-render site runs where the failed result is still in hand, "
+        "ahead of the response panel",
+        len(chat_blockers) == 1
+        and len(panel_calls) == 1
+        and render.body.index(chat_blockers[0]) < render.body.index(panel_calls[0]),
     )
     check(
-        "the chat() site is gated on the worker's task id",
-        "HERMES_KANBAN_TASK" in chat_src,
+        "the chat-render site is gated on the worker's task id",
+        chat_blockers and "HERMES_KANBAN_TASK" in ast.unparse(chat_blockers[0]),
+    )
+    panel = _def(chat_tree, "_chat_print_response_panel")
+    check(
+        "the response panel is still where the billing call-to-action reads failure_reason",
+        panel is not None
+        and "failure_reason" in ast.unparse(panel)
+        and "billing" in ast.unparse(panel),
+        "the site was placed ahead of the last consumer of the failed result; that consumer moved",
     )
 
 from agent.error_classifier import FailoverReason  # noqa: E402
 from hermes_cli import kanban_db as K  # noqa: E402
+from hermes_cli import kanban_db_connect as KC  # noqa: E402
+from hermes_cli import kanban_db_dispatch as KD  # noqa: E402
 
 check(
     "transient is still a valid block kind",
@@ -623,7 +771,7 @@ DB = TMP / "kanban.db"
 
 
 def board():
-    return K.connect(DB)
+    return KC.connect(DB)
 
 
 def row(conn, tid):
@@ -663,7 +811,7 @@ recorded = record_missing_terminal_call(
     task_id=card,
     turn_exit_reason="guardrail_halt",
     connect=board,
-    record_failure=K._record_task_failure,
+    record_failure=KD._record_task_failure,
 )
 check("the leak is recorded", recorded is True)
 
@@ -706,7 +854,7 @@ check(
         task_id=card,
         turn_exit_reason="guardrail_halt",
         connect=board,
-        record_failure=K._record_task_failure,
+        record_failure=KD._record_task_failure,
     )
     is False,
 )
@@ -720,7 +868,7 @@ check(
         task_id="t_does_not_exist",
         turn_exit_reason="guardrail_halt",
         connect=board,
-        record_failure=K._record_task_failure,
+        record_failure=KD._record_task_failure,
     )
     is False,
 )
@@ -736,7 +884,7 @@ for _ in range(6):
         task_id=card,
         turn_exit_reason="guardrail_halt",
         connect=board,
-        record_failure=K._record_task_failure,
+        record_failure=KD._record_task_failure,
     )
     conn = board()
 
@@ -857,13 +1005,24 @@ check(
     is False,
 )
 
+# The site's own default opener, the one the shipped cli.py and chat-render
+# paths use when no connect is injected: it has to be the split module's real
+# connect on this tree, not the revert-scheduled compat forward.
+from hermes_cli.kanban_guardrail_exit import _default_connect  # noqa: E402
+
+check(
+    "the default opener is the split module's connect",
+    _default_connect() is KC.connect,
+    f"resolved to {_default_connect()!r}",
+)
+
 # The finalize_turn site: retries exhausted with no response, after a 429.
 fin_card, fin_run = claimed_card("Audit node pools (finalize_turn site)")
 did = record_missing_terminal_call(
     task_id=fin_card,
     turn_exit_reason=RETRIES_EXHAUSTED_EXIT_REASON,
     connect=board,
-    record_failure=K._record_task_failure,
+    record_failure=KD._record_task_failure,
     block_task=K.block_task,
     last_api_failure=("rate_limit", STORM_ERROR),
     run_id=fin_run,
@@ -891,42 +1050,46 @@ did = record_missing_terminal_call(
     task_id=stale_card,
     turn_exit_reason=RETRIES_EXHAUSTED_EXIT_REASON,
     connect=board,
-    record_failure=K._record_task_failure,
+    record_failure=KD._record_task_failure,
     block_task=K.block_task,
     last_api_failure=("rate_limit", STORM_ERROR),
     run_id=stale_run + 1000,
 )
 check("a stale run id is refused", did is False)
 check(
-    "and the card is left as it was",
+    "and the card is still running for its real worker",
     block_row(board(), stale_card)["status"] == "running",
 )
 
-# A retries-exhausted exit that was not a 429 still counts a timed_out.
-ctx_card, ctx_run = claimed_card("Compare chart values (context overflow)")
+# A non-429 exhaustion still records the counted timed_out.
+other_card, other_run = claimed_card("Reconcile IAM bindings (server error)")
 did = record_missing_terminal_call(
-    task_id=ctx_card,
+    task_id=other_card,
     turn_exit_reason=RETRIES_EXHAUSTED_EXIT_REASON,
     connect=board,
-    record_failure=K._record_task_failure,
+    record_failure=KD._record_task_failure,
     block_task=K.block_task,
-    last_api_failure=("context_overflow", "request too large"),
-    run_id=ctx_run,
+    last_api_failure=("server_error", "Error code: 503"),
+    run_id=other_run,
 )
 check("a non-429 exhaustion is still recorded", did is True)
 conn = board()
-after = block_row(conn, ctx_card)
+after = block_row(conn, other_card)
 check(
-    f"and it is still a counted {OUTCOME}",
+    f"and it is the counted {OUTCOME}, not a block",
     (after["consecutive_failures"] or 0) == 1
-    and OUTCOME in [k for k, _ in events(conn, ctx_card)],
-    f"failures={after['consecutive_failures']!r} "
-    f"events={[k for k, _ in events(conn, ctx_card)]}",
+    and OUTCOME in [k for k, _ in events(conn, other_card)]
+    and after["block_kind"] != RATE_LIMIT_BLOCK_KIND,
+    f"failures={after['consecutive_failures']!r} kind={after['block_kind']!r} "
+    f"events={[k for k, _ in events(conn, other_card)]}",
 )
 
-# The recurrence rule the module docstring states: unblock keeps block_kind,
-# so a second transient block after an unblock trips upstream's loop breaker
-# and lands the card in triage. If upstream changes that, the docstring lies.
+# The recurrence rule the module docstring states, re-derived for v2026.9.14's
+# ``_route_block``: ``unblock_task`` deliberately keeps ``block_kind`` and
+# ``block_recurrences``, so a second block for the same kind counts
+# ``recurrences = 2``, which meets ``BLOCK_RECURRENCE_LIMIT`` (2) and routes the
+# card to ``triage`` with a ``block_loop_detected`` event instead of ``blocked``.
+# If upstream changes that, the docstring lies.
 conn = board()
 check("the cli.py-site card can be unblocked", K.unblock_task(conn, cli_card))
 K.recompute_ready(conn)
@@ -941,28 +1104,32 @@ did = block_rate_limited_worker(
     delegated_child=False,
 )
 check("a second storm on the same card still writes", did is True)
-after = block_row(board(), cli_card)
+conn = board()
+after = block_row(conn, cli_card)
 check(
     "and upstream's loop breaker routes it to triage, as the docstring says",
-    after["status"] == "triage" and after["block_kind"] == RATE_LIMIT_BLOCK_KIND,
-    f"status={after['status']!r} kind={after['block_kind']!r}; "
+    after["status"] == "triage"
+    and after["block_kind"] == RATE_LIMIT_BLOCK_KIND
+    and "block_loop_detected" in [k for k, _ in events(conn, cli_card)],
+    f"status={after['status']!r} kind={after['block_kind']!r} "
+    f"events={[k for k, _ in events(conn, cli_card)]}; "
     f"BLOCK_RECURRENCE_LIMIT={getattr(K, 'BLOCK_RECURRENCE_LIMIT', None)!r}",
 )
 
-# billing keeps the stock path: the card is left for the reaper.
-bill_card, bill_run = claimed_card("Estimate spend (billing wall)")
+# billing keeps the stock exit at both sites.
+bill_card, bill_run = claimed_card("Estimate egress cost (billing)")
+did = block_rate_limited_worker(
+    {"failed": True, "failure_reason": "billing", "error": "Error code: 402"},
+    connect=board,
+    block_task=K.block_task,
+    environ={"HERMES_KANBAN_TASK": bill_card, "HERMES_KANBAN_RUN_ID": str(bill_run)},
+    cron_run=False,
+    delegated_child=False,
+)
+check("billing is left to the stock exit", did is False)
 check(
-    "a billing wall is left to the stock exit",
-    block_rate_limited_worker(
-        {"failed": True, "failure_reason": "billing", "error": "402"},
-        connect=board,
-        block_task=K.block_task,
-        environ={"HERMES_KANBAN_TASK": bill_card, "HERMES_KANBAN_RUN_ID": str(bill_run)},
-        cron_run=False,
-        delegated_child=False,
-    )
-    is False
-    and block_row(board(), bill_card)["status"] == "running",
+    "and the card is untouched",
+    block_row(board(), bill_card)["status"] == "running",
 )
 
 

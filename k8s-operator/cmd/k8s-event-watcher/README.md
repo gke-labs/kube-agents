@@ -174,7 +174,7 @@ To watch every managed cluster from a single watcher process, point the watcher 
 
 > **The directory is read once, at startup.** It is a snapshot taken at boot, not something the watcher tracks. A cluster onboarded afterwards is not watched until the watcher restarts, and a cluster torn down afterwards leaves its informer retrying against a control plane that no longer exists. Restarting the process — or the Pod — re-reads the directory and reconciles both. Periodic re-scanning is follow-up work, not implemented here.
 
-In a running Platform Agent pod. Note `--in-cluster` alongside `--profiles-dir`: the management cluster has to be watched from the first second of a fresh install, before `cluster_agent_reconcile.py` has run and given it a profile like every other cluster in the project. Cluster sources are additive, so this watches the host **plus** every profile cluster — except that once the host's own profile exists, the direct entry absorbs it (see the note on duplicates below):
+In a running Platform Agent pod. Note `--in-cluster` alongside `--profiles-dir`: the management cluster has to be watched from the first second of a fresh install, before `cluster_agent_reconcile.py` has run and given it a profile like every other cluster in every project in scope. Cluster sources are additive, so this watches the host **plus** every profile cluster — except that once the host's own profile exists, the direct entry absorbs it (see the note on duplicates below):
 
 ```bash
 ./k8s-event-watcher \

@@ -276,6 +276,17 @@ variable "model_default_name" {
   default     = ""
 }
 
+variable "model_max_tokens" {
+  description = "Output tokens the LiteLLM gateway asks the provider for on a request that names none, rendered as max_tokens under every model_list alias; 0 leaves the key out. For a self-hosted backend whose prompt and output share one window. What it does and does not cap: the site's inference-gateway page, \"Setting the output-token budget\"."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.model_max_tokens >= 0 && floor(var.model_max_tokens) == var.model_max_tokens
+    error_message = "model_max_tokens must be a whole number of tokens, 0 or more."
+  }
+}
+
 variable "api_server_key" {
   description = "API_SERVER_KEY for the agent harness (required; stored in the platform-agent-secrets Secret)"
   type        = string
@@ -346,7 +357,7 @@ variable "enable_slack" {
 }
 
 variable "slack_bot_token" {
-  description = "SLACK_BOT_TOKEN (xoxb-...) stored in the credentials Secret. Only used when enable_slack is true."
+  description = "SLACK_BOT_TOKEN stored in the credentials Secret: one xoxb-... token, or several comma-separated, one per Slack workspace the agent serves. Only used when enable_slack is true."
   type        = string
   sensitive   = true
   default     = ""
@@ -496,7 +507,7 @@ variable "enable_cert_manager" {
 variable "cert_manager_version" {
   description = "cert-manager chart version. Values below 1.15.x need the crds.enabled key in main.tf renamed back to installCRDs."
   type        = string
-  default     = "v1.21.1"
+  default     = "v1.21.2"
 }
 
 variable "enable_webhooks" {

@@ -5,13 +5,56 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// TasksStream is the JetStream stream holding a2a.tasks.> (provisioned by the
-// deployment, W2).
-const TasksStream = "TASKS"
+const (
+	// TasksStream is the JetStream stream holding a2a.tasks.> (provisioned by
+	// the deployment, W2).
+	TasksStream = "TASKS"
+
+	// EphemeralConsumerInactiveThreshold is how long the server keeps an
+	// ephemeral consumer this module creates on TASKS after its last client
+	// went away. TasksGet sets it on the replay's ordered consumer and the
+	// worker adapter sets it on a session's named consumers, so the two
+	// reap on the same clock.
+	//
+	// It is set explicitly because nats.go's ordered-consumer default is five
+	// MINUTES (v1.53.1, jetstream/ordered.go:635; the caller's value replaces
+	// it only when non-zero, :646), and stopping an ordered iterator never
+	// deletes the consumer behind it (orderedSubscription.Stop, :364). With
+	// the default in place every tasks/get left a consumer on TASKS for five
+	// minutes, so the count tracked the call rate over that window rather
+	// than the replays in flight, against a max_consumers sized for the
+	// latter (#1739).
+	//
+	// The threshold is the only cleanup: TasksGet does not delete the
+	// consumer it creates, and must not be made to. The delete is a publish
+	// on $JS.API.CONSUMER.DELETE.TASKS.*, a subject the rendered bridge
+	// grant withholds, and a refused publish on a request subject gets no
+	// reply at all -- the caller blocks to its own deadline while the
+	// violation arrives out of band, on the connection's async error
+	// handler. Both halves were measured: re-adding a synchronous delete
+	// here takes a replay from 0.11s to 30.07s and logs one Error-level
+	// permissions violation per call, which is the line an operator is
+	// taught to read as a missing grant.
+	//
+	// Widening the grant instead is the fix that suggests itself, and it is
+	// worse than the leak it closes. A wildcard is the only form on offer:
+	// nats.go names an ordered consumer <prefix>_<serial> and bumps the
+	// serial on every reset (v1.53.1, jetstream/ordered.go:629), so no
+	// exact-name grant can cover one. And DELETE.TASKS.* is a wildcard over
+	// consumer names, not over the consumers its holder created, so it would
+	// hand everything carrying the bridge password delete on any consumer on
+	// TASKS -- the gateway's own gateway-relay durable included. That is the
+	// same argument sessionConsumer makes for MSG.NEXT in the worker adapter
+	// (adapter.go:816), and the stated reason the adapter uses named
+	// consumers rather than ordered ones. Reclaim the slot sooner by
+	// shortening this constant, not by adding a delete or a grant.
+	EphemeralConsumerInactiveThreshold = 5 * time.Second
+)
 
 // Task is the A2A Task materialized by folding a task's event stream —
 // tasks/get with no live executor required.
@@ -212,8 +255,9 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 		return nil, &A2AError{Code: CodeTaskNotFound, Message: fmt.Sprintf("task %q has no events in the retention window", taskID)}
 	}
 	cons, err := js.OrderedConsumer(ctx, TasksStream, jetstream.OrderedConsumerConfig{
-		FilterSubjects: subjects,
-		DeliverPolicy:  jetstream.DeliverAllPolicy,
+		FilterSubjects:    subjects,
+		DeliverPolicy:     jetstream.DeliverAllPolicy,
+		InactiveThreshold: EphemeralConsumerInactiveThreshold,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("ordered consumer for %s: %w", taskID, err)

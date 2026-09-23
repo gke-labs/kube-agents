@@ -93,7 +93,7 @@ ENABLE_PUBSUB_PLATFORM:ENABLE_PUBSUB_PLATFORM
 ENABLE_STOCKOUT_INVESTIGATOR:ENABLE_STOCKOUT_INVESTIGATOR
 REGISTRY_PREFIX:REGISTRY_PREFIX
 THIRD_PARTY_REGISTRY_PREFIX:THIRD_PARTY_REGISTRY_PREFIX
-NAMESPACE:AGENT_NAMESPACE
+NAMESPACE:NAMESPACE
 "
 
 # Always required: without these the script cannot name an install at all, so
@@ -238,13 +238,6 @@ case "${MEMORY_PROVIDER:-}" in
 esac
 export MEMORY
 
-# NAMESPACE has three spellings in play: the installer's own NAMESPACE, rc and
-# nightly's AGENT_NAMESPACE, and staging's bare NAMESPACE. The mapping above
-# reads AGENT_NAMESPACE; this fills in from the other before it, so an
-# environment carrying either one is understood and neither has to be renamed
-# in the GitHub UI while installs are running against it.
-: "${AGENT_NAMESPACE:=${NAMESPACE:-}}"
-export AGENT_NAMESPACE
 
 # ---------------------------------------------------------------------------
 # Write it

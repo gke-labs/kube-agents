@@ -37,7 +37,9 @@
 # Every release image in the template is checked, not just the agent
 # container's. The operator renders the agent container, the
 # sandbox-credential-cleanup init container, the platform-agent-dashboard
-# container (on by default), and the agent-api-auth sidecar. The credential
+# container (on by default), the agent-api-auth sidecar and, for each enabled
+# AgentPlugin, either a stage-<plugin> init container or a plugin-<name> image
+# volume, depending on whether the cluster supports ImageVolumeSource. The credential
 # proxy is a Deployment of its own, which this script is not pointed at and so
 # does not cover, and neither is the shell sandbox StatefulSet. The proxy's
 # image reference is derived from resolveAgentImage's output, so it normally
@@ -125,7 +127,31 @@ release_names="$(jq -r '.images[] | select(.origin == "first-party" and .tagPoli
 }
 
 # name=image, one per line, init containers first.
-readonly JSONPATH='{range .spec.template.spec.initContainers[*]}{.name}={.image}{"\n"}{end}{range .spec.template.spec.containers[*]}{.name}={.image}{"\n"}{end}'
+# Image volumes too: on a cluster with ImageVolumeSource the operator mounts a
+# plugin image as a volume instead of staging it with an init container, and
+# the reference lives under .volumes[].image. A volume of any other kind has
+# no reference and reads as "name=", which the loop below skips.
+readonly JSONPATH='{range .spec.template.spec.initContainers[*]}{.name}={.image}{"\n"}{end}{range .spec.template.spec.containers[*]}{.name}={.image}{"\n"}{end}{range .spec.template.spec.volumes[*]}{.name}={.image.reference}{"\n"}{end}'
+
+# A plugin image is the release's business only when its AgentPlugin is: the
+# operator stages every AgentPlugin in the namespace that names the agent,
+# including one installed on its own (agentplugins/*/install.sh, its own Helm
+# release and its own image tag), which no re-tag of this release moves. The
+# release that owns the PlatformAgent, and the one that owns each AgentPlugin,
+# are read from Helm's release annotation; a plugin under another release is
+# skipped, and an agent with no annotation (a kustomize install) counts them
+# all, as before.
+readonly PLUGIN_INIT_PREFIX="stage-"
+readonly PLUGIN_VOLUME_PREFIX="plugin-"
+# The operator's own naming, mirrored from buildPluginStagingContainerName
+# and buildPluginVolumeName in the controller: a name past the limit is cut
+# and given "-" plus the first eight hex characters of sha256(plugin name).
+# The staging limit is the Autopilot container-name limit (35).
+readonly PLUGIN_INIT_MAX_LEN=35
+readonly PLUGIN_VOLUME_MAX_LEN=63
+readonly PLUGIN_NAME_HASH_LEN=8
+readonly AGENT_RELEASE_JSONPATH='{range .items[*]}{.metadata.annotations.meta\.helm\.sh/release-name}{"\n"}{end}'
+readonly PLUGIN_RELEASE_JSONPATH='{range .items[*]}{.metadata.name}={.metadata.annotations.meta\.helm\.sh/release-name}{"\n"}{end}'
 
 stderr_file="$(mktemp)"
 # Carry the real status through the cleanup. A bare `rm` in an EXIT trap
@@ -160,15 +186,78 @@ is_release_image() {
   grep -qxF "$segment" <<<"$release_names"
 }
 
-# Sets matched and mismatched from a name=image listing.
+# The first eight hex characters of sha256 of a plugin name, as the operator
+# computes them. sha256sum on Linux, shasum on macOS.
+plugin_name_hash() {
+  local digest
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(printf '%s' "$1" | sha256sum)"
+  else
+    digest="$(printf '%s' "$1" | shasum -a 256)"
+  fi
+  printf '%s' "${digest:0:${PLUGIN_NAME_HASH_LEN}}"
+}
+
+# The entry name the operator gives a plugin, for one prefix and its limit:
+# "<prefix><plugin>" whole when it fits, else its first (limit - 9)
+# characters, "-", and the hash.
+plugin_entry_name() {
+  local prefix="$1" plugin="$2" max_len="$3" name cut_len
+  name="${prefix}${plugin}"
+  if [ "${#name}" -gt "$max_len" ]; then
+    cut_len=$((max_len - PLUGIN_NAME_HASH_LEN - 1))
+    name="${name:0:${cut_len}}-$(plugin_name_hash "$plugin")"
+  fi
+  printf '%s' "$name"
+}
+
+# The Helm release of the AgentPlugin a plugin entry comes from, found by
+# building each AgentPlugin's staging container and volume names the way the
+# operator does and comparing. Empty when no AgentPlugin produces the entry.
+plugin_release_of() {
+  local entry="$1" pname prelease
+  case "$entry" in
+    "$PLUGIN_INIT_PREFIX"* | "$PLUGIN_VOLUME_PREFIX"*) ;;
+    *) return 0 ;;
+  esac
+  while IFS='=' read -r pname prelease; do
+    [ -n "$pname" ] || continue
+    if [ "$entry" = "$(plugin_entry_name "$PLUGIN_INIT_PREFIX" "$pname" "$PLUGIN_INIT_MAX_LEN")" ] ||
+      [ "$entry" = "$(plugin_entry_name "$PLUGIN_VOLUME_PREFIX" "$pname" "$PLUGIN_VOLUME_MAX_LEN")" ]; then
+      echo "$prelease"
+      return 0
+    fi
+  done <<<"$plugin_releases"
+}
+
+# True for a plugin entry whose AgentPlugin belongs to another Helm release
+# than the agent, which this release's re-tag cannot move and must not judge.
+is_foreign_plugin() {
+  local entry="$1" prelease
+  case "$entry" in
+    "$PLUGIN_INIT_PREFIX"* | "$PLUGIN_VOLUME_PREFIX"*) ;;
+    *) return 1 ;;
+  esac
+  [ -n "$agent_releases" ] || return 1
+  prelease="$(plugin_release_of "$entry")"
+  [ -n "$prelease" ] || return 1
+  ! grep -qxF "$prelease" <<<"$agent_releases"
+}
+
+# Sets matched, mismatched and skipped from a name=image listing.
 inspect_template() {
   matched=0
   mismatched=""
+  skipped=""
 
   local name image
   while IFS='=' read -r name image; do
     [ -n "$image" ] || continue
     is_release_image "$image" || continue
+    if is_foreign_plugin "$name"; then
+      skipped="${skipped}  ${name}: ${image} (AgentPlugin of another Helm release)"$'\n'
+      continue
+    fi
     matched=$((matched + 1))
     case "$image" in
       *:"$tag") ;;
@@ -184,10 +273,15 @@ while true; do
   # kubectl's own error is kept rather than discarded, because an expired
   # credential and a slow operator look identical from here until the deadline.
   listing="$(kubectl get "deployment/${deployment}" -n "$namespace" -o jsonpath="$JSONPATH" 2>"$stderr_file" || true)"
+  # Errors here are not kept: a cluster without the AgentPlugin CRD, or an
+  # agent no Helm release owns, reads as empty and every plugin entry counts.
+  agent_releases="$(kubectl get platformagent -n "$namespace" -o jsonpath="$AGENT_RELEASE_JSONPATH" 2>/dev/null | grep -v '^$' | sort -u || true)"
+  plugin_releases="$(kubectl get agentplugin -n "$namespace" -o jsonpath="$PLUGIN_RELEASE_JSONPATH" 2>/dev/null || true)"
   inspect_template "$listing"
 
   if [ "$matched" -gt 0 ] && [ -z "$mismatched" ]; then
     echo "Operator applied tag ${tag} to all ${matched} release image(s) in ${deployment}."
+    [ -z "$skipped" ] || printf 'Not judged, installed outside the release:\n%s' "$skipped"
     exit 0
   fi
 
@@ -256,6 +350,10 @@ while true; do
       echo "An image above is unset. The operator then serves its own default image and never reads spec.deployment.tag, so this deploy's tag was ignored before any pin could matter. Set the repository with:"
       echo "  kubectl patch platformagent <name> -n ${namespace} --type=merge \\"
       echo "    -p '{\"spec\":{\"deployment\":{\"image\":\"<repository, no tag>\"}}}'"
+    elif ! grep -qvE '^  (plugin-|stage-)' <<<"${mismatched%$'\n'}"; then
+      echo "Only plugin images are off the tag. The operator renders them from the AgentPlugin objects the chart renders from plugins.<name>.image.tag, which a re-tag that set the agent tag alone leaves behind. Move them with:"
+      echo "  helm upgrade kube-agents <chart> -n ${namespace} --reset-then-reuse-values \\"
+      echo "    --set plugins.<name>.image.tag=${tag}"
     else
       echo "No CR above pins or omits spec.deployment.image, so the CR is not the cause here. Read the status: an operator that is absent, crash-looping, or returning early leaves the pod template as it was."
     fi

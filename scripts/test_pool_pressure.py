@@ -476,6 +476,65 @@ class DailyRows(unittest.TestCase):
         self.assertEqual(10, pp.DayRow("2026-08-27", waits).max_concurrency)
 
 
+class RecentRow(unittest.TestCase):
+    """The stretch the chat alert quotes, so its numbers and its remedy share
+    a clock. Evidence only: `breached` stays on the daily rows and the live
+    queue, so TestGrid's row does not move with it."""
+
+    END = pp.parse_rfc3339("2026-08-27T12:00:00Z")
+
+    def _waits(self, offsets_minutes, wait_minutes=20):
+        """One wait per offset, that many minutes before the window's end."""
+        return [pp.Wait(n, "1", self.END - timedelta(minutes=back),
+                        self.END - timedelta(minutes=back - wait_minutes), 10)
+                for n, back in enumerate(offsets_minutes)]
+
+    def test_it_measures_the_last_three_hours_and_ignores_what_came_before(self):
+        row = pp.recent_row(self._waits([30, 60, 90, 120, 150, 400, 4000]), self.END)
+        self.assertEqual(row["hours"], 3)
+        self.assertEqual(row["runs"], 5, "the 400- and 4000-minute-old runs are outside")
+        self.assertTrue(row["judged"])
+        self.assertEqual(row["p50_minutes"], 20.0)
+        self.assertEqual(row["window_start"], "2026-08-27T09:00:00Z")
+
+    def test_a_stretch_under_the_sample_floor_withholds_its_percentiles(self):
+        # Two samples put any number at p95, the same reason a day's row is
+        # withheld. Silence costs nothing here: the alarm comes from the live
+        # queue, which does not sample.
+        row = pp.recent_row(self._waits([30, 60]), self.END)
+        self.assertEqual(row["runs"], 2)
+        self.assertFalse(row["judged"])
+        self.assertIsNone(row["p50_minutes"])
+        self.assertIsNone(row["p95_minutes"])
+        self.assertIsNone(row["worst_minutes"])
+
+    def test_an_empty_stretch_reports_no_runs_rather_than_zero_minutes(self):
+        row = pp.recent_row([], self.END)
+        self.assertEqual(row["runs"], 0)
+        self.assertFalse(row["judged"])
+        self.assertIsNone(row["p50_minutes"])
+
+    def test_a_terrible_recent_stretch_does_not_breach_on_its_own(self):
+        # Evidence, not a verdict. `breached` is breached_days or the live
+        # queue; wiring this block into it would move TestGrid's row and the
+        # JUnit exit code with a three-hour reading. Six 200-minute waits
+        # straddling midnight: enough to judge the stretch, three a side and so
+        # too few to judge either day.
+        end = pp.parse_rfc3339("2026-08-27T01:00:00Z")
+        waits = [pp.Wait(n, "1", end - timedelta(minutes=back),
+                         end - timedelta(minutes=back - 200), 10)
+                 for n, back in enumerate((15, 30, 45, 90, 120, 150))]
+        sweep = pp.Source(value=pp.Sweep(waits, len(waits), 0.0, end - timedelta(days=7)))
+        summary = pp.summarise(
+            end - timedelta(days=7), end, 15, 45, 45,
+            sweep, pp.Source(value=pp.LiveQueue([], set())), pp.Source(error="not read"),
+        )
+        self.assertEqual(summary["recent"]["runs"], 6)
+        self.assertEqual(summary["recent"]["p50_minutes"], 200.0, "the stretch is awful")
+        self.assertFalse(summary["breached"], "and no day in the window breached")
+        self.assertEqual(summary["exit_code"], pp.EXIT_OK)
+
+
 class Outliers(unittest.TestCase):
     def test_they_are_listed_longest_first_and_exclude_the_boundary(self):
         created = pp.parse_rfc3339("2026-08-26T12:00:00Z")
@@ -757,6 +816,19 @@ class JsonOutput(unittest.TestCase):
         self.assertEqual(0, payload["pool"]["free"])
         self.assertEqual([], payload["leaked_leases"])
 
+    def test_the_recent_stretch_travels_beside_the_trend(self):
+        # health.py's pool_note reads this to date the alert's numbers, so it
+        # is an interface: the keys matter, and so does its presence on a run
+        # too quiet to judge.
+        payload = self._payload(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
+        self.assertEqual(
+            set(payload["recent"]),
+            {"hours", "window_start", "runs", "judged", "p50_minutes", "p95_minutes", "worst_minutes"},
+        )
+        self.assertEqual(payload["recent"]["hours"], pp.RECENT_WINDOW_HOURS)
+        self.assertFalse(payload["recent"]["judged"], "nothing ran in the fixture's last three hours")
+        self.assertIn("last 3h", payload["report"])
+
     def test_a_quiet_payload_says_so_without_a_cause_of_capacity(self):
         payload = self._payload(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)
         self.assertEqual("OK", payload["verdict"])
@@ -810,6 +882,43 @@ class JsonOutput(unittest.TestCase):
         self.assertEqual(pp.VERDICT_OK, payload["verdict"])
         self.assertIsNone(payload["cause"])
         self.assertEqual([], payload["cause_text"])
+
+
+class XmlText(unittest.TestCase):
+    """`_xml_text` drops exactly what XML 1.0's Char production excludes.
+
+    The class is written in escapes, so the check runs over every code point
+    rather than a sample: one wrong digit at a boundary moves a plane in or out
+    and no captured fixture carries a character that would notice.
+    """
+
+    # XML 1.0 section 2.2, Char ::= #x9 | #xA | #xD | [#x20-#xD7FF]
+    #                              | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+    CHAR_RANGES = ((0x9, 0x9), (0xA, 0xA), (0xD, 0xD), (0x20, 0xD7FF),
+                   (0xE000, 0xFFFD), (0x10000, 0x10FFFF))
+
+    def test_every_code_point_lands_on_the_side_the_production_puts_it(self):
+        everything = "".join(map(chr, range(sys.maxunicode + 1)))
+        expected = "".join(
+            chr(cp) for low, high in self.CHAR_RANGES for cp in range(low, high + 1)
+        )
+        actual = pp._xml_text(everything)
+        if actual != expected:
+            wrong = sorted(set(map(ord, actual)) ^ set(map(ord, expected)))
+            self.fail("on the wrong side of the Char production: "
+                      + ", ".join(f"U+{cp:04X}" for cp in wrong[:20]))
+
+    def test_the_boundaries_by_name(self):
+        """The edges of each range and a character from each plane, readable
+        without decoding the sweep above."""
+        kept = "\t\n\r A\ud7ff\ue000\ufffd\U00010000\U0001F600\U0010FFFF"
+        dropped = "\x00\x01\x08\x0b\x0c\x1f\ud800\udfff\ufffe\uffff"
+        self.assertEqual(kept, pp._xml_text(kept + dropped))
+        self.assertEqual(kept, pp._xml_text(dropped + kept))
+
+    def test_none_and_empty_are_empty(self):
+        self.assertEqual("", pp._xml_text(None))
+        self.assertEqual("", pp._xml_text(""))
 
 
 class JunitOutput(unittest.TestCase):

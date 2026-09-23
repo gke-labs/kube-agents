@@ -2,7 +2,7 @@
 """Wire tools/cron_run_scope.py into the Hermes source tree.
 
 Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Two AST locators
-and fifteen anchored string replacements across four files is past the point
+and sixteen anchored string replacements across four files is past the point
 where an inline ``python3 -c`` stays readable, so the edits live here — but the
 guarantee is the same as the other patches in the Dockerfile: every anchor must
 be found the number of times expected, every edited file must still parse, and
@@ -12,6 +12,15 @@ Why each edit is needed is documented in the module docstring of
 ``deploy/docker/patches/cron_run_scope.py``. Usage::
 
     python3 apply_cron_run_scope.py [HERMES_ROOT]   # default /opt/hermes
+
+Anchors are derived against v2026.9.14. That release decomposed
+``cron/scheduler.py`` (``_run_one_job_body`` now delegates its save/deliver
+phase to ``_save_compose_deliver`` over a ``_RunDelivery`` record and its
+bookkeeping tail to ``_finish_completed_run``), split ``tools/cronjob_tools.py``
+into per-action helpers (``_action_run``, ``_action_create``) and rewrote the
+kanban ownership helpers to raise ``_Reject`` instead of returning a
+``tool_error``. The edit sites below follow those moves; the behaviour they
+produce is unchanged.
 """
 
 from __future__ import annotations
@@ -69,88 +78,77 @@ SCHEDULER_DELEGATE_PATCHED = SCHEDULER_DELEGATE + "                outcome=outco
 #: second ``outcome=None``.
 SCHEDULER_PATCHED_MARKER = 'outcome["response"] = final_response'
 
+# v2026.9.14 collapsed the two run_job call shapes (with and without a
+# cancel_event) into one call over a kwargs dict, so the scope now wraps that
+# single call. The ``except BaseException`` that follows it is upstream's
+# teardown-on-raise handler and is left exactly where it was: the scope's
+# ContextVar reset runs on the way out of the ``with`` before that handler sees
+# the exception, which is the order the old two-branch form had too.
 SCHEDULER_RUN_JOB = (
-    "        _deferred_agents: list = []\n"
     "        try:\n"
-    "            if fire_claim_lost is None:\n"
-    "                success, output, final_response, error = run_job(\n"
-    "                    job,\n"
-    "                    defer_agent_teardown=_deferred_agents,\n"
-    "                    extra_prompt=extra_prompt,\n"
-    "                )\n"
-    "            else:\n"
-    "                success, output, final_response, error = run_job(\n"
-    "                    job,\n"
-    "                    defer_agent_teardown=_deferred_agents,\n"
-    "                    extra_prompt=extra_prompt,\n"
-    "                    cancel_event=fire_claim_lost,\n"
-    "                )\n"
+    "            success, output, final_response, error = run_job(job, **_run_kwargs)\n"
+    "        except BaseException:\n"
 )
 
 SCHEDULER_RUN_JOB_PATCHED = (
-    "        _deferred_agents: list = []\n"
     "        try:\n"
     "            # kube-agents patch: enter cron run & risk scope so scheduled runs\n"
     "            # enforce risk-keyed approval gates and execute_code blocks.\n"
     "            # See tools/cron_run_scope.py and tools/cron_risk_gate.py.\n"
     "            from tools.cron_run_scope import cron_run_scope\n"
     '            with cron_run_scope(job["id"], risk=str(job.get("risk") or "high")):\n'
-    "                if fire_claim_lost is None:\n"
-    "                    success, output, final_response, error = run_job(\n"
-    "                        job,\n"
-    "                        defer_agent_teardown=_deferred_agents,\n"
-    "                        extra_prompt=extra_prompt,\n"
-    "                    )\n"
-    "                else:\n"
-    "                    success, output, final_response, error = run_job(\n"
-    "                        job,\n"
-    "                        defer_agent_teardown=_deferred_agents,\n"
-    "                        extra_prompt=extra_prompt,\n"
-    "                        cancel_event=fire_claim_lost,\n"
-    "                    )\n"
+    "                success, output, final_response, error = run_job(job, **_run_kwargs)\n"
+    "        except BaseException:\n"
 )
 
-SCHEDULER_SAVE_OUTPUT = '            output_file = save_job_output(job["id"], output)\n'
+# save_job_output moved out of the body into _save_compose_deliver, which does
+# not see the out-param. The saved path travels back on the _RunDelivery record
+# that function already fills in for the bookkeeping tail, so the record gains a
+# field and the tail copies it across. A dataclass field with a default rather
+# than an attribute set on the fly: a save that raises before the assignment
+# would otherwise leave the tail reading an attribute that does not exist.
+SCHEDULER_DELIVERY_FIELD = "    side_effect_ownership_lost: bool = False\n"
+
+SCHEDULER_DELIVERY_FIELD_PATCHED = (
+    SCHEDULER_DELIVERY_FIELD
+    + "    # kube-agents patch: where the output landed, for the run's own report.\n"
+    "    # See tools/cron_run_scope.py.\n"
+    "    output_file: Optional[str] = None\n"
+)
+
+SCHEDULER_SAVE_OUTPUT = (
+    '        output_file = save_job_output(job["id"], output)\n'
+    "    if verbose:\n"
+    '        logger.info("Output saved to: %s", output_file)\n'
+)
 
 SCHEDULER_SAVE_OUTPUT_PATCHED = (
     SCHEDULER_SAVE_OUTPUT
-    + "            # kube-agents patch: see tools/cron_run_scope.py\n"
-    + "            if outcome is not None:\n"
-    + "                # str(): save_job_output returns a pathlib.Path, and this\n"
-    + "                # value ends up inside the json.dumps of the run action.\n"
-    + '                outcome["output_file"] = str(output_file)\n'
+    + "    # kube-agents patch: see tools/cron_run_scope.py\n"
+    "    # str(): save_job_output returns a pathlib.Path, and this value ends up\n"
+    "    # inside the json.dumps of the run action.\n"
+    "    d.output_file = str(output_file)\n"
 )
 
-# The success-path tail. Anchored on the multi-line finish_execution call
-# rather than the whole tail: the except-path below it passes success=False on
-# one line and returns False, so this block appears exactly once, and keeping
-# the anchor to the lines the patch actually inserts against means upstream
-# churn in the delivery_outcome branches above does not break it.
-SCHEDULER_TAIL = (
-    "        finish_execution(\n"
-    "            execution_id,\n"
-    "            success=success,\n"
-    "            error=error,\n"
-    "            delivery_outcome=delivery_outcome,\n"
-    "        )\n"
-    "        return True\n"
-)
+# The success-path tail. v2026.9.14 moved the finish_execution/return pair into
+# _finish_completed_run, which sees neither final_response nor the out-param,
+# so the report is handed back in the body just before that call — after the
+# empty-response soft-failure has adjusted d.success, which is the state the
+# old tail wrote too. The one visible difference from anchoring inside the
+# tail: a run whose owner-fenced mark_job_run is refused now also reports,
+# which is the better answer for a caller that waited on it.
+SCHEDULER_TAIL = "        return _finish_completed_run(d, fire_owner, execution_id)\n"
 
 SCHEDULER_TAIL_PATCHED = (
-    "        finish_execution(\n"
-    "            execution_id,\n"
-    "            success=success,\n"
-    "            error=error,\n"
-    "            delivery_outcome=delivery_outcome,\n"
-    "        )\n"
     "        # kube-agents patch: hand the run's own report back to whoever\n"
     "        # dispatched it. See tools/cron_run_scope.py.\n"
     "        if outcome is not None:\n"
     '            outcome["response"] = final_response\n'
-    '            outcome["success"] = success\n'
-    '            outcome["error"] = error\n'
+    '            outcome["success"] = d.success\n'
+    '            outcome["error"] = d.error\n'
     '            outcome["delivery_error"] = delivery_error\n'
-    "        return True\n"
+    '            outcome["output_file"] = d.output_file\n'
+    + SCHEDULER_TAIL
 )
 
 # --- tools/cronjob_tools.py: return the report to the caller ----------------
@@ -172,15 +170,14 @@ CRONJOB_IMPORT_PATCHED = (
 # Anchored separately, that reshuffle costs nothing; anchored as one block, as
 # it was, it broke both edits at once.
 #
-# The cron scope nests inside the try that stops the heartbeat thread upstream
-# added in v2026.8.3, so the heartbeat is still joined if the scope or the run
-# raises.
+# v2026.9.14 turned the heartbeat that keeps the caller's inactivity watchdog
+# at bay into a context manager (``_run_heartbeat``) around the call. The cron
+# scope nests inside it, so the heartbeat is still joined if the scope or the
+# run raises; the out-param is bound just ahead of the ``with`` so the return
+# below can read it whether or not the run reached the scope.
 CRONJOB_EXECUTE = (
-    "            try:\n"
-    "                processed = run_one_job(\n"
-    "                    job, adapters=adapters, loop=gateway_loop,\n"
-    "                    extra_prompt=extra_prompt,\n"
-    "                )\n"
+    '            with _run_heartbeat(str(job.get("name") or job_id)):\n'
+    "                processed = run_one_job(job, adapters=adapters, loop=gateway_loop, extra_prompt=extra_prompt)\n"
 )
 
 CRONJOB_EXECUTE_PATCHED = (
@@ -189,7 +186,7 @@ CRONJOB_EXECUTE_PATCHED = (
     "            # inherited, and collect the run's report instead of throwing\n"
     "            # it away.\n"
     "            outcome: Dict[str, Any] = {}\n"
-    "            try:\n"
+    '            with _run_heartbeat(str(job.get("name") or job_id)):\n'
     '                with cron_run_scope(job_id, risk=str(job.get("risk") or "high")):\n'
     "                    processed = run_one_job(\n"
     "                        job, adapters=adapters, loop=gateway_loop,\n"
@@ -198,22 +195,14 @@ CRONJOB_EXECUTE_PATCHED = (
 )
 
 CRONJOB_RETURN = (
-    "        refreshed = get_job(job_id) or {}\n"
-    '        ok = refreshed.get("last_status") == "ok"\n'
-    "        return {\n"
-    '            "claimed": True,\n'
-    '            "success": bool(processed and ok),\n'
-    '            "error": refreshed.get("last_error"),\n'
-    "        }\n"
+    '        return {"claimed": True, "success": bool(processed and ok), "error": run_error}\n'
 )
 
 CRONJOB_RETURN_PATCHED = (
-    "        refreshed = get_job(job_id) or {}\n"
-    '        ok = refreshed.get("last_status") == "ok"\n'
     "        return {\n"
     '            "claimed": True,\n'
     '            "success": bool(processed and ok),\n'
-    '            "error": refreshed.get("last_error"),\n'
+    '            "error": run_error,\n'
     "            # kube-agents patch: the run's own report, collected above.\n"
     '            "response": outcome.get("response"),\n'
     '            "output_file": outcome.get("output_file"),\n'
@@ -222,72 +211,71 @@ CRONJOB_RETURN_PATCHED = (
 )
 
 CRONJOB_RESULT = (
-    '            elif exec_result.get("error"):\n'
-    '                result["execution_error"] = exec_result["error"]\n'
-    '            return json.dumps({"success": True, "job": result}, indent=2)\n'
+    '    elif exec_result.get("error"):\n'
+    '        result["execution_error"] = exec_result["error"]\n'
+    '    return _dumps({"success": True, "job": result})\n'
 )
 
 CRONJOB_RESULT_PATCHED = (
-    '            elif exec_result.get("error"):\n'
-    '                result["execution_error"] = exec_result["error"]\n'
-    "            # kube-agents patch: a synchronous run must report what it did.\n"
-    "            # Without this the caller sees only executed/execution_success\n"
-    "            # and cannot tell that the run already published its result.\n"
-    '            response = clip_cron_response(exec_result.get("response"))\n'
-    "            if response:\n"
-    '                result["response"] = response\n'
-    "            # str(): everything merged here is about to be json.dumps'd, and\n"
-    "            # a TypeError there would lose the whole result, not just a field.\n"
-    '            if exec_result.get("output_file"):\n'
-    '                result["output_file"] = str(exec_result["output_file"])\n'
-    '            if exec_result.get("delivery_error"):\n'
-    '                result["delivery_error"] = str(exec_result["delivery_error"])\n'
-    '            return json.dumps({"success": True, "job": result}, indent=2)\n'
+    '    elif exec_result.get("error"):\n'
+    '        result["execution_error"] = exec_result["error"]\n'
+    "    # kube-agents patch: a synchronous run must report what it did.\n"
+    "    # Without this the caller sees only executed/execution_success\n"
+    "    # and cannot tell that the run already published its result.\n"
+    '    response = clip_cron_response(exec_result.get("response"))\n'
+    "    if response:\n"
+    '        result["response"] = response\n'
+    "    # str(): everything merged here is about to be json.dumps'd, and\n"
+    "    # a TypeError there would lose the whole result, not just a field.\n"
+    '    if exec_result.get("output_file"):\n'
+    '        result["output_file"] = str(exec_result["output_file"])\n'
+    '    if exec_result.get("delivery_error"):\n'
+    '        result["delivery_error"] = str(exec_result["delivery_error"])\n'
+    '    return _dumps({"success": True, "job": result})\n'
 )
 
 # Allow runtime cronjob create to accept an explicit or default risk tier.
+# ``cronjob()`` now snapshots ``locals()`` into the dict every action helper
+# reads, so a parameter added here reaches ``_action_create`` as ``a["risk"]``
+# with nothing else to thread. The model-facing handler forwards an enumerated
+# list of schema fields that has never included ``risk`` (nor did the v2026.8.19
+# lambda it replaced); the tier is stamped by the profile scaffold and by
+# in-process callers, exactly as before.
 CRONJOB_CREATE_PARAM_ANCHOR = (
-    "    reasoning_effort: Optional[str] = None,\n"
     "    task_id: str = None,\n"
+    "    session_id: Optional[str] = None,\n"
 )
 
 CRONJOB_CREATE_PARAM_PATCHED = (
-    "    reasoning_effort: Optional[str] = None,\n"
     "    risk: Optional[str] = None,\n"
     "    task_id: str = None,\n"
+    "    session_id: Optional[str] = None,\n"
 )
 
-CRONJOB_CREATE_CALL_ANCHOR = (
-    "                    reasoning_effort=reasoning_effort,\n"
-    "                )\n"
-)
+CRONJOB_CREATE_CALL_ANCHOR = '            reasoning_effort=a["reasoning_effort"],\n'
 
 CRONJOB_CREATE_CALL_PATCHED = (
-    "                    reasoning_effort=reasoning_effort,\n"
-    "                    risk=risk,\n"
-    "                )\n"
+    '            reasoning_effort=a["reasoning_effort"],\n'
+    '            risk=a["risk"],\n'
 )
 
 # --- cron/jobs.py: stamp default risk on newly created jobs -----------------
 
 JOBS_DEF_ANCHOR = (
-    "    monitor_url: Optional[str] = None,\n"
-    "    reasoning_effort: Optional[str] = None,\n"
+    "    paused_reason: Optional[str] = None,\n"
     ") -> Dict[str, Any]:\n"
 )
 
 JOBS_DEF_PATCHED = (
-    "    monitor_url: Optional[str] = None,\n"
-    "    reasoning_effort: Optional[str] = None,\n"
+    "    paused_reason: Optional[str] = None,\n"
     "    risk: Optional[str] = None,\n"
     ") -> Dict[str, Any]:\n"
 )
 
 JOBS_APPEND_ANCHOR = (
     "    with _jobs_lock():\n"
-    "        jobs = load_jobs()\n"
-    "        jobs.append(job)\n"
-    "        save_jobs(jobs)\n"
+    "        save_jobs(load_jobs() + [job])\n"
+    "    return job\n"
 )
 
 JOBS_APPEND_PATCHED = (
@@ -309,9 +297,8 @@ JOBS_APPEND_PATCHED = (
     '    job["risk"] = _eff_risk\n'
     "\n"
     "    with _jobs_lock():\n"
-    "        jobs = load_jobs()\n"
-    "        jobs.append(job)\n"
-    "        save_jobs(jobs)\n"
+    "        save_jobs(load_jobs() + [job])\n"
+    "    return job\n"
 )
 
 # --- tools/kanban_tools.py: a cron run owns no card -------------------------
@@ -331,23 +318,28 @@ KANBAN_IMPORT_PATCHED = (
 # There is no _default_task_id edit here any more, and its absence is the
 # patch, not an omission. v2026.8.13 absorbed that half: cron.scheduler.run_job
 # now enters agent.delegation_context.non_dispatcher_owned_context() around the
-# whole run, _default_task_id consults it through _is_dispatcher_owned_worker(),
-# and a dispatched job therefore inherits no ambient card upstream-side. Keeping
-# our own rewrite of that function would be a second implementation of a rule
-# upstream now owns, pinned to a literal anchor on a body upstream is actively
-# editing — every future bump would break the build to re-apply a no-op.
+# whole run (v2026.9.14 does it from _CronRunScope.enter()/exit() through the
+# enter_/exit_non_dispatcher_owned_context pair), _default_task_id
+# consults it through _is_dispatcher_owned_worker(), and a dispatched job
+# therefore inherits no ambient card upstream-side. Keeping our own rewrite of
+# that function would be a second implementation of a rule upstream now owns,
+# pinned to a literal anchor on a body upstream is actively editing — every
+# future bump would break the build to re-apply a no-op.
 #
 # What the scope is still needed for is everything below: upstream's marker
 # says "not the dispatcher's worker", not "cron job X", so the refusal messages
 # that name the job and the explicit-task_id guard both still come from here.
 # verify_cron_run_scope.py asserts upstream's mechanism still returns no
 # ambient card, because nothing else would now notice if it stopped.
-
+#
+# v2026.9.14 made the ownership helper raise ``_Reject`` (a finished tool_error
+# the ``_kanban_handler`` wrapper renders) instead of returning the error
+# string, so the refusal raises the same way. The env-scoped check that follows
+# it is upstream's and is unchanged.
 KANBAN_OWNERSHIP = (
     '    env_tid = os.environ.get("HERMES_KANBAN_TASK")\n'
-    "    if not env_tid:\n"
-    "        # Orchestrator or CLI context — no task-scope restriction.\n"
-    "        return None\n"
+    "    if env_tid and tid != env_tid:\n"
+    "        raise _Reject(\n"
 )
 
 KANBAN_OWNERSHIP_PATCHED = (
@@ -355,11 +347,14 @@ KANBAN_OWNERSHIP_PATCHED = (
     "    # card of its own. See tools/cron_run_scope.py.\n"
     "    cron_err = cron_ownership_violation(tid)\n"
     "    if cron_err:\n"
-    "        return tool_error(cron_err)\n" + KANBAN_OWNERSHIP
+    "        raise _Reject(cron_err)\n" + KANBAN_OWNERSHIP
 )
 
 # Told to set an env var that is already set, to a card it must not touch, a
 # cron run would just pass that card explicitly. Give it the real answer.
+# v2026.9.14 folded the nine per-tool copies of this message into one
+# ``_require_task_id`` helper; substitute_all keeps the count upstream's
+# business either way.
 KANBAN_MISSING_MSG = '"task_id is required (or set HERMES_KANBAN_TASK in the env)"'
 KANBAN_MISSING_MSG_PATCHED = "missing_task_id_error()"
 
@@ -391,10 +386,15 @@ def apply(root: Path) -> None:
         SCHEDULER_RUN_JOB, SCHEDULER_RUN_JOB_PATCHED, label="scoped run_job"
     )
     scheduler.substitute(
+        SCHEDULER_DELIVERY_FIELD,
+        SCHEDULER_DELIVERY_FIELD_PATCHED,
+        label="delivery record field",
+    )
+    scheduler.substitute(
         SCHEDULER_SAVE_OUTPUT, SCHEDULER_SAVE_OUTPUT_PATCHED, label="saved output"
     )
     scheduler.substitute(SCHEDULER_TAIL, SCHEDULER_TAIL_PATCHED, label="run tail")
-    scheduler.commit("2 locators, 4 anchors")
+    scheduler.commit("2 locators, 5 anchors")
 
     cronjob = patchlib.Patch(root, "tools/cronjob_tools.py", prefix=PREFIX)
     cronjob.substitute(
@@ -436,7 +436,8 @@ def apply(root: Path) -> None:
         KANBAN_OWNERSHIP, KANBAN_OWNERSHIP_PATCHED, label="ownership guard"
     )
     # One per lifecycle tool, and how many of those there are is upstream's
-    # business: v2026.8.13 shipped nine where v2026.8.3 had seven.
+    # business: v2026.8.13 shipped nine where v2026.8.3 had seven, and
+    # v2026.9.14 folded them into one helper.
     kanban.substitute_all(
         KANBAN_MISSING_MSG, KANBAN_MISSING_MSG_PATCHED, label="missing task_id"
     )

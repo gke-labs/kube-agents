@@ -5,8 +5,10 @@ Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after the applier. The
 applier only proves its one anchor matched. This drives the *real patched*
 handler — the same ``_handle_comment`` a ``kanban_comment`` tool call reaches —
 against a real board, and replays the 2026-08-08 shape that produced the
-incident: a card completed, its report delivered, its subscription torn down,
-and then a comment written to it.
+incident: a card completed, its report delivered, and then a comment written
+to it. (The 2026-08-08 gateway also tore the subscription down in the same
+tick; the v2026.9.14 notifier keeps a done card's row and unsubscribes only on
+``archived``, so the replay leaves the row in place — see section 4.)
 
 Not vacuous, and measured rather than asserted: run against the same image with
 the applier skipped, 16 of the 36 checks fail and the script exits 1, because
@@ -52,6 +54,8 @@ os.environ["HERMES_PROFILE"] = "default"
 os.environ.pop("HERMES_KANBAN_TASK", None)
 
 from hermes_cli import kanban_db as K  # noqa: E402
+from hermes_cli import kanban_db_connect as KC  # noqa: E402
+from hermes_cli import kanban_db_notify as KN  # noqa: E402
 import tools.kanban_tools as kt  # noqa: E402
 
 try:
@@ -59,7 +63,10 @@ try:
 except ImportError:  # the module was never COPYd in
     kcs = None
 
-conn = K.connect(DB)
+#: Where upstream's notifier lives since the Sep 2026 split of kanban_watchers.
+NOTIFIER_MODULE = "gateway/kanban_watchers_notifier.py"
+
+conn = KC.connect(DB)
 
 UPSTREAM_KEYS = {"ok", "task_id", "comment_id"}
 
@@ -84,7 +91,7 @@ def card(title: str, status: str = "running") -> str:
 
 
 def subscribe(task_id: str) -> None:
-    K.add_notify_sub(
+    KN.add_notify_sub(
         conn,
         task_id=task_id,
         platform="slack",
@@ -168,9 +175,11 @@ check(
 
 # --- 3. The 2026-08-08 incident, replayed ------------------------------------
 # t_a8f58a2a completed at 19:09:43, its 6,191-char report reached the Slack
-# thread at 19:09:44, the notifier unsubscribed on the same tick, and at 19:11:30
-# the front door commented on the card and told the user the results would post
-# there when the agent finished.
+# thread at 19:09:44, and at 19:11:30 the front door commented on the card and
+# told the user the results would post there when the agent finished. (The
+# notifier of that day also unsubscribed the card on the same tick; the replay
+# does not reproduce that step, because the v2026.9.14 notifier no longer takes
+# it -- see the next comment -- and the status has to carry the verdict alone.)
 print("2026-08-08 incident replay:")
 incident = card("audit the fleet", "running")
 subscribe(incident)
@@ -178,17 +187,14 @@ report = "FINDINGS\n" + ("cluster row " * 500)
 K.complete_task(
     conn, incident, result=report, summary="Audited the fleet; 9 findings.",
 )
-# What gateway/kanban_watchers.py does on the tick that carries the terminal
-# event: task_terminal -> _kanban_unsub.
-K.remove_notify_sub(
-    conn,
-    task_id=incident,
-    platform="slack",
-    chat_id="C0PLATFORM",
-    thread_id="1723033132.001",
-)
+# What gateway/kanban_watchers_notifier.py does on the tick that carries the
+# terminal event at v2026.9.14: it unsubscribes only when
+# ``self.task.status == "archived"`` — ``done`` is reversible — so a completed
+# card keeps its subscription row. On 2026-08-08 the gateway of the day had
+# also torn the row down; either way the status has to outrank the row, which
+# is what section 4 checks.
 check("the card is done", K.get_task(conn, incident).status == "done")
-check("its subscription is gone", sub_rows(incident) == 0)
+check("its subscription survives, as the notifier leaves it", sub_rows(incident) == 1)
 
 out = comment(incident, "Any update on this? Posting results here when done.")
 check("the comment still succeeds", out.get("ok") is True)
@@ -225,10 +231,12 @@ check(
 )
 
 # --- 4. Status outranks the subscription row ---------------------------------
-# The unsub happens when the notifier PROCESSES the terminal event, so for up to
-# one tick a done card still has its rows. If the racy field could contradict
-# the durable one, the model would resolve it optimistically -- which is the bug.
-print("done-but-not-yet-unsubscribed:")
+# A done card keeps its subscription rows: the notifier unsubscribes only on
+# ``archived`` (section 3), and even that happens when it PROCESSES the terminal
+# event, a tick after the status changed. So the row can never be read as "this
+# card can still deliver". If it could contradict the status, the model would
+# resolve the contradiction optimistically -- which is the bug.
+print("done-with-its-subscription-row:")
 racy = card("just completed", "running")
 subscribe(racy)
 K.complete_task(conn, racy, result="the answer", summary="done")
@@ -265,17 +273,20 @@ check(
 # 2026-08-08 incident on a new status. Upstream narrowing only leaves this
 # patch more conservative, which is deliberate and is asserted below.
 print("coupling to the notifier:")
-watchers = Path("gateway/kanban_watchers.py").read_text()
+# The notifier lives in gateway/kanban_watchers_notifier.py since upstream's
+# Sep 2026 split (fd2bfa1893); its terminal test is the ``if`` that guards
+# ``unsub()``: ``if self.task and self.task.status == "archived":``.
+watchers = Path(NOTIFIER_MODULE).read_text()
 # Every way this can fail to parse has to land on the named check below rather
 # than as a traceback out of the module. Two shapes reach it: a non-literal
-# right-hand side (`task.status in TERMINAL`), which literal_eval raises
-# ValueError on, and a second assignment elsewhere in the file, which would
-# leave the old re.search reading whichever came first. Both mean the same thing
-# to the porter — the terminal test moved, re-derive this — which is exactly
-# what "the notifier's terminal test was located" says. A trailing comment is
-# not one of them: `(.+)` swallows it and literal_eval ignores it, so the
-# current shape keeps parsing.
-_terminals = re.findall(r"task_terminal = task and task\.status (==|in) (.+)", watchers)
+# right-hand side (`self.task.status in TERMINAL`), which literal_eval raises
+# ValueError on, and a second test elsewhere in the file, which would leave a
+# re.search reading whichever came first. Both mean the same thing to the
+# porter — the terminal test moved, re-derive this — which is exactly what "the
+# notifier's terminal test was located" says. The trailing colon of the ``if``
+# is excluded by the character class; a trailing comment would not be, and
+# literal_eval would refuse it, which lands on the same check.
+_terminals = re.findall(r"self\.task\.status (==|in) ([^:\n]+)", watchers)
 notifier_terminal = None
 if len(_terminals) == 1:
     _op, _rhs = _terminals[0]
@@ -288,9 +299,9 @@ if len(_terminals) == 1:
 check(
     "the notifier's terminal test was located",
     notifier_terminal is not None,
-    "gateway/kanban_watchers.py no longer assigns task_terminal from "
-    "task.status exactly once against a literal — re-derive this check and "
-    "TERMINAL_STATUSES with it",
+    f"{NOTIFIER_MODULE} no longer tests self.task.status exactly once against "
+    "a literal before unsub() — re-derive this check and TERMINAL_STATUSES "
+    "with it",
 )
 check(
     "every status the notifier unsubscribes on is one this patch calls dead",

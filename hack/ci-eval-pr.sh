@@ -32,6 +32,15 @@ readonly EVAL_PRESUBMIT_CASES_FILE="eval/presubmit-cases.txt"
 readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 
+# What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
+# when the run could not be evaluated: an admitted case lost every repetition
+# to infrastructure, or every case did. Both are bench/kube_agents_bench/
+# gate.py's (SUITE_EXIT_NOT_EVALUATED) and scoring.py's
+# (SUITE_OUTCOME_NOT_EVALUATED); the verdict step below reads the two
+# together, because 2 alone is also what argparse exits on a bad flag.
+readonly EVAL_SUITE_NOT_EVALUATED_STATUS=2
+readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
+
 # ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
 # A push that changes only inert files re-runs this whole job and aborts the
 # run in flight -- #1127's comment-only push cost a 123-minute re-run. Prow's
@@ -642,6 +651,9 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
 # baseline store the gate compares against is built from PASSING runs on main,
 # and those are exactly the records the old failure-only trap threw away. It
 # cannot precede the `$?` capture, so it sits immediately after it.
+# collect_gateway_log follows it for the same reason: a green nightly whose
+# repetitions ran to the delegation ceiling used to leave no gateway log to
+# say whether the worker was starved by 429s or a stuck dispatcher.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -659,6 +671,7 @@ profile_and_dump_on_exit() {
   local exit_code=$?
   set +e
   collect_bench_results
+  collect_gateway_log
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
@@ -1607,11 +1620,17 @@ unit_cost_hint() {
     # nightly 2026-09-15 unmeasured; same SOP-faithful audit shape, same band.
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
+    consistency-no-environment-label) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
     # Nightly-only. Measured 980-1929s across build 2099539376672346112's
     # three repetitions (267-559s in August); median of the September run.
     pdb-remediation-pr) echo 1250 ;;
+    # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
+    # write (build 2099607409826729984); the crashloop triage takes the
+    # incumbent autoops hint (same watcher and card waits) until it passes.
+    ai-security-planted-model-audit) echo 1450 ;;
+    autoops-crashloop-config-triage) echo 900 ;;
     consistency-authorized-networks-probe) echo 300 ;;
     # Median of its 1155 presubmit repetitions 2026-09-04 to 09-15 (p10 248s,
     # p90 1318s); the 200s default under-packed it by 2.7x (#1023).
@@ -1631,7 +1650,7 @@ unit_cost_hint() {
 # The harness's delegation ceiling for one unit, in seconds: how long
 # devops-bench keeps polling the Platform Agent for a delegated worker before
 # it grades whatever the parent has said so far. Every unit inherits the
-# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the six
+# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the seven
 # full-audit units -- SOP dispatch, a delegated worker sweeping the fleet,
 # a ledger write, one closing line -- get 3000s.
 #
@@ -1664,6 +1683,7 @@ unit_delegation_timeout() {
   case "$1" in
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
+    consistency-no-environment-label) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
 }
@@ -1690,6 +1710,20 @@ for TASK in "${TASKS[@]}"; do
     TASK_REUSE+=("")
   fi
 done
+
+# How long a stack-bearing unit waits for lock-infra before giving up. The
+# lock is held for a unit's whole invocation and the queue launches every
+# repetition-1 unit within the first few lanes, so with N stack-bearing
+# tasks the last waiter has to outlast N-1 holders in a row: at 1800s flat
+# the third and fourth contenders in a four-tofu nightly cannot, and which
+# one loses is the mkdir race (the #1103 presubmit run showed it at N=2, a
+# 2279s audit rep starving its sibling). 1800s a contender keeps the
+# holder-died guard the flat figure was for, scaled to the matrix; the
+# presubmit, with no stack-bearing task, keeps the flat 1800s.
+STACK_CONTENDERS=0
+for HAS in "${TASK_HAS_STACK[@]}"; do [ -n "${HAS}" ] && STACK_CONTENDERS=$((STACK_CONTENDERS + 1)); done
+INFRA_LOCK_DEADLINE=$(( 1800 * (STACK_CONTENDERS > 1 ? STACK_CONTENDERS : 1) ))
+echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to ${INFRA_LOCK_DEADLINE}s for lock-infra"
 
 # One unit, in a background subshell: its exports stay local, its output goes
 # only to its own log (kept as an artifact either way), and its run directory
@@ -1751,7 +1785,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
   fi
-  if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra"; then
+  if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra" "${INFRA_LOCK_DEADLINE}"; then
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
     return 0
@@ -1943,19 +1977,62 @@ else
   echo "Not a main-branch recorder run (JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written."
 fi
 
-# The suite roll-up: blocking cases, the admitted-case aggregate, and the
-# all-infrastructure check. Exit 0 green, 1 red. --baseline-rate is not passed:
-# the rate is computed from the store, per admitted case at its own version
-# key. While the store holds nothing, and until EVAL_AGGREGATE_ARMED is set
-# to 1, the aggregate stays advisory and the markdown says so, rather than implying
-# a comparison that did not happen or a rule that was armed.
+# The suite roll-up: blocking cases, the admitted-case aggregate, the
+# per-admitted-case coverage floor and the all-infrastructure check. Exit 0
+# green, 1 red, 2 not evaluated -- an admitted case lost every repetition to
+# infrastructure (or every case did), so the run cannot certify green and has
+# nothing against the change to debug either. Prow reds 2 as it reds 1, which
+# is right: a run that proved nothing does not merge. The distinct status and
+# the `outcome` in eval-verdict.json are for the artifact and for the
+# release-candidate lane, which reports NOT RUN rather than RED on them. The
+# dashboard and the health bot do not read either yet: they classify this
+# run from the final line's `Failed` word and from Prow's FAILURE, so until
+# #1782 they still call it red; the banner in eval-verdict.md is what says
+# otherwise. --baseline-rate is not passed: the rate is computed from the
+# store, per admitted case at its own version key. While the store holds
+# nothing, and until EVAL_AGGREGATE_ARMED is set to 1, the aggregate stays
+# advisory and the markdown says so, rather than implying a comparison that
+# did not happen or a rule that was armed.
+#
+# A function, so tests/test_ci_eval_verdict.py can lift it out of this file
+# and run it: the status-2 confirmation below is the one branch of the verdict
+# the bench tests cannot reach, and the shell's copy of the outcome word has
+# to keep agreeing with scoring.py's. Prints the final line; returns the
+# status the job exits with.
+announce_suite_verdict() {
+  local suite_status=$1 verdict_json=$2 verdict_md=$3 total_duration=$4
+  # The status alone does not prove a not-evaluated verdict: argparse exits 2
+  # on a bad flag, and `uv run` can exit 2 without ever reaching bench-gate.
+  # Only a verdict file that says so is announced as one; anything else that
+  # is not 0 is the plain failure it always was, so a broken invocation
+  # cannot dress itself as weather.
+  local not_evaluated="false"
+  if [ "${suite_status}" -eq "${EVAL_SUITE_NOT_EVALUATED_STATUS}" ] && \
+    python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("outcome") == sys.argv[2] else 1)' \
+      "${verdict_json}" "${EVAL_VERDICT_OUTCOME_NOT_EVALUATED}" 2>/dev/null; then
+    not_evaluated="true"
+  fi
+  # The final line keeps the `PR Smoke Test Evaluation Failed` and
+  # `(Total Duration: Ns)` anchors that scripts/eval_dashboard/collect.py
+  # matches, so a not-evaluated run does not lose its final line on the
+  # dashboard; the classification words sit between them.
+  if [ "${suite_status}" -eq 0 ]; then
+    echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Succeeded (Total Duration: ${total_duration}s) ==="
+    return 0
+  fi
+  if [ "${not_evaluated}" = "true" ]; then
+    echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- NOT EVALUATED: an admitted case (or every case) lost every repetition to infrastructure, so this run cannot certify green. Not a finding against the change: rerun when the environment is healthy rather than debugging it. See ${verdict_md} (Total Duration: ${total_duration}s)"
+    return "${EVAL_SUITE_NOT_EVALUATED_STATUS}"
+  fi
+  echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- see ${verdict_md} (Total Duration: ${total_duration}s)"
+  return 1
+}
+
 TOTAL_DURATION=$((SECONDS - START_TIME))
-if (cd "${BENCH_DIR}" && uv run bench-gate suite \
+SUITE_STATUS=0
+(cd "${BENCH_DIR}" && uv run bench-gate suite \
   "${CASE_RESULTS[@]}" \
   --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \
-  --json-out "${ARTIFACT_DIR}/eval-verdict.json"); then
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Succeeded (Total Duration: ${TOTAL_DURATION}s) ==="
-else
-  echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- see ${ARTIFACT_DIR}/eval-verdict.md (Total Duration: ${TOTAL_DURATION}s)"
-  exit 1
-fi
+  --json-out "${ARTIFACT_DIR}/eval-verdict.json") || SUITE_STATUS=$?
+announce_suite_verdict "${SUITE_STATUS}" "${ARTIFACT_DIR}/eval-verdict.json" \
+  "${ARTIFACT_DIR}/eval-verdict.md" "${TOTAL_DURATION}" || exit $?

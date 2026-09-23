@@ -97,10 +97,18 @@ exactly 0 is the never-ran signature — no tool ran and no model call was bille
 `classify_rep()` classifies that repetition as `infra`, whatever produced the record (#1184). The
 `KUBE_AGENTS_INFRA_FAILURE` marker covers the producers the harness can name (#1095's terminal
 429s, #1137's unestablishable tunnels); this covers the ones it cannot, such as a transport
-failure that comes back as an empty success with no error string. The check sits after rung 1 —
+failure that comes back as an empty success with no error string. A second marker,
+`KUBE_AGENTS_DELEGATION_CEILING`, names the harness's own delegation wait running out
+(`AGENT_DELEGATION_TIMEOUT`) with the delegated card still running and nothing delivered: the
+record is scored, but what was scored is the acknowledgement the front door gives by design when
+it delegates, so `classify_rep()` classifies the repetition `infra` under a reason that leads
+with the marker. The dashboard reads that lead to count these apart from quota-storm repetitions
+(`scripts/eval_dashboard/SCHEMA.md`). A ceiling hit after a partial delivery carries no marker
+and grades on what arrived. Both the ceiling check and the never-ran signature sit after rung 1 —
 the catastrophic score grades the cluster rather than the record, so a tripped safeguard is
-positive evidence something acted and keeps blocking — and applies only to a record that carries
-a scores map; a scoreless one still blocks at rung 2. The near-misses still block at rung 3:
+positive evidence something acted and keeps blocking, whether the worker was still running at the
+deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
+one still blocks at rung 2. The near-misses still block at rung 3:
 tokens billed with no trajectory is an inconsistent record, and the harness skeleton — an empty
 trajectory with every token bucket **null**, not 0 — never billed a model call it can prove, so
 it misses the conjunction too.
@@ -132,9 +140,20 @@ environment. Unarmed,
 which is the default, a rate below the margin over a full sample is written into the verdict as a
 note rather than a reason: the flat margin has not been measured against how much an unchanged
 pull request moves the aggregate on `main`, and arming it is a decision for after the store holds
-enough nights to say. Two job-level rules sit alongside it: any blocking case reds the job, and _all_ cases
-failing on infrastructure reds it too — individually that is weather, but all at once means the
-eval infrastructure is down and a green would be a lie about coverage.
+enough nights to say. Two job-level rules sit alongside it. Any blocking case reds the job
+(`suite` exits 1). And green has a coverage floor: an admitted case with no scored repetition —
+every one excluded as infrastructure — makes the run **not evaluated**: `suite` exits 2, the code `case` already uses for
+"could not grade", and writes `outcome: not_evaluated` with the case ids under `not_evaluated`; the
+markdown carries a banner saying rerun when the environment is healthy rather than debug the
+change, and `hack/ci-eval-pr.sh` passes the status through (confirming it against the JSON first,
+since argparse exits 2 too) so the release-candidate lane reports NOT RUN rather than RED. Weather
+that takes one repetition leaves the case scored and trips nothing; only a case lost whole does,
+and only an admitted one. _All_ cases failing on infrastructure is the same floor at its limit and
+reports the same outcome — individually that is weather, but all at once means the eval
+infrastructure is down and a green would be a lie about coverage. A blocking case outranks the
+weather: the outcome is red, with the lost cases still listed among the reasons. `green` stays in
+the JSON, derived from `outcome`, so a reader that only knows the boolean sees not-evaluated as
+not green.
 
 **Why the aggregate has a sample floor and the per-case rungs do not.** A flat margin is a
 suite-scale rule, and at small `n` it measures luck. Against a baseline screened at the 19/20
@@ -571,7 +590,10 @@ measured data. Config belongs where it gets reviewed.
 
 The reader lists the whole prefix once, groups the object names by case and then by key directory,
 takes the newest `EVAL_BASELINE_MAX_OBJECTS` (default 200) **per case per key**, and concatenates
-what survives in one `cat`. 200 objects is roughly 600 runs, two orders of magnitude past the 20
+what survives in one `cat` per case. Those per-case `cat`s run concurrently, at most
+`EVAL_BASELINE_CAT_WORKERS` (default 16) at a time: the cost of a read is one `gcloud` process
+startup per case and almost nothing else, so serially it grew with the matrix. 200 objects is
+roughly 600 runs, two orders of magnitude past the 20
 the admission bar wants, so the cap never binds in practice — but it bounds a read that would
 otherwise grow without limit as one key accumulates years of history, and when it does bind the
 gate says which case was capped and by how much. A cap that is silent reads as "I considered
@@ -597,9 +619,10 @@ that is invisible. If it ever stops being invisible, the fix is to scope the lis
 the key being read rather than the whole prefix, which the layout now makes a one-line change; see
 [Open items](#open-items).
 
-Costs are not the constraint at any of these scales. Standard storage bills actual bytes with no
+Money is not the constraint at any of these scales. Standard storage bills actual bytes with no
 minimum object size, and both the listing and the per-object fetches are fractions of a cent per
-run.
+run. Wall clock was: the gate reads the whole store once per graded case, which is why the fetches
+are concurrent.
 
 The key partition also retires a caveat this section used to carry. Under a flat layout and a
 per-case window, a version key that went A → B → A could push the revert's own evidence at key A

@@ -2,7 +2,8 @@
 """Wire hermes_cli/kanban_wake_nudge.py into the Hermes source tree.
 
 Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Seven anchored
-edits across two files plus an import trailer on each:
+edits across two files plus an import trailer on each; anchors derived against
+v2026.9.14 as patched by the steps the Dockerfile runs before this one.
 
 ``hermes_cli/kanban_db.py`` — the producers. One nudge after each commit that
 gives a watcher something to do:
@@ -15,14 +16,24 @@ gives a watcher something to do:
    dedents it out: txn exits → commit → nudge → return. The early
    ``return False`` path is untouched.
 
-``gateway/kanban_watchers.py`` — the consumers. Per watcher loop, one
-``WakeMonitor`` constructed where the loop starts (passed
-``_kb.kanban_db_path`` uncalled, so resolution failures degrade the monitor
-instead of killing the coroutine), and the fixed sleep swapped for
-``wait_interval``:
+``gateway/kanban_watchers.py`` — the consumers. v2026.9.14 moved the per-tick
+work into ``kanban_watchers_notifier.py`` / ``kanban_watchers_dispatcher.py``
+and left only the two loops on the mixin, both of which now doze through one
+shared ``await self._sleep_between_ticks(interval)`` (a plain 1s-sliced
+sleep). Per loop, one ``WakeMonitor`` constructed where the loop starts
+(passed ``_kb.kanban_db_path`` uncalled, so resolution failures degrade the
+monitor instead of killing the coroutine), and that shared sleep call swapped
+for ``wait_interval``:
 
 4. notifier monitor construction        5. notifier sleep swap
 6. dispatcher monitor construction      7. dispatcher sleep swap
+
+The two sleep calls are byte-identical at identical indentation, so each sleep
+anchor carries the log line that precedes it, which is unique per loop. The
+``_sleep_between_ticks`` method itself is left in place: it is upstream's
+API surface and nothing else calls it after this edit. Both loops re-check
+``self._running`` at the top of the ``while``, so the wait simply returns on
+shutdown — the same contract the upstream helper had.
 
 Deliberately NOT hooked: ``claim_task``, ``heartbeat_claim``, and the rest of
 what a dispatcher tick writes — nudging on those would let the dispatcher
@@ -60,14 +71,15 @@ CREATE_PATCHED = (
     "            return task_id\n"
 )
 
+# v2026.9.14 folded the explanatory comment into the line; ``recompute_ready(conn)``
+# alone occurs five times in the file, so the inline comment is what pins this
+# to ``complete_task``.
 COMPLETE_ANCHOR = (
-    "    # Recompute ready status for dependents (separate txn so children see done).\n"
-    "    recompute_ready(conn)\n"
+    "    recompute_ready(conn)  # separate txn so children see ``done``\n"
 )
 
 COMPLETE_PATCHED = (
-    "    # Recompute ready status for dependents (separate txn so children see done).\n"
-    "    recompute_ready(conn)\n"
+    "    recompute_ready(conn)  # separate txn so children see ``done``\n"
     "    # kube-agents patch: completion and any child promotion are committed;\n"
     "    # nudge the watchers so the notifier delivers and the dispatcher claims\n"
     "    # dependents now, not next tick. See hermes_cli/kanban_wake_nudge.py.\n"
@@ -111,20 +123,18 @@ DB_TRAILER = (
 # --- gateway/kanban_watchers.py ----------------------------------------------
 
 # The monitor goes on the last line before the loop, whatever that line is.
-# It used to be the startup ``asyncio.sleep(5)``; v2026.8.13 put the done-sub GC
-# cadence in between, so the anchor moved down to the setup that now sits there.
 # ``_gc_next_at`` is the anchor rather than the ``while`` because the ``while``
 # alone is not unique in this file — the dispatcher loop below opens the same
 # way — and because a monitor constructed above the GC setup would be dead
 # weight for the length of a block upstream is evidently still growing.
 NOTIFIER_MONITOR_ANCHOR = (
-    "        _gc_next_at = 0.0  # 0 → sweep on the first tick after startup\n"
+    "        _gc_next_at = 0.0\n"
     "\n"
     "        while self._running:\n"
 )
 
 NOTIFIER_MONITOR_PATCHED = (
-    "        _gc_next_at = 0.0  # 0 → sweep on the first tick after startup\n"
+    "        _gc_next_at = 0.0\n"
     "\n"
     "        # kube-agents patch: cross-process wake monitor, one per watcher\n"
     "        # loop. See hermes_cli/kanban_wake_nudge.py.\n"
@@ -133,36 +143,29 @@ NOTIFIER_MONITOR_PATCHED = (
 )
 
 NOTIFIER_SLEEP_ANCHOR = (
-    "            # Sleep with cancellation checks.\n"
-    "            for _ in range(int(max(1, interval))):\n"
-    "                if not self._running:\n"
-    "                    return\n"
-    "                await asyncio.sleep(1)\n"
+    '                logger.warning("kanban notifier tick failed: %s", exc)\n'
+    "            await self._sleep_between_ticks(interval)\n"
 )
 
 NOTIFIER_SLEEP_PATCHED = (
+    '                logger.warning("kanban notifier tick failed: %s", exc)\n'
     "            # kube-agents patch: wake-aware wait — reacts to a board\n"
     "            # mutation in <=0.25s, degrades to the full-interval poll when\n"
-    "            # the wake file is unavailable, and returns False on shutdown\n"
-    "            # exactly where the old loop returned.\n"
-    "            # See hermes_cli/kanban_wake_nudge.py.\n"
-    "            if not await _kanban_wait_interval(\n"
+    "            # the wake file is unavailable, and returns on shutdown exactly\n"
+    "            # where the shared sleep returned; the ``while`` re-checks\n"
+    "            # ``self._running``. See hermes_cli/kanban_wake_nudge.py.\n"
+    "            await _kanban_wait_interval(\n"
     "                _wake_monitor, interval, lambda: self._running\n"
-    "            ):\n"
-    "                return\n"
+    "            )\n"
 )
 
 DISPATCHER_MONITOR_ANCHOR = (
-    "        logger.info(\n"
-    '            "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval\n'
-    "        )\n"
+    '        logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)\n'
     "        while self._running:\n"
 )
 
 DISPATCHER_MONITOR_PATCHED = (
-    "        logger.info(\n"
-    '            "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval\n'
-    "        )\n"
+    '        logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)\n'
     "        # kube-agents patch: cross-process wake monitor, one per watcher\n"
     "        # loop. See hermes_cli/kanban_wake_nudge.py.\n"
     "        _wake_monitor = _KanbanWakeMonitor(_kb.kanban_db_path)\n"
@@ -170,18 +173,18 @@ DISPATCHER_MONITOR_PATCHED = (
 )
 
 DISPATCHER_SLEEP_ANCHOR = (
-    "            # Sleep in 1s slices so shutdown is snappy — otherwise a stop()\n"
-    "            # waits up to `interval` seconds for the current sleep to finish.\n"
-    "            slept = 0.0\n"
-    "            while slept < interval and self._running:\n"
-    "                await asyncio.sleep(min(1.0, interval - slept))\n"
-    "                slept += 1.0\n"
+    '                logger.exception("kanban dispatcher: unexpected watcher error")\n'
+    "\n"
+    "            await self._sleep_between_ticks(interval)\n"
 )
 
 DISPATCHER_SLEEP_PATCHED = (
+    '                logger.exception("kanban dispatcher: unexpected watcher error")\n'
+    "\n"
     "            # kube-agents patch: wake-aware wait; still checks self._running\n"
-    "            # before every slice so shutdown stays snappy.\n"
-    "            # See hermes_cli/kanban_wake_nudge.py.\n"
+    "            # before every slice so shutdown stays snappy, and falls through\n"
+    "            # to the lock release below the loop exactly as the shared sleep\n"
+    "            # did. See hermes_cli/kanban_wake_nudge.py.\n"
     "            await _kanban_wait_interval(\n"
     "                _wake_monitor, interval, lambda: self._running\n"
     "            )\n"
@@ -195,9 +198,16 @@ WATCHERS_TRAILER = (
     ")\n"
 )
 
+#: Text that only exists after a successful run, one marker per file. The
+#: ``complete_task`` anchor survives its own edit (the nudge is inserted after
+#: it), so the count check alone cannot tell a fresh file from a patched one.
+DB_SENTINEL = "_kanban_record_wake(conn)"
+WATCHERS_SENTINEL = "_wake_monitor = _KanbanWakeMonitor("
+
 FILES = (
     (
         DB_RELATIVE,
+        DB_SENTINEL,
         (
             ("create_task nudge", CREATE_ANCHOR, CREATE_PATCHED),
             ("complete_task nudge", COMPLETE_ANCHOR, COMPLETE_PATCHED),
@@ -207,6 +217,7 @@ FILES = (
     ),
     (
         WATCHERS_RELATIVE,
+        WATCHERS_SENTINEL,
         (
             ("notifier monitor", NOTIFIER_MONITOR_ANCHOR, NOTIFIER_MONITOR_PATCHED),
             ("notifier sleep", NOTIFIER_SLEEP_ANCHOR, NOTIFIER_SLEEP_PATCHED),
@@ -219,13 +230,22 @@ FILES = (
 
 
 def apply(root: Path) -> None:
-    """Apply the patch under ``root``, or raise SystemExit with the reason."""
-    for relative, edits, trailer in FILES:
+    """Apply the patch under ``root``, or raise SystemExit with the reason.
+
+    Every anchor in both files is checked before either file is written, so a
+    drifted watcher anchor cannot leave ``kanban_db.py`` nudging watchers that
+    never learned to listen.
+    """
+    patches = []
+    for relative, sentinel, edits, trailer in FILES:
         patch = patchlib.Patch(root, relative, prefix="kanban_wake_nudge")
+        patch.refuse_if_patched(sentinel)
         for label, anchor, patched in edits:
             patch.substitute(anchor, patched, label=label)
         patch.append(trailer)
-        patch.commit(f"{len(edits)} anchors")
+        patches.append((patch, len(edits)))
+    for patch, count in patches:
+        patch.commit(f"{count} anchors")
 
 
 if __name__ == "__main__":

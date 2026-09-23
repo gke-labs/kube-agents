@@ -2,9 +2,9 @@
 """Build gate for the rolling-progress-message patch.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` immediately after
-``apply_kanban_progress_lines.py``. The applier proves three anchors matched in
-``gateway/kanban_watchers.py``; a matched anchor is the weaker half of every
-concern here, because **every** failure mode of this patch is silent:
+``apply_kanban_progress_lines.py``. The applier proves its anchors matched in
+``gateway/kanban_watchers_notifier.py``; a matched anchor is the weaker half of
+every concern here, because **every** failure mode of this patch is silent:
 
 * **The wiring.** A trailer import that did not execute, or a ``deliver`` that
   no longer resolves, does not fail at build time — it raises inside the
@@ -29,9 +29,15 @@ concern here, because **every** failure mode of this patch is silent:
   bullets it already delivered; the trail stutters and no error is raised.
 
 So this drives the *patched* runtime rather than reading it: the real
-``watchers._progress_deliver`` the trailer resolved, on an instance of the real
-``GatewayKanbanWatchersMixin`` the map hangs off, and the real
-``BasePlatformAdapter``/``SendResult`` the fallback rests on.
+``_progress_deliver`` the trailer resolved in ``gateway/kanban_watchers_notifier.py``,
+a real ``_KanbanNotification`` formatting and sending a heartbeat, an instance of
+the real ``GatewayKanbanWatchersMixin`` (the runner) the map hangs off, and the
+real ``BasePlatformAdapter``/``SendResult`` the fallback rests on.
+
+Since v2026.9.14 the notifier's delivery lives in
+``gateway/kanban_watchers_notifier.py`` (``_KanbanNotification``, the
+``_EVENT_FORMATTERS`` table) and ``gateway/kanban_watchers.py`` only owns the
+loop; the source and the names below are read from the former.
 
 One thing is deliberately **not** checked here: that this module's ``sub_key``
 agrees with ``kanban_notify_delivery.sub_key``. That module is copied into the
@@ -60,6 +66,7 @@ def check(label: str, condition: object, detail: str = "") -> None:
 
 
 import gateway.kanban_watchers as watchers  # noqa: E402
+import gateway.kanban_watchers_notifier as notifier  # noqa: E402
 from gateway.kanban_progress_lines import (  # noqa: E402
     DEFAULT_NOTE_LIMIT,
     FINISHED,
@@ -77,7 +84,7 @@ from gateway.kanban_progress_lines import (  # noqa: E402
 )
 from gateway.platforms.base import BasePlatformAdapter, SendResult  # noqa: E402
 
-with open("gateway/kanban_watchers.py", encoding="utf-8") as _notifier_src:
+with open("gateway/kanban_watchers_notifier.py", encoding="utf-8") as _notifier_src:
     NOTIFIER_SOURCE = _notifier_src.read()
 
 GOOGLE_CHAT_ADAPTER = "plugins/platforms/google_chat/adapter.py"
@@ -94,18 +101,33 @@ HEADER = "[default] @platform "
 print("import wiring:")
 check(
     "the notifier resolved the progress-note import",
-    hasattr(watchers, "_progress_note"),
+    hasattr(notifier, "_progress_note"),
     "the trailer import did not execute",
 )
 check(
     "the notifier resolved the rolling-delivery import",
-    hasattr(watchers, "_progress_deliver"),
+    hasattr(notifier, "_progress_deliver"),
     "the trailer import did not execute; every note would still be its own message",
 )
 check(
     "the name the send site calls is this module's deliver",
-    getattr(watchers, "_progress_deliver", None) is deliver,
+    getattr(notifier, "_progress_deliver", None) is deliver,
     "something else is bound to the name the notifier calls",
+)
+check(
+    "heartbeat is claimed",
+    "heartbeat" in notifier.TERMINAL_KINDS,
+    "an unclaimed kind never reaches the formatter",
+)
+check(
+    "heartbeat never wakes the creator",
+    "heartbeat" not in notifier._WAKE_KINDS,
+    "a progress note that costs a full LLM turn is the most expensive thing on the board",
+)
+check(
+    "heartbeat has a formatter",
+    callable(notifier._EVENT_FORMATTERS.get("heartbeat")),
+    "a claimed kind with no formatter is silently skipped by format_event()",
 )
 check(
     "the trailer is applied exactly once",
@@ -116,22 +138,28 @@ check(
 
 # --- 2. The send site ---------------------------------------------------------
 # One call site is the whole reason this patch is three anchors and not thirty.
-# If upstream grows a second `adapter.send` inside the notifier loop, the events
-# leaving through it bypass the rolling message entirely.
+# If upstream grows a second `adapter.send` inside the notifier's delivery, the
+# events leaving through it bypass the rolling message entirely.
 print("send site:")
 check(
     "the notifier delivers through the rolling helper",
     NOTIFIER_SOURCE.count("_send_res = await _progress_deliver(") == 1,
 )
 check(
-    "upstream's direct send is gone from the notifier loop",
+    "upstream's direct send is gone from the notifier's delivery",
     "_send_res = await adapter.send(" not in NOTIFIER_SOURCE,
     "a surviving direct send would post progress notes as separate messages",
 )
 check(
     "the helper is given the card's header",
-    'header=f"{board_tag}{tag}",' in NOTIFIER_SOURCE,
+    "header=self.progress_header," in NOTIFIER_SOURCE,
     "without it the rolling message loses the board slug and the @-mention",
+)
+check(
+    "the map is hung off the runner, not the per-delivery notification",
+    "self.runner, adapter, sub, ev.kind, ev, msg, metadata," in NOTIFIER_SOURCE,
+    "_KanbanNotification is rebuilt for every delivery; a map on it forgets "
+    "the message id between ticks and every note posts fresh",
 )
 _deliver_at = NOTIFIER_SOURCE.find("_send_res = await _progress_deliver(")
 _check_at = NOTIFIER_SOURCE.find('if getattr(_send_res, "success", True) is False:')
@@ -141,15 +169,121 @@ check(
     "the send-failure accounting is what makes delivery at-least-once",
 )
 check(
-    "the heartbeat branch still builds the first rendering",
-    'msg = f"⏳ {board_tag}{tag}{note}"' in NOTIFIER_SOURCE,
-    "the render branch and the helper have to agree on the header",
+    "the heartbeat formatter still builds the first rendering",
+    'f"⏳ {n.progress_header}{note}"' in NOTIFIER_SOURCE,
+    "the formatter and the helper have to agree on the header",
 )
 check(
     "a first note is byte-identical to what the notifier posted before",
     render(HEADER, ["Reading the scheduler directly."])
     == f"⏳ {HEADER}Reading the scheduler directly.",
     "the common case — a card that reports once — must not change at all",
+)
+
+# --- 2b. The real notification object, driven ---------------------------------
+# The formatter table and the send site are upstream's structure now; the two
+# checks a grep cannot make are that a noteless auto-heartbeat comes out of
+# format_event() as None (the silent path _send_pings skips) and that a sent
+# heartbeat lands its message id on the RUNNER. Both are driven on the real
+# class, with a real task-shaped row and a recording adapter.
+print("notification object:")
+
+
+class _Task:
+    def __init__(self, assignee="platform", title="List configured cron jobs"):
+        self.assignee = assignee
+        self.title = title
+        self.status = "in_progress"
+        self.result = None
+        self.session_id = ""
+
+
+class _Runner(watchers.GatewayKanbanWatchersMixin):
+    """The runner the map hangs off; nothing else of it is touched here."""
+
+    def __init__(self):
+        pass
+
+
+class _RecordingAdapter:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.sent.append((chat_id, content, metadata))
+        return SendResult(success=True, message_id=f"spaces/AAA/messages/{len(self.sent)}")
+
+    async def edit_message(self, chat_id, message_id, content):
+        return SendResult(success=True, message_id=message_id)
+
+
+class _Ev:
+    def __init__(self, event_id, kind, payload=None):
+        self.id = event_id
+        self.kind = kind
+        self.payload = payload
+
+
+_NOTE_SUB = {
+    "task_id": "t_a8f58a2a",
+    "platform": "google_chat",
+    "chat_id": "spaces/AAAQ",
+    "thread_id": "spaces/AAAQ/threads/xyz",
+}
+_runner = _Runner()
+_delivery = {"sub": _NOTE_SUB, "task": _Task(), "board": "default", "cursor": 3, "old_cursor": 0, "events": []}
+_notification = notifier._KanbanNotification(
+    _runner, _delivery, platform_cls=object, sub_fail_counts={},
+)
+check(
+    "the notification carries the progress header",
+    getattr(_notification, "progress_header", None) == "[default] @platform ",
+    f"got {getattr(_notification, 'progress_header', None)!r}",
+)
+check(
+    "a noteless auto-heartbeat formats to None, the silent path",
+    _notification.format_event(_Ev(1, "heartbeat", None)) is None
+    and _notification.format_event(_Ev(2, "heartbeat", {})) is None,
+    "the live board carries ~2,100 of these; each one would be a message",
+)
+check(
+    "a deliberate note formats as the progress line",
+    _notification.format_event(_Ev(3, "heartbeat", {"note": "scanned 3 of 7"}))
+    == "⏳ [default] @platform scanned 3 of 7",
+    f"got {_notification.format_event(_Ev(3, 'heartbeat', {'note': 'scanned 3 of 7'}))!r}",
+)
+check(
+    "a heartbeat leaves the wake handoff alone",
+    _notification.wake_handoff == "" and _notification.wake_review_detail == "",
+    "a progress note must not become the synthetic wake turn's summary",
+)
+_recording = _RecordingAdapter()
+_notification.adapter = _recording
+try:
+    asyncio.run(
+        _notification._send_event(
+            _Ev(4, "heartbeat", {"note": "scanned 3 of 7"}),
+            "⏳ [default] @platform scanned 3 of 7",
+        )
+    )
+    _sent_ok = True
+except Exception as exc:  # noqa: BLE001 - that is the failure being checked
+    _sent_ok = False
+    print(f"       _send_event raised: {exc}")
+check("the real send site delivers a heartbeat", _sent_ok and len(_recording.sent) == 1)
+check(
+    "the thread metadata reaches the adapter from the subscription",
+    _recording.sent and _recording.sent[0][2] == {"thread_id": _NOTE_SUB["thread_id"]},
+    f"got {_recording.sent[0][2] if _recording.sent else None!r}",
+)
+check(
+    "the message id is tracked on the runner",
+    _NOTE_SUB["task_id"] in {k[0] for k in getattr(_runner, "_kanban_progress_messages", {})},
+    "the next tick's note would post a fresh message instead of editing this one",
+)
+check(
+    "and not on the per-delivery notification object",
+    not hasattr(_notification, "_kanban_progress_messages"),
 )
 
 # --- 3. The platform contract the fallback rests on ---------------------------
@@ -189,8 +323,10 @@ check(
     "self._patch_message(message_id" in GCHAT_SOURCE,
     "messages.patch is the API that updates a message without re-notifying",
 )
+# v2026.9.14 carries a trailing comment on the constant's line; only the value
+# ahead of it is the cap.
 _cap = [
-    int(line.split("=")[1].strip())
+    int(line.split("=", 1)[1].split("#", 1)[0].strip())
     for line in GCHAT_SOURCE.splitlines()
     if line.startswith("_MAX_TEXT_LENGTH = ")
 ]
@@ -212,7 +348,7 @@ check(
 # check. Falling back to the module's own ``deliver`` when the trailer did not
 # execute at all keeps the remaining sections reporting: a broken build is more
 # useful with every failure named than with one AttributeError traceback.
-_deliver = getattr(watchers, "_progress_deliver", deliver)
+_deliver = getattr(notifier, "_progress_deliver", deliver)
 
 print("rolling delivery:")
 

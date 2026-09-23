@@ -29,8 +29,8 @@ return value mentioned none of them:
    patch still treats ``done`` as undeliverable. See ``TERMINAL_STATUSES``.
 3. **Nobody ever re-read the comment.** Comments reach a worker two ways —
    ``build_worker_context`` folds them into the *next* worker's system prompt,
-   and ``inject_new_comments_from_env`` (``run_agent.py``) steers them into a
-   worker that is running right now. A ``done`` card has neither.
+   and ``inject_new_comments_from_env`` (``tools/kanban_tools.py``) steers them
+   into a worker that is running right now. A ``done`` card has neither.
 
 There is also a fourth thing that is true of *every* card, not just closed ones,
 and is worth saying because it is the belief that produced the sentence:

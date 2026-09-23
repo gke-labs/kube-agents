@@ -76,12 +76,34 @@ type Discoverer struct {
 	// GKEAuthScope. A field for the same reason as Describe.
 	TokenSource func(ctx context.Context) (oauth2.TokenSource, error)
 
+	// Want decides whether a profile's cluster is one this caller wants at all,
+	// from its identity alone and before anything is spent on reaching it. nil
+	// wants every cluster.
+	//
+	// A caller can drop clusters from the slice Discover returns instead, and
+	// gets a different outcome: by then the token has been minted and the GKE
+	// API has been asked where each cluster is. That costs a describe call per
+	// unwanted cluster, and — where the caller's credentials do not carry
+	// container.clusters.get in the unwanted cluster's project — turns the drop
+	// into a skip reported as a GKE permission failure, which sends an operator
+	// to grant access to a cluster the caller was going to discard. Deciding
+	// here rather than there is what makes an unwanted cluster free and silent.
+	//
+	// Not reported through OnSkip: a cluster the caller never wanted is not a
+	// cluster it failed to reach, and counting the two together would inflate
+	// the number an operator reads as "clusters I am losing coverage of".
+	Want func(id Identity) bool
+
 	// OnSkip is told about every cluster that will not be reached, with the
 	// profile it came from — or NoProfile, when the profiles directory itself
 	// could not be read. A skip is not an error return (see Discover), so this
 	// is the only channel through which "this cluster is not being watched"
 	// becomes visible. nil discards them.
 	OnSkip func(profile string, err error)
+}
+
+func (d Discoverer) want(id Identity) bool {
+	return d.Want == nil || d.Want(id)
 }
 
 func (d Discoverer) describe(ctx context.Context, id Identity) (*container.Cluster, error) {
@@ -191,6 +213,12 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 		}
 		if identity == nil {
 			continue // not a cluster profile
+		}
+		// Before the token and the describe below, which is the whole point of
+		// the field. Also before the duplicate check: two profiles claiming a
+		// cluster nobody wants is not a collision worth reporting.
+		if !d.want(*identity) {
+			continue
 		}
 		if prev, dup := seen[identity.String()]; dup {
 			d.skip(e.Name(), fmt.Errorf("cluster %s is already claimed by profile %s", identity, prev))

@@ -317,10 +317,10 @@ Agents with a user in the loop follow this file.
   Kubernetes resource; `install.sh` / `uninstall.sh` / `upgrade.sh` are front doors
   that generate `terraform.tfvars` and drive it. Do not add a second expression of an
   install step — a kubectl-applied manifest a chart template already renders, a gcloud
-  call the composition already makes. The two places manifests still exist twice on
-  purpose (`k8s-operator/config/crd` + `config/rbac` mirrored into the chart by
-  `make chart-check`, and the kustomize integration manifests kept in step with the
-  chart templates for the dev path) each have a check or a comment saying so.
+  call the composition already makes. Operator-owned YAML mirrored or derived into
+  the chart (`config/crd`, `config/rbac`, the admission policy, the generated
+  `files/footprint.yaml`, and the webhook template it compares) is held in step by
+  `make chart-check`; the dev path's kustomize manifests are the other copy.
 - **Expect an automated review after opening a PR.** Opening the pull request starts
   `kube-agents-bot`; see
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)

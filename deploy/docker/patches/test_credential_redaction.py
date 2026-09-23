@@ -270,9 +270,7 @@ def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | No
     if not isinstance(args, dict):
         return args
     if tool_name == "browser_type" and isinstance(args.get("text"), str):
-        safe_args = dict(args)
-        safe_args["text"] = redact_sensitive_text(args["text"], force=True)
-        return safe_args
+        return {**args, "text": redact_sensitive_text(args["text"], force=True)}
     return args
 
 
@@ -330,8 +328,8 @@ class ApplierTest(unittest.TestCase):
         self.assertEqual(redact.count("_kube_agents_register_patterns()"), 1)
 
         self.assertEqual(display.count("_kube_agents_redact_tool_argument"), 2)
-        self.assertIn('safe_args["text"] = redact_sensitive_text(args["text"], force=True)', display)
-        self.assertNotIn("        return safe_args\n    return args\n", display)
+        self.assertIn('return {**args, "text": redact_sensitive_text(args["text"], force=True)}', display)
+        self.assertNotIn('force=True)}\n    return args\n', display)
 
         # The prologue is main()'s first statement, after the docstring and
         # ahead of the comment that introduces upstream's first statement.

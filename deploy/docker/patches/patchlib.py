@@ -224,9 +224,9 @@ class Assignment(_Site):
     """A single-target ``NAME = ...`` located by name, at any nesting depth.
 
     Unlike :class:`Definition` and :class:`CallSite` this looks inside function
-    bodies, because the constants worth pinning are not all module-level: the
-    kind filter the kanban notifier claims events with is a local in the method
-    that uses it. The uniqueness check is what keeps that honest — a name
+    bodies, because the constants worth pinning are not all module-level: a
+    filter tuple or a mode flag a method assigns locally is as much an edit site
+    as a module constant. The uniqueness check is what keeps that honest — a name
     assigned in two places is refused rather than guessed at.
     """
 
@@ -538,8 +538,10 @@ class Patch:
                 # compile(), not ast.parse(). ast.parse accepts a ``continue``
                 # outside a loop and only the compile step rejects it, so a
                 # branch spliced one indent level out of its ``for`` would parse
-                # here and fail at import, inside the running gateway.
-                # apply_kanban_progress_lines.py inserts exactly such a branch.
+                # here and fail at import, inside the running gateway. An
+                # earlier apply_kanban_progress_lines.py inserted exactly such
+                # a branch; nothing in the directory does today, and the
+                # compile step is what keeps the next one honest.
                 compile(self.source, self.relative, "exec")
             except SyntaxError as e:
                 raise SystemExit(

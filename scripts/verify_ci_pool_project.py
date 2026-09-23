@@ -2009,8 +2009,10 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
     a run publish its ledger issue. This is the read half, and it is a different
     App with a different key. `ledger_issue_contains`
     (bench/kube_agents_bench/verifiers.py) reads the published issue back from
-    the Prow runner, needing `issues: read` and nothing else. Nothing in the
-    project implies it, and nothing else here looks at it.
+    the Prow runner, needing `issues: read`; `pull_request_opened` reads a
+    remediation pull request the same way, needing `pull_requests: read`. This
+    check covers the issues half. Nothing in the project implies it, and
+    nothing else here looks at it.
 
     kube-agents-evals-6 is why this exists. It passed every other check, was
     registered, and redded the first pull request that leased it: the agent filed

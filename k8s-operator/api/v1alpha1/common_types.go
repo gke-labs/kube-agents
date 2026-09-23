@@ -180,6 +180,11 @@ var SensitiveEnvVars = map[string]struct{}{
 // half is BusCredentialRoutes below, keyed on the audience and on the Secrets
 // the operator renders with bus credentials in them.
 //
+// A hostPath entry on those same two lists is refused by a source check too,
+// and the render drops it and every mount naming it whether or not the
+// webhook ran (gke-labs#1675). That one is not part of this pair: it guards
+// the node filesystem, not the bus credential.
+//
 // Which fixes the terms this should be read on. KSA tokens are pod-scoped and
 // the callout cannot see which container presented one, so neither a name nor
 // an audience reservation is a boundary against a hostile sidecar; it is a
@@ -758,30 +763,57 @@ type DeploymentSpec struct {
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
 	// InitContainers specifies standard Kubernetes initContainers to run before the agent starts.
+	// A volumeMounts entry naming a reserved volume is refused at admission, and
+	// dropped from the render on an install running the A2A surface.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	InitContainers []corev1.Container `json:"initContainers,omitempty"`
 
 	// Sidecars specifies standard Kubernetes sidecar/application containers to run alongside the agent.
+	// A volumeMounts entry naming a reserved volume is refused at admission, and
+	// dropped from the render on an install running the A2A surface.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	Sidecars []corev1.Container `json:"sidecars,omitempty"`
 
 	// SidecarVolumes specifies custom volumes to mount for the sidecar containers.
+	// An entry is refused at admission if it takes a reserved volume name, or if
+	// its source is one of the routes to the agent's A2A bus credentials: a
+	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
+	// to one of the Secrets the operator renders bus credentials into
+	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys),
+	// as either a secret volume or a projected secret source. The refusal is on
+	// the name and the shape of the source, not on what a given Secret happens to
+	// hold at the time. Reading those Secrets through env is not refused here. On
+	// an install running the A2A surface the same entries are dropped from the
+	// render as well, which is the half that holds when admission does not run:
+	// a default chart install does not register the webhooks at all
+	// (operator.webhooks.enabled=false), and one that does registers them at
+	// failurePolicy Ignore by default.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	SidecarVolumes []corev1.Volume `json:"sidecarVolumes,omitempty"`
 
 	// ExtraVolumes specifies custom volumes to mount for the main container.
+	// The same reserved names and reserved sources as SidecarVolumes are refused
+	// at admission -- a ServiceAccount token projection for the "a2a-bus"
+	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config
+	// or <agent>-a2a-callout-keys -- and dropped from the render on an install
+	// running the A2A surface.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	ExtraVolumes []corev1.Volume `json:"extraVolumes,omitempty"`
 
 	// ExtraVolumeMounts specifies custom volume mounts for the main container.
+	// Appended to platform-agent and platform-agent-dashboard both, so an entry
+	// naming a reserved volume is refused at admission, and dropped from the
+	// render on an install running the A2A surface. The render drops one more
+	// shape admission does not: an entry naming a user volume that was itself
+	// dropped for the credential its source carries.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
@@ -1061,7 +1093,9 @@ type SecuritySpec struct {
 	//     git wrappers, which go through the broker;
 	//   - the metadata lookup in cluster_agent_reconcile.py, which finds that
 	//     script's project id. It fails soft after a five-second timeout and
-	//     falls back to a broker gcloud call; set RECONCILE_PROJECT to skip it.
+	//     falls back to a broker gcloud call. RECONCILE_PROJECT, the old override, is
+	//     pinned empty in the managed .env (a project other than the pod's belongs in
+	//     spec.scope.projects, the management project still has to resolve).
 	//
 	// Those would not be accidental casualties. A headless browser with
 	// unrestricted egress is the exfiltration path, so the capabilities this

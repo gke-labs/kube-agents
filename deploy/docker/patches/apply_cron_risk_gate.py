@@ -3,12 +3,16 @@
 
 Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``.
 Must run AFTER ``apply_cron_tirith_scan.py``: anchors into ``tools/approval.py``
-where ``apply_cron_tirith_scan.py`` introduced ``_cron_mode = _get_cron_approval_mode()``.
+where ``apply_cron_tirith_scan.py`` introduced
+``_cron_mode = approval_context._get_cron_approval_mode()``.
 
-Two edits to ``tools/approval.py``:
+Two edits to ``tools/approval.py``, derived against v2026.9.14:
 1. In ``check_all_command_guards``: enforces read-only command policy for high-risk
-   cron jobs and runs content checks (terminal escapes and lookalike TLDs).
-2. In ``check_execute_code_guard``: unconditionally refuses execute_code on cron runs.
+   cron jobs and runs content checks (terminal escapes and lookalike TLDs), ahead
+   of the Tirith scan and of upstream's ``_unattended_deny`` loop, in every mode.
+2. In ``check_execute_code_guard``: unconditionally refuses execute_code on cron
+   runs, ahead of upstream's ``_unattended_contexts()`` loop that would approve it
+   under ``cron_mode: approve``.
 
 Usage::
 
@@ -23,14 +27,16 @@ from pathlib import Path
 import patchlib
 
 # --- tools/approval.py: check_all_command_guards ----------------------------
+# Both lines are text apply_cron_tirith_scan.py inserted; upstream has no
+# ``_cron_mode`` local of its own at v2026.9.14.
 COMMAND_CRON_ARM = (
     "        if _is_cron_approval_context():\n"
-    "            _cron_mode = _get_cron_approval_mode()\n"
+    "            _cron_mode = approval_context._get_cron_approval_mode()\n"
 )
 
 COMMAND_CRON_ARM_PATCHED = (
     "        if _is_cron_approval_context():\n"
-    "            _cron_mode = _get_cron_approval_mode()\n"
+    "            _cron_mode = approval_context._get_cron_approval_mode()\n"
     "            # kube-agents patch: see tools/cron_risk_gate.py\n"
     "            from tools.cron_risk_gate import (\n"
     "                cron_command_policy_block,\n"
@@ -47,21 +53,27 @@ COMMAND_CRON_ARM_PATCHED = (
 )
 
 # --- tools/approval.py: check_execute_code_guard ----------------------------
+# Upstream's per-context loop (55248a133f): the first active unattended context
+# either denies or approves the whole script from its mode, so under
+# ``cron_mode: approve`` execute_code runs on cron. ``_run_approval_gate`` has a
+# loop over ``_unattended_contexts()`` too, but four spaces deeper and assigning
+# a message rather than returning ``_denied(``, so this spelling occurs once.
 EXECUTE_CODE_CRON_ARM = (
-    "    # Cron: no user is present to approve arbitrary code.\n"
-    "    if _is_cron_approval_context():\n"
-    '        if _get_cron_approval_mode() == "deny":\n'
+    "    for ctx in _unattended_contexts():\n"
+    '        if ctx.mode() == "deny":\n'
+    "            return _denied(\n"
 )
 
 EXECUTE_CODE_CRON_ARM_PATCHED = (
-    "    # Cron: no user is present to approve arbitrary code.\n"
+    "    # kube-agents patch: block execute_code unconditionally on cron runs (THREAT-002).\n"
     "    if _is_cron_approval_context():\n"
-    "        # kube-agents patch: block execute_code unconditionally on cron runs (THREAT-002).\n"
     "        from tools.cron_risk_gate import cron_execute_code_block\n"
     "        _exec_block = cron_execute_code_block()\n"
     "        if _exec_block is not None:\n"
     "            return _exec_block\n"
-    '        if _get_cron_approval_mode() == "deny":\n'
+    "    for ctx in _unattended_contexts():\n"
+    '        if ctx.mode() == "deny":\n'
+    "            return _denied(\n"
 )
 
 PATCHES = (

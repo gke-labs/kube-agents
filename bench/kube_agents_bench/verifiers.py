@@ -14,17 +14,18 @@
 
 """Leaf verifiers this repository adds to devops-bench's own.
 
-Three of them answer the half of a task's exact checks that cluster state
+Four of them answer the half of a task's exact checks that cluster state
 cannot: did the *report* name the thing we planted, did the agent *call* the
-tools it claims to have used, and — for the fleet audits, whose SOPs
-deliberately keep the chat reply to one line — does the *ledger issue the run
-published* carry the finding. All three read the per-run stash in
-:mod:`kube_agents_bench.transcript`, and all three fail closed: an empty
+tools it claims to have used, does the *ledger issue the run published* carry
+the finding — for the fleet audits, whose SOPs deliberately keep the chat reply
+to one line — and is the *pull request* the reply links one this run opened
+rather than an earlier one. All four read the per-run stash in
+:mod:`kube_agents_bench.transcript`, and all four fail closed: an empty
 stash is ``status="error"`` — the check could not be evaluated — never a pass
 or a fail, so ``VerificationCoverage`` drops below 1.0 and the gate catches
 it.
 
-The fourth, ``fleet_resource_property``, does read cluster state, and exists
+The fifth, ``fleet_resource_property``, does read cluster state, and exists
 because upstream's ``resource_property`` reads the WRONG cluster and cannot
 tell a missing fixture from a missing cluster. See
 :class:`FleetResourcePropertyVerifier`.
@@ -69,6 +70,7 @@ from kube_agents_bench.fleet import (
 __all__ = [
     "FleetResourcePropertyVerifier",
     "LedgerIssueContainsVerifier",
+    "PullRequestOpenedVerifier",
     "ReportContainsVerifier",
     "ToolCalledVerifier",
     "WorkerCommandsVerifier",
@@ -203,15 +205,17 @@ class ReportContainsVerifier(BaseVerifier):
 class ToolCalledVerifier(BaseVerifier):
     """Count trajectory entries whose tool name is in ``tool_names``.
 
-    THE TRAJECTORY IS THE ROUTER'S, NOT THE FLEET'S. By this harness's
-    design, ``result.trajectory`` holds only the delegating turn's calls:
-    poll-turn calls are the harness's own bookkeeping and are kept out
-    (``_fold_status_turn``), and a delegated worker's calls never reach it
-    at all. This verifier can therefore assert what the ROUTER did
-    (``kanban_create`` is the router's own call) and nothing about what a
-    worker did on a cluster — a mutation safeguard built on it would be
-    blind to the very calls it fears. Use a cluster-state check
-    (``resource_property``) for those.
+    THE COUNT IS THE ROUTER'S, NOT THE FLEET'S. By this harness's
+    design, this verifier counts only the delegating turn's calls: poll-turn
+    calls are the harness's own bookkeeping and are kept out of the
+    trajectory (``_fold_status_turn``), and the delegated workers' calls,
+    which the harness appends after settlement tagged with the ``agent``
+    that made them (``worker_trajectory``), are skipped here so the count
+    keeps meaning what it always has. This verifier can therefore assert
+    what the ROUTER did (``kanban_create`` is the router's own call) and
+    nothing about what a worker did on a cluster — a mutation safeguard
+    built on it would be blind to the very calls it fears. Use a
+    cluster-state check (``resource_property``) for those.
 
     Passes when at least ``minimum_calls`` matching calls were made. Wrapped
     in a ``none`` compound, it is the safeguard shape "this tool was never
@@ -245,6 +249,7 @@ class ToolCalledVerifier(BaseVerifier):
             entry
             for entry in snap.trajectory
             if isinstance(entry, dict)
+            and not entry.get("agent")
             and entry.get("name") in wanted
             and not (self.require_success and entry.get("status") == "error")
         ]
@@ -292,6 +297,13 @@ LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 # which every audit report also links and which is not the ledger.
 _ISSUE_URL_RE = re.compile(
     r"https://github\.com/([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)/issues/(\d+)",
+    re.IGNORECASE,
+)
+
+# The other half of the pair above: pull requests only. A remediation case is
+# graded on the PR it opened, and the ledger issue beside it is not that.
+_PULL_URL_RE = re.compile(
+    r"https://github\.com/([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)/pull/(\d+)",
     re.IGNORECASE,
 )
 
@@ -343,6 +355,23 @@ _NO_RUN_CLOCK_REASON = (
     "run's and refuses to grade it"
 )
 
+# Bound on pull request URLs resolved from one report, for the reason
+# _MAX_LEDGER_CANDIDATES exists: a remediation reply links the PR it opened,
+# and a report naming a dozen is one to read by hand.
+_MAX_PR_CANDIDATES = 8
+
+_NO_PR_RUN_CLOCK_REASON = (
+    "the run's transcript carries no start time (TranscriptSnapshot.started_at "
+    "is unset), so this check cannot tell a pull request this run opened from "
+    "one left behind by a previous run, and refuses to grade it"
+)
+
+_NO_PR_URL_REASON = (
+    "the run's report names no github.com pull request URL, so no fix was "
+    "proposed (or the agent did not report the PR it opened); a remediation "
+    "reply must carry the pull request URL in full"
+)
+
 _NO_TOKEN_REASON = (
     "no GitHub read credential in the environment: set one of "
     f"{', '.join(LEDGER_TOKEN_ENV_VARS)} to a token that can read issues on "
@@ -370,7 +399,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     """Pattern checks against the terminal commands the delegated workers ran.
 
     The one check that sees the ROUTE a worker took rather than the answer it
-    gave. ``tool_called`` cannot: a worker's calls never reach the trajectory.
+    gave. ``tool_called`` cannot: it skips the worker entries the harness
+    appends to the trajectory, by design (see its docstring).
     The harness reads each delegated card's worker log before purging it and
     stashes every ``💻 $`` line as a command (``transcript.worker_commands``);
     this verifier matches Python regular expressions against those strings,
@@ -572,8 +602,9 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     prints ``"issue": null`` until a ledger exists (only ``finish`` ever calls
     ``gh issue create``), the audit's ``.lease`` marker on disk records the
     repo and the audit id but no issue number, and the audit runs in a
-    delegated worker whose tool calls never reach ``snap.trajectory``. What
-    does cross back is ``finish``'s ``issue_url``, which the SOP requires
+    delegated worker whose calls reach ``snap.trajectory`` only as clipped,
+    tagged entries that no verifier reads for content. What does cross back
+    is ``finish``'s ``issue_url``, which the SOP requires
     every non-silent report to carry in full — and an on-demand run, which is
     what an eval task is, is never silent. The URL is treated as a POINTER and
     never as evidence: everything asserted below comes from what GitHub
@@ -901,6 +932,236 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             f"{surface}, generated at {generated_at.isoformat()} by this run, "
             "contains " + ", ".join(satisfied),
             raw=raw,
+        )
+
+
+@VERIFIERS.register("pull_request_opened")
+class PullRequestOpenedVerifier(BaseVerifier):
+    """A remediation pull request THIS run opened, resolved through GitHub.
+
+    WHY THIS EXISTS. The remediation cases used to grade on a
+    ``report_contains`` over ``["github.com/", "/pull/"]``, which asks only
+    that the reply hold a URL-shaped string. Nothing is fetched, so an invented
+    link passes; and nothing sweeps the eval GitOps repositories, so a pull
+    request an earlier rep opened is still there and still linkable. Repeats of
+    a case were being graded against a pile of their own earlier output (#1755).
+
+    WHAT IT ASSERTS. The reply names a github.com pull request URL; GitHub
+    resolves it; the number is a pull request and not an issue; it lives under
+    ``owner`` when one is set; it is not closed unmerged; and it was written --
+    created or updated -- at or after this run started, less
+    ``max_clock_skew_sec``. Updating counts because
+    the skill reuses a branch and edits the pull request already open on it --
+    which also means the stamp proves only that the pull request was written to
+    during the run, by anyone. One surviving candidate is enough — a reply may
+    link the ticket it came from beside the fix — and a candidate GitHub cannot
+    answer for ends the check only when no other candidate passes.
+
+    WHICH ENDPOINT. ``/issues/{n}`` first: a pull request is an issue to that
+    API, the response carries ``created_at``, and it is the endpoint the read
+    credential is known to reach (``issues: read`` — see
+    :class:`LedgerIssueContainsVerifier`). ``/pulls/{n}`` is tried only when
+    that answers 401/403/404, which separates a number that is not there from a
+    credential that cannot see pull requests. Denied by both is
+    ``status="error"`` naming the permission to add, never a fail: an
+    unreadable API is the absence of an observation. 404 on both is either the
+    number or a repository this credential cannot see; nothing in the API
+    separates them, so both are graded as absence.
+    """
+
+    type: Literal["pull_request_opened"]
+    # The organisation the pull request must sit under, "" for any. The eval
+    # GitOps repositories are `gke-agentic/<project>-infra`, so the org half is
+    # a fair exact match across every pool project and breaks loudly if the org
+    # moves.
+    owner: str = ""
+    # Tolerance between GitHub's creation stamp and the harness's run-start
+    # clock, which are two different machines. Small on purpose: every second
+    # of it is a second of a previous rep's pull request reading as this one's.
+    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    def _resolve(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[dict | None, str | None]:
+        """``(payload, None)`` when resolved, ``(None, reason)`` when unevaluable.
+
+        ``(None, None)`` is the third answer: no such pull request, which is a
+        rejected candidate rather than a broken check. Only a credential the
+        API refuses is a broken check -- that is a fault of ours, it is the
+        same for every repetition, and no grade drawn from it would mean
+        anything. Everything else the agent chose, so it is graded.
+        """
+        base = f"https://api.github.com/repos/{owner}/{repo}"
+        first, payload = _http_get_json(f"{base}/issues/{number}", token, budget)
+        status_code = first
+        if first in (401, 403, 404):
+            status_code, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
+        if 401 in (first, status_code):
+            # 401 is the credential itself, not its scopes: an installation
+            # token lasts an hour, and telling the reader to widen a permission
+            # sends them to the App's settings for a fault that is in the mint.
+            return None, (
+                f"GitHub answered 401 for {owner}/{repo}#{number}: the token in "
+                f"{LEDGER_TOKEN_ENV_VARS[0]} is not valid — an installation token "
+                "expires an hour after it is minted — so this check could not be "
+                "evaluated"
+            )
+        if status_code == 200 and isinstance(payload, dict):
+            return payload, None
+        if first == 403 and status_code == 403:
+            return None, (
+                f"GitHub denied {owner}/{repo}#{number} on both endpoints: the token "
+                f"behind {LEDGER_TOKEN_ENV_VARS[0]} can reach that repository but "
+                "read neither its issues nor its pull requests — add "
+                "`pull_requests: read` to the installation — so this check could "
+                "not be evaluated"
+            )
+        if status_code in (403, 404):
+            # Absence, and graded as such. A 403 from one endpoint proves the
+            # repository is reachable, so the other endpoint's 404 is the
+            # number's own. 404 from both is either the number or a repository
+            # this credential cannot see -- and an onboarding gap belongs to
+            # `scripts/verify_ci_pool_project.py`, which checks installation
+            # membership, not to a grading check that would have to red every
+            # open pull request to report it.
+            return None, None
+        return None, (
+            f"unexpected GitHub response {status_code} for "
+            f"{owner}/{repo}#{number}; this check could not be evaluated"
+        )
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+
+        def done(
+            success: bool,
+            reason: str,
+            *,
+            status: str | None = None,
+            raw: dict | None = None,
+        ) -> VerificationResult:
+            return VerificationResult(
+                success=success,
+                status=status,
+                elapsed_time=time.monotonic() - start,
+                reason=reason,
+                raw=raw,
+            )
+
+        snap = transcript.get()
+        if snap is None:
+            return done(False, _NO_TRANSCRIPT_REASON, status="error")
+        if not snap.started_at:
+            return done(False, _NO_PR_RUN_CLOCK_REASON, status="error")
+        token = next(
+            (v for v in (os.environ.get(n) for n in LEDGER_TOKEN_ENV_VARS) if v), None
+        )
+        if not token:
+            return done(False, _NO_TOKEN_REASON, status="error")
+
+        seen: list[tuple[str, str, int]] = []
+        for owner, repo, number in _PULL_URL_RE.findall(snap.final_message):
+            key = (owner, repo, int(number))
+            if key not in seen:
+                seen.append(key)
+        if not seen:
+            return done(False, _NO_PR_URL_REASON)
+        if len(seen) > _MAX_PR_CANDIDATES:
+            return done(
+                False,
+                f"the run's report names {len(seen)} distinct pull request URLs; a "
+                f"remediation proposes one fix, so more than {_MAX_PR_CANDIDATES} is "
+                "not a set of candidates worth resolving",
+            )
+
+        started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
+        budget = single_call_timeout(timeout_sec)
+        rejected: list[str] = []
+        # A candidate the API cannot answer for only ends the check if nothing
+        # else resolves. An agent that mistypes a repository slug beside the
+        # real URL would otherwise error, and an error is rung 2, which reds the
+        # eval job for every open pull request.
+        unresolved: list[str] = []
+        for owner, repo, number in seen:
+            slug = f"{owner}/{repo}#{number}"
+            if self.owner and owner.lower() != self.owner.lower():
+                rejected.append(f"{slug}: not under {self.owner}")
+                continue
+            try:
+                payload, unevaluable = self._resolve(owner, repo, number, token, budget)
+            except OSError as exc:
+                unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                continue
+            if payload is None:
+                if unevaluable is None:
+                    rejected.append(f"{slug}: no such pull request (404)")
+                else:
+                    unresolved.append(unevaluable)
+                continue
+            # `pull_request` is how the issues endpoint marks one; `head` is
+            # what the pulls endpoint returns instead. Neither means the URL
+            # said /pull/ over a number that is a plain issue.
+            if not payload.get("pull_request") and "head" not in payload:
+                rejected.append(f"{slug}: that number is an issue, not a pull request")
+                continue
+            merged_at = payload.get("merged_at") or (
+                payload.get("pull_request") or {}
+            ).get("merged_at")
+            if str(payload.get("state") or "").lower() == "closed" and not merged_at:
+                # Closing moves `updated_at`, so without this a run that closed
+                # a leftover -- or its own pull request -- would read as one
+                # that wrote a fix. The objective is that the fix went out.
+                rejected.append(f"{slug}: closed without being merged")
+                continue
+            created = _parse_github_time(payload.get("created_at"))
+            if created is None:
+                rejected.append(f"{slug}: GitHub returned no readable created_at")
+                continue
+            # Creation is not the only way a run owns a pull request: the
+            # submit-suggestion skill derives the branch from the change, so a
+            # later rep pushes onto the branch the first one used, `gh pr
+            # create` answers "already exists", and the skill edits that pull
+            # request and returns its URL. That work lands in `updated_at`
+            # alone. The stamp moves on any write by anyone, so a rep that only
+            # comments on a leftover passes too; the head commit would separate
+            # the two and the ledger App cannot read it. A rep that resubmits
+            # byte-identical content writes nothing at all -- the skill raises
+            # before the push -- so a correct rep lands here too, which is why
+            # the reason names both readings. Sweeping the GitOps repository
+            # between reps (#1755 item 2) is what removes leftovers.
+            updated = _parse_github_time(payload.get("updated_at"))
+            touched = updated if updated and updated > created else created
+            age = (started - touched).total_seconds()
+            if age > self.max_clock_skew_sec:
+                rejected.append(
+                    f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
+                    f"BEFORE this run started ({started.isoformat()}) — a leftover "
+                    "an earlier run opened, which this run either quoted or "
+                    "resubmitted unchanged"
+                )
+                continue
+            return done(
+                True,
+                f"{slug} was {'opened' if touched == created else 'updated'} at "
+                f"{touched.isoformat()}, during this run",
+                raw={
+                    "pull_request": slug,
+                    "created_at": created.isoformat(),
+                    "updated_at": updated.isoformat() if updated else None,
+                },
+            )
+
+        if unresolved:
+            return done(
+                False,
+                "no pull request URL in the report resolved: " + "; ".join(unresolved)
+                + (f"; also rejected: {'; '.join(rejected)}" if rejected else ""),
+                status="error",
+            )
+        return done(
+            False,
+            "none of the pull request URLs the report names is one this run opened: "
+            + "; ".join(rejected),
         )
 
 

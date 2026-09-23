@@ -14,6 +14,15 @@
         }
       }
     },
+    "quotaPreflight": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": ["boolean", "null"]
+        }
+      }
+    },
     "global": {
       "type": "object",
       "additionalProperties": false,
@@ -145,6 +154,10 @@
         },
         "modelDefaultName": {
           "type": "string"
+        },
+        "maxTokens": {
+          "type": "integer",
+          "minimum": 0
         },
         "vertex": {
           "type": "object",

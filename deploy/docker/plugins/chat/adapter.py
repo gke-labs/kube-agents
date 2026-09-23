@@ -3,7 +3,7 @@
 Installed at ``/opt/hermes/plugins/platforms/chat/`` so Hermes discovers it as a
 bundled platform plugin. Nothing in the Hermes tree is edited: the scheduler
 already routes ``deliver=<name>`` through the platform registry, and
-``cron/scheduler.py::_plugin_cron_env_var`` says so in its own words —
+``cron/scheduler_delivery.py::_plugin_cron_env_var`` says so in its own words —
 plugins that set ``cron_deliver_env_var`` on their ``PlatformEntry`` "get cron
 delivery support without editing this module".
 
@@ -115,7 +115,7 @@ _DETAIL_MAX_CHARS = 200
 #: the scheduler's ``all`` expands over the platforms it finds set. This plugin
 #: reads the same variables and nothing else, so it can under-report a sibling
 #: (a duplicate) but never claim one the scheduler lacks, without importing
-#: anything from ``cron.scheduler``.
+#: anything from ``cron.scheduler_delivery``.
 _HOME_CHANNEL_SUFFIX = "_HOME_CHANNEL"
 
 #: Where a cron child's profile lives when ``HERMES_HOME`` is unset, and the
@@ -235,7 +235,7 @@ def sibling_delivery_targets(job_id: str) -> list[str]:
     # the duplicate copy this function exists to subtract.
     text = ",".join(str(entry) for entry in raw) if isinstance(raw, list) else str(raw)
     # Split the way the scheduler does and no other way. It is
-    # `cron/scheduler.py::_resolve_delivery_targets`, and it splits on `,`
+    # `cron/scheduler_delivery.py::_resolve_delivery_targets`, and it splits on `,`
     # alone. Accepting `;` as well made this the looser of the two parsers,
     # which is the direction the docstring above says never to err in:
     # `deliver: "chat,slack;x"` gave the scheduler one part it cannot resolve,

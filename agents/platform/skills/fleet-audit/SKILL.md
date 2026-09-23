@@ -191,7 +191,9 @@ it again; you re-ran its check on that cluster, saw it gone, and say so under
 it is a posture now covered by a declaration and sits under `declared`; or you did not run that
 check there and your `checks_run` does not claim you did. A run whose
 `checks_run` says the check ran and whose document neither reports nor explains the finding is
-**held** — see [The clean run](#the-clean-run). Empty when there is no open ledger or its body could
+**held** — see [The clean run](#the-clean-run). On a stream that passes `--manifest-file` there is
+a fifth ending for a finding the collector still emits: `resolved_because` does not release it, and
+only the collector no longer emitting it or a `declared` entry does. Empty when there is no open ledger or its body could
 not be read (`start` says so on stderr).
 
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
@@ -298,20 +300,34 @@ All three exit 2 in directory mode, where the clone already holds the file.
 ./skills/fleet-audit/scripts/audit_report.py finish \
   --audit <audit-id> \
   --findings-file <findings_path> \
-  [--repo "<owner>/<repo>"]
+  [--repo "<owner>/<repo>"] \
+  [--manifest-file <path> | --no-collector-manifest "<why>"]
 ```
+
+The last pair is optional and belongs to a stream whose SOP runs a collector (the repository's
+collector-manifest design says what the manifest holds): `--manifest-file` names the manifest the
+collector wrote and `--no-collector-manifest` publishes without one, reporting the reason as a
+coverage gap. An SOP that mentions neither runs `finish` without them, exactly as before.
+
+A stream with a collector runs it before Step 2's inspection, not after: the SOP names the script
+and the path to write its manifest to, the manifest's `commands` are that cluster's `checks_run`
+and its `candidates` are the findings the collector vouches for, and Step 3 passes the same file as
+`--manifest-file`. Today that is the drift stream — `governance/fleet_consistency_drift_sop.md` §4
+says how to read its manifest and what is still yours to write.
 
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line with twelve fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
+JSON line — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
 `partial`, `coverage_gaps`, `silent_ok`, `declared`, the number of postures a repository
 declaration kept off the ledger (it never decides silence), `postures_withheld`, the ids of the
 posture findings `finish` held back because the document recorded no complete declared-intent
 search (empty everywhere but on a declaring stream that skipped the step; see
 [`declared_intent_searched`](#declared_intent_searched)), and `unaccounted`, the ids of the previous
 findings a clean run was refused its close over (empty on every other outcome; see
-[The clean run](#the-clean-run)):
+[The clean run](#the-clean-run)). With `--manifest-file` the line also carries
+`unpublished_candidates`, `wholly_unpublished_checks` and `uncorroborated_findings` — which are
+absent on every other run:
 
 - `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
   — the stream had no open ledger.
@@ -332,19 +348,28 @@ the directory you happen to be standing in, so "the manifest is missing" is a fi
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.
 
 Exit 0 means published. **Exit 2 means the run was rejected before publishing anything** — fix what
-the message names and re-run; never delete the finding that tripped it. Three things reach exit 2:
-the document failed a field rule, the file named by `--findings-file` is missing or is not valid
-JSON, or `--audit` is not one of the registered ids above. Exit 1 is fatal and means something else
-broke.
+the message names and re-run; never delete the finding that tripped it. What reaches exit 2: the
+document failed a field rule, the file named by `--findings-file` is missing or is not valid JSON,
+`--audit` is not one of the registered ids above, the document contradicts the collector manifest
+named by `--manifest-file`, that manifest is missing or malformed, `--manifest-file` was given an
+empty path, or `--no-collector-manifest` was given a blank reason. A manifest that finished before
+this run's `start` opened reaches exit 2 too: the collector writes to a fixed path that is not
+scrubbed between runs, so a run whose collector never ran finds the previous one's manifest sitting
+there, and cross-checking against a week-old reading of the fleet is worse than cross-checking
+against nothing. Re-run the collector. Exit 1 is fatal and means
+something else broke.
 
 ### Partial coverage
 
-`partial` is `true` exactly when the run could not speak for the whole fleet: any entry in
-`scope.skipped`, any cluster carrying a `limitations` note, any cluster whose `checks_run` is
-short of the checks that _apply_ to it, or — on a stream with a declared-intent step — posture
-checks that ran without a complete search record ([`declared_intent_searched`](#declared_intent_searched)).
-`coverage_gaps` says which, and why — so `partial` is `true` if and only if `coverage_gaps` is
-non-empty, and you can report from either.
+`partial` is `true` exactly when the run could not speak for the whole fleet. Four of the six
+sources are in the document: any entry in `scope.skipped`, any cluster carrying a `limitations`
+note, any cluster whose `checks_run` is short of the checks that _apply_ to it, or — on a stream
+with a declared-intent step — posture checks that ran without a complete search record
+([`declared_intent_searched`](#declared_intent_searched)). The other two belong to the run rather
+than to the document, so a document that reads as complete can still produce them: a collector
+manifest waived with `--no-collector-manifest`, whose reason becomes the gap, and a previous ledger
+body `finish` could not read and therefore left as it was. `coverage_gaps` says which, and why — so
+`partial` is `true` if and only if `coverage_gaps` is non-empty, and you can report from either.
 
 A check the cluster's shape rules out is not a gap. Declaring it in that cluster's
 `checks_not_applicable` (below) takes it out of the denominator, so a cluster that ran everything
@@ -361,9 +386,11 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
 
 - reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
 - closes **no** remediation pull request as stale, so a fix survives to the next complete run;
-- does **not** close the ledger, even with zero findings — `status` is still `CLEAN`, but the issue
-  stays open and gains a comment naming the gaps. The stream self-heals the day the fleet is fully
-  readable again.
+- does **not** close the ledger, even with zero findings — the issue stays open and gains a comment
+  naming the gaps. `status` is `CLEAN` where the run accounted for every finding the previous
+  ledger held, and `HELD` where it did not, which is a separate refusal that a gap neither causes
+  nor prevents (see [The clean run](#the-clean-run)). The stream self-heals the day the fleet is
+  fully readable again.
 
 A partial run is never `[SILENT]` — `finish` returns `silent_ok: false` for it. Report the issue URL
 and say which clusters were not covered. See [The clean run](#the-clean-run) for the full rule.
@@ -829,8 +856,9 @@ the record, and `finish` reports the count as `declared`.
 A pull request is opened for a finding only when its remediation is a `manifest` — there is nothing
 to put in a diff otherwise. Three paths lead there:
 
-- **Auto-promotion.** A finding that is `critical`, is a `manifest`, and has no live pull request on
-  its branch is promoted automatically by `finish` — **at most five per run**. The surplus is named
+- **Auto-promotion.** A finding that is `critical`, is a `manifest`, has no live pull request on
+  its branch — and, on a run that passed `--manifest-file`, is neither uncorroborated nor
+  triage-marked by the collector — is promoted automatically by `finish` — **at most five per run**. The surplus is named
   in the ledger as awaiting `/remediate`, so nothing is silently dropped. "Live" excludes a pull
   request the harness itself closed as stale (that one is re-openable) and includes one a human
   closed or merged (those are not).
@@ -852,18 +880,26 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
   failed and the next run will retry. "3 requests processed" is indistinguishable from "3 requests
   silently dropped".
 - Refused — one reply saying why, for a commenter without write access, a `/remediate` naming a
-  finding that is not in the current document, one naming a non-`manifest` finding, or one naming
-  a posture a repository declaration covers, the model's entry or the harness's: the reply names
-  the declaring `repo:path`, on the findings branch and the clean branch alike, since neither
-  "typo" nor "no longer reproduces" is true of it. Removing the declaration brings the finding
-  back, and a new request then opens it.
+  finding that is not in the current document (unless it is held by the collector — deferred,
+  below), one naming a non-`manifest` finding, or one naming a posture a repository declaration
+  covers, the model's entry or the harness's: the reply names the declaring `repo:path`, on the
+  findings branch and the clean branch alike, since neither "typo" nor "no longer reproduces" is
+  true of it. Removing the declaration brings the finding back, and a new request then opens it.
 - **Deferred**, when the target is a posture this run withheld for want of a declared-intent search
-  ([`declared_intent_searched`](#declared_intent_searched)) — on the findings branch and on the clean
-  branch alike, since "no longer reproduces" would be false there. One reply says the request is on
-  hold and why, under its own `audit-deferred` marker, which nothing reads as an answer: the same
-  comment is acted on, and acknowledged, by the first run that records the search and still sees
-  the posture. The refused marker is never written for it, so the requester is not told their id was
-  a typo and does not have to ask again.
+  ([`declared_intent_searched`](#declared_intent_searched)), or an id a collector manifest holds
+  that the document does not carry — this run's manifest, or a previous run's when this run passed
+  none and the ledger still carries the row. Two wordings there: an id the ledger's hidden block carries is held until the collector
+  stops emitting it or a `declared` entry covers it, the model's or the harness's; an id the ledger
+  never carried is named only on
+  the run's JSON line as an unpublished candidate. Either way there is no finding to open a pull
+  request from — on the findings branch and on the clean branch alike, since "no longer reproduces"
+  would be false there. A run that could not read the ledger body and passed no manifest cannot
+  know which ids are held, so it answers no `/remediate` at all; the next run that can read the
+  body answers them. One reply says the request is on hold and why, under its own
+  `audit-deferred` marker, which nothing reads as an answer: the same comment is acted on, and
+  acknowledged, by the first run that records the search and still sees the posture, or whose
+  document carries the held finding again. The refused marker is never written for it, so the
+  requester is not told their id was a typo and does not have to ask again.
 - Refused **on syntax**, likewise once, because a command the parser will not honour is a person
   waiting for a fix that is never coming. `/remediate` is only read at the start of its own line outside
   block quotes, so one written mid-sentence or rendered inside a block quote / lazy continuation gets a reply
@@ -898,7 +934,7 @@ per id:
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py remediate --audit <audit-id> \
   --findings-file <findings_path> --finding <id> [--finding <id> …] [--issue <n>] \
-  [--repo "<owner>/<repo>"]
+  [--repo "<owner>/<repo>"] [--manifest-file <path>]
 ```
 
 **It opens exactly what you name, and nothing else.** The auto-promotion sweep does not ride along:
@@ -923,10 +959,11 @@ other targets still open — `/remediate all` expands to every **manifest-remedi
 document, and failing the batch over one unwritten file would answer a request for many fixes with
 none. Say which were refused when you acknowledge the command.
 
-Exit 2 means nothing was published, for one of three reasons — read the message before reporting
-which: a named id is not in the document at all, a named target is not a `manifest`, or _every_
-named target was refused because its file is not readable inside the workspace. The first two are fixed
-by dropping the bad id and asking again; only the third is about writing manifests.
+Exit 2 means nothing was published — read the message before reporting why: a named id is not in
+the document at all; a named id is held by the collector (given the same `--manifest-file` `finish`
+had, the message says so instead of "not in the document"); a named target is not a `manifest`; or
+_every_ named target was refused because its file is not readable inside the workspace. The first
+three are fixed by dropping the bad id and asking again; only the last is about writing manifests.
 
 **Findings whose remediation paths intersect share one pull request.** They have to: separate
 branches touching the same file conflict on merge. Promoting any member promotes the whole group —
@@ -1008,8 +1045,10 @@ a comment naming each such finding and the check that ran (plus any `resolved_be
 declared postures the document does carry), no remediation pull request is closed, and `finish` returns
 `status: "HELD"` with `resolved: 0`, `silent_ok: false` and the ids in `unaccounted`. Report it as
 you would a partial run — the ledger URL and the held ids — and on the next run either report the
-finding or, if you re-ran its check and saw the object gone, say so in `resolved_because`. On
-2026-09-16 a compliance run closed its ledger as clean over a live cluster-admin binding its own
+finding or, if you re-ran its check and saw the object gone, say so in `resolved_because`. On a
+stream that passes `--manifest-file`, a finding the collector still emits a candidate for is held
+whatever `resolved_because` says; only the collector no longer emitting it, or a `declared` entry,
+releases it. On 2026-09-16 a compliance run closed its ledger as clean over a live cluster-admin binding its own
 `checks_run` claimed to have checked; this is the guard that turns that close into a held ledger. A
 check declared `checks_not_applicable` on that cluster did not run there and holds nothing — the
 excuse is published in the evidence table, where a reviewer can weigh it.
@@ -1022,8 +1061,9 @@ not earned — on 2026-08-03 a run with two partially-covered clusters answered 
 ledger URL never reached the operator who had asked for it.
 
 > **`silent_ok` is `true` only when the run moved nothing an operator needs to hear about:** nothing
-> new, nothing resolved, no coverage gap, no held close, and no remediation pull request opened or
-> closed.
+> new, nothing resolved, no coverage gap, no held close, no remediation pull request opened or
+> closed, and — on a stream that passes `--manifest-file` — no collector candidate the document
+> dropped.
 
 Two rules follow, and they are the whole rule:
 
@@ -1034,7 +1074,7 @@ Two rules follow, and they are the whole rule:
   kanban card or straight from chat, they are waiting on the answer and
   `[SILENT]` throws it away. Report the outcome and the ledger URL whatever the flag says.
 
-Three zero-finding runs come back `silent_ok: false`, and all of them matter:
+A zero-finding run comes back `silent_ok: false` in each of these cases, and all of them matter:
 
 - **`resolved > 0`** — the fleet was carrying findings yesterday and is not today. Something got
   fixed, and that is the best thing this audit ever gets to say. Reporting `partial` failures while
@@ -1044,13 +1084,19 @@ Three zero-finding runs come back `silent_ok: false`, and all of them matter:
 - **`status: "HELD"`** — the ledger stayed open because the run did not account for findings it was
   carrying. "I found nothing" and "I did not write it down" must not arrive as the same silence
   either.
+- **A dropped collector candidate** — on a stream that passes `--manifest-file`, the collector
+  flagged something the document did not carry. The check reads as having run and found nothing;
+  the JSON line's `unpublished_candidates` says otherwise, and it must not arrive as silence.
 
 There is one case where the harness reports `new: 0, resolved: 0` without knowing it: if the
 previous ledger body could not be read, the delta is unknowable, so it announces nothing rather than
-declaring every live finding new. `silent_ok` follows the counts it can defend and comes back `true`
-on an otherwise quiet run. The run logs
-`Previous ledger body was unreadable; skipping the delta comment` to stderr and the ledger is still
-rewritten correctly — the issue carries the truth either way.
+declaring every live finding new. The ledger body is the only record of what a collector holds, so
+a run that cannot read it leaves the body, title, label and promotions exactly as they were, answers
+only `/remediate` refusals and deferrals when it passed a manifest — and none at all when it passed
+no manifest, since without one it cannot tell a held id from a typo — and reports `partial: true`
+with a coverage gap saying the body was left as it was — `silent_ok` is `false`. The run logs
+`Previous ledger body was unreadable; skipping the delta comment` to stderr, and the ledger body may
+be a day stale until a run can read it; report the gap as you would any other partial run.
 
 ## Red lines
 

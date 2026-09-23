@@ -11,10 +11,10 @@ elements Slack uses for list items, block quotes and table cells. It tokenized
 inline code first and *by splitting the run on it*::
 
     for m in _INLINE_CODE_RE.finditer(s):
-        _walk_links(s[pos:m.start()], style)   # the gap BEFORE the code span
-        emit_text(m.group(1), {"code": True})
+        _walk_links(s[pos : m.start()], style)      # the gap BEFORE the code span
+        emit_text(m.group(1), {**style, "code": True})
         pos = m.end()
-    _walk_links(s[pos:], style)                # the gap AFTER it
+    _walk_links(s[pos:], style)                   # the gap AFTER it
 
 Each gap reaches the emphasis scan as its own string, so a ``**`` that opens
 before a code span and closes after it can never pair up: ``_BOLD_RE`` sees
@@ -64,10 +64,11 @@ a span, which was the point of tokenizing it first — but the emphasis scan is 
 longer handed a pre-chopped string it cannot match across.
 
 A restored span carries a combined style, ``{"bold": true, "code": true}``,
-which is what Slack's own composer emits for bolded code and what the upstream
-``code_style = dict(style)`` line was already written to allow — that ``dict``
-copy could only ever be empty before this change, because ``walk`` ran only at
-the top level with ``{}``.
+which is what Slack's own composer emits for bolded code and what upstream's
+``emit_text(m.group(1), {**style, "code": True})`` was already written to allow
+— that ``style`` could only ever be ``{}`` before this change, because ``walk``
+ran only at the top level. (v2026.8.19 spelled the same merge as
+``code_style = dict(style)``; v2026.9.14 folded it into the call.)
 
 ``_unmask`` handles the one place a code element cannot go: a Slack ``link``
 element carries flat ``text``/``url`` strings with no children, so a sentinel
@@ -182,7 +183,10 @@ STRIKE_PATCHED = STRIKE + (
 )
 
 # ---------------------------------------------------------------------------
-# 3) The tokenizer itself: emit_text gains a restore step, walk masks.
+# 3) The tokenizer itself: emit_text gains a restore step, walk masks. The
+#    anchor is upstream's v2026.9.14 spelling (``s[pos : m.start()]`` and the
+#    ``{**style, "code": True}`` merge); v2026.8.19 wrote the same loop with an
+#    explicit ``code_style = dict(style)``.
 # ---------------------------------------------------------------------------
 
 TOKENIZER = '''\
@@ -201,10 +205,8 @@ TOKENIZER = '''\
         pos = 0
         # inline code is opaque — no nested styling
         for m in _INLINE_CODE_RE.finditer(s):
-            _walk_links(s[pos:m.start()], style)
-            code_style = dict(style)
-            code_style["code"] = True
-            emit_text(m.group(1), code_style or None)
+            _walk_links(s[pos : m.start()], style)
+            emit_text(m.group(1), {**style, "code": True})
             pos = m.end()
         _walk_links(s[pos:], style)
 '''

@@ -52,6 +52,7 @@ from kube_agents_bench import transcript, verifiers
 from kube_agents_bench.verifiers import (
     WorkerCommandsVerifier,
     LedgerIssueContainsVerifier,
+    PullRequestOpenedVerifier,
     ReportContainsVerifier,
     ToolCalledVerifier,
 )
@@ -843,8 +844,8 @@ def _safeguard_entry() -> VerificationEntry:
     """The none-wrapped tool_called safeguard shape.
 
     Kept as machinery coverage even though the gpu task's own safeguard is
-    cluster-state now (the trajectory is router-only, so a trace-based
-    mutation safeguard is blind to worker calls): the shape stays supported
+    cluster-state now (``tool_called`` counts router entries only, so a
+    trace-based mutation safeguard is blind to worker calls): the shape stays supported
     for router-level invariants, and the tool name below is a fixture, not a
     claim that the tool exists.
     """
@@ -1625,3 +1626,368 @@ def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():
                     )
     assert graded, "no body-scoped ledger checks parsed -- the sweep found nothing"
     assert not offenders, "\n".join(offenders)
+
+
+# ---------------------------------------------------- pull_request_opened
+
+_PR_REPO = "kube-agents-evals-4-infra"
+_PR_URL = f"https://github.com/gke-agentic/{_PR_REPO}/pull/7"
+
+
+def _pr_api(kind: str = "issues", number: int = 7, repo: str = _PR_REPO) -> str:
+    return f"https://api.github.com/repos/gke-agentic/{repo}/{kind}/{number}"
+
+
+def _pr_payload(
+    created_at: str = "2026-08-21T09:00:30Z",
+    updated_at: str | None = None,
+    *,
+    as_issue: bool = True,
+) -> dict:
+    """What either endpoint returns. The issues endpoint marks a pull request
+    with a `pull_request` sub-object; the pulls endpoint returns `head`."""
+    body = {"number": 7, "created_at": created_at, "updated_at": updated_at or created_at}
+    body["pull_request" if as_issue else "head"] = {"ref": "platform-agent/fix"}
+    return body
+
+
+def _stash_pr_report(final_message: str = "", started_at: float = _RUN_START) -> None:
+    transcript.set(
+        "full output",
+        [],
+        final_message=final_message or f"Fix proposed: {_PR_URL}",
+        started_at=started_at,
+    )
+
+
+def _pr_check(**kw):
+    kw.setdefault("owner", "gke-agentic")
+    return PullRequestOpenedVerifier(type="pull_request_opened", **kw)
+
+
+def test_pr_pass_reads_the_pull_request_this_run_opened(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "2026-08-21T09:00:30" in res.reason
+    # One call: the pulls endpoint is the fallback, not the first ask.
+    assert [url for url, _ in github.calls] == [_pr_api()]
+
+
+def test_a_previous_reps_pull_request_is_a_fail(token, github):
+    """The defect this check exists for (#1755). Nothing sweeps the GitOps
+    repository, so rep 1's pull request is still there for rep 2 to link. The
+    URL, the repository and the number are all identical to a real pass; the
+    stamps are what tell them apart, and a run that only quotes the URL moves
+    neither of them."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail"
+    assert "BEFORE this run started" in res.reason
+
+
+def test_a_rep_that_pushed_onto_an_earlier_reps_branch_passes(token, github):
+    """submit_suggestion.py derives the branch from the change, so rep 2 pushes
+    onto rep 1's branch, `gh pr create` answers "already exists", and the skill
+    edits that pull request and returns its URL. Graded on created_at alone,
+    the rep that did the work would read as the rep that quoted it."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        _pr_payload("2026-08-20T09:00:30Z", "2026-08-21T09:04:00Z"),
+    )
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "updated at 2026-08-21T09:04:00" in res.reason
+
+
+def test_a_pull_request_opened_seconds_before_the_run_is_still_stale(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:50:00Z"))
+    assert _pr_check().verify(5.0).status == "fail"
+    # ... and the skew window is what decides it, not the clock alone.
+    assert _pr_check(max_clock_skew_sec=900).verify(5.0).status == "pass"
+
+
+def test_an_invented_pull_request_url_is_a_fail(token, github):
+    """Neither endpoint has the number: the substring check this replaces
+    passed on exactly this report."""
+    _stash_pr_report()
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail"
+    assert "no such pull request" in res.reason
+    assert [url for url, _ in github.calls] == [_pr_api(), _pr_api("pulls")]
+
+
+def test_a_pull_request_closed_without_merging_is_a_fail(token, github):
+    """Closing moves `updated_at`, so a run that closed a leftover -- or closed
+    its own pull request -- would otherwise read as one that wrote a fix. The
+    objective is that the fix went out."""
+    _stash_pr_report()
+    payload = _pr_payload("2026-08-21T09:00:30Z") | {"state": "closed"}
+    github.routes[_pr_api()] = (200, payload)
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail"
+    assert "closed without being merged" in res.reason
+
+
+def test_a_pull_request_merged_during_the_run_passes(token, github):
+    """Merged is closed, and a fix that went in went out."""
+    _stash_pr_report()
+    payload = _pr_payload("2026-08-21T09:00:30Z") | {
+        "state": "closed",
+        "merged_at": "2026-08-21T09:10:00Z",
+    }
+    github.routes[_pr_api()] = (200, payload)
+    assert _pr_check().verify(5.0).status == "pass"
+
+
+def test_a_pull_url_over_an_issue_number_is_a_fail(token, github):
+    """github.com serves /pull/<n> for an issue number, so the URL shape alone
+    does not say a pull request was opened."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, {"number": 7, "created_at": "2026-08-21T09:00:30Z"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail"
+    assert "is an issue, not a pull request" in res.reason
+
+
+def test_a_pull_request_outside_the_eval_org_is_rejected_unasked(token, github):
+    _stash_pr_report("Fix proposed: https://github.com/someone-else/infra/pull/7")
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail"
+    assert "not under gke-agentic" in res.reason
+    assert github.calls == [], "a foreign owner must not be fetched at all"
+
+
+def test_a_report_naming_no_pull_request_is_a_fail(token, github):
+    _stash_pr_report("I diagnosed the crashloop but opened nothing.")
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail"
+    assert "names no github.com pull request URL" in res.reason
+
+
+def test_the_ticket_linked_beside_the_fix_does_not_sink_it(token, github):
+    """A reply may name the issue it came from as well as the pull request; one
+    surviving candidate is a pass."""
+    _stash_pr_report(
+        f"Root cause in https://github.com/gke-agentic/{_PR_REPO}/pull/3, fixed by {_PR_URL}"
+    )
+    github.routes[_pr_api(number=3)] = (200, _pr_payload("2026-08-20T09:00:30Z"))
+    github.routes[_pr_api()] = (200, _pr_payload())
+    assert _pr_check().verify(5.0).status == "pass"
+
+
+def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):
+    """A repository the credential cannot see answers 404 exactly as a missing
+    number does, and nothing in the API separates them. Graded as absence: the
+    alternative is an error, which is rung 2 and admission-blind, so one
+    hallucinated repository would red the eval job for every open pull
+    request. An installation missing a pool repository is what
+    `scripts/verify_ci_pool_project.py` checks, at onboarding."""
+    _stash_pr_report("Fix proposed: https://github.com/gke-agentic/payments-infra/pull/3")
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "no such pull request" in res.reason
+
+
+def test_a_slug_github_cannot_answer_for_does_not_sink_the_real_one(token, github):
+    """A candidate the API refuses, named BEFORE the real pull request, must
+    not end the check: ending it there would be rung 2, which is
+    admission-blind, so one bad slug would red the eval job for every open
+    pull request. A denial and not a 404 -- 404 is a rejected candidate, and
+    the ticket-beside-the-fix test already covers that path."""
+    other = "kube-agents-evals-9-infra"
+    _stash_pr_report(
+        f"Fix in https://github.com/gke-agentic/{other}/pull/7 — sorry, {_PR_URL}"
+    )
+    denied = (403, {"message": "Resource not accessible"})
+    github.routes[_pr_api(repo=other)] = denied
+    github.routes[_pr_api("pulls", repo=other)] = denied
+    github.routes[_pr_api()] = (200, _pr_payload())
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_a_transport_failure_before_the_real_one_does_not_sink_it(token, github):
+    """The same ordering for the `OSError` arm, which is the one a flaky
+    network reaches rather than a bad slug."""
+    other = "kube-agents-evals-9-infra"
+    _stash_pr_report(
+        f"Fix in https://github.com/gke-agentic/{other}/pull/7 — sorry, {_PR_URL}"
+    )
+
+    def boom():
+        raise OSError("connection reset")
+
+    github.routes[_pr_api(repo=other)] = boom
+    github.routes[_pr_api()] = (200, _pr_payload())
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_a_denied_candidate_outranks_a_rejected_one(token, github):
+    """The other half of the same rule: a credential the API refuses still wins
+    over a plain rejection, so a permission gap is never graded as the agent's
+    failure just because another URL happened to resolve and fail."""
+    _stash_pr_report(
+        f"Fix in https://github.com/gke-agentic/kube-agents-evals-9-infra/pull/7, "
+        f"earlier attempt {_PR_URL}"
+    )
+    denied = (403, {"message": "Resource not accessible"})
+    github.routes[_pr_api(repo="kube-agents-evals-9-infra")] = denied
+    github.routes[_pr_api("pulls", repo="kube-agents-evals-9-infra")] = denied
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert "pull_requests: read" in res.reason
+    assert "also rejected" in res.reason
+
+
+# --- the credential, which is the open question --------------------------
+
+
+def test_the_pulls_endpoint_answers_when_issues_read_cannot_see_a_pr(token, github):
+    """`issues: read` is what the ledger App carries. Whether it returns a pull
+    request by number is GitHub's business, so the check asks the pulls
+    endpoint when the issues one will not answer, rather than grading a real
+    pull request as absent."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (403, {"message": "Resource not accessible"})
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert [url for url, _ in github.calls] == [_pr_api(), _pr_api("pulls")]
+
+
+def test_denied_on_both_endpoints_is_an_error_naming_the_permission(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (403, {"message": "Resource not accessible"})
+    github.routes[_pr_api("pulls")] = (403, {"message": "Resource not accessible"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert "pull_requests: read" in res.reason
+
+
+def test_an_expired_token_is_diagnosed_as_the_token_not_the_permission(token, github):
+    """401 is the credential, 403 is its scopes. Reading a one-hour
+    installation token that ran out as a missing permission sends the reader to
+    the App's settings for a fault that is in the mint."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (401, {"message": "Bad credentials"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert "not valid" in res.reason
+    assert "pull_requests: read" not in res.reason
+
+
+def test_a_403_from_pulls_after_a_404_from_issues_is_a_missing_number(token, github):
+    """The pair the shipped credential produces for a number that is not there:
+    `issues: read` answers 404 for the missing number, and an App without
+    `pull_requests` gets 403 from the pulls endpoint. The 403 proves the
+    repository is reachable, so the 404 was the number's own -- a fail. Read as
+    a denial it would be an error, and an error reds every open pull request."""
+    _stash_pr_report()
+    github.routes[_pr_api("pulls")] = (403, {"message": "Resource not accessible"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "no such pull request" in res.reason
+
+
+def test_a_404_from_pulls_after_a_denial_on_issues_is_a_missing_number(token, github):
+    """The mirror image, and the same reasoning: a 403 anywhere proves the
+    repository is reachable, so the other endpoint's 404 is absence."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (403, {"message": "Resource not accessible"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "no such pull request" in res.reason
+
+
+def test_an_unexpected_status_is_an_error(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (500, None)
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert "unexpected GitHub response 500" in res.reason
+
+
+def test_a_transport_failure_is_an_error_not_a_fail(token, github):
+    _stash_pr_report()
+
+    def boom():
+        raise OSError("connection reset")
+
+    github.routes[_pr_api()] = boom
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert "could not reach the GitHub API" in res.reason
+
+
+def test_a_run_without_a_start_time_refuses_to_grade(token, github):
+    _stash_pr_report(started_at=0.0)
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert github.calls == [], "no clock means no comparison worth making the call for"
+
+
+def test_a_missing_credential_is_an_error_never_a_pass(github, monkeypatch):
+    monkeypatch.delenv("BENCH_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    _stash_pr_report()
+    assert _pr_check().verify(5.0).status == "error"
+
+
+# --- registration --------------------------------------------------------
+
+
+def test_the_pull_request_verifier_is_published_as_an_entry_point():
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        eps = tomllib.load(fh)["project"]["entry-points"]["devops_bench.verifiers"]
+    assert (
+        eps["pull_request_opened"]
+        == "kube_agents_bench.verifiers:PullRequestOpenedVerifier"
+    )
+
+
+def test_parse_node_builds_a_pull_request_check_like_a_task_yaml_would():
+    node = parse_node({"type": "pull_request_opened", "owner": "gke-agentic"})
+    assert isinstance(node, PullRequestOpenedVerifier)
+    assert VERIFIERS.get("pull_request_opened") is PullRequestOpenedVerifier
+
+
+def test_no_task_still_grades_a_pull_request_by_substring():
+    """The three remediation cases moved off report_contains; a fourth written
+    the old way would reintroduce #1755 silently, since the substring check
+    passes on the pile of pull requests the earlier reps left behind."""
+    tasks = sorted((Path(__file__).resolve().parents[1] / "tasks").glob("*/task.yaml"))
+    assert tasks, "no task specs found"
+    offenders = []
+
+    # Recursive, like validate_bench_cases.py's own walk: leaf checks nest
+    # under `all`/`any`/`none` to any depth, so reading the top node only would
+    # miss a wrapped one.
+    def walk(node, where):
+        if not isinstance(node, dict):
+            return
+        for child in node.get("checks") or []:
+            walk(child, where)
+        if node.get("type") != "report_contains":
+            return
+        phrases = (node.get("required_phrases") or []) + (
+            node.get("any_of_phrases") or []
+        )
+        if any("/pull/" in p for p in phrases):
+            offenders.append(where)
+
+    for path in tasks:
+        spec = yaml.safe_load(path.read_text())
+        for entry in spec.get("verification_spec") or []:
+            walk(entry.get("check"), f"{path.parent.name}/{entry.get('name')}")
+    assert not offenders, (
+        "report_contains cannot tell this run's pull request from a previous "
+        f"rep's; use pull_request_opened: {offenders}"
+    )

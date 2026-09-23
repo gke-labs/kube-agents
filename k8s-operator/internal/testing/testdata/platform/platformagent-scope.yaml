@@ -1,0 +1,57 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: platformagent
+  namespace: kubeagents-system
+spec:
+  # Golden fixture: platformagent-tagged.yaml plus a spec.scope block, and
+  # nothing else. Diff the two expected outputs and the whole of what a scope
+  # renders is visible at once: the scope.json key in the config ConfigMap
+  # goes from the empty declaration every install carries to one populated and
+  # sorted regardless of declaration order. The volume, mount and env that
+  # carry it are unconditional and so appear in every expected output.
+  harness:
+    clusterName: "cluster-a"
+    location: "us-central1-a"
+    projectId: "example-project"
+    hermes:
+      dashboardEnabled: true
+      pluginsDebug: false
+      apiServerSecretRef:
+        name: "platformagent-secrets"
+        key: "api-key"
+  deployment:
+    image: "ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9"
+    tag: "latest"
+    imagePullPolicy: "IfNotPresent"
+  security:
+    serviceAccountName: "kubeagents-platform-agent"
+    serviceAccountAnnotations:
+      iam.gke.io/gcp-service-account: "kubeagents-platform-gsa@kube-agents-gkedemos.iam.gserviceaccount.com"
+  # Deliberately out of sorted order, and with an exclusion that only phase 1
+  # honours by the full triple: the rendered scope.json must come back sorted.
+  scope:
+    projects:
+      - "payments-staging"
+      - "payments-prod"
+    exclude:
+      projects:
+        - "*-sandbox"
+      clusters:
+        - projectId: "payments-staging"
+          location: "us-central1"
+          clusterName: "scratch-cluster"
+  integration:
+    googleChat:
+      enabled: true
+      mode: "default"
+      projectId: "kube-agents-gkedemos"
+      topicName: "kubeagents-google-chat-events"
+      subscriptionName: "kubeagents-google-chat-events-sub"
+    slack:
+      enabled: false
+      botToken: ""
+      appToken: ""
+      allowedUsers: []
+      homeChannel: ""
+      homeChannelName: ""

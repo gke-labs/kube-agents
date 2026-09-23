@@ -19,8 +19,8 @@ interrupt the turn — the user just never sees the 👀, which is indistinguish
 from the agent being slow. The build is the last place it can be caught loudly.
 
 The adapter is checked too, in the other direction: if upstream ever drops the
-reaction calls, this patch would be granting a write scope nothing uses, and
-that should fail rather than pass quietly.
+reaction calls from the two lifecycle hooks, this patch would be granting a
+write scope nothing uses, and that should fail rather than pass quietly.
 
 ``test_slack_reactions_scope.py`` covers the applier against a fixture on the
 host and cannot cover any of this — the edit lives inside Hermes' own module,
@@ -34,6 +34,7 @@ body, so calling it imports the package anyway.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 from pathlib import Path
@@ -48,14 +49,21 @@ WRITE_SCOPE = "reactions:write"
 #: separate chance for the emitted list to differ from the source literal.
 EXPERIENCES = ("assistant", "agent", "none")
 
-#: The reaction *call sites* the scope is being granted for — the ``self.``
-#: prefix is load-bearing. ``_add_reaction``/``_remove_reaction`` are the private
-#: helpers that wrap ``reactions.add``/``reactions.remove``; matching their
-#: ``async def`` lines, or the ``.reactions_add(`` inside them, would keep
-#: passing after upstream deleted the two lifecycle hooks and left the helpers
-#: defined but dead — which is the realistic way this feature dies, and exactly
-#: the case this check claims to catch.
-WRITE_CALLS = ("self._add_reaction(", "self._remove_reaction(")
+#: The lifecycle hooks that spend the scope: 👀 on pickup, ✅/❌ on the outcome.
+#: Each must still call one of the reaction helpers on ``self``. The check is on
+#: the hooks' bodies rather than on a substring of the file because the helpers
+#: outlive their callers: at v2026.9.14 ``_add_reaction``/``_remove_reaction``
+#: are defined and dead, thin wrappers over ``_react(..., remove=...)`` that the
+#: hooks call directly. A substring match on either spelling would keep passing
+#: after upstream deleted the hooks and left the helpers behind — which is the
+#: realistic way this feature dies, and exactly the case this check claims to
+#: catch.
+REACTING_HOOKS = ("on_processing_start", "on_processing_complete")
+
+#: The methods that wrap ``reactions.add``/``reactions.remove``, in both the
+#: v2026.8.19 spelling (``_add_reaction``/``_remove_reaction``) and the
+#: v2026.9.14 one (``_react``).
+REACTION_HELPERS = frozenset({"_react", "_add_reaction", "_remove_reaction"})
 
 
 def _fail(detail: str) -> "SystemExit":
@@ -90,20 +98,37 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     adapter_path = root / ADAPTER
     if not adapter_path.is_file():
         raise _fail(f"{adapter_path} does not exist")
-    adapter = adapter_path.read_text()
-    names = {call: call.rstrip("(").removeprefix("self.") for call in WRITE_CALLS}
-    unused = [names[call] for call in WRITE_CALLS if call not in adapter]
-    if unused:
+    hooks = {
+        node.name: node
+        for node in ast.walk(ast.parse(adapter_path.read_text()))
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name in REACTING_HOOKS
+    }
+    called: dict[str, set[str]] = {}
+    for hook in REACTING_HOOKS:
+        node = hooks.get(hook)
+        called[hook] = set() if node is None else {
+            call.func.attr
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "self"
+            and call.func.attr in REACTION_HELPERS
+        }
+    silent = [hook for hook in REACTING_HOOKS if not called[hook]]
+    if silent:
         raise _fail(
-            f"{ADAPTER} defines but no longer calls {', '.join(unused)}, so "
-            f"{WRITE_SCOPE} is being granted for nothing — drop this patch "
-            "instead of widening the app's permissions"
+            f"{ADAPTER} no longer reacts from {', '.join(silent)} (no call to "
+            f"{', '.join(sorted(REACTION_HELPERS))} on self), so {WRITE_SCOPE} "
+            "is being granted for nothing — drop this patch instead of "
+            "widening the app's permissions"
         )
 
     print(
         f"slack_reactions_scope verify: {WRITE_SCOPE} present in all "
-        f"{len(EXPERIENCES)} emitted manifests; adapter still calls "
-        f"{', '.join(names.values())}"
+        f"{len(EXPERIENCES)} emitted manifests; adapter still reacts from "
+        + ", ".join(f"{hook} via {'/'.join(sorted(called[hook]))}" for hook in REACTING_HOOKS)
     )
 
 

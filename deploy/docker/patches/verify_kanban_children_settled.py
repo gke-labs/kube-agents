@@ -48,10 +48,11 @@ os.environ.pop("HERMES_KANBAN_TASK", None)
 os.environ.pop("HERMES_SESSION_KEY", None)
 
 from hermes_cli import kanban_db as K  # noqa: E402
+from hermes_cli import kanban_db_connect as KC  # noqa: E402
 import tools.kanban_tools as kt  # noqa: E402
 import tools.kanban_children_settled as kcs  # noqa: E402
 
-conn = K.connect(DB)
+conn = KC.connect(DB)
 
 RECEIPT = (
     "Fanned out cluster investigation tasks for `inference-server` to each "

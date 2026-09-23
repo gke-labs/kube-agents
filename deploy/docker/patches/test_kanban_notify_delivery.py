@@ -5,11 +5,13 @@ Two halves, matching the two files under test:
 * :class:`ReadUnclaimedTest` and friends drive ``kanban_notify_delivery`` itself
   against a fake ``kanban_db`` — the delivery semantics, the high-water bound,
   and the cursor repair.
-* :class:`ApplyTest` drives ``apply_kanban_notify_delivery`` against a reduced
-  copy of upstream's notifier loop. The fixture deliberately contains **both**
-  occurrences of the advance block, at their real 24-space indentation, because
-  the ambiguity between them is the reason anchor 2 is shaped the way it is; a
-  fixture with only one would let a regression through.
+* :class:`ApplyTest` drives ``apply_kanban_notify_delivery`` against reduced
+  copies of upstream's two files: the notifier module (``_Collector`` and
+  ``_KanbanNotification``) and the mixin that owns ``_kanban_rewind``. The
+  notifier fixture deliberately contains **both** ``await self.advance()``
+  sites, at their real indentation, because the ambiguity between them is the
+  reason anchor 2 is shaped the way it is; a fixture with only one would let a
+  regression through.
 
 The behavioural gate that proves the patched notifier actually replays a lost
 notification is ``verify_kanban_notify_delivery.py``, which runs inside the
@@ -28,7 +30,8 @@ from pathlib import Path
 from apply_kanban_notify_delivery import (
     ADVANCE_ANCHOR,
     CLAIM_ANCHOR,
-    RELATIVE,
+    MIXIN_RELATIVE,
+    NOTIFIER_RELATIVE,
     REWIND_ANCHOR,
     apply,
 )
@@ -161,7 +164,8 @@ class ReadUnclaimedTest(unittest.TestCase):
         self.assertEqual(old_cursor, 0)
 
     def test_no_events_yields_the_skip_shape(self):
-        # `if not events: continue` upstream — the empty list must survive.
+        # Upstream's empty-events path is `return None` from _claim_for_sub — the
+        # empty list must survive so the caller takes that same exit.
         old_cursor, cursor, events = read_unclaimed(
             _FakeKB([]), conn_at(958), SUB, kinds=TERMINAL_KINDS,
             watcher=_Watcher(),
@@ -345,228 +349,263 @@ class EndToEndSemanticsTest(unittest.TestCase):
 # The applier
 # =============================================================================
 
-# Upstream's notifier reduced to the three sites the patch rewrites, at their
-# real nesting depth because every anchor is indentation-sensitive. Both
-# advance blocks are present: they are byte-identical at identical indentation,
-# and that ambiguity is why anchor 2 carries a comment line.
-UPSTREAM_WATCHERS = '''\
-class GatewayKanbanWatchers:
-    async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
-        while self._running:
+# Upstream's notifier module (v2026.9.14) reduced to the two sites the patch
+# rewrites there, at their real nesting depth because every anchor is
+# indentation-sensitive. Both `await self.advance()` sites are present at
+# upstream's depths: the skip-path one sits one indent deeper inside
+# `except ValueError:`, the success-path one at method depth. The deeper line
+# still contains the method-depth anchor as a substring, so a bare
+# `await self.advance()` anchor counts two, and that is why anchor 2 carries
+# the comment line above the success-path call.
+UPSTREAM_NOTIFIER = '''\
+class _Collector:
+    def _claim_for_sub(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:
+        """Claim one subscription's unseen events; None when skipped or nothing new."""
+        if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile) is None:
+            return None
+        old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
+            conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+            thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
+        )
+        if not events:
+            return None
+        task = self.kb.get_task(conn, sub["task_id"])
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+
+    def collect_board(self, slug: str) -> None:
+        for sub in subs:
             try:
-                def _collect():
-                    for board_meta in boards:
-                        try:
-                            for sub in subs:
-                                try:
-                                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
-                                        conn,
-                                        task_id=sub["task_id"],
-                                        platform=sub["platform"],
-                                        chat_id=sub["chat_id"],
-                                        thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
-                                    )
-                                    if not events:
-                                        continue
-                                    task = _kb.get_task(conn, sub["task_id"])
-                                except Exception as sub_exc:
-                                    logger.warning("failed: %s", sub_exc)
-                        finally:
-                            conn.close()
+                claimed = self._claim_for_sub(conn, slug, sub)
+            except Exception as sub_exc:
+                logger.warning("kanban notifier: subscription for %s on board %s failed: %s",
+                               sub.get("task_id"), slug, sub_exc)
 
-                deliveries = await asyncio.to_thread(_collect)
-                for d in deliveries:
-                    try:
-                        plat = _Platform(platform_str)
-                    except ValueError:
-                        # Unknown platform string; skip and advance cursor so
-                        # we don't replay forever.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
-                        continue
-                    for ev in d["events"]:
-                        await adapter.send(sub["chat_id"], msg)
-                    else:
-                        # Delivery complete (text ping for push adapters, wake
-                        # self-post for non-push, wake injection for wake-only
-                        # push subs): advance cursor. The cursor is the dedup
-                        # mechanism — it prevents re-delivery of the same
-                        # event on subsequent ticks.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
-                        if task_terminal:
-                            await asyncio.to_thread(
-                                self._kanban_unsub, sub, board_slug,
-                            )
+
+class _KanbanNotification:
+    async def rewind(self) -> None:
+        await _to_thread_process_service(
+            self.runner._kanban_rewind, self.sub, self.d["cursor"], self.d.get("old_cursor", 0), self.board_slug,
+        )
+
+    async def advance(self) -> None:
+        await _to_thread_process_service(self.runner._kanban_advance, self.sub, self.d["cursor"], self.board_slug)
+
+    async def _send_pings(self) -> bool:
+        for ev in self.d["events"]:
+            try:
+                await self._send_event(ev, msg)
             except Exception as exc:
-                logger.warning("kanban notifier tick failed: %s", exc)
+                await self.delivery_failed(exc)
+                return False
+        return True
 
-    def _kanban_rewind(
-        self,
-        sub: dict,
-        claimed_cursor: int,
-        old_cursor: int,
-        board: Optional[str] = None,
-    ) -> None:
-        """Sync helper: undo a claimed notification cursor after send failure."""
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
+    async def deliver(self) -> None:
         try:
-            _kb.rewind_notify_cursor(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-                claimed_cursor=claimed_cursor,
-                old_cursor=old_cursor,
+            self.plat = self.platform_cls(self.platform_str)
+        except ValueError:
+            await self.advance()
+            return
+        if not await self._send_pings():
+            return
+        if wake_kinds:
+            try:
+                await self.wake()
+            except WakeNotAccepted:
+                await self.rewind()
+                return
+
+        # Delivery complete: advance the cursor (the dedup mechanism).
+        await self.advance()
+        if not is_push:
+            self.clear_failures()
+'''
+
+# The mixin (v2026.9.14) reduced to the cursor helpers; `_kanban_rewind` is the
+# one site the patch rewrites here.
+UPSTREAM_MIXIN = '''\
+class GatewayKanbanWatchersMixin:
+    def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> None:
+        """Sync helper (runs in to_thread): call ``kanban_db_notify.<op>`` for one subscription on its board."""
+        conn = _kbc.connect(board=board)
+        try:
+            getattr(_kbn, op)(
+                conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "", **extra,
             )
         finally:
             conn.close()
+
+    def _kanban_advance(self, sub: dict, cursor: int, board: Optional[str] = None) -> None:
+        self._kanban_sub_op(board, "advance_notify_cursor", sub, new_cursor=cursor)
+
+    def _kanban_rewind(self, sub: dict, claimed_cursor: int, old_cursor: int, board: Optional[str] = None) -> None:
+        """Undo a claimed notification cursor after send failure."""
+        self._kanban_sub_op(board, "rewind_notify_cursor", sub, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
 '''
 
 
-def patch_tree(source):
-    """Write ``source`` as gateway/kanban_watchers.py under a temp root and patch it."""
+def write_tree(notifier_source, mixin_source):
+    """Write both miniature sources under a temp root; return (root, notifier path, mixin path)."""
     root = Path(tempfile.mkdtemp())
-    target = root / RELATIVE
-    target.parent.mkdir(parents=True)
-    target.write_text(source)
+    notifier = root / NOTIFIER_RELATIVE
+    notifier.parent.mkdir(parents=True)
+    notifier.write_text(notifier_source)
+    mixin = root / MIXIN_RELATIVE
+    mixin.write_text(mixin_source)
+    return root, notifier, mixin
+
+
+def patch_tree(notifier_source=UPSTREAM_NOTIFIER, mixin_source=UPSTREAM_MIXIN):
+    """Patch both miniature files and return their texts as (notifier, mixin)."""
+    root, notifier, mixin = write_tree(notifier_source, mixin_source)
     apply(root)
-    return target.read_text()
+    return notifier.read_text(), mixin.read_text()
 
 
 class ApplyTest(unittest.TestCase):
     def test_every_anchor_matches_upstream_exactly_once(self):
-        for label, anchor in (
-            ("claim", CLAIM_ANCHOR),
-            ("advance", ADVANCE_ANCHOR),
-            ("rewind", REWIND_ANCHOR),
+        for label, anchor, source in (
+            ("claim", CLAIM_ANCHOR, UPSTREAM_NOTIFIER),
+            ("advance", ADVANCE_ANCHOR, UPSTREAM_NOTIFIER),
+            ("rewind", REWIND_ANCHOR, UPSTREAM_MIXIN),
         ):
             with self.subTest(label):
-                self.assertEqual(UPSTREAM_WATCHERS.count(anchor), 1)
+                self.assertEqual(source.count(anchor), 1)
 
-    def test_the_advance_block_alone_is_ambiguous(self):
+    def test_the_advance_call_alone_is_ambiguous(self):
         # The reason anchor 2 carries a comment line. Without it `substitute`
         # would SystemExit on expected=1, and raising the count to 2 would
         # silently patch the unknown-platform skip as well.
-        bare = "\n".join(ADVANCE_ANCHOR.splitlines()[1:]) + "\n"
-        self.assertEqual(UPSTREAM_WATCHERS.count(bare), 2)
-        self.assertEqual(UPSTREAM_WATCHERS.count(ADVANCE_ANCHOR), 1)
+        bare = ADVANCE_ANCHOR.splitlines()[-1] + "\n"
+        self.assertEqual(UPSTREAM_NOTIFIER.count(bare), 2)
+        self.assertEqual(UPSTREAM_NOTIFIER.count(ADVANCE_ANCHOR), 1)
 
     def test_the_claim_is_gone(self):
-        patched = patch_tree(UPSTREAM_WATCHERS)
-        self.assertNotIn("_kb.claim_unseen_events_for_sub(", patched)
-        self.assertIn("old_cursor, cursor, events = _kanban_read_unclaimed(", patched)
+        notifier, _ = patch_tree()
+        self.assertNotIn("claim_unseen_events_for_sub(", notifier)
+        self.assertIn("old_cursor, cursor, events = _kanban_read_unclaimed(", notifier)
 
-    def test_the_read_is_handed_the_watcher(self):
+    def test_the_read_is_handed_the_runner(self):
         # Without it there is no high-water map and no bound on the resend
-        # storm, and the patch would still look applied.
-        self.assertIn("watcher=self,", patch_tree(UPSTREAM_WATCHERS))
+        # storm, and the patch would still look applied. It has to be the
+        # runner: `_Collector` is rebuilt every tick and would forget the map.
+        notifier, _ = patch_tree()
+        self.assertIn("watcher=self.runner,", notifier)
+
+    def test_the_read_is_handed_the_module_that_owns_the_notify_functions(self):
+        # `unseen_events_for_sub` / `advance_notify_cursor` live in
+        # kanban_db_notify since the split; `_kbn()` is upstream's own accessor.
+        notifier, _ = patch_tree()
+        self.assertIn("_kanban_read_unclaimed(\n            _kbn(), conn, sub,", notifier)
 
     def test_get_task_stays_below_the_read(self):
         # Hoisting it above would split `complete_task`'s single transaction
         # and make a stale task row the deterministic outcome under contention.
-        patched = patch_tree(UPSTREAM_WATCHERS)
+        notifier, _ = patch_tree()
         self.assertLess(
-            patched.index("_kanban_read_unclaimed("),
-            patched.index('task = _kb.get_task(conn, sub["task_id"])'),
+            notifier.index("_kanban_read_unclaimed("),
+            notifier.index('task = self.kb.get_task(conn, sub["task_id"])'),
         )
 
     def test_only_the_success_path_advance_is_rewritten(self):
-        patched = patch_tree(UPSTREAM_WATCHERS)
-        self.assertEqual(patched.count("_kanban_advance_delivered"), 2)  # call + import
+        notifier, _ = patch_tree()
+        self.assertEqual(notifier.count("_kanban_advance_delivered"), 2)  # call + import
         # The unknown-platform skip keeps upstream's direct advance: nothing was
         # delivered there, so there is nothing to mark.
-        self.assertEqual(
-            patched.count('self._kanban_advance, sub, d["cursor"], board_slug,'), 1
-        )
+        self.assertEqual(notifier.count("await self.advance()"), 1)
+        self.assertIn("        except ValueError:\n            await self.advance()", notifier)
 
     def test_the_mark_precedes_the_durable_write(self):
-        patched = patch_tree(UPSTREAM_WATCHERS)
+        notifier, _ = patch_tree()
         self.assertLess(
-            patched.index('_kanban_mark_delivered(self, sub, d["cursor"])'),
-            patched.index("_kanban_advance_delivered,"),
+            notifier.index('_kanban_mark_delivered(self.runner, self.sub, self.d["cursor"])'),
+            notifier.index("_kanban_advance_delivered,"),
         )
 
-    def test_the_mark_follows_the_send(self):
-        # Marking before the send would suppress the retry of a failed one.
-        patched = patch_tree(UPSTREAM_WATCHERS)
-        self.assertLess(
-            patched.index("await adapter.send("),
-            patched.index('_kanban_mark_delivered(self, sub, d["cursor"])'),
+    def test_the_mark_follows_every_send_leg(self):
+        # Marking before a send would suppress the retry of a failed one; the
+        # wake is the last leg, so the mark has to sit below it.
+        notifier, _ = patch_tree()
+        mark = notifier.index('_kanban_mark_delivered(self.runner, self.sub, self.d["cursor"])')
+        self.assertLess(notifier.index("await self._send_event("), mark)
+        self.assertLess(notifier.index("await self.wake()"), mark)
+
+    def test_the_advance_runs_in_a_fresh_context_thread(self):
+        # Same offload as upstream's own `advance()`: a plain to_thread would
+        # inherit a lingering delegate_task marker and false-trip write_txn.
+        notifier, _ = patch_tree()
+        self.assertIn(
+            "await _to_thread_process_service(\n            _kanban_advance_delivered,", notifier
         )
 
     def test_the_rewind_no_longer_writes(self):
-        patched = patch_tree(UPSTREAM_WATCHERS)
-        self.assertNotIn("_kb.rewind_notify_cursor(", patched)
-        self.assertIn("no-op", patched)
+        _, mixin = patch_tree()
+        self.assertNotIn('"rewind_notify_cursor"', mixin)
+        self.assertIn("no-op", mixin)
+        # The neighbouring helpers are upstream's and must survive untouched.
+        self.assertIn('"advance_notify_cursor"', mixin)
 
     def test_one_import_trailer_carries_all_three_names(self):
-        patched = patch_tree(UPSTREAM_WATCHERS)
+        notifier, mixin = patch_tree()
         for name in (
             "advance_after_delivery as _kanban_advance_delivered",
             "mark_delivered as _kanban_mark_delivered",
             "read_unclaimed as _kanban_read_unclaimed",
         ):
-            self.assertIn(name, patched)
-        self.assertEqual(
-            patched.count("from gateway.kanban_notify_delivery import"), 1
-        )
+            self.assertIn(name, notifier)
+        self.assertEqual(notifier.count("from gateway.kanban_notify_delivery import"), 1)
+        # The mixin's replacement uses only `logger`; no trailer belongs there.
+        self.assertNotIn("kanban_notify_delivery import", mixin)
 
-    def test_the_patched_module_still_parses(self):
-        ast.parse(patch_tree(UPSTREAM_WATCHERS))
+    def test_both_patched_modules_still_parse(self):
+        notifier, mixin = patch_tree()
+        ast.parse(notifier)
+        ast.parse(mixin)
 
     def test_a_drifted_claim_anchor_fails_loudly(self):
-        drifted = UPSTREAM_WATCHERS.replace("kinds=TERMINAL_KINDS,", "kinds=KINDS,", 1)
+        drifted = UPSTREAM_NOTIFIER.replace("kinds=TERMINAL_KINDS,", "kinds=KINDS,", 1)
         with self.assertRaises(SystemExit) as ctx:
-            patch_tree(drifted)
+            patch_tree(notifier_source=drifted)
         self.assertIn("found 0", str(ctx.exception))
         self.assertIn("notifier claim", str(ctx.exception))
 
     def test_a_reworded_advance_comment_fails_loudly(self):
         # The comment line is load-bearing. If upstream rewords it the build
-        # must stop, because the remaining lines match two different sites.
-        drifted = UPSTREAM_WATCHERS.replace(
-            "# event on subsequent ticks.",
-            "# event on later ticks.",
+        # must stop, because the remaining line matches two different sites.
+        drifted = UPSTREAM_NOTIFIER.replace(
+            "# Delivery complete: advance the cursor (the dedup mechanism).",
+            "# Delivery complete: settle the cursor.",
         )
         with self.assertRaises(SystemExit) as ctx:
-            patch_tree(drifted)
+            patch_tree(notifier_source=drifted)
         self.assertIn("found 0", str(ctx.exception))
         self.assertIn("post-delivery advance", str(ctx.exception))
 
     def test_a_drifted_rewind_anchor_fails_loudly(self):
-        drifted = UPSTREAM_WATCHERS.replace("claimed_cursor=claimed_cursor,", "")
+        drifted = UPSTREAM_MIXIN.replace("claimed_cursor=claimed_cursor, ", "")
         with self.assertRaises(SystemExit) as ctx:
-            patch_tree(drifted)
+            patch_tree(mixin_source=drifted)
         self.assertIn("found 0", str(ctx.exception))
         self.assertIn("vestigial rewind", str(ctx.exception))
 
-    def test_a_later_anchor_failing_leaves_the_file_untouched(self):
-        drifted = UPSTREAM_WATCHERS.replace("claimed_cursor=claimed_cursor,", "")
-        root = Path(tempfile.mkdtemp())
-        target = root / RELATIVE
-        target.parent.mkdir(parents=True)
-        target.write_text(drifted)
+    def test_a_drifted_rewind_leaves_the_notifier_untouched(self):
+        # The two files are one change: a swapped claim beside a live rewind
+        # would drag cursors backwards on every handled failure.
+        drifted = UPSTREAM_MIXIN.replace("claimed_cursor=claimed_cursor, ", "")
+        root, notifier, mixin = write_tree(UPSTREAM_NOTIFIER, drifted)
         with self.assertRaises(SystemExit):
             apply(root)
-        self.assertEqual(target.read_text(), drifted)
+        self.assertEqual(notifier.read_text(), UPSTREAM_NOTIFIER)
+        self.assertEqual(mixin.read_text(), drifted)
 
     def test_applying_twice_fails_rather_than_stacking_a_trailer(self):
-        root = Path(tempfile.mkdtemp())
-        target = root / RELATIVE
-        target.parent.mkdir(parents=True)
-        target.write_text(UPSTREAM_WATCHERS)
+        root, notifier, _ = write_tree(UPSTREAM_NOTIFIER, UPSTREAM_MIXIN)
         apply(root)
         with self.assertRaises(SystemExit) as ctx:
             apply(root)
         self.assertIn("already patched", str(ctx.exception))
         self.assertEqual(
-            target.read_text().count("from gateway.kanban_notify_delivery import"), 1
+            notifier.read_text().count("from gateway.kanban_notify_delivery import"), 1
         )
 
     def test_a_missing_file_fails_loudly(self):

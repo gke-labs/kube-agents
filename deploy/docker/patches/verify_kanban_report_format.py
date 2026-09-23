@@ -86,7 +86,7 @@ check(
 _kanban_tools_src = open("tools/kanban_tools.py").read()
 check(
     "the create handler appends the stanza",
-    "body = _with_report_format(body)" in _kanban_tools_src,
+    'body=_with_report_format(args.get("body")),' in _kanban_tools_src,
 )
 
 plain = "Sleep for 1ms and report the epochs."

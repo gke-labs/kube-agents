@@ -72,9 +72,9 @@ RUN apt-get update && \
 # command here arrives over a non-interactive `ssh host -- cmd` with no tty, so
 # it could not run even if a skill asked for it. Nothing in agents/ does.
 RUN ARCH=$(dpkg --print-architecture) && \
-    curl -sSLf -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
+    curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
-    curl -sSLf -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
+    curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
     tar -xzf /tmp/helm.tar.gz -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
     rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}

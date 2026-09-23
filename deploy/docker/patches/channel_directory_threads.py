@@ -34,12 +34,13 @@ still builds, and the only symptom is someone else's error-rate graph.
 The fix
 -------
 Three changes, in the order they matter. Upstream has since arrived at the first
-two independently -- v2026.8.13 added its own ``slack_lookup_id`` and groups the
-probes by base conversation before gathering them concurrently -- so the wiring
-in ``apply_channel_directory_threads.py`` keeps upstream's version of those and
-this module supplies the rest. They are still described here because the third
-change only makes sense against the whole picture, and because a future base
-image could take them away again.
+two independently -- v2026.8.13 added its own base-id helper (``_slack_base_id``
+at v2026.9.14) and groups the probes by base conversation before gathering them
+concurrently, in what v2026.9.14 split out as ``_slack_resolve_raw_names`` -- so
+the wiring in ``apply_channel_directory_threads.py`` keeps upstream's version of
+those and this module supplies the rest. They are still described here because
+the third change only makes sense against the whole picture, and because a
+future base image could take them away again.
 
 ``base_channel_id``
     Resolve against the channel, not the thread. This alone turns every one of
@@ -48,16 +49,18 @@ image could take them away again.
 ``unresolved_by_channel``
     One probe per distinct channel, not one per entry. 33 calls become 1, and the
     resolved name is applied to every entry sharing that channel. *Upstream does
-    the grouping now*; this helper is still what the notifier calls, because it
-    is also where the two changes below live.
+    the grouping now*; this helper is still what ``_slack_resolve_raw_names``
+    calls, because it is also where the two changes below live.
 
 ``note_unresolvable`` / the miss cache
     A channel that genuinely cannot be resolved -- a private channel the bot was
     removed from -- is not retried for :data:`MISS_TTL_SECONDS`. The first two
     changes fix the storm we have; this one bounds the cost of the next one,
     because the failure mode above was unbounded repetition of a call that could
-    never succeed. *Upstream has no equivalent*: its rewrite still re-probes an
-    unresolvable channel on every five-minute refresh, forever.
+    never succeed. *Upstream has no equivalent* as of v2026.9.14: its
+    ``_slack_resolve_raw_names`` returns from a not-ok answer and logs an
+    exception at DEBUG without recording either, so an unresolvable channel is
+    re-probed on every five-minute refresh, forever.
 
 :data:`MAX_PROBES_PER_REFRESH` caps a single refresh. Reaching it is logged at
 WARNING rather than passed over: a silent cap would read like a fully resolved

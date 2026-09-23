@@ -10,6 +10,8 @@ touching the board.
 
 import ast
 import importlib
+import importlib.util
+import os
 import sqlite3
 import sys
 import tempfile
@@ -19,14 +21,16 @@ from pathlib import Path
 from unittest import mock
 
 from apply_kanban_guardrail_exit import (
+    API_ERROR_RELATIVE,
     CHAT_ANCHOR,
+    CHAT_RELATIVE,
     CLASSIFY_ANCHOR,
     CLI_ANCHOR,
     CLI_RELATIVE,
     FINALIZER_ANCHOR,
     FINALIZER_RELATIVE,
     HALT_ANCHOR,
-    LOOP_RELATIVE,
+    TOOL_ROUND_RELATIVE,
     apply,
 )
 from kanban_guardrail_exit import (
@@ -817,52 +821,64 @@ class BlockRateLimitedWorkerTest(unittest.TestCase):
         self.assertIn("no provider error text", blocker.calls[0][1]["reason"])
 
 
-# The applier is exercised against a miniature of the three real files. The real
-# anchors are asserted against the shipped image by verify_kanban_guardrail_exit.py.
-LOOP_STUB = '''import os
+# The applier is exercised against a miniature of the five real files, in the
+# shape v2026.9.14 gives them: the turn loop's phases are helpers that return a
+# verdict, and the loop copies the verdict's fields back into its locals. The
+# real anchors are asserted against the shipped image by
+# verify_kanban_guardrail_exit.py.
+TOOL_ROUND_STUB = '''import logging
 
-logger = None
+logger = logging.getLogger("agent.conversation_loop")
 
-# v2026.8.19 routed the loop's appends through this helper instead of calling
-# list.append directly, which is the one line of the halt anchor that moved.
 # The real one (agent/message_metadata.py) stamps a timestamp on the way past,
 # so the nudge this patch inserts has to go through it too.
 def append_message(messages, message):
     message.setdefault("timestamp", 0.0)
     messages.append(message)
 
-def run_conversation(agent, messages):
-    _pending_verification_response = None
-    _pending_verification_response_previewed = False
-    final_response = None
-    while True:
-        if agent.tool_calls:
-            if agent._tool_guardrail_halt_decision is not None:
-                    decision = agent._tool_guardrail_halt_decision
-                    _turn_exit_reason = "guardrail_halt"
-                    final_response = agent._toolguard_controlled_halt_response(decision)
-                    agent._emit_status(
-                        f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
-                    )
-                    append_message(messages, {"role": "assistant", "content": final_response})
-                    break
-        while True:
-            try:
-                response = agent.call()
-            except Exception as api_error:
-                approx_tokens = 0
-                _ctx_len = 0
-                api_messages = []
-                classified = classify_api_error(
-                    api_error,
-                    provider=getattr(agent, "provider", "") or "",
-                    model=getattr(agent, "model", "") or "",
-                    approx_tokens=approx_tokens,
-                    context_length=_ctx_len,
-                    num_messages=len(api_messages) if api_messages else 0,
-                )
-                logger.debug("Error classified: reason=%s", classified.reason.value)
-    return final_response
+
+class ToolRoundVerdict:
+    def __init__(self, action, messages, final_response, _turn_exit_reason):
+        self.action = action
+        self.messages = messages
+        self.final_response = final_response
+        self._turn_exit_reason = _turn_exit_reason
+
+
+def run_tool_round(agent, *, messages, final_response, _turn_exit_reason):
+    def _verdict(action):
+        return ToolRoundVerdict(action, messages, final_response, _turn_exit_reason)
+
+    agent._execute_tool_calls(messages)
+
+    if agent._tool_guardrail_halt_decision is not None:
+        decision = agent._tool_guardrail_halt_decision
+        _turn_exit_reason = "guardrail_halt"
+        final_response = agent._toolguard_controlled_halt_response(decision)
+        agent._emit_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
+        append_message(messages, {"role": "assistant", "content": final_response})
+        # Emit the halt so it isn't mistaken for a crash.
+        if final_response:
+            agent._safe_print(f"\\n{final_response}\\n")
+        return _verdict("break")
+
+    return _verdict("continue")
+'''
+
+API_ERROR_STUB = '''import logging
+
+logger = logging.getLogger("agent.conversation_loop")
+
+
+def handle_api_error(agent, *, api_error, api_messages, approx_tokens, retry_count):
+    _ctx_len = 200000
+    classified = classify_api_error(
+        api_error, provider=getattr(agent, "provider", "") or "",
+        model=getattr(agent, "model", "") or "", approx_tokens=approx_tokens,
+        context_length=_ctx_len, num_messages=len(api_messages) if api_messages else 0,
+    )
+    logger.debug("Error classified: reason=%s", classified.reason.value)
+    return retry_count + 1
 '''
 
 CLI_STUB = '''import os
@@ -870,132 +886,230 @@ import sys
 
 logger = None
 
-class CLI:
-    def chat(self, message):
-                result = self.agent.run_conversation(message)
-                response = result.get("final_response")
-                if result and result.get("failure_reason") == "billing":
-                    print("billing")
-                return response
 
-def main(result):
-                        _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                _exit_code = 75
-                        sys.exit(_exit_code)
+def _run_quiet_single_query(cli, effective_query):
+    result = cli.agent.run_conversation(effective_query)
+    _exit_code = 0
+    if isinstance(result, dict) and result.get("failed"):
+        _exit_code = 1
+        if os.environ.get("HERMES_KANBAN_TASK") and result.get("failure_reason") in ("rate_limit", "billing"):
+            _exit_code = 75
+    sys.exit(_exit_code)
+'''
+
+CHAT_STUB = '''import logging
+import os
+
+
+class CLIChatTurnMixin:
+    def _chat_render_turn(self, turn, agent_thread, interrupt_msg):
+        response = turn.result.get("final_response", "") if turn.result else ""
+        self._chat_print_reasoning_box(turn)
+        self._chat_print_response_panel(turn, response)
+        return response
+
+    def _chat_print_response_panel(self, turn, response):
+        if turn.result and turn.result.get("failure_reason") == "billing":
+            print("billing")
 '''
 
 FINALIZER_STUB = '''import os
 
-def finalize_turn(agent, messages, interrupted, failed, _turn_exit_reason):
-    logger = None
-    iteration_limit_fallback = False
 
-    # Determine if conversation completed successfully
-    return {}
+def _resolve_budget_fallback(agent, final_response, api_call_count):
+    budget_exhausted = (
+        api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0
+    )
+    if final_response is None and budget_exhausted:
+        return final_response, "budget_exhausted", False
+    return final_response, "unknown", False
+
+
+def finalize_turn(agent, *, final_response, api_call_count, interrupted, failed, messages, _turn_exit_reason):
+    from agent.conversation_loop import logger
+
+    final_response, _turn_exit_reason, preserved = _resolve_budget_fallback(
+        agent, final_response, api_call_count,
+    )
+
+    completed = (
+        final_response is not None
+        and not failed
+        and api_call_count < agent.max_iterations
+    )
+    return {"completed": completed}
 '''
 
 
 def stage_tree():
     root = Path(tempfile.mkdtemp())
     (root / "agent").mkdir()
-    (root / LOOP_RELATIVE).write_text(LOOP_STUB)
+    (root / "hermes_cli").mkdir()
+    (root / TOOL_ROUND_RELATIVE).write_text(TOOL_ROUND_STUB)
+    (root / API_ERROR_RELATIVE).write_text(API_ERROR_STUB)
     (root / FINALIZER_RELATIVE).write_text(FINALIZER_STUB)
     (root / CLI_RELATIVE).write_text(CLI_STUB)
+    (root / CHAT_RELATIVE).write_text(CHAT_STUB)
     return root
 
 
-class ApplierTest(unittest.TestCase):
-    def _apply(self):
-        root = stage_tree()
-        apply(root)
-        return (
-            (root / LOOP_RELATIVE).read_text(),
-            (root / FINALIZER_RELATIVE).read_text(),
-        )
+def _assigned_value(fn, name):
+    for n in ast.walk(fn):
+        if (
+            isinstance(n, ast.Assign)
+            and len(n.targets) == 1
+            and isinstance(n.targets[0], ast.Name)
+            and n.targets[0].id == name
+        ):
+            return ast.unparse(n.value)
+    return None
 
+
+def budget_predicates(finalizer_source):
+    """``(upstream, inserted)``: upstream's ``budget_exhausted`` value in
+    ``_resolve_budget_fallback`` and the ``iteration_limit_fallback=`` the
+    inserted call passes, both unparsed so layout does not count."""
+    tree = ast.parse(finalizer_source)
+    defs = {
+        n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    upstream = _assigned_value(defs["_resolve_budget_fallback"], "budget_exhausted")
+    inserted = None
+    for n in ast.walk(defs["finalize_turn"]):
+        if isinstance(n, ast.Call) and ast.unparse(n.func) == "_kanban_should_record_missing":
+            for k in n.keywords:
+                if k.arg == "iteration_limit_fallback":
+                    inserted = ast.unparse(k.value)
+    return upstream, inserted
+
+
+class ApplierTest(unittest.TestCase):
     def _apply_all(self):
         root = stage_tree()
         apply(root)
-        return (
-            (root / LOOP_RELATIVE).read_text(),
-            (root / FINALIZER_RELATIVE).read_text(),
-            (root / CLI_RELATIVE).read_text(),
-        )
+        return {
+            "round": (root / TOOL_ROUND_RELATIVE).read_text(),
+            "finalizer": (root / FINALIZER_RELATIVE).read_text(),
+            "api_error": (root / API_ERROR_RELATIVE).read_text(),
+            "cli": (root / CLI_RELATIVE).read_text(),
+            "chat": (root / CHAT_RELATIVE).read_text(),
+        }
 
     def test_all_files_are_patched_and_stay_parseable(self):
-        loop, finalizer, cli = self._apply_all()
-        ast.parse(loop)
-        ast.parse(finalizer)
-        ast.parse(cli)
-        self.assertIn("if _kanban_halt_nudge:", loop)
-        self.assertIn("_kanban_should_record_missing(", finalizer)
-        self.assertIn("agent._kube_last_api_failure = (", loop)
-        self.assertIn("_kube_block_rate_limited(result)", cli)
+        files = self._apply_all()
+        for source in files.values():
+            ast.parse(source)
+        self.assertIn("if _kanban_halt_nudge:", files["round"])
+        self.assertIn("_kanban_should_record_missing(", files["finalizer"])
+        self.assertIn("agent._kube_last_api_failure = (", files["api_error"])
+        self.assertIn("_kube_block_rate_limited(result)", files["cli"])
+        self.assertIn("_kube_block_rate_limited_chat(turn.result)", files["chat"])
 
     def test_the_stash_follows_the_classification(self):
-        loop, _, _ = self._apply_all()
+        api_error = self._apply_all()["api_error"]
         self.assertLess(
-            loop.index("classified = classify_api_error("),
-            loop.index("agent._kube_last_api_failure = ("),
+            api_error.index("classified = classify_api_error("),
+            api_error.index("agent._kube_last_api_failure = ("),
         )
         self.assertLess(
-            loop.index("agent._kube_last_api_failure = ("),
-            loop.index("Error classified"),
+            api_error.index("agent._kube_last_api_failure = ("),
+            api_error.index("Error classified"),
         )
 
     def test_the_stash_and_the_finalizer_agree_on_the_attribute(self):
         """The applier spells the name twice; the module owns it."""
-        loop, finalizer, _ = self._apply_all()
-        self.assertIn(f"agent.{LAST_API_FAILURE_ATTR} = (", loop)
-        self.assertIn(f'getattr(agent, "{LAST_API_FAILURE_ATTR}", None)', finalizer)
+        files = self._apply_all()
+        self.assertIn(f"agent.{LAST_API_FAILURE_ATTR} = (", files["api_error"])
+        self.assertIn(f'getattr(agent, "{LAST_API_FAILURE_ATTR}", None)', files["finalizer"])
 
     def test_the_stash_cannot_raise_out_of_the_error_handler(self):
-        loop, _, _ = self._apply_all()
-        body = loop[loop.index("agent._kube_last_api_failure = (") :]
+        api_error = self._apply_all()["api_error"]
+        body = api_error[api_error.index("agent._kube_last_api_failure = (") :]
         self.assertIn("except Exception:", body[: body.index("logger.debug")])
         self.assertIn("agent._kube_last_api_failure = None", body)
 
     def test_the_finalizer_passes_the_block_path_and_the_stash(self):
-        _, finalizer, _ = self._apply_all()
+        finalizer = self._apply_all()["finalizer"]
         call = finalizer[finalizer.index("_kanban_record_missing_terminal(") :]
         call = call[: call.index("):")]
         self.assertIn("block_task=_kb.block_task", call)
+        self.assertIn("connect=_kube_kanban_connect", call)
+        self.assertIn("record_failure=_kube_record_task_failure", call)
         self.assertIn(
             'last_api_failure=getattr(agent, "_kube_last_api_failure", None)', call
         )
         self.assertIn("run_id=_kube_worker_run_id()", call)
 
+    def test_the_finalizer_reads_the_split_kanban_modules(self):
+        """hermes_cli.kanban_db no longer defines connect or _record_task_failure."""
+        finalizer = self._apply_all()["finalizer"]
+        self.assertIn("from hermes_cli.kanban_db_connect import connect as _kube_kanban_connect", finalizer)
+        self.assertIn("from hermes_cli.kanban_db_dispatch import (", finalizer)
+        self.assertIn("_record_task_failure as _kube_record_task_failure", finalizer)
+        self.assertNotIn("_kb.connect", finalizer)
+        self.assertNotIn("_kb._record_task_failure", finalizer)
+
+    def test_the_backstop_runs_after_the_budget_fallback_and_before_completed(self):
+        finalizer = self._apply_all()["finalizer"]
+        self.assertLess(
+            finalizer.index("_resolve_budget_fallback(\n"),
+            finalizer.index("_kanban_should_record_missing("),
+        )
+        self.assertLess(
+            finalizer.index("_kanban_should_record_missing("),
+            finalizer.index("completed = ("),
+        )
+        self.assertEqual(finalizer.count(FINALIZER_ANCHOR), 1)
+
+    def test_the_budget_exclusion_mirrors_upstreams_predicate(self):
+        # Compared the way the verifier compares them in the image: the value
+        # upstream's _resolve_budget_fallback binds to budget_exhausted against
+        # the iteration_limit_fallback= the insert passes, both unparsed.
+        upstream, inserted = budget_predicates(self._apply_all()["finalizer"])
+        self.assertIsNotNone(upstream)
+        self.assertEqual(inserted, upstream)
+
+    def test_the_predicate_comparison_sees_an_upstream_rewording(self):
+        # The check has teeth only if a drifted upstream predicate reads as a
+        # mismatch rather than being satisfied by the insert alone.
+        root = stage_tree()
+        drifted = FINALIZER_STUB.replace(
+            "api_call_count >= agent.max_iterations or", "api_call_count > agent.max_iterations or"
+        )
+        self.assertNotEqual(drifted, FINALIZER_STUB)
+        (root / FINALIZER_RELATIVE).write_text(drifted)
+        apply(root)
+        upstream, inserted = budget_predicates((root / FINALIZER_RELATIVE).read_text())
+        self.assertIsNotNone(upstream)
+        self.assertNotEqual(inserted, upstream)
+
     def test_the_cli_block_runs_before_the_exit_code_is_decided(self):
-        _, _, cli = self._apply_all()
+        cli = self._apply_all()["cli"]
         self.assertLess(
             cli.index("_kube_block_rate_limited(result)"),
             cli.index("_exit_code = 0"),
         )
         self.assertEqual(cli.count(CLI_ANCHOR), 1)
 
-    def test_the_chat_path_blocks_before_the_billing_cta(self):
+    def test_the_chat_render_path_blocks_before_the_response_panel(self):
         """Normal workers end in chat(); only -Q workers reach the exit block."""
-        _, _, cli = self._apply_all()
+        chat = self._apply_all()["chat"]
         self.assertLess(
-            cli.index("_kube_block_rate_limited_chat(result)"),
-            cli.index('if result and result.get("failure_reason") == "billing":'),
+            chat.index("_kube_block_rate_limited_chat(turn.result)"),
+            chat.index("self._chat_print_response_panel(turn, response)"),
         )
-        self.assertEqual(cli.count(CHAT_ANCHOR), 1)
-        chat_site = cli[cli.index("def chat(") : cli.index("def main(")]
-        self.assertIn("_kube_block_rate_limited_chat(result)", chat_site)
-        self.assertIn('os.environ.get("HERMES_KANBAN_TASK")', chat_site)
-        self.assertIn("except Exception:", chat_site)
+        self.assertEqual(chat.count(CHAT_ANCHOR), 1)
+        render = chat[chat.index("def _chat_render_turn(") : chat.index("def _chat_print_response_panel(")]
+        self.assertIn("_kube_block_rate_limited_chat(turn.result)", render)
+        self.assertIn('os.environ.get("HERMES_KANBAN_TASK")', render)
+        self.assertIn("except Exception:", render)
+        self.assertIn("logging.getLogger(__name__)", render, "the mixin has no module logger")
 
     def test_a_missing_chat_anchor_is_fatal_too(self):
         root = stage_tree()
-        (root / CLI_RELATIVE).write_text(CLI_STUB.replace(
-            'if result and result.get("failure_reason") == "billing":',
-            'if result and result.get("failure_reason") == "credits":',
+        (root / CHAT_RELATIVE).write_text(CHAT_STUB.replace(
+            "self._chat_print_response_panel(turn, response)",
+            "self._chat_print_answer_panel(turn, response)",
         ))
         with self.assertRaises(SystemExit) as ctx:
             apply(root)
@@ -1003,55 +1117,122 @@ class ApplierTest(unittest.TestCase):
 
     def test_the_cli_block_cannot_change_the_exit_code(self):
         """Exit 75 is the reaper's contract; the block is additive."""
-        _, _, cli = self._apply_all()
+        cli = self._apply_all()["cli"]
         block = cli[cli.index("kube-agents patch: a worker") : cli.index("_exit_code = 0")]
         self.assertNotIn("_exit_code", block)
         self.assertNotIn("sys.exit", block)
         self.assertIn("except Exception:", block)
 
-    def test_the_nudge_runs_before_the_break_it_replaces(self):
-        loop, _ = self._apply()
+    def test_the_nudge_runs_before_the_break_verdict_it_replaces(self):
+        loop = self._apply_all()["round"]
+        # The indented code line, not the insert's own comment naming it.
         self.assertLess(
             loop.index("if _kanban_halt_nudge:"),
-            loop.index("\n                    break\n"),
+            loop.index('\n        return _verdict("break")\n'),
         )
 
+    def test_the_nudge_hands_back_a_continue_verdict(self):
+        """The phase helper returns; the loop copies final_response and the exit reason back."""
+        loop = self._apply_all()["round"]
+        body = loop[loop.index("if _kanban_halt_nudge:") :]
+        nudge_body = body[: body.index('return _verdict("break")')]
+        self.assertIn('return _verdict("continue")', nudge_body)
+        self.assertNotIn("\n            continue\n", nudge_body)
+
     def test_the_halt_decision_is_cleared_before_continuing(self):
-        """reset_for_turn clears it per turn, not per iteration."""
-        loop, _ = self._apply()
+        """reset_for_turn clears it per turn, not per round."""
+        loop = self._apply_all()["round"]
         body = loop[loop.index("if _kanban_halt_nudge:") :]
         self.assertLess(
             body.index("agent._tool_guardrail_halt_decision = None"),
-            body.index("continue"),
+            body.index('return _verdict("continue")'),
+        )
+        self.assertLess(
+            body.index("final_response = None"),
+            body.index('return _verdict("continue")'),
         )
 
     def test_the_nudge_is_appended_through_the_stamping_helper(self):
         """A raw list.append leaves one undated message in a dated transcript."""
-        loop, _ = self._apply()
+        loop = self._apply_all()["round"]
         body = loop[loop.index("if _kanban_halt_nudge:") :]
         self.assertIn("append_message(messages, {", body)
         self.assertNotIn("messages.append(", body)
 
     def test_the_exit_reason_is_taken_back_off_guardrail_halt(self):
-        loop, _ = self._apply()
+        loop = self._apply_all()["round"]
         body = loop[loop.index("if _kanban_halt_nudge:") :]
         self.assertIn('_turn_exit_reason = "unknown"', body)
 
     def test_the_search_counter_is_never_reset(self):
         """Resetting it would hand out another 50 searches, not fix the exit."""
-        loop, _ = self._apply()
+        loop = self._apply_all()["round"]
         self.assertNotIn("_turn_web_search_count", loop)
 
-    def test_the_backstop_runs_before_the_completed_determination(self):
-        _, finalizer = self._apply()
-        self.assertLess(
-            finalizer.index("_kanban_should_record_missing("),
-            finalizer.index("# Determine if conversation completed successfully"),
-        )
+    def test_the_nudge_path_carries_its_own_os_import(self):
+        """turn_tool_round.py does not import os; the insert must not assume it."""
+        loop = self._apply_all()["round"]
+        self.assertIn("import os as _kube_os", loop)
+        self.assertNotIn("\n                os.environ", loop)
+
+    def test_the_patched_round_really_continues(self):
+        """Run the miniature: a halted worker gets its nudge and a continue verdict."""
+        root = stage_tree()
+        apply(root)
+        sys.modules.setdefault("agent", types.ModuleType("agent"))
+        stop = types.ModuleType("agent.kanban_stop")
+        stop.build_kanban_stop_nudge = lambda messages, attempts: "finish on the board"
+        sys.modules["agent.kanban_stop"] = stop
+        hermes_cli = types.ModuleType("hermes_cli")
+        hermes_cli.kanban_guardrail_exit = importlib.import_module("kanban_guardrail_exit")
+        sys.modules["hermes_cli"] = hermes_cli
+        sys.modules["hermes_cli.kanban_guardrail_exit"] = hermes_cli.kanban_guardrail_exit
+        try:
+            spec = importlib.util.spec_from_file_location("patched_round", root / TOOL_ROUND_RELATIVE)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            class Decision:
+                tool_name = "web_search"
+                code = "loop_web_search_cap"
+
+            class Agent:
+                _tool_guardrail_halt_decision = Decision()
+                statuses = []
+
+                def _execute_tool_calls(self, messages):
+                    pass
+
+                def _toolguard_controlled_halt_response(self, decision):
+                    return "halted"
+
+                def _emit_status(self, text):
+                    self.statuses.append(text)
+
+                def _safe_print(self, text):
+                    raise AssertionError("the halt text must not be printed on the nudge path")
+
+            agent = Agent()
+            messages = []
+            with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_verify"}):
+                verdict = module.run_tool_round(
+                    agent, messages=messages, final_response=None, _turn_exit_reason="unknown"
+                )
+            self.assertEqual(verdict.action, "continue")
+            self.assertIsNone(verdict.final_response)
+            self.assertEqual(verdict._turn_exit_reason, "unknown")
+            self.assertIsNone(agent._tool_guardrail_halt_decision)
+            self.assertEqual(agent._kanban_stop_nudges, 1)
+            self.assertEqual([m["role"] for m in messages], ["assistant", "user"])
+            self.assertTrue(messages[-1]["_kanban_stop_synthetic"])
+            self.assertIn("timestamp", messages[-1])
+        finally:
+            for name in ("agent.kanban_stop", "hermes_cli.kanban_guardrail_exit", "hermes_cli"):
+                sys.modules.pop(name, None)
 
     def test_a_missing_anchor_is_fatal_not_silent(self):
         root = stage_tree()
-        (root / LOOP_RELATIVE).write_text("def run_conversation():\n    pass\n")
+        (root / TOOL_ROUND_RELATIVE).write_text("def run_tool_round():\n    pass\n")
         with self.assertRaises(SystemExit) as ctx:
             apply(root)
         self.assertIn("found 0", str(ctx.exception))
@@ -1072,10 +1253,10 @@ class ApplierTest(unittest.TestCase):
 
     def test_the_anchors_are_the_ones_the_image_greps_for(self):
         self.assertIn("_turn_exit_reason = \"guardrail_halt\"", HALT_ANCHOR)
-        self.assertIn("# Determine if conversation completed", FINALIZER_ANCHOR)
+        self.assertIn("completed = (", FINALIZER_ANCHOR)
         self.assertIn("classified = classify_api_error(", CLASSIFY_ANCHOR)
         self.assertIn("_exit_code = 0", CLI_ANCHOR)
-        self.assertIn('result.get("failure_reason") == "billing"', CHAT_ANCHOR)
+        self.assertIn("self._chat_print_response_panel(turn, response)", CHAT_ANCHOR)
 
 
 if __name__ == "__main__":

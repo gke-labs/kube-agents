@@ -102,7 +102,12 @@ the same layout and is collected from the moment it starts running.
   `ABORTED`. This is the Prow job verdict, not the eval verdict.
 - `eval_verdict` — **optional, additive**: the eval loop's own verdict, from
   the final `PR Smoke Test Evaluation Succeeded/Failed` line: `GREEN` or
-  `RED`. `null` when the log has no such line — the job ended before its
+  `RED`. A run the suite could not evaluate (an admitted case lost every
+  repetition to infrastructure; the job exits `2` and the line carries
+  `NOT EVALUATED` between the anchors) records as `RED` here, because the
+  collector reads the `Failed` word and not the words after it; the
+  verdict's own `outcome` is in the run's `eval-verdict.json`, which nothing
+  on the dashboard reads yet. `null` when the log has no such line — the job ended before its
   verdict: Prow's deadline (it delivers SIGTERM and records `FAILURE`, not
   `ABORTED`; build 2092688354838581248 below is one), a death before the
   cases, or step 0's revalidation (a `SUCCESS`). A record written before
@@ -135,7 +140,16 @@ the same layout and is collected from the moment it starts running.
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
-      tokens this collector has never seen) → `fail`.
+      tokens this collector has never seen) → `fail`. An `infra` rep whose
+      `reason` leads with `KUBE_AGENTS_DELEGATION_CEILING` is a
+      **delegation-ceiling** rep: the harness's wait for the delegated worker
+      ran out with the card still running and nothing delivered. The readers
+      (`classify.py`, `health.py`) count it apart from the storm reps — it is
+      not lost to 429s — and outside every pass-rate denominator; `classify.py`
+      classes a case whose ungraded reps are all of this kind
+      `delegation-ceiling`. The run page, the PR view and the PR comment's
+      result cell count it in a case's total and name it apart; the Cases
+      page's per-run counts (`render.rep_counts`) still fold it into `infra`.
     - `reason` — the free text after the first space-padded `--` separator
       (later separators belong to the reason — fail reasons contain the
       delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
@@ -346,9 +360,12 @@ Additive, optional, and safe to omit — consumers must default them.
   so a `RED` candidate still leaves a `SUCCESS` in `result`. That is the job
   config's doing — it runs the driver under `|| true` — not the driver's, so
   a future config that drops the `|| true` would make the two agree without
-  anything here changing. `NOT RUN` is
-  the deploy-failed path — nothing was measured, so it is not a judgement
-  on the candidate.
+  anything here changing. `NOT RUN` is written on two paths, and on
+  neither is it a judgement on the candidate: the deploy failed, so nothing
+  was measured; or the eval ran and could not be evaluated (`ci-eval-pr.sh`
+  exited `2` and `eval-verdict.json` says `outcome: not_evaluated` — an
+  admitted case lost every repetition to infrastructure), so the candidate
+  was not measured on it.
 - `pass_rate` / `baseline_rate` / `margin` — fractions in `0..1` (`margin`
   may be negative), from `bench-gate suite`'s `Admitted-case pass rate:`
   line. `baseline_rate` and `margin` are `null` while the baseline store
@@ -374,8 +391,11 @@ what the renderer does with them.
   `[{"n": 1, "result": "pass"|"fail"|"infra", "reason": "<string>"|null}]`.
   `reason` is free-form log text (renderers must escape it). `infra` reps
   are excluded from every pass-fraction denominator, exactly like `infra`
-  task results. When `reps` is absent the task's single `result` stands in
-  for one rep.
+  task results; an `infra` rep whose `reason` leads with
+  `KUBE_AGENTS_DELEGATION_CEILING` is also excluded from the storm counts
+  (`storm_reps`, `health.json`'s `infra_reps`) and reported under
+  `metrics.ceiling_reps` instead. When `reps` is absent the task's single
+  `result` stands in for one rep.
 - `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
   it; a night that is not a `SUCCESS` and carries `null` was ended before
   its verdict and is reported as truncated. Absent means unknown.
@@ -605,9 +625,10 @@ pending[], releases[], nightly{}, trend{}}`. `runs[]` is the **presubmit's** las
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
 `infra` = the gate's), `headline`, `lede`, `matches_incident`,
-`setup_death`, `storm_reps`, `do`, `cases[]` (`{case, outcome, cls,
+`setup_death`, `storm_reps`, `ceiling_reps`, `do`, `cases[]` (`{case, outcome, cls,
 also_failing_prs, pass_rate_30d, reason, excerpt, rep_n, do, admitted, reps,
-nightly_failed_recent}`) and `health_at` (the verdict in force when it
+nightly_failed_recent}`, `reps` being `{pass, fail, infra, ceiling}`) and
+`health_at` (the verdict in force when it
 finished, from history; `null` without history). `rep_n` is the 1-based
 repetition the row is about — the one whose `reason` is shown, else the
 one whose `excerpt` is (`null` when there is neither); the pages link that
@@ -768,9 +789,9 @@ read is final.
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths|lost_pods|fixture_drift`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|delegation_ceiling`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
-`slow`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
+`slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
@@ -778,7 +799,10 @@ and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
 it}`) and `event` (`true` when the loss counts as a build-cluster event);
 the pages give it the same 2-hour lead on the Brief's window as a storm and
 a run-page banner of its own, and otherwise show the generic degraded
-headline. `issue` (`{number, url}`) may carry `condition`, the one it was
+headline. For `delegation_ceiling` (15+ repetitions across 3+ PRs in 2 hours
+ended at the harness's delegation wait with the worker still running, #1874)
+the `incident` also carries `reps`, and the pages give it the storm's 2-hour
+lead, a Brief headline and a run-page banner of its own. `issue` (`{number, url}`) may carry `condition`, the one it was
 filed for. `fixture_drift` (the hourly seeded-fleet scan found a fixture
 role out of its designed state; docs/ci-health.md, "The seeded-fleet scan")
 carries `roles`, `projects` and `drift` in its `incident` and a
@@ -790,6 +814,48 @@ baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
 `baseline_days` for the one sentence the Brief's healthy headline adds while
 it is set.
+
+`pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
+pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
+window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, waiting_since, over_threshold,
+threshold_p50_s, threshold_p95_s, free, total, cause, max_concurrency}` when
+`verdict` is `BREACH` or `UNMEASURED`. `waiting_longest_s` is how long the
+longest run has been waiting for a project right now, `0` for an empty queue
+and `null` when Deck was not read; `over_threshold` is the count already past
+the p95 limit. `waiting_now` is whether that wait is past the p50 limit — a
+live backlog — and `null` when Deck was unread or no limit was given. A verdict
+lasts a week, so every present-tense reader asks it: the alert is withheld on
+`false`, `CONTROL_PLANE` drops its diagnosis on `null`, and the digest and
+Brief go past tense on either. `waiting_since` dates the backlog from its
+oldest queued run, and is `null` when there is none; the Brief's present-tense
+sentence prefers it to `since`, which can be days older.
+`breach_seen` says whether the open episode has ever measured a breach, and
+`since` is the episode's start except that a `BREACH` does not inherit one from
+a stretch that only ever said the queue could not be read. `metrics` carries
+both across a tick that read no artifact, as `pool_since` and
+`pool_breach_seen`. The two
+figures are never the seven-day window's — the periodic breaches on a day's row
+or on runs queued past p95 right now, and the window sits back inside its own
+limit after one bad day. Exactly one of `window_hours` and `day` says which
+stretch they cover: the periodic's recent window when it had the runs to judge
+it and went over a limit, the worst breached day otherwise. A verdict lasts a
+week, so the recent window comes first — a Thursday incident evidenced by
+Monday reads as a contradiction — but a compliant stretch is the same
+contradiction, only newer. Both are `null` when only the live queue breached;
+`over_threshold` counts those runs. A `STALE` verdict carries no numbers: the
+periodic stopped publishing, and the last reading is not evidence about now.
+Unlike `slow` it is set in every state, and the pages read `verdict`, `since`,
+`measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `over_threshold`,
+`threshold_p50_s` and `threshold_p95_s` for one sentence on the Brief's healthy
+headline and on the last-24-hours view.
+`metrics.queue_wait_p50_s` is the same job's median wait over the last day, or
+`null`; it is not derived from the runs. `metrics.queue_wait_read` says whether
+the artifact was there at all. Nothing else answers that: `pool` is `null` for a
+healthy pool and for a failed fetch alike, and `queue_wait_p50_s` is `null` on a
+day with no runs. The poster needs the difference — going blind must not read as
+the episode ending. `metrics.pool_since` is the open episode's start, held
+across the ticks that read no artifact and so write no `pool`, and `null` once
+a tick reads one and writes none, which is the episode ending.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus

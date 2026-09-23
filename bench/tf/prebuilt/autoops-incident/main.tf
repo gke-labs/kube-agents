@@ -14,8 +14,9 @@
 
 # The scenario driver for bench/tasks/autoops-warning-event-triage.
 #
-# Every other prebuilt stack here builds a cluster and plants something on it.
-# This one builds nothing. The incident has to happen on the cluster the
+# Most prebuilt stacks here build a cluster and plant something on it. This
+# one builds nothing — a shape its #1023 siblings (autoops-crashloop-incident,
+# ai-model-defects) copy. The incident has to happen on the cluster the
 # Platform Agent pod is running on, because that is the only cluster
 # k8s-event-watcher is guaranteed to be watching while the case runs.
 #

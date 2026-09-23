@@ -16,13 +16,15 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// replayFixture publishes n status events for taskID and returns the client.
 func replayAddressee(taskID string) string { return "worker-" + taskID }
 
-func replayFixture(t *testing.T, url, taskID string, states []TaskState) *Client {
+// replayFixture publishes n status events for taskID and returns the client.
+// opts are appended to the client's, for a fixture that must connect as a
+// particular user.
+func replayFixture(t *testing.T, url, taskID string, states []TaskState, opts ...ClientOption) *Client {
 	t.Helper()
 	ctx := testCtx(t)
-	c, err := Connect(ctx, url, WithName("replay-test"))
+	c, err := Connect(ctx, url, append([]ClientOption{WithName("replay-test")}, opts...)...)
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}

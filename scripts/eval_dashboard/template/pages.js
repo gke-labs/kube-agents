@@ -57,10 +57,11 @@ const PAGE = {
   // The adjudicator's STORM_COOLDOWN: retest this long after the last storm-hit run.
   stormCooldownMs: 30 * 60 * 1000,
   // An incident's window opens this long before its `since`: the rule's own
-  // lookback (shared break 6 h, storm, setup deaths and lost pods 2 h), so
+  // lookback (shared break 6 h; storm, delegation ceiling, setup deaths and
+  // lost pods 2 h), so
   // the runs that made the bot declare it are on the page, not only the ones
   // after.
-  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000 },
+  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000, delegation_ceiling: 2 * 3600 * 1000 },
   recoveryGreenRuns: 3,
   // A shared break "explains" the reds when at least this share of red runs
   // in the window collapsed one of its cases; below it the headline says "most".
@@ -75,6 +76,12 @@ const PAGE = {
   views: { gate: "gate", agent: "agent" },
   states: { GREEN: "hs-green", DEGRADED: "hs-amber", OUTAGE: "hs-red", PAST: "hs-past" },
   glyphs: { GREEN: "🟢", DEGRADED: "🟡", OUTAGE: "🔴", PAST: "⚪" },
+  // health.py's pool verdicts (rule 8). The verdict picks the lede's
+  // sentence, so an unrecognised one renders nothing rather than guessing.
+  poolVerdicts: ["BREACH", "UNMEASURED", "STALE"],
+  // The breached day, as pool_pressure.py buckets it: a UTC calendar date.
+  // The lede prints it verbatim, so it is shape-checked and not only typed.
+  poolDayRe: /^\d{4}-\d{2}-\d{2}$/,
   spyglass: "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents",
   job: "pull-kube-agents-smoke-test",
   prUrl: "https://github.com/gke-labs/kube-agents/pull",
@@ -205,6 +212,7 @@ function normalizeHealth(raw) {
   const list = (key) => (Array.isArray(raw[key]) ? raw[key].filter((v) => typeof v === "string") : []);
   const incident = raw.incident && typeof raw.incident === "object" ? raw.incident : null;
   const slow = raw.slow && typeof raw.slow === "object" ? raw.slow : null;
+  const pool = raw.pool && typeof raw.pool === "object" ? raw.pool : null;
   const count = (v) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null);
   return {
     state,
@@ -231,6 +239,23 @@ function normalizeHealth(raw) {
       baseline_p50_s: count(slow.baseline_p50_s),
       baseline_days: count(slow.baseline_days),
     } : null,
+    // The pool note (health.py rule 8), as render.py normalizes it.
+    pool: pool ? {
+      verdict: PAGE.poolVerdicts.includes(pool.verdict) ? pool.verdict : null,
+      since: parseIso(pool.since) != null ? pool.since : null,
+      measured_at: parseIso(pool.measured_at) != null ? pool.measured_at : null,
+      day: typeof pool.day === "string" && PAGE.poolDayRe.test(pool.day) ? pool.day : null,
+      window_hours: count(pool.window_hours),
+      p50_s: count(pool.p50_s),
+      p95_s: count(pool.p95_s),
+      // Tri-state, so only a real bool passes: null is "Deck was not read",
+      // and the sentence must not reach it through a malformed field.
+      waiting_now: typeof pool.waiting_now === "boolean" ? pool.waiting_now : null,
+      waiting_since: parseIso(pool.waiting_since) != null ? pool.waiting_since : null,
+      over_threshold: count(pool.over_threshold),
+      threshold_p50_s: count(pool.threshold_p50_s),
+      threshold_p95_s: count(pool.threshold_p95_s),
+    } : null,
     tick: parseIso(raw.tick) != null ? raw.tick : null,
   };
 }
@@ -242,6 +267,56 @@ function slowSentence(h) {
   if (!s || s.median_s == null || s.baseline_p50_s == null) return "";
   const since = s.since ? ` since ${esc(et(parseIso(s.since)))}` : "";
   return ` Runs are slow${since}: the last ${s.runs ?? "few"} full runs took a median of ${Math.round(s.median_s / 60)} min against a ${s.baseline_days ?? "7"}-day typical of ${Math.round(s.baseline_p50_s / 60)}. Nothing is broken; /retest won't make yours faster.`;
+}
+
+// One sentence for the Brief's headline while runs are waiting to start; ""
+// otherwise. Cause-free, like the digest's line: the Chat alert names the
+// cause and what to do, this says the gate is queuing and nothing is broken.
+function poolSentence(h) {
+  // health.py's wait_text: the gate breaches on p50 or p95, so a p95-only
+  // breach carries a sub-minute median that whole minutes print as "0 min".
+  const waitText = (s) => (s < 60 ? `${Math.round(s)}s` : `${Math.floor(s / 60)} min`);
+  const p = h && h.pool;
+  if (!p || !p.verdict) return "";
+  if (p.verdict === "STALE") {
+    // No timestamp when the periodic ran and published nothing: there is no
+    // last reading to date.
+    const since = p.measured_at ? ` since ${esc(et(parseIso(p.measured_at)))}` : "";
+    return ` No pool numbers${since}: the hourly pool check has stopped reporting.`;
+  }
+  if (p.verdict === "UNMEASURED") return " The queue wait is unknown: the hourly pool check ran but could not read how long recent runs waited.";
+  // What tripped the verdict, which is a single day's row or the live queue --
+  // never the seven-day window, which one bad day leaves inside its own limit.
+  // The backlog's start while there is one, the episode's otherwise: the
+  // verdict spans a week, so the episode can have opened days before the jam
+  // the present tense below is describing.
+  const began = p.waiting_since || p.since;
+  const since = began ? ` since ${esc(et(parseIso(began)))}` : "";
+  // Both halves, like post_health.pool_numbers: a day can breach on p95 with a
+  // compliant median, and quoting the median alone puts a passing number
+  // forward as the evidence.
+  const found = [];
+  // health.pool_span: the recent stretch when the periodic could judge it, the
+  // worst breached day when it could not.
+  const span = p.window_hours ? `over the last ${p.window_hours}h` : p.day != null ? `on ${esc(p.day)}` : null;
+  if (span != null && p.p50_s != null && p.p95_s != null && p.threshold_p50_s != null && p.threshold_p95_s != null) {
+    found.push(
+      `${span} the median wait was ${waitText(p.p50_s)} against a ${Math.floor(p.threshold_p50_s / 60)} min limit` +
+        `, p95 ${waitText(p.p95_s)} against ${Math.floor(p.threshold_p95_s / 60)}`,
+    );
+  }
+  if (p.over_threshold && p.threshold_p95_s != null) {
+    found.push(`${p.over_threshold} run${p.over_threshold === 1 ? "" : "s"} queued past the ${Math.floor(p.threshold_p95_s / 60)} min limit`);
+  }
+  if (!found.length) return "";
+  // health.pool_note's waiting_now. The verdict lasts a week, so most renders
+  // of an episode find the queue already drained, and "are waiting" then sends
+  // a reader looking for a jam that ended on Monday. Null is Deck unread: past
+  // tense, but no claim that it cleared either.
+  const live = p.waiting_now;
+  // False is "nothing has waited past the limit", not "the queue is empty".
+  const cleared = live === false ? " No backlog right now." : "";
+  return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} Runs still pass; /retest makes the queue longer.`;
 }
 
 /* ---- URL contract ---- */
@@ -467,7 +542,7 @@ function breakFacts(inc, inWindow) {
   const mergeFact = mergesFact(inc, inWindow);
   if (mergeFact) facts.push(mergeFact);
   let reps = 0, storm = 0;
-  for (const run of hit) for (const c of run.cases || []) { reps += c.reps.pass + c.reps.fail + c.reps.infra; storm += c.reps.infra; }
+  for (const run of hit) for (const c of run.cases || []) { reps += repTotal(c.reps); storm += c.reps.infra; }
   const quiet = reps > 0 && storm / reps < PAGE.stormNoiseShare;
   facts.push(fact(!quiet, quiet
     ? `Not a quota storm: the agent ran and was graded on ${pct(1 - storm / reps)} of repetitions in these runs.`
@@ -481,7 +556,7 @@ function stormFacts(inc, inWindow) {
   const projects = new Set();
   for (const run of inWindow) {
     let mine = 0;
-    for (const c of run.cases || []) { reps += c.reps.pass + c.reps.fail + c.reps.infra; storm += c.reps.infra; mine += c.reps.infra; }
+    for (const c of run.cases || []) { reps += repTotal(c.reps); storm += c.reps.infra; mine += c.reps.infra; }
     if (mine) { if (run.pr != null) prs.add(run.pr); if (run.project) projects.add(run.project); }
   }
   const graded = inWindow.flatMap((r) => (r.cases || []).filter((c) => c.admitted && c.outcome !== "infra"));
@@ -493,6 +568,34 @@ function stormFacts(inc, inWindow) {
     fact(true, `<b>${storm} of ${reps} repetitions</b> came back with no agent run (429s, empty records) across ${plural(prs.size, "PR")}.`),
     fact(graded.length > 0, graded.length
       ? `When the agent did run it mostly passed: ${passed} of ${graded.length} graded gate cases.`
+      : "Nothing was graded in this window at all."),
+    fact(projects.size > 1, `Spread over ${plural(projects.size, "project")}, so not one bad cluster.`),
+    fact(widest < 3, widest < 3
+      ? `No single case fails everywhere: the widest shared failure is on ${plural(widest, "PR")}.`
+      : `One case also fails on ${plural(widest, "PR")}; a shared break may be underneath.`),
+  ];
+}
+
+// The delegation-ceiling brief's facts (#1874): the storm's shape over
+// ceiling reps. `ceiling_reps` on the run doc anchors the incident's first run.
+function ceilingFacts(inc, inWindow) {
+  let reps = 0, ceiling = 0;
+  const prs = new Set();
+  const projects = new Set();
+  for (const run of inWindow) {
+    let mine = 0;
+    for (const c of run.cases || []) { reps += repTotal(c.reps); ceiling += c.reps.ceiling || 0; mine += c.reps.ceiling || 0; }
+    if (mine) { if (run.pr != null) prs.add(run.pr); if (run.project) projects.add(run.project); }
+  }
+  const graded = inWindow.flatMap((r) => (r.cases || []).filter((c) => c.admitted && c.outcome !== "infra"));
+  const passed = graded.filter((c) => c.outcome === "passed" || c.outcome === "partial").length;
+  const collapsed = new Map();
+  for (const run of inWindow) for (const c of gateFailures(run)) collapsed.set(c, (collapsed.get(c) || new Set()).add(run.pr));
+  const widest = Math.max(0, ...[...collapsed.values()].map((s) => s.size));
+  return [
+    fact(true, `<b>${ceiling} of ${reps} repetitions</b> ended at the harness's delegation wait with the worker still running, across ${plural(prs.size, "PR")}; none of them was graded or counted against a case.`),
+    fact(graded.length > 0, graded.length
+      ? `When a worker did finish it mostly passed: ${passed} of ${graded.length} graded gate cases.`
       : "Nothing was graded in this window at all."),
     fact(projects.size > 1, `Spread over ${plural(projects.size, "project")}, so not one bad cluster.`),
     fact(widest < 3, widest < 3
@@ -586,6 +689,12 @@ function briefHeadline(inc, inWindow) {
       lede: `${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `Since ${esc(et(inc.sinceMs))}`}. The leased project failed at clone or deploy, so the agent was never started.`,
     };
   }
+  if (inc.condition === "delegation_ceiling") {
+    return {
+      head: inc.past ? "Workers did not finish: repetitions ended at the harness's delegation wait" : "Workers aren't finishing: repetitions are ending at the harness's delegation wait",
+      lede: `${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `Since ${esc(et(inc.sinceMs))}`}. The front door delegated and the card was still running when the eval stopped waiting, so nothing was graded; those runs read not evaluated, not red. The gateway log in a run's artifacts says whether the dispatcher stalled (#1879).`,
+    };
+  }
   return { head: inc.past ? "A past gate incident" : "The gate is degraded", lede: esc(inc.cause || "") };
 }
 
@@ -609,6 +718,7 @@ function whyTitle(inc) {
   if (isBreak(inc)) return "Why we think it's the environment, not a PR";
   if (inc.condition === "storm") return "Why we think it's a quota storm";
   if (inc.condition === "setup_deaths") return "Why we think it's the setup, not the PRs";
+  if (inc.condition === "delegation_ceiling") return "Why we think it's the workers, not the PRs";
   return "What the data shows";
 }
 
@@ -617,7 +727,7 @@ function agentSawHtml(inc, inWindow) {
   let pick = null;
   for (const run of [...inWindow].reverse()) {
     for (const c of run.cases || []) {
-      if (inc.condition === "storm" ? c.outcome === "infra" && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
+      if (inc.condition === "storm" || inc.condition === "delegation_ceiling" ? c.outcome === "infra" && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
         pick = { run, c };
         break;
       }
@@ -640,7 +750,7 @@ function agentSawHtml(inc, inWindow) {
 
 function changedBeforeHtml(inc, inWindow) {
   if (!Array.isArray(brief.merges)) return "";
-  const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : (r.storm_reps || 0) > 0));
+  const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : inc.condition === "delegation_ceiling" ? (r.ceiling_reps || 0) > 0 : (r.storm_reps || 0) > 0));
   const firstRedMs = firstRed ? runFinish(firstRed) : inc.sinceMs;
   if (firstRedMs == null) {
     // Same anchor as mergesFact: without it there is no "before" to show.
@@ -663,6 +773,7 @@ function beingDoneHtml(inc) {
     const retest = stormRetestMs(inc);
     lines.push(`<p>Wait it out${retest != null ? `: retest after ${esc(et(retest))}` : ""}. The API quota is fixed, so fewer runs at once is the only lever; a retest inside the storm loses repetitions the same way.</p>`);
   } else if (inc.condition === "setup_deaths" && !inc.past) lines.push(`<p>Check the leased pool projects before spending another run: a stuck Helm release or a failing image pull is the usual cause. Retest once the deaths stop.</p>`);
+  else if (inc.condition === "delegation_ceiling" && !inc.past) lines.push(`<p>Retest once workers are finishing again. Read <code>platform-agent-gateway.log</code> in a run's artifacts for <code>kanban dispatcher stuck</code> and <code>RESOURCE_EXHAUSTED</code> lines: a stalled dispatcher is #1879, starved workers are the quota.</p>`);
   if (inc.past) lines.push(`<p class="mut">This incident is over${inc.untilMs != null ? `; the gate was reported healthy again at ${esc(et(inc.untilMs))}` : ""}.</p>`);
   if (inc.stale) lines.push(`<p class="stale">The data behind this state stopped refreshing; the state is as old as the data.</p>`);
   if (!lines.length) return "";
@@ -680,11 +791,14 @@ function runsListHtml(inWindow, inc, title) {
     let note = "";
     if (run.setup_death) note = '<span class="chip inf">died in setup</span>';
     else if (!measured(run)) note = `<span class="chip inf">${run.result === "ABORTED" ? "aborted" : "no cases recorded"}</span>`;
-    else if (!failed.length) note = '<span class="chip ok">all gate cases passed</span>';
+    // A run whose every recorded case went ungraded (a storm, or every
+    // worker at the delegation ceiling) passed nothing; the chips say why.
+    else if (!failed.length) note = (run.cases || []).some((c) => c.outcome !== "infra") ? '<span class="chip ok">all gate cases passed</span>' : '<span class="chip inf">nothing graded</span>';
     const stormChip = (run.storm_reps || 0) >= 5 ? `<span class="chip inf">${run.storm_reps} reps lost</span>` : "";
+    const ceilingChip = (run.ceiling_reps || 0) >= 5 ? `<span class="chip inf">${run.ceiling_reps} reps at the delegation ceiling</span>` : "";
     return `<a class="runrow v-${esc(run.verdict || "infra")}" href="${esc(runHref(run))}">` +
       `<span class="rpr">#${esc(run.pr ?? "?")}</span><span class="rwhen">${esc(et(runFinish(run)))}</span>` +
-      `<span class="rproj">${esc(projectShort(run.project))}</span><span class="rcases">${chips}${note}${stormChip}${held ? `<span class="mut small">+${held} held-out</span>` : ""}</span></a>`;
+      `<span class="rproj">${esc(projectShort(run.project))}</span><span class="rcases">${chips}${note}${stormChip}${ceilingChip}${held ? `<span class="mut small">+${held} held-out</span>` : ""}</span></a>`;
   });
   // The incident's own window on the Grid: the same cases, since and until.
   const grid = inc ? `<p><a href="${esc(gridHref(inc))}">See it in the grid →</a></p>` : "";
@@ -703,7 +817,7 @@ function numbers(sinceMs, untilMs) {
   const walls = done.map((r) => (parseIso(r.finished) ?? 0) - (parseIso(r.started) ?? 0)).filter((w) => w > 0).sort((a, b) => a - b);
   const p = (q) => (walls.length ? walls[Math.round(q * (walls.length - 1))] : null);
   let reps = 0, lost = 0;
-  for (const run of full) for (const c of run.cases || []) { reps += c.reps.pass + c.reps.fail + c.reps.infra; lost += c.reps.infra; }
+  for (const run of full) for (const c of run.cases || []) { reps += repTotal(c.reps); lost += c.reps.infra; }
   return { full: full.length, prs: new Set(full.map((r) => r.pr).filter((x) => x != null)).size, green: green.length, reds, own, infra: reds - own + deaths, deaths, p50: p(0.5), p90: p(0.9), lostShare: reps ? lost / reps : null, aborted: all.filter((r) => !concluded(r)).length };
 }
 
@@ -726,7 +840,7 @@ function lastIncidentHtml() {
   const past = historyIncidents().map(incidentFromHistory).filter((inc) => inc.sinceMs != null).sort((a, b) => b.sinceMs - a.sinceMs);
   if (!past.length) return brief.history ? `<p class="mut">No incident on record yet.</p>` : `<p class="mut">No incident history is published yet, so only the current state is shown.</p>`;
   const inc = past[0];
-  const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : "a degraded gate";
+  const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : inc.condition === "delegation_ceiling" ? "workers not finishing (delegation ceiling)" : "a degraded gate";
   return `<p>${pillHtml(inc.state, `PAST ${inc.state}`)} <b>${esc(etSpan(inc.sinceMs, inc.untilMs))}</b> — ${what}${inc.cases.length ? ` (<code>${inc.cases.map(esc).join("</code>, <code>")}</code>)` : ""}. <a href="${esc(incidentHref(inc))}">Open the brief for it →</a> <a href="${esc(trendHref(inc.cases, inc.sinceMs, inc.untilMs))}">The record on main around the night it started →</a></p>`;
 }
 
@@ -789,7 +903,7 @@ function briefHtml(link) {
     let head, lede, pill;
     if (healthy) {
       head = "Smoke gate is healthy";
-      lede = `No shared breaks, quota storms or setup failures right now. ${n.green} of ${n.green + n.reds} concluded runs in the last 24 hours were green.${health.stale ? " The data behind this state has stopped refreshing." : ""}${slowSentence(health)}`;
+      lede = `No shared breaks, quota storms or setup failures right now. ${n.green} of ${n.green + n.reds} concluded runs in the last 24 hours were green.${health.stale ? " The data behind this state has stopped refreshing." : ""}${slowSentence(health)}${poolSentence(health)}`;
       pill = pillHtml(health.stale ? "DEGRADED" : "GREEN", health.stale ? "HEALTHY · STALE" : "HEALTHY");
     } else if (noVerdict) {
       // No health.json beside the data: the runs alone cannot say the gate is healthy.
@@ -798,7 +912,10 @@ function briefHtml(link) {
       pill = pillHtml("PAST", "NO VERDICT");
     } else {
       head = "The last 24 hours in numbers";
-      lede = `The gate is ${inc.recovering ? "recovering" : inc.state.toLowerCase()} — <a href="${PAGE.pages.brief}">read the brief</a>. These are the plain counts.`;
+      // The pool sentence rides here too, unlike the slow one: a different
+      // job measuring different data cannot be this incident's own symptom,
+      // and when leases are the incident the wait is the explanation.
+      lede = `The gate is ${inc.recovering ? "recovering" : inc.state.toLowerCase()} — <a href="${PAGE.pages.brief}">read the brief</a>. These are the plain counts.${poolSentence(health)}`;
       pill = pillHtml(inc.state, stateWord(inc));
     }
     return `<div class="sec head">${pill}<h1>${esc(head)}</h1><div class="lede">${lede}</div></div>` +
@@ -817,7 +934,7 @@ function briefHtml(link) {
       beingDoneHtml(inc) + footHtml();
   }
   const { head, lede } = briefHeadline(inc, inWindow);
-  const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : [];
+  const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : inc.condition === "delegation_ceiling" ? ceilingFacts(inc, inWindow) : [];
   const pillText = `${stateWord(inc)} · ${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `since ${et(inc.sinceMs)}`}${inc.stale ? " · STALE" : ""}`;
   let recoveringLine = "";
   if (inc.recovering) recoveringLine = `<div class="lede">The condition has cleared; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} clean runs on distinct PRs so far. A retest is reasonable.</div>`;
@@ -855,6 +972,7 @@ function bannerHtml(run) {
   else if (h.condition === "storm") text = `<b>Quota storm ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs lose repetitions to 429s and empty records. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "setup_deaths") text = `<b>Setup failures ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs die before any case runs. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "lost_pods") text = `<b>Build nodes lost ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs died with the node under them; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
+  else if (h.condition === "delegation_ceiling") text = `<b>Workers not finishing ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: repetitions end at the harness's delegation wait with the card still running; those runs read not evaluated, not red. <a href="${esc(href)}">Read the brief →</a>`;
   else text = `<b>Gate ${h.recovering ? "recovering" : "outage"} ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: ${cases.length ? `<code>${cases.map(esc).join("</code>, <code>")}</code> fail${cases.length === 1 ? "s" : ""} on every PR` : esc(h.cause || "a shared break")}. <a href="${esc(href)}">Read the brief →</a>`;
   const state = h.recovering ? "DEGRADED" : h.state;
   return `<div class="banner ${PAGE.states[state] || "hs-past"}">${pillHtml(state, h.recovering ? "RECOVERING" : h.state)}<span>${text}</span></div>`;
@@ -865,13 +983,32 @@ function tagFor(c) {
   if (c.cls === "shared") return `<span class="tag shared">${c.also_failing_prs >= 1 ? `failing on ${plural(c.also_failing_prs, "other PR")}` : "in the current outage"}</span>`;
   if (c.cls === "only-this-pr") return '<span class="tag yours">only your PR</span>';
   if (c.cls === "storm") return '<span class="tag storm">quota storm</span>';
+  if (c.cls === "delegation-ceiling") return '<span class="tag storm">delegation ceiling</span>';
   return '<span class="tag unclear">unexplained</span>';
 }
 
+// A case's repetitions by kind. `ceiling` is the repetitions the harness
+// stopped watching at its delegation wait with the worker still running
+// (#1874): ungraded like a storm-lost rep, counted apart from it, and part of
+// the total or a three-rep case would read "all 0 reps lost".
+function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0); }
+function lostText(reps) {
+  const parts = [];
+  if (reps.infra) parts.push(`${reps.infra} lost`);
+  if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
+  return parts.length ? ` (${parts.join(", ")})` : "";
+}
+function ungradedText(reps) {
+  const total = plural(repTotal(reps), "rep");
+  if (reps.ceiling && !reps.infra) return `all ${total} hit the delegation ceiling with the worker still running`;
+  if (reps.ceiling) return `all ${total} ungraded: ${reps.infra} lost before grading, ${reps.ceiling} at the delegation ceiling`;
+  return `all ${total} lost before grading`;
+}
+
 function caseCard(run, c) {
-  const reps = c.reps || { pass: 0, fail: 0, infra: 0 };
-  const total = reps.pass + reps.fail + reps.infra;
-  const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${reps.infra ? ` (${reps.infra} lost)` : ""}` : c.outcome === "infra" ? `all ${plural(total, "rep")} lost before grading` : `${reps.pass} of ${total} reps passed`;
+  const reps = c.reps || { pass: 0, fail: 0, infra: 0, ceiling: 0 };
+  const total = repTotal(reps);
+  const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${lostText(reps)}` : c.outcome === "infra" ? ungradedText(reps) : `${reps.pass} of ${total} reps passed${lostText(reps)}`;
   const rate = c.pass_rate_30d != null ? ` · this case passed ${pct(c.pass_rate_30d)} of the time over the last 30 days on PRs` : "";
   // The nightly's record beside the gate's: the newest night within two
   // days of this run, when one graded the case. Evidence about main, never
@@ -999,6 +1136,7 @@ function lastFailureHtml(c) {
   if (f.state === "partial") head = `${reps.fail} of ${reps.pass + reps.fail} reps failed (the gate counts that as a pass)`;
   else if (f.cls === "shared") head = f.also_failing_prs >= 1 ? `the gate's: failing on ${plural(f.also_failing_prs, "other PR")} at the time` : "the gate's: in the outage at the time";
   else if (f.cls === "storm") head = "a quota storm: repetitions lost before grading";
+  else if (f.cls === "delegation-ceiling") head = "the delegation ceiling: the harness stopped waiting with the worker still running";
   else if (f.cls === "only-this-pr") head = "PR-caused: passed on other PRs around it";
   else if (f.event) head = "failed all reps in a run where almost everything failed";
   else head = "failed all reps";
@@ -1139,7 +1277,7 @@ function gridMarkers(win, cols) {
       seen.push({ t, cls });
       markers.push({ t, cls, label, title: `${et(t)} · ${label}` });
     };
-    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : "degraded");
+    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : inc.condition === "delegation_ceiling" ? "delegation ceiling" : "degraded");
     for (const inc of historyIncidents().map(incidentFromHistory)) {
       add(inc.sinceMs, "incident", `${inc.state.toLowerCase()}: ${what(inc)}`);
       add(inc.untilMs, "recovered", "healthy again");
@@ -1252,9 +1390,9 @@ function detailHtml() {
   const run = runs().find((r) => String(r.build) === sel.build);
   const c = run ? (run.cases || []).find((x) => x.case === sel.case) : null;
   if (!run || !c) return "";
-  const reps = c.reps || { pass: 0, fail: 0, infra: 0 };
-  const total = reps.pass + reps.fail + reps.infra;
-  const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${reps.infra ? ` (${reps.infra} lost)` : ""}` : c.outcome === "infra" ? `all ${plural(total, "rep")} lost before grading` : c.outcome === "partial" ? `${reps.fail} of ${total} reps failed` : `passed all ${plural(reps.pass, "rep")}`;
+  const reps = c.reps || { pass: 0, fail: 0, infra: 0, ceiling: 0 };
+  const total = repTotal(reps);
+  const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${lostText(reps)}` : c.outcome === "infra" ? ungradedText(reps) : c.outcome === "partial" ? `${reps.fail} of ${total} reps failed${lostText(reps)}` : `passed all ${plural(reps.pass, "rep")}${lostText(reps)}`;
   const others = (run.cases || []).filter((x) => x.case !== c.case && x.outcome === "passed").length;
   const startMs = parseIso(run.started), finishMs = parseIso(run.finished);
   const length = startMs != null && finishMs != null ? ` · ${minutesText(finishMs - startMs)} run` : "";

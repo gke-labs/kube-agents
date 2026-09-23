@@ -27,6 +27,7 @@ their own copies:
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
 | `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `litellm.yaml` mirrors them     |
+| `DEFAULT_MODEL_MAX_TOKENS`                                                | Output tokens the gateway asks for on a request that names none (`0`: no `max_tokens`) |
 | `DEFAULT_GEMINI_API_KEY_SECRET_NAME`                                      | Secret Manager secret a Gemini key is read from when none is given (`gemini-api-key`)  |
 | `DEFAULT_NAMESPACE`                                                       | Kubernetes namespace of the release (`kubeagents-system`)                              |
 | `DEFAULT_PLATFORM_AGENT_GSA_NAME`                                         | The agent's GCP service account id (`kubeagents-platform-gsa`); one name per project   |
@@ -75,11 +76,13 @@ installer-driven one name the same objects.
 
 `installer_common.sh` does declare constants of its own, and the distinction is the
 point: the Helm release name, the LiteLLM, operator and agent Deployment names, the
+agent container and Hermes profile inside that Deployment's pod, the
 `platform-agent-secrets` Secret, and the sandbox StatefulSet, credential-proxy
 Deployment and authorized-keys Secret the operator derives from the agent's name are
 the chart's and the operator's fixed names, which no `install.env` key can change, so
 they are `readonly` constants there (`KUBE_AGENTS_HELM_RELEASE`,
-`KUBE_AGENTS_OPERATOR_DEPLOYMENT`, `PLATFORM_AGENT_DEPLOYMENT`, `PLATFORM_AGENT_SECRET`,
+`KUBE_AGENTS_OPERATOR_DEPLOYMENT`, `PLATFORM_AGENT_DEPLOYMENT`,
+`PLATFORM_AGENT_CONTAINER`, `PLATFORM_AGENT_HERMES_PROFILE`, `PLATFORM_AGENT_SECRET`,
 `LITELLM_DEPLOYMENT`, `PLATFORM_AGENT_SHELL_STATEFULSET`,
 `PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT`, `PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET`)
 rather than defaults an install could override. So are the Helm timeouts
@@ -104,9 +107,10 @@ reach `write_tfvars_from_state` and the `TF_VAR_*` handoff, both of which read t
 environment. Order of authority is **flag, then file, then an exported variable, then
 the defaults above** — `set -a` sourcing means a key the file carries overwrites an
 export of the same name, so a flag is what overrides a recorded value for one run.
-One key is file-only: the front doors clear a shell-exported `NAMESPACE` before reading
-the file, because kubectl tooling exports that name and the value now reaches the Helm
-release's namespace. The dev tooling's `load_state` clears it the same way.
+One key ignores the environment: the front doors clear a shell-exported `NAMESPACE`
+before reading the file, because kubectl tooling exports that name and the value now
+reaches the Helm release's namespace. The file and `--agent-namespace` are the two
+routes in. The dev tooling's `load_state` clears it the same way.
 `KUBE_AGENTS_INSTALL_ENV` points at a different path, which is how CI renders one from
 its own variables rather than keeping install state on an ephemeral runner.
 

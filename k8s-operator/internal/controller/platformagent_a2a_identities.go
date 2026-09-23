@@ -222,6 +222,33 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 // publish; `from` is checked for agreement by consumers, never trusted.
 func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	_ = ns
+	// The JetStream API grant is a2aGatewayJetStreamGrants() rather than the
+	// $JS.API.> this user shipped with: INFO, CONSUMER and DIRECT.GET on
+	// TASKS and on its own session-registry bucket, by name and by verb
+	// (#1666). Seed came off the wildcard in #1306 and worker in #1393; this
+	// is the last holder, and the reason it was last is that it is static
+	// rather than callout-issued, so it fell outside the sweep
+	// a2aJetStreamSurfaceRationale below was written for -- not any argument
+	// that the wildcard was right here. The argument for every verb it holds
+	// and every verb it refuses is on a2aGatewayJetStreamGrants itself.
+	publish := []string{
+		"a2a.tasks.*.*.in",
+		"a2a.tasks.*.*.supervisor",
+		// The session registry's data plane. The bucket is spelled here and
+		// named by constant inside the grant function; the two are held
+		// together by TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo,
+		// because a registry whose KV publishes and whose JetStream grants
+		// name different buckets is an authorization failure at runtime with
+		// a green suite.
+		"$KV.session-state.>",
+	}
+	publish = append(publish, a2aGatewayJetStreamGrants()...)
+	publish = append(publish,
+		"$JS.ACK.TASKS.>",
+		"$JS.FC.>",
+		"_INBOX.gateway.>",
+	)
+
 	return a2aIdentity{
 		user:    "gateway",
 		account: a2aAccountApp,
@@ -231,7 +258,15 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"tomorrow; what it does not yet have is a client that presents a token\n" +
 			"instead of a password, because the gateway program lands separately\n" +
 			"from this render. Moving the identity before the program that uses it\n" +
-			"would refuse the gateway at connect on every install.",
+			"would refuse the gateway at connect on every install.\n" +
+			"Its $JS.API grant is scoped to what it emits, by name and by verb\n" +
+			"(#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on\n" +
+			"TASKS, and INFO, DIRECT.GET and consumer create/delete on\n" +
+			"KV_session-state, its own registry. So no STREAM.DELETE, PURGE,\n" +
+			"UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here\n" +
+			"used to destroy every task's history and the five consumers on it -\n" +
+			"no CONSUMER.DELETE on TASKS, and nothing at all on DIRECTORY, the\n" +
+			"topic streams or the other two buckets.",
 		auth:     a2aAuthStatic,
 		credsKey: a2aGatewayPasswordKey,
 		// $JS.ACK / $JS.FC.> are the delivery path's reply subjects: an
@@ -244,16 +279,11 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// else it reads is ordered/ack-none). An ack subject names a
 		// stream and a CONSUMER, never the caller, so unscoped
 		// $JS.ACK.> would let this user +TERM another principal's
-		// in-flight delivery on ANY stream.
-		publish: []string{
-			"a2a.tasks.*.*.in",
-			"a2a.tasks.*.*.supervisor",
-			"$KV.session-state.>",
-			"$JS.API.>",
-			"$JS.ACK.TASKS.>",
-			"$JS.FC.>",
-			"_INBOX.gateway.>",
-		},
+		// in-flight delivery on ANY stream. Until #1666 that scoping
+		// bought nothing: $JS.API.CONSUMER.DELETE.TASKS.* sat inside
+		// the $JS.API.> beside it, so the consumer this ack grant
+		// protects could be deleted outright.
+		publish: publish,
 		subscribe: []string{
 			"a2a.tasks.*.*.events",
 			"a2a.tasks.*.*.supervisor",
@@ -274,8 +304,12 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 // (platformagent_manifests.go, the A2A bus block) and never had.
 
 // a2aJetStreamSurfaceRationale, kept as prose rather than a symbol because it
-// is the reason every callout principal below enumerates its JetStream API
-// subjects one at a time instead of taking $JS.API.>:
+// is the reason every principal in this file enumerates its JetStream API
+// subjects one at a time instead of taking $JS.API.>. It was written for the
+// callout principals, and the gateway above is what the omission cost: a
+// static user, outside that sweep, holding the wildcard for as long as the
+// rationale sat here saying why nothing should (#1666). Every principal
+// enumerates now, callout-issued or not:
 //
 // A grant list is a capability surface for JetStream, not a read/write
 // distinction. Subject permissions cannot see a request BODY, and a consumer's
