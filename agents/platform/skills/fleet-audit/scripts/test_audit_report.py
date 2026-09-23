@@ -3895,8 +3895,40 @@ class TestStart(HarnessTestCase):
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
         self.assertIn("run in flight", self.err)
         self.assertIn("--takeover", self.err)
+        # Refused means refused: the other run's note is still there.
+        self.assertTrue(Path(audit_report.inflight_path_for(AUDIT)).is_file())
         # The note names the stream, not the caller's guess about it.
         self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--takeover"]), 0)
+
+    def test_a_half_written_note_is_a_claim_not_an_absence(self):
+        # The claim is the exclusive create. Between another `start`'s create
+        # and its write the file exists and is empty; a reader that took
+        # "does not parse" for "no note" would let both runs through.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text("")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("run in flight", self.err)
+        self.assertEqual(note.read_text(), "")
+        # Once that note is older than the TTL it is debris like any other.
+        stale = time.time() - audit_report.INFLIGHT_TTL_SECONDS - 1
+        os.utime(note, (stale, stale))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+
+    def test_a_clean_finish_releases_the_stream_too(self):
+        # The zero-finding run is the ordinary nightly outcome; it leaves by
+        # the close branch, which must free the stream like the publish one.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertTrue(note.is_file())
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertFalse(note.is_file())
 
     def test_finish_releases_the_stream_and_a_stale_note_is_forgotten(self):
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)

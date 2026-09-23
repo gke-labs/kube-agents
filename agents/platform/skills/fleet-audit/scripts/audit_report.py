@@ -1451,6 +1451,28 @@ def inflight_path_for(audit_id: str) -> str:
 INFLIGHT_TTL_SECONDS = 2 * 60 * 60
 
 
+def _in_flight_since(path: Path) -> tuple[float | None, object]:
+    """`(started_at, pid)` of the note at `path`, or `(None, None)` when it is gone.
+
+    A note that exists but does not parse -- another `start` created it a
+    moment ago and has not written it yet -- counts from its mtime: an
+    unreadable note is a claim, not an absence.
+    """
+    try:
+        note = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError):
+        note = None
+    started = note.get("started_at") if isinstance(note, dict) else None
+    if isinstance(started, (int, float)):
+        return float(started), note.get("pid")
+    try:
+        return path.stat().st_mtime, None
+    except OSError:
+        return None, None
+
+
 def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
     """Refuse a second `start` while a run of this stream is under way.
 
@@ -1461,34 +1483,63 @@ def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
     interim, #1876) holds no such lock, so without this a tick landing
     mid-sweep, or a second card for the same stream, wiped the first run's
     state out from under it and both `finish` calls rewrote one ledger.
+
+    The claim is the exclusive create of the note (O_EXCL), so two `start`s
+    racing for one stream cannot both pass: the loser sees the winner's
+    file, fresh, and is refused. A stale or taken-over note is unlinked and
+    the create raced for again, so that path is exclusive too.
     """
     path = Path(inflight_path_for(audit_id))
-    now = time.time()
-    if not takeover:
-        try:
-            note = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            note = None
-        started = note.get("started_at") if isinstance(note, dict) else None
-        if isinstance(started, (int, float)) and now - started < INFLIGHT_TTL_SECONDS:
-            when = datetime.fromtimestamp(started, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            raise ValidationError(
-                f"{audit_id} has a run in flight since {when} (pid {note.get('pid')}); a second "
-                f"`start` would scrub its run record, workspace and findings document. Wait for "
-                f"that run's `finish`, or pass --takeover if you know it is dead."
-            )
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({"audit": audit_id, "started_at": now, "pid": os.getpid()}),
-            encoding="utf-8",
-        )
     except OSError as exc:
         log(f"WARNING: could not record the in-flight note at {path}: {exc}")
+        return
+    for _attempt in range(3):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            started, pid = _in_flight_since(path)
+            if started is None:
+                continue  # gone between the create and the read: race again
+            if not takeover and time.time() - started < INFLIGHT_TTL_SECONDS:
+                when = datetime.fromtimestamp(started, tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M UTC"
+                )
+                raise ValidationError(
+                    f"{audit_id} has a run in flight since {when} (pid {pid}); a second "
+                    f"`start` would scrub its run record, workspace and findings document. "
+                    f"Wait for that run's `finish`, or pass --takeover if you know it is dead."
+                )
+            path.unlink(missing_ok=True)  # stale, or taken over: clear it and race again
+            continue
+        except OSError as exc:
+            log(f"WARNING: could not record the in-flight note at {path}: {exc}")
+            return
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({"audit": audit_id, "started_at": time.time(), "pid": os.getpid()})
+            )
+        return
+    raise ValidationError(
+        f"{audit_id}: another `start` kept claiming the in-flight note at {path}; "
+        f"this one stops rather than share the stream."
+    )
 
 
 def release_in_flight(audit_id: str) -> None:
-    """`finish` published or closed: the stream is free for its next run."""
+    """`finish` published or closed: the stream is free for its next run.
+
+    Unconditional on purpose, and that is a known limit: `start` and `finish`
+    are separate processes, and every state they share is keyed by audit id,
+    so a `finish` cannot tell its own run's note from one a `--takeover` (or
+    the two-hour expiry) wrote after it. A run that outlives its takeover and
+    then finishes publishes over the takeover's run record already; removing
+    the takeover's note is the smaller part of that shape, and the fix for
+    both is the same one: a run identity that travels from `start` through
+    the findings document to `finish`, which is a change to the SOP contract
+    and not made here.
+    """
     Path(inflight_path_for(audit_id)).unlink(missing_ok=True)
 
 
