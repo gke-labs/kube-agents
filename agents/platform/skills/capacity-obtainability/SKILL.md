@@ -66,9 +66,11 @@ the check: put the same
 JSON under an `## Evidence` heading in your report, and the manifests as
 fenced YAML there, so the record still reaches the reader.
 
-- after the quota check: `type: quota_check` with the metric, limit, usage,
-  whether the request fits, and the reservations found, in `analysis` — this
-  record is the On-Demand assessment;
+- after the quota check: `type: quota_check` with `request` naming the
+  `region` and the quota `metric` you read (the recorder refuses a completed
+  record whose request lacks the region), and the limit, usage, whether the
+  request fits, and the reservations found, in `analysis` — this record is
+  the On-Demand assessment;
 - after the capacity advice calls: `type: advice_service_capacity` with
   `api_method: compute.beta.AdviceService.Capacity`, shaped exactly as below.
 
