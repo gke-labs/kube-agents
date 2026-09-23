@@ -105,8 +105,7 @@ workflow, run under `make test-python` in
 **KV** marks a known violation: the test exists, asserts the invariant, and
 currently fails.
 
-> **The cited documents are not in this repository.**
-> `04_major_requirements.md`, `slice-2a/`, `slice-2b/findings.md`,
+> **The cited documents are not in this repository.** > `04_major_requirements.md`, `slice-2a/`, `slice-2b/findings.md`,
 > `overnight-b/findings.md` and `round_2/` live in a separate working
 > repository that is not published, so those citations do not resolve for a
 > reader here. The table below is the vendored summary: it states each
@@ -192,6 +191,7 @@ currently fails.
 | C3  | untrusted content cannot derive an approval tier                           | **3**    | —                                                                                   | needs the provenance labelling D3 also needs. The fleet-drift attack (an attacker shifting a derived baseline until production reads as drift) is the case to write first.                                                                               |
 | C4  | every third-party action is pinned to a commit                             | 1        | `test_C4_every_third_party_action_is_pinned_to_a_commit`                            | a retagged release silently changing what CI runs                                                                                                                                                                                                        |
 | C4  | the agent base image is pinned by digest                                   | 1        | `test_C4_the_agent_base_image_is_pinned_by_digest`                                  | — (the one reference this repo gets right)                                                                                                                                                                                                               |
+| C4  | every hermes plugin install is pinned to a commit                          | 1        | `test_C4_every_hermes_plugin_install_is_pinned_to_a_commit`                         | an upstream default branch shipping a plugin manifest the pinned installer cannot read, breaking every image build                                                                                                                                       |
 | C4  | upstream skills are pinned and verified                                    | 1 **KV** | `test_C4_upstream_skills_are_pinned_and_verified`                                   | whatever is at upstream HEAD becoming agent instructions, landing in a preflight hook before the model wakes                                                                                                                                             |
 | C4  | every shipped image is pinned by digest                                    | 1 **KV** | `test_C4_every_shipped_image_is_pinned_by_digest`                                   | `DefaultPlatformAgentVersion = "latest"`                                                                                                                                                                                                                 |
 | C5  | no minted role grants a write verb                                         | 1        | `test_C5_no_minted_role_grants_a_write_verb`                                        | the blueprints operator minting ClusterRoleBindings from a namespaced CRD with no ceiling                                                                                                                                                                |
@@ -261,7 +261,8 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-105 mutations: 80 KILLED, 23 NOISY, two `must_survive` controls (one on the
+106 mutations: 81 KILLED, 22 NOISY, one STALE (`A3-supervisor-terminal-back-on-events`, whose
+target text left `main` before this change; it is not this change's to rewrite), two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
 handling), zero genuine survivors, zero stale — measured 2026-09-21 against
 this branch merged with `main`; re-run the harness rather than trusting

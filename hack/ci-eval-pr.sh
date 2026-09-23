@@ -764,12 +764,15 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # still parked outside the matrix, and that was the point: the warnings it
 # prints per project ("carries no clusters labelled environment=seeded") are
 # how a pool project still needing bench/tf/fleet applied was found BEFORE
-# these tasks started gating PRs rather than after. Eleven of the active
-# tasks below read the seeded fleet (six domain probes, the fleet-audits
-# canary, cluster-agent-crashloop-debug and the three cluster-debugging
-# cases beside it), so those warnings have consumers. It costs one
-# clusters.list, one get-credentials per seeded cluster, and one namespace
-# read per probe -- seconds, against a job measured in tens of minutes.
+# these tasks started gating PRs rather than after. Most of the active
+# tasks below read the seeded fleet -- the six domain probes, the
+# cluster-debugging cases, the incident-triage probe over the same
+# crashloop, the reliability variation that proposes a fix for the same
+# plant, and in the nightly the full audits and the two remediation
+# writers -- so those warnings have consumers.
+# It costs one clusters.list, one get-credentials per seeded cluster, and
+# one namespace read per probe -- seconds, against a job measured in tens
+# of minutes.
 #
 # The `||` catches a REPOSITORY bug only: a missing or malformed
 # bench/tf/fleet/fixtures.json, or an unusable output directory. Every
@@ -1286,7 +1289,10 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # seat on that record; measured cost, presubmit redundancy or grading
 # something outside the core journeys keep a case there for good. The file's
 # header carries the budget arithmetic against the periodic's 480m deadline
-# at EVAL_TASK_PARALLELISM=6 (#1491), and that is the copy to keep current.
+# at EVAL_TASK_PARALLELISM=6 (#1491; oss-test-infra#2707, open, moves it to
+# 8), and that is the copy to keep current. Since 2026-09-22 (#1023) the
+# presubmit file is the blocking roster and nothing else, so this file is
+# also where every held-out case lives, with its hold-out reason.
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -1425,6 +1431,47 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # The expensive term is instead compliance-rbac-overgrant at 2042s for three
 # repetitions (681s each), which is 24% of the whole task budget on its own.
 #
+# 2026-09-22: incident-triage-oom-event-probe moved in from the nightly
+# (#1023), the nineteenth case, measured rather than projected. Under the
+# fan-out at parallelism 4 the serial arithmetic above no longer prices the
+# job: the 14 green presubmits of 09-19 to 09-21 ran the fan-out in
+# 6073-10940s (median 8147s) against the 360m deadline, with ~15min of build
+# and deploy outside it. This case cost 737/599/1357s a repetition in its
+# one presubmit run and 529-2808s on the four graded nights, so three
+# repetitions add ~1800-4100s of lane time (~8-17min of wall clock at four
+# lanes; up to ~35min if it runs at its nightly maximum). Hinted at 700, the
+# presubmit's largest, it launches first in each repetition round, and its
+# presubmit band ends well inside the shortest round-3 tail measured (first
+# rep-3 launch to the fan-out's end: 2118-5849s in those 14 runs); only a
+# repetition at the nightly maximum (2808s) could outlast that tail and make
+# it the last unit, by minutes. No Prow deadline change rides with this
+# activation. (The same pull request first moved pdb-remediation-pr in
+# beside it, hinted at 1250, and withdrew that before merge: its record was
+# graded by the check #1780 replaced; nightly-cases.txt carries the note.)
+#
+# Later on 2026-09-22 the presubmit became the BLOCKING ROSTER ONLY (#1023,
+# the eval crew's call): the seven held-out cases it had been running
+# without letting them block -- security-overgrant-remediation-proposal,
+# #1049's three obtainability variations, rca-remediation-pr, the
+# compliance-rbac-overgrant canary and cluster-agent-healthy-workload-no-
+# finding -- moved to nightly-cases.txt with their hold-out reasons, and the
+# arithmetic above is for a matrix that no longer runs here. TWELVE tasks,
+# 36 units, against the same 360m deadline. What left: ~21 units at
+# 178-1002s median a repetition (the canary's 1002s and p90 2074s the
+# largest), roughly 7200-9000s of lane time, ~30-38min of wall clock at four
+# lanes -- and, more to the point, the critical path. Over the 385
+# presubmit runs of 09-04 to 09-15 the last unit to finish was
+# obtainability-healthy-namespace-silence or obtainability-fleet-exposure-
+# sweep in 81% of them (200-hinted, so launched at the tail of round 3);
+# both are gone, so the tail is now one of the nine 200-hinted units still
+# here, launched after incident-triage (700), capacity (540) and
+# consistency (300) in each round, or the incident probe itself on a
+# repetition at its nightly maximum. The span the 14 green presubmits of
+# 09-19 to 09-21 measured (6073-10940s) priced the eighteen-case matrix's
+# fifty-four units; the first runs of the twelve-case matrix measure the
+# new one, and until they have, this note is the projection rather than the
+# record. Still no Prow deadline change: the matrix shrank.
+#
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
 # pull request. It is not a legitimate default: at 1 the collapse rung
@@ -1525,9 +1572,10 @@ esac
 # list in the file, the prose there. hack/OWNERS puts the file under the
 # eval-crew alias (#1546).
 #
-# Demoting a flaky case is a one-line same-day edit: delete its name from
-# the file, referencing the issue that names its re-admission condition
-# and citing what the record says about it.
+# Demoting a flaky case is a same-day edit: delete its name from that file
+# and its line from presubmit-cases.txt, add the line to nightly-cases.txt
+# with the issue that names its re-admission condition as the # line above
+# it, and cite what the record says about it.
 #
 # A name that is not a presubmit case stops the job here: a misspelled entry
 # would otherwise arm nothing and look like a working roster, and a nightly
@@ -1622,9 +1670,18 @@ unit_cost_hint() {
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     consistency-no-environment-label) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
+    # Nightly-only since 2026-09-22 (#1023; held out on #1171 and #1189),
+    # presubmit before that. The canary measured 1002s median, 2074s p90,
+    # over 903 presubmit repetitions 2026-09-04 to 09-15; the hint stays at
+    # the 700 it carried as a presubmit case until the nightly record says
+    # otherwise.
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
-    # Nightly-only. Measured 980-1929s across build 2099539376672346112's
-    # three repetitions (267-559s in August); median of the September run.
+    # Nightly-only. The 2026-09-22 promotion (#1023) was withdrawn before
+    # merge: its record was graded by the check #1780 replaced. Measured
+    # 980-1929s across build 2099539376672346112's three repetitions (267-559s
+    # in August); median of the September run, kept although the four graded
+    # nights of 09-16 to 09-20 ran 420-1153s, until the nightly record under
+    # pull_request_opened says otherwise.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
@@ -1639,9 +1696,12 @@ unit_cost_hint() {
     # repetitions (615/715/166s, build 2097362391401500672); the 200s default
     # under-packs it by 3x.
     knowledge-grounding-sources-probe) echo 600 ;;
-    # Nightly-only since 2026-09-15. Median of its first three measured
-    # repetitions (737/599/1357s, build 2099969322708373504); the 200s
-    # default under-packs it by 3x.
+    # Presubmit since 2026-09-22 (#1023), nightly-only from 2026-09-15 before
+    # that. Median of its three measured presubmit repetitions (737/599/1357s,
+    # build 2099969322708373504); the 200s default under-packs it by 3x. The
+    # four graded nights ran 529-2808s a repetition at parallelism 6 beside
+    # the tofu cases; the hint stays at the presubmit measurement until the
+    # presubmit record says otherwise.
     incident-triage-oom-event-probe) echo 700 ;;
     *) echo 200 ;;
   esac
