@@ -74,10 +74,16 @@ fenced YAML there, so the record still reaches the reader.
 
 For `advice_service_capacity`, use **exactly** these key names and shapes for
 `request` and `analysis` — do not rename keys, do not replace object entries
-with bare strings, fill the values from the real responses (probe at least two
-zones, with per-zone queries if one call returns fewer). Only the two models
-the API returns belong in this record; On-Demand is assessed from the quota
-and reservation checks and reported under its own path below:
+with bare strings, fill the values from the real responses. **Cover at least
+two zones**: a region-level call with `ANY` reports its single best zone, so
+when it returns fewer than two, run the per-zone follow-up in Diagnostics D
+(`--zones=<zone>`) for the region's other zones and record each one — a low
+score is still a signal and stays in `zones`; a zone the probe reports as
+unsupported goes in `analysis.zoneStatuses` (`{"us-central1-b":
+"NOT_SUPPORTED"}`). The recorder refuses a completed record covering fewer
+than two. Only the two models the API returns belong in this record;
+On-Demand is assessed from the quota and reservation checks and reported
+under its own path below:
 
 ```json
 {
@@ -381,6 +387,22 @@ gcloud beta compute advice capacity \
     --target-distribution-shape=ANY \
     --size=1 \
     --region=us-central1 \
+    --format="json"
+```
+
+**Per-zone follow-up** (when the region-level call above returns fewer than
+two zones — `ANY` reports the single best one, and a design needs the
+sideways look; run once per remaining zone of the region that supports the
+family):
+
+```bash
+gcloud beta compute advice capacity \
+    --provisioning-model=SPOT \
+    --instance-selection-machine-types="a2-highgpu-8g" \
+    --target-distribution-shape=ANY \
+    --size=4 \
+    --region=us-central1 \
+    --zones=us-central1-a \
     --format="json"
 ```
 
