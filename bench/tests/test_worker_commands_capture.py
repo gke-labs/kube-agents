@@ -96,25 +96,52 @@ def test_settle_records_the_commands_before_purging(monkeypatch):
     assert "rm -rf" in calls[-1]
 
 
-def test_a_stalled_card_is_archived_after_its_transcript_is_read_and_before_the_purge(monkeypatch):
+def test_a_stalled_card_is_archived_after_its_transcript_is_read_and_before_the_purge(
+    monkeypatch, caplog
+):
     # The unit gave up on the card; its worker would otherwise keep its
     # dispatcher slot until it finished on its own.
     calls = []
 
     def fake_shell(script, timeout):
         calls.append(script)
+        if "kanban archive" in script:
+            return "Archived t_2\n"
         return _LOG if "head -c" in script and ".log" in script else ""
 
     monkeypatch.setattr(harness, "_agent_shell", fake_shell)
     result = AgentResult(output="answer", trajectory=[])
     result.metadata["final_message"] = "answer"
-    harness.KubeAgentsHarness._settle(result, [], ["t_1", "t_2"], stalled=["t_2"])
+    with caplog.at_level("INFO", logger="kube_agents_bench.harness"):
+        harness.KubeAgentsHarness._settle(result, [], ["t_1", "t_2"], stalled=["t_2"])
     archive = [i for i, s in enumerate(calls) if "kanban archive" in s]
     assert len(archive) == 1
     assert "'t_2'" in calls[archive[0]] and "'t_1'" not in calls[archive[0]]
     read = next(i for i, s in enumerate(calls) if "head -c" in s)
     assert read < archive[0] < len(calls) - 1
     assert "rm -rf" in calls[-1]
+    assert "archived stalled card t_2" in caplog.text
+    assert "could not archive" not in caplog.text
+
+
+def test_each_stalled_card_is_archived_in_its_own_exec(monkeypatch):
+    # hermes exits 1 if any id in a batch fails and the exec then returns
+    # nothing at all, so one card the dispatcher already archived would hide
+    # whether the others were stopped.
+    calls = []
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: calls.append(script) or "")
+    harness._archive_stalled_cards(["t_a", "t_b"], 5.0)
+    assert ["'t_a'" in s for s in calls] == [True, False]
+    assert ["'t_b'" in s for s in calls] == [False, True]
+
+
+def test_an_archive_that_fails_is_a_warning_naming_the_card(monkeypatch, caplog):
+    # _agent_shell returns "" for a failed exec exactly as for silence; the
+    # log must not read as if the worker was stopped.
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._archive_stalled_cards(["t_stuck"], 5.0)
+    assert "could not archive stalled card t_stuck" in caplog.text
 
 
 def test_a_card_that_settled_is_not_archived(monkeypatch):

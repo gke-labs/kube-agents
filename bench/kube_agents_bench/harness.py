@@ -45,7 +45,8 @@ Environment:
     AGENT_HTTP_TIMEOUT: Per-request timeout in seconds (default ``600``).
     AGENT_DELEGATION_TIMEOUT: Total seconds to wait for delegated work across
         all status turns (default ``1800``). ``0`` disables waiting, restoring
-        the single-turn behaviour.
+        the single-turn behaviour. A card still running when it elapses is
+        archived on the agent's board, which stops its worker.
     AGENT_DELEGATION_POLL_INTERVAL: Seconds between board reads while delegated
         work is awaited (default ``30``). Each read is a ``kubectl exec``
         against the agent's kanban store; a status turn through the model is
@@ -132,6 +133,9 @@ _ATTACHMENTS_DIR = "/opt/data/kanban/attachments"
 _LOGS_DIR = "/opt/data/kanban/logs"
 # The hermes CLI in the agent pod, for when it is not on the exec shell's PATH.
 _HERMES_BIN_FALLBACK = "/opt/hermes/.venv/bin/hermes"
+# What ``hermes kanban archive <id>`` prints on success; a failure goes to
+# stderr with exit 1, which ``_agent_shell`` returns as an empty string.
+_ARCHIVED_PREFIX = "Archived "
 # One terminal command per line in a card's worker log, as hermes renders it:
 # ``  ┊ 💻 $         <command>  0.6s [exit 1]``. The timing and exit suffixes
 # are stripped; the command is kept verbatim otherwise.
@@ -819,19 +823,33 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     """Archive the cards that ran to the ceiling, which stops their workers.
 
     The unit has given up on them: its record is written and their files are
-    about to be deleted. Left alone, each worker keeps its dispatcher slot
-    until it finishes on its own, and every later unit's card queues behind
+    about to be deleted. Left alone, a worker that still heartbeats keeps its
+    dispatcher slot until it finishes on its own (the dispatcher's stale timer
+    reclaims only a silent one), and every later unit's card queues behind
     it. ``hermes kanban archive`` moves a running card to the terminal
     ``archived`` state and terminates its worker. Children the worker filed
-    are not known here and keep running. Best effort, like the rest of
-    :meth:`KubeAgentsHarness._settle`.
+    are not known here and keep running.
+
+    One exec per card, so a card the dispatcher already archived does not
+    fail the batch for the rest, and each kill has the whole exec timeout.
+    Best effort, like the rest of :meth:`KubeAgentsHarness._settle`, but a
+    card that did not archive is warned about by name: its worker may still
+    hold a slot, and the run log should not say otherwise.
     """
-    if not stalled:
-        return
-    ids = " ".join(_shell_quote(tid) for tid in stalled)
-    script = f'H=$(command -v hermes || echo {_HERMES_BIN_FALLBACK}); "$H" kanban archive {ids}'
-    out = _agent_shell(script, timeout)
-    _log.info("archived %d stalled card(s): %s", len(stalled), out.strip()[:200])
+    for tid in stalled:
+        script = (
+            f'H=$(command -v hermes || echo {_HERMES_BIN_FALLBACK}); '
+            f'"$H" kanban archive {_shell_quote(tid)}'
+        )
+        out = _agent_shell(script, timeout).strip()
+        if out.startswith(_ARCHIVED_PREFIX):
+            _log.info("archived stalled card %s", tid)
+        else:
+            _log.warning(
+                "could not archive stalled card %s; its worker may still hold a dispatcher slot (%s)",
+                tid,
+                out[:200] or "no output",
+            )
 
 
 def _purge_card_state(task_ids: list[str], timeout: float) -> None:
@@ -1482,9 +1500,10 @@ class KubeAgentsHarness(AgentHarness):
 
         Reading precedes purging: the artifacts are only worth deleting once
         they are part of the answer. ``stalled`` is the subset of ``awaited``
-        that ran to the delegation ceiling: their transcripts are kept as run
-        artifacts rather than deleted with the rest, and the cards are archived
-        so their workers stop holding dispatcher slots. Keyword-only with a default
+        that ran to the delegation ceiling: their transcripts are copied out
+        under ``ARTIFACTS`` before the purge deletes them with the rest, and the
+        cards are archived so their workers stop holding dispatcher slots.
+        Keyword-only with a default
         so a caller that has no stalled cards, in-tree or in a sibling branch,
         need not name it.
 

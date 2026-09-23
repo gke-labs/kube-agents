@@ -250,12 +250,17 @@ class FinderMustNotImportTest(unittest.TestCase):
         self.assertIsNotNone(spec.loader)
         self.assertNotIn("gateway", sys.modules)
 
+    @unittest.skipIf(
+        sys.version_info >= (3, 14),
+        "3.14 waits on the parent's module lock before it consults any finder, so the old "
+        "hook cannot deadlock there and this test would pass on both versions",
+    )
     def test_two_threads_importing_the_package_and_the_trigger_both_finish(self):
         # The losing order, forced: thread A is inside gateway/__init__ when
         # thread B imports the trigger module through the hook, and A then
         # needs the global import lock for a fresh module. Under the old hook
-        # neither thread ever returns, so this runs in a subprocess with a
-        # deadline rather than wedging the test process.
+        # neither thread ever returns (measured on 3.12 and 3.13), so this runs
+        # in a subprocess with a deadline rather than wedging the test process.
         (self.root / "gateway" / "__init__.py").write_text(
             textwrap.dedent(
                 """
