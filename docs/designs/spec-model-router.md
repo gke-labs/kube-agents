@@ -139,8 +139,10 @@ spec already has.
   interceptor, which today cancels for anyone in the room; a `stop` from someone other
   than the requester gets a notice, not a cancel. The prompt carries the same rule as the
   second line of defence.
-- **Model output is never an authorization signal.** Effective-permission intersection
-  happens where it happens today, at the broker and in the identity map.
+- **Model output is never an authorization signal.** The gateway's allowlist at ingress
+  decides who may reach an agent at all. From there the bound is the executor's own
+  ceiling. Section 4a of
+  [`../architecture/03-security-model.md`](../architecture/03-security-model.md) owns it.
 
 ### What bypasses the model
 
@@ -393,12 +395,18 @@ injection can and cannot do:
   `authority` block. So a captured router does not need a new destination. It keeps a
   legitimate addressee and changes what is being asked for: "describe namespace foo"
   becomes "delete namespace foo", attributed to the person who typed something else. The
-  bound is the requester's own permissions. Effective-permission intersection happens at
-  the broker and in the identity map. Model output is never an authorization signal, so a
-  rewrite cannot reach anything the requester was not already permitted to do. What it
-  changes is intent, inside permissions the user already has. The one place the rewrite
-  would be visible is the verbatim decision in the audit record. That is build step 5, so
-  it lands last.
+  bound on that is the executor's own ceiling, not the requester's permissions. Every
+  allowlisted human runs under one shared Google service account and one Kubernetes
+  identity. A rewrite is not bounded by who asked. Against that example the ceiling does
+  hold today: the argv allowlist in `agents/platform/scripts/command_policy.py` refuses a
+  `kubectl delete`, and on the customer-cluster path that allowlist is the only thing
+  enforcing it. It is not a blanket read-only bound. `/v1/vcs/` carries forge writes on
+  the broker's own credential, bounded by a managed-repository allowlist rather than by
+  the requester. What would make the requester's permissions the bound is per-request
+  down-scoping, which is deferred (section 4a of
+  [`../architecture/03-security-model.md`](../architecture/03-security-model.md)). The
+  one place the rewrite would be visible is the verbatim decision in the audit record.
+  That is build step 5, so it lands last.
 - **It cannot cancel someone else's task.** Requester ownership is checked in the gateway
   against the pseudonym recorded on the task.
 - **It cannot publish.** No credential, no publish path.
@@ -413,6 +421,10 @@ rewritten ask arrives downstream looking like any other complete request. The ro
 upstream of every existing control and replaces none of them. Mutation escalation, when
 it lands, makes a misroute visible to the user rather than silent; it does not narrow the
 surface. What narrows the surface is the window never rendering event text.
+
+What holds a rewritten `ask` today is the executor's ceiling. Mutation escalation weakens
+that bound, which makes the open question about constraining `ask` sharper than it is
+now.
 
 ## Broadcast
 
