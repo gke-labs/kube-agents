@@ -2555,6 +2555,10 @@ class CommandExecutorTest(unittest.TestCase):
             ["kubectl", "exec", "pod/api", "--", "true"],
             ["kubectl", "port-forward", "pod/api", "8080:80"],
             ["kubectl", "--namespace=demo", "wait", "--for=delete", "pod/api"],
+            ["kubectl", "-n", "kube-system", "logs", "-f", "pod/api"],
+            ["kubectl", "-n", "demo", "rollout", "status", "deployment/api"],
+            ["kubectl", "--namespace", "demo", "wait", "--for=condition=Ready", "pod/x"],
+            ["kubectl", "--context", "foo", "wait", "--for=delete", "pod/api"],
         )
 
         for command in blocking:
@@ -2565,6 +2569,17 @@ class CommandExecutorTest(unittest.TestCase):
                     argv,
                 )
                 self.assertIsNone(deadline)
+
+    def test_kubectl_detached_global_flag_does_not_exempt_ordinary_reads(self):
+        executor = self.fake_kubectl(self.executor())
+        argv, deadline = self.dispatched(
+            executor, ["kubectl", "-n", "kube-system", "get", "pods"]
+        )
+        self.assertIn(
+            f"--request-timeout={credential_proxy.DEFAULT_KUBECTL_REQUEST_TIMEOUT}",
+            argv,
+        )
+        self.assertEqual(executor.kubectl_timeout_seconds, deadline)
 
     def test_kubectl_filename_flag_is_not_mistaken_for_logs_follow(self):
         # `-f` is `--filename` on every verb except `logs`. Reading it as "this

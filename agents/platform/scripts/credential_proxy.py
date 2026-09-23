@@ -1976,15 +1976,17 @@ def _is_get_credentials(argv: list[str]) -> bool:
 def _kubectl_runs_long(argv: list[str]) -> bool:
     """Is this a kubectl that is meant to block, rather than a one-shot read?
 
-    Read off the verb -- the first argument that is not a flag, since global
-    flags may precede it -- plus the flags that make an otherwise-bounded verb
-    stream.
+    Read off the verb -- resolved through command_policy so global flags with
+    detached values do not hide it -- plus the flags that make an otherwise-
+    bounded verb stream.
     """
-    verb = ""
-    for arg in argv[1:]:
-        if not arg.startswith("-"):
-            verb = arg
-            break
+    verb_tuple, _ = command_policy._kubectl_verb_and_flag(argv)
+    verb = verb_tuple[0] if verb_tuple else ""
+    if not verb:
+        for arg in argv[1:]:
+            if not arg.startswith("-"):
+                verb = arg
+                break
     if verb in KUBECTL_LONG_RUNNING_VERBS:
         return True
     if verb == KUBECTL_FOLLOW_VERB and any(
