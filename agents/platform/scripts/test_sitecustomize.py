@@ -206,6 +206,105 @@ class DeferredInstallTest(unittest.TestCase):
             importlib.import_module("gateway.platform_registry")
 
 
+class FinderMustNotImportTest(unittest.TestCase):
+    """The finder answers without importing, because Python calls it with the
+    global import lock held.
+
+    ``importlib.util.find_spec`` imports the parent package to read its
+    ``__path__``. In a kanban worker the main thread is importing ``gateway``
+    at the same moment the plugin-discovery thread imports
+    ``gateway.platform_registry``; the hook then waited for the main thread
+    while holding the global import lock, and the main thread waited for the
+    global import lock. Every such worker sat with an 83-byte transcript until
+    the dispatcher's stale timer killed it.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.root = Path(self.tmpdir.name)
+        (self.root / "gateway").mkdir()
+        (self.root / "gateway" / "__init__.py").write_text("")
+        (self.root / "gateway" / "platform_registry.py").write_text("EXECUTED = True\n")
+        sys.path.insert(0, str(self.root))
+        self.addCleanup(sys.path.remove, str(self.root))
+        importlib.invalidate_caches()
+        self._saved_modules = {
+            name: sys.modules.pop(name)
+            for name in list(sys.modules)
+            if name == "gateway" or name.startswith("gateway.")
+        }
+        self.addCleanup(sys.modules.update, self._saved_modules)
+        self.addCleanup(self._purge_gateway)
+
+    def _purge_gateway(self):
+        for name in ("gateway.platform_registry", "gateway"):
+            sys.modules.pop(name, None)
+
+    def test_find_spec_does_not_import_the_parent_package(self):
+        finder = sitecustomize.PatchOnImport([])
+        spec = finder.find_spec(
+            "gateway.platform_registry", [str(self.root / "gateway")], None
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        self.assertNotIn("gateway", sys.modules)
+
+    def test_two_threads_importing_the_package_and_the_trigger_both_finish(self):
+        # The losing order, forced: thread A is inside gateway/__init__ when
+        # thread B imports the trigger module through the hook, and A then
+        # needs the global import lock for a fresh module. Under the old hook
+        # neither thread ever returns, so this runs in a subprocess with a
+        # deadline rather than wedging the test process.
+        (self.root / "gateway" / "__init__.py").write_text(
+            textwrap.dedent(
+                """
+                import sys
+                ctl = sys.modules["_deadlock_ctl"]
+                ctl.started.set()
+                ctl.go.wait(10)
+                import gateway_helper  # a new module: needs the global import lock
+                """
+            )
+        )
+        (self.root / "gateway_helper.py").write_text("VALUE = 1\n")
+        script = textwrap.dedent(
+            f"""
+            import importlib, importlib.util, sys, threading, time, types
+            sys.path.insert(0, {str(self.root)!r})
+            spec = importlib.util.spec_from_file_location(
+                "_sc", {str(SCRIPTS_DIR / "sitecustomize.py")!r}
+            )
+            sc = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(sc)
+            sys.meta_path[:] = [f for f in sys.meta_path if type(f).__name__ != "PatchOnImport"]
+            ctl = types.ModuleType("_deadlock_ctl")
+            ctl.started, ctl.go = threading.Event(), threading.Event()
+            sys.modules["_deadlock_ctl"] = ctl
+            patch = types.ModuleType("fake_patch")
+            patch.install = lambda: None
+            sys.modules["fake_patch"] = patch
+            sys.meta_path.insert(0, sc.PatchOnImport(["fake_patch"]))
+            a = threading.Thread(target=lambda: importlib.import_module("gateway"), daemon=True)
+            b = threading.Thread(
+                target=lambda: importlib.import_module("gateway.platform_registry"), daemon=True
+            )
+            a.start()
+            assert ctl.started.wait(10)
+            b.start()
+            time.sleep(0.5)
+            ctl.go.set()
+            a.join(5)
+            b.join(5)
+            print("OK" if not (a.is_alive() or b.is_alive()) else "DEADLOCK", flush=True)
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(result.stdout.strip(), "OK", result.stdout + result.stderr)
+
+
 class StartupCostTest(unittest.TestCase):
     """The regression guard: importing sitecustomize stays cheap."""
 
