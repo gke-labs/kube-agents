@@ -335,10 +335,11 @@ resource "kubernetes_horizontal_pod_autoscaler_v2" "inference_server" {
 # Defect (cluster debugging, stall detection): a Deployment whose container
 # references a ConfigMap (inventory-flags) that does not exist through
 # envFrom. Its pods sit in CreateContainerConfigError, restartCount stays 0,
-# and the Deployment never progresses. Once progressDeadlineSeconds (default
-# 600s) elapses, the Deployment controller marks the Progressing condition
-# False with reason ProgressDeadlineExceeded. stall_report.py reports it as a
-# dangling-reference. Asserted by cluster-agent-stalled-controller-diagnosis.
+# and the Deployment never progresses. Once progressDeadlineSeconds (120s,
+# under the verifier's 300s FLEET_STATE_WAIT_SECONDS) elapses, the Deployment
+# controller marks the Progressing condition False with reason
+# ProgressDeadlineExceeded. stall_report.py reports it as a dangling-reference.
+# Asserted by cluster-agent-stalled-controller-diagnosis.
 resource "kubernetes_deployment_v1" "inventory_api" {
   metadata {
     name      = "inventory-api"
@@ -346,7 +347,7 @@ resource "kubernetes_deployment_v1" "inventory_api" {
   }
   spec {
     replicas                  = 1
-    progress_deadline_seconds = 600
+    progress_deadline_seconds = 120
     selector {
       match_labels = { app = "inventory-api" }
     }
