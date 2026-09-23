@@ -873,9 +873,9 @@ LEDGER_RESET_MINT_ATTEMPTS=2
 LEDGER_RESET_MINT_RETRY_DELAY=2
 # What the grading mint asks for: the three reads docs/ci-pool-projects.md 5.4
 # documents, requested explicitly so BENCH_GITHUB_TOKEN's reach is pinned at
-# mint rather than inherited from the installation's whole grant -- which
-# includes issues: write on every pool repository once the ledger reset's
-# grant lands. An omitted body on this endpoint means "everything granted".
+# mint rather than inherited from the installation's whole grant -- which,
+# since 2026-09-22, includes issues: write on every pool repository for the
+# ledger reset. An omitted body on this endpoint means "everything granted".
 LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","metadata":"read"}}'
 
 # Emits "<token> <expires_at>" on stdout, diagnostics on stderr, non-zero on
@@ -1065,9 +1065,12 @@ fi
 # for its reads explicitly (LEDGER_GRADING_MINT_BODY), so the grant the reset
 # needs does not widen the token grading holds.
 # A reset that cannot run (no App key, an unmapped project, a mint the
-# installation refuses because issues: write was not granted to App
-# EVAL_LEDGER_APP_ID, docs/ci-pool-projects.md 5.4) says so and the run goes
-# on as it always did; it never reds a pull request.
+# installation refuses because App EVAL_LEDGER_APP_ID's installation no longer
+# holds issues: write -- granted 2026-09-22, docs/ci-pool-projects.md 5.4)
+# says so and the run goes on as it always did; it never reds a pull request.
+# The comment it leaves opens with a marker (RESET_MARKER in the helper) that
+# ledger_issue_contains reads back, so a report citing the retired ledger is
+# graded as a stale pointer to the harness's close, not as a false clean.
 eval_gitops_repo() { # <project-id>
   # Lifted rather than sourced: sourcing hack/ci-deploy.sh would run the
   # deploy. tests/test_ci_gitops_repo.py pins every pair of the mapping.
@@ -1105,10 +1108,23 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
   local file="$1"
   case "${file}" in /*) ;; *) file="${BENCH_DIR}/${file}" ;; esac
   [ -f "${file}" ] || return 0
-  # awk with `exit`, not `sed | head`: under pipefail a `head` that closes the
+  # Armed by the `type: ledger_issue_contains` line and reads the `audit:`
+  # key after it, so an `audit:` word in the prompt or a note ahead of the
+  # check cannot retarget the reset at a label that does not exist; a quoted
+  # value is read without its quotes, a comment after it is dropped. awk
+  # with `exit`, not `sed | head`: under pipefail a `head` that closes the
   # pipe after the first of several matches can hand sed a SIGPIPE, and the
   # caller assigns this inside `set -e`.
-  awk 'match($0, /^[[:space:]]*audit:[[:space:]]*/) { id = substr($0, RLENGTH + 1); sub(/[^A-Za-z0-9_.-].*$/, "", id); print id; exit }' "${file}"
+  awk '
+    /^[[:space:]]*(- )?type:[[:space:]]*ledger_issue_contains[[:space:]]*(#.*)?$/ { armed = 1; next }
+    armed && match($0, /^[[:space:]]*audit:[[:space:]]*/) {
+      id = substr($0, RLENGTH + 1)
+      sub(/^[^A-Za-z0-9_.-]+/, "", id)
+      sub(/[^A-Za-z0-9_.-].*$/, "", id)
+      print id
+      exit
+    }
+  ' "${file}"
 }
 
 # Returns 0 whatever happens; the reason it could not reset is printed.
@@ -1125,7 +1141,7 @@ reset_audit_ledgers() { # <label> [audit-id]
     return 0
   fi
   if ! token="$(ledger_reset_token "${EVAL_LEDGER_REPO}")"; then
-    echo "WARNING: Ledger reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint issues: write narrowed to ${EVAL_LEDGER_REPO}; ${scope} keeps whatever ledger is open. A 422 above means the installation has not been granted issues: write (docs/ci-pool-projects.md 5.4)." >&2
+    echo "WARNING: Ledger reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint issues: write narrowed to ${EVAL_LEDGER_REPO}; ${scope} keeps whatever ledger is open. A 422 above means the installation no longer holds issues: write, which it was granted on 2026-09-22 (docs/ci-pool-projects.md 5.4)." >&2
     return 0
   fi
   local args=(--repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}")

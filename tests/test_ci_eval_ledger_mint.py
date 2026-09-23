@@ -84,8 +84,8 @@ class LedgerMintRetryTest(unittest.TestCase):
                 'echo 0 > "${COUNT_FILE}"',
                 "_ledger_token_mint() {",
                 # The grading mint must pin its reads: a bodiless mint inherits
-                # the installation's whole grant, issues: write included once
-                # the ledger reset's grant lands.
+                # the installation's whole grant, issues: write included since
+                # the ledger reset's grant (2026-09-22).
                 '  [ "${LEDGER_MINT_BODY:-}" = "${LEDGER_GRADING_MINT_BODY}" ] || { echo "grading mint did not send its read body" >&2; return 98; }',
                 '  local n=$(( $(cat "${COUNT_FILE}") + 1 ))',
                 '  echo "${n}" > "${COUNT_FILE}"',

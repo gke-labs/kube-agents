@@ -28,7 +28,10 @@ What it will not do:
   `[audit] ` title prefix `render_issue_title` writes, and a `[bot]` author.
   A human's issue in the repository, labelled or not, stays open.
 * delete anything. Closing is a state change with a comment naming the eval
-  build; the issue and its history stay readable.
+  build; the issue and its history stay readable. The comment opens with a
+  fixed marker (`RESET_MARKER`) that the `ledger_issue_contains` check reads
+  back, so a report that still cites a retired ledger is graded as a stale
+  pointer to the harness's close, not as a run that closed its own ledger.
 
 The token arrives in the environment (`LEDGER_RESET_TOKEN`), never on argv
 where `ps` would show it. `--dry-run` lists what would close and writes
@@ -63,8 +66,15 @@ BOT_LOGIN_SUFFIX = "[bot]"
 # The one organisation that hosts every pool repository, and the suffix the
 # mapping in hack/ci-deploy.sh gives each: gitops_repo_for_project() is the
 # mapping's home, this is the shape check on what the caller resolved there.
+REPO_OWNER = "gke-agentic"
 REPO_SUFFIX = "-infra"
 CLOSE_REASON = "not_planned"
+# The first line of every closing comment. bench/kube_agents_bench/verifiers.py
+# (LEDGER_RESET_MARKER) looks for it on a closed ledger a report still cites,
+# so the grader says "the harness retired this before the run" rather than
+# blaming the run for a close it did not make. scripts/test_ci_eval_ledger_reset.py
+# pins the two literals equal.
+RESET_MARKER = "<!-- kube-agents-eval-ledger-reset -->"
 
 
 class ResetError(Exception):
@@ -83,10 +93,15 @@ def expected_repo(repo: str, project: str) -> None:
     owner, _, name = repo.partition("/")
     if not owner or not name or "/" in name:
         raise ResetError(f"{repo!r} is not an owner/name repository")
+    if owner != REPO_OWNER:
+        raise ResetError(
+            f"{repo} is not in the {REPO_OWNER} organisation, where every pool repository "
+            "lives; refusing to touch it"
+        )
     if name != project + REPO_SUFFIX:
         raise ResetError(
             f"{repo} is not the GitOps repository of the leased project {project} "
-            f"(expected <org>/{project}{REPO_SUFFIX}); refusing to touch it"
+            f"(expected {REPO_OWNER}/{project}{REPO_SUFFIX}); refusing to touch it"
         )
 
 
@@ -94,7 +109,7 @@ def api(method: str, path: str, token: str, body: dict | None = None):
     """One GitHub call. Returns the decoded body, or None when it is empty."""
     data = None
     headers = {
-        "Authorization": "token " + token,
+        "Authorization": "Bearer " + token,
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": GITHUB_API_VERSION,
         "User-Agent": USER_AGENT,
@@ -105,7 +120,14 @@ def api(method: str, path: str, token: str, body: dict | None = None):
     request = urllib.request.Request(API_ROOT + path, method=method, headers=headers, data=data)
     with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
         raw = response.read()
-    return json.loads(raw) if raw else None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        # A 200 whose body is not JSON (a maintenance page, say) is the same
+        # to the caller as an API it could not reach: reported, never a traceback.
+        raise OSError(f"GitHub answered {method} {path} with a body that is not JSON: {exc}") from exc
 
 
 def label_names(issue: dict) -> set[str]:
@@ -158,10 +180,12 @@ def open_ledgers(repo: str, token: str, audit_id: str | None) -> list[dict]:
 
 def closing_comment(build: str, scope: str) -> str:
     return (
-        f"Closed by kube-agents eval build {build} {scope}, so that every repetition "
-        "audits from an empty ledger rather than the one an earlier run left open "
-        "(gke-labs/kube-agents#1023). The next audit run opens a fresh ledger; nothing "
-        "here was resolved."
+        f"{RESET_MARKER}\n"
+        f"Closed by kube-agents eval build {build} {scope}: the eval harness's ledger "
+        "reset retired it so that every repetition audits from an empty ledger rather "
+        "than the one an earlier run left open (gke-labs/kube-agents#1023). The next "
+        "audit run opens a fresh ledger; nothing here was resolved, and no run of the "
+        "audit closed this."
     )
 
 

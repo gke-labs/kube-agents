@@ -45,12 +45,13 @@ REPO = "gke-agentic/kube-agents-evals-2-infra"
 PROJECT = "kube-agents-evals-2"
 BOT = "kube-agents-evals-token-minter[bot]"
 
-# The seven ledger-writing cases and the audit id each grades under; a case
+# The eight ledger-writing cases and the audit id each grades under; a case
 # that writes no ledger has none.
 AUDIT_IDS = {
     "ai-security-planted-model-audit": "ai-security-audit",
     "compliance-rbac-overgrant": "compliance-audit",
     "consistency-drift-outlier": "fleet-consistency-drift",
+    "consistency-no-environment-label": "fleet-consistency-drift",
     "fleet-cost-idle-pool": "fleet-wide-cost-analysis",
     "obtainability-planted-pdb": "obtainability-audit",
     "stockout-pinned-pool": "stockout-prevention",
@@ -104,6 +105,10 @@ class RepositoryGuardTest(unittest.TestCase):
         for repo, project in [
             ("gke-agentic/kube-agents-evals-3-infra", PROJECT),
             ("gke-agentic/kube-agents-evals-2", PROJECT),
+            # The right name in the wrong organisation: the mapping only ever
+            # yields gke-agentic, and the helper checks that on its own.
+            ("someone-else/kube-agents-evals-2-infra", PROJECT),
+            ("/kube-agents-evals-2-infra", PROJECT),
             ("gke-agentic/kube-agents-evals-22-infra", PROJECT),
             ("kube-agents-evals-2-infra", PROJECT),
             (REPO, ""),
@@ -131,6 +136,32 @@ class RepositoryGuardTest(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True), redirect_stderr(io.StringIO()):
             rc = helper.main(["--repo", REPO, "--project", PROJECT, "--build", "b", "--dry-run"])
         self.assertEqual(rc, 2)
+
+
+class ApiTest(unittest.TestCase):
+    def _call(self, raw: bytes):
+        response = mock.MagicMock()
+        response.read.return_value = raw
+        response.__enter__.return_value = response
+        with mock.patch.object(helper.urllib.request, "urlopen", return_value=response) as urlopen:
+            result = helper.api("GET", "/repos/x/y/issues?page=1", "tok")
+        return result, urlopen.call_args[0][0]
+
+    def test_the_token_is_a_bearer_header_and_never_in_the_url(self):
+        # An installation token authenticates as Bearer, as every other caller
+        # in the tree sends it (scripts/github_api.py, the verifier).
+        _, request = self._call(b"[]")
+        self.assertEqual(request.get_header("Authorization"), "Bearer tok")
+        self.assertNotIn("tok", request.full_url)
+        self.assertEqual(request.get_method(), "GET")
+
+    def test_an_empty_body_is_none(self):
+        self.assertIsNone(self._call(b"")[0])
+
+    def test_a_body_that_is_not_json_is_a_reported_fault_not_a_traceback(self):
+        with self.assertRaises(OSError) as raised:
+            self._call(b"<html>maintenance</html>")
+        self.assertIn("not JSON", str(raised.exception))
 
 
 class LedgerSelectionTest(unittest.TestCase):
@@ -173,6 +204,18 @@ class LedgerSelectionTest(unittest.TestCase):
         self.assertIn(f"closed 2 open ledger(s) in {REPO} at lease time", out)
         self.assertIn("  #43 [audit] Fleet Waste Audit", out)
         self.assertEqual(err, "")
+
+    def test_the_closing_comment_opens_with_the_marker_the_grader_reads(self):
+        comment = helper.closing_comment("b", "at lease time")
+        self.assertTrue(comment.startswith(helper.RESET_MARKER + "\n"), comment)
+        self.assertIn("eval harness's ledger reset", comment)
+        # bench/kube_agents_bench/verifiers.py cannot import this script and
+        # this test cannot import the bench package, so the literal is pinned
+        # by reading the verifier's source.
+        verifier_src = (REPO_ROOT / "bench" / "kube_agents_bench" / "verifiers.py").read_text(encoding="utf-8")
+        match = re.search(r'^LEDGER_RESET_MARKER = "(.+)"$', verifier_src, re.MULTILINE)
+        self.assertIsNotNone(match, "LEDGER_RESET_MARKER not found in verifiers.py")
+        self.assertEqual(match.group(1), helper.RESET_MARKER)
 
     def test_a_close_is_a_comment_naming_the_build_then_state_closed(self):
         api = FakeApi([[issue(54)]])
@@ -390,7 +433,7 @@ class AuditIdTest(unittest.TestCase):
         # matches than the pipe buffer holds, and the unit would die unlaunched.
         with tempfile.TemporaryDirectory() as tmp:
             yaml = pathlib.Path(tmp) / "task.yaml"
-            yaml.write_text("      audit: compliance-audit\n" * 20000)
+            yaml.write_text("      type: ledger_issue_contains\n" + "      audit: compliance-audit\n" * 20000)
             body = "\n".join(
                 [
                     "set -e",
@@ -403,6 +446,37 @@ class AuditIdTest(unittest.TestCase):
             result = run_bash(body)
         self.assertEqual(result.stdout.strip(), "OK compliance-audit")
         self.assertEqual(result.stderr, "")
+
+    def test_the_id_is_the_one_under_the_ledger_check_not_the_first_audit_word(self):
+        # kyber775's review of #1881 and review-ledgerreset finding 3: a prompt
+        # line starting with `audit:` ahead of the check used to win, and a
+        # quoted value came out empty, so the unit reset silently did nothing.
+        shapes = {
+            "decoy prose": (
+                (
+                    "prompt: |\n  audit: the fleet, then file it.\n  audit: everything\n"
+                    "verification_spec:\n  checks:\n    - check:\n        type: ledger_issue_contains\n"
+                    "        audit: compliance-audit\n"
+                ),
+                "compliance-audit",
+            ),
+            "double quotes": ('check:\n  type: ledger_issue_contains\n  audit: "obtainability-audit"\n', "obtainability-audit"),
+            "single quotes": ("check:\n  type: ledger_issue_contains\n  audit: 'stockout-prevention' # trailing\n", "stockout-prevention"),
+            "list item": ("- type: ledger_issue_contains\n  audit: fleet-consistency-drift\n", "fleet-consistency-drift"),
+            "type with comment": ("check:\n  type: ledger_issue_contains  # the ledger\n  audit: ai-security-audit\n", "ai-security-audit"),
+            "commented check": ("# report_contains, not ledger_issue_contains: a chat probe\n      audit: not-a-stream\n", ""),
+            "other check type": ("check:\n  type: report_contains\n  audit: not-a-stream\n", ""),
+            "no check": ("prompt: audit: something\n", ""),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, (text, want) in shapes.items():
+                yaml = pathlib.Path(tmp) / "task.yaml"
+                yaml.write_text(text)
+                body = "\n".join(['BENCH_DIR="/nonexistent"', lifted("ledger_audit_id_for_task"), f'ledger_audit_id_for_task "{yaml}"'])
+                result = run_bash(body)
+                with self.subTest(shape=name):
+                    self.assertEqual(result.stdout.strip(), want)
+                    self.assertEqual(result.stderr, "")
 
     def test_an_absolute_path_is_read_as_given(self):
         with tempfile.TemporaryDirectory() as tmp:

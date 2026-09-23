@@ -112,11 +112,12 @@ MINTER_KSA = "kubeagents-system/kubeagents-github-minter"
 # is what makes it a usable identity probe rather than just a reachability test.
 GITHUB_APP_URL = "https://api.github.com/app"
 
-# The read-only App the EVAL RUNNER grades ledger issues with, which is not the
-# minter App above. hack/ci-eval-pr.sh mints an installation token from it into
-# BENCH_GITHUB_TOKEN before each devops-bench invocation; a test pins these two
-# to that script, so changing the App there cannot leave this check attesting a
-# credential CI no longer uses.
+# The App the EVAL RUNNER grades ledger issues with (a mint pinned to reads; its
+# installation also holds issues: write, for hack/ci-eval-pr.sh's ledger reset),
+# which is not the minter App above. hack/ci-eval-pr.sh mints an installation
+# token from it into BENCH_GITHUB_TOKEN before each devops-bench invocation; a
+# test pins these two to that script, so changing the App there cannot leave
+# this check attesting a credential CI no longer uses.
 LEDGER_APP_ID = 4739812
 LEDGER_INSTALLATION_ID = 157029058
 GITHUB_INSTALLATION_TOKEN_URL = (

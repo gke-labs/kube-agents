@@ -1085,6 +1085,84 @@ def test_a_ledger_closed_during_this_run_over_a_stale_body_is_named_a_false_clea
     assert res.raw["closed_at"] == "2026-08-21T09:20:00+00:00"
 
 
+# 20 s before the run started: where the per-unit reset's close lands, inside
+# the window a false clean would also fall in. Its comments are asked for from
+# the hour before the close.
+_RESET_CLOSE = "2026-08-21T08:59:40Z"
+_RESET_COMMENTS = _api() + "/comments?per_page=100&since=2026-08-21T07:59:40Z"
+
+
+def _ledger_closed_at(closed_at: str, state_reason: str = "not_planned") -> dict:
+    stale = _ledger_body(generated_at="2026-08-20T09:00:30+00:00")
+    return {**_issue(stale), "state": "closed", "state_reason": state_reason, "closed_at": closed_at}
+
+
+def _reset_comment() -> dict:
+    return {
+        "body": (
+            f"{verifiers.LEDGER_RESET_MARKER}\nClosed by kube-agents eval build 1 before "
+            "repetition of the compliance-audit stream: the eval harness's ledger reset ..."
+        )
+    }
+
+
+def test_a_ledger_the_harness_reset_before_the_run_is_named_as_the_resets_close(token, github):
+    """hack/ci-eval-pr.sh retires the previous repetition's ledger seconds before
+    devops-bench starts, so its closed_at sits inside the false-clean window. A
+    worker that cites that retired ledger did not close it, and the reason must
+    not say it did. Still a fail: nothing was published to the ledger named."""
+    _stash_report()
+    github.routes[_api()] = (200, _ledger_closed_at(_RESET_CLOSE))
+    github.routes[_RESET_COMMENTS] = (200, [{"body": "looks fine to me"}, _reset_comment()])
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail" and not res.success
+    assert "by the eval harness's ledger reset, before this run started" in res.reason
+    assert "closed as not_planned" in res.reason
+    assert "the audit reported the stream clean" not in res.reason
+    assert res.raw["reset_by_harness"] is True
+    assert res.raw["closed_at"] == "2026-08-21T08:59:40+00:00"
+    # The issue, then its comments, and nothing else.
+    assert [c[0] for c in github.calls] == [_api(), _RESET_COMMENTS]
+
+
+def test_a_close_in_the_window_without_the_marker_is_still_a_false_clean(token, github):
+    # A worker that closed the ledger as not_planned itself, seconds before the
+    # harness's clock started: no marker, so the false-clean reading stands.
+    _stash_report()
+    github.routes[_api()] = (200, _ledger_closed_at(_RESET_CLOSE))
+    github.routes[_RESET_COMMENTS] = (200, [{"body": "Closing, nothing found this time."}])
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail"
+    assert "false clean" in res.reason
+    assert "closed as not_planned" in res.reason
+    assert "could not be read" not in res.reason
+    assert res.raw["reset_by_harness"] is False
+
+
+def test_unreadable_comments_say_so_rather_than_ruling_the_reset_out(token, github):
+    # The comments GET is not routed, so it answers 404: the false clean is
+    # reported with the caveat, never silently either way.
+    _stash_report()
+    github.routes[_api()] = (200, _ledger_closed_at("2026-08-21T09:20:00Z", "completed"))
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail"
+    assert "false clean" in res.reason
+    assert "comments could not be read" in res.reason
+    assert res.raw["reset_by_harness"] is None
+
+
+def test_a_ledger_the_lease_time_reset_closed_long_before_the_run_is_still_the_resets(token, github):
+    # The lease-time reset runs before any unit; a unit ninety minutes later
+    # citing that ledger gets the same sentence, not "a previous run's".
+    _stash_report()
+    github.routes[_api()] = (200, _ledger_closed_at("2026-08-21T07:30:00Z"))
+    github.routes[_api() + "/comments?per_page=100&since=2026-08-21T06:30:00Z"] = (200, [_reset_comment()])
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail"
+    assert "eval harness's ledger reset" in res.reason
+    assert "previous run's ledger, so this run published nothing" not in res.reason
+
+
 def test_a_ledger_closed_before_this_run_is_still_a_previous_runs(token, github):
     # Closed yesterday, by yesterday's run: nothing this run did, so the
     # previous-run reason stands and the close is not blamed on it.
