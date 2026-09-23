@@ -840,9 +840,9 @@ export BENCH_TF_ROOT="./tf"
 #
 # EVAL_LEDGER_APP_KEY_FILE set: mint an installation token from App 4739812
 # instead, once per fan-out unit, because a token lasts an hour and units
-# launch across the whole run; grading's mint asks for nothing beyond the
-# installation's grant, and the ledger reset below mints its own, narrowed
-# to one repository and issues: write. Unset: the mounted PAT stands. A mint that
+# launch across the whole run; grading's mint asks for its three reads
+# explicitly (LEDGER_GRADING_MINT_BODY), and the ledger reset below mints its
+# own, narrowed to one repository and issues: write. Unset: the mounted PAT stands. A mint that
 # fails after its retries stops the run at preflight and costs a unit its
 # repetition inside the fan-out; it never falls back to the PAT, which would
 # let a smoke test pass while proving nothing about the credential it was added
@@ -867,6 +867,12 @@ LEDGER_MINT_ATTEMPTS=3
 # mint is reported and skipped rather than retried into the unit's budget.
 LEDGER_RESET_MINT_ATTEMPTS=2
 LEDGER_RESET_MINT_RETRY_DELAY=2
+# What the grading mint asks for: the three reads docs/ci-pool-projects.md 5.4
+# documents, requested explicitly so BENCH_GITHUB_TOKEN's reach is pinned at
+# mint rather than inherited from the installation's whole grant -- which
+# includes issues: write on every pool repository once the ledger reset's
+# grant lands. An omitted body on this endpoint means "everything granted".
+LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","metadata":"read"}}'
 
 # Emits "<token> <expires_at>" on stdout, diagnostics on stderr, non-zero on
 # any failure -- LEDGER_MINT_RETRYABLE when another attempt could survive it,
@@ -897,10 +903,11 @@ def temporary(message):
 key_file = os.environ["EVAL_LEDGER_APP_KEY_FILE"]
 app_id = os.environ["EVAL_LEDGER_APP_ID"]
 installation_id = os.environ["EVAL_LEDGER_INSTALLATION_ID"]
-# What the token may reach. Empty -- the default, and what every grading mint
-# sends -- means the installation's whole grant. The ledger reset below sets
-# it to one repository and `issues: write` (ledger_reset_token); a token
-# narrowed at mint cannot be widened by whoever holds it afterwards.
+# What the token may reach. Empty means the installation's whole grant, which
+# no caller sends: the grading mint asks for its three reads
+# (LEDGER_GRADING_MINT_BODY) and the ledger reset asks for one repository and
+# `issues: write` (ledger_reset_token). A token narrowed at mint cannot be
+# widened by whoever holds it afterwards.
 mint_body = os.environ.get("LEDGER_MINT_BODY", "").strip()
 
 
@@ -999,7 +1006,7 @@ mint_ledger_token() { # <label>
   # arriving on the first attempt.
   local minted rc attempt=1 delay=2
   while :; do
-    minted="$(_ledger_token_mint)" && break
+    minted="$(LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint)" && break
     rc=$?
     if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_MINT_ATTEMPTS}" ]; then
       echo "ERROR: ${1}: could not mint a ledger read token from App ${EVAL_LEDGER_APP_ID}," \
@@ -1050,7 +1057,9 @@ fi
 # from that file, the mapping's one home), the helper refuses a repository
 # that is not <org>/<PROJECT_ID>-infra, and the token is minted narrowed to
 # that repository and issues: write -- three guards that fail independently.
-# The token stays out of BENCH_GITHUB_TOKEN, which grading keeps read-only.
+# The reset token stays out of BENCH_GITHUB_TOKEN, and the grading mint asks
+# for its reads explicitly (LEDGER_GRADING_MINT_BODY), so the grant the reset
+# needs does not widen the token grading holds.
 # A reset that cannot run (no App key, an unmapped project, a mint the
 # installation refuses because issues: write was not granted to App
 # EVAL_LEDGER_APP_ID, docs/ci-pool-projects.md 5.4) says so and the run goes

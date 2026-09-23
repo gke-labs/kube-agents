@@ -456,12 +456,20 @@ class CallSiteTest(unittest.TestCase):
         # Gated on the case writing a ledger at all.
         self.assertIn('if [ -n "${audit_id}" ]; then', unit)
 
-    def test_the_grading_mint_sends_no_body_unless_asked(self):
+    def test_the_grading_mint_pins_its_reads_rather_than_inheriting_the_grant(self):
+        # An omitted body on the access-token endpoint yields everything the
+        # installation holds, so once issues: write is granted for the reset a
+        # bodiless grading mint would hand every unit a write token over every
+        # pool repository. The grading mint therefore asks for its reads.
         mint = lifted("_ledger_token_mint")
         self.assertIn('os.environ.get("LEDGER_MINT_BODY", "")', mint)
         self.assertIn("mint_data = None", mint)
-        # mint_ledger_token, the grading path, sets no body.
-        self.assertNotIn("LEDGER_MINT_BODY", lifted("mint_ledger_token"))
+        body_line = lifted_line(r"^LEDGER_GRADING_MINT_BODY=.*$")
+        body = json.loads(body_line.split("=", 1)[1].strip().strip("'"))
+        self.assertEqual(body, {"permissions": {"issues": "read", "pull_requests": "read", "metadata": "read"}})
+        self.assertNotIn("repositories", body)
+        self.assertIn('LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint', lifted("mint_ledger_token"))
+        self.assertNotIn("write", body_line)
 
 
 if __name__ == "__main__":

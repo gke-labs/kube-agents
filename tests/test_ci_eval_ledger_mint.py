@@ -76,12 +76,17 @@ class LedgerMintRetryTest(unittest.TestCase):
                 "set -euo pipefail",
                 _extract(r"^LEDGER_MINT_RETRYABLE=\d+$", "LEDGER_MINT_RETRYABLE"),
                 _extract(r"^LEDGER_MINT_ATTEMPTS=\d+$", "LEDGER_MINT_ATTEMPTS"),
+                _extract(r"^LEDGER_GRADING_MINT_BODY=[^\n]*$", "LEDGER_GRADING_MINT_BODY"),
                 _extract(r"^mint_ledger_token\(\) \{.*?^\}", "mint_ledger_token"),
                 # The real function runs in a command substitution, so a shell
                 # variable it sets would not survive back into the caller. The
                 # count goes in a file for the same reason.
                 'echo 0 > "${COUNT_FILE}"',
                 "_ledger_token_mint() {",
+                # The grading mint must pin its reads: a bodiless mint inherits
+                # the installation's whole grant, issues: write included once
+                # the ledger reset's grant lands.
+                '  [ "${LEDGER_MINT_BODY:-}" = "${LEDGER_GRADING_MINT_BODY}" ] || { echo "grading mint did not send its read body" >&2; return 98; }',
                 '  local n=$(( $(cat "${COUNT_FILE}") + 1 ))',
                 '  echo "${n}" > "${COUNT_FILE}"',
                 '  local outcome; outcome="$(sed -n "${n}p" "${OUTCOME_FILE}")"',
