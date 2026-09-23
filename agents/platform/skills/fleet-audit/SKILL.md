@@ -52,7 +52,7 @@ An audit request arrives in one of two distinct forms, and the execution path de
 
 ### 1. In a delegated kanban task or worker session: Run the audit directly
 
-When you are delegated a kanban card to run an audit (e.g. *"Run the security and RBAC posture audit, following the compliance-audit SOP"*):
+When you are delegated a kanban card to run an audit (e.g. _"Run the security and RBAC posture audit, following the compliance-audit SOP"_):
 
 - **You are the audit worker.** You have been given a dedicated worker session and turn budget for this specific audit.
 - **Execute the audit following its SOP (mapped in `AUDITS` at the top of `audit_report.py`, e.g. `governance/compliance_audit_sop.md` for `compliance-audit`) directly.** Use the two-command lifecycle below:
@@ -65,7 +65,7 @@ When you are delegated a kanban card to run an audit (e.g. *"Run the security an
 
 ### 2. In the interactive front-door chat: Triggering the cron schedule
 
-When a user in interactive chat asks to trigger the background schedule (e.g. *"Trigger the compliance-audit cron job"* or *"Run all scheduled audits"*) without delegating a dedicated kanban task:
+When a user in interactive chat asks to trigger the background schedule (e.g. _"Trigger the compliance-audit cron job"_ or _"Run all scheduled audits"_) without delegating a dedicated kanban task:
 
 Each stream's cron job id **is** its audit id, so an operator asking for a run off-schedule is asking
 for one command per stream:
