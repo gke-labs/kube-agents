@@ -1683,7 +1683,8 @@ path in the sandbox that prints why it cannot run there and exits non-zero. Leav
 path empty was the other option and reads worse — the model gets `No such file or
 directory`, concludes the image is broken, and spends a turn proving it. The fuller
 answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
-pod; `platform_mcp_server.py` exposes no profile tool today.
+pod; `platform_mcp_server.py` now exposes `list_cluster_profiles` and
+`get_cluster_profile_name` for read-only cluster discovery.
 
 None of this is held together by review.
 [`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)
