@@ -542,7 +542,7 @@ function breakFacts(inc, inWindow) {
   const mergeFact = mergesFact(inc, inWindow);
   if (mergeFact) facts.push(mergeFact);
   let reps = 0, storm = 0;
-  for (const run of hit) for (const c of run.cases || []) { reps += c.reps.pass + c.reps.fail + c.reps.infra; storm += c.reps.infra; }
+  for (const run of hit) for (const c of run.cases || []) { reps += repTotal(c.reps); storm += c.reps.infra; }
   const quiet = reps > 0 && storm / reps < PAGE.stormNoiseShare;
   facts.push(fact(!quiet, quiet
     ? `Not a quota storm: the agent ran and was graded on ${pct(1 - storm / reps)} of repetitions in these runs.`
@@ -556,7 +556,7 @@ function stormFacts(inc, inWindow) {
   const projects = new Set();
   for (const run of inWindow) {
     let mine = 0;
-    for (const c of run.cases || []) { reps += c.reps.pass + c.reps.fail + c.reps.infra; storm += c.reps.infra; mine += c.reps.infra; }
+    for (const c of run.cases || []) { reps += repTotal(c.reps); storm += c.reps.infra; mine += c.reps.infra; }
     if (mine) { if (run.pr != null) prs.add(run.pr); if (run.project) projects.add(run.project); }
   }
   const graded = inWindow.flatMap((r) => (r.cases || []).filter((c) => c.admitted && c.outcome !== "infra"));
@@ -791,11 +791,14 @@ function runsListHtml(inWindow, inc, title) {
     let note = "";
     if (run.setup_death) note = '<span class="chip inf">died in setup</span>';
     else if (!measured(run)) note = `<span class="chip inf">${run.result === "ABORTED" ? "aborted" : "no cases recorded"}</span>`;
-    else if (!failed.length) note = '<span class="chip ok">all gate cases passed</span>';
+    // A run whose every recorded case went ungraded (a storm, or every
+    // worker at the delegation ceiling) passed nothing; the chips say why.
+    else if (!failed.length) note = (run.cases || []).some((c) => c.outcome !== "infra") ? '<span class="chip ok">all gate cases passed</span>' : '<span class="chip inf">nothing graded</span>';
     const stormChip = (run.storm_reps || 0) >= 5 ? `<span class="chip inf">${run.storm_reps} reps lost</span>` : "";
+    const ceilingChip = (run.ceiling_reps || 0) >= 5 ? `<span class="chip inf">${run.ceiling_reps} reps at the delegation ceiling</span>` : "";
     return `<a class="runrow v-${esc(run.verdict || "infra")}" href="${esc(runHref(run))}">` +
       `<span class="rpr">#${esc(run.pr ?? "?")}</span><span class="rwhen">${esc(et(runFinish(run)))}</span>` +
-      `<span class="rproj">${esc(projectShort(run.project))}</span><span class="rcases">${chips}${note}${stormChip}${held ? `<span class="mut small">+${held} held-out</span>` : ""}</span></a>`;
+      `<span class="rproj">${esc(projectShort(run.project))}</span><span class="rcases">${chips}${note}${stormChip}${ceilingChip}${held ? `<span class="mut small">+${held} held-out</span>` : ""}</span></a>`;
   });
   // The incident's own window on the Grid: the same cases, since and until.
   const grid = inc ? `<p><a href="${esc(gridHref(inc))}">See it in the grid →</a></p>` : "";
@@ -814,7 +817,7 @@ function numbers(sinceMs, untilMs) {
   const walls = done.map((r) => (parseIso(r.finished) ?? 0) - (parseIso(r.started) ?? 0)).filter((w) => w > 0).sort((a, b) => a - b);
   const p = (q) => (walls.length ? walls[Math.round(q * (walls.length - 1))] : null);
   let reps = 0, lost = 0;
-  for (const run of full) for (const c of run.cases || []) { reps += c.reps.pass + c.reps.fail + c.reps.infra; lost += c.reps.infra; }
+  for (const run of full) for (const c of run.cases || []) { reps += repTotal(c.reps); lost += c.reps.infra; }
   return { full: full.length, prs: new Set(full.map((r) => r.pr).filter((x) => x != null)).size, green: green.length, reds, own, infra: reds - own + deaths, deaths, p50: p(0.5), p90: p(0.9), lostShare: reps ? lost / reps : null, aborted: all.filter((r) => !concluded(r)).length };
 }
 

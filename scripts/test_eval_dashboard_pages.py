@@ -25,7 +25,7 @@ import tempfile
 import unittest
 import unittest.mock
 import urllib.parse
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 
 from eval_dashboard import render
 
@@ -584,6 +584,34 @@ class BrowserTest(unittest.TestCase):
         run_page = dom_text(out / "run.html", query="build=2097282860221206528")
         self.assertIn("Workers not finishing", run_page)
         self.assertIn("those runs read not evaluated, not red", run_page)
+
+    def test_a_run_of_ceiling_hits_is_not_a_pass_in_the_brief_and_counts_in_the_storms_totals(self):
+        """A run whose every case ended at the ceiling passed nothing, so its row
+        cannot read "all gate cases passed"; and the storm brief's totals count
+        those repetitions among the ones that ran, as the run page does."""
+        data = copy.deepcopy(self.data)
+        run = max((r for r in data["runs"] if r.get("pr") is not None and r.get("tasks")), key=lambda r: r["finished"])
+        for task in run["tasks"]:
+            task["result"] = "infra"
+            task["reps"] = [{"n": n, "result": "infra", "reason": CEILING_REASON} for n in (1, 2, 3)]
+        finished = datetime.fromisoformat(run["finished"].replace("Z", "+00:00"))
+        since = (finished - timedelta(hours=1)).isoformat()
+        incident = {"prs": [1, 2, 3], "runs": 3, "window_start": since, "window_end": finished.isoformat()}
+        ceiling = health_doc("DEGRADED", condition="delegation_ceiling", failing_cases=[], tracking_issues=[], since=since,
+                             advice=health_module_advice(), incident=dict(incident, reps=18))
+        app = dom_text(render_to(pathlib.Path(self.tmp.name) / "ceiling-rows", data, health=ceiling) / "index.html")
+        row = re.search(rf'<a class="runrow[^"]*" href="run.html#build={run["build_id"]}">.*?</a>', app)
+        self.assertIsNotNone(row, "the run is listed in the wave's window")
+        self.assertIn("nothing graded", row.group(0))
+        self.assertIn(f"{3 * len(run['tasks'])} reps at the delegation ceiling", row.group(0))
+        self.assertNotIn("all gate cases passed", row.group(0))
+        storm = health_doc("DEGRADED", condition="storm", failing_cases=[], tracking_issues=[], since=since, incident=incident)
+        before = dom_text(render_to(pathlib.Path(self.tmp.name) / "storm-before", self.data, health=storm) / "index.html")
+        after = dom_text(render_to(pathlib.Path(self.tmp.name) / "storm-after", data, health=storm) / "index.html")
+        total = lambda page: int(re.search(r"of (\d+) repetitions</b> came back with no agent run", page).group(1))
+        # The reps were graded before and ceiling hits after; either way they
+        # ran, so the total is the same (the old sum dropped every one of them).
+        self.assertEqual(total(after), total(before), "ceiling reps are repetitions that ran")
 
     def test_outage_brief(self):
         app = dom_text(self.index)

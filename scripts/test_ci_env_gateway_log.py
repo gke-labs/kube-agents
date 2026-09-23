@@ -111,6 +111,18 @@ class GatewayLogCollectionTest(unittest.TestCase):
         self.assertIn("STATUS AFTER: 0", proc.stdout)
         self.assertTrue(log.is_file())
 
+    def test_the_read_is_pinned_to_the_agent_cluster_when_the_pin_is_known(self):
+        """The task loop's tofu stacks repoint kubectl's current context at
+        their own clusters and the EXIT trap runs after the last of them, so
+        the read uses the pin ci-eval-pr.sh exports for the bench's kubectl."""
+        proc, log = run_collect(AGENT_CLUSTER_CONTEXT="gke_proj_region_host")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        first = log.read_text(encoding="utf-8").splitlines()[0]
+        self.assertTrue(first.startswith("ARGS: --context gke_proj_region_host logs deployment/platform-agent-gateway"), first)
+        proc, log = run_collect(AGENT_CLUSTER_CONTEXT="")
+        first = log.read_text(encoding="utf-8").splitlines()[0]
+        self.assertNotIn("--context", first, "no pin, no flag: the deploy script's failure path has only the ambient context")
+
     def test_the_eval_trap_and_the_failure_dumper_both_call_it(self):
         env_src = ENV_SCRIPT.read_text(encoding="utf-8")
         eval_src = (REPO_ROOT / "hack" / "ci-eval-pr.sh").read_text(encoding="utf-8")

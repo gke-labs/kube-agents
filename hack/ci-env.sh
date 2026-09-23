@@ -116,7 +116,15 @@ collect_gateway_log() {
   local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
   local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
   mkdir -p "${artifact_dir}" || true
-  kubectl logs deployment/platform-agent-gateway -n "${ns}" --tail="${GATEWAY_LOG_TAIL_LINES}" 2>&1 \
+  # Pinned to the agent cluster when the pin is known: the task loop's tofu
+  # stacks repoint kubectl's current context at their own clusters
+  # (bench/README.md) and the EXIT trap runs after the last of them, so the
+  # ambient context is not reliably the host by then. AGENT_CLUSTER_CONTEXT
+  # is the pin ci-eval-pr.sh exports for the bench's own kubectl; unset (the
+  # deploy script's failure path) the ambient context is the host cluster.
+  # shellcheck disable=SC2086
+  kubectl ${AGENT_CLUSTER_CONTEXT:+--context "${AGENT_CLUSTER_CONTEXT}"} logs deployment/platform-agent-gateway \
+    -n "${ns}" --tail="${GATEWAY_LOG_TAIL_LINES}" 2>&1 \
     | tail -c "${GATEWAY_LOG_MAX_BYTES}" > "${artifact_dir}/platform-agent-gateway.log" || true
 }
 
