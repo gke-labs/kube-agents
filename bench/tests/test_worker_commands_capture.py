@@ -9,6 +9,9 @@ suffixes stripped, that ``_settle`` records them on the result, and that
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 from devops_bench.agents import AgentResult
 
@@ -51,11 +54,58 @@ def test_every_command_line_becomes_a_row_without_its_suffixes(monkeypatch):
     assert seen and "/opt/data/kanban/logs/t_ab12.log" in seen[0]
 
 
+def test_the_read_returns_text_when_the_output_is_cut_inside_a_glyph(monkeypatch):
+    # ``head -c`` can cut a transcript between the bytes of one character. The
+    # decode must not raise out of _settle ahead of the purge that follows it,
+    # so this runs the real subprocess call, against a child that writes a
+    # truncated multibyte sequence in kubectl's place.
+    real_run = subprocess.run
+
+    def run_a_truncated_writer(cmd, **kwargs):
+        assert cmd[:2] == ["kubectl", "exec"]
+        return real_run(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'ok \\xe2\\x94')"],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(harness.subprocess, "run", run_a_truncated_writer)
+    assert harness._agent_shell("head -c 5 /opt/data/kanban/logs/t_1.log", 10.0).startswith("ok ")
+
+
 def test_an_unreadable_log_is_none_so_the_check_errors_rather_than_grades(monkeypatch):
     # kubectl failed (a credential hiccup on the runner): no sentinel at all.
     monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
-    assert harness._worker_logs(["t_gone"], 5.0) is None
-    assert harness._worker_commands(None) is None
+    logs = harness._worker_logs(["t_gone"], 5.0)
+    assert logs == {"t_gone": None}
+    assert harness._worker_commands(logs) is None
+
+
+def test_one_unread_card_keeps_the_transcripts_read_around_it(monkeypatch, tmp_path):
+    # Review finding: the first unread card returned None for the whole map,
+    # so a transcript already in hand was dumped as "unread" and the cards
+    # after it were never read. The verifier still errors on the partial
+    # capture; the dump keeps what was read.
+    def fake_shell(script, timeout):
+        if "t_read" in script:
+            return "__WORKER_LOG__ 1758579012 83\nbanner\n"
+        if "t_after" in script:
+            return "__NO_WORKER_LOG__\n"
+        return ""  # t_lost: the exec failed
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    monkeypatch.setenv("ARTIFACTS", str(tmp_path))
+    logs = harness._worker_logs(["t_read", "t_lost", "t_after"], 5.0)
+    assert set(logs) == {"t_read", "t_lost"} and logs["t_lost"] is None
+    assert harness._worker_commands(logs) is None
+    harness._dump_worker_logs(logs, ["t_read", "t_lost", "t_after"])
+    index = (tmp_path / "worker-logs" / "index.txt").read_text().splitlines()
+    assert index[1:] == [
+        "t_read\t1758579012\t83\t__WORKER_LOG__",
+        "t_lost\t-\t-\t__WORKER_LOG_UNREAD__",
+        "t_after\t-\t-\t__NO_WORKER_LOG__",
+    ]
+    assert (tmp_path / "worker-logs" / "t_read.log").read_text() == "banner\n"
+    assert not (tmp_path / "worker-logs" / "t_lost.log").exists()
 
 
 def test_no_delegated_card_means_nothing_captured_not_an_empty_capture(monkeypatch):
@@ -255,13 +305,13 @@ def test_the_index_records_the_stat_of_a_transcript_that_is_there(monkeypatch, t
 
 
 def test_a_capture_that_failed_is_not_written_as_no_worker(monkeypatch, tmp_path):
-    # _worker_logs returns None when the exec failed on any card. That says
+    # _worker_logs maps a card to None when its exec failed. That says
     # nothing about the file, so the row must not read as "never had a
     # worker" -- the state that points a reader at the dispatcher.
     monkeypatch.setenv("ARTIFACTS", str(tmp_path))
     monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
     logs = harness._worker_logs(["t_unread"], 5.0)
-    assert logs is None
+    assert logs == {"t_unread": None}
     harness._dump_worker_logs(logs, ["t_unread"])
     index = (tmp_path / "worker-logs" / "index.txt").read_text().splitlines()
     assert index[1] == "t_unread\t-\t-\t__WORKER_LOG_UNREAD__"

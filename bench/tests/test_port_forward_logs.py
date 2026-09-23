@@ -78,3 +78,48 @@ def test_each_port_gets_its_own_log(monkeypatch, tmp_path):
     monkeypatch.setenv("ARTIFACTS", str(tmp_path))
     assert harness._pf_log_path(28642).name == "pf-28642.log"
     assert harness._pf_log_path(28643).name == "pf-28643.log"
+
+
+def test_a_respawn_keeps_the_stderr_of_the_tunnel_that_died(monkeypatch, tmp_path):
+    # The first version opened the log with "wb", so the respawn after a dead
+    # tunnel erased the only line that said why it died. Each spawn appends,
+    # behind a marker, so both tunnels' stderr survive.
+    monkeypatch.setenv("ARTIFACTS", str(tmp_path))
+    monkeypatch.setattr(harness, "_PF_PROCESSES", {})
+    port = 28699
+    spawned = []
+
+    class FakeTunnel:
+        def __init__(self, cmd, stdout, stderr):
+            stderr.write(f"error: lost connection {len(spawned)}\n".encode())
+            spawned.append(self)
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        kill = terminate
+
+    monkeypatch.setattr(harness.subprocess, "Popen", FakeTunnel)
+    # The port is open while a tunnel is alive, closed otherwise.
+    monkeypatch.setattr(
+        harness,
+        "_port_open",
+        lambda port, host="127.0.0.1": any(t.returncode is None for t in spawned),
+    )
+
+    harness._ensure_port_forward(port)
+    spawned[0].returncode = 1  # the tunnel dies
+    harness._ensure_port_forward(port)
+
+    text = harness._pf_log_path(port).read_text()
+    assert text.count(harness._PF_SPAWN_MARKER) == 2
+    assert "error: lost connection 0\n" in text
+    assert "error: lost connection 1\n" in text
+    assert text.index("lost connection 0") < text.index("lost connection 1")

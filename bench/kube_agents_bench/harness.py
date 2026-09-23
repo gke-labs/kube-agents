@@ -676,7 +676,7 @@ class _WorkerLog:
     size: str
 
 
-def _worker_logs(task_ids: list[str], timeout: float) -> dict[str, _WorkerLog] | None:
+def _worker_logs(task_ids: list[str], timeout: float) -> dict[str, _WorkerLog | None] | None:
     """Each delegated card's worker transcript, keyed by card id.
 
     The worker is a separate hermes session; its tool calls reach
@@ -692,16 +692,18 @@ def _worker_logs(task_ids: list[str], timeout: float) -> dict[str, _WorkerLog] |
     answered -- and by :func:`_dump_worker_logs` for the run artifacts. One
     read serves both; each is a ``kubectl exec`` into the agent pod.
 
-    ``None`` when any card's log could not be read at all. ``_agent_shell``
+    A card whose log could not be read at all maps to ``None``. ``_agent_shell``
     returns ``""`` for a kubectl that failed as readily as for an empty file,
     and the first time this ran, a credential hiccup on the runner turned a
     worker that had run dozens of commands into "0 command(s)" -- which
     failed the required pattern for the wrong reason and passed the forbidden
     one for no reason. The script therefore prints a sentinel before the log
     (or a different one when the file is absent), and a reply carrying
-    neither is a capture failure, which the verifier reports as
-    ``status="error"`` rather than grading. A card that simply has no log is
-    absent from the map, which is not a failure.
+    neither is a capture failure: :func:`_worker_commands` reports it as
+    ``status="error"`` rather than grading, while the cards read before and
+    after it stay in the map for the dump. A card that simply has no log is
+    absent from the map, which is not a failure. ``None`` for the whole map
+    means nothing was read because no card was delegated.
 
     The sentinel line carries the file's mtime and size, so one exec returns
     both the transcript and the metadata :class:`_WorkerLog` documents. A
@@ -714,7 +716,7 @@ def _worker_logs(task_ids: list[str], timeout: float) -> dict[str, _WorkerLog] |
     # this returning [] here.
     if not task_ids:
         return None
-    logs: dict[str, _WorkerLog] = {}
+    logs: dict[str, _WorkerLog | None] = {}
     for tid in task_ids:
         path = _shell_quote(f"{_LOGS_DIR}/{tid}.log")
         unknown = f"{_STAT_UNKNOWN} {_STAT_UNKNOWN}"
@@ -733,14 +735,17 @@ def _worker_logs(task_ids: list[str], timeout: float) -> dict[str, _WorkerLog] |
         if marker == _LOG_ABSENT:
             continue
         if marker != _LOG_PRESENT:
+            # Keep going: one unread card errors the verifier, but the dump
+            # wants every transcript that was in hand.
             _log.warning("worker log for %s could not be read; route checks will error", tid)
-            return None
+            logs[tid] = None
+            continue
         mtime, size = (fields + [_STAT_UNKNOWN, _STAT_UNKNOWN])[1:3]
         logs[tid] = _WorkerLog(body=body, mtime=mtime, size=size)
     return logs
 
 
-def _worker_commands(logs: dict[str, _WorkerLog] | None) -> list[dict[str, str]] | None:
+def _worker_commands(logs: dict[str, _WorkerLog | None] | None) -> list[dict[str, str]] | None:
     """Every terminal command the delegated workers ran, from their card logs.
 
     The worker is a separate hermes session and its tool calls never reach
@@ -749,14 +754,16 @@ def _worker_commands(logs: dict[str, _WorkerLog] | None) -> list[dict[str, str]]
     route a worker took, not only what it answered. Only terminal commands
     are visible; MCP tool calls are not.
 
-    ``None`` passes through from :func:`_worker_logs`: a capture that failed,
-    or a run that delegated nothing, is not a run whose workers issued no
-    commands.
+    ``None`` when :func:`_worker_logs` read nothing or failed on any card: a
+    capture that failed, or a run that delegated nothing, is not a run whose
+    workers issued no commands, and a partial capture must not be graded.
     """
     if logs is None:
         return None
     commands: list[dict[str, str]] = []
     for tid, log in logs.items():
+        if log is None:
+            return None
         for line in log.body.splitlines():
             match = _WORKER_COMMAND_RE.search(line)
             if match:
@@ -764,7 +771,7 @@ def _worker_commands(logs: dict[str, _WorkerLog] | None) -> list[dict[str, str]]
     return commands
 
 
-def _dump_worker_logs(logs: dict[str, _WorkerLog] | None, stalled: Sequence[str]) -> None:
+def _dump_worker_logs(logs: dict[str, _WorkerLog | None] | None, stalled: Sequence[str]) -> None:
     """Write the transcript of every card that ran to the ceiling into ARTIFACTS.
 
     Without this a stalled card would leave nothing behind: :func:`_worker_commands`
@@ -781,8 +788,9 @@ def _dump_worker_logs(logs: dict[str, _WorkerLog] | None, stalled: Sequence[str]
     with no transcript at all. That row is not an empty result: a stalled card
     with no file never had a worker, which is a different fault from a worker
     that started and went quiet, and a missing file cannot tell the two apart.
-    A capture that failed outright (``logs is None``) is a third state,
-    ``_LOG_UNREAD``, because it says nothing about whether the file was there.
+    A card whose read failed (``None`` in the map, or no map at all) is a
+    third state, ``_LOG_UNREAD``, because it says nothing about whether the
+    file was there; the cards read alongside it keep their transcripts.
     """
     directory = os.environ.get(_ARTIFACTS_ENV)
     if not directory or not stalled:
@@ -791,12 +799,12 @@ def _dump_worker_logs(logs: dict[str, _WorkerLog] | None, stalled: Sequence[str]
     found = logs or {}
     rows = []
     for tid in stalled:
-        if logs is None:
-            rows.append(f"{tid}\t{_STAT_UNKNOWN}\t{_STAT_UNKNOWN}\t{_LOG_UNREAD}")
+        if logs is not None and tid not in found:
+            rows.append(f"{tid}\t{_STAT_UNKNOWN}\t{_STAT_UNKNOWN}\t{_LOG_ABSENT}")
             continue
         log = found.get(tid)
         if log is None:
-            rows.append(f"{tid}\t{_STAT_UNKNOWN}\t{_STAT_UNKNOWN}\t{_LOG_ABSENT}")
+            rows.append(f"{tid}\t{_STAT_UNKNOWN}\t{_STAT_UNKNOWN}\t{_LOG_UNREAD}")
             continue
         rows.append(f"{tid}\t{log.mtime}\t{log.size}\t{_LOG_PRESENT}")
     try:
