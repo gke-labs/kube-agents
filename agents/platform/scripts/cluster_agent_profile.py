@@ -56,7 +56,6 @@ def _resolve_data_root() -> Path:
     if (
         raw_home.parent.name == PROFILES_DIR_NAME
         and (raw_home.name in RESERVED_PROFILES or raw_home.name.startswith(CLUSTER_PROFILE_PREFIX))
-        and not (raw_home / PROFILES_DIR_NAME).is_dir()
     ):
         return raw_home.parent.parent
     return raw_home

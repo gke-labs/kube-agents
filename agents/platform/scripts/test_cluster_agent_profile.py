@@ -548,6 +548,14 @@ class ResolveProfilesBaseTest(unittest.TestCase):
             self.assertEqual(cap._resolve_data_root(), Path("/srv/profiles/data"))
             self.assertEqual(cap._resolve_profiles_base(), Path("/srv/profiles/data/profiles"))
 
+    def test_resolves_when_profile_home_contains_profiles_directory(self):
+        with tempfile.TemporaryDirectory(prefix="test-prof-") as tmpdir:
+            profile_home = Path(tmpdir) / "profiles" / "platform"
+            (profile_home / "profiles").mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}, clear=True):
+                self.assertEqual(cap._resolve_data_root(), Path(tmpdir))
+                self.assertEqual(cap._resolve_profiles_base(), Path(tmpdir) / "profiles")
+
 
 class ListProfilesTest(unittest.TestCase):
     def setUp(self):
