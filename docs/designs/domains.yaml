@@ -102,7 +102,10 @@ allowlist:
   # ai-security-planted-model-audit's), or when the coverage contract
   # formally recognizes the nightly tier (#1175). incident-triage sat here
   # from 2026-09-03 to 2026-09-22 for the same shape of reason.
-  - fleet-audits
+  # TEMP (#1877): the canary is seated in presubmit-cases.txt for one
+  # observed run, so the lint counts the domain covered; the entry below is
+  # uncommented again when that seat is reverted, before the PR merges.
+  # - fleet-audits
   # remediation, since 2026-09-22 (#1023): the same decision, and neither of
   # the domain's two writers holds a seat. rca-remediation-pr was demoted
   # 2026-09-02 (#1189) and moved to hack/eval/nightly-cases.txt with the

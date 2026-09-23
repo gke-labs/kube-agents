@@ -1220,7 +1220,8 @@ class TestNightlySource(_MergeBase):
         self.assertFalse(cases["obtainability-planted-pdb"]["active"])
         self.assertTrue(cases["obtainability-planted-pdb"]["nightly_active"], "a nightly-cases.txt entry")
         # Nightly-only since 2026-09-22 (#1023): the presubmit runs the blocking roster only.
-        self.assertFalse(cases["compliance-rbac-overgrant"]["active"])
+        # TEMP (#1877): seated in presubmit-cases.txt for one observed run; back to assertFalse on revert.
+        self.assertTrue(cases["compliance-rbac-overgrant"]["active"])
         self.assertTrue(cases["compliance-rbac-overgrant"]["nightly_active"], "a held-out case is a nightly case")
 
     def test_head_sha_falls_back_to_the_started_commit_for_a_periodic(self):
@@ -1276,14 +1277,15 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # to the nightly (#1876), and remediation's coverage left with it:
         # rca-remediation-pr is held out and pdb-remediation-pr's promotion
         # was withdrawn until it has a record under its #1780 grader.
-        self.assertEqual(cov["uncovered"], ["fleet-audits", "remediation"])
+        # TEMP (#1877): fleet-audits counts covered while the canary is seated; ["fleet-audits", "remediation"] on revert.
+        self.assertEqual(cov["uncovered"], ["remediation"])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_presubmit_file_entries(self):
         active = collect.active_task_names()
         self.assertIn("reliability-pdb-probe", active)
         self.assertIn("incident-triage-oom-event-probe", active)  # a roster seat since 2026-09-22
-        self.assertNotIn("compliance-rbac-overgrant", active)  # nightly only since 2026-09-22
+        self.assertIn("compliance-rbac-overgrant", active)  # TEMP (#1877): seated for one observed run; nightly only since 2026-09-22, assertNotIn on revert
         self.assertNotIn("pdb-remediation-pr", active)  # nightly only; its 2026-09-22 promotion was withdrawn
         self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)
