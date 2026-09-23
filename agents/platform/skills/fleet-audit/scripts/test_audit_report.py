@@ -3895,8 +3895,14 @@ class TestStart(HarnessTestCase):
         self.harness.replies = {"issue list": self.issue_list()}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
-        self.assertIn("run in flight", self.err)
-        self.assertIn("--takeover", self.err)
+        self.assertIn("is in flight since", self.err)
+        self.assertIn("wait for its `finish` or report it", self.err)
+        # The refusal is addressed to the worker, and a worker has two
+        # options. The first wording offered the override "if you know it is
+        # dead"; on 2026-09-23 a refused session passed it 42 seconds later
+        # over a run that was alive. The flag is documented for an operator
+        # and stays off the message.
+        self.assertNotIn("takeover", self.err)
         # Refused means refused: the other run's note is still there.
         self.assertTrue(Path(audit_report.inflight_path_for(AUDIT)).is_file())
         # The note names the stream, not the caller's guess about it.
@@ -3912,7 +3918,7 @@ class TestStart(HarnessTestCase):
         note.parent.mkdir(parents=True, exist_ok=True)
         note.write_text("")
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
-        self.assertIn("run in flight", self.err)
+        self.assertIn("is in flight since", self.err)
         self.assertEqual(note.read_text(), "")
         # Once that note is older than the TTL it is debris like any other.
         stale = time.time() - audit_report.INFLIGHT_TTL_SECONDS - 1
@@ -12024,9 +12030,17 @@ class TestDispatchAndHandover(unittest.TestCase):
         self.assertIn("audit_report.py start", bullet)
         # The overlap guard is the script's in-flight note, not a ledger the
         # in-session run never appears in; the worker is told what the
-        # refusal means and that --takeover is not its call.
+        # refusal means and what to do (wait or report). The override is not
+        # named where the worker reads: a refused rep on 2026-09-23 passed
+        # `--takeover` 42 s after being told it was "not for you".
         self.assertIn("refuses while a run of that stream is in flight", bullet)
-        self.assertIn("--takeover", bullet)
+        self.assertNotIn("--takeover", bullet)
+        # A partial run is allowed; a partial run that spent its turns on the
+        # low-severity checks is not. Rep 3 of build 2102781983259103232 ran
+        # `netpol-missing` and `public-control-plane` and skipped
+        # `cluster-admin-binding`, the one check the planted defect needs.
+        self.assertIn("severity order", bullet)
+        self.assertIn("`carried`", bullet)
         self.assertIn("coverage gap", bullet)
         self.assertIn("more than one job", bullet)
         self.assertIn("not an audit stream", bullet)
@@ -12045,8 +12059,24 @@ class TestDispatchAndHandover(unittest.TestCase):
         self.assertIn("Exactly one stream", section)
         self.assertIn("audit_report.py finish", section)
         self.assertIn("`start` refuses", section)
-        self.assertIn("--takeover", section)
         self.assertIn("coverage gap", section)
+        # The spelling the worker is told to use has to be one the sandbox's
+        # command guard lets through. Build 2102781983259103232 blocked the
+        # quoted `"$HERMES_HOME"/skills/...` form in two of three reps
+        # ("Nested executable body could not be resolved"); the `python3`
+        # leader with the literal profile path ran every time.
+        self.assertIn(
+            "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py",
+            section,
+        )
+        self.assertNotIn('"$HERMES_HOME"/skills/fleet-audit', section)
+        # The worker's bullet says wait or report; the override is named once,
+        # in the paragraph about the guard, as an operator's.
+        one_stream = section.split("- **Exactly one stream:**", 1)[1].split("\n- ", 1)[0]
+        self.assertNotIn("--takeover", one_stream)
+        self.assertIn("severity order", one_stream)
+        self.assertIn("`carried`", one_stream)
+        self.assertIn("operator", section.split("--takeover", 1)[0][-400:])
         self.assertIn("More than one stream", section)
         self.assertIn("2026-08-03", section)
         self.assertIn("cronjob(action='run')", section)

@@ -1513,10 +1513,16 @@ def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
         started, pid = _in_flight_since(path)
         if not takeover and started is not None and time.time() - started < INFLIGHT_TTL_SECONDS:
             when = datetime.fromtimestamp(started, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            # Addressed to the worker that was refused: wait or report, and
+            # no third option. The first wording offered `--takeover` "if you
+            # know it is dead", and on 2026-09-23 a refused session took that
+            # as its cue and passed the flag 42 seconds later over a run that
+            # was alive. The override stays on the CLI for an operator; the
+            # refusal does not advertise it.
             raise ValidationError(
-                f"{audit_id} has a run in flight since {when} (pid {pid}); a second "
-                f"`start` would scrub its run record, workspace and findings document. "
-                f"Wait for that run's `finish`, or pass --takeover if you know it is dead."
+                f"a run of {audit_id} is in flight since {when} (pid {pid}); wait for "
+                f"its `finish` or report it. A second `start` would scrub its run "
+                f"record, workspace and findings document."
             )
         path.write_text(
             json.dumps({"audit": audit_id, "started_at": time.time(), "pid": os.getpid()}),
@@ -11592,9 +11598,10 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--takeover",
         action="store_true",
-        help="Start even though a run of this stream is recorded as in flight "
-        "(only when you know that run is dead; the note expires by itself after "
-        f"{INFLIGHT_TTL_SECONDS // 60} minutes).",
+        help="Operator override: start even though a run of this stream is "
+        "recorded as in flight. Only when you know that run is dead; never as "
+        "the answer to a refusal. The note expires by itself after "
+        f"{INFLIGHT_TTL_SECONDS // 60} minutes.",
     )
 
     finish_parser = subparsers.add_parser(
