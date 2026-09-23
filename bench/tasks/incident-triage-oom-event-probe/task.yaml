@@ -77,9 +77,10 @@
 # BLOCKING SINCE 2026-09-22. Moving this line to hack/eval/presubmit-cases.txt
 # deleted `incident-triage` from the allowlist in docs/designs/domains.yaml
 # (scripts/test_domain_coverage.py fails on a covered domain still listed)
-# and emptied the uncovered list that scripts/test_eval_dashboard_collect.py
-# (test_coverage_matches_domains_yaml) pins; a nightly-cases.txt entry
-# changed neither.
+# and took it off the uncovered list that scripts/test_eval_dashboard_collect.py
+# (test_coverage_matches_domains_yaml) pins -- fleet-audits and remediation
+# joined that list the same day, so it is not empty; a nightly-cases.txt
+# entry changed neither.
 #
 # Expected cost bracket: measured 737s/599s/1357s a repetition on build
 # 2099969322708373504 (agent latency 631s/494s/1258s), above the

@@ -33,9 +33,10 @@
 # (.agents/rules/eval_driven_development.md): a seat is earned on the
 # record, which the verdict's "Record says" column reports per case.
 #
-# Demoting a flaky case is a one-line same-day edit: delete its name,
-# referencing the issue that names its re-admission condition and citing
-# what the record says about it.
+# Demoting a flaky case is a same-day edit: delete its name here and its
+# line from presubmit-cases.txt, add that line to nightly-cases.txt with the
+# issue that names its re-admission condition as the # line above it, and
+# cite what the record says about it.
 
 reliability-pdb-probe
 capacity-pinned-pool-probe

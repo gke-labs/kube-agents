@@ -27,9 +27,9 @@ repositories that CI pulls from.
 4. Open the pull request. `scripts/test_task_registration.py` runs the same rules in CI, and
    the nightly runs the case from the night it merges, so a case that cannot pass or cannot
    fail shows up on its record.
-5. The case merges unadmitted. It runs and reports every night from then on, earns a
-   presubmit seat on that record, and then admission, as described under "Roster admission"
-   below.
+5. The case merges unadmitted. It runs and reports every night from then on and earns its
+   presubmit seat on that record — which is admission: since 2026-09-22 the two are one edit,
+   as described under "Roster admission" below.
 
 A case for a gap whose fix is not yours takes the same path with one addition: it lands marked
 `expected_fail: true`, having been seen red, and the owner's fix flips the marker in the diff

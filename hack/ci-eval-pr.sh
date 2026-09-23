@@ -1572,9 +1572,10 @@ esac
 # list in the file, the prose there. hack/OWNERS puts the file under the
 # eval-crew alias (#1546).
 #
-# Demoting a flaky case is a one-line same-day edit: delete its name from
-# the file, referencing the issue that names its re-admission condition
-# and citing what the record says about it.
+# Demoting a flaky case is a same-day edit: delete its name from that file
+# and its line from presubmit-cases.txt, add the line to nightly-cases.txt
+# with the issue that names its re-admission condition as the # line above
+# it, and cite what the record says about it.
 #
 # A name that is not a presubmit case stops the job here: a misspelled entry
 # would otherwise arm nothing and look like a working roster, and a nightly
