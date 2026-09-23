@@ -907,6 +907,20 @@ class SlowGate(unittest.TestCase):
             aborted["result"] = "ABORTED"
         self.assertIsNone(adjudicate(doc, T0)["slow"])
 
+    def test_the_floor_sits_one_demotion_below_the_twelve_case_presubmit(self):
+        # Since 2026-09-22 the presubmit runs the blocking roster only, twelve
+        # cases (#1023). A twelve-case run is a full run, one demotion away it
+        # still is, and the ten-case run Prow cut short above is not; with the
+        # floor back at its old 15 the rule would never see a full run and go
+        # silent. The live roster, not this fixture, is what the floor tracks.
+        import eval_rosters
+
+        twelve = [task(f"case-{k}", "ppp") for k in range(12)]
+        self.assertIsNotNone(adjudicate(self.week([200] * 5, tasks=twelve), T0)["slow"])
+        self.assertIsNotNone(adjudicate(self.week([200] * 5, tasks=twelve[:11]), T0)["slow"])
+        self.assertIsNone(adjudicate(self.week([200] * 5, tasks=twelve[:10]), T0)["slow"])
+        self.assertEqual(health.SLOW_MIN_TASKS, len(eval_rosters.presubmit_cases()) - 1, "one demotion below the live presubmit roster, on purpose")
+
     def test_an_episode_holds_until_the_median_is_under_1_1x_and_keeps_its_start(self):
         first = adjudicate(self.week([180] * 5), T0)
         self.assertIsNotNone(first["slow"])
