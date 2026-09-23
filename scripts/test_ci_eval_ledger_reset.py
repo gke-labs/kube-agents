@@ -488,6 +488,9 @@ class AuditIdTest(unittest.TestCase):
             "type with comment": ("check:\n  type: ledger_issue_contains  # the ledger\n  audit: ai-security-audit\n", "ai-security-audit"),
             "commented check": ("# report_contains, not ledger_issue_contains: a chat probe\n      audit: not-a-stream\n", ""),
             "audit before type": ("check:\n  audit: compliance-audit\n  type: ledger_issue_contains\n", "compliance-audit"),
+            "another key between": ("check:\n  type: ledger_issue_contains\n  scope: finding_ids\n  audit: obtainability-audit\n", "obtainability-audit"),
+            "blank and comment between": ("check:\n  type: ledger_issue_contains\n\n  # the stream\n  audit: compliance-audit\n", "compliance-audit"),
+            "nested key is not the mapping": ("check:\n  type: ledger_issue_contains\n  extra:\n    audit: nested\n  audit: compliance-audit\n", "compliance-audit"),
             "other check type": ("check:\n  type: report_contains\n  audit: not-a-stream\n", ""),
             "no check": ("prompt: audit: something\n", ""),
         }
@@ -507,13 +510,19 @@ class AuditIdTest(unittest.TestCase):
         # skipped its reset without a word. Now the skip is loud.
         with tempfile.TemporaryDirectory() as tmp:
             yaml = pathlib.Path(tmp) / "task.yaml"
-            yaml.write_text("check:\n  type: ledger_issue_contains\n  scope: finding_ids\n  required_phrases: [x]\n")
-            body = "\n".join(['BENCH_DIR="/nonexistent"', lifted("ledger_audit_id_for_task"), f'ledger_audit_id_for_task "{yaml}"'])
-            result = run_bash(body)
-        self.assertEqual(result.stdout.strip(), "")
-        self.assertIn("WARNING:", result.stderr)
-        self.assertIn("ledger_issue_contains check but no audit: key beside its type:", result.stderr)
-        self.assertIn(str(yaml), result.stderr)
+            for text in (
+                "check:\n  type: ledger_issue_contains\n  scope: finding_ids\n  required_phrases: [x]\n",
+                # The audit key after a dedent belongs to another mapping.
+                "- check:\n    type: ledger_issue_contains\n- other:\n  audit: compliance-audit\n",
+            ):
+                yaml.write_text(text)
+                body = "\n".join(['BENCH_DIR="/nonexistent"', lifted("ledger_audit_id_for_task"), f'ledger_audit_id_for_task "{yaml}"'])
+                result = run_bash(body)
+                with self.subTest(text=text):
+                    self.assertEqual(result.stdout.strip(), "")
+                    self.assertIn("WARNING:", result.stderr)
+                    self.assertIn("ledger_issue_contains check but no audit: key in the same mapping as its type:", result.stderr)
+                    self.assertIn(str(yaml), result.stderr)
 
     def test_an_absolute_path_is_read_as_given(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -566,6 +575,54 @@ class CallSiteTest(unittest.TestCase):
         self.assertIn('audit_id="$(ledger_audit_id_for_task "${task}")"', unit)
         # Gated on the case writing a ledger at all.
         self.assertIn('if [ -n "${audit_id}" ]; then', unit)
+
+    def test_a_ledger_writing_unit_holds_its_stream_lock_from_before_the_reset_until_the_run_returns(self):
+        # Two cases grade fleet-consistency-drift; their task locks differ, so
+        # without this one lane's reset closes the other lane's live ledger
+        # and the other's finish lands in this lane's fresh one. The stream
+        # lock is taken after the task lock (one order everywhere, no cycle),
+        # only when the case names a stream, and released on every exit.
+        unit = lifted("run_one_unit")
+        task_lock = unit.index('lock_acquire "${STATE_DIR}/lock-task-${name}"')
+        stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"')
+        reset = unit.index('reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"')
+        launch = unit.index("uv run devops-bench")
+        stream_release = unit.index('lock_release "${STATE_DIR}/lock-stream-${audit_id}"', launch)
+        task_release = unit.index('lock_release "${STATE_DIR}/lock-task-${name}"', launch)
+        self.assertLess(task_lock, stream_lock)
+        self.assertLess(stream_lock, reset)
+        self.assertLess(reset, launch)
+        self.assertLess(launch, stream_release)
+        self.assertLess(stream_release, task_release)
+        self.assertIn('if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"', unit)
+        # Released on the mint-failure path as well as after the run.
+        self.assertEqual(unit.count('[ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"'), 2)
+        # The same deadline as the task lock: a holder runs a whole unit.
+        self.assertEqual(unit.count('"$(($(unit_delegation_timeout "${name}") + 600))"'), 2)
+
+    def test_two_units_on_one_stream_serialise_and_two_on_different_streams_do_not(self):
+        # The lock helpers as shipped, with mkdir as the mutex: the second
+        # holder of one stream waits until the first releases; a different
+        # stream is not waited on.
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "\n".join(
+                [
+                    f'STATE_DIR="{tmp}"',
+                    lifted("lock_acquire"),
+                    lifted_line(r"^lock_release\(\) \{.*\}$"),
+                    'lock_acquire "${STATE_DIR}/lock-stream-fleet-consistency-drift" 30',
+                    'lock_acquire "${STATE_DIR}/lock-stream-compliance-audit" 30 && echo "other stream: free"',
+                    '( lock_acquire "${STATE_DIR}/lock-stream-fleet-consistency-drift" 4 && echo "same stream: taken" ) || echo "same stream: waited out"',
+                    'lock_release "${STATE_DIR}/lock-stream-fleet-consistency-drift"',
+                    'lock_acquire "${STATE_DIR}/lock-stream-fleet-consistency-drift" 30 && echo "same stream after release: taken"',
+                ]
+            )
+            result = run_bash(body)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["other stream: free", "same stream: waited out", "same stream after release: taken"],
+            result.stderr,
+        )
 
     def test_the_grading_mint_pins_its_reads_rather_than_inheriting_the_grant(self):
         # An omitted body on the access-token endpoint yields everything the

@@ -2150,7 +2150,10 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
             r"^  if ! mint_ledger_token .*?^  fi", self._unit(), re.S | re.M
         )
         self.assertIsNotNone(branch, "could not find the unit's mint-failure branch")
-        self.assertEqual(2, branch.group(0).count("lock_release"))
+        # The task lock, the infra lock and, for a ledger-writing case, the
+        # stream lock: everything taken before the mint.
+        self.assertEqual(3, branch.group(0).count("lock_release"))
+        self.assertIn("lock-stream-", branch.group(0))
         self.assertIn("return 0", branch.group(0))
 
     def test_every_bench_invocation_is_preceded_by_a_mint(self):

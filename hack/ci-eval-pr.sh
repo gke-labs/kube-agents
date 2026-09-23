@@ -1110,14 +1110,15 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
   local file="$1"
   case "${file}" in /*) ;; *) file="${BENCH_DIR}/${file}" ;; esac
   [ -f "${file}" ] || return 0
-  # Reads the `audit:` key beside the `type: ledger_issue_contains` line --
-  # the line after it, or the one just before -- so an `audit:` word in the
-  # prompt or a note elsewhere cannot retarget the reset at a label that does
-  # not exist; a quoted value is read without its quotes, a comment after it
-  # is dropped. A check laid out any other way is a loud skip, not a silent
-  # one. awk with `exit`, not `sed | head`: under pipefail a `head` that
-  # closes the pipe after the first of several matches can hand sed a
-  # SIGPIPE, and the caller assigns this inside `set -e`.
+  # Reads the `audit:` key in the same mapping as the `type:
+  # ledger_issue_contains` line -- a later key at the same indentation, or
+  # the line just before -- so an `audit:` word in the prompt or a note
+  # elsewhere cannot retarget the reset at a label that does not exist; a
+  # quoted value is read without its quotes, a comment after it is dropped,
+  # and a dedent ends the mapping. A check laid out any other way is a loud
+  # skip, not a silent one. awk with `exit`, not `sed | head`: under pipefail
+  # a `head` that closes the pipe after the first of several matches can
+  # hand sed a SIGPIPE, and the caller assigns this inside `set -e`.
   awk -v file="${file}" '
     function value(line) {
       sub(/^[[:space:]]*audit:[[:space:]]*/, "", line)
@@ -1125,17 +1126,20 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
       sub(/[^A-Za-z0-9_.-].*$/, "", line)
       return line
     }
+    function indent(line) { match(line, /^[[:space:]]*/); return RLENGTH }
+    /^[[:space:]]*(#|$)/ { next }
     /^[[:space:]]*(- )?type:[[:space:]]*ledger_issue_contains[[:space:]]*(#.*)?$/ {
       if (prev != "") { print prev; found = 1; exit }
-      armed = 1; next
+      seen = 1; armed = 1
+      depth = indent($0) + ($0 ~ /^[[:space:]]*- / ? 2 : 0)
+      next
     }
-    /^[[:space:]]*audit:[[:space:]]*/ {
-      if (armed) { print value($0); found = 1; exit }
-      prev = value($0); next
-    }
+    armed && indent($0) < depth { armed = 0 }
+    armed && indent($0) == depth && /^[[:space:]]*audit:[[:space:]]*/ { print value($0); found = 1; exit }
+    /^[[:space:]]*audit:[[:space:]]*/ { prev = value($0); next }
     { prev = "" }
     END {
-      if (armed && !found) print "WARNING: " file " has a ledger_issue_contains check but no audit: key beside its type: line; its ledger reset is skipped" > "/dev/stderr"
+      if (seen && !found) print "WARNING: " file " has a ledger_issue_contains check but no audit: key in the same mapping as its type: line; its ledger reset is skipped" > "/dev/stderr"
     }
   ' "${file}"
 }
@@ -1895,19 +1899,28 @@ STATE_DIR="$(mktemp -d)"
 # otherwise strand every contender in a silent spin that `wait` can never
 # collect past, so acquisition carries a deadline: a unit that gives up fails
 # loudly and grades as MISSING, which is a diagnosis the gate already
-# reports. Two locks serialize what genuinely cannot overlap while noop
+# reports. Three locks serialize what genuinely cannot overlap while noop
 # units fill the lanes:
-#   per task  -- repetitions of ONE task never overlap. Concurrent reps of a
-#                ledger-writing audit rewrite one shared ledger issue and
-#                grade each other's artifact; concurrent reps of the autoops
-#                task plant simultaneous incidents with no card attribution;
-#                and same-task reps share a tofu stack directory and cluster
-#                name. Serial reps are also what keeps them comparable.
-#   infra     -- at most one stack-bearing (tofu) unit runs at a time,
-#                across tasks: BENCH_PARALLEL stays false, so devops-bench's
-#                per-run isolation (own kubeconfig, gcloud config, tofu data
-#                dir) is off, and two concurrent tofu units would race the
-#                shared kubeconfig's current-context and their state locks.
+#   per task   -- repetitions of ONE task never overlap. Concurrent reps of a
+#                 ledger-writing audit rewrite one shared ledger issue and
+#                 grade each other's artifact; concurrent reps of the autoops
+#                 task plant simultaneous incidents with no card attribution;
+#                 and same-task reps share a tofu stack directory and cluster
+#                 name. Serial reps are also what keeps them comparable.
+#   per stream -- units that grade ONE audit stream never overlap, across
+#                 tasks: consistency-drift-outlier and
+#                 consistency-no-environment-label both write the
+#                 fleet-consistency-drift ledger, and audit_report.py finish
+#                 writes to the highest OPEN issue under the stream's label,
+#                 whichever unit opened it. Without this, one lane's ledger
+#                 reset closes the sibling's live ledger and the sibling's
+#                 finish lands in this lane's fresh one. Taken after the task
+#                 lock, keyed on the audit id, only by units that write one.
+#   infra      -- at most one stack-bearing (tofu) unit runs at a time,
+#                 across tasks: BENCH_PARALLEL stays false, so devops-bench's
+#                 per-run isolation (own kubeconfig, gcloud config, tofu data
+#                 dir) is off, and two concurrent tofu units would race the
+#                 shared kubeconfig's current-context and their state locks.
 lock_acquire() { # <dir> [deadline-seconds]
   local waited=0 limit="${2:-1800}"
   until mkdir "$1" 2>/dev/null; do
@@ -1946,22 +1959,36 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
     return 0
   fi
+  # The stream this case writes its ledger under, empty for a case that
+  # writes none. A ledger-writing unit also holds the stream lock from here
+  # until devops-bench returns: two cases on one stream (the two consistency
+  # cases) must not reset and rewrite each other's ledger mid-run. Same
+  # deadline as the task lock, for the same reason.
+  local audit_id
+  audit_id="$(ledger_audit_id_for_task "${task}")"
+  if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}" \
+    "$(($(unit_delegation_timeout "${name}") + 600))"; then
+    [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${audit_id} stream lock" >&2
+    return 0
+  fi
   # This unit's own token, minted rather than inherited, and minted after the
   # waiting rather than before it: reps of one task serialize on the task lock,
   # so at the default EVAL_REPETITIONS=3 a unit can sleep past the hour a token
   # lasts and reach devops-bench holding a dead one.
   if ! mint_ledger_token "${name} rep ${rep}"; then
+    [ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"
     [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} could not mint a ledger token" >&2
     return 0
   fi
   # This stream's open ledger, closed before the unit runs and while the task
-  # lock keeps its sibling repetitions out: repetitions 2 and 3 audit from the
-  # empty ledger repetition 1 had (the lease-time reset above). Only this
-  # stream's label, so an audit case running in another lane keeps its own.
-  local audit_id
-  audit_id="$(ledger_audit_id_for_task "${task}")"
+  # lock keeps its sibling repetitions out and the stream lock keeps the other
+  # case on the same stream out: repetitions 2 and 3 audit from the empty
+  # ledger repetition 1 had (the lease-time reset above). Only this stream's
+  # label, so an audit case on another stream in another lane keeps its own.
   if [ -n "${audit_id}" ]; then
     reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
   fi
@@ -1983,6 +2010,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && uv run devops-bench "${task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
+  [ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"
   [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
   lock_release "${STATE_DIR}/lock-task-${name}"
   # `|| true`: a run that never printed a `results:` line must still write

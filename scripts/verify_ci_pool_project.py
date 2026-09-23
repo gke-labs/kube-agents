@@ -2080,9 +2080,10 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
             response.read()
     except urllib.error.HTTPError as exc:
         # A 403 is two different answers. Rate limiting is a limit of the moment
-        # and leaves the question open; anything else is the token reaching the
-        # repository without `issues: read`, which is a real failure and the one
-        # a blanket "403 is unverified" would hide.
+        # and leaves the question open; anything else is a token that was just
+        # minted WITH `issues: read` being refused the repository anyway (a
+        # suspended installation, an organisation access setting), which is a
+        # real failure and the one a blanket "403 is unverified" would hide.
         if exc.code == 403 and (exc.headers or {}).get("x-ratelimit-remaining") == "0":
             return CheckResult(
                 name,
