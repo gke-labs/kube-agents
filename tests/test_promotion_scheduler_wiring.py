@@ -1,10 +1,10 @@
-"""The nightly cron lives on the scheduler, and the pipeline has no skip-green path.
+"""The staging promotion cron lives on the scheduler, and the pipeline has no skip-green path.
 
 A skipped run and a passing run should not be the same green. Step 1 resolving
 a candidate that has already been promoted or that requires no staging promotion
 should produce no pipeline run at all.
 
-The cron sits on `nightly-scheduler.yml`, which resolves the candidate and
+The cron sits on `staging-promotion-scheduler.yml`, which resolves the candidate and
 dispatches the pipeline only when work is needed. Every property that makes that
 work is easy to undo by accident and invisible when undone — putting the cron
 back on the pipeline, dropping the `actions: write` the dispatch needs, or
@@ -19,14 +19,14 @@ import yaml
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
-_SCHEDULER = "nightly-scheduler.yml"
-_PIPELINE = "nightly-pipeline.yml"
+_SCHEDULER = "staging-promotion-scheduler.yml"
+_PIPELINE = "staging-promotion-pipeline.yml"
 _NIGHTLY_CRON = "17 2 * * *"
 
-_DISPATCH_SCRIPT_NAME = "dispatch_nightly_pipeline.sh"
+_DISPATCH_SCRIPT_NAME = "dispatch_promotion_pipeline.sh"
 _DISPATCH_SCRIPT = _REPO_ROOT / "scripts" / "release" / _DISPATCH_SCRIPT_NAME
 _DISPATCH_SOURCE = _DISPATCH_SCRIPT.read_text()
-_SKIP_SCRIPT_NAME = "record_nightly_scheduler_skip.sh"
+_SKIP_SCRIPT_NAME = "record_promotion_scheduler_skip.sh"
 
 
 def _dispatch_step(doc: dict) -> dict:
@@ -69,7 +69,7 @@ class SchedulerOwnsTheCron(unittest.TestCase):
         self.assertNotIn(
             "schedule",
             _workflow(_PIPELINE)["on"],
-            "nightly-pipeline.yml must be dispatch-only; nightly-scheduler.yml owns "
+            "staging-promotion-pipeline.yml must be dispatch-only; staging-promotion-scheduler.yml owns "
             "the cron so that a tick with nothing to do produces no run at all",
         )
 
