@@ -107,9 +107,14 @@ the runs of the last 2 hours, #1478; 8+ is announced as a build-cluster event,
 and the cluster owner's issue below is filed on any new `lost_pods`
 condition), a quota storm (15+
 repetitions lost to 429s or empty records across 3+ pull requests among the
-runs that finished in the last 2 hours, #1225 / #1214), or setup deaths (3+ runs
-that concluded `FAILURE` under 5 minutes with no tasks, on 2+ pull requests, in
-2 hours, #1172; an aborted zero-task run is a superseded push), or seeded
+runs that finished in the last 2 hours, #1225 / #1214), a delegation-ceiling
+wave (15+ repetitions across 3+ pull requests, among the runs that finished in
+the last 2 hours, ended at the harness's delegation wait with the worker still
+running, #1874; the dispatcher stall of #1879 is its usual cause, and it ranks
+below a storm because a 429-starved worker hits the same wait), or setup
+deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
+pull requests, in 2 hours, #1172; an aborted zero-task run is a superseded
+push), or seeded
 fixture drift (the hourly scan found the same fixture role out of its designed
 state on the same pool project on two consecutive scans, or on 3+ projects in
 one scan; #1550, below). A zero-task run
@@ -118,7 +123,9 @@ that order: a lost pod is never a setup death, whatever its duration. When more
 than one condition fires, the order
 above decides which one the message carries; the others stay in the evidence.
 For a storm, retest after the time the message gives; for lost pods, once new
-jobs are progressing; for fixture drift, once the fleet owner has re-applied
+jobs are progressing; for a delegation-ceiling wave, once workers are
+finishing again (the gateway log in a run's artifacts says whether the
+dispatcher stalled); for fixture drift, once the fleet owner has re-applied
 the stack — a red on a case that depends on the drifted fixture, from a run
 that leased one of those projects, is the fixture's, not the change's.
 
@@ -136,10 +143,11 @@ what keeps the replay fixtures cut before the field valid.
 **GREEN** — none of the above. No message of its own beyond the recovery that
 announces it; the daily digest carries the last 24 hours' runs, greens,
 PR-caused reds and infra reds (setup deaths and lost pods are folded into the
-infra count), the typical run length and the typical wait before a run starts.
-`health.json`'s `metrics` keeps the rest — green rate, wall clock p50/p90,
-`queue_wait_p50_s` and whether it was read at all, the infra-rep rate,
-`setup_deaths`, `lost_pods`.
+infra count), the typical run length and the typical wait before a run starts,
+and the delegation-ceiling repetitions on a day that had any. `health.json`'s
+`metrics` keeps the rest — green rate, wall clock p50/p90, `queue_wait_p50_s`
+and whether it was read at all, the infra-rep rate, `setup_deaths`,
+`lost_pods`, `ceiling_reps`.
 
 A case failing on exactly one pull request while passing elsewhere is that pull
 request's problem and moves no state; the message lists it as "PR-caused".
@@ -153,7 +161,7 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 ## Hysteresis
 
 A single bad tick does not change the state, and a single lucky green does not
-end an incident. Entering OUTAGE or a storm DEGRADED needs the condition to be
+end an incident. Entering OUTAGE or a storm or delegation-ceiling DEGRADED needs the condition to be
 current: one of the three newest completed runs carries it (setup deaths and
 lost pods are not completed runs, so their count is the currency). Returning to GREEN needs 3
 consecutive green runs on distinct pull requests, all finished after the
@@ -341,6 +349,21 @@ when there are several):
 Which class a case gets — `shared`, `only-this-pr`, `storm`, unexplained — is
 `scripts/eval_dashboard/classify.py`'s `classify_run`, the same rules the
 dashboard's run page and the incident brief use; the comment only phrases it.
+
+A repetition the scorer graded `infra` under a reason that leads with
+`KUBE_AGENTS_DELEGATION_CEILING` is a delegation-ceiling repetition: the
+harness's wait for the delegated worker (`AGENT_DELEGATION_TIMEOUT`) ran out
+with the card still running and nothing delivered, so what the judge saw was
+the front door's acknowledgement. It is not a storm repetition — the agent ran
+and nothing was lost to 429s — so the storm rule above does not count it, no
+pass rate has it in the denominator, and a case whose ungraded repetitions are
+all of this kind is classed `delegation-ceiling` on the run page (its Do is a
+retest). `health.json`'s `metrics.ceiling_reps` counts them apart from
+`infra_reps`, and the daily digest carries that count on any day it is not
+zero. Fifteen of them across three pull requests in two hours are the
+delegation-ceiling condition above: DEGRADED under its own name, its own
+message and advice, so a fleet-wide worker stall (#1879) is named here rather
+than read only as "not evaluated" on every pull request.
 
 A run the suite marked **not evaluated** because one admitted case lost every
 repetition to infrastructure while other cases were graded is, to this filter,

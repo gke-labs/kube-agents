@@ -39,6 +39,18 @@ HELM_SHA256_LINUX_ARM64="b54c04b4e0b2540bbdc08c17a121dab70e9a2ed0de5705528fec68a
 # had nothing to do with helm.
 readonly HELM_DOWNLOAD_RETRIES=5
 
+# ─── Gateway log capture ─────────────────────────────────────────────────────
+# collect_gateway_log keeps the tail of the platform-agent-gateway log as an
+# artifact of every eval run, green ones included. The failure-only dump used
+# to be the only capture, so a passing nightly whose repetitions ran to the
+# delegation ceiling left no record of what the dispatcher and the workers
+# were doing (429 storms and a stuck dispatcher both live only in this log).
+# Bounded twice: kubectl's line tail, then a byte cap on what is written. At
+# the ~110 bytes/line a nightly's gateway log runs, the line tail is about
+# 2 MB per run; the byte cap is the belt for a log with long lines.
+readonly GATEWAY_LOG_TAIL_LINES=20000
+readonly GATEWAY_LOG_MAX_BYTES=$((8 * 1024 * 1024))
+
 ensure_helm() {
   if command -v helm >/dev/null 2>&1; then
     return 0
@@ -92,6 +104,30 @@ collect_bench_results() {
   cp results_*.json "${artifact_dir}/" 2>/dev/null || true
 }
 
+# ─── Gateway Log Collection (runs on PASS as well as on failure) ──────────────
+# The bounded tail of the platform-agent-gateway log, written on every exit
+# (GATEWAY_LOG_TAIL_LINES / GATEWAY_LOG_MAX_BYTES above say why and how much).
+# Same contract as collect_bench_results: every command ends in `|| true`, so
+# it leaves `$?` alone for a dumper that runs after it, and a cluster that
+# cannot be reached costs the run its gateway log and nothing else. The
+# failure dumper below calls this rather than taking its own, shorter tail, so
+# the failure path never overwrites the every-run capture with less.
+collect_gateway_log() {
+  local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
+  local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
+  mkdir -p "${artifact_dir}" || true
+  # Pinned to the agent cluster when the pin is known: the task loop's tofu
+  # stacks repoint kubectl's current context at their own clusters
+  # (bench/README.md) and the EXIT trap runs after the last of them, so the
+  # ambient context is not reliably the host by then. AGENT_CLUSTER_CONTEXT
+  # is the pin ci-eval-pr.sh exports for the bench's own kubectl; unset (the
+  # deploy script's failure path) the ambient context is the host cluster.
+  # shellcheck disable=SC2086
+  kubectl ${AGENT_CLUSTER_CONTEXT:+--context "${AGENT_CLUSTER_CONTEXT}"} logs deployment/platform-agent-gateway \
+    -n "${ns}" --tail="${GATEWAY_LOG_TAIL_LINES}" 2>&1 \
+    | tail -c "${GATEWAY_LOG_MAX_BYTES}" > "${artifact_dir}/platform-agent-gateway.log" || true
+}
+
 # ─── Shared Artifact Collection Handler for Prow Job Failures ───────────────────
 dump_prow_artifacts_on_failure() {
   local exit_code=$?
@@ -113,8 +149,10 @@ dump_prow_artifacts_on_failure() {
       cat /tmp/pf-8642.log 2>&1 || true
     } > "${artifact_dir}/ci-failure-summary.txt" 2>&1 || true
 
-    # 2. Current running & previous crashed pod logs (crucial for rollout deadline / CrashLoopBackOff failures)
-    kubectl logs deployment/platform-agent-gateway -n "${ns}" --tail=2000 > "${artifact_dir}/platform-agent-gateway.log" 2>&1 || true
+    # 2. Current running & previous crashed pod logs (crucial for rollout deadline / CrashLoopBackOff failures).
+    #    The running pod's log is the every-run capture above, taken again here
+    #    so a caller without a green-path collector (ci-deploy.sh) still gets it.
+    collect_gateway_log
     kubectl logs deployment/platform-agent-gateway -n "${ns}" --previous --tail=1000 > "${artifact_dir}/platform-agent-gateway-previous-crash.log" 2>&1 || true
     kubectl logs deployment/kube-agents-controller-manager -n "${ns}" --tail=1000 > "${artifact_dir}/controller-manager.log" 2>&1 || true
     # The model path runs through LiteLLM, and with vertex_ai its failure

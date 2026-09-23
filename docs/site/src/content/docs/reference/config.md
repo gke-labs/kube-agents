@@ -130,7 +130,7 @@ A second, top-level gate distinct from `platform_toolsets`: listing `kanban` her
 
 ### `agent`
 
-`max_turns` is the per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet audits outgrow — the cost audit runs ten checks against every cluster and the drift audit nineteen — so this profile raises it to 250. It is set here rather than in the operator's generated root config because both dispatch paths read the profile's `config.yaml`: kanban workers are spawned with `HERMES_HOME` pinned to the profile, and the cron scheduler resolves `agent.max_turns` from `$HERMES_HOME/config.yaml`. Scoping it to this profile leaves the Planning Agent and the Cluster Agents on the default. The comment in the file itself records the runs that motivated the number.
+`max_turns` is the per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet audits outgrow — the cost audit runs ten checks against every cluster and the drift audit twenty — so this profile raises it to 250. It is set here rather than in the operator's generated root config because both dispatch paths read the profile's `config.yaml`: kanban workers are spawned with `HERMES_HOME` pinned to the profile, and the cron scheduler resolves `agent.max_turns` from `$HERMES_HOME/config.yaml`. Scoping it to this profile leaves the Planning Agent and the Cluster Agents on the default. The comment in the file itself records the runs that motivated the number.
 
 ### `tool_loop_guardrails`
 

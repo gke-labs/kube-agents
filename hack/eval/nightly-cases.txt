@@ -38,9 +38,10 @@
 # validator's FIXTURE_NOT_READY allowlist with the issue that plants it, and
 # today that is obtainability-declared-intent-no-finding (#1341, needs a
 # second multi-replica workload as a role of its own plus a declaration
-# seeded in each pool project's *-infra repository) and vcs-history-only-fact
+# seeded in each pool project's *-infra repository), vcs-history-only-fact
 # (#1253, needs the git-access-ab/r200 branch pushed to every pool
-# project's GitOps repository).
+# project's GitOps repository) and scope-second-project-denied (#1865, needs
+# a second GCP project in scope per pool project).
 #
 # BUDGET, priced the way EVAL_REPETITIONS' comment in the script prices the
 # presubmit. The twenty-six-case matrix of 2026-09-09 priced at ~532-552min
@@ -56,20 +57,22 @@
 # (#1023, ~45min at its measured 737s/599s/1357s). 2026-09-21 added #1103's
 # two tofu cases (ai-security-planted-model-audit ~73min at its 1450s hint,
 # autoops-crashloop-config-triage ~45min at the 900s band; both serialize on
-# the infra lock with the two incumbents). Forty-one cases, ~893-913min
-# serial. 2026-09-22 moved incident-triage-oom-event-probe from this file
-# to the presubmit one (#1023): the nightly runs both files, so it still
-# runs the same forty-one cases at the same price. The
+# the infra lock with the two incumbents) and consistency-no-environment-label
+# (#1818, ~28min at its measured 381s/385s/880s -- a full fleet audit, and the
+# spread is the audit band's, not this case's, so it takes the 900s hint the
+# band uses rather than its mean). Forty-two cases, ~921-941min serial.
+# 2026-09-22 moved incident-triage-oom-event-probe from this file to the
+# presubmit one (#1023): the nightly runs both files, so it still runs the
+# same forty-two cases at the same price. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
 # at its default 3 (#1491). At the ~1.15x the presubmit realised on
 # whole-job wall clock at parallelism 4 under daytime quota contention that
-# would be ~775-795min, over the deadline; 480m holds only if the nightly,
+# would be ~800-820min, over the deadline; 480m holds only if the nightly,
 # alone on the model quota at that hour and two lanes wider, realises ~1.9x
 # or better. Night one (2026-09-16, build 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
-# so the two additions are priced inside its headroom. The first nights
-# after this change measure it:
+# so the three additions are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
 # order. A deadline kill is survivable by design -- the cost-hinted queue
@@ -78,9 +81,10 @@
 #
 # 2026-09-22, the seven held-out cases. The nightly's matrix does NOT grow:
 # it runs both files, and the seven were already in it through the presubmit
-# one, so it is still forty-one cases and 123 units at the same price. What
-# grows is this file's own share, from twenty-one cases (63 units) to
-# twenty-eight (84), +21 units: at their hints (178s, 200s x4, 700s x2) about
+# one, so it is still forty-two cases and 126 units at the same price
+# (counting #1818's drift audit, which landed beside this change). What
+# grows is this file's own share, from twenty-three cases (69 units) to
+# thirty (90), +21 units: at their hints (178s, 200s x4, 700s x2) about
 # 120 serial minutes, at their measured presubmit medians (the canary's is
 # 1002s, p90 2074s, over 903 repetitions 2026-09-04 to 09-15) nearer 150.
 # Whether the worst night fits is a question about the whole matrix, and the
@@ -209,6 +213,13 @@
 #      incumbent's 900s hint until it passes.
 ./tasks/ai-security-planted-model-audit/task.yaml
 ./tasks/autoops-crashloop-config-triage/task.yaml
+
+# The drift stream's second full audit, nightly from the start (2026-09-18):
+# the same SOP-faithful shape and 900s band as consistency-drift-outlier
+# above, grading the collector-only `no-environment-label` check (SOP §4.14)
+# against the install's own unlabelled host cluster beside the labelled
+# seeded trio. Its domain's presubmit seat stays with the probe.
+./tasks/consistency-no-environment-label/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was

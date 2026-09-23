@@ -27,10 +27,11 @@ spec:
   telemetry: { ... } # OTLP collector endpoint (optional)
   networkPolicy: { ... } # generated egress NetworkPolicy (optional)
   integration: { ... } # Google Chat, Slack, GitHub
+  scope: { ... } # projects beyond the management project, and exclusions (optional)
   mode: today # unsupported dev toggle for the A2A stack (optional)
 ```
 
-`spec.deployment`, `spec.security`, `spec.telemetry`, and `spec.networkPolicy` are inlined from the shared `AgentSpec`, so they are common to every agent type. `spec.harness` is required; `spec.integration`, `spec.telemetry`, and `spec.networkPolicy` are optional. `spec.mode` is an optional enum (`today`/`next`, absent means `today`) and, like `experimental.platformFrontDoor`, **unsupported**: it is the dev toggle from `docs/designs/spec-mode-switch.md` that keeps the A2A `next` stack dark, and it is deliberately not surfaced in the Helm chart. Under `next` the operator additionally renders the stage-1 A2A playground stack — the NATS/JetStream component and its provisioning Job, an ingress NetworkPolicy fencing the bus, an egress NetworkPolicy fencing the session pods, a session-pod ResourceQuota, the A2A gateway Deployment with session-pod spawning armed, and the auth callout that authenticates bus clients (its Deployment, Service, ServiceAccount, Role and RoleBinding, a cluster-scoped ClusterRoleBinding to `system:auth-delegator`, the identity-map ConfigMap `<agent>-a2a-authmap`, and the keys Secret `<agent>-a2a-callout-keys`), plus ServiceAccounts for the provisioning Job and for the spawned session pods, so the callout has an identity to resolve each by. Flipping back to `today` tears that stack down, keeping the generated credentials Secret and the JetStream PVC. The callout's keys Secret is **not** kept: a stale issuer key would make every answer the callout gives be refused, so it is deleted with the rest.
+`spec.deployment`, `spec.security`, `spec.telemetry`, and `spec.networkPolicy` are inlined from the shared `AgentSpec`, so they are common to every agent type. `spec.harness` is required; `spec.integration`, `spec.telemetry`, `spec.networkPolicy`, and `spec.scope` are optional. `spec.mode` is an optional enum (`today`/`next`, absent means `today`) and, like `experimental.platformFrontDoor`, **unsupported**: it is the dev toggle from `docs/designs/spec-mode-switch.md` that keeps the A2A `next` stack dark, and it is deliberately not surfaced in the Helm chart. Under `next` the operator additionally renders the stage-1 A2A playground stack — the NATS/JetStream component and its provisioning Job, an ingress NetworkPolicy fencing the bus, an egress NetworkPolicy fencing the session pods, a session-pod ResourceQuota, the A2A gateway Deployment with session-pod spawning armed, and the auth callout that authenticates bus clients (its Deployment, Service, ServiceAccount, Role and RoleBinding, a cluster-scoped ClusterRoleBinding to `system:auth-delegator`, the identity-map ConfigMap `<agent>-a2a-authmap`, and the keys Secret `<agent>-a2a-callout-keys`), plus ServiceAccounts for the provisioning Job and for the spawned session pods, so the callout has an identity to resolve each by. Flipping back to `today` tears that stack down, keeping the generated credentials Secret and the JetStream PVC. The callout's keys Secret is **not** kept: a stale issuer key would make every answer the callout gives be refused, so it is deleted with the rest.
 
 ## `spec.harness`
 
@@ -453,6 +454,44 @@ The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gservic
 - `read-only` (default)
 - `custom` (roles supplied via the installer's `--custom-roles`, the composition's `project_roles`)
 
+## `spec.scope`
+
+Optional. Which GCP projects, beyond the one the agent runs in, the hourly Cluster Agent reconcile
+enumerates for GKE clusters, and which projects and clusters it leaves unmanaged. Not yet surfaced
+in the Helm chart, which owns the CR on a chart install: until the chart gains the values, the field
+is set by editing the `PlatformAgent` directly. Absent, the reconcile lists the management project alone, every cluster there getting a Cluster Agent profile, keeps the last declaration's exclusions and retires nothing; an empty `projects` list in a present block drops the projects an earlier block declared, over two clean runs. The management project is always in scope and cannot be excluded.
+
+```yaml
+spec:
+  scope:
+    projects: # explicit project IDs, in addition to the management project
+      - payments-prod
+      - payments-staging
+    exclude:
+      projects: # project IDs or shell-style globs, dropped after resolution
+        - "*-sandbox"
+      clusters: # one cluster each, by the full triple
+        - projectId: payments-staging
+          location: us-central1
+          clusterName: scratch-cluster
+```
+
+- `projects` — project IDs whose clusters get profiles. The agent's service account needs the
+  read roles in each one (`roles/container.clusterViewer`, `roles/container.viewer`,
+  `roles/compute.viewer`, `roles/monitoring.viewer`, `roles/logging.viewer`,
+  `roles/iam.securityReviewer`, the read subset of the `read_only_roles` the Terraform composition binds in the management project). No installer path grants them yet: until the Terraform
+  composition gains a scope input, grant them by hand in each project. A project it cannot list is reported as `denied` (no role left that grants `container.clusters.list`; `roles/iam.securityReviewer` alone keeps a project listable, so a project reads `denied` only once every such role is gone), `api-disabled` (GKE API off in that project) or `unreachable` (anything else, including a listing that did not finish within the run's listing budget) and its existing profiles are kept. Each list is capped at 100
+  entries, and the run lists at most 100 projects in total, the management project included; an
+  explicit project past that reads `over-cap` and is likewise kept but not listed.
+- `exclude.projects` — IDs or globs matched against every resolved project ID. An entry that matches
+  the management project is ignored and recorded in the snapshot, never applied.
+- `exclude.clusters` — single clusters by `projectId`, `location` and `clusterName`, because a
+  cluster name is unique only within a project and location. This replaces the
+  `RECONCILE_EXCLUDE` environment variable, which matched bare names across every project and keeps
+  working for one release alongside it.
+
+The operator renders the block as `scope.json` in the agent's config ConfigMap, mounted read-only at `/etc/kube-agents/scope.json`, so editing it moves the config hash and rolls the pod. The file records whether the CR carries a `scope` block at all: a CR without one declares nothing, so the reconcile lists the management project alone and retires nothing, keeping the last declaration's exclusions and carrying its projects, because a block goes missing on its own when a CR write passes an older operator's webhook. To drop projects, empty `projects` and keep the block. Each reconcile run (other than `--dry-run`) writes what it resolved to `fleet_scope.json` beside the profiles on the data volume: the declaration the run applied, or on a run that could not read it the last one read (`declared`), every project with its outcome (`ok`, `denied`, `api-disabled`, `unreachable`, `over-cap`), the profiles whose project the scope never produced or whose prune waits for a clean run (`unmanaged`; a profile whose identity could not be read is kept but appears under the report's `skipped_no_identity`, and under `profiles` once an earlier run has read its identity), any exclusion it declined to honour (`ignoredExcludes`), and each profile's project as read this run or, for a profile whose identity could not be read, as last read (`profiles`), which is what keeps such a profile attributed while it stays on the volume. A cluster named in `exclude.clusters` loses its profile on the next run, unconditionally, as `RECONCILE_EXCLUDE` always did. A project removed from the scope, or newly matched by an `exclude.projects` entry, has its profiles pruned over two clean runs: a run is clean when no project came back `unreachable`, the management project resolved, listed its own clusters and is the one the previous snapshot named, and the scope file was readable. The first clean run that finds a previously in-scope project absent records it as `retiring` in `fleet_scope.json` and keeps its profiles (listed under `unmanaged`); the next clean run deletes them, so a scope edit reverted before that run costs nothing. A management project that changes identity (`RECONCILE_PROJECT` re-pointed, or the metadata server naming another project) marks the old project `retiring` on the run the change is seen, once the new project has listed its own clusters, and the next clean run prunes, unless `projects` names the old project and no `exclude.projects` entry matches it; an answer from the gcloud config fallback that disagrees with the previous run is treated as unresolved instead: nothing is created or retired under the management project until an authoritative source, or a fallback answer that matches the previous run, names it. A run that cannot read the declaration, or reads a CR without a scope block, keeps the exclusions of the last declaration it read and retires nothing, so a rollback to an operator without the field neither re-onboards an excluded cluster nor, on the roll forward, prunes a project the rollback's own CR write dropped. A profile the scope never produced is kept and listed, which is also what a project dropped while `fleet_scope.json` was lost between the two runs becomes: declare and drop it again to retire it. On an install whose scope resolved more than one project, the onboarding sweep names any project the reconcile could not list, so a partial roster reads as partial; an install with one project renders the sweep prompt it rendered before scopes existed.
+
 ## `spec.telemetry`
 
 - `otlpEndpoint` — the OTLP/HTTP collector **base** URL (no `/v1/traces` suffix; the exporters append their own per-signal path). Up to 2048 characters, `http://` or `https://`.
@@ -706,7 +745,7 @@ from chat. The platform credentials and endpoints that have no `config.yaml` equ
 through a companion `/etc/hermes/.env`, which Hermes applies last with `override=True` and refuses to
 let the agent overwrite — without that, a container env var would beat the pinned `platforms.*` leaf.
 
-That file also pins three values that are not credentials at all. The first is `API_SERVER_KEY=cluster-internal-trusted`,
+That file also pins five values that are not credentials at all. The first is `API_SERVER_KEY=cluster-internal-trusted`,
 the non-secret loopback sentinel the Hermes API server on `127.0.0.1:8642` validates. It is pinned here
 because Hermes' stage2 hook generates a random `API_SERVER_KEY` into `$HERMES_HOME/.env` whenever that
 file carries none, and the PVC `.env` is applied with `override=True` too — ahead of the container env,
@@ -722,8 +761,18 @@ directory Hermes secures on the shared volume.
 
 The third is `KUBEAGENTS_MODE` (`today` or `next`, from `spec.mode`) — the mode switch's delivery
 contract (`docs/designs/spec-mode-switch.md`). It is pinned always, with the real value, because an
-absent key is a key the agent may write, and it is read back by exactly one module,
-`agents/platform/scripts/runtime_mode.py`.
+absent key is a key the agent may write, and it is read back by exactly one module, `agents/platform/scripts/runtime_mode.py`.
+
+The fourth is `KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json`, where the reconcile finds the
+[`spec.scope`](#specscope) declaration. The container env carries it too, for the same reason as
+`HERMES_HOME_MODE`: a line the agent writes into the PVC `.env` would otherwise outrank it and hand
+the reconcile a declaration the agent authored. Its one reader is `agents/platform/scripts/cluster_agent_reconcile.py`.
+
+The fifth is `RECONCILE_PROJECT=`, pinned empty. The reconcile reads that variable as the management
+project ahead of the metadata server, and a management project that changes identity retires the
+old one's profiles, so a line the agent wrote into the PVC `.env` could otherwise re-point it and
+have two clean runs delete every profile of the real management project. Nothing in the operator
+or the chart sets the variable; the script treats the empty value as unset.
 
 One consequence of the render is worth knowing: the managed overlay is a
 leaf-level merge, and a list is a leaf, so a list rendered here **replaces** the image's rather than
