@@ -170,6 +170,7 @@ CONDITION_SHARED_BREAK = "shared_break"
 CONDITION_STORM = "storm"
 CONDITION_SETUP_DEATHS = "setup_deaths"
 CONDITION_LOST_PODS = "lost_pods"
+CONDITION_DELEGATION_CEILING = "delegation_ceiling"
 # The pod event health.py's rule 3b reads (runs[].pod_last_event).
 POD_EVENT_NODE_NOT_READY = "NodeNotReady"
 RUN_SUCCESS = "SUCCESS"
@@ -836,6 +837,9 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
     others = _other_pr_runs(run, gate)
     rates = case_pass_rates(gate, anchor)
     run_storm = storm_reps(run) >= STORM_RUN_SIGNATURE_REPS
+    # The delegation-ceiling wave's run signature is the storm's (health.py
+    # aliases the thresholds): five ceiling reps tie a run to a declared wave.
+    run_ceiling = ceiling_reps(run) >= STORM_RUN_SIGNATURE_REPS
     cases = [classify_case(t, run, others, admitted, health_at, rates, run_storm, nightly) for t in tasks]
     cases = [c for c in cases if c["outcome"] is not None]
 
@@ -844,6 +848,8 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
         matches = bool(failed_names & named)
     elif condition == CONDITION_STORM:
         matches = run_storm
+    elif condition == CONDITION_DELEGATION_CEILING:
+        matches = run_ceiling
     elif condition == CONDITION_SETUP_DEATHS:
         matches = False
     else:

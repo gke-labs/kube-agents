@@ -147,7 +147,9 @@ the same layout and is collected from the moment it starts running.
       (`classify.py`, `health.py`) count it apart from the storm reps — it is
       not lost to 429s — and outside every pass-rate denominator; `classify.py`
       classes a case whose ungraded reps are all of this kind
-      `delegation-ceiling`.
+      `delegation-ceiling`. The run page, the PR view and the PR comment's
+      result cell count it in a case's total and name it apart; the Cases
+      page's per-run counts (`render.rep_counts`) still fold it into `infra`.
     - `reason` — the free text after the first space-padded `--` separator
       (later separators belong to the reason — fail reasons contain the
       delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
@@ -623,9 +625,10 @@ pending[], releases[], nightly{}, trend{}}`. `runs[]` is the **presubmit's** las
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
 `infra` = the gate's), `headline`, `lede`, `matches_incident`,
-`setup_death`, `storm_reps`, `do`, `cases[]` (`{case, outcome, cls,
+`setup_death`, `storm_reps`, `ceiling_reps`, `do`, `cases[]` (`{case, outcome, cls,
 also_failing_prs, pass_rate_30d, reason, excerpt, rep_n, do, admitted, reps,
-nightly_failed_recent}`) and `health_at` (the verdict in force when it
+nightly_failed_recent}`, `reps` being `{pass, fail, infra, ceiling}`) and
+`health_at` (the verdict in force when it
 finished, from history; `null` without history). `rep_n` is the 1-based
 repetition the row is about — the one whose `reason` is shown, else the
 one whose `excerpt` is (`null` when there is neither); the pages link that

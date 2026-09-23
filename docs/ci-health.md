@@ -143,10 +143,11 @@ what keeps the replay fixtures cut before the field valid.
 **GREEN** — none of the above. No message of its own beyond the recovery that
 announces it; the daily digest carries the last 24 hours' runs, greens,
 PR-caused reds and infra reds (setup deaths and lost pods are folded into the
-infra count), the typical run length and the typical wait before a run starts.
-`health.json`'s `metrics` keeps the rest — green rate, wall clock p50/p90,
-`queue_wait_p50_s` and whether it was read at all, the infra-rep rate,
-`setup_deaths`, `lost_pods`.
+infra count), the typical run length and the typical wait before a run starts,
+and the delegation-ceiling repetitions on a day that had any. `health.json`'s
+`metrics` keeps the rest — green rate, wall clock p50/p90, `queue_wait_p50_s`
+and whether it was read at all, the infra-rep rate, `setup_deaths`,
+`lost_pods`, `ceiling_reps`.
 
 A case failing on exactly one pull request while passing elsewhere is that pull
 request's problem and moves no state; the message lists it as "PR-caused".
@@ -160,7 +161,7 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 ## Hysteresis
 
 A single bad tick does not change the state, and a single lucky green does not
-end an incident. Entering OUTAGE or a storm DEGRADED needs the condition to be
+end an incident. Entering OUTAGE or a storm or delegation-ceiling DEGRADED needs the condition to be
 current: one of the three newest completed runs carries it (setup deaths and
 lost pods are not completed runs, so their count is the currency). Returning to GREEN needs 3
 consecutive green runs on distinct pull requests, all finished after the

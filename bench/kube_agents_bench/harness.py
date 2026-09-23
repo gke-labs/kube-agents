@@ -447,9 +447,13 @@ def _canonical_session_tokens(
 
 
 # A card in one of these has stopped moving on its own: done and archived are
-# finished, and blocked needs a human. The other hermes statuses (triage, todo,
-# ready, running) still have a worker or the dispatcher behind them.
-_TERMINAL_STATUSES = frozenset({"done", "archived", "blocked"})
+# finished, blocked needs a human, and failed and cancelled are hermes' own
+# terminal failures (agents/platform/scripts/kanban_workspace_gc.py names the
+# same set). The other hermes statuses (triage, todo, ready, running) still
+# have a worker or the dispatcher behind them. A failed card left out of this
+# set would run the wait to its ceiling and grade as the harness's, not the
+# worker's.
+_TERMINAL_STATUSES = frozenset({"done", "archived", "blocked", "failed", "cancelled"})
 
 # ``kanban_show`` shares kanban_create's toolset in hermes, so a profile that
 # can file a card can always read one back.
@@ -1123,6 +1127,13 @@ class KubeAgentsHarness(AgentHarness):
                     on_board[t] in _TERMINAL_STATUSES for t in outstanding
                 ):
                     continue
+
+            # The board read took its own time off the budget (up to
+            # _EXEC_TIMEOUT); clamp again so the turn cannot overrun the
+            # deadline by that much.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
 
             poll = _POLL_PROMPT.format(tool=STATUS_TOOL, ids=", ".join(outstanding))
             try:

@@ -57,7 +57,8 @@ const PAGE = {
   // The adjudicator's STORM_COOLDOWN: retest this long after the last storm-hit run.
   stormCooldownMs: 30 * 60 * 1000,
   // An incident's window opens this long before its `since`: the rule's own
-  // lookback (shared break 6 h, storm, setup deaths and lost pods 2 h), so
+  // lookback (shared break 6 h; storm, delegation ceiling, setup deaths and
+  // lost pods 2 h), so
   // the runs that made the bot declare it are on the page, not only the ones
   // after.
   incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000, delegation_ceiling: 2 * 3600 * 1000 },

@@ -97,17 +97,18 @@ exactly 0 is the never-ran signature — no tool ran and no model call was bille
 `classify_rep()` classifies that repetition as `infra`, whatever produced the record (#1184). The
 `KUBE_AGENTS_INFRA_FAILURE` marker covers the producers the harness can name (#1095's terminal
 429s, #1137's unestablishable tunnels); this covers the ones it cannot, such as a transport
-failure that comes back as an empty success with no error string. A third marker,
+failure that comes back as an empty success with no error string. A second marker,
 `KUBE_AGENTS_DELEGATION_CEILING`, names the harness's own delegation wait running out
 (`AGENT_DELEGATION_TIMEOUT`) with the delegated card still running and nothing delivered: the
 record is scored, but what was scored is the acknowledgement the front door gives by design when
 it delegates, so `classify_rep()` classifies the repetition `infra` under a reason that leads
 with the marker. The dashboard reads that lead to count these apart from quota-storm repetitions
 (`scripts/eval_dashboard/SCHEMA.md`). A ceiling hit after a partial delivery carries no marker
-and grades on what arrived. The check sits after rung 1 —
+and grades on what arrived. Both the ceiling check and the never-ran signature sit after rung 1 —
 the catastrophic score grades the cluster rather than the record, so a tripped safeguard is
-positive evidence something acted and keeps blocking — and applies only to a record that carries
-a scores map; a scoreless one still blocks at rung 2. The near-misses still block at rung 3:
+positive evidence something acted and keeps blocking, whether the worker was still running at the
+deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
+one still blocks at rung 2. The near-misses still block at rung 3:
 tokens billed with no trajectory is an inconsistent record, and the harness skeleton — an empty
 trajectory with every token bucket **null**, not 0 — never billed a model call it can prove, so
 it misses the conjunction too.

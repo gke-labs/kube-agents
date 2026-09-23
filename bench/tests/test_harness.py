@@ -1717,6 +1717,21 @@ def test_a_blocked_card_ends_the_wait_immediately(
     assert len(stub_agent.requests) == 2
 
 
+def test_a_failed_card_ends_the_wait_and_is_graded(
+    stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """hermes' own terminal failures (``failed``, ``cancelled``) end the wait the
+    way ``blocked`` does, so the record grades the worker's failure instead of
+    running to the ceiling and reading as the harness's."""
+    stub_agent.turns = [_create_turn(), _show_turn("failed", body="Worker exited: OOMKilled.")]
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert "Worker exited: OOMKilled." in result.output
+    assert len(stub_agent.requests) == 2
+
+
 def test_delegation_budget_exhaustion_is_an_error_not_a_crash(
     stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:

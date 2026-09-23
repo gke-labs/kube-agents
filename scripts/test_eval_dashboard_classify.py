@@ -166,6 +166,14 @@ class RepAndOutcomeTest(unittest.TestCase):
         mixed = run(2, 1, T0, tasks=gate_tasks() + [task("x", "cci")], result="SUCCESS")
         self.assertEqual(case(classify_run(mixed, [mixed], health_at=STORM), "x")["cls"], "storm")
 
+
+    def test_a_run_of_ceiling_hits_matches_a_declared_ceiling_wave(self):
+        wave = dict(STORM, condition="delegation_ceiling")
+        target = run(1, 1, T0, tasks=[task(n, "ccc") for n in sorted(ADMITTED)], result="FAILURE")
+        self.assertTrue(classify_run(target, [target], health_at=wave)["matches_incident"])
+        self.assertFalse(classify_run(target, [target], health_at=STORM)["matches_incident"], "ceiling reps are not the storm's signature")
+        lone = run(2, 2, T0, tasks=gate_tasks(["agent-kanban-smoke"], letters="ppc"))
+        self.assertFalse(classify_run(lone, [lone], health_at=wave)["matches_incident"], "matching the wave needs the run's own signature")
     def test_nothing_graded_because_of_the_ceiling_says_so(self):
         target = run(1, 1, T0, tasks=[task(n, "ccc") for n in sorted(ADMITTED)], result="FAILURE")
         verdict = classify_run(target, [target])

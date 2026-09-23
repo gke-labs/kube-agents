@@ -32,6 +32,8 @@ import logging
 import shlex
 from collections.abc import Callable
 
+from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERMES_PYTHON
+
 __all__ = ["read_statuses"]
 
 _log = logging.getLogger("kube_agents_bench.board")
@@ -40,20 +42,15 @@ _log = logging.getLogger("kube_agents_bench.board")
 # script never ran to completion.
 BOARD_PRESENT = "__KANBAN_BOARD__"
 
-# The hermes data volume; ``kanban.db`` sits at its root (worker_trajectory
-# documents the layout). Passed to the script as an argument so the tests can
-# point it at a temporary tree.
-DATA_ROOT = "/opt/data"
+# DATA_ROOT, the hermes data volume, and the two interpreters are imported
+# from worker_trajectory (which documents the volume's layout) so a base-image
+# change moves both readers at once. ``kanban.db`` sits at the volume's root;
+# DATA_ROOT is passed to the script as an argument so the tests can point it
+# at a temporary tree.
 
 # The board file under DATA_ROOT. Named here rather than in the script so the
 # harness side and the tests spell it once.
 BOARD_FILE = "kanban.db"
-
-# Interpreters to run the in-pod script under, in order: hermes' own venv,
-# the one binary the image is guaranteed to carry, then whatever ``python3``
-# resolves to on the container's PATH. The same pair worker_trajectory uses.
-HERMES_PYTHON = "/opt/hermes/.venv/bin/python3"
-FALLBACK_PYTHON = "python3"
 
 # Runs inside the agent container. Plain ``sqlite3`` on a read-only URI, so a
 # writer holding the WAL lock is waited on briefly rather than fought with,
