@@ -559,8 +559,9 @@ fi
 # The pool's pull-request sweep (hack/ci_sweep_agent_pulls.py) signs the same
 # App's JWT with this project's copy of the key, from a Prow periodic that runs
 # only main under its own identity. Signer on the key, and nothing on the
-# project: that is the whole reach the sweep has here, and the presubmit's
-# runner is deliberately not on this list.
+# project: that is the whole reach the sweep has here. The presubmit's runner
+# is not granted it; it does hold project IAM admin for the deploy, so this
+# is where the line is drawn, not a fence GitHub enforces.
 PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
 echo "Granting the pull-request sweeper signer rights on github-token-minter-key..."
 gcloud kms keys add-iam-policy-binding github-token-minter-key \

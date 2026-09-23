@@ -63,9 +63,9 @@
 #
 # Isolation class: read-only on the cluster; unbounded write to the eval
 # GitOps repo. Presubmit-eligible on the same terms as the audit scenarios
-# (throwaway repo, token scoped to it), with the accumulation above accepted
-# rather than mitigated. Eligible tier: presubmit once re-admitted; active
-# there 2026-08-27 to 2026-09-22, nightly since.
+# (throwaway repo, token scoped to it), with the within-job accumulation above
+# accepted; the pool sweep bounds it across leases. Eligible tier: presubmit
+# once re-admitted; active there 2026-08-27 to 2026-09-22, nightly since.
 id: rca-remediation-pr
 name: RCA lands its fix as a pull request, never on the cluster
 prompt: >-

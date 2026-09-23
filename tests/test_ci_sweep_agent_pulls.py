@@ -94,10 +94,13 @@ class _GitHub:
     `pulls` is one list served for every repository, or a dict by repository.
     """
 
-    def __init__(self, pulls=None, mint_error=None, close_errors=None):
+    def __init__(self, pulls=None, mint_error=None, close_errors=None, odd_bodies=None):
         self.calls = []
         self.pulls = pulls if pulls is not None else []
         self.mint_error = mint_error
+        # {"<METHOD> <path prefix>": raw bytes} answered verbatim with a 200:
+        # an intermediary's HTML page, an empty object, a null.
+        self.odd_bodies = odd_bodies or {}
         # Keyed by pull-request number, so one close can fail while the rest
         # succeed.
         self.close_errors = close_errors or {}
@@ -113,6 +116,9 @@ class _GitHub:
         key = "%s %s" % (request.method, path)
         body = json.loads(request.data) if request.data else None
         self.calls.append((key, body))
+        for prefix, raw in self.odd_bodies.items():
+            if key.startswith(prefix):
+                return io.BytesIO(raw)
         if key.startswith("GET /repos/") and key.endswith("/installation"):
             return io.BytesIO(json.dumps({"id": 157029058}).encode())
         if key.startswith("POST /app/installations/"):
@@ -495,6 +501,26 @@ class PoolTest(unittest.TestCase):
         self.assertEqual(list(failures), ["kube-agents-evals-7"])
         self.assertEqual(closed, {"kube-agents-evals-8": 0})
         self.assertEqual(boskos.released, ["kube-agents-evals-7", "kube-agents-evals-8"])
+
+    def test_a_body_that_is_not_the_expected_json_is_that_projects_failure(self):
+        # A 200 with an HTML page, and a 200 with an empty object: each is
+        # recorded against the project it came from, and the walk goes on.
+        for odd in ({"GET /repos/gke-agentic/kube-agents-evals-7-infra/installation": b"<html>maintenance</html>"},
+                    {"POST /app/installations/": b"{}"}):
+            with self.subTest(odd=list(odd)[0]):
+                (closed, failures, _), boskos, _ = run_pool(
+                    ["kube-agents-evals-7", "kube-agents-evals-8"], _GitHub(pulls={}, odd_bodies=odd)
+                )
+                self.assertIn("kube-agents-evals-7", failures)
+                self.assertEqual(boskos.released, ["kube-agents-evals-7", "kube-agents-evals-8"])
+                if list(odd)[0].startswith("GET /repos/"):
+                    # Only the first project's lookup was odd; the second swept clean.
+                    self.assertEqual(closed, {"kube-agents-evals-8": 0})
+
+    def test_the_reset_names_what_it_returned_to_free(self):
+        boskos = _Boskos(["kube-agents-evals-7"], stranded=["kube-agents-evals-9"])
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_GitHub(), boskos)):
+            self.assertEqual(sweeper.boskos_reset_stranded(BOSKOS), ["kube-agents-evals-9"])
 
     def test_a_project_is_released_when_github_is_unreachable(self):
         def unreachable(request, timeout=None):

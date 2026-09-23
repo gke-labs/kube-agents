@@ -232,7 +232,14 @@ def api(method, path, authorization, body=None):
     request = urllib.request.Request(API_ROOT + path, method=method, headers=headers, data=data)
     with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
         raw = response.read()
-    return json.loads(raw) if raw else None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        # A 200 whose body is not JSON (an intermediary's page mid-incident):
+        # one repository's fault, reported as such rather than as a traceback.
+        raise SweepError("GitHub answered %s %s with a body that is not JSON: %s" % (method, path, exc))
 
 
 def open_pulls(repo, authorization):
@@ -278,7 +285,7 @@ def scoped_token(app_id, project, repo, runner=subprocess.run):
     """
     bearer = "Bearer " + app_jwt(app_id, project, runner)
     try:
-        installation = api("GET", "/repos/%s/installation" % repo, bearer)["id"]
+        installation = _field(api("GET", "/repos/%s/installation" % repo, bearer), "id", "the installation lookup", repo)
     except urllib.error.HTTPError as exc:
         # 401: the key in this project's KMS is not App app_id's. 404: the App
         # is not installed on this repository, an onboarding gap rather than a
@@ -306,7 +313,14 @@ def scoped_token(app_id, project, repo, runner=subprocess.run):
             "GitHub answered HTTP %d (%s) minting for App %s on %s"
             % (exc.code, exc.reason, app_id, repo)
         )
-    return minted["token"]
+    return _field(minted, "token", "the token mint", repo)
+
+
+def _field(payload, key, what, repo):
+    """`payload[key]` from a JSON object, or a SweepError naming the shapeless answer."""
+    if not isinstance(payload, dict) or key not in payload or payload[key] in (None, ""):
+        raise SweepError("GitHub answered %s for %s without a %r field" % (what, repo, key))
+    return payload[key]
 
 
 def close_agent_pulls(repo, authorization, dry_run=False):
@@ -382,7 +396,12 @@ def _boskos(server, action, params):
     )
     with urllib.request.urlopen(request, timeout=BOSKOS_TIMEOUT_SECONDS) as response:
         raw = response.read()
-    return json.loads(raw) if raw else None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        raise SweepError("Boskos answered %s with a body that is not JSON: %s" % (action, exc))
 
 
 def boskos_acquire(server, owner):
