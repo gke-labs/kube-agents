@@ -231,6 +231,14 @@ func TestInjectSendsAGitopsDriftPayload(t *testing.T) {
 	if got.Resource.Group != "apps" || got.Resource.Version != "v1" {
 		t.Errorf("Resource group/version = %q/%q, want apps/v1", got.Resource.Group, got.Resource.Version)
 	}
+	// The payload's verb stays raw while the summary's is conjugated, so the two
+	// halves of that split have to be pinned together or only one of them is.
+	// The card renders this field as code next to the method name
+	// ("`patch` via `io.k8s.apps.v1.deployments.patch`"), where a past tense
+	// would read as a value that does not exist.
+	if got.Verb != "patch" {
+		t.Errorf("Verb = %q, want the raw audit verb patch -- only driftSummary conjugates", got.Verb)
+	}
 	if got.Join != string(joinEnriched) {
 		t.Errorf("Join = %q, want %q", got.Join, joinEnriched)
 	}
@@ -515,6 +523,58 @@ func TestInjectCarriesAReconcileClaim(t *testing.T) {
 	}
 	if !strings.Contains(got.Summary, "argocd-controller") {
 		t.Errorf("Summary = %q, want it to name the reconciling manager", got.Summary)
+	}
+}
+
+// The summary is a report of something that already happened, so the verb has
+// to be past tense. With the raw audit verb the line reads as an instruction to
+// whoever is looking at the card -- "ada@corp.example patch shop/deployments" --
+// which is the opposite of what it means.
+func TestDriftSummaryReportsTheVerbInThePast(t *testing.T) {
+	for verb, want := range map[string]string{
+		"create":           "created",
+		"update":           "updated",
+		"patch":            "patched",
+		"delete":           "deleted",
+		"deletecollection": "deleted a collection of",
+	} {
+		t.Run(verb, func(t *testing.T) {
+			event := driftEvent("insert-1")
+			event.Record.Verb = verb
+
+			got := driftSummary(event)
+			if !strings.Contains(got, " "+want+" ") {
+				t.Errorf("driftSummary() = %q, want the verb rendered as %q", got, want)
+			}
+			// The raw verb must be gone, not merely joined by its past tense:
+			// "patch" is a substring of "patched", so match it with its spaces.
+			if verb != want && strings.Contains(got, " "+verb+" ") {
+				t.Errorf("driftSummary() = %q, still carries the raw verb %q", got, verb)
+			}
+		})
+	}
+}
+
+// A verb the map does not name travels unchanged. It means the sink or the
+// subresource filter started forwarding something new, and the operator is
+// better served seeing that verbatim than reading a guessed conjugation.
+func TestDriftSummaryLeavesAnUnknownVerbAlone(t *testing.T) {
+	event := driftEvent("insert-1")
+	event.Record.Verb = "bind"
+
+	if got := driftSummary(event); !strings.Contains(got, " bind ") {
+		t.Errorf("driftSummary() = %q, want the unmapped verb passed through", got)
+	}
+}
+
+// Word order, pinned once on the whole sentence. The parts are assembled from
+// four fields and the tests above only check the verb; this is what stops a
+// reordering that keeps every substring present from going unnoticed.
+func TestDriftSummaryReadsAsASentence(t *testing.T) {
+	want := "ada@corp.example patched shop/deployments/checkout on cluster prod-a, fields owned by kubectl-edit"
+
+	if got := driftSummary(driftEvent("insert-1")); got != want {
+		t.Errorf("driftSummary() = %q, want %q", got, want)
 	}
 }
 
