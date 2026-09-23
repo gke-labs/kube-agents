@@ -897,10 +897,11 @@ class SlowGate(unittest.TestCase):
         # is waiting on them.
         self.assertIsNone(adjudicate(self.week([200] * 5, recent_end=T0 - timedelta(hours=6)), T0)["slow"])
         self.assertIsNotNone(adjudicate(self.week([200] * 5, recent_end=T0 - timedelta(hours=5)), T0)["slow"])
-        # Ten cases is a run Prow cut short, not a full run, and an aborted
-        # run concluded nothing: the newest five full runs are then the
-        # baseline's own, at the typical length.
-        short = [task(f"case-{k}", "ppp") for k in range(10)]
+        # A run one case under the floor is a run Prow cut short, not a full
+        # run (the floor follows the presubmit file, one below its count), and
+        # an aborted run concluded nothing: the newest five full runs are then
+        # the baseline's own, at the typical length.
+        short = [task(f"case-{k}", "ppp") for k in range(health.SLOW_MIN_TASKS - 1)]
         self.assertIsNone(adjudicate(self.week([200] * 5, tasks=short), T0)["slow"])
         doc = self.week([200] * 5)
         for aborted in doc["runs"][-5:]:

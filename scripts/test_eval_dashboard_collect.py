@@ -1193,8 +1193,8 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # 2026-09-22 (#1023): incident-triage-oom-event-probe, the non-tofu
         # probe, took a roster seat, closing the gap open since the tofu case
         # moved to the nightly tier on 2026-09-03 (#1202); the same day the
-        # presubmit became the blocking roster only, and the never-admitted
-        # compliance-rbac-overgrant canary took fleet-audits' coverage with it
+        # presubmit became the blocking roster only, and the demoted (2026-09-02,
+        # #1171) compliance-rbac-overgrant canary took fleet-audits' coverage with it
         # to the nightly (#1876), and remediation's coverage left with it:
         # rca-remediation-pr is held out and pdb-remediation-pr's promotion
         # was withdrawn until it has a record under its #1780 grader.
