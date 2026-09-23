@@ -251,6 +251,11 @@ def open_pulls(repo, authorization):
             "/repos/%s/pulls?state=open&per_page=%d&page=%d" % (repo, PER_PAGE, page),
             authorization,
         )
+        if not isinstance(batch, list) or not all(isinstance(pull, dict) for pull in batch):
+            # A 200 that is not a list of pull requests (an object, a null, an
+            # empty body): a fault to report, never "closed 0" over a
+            # repository that was not read. GitHub's last page is `[]`.
+            raise SweepError("GitHub answered the pull-request listing for %s with a body that is not a list of pull requests" % repo)
         if not batch:
             break
         found.extend(batch)
@@ -346,7 +351,7 @@ def close_agent_pulls(repo, authorization, dry_run=False):
                 authorization,
                 {"state": "closed"},
             )
-        except (urllib.error.HTTPError, OSError, http.client.HTTPException) as exc:
+        except (urllib.error.HTTPError, OSError, http.client.HTTPException, SweepError) as exc:
             print("  #%s did not close (%s)" % (number, exc), file=sys.stderr)
             unclosed.append(number)
             continue
@@ -500,7 +505,14 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
                 print("  %s: %s" % (name, exc), file=sys.stderr)
                 failures[name] = str(exc)
         finally:
-            boskos_release(server, owner, name)
+            try:
+                boskos_release(server, owner, name)
+            except (SweepError, urllib.error.HTTPError, OSError, http.client.HTTPException) as exc:
+                # The project stays in the sweep state until the next run's
+                # reset returns it; the walk goes on, and an exception already
+                # unwinding (SIGTERM) is not replaced by this one.
+                print("  %s: release failed (%s); the next run's reset returns it" % (name, exc), file=sys.stderr)
+                failures[name] = "release failed: %s" % exc
     print(
         "swept %d project(s): closed %d pull request(s), %d failed, %d unmapped"
         % (len(closed) + len(failures), sum(closed.values()), len(failures), len(unmapped))

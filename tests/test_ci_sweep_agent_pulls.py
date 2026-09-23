@@ -145,11 +145,13 @@ class _GitHub:
 class _Boskos:
     """A stand-in for the Boskos server: hands out `free` in order, then 404."""
 
-    def __init__(self, free=(), error=None, stranded=(), reset_error=None):
+    def __init__(self, free=(), error=None, stranded=(), reset_error=None, release_errors=None):
         self.free = list(free)
         self.error = error
         self.stranded = list(stranded)
         self.reset_error = reset_error
+        # Keyed by project name: one release can fail while the rest succeed.
+        self.release_errors = release_errors or {}
         self.acquired = []
         self.released = []
         self.resets = []
@@ -176,6 +178,9 @@ class _Boskos:
             return io.BytesIO(json.dumps({"name": name, "state": "cleaning"}).encode())
         if action == "release":
             assert query["dest"] == "free" and query["owner"] == OWNER, query
+            failure = self.release_errors.get(query["name"])
+            if failure is not None:
+                raise failure
             self.released.append(query["name"])
             return io.BytesIO(b"")
         if action == "reset":
@@ -202,9 +207,9 @@ class _Cluster:
 class _Gcloud:
     """A stand-in for `gcloud kms asymmetric-sign` that writes a signature."""
 
-    def __init__(self, returncode=0, signature=b"signature", raise_on_project=None):
+    def __init__(self, returncode=0, raise_on_project=None):
         self.returncode = returncode
-        self.signature = signature
+        self.signature = b"signature"
         self.raise_on_project = raise_on_project
         self.argv = []
 
@@ -397,6 +402,15 @@ class CloseFailureTest(unittest.TestCase):
             run_repo(github)
         self.assertIn("PATCH /repos/%s/pulls/2" % REPO, github.keys("PATCH "))
 
+    def test_a_non_json_answer_to_one_close_is_that_closes_failure(self):
+        # A 200 with an HTML page on one PATCH: that pull request is reported
+        # unclosed and the loop goes on to the next.
+        github = _GitHub(pulls=[agent_pull(number=1), agent_pull(number=2)], odd_bodies={"PATCH /repos/gke-agentic/kube-agents-evals-7-infra/pulls/1": b"<html>"})
+        with self.assertRaises(sweeper.SweepError) as caught:
+            run_repo(github)
+        self.assertIn("#1", str(caught.exception))
+        self.assertIn("PATCH /repos/%s/pulls/2" % REPO, github.keys("PATCH "))
+
     def test_a_response_cut_short_mid_close_is_survived(self):
         # IncompleteRead is an HTTPException, not an OSError; before this arm a
         # half-read PATCH response aborted the loop.
@@ -516,6 +530,32 @@ class PoolTest(unittest.TestCase):
                 if list(odd)[0].startswith("GET /repos/"):
                     # Only the first project's lookup was odd; the second swept clean.
                     self.assertEqual(closed, {"kube-agents-evals-8": 0})
+
+    def test_a_listing_that_is_not_a_list_is_that_projects_failure_not_a_clean_sweep(self):
+        for raw in (b"{}", b"null", b'{"message": "moved"}'):
+            with self.subTest(raw=raw):
+                odd = {"GET /repos/gke-agentic/kube-agents-evals-7-infra/pulls?": raw}
+                (closed, failures, _), boskos, _ = run_pool(["kube-agents-evals-7", "kube-agents-evals-8"], _GitHub(pulls={}, odd_bodies=odd))
+                self.assertEqual(closed, {"kube-agents-evals-8": 0}, raw)
+                self.assertIn("kube-agents-evals-7", failures)
+                self.assertEqual(boskos.released, ["kube-agents-evals-7", "kube-agents-evals-8"])
+
+    def test_a_release_that_fails_is_that_projects_failure_and_the_walk_goes_on(self):
+        boskos = _Boskos(["kube-agents-evals-7", "kube-agents-evals-8"], release_errors={"kube-agents-evals-7": _http_error(502, BOSKOS)})
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_GitHub(), boskos)):
+            closed, failures, _ = sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
+        self.assertEqual(sorted(closed), ["kube-agents-evals-7", "kube-agents-evals-8"])
+        self.assertIn("release failed", failures["kube-agents-evals-7"])
+        self.assertEqual(boskos.released, ["kube-agents-evals-8"])
+
+    def test_a_failed_release_does_not_replace_a_termination(self):
+        def terminated(request, timeout=None):
+            raise sweeper.Terminated("signal 15")
+
+        boskos = _Boskos(["kube-agents-evals-7"], release_errors={"kube-agents-evals-7": OSError("boskos down")})
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(terminated, boskos)):
+            with self.assertRaises(sweeper.Terminated):
+                sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
 
     def test_the_reset_names_what_it_returned_to_free(self):
         boskos = _Boskos(["kube-agents-evals-7"], stranded=["kube-agents-evals-9"])
