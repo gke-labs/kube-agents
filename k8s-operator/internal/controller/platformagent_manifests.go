@@ -948,7 +948,10 @@ var frontDoorPlugins = []string{
 // block to the platform profile; nothing renders them for the default profile, whose
 // copy is the image's. TestFrontDoorKanbanMatchesChatConfig fails the build when the two
 // drift, and the note beside each key in that file is the reasoning for its value.
-const kanbanDispatchIntervalSeconds = 5
+const (
+	kanbanDispatchIntervalSeconds     = 5
+	kanbanDispatchStaleTimeoutSeconds = 1800
+)
 
 var kanbanWakeOnEvents = []string{"gave_up", "crashed", "timed_out", "blocked"}
 
@@ -982,11 +985,12 @@ func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
 // quietly having no effect at all.
 func frontDoorKanban(agent *agentv1alpha1.PlatformAgent) map[string]any {
 	return map[string]any{
-		"dispatch_in_gateway":       true,
-		"auto_subscribe_on_create":  true,
-		"dispatch_interval_seconds": kanbanDispatchIntervalSeconds,
-		"wake_on_events":            slices.Clone(kanbanWakeOnEvents),
-		"max_in_progress":           resolveKanbanMaxInProgress(agent),
+		"dispatch_in_gateway":            true,
+		"auto_subscribe_on_create":       true,
+		"dispatch_interval_seconds":      kanbanDispatchIntervalSeconds,
+		"dispatch_stale_timeout_seconds": kanbanDispatchStaleTimeoutSeconds,
+		"wake_on_events":                 slices.Clone(kanbanWakeOnEvents),
+		"max_in_progress":                resolveKanbanMaxInProgress(agent),
 	}
 }
 
