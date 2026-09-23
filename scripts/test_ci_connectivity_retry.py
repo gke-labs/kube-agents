@@ -84,14 +84,16 @@ def dump_function() -> str:
 
 
 def gateway_collector() -> str:
-    """collect_gateway_log() and the constants it reads, lifted from ci-env.sh.
+    """collect_gateway_log() and the log-tail constants, lifted from ci-env.sh.
 
     The dumper calls it for the running pod's log, so the dump under test
     carries the real collector rather than a stub: its `|| true` guard is
-    one of the ones the survival test below is about.
+    one of the ones the survival test below is about. Every `*_LOG_*`
+    readonly comes along, since the dumper reads the litellm and envoy tail
+    sizes too and `set -u` would end the script at the first unbound one.
     """
     src = ENV_SCRIPT.read_text(encoding="utf-8")
-    constants = re.findall(r"^readonly GATEWAY_LOG_[A-Z_]+=.*$", src, re.MULTILINE)
+    constants = re.findall(r"^readonly [A-Z_]*_LOG_[A-Z_]+=.*$", src, re.MULTILINE)
     match = re.search(r"^collect_gateway_log\(\) \{\n.*?^\}$", src, re.DOTALL | re.MULTILINE)
     if match is None or not constants:  # pragma: no cover
         raise AssertionError(f"collect_gateway_log() not found in {ENV_SCRIPT}")
