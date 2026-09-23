@@ -1675,11 +1675,12 @@ unit_cost_hint() {
     # the 700 it carried as a presubmit case until the nightly record says
     # otherwise.
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
-    # Presubmit since 2026-09-22 (#1023), nightly-only before that. Measured
+    # Nightly-only. The 2026-09-22 promotion (#1023) was withdrawn before
+    # merge: its record was graded by the check #1780 replaced. Measured
     # 980-1929s across build 2099539376672346112's three repetitions (267-559s
     # in August); median of the September run, kept although the four graded
-    # nights of 09-16 to 09-20 ran 420-1153s: the presubmit shares the model
-    # quota with the daytime herd, which is where the September run was.
+    # nights of 09-16 to 09-20 ran 420-1153s, until the nightly record under
+    # pull_request_opened says otherwise.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the

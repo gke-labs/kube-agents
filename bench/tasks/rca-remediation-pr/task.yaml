@@ -1,7 +1,8 @@
 # NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-09-22.
 # Uncommented in hack/ci-eval-pr.sh TASKS on 2026-08-27, taking
 # `remediation` off the coverage allowlist in docs/designs/domains.yaml
-# (pdb-remediation-pr holds that coverage now); demoted from the blocking
+# (back on it since 2026-09-22: neither remediation writer holds a seat,
+# pdb-remediation-pr's promotion having been withdrawn); demoted from the blocking
 # roster on 2026-09-02 (#1189) and, when the presubmit became the blocking
 # roster only (#1023), moved to the nightly with the other held-out cases
 # (434/681 graded presubmit repetitions 2026-09-15 to 09-22; since #1780 it
