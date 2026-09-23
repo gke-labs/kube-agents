@@ -583,6 +583,11 @@ class BaseTestCase(unittest.TestCase):
         )
         env.start()
         self.addCleanup(env.stop)
+        # Many tests run `start` more than once against one scratch directory
+        # and never `finish`; the in-flight note would refuse the second. The
+        # tests about the note itself put the real check back.
+        self.real_claim_in_flight = audit_report.claim_in_flight
+        self.patch_attr("claim_in_flight", lambda *a, **k: None)
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
         return json.dumps([{"number": number, "url": url}])
@@ -3745,6 +3750,58 @@ class TestStart(HarnessTestCase):
         # Autopilot fleet came from.
         self.assertIn("checks_not_applicable", contract)
         self.assertIn("reason", contract)
+
+    def test_a_second_start_is_refused_while_the_stream_is_in_flight(self):
+        """One stream, one run at a time, whoever started it (#1876).
+
+        Every path `start` scrubs is keyed by audit id on a volume every
+        session shares. The scheduler's lock keeps two ticks apart; a run
+        started from a session holds no lock, so `start` itself has to refuse
+        the second caller, or the tick landing mid-sweep wipes the first run's
+        state and both `finish` calls rewrite one ledger.
+        """
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("run in flight", self.err)
+        self.assertIn("--takeover", self.err)
+        # The note names the stream, not the caller's guess about it.
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--takeover"]), 0)
+
+    def test_finish_releases_the_stream_and_a_stale_note_is_forgotten(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertTrue(note.is_file())
+        # A crash without `finish` must not block tomorrow's tick: the note
+        # is believed for INFLIGHT_TTL_SECONDS and no longer.
+        stale = json.loads(note.read_text())
+        stale["started_at"] -= audit_report.INFLIGHT_TTL_SECONDS + 1
+        note.write_text(json.dumps(stale))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertTrue(note.is_file())
+        audit_report.release_in_flight(AUDIT)
+        self.assertFalse(note.is_file())
+        # And `finish` is what releases it on the happy path.
+        Path(audit_report.inflight_path_for(AUDIT)).write_text(
+            json.dumps({"audit": AUDIT, "started_at": time.time(), "pid": 1})
+        )
+        rc = self.run_finish(make_doc())
+        self.assertEqual(rc, 0, self.err)
+        self.assertFalse(note.is_file())
+
+    def test_a_start_that_fails_frees_the_stream_for_the_retry(self):
+        # The note means a run is under way. A `start` that raised left none
+        # behind, so the operator's retry must not need --takeover.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.failures = {"issue list": 1}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
+        self.assertFalse(Path(audit_report.inflight_path_for(AUDIT)).is_file())
+        self.harness.failures = {}
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
 
     def test_start_hands_over_the_findings_the_ledger_carries(self):
         # The worker cannot write `resolved_because` for a finding it was
@@ -11737,8 +11794,12 @@ class TestDispatchAndHandover(unittest.TestCase):
         self.assertIn("HERMES_HOME=/opt/data/profiles/platform", bullet)
         self.assertIn("cronjob(action='run')", bullet)
         self.assertIn("exactly one audit stream", bullet)
-        self.assertIn("cronjob(action='runs')", bullet)
         self.assertIn("audit_report.py start", bullet)
+        # The overlap guard is the script's in-flight note, not a ledger the
+        # in-session run never appears in; the worker is told what the
+        # refusal means and that --takeover is not its call.
+        self.assertIn("refuses while a run of that stream is in flight", bullet)
+        self.assertIn("--takeover", bullet)
         self.assertIn("coverage gap", bullet)
         self.assertIn("more than one job", bullet)
         self.assertIn("not an audit stream", bullet)
@@ -11755,8 +11816,9 @@ class TestDispatchAndHandover(unittest.TestCase):
         text = self.read("skills/fleet-audit/SKILL.md")
         section = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
         self.assertIn("Exactly one stream", section)
-        self.assertIn("cronjob(action='runs')", section)
         self.assertIn("audit_report.py finish", section)
+        self.assertIn("`start` refuses", section)
+        self.assertIn("--takeover", section)
         self.assertIn("coverage gap", section)
         self.assertIn("More than one stream", section)
         self.assertIn("2026-08-03", section)

@@ -1412,6 +1412,59 @@ def declarations_path_for(audit_id: str) -> str:
     return f"{SCRATCH_DIR}/declarations_{audit_id}.json"
 
 
+def inflight_path_for(audit_id: str) -> str:
+    """Where `start` leaves the note that a run of this stream is under way."""
+    return f"{SCRATCH_DIR}/inflight_{audit_id}.json"
+
+
+# How long an in-flight note is believed. A full audit takes 600-1300 s; a
+# run that died without `finish` is forgotten after this, so a crash never
+# blocks the stream's next daily tick, and only an operator retrying within
+# the window has to say `--takeover`.
+INFLIGHT_TTL_SECONDS = 2 * 60 * 60
+
+
+def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
+    """Refuse a second `start` while a run of this stream is under way.
+
+    Every path `start` scrubs — the run record, the declarations, the
+    findings document, the workspace — is keyed by audit id alone, on one
+    volume every session's shell shares. The scheduler's per-job lock keeps
+    two ticks apart, but a run started from a session (the on-demand
+    interim, #1876) holds no such lock, so without this a tick landing
+    mid-sweep, or a second card for the same stream, wiped the first run's
+    state out from under it and both `finish` calls rewrote one ledger.
+    """
+    path = Path(inflight_path_for(audit_id))
+    now = time.time()
+    if not takeover:
+        try:
+            note = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            note = None
+        started = note.get("started_at") if isinstance(note, dict) else None
+        if isinstance(started, (int, float)) and now - started < INFLIGHT_TTL_SECONDS:
+            when = datetime.fromtimestamp(started, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            raise ValidationError(
+                f"{audit_id} has a run in flight since {when} (pid {note.get('pid')}); a second "
+                f"`start` would scrub its run record, workspace and findings document. Wait for "
+                f"that run's `finish`, or pass --takeover if you know it is dead."
+            )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"audit": audit_id, "started_at": now, "pid": os.getpid()}),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        log(f"WARNING: could not record the in-flight note at {path}: {exc}")
+
+
+def release_in_flight(audit_id: str) -> None:
+    """`finish` published or closed: the stream is free for its next run."""
+    Path(inflight_path_for(audit_id)).unlink(missing_ok=True)
+
+
 def base_branch() -> str:
     """The branch remediation pull requests target: this repository's own default.
 
@@ -9401,7 +9454,19 @@ def unsearched_intent_entries(
 
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
+    claim_in_flight(audit_id, takeover=bool(getattr(args, "takeover", False)))
+    try:
+        _start(args, audit_id)
+    except BaseException:
+        # A `start` that raised left no run in flight, so the retry must not
+        # be told to --takeover its own failure. The refusal above sits outside
+        # this block on purpose: a caller refused for another run's note must
+        # not remove that note on its way out.
+        release_in_flight(audit_id)
+        raise
 
+
+def _start(args: argparse.Namespace, audit_id: str) -> None:
     # Yesterday's run record goes first, before anything below can fail. Every
     # step from here to the write can raise, and a `start` that died between
     # them would otherwise leave the previous run's repository list for a
@@ -10919,6 +10984,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 }
             )
         )
+        release_in_flight(audit_id)
         return
 
     # --- Findings: publish the ledger, then propose fixes separately. ---
@@ -11314,6 +11380,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             }
         )
     )
+    release_in_flight(audit_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -11362,6 +11429,13 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--repo",
         help="Optional target GitOps repository (defaults to ConfigMap registered repo).",
+    )
+    start_parser.add_argument(
+        "--takeover",
+        action="store_true",
+        help="Start even though a run of this stream is recorded as in flight "
+        "(only when you know that run is dead; the note expires by itself after "
+        f"{INFLIGHT_TTL_SECONDS // 60} minutes).",
     )
 
     finish_parser = subparsers.add_parser(

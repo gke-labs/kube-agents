@@ -75,12 +75,13 @@ where `hermes` and `/opt/data/profiles` are; your shell runs in the sandbox pod,
 does not license `cronjob(action='run')`. What you do instead depends on how many streams the request
 names:
 
-- **Exactly one stream:** check `cronjob(action='runs')` first; a run of that stream already in
-  flight holds the per-job lock this session does not, so say it is running and stop. Otherwise run
-  that stream's SOP here, in this session, through the two-command lifecycle below —
-  `audit_report.py start`, the sweep, `audit_report.py finish` — spelling the script
-  `"$HERMES_HOME"/skills/fleet-audit/scripts/audit_report.py`, because a card's working directory is
-  its own kanban workspace and the `./skills/...` form below does not resolve there. Report every
+- **Exactly one stream:** run that stream's SOP here, in this session, through the two-command
+  lifecycle below — `audit_report.py start`, the sweep, `audit_report.py finish` — spelling the
+  script `"$HERMES_HOME"/skills/fleet-audit/scripts/audit_report.py`, because a card's working
+  directory is its own kanban workspace and the `./skills/...` form below does not resolve there.
+  `start` refuses while a run of that stream is in flight, whether a scheduled tick's or another
+  session's: it exits 2 and names the run. If it refuses, say the stream is already running and
+  stop; `--takeover` is for an operator who knows that run is dead, not for you. Report every
   check you did not run as a coverage gap: a cluster you could not read goes in `scope.skipped`, a
   check that could have run on a cluster and did not goes in that cluster's `limitations`, so
   `finish` reports the run `partial` and names each gap. Never skip a check silently: a document
@@ -98,8 +99,11 @@ fleet-wide all-clear. One stream, run through `start` and `finish` with its gaps
 whole of what this session may take on.
 
 The scheduler holds a per-job lock for the length of a triggered run, so the tick does not start a
-stream twice. A stream run here holds no such lock, which is why the bullet above checks
-`cronjob(action='runs')` first: it shows what is running and what each attempt did.
+stream twice. A stream run here holds no such lock, and the scheduler's ledger
+(`cronjob(action='runs')`) never sees it, so the guard lives in the script: `start` leaves an
+in-flight note for the stream and refuses while one younger than two hours exists, whichever side
+wrote it, and a completed `finish` removes it. A run that died without `finish` is forgotten after
+those two hours, so a crash never blocks the stream's next tick.
 
 **Each run reports on itself. Your own answer is a roll-up, not a copy.** Answer with one line per
 stream: for a stream you queued, that it is queued for the next tick; for the one stream you ran
