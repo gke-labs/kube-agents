@@ -60,7 +60,9 @@
 # the infra lock with the two incumbents) and consistency-no-environment-label
 # (#1818, ~28min at its measured 381s/385s/880s -- a full fleet audit, and the
 # spread is the audit band's, not this case's, so it takes the 900s hint the
-# band uses rather than its mean). Forty-two cases, ~921-941min serial.
+# band uses rather than its mean). Forty-two cases, ~921-941min serial
+# (forty-three with cluster-agent-unlocated-crashloop-debug, ~10min each at
+# three repetitions).
 # 2026-09-22 moved incident-triage-oom-event-probe from this file to the
 # presubmit one (#1023): the nightly runs both files, so it still runs the
 # same forty-two cases at the same price. The
@@ -228,9 +230,8 @@
 # cluster A of the 3-cluster standing dirty fleet (bench/tf/fleet/README.md).
 # Authored in PR #1670; its eval loop was not run locally because the contributor
 # environment is single-cluster (kyber-test) without the multi-cluster OpenTofu
-# fleet stack applied, and cloud infrastructure creation exceeds agent autonomy.
-# Held subject to maintainer waiver on the #1670 review (OWNERS approvers / maintainers)
-# per the precedent of #1412 / #1525 (upgrades-api-deprecation-clean-repo). Lands in the
+# fleet stack applied. Unvalidated live on dev cluster; awaiting maintainer
+# determination on PR #1670 review (@scromp / OWNERS approvers). Lands in the
 # nightly roster under ADDED_AFTER_THE_SPLIT to build its empirical baseline in
 # Boskos-leased pool projects.
 ./tasks/cluster-agent-unlocated-crashloop-debug/task.yaml
@@ -364,4 +365,3 @@
 # repetition, the 200s default. Enters when a re-derived record clears the
 # bar in docs/eval-gate-roster.md.
 ./tasks/cluster-agent-healthy-workload-no-finding/task.yaml
-
