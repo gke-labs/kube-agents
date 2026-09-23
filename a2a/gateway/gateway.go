@@ -17,7 +17,10 @@ import (
 
 // turnTimeout bounds one handler turn — an inbound message or a relay
 // batch — so a stuck bus or backend call frees the conversation's queue
-// slot instead of holding it forever.
+// slot instead of holding it forever. For an inbound message the clock
+// starts before the wait for the conversation's session lock, so the
+// bound is on the turn as a whole and not on the work after the lock; see
+// handleInbound for what depends on that.
 const turnTimeout = 60 * time.Second
 
 // relayDurable is the event relay's durable consumer name; see
@@ -345,6 +348,23 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// rather than as a guess about timing.
 	defer g.observeTurnFinished(msg.Conversation)
 
+	// The turn's clock starts here, before the wait for the conversation's
+	// session lock inside runTurn. The relay, the reap and the sweep each
+	// hold that lock for up to a turn of their own, and a clock started
+	// after the lock would let a turn run for a lock-hold plus turnTimeout.
+	// The inject door depends on the whole turn fitting inside turnTimeout:
+	// it hands a message over only with that much of its submit bound left
+	// and reads a bound that expires with the turn unfinished as "nothing
+	// started", which has to be true (InjectAdapter.claimTurn, awaitTurn).
+	ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
+	defer cancel()
+	g.runTurn(ctx, msg)
+}
+
+// runTurn is the body of handleInbound under the turn's context: verify,
+// lock the session, route. Split from handleInbound so a test can hand it
+// a context of its own and hold the lock against it.
+func (g *Gateway) runTurn(ctx context.Context, msg InboundMessage) {
 	// Verify against the backend's identity mechanism — the mapping table
 	// on Discord, the Google-asserted email gated by the allowlist on gchat
 	// — and drop the message if we can't (gateway design, turns-and-tasks
@@ -387,9 +407,14 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	l := g.lockSession(msg.Conversation)
 	l.Lock()
 	defer l.Unlock()
-
-	ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
-	defer cancel()
+	if err := ctx.Err(); err != nil {
+		// The whole turn went on waiting for the lock. Every call below
+		// would fail on the expired context anyway; said once, and plainly,
+		// rather than as a session lookup failure.
+		g.log.Warn("turn skipped: the conversation's session lock was held for the whole turn",
+			"conversation", msg.Conversation, "messageId", msg.MessageID, "err", err)
+		return
+	}
 
 	rec, err := g.reg.Get(ctx, msg.Conversation)
 	if err != nil {

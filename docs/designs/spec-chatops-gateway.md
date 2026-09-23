@@ -599,12 +599,14 @@ not be silent about it.
   is a read rather than a message because every message a program could send to the gateway is
   itself a turn - a status phrase falls through to `startTask` and mints a task whose ask is the
   phrase, and a cancel sets `Detached`. The harness asks for it on every poll, which is where the
-  task's lifecycle comes from, and reads five outcomes off it: a terminal posted, grade normally;
+  task's lifecycle comes from, and reads six outcomes off it: a terminal posted, grade normally;
   an active task with no executor event and an age past the grace, infrastructure (no executor
   took it, whether or not the gateway has since released the conversation on some turn - the
   harness keys every case and repetition to a fresh conversation, so release timing does not
   matter); `submitted` only for the whole budget, infrastructure (the bridge queued it behind its
-  concurrency cap and never ran it); `working` at the budget, a graded timeout; and an active
+  concurrency cap and never ran it); a state past `submitted` that is never `working` for the
+  whole budget (`input-required`, say), infrastructure (an executor took it and did not run it);
+  `working` at the budget, a graded timeout; and an active
   record whose stream already folds to a terminal, which is the relay's lost record write (the
   relay acks a terminal before it clears `ActiveTask` and writes the record, and on a key never
   reused no heal arrives) - graded like a finished run from the fold's result text when the

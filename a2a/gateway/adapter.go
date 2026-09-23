@@ -110,9 +110,11 @@ type Adapter interface {
 // nothing and makes the eval transport independent of how the relay words
 // itself.
 //
-// Both methods are called on the conversation's own worker (the inbox queue
-// for TaskStarted, the relay queue for TaskTerminal) while the session lock is
-// held, so an implementation must not block: record and return.
+// Every method is called on one of the conversation's own workers (the
+// inbox worker for what a turn does -- TaskStarted, TaskAccepted,
+// CancelPublished, and TaskTerminal from the heal; the relay queue for a
+// relayed TaskTerminal) while the session lock is held, so an implementation
+// must not block: record and return.
 type TaskObserver interface {
 	// TaskStarted names the task a turn on this conversation minted. Called
 	// after the id exists and BEFORE the placeholder is posted, so a caller
@@ -211,9 +213,10 @@ const (
 	// TerminalFromSupervisor is a terminal that arrived on the task's
 	// supervisor subject -- the gateway's own word about an executor that
 	// died or never ran, rather than the executor's account of the work.
-	// The read route's fold and the heal report it: they are the two places
-	// that have the subject a terminal arrived on (probeConversation,
-	// healActiveTask). It is not an
+	// The relay, the heal and the read route's fold report it, each from
+	// the subject the terminal arrived on (terminalSourceOf under
+	// relayBatch, healActiveTask, probeConversation), so one terminal is
+	// attributed the same way on every path. It is not an
 	// answer either, and it is not TerminalFromGateway, which says something
 	// narrower and more useful -- that this gateway could not put the task
 	// on the bus at all.

@@ -700,6 +700,8 @@ func TestInjectConversationKey(t *testing.T) {
 		{"trimmed", "  case-1  ", "inject:case-1", false},
 		{"empty", "", "", true},
 		{"only spaces", "   ", "", true},
+		{"bare prefix", injectKeyPrefix, "", true},
+		{"bare prefix and spaces", " " + injectKeyPrefix + " ", "", true},
 		{"foreign backend", "gchat:spaces/AAA/threads/BBB", "", true},
 		{"newline", "case\n1", "", true},
 		{"too long", strings.Repeat("x", injectMaxKeyRunes+1), "", true},
@@ -2065,6 +2067,62 @@ func TestInjectRelayAndReadRouteAgreeOnWhoseTerminalItIs(t *testing.T) {
 	}
 }
 
+// TestInjectTheTurnClockStartsBeforeTheSessionLock: the door hands a
+// message over only with a whole turnTimeout of its submit bound left, and
+// reads a bound that expires with the turn unfinished as the gateway being
+// stuck -- a refusal that has to mean nothing started. That holds only if
+// the turn's clock starts at hand-over and not once the conversation's
+// session lock is acquired: the relay, the reap and the sweep each hold that
+// lock for up to a turn of their own, and a turn that waited out a lock-hold
+// and then began its own turnTimeout would outlive the door's bound and
+// start a task after the door had told its caller it did not. So the clock
+// runs through the lock wait, and a turn whose clock ran out while it waited
+// does nothing once it has the lock. Driven through runTurn with a short
+// context so the test does not wait a real turnTimeout; the relay standing
+// in for the lock-holder is the test itself.
+func TestInjectTheTurnClockStartsBeforeTheSessionLock(t *testing.T) {
+	r := startInjectRig(t)
+	key := injectKeyPrefix + "held-lock"
+	l := r.g.lockSession(key)
+	l.Lock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.g.runTurn(ctx, InboundMessage{
+			Conversation: key,
+			Kind:         injectConversationKind,
+			AuthorID:     injectTestAuthor,
+			MessageID:    "held-lock-1",
+			Text:         "how is the fleet?",
+			Backend:      injectBackend,
+		})
+	}()
+	<-ctx.Done()
+	select {
+	case <-done:
+		t.Fatal("the turn returned while the session lock was still held")
+	case <-time.After(4 * injectPollInterval):
+	}
+	l.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the turn did not return once the lock was released")
+	}
+
+	if envs := inSubjectEnvelopes(t, r.url, "platform"); len(envs) != 0 {
+		t.Fatalf("a turn whose clock ran out waiting for the lock reached the bus: %d envelopes", len(envs))
+	}
+	page := r.probe(t, key, "")
+	if page.Probe.Active || page.Probe.TaskID != "" || len(page.Entries) != 0 {
+		t.Fatalf("a turn whose clock ran out waiting for the lock started something: %+v, %d entries",
+			page.Probe, len(page.Entries))
+	}
+}
+
 // TestInjectCancelNamesTheTaskAfterTheHealReleasedIt: the production sequence
 // for a task nobody took. The harness classifies it from the read, past the
 // grace, and then cancels naming the task id its POST was answered with. The
@@ -2256,10 +2314,12 @@ func TestInjectRefusesASecondDropWithoutWaitingForTheBound(t *testing.T) {
 // TestInjectWaitsThroughThePlaceholderForTheAccept: the placeholder post now
 // lands between a task's announcement and its publish, and the rule that a
 // post without a task means "the turn answered without starting one" must not
-// fire on it. Without the in-flight guard a gateway whose record write and
-// publish take longer than a poll interval -- a loaded KV, a bus retry --
-// would have its submissions refused as `no-task`, and the harness would call
-// a healthy run infrastructure. The handler here is deliberately slow between
+// fire on it. Were the wait to classify from the entries alone rather than
+// only once the turn has ended (awaitTurn reads the counts only after
+// TurnFinished has moved `turns`), a gateway whose record write and publish
+// take longer than a poll interval -- a loaded KV, a bus retry -- would have
+// its submissions refused as `no-task`, and the harness would call a healthy
+// run infrastructure. The handler here is deliberately slow between
 // the two halves; the real one is fast, which is why nothing else catches it.
 func TestInjectWaitsThroughThePlaceholderForTheAccept(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

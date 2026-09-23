@@ -860,6 +860,23 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
 
 
+def _error_detail(exc: urllib.error.HTTPError) -> str:
+    """The body of an error answer, or what stopped it arriving.
+
+    The status line and headers are in hand by the time an ``HTTPError``
+    exists; the body is read here, and a tunnel that drops before the small
+    JSON body completes raises from that read. Raised inside ``_request``'s
+    ``HTTPError`` clause, an ``IncompleteRead`` or ``ConnectionResetError``
+    is not caught by the sibling clause that maps ``OSError``, so it is
+    caught here: the status still decides how the failure is classified,
+    and the loss is recorded in place of the detail.
+    """
+    try:
+        return exc.read().decode("utf-8", errors="replace").strip()
+    except (OSError, http.client.HTTPException) as lost:
+        return f"(error body lost: {type(lost).__name__}: {lost})"
+
+
 def _request(
     url: str, timeout: float, token: str, payload: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -881,7 +898,7 @@ def _request(
         with _OPENER.open(request, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace").strip()
+        detail = _error_detail(exc)
         if exc.code == 401:
             # Named, because the cause is one thing and the fix is one thing:
             # the token the harness holds is not the token the operator

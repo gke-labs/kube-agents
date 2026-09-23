@@ -1844,6 +1844,11 @@ func injectConversationKey(raw string) (string, error) {
 		}
 		key = injectKeyPrefix + key
 	}
+	if key == injectKeyPrefix {
+		// The prefix alone is an empty conversation id wearing the prefix,
+		// and would otherwise pass every check the bare empty string fails.
+		return "", fmt.Errorf("conversation is required after the %q prefix", injectKeyPrefix)
+	}
 	// Bounded once the prefix is settled, so the key a POST answers with is a
 	// key the read and cancel routes accept: the prefix is part of what rides
 	// into the KV key and the log line either way, and measuring the raw value

@@ -2214,11 +2214,6 @@ func buildA2AGatewayRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role
 	}
 }
 
-// buildA2AGatewayDeployment renders the A2A gateway (the chatops gateway of
-// docs/designs/spec-chatops-gateway.md: Discord adapter and session manager).
-// It is expected to crash-loop until the gateway image is reachable and the
-// discord-bot Secret is created — both are optional references so the render
-// never blocks the rest of the stack.
 // buildA2AInjectService is how the eval runner reaches the inject backend:
 // a ClusterIP, which is what `kubectl port-forward svc/...` resolves.
 //
@@ -2389,6 +2384,11 @@ func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 	}
 }
 
+// buildA2AGatewayDeployment renders the A2A gateway (the chatops gateway of
+// docs/designs/spec-chatops-gateway.md: Discord adapter and session manager).
+// It is expected to crash-loop until the gateway image is reachable and the
+// discord-bot Secret is created — both are optional references so the render
+// never blocks the rest of the stack.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
 	labels := a2aLabels(agent, "gateway")

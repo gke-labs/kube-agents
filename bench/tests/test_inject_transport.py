@@ -34,6 +34,7 @@ message id, as the door does.
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import time
 from collections.abc import Generator
@@ -1614,6 +1615,49 @@ def test_a_refused_token_is_not_retried(
     assert infra(result)
     assert "refused the bearer token" in result.errors[0]
     assert len(stub_gateway.seen_authorization) == 1, "a refused token was retried"
+
+
+def test_a_connection_lost_reading_an_error_body_is_unavailable() -> None:
+    """A tunnel that drops after a 503's status line and headers but before
+    its body raises from the body read, inside the HTTPError clause, where
+    the sibling clause that maps OSError cannot catch it. It has to leave
+    _request as InjectUnavailable all the same: it is the transport failing,
+    and a raw IncompleteRead escaping the harness's exchange would skip the
+    retry, the tunnel respawn and the cancel an accepted task is owed."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def serve_a_truncated_error() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                request += chunk
+            conn.sendall(
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 4096\r\n"
+                b"\r\n"
+                b'{"error": "the tunnel dropped mid-'
+            )
+
+    server = threading.Thread(target=serve_a_truncated_error, daemon=True)
+    server.start()
+    try:
+        with pytest.raises(inject.InjectUnavailable) as raised:
+            inject._request(f"http://127.0.0.1:{port}/inject", 5.0, TOKEN)
+    finally:
+        listener.close()
+        server.join(timeout=5)
+
+    assert raised.value.retryable, "a 503 whose body was lost is still the retryable kind"
+    assert "HTTP 503" in str(raised.value)
+    assert "error body lost" in str(raised.value)
 
 
 # --------------------------------------------------------------------------
