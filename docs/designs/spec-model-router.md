@@ -384,9 +384,21 @@ belongs to, so reconstructing "why did it go there" is the same ordered read tha
 The router reads untrusted text and produces a routing decision. What a successful
 injection can and cannot do:
 
-- **It cannot escalate.** The addressee must be on the list the gateway rendered for this
-  conversation, and the gateway re-checks it. The worst case is a wrong destination among
-  destinations this conversation could legitimately have asked for.
+- **It cannot reach a new destination.** The addressee must be on the list the gateway
+  rendered for this conversation, and the gateway re-checks it. The worst case for that
+  field is a wrong destination among destinations this conversation could legitimately
+  have asked for.
+- **It can rewrite the request itself.** `ask` is model-authored free text. The gateway
+  publishes it as the task submission, in an envelope it mints with the requester's
+  `authority` block. So a captured router does not need a new destination. It keeps a
+  legitimate addressee and changes what is being asked for: "describe namespace foo"
+  becomes "delete namespace foo", attributed to the person who typed something else. The
+  bound is the requester's own permissions. Effective-permission intersection happens at
+  the broker and in the identity map. Model output is never an authorization signal, so a
+  rewrite cannot reach anything the requester was not already permitted to do. What it
+  changes is intent, inside permissions the user already has. The one place the rewrite
+  would be visible is the verbatim decision in the audit record. That is build step 5, so
+  it lands last.
 - **It cannot cancel someone else's task.** Requester ownership is checked in the gateway
   against the pseudonym recorded on the task.
 - **It cannot publish.** No credential, no publish path.
@@ -396,10 +408,11 @@ injection can and cannot do:
 
 That last item is why the destination list is the gateway's and why `ask` is
 self-contained: the receiving agent's own gates see a complete request and apply their
-own controls. The router is upstream of every existing control and replaces none of them.
-Mutation escalation, when it lands, makes a misroute visible to the user rather than
-silent; it does not narrow the surface. What narrows the surface is the window never
-rendering event text.
+own controls. Self-containment is also what makes the body worth capturing, since a
+rewritten ask arrives downstream looking like any other complete request. The router is
+upstream of every existing control and replaces none of them. Mutation escalation, when
+it lands, makes a misroute visible to the user rather than silent; it does not narrow the
+surface. What narrows the surface is the window never rendering event text.
 
 ## Broadcast
 
