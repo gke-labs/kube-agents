@@ -39,21 +39,21 @@ func TestScaleUpMemoRecordsLatestByEventTime(t *testing.T) {
 	m := newScaleUpMemo(time.Hour, 0)
 	m.now = func() time.Time { return now }
 
-	m.Record("pod-1", scaleUpTriggered, now.Add(-time.Minute))
-	m.Record("pod-1", scaleUpDeclined, now)
-	if got := m.Lookup("pod-1"); got.Verdict != scaleUpDeclined || !got.At.Equal(now) {
+	m.Record("default", "pod-1", scaleUpTriggered, now.Add(-time.Minute))
+	m.Record("default", "pod-1", scaleUpDeclined, now)
+	if got := m.Lookup("default", "pod-1"); got.Verdict != scaleUpDeclined || !got.At.Equal(now) {
 		t.Errorf("after a newer decline, mark = %+v; want declined at %v", got, now)
 	}
 
 	// A replayed older mark must not overwrite the newer verdict.
-	m.Record("pod-1", scaleUpTriggered, now.Add(-2*time.Minute))
-	if got := m.Lookup("pod-1"); got.Verdict != scaleUpDeclined {
+	m.Record("default", "pod-1", scaleUpTriggered, now.Add(-2*time.Minute))
+	if got := m.Lookup("default", "pod-1"); got.Verdict != scaleUpDeclined {
 		t.Errorf("older replayed mark overwrote the newer one: %+v", got)
 	}
 
 	// A newer TriggeredScaleUp does supersede a decline: the autoscaler changed its mind.
-	m.Record("pod-1", scaleUpTriggered, now.Add(time.Minute))
-	if got := m.Lookup("pod-1"); got.Verdict != scaleUpTriggered {
+	m.Record("default", "pod-1", scaleUpTriggered, now.Add(time.Minute))
+	if got := m.Lookup("default", "pod-1"); got.Verdict != scaleUpTriggered {
 		t.Errorf("newer trigger did not supersede the decline: %+v", got)
 	}
 }
@@ -63,8 +63,8 @@ func TestScaleUpMemoZeroTimestampIsNow(t *testing.T) {
 	m := newScaleUpMemo(time.Hour, 0)
 	m.now = func() time.Time { return now }
 
-	m.Record("pod-1", scaleUpTriggered, time.Time{})
-	if got := m.Lookup("pod-1"); !got.At.Equal(now) {
+	m.Record("default", "pod-1", scaleUpTriggered, time.Time{})
+	if got := m.Lookup("default", "pod-1"); !got.At.Equal(now) {
 		t.Errorf("zero event time recorded as %v; want now (%v)", got.At, now)
 	}
 }
@@ -74,9 +74,9 @@ func TestScaleUpMemoExpires(t *testing.T) {
 	m := newScaleUpMemo(10*time.Minute, 0)
 	m.now = func() time.Time { return now }
 
-	m.Record("pod-1", scaleUpDeclined, now)
+	m.Record("default", "pod-1", scaleUpDeclined, now)
 	now = now.Add(11 * time.Minute)
-	if got := m.Lookup("pod-1"); got.Verdict != scaleUpNone {
+	if got := m.Lookup("default", "pod-1"); got.Verdict != scaleUpNone {
 		t.Errorf("mark past ttl = %+v; want none", got)
 	}
 	if got := m.Len(); got != 0 {
@@ -86,9 +86,27 @@ func TestScaleUpMemoExpires(t *testing.T) {
 
 func TestScaleUpMemoIsPerUID(t *testing.T) {
 	m := newScaleUpMemo(0, 0)
-	m.Record("pod-1", scaleUpTriggered, time.Now())
-	if got := m.Lookup("pod-2"); got.Verdict != scaleUpNone {
+	m.Record("default", "pod-1", scaleUpTriggered, time.Now())
+	if got := m.Lookup("default", "pod-2"); got.Verdict != scaleUpNone {
 		t.Errorf("unrelated pod inherited a mark: %+v", got)
+	}
+}
+
+// TestScaleUpMemoIsPerNamespace: a mark is the pod's only in the namespace it
+// was written in. The API server does not check that a mark's
+// involvedObject.uid names a real object, so a mark written in one namespace
+// against another namespace's pod UID must not be found by that pod.
+func TestScaleUpMemoIsPerNamespace(t *testing.T) {
+	m := newScaleUpMemo(0, 0)
+	m.Record("tenant-a", "pod-1", scaleUpTriggered, time.Now())
+	if got := m.Lookup("kube-system", "pod-1"); got.Verdict != scaleUpNone {
+		t.Errorf("a pod in another namespace inherited a mark written against its UID: %+v", got)
+	}
+	if got := m.Lookup("tenant-a", "pod-1"); got.Verdict != scaleUpTriggered {
+		t.Errorf("the mark is not found in its own namespace: %+v", got)
+	}
+	if got := m.Lookup("", "pod-1"); got.Verdict != scaleUpNone {
+		t.Errorf("an empty namespace found a mark: %+v", got)
 	}
 }
 
@@ -98,30 +116,31 @@ func TestScaleUpMemoIsBounded(t *testing.T) {
 	m.now = func() time.Time { return now }
 
 	for i := 0; i < 20; i++ {
-		m.Record(string(rune('a'+i)), scaleUpTriggered, now)
+		m.Record("default", string(rune('a'+i)), scaleUpTriggered, now)
 		now = now.Add(time.Second)
 	}
 	if got := m.Len(); got > 4 {
 		t.Errorf("memo holds %d entries; want <= 4", got)
 	}
 	// The newest survives the eviction of the oldest.
-	if got := m.Lookup(string(rune('a' + 19))); got.Verdict != scaleUpTriggered {
+	if got := m.Lookup("default", string(rune('a'+19))); got.Verdict != scaleUpTriggered {
 		t.Errorf("newest entry was evicted: %+v", got)
 	}
 }
 
 func TestScaleUpMemoNilAndEmptyUIDAreInert(t *testing.T) {
 	var nilMemo *scaleUpMemo
-	nilMemo.Record("pod-1", scaleUpDeclined, time.Now())
-	if got := nilMemo.Lookup("pod-1"); got.Verdict != scaleUpNone {
+	nilMemo.Record("default", "pod-1", scaleUpDeclined, time.Now())
+	if got := nilMemo.Lookup("default", "pod-1"); got.Verdict != scaleUpNone {
 		t.Errorf("nil memo returned %+v; want the zero mark", got)
 	}
 
 	m := newScaleUpMemo(0, 0)
-	m.Record("", scaleUpDeclined, time.Now())
-	m.Record("pod-1", scaleUpNone, time.Now())
+	m.Record("default", "", scaleUpDeclined, time.Now())
+	m.Record("", "pod-1", scaleUpDeclined, time.Now())
+	m.Record("default", "pod-1", scaleUpNone, time.Now())
 	if got := m.Len(); got != 0 {
-		t.Errorf("empty uid or none verdict recorded %d entries; want 0", got)
+		t.Errorf("empty uid, empty namespace or none verdict recorded %d entries; want 0", got)
 	}
 }
 
@@ -160,13 +179,13 @@ func TestScaleUpMemoFutureTimestampIsReadAsNow(t *testing.T) {
 	m := newScaleUpMemo(time.Hour, 0)
 	m.now = func() time.Time { return now }
 
-	m.Record("pod-1", scaleUpTriggered, now.Add(48*time.Hour))
-	if got := m.Lookup("pod-1"); got.Verdict != scaleUpTriggered || !got.At.Equal(now) {
+	m.Record("default", "pod-1", scaleUpTriggered, now.Add(48*time.Hour))
+	if got := m.Lookup("default", "pod-1"); got.Verdict != scaleUpTriggered || !got.At.Equal(now) {
 		t.Fatalf("a future mark was recorded as %+v; want triggered at %v", got, now)
 	}
 	// Clamped to now, it expires with the TTL like any other mark.
 	now = now.Add(time.Hour + time.Second)
-	if got := m.Lookup("pod-1"); got.Verdict != scaleUpNone {
+	if got := m.Lookup("default", "pod-1"); got.Verdict != scaleUpNone {
 		t.Errorf("the clamped mark outlived the TTL: %+v", got)
 	}
 }

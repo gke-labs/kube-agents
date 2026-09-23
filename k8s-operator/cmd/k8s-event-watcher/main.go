@@ -505,12 +505,14 @@ func (d *dispatcher) reopenPolicyFiltered(ev TriageEvent, replay bool) (dedupRes
 // that batch (watcher.go, recordMark), and the same event comes through
 // Dispatch when the batch is delivered, where it is counted and logged once.
 // The filter decides admission here as it does there, so the --reason list
-// and the namespace rules still say which verdicts are remembered.
+// and the namespace rules still say which verdicts are remembered, and the
+// mark is filed under the event's own namespace with the UID, so it is found
+// only by a FailedScheduling on a pod in that namespace (scaleup.go).
 func (d *dispatcher) RecordScaleUpMark(ev TriageEvent) bool {
 	if d.filter.Decide(ev) != gateScaleUpMark {
 		return false
 	}
-	d.scaleUps.Record(ev.Key.UID, scaleUpVerdictFor(ev.Key.Reason), ev.LastSeen)
+	d.scaleUps.Record(ev.Namespace, ev.Key.UID, scaleUpVerdictFor(ev.Key.Reason), ev.LastSeen)
 	return true
 }
 
@@ -536,14 +538,16 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	// that reads the verdict runs inside Decide, and the verdict arrived on a
 	// different event. Only FailedScheduling carries it; the marks themselves
 	// are recorded below, once the filter has admitted them, so the --reason
-	// list and the namespace rules decide which verdicts are remembered.
+	// list and the namespace rules decide which verdicts are remembered. The
+	// memo is keyed on the namespace with the UID, so a mark written in one
+	// namespace is not found by a pod in another whose UID it named.
 	if ev.Key.Reason == reasonFailedScheduling {
-		ev.ScaleUp = d.scaleUps.Lookup(ev.Key.UID)
+		ev.ScaleUp = d.scaleUps.Lookup(ev.Namespace, ev.Key.UID)
 	}
 	if gate := d.filter.Decide(ev); gate != gateAccepted {
 		if gate == gateScaleUpMark {
 			verdict := scaleUpVerdictFor(ev.Key.Reason)
-			d.scaleUps.Record(ev.Key.UID, verdict, ev.LastSeen)
+			d.scaleUps.Record(ev.Namespace, ev.Key.UID, verdict, ev.LastSeen)
 			log.Printf("recorded %s pod=%s/%s as scale-up %s (%s); not forwarded",
 				ev.Key.Reason, ev.Namespace, ev.Name, verdict, ev.Message)
 		}

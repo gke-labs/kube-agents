@@ -54,6 +54,9 @@ const (
 	// pullClassMemo: pending pods are a small fraction of a cluster's pods,
 	// and a cluster churning through them must not grow the map without limit.
 	defaultScaleUpEntries = 4096
+	// scaleUpMemoKeySep joins a pod's namespace and UID into the memo's key.
+	// A UID is a UUID and carries no slash, so the join is unambiguous.
+	scaleUpMemoKeySep = "/"
 )
 
 // scaleUpMemoTTL is how long a dispatcher remembers a pod's marks: the dedup
@@ -123,10 +126,21 @@ type scaleUpMark struct {
 	At      time.Time
 }
 
-// scaleUpMemo remembers, per involved-object UID, the latest verdict
-// cluster-autoscaler recorded against the pod. It exists because the verdict
-// and the FailedScheduling it qualifies are two different events, and the
-// dedup key is (UID, Reason), so nothing downstream would correlate them.
+// scaleUpMemo remembers, per involved-object namespace and UID, the latest
+// verdict cluster-autoscaler recorded against the pod. It exists because the
+// verdict and the FailedScheduling it qualifies are two different events, and
+// the dedup key is (UID, Reason), so nothing downstream would correlate them.
+//
+// The namespace is in the key because the UID alone is the author's word. The
+// API server binds an event's namespace to its involved object's, so a mark
+// can only be written where its author may create events, but it does not
+// check that involvedObject.uid names a real object there; keyed on the UID
+// alone, a mark written in one namespace against the UID of a pod in another
+// (kube-system's, say, read off kube_pod_info or an owner reference) would be
+// found by that pod's FailedScheduling and hold or release its card from a
+// namespace with no access to it. With the namespace in the key the mark
+// reaches only a pod in the namespace it was written in, which is the reach
+// the reporter check (scaleUpReporter) already assumes.
 //
 // Latest is by event time, not arrival order, so a replayed older mark cannot
 // overwrite a newer one. A later TriggeredScaleUp supersedes a NotTriggerScaleUp
@@ -157,17 +171,28 @@ func (m *scaleUpMemo) clock() time.Time {
 	return time.Now()
 }
 
-// Record remembers verdict for uid as of at, unless a newer mark is already
-// held. A zero at (an emitter that set no timestamp) is taken as now, which is
-// the most recent reading the mark can honestly claim, and so is an at in the
-// future: the hold is measured from the mark, so a TriggeredScaleUp stamped
-// ahead of the watcher's clock (skew, or an author who chose the stamp) would
-// otherwise hold the pod's FailedScheduling for the hold plus the lead, and
-// the memo's own expiry, which ages from the same stamp, would keep it for as
-// long again. Safe on a nil receiver and a no-op for an empty uid or
-// scaleUpNone.
-func (m *scaleUpMemo) Record(uid string, verdict scaleUpVerdict, at time.Time) {
-	if m == nil || uid == "" || verdict == scaleUpNone {
+// scaleUpMemoKey is the memo's key for the pod uid in namespace, or "" when
+// either is empty: a FailedScheduling is always a namespaced pod's, so a mark
+// missing either half names no pod this memo will be asked about.
+func scaleUpMemoKey(namespace, uid string) string {
+	if namespace == "" || uid == "" {
+		return ""
+	}
+	return namespace + scaleUpMemoKeySep + uid
+}
+
+// Record remembers verdict for the pod uid in namespace as of at, unless a
+// newer mark is already held. A zero at (an emitter that set no timestamp) is
+// taken as now, which is the most recent reading the mark can honestly claim,
+// and so is an at in the future: the hold is measured from the mark, so a
+// TriggeredScaleUp stamped ahead of the watcher's clock (skew, or an author
+// who chose the stamp) would otherwise hold the pod's FailedScheduling for the
+// hold plus the lead, and the memo's own expiry, which ages from the same
+// stamp, would keep it for as long again. Safe on a nil receiver and a no-op
+// for an empty namespace or uid, or scaleUpNone.
+func (m *scaleUpMemo) Record(namespace, uid string, verdict scaleUpVerdict, at time.Time) {
+	key := scaleUpMemoKey(namespace, uid)
+	if m == nil || key == "" || verdict == scaleUpNone {
 		return
 	}
 	now := m.clock()
@@ -176,22 +201,24 @@ func (m *scaleUpMemo) Record(uid string, verdict scaleUpVerdict, at time.Time) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, prevAt, ok := m.entries.lookup(uid, now); ok && prevAt.After(at) {
+	if _, prevAt, ok := m.entries.lookup(key, now); ok && prevAt.After(at) {
 		return
 	}
-	m.entries.store(uid, verdict, at, now)
+	m.entries.store(key, verdict, at, now)
 }
 
-// Lookup returns the live mark for uid, or the zero mark when none is held or
-// the held one has aged past ttl. Safe on a nil receiver.
-func (m *scaleUpMemo) Lookup(uid string) scaleUpMark {
-	if m == nil || uid == "" {
+// Lookup returns the live mark for the pod uid in namespace, or the zero mark
+// when none is held or the held one has aged past ttl. A mark recorded under
+// the same UID in another namespace is not this pod's. Safe on a nil receiver.
+func (m *scaleUpMemo) Lookup(namespace, uid string) scaleUpMark {
+	key := scaleUpMemoKey(namespace, uid)
+	if m == nil || key == "" {
 		return scaleUpMark{}
 	}
 	now := m.clock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	verdict, at, ok := m.entries.lookup(uid, now)
+	verdict, at, ok := m.entries.lookup(key, now)
 	if !ok {
 		return scaleUpMark{}
 	}

@@ -1408,7 +1408,7 @@ func TestNewDispatcherScaleUpMemoOutlivesAShortDedupWindow(t *testing.T) {
 	if *injectCount != 0 {
 		t.Errorf("fired %d injects six minutes into a 15m hold with a 5m dedup window; want 0", *injectCount)
 	}
-	if got := disp.scaleUps.Lookup("pod-1"); got.Verdict != scaleUpTriggered {
+	if got := disp.scaleUps.Lookup("default", "pod-1"); got.Verdict != scaleUpTriggered {
 		t.Errorf("mark after six minutes = %v; want triggered", got.Verdict)
 	}
 }
@@ -1471,6 +1471,59 @@ func TestDispatcherReplayedFailedSchedulingSightedBeforeItsDeclineIsNotPassed(t 
 	}
 }
 
+// TestDispatcherScaleUpMarkFromAnotherNamespaceIsNotThePodsVerdict: a mark
+// is filed under the namespace it was written in, so a TriggeredScaleUp or
+// NotTriggerScaleUp created in one namespace against the UID of a pod in
+// another (the API server binds an event's namespace to its involved object's
+// but does not check the UID names a real object) neither holds that pod's
+// fifth attempt nor passes its first. The same mark is the verdict for a pod
+// of that UID in its own namespace, on both recording paths.
+func TestDispatcherScaleUpMarkFromAnotherNamespaceIsNotThePodsVerdict(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	disp, _, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
+	ctx := context.Background()
+
+	// A trigger written in tenant-a against pod-1's UID, through Dispatch.
+	forged := autoscalerEvent("pod-1", "TriggeredScaleUp", now)
+	forged.Namespace = "tenant-a"
+	disp.Dispatch(ctx, forged)
+	if got := disp.scaleUps.Lookup("tenant-a", "pod-1"); got.Verdict != scaleUpTriggered {
+		t.Fatalf("the mark was not recorded in its own namespace: %+v", got)
+	}
+	if got := disp.scaleUps.Lookup("kube-system", "pod-1"); got.Verdict != scaleUpNone {
+		t.Fatalf("a mark written in tenant-a was found by a kube-system pod: %+v", got)
+	}
+	now = now.Add(20 * time.Second)
+	target := failedSchedulingEvent("pod-1", 5, now)
+	target.Namespace = "kube-system"
+	disp.Dispatch(ctx, target)
+	if *injectCount != 1 {
+		t.Fatalf("kube-system FailedScheduling at count 5 after a tenant-a TriggeredScaleUp on its UID: injects = %d; want 1 (not held)", *injectCount)
+	}
+
+	// A decline written in tenant-a against pod-2's UID, through the list
+	// path (RecordScaleUpMark), does not pass kube-system's pod-2 at count 1.
+	declined := autoscalerEvent("pod-2", "NotTriggerScaleUp", now)
+	declined.Namespace = "tenant-a"
+	if !disp.RecordScaleUpMark(declined) {
+		t.Fatal("RecordScaleUpMark did not record the autoscaler's own decline in tenant-a")
+	}
+	other := failedSchedulingEvent("pod-2", 1, now.Add(time.Second))
+	other.Namespace = "kube-system"
+	disp.Dispatch(ctx, other)
+	if *injectCount != 1 {
+		t.Fatalf("kube-system FailedScheduling at count 1 after a tenant-a NotTriggerScaleUp on its UID: injects = %d; want 1 (held on the count)", *injectCount)
+	}
+
+	// In its own namespace the same decline passes the pod at count 1.
+	own := failedSchedulingEvent("pod-2", 1, now.Add(time.Second))
+	own.Namespace = "tenant-a"
+	disp.Dispatch(ctx, own)
+	if *injectCount != 2 {
+		t.Fatalf("tenant-a FailedScheduling after cluster-autoscaler's decline in tenant-a: injects = %d; want 2", *injectCount)
+	}
+}
+
 // TestDispatcherScaleUpMarkFromAnotherReporterRecordsNoVerdict: a
 // TriggeredScaleUp or NotTriggerScaleUp that names a reporter other than
 // cluster-autoscaler is dropped at the filter, logged with its reporter and
@@ -1487,7 +1540,7 @@ func TestDispatcherScaleUpMarkFromAnotherReporterRecordsNoVerdict(t *testing.T) 
 	forged := autoscalerEvent("pod-1", "TriggeredScaleUp", now)
 	forged.Reporter = "my-operator"
 	disp.Dispatch(ctx, forged)
-	if got := disp.scaleUps.Lookup("pod-1"); got.Verdict != scaleUpNone {
+	if got := disp.scaleUps.Lookup("default", "pod-1"); got.Verdict != scaleUpNone {
 		t.Fatalf("a mark from %q was recorded as %+v; want none", forged.Reporter, got)
 	}
 	if !strings.Contains(logs.String(), `ignored TriggeredScaleUp pod=default/api reported by "my-operator", not cluster-autoscaler`) {
