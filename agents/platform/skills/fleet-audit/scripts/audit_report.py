@@ -1490,14 +1490,24 @@ def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
     pod, against the one volume), so two `start`s racing for one stream
     cannot both pass, and a stale or taken-over note is replaced by exactly
     one of them: the other reads the fresh note and is refused.
+
+    The guard fails closed. A lock that cannot be opened or taken, or a note
+    that cannot be written, is a `start` that cannot know whether a run is in
+    flight, and the thing it would do next is scrub that run's state; it
+    exits 2 instead and says why. Nothing else in `start` runs on a volume
+    that refuses these, so failing open would buy no run that failing closed
+    loses, and a `start` refused here wrote nothing, so it has nothing to
+    release.
     """
     path = Path(inflight_path_for(audit_id))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         lock = os.open(f"{path}.lock", os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as exc:
-        log(f"WARNING: could not record the in-flight note at {path}: {exc}")
-        return
+        raise ValidationError(
+            f"could not take the in-flight guard for {audit_id} at {path}.lock ({exc}); "
+            f"refusing to start rather than scrub a run that may be in flight."
+        ) from exc
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         started, pid = _in_flight_since(path)
@@ -1513,7 +1523,10 @@ def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
             encoding="utf-8",
         )
     except OSError as exc:
-        log(f"WARNING: could not record the in-flight note at {path}: {exc}")
+        raise ValidationError(
+            f"could not record the in-flight note for {audit_id} at {path} ({exc}); "
+            f"refusing to start rather than run unguarded against a run in flight."
+        ) from exc
     finally:
         os.close(lock)  # closing the descriptor drops the lock
 
@@ -10492,13 +10505,21 @@ def handle_finish(args: argparse.Namespace) -> None:
         return
     try:
         _finish(args, audit_id)
-    finally:
-        # Every other exit frees the stream, the failed ones included. `finish`
-        # never reads the note, so a retry of `finish` after a `gh` failure or
-        # a rejected document loses nothing by this; what it buys is that the
+    except ValidationError:
+        # The validator rejected the document and nothing was published. Every
+        # SOP's next step is "fix the findings file and re-run `finish`", so
+        # the run is still in flight while the worker edits, and the note has
+        # to hold: a tick landing in that window would otherwise pass `start`
+        # and unlink the very document about to be resubmitted.
+        raise
+    except BaseException:
+        # A `finish` that died on a `gh` call or anything else is over; the
+        # retry loads the document afresh and loses nothing by this, and the
         # SOP's next `start --repo B`, or the requester's own retry, is not
         # refused for two hours by an attempt that already died.
         release_in_flight(audit_id)
+        raise
+    release_in_flight(audit_id)
 
 
 def _finish(args: argparse.Namespace, audit_id: str) -> None:

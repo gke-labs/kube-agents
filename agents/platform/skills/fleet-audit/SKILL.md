@@ -102,9 +102,12 @@ The scheduler holds a per-job lock for the length of a triggered run, so the tic
 stream twice. A stream run here holds no such lock, and the scheduler's ledger
 (`cronjob(action='runs')`) never sees it, so the guard lives in the script: `start` leaves an
 in-flight note for the stream and refuses while one younger than two hours exists, whichever side
-wrote it, and `finish` removes it on every exit but `--dry-run`, the failed ones included, so a
-`finish` that died does not refuse the stream's next repository or your own retry. A run that died
-before `finish` is forgotten after those two hours, so a crash never blocks the stream's next tick.
+wrote it, and `finish` removes it when the run is over, published or died on a `gh` call, so a
+`finish` that died does not refuse the stream's next repository or your own retry. Two exits keep
+it: `--dry-run`, a preview mid-run, and exit 2, a rejected document you are about to fix and
+resubmit, which is still the run in flight. If `start` cannot take the guard at all it exits 2 too,
+rather than run unguarded. A run that died before `finish` is forgotten after those two hours, so
+a crash never blocks the stream's next tick.
 
 **Each run reports on itself. Your own answer is a roll-up, not a copy.** Answer with one line per
 stream: for a stream you queued, that it is queued for the next tick; for the one stream you ran

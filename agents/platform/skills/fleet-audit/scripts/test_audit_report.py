@@ -3954,9 +3954,31 @@ class TestStart(HarnessTestCase):
         self.assertTrue(note.is_file())
         self.assertEqual(self.run_finish(make_doc(), argv_extra=("--dry-run",)), 0, self.err)
         self.assertTrue(note.is_file())
+        # Exit 2 is "fix the document and re-run `finish`" in every SOP: the
+        # run is still in flight while the worker edits, and a tick landing
+        # in that window must not scrub the document about to be resubmitted.
+        self.assertEqual(self.run_finish(make_doc(clusters=[])), 2)
+        self.assertIn("scope.clusters", self.err)
+        self.assertTrue(note.is_file())
         self.harness.failures = {"issue create": 1}
         self.assertEqual(self.run_finish(make_doc()), 1, self.err)
         self.assertFalse(note.is_file())
+
+    def test_a_guard_that_cannot_be_taken_refuses_rather_than_running_unguarded(self):
+        # The guard exists so `start` never scrubs a run in flight. A lock it
+        # cannot open is a `start` that cannot know, so it exits 2 and touches
+        # nothing: not the other run's note, and not its state.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        note.parent.mkdir(parents=True, exist_ok=True)
+        theirs = json.dumps({"audit": AUDIT, "started_at": time.time(), "pid": 1})
+        note.write_text(theirs)
+        Path(f"{note}.lock").mkdir()  # os.open(O_RDWR) on a directory: EISDIR
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("in-flight guard", self.err)
+        self.assertEqual(note.read_text(), theirs)
+        self.assertFalse(Path(audit_report.run_record_path_for(AUDIT)).exists())
 
     def test_a_clean_finish_releases_the_stream_too(self):
         # The zero-finding run is the ordinary nightly outcome; it leaves by
@@ -11995,6 +12017,10 @@ class TestDispatchAndHandover(unittest.TestCase):
         self.assertIn("HERMES_HOME=/opt/data/profiles/platform", bullet)
         self.assertIn("cronjob(action='run')", bullet)
         self.assertIn("exactly one audit stream", bullet)
+        # A stream is one of the nine jobs the script accepts, not any job
+        # with a governance SOP: `eod-event-watcher-daily-report` has one and
+        # is a script job `validate_audit_id` refuses.
+        self.assertIn("whose `skills` list `fleet-audit`", bullet)
         self.assertIn("audit_report.py start", bullet)
         # The overlap guard is the script's in-flight note, not a ledger the
         # in-session run never appears in; the worker is told what the
