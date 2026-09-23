@@ -547,17 +547,21 @@ The callout reads the map through an API informer, not a volume mount: kubelet C
 sync lags up to a minute, and the dispatcher can spawn a Job seconds after a profile
 lands - a race that ends in an Authorization Violation for a legitimate worker. The
 ordering is enforced, not hoped for: the operator sets `BusCredentialsReady` only after
-the callout reports serving, and nothing dispatches before that condition is true.
-Submissions queue on the stream meanwhile; nothing is lost. The callout logs the map
-version it is serving and exposes it at runtime on `/status` and `/readyz`, so "the map
-says X" is checkable against the running system rather than against the rendered object.
+the callout reports serving, and nothing dispatches before that condition is true (the
+shipping gate is narrower than the condition: a first gateway waits for one callout
+replica serving on the current spec, not for every replica - see the 9/17 amendment
+below). Submissions queue on the stream meanwhile; nothing is lost. The callout logs the
+map version it is serving and exposes it at runtime on `/status` and `/readyz`, so "the
+map says X" is checkable against the running system rather than against the rendered
+object.
 
 **What ships today is coarser than that sentence, and the gap is deliberate.** The
 condition is on the `PlatformAgent`, not on an `AgentProfile`, because the profile CRD
 does not exist yet.
 
-**Amended 9/16: the second half of the sentence is enforced now.** "Nothing dispatches
-before that condition is true" used to describe an intention - the operator wrote
+**Amended 9/16: the second half of the sentence is enforced now (as written here; the
+9/17 amendment narrows what the gate reads).** "Nothing dispatches before that condition
+is true" used to describe an intention - the operator wrote
 `BusCredentialsReady` and no code in this repository read it. The dispatcher it was
 waiting for turns out to be one that already ships: the A2A gateway is what spawns
 session pods and relays their work onto the bus. It is not the only thing that
