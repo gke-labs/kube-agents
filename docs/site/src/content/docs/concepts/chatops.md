@@ -99,7 +99,7 @@ Both jobs fire every minute (`* * * * *`, see [Autonomous watchdogs](/kube-agent
 
 ## What's not here
 
-- **No web UI in the install.** Chat is the primary surface. A local [admin console](/kube-agents/reference/admin-console/) runs from a repository checkout on your own machine, loopback only; the install does not deploy it.
+- **No user-facing web UI.** Chat is the primary surface. The one web UI the install can run is the Hermes dashboard, a per-pod debugging view the installer offers as `--enable-hermes-dashboard` (off by default there; the CRD's own default is on) that binds loopback inside the pod, so reaching it means a port-forward or the tunnel script — [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specharness) is canonical. A local [admin console](/kube-agents/reference/admin-console/) runs from a repository checkout on your own machine, loopback only; the install does not deploy it.
 - **No CLI beyond the Hermes CLI inside the pod.** `kubectl exec` into the agent pod and run the Hermes CLI there — note the pod hosts several profiles, so a bare `hermes` command talks to the locked-down Planning Agent; use `hermes -p platform` to reach the Platform Agent (or `hermes -p <cluster-profile>` for a Cluster Agent). `kubectl port-forward` is not a way in on a GKE Sandbox (gVisor) node pool, which is the install default: the forward is established in the host-side netns and cannot see a listener inside the sandbox — [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specharness) is canonical on that. `kubectl exec` has no such problem, because it enters the sandbox.
 - **No email, PagerDuty, or generic webhook ingress.** Chat channels only.
 
