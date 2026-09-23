@@ -56,7 +56,7 @@ Once the [installer](/kube-agents/install/quickstart-gke/) finishes, you have:
 ## What is _not_ included
 
 - **No local Kind path** — there is no `kind` workflow in the repo; the installer and the Terraform composition it drives both target GKE. You need a real GKE cluster. (For versioned Helm/Terraform installs on GKE, see [Helm and Kind](/kube-agents/install/helm-and-kind/).)
-- **No web UI, and no CLI outside the pod** — chat is the primary user interface. The Hermes CLI is reachable with `kubectl exec` into the agent pod; `kubectl port-forward` is not a way in, because the install defaults to a GKE Sandbox (gVisor) node pool whose loopback listeners it cannot reach. [ChatOps](/kube-agents/concepts/chatops/) is canonical.
+- **No web UI in the install, and no CLI outside the pod** — chat is the primary user interface. A local [admin console](/kube-agents/reference/admin-console/) runs from a repository checkout on your own machine, loopback only; the install does not deploy it. The Hermes CLI is reachable with `kubectl exec` into the agent pod; `kubectl port-forward` is not a way in, because the install defaults to a GKE Sandbox (gVisor) node pool whose loopback listeners it cannot reach. [ChatOps](/kube-agents/concepts/chatops/) is canonical.
 - **No cross-cloud abstractions** — the shipping MCP toolset, IAM assumptions, and install path all target GKE. The runtime and persona are cluster-agnostic; the skill catalog is not.
 
 ## Where to go next
