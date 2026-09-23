@@ -38,11 +38,16 @@ const (
 
 	consoleInSubjectWildcard = "chat.console.*.in"
 
+	// bytesPerKiB names the unit consoleTextCap is expressed in, so the
+	// oversize notice's "N KiB" can be derived from the cap rather than
+	// hardcoded and left free to drift from it.
+	bytesPerKiB = 1024
+
 	// consoleTextCap bounds one frame's text. A browser can publish up to
 	// the server's max_payload (1 MiB by default), which is far more ask
 	// than the gateway should forward as a task; the ask echo in the
 	// session record is truncated anyway. 16 KiB is roomy for a chat turn.
-	consoleTextCap = 16 * 1024
+	consoleTextCap = 16 * bytesPerKiB
 )
 
 // consoleTokenRe is one dot-free DNS-1123 label, so the `*` in the
@@ -121,7 +126,10 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 	return a, nil
 }
 
-// Close drains the connection. Run's ctx cancellation also closes it.
+// Close is for an adapter that was never run, or needs closing early: Run
+// closes the connection itself once ctx is cancelled, so a caller that also
+// defers Close (or registers it with t.Cleanup) after cancelling is safe —
+// IsClosed makes this idempotent.
 func (a *ConsoleAdapter) Close() {
 	if a.nc != nil && !a.nc.IsClosed() {
 		a.nc.Close()
@@ -131,7 +139,12 @@ func (a *ConsoleAdapter) Close() {
 // subscribed reports whether Run has bound its subscription (tests).
 func (a *ConsoleAdapter) subscribed() bool { return a.subscribedFlag.Load() }
 
-// Run delivers frames as InboundMessages until ctx is done.
+// closed reports whether the connection has been closed (tests).
+func (a *ConsoleAdapter) closed() bool { return a.nc != nil && a.nc.IsClosed() }
+
+// Run delivers frames as InboundMessages until ctx is done. It owns the
+// connection's lifecycle from here: on ctx cancellation it unsubscribes and
+// closes the connection, so a caller does not leak it by trusting Run alone.
 func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
 	sub, err := a.nc.Subscribe(consoleInSubjectWildcard, func(m *nats.Msg) {
 		msg, notice, ok := a.inbound(m)
@@ -152,6 +165,7 @@ func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) 
 	a.subscribedFlag.Store(true)
 	<-ctx.Done()
 	_ = sub.Unsubscribe()
+	a.Close()
 	return nil
 }
 
@@ -184,7 +198,7 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 	msg := InboundMessage{Conversation: conversation, Kind: "dm", AuthorID: consoleAuthor, MessageID: f.MessageID}
 	if len(text) > consoleTextCap {
 		a.log.Warn("console frame dropped", "reason", "oversize", "conversation", conversation, "messageId", f.MessageID, "bytes", len(text))
-		return msg, fmt.Sprintf("⚠️ that message is %d bytes and the console takes at most 16 KiB per turn; it was not sent", len(text)), false
+		return msg, fmt.Sprintf("⚠️ that message is %d bytes and the console takes at most %d KiB per turn; it was not sent", len(text), consoleTextCap/bytesPerKiB), false
 	}
 	msg.Text = text
 	return msg, "", true

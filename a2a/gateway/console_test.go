@@ -181,6 +181,37 @@ func TestConsolePostAndEditArriveAsOutFrames(t *testing.T) {
 	}
 }
 
+// TestConsoleRunClosesTheConnectionOnCtxCancellation guards Close's doc
+// comment: Run is documented to close the connection itself once ctx is
+// cancelled, so a caller that trusts that and skips an explicit Close does
+// not leak the connection.
+func TestConsoleRunClosesTheConnectionOnCtxCancellation(t *testing.T) {
+	s := startServer(t)
+	a, err := NewConsoleAdapter(s.ClientURL(), nil, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	if err != nil {
+		t.Fatalf("NewConsoleAdapter: %v", err)
+	}
+	t.Cleanup(a.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = a.Run(ctx, func(InboundMessage) {})
+		close(done)
+	}()
+	waitFor(t, "console subscription", func() bool { return a.subscribed() })
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after ctx cancellation")
+	}
+	if !a.closed() {
+		t.Error("Run returned without closing the connection")
+	}
+}
+
 func TestConsoleRosterIsTheOneAuthorAndOpenDirectIsNotOffered(t *testing.T) {
 	r := startConsoleRig(t)
 	ids, complete, err := r.adapter.Roster("console:tab-5")
