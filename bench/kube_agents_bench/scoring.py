@@ -151,10 +151,10 @@ DEFAULT_JUDGED_MARGIN = 0.5
 #: duplication cannot drift silently.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
-#: The trajectory entry name the harness's bus-backed transports give a
-#: task's lifecycle events (``inject_transport.EVENT_ENTRY_STATUS``; the a2a
-#: transport on the bus uses the same name). Neither the gateway nor the bus
-#: reports token usage, so such a record's ``tokens`` are all null and its
+#: The trajectory entry name the harness's inject transport gives a task's
+#: lifecycle events (``inject_transport.EVENT_ENTRY_STATUS``; a transport
+#: that read the bus directly would use the same name). The gateway reports
+#: no token usage, so such a record's ``tokens`` are all null and its
 #: liveness signal is the executor's own events instead: an entry of this
 #: name whose ``args.final`` is true (the task ended), or whose ``args.state``
 #: is ``working`` (the executor spawned the persona; a task the harness
@@ -428,7 +428,7 @@ class RepResult:
 def _a2a_run_evidence(trajectory: list[Any]) -> bool:
     """Whether the trajectory shows an executor ran the task.
 
-    The bus-backed transports record the task's lifecycle events as
+    The inject transport records the task's lifecycle events as
     trajectory entries. A final one means an executor took the task and
     ended it; a ``working`` one means the executor spawned the persona (the
     bridge publishes it only when it does), which is what a graded timeout
@@ -477,7 +477,7 @@ def _liveness_failures(record: RunRecord) -> list[str]:
     # empty_tokens() fills every bucket with None, so a skeleton record reads
     # None here rather than 0. Both are liveness failures; the wording differs
     # so the log says which one happened. The one record that legitimately
-    # carries null buckets is a bus-backed transport's run: the gateway
+    # carries null buckets is an inject transport run: the gateway
     # reports no usage, and its liveness is the executor's status events in
     # the trajectory instead (see _a2a_run_evidence).
     total = record.tokens.get("total")

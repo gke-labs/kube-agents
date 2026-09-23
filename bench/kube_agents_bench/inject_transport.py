@@ -167,9 +167,9 @@ ENTRY_TERMINAL = "terminal"
 # What this one can truthfully record is the conversation itself -- what the
 # agent said -- and the task's lifecycle: every executor state the read route
 # showed (submitted, working) and the terminal, each as an entry named
-# ``a2a.status-update`` with ``args.state`` and ``args.final``, the same name
-# and shape the bus-reading a2a transport gives the task's status-update
-# events. ``scoring.py`` reads a final one as the record's liveness signal in
+# ``a2a.status-update`` with ``args.state`` and ``args.final``, the name and
+# shape of the bus's own status-update events, so a transport that read the
+# bus directly would record the same. ``scoring.py`` reads a final one as the record's liveness signal in
 # place of a token count and duplicates the literal (importing this module
 # would drag the transport into the scorer); ``test_scoring.py`` asserts the
 # two agree, so change it in both files or in neither.

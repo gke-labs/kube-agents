@@ -730,9 +730,11 @@ that treated the three alike is what this value exists to stop.
 5. **While it is armed, a NetworkPolicy fences the gateway pod against every pod on the cluster
    network**: ingress with no rules. It is a second control over the edge the bind already
    closes, kept so that a reader of the rendered objects sees the intent and so that a later
-   change to the bind address does not open the pod network by itself. Its honest edge is the
-   exemption above seen from the other side: a `hostNetwork` pod on the gateway's node reaches
-   the listener the way the port-forward does, and the token is what that pod would still lack.
+   change to the bind address does not open the pod network by itself. Neither it nor the bind
+   governs the port-forward, which the kubelet serves from inside the pod's network namespace;
+   a `hostNetwork` pod on the gateway's node is in the node's namespace, not the pod's, so the
+   loopback bind is not reachable from it either. The token is what any caller that does reach
+   the listener still has to hold.
 
 **What it also settles.** The gateway refuses to start without a backend, which makes it
 crash-loop on any install with neither a Discord token nor a Chat relay - so a `mode: next`

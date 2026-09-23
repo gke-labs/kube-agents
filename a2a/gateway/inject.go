@@ -44,10 +44,10 @@ import (
 // token, the population that can drive the platform persona with the
 // install's cluster and GitHub credentials would be everyone holding
 // pods/portforward in the namespace, rather than the holders of the agent's
-// API key the door stands in for. The fence's honest edge is the same
-// exemption seen from the other side: a hostNetwork pod on the gateway's
-// node reaches the listener the way the port-forward does, and the token is
-// what that pod would still lack.
+// API key the door stands in for. (A hostNetwork pod on the gateway's node
+// is in the node's network namespace, not the pod's, so the loopback bind
+// is not reachable from it either; the token is what any caller that does
+// reach the listener still has to hold.)
 //
 // What the token is not is an identity. It says the caller may use the door;
 // the author in the request body says who they claim to be, and the door's
