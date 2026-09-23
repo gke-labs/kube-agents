@@ -69,6 +69,18 @@ on_error() {
   local exit_code="$1"
   local line_no="$2"
   local bash_cmd="$3"
+  # An inherited firing inside a subshell: `set -E` hands this trap to every
+  # `$(...)`, and a probe whose miss the caller handles (`if !`, `||`) still
+  # fires it there on bash 3.2 (macOS's /bin/bash) before the caller is
+  # consulted. The parent decides: it prints the banner and writes the report
+  # itself when the failure reaches it, and nothing when it is handled. Exit,
+  # not return: command substitution does not inherit errexit, so a returning
+  # handler would let a multi-step probe run on past its failure. Process
+  # substitution (`< <(...)`) keeps the counter at 0 on bash 3.2 and clears
+  # the trap inline instead.
+  if [ "${BASH_SUBSHELL:-0}" -gt 0 ]; then
+    exit "$exit_code"
+  fi
   # The frame that ran the failing command: a sourced library's file and the
   # function it was in, or this script and `main` at top level. $LINENO alone
   # counts from the top of whichever file the command sat in, so a bare line
@@ -466,7 +478,7 @@ verify_local_source_ref() {
     # BAKED_RELEASE_VERSION is stamped during release automation.
     if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ]; then
       local bundle_version=""
-      if bundle_version="$(trap - ERR; matches_release_bundle_ref "$repo_dir" "$expected_ref")"; then
+      if bundle_version="$(matches_release_bundle_ref "$repo_dir" "$expected_ref")"; then
         print_success "Verified upgrade sources match official release bundle ${bundle_version}."
         return 0
       fi
@@ -482,7 +494,7 @@ verify_local_source_ref() {
   fi
 
   local expected_commit current_commit
-  if ! expected_commit="$(trap - ERR; git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
+  if ! expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
     print_error "The requested image/source ref '$expected_ref' is not present in the current checkout. Check out that exact revision first."
     return 1
   fi

@@ -245,13 +245,16 @@ dotenv and `vars.sh` was generated with `printf %q`.
 - **[installer_common.sh](installer_common.sh)**: the `install.env` loader, validators,
   GitHub org checks, and the `terraform.tfvars` generator (table above). Sources the
   defaults from [`install.defaults.env`](../../install.defaults.env) rather than
-  declaring any itself. One convention binds it and every front door: they run `set -E`
-  with an ERR trap that each `$(...)` inherits, and bash 3.2 (macOS's `/bin/bash`) runs
-  that trap inside the subshell even when the caller handles the failure. A probe whose
-  non-zero exit is a tolerated answer (a release, deployment, ref or state object that is
-  not there) therefore runs `trap - ERR` inside its substitution, as `helm_release_status`
-  and `tf_state_read` do; without it the miss prints an abort banner and writes a FAILED
-  report from a run that succeeds.
+  declaring any itself. The front doors run `set -E` with an ERR trap that every `$(...)`
+  inherits, and bash 3.2 (macOS's `/bin/bash`) runs that trap inside the subshell even
+  when the caller handles the failure. Each front door's `on_error` therefore exits a
+  subshell silently and leaves the banner and the report to the parent, which prints
+  them only when the failure reaches it; a probe in a front door needs no guard of its
+  own. This library cannot know its caller's trap, so its tolerated probes (a release,
+  deployment, ref or state object that is not there: `helm_release_status`,
+  `tf_state_read`) run `trap - ERR` inside their substitution as well. Process
+  substitution (`< <(...)`) leaves `BASH_SUBSHELL` at 0 on bash 3.2, so a tolerated read
+  through one clears the trap inline wherever it sits.
 - **[common.sh](common.sh)**: utilities the dev tooling and the Prow CI scripts
   (`hack/ci-deploy.sh`) use — colour output, `init_var`/`load_state`,
   registry and third-party-image resolution, cluster connection helpers. Sources

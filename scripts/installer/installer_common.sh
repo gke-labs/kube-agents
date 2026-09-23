@@ -1093,9 +1093,10 @@ helm_release_status() {
   # bare failing command the outer `if !` cannot shield. On bash 3.2 (macOS's
   # default) the trap fires in the subshell: abort banner, FAILED report,
   # then the caller carries on. A missing release is the ordinary
-  # first-install answer, not an abort. The other tolerated probes in the
-  # front doors and this library do the same; scripts/installer/README.md
-  # states the rule.
+  # first-install answer, not an abort. The front doors' own handlers exit
+  # a subshell silently, so a probe there needs no guard; this library
+  # cannot know its caller's trap, so its tolerated probes guard themselves.
+  # scripts/installer/README.md states the rule.
   if ! status_json="$(trap - ERR; helm status "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
     return 0
   fi

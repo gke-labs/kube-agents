@@ -234,6 +234,32 @@ bash -c "exit 3"
         self.assertIn("Teardown error encountered", proc.stderr)
         self.assertIn("exit code 1", proc.stderr)
 
+    def test_a_child_exiting_3_inside_a_substitution_is_reported_once_as_1(self):
+        # The subshell's handler normalises the code and exits silently; the
+        # parent's then fires at the assignment with 1 and prints the one
+        # banner (#1798). The echo after the failing child proves the subshell
+        # stopped there: command substitution does not inherit errexit.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UNINSTALL_SH}"
+x="$(bash -c "exit 3"; echo "NOT_REACHED_IN_PROBE")"
+echo "NOT_REACHED x=[$x]"
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("NOT_REACHED", proc.stdout)
+        self.assertEqual(proc.stderr.count("Teardown error encountered"), 1, proc.stderr)
+        self.assertIn("exit code 1", proc.stderr)
+        self.assertNotIn("exit code 3", proc.stderr)
+
     def _scratch_repo(self, tmp):
         """A minimal kube-agents tree for whole-script runs.
 

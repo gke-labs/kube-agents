@@ -20,8 +20,6 @@ from tests.testing.common import get_isolated_test_env
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
 _GKE_DNS_ENDPOINT = _REPO_ROOT / "scripts" / "installer" / "gke_dns_endpoint.sh"
-_INSTALL_SH = _REPO_ROOT / "install.sh"
-_UPGRADE_SH = _REPO_ROOT / "upgrade.sh"
 
 # The two ERR-trap tests below are real only on a bash that runs an inherited
 # ERR trap inside a `$(...)` whose failure the caller handles: bash 3.2 does,
@@ -2086,13 +2084,16 @@ if __name__ == "__main__":
 
 
 class ToleratedProbesClearErrTrapTest(unittest.TestCase):
-    """Every tolerated probe clears the inherited ERR trap inside its $(...).
+    """The library's tolerated probes clear the inherited ERR trap inside their $(...).
 
-    The behavioural tests above cannot see the guard missing on the bash CI
-    runs, so this pins the shape: each probe whose non-zero exit the caller
-    handles begins its substitution with `trap - ERR;`. Dropping the prefix
-    at any of them brings back the bash 3.2 abort banner and FAILED report
-    from a successful run (#1798), and this is the test that goes red for it.
+    The front doors' own handlers exit a subshell silently, so a probe there
+    needs no guard; this library cannot know its caller's trap, so its probes
+    guard themselves. The behavioural tests above cannot see the guard missing
+    on the bash CI runs, so this pins the shape: each probe whose non-zero exit
+    the caller handles begins its substitution with `trap - ERR;`. Dropping the
+    prefix at any of them brings back the bash 3.2 abort banner and FAILED
+    report under a caller whose trap is not subshell-aware (#1798), and this is
+    the test that goes red for it.
     """
 
     # (file, guarded substring, how many times it appears). The unguarded form
@@ -2104,13 +2105,6 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
         (_INSTALLER_COMMON, 'history_json="$(trap - ERR; helm history ', 2),
         (_INSTALLER_COMMON, 'last_good_rev="$(trap - ERR; printf ', 1),
         (_GKE_DNS_ENDPOINT, 'described=$(trap - ERR; gcloud container clusters describe ', 1),
-        (_INSTALL_SH, 'bundle_version="$(trap - ERR; matches_release_bundle_ref ', 1),
-        (_INSTALL_SH, 'expected_commit="$(trap - ERR; git -C "$repo_dir" rev-parse --verify ', 2),
-        (_INSTALL_SH, 'head_commit="$(trap - ERR; git -C "$repo_dir" rev-parse --verify HEAD', 1),
-        (_INSTALL_SH, '"$(trap - ERR; git -C "$repo_dir" rev-parse --is-shallow-repository', 1),
-        (_INSTALL_SH, 'status_line="$(trap - ERR; tail -n 1 ', 1),
-        (_UPGRADE_SH, 'bundle_version="$(trap - ERR; matches_release_bundle_ref ', 1),
-        (_UPGRADE_SH, 'expected_commit="$(trap - ERR; git -C "$repo_dir" rev-parse --verify ', 1),
     )
 
     def test_each_tolerated_probe_clears_the_trap_inside_its_substitution(self):
