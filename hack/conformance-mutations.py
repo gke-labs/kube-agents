@@ -686,10 +686,12 @@ Mutation(
     Mutation(
         "C4-hermes-plugin-ref",
         "deploy/docker/Dockerfile",
-        (" --ref b7ece46a5c883a619686b6c698b0316d9fd50962", ""),
+        (' --ref "${HERMES_OTEL_REF}"', ""),
         "test_C4_every_hermes_plugin_install_is_pinned_to_a_commit",
         "drop the ref and install the plugin from whatever the upstream "
-        "default branch holds, which is how the build broke in the first place",
+        "default branch holds, which is how the build broke in the first place; "
+        "the SHA itself lives in an ARG, so the ref token is what a careless "
+        "edit removes",
     ),
     Mutation(
         "C5-minted-write-verb",
