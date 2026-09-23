@@ -1175,9 +1175,12 @@ def list_cluster_profiles() -> str:
     Returns the newline-separated list of active, fully scaffolded Cluster Agent
     Hermes profile names (excluding default and platform profiles).
     """
-    from cluster_agent_profile import list_ready_profiles
-    profiles = list_ready_profiles()
-    return "\n".join(profiles)
+    try:
+        from cluster_agent_profile import list_ready_profiles
+        profiles = list_ready_profiles()
+        return "\n".join(profiles)
+    except Exception as e:
+        return f"ERROR: Failed to list cluster profiles: {e}"
 
 
 @mcp.tool()
@@ -1189,8 +1192,11 @@ def get_cluster_profile_name(project: str, cluster: str, location: str) -> str:
         cluster: GKE cluster name.
         location: GKE cluster location/region/zone.
     """
-    from cluster_agent_profile import profile_name
-    return profile_name(project, cluster, location)
+    try:
+        from cluster_agent_profile import profile_name
+        return profile_name(project, cluster, location)
+    except Exception as e:
+        return f"ERROR: Failed to derive cluster profile name: {e}"
 
 
 def start_session_kv_server() -> None:

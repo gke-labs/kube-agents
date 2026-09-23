@@ -169,8 +169,11 @@ def read_cluster_identity(home: Path) -> dict[str, str] | None:
 
     config_path = home / "config.yaml"
     try:
-        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except (FileNotFoundError, yaml.YAMLError):
+        raw = config_path.read_text(encoding="utf-8")
+        data = yaml.safe_load(raw) or {}
+    except (OSError, yaml.YAMLError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
         return None
     identity = data.get("cluster_identity")
     if not isinstance(identity, dict):
@@ -523,12 +526,15 @@ def list_ready_profiles() -> list[str]:
     for name in list_profiles():
         if not name.startswith(CLUSTER_PROFILE_PREFIX):
             continue
-        home = profile_home(name)
-        if not (home / IDENTITY_FILE).is_file():
+        try:
+            home = profile_home(name)
+            if not (home / IDENTITY_FILE).is_file():
+                continue
+            if read_cluster_identity(home) is None:
+                continue
+            valid.append(name)
+        except Exception:
             continue
-        if read_cluster_identity(home) is None:
-            continue
-        valid.append(name)
     return sorted(valid)
 
 

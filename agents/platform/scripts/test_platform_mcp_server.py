@@ -1368,6 +1368,18 @@ class TestClusterProfileTools(unittest.TestCase):
         mock_pname.assert_called_once_with("myproj", "myclust", "us-central1")
         self.assertEqual(result, "cluster-myproj-myclust-us-central1")
 
+    @patch("cluster_agent_profile.list_ready_profiles")
+    def test_list_cluster_profiles_handles_exception(self, mock_list):
+        mock_list.side_effect = RuntimeError("disk failure")
+        result = platform_mcp_server.list_cluster_profiles()
+        self.assertEqual(result, "ERROR: Failed to list cluster profiles: disk failure")
+
+    @patch("cluster_agent_profile.profile_name")
+    def test_get_cluster_profile_name_handles_exception(self, mock_pname):
+        mock_pname.side_effect = RuntimeError("lookup failure")
+        result = platform_mcp_server.get_cluster_profile_name("myproj", "myclust", "us-central1")
+        self.assertEqual(result, "ERROR: Failed to derive cluster profile name: lookup failure")
+
 
 if __name__ == '__main__':
     unittest.main()

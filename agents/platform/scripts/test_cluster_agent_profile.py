@@ -648,6 +648,67 @@ class ListReadyProfilesTest(unittest.TestCase):
         with mock.patch.object(cap, "kubeconfig_landed", side_effect=AssertionError("kubeconfig_landed should not be called")):
             self.assertEqual(cap.list_ready_profiles(), ["cluster-ready"])
 
+    def test_ready_profiles_skips_malformed_config_yaml_and_non_dict_payloads(self):
+        self._scaffold("cluster-ready")
+
+        # 1. config.yaml parses to a scalar or list
+        p_scalar = self._scaffold("cluster-scalar", user_md=True, identity=False)
+        (p_scalar / "config.yaml").write_text("just a string\n", encoding="utf-8")
+
+        p_list = self._scaffold("cluster-list", user_md=True, identity=False)
+        (p_list / "config.yaml").write_text("- item1\n- item2\n", encoding="utf-8")
+
+        # 2. config.yaml with non-dict cluster_identity
+        p_non_dict_ident = self._scaffold("cluster-bad-ident", user_md=True, identity=False)
+        (p_non_dict_ident / "config.yaml").write_text("cluster_identity: not-a-dict\n", encoding="utf-8")
+
+        # 3. Corrupt syntax in config.yaml
+        p_corrupt = self._scaffold("cluster-corrupt", user_md=True, identity=False)
+        (p_corrupt / "config.yaml").write_text("cluster_identity: [invalid yaml: {{\n", encoding="utf-8")
+
+        # 4. config.yaml that is a directory instead of a file
+        p_dir = self.tmp / "cluster-config-is-dir"
+        p_dir.mkdir()
+        (p_dir / "USER.md").write_text("valid\n", encoding="utf-8")
+        (p_dir / "config.yaml").mkdir()
+
+        # Should skip all malformed configs without crashing and still return the valid cluster
+        self.assertEqual(cap.list_ready_profiles(), ["cluster-ready"])
+
+    def test_read_cluster_identity_robustness(self):
+        # 1. Nonexistent directory
+        self.assertIsNone(cap.read_cluster_identity(self.tmp / "nonexistent"))
+
+        # 2. Scalar and list YAML
+        p1 = self.tmp / "p1"
+        p1.mkdir()
+        (p1 / "config.yaml").write_text("scalar_value\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        (p1 / "config.yaml").write_text("[item1, item2]\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        # 3. Non-dict cluster_identity
+        (p1 / "config.yaml").write_text("cluster_identity: 12345\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        # 4. Incomplete fields
+        (p1 / "config.yaml").write_text("cluster_identity:\n  project: p\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        # 5. Invalid YAML syntax
+        (p1 / "config.yaml").write_text("{{invalid-yaml\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        # 6. Valid cluster_identity
+        (p1 / "config.yaml").write_text(
+            "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n", encoding="utf-8"
+        )
+        self.assertEqual(
+            cap.read_cluster_identity(p1),
+            {"project": "p", "cluster": "c", "location": "l"},
+        )
+
 
 
 class SandboxStubTest(unittest.TestCase):
