@@ -124,10 +124,12 @@ else:
 '''
 
 
-def _pod(*, restarts: int, last_reason: str | None, phase: str = "Running") -> dict:
+def _pod(*, restarts: int, last_reason: str | None, phase: str = "Running", waiting_reason: str | None = None) -> dict:
     status = {"restartCount": restarts, "lastState": {}}
     if last_reason:
         status["lastState"] = {"terminated": {"reason": last_reason, "exitCode": 137}}
+    if waiting_reason:
+        status["state"] = {"waiting": {"reason": waiting_reason}}
     return {"status": {"phase": phase, "containerStatuses": [status]}}
 
 
@@ -193,6 +195,9 @@ def _healthy_world() -> dict:
                     ]
                 }
             },
+            "pod?app=inventory-api": _pods(
+                _pod(restarts=0, last_reason=None, phase="Pending", waiting_reason="CreateContainerConfigError")
+            ),
         },
         "describe": {
             "seeded-b": _cluster_b(),
@@ -638,6 +643,20 @@ class PassTest(_Harness):
         assert set(files) == {"stalled-controller"}
         body = files["stalled-controller"]
         assert "status.availableReplicas absent: observed 1" in body
+
+    def test_stalled_controller_fixture_detects_drift_when_pod_waiting_reason_mismatches(self):
+        world = _healthy_world()
+        world["kubectl"]["pod?app=inventory-api"] = _pods(
+            _pod(restarts=0, last_reason=None, phase="Pending", waiting_reason="ImagePullBackOff")
+        )
+        done = self.run_script(world)
+        assert done.returncode == 0, done.stderr
+        assert "1 drifted" in done.stderr
+        files = self.drift_files()
+        assert set(files) == {"stalled-controller"}
+        body = files["stalled-controller"]
+        assert "CreateContainerConfigError" in body
+        assert "ImagePullBackOff" in body
 
 
 

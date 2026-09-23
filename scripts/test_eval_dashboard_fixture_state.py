@@ -179,10 +179,12 @@ print(json.dumps(answers[key]))
 '''
 
 
-def _pod(*, restarts, last_reason, phase="Running"):
+def _pod(*, restarts, last_reason, phase="Running", waiting_reason=None):
     status = {"restartCount": restarts, "lastState": {}}
     if last_reason:
         status["lastState"] = {"terminated": {"reason": last_reason, "exitCode": 137}}
+    if waiting_reason:
+        status["state"] = {"waiting": {"reason": waiting_reason}}
     return {"status": {"phase": phase, "containerStatuses": [status]}}
 
 
@@ -232,6 +234,9 @@ def healthy_world(*projects):
                     ]
                 }
             },
+            "pod?app=inventory-api": _pods(
+                _pod(restarts=0, last_reason=None, phase="Pending", waiting_reason="CreateContainerConfigError")
+            ),
         },
         "describe": {project: {"seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1"}} for project in projects},
         "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},

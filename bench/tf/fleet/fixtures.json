@@ -123,6 +123,13 @@
           "op": "any_eq",
           "value": "ProgressDeadlineExceeded",
           "why": "the Deployment controller sets ProgressDeadlineExceeded when a rollout sits unable to make progress past its deadline"
+        },
+        {
+          "subject": "pod?app=inventory-api",
+          "path": "status.containerStatuses[*].state.waiting.reason",
+          "op": "any_eq",
+          "value": "CreateContainerConfigError",
+          "why": "the container cannot start because the ConfigMap does not exist; an image pull failure or capacity stall is a different defect from the one the stall-watch cron and cases diagnose"
         }
       ]
     },
