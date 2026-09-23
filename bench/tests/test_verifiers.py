@@ -1875,6 +1875,30 @@ def test_a_head_commit_the_api_will_not_date_does_not_fail_the_run(token, github
     assert _pr_check().verify(5.0).status == "pass"
 
 
+@pytest.mark.parametrize(
+    "status, body, names",
+    [
+        (401, {"message": "Bad credentials"}, "is not valid"),
+        (403, {"message": "Resource not accessible by integration"}, "`pull_requests: read`"),
+        (502, {"message": "Bad Gateway"}, "unexpected GitHub response 502"),
+        (200, {"message": "not a list"}, "unexpected GitHub response 200"),
+    ],
+)
+def test_a_commits_page_github_would_not_serve_is_an_error_not_a_pass(token, github, status, body, names):
+    """The same rule as one read earlier on `/pulls/{n}`: a page the credential
+    or GitHub would not serve is the absence of an observation, an error. Read
+    as `None` it passed the stamps alone, which is the hole the head-commit
+    check exists to close -- a leftover the run only commented on has a fresh
+    `updated_at` and an old head."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (status, body)
+    res = _pr_check().verify(5.0)
+    assert res.status == "error" and not res.success, res.reason
+    assert names in res.reason and "commits page" in res.reason, res.reason
+
+
 def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):
     """A repository the credential cannot see answers 404 exactly as a missing
     number does, and nothing in the API separates them. Graded as absence: the

@@ -1061,9 +1061,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
         listing, whose last page holds it. ``/commits/{sha}`` would be one call
         and wants ``contents: read``, which grading does not carry.
 
-        A date this cannot establish comes back ``None`` and the caller does
-        not reject on it: an observation the API would not give is not
-        evidence that a run pushed nothing.
+        A page GitHub has not got (404, or one the head is not on) dates
+        nothing, comes back ``None``, and the caller does not reject on it: an
+        observation the API would not give is not evidence that a run pushed
+        nothing. A page it would not serve -- 401, 403, a 5xx -- is the
+        credential's or GitHub's fault, and is an unevaluable reason exactly
+        as on ``/pulls/{n}``; folding it into ``None`` would pass a leftover
+        the run only wrote to.
         """
         base = f"https://api.github.com/repos/{owner}/{repo}"
         payload = resolved
@@ -1109,8 +1113,33 @@ class PullRequestOpenedVerifier(BaseVerifier):
             token,
             budget,
         )
-        if status != 200 or not isinstance(commits, list):
+        if status == 404:
             return changed, None, None
+        if status == 401:
+            return (
+                None,
+                None,
+                f"GitHub answered 401 for {owner}/{repo}#{number} on the commits "
+                f"page: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                "an installation token expires an hour after it is minted — so "
+                "this check could not be evaluated",
+            )
+        if status == 403:
+            return (
+                None,
+                None,
+                f"GitHub denied {owner}/{repo}#{number} on the commits page; "
+                f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                "`pull_requests: read` to grade what a run pushed, so this "
+                "check could not be evaluated",
+            )
+        if status != 200 or not isinstance(commits, list):
+            return (
+                None,
+                None,
+                f"unexpected GitHub response {status} for {owner}/{repo}#{number} "
+                "on the commits page; this check could not be evaluated",
+            )
         for entry in reversed(commits):
             if not isinstance(entry, dict) or entry.get("sha") != head_sha:
                 continue
