@@ -212,14 +212,6 @@ _FAKE_URLOPEN = textwrap.dedent(
     import urllib.request
 
 
-    class _Response(io.BytesIO):
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-
     def _fake_urlopen(request, timeout=None):
         record = {
             "url": request.full_url,
@@ -230,7 +222,8 @@ _FAKE_URLOPEN = textwrap.dedent(
         }
         with open(os.environ["MINT_CAPTURE_FILE"], "w", encoding="utf-8") as fh:
             json.dump(record, fh)
-        return _Response(
+        # A BytesIO is already the context manager `with urlopen(...)` wants.
+        return io.BytesIO(
             json.dumps({"token": "ghs_minted", "expires_at": "2026-09-23T16:00:00Z"}).encode()
         )
 
@@ -257,10 +250,13 @@ class LedgerMintRequestTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = pathlib.Path(tmp.name)
         self.key = self.tmp / "throwaway.pem"
-        gen = subprocess.run(
-            ["openssl", "genrsa", "-out", str(self.key), "2048"], capture_output=True, text=True
-        )
-        if gen.returncode != 0:  # pragma: no cover - a machine without openssl
+        try:
+            gen = subprocess.run(
+                ["openssl", "genrsa", "-out", str(self.key), "2048"], capture_output=True, text=True
+            )
+        except FileNotFoundError:  # pragma: no cover - a machine without openssl
+            self.skipTest("openssl is not on PATH, and the mint signs its JWT with it")
+        if gen.returncode != 0:  # pragma: no cover - an openssl that cannot generate a key
             self.skipTest(f"openssl could not generate a throwaway key: {gen.stderr}")
         (self.tmp / "sitecustomize.py").write_text(_FAKE_URLOPEN, encoding="utf-8")
         self.capture = self.tmp / "request.json"

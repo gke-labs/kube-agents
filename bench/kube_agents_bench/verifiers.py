@@ -930,15 +930,23 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 reset = self._closed_by_the_reset(ledger["api_url"], closed_at, token, budget)
                 raw["reset_by_harness"] = reset
                 if reset:
+                    # The per-unit reset runs before the harness's clock starts,
+                    # so "before" is the expected reading; a reset close after
+                    # it would be another lane's, and is said as what it is.
+                    when = (
+                        f"before this run started ({started.isoformat()})"
+                        if closed_at <= started
+                        else f"{(closed_at - started).total_seconds():.0f}s after this run "
+                        f"started ({started.isoformat()})"
+                    )
                     return done(
                         False,
                         f"{ledger['slug']} was closed as {state_reason} at "
                         f"{closed_at.isoformat()} by the eval harness's ledger reset, "
-                        f"before this run started ({started.isoformat()}): the report "
-                        "cites the ledger the reset retired so this repetition would "
-                        "open a fresh one, and its body still carries the previous "
-                        f"run's stamp ({generated_at.isoformat()}), so this run "
-                        "published nothing to it -- a stale pointer to the harness's "
+                        f"{when}: the report cites the ledger the reset retired so a "
+                        "repetition would open a fresh one, and its body still carries "
+                        f"the previous run's stamp ({generated_at.isoformat()}), so this "
+                        "run published nothing to it -- a stale pointer to the harness's "
                         "close, not a false clean",
                         raw=raw,
                     )

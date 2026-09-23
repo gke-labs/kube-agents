@@ -1110,21 +1110,32 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
   local file="$1"
   case "${file}" in /*) ;; *) file="${BENCH_DIR}/${file}" ;; esac
   [ -f "${file}" ] || return 0
-  # Armed by the `type: ledger_issue_contains` line and reads the `audit:`
-  # key after it, so an `audit:` word in the prompt or a note ahead of the
-  # check cannot retarget the reset at a label that does not exist; a quoted
-  # value is read without its quotes, a comment after it is dropped. awk
-  # with `exit`, not `sed | head`: under pipefail a `head` that closes the
-  # pipe after the first of several matches can hand sed a SIGPIPE, and the
-  # caller assigns this inside `set -e`.
-  awk '
-    /^[[:space:]]*(- )?type:[[:space:]]*ledger_issue_contains[[:space:]]*(#.*)?$/ { armed = 1; next }
-    armed && match($0, /^[[:space:]]*audit:[[:space:]]*/) {
-      id = substr($0, RLENGTH + 1)
-      sub(/^[^A-Za-z0-9_.-]+/, "", id)
-      sub(/[^A-Za-z0-9_.-].*$/, "", id)
-      print id
-      exit
+  # Reads the `audit:` key beside the `type: ledger_issue_contains` line --
+  # the line after it, or the one just before -- so an `audit:` word in the
+  # prompt or a note elsewhere cannot retarget the reset at a label that does
+  # not exist; a quoted value is read without its quotes, a comment after it
+  # is dropped. A check laid out any other way is a loud skip, not a silent
+  # one. awk with `exit`, not `sed | head`: under pipefail a `head` that
+  # closes the pipe after the first of several matches can hand sed a
+  # SIGPIPE, and the caller assigns this inside `set -e`.
+  awk -v file="${file}" '
+    function value(line) {
+      sub(/^[[:space:]]*audit:[[:space:]]*/, "", line)
+      sub(/^[^A-Za-z0-9_.-]+/, "", line)
+      sub(/[^A-Za-z0-9_.-].*$/, "", line)
+      return line
+    }
+    /^[[:space:]]*(- )?type:[[:space:]]*ledger_issue_contains[[:space:]]*(#.*)?$/ {
+      if (prev != "") { print prev; found = 1; exit }
+      armed = 1; next
+    }
+    /^[[:space:]]*audit:[[:space:]]*/ {
+      if (armed) { print value($0); found = 1; exit }
+      prev = value($0); next
+    }
+    { prev = "" }
+    END {
+      if (armed && !found) print "WARNING: " file " has a ledger_issue_contains check but no audit: key beside its type: line; its ledger reset is skipped" > "/dev/stderr"
     }
   ' "${file}"
 }

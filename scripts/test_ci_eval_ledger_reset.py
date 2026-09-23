@@ -166,14 +166,17 @@ class ApiTest(unittest.TestCase):
 
 class LedgerSelectionTest(unittest.TestCase):
     def test_a_ledger_is_label_plus_title_plus_bot(self):
-        self.assertTrue(helper.is_ledger(issue(1), None))
-        self.assertTrue(helper.is_ledger(issue(1), "compliance-audit"))
-        self.assertFalse(helper.is_ledger(issue(1, title="fix(payments-api): resolve crashloop"), None))
-        self.assertFalse(helper.is_ledger(issue(1, author="jayantid"), None))
-        self.assertFalse(helper.is_ledger(issue(1, labels=["severity:major"]), None))
-        self.assertFalse(helper.is_ledger(issue(1, labels=["agent:audit"]), None), "no stream label")
-        self.assertFalse(helper.is_ledger(issue(1, pull=True), None))
-        self.assertFalse(helper.is_ledger(issue(1, audit_id="obtainability-audit"), "compliance-audit"))
+        def is_ledger(record, audit_id):
+            return helper.not_a_ledger_because(record, audit_id) is None
+
+        self.assertTrue(is_ledger(issue(1), None))
+        self.assertTrue(is_ledger(issue(1), "compliance-audit"))
+        self.assertFalse(is_ledger(issue(1, title="fix(payments-api): resolve crashloop"), None))
+        self.assertFalse(is_ledger(issue(1, author="jayantid"), None))
+        self.assertFalse(is_ledger(issue(1, labels=["severity:major"]), None))
+        self.assertFalse(is_ledger(issue(1, labels=["agent:audit"]), None), "no stream label")
+        self.assertFalse(is_ledger(issue(1, pull=True), None))
+        self.assertFalse(is_ledger(issue(1, audit_id="obtainability-audit"), "compliance-audit"))
 
     def test_a_labelled_issue_that_is_not_a_ledger_is_named_when_left_open(self):
         # The bot's re-read of #1881: "closed 0" said nothing about a labelled
@@ -484,6 +487,7 @@ class AuditIdTest(unittest.TestCase):
             "list item": ("- type: ledger_issue_contains\n  audit: fleet-consistency-drift\n", "fleet-consistency-drift"),
             "type with comment": ("check:\n  type: ledger_issue_contains  # the ledger\n  audit: ai-security-audit\n", "ai-security-audit"),
             "commented check": ("# report_contains, not ledger_issue_contains: a chat probe\n      audit: not-a-stream\n", ""),
+            "audit before type": ("check:\n  audit: compliance-audit\n  type: ledger_issue_contains\n", "compliance-audit"),
             "other check type": ("check:\n  type: report_contains\n  audit: not-a-stream\n", ""),
             "no check": ("prompt: audit: something\n", ""),
         }
@@ -496,6 +500,20 @@ class AuditIdTest(unittest.TestCase):
                 with self.subTest(shape=name):
                     self.assertEqual(result.stdout.strip(), want)
                     self.assertEqual(result.stderr, "")
+
+    def test_a_ledger_check_whose_audit_key_is_not_found_says_so(self):
+        # The awk reads `audit:` beside `type: ledger_issue_contains`; a
+        # check laid out any other way used to yield nothing and the unit
+        # skipped its reset without a word. Now the skip is loud.
+        with tempfile.TemporaryDirectory() as tmp:
+            yaml = pathlib.Path(tmp) / "task.yaml"
+            yaml.write_text("check:\n  type: ledger_issue_contains\n  scope: finding_ids\n  required_phrases: [x]\n")
+            body = "\n".join(['BENCH_DIR="/nonexistent"', lifted("ledger_audit_id_for_task"), f'ledger_audit_id_for_task "{yaml}"'])
+            result = run_bash(body)
+        self.assertEqual(result.stdout.strip(), "")
+        self.assertIn("WARNING:", result.stderr)
+        self.assertIn("ledger_issue_contains check but no audit: key beside its type:", result.stderr)
+        self.assertIn(str(yaml), result.stderr)
 
     def test_an_absolute_path_is_read_as_given(self):
         with tempfile.TemporaryDirectory() as tmp:

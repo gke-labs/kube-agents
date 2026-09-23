@@ -1171,6 +1171,22 @@ def test_a_ledger_the_lease_time_reset_closed_long_before_the_run_is_still_the_r
     assert "previous run's ledger, so this run published nothing" not in res.reason
 
 
+def test_a_reset_close_after_the_run_started_is_said_to_be_after_it(token, github):
+    # Not the per-unit reset's shape (that runs before the clock starts), so
+    # the reason must not claim "before" on the strength of the marker alone.
+    _stash_report()
+    github.routes[_api()] = (200, _ledger_closed_at("2026-08-21T09:00:30Z"))
+    github.routes[_api() + "/comments?per_page=100&since=2026-08-21T08:00:30Z"] = (
+        200,
+        [_reset_comment("2026-08-21T09:00:28Z")],
+    )
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail"
+    assert "by the eval harness's ledger reset, 30s after this run started" in res.reason
+    assert "before this run started" not in res.reason
+    assert res.raw["reset_by_harness"] is True
+
+
 def test_a_marker_left_by_a_reset_whose_close_failed_does_not_name_a_later_false_clean(token, github):
     """The reset comments first and closes second. When the close fails the
     marker stays on an OPEN ledger; a worker that then closes it as clean did

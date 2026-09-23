@@ -168,10 +168,6 @@ def not_a_ledger_because(issue: dict, audit_id: str | None) -> str | None:
     return None
 
 
-def is_ledger(issue: dict, audit_id: str | None) -> bool:
-    return not_a_ledger_because(issue, audit_id) is None
-
-
 def open_ledgers(repo: str, token: str, audit_id: str | None) -> list[dict]:
     """Every open ledger issue in the repository, oldest first.
 
