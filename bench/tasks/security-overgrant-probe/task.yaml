@@ -1,15 +1,17 @@
 # ACTIVE — an entry in hack/eval/presubmit-cases.txt, and what takes
 # `security` off the coverage allowlist in docs/designs/domains.yaml.
 #
-# A PROBE, not the audit. The full compliance-audit sweep stays ACTIVE as the
-# fleet-audits machinery canary (compliance-rbac-overgrant, 606s measured
-# clean on 2026-08-26) — it grades the same planted over-grant through the
-# ledger, so this probe is not the only eye on the fixture. What the probe
+# A PROBE, not the audit. The full compliance-audit sweep runs in the nightly
+# as the fleet-audits machinery canary (compliance-rbac-overgrant, 606s
+# measured clean on 2026-08-26; a presubmit case until 2026-09-22, when the
+# presubmit became the blocking roster only) — it grades the same planted
+# over-grant through the ledger, so this probe is not the only eye on the
+# fixture. What the probe
 # adds is presubmit coverage of the SECURITY domain at probe cost: a targeted
 # question about the planted defect, answered from observed evidence and
 # graded on the reply, in the shape cluster-agent-crashloop-debug proved at
-# 142s. Full audit SOP fidelity lives in the canary and in the future nightly
-# tier. Expected cost bracket: ~150-350s.
+# 142s. Full audit SOP fidelity lives in the nightly tier, the canary
+# included. Expected cost bracket: ~150-350s.
 #
 # Planted defect required: a cluster-scoped ClusterRoleBinding named
 # "debug-binding" on the seeded fleet, granting cluster-admin to the default
