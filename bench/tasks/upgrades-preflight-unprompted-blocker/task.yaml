@@ -130,6 +130,15 @@ verification_spec:
         - "drain would stall"
         - "drain will stall"
         - "drain cannot finish"
+        # The form the agent used unprompted on the first live run, with the
+        # budget named in the same line: "PDB Block: <ns>/<budget> ... blocking
+        # node drains". Bound to the budget by construction, so it belongs.
+        - "pdb block"
+        - "blocking node drains"
+        - "blocking node drain"
+        - "blocks node drains"
+        - "blocks node drain"
+        - "blocking the node drain"
 
   # The misattribution the sibling case REQUIRES and this one forbids: the
   # exclusion holds back the automatic upgrade; a manual upgrade is not subject
