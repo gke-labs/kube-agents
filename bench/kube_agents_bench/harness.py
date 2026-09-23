@@ -51,6 +51,11 @@ Environment:
         against the agent's kanban store; a status turn through the model is
         made only when a read shows a card settled, or when the board cannot
         be read at all.
+    ARTIFACTS: Set by Prow to the directory it uploads. When set, each unit's
+        port-forward stderr goes to ``<ARTIFACTS>/port-forward/`` and a card
+        that ran to the delegation ceiling leaves its worker transcript under
+        ``<ARTIFACTS>/worker-logs/``; unset, the stderr goes to a temp directory
+        and no transcript is kept.
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 """
 
@@ -72,6 +77,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +137,14 @@ _WORKER_COMMAND_RE = re.compile(
     r"💻 \$\s+(?P<command>.+?)(?:\s+\d+(?:\.\d+)?s(?: \[exit \d+\])?)?\s*$"
 )
 _MAX_WORKER_LOG_BYTES = 512_000
+# Where a stalled card's transcript is kept. Prow sets ARTIFACTS to the
+# directory it uploads; a local run leaves it unset and nothing is written.
+_ARTIFACTS_ENV = "ARTIFACTS"
+_WORKER_LOG_SUBDIR = "worker-logs"
+_PF_LOG_SUBDIR = "port-forward"
+# Written at the top of each spawn's stderr in the (appended) port log.
+_PF_SPAWN_MARKER = "--- port-forward spawned"
+_PF_SPAWN_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 # Bound on artifact text folded into one answer. The judge grades the output as
 # prose, so a worker that writes a large file would otherwise bury the reply.
@@ -149,6 +164,10 @@ _PF_LOCK = threading.Lock()  # guards the three registries below
 _PF_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 _PF_PORT_LOCKS: dict[int, threading.Lock] = {}
 _PF_LOG_DIR: Path | None = None
+# True while _PF_LOG_DIR is this process's own temp directory, and therefore
+# ours to delete. Under ARTIFACTS it is Prow's, and deleting it at exit would
+# take the logs with it -- the whole point of putting them there.
+_PF_LOG_DIR_IS_TEMP = True
 
 
 def _port_establishment_lock(port: int) -> threading.Lock:
@@ -157,16 +176,46 @@ def _port_establishment_lock(port: int) -> threading.Lock:
 
 
 def _pf_log_dir() -> Path:
-    global _PF_LOG_DIR
+    """Where each port's kubectl stderr is written.
+
+    Under Prow this is a subdirectory of ARTIFACTS, so a tunnel that dies
+    mid-run leaves a record: every unit gets its own port and so its own log,
+    and none of them survived the temp directory before (#1764). A local run,
+    or an ARTIFACTS that will not take a directory, falls back to the temp
+    directory this has always used.
+    """
+    global _PF_LOG_DIR, _PF_LOG_DIR_IS_TEMP
     with _PF_LOCK:
         if _PF_LOG_DIR is None:
-            _PF_LOG_DIR = Path(tempfile.mkdtemp(prefix="kubeagents-pf-"))
+            artifacts = os.environ.get(_ARTIFACTS_ENV)
+            if artifacts:
+                target = Path(artifacts) / _PF_LOG_SUBDIR
+                try:
+                    target.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    _log.warning("could not use %s for port-forward logs: %s", target, exc)
+                else:
+                    _PF_LOG_DIR = target
+                    _PF_LOG_DIR_IS_TEMP = False
+            if _PF_LOG_DIR is None:
+                _PF_LOG_DIR = Path(tempfile.mkdtemp(prefix="kubeagents-pf-"))
+                _PF_LOG_DIR_IS_TEMP = True
         return _PF_LOG_DIR
 
 
+def _pf_log_path(port: int) -> Path:
+    """One log per port. Each eval unit owns its own tunnel on its own port
+    (``AGENT_LOCAL_PORT``), so this keeps the units' stderr apart."""
+    return _pf_log_dir() / f"pf-{port}.log"
+
+
 def _tail(path: Path, max_bytes: int = 2048) -> str:
-    """Last ``max_bytes`` of ``path``, embedded in errors rather than linked --
-    the log directory is deleted at process exit."""
+    """Last ``max_bytes`` of ``path``, embedded in the error rather than linked.
+
+    The file outlives the run under ARTIFACTS but not in a temp directory, and
+    an error message a reader can act on without a second lookup is worth the
+    duplication either way.
+    """
     try:
         data = path.read_bytes()[-max_bytes:]
         return data.decode("utf-8", errors="replace").strip() or "(no output)"
@@ -204,9 +253,12 @@ def _cleanup_port_forwards() -> None:
             if proc.poll() is None:
                 _log.info("terminating agent port-forward on port %d", port)
             _stop_process(proc)
-        if _PF_LOG_DIR is not None:
+        # Only ours to delete. Under ARTIFACTS the directory is Prow's upload
+        # staging area, and removing it here would drop the logs seconds before
+        # they are collected.
+        if _PF_LOG_DIR is not None and _PF_LOG_DIR_IS_TEMP:
             shutil.rmtree(_PF_LOG_DIR, ignore_errors=True)
-            _PF_LOG_DIR = None
+        _PF_LOG_DIR = None
 
 
 def _kubectl_target() -> list[str]:
@@ -278,7 +330,11 @@ def _agent_shell(script: str, timeout: float) -> str:
         script,
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        # errors="replace": a transcript cut mid-glyph by ``head -c`` must not
+        # raise out of the read and skip the purge that follows it.
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, errors="replace", timeout=timeout, check=False
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         _log.debug("kubectl exec failed: %s", exc)
         return ""
@@ -309,9 +365,15 @@ def _ensure_port_forward(local_port: int) -> None:
 
         cmd = _port_forward_command(local_port)
         _log.info("port %d closed; establishing port-forward: %s", local_port, " ".join(cmd))
-        stderr_log = _pf_log_dir() / f"pf-{local_port}.log"
+        stderr_log = _pf_log_path(local_port)
         try:
-            with open(stderr_log, "wb") as log_file:
+            # Append, with a marker per spawn: a respawn after a dead tunnel
+            # must not erase the stderr that says why the last one died.
+            with open(stderr_log, "ab") as log_file:
+                log_file.write(
+                    f"{_PF_SPAWN_MARKER} {time.strftime(_PF_SPAWN_TIME_FORMAT, time.gmtime())}\n".encode()
+                )
+                log_file.flush()
                 proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
         except OSError as exc:
             # A missing kubectl reaches _execute as a known error, not a crash.
@@ -572,19 +634,54 @@ def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) 
 
 _LOG_PRESENT = "__WORKER_LOG__"
 _LOG_ABSENT = "__NO_WORKER_LOG__"
+# Index state for a card whose transcript could not be read at all (the exec
+# failed): the file may exist, and its worker may have run.
+_LOG_UNREAD = "__WORKER_LOG_UNREAD__"
+# ``stat -c`` is GNU and busybox; both ship it, and a pod whose image has
+# neither still yields the sentinel, so the body is read either way.
+_STAT_FORMAT = "%Y %s"
+# Printed for mtime and size when ``stat`` itself failed. Distinct from the
+# absent sentinel: the file is there, its metadata is not.
+_STAT_UNKNOWN = "-"
+# One row per stalled card, appended: every repetition in a build shares one
+# ARTIFACTS directory, so a file written whole would keep only the last stall.
+# The header is written once, by whichever repetition creates the file.
+_WORKER_LOG_INDEX = "index.txt"
+_WORKER_LOG_INDEX_HEADER = "card\tmtime_epoch\tsize_bytes\tstate"
 
 
-def _worker_commands(task_ids: list[str], timeout: float) -> list[dict[str, str]] | None:
-    """Every terminal command the delegated workers ran, from their card logs.
+@dataclass(frozen=True)
+class _WorkerLog:
+    """One card's worker transcript and the metadata of the file it came from.
+
+    ``mtime`` and ``size`` are read in the same ``kubectl exec`` as the body,
+    before :func:`_purge_card_state` deletes the file, because they answer a
+    question the body cannot: an mtime frozen near claim time says the worker
+    died or wedged as it started, and one still advancing at the ceiling says
+    it was alive and the wait is elsewhere. Both are the raw strings ``stat``
+    printed -- epoch seconds and bytes -- or ``_STAT_UNKNOWN``.
+    """
+
+    body: str
+    mtime: str
+    size: str
+
+
+def _worker_logs(task_ids: list[str], timeout: float) -> dict[str, _WorkerLog] | None:
+    """Each delegated card's worker transcript, keyed by card id.
 
     The worker is a separate hermes session; its tool calls reach
     ``result.trajectory`` only through the session-store read in
     :mod:`kube_agents_bench.worker_trajectory`, tagged so that
     ``ToolCalledVerifier`` skips them, and its log records each terminal
-    command it executed. Read here, before ``_purge_card_state``
-    deletes the log, and stashed for the ``worker_commands`` verifier -- the
-    one check that can say which route a worker took, not only what it
-    answered. Only terminal commands are visible; MCP tool calls are not.
+    command it executed. Only terminal commands are visible; MCP tool calls
+    are not.
+
+    Read here, before ``_purge_card_state`` deletes the logs, and consumed
+    twice: by :func:`_worker_commands` for the ``worker_commands`` verifier --
+    the one check that can say which route a worker took, not only what it
+    answered -- and by :func:`_dump_worker_logs` for the run artifacts. One
+    read serves both; each is a ``kubectl exec`` into the agent pod.
 
     ``None`` when any card's log could not be read at all. ``_agent_shell``
     returns ``""`` for a kubectl that failed as readily as for an empty file,
@@ -594,7 +691,13 @@ def _worker_commands(task_ids: list[str], timeout: float) -> list[dict[str, str]
     one for no reason. The script therefore prints a sentinel before the log
     (or a different one when the file is absent), and a reply carrying
     neither is a capture failure, which the verifier reports as
-    ``status="error"`` rather than grading.
+    ``status="error"`` rather than grading. A card that simply has no log is
+    absent from the map, which is not a failure.
+
+    The sentinel line carries the file's mtime and size, so one exec returns
+    both the transcript and the metadata :class:`_WorkerLog` documents. A
+    ``stat`` that fails degrades to ``_STAT_UNKNOWN`` rather than losing the
+    body with it.
     """
     # No card, no capture: a router that answered from memory leaves nothing
     # to read, and grading an empty list would let a forbidden-pattern check
@@ -602,25 +705,112 @@ def _worker_commands(task_ids: list[str], timeout: float) -> list[dict[str, str]
     # this returning [] here.
     if not task_ids:
         return None
-    commands: list[dict[str, str]] = []
+    logs: dict[str, _WorkerLog] = {}
     for tid in task_ids:
         path = _shell_quote(f"{_LOGS_DIR}/{tid}.log")
+        unknown = f"{_STAT_UNKNOWN} {_STAT_UNKNOWN}"
         script = (
-            f'if [ -f {path} ]; then echo {_LOG_PRESENT}; head -c {_MAX_WORKER_LOG_BYTES} {path}; '
+            f"if [ -f {path} ]; then "
+            f"echo {_LOG_PRESENT} \"$(stat -c '{_STAT_FORMAT}' {path} 2>/dev/null "
+            f'|| echo "{unknown}")"; head -c {_MAX_WORKER_LOG_BYTES} {path}; '
             f"else echo {_LOG_ABSENT}; fi"
         )
         text = _agent_shell(script, timeout)
         first, _, body = text.partition("\n")
-        if first.strip() == _LOG_ABSENT:
+        # The sentinel is the first field; stat's two follow it when the file
+        # is present, so split on whitespace rather than comparing the line.
+        fields = first.split()
+        marker = fields[0] if fields else ""
+        if marker == _LOG_ABSENT:
             continue
-        if first.strip() != _LOG_PRESENT:
+        if marker != _LOG_PRESENT:
             _log.warning("worker log for %s could not be read; route checks will error", tid)
             return None
-        for line in body.splitlines():
+        mtime, size = (fields + [_STAT_UNKNOWN, _STAT_UNKNOWN])[1:3]
+        logs[tid] = _WorkerLog(body=body, mtime=mtime, size=size)
+    return logs
+
+
+def _worker_commands(logs: dict[str, _WorkerLog] | None) -> list[dict[str, str]] | None:
+    """Every terminal command the delegated workers ran, from their card logs.
+
+    The worker is a separate hermes session and its tool calls never reach
+    ``result.trajectory`` (see ``ToolCalledVerifier``), but its log records
+    each terminal command it executed -- the one check that can say which
+    route a worker took, not only what it answered. Only terminal commands
+    are visible; MCP tool calls are not.
+
+    ``None`` passes through from :func:`_worker_logs`: a capture that failed,
+    or a run that delegated nothing, is not a run whose workers issued no
+    commands.
+    """
+    if logs is None:
+        return None
+    commands: list[dict[str, str]] = []
+    for tid, log in logs.items():
+        for line in log.body.splitlines():
             match = _WORKER_COMMAND_RE.search(line)
             if match:
                 commands.append({"task": tid, "command": match.group("command").strip()})
     return commands
+
+
+def _dump_worker_logs(logs: dict[str, _WorkerLog] | None, stalled: Sequence[str]) -> None:
+    """Write the transcript of every card that ran to the ceiling into ARTIFACTS.
+
+    Without this a stalled card would leave nothing behind: :func:`_worker_commands`
+    keeps its shell lines, the rest is dropped, and :func:`_purge_card_state`
+    deletes the file -- so by the time anyone read the run, the only record of
+    where the worker stopped was gone and the stall could not be root-caused.
+
+    Written for the stalled cards alone, so a run that never hit the ceiling
+    adds no files, and only when ``ARTIFACTS`` names a directory. Card ids come
+    from ``delegated_task_ids``, which rejects anything carrying a path
+    separator, so they are safe as file names.
+
+    ``_WORKER_LOG_INDEX`` gets a row for every stalled card, including one
+    with no transcript at all. That row is not an empty result: a stalled card
+    with no file never had a worker, which is a different fault from a worker
+    that started and went quiet, and a missing file cannot tell the two apart.
+    A capture that failed outright (``logs is None``) is a third state,
+    ``_LOG_UNREAD``, because it says nothing about whether the file was there.
+    """
+    directory = os.environ.get(_ARTIFACTS_ENV)
+    if not directory or not stalled:
+        return
+    target = Path(directory) / _WORKER_LOG_SUBDIR
+    found = logs or {}
+    rows = []
+    for tid in stalled:
+        if logs is None:
+            rows.append(f"{tid}\t{_STAT_UNKNOWN}\t{_STAT_UNKNOWN}\t{_LOG_UNREAD}")
+            continue
+        log = found.get(tid)
+        if log is None:
+            rows.append(f"{tid}\t{_STAT_UNKNOWN}\t{_STAT_UNKNOWN}\t{_LOG_ABSENT}")
+            continue
+        rows.append(f"{tid}\t{log.mtime}\t{log.size}\t{_LOG_PRESENT}")
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        index = target / _WORKER_LOG_INDEX
+        # Exclusive create for the header, append for the rows: repetitions
+        # run in parallel, and the pair leaves no window for two of them to
+        # both write the header or for either to lose the other's rows.
+        try:
+            with index.open("x", encoding="utf-8") as fh:
+                fh.write(_WORKER_LOG_INDEX_HEADER + "\n")
+        except FileExistsError:
+            pass
+        with index.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(rows) + "\n")
+        for tid in stalled:
+            log = found.get(tid)
+            if log is not None:
+                (target / f"{tid}.log").write_text(log.body, encoding="utf-8")
+    except OSError as exc:
+        # Best effort, like every other read _settle makes: an artifact
+        # directory that will not take a file is not worth a failed run.
+        _log.warning("could not write the worker logs: %s", exc)
 
 
 def _purge_card_state(task_ids: list[str], timeout: float) -> None:
@@ -974,7 +1164,8 @@ class KubeAgentsHarness(AgentHarness):
                     # run class, not an answer.
                     return _infra_failure(
                         f"the opening turn failed in transport {transport_failures} times "
-                        f"running; last failure: {exc}"
+                        f"running; last failure: {exc}; "
+                        f"tunnel log: {_tail(_pf_log_path(local_port))}"
                     )
                 try:
                     _reset_port_forward(local_port)
@@ -1182,7 +1373,8 @@ class KubeAgentsHarness(AgentHarness):
                     _purge_card_state(awaited, _EXEC_TIMEOUT)
                     raise _DelegationTransportExhausted(
                         f"status turns failed in transport {transport_failures} times "
-                        "running; still waiting on: " + ", ".join(outstanding)
+                        "running; still waiting on: " + ", ".join(outstanding) + "; "
+                        f"tunnel log: {_tail(_pf_log_path(local_port))}"
                     ) from exc
                 # A handler answered every time (a non-429 4xx, a 500,
                 # non-JSON): that is the agent's own failure, so it stays in
@@ -1191,7 +1383,8 @@ class KubeAgentsHarness(AgentHarness):
                 # record.
                 result.errors.append(
                     f"status turns failed in transport {transport_failures} times running; "
-                    "still waiting on: " + ", ".join(outstanding)
+                    "still waiting on: " + ", ".join(outstanding) + "; "
+                    f"tunnel log: {_tail(_pf_log_path(local_port))}"
                 )
                 timed_out = False
                 break
@@ -1250,15 +1443,28 @@ class KubeAgentsHarness(AgentHarness):
             if not delivered_results(observed, awaited):
                 report = f"{DELEGATION_CEILING_MARKER}: {report}"
             result.errors.append(report)
-        self._settle(result, observed, awaited)
+        # Only the deadline path leaves transcripts behind: a card still
+        # outstanding after a transport failure or a mute agent did not stall,
+        # and the run stopped for a reason the record already names.
+        self._settle(result, observed, awaited, stalled=outstanding if timed_out else [])
         return session_id
 
     @staticmethod
-    def _settle(result: AgentResult, observed: list[dict[str, Any]], awaited: list[str]) -> None:
+    def _settle(
+        result: AgentResult,
+        observed: list[dict[str, Any]],
+        awaited: list[str],
+        *,
+        stalled: Sequence[str] = (),
+    ) -> None:
         """Collect everything the delegated cards produced, then clear them out.
 
         Reading precedes purging: the artifacts are only worth deleting once
-        they are part of the answer.
+        they are part of the answer. ``stalled`` is the subset of ``awaited``
+        that ran to the delegation ceiling, whose transcripts are kept as run
+        artifacts rather than deleted with the rest. Keyword-only with a default
+        so a caller that has no stalled cards, in-tree or in a sibling branch,
+        need not name it.
 
         The workers' own tool calls join the trajectory here, after the front
         agent's, each tagged with the profile that made them (see
@@ -1271,7 +1477,9 @@ class KubeAgentsHarness(AgentHarness):
         """
         _append_delivered(result, observed, awaited)
         _append_artifacts(result, awaited, _EXEC_TIMEOUT)
-        result.metadata["worker_commands"] = _worker_commands(awaited, _EXEC_TIMEOUT)
+        logs = _worker_logs(awaited, _EXEC_TIMEOUT)
+        result.metadata["worker_commands"] = _worker_commands(logs)
+        _dump_worker_logs(logs, stalled)
         captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
         if captured is None:
             result.metadata["worker_trajectory"] = None
