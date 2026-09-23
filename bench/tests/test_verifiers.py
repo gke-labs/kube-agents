@@ -1143,6 +1143,22 @@ def test_a_report_with_no_url_and_no_clean_claim_keeps_the_generic_reason(token,
     assert github.calls == []
 
 
+def test_a_report_that_queues_the_stream_gets_the_queued_reason(token, github):
+    """When a worker reports the stream was queued for later cron rather than run now (#1876)."""
+    _stash_report(
+        final_message=(
+            "Task t_ececdfb3 is now done. The compliance-audit stream has been "
+            "queued to run on its next cron schedule. The audit cannot be run synchronously "
+            "here as the shell environment does not have access to the hermes cron run executable."
+        )
+    )
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail" and not res.success
+    assert "queued the audit for later instead of running it" in res.reason
+    assert "#1876" in res.reason
+    assert github.calls == []
+
+
 def test_clock_skew_tolerance_admits_a_slightly_early_stamp(token, github):
     # The Prow runner and the agent pod are different machines; a stamp 60s
     # before the run's own start is drift, not a previous run.

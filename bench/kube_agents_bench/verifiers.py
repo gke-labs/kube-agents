@@ -349,6 +349,16 @@ _CLEAN_CLOSE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches when the worker queued the audit for a future cron schedule or reported
+# that the on-demand trigger was unavailable (#1876), instead of running the audit.
+_QUEUED_INSTEAD_OF_RUN_RE = re.compile(
+    r"\b(?:queued\s+(?:to\s+run|for\s+its\s+next|for\s+the\s+next|the\s+stream)|"
+    r"on-demand\s+trigger\s+is\s+unavailable|"
+    r"stream\s+will\s+run\s+on\s+its\s+\d{2}:\d{2}\s+schedule|"
+    r"will\s+run\s+on\s+its\s+next\s+cron\s+schedule)\b",
+    re.IGNORECASE,
+)
+
 _NO_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
     "is unset), so this check cannot tell this run's ledger from a previous "
@@ -734,6 +744,15 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             if key not in seen:
                 seen.append(key)
         if not seen:
+            queued = _QUEUED_INSTEAD_OF_RUN_RE.search(snap.final_message)
+            if queued:
+                return done(
+                    False,
+                    "the run's report names no github.com issue URL because the worker queued "
+                    f"the audit for later instead of running it ({queued.group(0).strip()!r}): "
+                    "when asked to run an audit following its SOP, the worker must execute "
+                    "the audit now via audit_report.py start/finish rather than deferring to cron (#1876)",
+                )
             clean = _CLEAN_CLOSE_RE.search(snap.final_message)
             if clean:
                 return done(

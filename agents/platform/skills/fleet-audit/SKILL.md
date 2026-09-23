@@ -46,7 +46,25 @@ watchdog — **not** a prettified form of the audit id:
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
 fails if the two drift apart. Do not restate a title anywhere else.
 
-## Running a stream on demand
+## Running an audit stream on demand
+
+An audit request arrives in one of two distinct forms, and the execution path depends on your session context:
+
+### 1. In a delegated kanban task or worker session: Run the audit directly
+
+When you are delegated a kanban card to run an audit (e.g. *"Run the security and RBAC posture audit, following the compliance-audit SOP"*, or *"Run the compliance-audit stream now"*):
+
+- **You are the audit worker.** You have been given a dedicated worker session and turn budget for this specific audit.
+- **Execute the audit following its SOP (`governance/<stream>_sop.md`) directly.** Use the two-command lifecycle below:
+  1. `./skills/fleet-audit/scripts/audit_report.py start --audit <stream> [--repo "<owner>/<repo>"]`
+  2. Enumerate clusters and run the checks per the SOP.
+  3. `./skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
+- **Do not reach for `hermes cron run` or say "queued for the next cron tick":** The user or parent agent explicitly delegated this task to be executed now.
+- **A card whose result is "queued for later" must NEVER be marked `done` (#1876):** If an audit cannot be run in this session due to missing credentials or infrastructure failure, call `kanban_block` (or ask for input); **never** call `kanban_complete` claiming `done` when zero findings or ledger were produced.
+
+### 2. In the interactive front-door chat: Triggering the cron schedule
+
+When a user in interactive chat asks to trigger the background schedule (e.g. *"Trigger the compliance-audit cron job"* or *"Run all scheduled audits"*) without delegating a dedicated kanban task:
 
 Each stream's cron job id **is** its audit id, so an operator asking for a run off-schedule is asking
 for one command per stream:
@@ -68,16 +86,14 @@ paragraph exists to prevent. Elsewhere it hands the run to the background delega
 returns a handle; that is closer to what you want, but `hermes cron run` is the one route that
 behaves identically on every runtime and always runs in a fresh process.
 
-**Your shell cannot reach that command, and there is no substitute yet.** It runs on the gateway pod,
+**Your shell cannot reach that command in the sandbox pod, and there is no substitute yet.** It runs on the gateway pod,
 where `hermes` and `/opt/data/profiles` are; your shell runs in the sandbox pod, which has neither, so
 `command not found` there is the split working as designed rather than a broken install. When you hit
-it, say the on-demand trigger is unavailable and that the stream will run on its 06:20 schedule. That
-does not license either fallback: not `cronjob(action='run')`, and not running the audit yourself —
-see the next paragraph. The gap is a deliberate deferral of the shell-sandbox design, not an
-oversight.
+it in an interactive chat session, say the on-demand trigger is unavailable and that the stream will run on its 06:20 schedule. That
+does not license either fallback: not `cronjob(action='run')`, and not running the audit yourself in an un-delegated chat session.
 
-**Do not run the audit yourself in the session that received the request.** A triggered run gets its
-own process and its own turn budget. A session that improvises the audit instead has neither — and
+**Do not improvise all audits in a single front-door chat turn.** A triggered run gets its
+own process and its own turn budget. An un-delegated session that improvises multiple audits instead has neither — and
 when the request is "run them all", it has one turn budget for work the schedule spreads across
 every stream and two days. That is not a hypothetical failure mode: on 2026-08-03 a single worker
 asked to run all five streams that existed then issued zero `kubectl` commands, hand-typed five
@@ -87,7 +103,7 @@ The scheduler holds a per-job lock for the length of a run, so a stream already 
 started a second time and cannot write its ledger issue twice. `cronjob(action='runs')` shows what
 is running and what each attempt did.
 
-**Each run reports on itself. Your own answer is a roll-up, not a copy.** Answer with one line per
+**Each run reports on itself. Your own answer is a roll-up, not a copy.** In an interactive chat session triggering cron jobs, answer with one line per
 stream — the stream, and that it is queued for the next tick. The reports arrive through each run's
 own `deliver` setting; repeating them here sends the same content twice.
 
