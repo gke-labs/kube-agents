@@ -726,6 +726,22 @@ class NotEvaluatedTest(unittest.TestCase):
         self.assertIn("A quota storm is declared right now.", verdict["lede"])
         self.assertEqual(verdict["not_evaluated"], sorted(ADMITTED) + [HOLD_OUT])
 
+    def test_a_run_lost_to_the_delegation_ceiling_carries_the_count_and_matches_a_declared_wave(self):
+        # The suite reads a ceiling repetition as infrastructure, so a case
+        # whose every repetition hit the ceiling is one it could not evaluate;
+        # the run doc carries `ceiling_reps` as every other verdict's does and
+        # the wave's signature is the ceiling count, not the storm's.
+        target = not_evaluated_run(every=True)
+        target["tasks"] = [task(n, "ccc") for n in sorted(ADMITTED)] + [task(HOLD_OUT, "ccc")]
+        wave = dict(STORM, condition="delegation_ceiling")
+        verdict = classify_run(target, [target], health_at=wave)
+        self.assertEqual(verdict["verdict"], "not_evaluated")
+        self.assertEqual((verdict["storm_reps"], verdict["ceiling_reps"]), (0, 3 * (len(ADMITTED) + 1)))
+        self.assertTrue(verdict["matches_incident"])
+        self.assertEqual(case(verdict, HOLD_OUT)["cls"], classify.CLS_CEILING)
+        self.assertNotIn("quota storm", verdict["lede"])
+        self.assertFalse(classify_run(target, [target], health_at=STORM)["matches_incident"], "ceiling reps are not the storm's signature")
+
     def test_without_the_suites_list_the_lost_cases_are_the_admitted_ones_that_graded_nothing(self):
         target = not_evaluated_run()
         target["not_evaluated"] = []
