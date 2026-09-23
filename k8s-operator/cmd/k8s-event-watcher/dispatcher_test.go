@@ -1471,6 +1471,31 @@ func TestDispatcherReplayedFailedSchedulingSightedBeforeItsDeclineIsNotPassed(t 
 	}
 }
 
+// TestDispatcherReplayedMicroTimeFailedSchedulingSightedInTheSecondOfItsDeclineIsNotPassed
+// is the same restart case on an events.k8s.io/v1 scheduler (GKE Standard),
+// whose sighting carries microseconds: created 400ms into the second the
+// autoscaler's whole-second decline names, deleted before a retry, replayed
+// after the decline is on record. Compared as stamped, 25.400 reads as later
+// than 25 and the replay opens a card for a pod that is gone; read to the
+// second it is the attempt that drew the decline and falls to the count.
+func TestDispatcherReplayedMicroTimeFailedSchedulingSightedInTheSecondOfItsDeclineIsNotPassed(t *testing.T) {
+	declinedAt := time.Unix(1_700_000_000, 0)
+	createdAt := declinedAt.Add(400 * time.Millisecond)
+	now := declinedAt.Add(5 * time.Minute)
+	disp, _, injectCount := newScaleUpDispatcher(t, filterThresholds{}, &now)
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, autoscalerEvent("pod-1", "NotTriggerScaleUp", declinedAt))
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 1, createdAt))
+	if *injectCount != 0 {
+		t.Fatalf("replayed microsecond FailedScheduling sighted in the second of its decline fired %d injects; want 0", *injectCount)
+	}
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 2, declinedAt.Add(time.Second+400*time.Millisecond)))
+	if *injectCount != 1 {
+		t.Errorf("a sighting in the second after the decline fired %d injects; want 1", *injectCount)
+	}
+}
+
 // TestDispatcherScaleUpMarkFromAnotherNamespaceIsNotThePodsVerdict: a mark
 // is filed under the namespace it was written in, so a TriggeredScaleUp or
 // NotTriggerScaleUp created in one namespace against the UID of a pod in

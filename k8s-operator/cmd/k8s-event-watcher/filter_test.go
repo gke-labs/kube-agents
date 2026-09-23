@@ -345,6 +345,12 @@ func TestFilterDecideFailedScheduling(t *testing.T) {
 		{name: "event sighted before its decline falls through to the count and fires", event: sightedAt(fs(5, declined(time.Minute)), now.Add(-2*time.Minute)), wantGate: gateAccepted},
 		{name: "event sighted in the second of its decline is the attempt that drew it and is held", event: sightedAt(fs(1, declined(2*time.Minute)), now.Add(-2*time.Minute)), wantGate: gateFailedSchedulingMinCount},
 		{name: "event sighted a second after its decline passes", event: sightedAt(fs(1, declined(2*time.Minute)), now.Add(-2*time.Minute+time.Second)), wantGate: gateAccepted},
+		// An events.k8s.io/v1 sighting carries microseconds; the autoscaler's
+		// core/v1 stamp is whole seconds. Both are read to the second, so a
+		// sighting 400ms into the decline's second is still that attempt.
+		{name: "microsecond sighting in the second of its decline is the attempt that drew it and is held", event: sightedAt(fs(1, declined(2*time.Minute)), now.Add(-2*time.Minute+400*time.Millisecond)), wantGate: gateFailedSchedulingMinCount},
+		{name: "microsecond sighting in the second after its decline passes", event: sightedAt(fs(1, declined(2*time.Minute)), now.Add(-2*time.Minute+time.Second+400*time.Millisecond)), wantGate: gateAccepted},
+		{name: "microsecond sighting before a decline read as now, in its second, is held", event: sightedAt(fs(1, declined(2*time.Minute-700*time.Millisecond)), now.Add(-2*time.Minute+400*time.Millisecond)), wantGate: gateFailedSchedulingMinCount},
 
 		// An event the scheduler stopped re-emitting describes a pod that is
 		// no longer pending, whatever the count or the marks say.

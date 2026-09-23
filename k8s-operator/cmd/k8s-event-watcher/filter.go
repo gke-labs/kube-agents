@@ -339,6 +339,12 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 //     01:53:25Z, and the replay opened a card for a pod deleted two seconds
 //     later), so a sighting in the verdict's own second is read as the
 //     attempt that drew it. A retry in that same second waits for the next.
+//     Both stamps are read to the second before they are compared: an
+//     events.k8s.io/v1 sighting (eventTime, series.lastObservedTime) carries
+//     microseconds while the autoscaler's core/v1 stamp is whole seconds, so
+//     compared as they are a sighting at 25.400 would read as later than a
+//     decline stamped 25 and the replay would pass it on GKE Standard, where
+//     upstream kube-scheduler records through the new API.
 //   - A TriggeredScaleUp mark holds the event at any count while the event's
 //     last sighting is within scaleUpHold of the mark. A node is on its way;
 //     the scheduler retries the pod on every cluster change while it joins,
@@ -378,7 +384,7 @@ func (f *filter) failedSchedulingGate(ev TriageEvent) filterGate {
 	}
 	switch ev.ScaleUp.Verdict {
 	case scaleUpDeclined:
-		if !ev.LastSeen.IsZero() && !ev.LastSeen.After(ev.ScaleUp.At) {
+		if !ev.LastSeen.IsZero() && !ev.LastSeen.Truncate(time.Second).After(ev.ScaleUp.At.Truncate(time.Second)) {
 			log.Printf("%s pod=%s/%s (count=%d): cluster-autoscaler declined to scale up %s ago, %s after this sighting; the scheduler has not retried since, falling back to the count backstop",
 				ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second), ev.ScaleUp.At.Sub(ev.LastSeen).Round(time.Second))
 			break
