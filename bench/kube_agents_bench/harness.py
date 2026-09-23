@@ -130,6 +130,8 @@ DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 # finished answer by searching the filesystem.
 _ATTACHMENTS_DIR = "/opt/data/kanban/attachments"
 _LOGS_DIR = "/opt/data/kanban/logs"
+# The hermes CLI in the agent pod, for when it is not on the exec shell's PATH.
+_HERMES_BIN_FALLBACK = "/opt/hermes/.venv/bin/hermes"
 # One terminal command per line in a card's worker log, as hermes renders it:
 # ``  ┊ 💻 $         <command>  0.6s [exit 1]``. The timing and exit suffixes
 # are stripped; the command is kept verbatim otherwise.
@@ -813,6 +815,25 @@ def _dump_worker_logs(logs: dict[str, _WorkerLog] | None, stalled: Sequence[str]
         _log.warning("could not write the worker logs: %s", exc)
 
 
+def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
+    """Archive the cards that ran to the ceiling, which stops their workers.
+
+    The unit has given up on them: its record is written and their files are
+    about to be deleted. Left alone, each worker keeps its dispatcher slot
+    until it finishes on its own, and every later unit's card queues behind
+    it. ``hermes kanban archive`` moves a running card to the terminal
+    ``archived`` state and terminates its worker. Children the worker filed
+    are not known here and keep running. Best effort, like the rest of
+    :meth:`KubeAgentsHarness._settle`.
+    """
+    if not stalled:
+        return
+    ids = " ".join(_shell_quote(tid) for tid in stalled)
+    script = f'H=$(command -v hermes || echo {_HERMES_BIN_FALLBACK}); "$H" kanban archive {ids}'
+    out = _agent_shell(script, timeout)
+    _log.info("archived %d stalled card(s): %s", len(stalled), out.strip()[:200])
+
+
 def _purge_card_state(task_ids: list[str], timeout: float) -> None:
     """Delete the attachments and worker log of every card this run filed.
 
@@ -1461,8 +1482,9 @@ class KubeAgentsHarness(AgentHarness):
 
         Reading precedes purging: the artifacts are only worth deleting once
         they are part of the answer. ``stalled`` is the subset of ``awaited``
-        that ran to the delegation ceiling, whose transcripts are kept as run
-        artifacts rather than deleted with the rest. Keyword-only with a default
+        that ran to the delegation ceiling: their transcripts are kept as run
+        artifacts rather than deleted with the rest, and the cards are archived
+        so their workers stop holding dispatcher slots. Keyword-only with a default
         so a caller that has no stalled cards, in-tree or in a sibling branch,
         need not name it.
 
@@ -1480,6 +1502,7 @@ class KubeAgentsHarness(AgentHarness):
         logs = _worker_logs(awaited, _EXEC_TIMEOUT)
         result.metadata["worker_commands"] = _worker_commands(logs)
         _dump_worker_logs(logs, stalled)
+        _archive_stalled_cards(stalled, _EXEC_TIMEOUT)
         captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
         if captured is None:
             result.metadata["worker_trajectory"] = None

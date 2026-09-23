@@ -96,6 +96,36 @@ def test_settle_records_the_commands_before_purging(monkeypatch):
     assert "rm -rf" in calls[-1]
 
 
+def test_a_stalled_card_is_archived_after_its_transcript_is_read_and_before_the_purge(monkeypatch):
+    # The unit gave up on the card; its worker would otherwise keep its
+    # dispatcher slot until it finished on its own.
+    calls = []
+
+    def fake_shell(script, timeout):
+        calls.append(script)
+        return _LOG if "head -c" in script and ".log" in script else ""
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    result = AgentResult(output="answer", trajectory=[])
+    result.metadata["final_message"] = "answer"
+    harness.KubeAgentsHarness._settle(result, [], ["t_1", "t_2"], stalled=["t_2"])
+    archive = [i for i, s in enumerate(calls) if "kanban archive" in s]
+    assert len(archive) == 1
+    assert "'t_2'" in calls[archive[0]] and "'t_1'" not in calls[archive[0]]
+    read = next(i for i, s in enumerate(calls) if "head -c" in s)
+    assert read < archive[0] < len(calls) - 1
+    assert "rm -rf" in calls[-1]
+
+
+def test_a_card_that_settled_is_not_archived(monkeypatch):
+    calls = []
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: calls.append(script) or "")
+    result = AgentResult(output="answer", trajectory=[])
+    result.metadata["final_message"] = "answer"
+    harness.KubeAgentsHarness._settle(result, [], ["t_1"])
+    assert not any("kanban archive" in s for s in calls)
+
+
 def test_one_read_serves_both_the_verifier_and_the_dump(monkeypatch, tmp_path):
     # Each read is a kubectl exec into the agent pod, so the log is fetched
     # once per card however many consumers it has.
