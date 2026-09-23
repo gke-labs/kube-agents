@@ -963,12 +963,6 @@ class KubeAgentsHarness(AgentHarness):
                     # Counted, not returned: a forward that will not come back
                     # is the same outage, and the loop's own ceiling ends it.
                     _log.warning("port-forward respawn failed before retry: %s", pf_exc)
-                if not os.environ.get("AGENT_CONVERSATION_ID"):
-                    # Generate a fresh conversation id so an opening turn whose
-                    # reply was lost in transport does not double-post to the
-                    # existing session and orphan a duplicate card (#1880).
-                    body = dict(body)
-                    body["conversation"] = f"devops-bench-{uuid.uuid4().hex[:12]}"
 
         if delegation_timeout > 0:
             try:
@@ -1192,7 +1186,7 @@ class KubeAgentsHarness(AgentHarness):
         # the run stopped.
         if outstanding and timed_out:
             result.errors.append(
-                f"{INFRA_FAILURE_MARKER}: delegated tasks did not finish within "
+                "delegated tasks did not finish within "
                 f"{delegation_timeout:.0f}s: "
                 + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
             )
