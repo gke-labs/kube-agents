@@ -905,9 +905,9 @@ class ShippedDownloadsRetryTest(unittest.TestCase):
         ]
         self.assertGreaterEqual(
             len(fetches),
-            5,
-            "expected at least the apt key, gh, yq, helm and ci-env helm fetches; a "
-            "walk finding fewer is matching the wrong shape",
+            6,
+            "expected at least the apt key, gh, yq, helm, ci-env helm and shellcheck "
+            "fetches; a walk finding fewer is matching the wrong shape",
         )
         exempt = [number for number, _, piped in fetches if piped]
         self.assertEqual(
