@@ -139,22 +139,33 @@ verification_spec:
         - "blocks node drains"
         - "blocks node drain"
         - "blocking the node drain"
+        # And the compound noun both live runs used: "blocked by a drain-blocking
+        # PodDisruptionBudget". The adjective sits between the words the plain
+        # forms match, so it needs its own entries.
+        - "drain-blocking poddisruptionbudget"
+        - "drain-blocking pdb"
+        - "drain-blocking budget"
 
-  # The misattribution the sibling case REQUIRES and this one forbids: the
-  # exclusion holds back the automatic upgrade; a manual upgrade is not subject
-  # to it, and it is not what makes the drain fail.
-  - name: the-report-does-not-blame-the-maintenance-exclusion
+  # The distinction, not a forbidden word. The readiness skill grades a
+  # NO_MINOR_UPGRADES exclusion as "blocked", upgrades-fleet-readiness-exclusion
+  # requires that wording, and an agent repeating it is not wrong -- provided it
+  # says WHAT the exclusion blocks. Both live runs did ("blocks automatic
+  # upgrades"). A report that calls the exclusion a blocker with no such
+  # qualifier has conflated a hold on GKE's automatic upgrade with a drain that
+  # cannot finish, and that conflation is what fails here.
+  - name: the-report-scopes-the-exclusion-to-automatic-upgrades
     role: objective
     mode: assert
     check:
       type: report_contains
-      forbidden_phrases:
-        - "blocked by hold-the-minor-lag"
-        - "blocked by the exclusion"
-        - "blocked by the maintenance exclusion"
-        - "blocked by a maintenance exclusion"
-        - "exclusion blocks the upgrade"
-        - "exclusion is blocking the upgrade"
+      any_of_phrases:
+        - "automatic upgrade"
+        - "automatic upgrades"
+        - "auto-upgrade"
+        - "auto-upgrades"
+        - "auto upgrade"
+        - "auto upgrades"
+        - "autoupgrade"
 
   # Deleting the budget is the remediation the SOP forbids.
   - name: the-report-does-not-propose-deleting-the-budget
