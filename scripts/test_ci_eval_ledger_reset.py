@@ -175,6 +175,25 @@ class LedgerSelectionTest(unittest.TestCase):
         self.assertFalse(helper.is_ledger(issue(1, pull=True), None))
         self.assertFalse(helper.is_ledger(issue(1, audit_id="obtainability-audit"), "compliance-audit"))
 
+    def test_a_labelled_issue_that_is_not_a_ledger_is_named_when_left_open(self):
+        # The bot's re-read of #1881: "closed 0" said nothing about a labelled
+        # issue the helper declined, so a human-authored or mis-titled one
+        # looked like an empty repository. Now it is named with the reason.
+        api = FakeApi([[issue(7, author="jayantid"), issue(8, title="Security posture"), issue(9)]])
+        unclosed, out, err = run_reset(api, dry_run=True)
+        self.assertEqual(unclosed, 0)
+        self.assertIn("#7 left open, not a ledger: author jayantid is not a [bot] login", out)
+        self.assertIn("#8 left open, not a ledger: title does not start with '[audit] '", out)
+        self.assertIn("would close 1 open ledger(s)", out)
+        self.assertEqual(err, "")
+        self.assertEqual(helper.not_a_ledger_because(issue(9), None), None)
+        self.assertEqual(helper.not_a_ledger_because(issue(9, pull=True), None), "a pull request")
+        self.assertEqual(helper.not_a_ledger_because(issue(9, labels=["agent:audit"]), None), "no audit:<id> label")
+        self.assertEqual(
+            helper.not_a_ledger_because(issue(9, audit_id="obtainability-audit"), "compliance-audit"),
+            "no audit:compliance-audit label",
+        )
+
     def test_the_lease_reset_closes_every_stream_oldest_first(self):
         api = FakeApi(
             [

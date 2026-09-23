@@ -143,29 +143,41 @@ def label_names(issue: dict) -> set[str]:
     return names
 
 
-def is_ledger(issue: dict, audit_id: str | None) -> bool:
-    """The three conditions above, over a REST issue object.
+def not_a_ledger_because(issue: dict, audit_id: str | None) -> str | None:
+    """Why a REST issue object is not a ledger, or None when it is one.
 
-    `/issues` also lists pull requests; one is never a ledger.
+    The three conditions above; `/issues` also lists pull requests, and one
+    is never a ledger. The reason is printed for a labelled issue that is
+    left open, so "closed 0" never hides one the helper declined.
     """
     if issue.get("pull_request"):
-        return False
+        return "a pull request"
     labels = label_names(issue)
     if AUDIT_LABEL not in labels:
-        return False
+        return f"no {AUDIT_LABEL} label"
     if audit_id:
         if STREAM_LABEL_PREFIX + audit_id not in labels:
-            return False
+            return f"no {STREAM_LABEL_PREFIX}{audit_id} label"
     elif not any(name.startswith(STREAM_LABEL_PREFIX) for name in labels):
-        return False
+        return f"no {STREAM_LABEL_PREFIX}<id> label"
     if not str(issue.get("title") or "").startswith(TITLE_PREFIX):
-        return False
+        return f"title does not start with {TITLE_PREFIX!r}"
     author = str((issue.get("user") or {}).get("login") or "")
-    return author.endswith(BOT_LOGIN_SUFFIX)
+    if not author.endswith(BOT_LOGIN_SUFFIX):
+        return f"author {author or '?'} is not a {BOT_LOGIN_SUFFIX} login"
+    return None
+
+
+def is_ledger(issue: dict, audit_id: str | None) -> bool:
+    return not_a_ledger_because(issue, audit_id) is None
 
 
 def open_ledgers(repo: str, token: str, audit_id: str | None) -> list[dict]:
-    """Every open ledger issue in the repository, oldest first."""
+    """Every open ledger issue in the repository, oldest first.
+
+    A labelled issue that is not a ledger is named on stdout with the reason
+    it stays open, so the count that follows is never read as "nothing there".
+    """
     labels = AUDIT_LABEL if not audit_id else f"{AUDIT_LABEL},{STREAM_LABEL_PREFIX}{audit_id}"
     query = {"state": "open", "labels": labels, "per_page": str(PER_PAGE)}
     found = []
@@ -174,7 +186,12 @@ def open_ledgers(repo: str, token: str, audit_id: str | None) -> list[dict]:
         batch = api("GET", f"/repos/{repo}/issues?" + urllib.parse.urlencode(query), token)
         if not batch:
             break
-        found.extend(issue for issue in batch if is_ledger(issue, audit_id))
+        for issue in batch:
+            why = not_a_ledger_because(issue, audit_id)
+            if why is None:
+                found.append(issue)
+            else:
+                print(f"  #{issue.get('number', '?')} left open, not a ledger: {why}")
         if len(batch) < PER_PAGE:
             break
     found.sort(key=lambda issue: int(issue.get("number") or 0))

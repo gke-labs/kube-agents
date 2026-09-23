@@ -123,6 +123,12 @@ LEDGER_INSTALLATION_ID = 157029058
 GITHUB_INSTALLATION_TOKEN_URL = (
     "https://api.github.com/app/installations/{installation}/access_tokens"
 )
+# What this script's probe mint asks for: the same three reads the eval's
+# grading mint pins (LEDGER_GRADING_MINT_BODY in hack/ci-eval-pr.sh; a test
+# holds the two equal). An omitted body would mint the installation's whole
+# grant, which since 2026-09-22 includes issues: write on every pool repository
+# for the ledger reset; a read probe has no business holding that.
+LEDGER_READ_PERMISSIONS = {"issues": "read", "pull_requests": "read", "metadata": "read"}
 
 # Its private key, read from the cluster rather than the operator's disk: a
 # local copy answers a question nobody asked. `build-kube-agents` is the Prow
@@ -1955,8 +1961,10 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
         headers={
             "Authorization": f"Bearer {jwt}",
             "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
             "User-Agent": "kube-agents-verify-ci-pool-project",
         },
+        data=json.dumps({"permissions": LEDGER_READ_PERMISSIONS}).encode(),
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:

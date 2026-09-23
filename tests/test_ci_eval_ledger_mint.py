@@ -22,10 +22,12 @@ The functions are extracted from the script and executed with the network half
 stubbed out, so these assertions are against the code that ships.
 """
 
+import json
 import pathlib
 import re
 import subprocess
 import tempfile
+import textwrap
 import unittest
 
 from tests.testing.common import get_isolated_test_env
@@ -197,6 +199,137 @@ class LedgerMintRetryTest(unittest.TestCase):
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertNotIn("the mint must not run", proc.stderr)
         self.assertIn("TOKEN=the-mounted-pat", proc.stdout)
+
+
+# Installed through PYTHONPATH: python imports sitecustomize at startup, so the
+# heredoc's urllib.request.urlopen is replaced before the mint runs. The
+# request it was handed is written out for the test to read.
+_FAKE_URLOPEN = textwrap.dedent(
+    '''
+    import io
+    import json
+    import os
+    import urllib.request
+
+
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+
+    def _fake_urlopen(request, timeout=None):
+        record = {
+            "url": request.full_url,
+            "method": request.get_method(),
+            "data": request.data.decode() if request.data is not None else None,
+            "content_type": request.get_header("Content-type"),
+            "auth_scheme": (request.get_header("Authorization") or "").split(" ", 1)[0],
+        }
+        with open(os.environ["MINT_CAPTURE_FILE"], "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+        return _Response(
+            json.dumps({"token": "ghs_minted", "expires_at": "2026-09-23T16:00:00Z"}).encode()
+        )
+
+
+    urllib.request.urlopen = _fake_urlopen
+    '''
+)
+
+
+class LedgerMintRequestTest(unittest.TestCase):
+    """The Python half of _ledger_token_mint, run for real against a faked GitHub.
+
+    The retry tests above stub the mint in shell, so the lines that turn
+    LEDGER_MINT_BODY into the POST's data and Content-Type never ran under
+    test, and a regression there -- `data=mint_data` dropped, the `if
+    mint_body:` inverted -- would mint the installation's whole grant (issues:
+    write on every pool repository since the ledger reset's grant) and stay
+    green. Here the real heredoc signs with a throwaway RSA key and posts to
+    a urlopen installed through sitecustomize, and the request is asserted.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = pathlib.Path(tmp.name)
+        self.key = self.tmp / "throwaway.pem"
+        gen = subprocess.run(
+            ["openssl", "genrsa", "-out", str(self.key), "2048"], capture_output=True, text=True
+        )
+        if gen.returncode != 0:  # pragma: no cover - a machine without openssl
+            self.skipTest(f"openssl could not generate a throwaway key: {gen.stderr}")
+        (self.tmp / "sitecustomize.py").write_text(_FAKE_URLOPEN, encoding="utf-8")
+        self.capture = self.tmp / "request.json"
+
+    def _mint(self, call):
+        script = "\n".join(
+            [
+                "set -euo pipefail",
+                _extract(r"^LEDGER_MINT_RETRYABLE=\d+$", "LEDGER_MINT_RETRYABLE"),
+                _extract(r"^LEDGER_MINT_ATTEMPTS=\d+$", "LEDGER_MINT_ATTEMPTS"),
+                _extract(r"^LEDGER_RESET_MINT_ATTEMPTS=\d+$", "LEDGER_RESET_MINT_ATTEMPTS"),
+                _extract(r"^LEDGER_RESET_MINT_RETRY_DELAY=\d+$", "LEDGER_RESET_MINT_RETRY_DELAY"),
+                _extract(r"^LEDGER_GRADING_MINT_BODY=[^\n]*$", "LEDGER_GRADING_MINT_BODY"),
+                _extract(r"^_ledger_token_mint\(\) \{.*?^\}", "_ledger_token_mint"),
+                _extract(r"^mint_ledger_token\(\) \{.*?^\}", "mint_ledger_token"),
+                _extract(r"^ledger_reset_token\(\) \{.*?^\}", "ledger_reset_token"),
+                "sleep() { :; }",
+                call,
+            ]
+        )
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={
+                    "PYTHONPATH": str(self.tmp),
+                    "MINT_CAPTURE_FILE": str(self.capture),
+                    "EVAL_LEDGER_APP_KEY_FILE": str(self.key),
+                    "EVAL_LEDGER_APP_ID": "4739812",
+                    "EVAL_LEDGER_INSTALLATION_ID": "157029058",
+                    "BENCH_GITHUB_TOKEN": "the-mounted-pat",
+                }
+            ),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertTrue(self.capture.exists(), "the faked urlopen was never reached: " + proc.stderr)
+        return json.loads(self.capture.read_text(encoding="utf-8")), proc
+
+    def test_the_grading_mint_posts_its_three_reads(self):
+        seen, proc = self._mint('mint_ledger_token "unit-under-test"; echo "TOKEN=${BENCH_GITHUB_TOKEN}"')
+        self.assertEqual(
+            {"permissions": {"issues": "read", "pull_requests": "read", "metadata": "read"}},
+            json.loads(seen["data"]),
+        )
+        self.assertEqual("application/json", seen["content_type"])
+        self.assertEqual("POST", seen["method"])
+        self.assertIn("/app/installations/157029058/access_tokens", seen["url"])
+        self.assertEqual("Bearer", seen["auth_scheme"])
+        self.assertIn("TOKEN=ghs_minted", proc.stdout)
+
+    def test_the_reset_mint_posts_one_repository_and_issues_write(self):
+        seen, proc = self._mint(
+            'tok="$(ledger_reset_token gke-agentic/kube-agents-evals-2-infra)"; echo "RESET=${tok}"'
+        )
+        self.assertEqual(
+            {"repositories": ["kube-agents-evals-2-infra"], "permissions": {"issues": "write"}},
+            json.loads(seen["data"]),
+        )
+        self.assertEqual("application/json", seen["content_type"])
+        self.assertIn("RESET=ghs_minted", proc.stdout)
+
+    def test_no_body_means_no_data_which_is_why_every_caller_sends_one(self):
+        # The endpoint's contract: no body, the installation's whole grant.
+        # Documented by running it, so the two callers above are read as the
+        # deliberate narrowing they are.
+        seen, _ = self._mint("_ledger_token_mint >/dev/null")
+        self.assertIsNone(seen["data"])
+        self.assertIsNone(seen["content_type"])
 
 
 class LedgerMintContractTest(unittest.TestCase):

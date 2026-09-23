@@ -1858,6 +1858,22 @@ class LedgerTokenMintTest(unittest.TestCase):
         self.assertIn(str(checker.LEDGER_INSTALLATION_ID), seen["url"])
         self.assertEqual("POST", seen["method"])
 
+    def test_the_probe_mint_pins_its_reads_rather_than_taking_the_whole_grant(self):
+        # A bodiless mint yields everything the installation holds, and since
+        # the ledger reset's grant that is issues: write on every pool
+        # repository. A read probe asks for its reads.
+        seen = {}
+
+        def urlopen(request, timeout=None):
+            seen["body"] = json.loads(request.data.decode())
+            seen["content_type"] = request.get_header("Content-type")
+            return _Response({"token": "ghs_minted"})
+
+        self._mint(urlopen=urlopen)
+        self.assertEqual({"permissions": checker.LEDGER_READ_PERMISSIONS}, seen["body"])
+        self.assertEqual("application/json", seen["content_type"])
+        self.assertNotIn("write", json.dumps(seen["body"]))
+
     def test_the_jwt_is_issued_by_the_ledger_app(self):
         captured = {}
 
@@ -2056,6 +2072,11 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
         self.assertEqual(
             str(checker.LEDGER_INSTALLATION_ID), self._default("EVAL_LEDGER_INSTALLATION_ID")
         )
+
+    def test_the_probe_asks_for_the_reads_the_grading_mint_asks_for(self):
+        m = re.search(r"^LEDGER_GRADING_MINT_BODY='(.+)'$", self.script, re.M)
+        self.assertIsNotNone(m, "could not find LEDGER_GRADING_MINT_BODY in hack/ci-eval-pr.sh")
+        self.assertEqual({"permissions": checker.LEDGER_READ_PERMISSIONS}, json.loads(m.group(1)))
 
     def test_the_script_mints_into_the_variable_bench_reads_first(self):
         text = (checker._ROOT / "bench" / "kube_agents_bench" / "verifiers.py").read_text()
