@@ -80,6 +80,7 @@ DOWNLOAD_SOURCES = (
     REPO_ROOT / "deploy" / "docker" / "Dockerfile",
     REPO_ROOT / "deploy" / "sandbox" / "Dockerfile",
     REPO_ROOT / "hack" / "ci-env.sh",
+    WORKFLOWS_DIR / "validate.yml",
 )
 
 #: The start of a curl command. What follows it up to the next separator is
