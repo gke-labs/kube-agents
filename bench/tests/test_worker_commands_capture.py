@@ -318,6 +318,26 @@ def test_a_capture_that_failed_is_not_written_as_no_worker(monkeypatch, tmp_path
     assert not (tmp_path / "worker-logs" / "t_unread.log").exists()
 
 
+def test_a_transcript_that_would_not_write_is_not_indexed_as_present(monkeypatch, tmp_path):
+    # Review finding: the index was appended before the .log files, so a body
+    # write that failed left a "present" row pointing at a file that is not
+    # there. Bodies go first now, and the one that failed keeps its stat under
+    # its own state; the sibling's file and the index are still written.
+    monkeypatch.setenv("ARTIFACTS", str(tmp_path))
+    monkeypatch.setattr(
+        harness, "_agent_shell", lambda script, timeout: "__WORKER_LOG__ 1758579012 83\nbody\n"
+    )
+    (tmp_path / "worker-logs").mkdir()
+    (tmp_path / "worker-logs" / "t_blocked.log").mkdir()  # write_text fails: is a directory
+    harness._dump_worker_logs(harness._worker_logs(["t_blocked", "t_ok"], 5.0), ["t_blocked", "t_ok"])
+    index = (tmp_path / "worker-logs" / "index.txt").read_text().splitlines()
+    assert index[1:] == [
+        "t_blocked\t1758579012\t83\t__WORKER_LOG_UNWRITTEN__",
+        "t_ok\t1758579012\t83\t__WORKER_LOG__",
+    ]
+    assert (tmp_path / "worker-logs" / "t_ok.log").read_text() == "body\n"
+
+
 def test_a_second_episode_appends_to_the_index_rather_than_replacing_it(monkeypatch, tmp_path):
     # Every repetition in a build dumps into the same ARTIFACTS directory. The
     # first version of this wrote the index whole, and a build with three

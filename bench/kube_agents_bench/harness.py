@@ -646,6 +646,9 @@ _LOG_ABSENT = "__NO_WORKER_LOG__"
 # Index state for a card whose transcript could not be read at all (the exec
 # failed): the file may exist, and its worker may have run.
 _LOG_UNREAD = "__WORKER_LOG_UNREAD__"
+# Index state for a transcript that was read but whose copy under ARTIFACTS
+# could not be written: the stat is real, the file beside the index is not.
+_LOG_UNWRITTEN = "__WORKER_LOG_UNWRITTEN__"
 # ``stat -c`` is GNU and busybox; both ship it, and a pod whose image has
 # neither still yields the sentinel, so the body is read either way.
 _STAT_FORMAT = "%Y %s"
@@ -790,12 +793,22 @@ def _dump_worker_logs(logs: dict[str, _WorkerLog | None] | None, stalled: Sequen
     that started and went quiet, and a missing file cannot tell the two apart.
     A card whose read failed (``None`` in the map, or no map at all) is a
     third state, ``_LOG_UNREAD``, because it says nothing about whether the
-    file was there; the cards read alongside it keep their transcripts.
+    file was there; the cards read alongside it keep their transcripts. The
+    transcripts are written before the index, so a ``_LOG_PRESENT`` row means
+    the file is beside it; one that would not write keeps its stat under
+    ``_LOG_UNWRITTEN``.
     """
     directory = os.environ.get(_ARTIFACTS_ENV)
     if not directory or not stalled:
         return
     target = Path(directory) / _WORKER_LOG_SUBDIR
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # Best effort, like every other read _settle makes: an artifact
+        # directory that will not take a file is not worth a failed run.
+        _log.warning("could not write the worker logs: %s", exc)
+        return
     found = logs or {}
     rows = []
     for tid in stalled:
@@ -806,9 +819,14 @@ def _dump_worker_logs(logs: dict[str, _WorkerLog | None] | None, stalled: Sequen
         if log is None:
             rows.append(f"{tid}\t{_STAT_UNKNOWN}\t{_STAT_UNKNOWN}\t{_LOG_UNREAD}")
             continue
-        rows.append(f"{tid}\t{log.mtime}\t{log.size}\t{_LOG_PRESENT}")
+        state = _LOG_PRESENT
+        try:
+            (target / f"{tid}.log").write_text(log.body, encoding="utf-8")
+        except OSError as exc:
+            _log.warning("could not write the transcript of %s: %s", tid, exc)
+            state = _LOG_UNWRITTEN
+        rows.append(f"{tid}\t{log.mtime}\t{log.size}\t{state}")
     try:
-        target.mkdir(parents=True, exist_ok=True)
         index = target / _WORKER_LOG_INDEX
         # One append-mode open under an exclusive flock. Repetitions run in
         # parallel, and a header written through a separate exclusive-create
@@ -824,14 +842,8 @@ def _dump_worker_logs(logs: dict[str, _WorkerLog | None] | None, stalled: Sequen
                 fh.flush()
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        for tid in stalled:
-            log = found.get(tid)
-            if log is not None:
-                (target / f"{tid}.log").write_text(log.body, encoding="utf-8")
     except OSError as exc:
-        # Best effort, like every other read _settle makes: an artifact
-        # directory that will not take a file is not worth a failed run.
-        _log.warning("could not write the worker logs: %s", exc)
+        _log.warning("could not write the worker log index: %s", exc)
 
 
 def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
