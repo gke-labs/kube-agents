@@ -135,27 +135,6 @@
 ./tasks/gpu-stress-test-diagnosis/task.yaml
 ./tasks/autoops-warning-event-triage/task.yaml
 
-# The third tofu-provisioned case, and the drift half of incident triage
-# (#1827). It is here for the reason the two above it are, plus one of its
-# own. Cost: its stack takes the infra lock, plants a Deployment whose replica
-# count was taken out of band, hands the Session KV daemon the audit record
-# that change would have produced, and blocks until the resulting triage card
-# is on the board (bounded at 5 minutes) -- then the agent turn waits on the
-# card itself, as autoops does. Hinted at 900s with them, unmeasured.
-#
-# Its own reason is a ceiling the other two do not have. The daemon allows
-# ALERT_DAILY_LIMIT_DRIFT drift alerts a day per install (5 by default) and
-# suppresses the rest, and a suppressed record files no card, so the case
-# cannot run more than that many times a day against one install whatever
-# tier it sits in. Three repetitions a night fit; a presubmit seat, at
-# several pull requests a day against the shared install, does not -- so this
-# case has a reason to stay nightly that no measurement will retire.
-#
-# `validated: false`, and honestly so: the case has never been run against an
-# install, for the reason its pull request's Live validation section records.
-# The nightly is where its first observed run happens.
-./tasks/gitops-drift-out-of-band-triage/task.yaml
-
 # Knowledge-grounding probe (#945): a pure GKE documentation question graded
 # on the persona's grounding contract -- the answer names the compute-class
 # nodeSelector key and ends in the mandated `## Sources` section.
@@ -241,6 +220,29 @@
 # against the install's own unlabelled host cluster beside the labelled
 # seeded trio. Its domain's presubmit seat stays with the probe.
 ./tasks/consistency-no-environment-label/task.yaml
+
+# The third tofu-provisioned case, and the drift half of incident triage
+# (#1827). It is here for the reason the two above it are, plus one of its
+# own. Cost: its stack takes the infra lock, plants a Deployment whose replica
+# count was taken out of band, hands the Session KV daemon the audit record
+# that change would have produced, and blocks until the resulting triage card
+# is on the board (bounded at 5 minutes) -- then the agent turn waits on the
+# card itself, as autoops does. Hinted at 900s with them, unmeasured.
+#
+# Its own reason is a ceiling the other two do not have. The daemon allows
+# ALERT_DAILY_LIMIT_DRIFT drift alerts a day per install (5 by default) and
+# suppresses the rest, and a suppressed record files no card, so the case
+# cannot run more than that many times a day against one install whatever
+# tier it sits in. Three repetitions a night fit; a presubmit seat, at
+# several pull requests a day against the shared install, does not -- so this
+# case has a reason to stay nightly that no measurement will retire.
+#
+# `validated: false`, in step with every case in this file -- none sets it
+# true. It has been run: three runs against a dev install, all five
+# deterministic checks green in each, and two checks it shipped with were cut
+# because those runs showed they could not hold. What the nightly adds is a
+# record built without anyone watching, on an install nobody prepared for it.
+./tasks/gitops-drift-out-of-band-triage/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was
