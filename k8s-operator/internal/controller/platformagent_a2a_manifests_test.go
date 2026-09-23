@@ -63,6 +63,7 @@ func a2aTestCreds() *corev1.Secret {
 			"bridge-password":  []byte("pw-bridge"),
 			"seed-password":    []byte("pw-seed"),
 			"web-password":     []byte("pw-web"),
+			"console-password": []byte("pw-console"),
 			"sys-password":     []byte("pw-sys"),
 			"callout-password": []byte("pw-callout"),
 		},
@@ -238,6 +239,7 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		"session": nil,
 		"seed":    nil,
 		"web":     nil,
+		"console": nil,
 		"sys":     nil,
 	}
 
@@ -665,6 +667,92 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 	// message streams, and a KV bucket is a stream called KV_<bucket>.
 	if strings.Contains(pub, "KV_") || strings.Contains(pub, "$KV.") {
 		t.Error("web can address a KV bucket stream")
+	}
+}
+
+// The console user is the web read surface plus one narrow publish: the
+// inbound chat subject the gateway's console adapter subscribes. Pinned
+// EXACTLY for the same reason web's list is - the reach lives in request
+// bodies and wildcards, and a blocklist cannot see either.
+func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+
+	start := strings.Index(conf, "user: console")
+	if start < 0 {
+		t.Fatal("nats.conf has no console user")
+	}
+	rest := conf[start:]
+	if next := strings.Index(rest[1:], "user: "); next >= 0 {
+		rest = rest[:next+1]
+	}
+	if !strings.Contains(rest, "pw-console") {
+		t.Error("console's password does not come from the creds Secret")
+	}
+
+	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
+	sub := rest[strings.Index(rest, "subscribe"):]
+	var got, gotSub []string
+	for _, line := range strings.Split(pub, "\n") {
+		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+		if strings.HasPrefix(line, `"`) {
+			got = append(got, strings.Trim(line, `"`))
+		}
+	}
+	for _, line := range strings.Split(sub, "\n") {
+		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+		if strings.HasPrefix(line, `"`) {
+			gotSub = append(gotSub, strings.Trim(line, `"`))
+		}
+	}
+	want := []string{
+		"$JS.API.INFO",
+		"$JS.API.STREAM.INFO.TASKS",
+		"$JS.API.STREAM.INFO.DIRECTORY",
+		"$JS.API.STREAM.INFO.TOPICS-STATE",
+		"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+		"$JS.API.STREAM.INFO.KV_session-state",
+		"$JS.API.STREAM.INFO.KV_runtime-state",
+		"$JS.API.STREAM.INFO.KV_cap",
+		"$JS.API.CONSUMER.CREATE.TASKS.>",
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+		"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+		"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+		"$JS.API.CONSUMER.INFO.TASKS.*",
+		"$JS.API.CONSUMER.INFO.DIRECTORY.*",
+		"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+		"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+		"chat.console.*.in",
+		"_INBOX.console.>",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("console publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+	wantSub := []string{"a2a.>", "chat.console.*.out", "_INBOX.console.>"}
+	if !reflect.DeepEqual(gotSub, wantSub) {
+		t.Errorf("console subscribe allow-list changed.\n got: %q\nwant: %q", gotSub, wantSub)
+	}
+	// STREAM.INFO on a KV stream is sizes and counts. The data plane and the
+	// consumer-create verbs on KV_* stay off, so the bucket contents do not
+	// follow the size grant in.
+	for _, gone := range []string{"$KV.", "$JS.API.CONSUMER.CREATE.KV_", "$JS.API.DIRECT.GET.KV_", "$JS.ACK.", "$JS.FC.", "$JS.API.>", "a2a.tasks"} {
+		if strings.Contains(pub, gone) {
+			t.Errorf("console publish list contains %q", gone)
+		}
+	}
+
+	// The other half of the door: the gateway can hear the inbound subject
+	// and answer on the outbound one.
+	gw := conf[strings.Index(conf, "user: gateway"):]
+	gw = gw[:strings.Index(gw[1:], "user: ")+1]
+	if !strings.Contains(gw, `"chat.console.*.out"`) {
+		t.Error("gateway cannot publish console notices")
+	}
+	if !strings.Contains(gw, `"chat.console.*.in"`) {
+		t.Error("gateway cannot subscribe the console inbound subject")
 	}
 }
 
@@ -3345,7 +3433,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "_INBOX.gateway.>",
+		"agents.hb.>", "$KV.session-state.>", "chat.console.*.in", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
 	}
@@ -3354,6 +3442,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"a2a.tasks.*.*.in",
 		"a2a.tasks.*.*.supervisor",
 		"$KV.session-state.>",
+		"chat.console.*.out",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")
@@ -3855,10 +3944,11 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 	)
 	// The namespaces a grant may start in: the bus's own subjects, the
 	// core-NATS heartbeats (agents.hb.>, spec-a2a-payloads' subject table),
-	// JetStream, KV, and inboxes. A first token outside them is a grant
-	// nothing here can read, and a wildcard there (">", "*.API.>", "*.>")
-	// covers all five at once, which no literal spelling check would see.
-	namespaces := []string{"a2a", "agents", "$JS", "$KV", "_INBOX"}
+	// JetStream, KV, inboxes, and the console chat door. A first token
+	// outside them is a grant nothing here can read, and a wildcard there
+	// (">", "*.API.>", "*.>") covers all six at once, which no literal
+	// spelling check would see.
+	namespaces := []string{"a2a", "agents", "$JS", "$KV", "_INBOX", "chat"}
 	ownInbox := inboxPrefix + user + ".>"
 	reached := map[string]map[string]bool{}
 
@@ -3996,6 +4086,14 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 
 	kvSessionState := a2aKVStreamPrefix + "session-state"
 	kvRuntimeState := a2aKVStreamPrefix + a2aRuntimeStateBucket
+	// console holds web's four streams and verbs plus STREAM.INFO on all
+	// three KV buckets, the capacity tiles' size-and-count read.
+	consoleStreams := a2aSameVerbsOn(
+		[]string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream},
+		"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT")
+	for _, kv := range []string{kvSessionState, kvRuntimeState, "KV_cap"} {
+		consoleStreams[kv] = []string{"STREAM.INFO"}
+	}
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{
@@ -4030,6 +4128,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			streams: a2aSameVerbsOn(
 				[]string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream},
 				"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT"),
+			accountLevel: []string{"$JS.API.INFO"},
+		},
+		"console": {
+			streams:      consoleStreams,
 			accountLevel: []string{"$JS.API.INFO"},
 		},
 		"provision": {

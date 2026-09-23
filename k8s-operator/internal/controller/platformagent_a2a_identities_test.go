@@ -188,7 +188,7 @@ func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 	for _, id := range staticIdentities(identityTestAgent()) {
 		got = append(got, id.user)
 	}
-	want := []string{"gateway", a2aBridgeUser, "seed", "web", "sys"}
+	want := []string{"gateway", a2aBridgeUser, "seed", "web", "console", "sys"}
 	if !slices.Equal(got, want) {
 		t.Errorf("static principals = %v, want %v.\nA new static principal needs a recorded reason it cannot present a ServiceAccount token, and a card that closes it if it can.", got, want)
 	}

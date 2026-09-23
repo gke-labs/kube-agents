@@ -205,6 +205,7 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		bridgeIdentity(),
 		seedIdentity(),
 		webIdentity(),
+		consoleIdentity(),
 		sysIdentity(),
 	}
 }
@@ -241,6 +242,9 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// name different buckets is an authorization failure at runtime with
 		// a green suite.
 		"$KV.session-state.>",
+		// The console adapter's notices (spec-chatops-gateway.md, "The
+		// console adapter"): core NATS, one subject per conversation.
+		"chat.console.*.out",
 	}
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
 	publish = append(publish,
@@ -290,6 +294,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"a2a.agents.>",
 			"agents.hb.>",
 			"$KV.session-state.>",
+			"chat.console.*.in",
 			"_INBOX.gateway.>",
 		},
 	}
@@ -682,6 +687,62 @@ func webIdentity() a2aIdentity {
 		subscribe: []string{
 			"a2a.>",
 			"_INBOX.web.>",
+		},
+	}
+}
+
+// console: the web console's credential - the read surface plus one narrow
+// publish, the inbound chat subject the gateway's console adapter subscribes.
+//
+// STATIC permanently, for web's reason: a browser holds no ServiceAccount
+// token. What makes this credential a chat identity rather than a read
+// credential is the grant on chat.console.*.in: only this user can reach
+// that subject, so the gateway takes a frame there as coming from the
+// principal nats:console with no mapping table in between (the same
+// subject-derived identity every other writer on this bus has). One shared
+// principal is the posture until the account split makes it one per person.
+//
+// The three STREAM.INFO.KV_* grants are sizes and counts for the capacity
+// tiles. The data plane ($KV.*) and every consumer verb on KV_* stay off, so
+// the bucket contents do not follow the size grant in.
+func consoleIdentity() a2aIdentity {
+	return a2aIdentity{
+		user:    "console",
+		account: a2aAccountApp,
+		comment: "the web console: web's read surface plus one publish, chat.console.*.in,\n" +
+			"which is the gateway's console adapter's inbound subject. STATIC for\n" +
+			"web's reason. STREAM.INFO on the KV streams is sizes only; no $KV data\n" +
+			"plane and no consumer verbs on KV_*.",
+		auth:     a2aAuthStatic,
+		credsKey: a2aConsolePasswordKey,
+		publish: []string{
+			"$JS.API.INFO",
+			"$JS.API.STREAM.INFO.TASKS",
+			"$JS.API.STREAM.INFO.DIRECTORY",
+			"$JS.API.STREAM.INFO.TOPICS-STATE",
+			"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+			"$JS.API.STREAM.INFO.KV_session-state",
+			"$JS.API.STREAM.INFO.KV_runtime-state",
+			"$JS.API.STREAM.INFO.KV_cap",
+			"$JS.API.CONSUMER.CREATE.TASKS.>",
+			"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+			"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+			"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+			"$JS.API.CONSUMER.INFO.TASKS.*",
+			"$JS.API.CONSUMER.INFO.DIRECTORY.*",
+			"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+			"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+			"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+			"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+			"chat.console.*.in",
+			"_INBOX.console.>",
+		},
+		subscribe: []string{
+			"a2a.>",
+			"chat.console.*.out",
+			"_INBOX.console.>",
 		},
 	}
 }
