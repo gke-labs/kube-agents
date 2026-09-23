@@ -1837,8 +1837,9 @@ unit_cost_hint() {
 # verifier an expired token and a rung-2 "checks errored" red on a run that
 # had done its work. 300s over 2700 covers all three cut reps above with
 # margin. The task lock a later repetition waits behind is sized from this
-# ceiling (run_one_unit), so a unit that uses all of it cannot make its
-# successor give up.
+# ceiling (run_one_unit), times the cases that share the unit's audit
+# stream, so a unit that uses all of it -- after waiting its turn on the
+# stream -- cannot make its successor give up.
 unit_delegation_timeout() {
   case "$1" in
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
@@ -1916,6 +1917,10 @@ STATE_DIR="$(mktemp -d)"
 #                 reset closes the sibling's live ledger and the sibling's
 #                 finish lands in this lane's fresh one. Taken after the task
 #                 lock, keyed on the audit id, only by units that write one.
+#                 A task-lock holder on a shared stream waits its turn on
+#                 the stream before its own run, so both deadlines scale by
+#                 the cases on the stream (stream_case_count), as the infra
+#                 lock's does by contender.
 #   infra      -- at most one stack-bearing (tofu) unit runs at a time,
 #                 across tasks: BENCH_PARALLEL stays false, so devops-bench's
 #                 per-run isolation (own kubeconfig, gcloud config, tofu data
@@ -1934,6 +1939,20 @@ lock_acquire() { # <dir> [deadline-seconds]
 }
 lock_release() { rmdir "$1" 2>/dev/null || true; }
 
+# How many cases in this run write the given stream's ledger: 1 for an
+# empty id or a case alone on its stream, 2 for the two consistency cases.
+# A loop over TASKS rather than a map, since bash 3.2 (what `bash -n` runs
+# under on a contributor's Mac) has no associative arrays and TASKS is short.
+stream_case_count() { # <audit-id>
+  local n=0 t
+  if [ -n "$1" ]; then
+    for t in "${TASKS[@]}"; do
+      if [ "$(ledger_audit_id_for_task "${t}" 2>/dev/null)" = "$1" ]; then n=$((n + 1)); fi
+    done
+  fi
+  echo $(( n > 1 ? n : 1 ))
+}
+
 run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty> <seq>
   local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5" seq="$6"
   local log="/tmp/eval_${name}_rep${rep}.log"
@@ -1942,15 +1961,22 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # listener under every sibling mid-conversation. On its own port, each
   # unit owns its own tunnel and keeps the harness's stale-tunnel recycling.
   export AGENT_LOCAL_PORT=$((28642 + seq))
-  # The task lock is held for the holder's whole unit, so the wait must
-  # outlast one: the unit's delegation ceiling plus grading and teardown
-  # (about 300s on the record; 600s here). A fixed 1800s deadline under a
-  # 3000s ceiling would make a same-task successor give up while its
-  # predecessor was still legitimately running -- 24% of presubmit runs
-  # launch compliance rep 2 within 2090s of rep 1 (385 logs, 09-04 to
-  # 09-15). The infra lock keeps its default: audit units carry no stack.
-  if ! lock_acquire "${STATE_DIR}/lock-task-${name}" \
-    "$(($(unit_delegation_timeout "${name}") + 600))"; then
+  # The stream this case writes its ledger under, empty for a case that
+  # writes none, and the deadline for the locks below. The task lock is held
+  # for the holder's whole unit, so the wait must outlast one: the unit's
+  # delegation ceiling plus grading and teardown (about 300s on the record;
+  # 600s here). A fixed 1800s deadline under a 3000s ceiling would make a
+  # same-task successor give up while its predecessor was still legitimately
+  # running -- 24% of presubmit runs launch compliance rep 2 within 2090s of
+  # rep 1 (385 logs, 09-04 to 09-15). On a stream another case in this run
+  # also writes, the holder first waits its turn on the stream lock, so the
+  # deadline is that figure times the cases on the stream; alone on its
+  # stream, or writing none, a case keeps the single-unit figure. The infra
+  # lock keeps its default: audit units carry no stack.
+  local audit_id lock_deadline
+  audit_id="$(ledger_audit_id_for_task "${task}")"
+  lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600) ))"
+  if ! lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"; then
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
   fi
@@ -1959,15 +1985,11 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
     return 0
   fi
-  # The stream this case writes its ledger under, empty for a case that
-  # writes none. A ledger-writing unit also holds the stream lock from here
-  # until devops-bench returns: two cases on one stream (the two consistency
-  # cases) must not reset and rewrite each other's ledger mid-run. Same
-  # deadline as the task lock, for the same reason.
-  local audit_id
-  audit_id="$(ledger_audit_id_for_task "${task}")"
-  if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}" \
-    "$(($(unit_delegation_timeout "${name}") + 600))"; then
+  # A ledger-writing unit also holds the stream lock from here until
+  # devops-bench returns: two cases on one stream (the two consistency cases)
+  # must not reset and rewrite each other's ledger mid-run. The same scaled
+  # deadline: a waiter here outlasts the other cases' units on the stream.
+  if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}" "${lock_deadline}"; then
     [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${audit_id} stream lock" >&2

@@ -1,7 +1,7 @@
 """Tests for the ledger-token mint's retry in hack/ci-eval-pr.sh.
 
-`run_one_unit` mints its own installation token after it has taken both locks,
-and a unit that cannot mint releases them and returns. That return costs the
+`run_one_unit` mints its own installation token after it has taken its locks
+(task, stream, infra), and a unit that cannot mint releases them and returns. That return costs the
 repetition its run directory, the fan-out records it `MISSING`, and the gate
 grades `MISSING` at rung CHECK_DID_NOT_RUN -- which is blocking, and whose
 reason line reads "a harness or agent crash, not infrastructure". So one

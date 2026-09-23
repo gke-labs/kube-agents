@@ -597,8 +597,39 @@ class CallSiteTest(unittest.TestCase):
         self.assertIn('if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"', unit)
         # Released on the mint-failure path as well as after the run.
         self.assertEqual(unit.count('[ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"'), 2)
-        # The same deadline as the task lock: a holder runs a whole unit.
-        self.assertEqual(unit.count('"$(($(unit_delegation_timeout "${name}") + 600))"'), 2)
+        # One deadline for both locks, and it is the single-unit figure times
+        # the cases on the stream: a task-lock holder on a shared stream waits
+        # its turn on the stream before its own run, so a same-task successor
+        # has to outlast the sibling case's unit as well as the predecessor's.
+        self.assertIn(
+            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600) ))"',
+            unit,
+        )
+        self.assertEqual(unit.count('"${lock_deadline}"'), 2)
+        self.assertLess(unit.index('lock_deadline="$(('), task_lock)
+
+    def test_the_lock_deadline_scales_by_the_cases_that_share_a_stream(self):
+        # Against the real task files: the two consistency cases share
+        # fleet-consistency-drift, every other stream has one case, and a
+        # case that writes no ledger (or an empty id) keeps the single-unit
+        # figure.
+        tasks = " ".join(f"./tasks/{case}/task.yaml" for case in AUDIT_IDS) + " ./tasks/reliability-pdb-probe/task.yaml"
+        body = "\n".join(
+            [
+                f'BENCH_DIR="{REPO_ROOT / "bench"}"',
+                f"TASKS=({tasks})",
+                lifted("ledger_audit_id_for_task"),
+                lifted("stream_case_count"),
+                'echo "drift=$(stream_case_count fleet-consistency-drift)"',
+                'echo "compliance=$(stream_case_count compliance-audit)"',
+                'echo "none=$(stream_case_count "")"',
+                'echo "unknown=$(stream_case_count no-such-stream)"',
+            ]
+        )
+        result = run_bash(body)
+        got = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(got, {"drift": "2", "compliance": "1", "none": "1", "unknown": "1"}, result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_two_units_on_one_stream_serialise_and_two_on_different_streams_do_not(self):
         # The lock helpers as shipped, with mkdir as the mutex: the second
