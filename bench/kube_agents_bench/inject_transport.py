@@ -486,11 +486,18 @@ class InjectUnavailable(RuntimeError):
     ``retryable`` says whether the same exchange could plausibly succeed once
     the harness respawns the tunnel. A 4xx cannot -- the request is wrong, and
     sending it again produces the same refusal.
+
+    ``answered`` says whether the door replied at all -- an HTTP status, or a
+    body that was not the object expected -- as against a connection that
+    was refused or lost before a reply. A POST the door answered with an
+    error started nothing; one whose reply was lost may have, and the
+    abandon path reads the difference (:attr:`InjectTask.unanswered_post`).
     """
 
-    def __init__(self, message: str, *, retryable: bool = True) -> None:
+    def __init__(self, message: str, *, retryable: bool = True, answered: bool = False) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.answered = answered
 
 
 @dataclass
@@ -918,15 +925,23 @@ def _request(
                 f"the inject door refused the bearer token ({url}): read it from the "
                 f"{DEFAULT_TOKEN_SECRET_HINT}",
                 retryable=False,
+                answered=True,
             ) from exc
         raise InjectUnavailable(
-            f"HTTP {exc.code} from {url}: {detail}", retryable=exc.code in RETRYABLE_STATUSES
+            f"HTTP {exc.code} from {url}: {detail}",
+            retryable=exc.code in RETRYABLE_STATUSES,
+            answered=True,
         ) from exc
     except (OSError, http.client.HTTPException, ValueError) as exc:
+        # A ValueError is a body that was not JSON, which the door did
+        # answer; it is folded in here as unanswered on purpose, so that the
+        # abandon path still looks for a task rather than assuming none.
         raise InjectUnavailable(f"{type(exc).__name__} from {url}: {exc}") from exc
     if not isinstance(body, dict):
         raise InjectUnavailable(
-            f"{url} returned non-object JSON: {type(body).__name__}", retryable=False
+            f"{url} returned non-object JSON: {type(body).__name__}",
+            retryable=False,
+            answered=True,
         )
     return body
 
@@ -1038,9 +1053,16 @@ class InjectTask:
         if self.message_id:
             payload["messageId"] = self.message_id
         self.unanswered_post = True
-        body = _request(
-            self.base_url + INJECT_PATH, SUBMIT_TIMEOUT_SECONDS, self.token, payload
-        )
+        try:
+            body = _request(
+                self.base_url + INJECT_PATH, SUBMIT_TIMEOUT_SECONDS, self.token, payload
+            )
+        except InjectUnavailable as exc:
+            # An HTTP error is the door's answer, and a door that answered
+            # with an error started nothing; only a reply that never came
+            # leaves a task this side may not know about.
+            self.unanswered_post = not exc.answered
+            raise
         self.unanswered_post = False
         grace = body.get("firstEventGraceSeconds")
         if isinstance(grace, (int, float)) and grace > 0:

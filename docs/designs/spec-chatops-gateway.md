@@ -586,7 +586,7 @@ not be silent about it.
   have read. With `probe=1` the same read is also the **read route**: a pure read of the
   conversation's session record and of the active task's stream, which mutates nothing - no
   heal, no lock, no post, no publish, no write. It returns the record's active task with its
-  `submittedAt`, age and `detached` flag, the highest executor state the stream shows (none,
+  `submittedAt`, age and `detached` flag, the latest executor state the stream shows (none,
   `submitted`, `working`, or a terminal, with `final`), whether `working` was ever on the stream
   (`reachedWorking`, read off the fold's history, because two events can land between a
   caller's reads and the latest state alone would hide the one that says a model ran) and, when

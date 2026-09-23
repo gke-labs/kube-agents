@@ -314,9 +314,12 @@ type injectRequest struct {
 // TaskID is the task the message started, and Accepted says whether it
 // started one at all: a message that steers a running task, asks for its
 // status or stops it is a turn the gateway answered without minting a task,
-// and so is a message from an author the principal map does not know. In
-// every one of those cases the reply the conversation received is in Entries,
-// and the caller reads it there rather than inferring it from a status code.
+// and so is a message from an author the principal map does not know. The
+// reply the conversation received is in Entries, and Refusal says why there
+// is no task, as a code; a caller branches on the code rather than on the
+// prose or on a status code. Entries can be empty with a Refusal set: the
+// gateway tells an unverifiable sender once, so that sender's later
+// messages are dropped with no new entry (injectRefusalUnverifiedAuthor).
 type injectResponse struct {
 	Conversation string        `json:"conversation"`
 	TaskID       string        `json:"taskId,omitempty"`

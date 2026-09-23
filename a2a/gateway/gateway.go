@@ -90,6 +90,11 @@ type Gateway struct {
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
+	// turnBudget is the clock handleInbound mints for a turn: turnTimeout,
+	// unless a test shortens it to hold a session lock past a whole turn
+	// without waiting a real one. The door's own bounds (injectSubmitWait,
+	// claimTurn) read the constant, which is what production runs.
+	turnBudget time.Duration
 
 	// inbox orders inbound messages per conversation (the backend delivers
 	// events on unordered goroutines) and events orders relay work per
@@ -240,6 +245,7 @@ func New(o Options) (*Gateway, error) {
 		o.Config.FirstEventGrace = defaultFirstEventGrace
 	}
 	g := &Gateway{
+		turnBudget:     turnTimeout,
 		cfg:            o.Config,
 		client:         o.Client,
 		reg:            NewRegistry(o.Client),
@@ -371,7 +377,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// A chat turn's caller is a person, for whom a late answer beats none:
 	// the lock first, then a whole turn, as before the door existed.
 	if backend == injectBackend {
-		ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
+		ctx, cancel := context.WithTimeout(g.runCtx, g.turnBudget)
 		defer cancel()
 		g.runTurn(ctx, msg, backend, principal)
 		return
@@ -379,15 +385,16 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	l := g.lockSession(msg.Conversation)
 	l.Lock()
 	defer l.Unlock()
-	ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
+	ctx, cancel := context.WithTimeout(g.runCtx, g.turnBudget)
 	defer cancel()
 	g.routeTurn(ctx, msg, backend, principal)
 }
 
 // runTurn is a door turn under a clock already running: take the session
-// lock, and route only if the clock has not run out in the wait. Split
-// from handleInbound so a test can hand it a context of its own and hold
-// the lock against it.
+// lock, and route only if the clock has not run out in the wait. The
+// ordering it exists for -- the clock before the lock -- is handleInbound's,
+// and the rig test that pins it drives handleInbound with turnBudget
+// shortened rather than this function with a clock of its own.
 func (g *Gateway) runTurn(ctx context.Context, msg InboundMessage, backend, principal string) {
 	l := g.lockSession(msg.Conversation)
 	l.Lock()

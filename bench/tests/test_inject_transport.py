@@ -1000,13 +1000,18 @@ def test_an_unreachable_gateway_is_infrastructure_after_its_retries(
     stub_gateway: _StubGatewayServer,
 ) -> None:
     """A 503 clears on its own, so it is retried; exhausting the retries is
-    the run class, not an answer."""
+    the run class, not an answer. Every POST was answered, with an error, so
+    no task was started: the record says so, and nothing reads the
+    conversation looking for one."""
     stub_gateway.submit_status = 503
 
     result = KubeAgentsHarness().run("hello")
 
     assert infra(result)
     assert len(stub_gateway.submissions) == harness._MAX_TRANSPORT_FAILURES
+    assert "nothing is left running" in result.errors[0]
+    # One preflight read per attempt, and no recovery read after them.
+    assert len(stub_gateway.polls) == harness._MAX_TRANSPORT_FAILURES
 
 
 @pytest.mark.parametrize("status", sorted(inject.RETRYABLE_STATUSES))

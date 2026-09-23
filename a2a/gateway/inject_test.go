@@ -2089,8 +2089,13 @@ func TestInjectRelayAndReadRouteAgreeOnWhoseTerminalItIs(t *testing.T) {
 // does nothing once it has the lock. A chat turn keeps the other order
 // (the lock, then a whole turn), because its caller is a person for whom a
 // late answer beats none; handleInbound chooses by backend. Driven through
-// runTurn with a short context so the test does not wait a real
-// turnTimeout; the relay standing in for the lock-holder is the test itself.
+// handleInbound itself, which is where the ordering lives, with the
+// gateway's turn budget shortened so the test does not wait a real
+// turnTimeout; the relay standing in for the lock-holder is the test itself,
+// and it holds the lock for four whole budgets, so a turn goroutine that
+// was slow to be scheduled under load has still run out of clock. With the door branch
+// reordered to lock-then-mint, the turn runs a fresh budget after the
+// release and its submission reaches the bus, which is the failure.
 func TestInjectTheTurnClockStartsBeforeTheSessionLock(t *testing.T) {
 	r := startInjectRig(t)
 	key := injectKeyPrefix + "held-lock"
@@ -2102,25 +2107,20 @@ func TestInjectTheTurnClockStartsBeforeTheSessionLock(t *testing.T) {
 		Text:         "how is the fleet?",
 		Backend:      injectBackend,
 	}
-	backend, principal, ok := r.g.verifySender(msg)
-	if !ok || backend != injectBackend || principal != injectTestPrincipal {
-		t.Fatalf("verifySender = (%q, %q, %v), want the door's author resolved", backend, principal, ok)
-	}
+	const budget = 500 * time.Millisecond
+	r.g.turnBudget = budget
 	l := r.g.lockSession(key)
 	l.Lock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		r.g.runTurn(ctx, msg, backend, principal)
+		r.g.handleInbound(msg)
 	}()
-	<-ctx.Done()
 	select {
 	case <-done:
 		t.Fatal("the turn returned while the session lock was still held")
-	case <-time.After(4 * injectPollInterval):
+	case <-time.After(4 * budget):
 	}
 	l.Unlock()
 	select {
