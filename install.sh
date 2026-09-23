@@ -4197,6 +4197,54 @@ main() {
       google_chat_home_channel "$google_chat_home_channel"
   }
 
+  # Both chat platforms are opt-in and default off, so this is the common
+  # install, and the terminal is the only way to reach the agent. Printed again
+  # at the end of main(), beside the Google Chat and Slack instructions.
+  #
+  # project_id, region and cluster_name are all set by earlier steps, and
+  # NAMESPACE is exported before the menu runs.
+  _prompt_no_chat_enabled() {
+    print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
+
+    # gcloud rejects --dns-endpoint on clusters without an external DNS
+    # endpoint, so print the resolved flag rather than a literal one. Resolved
+    # up here because it can warn on stderr, which would otherwise split the
+    # block below.
+    #
+    # This is step 6 of the interview and the apply that creates the cluster is
+    # step 12, so on a fresh install -- and on every --dry-run and
+    # --generate-only run -- there is nothing to describe yet. That is not a
+    # failure: the helper leaves GKE_DNS_ENDPOINT_FLAG empty and the command
+    # below prints without --dns-endpoint, which is the only command there is
+    # anything to print before the cluster exists. The copy in the completion
+    # banner runs after the apply and resolves the real flag.
+    #
+    # What keeps that miss silent is `trap - ERR` inside the helper's own
+    # describe, not the guard here: bash 3.2 runs the inherited ERR trap in the
+    # substitution's subshell, which nothing on this line can reach. The guard
+    # covers the other half -- a non-zero return from the helper -- and matches
+    # the two get-credentials sites further down. The reset keeps the variable
+    # defined whatever the helper does.
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
+
+    echo ""
+    echo -e "${C_CYAN}${C_BOLD}--- [Talking to the Agent from a Terminal] ---${C_RESET}"
+    echo -e "With no chat platform, the terminal is the way in. Point kubectl at the cluster,"
+    echo -e "then open a Hermes session in the agent container:"
+    echo ""
+    # The `:+` keeps the empty flag from leaving a trailing space.
+    echo -e "  ${C_BOLD}gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}${GKE_DNS_ENDPOINT_FLAG:+ ${GKE_DNS_ENDPOINT_FLAG}}${C_RESET}"
+    echo -e "  ${C_BOLD}kubectl exec -it deploy/${PLATFORM_AGENT_DEPLOYMENT} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} -c ${PLATFORM_AGENT_CONTAINER} -- hermes -p ${PLATFORM_AGENT_HERMES_PROFILE}${C_RESET}"
+    echo ""
+    # The pod runs three containers and hosts more than one Hermes profile, so
+    # a command missing -c or -p lands somewhere by accident.
+    echo -e "  ${C_CYAN}-p ${PLATFORM_AGENT_HERMES_PROFILE} reaches the Platform Agent directly, bypassing the Planning${C_RESET}"
+    echo -e "  ${C_CYAN}Agent front door where a chat message would have landed.${C_RESET}"
+    echo ""
+    echo -e "  To add a chat platform later, re-run ${C_BOLD}./install.sh --enable-google-chat${C_RESET} or ${C_BOLD}./install.sh --enable-slack${C_RESET}."
+  }
+
   case "$chat_choice" in
     1)
       google_chat_enabled="true"
@@ -4213,7 +4261,7 @@ main() {
       _prompt_slack_settings
       ;;
     4)
-      print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
+      _prompt_no_chat_enabled
       ;;
   esac
 
@@ -5224,6 +5272,12 @@ main() {
   if [ "${slack_enabled:-false}" = "true" ]; then
     echo ""
     IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
+  fi
+  # Repeated here, where the two printers above give their instructions. Arm 4
+  # prints it as well, for the runs that never reach the end of main().
+  if [ "$chat_choice" = "4" ]; then
+    echo ""
+    _prompt_no_chat_enabled
   fi
 }
 

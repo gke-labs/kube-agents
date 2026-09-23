@@ -76,11 +76,13 @@ installer-driven one name the same objects.
 
 `installer_common.sh` does declare constants of its own, and the distinction is the
 point: the Helm release name, the LiteLLM, operator and agent Deployment names, the
+agent container and Hermes profile inside that Deployment's pod, the
 `platform-agent-secrets` Secret, and the sandbox StatefulSet, credential-proxy
 Deployment and authorized-keys Secret the operator derives from the agent's name are
 the chart's and the operator's fixed names, which no `install.env` key can change, so
 they are `readonly` constants there (`KUBE_AGENTS_HELM_RELEASE`,
-`KUBE_AGENTS_OPERATOR_DEPLOYMENT`, `PLATFORM_AGENT_DEPLOYMENT`, `PLATFORM_AGENT_SECRET`,
+`KUBE_AGENTS_OPERATOR_DEPLOYMENT`, `PLATFORM_AGENT_DEPLOYMENT`,
+`PLATFORM_AGENT_CONTAINER`, `PLATFORM_AGENT_HERMES_PROFILE`, `PLATFORM_AGENT_SECRET`,
 `LITELLM_DEPLOYMENT`, `PLATFORM_AGENT_SHELL_STATEFULSET`,
 `PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT`, `PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET`)
 rather than defaults an install could override. So are the Helm timeouts

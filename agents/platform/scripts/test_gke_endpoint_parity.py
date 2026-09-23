@@ -128,17 +128,32 @@ exit 0
             return [line for line in handle.read().splitlines() if line]
 
 
+# The marker the stub ERR trap below prints. install.sh arms `trap 'on_error …'
+# ERR` under `set -Eeuo pipefail`, and bash 3.2 runs an inherited ERR trap inside
+# a command substitution even when the failure is the tested condition of an
+# `if`. on_error prints a fatal-looking abort banner and rewrites the install
+# report as FAILED, so a probe that fires it turns an expected miss into a run
+# that claims to have died.
+ERR_TRAP_MARKER = "ERR_TRAP_FIRED"
+
+
 def run_bash(describe_stdout, describe_rc=0, supports_flag=True):
-    """What `gke_dns_endpoint_flag` leaves in GKE_DNS_ENDPOINT_FLAG."""
+    """What `gke_dns_endpoint_flag` leaves in GKE_DNS_ENDPOINT_FLAG.
+
+    Run under the callers' own shell options, not a milder set: `-u` because the
+    function has to leave the variable defined on every path, and `-E` with an
+    ERR trap because that is the shape install.sh runs it in. Every case routed
+    through here therefore also asserts the helper reports no failure, which is
+    what `trap - ERR` inside its describe buys.
+    """
     with StubGcloud(describe_stdout, describe_rc, supports_flag) as stub:
-        # -u included deliberately: the callers run under it, and the function
-        # has to leave the variable defined on every path.
         completed = subprocess.run(
             [
                 "bash",
                 "-c",
-                f'set -euo pipefail; source "{BASH_HELPER}"; '
-                'gke_dns_endpoint_flag cluster-a us-central1 proj-a; '
+                f'set -Eeuo pipefail; trap \'echo "{ERR_TRAP_MARKER}" >&2\' ERR; '
+                f'source "{BASH_HELPER}"; '
+                "gke_dns_endpoint_flag cluster-a us-central1 proj-a; "
                 'printf "%s" "$GKE_DNS_ENDPOINT_FLAG"',
             ],
             capture_output=True,
@@ -148,6 +163,11 @@ def run_bash(describe_stdout, describe_rc=0, supports_flag=True):
         )
     if completed.returncode != 0:
         raise AssertionError(f"helper exited {completed.returncode}: {completed.stderr}")
+    if ERR_TRAP_MARKER in completed.stderr:
+        raise AssertionError(
+            "the helper fired the caller's ERR trap; add `trap - ERR` inside the "
+            f"command substitution in {BASH_HELPER}: {completed.stderr}"
+        )
     return completed.stdout
 
 
@@ -196,6 +216,72 @@ class PredicateParity(unittest.TestCase):
     def test_a_failed_describe_yields_no_flag_anywhere(self):
         self.assertEqual("", run_bash("gke-x.gke.goog\tTrue", describe_rc=1))
         self.assertEqual([], run_python("gke-x.gke.goog", True, describe_rc=1))
+
+    def test_a_cluster_that_does_not_exist_yet_is_a_miss_not_a_failure(self):
+        """install.sh resolves this flag before the cluster is created.
+
+        The no-chat block of the chat interview prints a `get-credentials`
+        command, and that is step 6; the apply that creates the cluster is step
+        12. So on every fresh install, `--dry-run` and `--generate-only` run, the
+        describe answers NOT_FOUND -- the normal path here, not an edge.
+
+        Distinct from the bare `describe_rc=1` case above: that one proves the
+        empty flag, this one names the run it happens on and checks the real
+        gcloud error text reaches nothing. run_bash asserts the absence of the
+        ERR trap for both.
+        """
+        not_found = (
+            "ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, "
+            "message=Not found: projects/proj-a/locations/us-central1/clusters/cluster-a."
+        )
+        with StubGcloud(not_found, describe_rc=1) as stub:
+            completed = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f'set -Eeuo pipefail; trap \'echo "{ERR_TRAP_MARKER}" >&2\' ERR; '
+                    f'source "{BASH_HELPER}"; '
+                    "gke_dns_endpoint_flag cluster-a us-central1 proj-a; "
+                    'printf "FLAG=[%s]\\n" "$GKE_DNS_ENDPOINT_FLAG"; '
+                    'echo "INTERVIEW_CONTINUED"',
+                ],
+                capture_output=True,
+                text=True,
+                env=stub.env,
+                timeout=60,
+            )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertIn("FLAG=[]", completed.stdout)
+        # The interview goes on: the operator is asked the remaining questions
+        # and the install reaches its apply.
+        self.assertIn("INTERVIEW_CONTINUED", completed.stdout)
+        self.assertNotIn(ERR_TRAP_MARKER, completed.stderr)
+        # gcloud's own complaint is swallowed too. It would otherwise land in
+        # the middle of the printed terminal-access block.
+        self.assertNotIn("Not found", completed.stderr)
+
+    def test_the_describe_probe_clears_the_inherited_err_trap(self):
+        """Read from source, because bash 5 cannot demonstrate the bug.
+
+        The behavioural checks above run on whatever bash CI has, and bash 5
+        does not run an inherited ERR trap inside a substitution whose failure
+        is the tested condition -- so they pass with or without the clearing.
+        Bash 3.2 does, and that is macOS's /bin/bash and the `curl | bash`
+        audience. This assertion is the one that fails in CI when the clearing
+        is dropped.
+        """
+        with open(BASH_HELPER, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        match = re.search(r"described=\$\((.*?)gcloud container clusters describe", source)
+        self.assertIsNotNone(
+            match, "the describe probe was restructured; keep the ERR-trap clearing"
+        )
+        self.assertIn(
+            "trap - ERR",
+            match.group(1),
+            "the describe substitution must clear the caller's inherited ERR trap, "
+            "like every other gcloud probe in install.sh and installer_common.sh",
+        )
 
     def test_a_gcloud_without_the_flag_yields_no_flag(self):
         self.assertEqual("", run_bash("gke-x.gke.goog\tTrue", supports_flag=False))

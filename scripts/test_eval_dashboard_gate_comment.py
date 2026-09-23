@@ -257,6 +257,11 @@ class Shapes(Harness):
         self.assertIn(f"| `{HELD_OUT}` (held out) | 0 / 3 reps |", body)
         self.assertIn("6 cases passed.", body)
 
+    def test_the_result_cell_counts_ceiling_reps_in_the_total(self):
+        cell = gate_comment.result_cell({"reps": {"pass": 1, "fail": 1, "infra": 0, "ceiling": 1}})
+        self.assertEqual(cell, "1 / 3 reps (1 at the delegation ceiling)")
+        self.assertEqual(gate_comment.result_cell({"reps": {"pass": 0, "fail": 2, "infra": 1}}), "0 / 3 reps (1 infra)")
+
     def test_degraded_storm_match(self):
         names = sorted(ADMITTED)
         stormy = [task(names[0], "ffe")] + [task(name, "eee") for name in names[1:3]] + [task(name, "ppp") for name in names[3:]]

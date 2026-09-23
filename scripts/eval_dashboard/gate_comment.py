@@ -36,8 +36,9 @@ marker, edit-in-place and per-build dedupe as the red comment:
 
 Which words: classify.py's `classify_run` -- the same rules the dashboard's
 run.html and the incident brief use -- decides per case whether it is
-`shared` (the gate's), `only-this-pr` (yours), `storm` or unexplained; this
-module only phrases it.
+`shared` (the gate's), `only-this-pr` (yours), `storm`, `delegation-ceiling`
+(the harness's wait, nothing graded) or unexplained; this module only phrases
+it.
 
 One comment per pull request, found by a hidden marker and edited in place
 on later runs; a build already commented on is never commented on twice.
@@ -274,10 +275,15 @@ def also_text(count) -> str:
 
 def result_cell(case: dict) -> str:
     reps = case.get("reps") or {}
-    total = reps.get("pass", 0) + reps.get("fail", 0) + reps.get("infra", 0)
+    total = reps.get("pass", 0) + reps.get("fail", 0) + reps.get("infra", 0) + reps.get("ceiling", 0)
     cell = f"{reps.get('pass', 0)} / {total} reps"
+    notes = []
     if reps.get("infra"):
-        cell += f" ({reps['infra']} infra)"
+        notes.append(f"{reps['infra']} infra")
+    if reps.get("ceiling"):
+        notes.append(f"{reps['ceiling']} at the delegation ceiling")
+    if notes:
+        cell += f" ({', '.join(notes)})"
     return cell
 
 

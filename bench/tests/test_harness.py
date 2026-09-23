@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 
 from devops_bench.agents import AGENTS, AgentResult
-from kube_agents_bench import harness, transcript, worker_trajectory
+from kube_agents_bench import board, harness, transcript, worker_trajectory
 from kube_agents_bench.cases import CaseSpec
 from kube_agents_bench.harness import KubeAgentsHarness
 from kube_agents_bench.parsing import merge_new as _merge_new
@@ -1717,6 +1717,21 @@ def test_a_blocked_card_ends_the_wait_immediately(
     assert len(stub_agent.requests) == 2
 
 
+def test_a_failed_card_ends_the_wait_and_is_graded(
+    stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """hermes' own terminal failures (``failed``, ``cancelled``) end the wait the
+    way ``blocked`` does, so the record grades the worker's failure instead of
+    running to the ceiling and reading as the harness's."""
+    stub_agent.turns = [_create_turn(), _show_turn("failed", body="Worker exited: OOMKilled.")]
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert "Worker exited: OOMKilled." in result.output
+    assert len(stub_agent.requests) == 2
+
+
 def test_delegation_budget_exhaustion_is_an_error_not_a_crash(
     stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1725,20 +1740,73 @@ def test_delegation_budget_exhaustion_is_an_error_not_a_crash(
     devops-bench refuses to promote a run with a populated ``errors``, so an
     unfinished delegation cannot pass as a genuine low score.
     """
+    # Paced so the deadline, not the silent-turn ceiling, ends the wait: the
+    # stub repeats its last turn under the same call id, which reads as an
+    # agent that stopped reporting after three instant polls.
     monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
-    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.03")
     stub_agent.turns = [_create_turn(), _show_turn("running")]
 
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert result.has_errors()
+    assert "did not finish within" in result.errors[0]
     assert _TASK_ID in result.errors[0]
-    assert "running" in result.errors[0]
-    # A wait that timed out against a LIVE endpoint is agent slowness, not
-    # transport: it grades, and must never borrow the INFRA class.
+    assert "(running)" in result.errors[0]
+    # A wait that timed out against a LIVE endpoint is not transport, so it
+    # must never borrow that class; with nothing delivered it carries its own
+    # marker instead, which the scorer routes to the delegation-ceiling class
+    # rather than grading the acknowledgement as the answer.
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert result.errors[0].startswith(harness.DELEGATION_CEILING_MARKER)
     # Partial, not empty: whatever the agent did say is still recorded.
     assert result.trajectory
+
+
+def test_a_ceiling_hit_after_a_partial_delivery_carries_no_marker(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fan-out that delivered some results is graded on what arrived."""
+    # Paced as in the budget-exhaustion test: one status turn, then the
+    # deadline ends the wait with the second card still running.
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.2")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.1")
+    first, second = "t_00000001", "t_00000002"
+    creates = [
+        item
+        for index, tid in enumerate((first, second))
+        for item in _call(
+            "kanban_create",
+            {"title": f"task {index}"},
+            {"ok": True, "task_id": tid, "status": "ready"},
+            f"call_create_{index}",
+        )
+    ]
+    shows = [
+        *_call(
+            "kanban_show",
+            {"task_id": first},
+            {"task": {"id": first, "status": "done", "result": _RCA_RESULT}, "runs": []},
+            "call_show_1",
+        ),
+        *_call(
+            "kanban_show",
+            {"task_id": second},
+            {"task": {"id": second, "status": "running", "result": None}, "runs": []},
+            "call_show_2",
+        ),
+    ]
+    stub_agent.turns = [
+        _turn(*creates, _text("Filed both.")),
+        _turn(*shows, _text(f"{first} is done; {second} is still running.")),
+    ]
+
+    result = KubeAgentsHarness().run("Fan out.")
+
+    assert _RCA_RESULT in result.output
+    ceiling = [e for e in result.errors if "did not finish within" in e]
+    assert ceiling and second in ceiling[0]
+    assert harness.DELEGATION_CEILING_MARKER not in ceiling[0]
 
 
 def test_delegation_wait_can_be_disabled(
@@ -1752,6 +1820,89 @@ def test_delegation_wait_can_be_disabled(
 
     assert len(stub_agent.requests) == 1
     assert result.output == f"I've started this as task {_TASK_ID}."
+
+
+def _board(monkeypatch: pytest.MonkeyPatch, *statuses: str | None, task_id: str = _TASK_ID) -> list[str]:
+    """Stand in for ``_agent_shell`` with a board that answers each read in turn.
+
+    Each entry is the status the board reports for ``task_id`` on that read
+    (``None``: the card is not on the board); the last entry repeats once the
+    script is exhausted. Every other exec (settling reads, the purge) gets
+    ``""`` as ``no_cluster_exec`` gives it. Returns the board reads made.
+    """
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT not in script:
+            return ""
+        status = statuses[min(len(reads), len(statuses) - 1)]
+        reads.append(script)
+        payload = {"statuses": {} if status is None else {task_id: status}, "error": None}
+        return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    return reads
+
+
+def test_a_running_card_is_watched_on_the_board_without_a_model_turn(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The poll cost: no status turn while the card runs, one when it settles.
+
+    Before the board read, every poll was a model turn replaying the whole
+    conversation -- ~90 turns and millions of input tokens for a 45-minute
+    card, drawn from the quota the worker under test shares.
+    """
+    reads = _board(monkeypatch, "ready", "running", "running", "done")
+    stub_agent.turns = [_create_turn(), _show_turn("done", body=_RCA_RESULT, result=_RCA_RESULT)]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert not result.has_errors()
+    assert _RCA_RESULT in result.output
+    # Two POSTs: the prompt, then the one status turn that collects the
+    # result once the board shows the card done. The three reads that saw it
+    # still moving cost no turn at all.
+    assert len(stub_agent.requests) == 2
+    assert len(reads) == 4
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+
+
+def test_a_ceiling_hit_on_a_readable_board_costs_no_status_turn(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card still running at the deadline: the board's reading names its state."""
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
+    reads = _board(monkeypatch, "running")
+    stub_agent.turns = [_create_turn(), _show_turn("running")]
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert _TASK_ID in result.errors[0]
+    assert "(running)" in result.errors[0]
+    # Nothing was delivered, so the record is the acknowledgement alone and
+    # the error carries the marker the scorer routes to its own class.
+    assert result.errors[0].startswith(harness.DELEGATION_CEILING_MARKER)
+    assert len(stub_agent.requests) == 1
+    assert reads
+
+
+def test_a_card_the_board_does_not_know_is_asked_of_the_agent(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A readable board that lacks the card decides nothing: the turn is made,
+    so a card the agent cannot see still ends the wait at the silent-turn
+    ceiling rather than at the delegation deadline."""
+    _board(monkeypatch, None)
+    stub_agent.turns = [_create_turn(), _show_turn("running"), _show_turn("done", result=_RCA_RESULT)]
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert _RCA_RESULT in result.output
+    assert len(stub_agent.requests) == 3
 
 
 def test_a_turn_without_a_delegation_posts_once(
@@ -2756,13 +2907,17 @@ def test_artifacts_are_read_before_the_card_state_is_purged(
 
     KubeAgentsHarness().run("Find the root cause.")
 
-    kinds = ["purge" if "rm -rf" in s else "read" for s in no_cluster_exec]
-    # Three reads: the artifact listing, the card's worker log (for the
-    # worker_commands check), then the workers' session stores (for the
-    # worker trajectory); the purge comes after all of them.
-    assert kinds == ["read", "read", "read", "purge"]
-    assert harness._LOGS_DIR in no_cluster_exec[1]
-    assert worker_trajectory.CAPTURE_PRESENT in no_cluster_exec[2]
+    kinds = [
+        "purge" if "rm -rf" in s else "board" if board.BOARD_PRESENT in s else "read"
+        for s in no_cluster_exec
+    ]
+    # The board read of the one poll (unanswered here, so the status turn
+    # follows), then three reads: the artifact listing, the card's worker log
+    # (for the worker_commands check), then the workers' session stores (for
+    # the worker trajectory); the purge comes after all of them.
+    assert kinds == ["board", "read", "read", "read", "purge"]
+    assert harness._LOGS_DIR in no_cluster_exec[2]
+    assert worker_trajectory.CAPTURE_PRESENT in no_cluster_exec[3]
 
 
 def test_a_run_that_delegates_nothing_touches_no_pod(

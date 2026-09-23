@@ -170,6 +170,10 @@ kanban:
   # Dispatcher tick. Upstream defaults to 60s, which added a 0-60s (median ~38s)
   # dead wait to every delegation before the worker was claimed.
   dispatch_interval_seconds: 5
+  # Stale-running reclaim timeout. Upstream defaults to 14400s (4 hours), which
+  # caused wedged workers to occupy all dispatch slots for ~4 hours and killed
+  # presubmit eval runs at the 6h deadline (#1880). Bounded to 1800s (30m).
+  dispatch_stale_timeout_seconds: 1800
   # Which terminal events wake this agent for a follow-up turn. Upstream wakes
   # on every kind in its _WAKE_KINDS tuple and offers no way to say otherwise;
   # the image patches that key in (deploy/docker/patches/kanban_notifier.py).

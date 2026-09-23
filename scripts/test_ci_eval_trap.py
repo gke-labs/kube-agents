@@ -40,7 +40,7 @@ def trap_body() -> str:
 def run_trap(exit_code: int) -> subprocess.CompletedProcess:
     """Exit a `set -euo pipefail` shell with `exit_code`, trap installed.
 
-    The three functions the trap calls are stubbed: this is a test of control
+    The functions the trap calls are stubbed: this is a test of control
     flow through the trap, not of what the real callees do.
     """
     script = "\n".join(
@@ -48,6 +48,7 @@ def run_trap(exit_code: int) -> subprocess.CompletedProcess:
             "set -euo pipefail",
             "collect_bench_results() { echo 'called collect_bench_results'; }",
             "report_partial_verdict() { echo 'called report_partial_verdict'; }",
+            "collect_gateway_log() { echo 'called collect_gateway_log'; }",
             "profile_report() { echo \"called profile_report $1\"; }",
             "dump_prow_artifacts_on_failure() { echo \"called dumper with $?\"; }",
             trap_body(),
@@ -75,6 +76,15 @@ class ExitTrapTest(unittest.TestCase):
         result = run_trap(0)
         self.assertIn("called collect_bench_results", result.stdout)
         self.assertIn("called dumper with 0", result.stdout)
+
+    def test_the_gateway_log_is_collected_on_a_green_exit_too(self):
+        """A passing nightly whose repetitions ran to the delegation ceiling
+        used to leave no gateway log; the capture is on every exit now, and
+        ahead of the dumper, which takes the same capture again on a red run."""
+        out = run_trap(0).stdout
+        self.assertIn("called collect_gateway_log", out)
+        self.assertLess(out.index("called collect_gateway_log"), out.index("called dumper"))
+        self.assertIn("called collect_gateway_log", run_trap(7).stdout)
 
 
 class EvalLifetimeHeartbeatTest(unittest.TestCase):
@@ -140,6 +150,7 @@ class EvalLifetimeHeartbeatTest(unittest.TestCase):
         table goes first, ahead of the artifact dump and the dashboard."""
         out = run_trap(143).stdout
         self.assertLess(out.index("called collect_bench_results"), out.index("called report_partial_verdict"))
+        self.assertLess(out.index("called report_partial_verdict"), out.index("called collect_gateway_log"))
         self.assertLess(out.index("called report_partial_verdict"), out.index("called profile_report"))
         self.assertLess(out.index("called report_partial_verdict"), out.index("called dumper"))
 
@@ -155,6 +166,8 @@ class EvalLifetimeHeartbeatTest(unittest.TestCase):
             [
                 "set -euo pipefail",
                 "collect_bench_results() { :; }",
+                "report_partial_verdict() { :; }",
+                "collect_gateway_log() { :; }",
                 "profile_report() { :; }",
                 "dump_prow_artifacts_on_failure() { echo 'called dumper'; }",
                 unguarded,

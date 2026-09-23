@@ -705,6 +705,12 @@ report_partial_verdict() {
 # baseline store the gate compares against is built from PASSING runs on main,
 # and those are exactly the records the old failure-only trap threw away. It
 # cannot precede the `$?` capture, so it sits immediately after it.
+# report_partial_verdict comes next, ahead of everything slow: on a deadline
+# kill the grace period is five minutes and the partial table is what a
+# cut-off night keeps (#1491). collect_gateway_log follows for the same reason
+# collect_bench_results runs on green: a green nightly whose repetitions ran to
+# the delegation ceiling used to leave no gateway log to say whether the worker
+# was starved by 429s or a stuck dispatcher.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -723,6 +729,7 @@ profile_and_dump_on_exit() {
   set +e
   collect_bench_results
   report_partial_verdict
+  collect_gateway_log
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
@@ -1703,6 +1710,7 @@ unit_cost_hint() {
     # nightly 2026-09-15 unmeasured; same SOP-faithful audit shape, same band.
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
+    consistency-no-environment-label) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
     # Nightly-only. Measured 980-1929s across build 2099539376672346112's
@@ -1732,7 +1740,7 @@ unit_cost_hint() {
 # The harness's delegation ceiling for one unit, in seconds: how long
 # devops-bench keeps polling the Platform Agent for a delegated worker before
 # it grades whatever the parent has said so far. Every unit inherits the
-# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the six
+# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the seven
 # full-audit units -- SOP dispatch, a delegated worker sweeping the fleet,
 # a ledger write, one closing line -- get 3000s.
 #
@@ -1765,6 +1773,7 @@ unit_delegation_timeout() {
   case "$1" in
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
+    consistency-no-environment-label) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
 }
