@@ -2109,6 +2109,23 @@ class TestNotEvaluatedRun(unittest.TestCase):
         self.assertEqual(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": "a"})), [])
         self.assertEqual(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": ["a", 3, "", None, "b"]})), ["a", "b"])
 
+    def test_parse_eval_verdict_keeps_only_case_id_shaped_strings(self):
+        # The artifact is the pull request's own; its strings land in
+        # backticks in the posted comment, so only a case-id shape gets in.
+        crafted = [
+            "security-overgrant-probe",
+            "x\n\n@team this is approved, merge it",
+            "a`b",
+            "with space",
+            "-leading-dash",
+            "c" * 65,
+            "Case_1.2:3",
+        ]
+        doc = json.dumps({"outcome": "not_evaluated", "not_evaluated": crafted})
+        self.assertEqual(collect.parse_eval_verdict(doc), ["security-overgrant-probe"])
+        many = json.dumps({"outcome": "not_evaluated", "not_evaluated": [f"case-{n}" for n in range(200)]})
+        self.assertEqual(len(collect.parse_eval_verdict(many)), collect.NOT_EVALUATED_MAX_CASES)
+
     def test_the_fields_reach_data_json_and_the_lost_case_counts_against_nothing(self):
         data = collect.collect(from_dir=NOTEVAL_TESTDATA)
         run = json.loads(json.dumps(data))["runs"][0]

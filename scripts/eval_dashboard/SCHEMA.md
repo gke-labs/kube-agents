@@ -254,7 +254,10 @@ the same layout and is collected from the moment it starts running.
   final line carries that marker, and only for one, the collector reads that
   one artifact; when its `outcome` agrees, the run carries
   `eval_outcome: "not_evaluated"` and `not_evaluated: [<case id>, ...]`, the
-  case ids the suite named (empty when the artifact names none). A line
+  case ids the suite named (empty when the artifact names none; an entry
+  not shaped like a case id — letters, digits, `.`, `_`, `-`, at most 64
+  characters — is dropped, and the list is cut at 64, because the artifact
+  is the pull request's own and the ids are posted in the bot's comment). A line
   without an agreeing artifact writes neither field and a warning, and the
   run is the plain `RED` its `Failed` word says — the same double check the
   script makes before it prints the marker, so a broken invocation cannot
