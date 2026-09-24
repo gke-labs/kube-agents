@@ -56,7 +56,8 @@
 # keys the branch on the touched files and closes the PR when the finding
 # stops reproducing. What bounds the accumulation is the pool sweep
 # (hack/ci_sweep_agent_pulls.py --pool, a Prow periodic), which closes the
-# agent bot's open PRs on each free project's *-infra repo between leases. A
+# agent bot's open PRs on each free project's *-infra repo between leases and
+# deletes their branches (a leftover branch refuses an identical fix). A
 # job usually inherits none, its own reps accumulate within it, and the
 # head-commit check keeps an inherited one out of grading -- which is why this
 # scenario asserts on the PR URL its own run produced rather than on repo state.

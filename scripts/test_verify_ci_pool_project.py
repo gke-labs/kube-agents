@@ -1515,6 +1515,12 @@ class TokenMinterTest(unittest.TestCase):
         self.assertEqual(len(sweep), 1, result.details)
         self.assertIn("gcloud kms keys add-iam-policy-binding github-token-minter-key", sweep[0])
         self.assertIn(f"--member={checker.PULL_SWEEP_MEMBER}", sweep[0])
+        # The headline names the one missing thing; "not provisioned / PEM
+        # missing" would send the operator to the key and the PEM instead.
+        self.assertEqual(result.message, "Minter provisioned; the pull-request sweeper lacks signer on the key (the detail has the one-off grant)")
+        # With the minter's own grant missing too, the minter headline stands.
+        both = self._run(key_policy=_ok(self._key_policy(members=[])))
+        self.assertEqual(both.message, "Token minter not provisioned / PEM key missing or wrong")
         self.assertFalse(any(self._GSA in d and "lacks" in d for d in result.details), result.details)
 
     def test_missing_minter_gsa_fails(self):

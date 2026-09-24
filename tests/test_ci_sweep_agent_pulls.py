@@ -19,8 +19,10 @@ its key in each project's KMS -- the project being swept, not any other -- and
 a signature that cannot be made stops the sweep before GitHub is asked
 anything.
 
-Third, the token is narrowed at mint time -- to one repository, and to
-`pull_requests: write` -- so the sweep never holds the reach the App has.
+Third, the token is narrowed at mint time -- to one repository, and to the two
+writes the sweep makes (close, delete the branch) -- so the sweep never holds
+the reach the App has. The branch goes because a leftover branch refuses the
+next lease's identical fix "nothing to commit" (#1755 item 2).
 
 Fourth, which projects. The sweep takes only what Boskos hands out as free,
 holds each for the seconds it takes, and gives every one back -- on success, on
@@ -41,6 +43,7 @@ import pathlib
 import subprocess
 import unittest
 import urllib.error
+import urllib.parse
 from unittest import mock
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -95,7 +98,7 @@ class _GitHub:
     `pulls` is one list served for every repository, or a dict by repository.
     """
 
-    def __init__(self, pulls=None, mint_error=None, close_errors=None, odd_bodies=None, slug=BOT_SLUG):
+    def __init__(self, pulls=None, mint_error=None, close_errors=None, odd_bodies=None, slug=BOT_SLUG, delete_errors=None):
         self.calls = []
         self.pulls = pulls if pulls is not None else []
         self.mint_error = mint_error
@@ -107,6 +110,8 @@ class _GitHub:
         # Keyed by pull-request number, so one close can fail while the rest
         # succeed.
         self.close_errors = close_errors or {}
+        # Keyed by branch name: what DELETE /git/refs/heads/<branch> raises.
+        self.delete_errors = delete_errors or {}
 
     def _pulls_for(self, path):
         if isinstance(self.pulls, dict):
@@ -138,6 +143,12 @@ class _GitHub:
             if failure is not None:
                 raise failure
             return io.BytesIO(b"{}")
+        if key.startswith("DELETE /repos/") and "/git/refs/heads/" in key:
+            branch = urllib.parse.unquote(key.split("/git/refs/heads/", 1)[1])
+            failure = self.delete_errors.get(branch)
+            if failure is not None:
+                raise failure
+            return io.BytesIO(b"")  # 204
         raise AssertionError("unexpected call %s" % key)
 
     def bodies(self, prefix):
@@ -362,12 +373,12 @@ class TokenScopeTest(unittest.TestCase):
         run_repo(github)
         self.assertEqual(github.bodies("POST /app/installations/")[0]["repositories"], ["kube-agents-evals-7-infra"])
 
-    def test_the_token_asks_for_pull_requests_write_and_nothing_else(self):
-        # The installation also holds contents and issues write, for the
-        # agent. A token that inherited it whole would carry both here.
+    def test_the_token_asks_for_the_two_writes_it_makes_and_nothing_else(self):
+        # Close and delete the branch. The installation also holds issues
+        # write, for the agent; a token that inherited it whole would carry it.
         github = _GitHub()
         run_repo(github)
-        self.assertEqual(github.bodies("POST /app/installations/")[0]["permissions"], {"pull_requests": "write"})
+        self.assertEqual(github.bodies("POST /app/installations/")[0]["permissions"], {"pull_requests": "write", "contents": "write"})
 
     def test_the_installation_is_resolved_from_the_repository(self):
         github = _GitHub()
@@ -394,6 +405,36 @@ class ClosingTest(unittest.TestCase):
         run_repo(github)
         self.assertEqual(github.bodies("PATCH ")[0], {"state": "closed"})
 
+    def test_the_head_branch_is_deleted_after_the_close(self):
+        # #1755 item 2: a leftover branch refuses the next lease's identical
+        # fix "nothing to commit", so closing alone does not clear the miss.
+        github = _GitHub(pulls=[agent_pull(branch="platform-agent/fix the thing#2")])
+        self.assertEqual(run_repo(github), 1)
+        keys = [k for k, _ in github.calls]
+        patch, delete = keys.index("PATCH /repos/%s/pulls/1" % REPO), keys.index("DELETE /repos/%s/git/refs/heads/platform-agent/fix%%20the%%20thing%%232" % REPO)
+        self.assertLess(patch, delete, "the pull request closes before its head goes")
+
+    def test_a_branch_that_is_already_gone_is_not_a_failure(self):
+        for code in sweeper.REF_GONE_CODES:
+            with self.subTest(code=code):
+                github = _GitHub(pulls=[agent_pull()], delete_errors={"platform-agent/fix-the-thing": _http_error(code)})
+                self.assertEqual(run_repo(github), 1)
+
+    def test_a_branch_that_will_not_delete_is_reported_and_the_close_stands(self):
+        github = _GitHub(pulls=[agent_pull(number=1), agent_pull(number=2, branch="platform-agent/other")], delete_errors={"platform-agent/fix-the-thing": _http_error(403)})
+        with self.assertRaises(sweeper.SweepError) as caught:
+            run_repo(github)
+        self.assertIn("left 1 branch(es) behind closed pull requests: platform-agent/fix-the-thing", str(caught.exception))
+        self.assertNotIn("open", str(caught.exception))
+        self.assertEqual(len(github.keys("PATCH ")), 2, "both closed")
+        self.assertEqual(len(github.keys("DELETE ")), 2, "the second branch still went")
+
+    def test_a_pull_request_that_did_not_close_keeps_its_branch(self):
+        github = _GitHub(pulls=[agent_pull()], close_errors={1: _http_error(409)})
+        with self.assertRaises(sweeper.SweepError):
+            run_repo(github)
+        self.assertEqual(github.keys("DELETE "), [])
+
     def test_an_empty_repository_closes_nothing(self):
         github = _GitHub(pulls=[])
         self.assertEqual(run_repo(github), 0)
@@ -403,6 +444,7 @@ class ClosingTest(unittest.TestCase):
         github = _GitHub(pulls=[agent_pull()])
         self.assertEqual(run_repo(github, dry_run=True), 1)
         self.assertEqual(github.keys("PATCH "), [])
+        self.assertEqual(github.keys("DELETE "), [])
 
 
 class CloseFailureTest(unittest.TestCase):

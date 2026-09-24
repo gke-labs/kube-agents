@@ -11,13 +11,14 @@ what it still costs is a repository that fills up, and a repetition reproducing
 the same fix refused "nothing to commit" by the leftover branch.
 
 Runs from a Prow periodic that executes only `main`, never a pull request's
-code. That placement is the point: closing a pull request needs
-`pull_requests: write` on every pool repository, and a presubmit runs the pull
-request's own scripts, so a write credential mounted there is reachable by any
-change under test. Here the credential is the agent's own GitHub App, signed
-through each project's KMS key (the same key minty signs with in-cluster), by a
-service account only this job runs as. The token is narrowed at mint to one
-repository and `pull_requests: write`; the key never leaves KMS.
+code. That placement is the point: closing a pull request and deleting its
+branch need `pull_requests: write` and `contents: write` on every pool
+repository, and a presubmit runs the pull request's own scripts, so a write
+credential mounted there is reachable by any change under test. Here the
+credential is the agent's own GitHub App, signed through each project's KMS
+key (the same key minty signs with in-cluster), by a service account only this
+job runs as. The token is narrowed at mint to one repository and those two
+writes; the key never leaves KMS.
 
 Which projects: the ones Boskos hands out as `free`. Each is acquired into a
 `cleaning` state for the seconds the sweep takes and released back to `free`,
@@ -28,8 +29,10 @@ state is read.
 Three conditions, all required, matching is_agent_pull_request in
 agents/platform/scripts/forge.py: authored by the agent's bot, head branch
 carrying the agent's prefix, and that branch in the repository itself rather
-than a fork. The branch is left: deleting a ref needs `contents: write`, which
-this mint deliberately does not ask for.
+than a fork. The head branch goes with the pull request: submit_suggestion.py
+starts from the remote branch when it exists and refuses "nothing to commit"
+when the new tree matches it, so a closed pull request whose branch stayed
+would still cost the next lease a repetition (#1755 item 2).
 """
 
 import argparse
@@ -70,10 +73,14 @@ JWT_BACKDATE_SECONDS = 60
 BOT_LOGIN_SUFFIX = "[bot]"
 DEFAULT_APP_ID = "4675512"
 
-# The only permission this asks for. The installation carries contents and
-# issues write as well, for the agent; a token that inherited it whole would
-# hold both here for nothing.
-TOKEN_PERMISSIONS = {"pull_requests": "write"}
+# What this asks for: pull_requests to close, contents to delete the head
+# branch (a ref delete is a contents write). The installation carries issues
+# write as well, for the agent; a token that inherited it whole would hold
+# that here for nothing.
+TOKEN_PERMISSIONS = {"pull_requests": "write", "contents": "write"}
+# GitHub's answers for a ref that is already gone: 422 "Reference does not
+# exist", or 404. Neither is a failure -- the branch is what was wanted absent.
+REF_GONE_CODES = (404, 422)
 
 PER_PAGE = 100
 # A bound rather than a budget: orders of magnitude above any pool repository,
@@ -331,15 +338,33 @@ def _field(payload, key, what, repo):
     return payload[key]
 
 
+CALL_FAULTS = (urllib.error.HTTPError, OSError, http.client.HTTPException, SweepError)
+
+
+def delete_branch(repo, ref, authorization):
+    """Delete `ref` (a branch name) from the repository. Already gone is fine."""
+    try:
+        api("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, urllib.parse.quote(ref, safe="/")), authorization)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in REF_GONE_CODES:
+            raise
+
+
 def close_agent_pulls(repo, authorization, bot_login, dry_run=False):
-    """Close every open pull request `bot_login` owns. Returns (closed, unclosed)."""
+    """Close every open pull request `bot_login` owns, and delete its branch.
+
+    Returns (closed, unclosed, undeleted): the numbers that would not close,
+    and the branches of closed pull requests that would not delete.
+    """
     closed = 0
     unclosed = []
+    undeleted = []
     for pull in open_pulls(repo, authorization):
         if not is_agent_pull_request(pull, repo, bot_login):
             continue
         number = pull["number"]
-        print("  #%s (%s)" % (number, pull["head"]["ref"]))
+        ref = pull["head"]["ref"]
+        print("  #%s (%s)" % (number, ref))
         if dry_run:
             closed += 1
             continue
@@ -354,27 +379,36 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False):
                 authorization,
                 {"state": "closed"},
             )
-        except (urllib.error.HTTPError, OSError, http.client.HTTPException, SweepError) as exc:
+        except CALL_FAULTS as exc:
             print("  #%s did not close (%s)" % (number, exc), file=sys.stderr)
             unclosed.append(number)
             continue
         closed += 1
-    return closed, unclosed
+        # The branch only after the close: a branch deleted first would leave
+        # the pull request open on a head that no longer exists.
+        try:
+            delete_branch(repo, ref, authorization)
+        except CALL_FAULTS as exc:
+            print("  #%s closed but %s was not deleted (%s)" % (number, ref, exc), file=sys.stderr)
+            undeleted.append(ref)
+    return closed, unclosed, undeleted
 
 
 def sweep_repo(project, repo, app_id, dry_run=False, runner=subprocess.run):
     """Close the agent's leftovers in one project's repository; returns the count."""
     token, bot_login = scoped_token(app_id, project, repo, runner)
-    closed, unclosed = close_agent_pulls(repo, "token " + token, bot_login, dry_run=dry_run)
+    closed, unclosed, undeleted = close_agent_pulls(repo, "token " + token, bot_login, dry_run=dry_run)
     print(
-        "%s %d pull request(s) by %s in %s"
-        % ("would close" if dry_run else "closed", closed, bot_login, repo)
+        "%s %d pull request(s) by %s in %s%s"
+        % ("would close" if dry_run else "closed", closed, bot_login, repo, ", branches with them" if closed and not dry_run else "")
     )
+    faults = []
     if unclosed:
-        raise SweepError(
-            "left %d pull request(s) open in %s: %s"
-            % (len(unclosed), repo, ", ".join("#%s" % n for n in unclosed))
-        )
+        faults.append("left %d pull request(s) open: %s" % (len(unclosed), ", ".join("#%s" % n for n in unclosed)))
+    if undeleted:
+        faults.append("left %d branch(es) behind closed pull requests: %s" % (len(undeleted), ", ".join(undeleted)))
+    if faults:
+        raise SweepError("%s: %s" % (repo, "; ".join(faults)))
     return closed
 
 

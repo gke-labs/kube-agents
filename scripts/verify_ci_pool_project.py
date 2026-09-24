@@ -2292,6 +2292,7 @@ def check_token_minter(
     versions_checked = False
     key_checked = False
     signer_checked = False
+    sweeper_missing = False
     gsa_checked = False
 
     # Which version matters is the chart's business, not KMS's. The pool
@@ -2431,6 +2432,7 @@ def check_token_minter(
                 details.append(f"{minter_gsa} lacks roles/cloudkms.signerVerifier on {key}; it cannot sign a JWT")
             if PULL_SWEEP_MEMBER not in signers:
                 passed = False
+                sweeper_missing = True
                 details.append(
                     f"{PULL_SWEEP_MEMBER} lacks roles/cloudkms.signerVerifier on {key}; the pull-request "
                     "sweep cannot sign here. Grant it without re-running the provisioning script: "
@@ -2536,7 +2538,12 @@ def check_token_minter(
         ]
     )
     signing_version = f" v{probe_version}" if probe_version else ""
-    if not passed:
+    if not passed and sweeper_missing and len(details) == 1:
+        # The minter itself is whole; the one thing missing is the grant a
+        # project registered before the sweep existed never got (5.5). The
+        # headline says so, or an operator scanning it goes looking at the PEM.
+        message = "Minter provisioned; the pull-request sweeper lacks signer on the key (the detail has the one-off grant)"
+    elif not passed:
         message = "Token minter not provisioned / PEM key missing or wrong"
     elif partial:
         message = partial

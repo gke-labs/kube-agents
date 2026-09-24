@@ -505,7 +505,8 @@ moves on a comment as readily as on a push — so the check also reads the head 
 pull request that changes no files or whose head commit predates the run. That is what makes
 repetitions inside one lease gradable: rep 2 pushing onto rep 1's branch moves the head commit,
 rep 2 quoting rep 1's URL does not. A Prow periodic (`hack/ci_sweep_agent_pulls.py --pool`, run
-from `main` only) closes the agent's leftovers in free pool projects every ten minutes, so a lease
+from `main` only) closes the agent's leftovers in free pool projects every ten minutes and deletes
+their branches (a leftover branch refuses an identical fix "nothing to commit"), so a lease
 rarely inherits one; when it does, the head-commit check is what keeps it from grading.
 A pull request closed without being merged is rejected: closing moves `updated_at` too, and
 what the case grades is that the fix went out. `owner: gke-agentic` pins the organisation, a fair exact

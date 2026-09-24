@@ -45,8 +45,8 @@
 #
 # Isolation class: read-only on the cluster; write to the eval GitOps repo.
 # Every run leaves a pull request behind and submit-suggestion has no dedupe;
-# a Prow periodic (hack/ci_sweep_agent_pulls.py --pool) closes them between
-# leases (the accounting is in rca-remediation-pr's header). This case doubles
+# a Prow periodic (hack/ci_sweep_agent_pulls.py --pool) closes them, branches
+# too, between leases (the accounting is in rca-remediation-pr's header). This case doubles
 # the within-job accumulation,
 # accepted on the same terms: the *-infra repos are throwaway fixtures nobody
 # reads. Eligible tier: nightly, under the merged fan-out.
