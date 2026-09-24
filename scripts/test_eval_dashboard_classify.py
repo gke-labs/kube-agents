@@ -422,6 +422,13 @@ class StormAndSetupTest(unittest.TestCase):
         during = classify_run(target, [target], health_at={"state": "OUTAGE", "condition": "deadline_kill", "failing_cases": []})
         self.assertTrue(during["matches_incident"])
         self.assertIn("Other PRs are being killed the same way", during["lede"])
+        # The recovering hold: the rule has stopped firing, so this kill is not
+        # a wave's -- the reading the gate comment gives the same build.
+        held = classify_run(target, [target], health_at={"state": "OUTAGE", "condition": "deadline_kill", "failing_cases": [], "recovering": True})
+        self.assertFalse(held["matches_incident"])
+        self.assertIn("outage is recovering; this kill holds it back", held["lede"])
+        self.assertNotIn("Other PRs are being killed", held["lede"])
+        self.assertEqual(held["do"], classify.DO_DEADLINE_KILL_RECOVERING)
         # 344 minutes is under the margin: still the branch's own failure.
         short = dict(target, duration_s=344 * 60)
         self.assertEqual(classify_run(short, [short])["headline"], "The run failed before any case ran 344 minutes in.")

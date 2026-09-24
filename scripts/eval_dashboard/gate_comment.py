@@ -128,6 +128,9 @@ UNKNOWN_PROJECT = "an unknown project"
 HEADING = "### ❌ Smoke gate: failed · {failed} of {total} cases"
 HEADING_HARD = "### ❌ Smoke gate: failed · hard failure"
 BOX_OUTAGE = "🔴 **Gate outage in progress** since {since}. {what} fail on every PR ({prs} PRs so far)."
+# An OUTAGE that is not a shared break (deadline kills, #1894) names no
+# failing case; post_health's sentence for the condition says what it is.
+BOX_OUTAGE_OTHER = "🔴 **Gate outage in progress** since {since}. {cause}"
 BOX_DEGRADED = "🟡 **Gate degraded** since {since}. {cause}"
 BOX_HEALTHY = "🟢 **Gate healthy.**"
 ALL_THEIRS = "**Your {n} {failures} {are} exactly {those}, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
@@ -343,9 +346,13 @@ def health_box(red: Red, health_doc: dict, runs: list[dict]) -> str:
     n = len(red.failed)
     sentences = []
     if incident and theirs:
-        if state == health.OUTAGE:
+        if state == health.OUTAGE and health_doc.get("condition") == health.SHARED_BREAK:
             prs = len((health_doc.get("incident") or {}).get("prs") or [])
             sentences.append(BOX_OUTAGE.format(since=post_health.clock(since, weekday=True), what=capitalize(post_health.describe_cases(health_doc.get("failing_cases"))), prs=prs))
+        elif state == health.OUTAGE:
+            # Dated from the first kill, as the deadline comment is.
+            start = post_health.parse_iso((health_doc.get("incident") or {}).get("window_start")) or since
+            sentences.append(BOX_OUTAGE_OTHER.format(since=post_health.clock(start, weekday=True), cause=post_health.cause_sentence(health_doc)))
         else:
             sentences.append(BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=post_health.cause_sentence(health_doc)))
         if not yours and not unclear:

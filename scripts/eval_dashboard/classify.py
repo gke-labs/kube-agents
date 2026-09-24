@@ -222,6 +222,9 @@ DO_SETUP = "Retest. If it dies the same way again, the leased project is the sus
 DO_LOST_POD = "Retest once new jobs are progressing; the build node died under this run, not your change."
 DO_CEILING = "Retest. The worker was still running when the harness's delegation wait ran out; nothing about your change was graded."
 DO_DEADLINE_KILL = "Retest once the brief says runs are finishing again. Prow killed the run at its deadline before a verdict; if other PRs' runs are finishing, a change on this branch that hangs the eval looks like this too."
+# The outage's recovering hold: other PRs' runs are finishing, so a kill
+# arriving now may be the branch, and it holds the gate out of GREEN.
+DO_DEADLINE_KILL_RECOVERING = "Read the build log before retesting. Other PRs' runs are finishing, so this kill may be the branch: a change that hangs the eval ends this way, and each kill holds the gate out of GREEN."
 DO_MERGE_CONFLICT = "Rebase on main and push. A retest re-runs the same conflicted merge."
 DO_UNCLEAR = "Read the transcript. Nothing else on the gate matches this failure yet, so it may be yours."
 DO_HELD_OUT = "Nothing for the gate; this case is held out and does not block."
@@ -404,19 +407,28 @@ def is_deadline_kill(run: dict) -> bool:
     )
 
 
-def _deadline_verdict(base: dict, condition: str | None, cases: list[dict]) -> dict:
+def _deadline_verdict(base: dict, condition: str | None, cases: list[dict], holding: bool = False) -> dict:
+    """The kill's verdict. `holding`: the deadline-kill outage is in its
+    recovering hold, so this kill is not part of a wave -- the same reading
+    the gate comment gives it -- and it is not the incident's."""
     graded = f"{len(cases)} case(s) finished before that; the rest were never graded." if cases else "Nothing was graded."
+    live = condition == CONDITION_DEADLINE_KILL and not holding
+    recovering = condition == CONDITION_DEADLINE_KILL and holding
+    tail = (
+        " Other PRs are being killed the same way right now." if live
+        else " The gate's deadline-kill outage is recovering; this kill holds it back, and with other PRs' runs finishing it may be the branch." if recovering
+        else ""
+    )
     return dict(
         base,
         headline=f"Prow killed this run at its {int(PROW_JOB_TIMEOUT.total_seconds() // 60)}-minute deadline.",
-        lede=f"The run outlived the job's timeout before the eval reached a verdict. {graded}"
-        + ("" if condition != CONDITION_DEADLINE_KILL else " Other PRs are being killed the same way right now."),
+        lede=f"The run outlived the job's timeout before the eval reached a verdict. {graded}{tail}",
         verdict=VERDICT_INFRA,
         setup_death=False,
         cls=CLS_DEADLINE,
-        do=DO_DEADLINE_KILL,
+        do=DO_DEADLINE_KILL_RECOVERING if recovering else DO_DEADLINE_KILL,
         cases=cases,
-        matches_incident=condition == CONDITION_DEADLINE_KILL,
+        matches_incident=live,
     )
 
 
@@ -828,6 +840,10 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
     anchor = now or finish or datetime.now(UTC)
     state, condition, named = _health_fields(health_at)
     has_incident = state is not None and state != STATE_GREEN
+    # The hysteresis hold after an incident: the state is kept, the rule has
+    # stopped firing (health.json `recovering`). Read for the deadline kill,
+    # whose reading turns on whether a wave is live.
+    holding = has_incident and isinstance(health_at, dict) and bool(health_at.get("recovering"))
     build = str(run.get("build_id") or "")
     base = {"build": build, "pr": run.get("pr"), "cases": [], "matches_incident": False}
 
@@ -851,7 +867,7 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
                 matches_incident=condition == CONDITION_LOST_PODS,
             )
         if is_deadline_kill(run):
-            return _deadline_verdict(base, condition, [])
+            return _deadline_verdict(base, condition, [], holding)
         if is_merge_conflict(run):
             return dict(
                 base,
@@ -905,7 +921,7 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
         # #1875: the cases that finished before Prow stopped it are recorded,
         # the verdict never was. The kill is the run's class; the cases stay
         # on the page for what they are worth.
-        return dict(_deadline_verdict(base, condition, cases), storm_reps=storm_reps(run), ceiling_reps=ceiling_reps(run))
+        return dict(_deadline_verdict(base, condition, cases, holding), storm_reps=storm_reps(run), ceiling_reps=ceiling_reps(run))
 
     failed_names = {c["case"] for c in cases if c["outcome"] == OUTCOME_FAILED and c["admitted"]}
     if condition == CONDITION_SHARED_BREAK:

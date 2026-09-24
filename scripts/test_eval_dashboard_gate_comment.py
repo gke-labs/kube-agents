@@ -388,6 +388,28 @@ class DeadlineKillComment(Harness):
         self.assertNotIn("Don't retest yet", body)
         self.assertNotIn("No deadline-kill outage is declared", body)
 
+    def test_a_killed_run_that_recorded_cases_gets_the_deadline_comment_not_the_red_one(self):
+        # #1875: cases finished before Prow stopped it, so is_red would admit
+        # it too; the kill wins, tasks or not.
+        mine = killed(100, 1300, NOW - timedelta(minutes=5), tasks=[task("agent-kanban-smoke", "ppp"), task(TRIO[0], "fff")])
+        self.tick(data(mine, *green_others()), deadline_health())
+        body = self.gh.bodies()[0]
+        self.assertIn(gate_comment.HEADING_DEADLINE, body)
+        self.assertNotIn("Smoke gate: failed", body)
+        self.assertNotIn("| Case |", body)
+        self.assertIn("The gate is down", body)
+
+    def test_a_red_with_a_verdict_during_the_outage_gets_the_kills_sentence_not_the_breaks(self):
+        # The box for an ordinary red under an OUTAGE assumed a shared break;
+        # a deadline-kill OUTAGE names no failing case, so it says the kills.
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO)
+        self.tick(data(mine, *other_runs()), deadline_health())
+        body = self.gh.bodies()[0]
+        self.assertIn("### ❌ Smoke gate: failed · 3 of 7 cases", body)
+        self.assertIn("> 🔴 **Gate outage in progress** since Tue 10:05 AM ET. 3 runs on 3 PRs were killed at the 360-minute deadline", body)
+        self.assertNotIn("fail on every PR", body)
+        self.assertIn("[Incident brief →]", body)
+
     def test_a_long_red_with_a_verdict_is_not_a_kill(self):
         # Ran just as long, but graded: the ordinary red comment, not this one.
         graded = run(100, 1300, NOW - timedelta(minutes=5), failing=("agent-kanban-smoke",), minutes=363)

@@ -370,6 +370,11 @@ a lost pod and a deadline kill.
   build log, `run.html#build=<build id>` on the dashboard, and the incident
   brief when there is an incident.
 
+An ordinary red that reaches a verdict during a deadline-kill OUTAGE gets the
+outage box with the kills' sentence ("N runs on M PRs were killed at the
+360-minute deadline …"), not the shared break's "fail on every PR", since no
+case is failing everywhere.
+
 Which class a case gets — `shared`, `only-this-pr`, `storm`, unexplained — is
 `scripts/eval_dashboard/classify.py`'s `classify_run`, the same rules the
 dashboard's run page and the incident brief use; the comment only phrases it.
@@ -425,7 +430,8 @@ says the gate is down — "N runs on M PRs have been killed at the deadline sinc
 the author not to retest yet. During the hold that follows the outage
 (`recovering`) it says instead that the outage is recovering and this kill
 holds it back, and that with other pull requests' runs finishing it may be the
-branch. With no deadline-kill outage declared it does not
+branch; the run page reads the same way, from the same `recovering` flag, and
+does not count that kill as the incident's. With no deadline-kill outage declared it does not
 clear the branch: one pull request looping to the deadline is that pull request's
 problem (a change that hangs the eval ends the same way), so the box says it
 may be the branch and points at the build log.
