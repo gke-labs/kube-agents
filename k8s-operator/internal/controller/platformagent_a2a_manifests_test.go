@@ -3940,15 +3940,13 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 	)
 	// The namespaces a grant may start in: the bus's own subjects, the
 	// core-NATS heartbeats (agents.hb.>, spec-a2a-payloads' subject table),
-	// JetStream, KV, inboxes, and the console chat door. A first token
-	// outside them is a grant nothing here can read, and a wildcard there
-	// (">", "*.API.>", "*.>") covers all six at once, which no literal
-	// spelling check would see. Admitting "chat" here does not itself hold a
-	// chat.* grant to any row -- neither this function nor the table below it
-	// tracks the two console subjects at all -- so
-	// TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader is what refuses
-	// one on a principal other than console or gateway.
-	namespaces := []string{"a2a", "agents", "$JS", "$KV", "_INBOX", "chat"}
+	// JetStream, KV and inboxes. A first token outside them is a grant
+	// nothing here can read, and a wildcard there (">", "*.API.>", "*.>")
+	// covers all five at once, which no literal spelling check would see.
+	// The console door is admitted as two exact subjects rather than a sixth
+	// namespace -- see grantNamespaceAllowed for why, and for how this
+	// divides with TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader,
+	// which decides which principal may hold the door.
 	ownInbox := inboxPrefix + user + ".>"
 	reached := map[string]map[string]bool{}
 
@@ -3966,8 +3964,8 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 			// wholesale grant appears only where the table records it.
 			// Whether a wildcard further in covers a subject the row does
 			// not record is asked by subject matching in the caller.
-			if first, _, _ := strings.Cut(g, "."); !slices.Contains(namespaces, first) {
-				t.Errorf("%s %s holds %q, whose first token %q is none of %v", user, section, g, first, namespaces)
+			if !grantNamespaceAllowed(g) {
+				t.Errorf("%s %s holds %q, which names no namespace the bus reads and is neither console door subject (%s, %s)", user, section, g, consoleInbound, consoleOutbound)
 				continue
 			}
 			if g == bareJetStreamAPI {
@@ -4372,16 +4370,78 @@ func TestSubjectPatternsOverlap(t *testing.T) {
 	}
 }
 
+// The console chat door, in the one spelling every check here shares. Two
+// exact subjects, not a namespace: these are the only chat.* grants the
+// render produces, so admitting the "chat" namespace wholesale in rule 2
+// would be wider than the thing being held.
+const (
+	consoleInbound  = "chat.console.*.in"
+	consoleOutbound = "chat.console.*.out"
+)
+
+// grantNamespaceAllowed is rule 2's spelling check. A grant's first token
+// must name one of the bus's own namespaces, or the grant must BE one of the
+// two console door subjects.
+//
+// The door is deliberately not a namespace here. Admitting "chat" would stop
+// refusing chat.gchat.>, chat.console.*.status or chat.console.*.in.x by
+// spelling on every principal, and consoleDoorViolations cannot pick them up
+// because none of them overlaps either door pattern (the overlap table below
+// pins chat.console.*.in.x as a non-overlap). The two checks divide the work:
+// this one refuses everything in chat.* that is not the door, and the door
+// test decides which principal may hold the door itself.
+func grantNamespaceAllowed(g string) bool {
+	if g == consoleInbound || g == consoleOutbound {
+		return true
+	}
+	first, _, _ := strings.Cut(g, ".")
+	return slices.Contains([]string{"a2a", "agents", "$JS", "$KV", "_INBOX"}, first)
+}
+
+// TestGrantNamespaceCheckRefusesChatBeyondTheDoor pins rule 2's half of the
+// split. The door test cannot cover these: none of them overlaps either door
+// pattern, so consoleDoorViolations returns nothing for any of them and a
+// grant like chat.gchat.> would otherwise pass the whole suite on any list
+// with no exact pin (web subscribe, seed subscribe, provision's two lists).
+func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
+	for _, tc := range []struct {
+		grant   string
+		allowed bool
+	}{
+		{consoleInbound, true},
+		{consoleOutbound, true},
+		{"a2a.task.>", true},
+		{"agents.hb.>", true},
+		{"$JS.API.STREAM.INFO.a2a", true},
+		{"$KV.sessions.>", true},
+		{"_INBOX.>", true},
+		// chat.* that is not the door, in every shape the render could
+		// grow one: a sibling backend, a sibling verb, a suffix under a
+		// door subject, and the namespace wildcard.
+		{"chat.gchat.>", false},
+		{"chat.discord.*.in", false},
+		{"chat.console.*.status", false},
+		{"chat.console.*.in.x", false},
+		{"chat.console.>", false},
+		{"chat.>", false},
+		{"chat", false},
+		// And the wildcards that cover every namespace at once.
+		{">", false},
+		{"*.API.>", false},
+		{"*.>", false},
+	} {
+		if got := grantNamespaceAllowed(tc.grant); got != tc.allowed {
+			t.Errorf("grantNamespaceAllowed(%q) = %v, want %v", tc.grant, got, tc.allowed)
+		}
+	}
+}
+
 // consoleDoorViolations returns one line per grant, across ids, that
 // overlaps a console door subject pattern on a principal other than that
 // side's one intended holder: publish on chat.console.*.in is console's
 // alone, subscribe there is gateway's alone, and the reverse for
 // chat.console.*.out.
 func consoleDoorViolations(ids []a2aIdentity) []string {
-	const (
-		consoleInbound  = "chat.console.*.in"
-		consoleOutbound = "chat.console.*.out"
-	)
 	rules := []struct {
 		verb, pattern, owner string
 		grants               func(a2aIdentity) []string
@@ -4412,9 +4472,10 @@ func consoleDoorViolations(ids []a2aIdentity) []string {
 // the gateway takes a frame on chat.console.*.in as coming from nats:console
 // with no mapping table in between, because only console can publish there --
 // and console takes a notice on chat.console.*.out as coming from the
-// gateway for the same reason. Admitting "chat" as a recognized namespace in
-// rule 2 above stopped refusing any chat.* grant on any principal by
-// spelling alone, so this is what holds the two subjects to their one
+// gateway for the same reason. Rule 2 above refuses everything in chat.*
+// that is not one of the two door subjects; what it cannot do is say which
+// principal may hold the door, since the door subjects are spelled the same
+// on whoever carries them. That is this test's job, and it holds them to one
 // intended writer and one intended reader: every principal's publish and
 // subscribe lists are checked for pattern overlap (subjectPatternsOverlap,
 // wildcards on either side) against chat.console.*.in and
