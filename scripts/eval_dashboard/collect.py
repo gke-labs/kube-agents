@@ -277,12 +277,15 @@ EVAL_OUTCOME_NOT_EVALUATED = "not_evaluated"
 # The artifact is written by the checkout under test, so its `not_evaluated[]`
 # strings are the pull request's to choose, and they end up in backticks in
 # the comment the health bot posts. Only a string shaped like a case id is
-# kept -- the charset a `bench/tasks/<id>` directory name draws from, with
-# no whitespace, no backtick and no `@`, bounded in length -- and the list
-# is cut at the size a suite could name; the rest is dropped as malformed
-# detail, the way a non-string entry already is. Same idea as the log
-# parser's `\S+` task names and the excerpt scrub in gate_comment.py.
-_CASE_ID_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# kept -- the case-id grammar SCHEMA.md states for the pages (`caseIdRe` in
+# template/pages.js): the charset a `bench/tasks/<id>` directory name draws
+# from, with no whitespace, no backtick and no `@`, at most 80 characters, so
+# an id the pages link is one the collector keeps -- and the list is cut at
+# the size a suite could name; the rest is dropped as malformed detail, the
+# way a non-string entry already is. Same idea as the log parser's `\S+`
+# task names and the excerpt scrub in gate_comment.py. Matched with
+# `fullmatch`: a `$` anchor under `match` admits one trailing newline.
+_CASE_ID_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 NOT_EVALUATED_MAX_CASES = 64
 # Prow's clone-records.json: `[{refs, commands[], failed}]`. Read for the
 # zero-task FAILURE builds, to separate a pull request that would not merge
@@ -586,14 +589,18 @@ def parse_eval_verdict(text: str | None) -> list[str] | None:
         return None
     try:
         doc = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # The artifact is the checkout's own. json.loads raises
+        # RecursionError, not ValueError, past its nesting depth, and an
+        # exception here would escape build_run and drop the build from the
+        # sweep; malformed means the plain RED, whatever the malformation.
         return None
     if not isinstance(doc, dict) or doc.get("outcome") != EVAL_OUTCOME_NOT_EVALUATED:
         return None
     named = doc.get("not_evaluated")
     if not isinstance(named, list):
         return []
-    return [case for case in named if isinstance(case, str) and _CASE_ID_SHAPE.match(case)][:NOT_EVALUATED_MAX_CASES]
+    return [case for case in named if isinstance(case, str) and _CASE_ID_SHAPE.fullmatch(case)][:NOT_EVALUATED_MAX_CASES]
 
 
 def _iso(ts) -> str | None:
