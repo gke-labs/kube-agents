@@ -105,6 +105,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -241,6 +242,15 @@ SYSTEM_NAMESPACE_PREFIXES = ("gke-", "gke-managed-", "config-management-")
 #: goes dark mid-sweep costs one scan timeout rather than one per namespace.
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 CLUSTER_LIST_TIMEOUT_SECONDS = 120
+#: Projects are listed the way the reconciler lists them: the management
+#: project first and alone, since its ssh opens the connection the rest share,
+#: then LIST_WORKERS at a time, each gcloud timeout cut to the budget left. A
+#: listing still running at the deadline is unlisted this tick. One at a time,
+#: a hundred projects (the scope's cap) each hanging to the gcloud timeout would
+#: outlast the whole tick.
+LIST_WORKERS = 8
+LIST_BUDGET_SECONDS = 150
+LIST_GRACE_SECONDS = 5
 GET_CREDENTIALS_TIMEOUT_SECONDS = 60
 NAMESPACE_LIST_TIMEOUT_SECONDS = 60
 NAMESPACE_SCAN_TIMEOUT_SECONDS = 300
@@ -256,6 +266,11 @@ EPISODES_KEY = "episodes"
 #: filed for: the exclusion is the operator keeping a model turn off that
 #: cluster, and a card would hand its rows to another profile instead.
 NO_PROFILE_REASON = "no Cluster Agent profile; not read"
+#: A profile whose cluster_identity cannot be read names no project, so its
+#: cluster's rows are held rather than cleared.
+NO_IDENTITY_REASON = "no readable cluster_identity; its cluster's rows are held"
+#: The ledger's key for such a profile.
+PROFILE_SCOPE = "profile"
 #: Cards opened per tick. Each is a Cluster Agent turn, and the number of
 #: namespaces with a new stall is chosen by whoever can create namespaces, so
 #: the rest keep their rows and wait, oldest first sighting first: a tenant
@@ -430,13 +445,13 @@ def project_id() -> str | None:
     return r.stdout.strip() or None
 
 
-def list_clusters(project: str) -> tuple[list[dict], str | None]:
+def list_clusters(project: str, timeout: float = CLUSTER_LIST_TIMEOUT_SECONDS) -> tuple[list[dict], str | None]:
     """Every cluster as {name, location, status}, and why the listing is
     incomplete when gcloud said so. Raises on a list that could not be read,
     so the caller can tell an empty project from a failed call."""
     r = run_sandbox(
         ["gcloud", "container", "clusters", "list", f"--project={project}", "--format=json"],
-        timeout=CLUSTER_LIST_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     if r.returncode != 0:
         raise RuntimeError(f"gcloud container clusters list exited {r.returncode}: {stderr_excerpt(r.stderr)}")
@@ -755,45 +770,91 @@ def rotate_to_cursor(sweepable: list, cursor: dict | None) -> list:
     return sweepable
 
 
-def roster_projects() -> set[str]:
-    """The projects the Cluster Agent profiles' identities name. A profile
-    whose identity cannot be read names none; its rows are held, not cleared."""
-    from cluster_agent_profile import RESERVED_PROFILES, read_cluster_identity  # lazy, as in cluster_agent_for
+def profile_identity(home: Path) -> dict[str, str] | None:
+    """The profile's cluster_identity, or None when it is absent or cannot be
+    read. The file is in the model-writable agent home, so a malformed one
+    reads as absent rather than failing every project's sweep."""
+    from cluster_agent_profile import read_cluster_identity  # lazy, as in cluster_agent_for
+
+    try:
+        return read_cluster_identity(home)
+    except Exception:  # noqa: BLE001 - any unreadable file is an absent identity
+        return None
+
+
+def roster_projects() -> tuple[set[str], dict[str, str]]:
+    """The projects the Cluster Agent profiles' identities name, and a ledger
+    entry for each profile whose identity names none."""
+    from cluster_agent_profile import RESERVED_PROFILES  # lazy, as in cluster_agent_for
 
     base = Path(gitops_workspace.agent_home()) / PROFILES_DIR
     if not base.is_dir():
-        return set()
-    projects = set()
+        return set(), {}
+    projects, unread = set(), {}
     for home in base.iterdir():
         if home.name in RESERVED_PROFILES or not home.is_dir():
             continue
-        identity = read_cluster_identity(home)
+        identity = profile_identity(home)
         if identity:
             projects.add(identity["project"])
-    return projects
+        else:
+            unread[f"{PROFILE_SCOPE} {home.name}"] = NO_IDENTITY_REASON
+    return projects, unread
+
+
+def list_projects(projects: list[str], first: str, started: float) -> dict[str, tuple[list[dict], str | None] | Exception]:
+    """Every project's listing, or what it failed with; a listing still
+    running at the deadline fails with TimeoutExpired. `first` starts the
+    budget, so it gets gcloud's whole timeout."""
+    deadline = started + LIST_BUDGET_SECONDS
+
+    def listing(project: str, timeout: float) -> tuple[list[dict], str | None] | Exception:
+        try:
+            return list_clusters(project, timeout=timeout)
+        except sandbox_exec.SandboxUnavailable:
+            raise
+        except READ_FAILURES as exc:
+            return exc
+
+    def within_budget(project: str) -> tuple[list[dict], str | None] | Exception:
+        return listing(project, max(1.0, min(CLUSTER_LIST_TIMEOUT_SECONDS, deadline - time.monotonic())))
+
+    results = {first: listing(first, CLUSTER_LIST_TIMEOUT_SECONDS)}
+    rest = [p for p in projects if p != first]
+    if not rest:
+        return results
+    pool = ThreadPoolExecutor(max_workers=min(LIST_WORKERS, len(rest)))
+    futures = {project: pool.submit(within_budget, project) for project in rest}
+    done, _ = wait(futures.values(), timeout=max(0.0, deadline + LIST_GRACE_SECONDS - time.monotonic()))
+    pool.shutdown(wait=False, cancel_futures=True)
+    for project, future in futures.items():
+        # result() re-raises a lost sandbox from the worker.
+        results[project] = future.result() if future in done else subprocess.TimeoutExpired("gcloud container clusters list", LIST_BUDGET_SECONDS)
+    return results
 
 
 def sweep_fleet(management_project: str, cursor: dict | None = None) -> Sweep:
     """Sweep the management project and every project on the roster. One
     project's listing failing holds that project's rows; every listing failing
     fails the sweep."""
-    sweep = Sweep({management_project} | roster_projects())
+    projects, unread_profiles = roster_projects()
+    sweep = Sweep({management_project} | projects)
+    sweep.unreadable.update(unread_profiles)
     started = time.monotonic()
     source = report_source()
     failures: dict[str, Exception] = {}
+    listings = list_projects(sorted(sweep.projects), management_project, started)
     # Every listed cluster is registered before any is read: a cluster the
     # budget never reaches is unread, not gone.
     sweepable = []
     for project in sorted(sweep.projects):
-        try:
-            clusters, incomplete = list_clusters(project)
-        except sandbox_exec.SandboxUnavailable:
-            raise
-        except READ_FAILURES as exc:
-            failures[project] = exc
+        listing = listings[project]
+        if isinstance(listing, Exception):
+            failures[project] = listing
             sweep.unlisted_projects.add(project)
-            sweep.unreadable[f"{LISTING_SCOPE} {project}"] = failure_text(exc)
+            sweep.unreadable[f"{LISTING_SCOPE} {project}"] = failure_text(listing)
             continue
+        clusters, incomplete = listing
         if incomplete:
             sweep.unlisted_projects.add(project)
             sweep.unreadable[f"{LISTING_SCOPE} {project}"] = f"incomplete: {incomplete}"
@@ -967,9 +1028,15 @@ def cluster_agent_for(project: str, cluster: str, location: str) -> str | None:
     from cluster_agent_profile import profile_name  # lazy: pulls the scaffold module's imports
 
     name = profile_name(project, cluster, location)
-    if (Path(gitops_workspace.agent_home()) / PROFILES_DIR / name).is_dir():
-        return name
-    return None
+    home = Path(gitops_workspace.agent_home()) / PROFILES_DIR / name
+    if not home.is_dir():
+        return None
+    identity = profile_identity(home)
+    if identity and (identity["project"], identity["cluster"], identity["location"]) != (project, cluster, location):
+        # profile_name collapses separators, so `acme-prod`/`web` and
+        # `acme`/`prod-web` share a name; the identity says whose it is.
+        return None
+    return name
 
 
 def scope_label_text(scope: str) -> str:

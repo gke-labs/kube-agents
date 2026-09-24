@@ -82,14 +82,16 @@ The card's progress reaches chat because the script writes the card's
 `kanban_notify_subs` row itself: a cron child has no session identity for
 `kanban_create` to copy, and a card without a row is invisible to the gateway
 notifier. The row targets every shipped chat platform with a home channel in the agent home's `config.yaml` (`platforms.<p>.home_channel.chat_id`, the field the tick spawner reads, because Hermes strips every `*_HOME_CHANNEL` from a `no_agent` child's environment), with the same `notify+wake` delivery a user-filed card gets; `<PLATFORM>_HOME_CHANNEL` in the environment is read only for a platform the file does not settle, which is a run started by hand. A row the board refused is written on a later tick while the card is open. `deliver: chat` then carries three one-liners, "stall noticed in
-`<project>/<cluster>` / `<namespace>`: `<objects>`; card `<id>` opened", "stall cleared
+`<project>/<cluster>` (`<location>`) / `<namespace>`: `<objects>`; card `<id>` opened for
+`<profile>`", "stall cleared
 ...; card `<id>` closed" and "stall noticed in `<n>` more namespaces; cards
 follow on later ticks", each naming at most eight objects, plus the sweep-failed
 and sweep-recovered lines every roster entry owes. A clean tick prints nothing. Anything a tick could not read (a
 cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a project whose listing failed or that gcloud called incomplete, a profile whose `cluster_identity` could not be read, a sweep that hit its
 25-minute budget) keeps its rows and is recorded in the ledger, not posted, and
-an exhausted sweep resumes where it stopped. Only every project's listing
-failing at once is the sweep-failed line.
+an exhausted sweep resumes where it stopped. A project whose listing fails is
+held the same way; listing becomes the sweep-failed line only when every
+project's listing fails at once.
 
 Every `gcloud`, `kubectl` and `stall_report.py` call runs in the shell sandbox
 through `sandbox_exec`, because the agent container carries no kubectl (with the

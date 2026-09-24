@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -103,10 +104,12 @@ class FakeFleet:
     `name@location` or a Located value puts it somewhere else, and a key
     `project:name` or `project:name@location` in another project. A project
     in `listing_fails` cannot be listed; `listing_stderr` is a string for
-    every project or a {project: stderr} map."""
+    every project or a {project: stderr} map. A project in `listing_hangs`
+    does not answer its listing until its Event is set."""
 
-    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, listing_fails=()):
+    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, listing_fails=(), listing_hangs=None):
         self.api_resources_rc_one = api_resources_rc_one
+        self.listing_hangs = listing_hangs or {}
         self.listing_stderr = listing_stderr
         self.listing_fails = set(listing_fails)
         self.hidden = set(hidden)
@@ -129,6 +132,8 @@ class FakeFleet:
         self.calls.append((argv, kubeconfig, stdin))
         if argv[:4] == ["gcloud", "container", "clusters", "list"]:
             project = argv[4].split("=", 1)[1]
+            if project in self.listing_hangs:
+                self.listing_hangs[project].wait()
             if project in self.listing_fails:
                 return completed(argv, "", returncode=1, stderr=f"ERROR: (gcloud.container.clusters.list) PERMISSION_DENIED on {project}")
             body = [{"name": n, "location": l, "status": status} for (pr, n, l), (status, _) in self.fleet.items() if pr == project and n not in self.hidden]
@@ -1225,7 +1230,7 @@ class Projects(Base):
     def test_same_named_clusters_in_two_projects_each_get_their_own_card(self):
         lines, fake = self.run_tick({"c": {"storefront": GATEWAY_ROWS}, f"{self.OTHER}:c": {"checkout": [DEPLOYMENT_ROW]}})
         listed = [argv[4] for argv, _, _ in fake.calls if argv[:4] == ["gcloud", "container", "clusters", "list"]]
-        self.assertEqual(listed, [f"--project={self.OTHER}", f"--project={PROJECT}"])
+        self.assertEqual(listed, [f"--project={PROJECT}", f"--project={self.OTHER}"], "the management project lists first and alone")
         self.assertEqual(len(self.noticed(lines)), 2)
         cards = {c["assignee"]: c for c in self.board.cards.values()}
         other = cards[self.profile_dir("c", project=self.OTHER).name]
@@ -1292,6 +1297,52 @@ class Projects(Base):
         self.assertEqual(lines, [])
         self.assertEqual({e["cluster"] for e in self.ledger()["stalls"].values()}, {cid("d", project=self.OTHER)})
         self.assertEqual(next(iter(self.board.cards.values()))["status"], "ready")
+
+    def test_a_projectless_ledger_round_trips_every_cluster_key(self):
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
+        data = self.ledger()
+        data[stall_watch.GENERATIONS_KEY] = {f"{cid('c')}/storefront": 2}
+        data[stall_watch.CURSOR_KEY] = {"cluster": cid("c"), "namespace": "storefront"}
+        data["unreadable"] = {}
+        self.state.write_text(json.dumps(data))
+        self.projectless()
+        self.assertEqual(stall_watch.load_state(self.state, PROJECT), data)
+
+    def test_an_incomplete_listing_in_another_project_holds_only_that_projects_rows(self):
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS}, f"{self.OTHER}:d": {"checkout": [DEPLOYMENT_ROW]}})
+        partial = "WARNING: The following zones did not respond: us-central1-a. List results may be incomplete."
+        lines, _ = self.run_tick({"c": {"catalog": []}, f"{self.OTHER}:d": {"checkout": []}}, listing_stderr={self.OTHER: partial}, hidden=["d"])
+        self.assertEqual(len(self.cleared(lines)), 1)
+        unreadable = self.ledger()["unreadable"]
+        self.assertIn(f"{stall_watch.LISTING_SCOPE} {self.OTHER}", unreadable)
+        self.assertNotIn(f"{stall_watch.LISTING_SCOPE} {PROJECT}", unreadable)
+        self.assertEqual({e["cluster"] for e in self.ledger()["stalls"].values()}, {cid("d", project=self.OTHER)})
+
+    def test_a_listing_that_outlasts_the_budget_holds_its_project_and_the_rest_are_swept(self):
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS}, f"{self.OTHER}:d": {"checkout": [DEPLOYMENT_ROW]}})
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with patch.object(stall_watch, "LIST_BUDGET_SECONDS", 0.2), patch.object(stall_watch, "LIST_GRACE_SECONDS", 0):
+            lines, _ = self.run_tick({"c": {"catalog": []}, f"{self.OTHER}:d": {"checkout": []}}, listing_hangs={self.OTHER: release})
+        self.assertEqual(len(self.cleared(lines)), 1)
+        self.assertIn("timed out", self.ledger()["unreadable"][f"{stall_watch.LISTING_SCOPE} {self.OTHER}"])
+        self.assertEqual({e["cluster"] for e in self.ledger()["stalls"].values()}, {cid("d", project=self.OTHER)})
+
+    def test_a_malformed_identity_file_holds_its_rows_and_names_its_profile(self):
+        self.run_tick({"c": {"catalog": []}, f"{self.OTHER}:d": {"checkout": [DEPLOYMENT_ROW]}})
+        home = self.profile_dir("d", project=self.OTHER)
+        (home / "config.yaml").write_text("- a\n")
+        lines, _ = self.run_tick({"c": {"catalog": []}})
+        self.assertEqual(lines, [])
+        self.assertEqual(self.ledger()["unreadable"][f"{stall_watch.PROFILE_SCOPE} {home.name}"], stall_watch.NO_IDENTITY_REASON)
+        self.assertEqual({e["cluster"] for e in self.ledger()["stalls"].values()}, {cid("d", project=self.OTHER)})
+
+    def test_a_profile_name_two_clusters_share_belongs_to_the_one_its_identity_names(self):
+        owner = f"{PROJECT}-x"
+        self.assertEqual(self.profile_dir("x-c").name, self.profile_dir("c", project=owner).name)
+        self.scaffold("c", project=owner)
+        self.assertIsNone(stall_watch.cluster_agent_for(PROJECT, "x-c", LOCATION))
+        self.assertEqual(stall_watch.cluster_agent_for(owner, "c", LOCATION), self.profile_dir("c", project=owner).name)
 
     def test_a_domain_scoped_project_splits_back_out_of_its_key(self):
         project = "example.com:proj"
