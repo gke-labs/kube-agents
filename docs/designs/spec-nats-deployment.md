@@ -504,7 +504,9 @@ Layout:
   NetworkPolicy on the NATS pod granting **4222 to exactly the enumerated bus clients**
   (the auth callout, the agent pod - whose sidecars, the Hermes bridge included, share
   its labels - the A2A gateway, session pods by the spawner's labels, the provision Job,
-  and the hand-applied seed Job), and **no pod-network peer for 8222 or 9222**. The demo's
+  and the hand-applied seed Job), and ~~**no pod-network peer for 8222 or 9222**~~ **no
+  pod-network peer for 8222, and one for 9222: the console server (amended 9/24,
+  below)**. The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
   which NetworkPolicy does not govern, so the ws surface stays reachable through
   kubectl and through nothing else in-cluster. The enumeration is today's client
@@ -545,6 +547,19 @@ Layout:
   the provision Job is untouched and an existing install picks the door up on operator
   upgrade. Same posture as `web` and stated in the same places: static, published to a
   browser by design, port-forward only.
+
+  **Amended 9/24:** the page is served by an operator-rendered console server
+  (`<agent>-a2a-console`), which answers the browser on its own port, hands the page the
+  `console` password from the creds Secret, and proxies the page's websocket to 9222. It is
+  the one pod-network peer the NATS fence admits on 9222, by label, and its own pod carries
+  a deny-all ingress policy, so it too is reachable only through `kubectl port-forward`.
+  The origin allow-list moves to `http://localhost:8080` and `http://127.0.0.1:8080`, the
+  console server's forwarded address, and the proxy passes the browser's `Origin` through,
+  so the check still sees the page. `same_origin` would still never match, because the bus
+  sees the proxy's `Host`, not the browser's. The server answers only a `Host` naming that
+  forwarded address, so a forward to any other local port gets a refusal naming the right
+  one. The `web` user keeps the same posture it had: a 9222 port-forward and a page that
+  brings its own password.
 
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
