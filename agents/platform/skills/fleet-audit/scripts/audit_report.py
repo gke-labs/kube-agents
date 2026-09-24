@@ -1452,26 +1452,37 @@ def inflight_path_for(audit_id: str) -> str:
 INFLIGHT_TTL_SECONDS = 2 * 60 * 60
 
 
-def _in_flight_since(path: Path) -> tuple[float | None, object]:
-    """`(started_at, pid)` of the note at `path`, or `(None, None)` when it is gone.
+def _in_flight_since(path: Path) -> float | None:
+    """`started_at` of the note at `path`, or `None` when it is gone.
 
     A note that exists but does not parse -- another `start` created it a
     moment ago and has not written it yet -- counts from its mtime: an
     unreadable note is a claim, not an absence.
+
+    The note is a lease on the stream, not a process. It names the stream
+    and the time and nothing else on purpose: the first shape carried
+    `start`'s pid, and `start` exits as soon as it has written the run
+    record, so that pid was always dead by the time anyone read it. On
+    2026-09-23 (build 2102875230451011584, rep 1) a refused worker read the
+    note, ran `ps` against that pid, took "not running" for "the run is
+    over" and passed `--takeover` over its own live run. Nothing in the note
+    can tell a reader whether the run is alive, because the run is a
+    worker's session or a scheduled tick on another pod; only its `finish`
+    or the TTL ends the lease.
     """
     try:
         note = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return None, None
+        return None
     except (OSError, ValueError):
         note = None
     started = note.get("started_at") if isinstance(note, dict) else None
     if isinstance(started, (int, float)):
-        return float(started), note.get("pid")
+        return float(started)
     try:
-        return path.stat().st_mtime, None
+        return path.stat().st_mtime
     except OSError:
-        return None, None
+        return None
 
 
 def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
@@ -1498,6 +1509,13 @@ def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
     that refuses these, so failing open would buy no run that failing closed
     loses, and a `start` refused here wrote nothing, so it has nothing to
     release.
+
+    `takeover` is an operator's flag and nobody else's. A worker or a
+    session that was refused does not pass it: the refusal gives it no
+    liveness test to run (see `_in_flight_since`), so any reading of "that
+    run is dead" it arrives at from inside the sandbox is a guess, and the
+    cost of a wrong guess is the other run's state. The refusal text names
+    neither the flag nor anything a reader could check.
     """
     path = Path(inflight_path_for(audit_id))
     try:
@@ -1510,22 +1528,28 @@ def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
         ) from exc
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        started, pid = _in_flight_since(path)
+        started = _in_flight_since(path)
         if not takeover and started is not None and time.time() - started < INFLIGHT_TTL_SECONDS:
             when = datetime.fromtimestamp(started, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             # Addressed to the worker that was refused: wait or report, and
             # no third option. The first wording offered `--takeover` "if you
             # know it is dead", and on 2026-09-23 a refused session took that
             # as its cue and passed the flag 42 seconds later over a run that
-            # was alive. The override stays on the CLI for an operator; the
-            # refusal does not advertise it.
+            # was alive. The second wording dropped the offer but printed the
+            # note's pid, and that evening a refused session ran `ps` on it,
+            # read `start`'s long-exited process as a dead run, and took over
+            # its own. The override stays on the CLI for an operator; the
+            # refusal names neither it nor anything that reads as a check.
             raise ValidationError(
-                f"a run of {audit_id} is in flight since {when} (pid {pid}); wait for "
-                f"its `finish` or report it. A second `start` would scrub its run "
-                f"record, workspace and findings document."
+                f"a run of {audit_id} is in flight since {when}; wait for its "
+                f"`finish` or report it. A second `start` would scrub its run "
+                f"record, workspace and findings document. The note is a lease "
+                f"on the stream, not a process on this pod: nothing you can run "
+                f"here shows whether that run is alive, and this refusal is not "
+                f"a check to work around."
             )
         path.write_text(
-            json.dumps({"audit": audit_id, "started_at": time.time(), "pid": os.getpid()}),
+            json.dumps({"audit": audit_id, "started_at": time.time()}),
             encoding="utf-8",
         )
     except OSError as exc:
@@ -11598,9 +11622,12 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--takeover",
         action="store_true",
-        help="Operator override: start even though a run of this stream is "
-        "recorded as in flight. Only when you know that run is dead; never as "
-        "the answer to a refusal. The note expires by itself after "
+        help="Operator override, and an operator's only: a worker or session "
+        "that was refused does not pass it. Starts even though a run of this "
+        "stream is recorded as in flight. The note is a lease, not a process: "
+        "it names no pid and no `ps` can show the run dead, so only an "
+        "operator who knows the run is over from outside (its card closed, "
+        "its pod gone) passes this. The note expires by itself after "
         f"{INFLIGHT_TTL_SECONDS // 60} minutes.",
     )
 

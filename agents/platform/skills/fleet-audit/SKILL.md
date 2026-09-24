@@ -117,7 +117,12 @@ it: `--dry-run`, a preview mid-run, and exit 2, a rejected document you are abou
 resubmit, which is still the run in flight. If `start` cannot take the guard at all it exits 2 too,
 rather than run unguarded. A run that died before `finish` is forgotten after those two hours, so
 a crash never blocks the stream's next tick; an operator who knows a run is dead sooner than that
-can pass `--takeover` to `start`. The refusal a worker sees does not offer it.
+can pass `--takeover` to `start`. That flag is an operator's and nobody else's: a worker or a
+session that was refused does not pass it. The note is a lease on the stream, not a process: it
+names the stream and the time and no pid, because the run it stands for is another session's or a
+tick's on another pod, and nothing a worker can run in its shell (`ps`, the note's contents, the
+kanban board) says whether that run is alive. The refusal a worker sees does not offer the flag
+and is not a check to work around.
 
 **Each run reports on itself. Your own answer is a roll-up, not a copy.** Answer with one line per
 stream: for a stream you queued, that it is queued for the next tick; for the one stream you ran

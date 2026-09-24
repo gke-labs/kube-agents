@@ -3901,10 +3901,23 @@ class TestStart(HarnessTestCase):
         # options. The first wording offered the override "if you know it is
         # dead"; on 2026-09-23 a refused session passed it 42 seconds later
         # over a run that was alive. The flag is documented for an operator
-        # and stays off the message.
-        self.assertNotIn("takeover", self.err)
+        # and stays off the message, and so does anything that reads as a
+        # hint that it exists.
+        self.assertNotIn("takeover", self.err.lower())
+        self.assertNotIn("override", self.err.lower())
+        # Nor does the message hand the worker a liveness test. The second
+        # wording printed the note's pid, which is `start`'s own and always
+        # exited; that evening (build 2102875230451011584, rep 1) a refused
+        # worker ran `ps` on it, read the run as dead, and took over its own
+        # run. The note is a lease, not a process: no pid in the note, none
+        # in the refusal, and the message says so.
+        self.assertNotIn("pid", self.err.lower())
+        self.assertNotIn(str(os.getpid()), self.err)
+        self.assertIn("a lease on the stream, not a process", self.err)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertEqual(set(json.loads(note.read_text())), {"audit", "started_at"})
         # Refused means refused: the other run's note is still there.
-        self.assertTrue(Path(audit_report.inflight_path_for(AUDIT)).is_file())
+        self.assertTrue(note.is_file())
         # The note names the stream, not the caller's guess about it.
         self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--takeover"]), 0)
 
@@ -3978,7 +3991,7 @@ class TestStart(HarnessTestCase):
         self.harness.replies = {"issue list": self.issue_list()}
         note = Path(audit_report.inflight_path_for(AUDIT))
         note.parent.mkdir(parents=True, exist_ok=True)
-        theirs = json.dumps({"audit": AUDIT, "started_at": time.time(), "pid": 1})
+        theirs = json.dumps({"audit": AUDIT, "started_at": time.time()})
         note.write_text(theirs)
         Path(f"{note}.lock").mkdir()  # os.open(O_RDWR) on a directory: EISDIR
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
@@ -4015,7 +4028,7 @@ class TestStart(HarnessTestCase):
         self.assertFalse(note.is_file())
         # And `finish` is what releases it on the happy path.
         Path(audit_report.inflight_path_for(AUDIT)).write_text(
-            json.dumps({"audit": AUDIT, "started_at": time.time(), "pid": 1})
+            json.dumps({"audit": AUDIT, "started_at": time.time()})
         )
         rc = self.run_finish(make_doc())
         self.assertEqual(rc, 0, self.err)
