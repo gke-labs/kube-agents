@@ -7,7 +7,8 @@
 # back a ComputeClass design. The live sibling is
 # bench/cuj/obtainability/test_01_cluster_design.py, which needs a full
 # install and grades the portal projection; this case grades the same
-# behavior's report through the eval harness so a regression reds CI.
+# behavior's report through the eval harness, so a regression shows in the
+# nightly record (a nightly-only case cannot red a presubmit).
 #
 # Planted defect required: none — the case probes live GCP advice and quota
 # APIs in the eval project and grades the report's discipline, not a fixture.
@@ -49,7 +50,7 @@ verification_spec:
       type: worker_commands
       required_patterns:
         - "gcloud compute regions describe"
-        - "gcloud beta compute advice capacity"
+        - "gcloud beta compute advice capacity(?!-)"
   - name: report-separates-quota-from-capacity
     role: objective
     mode: assert

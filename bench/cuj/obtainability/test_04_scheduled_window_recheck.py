@@ -33,8 +33,9 @@ from cuj.utils.scenario import Scenario
 RECHECK_LEAD = timedelta(hours=2)
 RECHECK_LEAD_HOURS = int(RECHECK_LEAD.total_seconds() // 3600)
 RECHECK_LEAD_MINUTES = int(RECHECK_LEAD.total_seconds() // 60)
-# The lead spelled both ways an answer may echo it.
-LEAD_PHRASES = (f"{RECHECK_LEAD_HOURS} hours", "two hours")
+# The lead spelled both ways an answer may echo it. The digit form rejects
+# a preceding digit: "12 hours" is the job's duration, not the lead.
+LEAD_RE = re.compile(rf"(?<!\d)(?:{RECHECK_LEAD_HOURS}|two)\s+hours?\b")
 REQUIRED_SKILLS = {"capacity-obtainability"}
 # The one scheduling tool the runtime exposes. The projection carries tool
 # names without arguments, so a match shows scheduling activity, not a
@@ -53,14 +54,18 @@ FORBIDDEN_OPERATIONS = {
 # inside an ISO-8601 timestamp ("2026-09-22T22:00:00Z"). No leading word
 # boundary — a digit inside a timestamp has none.
 UTC_TIME_RE = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})")
-# The one-shot verdict is judged per sentence: a recurrence word counts
-# against the answer only when its sentence is about the schedule and does
-# not negate ("never a recurring schedule" echoes the request and is a
-# confirmation, not a commitment). Bare "single" is not a firing commitment
-# ("the single best zone"), so it counts only bound to the re-check.
+# The one-shot verdict is judged per recurrence mention: a recurrence word
+# counts against the answer only in a sentence about the schedule, and a
+# negation neutralizes it only when it sits just before it ("never a
+# recurring schedule") — a "no" elsewhere in the sentence ("with no end
+# date") does not un-say "hourly". Bare "once" is more often temporal
+# ("once the window is confirmed") and bare "single" descriptive ("the
+# single best zone"), so only firing-count shapes commit.
 ONE_SHOT_RE = re.compile(
-    r"\b(once|one[- ]time|single\s+(?:re-?check|firing|run|execution))\b"
+    r"\b(exactly once|only once|fires? once|runs? once|one[- ]time"
+    r"|single\s+(?:re-?check|firing|run|execution))\b"
 )
+NEGATION_WINDOW_CHARS = 20
 SCHEDULE_TERM_RE = re.compile(r"\b(re-?check|schedul\w*|cron\w*|fires?|firing)\b")
 RECURRENCE_RE = re.compile(
     r"\b(recurring|repeat\w*|hourly|daily|weekly|nightly"
@@ -106,8 +111,8 @@ ACCEPTANCE_CRITERIA = (
     ),
     AcceptanceCriterion(
         "ac05-recheck-is-one-shot",
-        "The re-check fires once: the answer states it, and no "
-        "non-negated schedule sentence describes a recurrence.",
+        "The re-check fires once: the answer states the firing count, "
+        "and no schedule sentence carries an un-negated recurrence.",
         "the delivered answer commits to a single firing",
     ),
 )
@@ -177,7 +182,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
             for fire in clock_minutes
         )
         and "utc" in folded_answer
-        and any(phrase in folded_answer for phrase in LEAD_PHRASES)
+        and bool(LEAD_RE.search(folded_answer))
     )
     reports_to_thread = (
         "this conversation" in folded_answer
@@ -187,9 +192,11 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     )
     recurring_committed = any(
         SCHEDULE_TERM_RE.search(sentence)
-        and RECURRENCE_RE.search(sentence)
-        and not NEGATION_RE.search(sentence)
+        and not NEGATION_RE.search(
+            sentence[max(0, match.start() - NEGATION_WINDOW_CHARS) : match.start()]
+        )
         for sentence in SENTENCE_SPLIT_RE.split(folded_answer)
+        for match in RECURRENCE_RE.finditer(sentence)
     )
     one_shot = bool(ONE_SHOT_RE.search(folded_answer)) and not recurring_committed
 

@@ -13,7 +13,6 @@ manifests, and no clarifying question back to a session with no person in it.
 
 from __future__ import annotations
 
-import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -35,11 +34,6 @@ INVALIDATED_ZONE = "us-central1-a"
 REMAINING_ZONE = "europe-west4-b"
 REMAINING_REGION = REMAINING_ZONE.rsplit("-", 1)[0]
 INVALIDATED_START_LEAD = timedelta(hours=20)
-# A revised start is a concrete moment: date and clock. A timestamp echoed
-# back from the incident text is not a new recommendation, and an RFC 3339
-# Z suffix is itself a UTC statement (test_03 accepts the same).
-TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{1,2}:\d{2}")
-ZULU_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z")
 OBTAINABILITY_PLANNING_METHODS = {
     "compute.beta.AdviceService.CalendarMode",
     "compute.advice.calendarMode",
@@ -74,6 +68,16 @@ the paired Dynamic Workload Scheduler ProvisioningRequest and Kueue \
 LocalQueue for the new target. This is planning-only: do not apply \
 manifests, submit a provisioning request, create infrastructure, or mutate \
 Kubernetes or cloud state."""
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
@@ -112,6 +116,28 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         and item["details"].get("apiMethod") in OBTAINABILITY_PLANNING_METHODS
         and item["details"].get("region") == REMAINING_REGION
     ]
+    analysis_records = [
+        item
+        for item in evidence
+        if item.get("type") == "workload_obtainability_planning_analysis"
+        and str(item.get("status") or "").casefold() in {"completed", "passed"}
+        and isinstance(item.get("details"), dict)
+    ]
+    analysis = (
+        analysis_records[0]["details"].get("analysis")
+        if len(analysis_records) == 1
+        else None
+    )
+    windows = [
+        item
+        for item in ((analysis.get("windows") if isinstance(analysis, dict) else None) or [])
+        if isinstance(item, dict)
+    ]
+    remaining_starts = [
+        (str(item.get("startTime") or ""), _parse_timestamp(item.get("startTime")))
+        for item in windows
+        if str(item.get("zone") or "") == REMAINING_ZONE
+    ]
 
     answer = delivered_answer(interaction)
     folded_answer = answer.casefold()
@@ -143,12 +169,20 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     )
     folded_input = input_text.casefold()
 
-    # Naming the zone and the letters "UTC" is not a revised verdict: an
-    # answer that only restates the incident carries both. A revision names
-    # a start the incident did not, or the honest no-window statement.
-    new_start_named = bool(
-        set(TIMESTAMP_RE.findall(answer)) - set(TIMESTAMP_RE.findall(input_text))
-    ) and ("utc" in folded_answer or bool(ZULU_RE.search(answer)))
+    # A revision names the recommended window's own start — the date and
+    # clock of a window the analysis record carries for the remaining zone,
+    # as test_03 requires for the original plan. Timestamps every compliant
+    # report contains anyway (the must-start-by deadline line, the probe
+    # commands' --start-time-range values, the incident echoed in another
+    # format) cannot satisfy it. An RFC 3339 Z timestamp is itself a UTC
+    # statement (test_03's rule).
+    new_start_named = any(
+        parsed is not None
+        and parsed.strftime("%Y-%m-%d") in answer
+        and parsed.strftime("%H:%M") in answer
+        and ("utc" in folded_answer or (raw and raw in answer))
+        for raw, parsed in remaining_starts
+    )
     revised_or_honest = REMAINING_ZONE in answer and (
         new_start_named or "no window" in folded_answer
     )
@@ -171,8 +205,8 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
                 "ac03-revised-recommendation-delivered",
                 "The answer names a new UTC start in the remaining zone, or "
                 "states honestly that no window exists there.",
-                "a start timestamp the incident did not carry, or the "
-                "no-window verdict, with the remaining zone named",
+                "the analysis record's remaining-zone window start named "
+                "in the answer, or the no-window verdict, with the zone named",
             ),
             AcceptanceCriterion(
                 "ac04-artifacts-retargeted",
@@ -206,7 +240,9 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         revised_or_honest,
         answer,
         blocked_by=tuple(
-            dict.fromkeys((*interaction_blocker, *final_output_blocker))
+            dict.fromkeys(
+                (*interaction_blocker, *evidence_blocker, *final_output_blocker)
+            )
         ),
     )
     suite.record(
