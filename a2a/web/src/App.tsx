@@ -16,7 +16,7 @@ import "./styles.css";
 
 /**
  * First load with no credentials shows this instead of a dead page. The
- * password is the install's `web-password` key; the recipe to fetch it and
+ * password is the install's `console-password` key; the recipe to fetch it and
  * start the port-forward is in the README and repeated here so the form is
  * self-explanatory in front of an audience.
  */
@@ -42,14 +42,14 @@ function ConnectForm({
       <h1>a2a bus</h1>
       <p className="connect-hint">
         kubectl port-forward the NATS websocket port, then paste the install&apos;s
-        <code> web-password</code>.
+        <code> console-password</code>.
       </p>
       <label>
         websocket url
         <input value={url} onChange={(e) => setUrl(e.target.value)} />
       </label>
       <label>
-        web password
+        console password
         <input
           type="password"
           value={pass}

@@ -16,12 +16,11 @@
  * a time and the UI must light up as they appear, not reject.
  */
 import { connect, type NatsConnection } from "nats.ws";
-import { parseEnvelope, parseSubject, type Envelope } from "./protocol.ts";
+import { STREAMS, parseEnvelope, parseSubject, type Envelope } from "./protocol.ts";
 import type { BusConfig } from "./config.ts";
 import type { BusEvent, ProbeResult } from "./model.ts";
 
-/** The four streams W6's provisioning Job creates; names are the contract. */
-export const STREAMS = ["TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL"] as const;
+export { STREAMS };
 
 const TICK_MS = 5_000;
 /** How long to wait before trying to attach to a missing stream again. */

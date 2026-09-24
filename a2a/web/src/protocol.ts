@@ -245,3 +245,36 @@ export function partsText(parts: Part[] | undefined): string {
   if (!Array.isArray(parts)) return "";
   return parts.map((p) => (p && typeof p.text === "string" ? p.text : "")).join("");
 }
+
+/** The four streams the provisioning Job creates; the names are the contract. */
+export const STREAMS = ["TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL"] as const;
+export type StreamName = (typeof STREAMS)[number];
+
+export interface AuthorityView {
+  backend?: string;
+  conversation?: string;
+}
+
+function stringField(obj: unknown, key: string): string | undefined {
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return undefined;
+  const v = (obj as Record<string, unknown>)[key];
+  return typeof v === "string" && v !== "" ? v : undefined;
+}
+
+/**
+ * The two fields the page reads from the gateway's authority block. The
+ * block is advisory (any publisher could invent one), so the page displays
+ * these and never decides anything on them. Everything else in it is
+ * pseudonymous hashes the page has no use for.
+ */
+export function authorityOf(env: Envelope): AuthorityView {
+  const a = env.authority;
+  if (typeof a !== "object" || a === null || Array.isArray(a)) return {};
+  const block = a as { requester?: unknown; audience?: unknown };
+  const view: AuthorityView = {};
+  const backend = stringField(block.requester, "backend");
+  const conversation = stringField(block.audience, "conversation");
+  if (backend !== undefined) view.backend = backend;
+  if (conversation !== undefined) view.conversation = conversation;
+  return view;
+}

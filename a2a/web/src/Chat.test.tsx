@@ -74,6 +74,10 @@ describe("Chat", () => {
     rerender(<Chat entries={[]} user="seed" onProbe={() => {}} />);
     expect(screen.getByText("seed")).toBeTruthy();
     expect(screen.queryByText(/read-only/)).toBeNull();
+
+    cleanup();
+    render(<Chat entries={[]} user="console" onProbe={() => {}} />);
+    expect(screen.queryByText(/read-only/)).toBeNull();
   });
 
   it("groups by correlation with one chip per exchange", () => {

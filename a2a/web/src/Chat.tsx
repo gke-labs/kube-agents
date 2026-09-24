@@ -14,11 +14,11 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChatEntry, ProbeResult } from "./model.ts";
 import { corrColor } from "./model.ts";
-import { DEFAULT_USER } from "./config.ts";
+import { READ_ONLY_USER } from "./config.ts";
 
 interface ChatProps {
   entries: ChatEntry[];
-  /** The connected NATS user — the read-only badge only vouches for `web`. */
+  /** The connected NATS user - the read-only badge only vouches for `web`. */
   user: string;
   probe?: ProbeResult;
   probePending?: boolean;
@@ -106,7 +106,7 @@ export default function Chat({ entries, user, probe, probePending, onProbe }: Ch
       <div className="probe-bar">
         <span className="probe-label">
           connected as <code>{user}</code>
-          {user === DEFAULT_USER ? " · read-only" : ""}
+          {user === READ_ONLY_USER ? " · read-only" : ""}
         </span>
         <button
           type="button"
