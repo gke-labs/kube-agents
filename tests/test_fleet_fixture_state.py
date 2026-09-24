@@ -182,6 +182,31 @@ def _healthy_world() -> dict:
                 "subjects": [{"kind": "ServiceAccount", "name": "default", "namespace": "seeded-security"}],
             },
             "node?cloud.google.com/gke-nodepool=idle-batch-pool": {"items": [_node()]},
+            # seeded-d's zonal-skew trio, each in the state its role's `state`
+            # block asserts: a scheduled pod for the scheduling case, a Bound
+            # claim for the volume case, a Pending pod for the capacity case.
+            # Those three signals are what say the skew's cause is present,
+            # not merely that the objects were created.
+            "namespace/seeded-topology": {"metadata": {"name": "seeded-topology"}},
+            "deployment/zone-pinned-api": {
+                "spec": {"template": {"spec": {
+                    "topologySpreadConstraints": [{"whenUnsatisfiable": "ScheduleAnyway"}],
+                    "affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [{"matchExpressions": [{"key": "topology.kubernetes.io/zone"}]}]
+                    }}},
+                }}},
+                "status": {"readyReplicas": 2, "replicas": 2},
+            },
+            "pod?app=zone-pinned-api": _pods(_pod(restarts=0, last_reason=None)),
+            "statefulset/zone-bound-store": {
+                "spec": {"volumeClaimTemplates": [{"spec": {"storageClassName": "standard-rwo"}}]},
+                "status": {"readyReplicas": 1},
+            },
+            "persistentvolumeclaim?app=zone-bound-store": {"items": [{"status": {"phase": "Bound"}}]},
+            "deployment/capacity-starved-worker": {"status": {"readyReplicas": 1, "replicas": 3}},
+            "pod?app=capacity-starved-worker": _pods(
+                _pod(restarts=0, last_reason=None), _pod(restarts=0, last_reason=None, phase="Pending")
+            ),
         },
         "describe": {
             "seeded-b": _cluster_b(),
@@ -378,7 +403,7 @@ class PassTest(_Harness):
     def test_a_healthy_fleet_converges_on_the_first_pass(self):
         done = self.run_script(_healthy_world())
         assert done.returncode == 0, done.stderr
-        assert "Seeded-fleet fixture state: 7 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
+        assert "Seeded-fleet fixture state: 10 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING" not in done.stderr
         # One read per distinct subject, and the channel default once.
@@ -408,7 +433,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "7 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "10 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
         # Only the pending role is re-read; converged roles are not asked again.
         assert self.log.read_text().count("get deployment checkout-gateway") == 1
@@ -429,7 +454,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "6 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "9 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING: fixture role 'no-pdb-workload' could not be checked" in done.stderr
         assert "Unable to connect" in done.stderr
@@ -455,7 +480,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "7 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
+        assert "10 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
 
     def test_a_read_failure_beside_a_failed_assertion_is_still_drift(self):
         world = _healthy_world()
@@ -477,7 +502,7 @@ class PassTest(_Harness):
     def test_the_idle_pool_needs_a_ready_tainted_node(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "7 role(s) in their designed state" in done.stderr, done.stderr
+        assert "10 role(s) in their designed state" in done.stderr, done.stderr
         # The label key carries a slash: the subject is a selector, not kind/name.
         assert "get node -l cloud.google.com/gke-nodepool=idle-batch-pool" in self.log.read_text()
         world["kubectl"]["node?cloud.google.com/gke-nodepool=idle-batch-pool"] = {"items": [_node(ready="False")]}
@@ -527,7 +552,7 @@ class PassTest(_Harness):
     def test_a_context_without_the_slots_cluster_is_not_checked(self):
         (self.fleet / ".fleet-context").write_text("project=kube-agents-evals\n")
         done = self.run_script(_healthy_world())
-        assert "5 role(s) in their designed state, 0 drifted, 2 not checked" in done.stderr
+        assert "8 role(s) in their designed state, 0 drifted, 2 not checked" in done.stderr
         assert "records no cluster for slot" in done.stderr
 
     def test_only_published_roles_are_asserted(self):
@@ -572,7 +597,7 @@ class PassTest(_Harness):
         }
         done = subprocess.run([sys.executable, str(_SCRIPT)], capture_output=True, text=True, env=env, check=False)
         assert done.returncode == 0, done.stderr
-        assert "7 role(s) in their designed state" in done.stderr
+        assert "10 role(s) in their designed state" in done.stderr
 
 
 
@@ -603,13 +628,16 @@ class ReportTest(_Harness):
                 "no-pdb-workload": "drifted",
                 "rbac-overgrant": "converged",
                 "version-laggard": "converged",
+                "zonal-skew-capacity": "converged",
+                "zonal-skew-scheduling": "converged",
+                "zonal-skew-volume": "converged",
             },
         )
         self.assertEqual(doc["roles"]["no-pdb-workload"]["detail"], self.drift_files()["no-pdb-workload"].splitlines())
         self.assertTrue(doc["roles"]["drift-outlier"]["detail"][0].startswith("cluster: clusters describe seeded-c failed"), doc["roles"]["drift-outlier"])
         self.assertEqual(doc["roles"]["idle-nodepool"], {"cluster_slot": "a", "state": "unpublished", "detail": []})
         self.assertEqual(doc["roles"]["version-laggard"]["cluster_slot"], "b")
-        self.assertEqual(doc["summary"], {"converged": 4, "drifted": 1, "unchecked": 1})
+        self.assertEqual(doc["summary"], {"converged": 7, "drifted": 1, "unchecked": 1})
         self.assertIn("1 drifted, 1 not checked", done.stderr)
 
     def test_without_the_flag_no_report_is_written(self):

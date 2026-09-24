@@ -6,7 +6,8 @@
   "cluster_slots": {
     "a": "Every namespace-level defect, plus the idle and pinned node pools.",
     "b": "Control plane held one minor behind the REGULAR channel default.",
-    "c": "The consistency outlier: no master authorized networks."
+    "c": "The consistency outlier: no master authorized networks.",
+    "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture."
   },
   "roles": {
     "crashloop-workload": {
@@ -168,6 +169,79 @@
           "op": "none_eq",
           "value": true,
           "why": "the outlier facet. Anyone enabling authorized networks on slot c gives the drift cohort a 3/3 agreement and consistency-authorized-networks-probe nothing to find"
+        }
+      ]
+    },
+    "zonal-skew-scheduling": {
+      "cluster_slot": "d",
+      "namespace": "seeded-topology",
+      "probes": ["deployment/zone-pinned-api"],
+      "fixture": "zone-pinned-api Deployment, two replicas, topology spread constraint with whenUnsatisfiable ScheduleAnyway plus a node affinity only the first zone satisfies, so both pods land in one zone",
+      "state": [
+        {
+          "subject": "pod?app=zone-pinned-api",
+          "path": "status.phase",
+          "op": "any_eq",
+          "value": "Running",
+          "why": "The skew is only observable once pods are placed. A cluster whose pods are all still Pending has no distribution to read, and a check asserting skew there would be asserting against an environment that is not ready rather than against the defect"
+        },
+        {
+          "subject": "deployment/zone-pinned-api",
+          "path": "spec.template.spec.topologySpreadConstraints[*].whenUnsatisfiable",
+          "op": "any_eq",
+          "value": "ScheduleAnyway",
+          "why": "the defect itself, and the half a check has to name. Flipping this to DoNotSchedule makes the constraint real, so the pods spread and the fixture is healed while every probe still passes and both pods are still Running"
+        },
+        {
+          "subject": "deployment/zone-pinned-api",
+          "path": "spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[*].matchExpressions[*].key",
+          "op": "any_eq",
+          "value": "topology.kubernetes.io/zone",
+          "why": "the other half: the required zone affinity is what makes ScheduleAnyway bite. Drop it and the pods spread on their own, leaving a constraint that looks misconfigured but produces no skew to attribute"
+        }
+      ]
+    },
+    "zonal-skew-volume": {
+      "cluster_slot": "d",
+      "namespace": "seeded-topology",
+      "probes": ["statefulset/zone-bound-store"],
+      "fixture": "zone-bound-store StatefulSet with a standard-rwo PersistentVolumeClaim, so the pod is bound to whichever zone its disk landed in and cannot move",
+      "state": [
+        {
+          "subject": "persistentvolumeclaim?app=zone-bound-store",
+          "path": "status.phase",
+          "op": "any_eq",
+          "value": "Bound",
+          "why": "The zone binding exists only once the claim is bound: an unbound claim has no disk and therefore no zone, so the cause this fixture exists to test is not yet true of the cluster"
+        },
+        {
+          "subject": "statefulset/zone-bound-store",
+          "path": "spec.volumeClaimTemplates[*].spec.storageClassName",
+          "op": "any_eq",
+          "value": "standard-rwo",
+          "why": "standard-rwo is the zonal class, and zonality is the whole fixture. Swap it for a regional class and the pod can move zones, so the skew has no storage cause to attribute -- while the claim is still Bound and the probe still passes"
+        }
+      ]
+    },
+    "zonal-skew-capacity": {
+      "cluster_slot": "d",
+      "namespace": "seeded-topology",
+      "probes": ["deployment/capacity-starved-worker"],
+      "fixture": "capacity-starved-worker Deployment, three replicas at 400m CPU each against two e2-small nodes, so some pods run and the rest stay Pending with an insufficient-cpu event",
+      "state": [
+        {
+          "subject": "pod?app=capacity-starved-worker",
+          "path": "status.phase",
+          "op": "any_eq",
+          "value": "Pending",
+          "why": "Capacity is the cause this fixture plants, and a Pending pod is the only evidence of it. If every replica scheduled -- a larger node, or a quieter system set -- the cluster is merely unevenly loaded and an agent naming capacity would be guessing"
+        },
+        {
+          "subject": "deployment/capacity-starved-worker",
+          "path": "status.readyReplicas",
+          "op": "ge",
+          "value": 1,
+          "why": "the other half of the fixture, and what separates skew from a cluster where nothing schedules. A Pending pod alone is satisfied by all three being Pending, which the fixture's own comment calls broken rather than skewed. hpa-saturated pairs its Pending assertion with a readyReplicas floor for the same reason"
         }
       ]
     }

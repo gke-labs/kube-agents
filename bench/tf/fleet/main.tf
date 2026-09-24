@@ -198,9 +198,10 @@ locals {
 }
 
 # ---------------------------------------------------------------------------
-# The three clusters. A carries every namespace-level defect; B is the
-# version laggard; C is the consistency outlier. One file-level rule: a
-# defect lives on exactly one cluster, so a scenario red points at one place.
+# The drift cohort: A carries every namespace-level defect; B is the version
+# laggard; C is the consistency outlier. seeded-d is at the bottom of this
+# file and is deliberately not one of them. One file-level rule: a defect
+# lives on exactly one cluster, so a scenario red points at one place.
 # ---------------------------------------------------------------------------
 
 resource "google_container_cluster" "seeded_a" {
@@ -636,4 +637,119 @@ resource "google_compute_disk" "orphan_pd" {
   zone  = var.zone
 
   labels = local.fleet_labels
+}
+
+# ---------------------------------------------------------------------------
+# seeded-d: the multi-zonal cluster, and the only one whose SHAPE is the
+# fixture. The anomaly-detection checks have to tell one cause of zonal skew
+# from another, and a cluster whose nodes are all in one zone has no zonal
+# distribution to skew -- a, b and c are each `location = var.zone` with a
+# single-zone pool, so no amount of in-cluster planting produces the signal.
+#
+# Zonal control plane with `node_locations` across two zones, not a regional
+# cluster: the fleet is standing, and a regional control plane would triple
+# the node floor for a property nothing here needs. Two e2-small nodes, one
+# per zone, is the minimum shape on which "the pods are all in one zone" is a
+# true statement about a real cluster.
+# ---------------------------------------------------------------------------
+
+resource "google_container_cluster" "seeded_d" {
+  name     = "${var.cluster_prefix}-d"
+  location = var.zone
+
+  # The shape. A zonal cluster with node_locations is multi-zonal: one control
+  # plane in var.zone, nodes in both. var.second_zone defaults to a sibling of
+  # var.zone's region, and the variable's description says why the pair has to
+  # stay in one region.
+  node_locations = [var.second_zone]
+
+  remove_default_node_pool = true
+  initial_node_count       = 1
+
+  # local.cluster_labels, the same as the trio. The runner has no other way to
+  # find this cluster: hack/fleet-kubeconfigs.sh discovers slots with
+  # `resourceLabels.environment=seeded AND resourceLabels.managed-by=...`, so a
+  # cluster without the environment label is never listed, never resolves to a
+  # slot, and its roles are never published -- which fails the fleet-presence
+  # check on every pool project, with no warning naming a cause, because
+  # nothing about the cluster was ever seen.
+  #
+  # That makes seeded-d a fourth voter in the drift cohort, which the locals
+  # block at the top of this file warns about, so the arithmetic is worked here
+  # rather than hoped for. The cohort is keyed on environment (drift SOP 2.3)
+  # and the ladder walks one step at r < 0.90 and another at r < 0.80 (SOP
+  # 3.5). The planted facet is authorized-networks, base critical: at three
+  # clusters it is 2/3 = 0.67, two steps, surviving as minor. At four, with
+  # seeded-d configured like seeded-a and seeded-b, it is 3/4 = 0.75 -- still
+  # two steps, still minor, and consistency-drift-outlier grades the same.
+  # What is NOT safe is leaving the block off: 2/4 = 0.5 is below SOP 3.3's
+  # 2/3 threshold, so there is no baseline, no finding, and that scenario reds.
+  # The master_authorized_networks_config below is therefore load-bearing.
+  #
+  # The other base-critical facets stay uniform at 4/4: neither private nodes
+  # nor database encryption is configured on any cluster in this stack. Every
+  # lower-severity facet is dropped by the ladder at 0.75 exactly as it was at
+  # 0.67, so no facet gains a finding because a fourth cluster arrived.
+  resource_labels     = local.cluster_labels
+  deletion_protection = false
+
+  logging_config {
+    enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
+  }
+
+  # The same background closure a and c carry: enrolled with a window, so the
+  # upgrade SOP's no-channel and no-maintenance-window checks stay quiet here
+  # and the only findings this cluster produces are the ones it is for.
+  release_channel {
+    channel = "REGULAR"
+  }
+
+  maintenance_policy {
+    daily_maintenance_window {
+      start_time = "03:00"
+    }
+  }
+
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  # Matches seeded-a and seeded-b so the authorized-networks drift facet keeps
+  # a majority -- see the resource_labels comment above for the arithmetic.
+  # Like theirs, this is also a declared compliance 2.10 background finding;
+  # README.md's accepted-background table carries the row.
+  master_authorized_networks_config {
+    cidr_blocks {
+      cidr_block   = "0.0.0.0/0"
+      display_name = "open-for-eval"
+    }
+  }
+}
+
+# One node per zone. node_count on a multi-zonal pool is PER ZONE, so 1 here
+# is two nodes in total. Not the whole standing cost of the cluster: GKE
+# charges a management fee per Standard cluster whatever its topology, and
+# README.md's accounting puts three of those fees at most of the fleet's
+# monthly total. A fourth cluster costs that fee plus these two nodes.
+resource "google_container_node_pool" "seeded_d_default" {
+  name       = "default-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.seeded_d.name
+  node_count = 1
+
+  node_config {
+    machine_type    = "e2-small"
+    disk_size_gb    = 20
+    resource_labels = local.fleet_labels
+    service_account = google_service_account.fleet_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+  }
 }

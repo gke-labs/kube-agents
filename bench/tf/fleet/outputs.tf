@@ -13,11 +13,12 @@
 # limitations under the License.
 
 output "cluster_names" {
-  description = "The three seeded clusters. seeded-b is the version laggard; seeded-c is the consistency outlier."
+  description = "The seeded clusters. seeded-b is the version laggard; seeded-c is the consistency outlier; seeded-d is multi-zonal and carries the zonal-skew fixtures."
   value = [
     google_container_cluster.seeded_a.name,
     google_container_cluster.seeded_b.name,
     google_container_cluster.seeded_c.name,
+    google_container_cluster.seeded_d.name,
   ]
 }
 

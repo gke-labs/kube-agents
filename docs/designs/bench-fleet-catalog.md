@@ -90,24 +90,63 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Eight fixtures: seven across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
-four seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security` and
-`seeded-capacity`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
-only and no workloads at all: `b` is the held-back control plane, `c` is the configuration
-outlier. Every cluster is labelled `environment=seeded`, which is what confines the drift
-cohort to these three and keeps `platform-agent-host` and transient `eval-pr*` clusters
-from voting on the baseline.
+Eleven fixtures: ten across the four cluster slots and one project-scoped. The namespace-level
+fixtures are on slot `a`, across the four seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security` and `seeded-capacity`, plus both defect node pools.
+Slots `b` and `c` carry GKE-level defects only and no workloads at all: `b` is the held-back
+control plane, `c` is the configuration outlier. Slot `d` is the exception to "the defect is
+something planted in a cluster" — there, the cluster's own shape is the fixture.
 
-| Role                 | Slot    | Day | What is planted                                                                       |
-| -------------------- | ------- | --- | ------------------------------------------------------------------------------------- |
-| `rbac-overgrant`     | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA |
-| `no-pdb-workload`    | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB           |
-| `crashloop-workload` | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop |
-| `hpa-saturated`      | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                 |
-| `idle-nodepool`      | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                   |
-| `orphan-disks`       | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                      |
-| `version-laggard`    | b       | 0   | Control plane one minor behind the REGULAR channel default                            |
-| `drift-outlier`      | c       | 1   | Master authorized networks absent, where a and b carry an open block                  |
+Every cluster in the stack is labelled `environment=seeded`, which confines the drift cohort to
+the fleet and keeps `platform-agent-host` and transient `eval-pr*` clusters from voting on the
+baseline. **Slot `d` carries it too, and has to**: `hack/fleet-kubeconfigs.sh` discovers slots by
+filtering on that label together with `managed-by`, so a cluster without it is never listed and
+its roles are never published.
+
+That makes `d` a fourth voter, so the arithmetic is worked rather than avoided. The planted facet
+is `authorized-networks`, base `critical`, and the ladder walks one step below an agreement ratio
+of 0.90 and another below 0.80. At three clusters the ratio is 2/3 and the finding survives two
+steps down as `minor`; at four, with `d` carrying the same open block `a` and `b` carry, it is 3/4
+— still two steps, still `minor`. Leaving the block off `d` would make it 2/4, below the baseline
+threshold, so there would be no finding and `consistency-drift-outlier` would red. Anything added
+to the fleet later inherits that: a new cluster joins the cohort, and it has to be configured so
+the facets the drift scenarios assert on keep their majority.
+
+### Slot `d`: the shape is the fixture
+
+Zonal skew is the one anomaly that cannot be planted as an object. A cluster whose nodes are all
+in one zone has no zonal distribution, so `a`, `b` and `c` — each single-zone — cannot carry it.
+Slot `d` is multi-zonal: a zonal control plane with `node_locations` spanning two zones, one
+`e2-small` in each. That is the cheapest shape on which "the pods are all in one zone" is a true
+statement about a real cluster, and it is two nodes' worth of standing cost rather than a
+regional control plane's.
+
+Its three roles exist to separate _noticing_ skew from _explaining_ it, which is the part an
+agent gets wrong:
+
+| Role                    | Cause it plants                                                                                     | What distinguishes it                                                                                |
+| ----------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `zonal-skew-scheduling` | A `topologySpreadConstraint` set to `ScheduleAnyway` beside a node affinity only one zone satisfies | The constraint reads as protection and is a preference; the fix is a manifest edit                   |
+| `zonal-skew-volume`     | A StatefulSet whose zonal PersistentVolumeClaim binds it to one zone                                | The pod cannot move without its data; the fix is a migration, not an edit                            |
+| `zonal-skew-capacity`   | Replicas that do not fit the second zone's node, leaving Pending pods                               | Distribution looks identical to the scheduling case, and only the Pending pods' events say otherwise |
+
+The last two rows are why there are three fixtures rather than one. A check that reports "skew"
+on all three has done the easy half; a check that calls the capacity case a misconfiguration
+sends someone to edit a manifest that is correct.
+
+| Role                    | Slot    | Day | What is planted                                                                                                                         |
+| ----------------------- | ------- | --- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `rbac-overgrant`        | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                                   |
+| `no-pdb-workload`       | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                             |
+| `crashloop-workload`    | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                   |
+| `hpa-saturated`         | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                   |
+| `idle-nodepool`         | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                     |
+| `orphan-disks`          | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                        |
+| `version-laggard`       | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                              |
+| `drift-outlier`         | c       | 1   | Master authorized networks absent, where a and b carry an open block                                                                    |
+| `zonal-skew-scheduling` | d       | 0   | `deployment/zone-pinned-api` in `seeded-topology`, two replicas, `ScheduleAnyway` zonal spread plus a required single-zone nodeAffinity |
+| `zonal-skew-volume`     | d       | 0   | `statefulset/zone-bound-store` in `seeded-topology`, one replica on a zonal `standard-rwo` claim                                        |
+| `zonal-skew-capacity`   | d       | 0   | `deployment/capacity-starved-worker` in `seeded-topology`, three replicas at 400m against two e2-smalls, so one stays Pending           |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
@@ -128,7 +167,7 @@ neither is going to be obvious from a slug.
 
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
-`seeded-role=idle-batch` on the idle pool's taint — so two of the eight roles are called
+`seeded-role=idle-batch` on the idle pool's taint — so two of the eleven roles are called
 one thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
