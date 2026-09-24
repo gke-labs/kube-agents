@@ -913,10 +913,18 @@ becomes one inbound subject per principal and nothing else here changes.
 
 **Backend per message.** One gateway process runs its configured chat backend and the console
 together, through a mux that dispatches `post`/`edit`/`roster` on the conversation prefix.
-The backend named in `authority.requester.backend`, in the drop notice and at verification
-is therefore the conversation's, derived from that prefix, with the configured backend as
-the fallback for an unprefixed id. `openDirect` takes a bare user id and goes to the
-configured backend.
+The console adapter stamps its own backend on every message it delivers, the way the inject
+door does, so `authority.requester.backend`, the drop notice and verification name the console
+rather than the configured backend. Where there is no message to ask (the relay holding a
+session record), the `console:` prefix answers the same question. `openDirect` takes a bare
+user id and goes to the configured backend. With no real backend, as on an inject-only eval
+install, the console is the only chat backend and runs without a mux.
+
+The inject door, when armed, sits beside the mux rather than inside it, for the reason in "A
+side door, not a fourth backend" above: the gateway finds the door's probe and observers by
+type assertion on the top of the adapter stack, and the mux implements none of them. The
+console runs whenever the gateway runs, so an inject-only gateway also exits when the console
+adapter does.
 
 **Bounds.** A frame's text is capped at 16 KiB; over it, the frame is refused with a notice
 naming the cap. Empty, malformed and mis-shaped frames drop with a log line each, as does a

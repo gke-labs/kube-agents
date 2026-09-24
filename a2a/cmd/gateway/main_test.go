@@ -169,7 +169,7 @@ func startTestServer(t *testing.T) *natsserver.Server {
 // fakePrimary is a gateway.Adapter stand-in for buildAdapters tests: it
 // proves the primary backend is still reachable through the mux without
 // standing up a real Discord or Google Chat adapter.
-type fakePrimary struct{}
+type fakePrimary struct{ posts []string }
 
 func newFakePrimary() *fakePrimary { return &fakePrimary{} }
 
@@ -179,6 +179,7 @@ func (f *fakePrimary) Run(ctx context.Context, handler func(gateway.InboundMessa
 }
 
 func (f *fakePrimary) Post(conversation, text string) (string, error) {
+	f.posts = append(f.posts, conversation)
 	return "1", nil
 }
 
@@ -211,5 +212,62 @@ func TestBuildAdaptersIncludesTheConsole(t *testing.T) {
 	}
 	if _, err := m.Post("discord:g/c", "hi"); err != nil {
 		t.Errorf("primary not wired: %v", err)
+	}
+}
+
+// TestComposeAdaptersKeepsTheDoorOnTop builds the stack realMain drives with
+// both doors in it, the case nothing else exercises. The inject door has to
+// sit above the mux: the gateway finds its probe and observers by type
+// assertion on the top of the stack, and the mux has no key for an inject:
+// conversation. Both shapes are covered, the door beside a real backend and
+// the inject-only eval install, where the console is the only chat backend.
+func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
+	s := startTestServer(t)
+	for _, tc := range []struct {
+		name    string
+		cfg     *gateway.Config
+		primary *fakePrimary
+	}{
+		{"beside discord", &gateway.Config{NATSURL: s.ClientURL(), DiscordToken: "x", InjectListen: "127.0.0.1:0", InjectToken: "token"}, newFakePrimary()},
+		{"inject only", &gateway.Config{NATSURL: s.ClientURL(), InjectListen: "127.0.0.1:0", InjectToken: "token"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			door, err := gateway.NewInjectAdapter(tc.cfg.InjectListen, tc.cfg.InjectToken, time.Second, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var primary gateway.Adapter
+			if tc.primary != nil {
+				primary = tc.primary
+			}
+			a, err := composeAdapters(tc.cfg, primary, door, nil, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := a.(gateway.ProbeSink); !ok {
+				t.Error("the door's ProbeSink is hidden: the gateway cannot hand it the probe")
+			}
+			if _, ok := a.(gateway.TaskObserver); !ok {
+				t.Error("the door's TaskObserver is hidden: its requests never see their task")
+			}
+			if _, ok := a.(gateway.InboundObserver); !ok {
+				t.Error("the door's InboundObserver is hidden: its drops and turn ends go unreported")
+			}
+			id, err := a.Post("inject:case-1", "hi")
+			if err != nil || !strings.HasPrefix(id, "inj-") {
+				t.Errorf("inject post = %q, %v; want the door's own message id", id, err)
+			}
+			if _, err := a.Post("console:tab-1", "hi"); err != nil {
+				t.Errorf("console not wired: %v", err)
+			}
+			if tc.primary != nil {
+				if _, err := a.Post("discord:g/c", "hi"); err != nil {
+					t.Errorf("primary not wired: %v", err)
+				}
+				if len(tc.primary.posts) != 1 || tc.primary.posts[0] != "discord:g/c" {
+					t.Errorf("primary saw posts %v, want only discord:g/c", tc.primary.posts)
+				}
+			}
+		})
 	}
 }
