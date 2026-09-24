@@ -63,9 +63,10 @@ EVAL_CREW = CONFIG["reviewers"]["groups"]["eval-crew"]
 REPO_ROOT = _HERE.parent
 LIVE_CONFIG = REPO_ROOT / rr.DEFAULT_CONFIG_PATH
 
-# The OWNERS approvers the verdict check is handed in these tests. `bnaylor`
-# is deliberately not one of them: he is the colleague whose real approvals
-# are `COMMENTED`-equivalent for Tide, and the shape the fixtures below reuse.
+# The OWNERS approvers the verdict check is handed in these tests, plus one
+# login outside them. The set mirrors the `repository-owners` group; what the
+# fixtures below actually rely on is only that `NON_APPROVER` is not in it, so
+# that an `APPROVED` review from him does not read as an approval.
 APPROVERS = {"bradhoekstra", "jayantid", "toshiowang", "dshnayder"}
 NON_APPROVER = "kyber775"
 
