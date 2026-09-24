@@ -546,11 +546,11 @@ never read the map - the constrained party does not see its own ceiling, it just
 The callout reads the map through an API informer, not a volume mount: kubelet ConfigMap
 sync lags up to a minute, and the dispatcher can spawn a Job seconds after a profile
 lands - a race that ends in an Authorization Violation for a legitimate worker. The
-ordering is enforced, not hoped for: the operator sets `BusCredentialsReady` only after
-the callout reports serving, and nothing dispatches before that condition is true (the
-shipping gate is narrower than the condition: a first gateway waits for one callout
-replica serving on the current spec, not for every replica - see the 9/17 amendment
-below). Submissions queue on the stream meanwhile; nothing is lost. The callout logs the
+ordering is enforced, not hoped for: nothing dispatches before one callout replica is
+ready on the current spec, read from the callout Deployment's status (the 9/17 amendment
+below has the rule), and `BusCredentialsReady` is the operator's claim about the callout
+as a whole - every replica ready and on the current spec - set only after the callout
+reports serving. Submissions queue on the stream meanwhile; nothing is lost. The callout logs the
 map version it is serving and exposes it at runtime on `/status` and `/readyz`, so "the
 map says X" is checkable against the running system rather than against the rendered
 object.
@@ -561,7 +561,7 @@ does not exist yet.
 
 **Amended 9/16: the second half of the sentence is enforced now (as written here; the
 9/17 amendment narrows what the gate reads).** "Nothing dispatches before that condition
-is true" used to describe an intention - the operator wrote
+is true", the rule sentence as it read until 9/17, used to describe an intention - the operator wrote
 `BusCredentialsReady` and no code in this repository read it. The dispatcher it was
 waiting for turns out to be one that already ships: the A2A gateway is what spawns
 session pods and relays their work onto the bus. It is not the only thing that

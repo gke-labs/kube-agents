@@ -2905,9 +2905,11 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// session pod's bus credential is minted by the auth callout. So this is
 	// where the deployment spec's ordering - "the operator sets
 	// BusCredentialsReady only after the callout reports serving, and nothing
-	// dispatches before that condition is true" - either holds or is a
-	// sentence. Until this gate, it was a sentence: the operator wrote the
-	// condition and nothing in the repository read it. This reads it.
+	// dispatches before that condition is true", as its rule sentence read
+	// until the 9/17 amendment restated it as one serving replica - either
+	// holds or is a sentence. Until this gate, it was a sentence: the operator
+	// wrote the condition and nothing in the repository read it. This reads
+	// the same Deployment the condition is written from.
 	//
 	// Creation only, and the distinction is the whole design. A callout that
 	// goes unready under a running install must not take the gateway with it:
