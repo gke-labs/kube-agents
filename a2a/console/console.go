@@ -15,12 +15,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"slices"
 	"strings"
+	"time"
 )
 
 const (
@@ -51,6 +53,18 @@ const (
 	lineEndings = "\r\n"
 
 	hostSeparator = " or "
+
+	// busDialTimeout bounds the TCP connect to the bus. A NetworkPolicy that
+	// drops SYNs rather than rejecting them would otherwise hold the browser's
+	// upgrade request for however long the platform's default dial timeout is.
+	busDialTimeout = 2 * time.Second
+	// busResponseHeaderTimeout bounds the wait for the bus's upgrade response
+	// once the connection is up. A bus that accepts TCP but never answers the
+	// handshake — a stuck process, a proxy dropping the upgrade — would
+	// otherwise hang the browser's socket forever, since the default
+	// transport has no such timeout. It does not apply once the upgrade
+	// succeeds: the proxy hijacks the connection at that point.
+	busResponseHeaderTimeout = 3 * time.Second
 
 	// The bodies a person sees. http.Error adds the trailing newline.
 	msgWrongHost     = "this console only answers on %s - port-forward to that local port"
@@ -163,11 +177,25 @@ func configHandler(cfg Config, log *slog.Logger) http.HandlerFunc {
 	}
 }
 
+// busTransport dials and waits for the bus's upgrade response with the
+// package's short timeouts, so a bus that never answers fails fast into a
+// 502 instead of hanging the browser's socket. It does not bound the
+// connection once the upgrade completes: ResponseHeaderTimeout stops timing
+// after the response headers arrive, and the proxy hijacks the connection
+// from there.
+func busTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = (&net.Dialer{Timeout: busDialTimeout}).DialContext
+	t.ResponseHeaderTimeout = busResponseHeaderTimeout
+	return t
+}
+
 // busHandler proxies the page's websocket to the bus. The browser's Origin
 // goes through unchanged, so the bus's allowed_origins checks the page and
 // not the proxy. A refusal from the bus (403) is copied back as it came.
 func busHandler(cfg Config, log *slog.Logger) http.Handler {
 	proxy := &httputil.ReverseProxy{
+		Transport: busTransport(),
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(cfg.BusURL)
 			// SetURL joins the target path with /bus. The bus URL names the

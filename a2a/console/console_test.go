@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -330,6 +331,57 @@ func TestABusThatDoesNotAnswerIsA502(t *testing.T) {
 	resp, _, _ := handshake(t, ts.Listener.Addr().String(), "http://localhost:8080")
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+	if !strings.Contains(string(body), "bus") {
+		t.Errorf("body %q does not say the bus failed", body)
+	}
+}
+
+func TestABusThatAcceptsButNeverAnswersIsA502WithinTheTimeout(t *testing.T) {
+	// A listener that takes the TCP connection and then never writes anything
+	// back: the black-holed-bus case (a NetworkPolicy dropping the reply, a
+	// stuck process) rather than the refused-connection case above. Without
+	// its own transport timeout, the proxy would wait for this forever.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var held []net.Conn
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range held {
+			_ = c.Close()
+		}
+	})
+
+	cfg := fixture(t, "x")
+	cfg.BusURL, _ = url.Parse("http://" + ln.Addr().String())
+	ts := httptest.NewServer(handler(t, cfg))
+	t.Cleanup(ts.Close)
+
+	start := time.Now()
+	resp, _, _ := handshake(t, ts.Listener.Addr().String(), "http://localhost:8080")
+	elapsed := time.Since(start)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if elapsed > 8*time.Second {
+		t.Errorf("took %s to answer; a hung upgrade must time out well inside that, not at the handshake's own read deadline", elapsed)
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 	if !strings.Contains(string(body), "bus") {
