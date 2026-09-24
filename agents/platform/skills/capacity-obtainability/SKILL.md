@@ -82,8 +82,7 @@ when it returns fewer than two, run the per-zone follow-up in Diagnostics D
 (`--zones=<zone>`) for the region's other zones and record each one — a low
 score is still a signal and stays in `zones`; a zone the probe reports as
 unsupported goes in `analysis.zoneStatuses` (`{"us-central1-b":
-"NOT_SUPPORTED"}`). The recorder refuses a completed record covering fewer
-than two. Only the two models the API returns belong in this record;
+"NOT_SUPPORTED"}`). Only the two models the API returns belong in this record;
 On-Demand is assessed from the quota and reservation checks and reported
 under its own path below:
 
@@ -319,8 +318,7 @@ submit nothing.
 
 **Anchor the probe at the clock, not at a buffer.** The range's `from` is
 now — the moment you run the command — not now plus a safety margin; the
-API's own window search supplies any slack, and the recorder refuses a
-window anchored away from the probe's time.
+API's own window search supplies any slack.
 
 **Report.** Carry this section, filled in:
 
@@ -453,7 +451,7 @@ gcloud beta compute advice calendar-mode \
 Compute both ends of `--start-time-range` from the clock at probe time, as
 RFC 3339 UTC (`date -u +%Y-%m-%dT%H:%M:%SZ`) — never reuse a timestamp
 from an example or an earlier turn; a window that starts in the past
-cannot be reserved and the recorder refuses it. `--location-policy`
+cannot be reserved. `--location-policy`
 narrows to the zones the user allowed, and is omitted to consider every
 zone in the region.
 
