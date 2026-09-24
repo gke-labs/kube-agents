@@ -19,6 +19,7 @@ is for the evaluators and reviewers who read it.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import sqlite3
@@ -67,6 +68,10 @@ REQUIRED_ARTIFACT_ARGS = {"provisioning_request": ("machine_spec",)}
 #: ComputeClass or a multi-zone analysis, small enough that a runaway worker
 #: cannot turn the board into a blob store.
 MAX_OBJECT_BYTES = 65536
+
+#: A string starting with one of these may be an object the model serialized
+#: instead of passing structurally; anything else is an ordinary string.
+EMBEDDED_OBJECT_PREFIXES = ("{", "[")
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS task_evidence (
@@ -258,6 +263,49 @@ def _bounded_json(value: object, field: str, tool_error):
     return rendered, None
 
 
+def _unquote_key(key: object) -> object:
+    if (
+        isinstance(key, str)
+        and len(key) >= 2
+        and key[0] == key[-1]
+        and key[0] in ("'", '"')
+    ):
+        return key[1:-1]
+    return key
+
+
+def _parse_embedded_objects(value: object) -> object:
+    """Re-parse object values a model serialized as strings.
+
+    Function-calling models intermittently render a nested object argument
+    as its JSON or Python-repr string, and occasionally wrap a dict key in a
+    second layer of quotes. The caller's intent is unambiguous, so both
+    encodings are accepted: a string that parses to a dict or list is
+    replaced by its parse, recursively; a key loses one surrounding quote
+    pair. A string that does not parse passes through untouched — this
+    normalizes encodings, it does not validate content.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith(EMBEDDED_OBJECT_PREFIXES):
+            for parse in (json.loads, ast.literal_eval):
+                try:
+                    parsed = parse(text)
+                except (ValueError, SyntaxError):
+                    continue
+                if isinstance(parsed, (dict, list)):
+                    return _parse_embedded_objects(parsed)
+        return value
+    if isinstance(value, list):
+        return [_parse_embedded_objects(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _unquote_key(key): _parse_embedded_objects(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 def _missing(container: object, fields: tuple[str, ...]) -> list[str]:
     if not isinstance(container, dict):
         return list(fields)
@@ -272,6 +320,7 @@ def make_handlers(tool_error):
     """Build the two handlers around the caller's ``tool_error`` shape."""
 
     def handle_record_evidence(args: dict, **_kw) -> str:
+        args = _parse_embedded_objects(args)
         kind = str(args.get("type") or "")
         if kind not in EVIDENCE_TYPES:
             return tool_error(
@@ -330,6 +379,7 @@ def make_handlers(tool_error):
         return f"recorded {kind} evidence on {tid}"
 
     def handle_attach_artifact(args: dict, **_kw) -> str:
+        args = _parse_embedded_objects(args)
         kind = str(args.get("type") or "")
         if kind not in ARTIFACT_TYPES:
             return tool_error(

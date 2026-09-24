@@ -94,6 +94,50 @@ class RecordEvidenceTest(RecorderFixture):
         self.assertEqual(row["status"], "completed")
         self.assertEqual(json.loads(row["analysis_json"]), {"availableQuantity": 8})
 
+    def test_object_values_a_model_serialized_as_strings_are_reparsed(self) -> None:
+        # Observed live (2026-09-24, runs 5z6bc8lc and _2v9b6zv): the model
+        # intermittently renders a nested object argument as its JSON or
+        # Python-repr string, and once wrapped a dict key in a second layer
+        # of quotes. The intent is unambiguous; the recorder accepts both
+        # encodings and stores the structure.
+        reply = self.record(
+            {
+                "type": "advice_service_workload_obtainability_planning",
+                "api_method": "compute.beta.AdviceService.CalendarMode",
+                "request": {
+                    "region": "europe-west4",
+                    "nodeCount": 64,
+                    "futureResourcesSpecs": "{'spec': {'deploymentType': 'DENSE'}}",
+                },
+                "analysis": json.dumps({"otherLocations": {"zones/x": "NO_CAPACITY"}}),
+            }
+        )
+        self.assertIn("recorded", reply)
+        (row,) = self.rows("task_evidence")
+        request = json.loads(row["request_json"])
+        self.assertEqual(
+            request["futureResourcesSpecs"], {"spec": {"deploymentType": "DENSE"}}
+        )
+        analysis = json.loads(row["analysis_json"])
+        self.assertEqual(analysis["otherLocations"], {"zones/x": "NO_CAPACITY"})
+
+    def test_quoted_keys_lose_one_quote_layer_and_plain_strings_pass_through(self) -> None:
+        reply = self.record(
+            {
+                "type": "workload_obtainability_planning_analysis",
+                "request": {"region": "europe-west4"},
+                "analysis": {
+                    "zoneStatuses": {"'us-central1-a'": "NO_CAPACITY"},
+                    "note": "not an object {just prose",
+                },
+            }
+        )
+        self.assertIn("recorded", reply)
+        (row,) = self.rows("task_evidence")
+        analysis = json.loads(row["analysis_json"])
+        self.assertEqual(analysis["zoneStatuses"], {"us-central1-a": "NO_CAPACITY"})
+        self.assertEqual(analysis["note"], "not an object {just prose")
+
     def test_a_completed_record_must_name_what_it_asked_and_which_api_answered(self) -> None:
         # Observed live: a record with the right method and an empty request
         # (nothing to check), and one with a full request and no method
