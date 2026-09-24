@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 
 	"github.com/nats-io/nats.go"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // The console backend: the web console's chat door, over core NATS.
@@ -60,10 +62,6 @@ const (
 	consoleTextCap = 16 * bytesPerKiB
 )
 
-// consoleTokenRe is one dot-free DNS-1123 label, so the `*` in the
-// subscription covers exactly one conversation.
-var consoleTokenRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
-
 // ConsoleInFrame is what the browser publishes. Kind is empty or "text";
 // it is the seam for gateway-side commands later, and a frame of any other
 // kind is dropped (logged, no notice) rather than forwarded as an ask.
@@ -84,7 +82,11 @@ type ConsoleOutFrame struct {
 // consoleConversationToken splits "console:<token>" and validates the token.
 func consoleConversationToken(conversation string) (string, bool) {
 	token, ok := strings.CutPrefix(conversation, consoleKeyPrefix)
-	if !ok || !consoleTokenRe.MatchString(token) {
+	// One dot-free DNS-1123 label, so the `*` in the subscription covers
+	// exactly one conversation. lib owns that rule rather than this file
+	// re-stating it: the regex here used to accept a trailing hyphen, which
+	// is not a label, so the comment claiming DNS-1123 was false.
+	if !ok || !lib.ValidSubjectToken(token) {
 		return "", false
 	}
 	return token, true

@@ -104,7 +104,9 @@ type Gateway struct {
 	// relays holds per-task render state for the rolling progress line.
 	relays map[string]*relayState
 
-	// backend names the chat backend for authority blocks.
+	// backend is the configured chat backend, which since the mux is only
+	// the fallback: backendFor resolves a conversation's backend from its
+	// id prefix and reaches this field only for a prefix it does not know.
 	backend string
 	// gchatAllowed and gchatAllowAll gate the gchat backend's identity
 	// resolution (Config.GchatAllowedUsers, lowercased at build).

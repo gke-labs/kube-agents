@@ -148,7 +148,7 @@ func TestConsoleRejectsATokenThatIsNotOneLabel(t *testing.T) {
 	// The wildcard subscription cannot deliver a dotted token, so this is
 	// the parser's own check on the conversation id it is handed back
 	// (Post/Edit take the id, not the subject).
-	for _, conv := range []string{"console:", "console:Has.Dot", "console:UPPER", "console:with space", "console:" + strings.Repeat("a", 64), "discord:g1/c1"} {
+	for _, conv := range []string{"console:", "console:Has.Dot", "console:UPPER", "console:with space", "console:" + strings.Repeat("a", 64), "console:-lead", "console:trail-", "discord:g1/c1"} {
 		if _, ok := consoleConversationToken(conv); ok {
 			t.Errorf("%q accepted", conv)
 		}
