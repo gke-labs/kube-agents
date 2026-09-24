@@ -54,7 +54,8 @@ every card has settled or
 six full-audit units). The delivered card results are appended to the answer, and the worker's
 report and terminal commands are read back with `kubectl exec` from
 `/opt/data/kanban/attachments/<id>/` and `/opt/data/kanban/logs/<id>.log` in the agent pod, then
-deleted. A customer sees the card result relayed to their thread; they never see the files, the
+deleted; a card still running when the wait ran out is archived first, which stops its worker. A
+customer sees the card result relayed to their thread; they never see the files, the
 store reads, or the collecting turn, which is a model call the customer never made.
 
 The consequence, measured: the presubmit matrix ran under `mode: next` with the A2A gateway in

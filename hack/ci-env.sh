@@ -50,6 +50,11 @@ readonly HELM_DOWNLOAD_RETRIES=5
 # 2 MB per run; the byte cap is the belt for a log with long lines.
 readonly GATEWAY_LOG_TAIL_LINES=20000
 readonly GATEWAY_LOG_MAX_BYTES=$((8 * 1024 * 1024))
+# The failure dump's litellm and envoy tails. At 1000 and 2000 lines a
+# six-hour run came back clipped to its last minutes, without the 429s and
+# token failures those two logs are collected for.
+readonly LITELLM_LOG_TAIL_LINES=20000
+readonly ENVOY_LOG_TAIL_LINES=20000
 
 ensure_helm() {
   if command -v helm >/dev/null 2>&1; then
@@ -158,11 +163,11 @@ dump_prow_artifacts_on_failure() {
     # The model path runs through LiteLLM, and with vertex_ai its failure
     # domain (Workload Identity token fetch, aiplatform 403s, model 404s)
     # is visible only in this pod's log -- the gateway just relays the text.
-    kubectl logs deployment/litellm -n "${ns}" --tail=1000 > "${artifact_dir}/litellm.log" 2>&1 || true
+    kubectl logs deployment/litellm -n "${ns}" --tail="${LITELLM_LOG_TAIL_LINES}" > "${artifact_dir}/litellm.log" 2>&1 || true
     # The gateway capture above reads the pod's default container (platform-agent);
     # a dropped port-forward stream is only visible from the auth sidecar's side.
     kubectl logs deployment/platform-agent-gateway -c agent-api-auth -n "${ns}" --tail=2000 > "${artifact_dir}/agent-api-auth.log" 2>&1 || true
-    kubectl logs deployment/platform-agent-credential-proxy -c envoy-credential-proxy -n "${ns}" --tail=2000 > "${artifact_dir}/envoy-credential-proxy.log" 2>&1 || true
+    kubectl logs deployment/platform-agent-credential-proxy -c envoy-credential-proxy -n "${ns}" --tail="${ENVOY_LOG_TAIL_LINES}" > "${artifact_dir}/envoy-credential-proxy.log" 2>&1 || true
     # Konnectivity/tunnel churn shows up as kube-system events, not in "${ns}".
     kubectl get events -n kube-system --sort-by=.lastTimestamp 2>&1 | tail -100 > "${artifact_dir}/kube-system-events.txt" 2>&1 || true
 

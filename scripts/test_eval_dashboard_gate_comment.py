@@ -320,6 +320,135 @@ def lost_pods_health(prs=(926, 1118, 1246, 1258, 1319, 1351, 1362, 1439, 1451, 1
     }
 
 
+def killed(build, pr, finished, minutes=363, **fields):
+    """A run Prow killed at the job deadline: FAILURE, no verdict, no tasks,
+    the collector's usual ended-fields -- 2026-09-22/23's seventeen."""
+    raw = run(build, pr, finished, tasks=[], result="FAILURE", minutes=minutes)
+    raw.update({"eval_verdict": None, "has_build_log": True, "pod_phase": "Failed", "pod_node": "n", "pod_last_event": None, "merge_conflict": False, **fields})
+    return raw
+
+
+def deadline_health(prs=(1826, 1838, 1877), recovering=False, first_kill=None):
+    # `since` is the tick that declared the state, after the third kill; the
+    # first kill is the incident's window_start, 55 minutes earlier -- or,
+    # once the window has slid, the `first_kill` health.py keeps.
+    incident = {"prs": list(prs), "runs": len(prs), "window_start": "2026-09-08T14:05:52+00:00", "window_end": "2026-09-08T14:50:00+00:00"}
+    if first_kill:
+        incident["first_kill"] = first_kill
+    return {
+        "state": "OUTAGE",
+        "condition": "deadline_kill",
+        "since": "2026-09-08T15:00:00+00:00",  # Tue 11:00 AM EDT
+        "recovering": recovering,
+        "failing_cases": [],
+        "tracking_issues": [],
+        "incident": incident,
+    }
+
+
+class DeadlineKillComment(Harness):
+    """A run Prow killed at the job deadline gets one short comment (#1894):
+    when, that nothing was graded, and -- while the gate is in the
+    deadline_kill outage -- that the gate is down and the red is not the
+    author's diff."""
+
+    def test_the_shape_without_an_incident(self):
+        mine = killed(100, 1300, NOW - timedelta(minutes=5))
+        self.tick(data(mine, *green_others()), green_health())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
+        body = self.gh.bodies()[0]
+        self.assertIn("### ⚪ Smoke gate: run killed at the deadline", body)
+        # No outage is declared, so the comment does not clear the branch: a
+        # change that hangs the eval ends the same way (health.py, one PR
+        # looping to the deadline is that PR's problem).
+        self.assertIn("> Prow killed this run at its 360-minute deadline at 10:55 AM ET; no verdict was reached. No deadline-kill outage is declared, so this may be the branch", body)
+        self.assertIn("Ran 363 min to the deadline", body)
+        self.assertNotIn("gate is down", body)
+        self.assertNotIn("not your diff", body)
+
+    def test_during_the_outage_it_says_the_gate_is_down_and_not_to_retest(self):
+        mine = killed(100, 1300, NOW - timedelta(minutes=5))
+        self.tick(data(mine, *green_others()), deadline_health())
+        body = self.gh.bodies()[0]
+        # Dated from the first kill (incident.window_start), not from the
+        # tick that declared the state after the third.
+        self.assertIn("**The gate is down: 3 runs on 3 PRs have been killed at the deadline since Tue 10:05 AM ET; your run's failure is not your diff.**", body)
+        self.assertNotIn("11:00 AM", body)
+        self.assertIn("Don't retest yet", body)
+        self.assertIn("[Incident brief →]", body)
+        self.assertNotIn("may be the branch", body)
+
+    def test_during_the_recovering_hold_it_does_not_say_the_gate_is_down(self):
+        # The rule has stopped firing and the space says a retest is
+        # reasonable; a kill arriving now is not part of a wave, so it may be
+        # the branch, and it holds the gate out of GREEN.
+        mine = killed(100, 1300, NOW - timedelta(minutes=5))
+        self.tick(data(mine, *green_others()), deadline_health(recovering=True))
+        body = self.gh.bodies()[0]
+        self.assertIn("**The gate's deadline-kill outage is recovering** (3 runs on 3 PRs were killed since Tue 10:05 AM ET); this kill holds it back.", body)
+        self.assertIn("this may be the branch", body)
+        self.assertIn("[Incident brief →]", body)
+        self.assertNotIn("gate is down", body)
+        self.assertNotIn("Don't retest yet", body)
+        self.assertNotIn("No deadline-kill outage is declared", body)
+
+    def test_a_killed_run_that_recorded_cases_gets_the_deadline_comment_not_the_red_one(self):
+        # #1875: cases finished before Prow stopped it, so is_red would admit
+        # it too; the kill wins, tasks or not.
+        mine = killed(100, 1300, NOW - timedelta(minutes=5), tasks=[task("agent-kanban-smoke", "ppp"), task(TRIO[0], "fff")])
+        self.tick(data(mine, *green_others()), deadline_health())
+        body = self.gh.bodies()[0]
+        self.assertIn(gate_comment.HEADING_DEADLINE, body)
+        self.assertNotIn("Smoke gate: failed", body)
+        self.assertNotIn("| Case |", body)
+        self.assertIn("The gate is down", body)
+
+    def test_a_red_with_a_verdict_during_the_outage_gets_the_kills_sentence_not_the_breaks(self):
+        # The box for an ordinary red under an OUTAGE assumed a shared break;
+        # a deadline-kill OUTAGE names no failing case, so it says the kills.
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO)
+        self.tick(data(mine, *other_runs()), deadline_health())
+        body = self.gh.bodies()[0]
+        self.assertIn("### ❌ Smoke gate: failed · 3 of 7 cases", body)
+        self.assertIn("> 🔴 **Gate outage in progress** since Tue 10:05 AM ET. 3 runs on 3 PRs were killed at the 360-minute deadline", body)
+        self.assertNotIn("fail on every PR", body)
+        self.assertIn("[Incident brief →]", body)
+
+    def test_a_red_that_is_its_own_still_gets_the_outage_box_not_a_degraded_one(self):
+        # No failure classed the gate's, so the case sentences are the PR's;
+        # the state sentence is still the outage's, not "degraded".
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=(TRIO[0],))
+        self.tick(data(mine, *green_others()), deadline_health())
+        body = self.gh.bodies()[0]
+        self.assertIn("> 🔴 **Gate outage in progress** since Tue 10:05 AM ET. 3 runs on 3 PRs were killed at the 360-minute deadline", body)
+        self.assertNotIn("Gate degraded", body)
+        self.assertIn("This looks specific to your PR", body)
+
+    def test_a_red_during_the_recovering_hold_is_told_a_retest_is_reasonable(self):
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO)
+        self.tick(data(mine, *other_runs()), deadline_health(recovering=True))
+        body = self.gh.bodies()[0]
+        self.assertIn("> 🟡 **Gate recovering** from a deadline-kill outage that began Tue 10:05 AM ET: runs are reaching verdicts again", body)
+        self.assertIn("so this red is likely the gate's.** A retest is reasonable now.", body)
+        self.assertNotIn("Don't retest yet", body)
+        self.assertNotIn("nothing is being graded", body)
+        self.assertNotIn("outage in progress", body)
+
+    def test_the_box_dates_the_outage_from_its_first_kill_once_the_window_has_slid(self):
+        mine = killed(100, 1300, NOW - timedelta(minutes=5))
+        self.tick(data(mine, *green_others()), deadline_health(first_kill="2026-09-08T12:00:00+00:00"))
+        body = self.gh.bodies()[0]
+        self.assertIn("killed at the deadline since Tue 8:00 AM ET", body)
+        self.assertNotIn("10:05 AM", body)
+
+    def test_a_long_red_with_a_verdict_is_not_a_kill(self):
+        # Ran just as long, but graded: the ordinary red comment, not this one.
+        graded = run(100, 1300, NOW - timedelta(minutes=5), failing=("agent-kanban-smoke",), minutes=363)
+        graded["eval_verdict"] = "RED"
+        self.tick(data(graded, *green_others()), green_health())
+        self.assertNotIn("killed at the deadline", self.gh.bodies()[0])
+
+
 class LostPodComment(Harness):
     """A run whose build node went away gets one short comment (#1478): the
     time and node, that nothing was graded, and /retest -- with the

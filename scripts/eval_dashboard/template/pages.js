@@ -57,11 +57,11 @@ const PAGE = {
   // The adjudicator's STORM_COOLDOWN: retest this long after the last storm-hit run.
   stormCooldownMs: 30 * 60 * 1000,
   // An incident's window opens this long before its `since`: the rule's own
-  // lookback (shared break 6 h; storm, delegation ceiling, setup deaths and
-  // lost pods 2 h), so
+  // lookback (shared break 6 h; storm, delegation ceiling, setup deaths,
+  // lost pods and deadline kills 2 h), so
   // the runs that made the bot declare it are on the page, not only the ones
   // after.
-  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000, delegation_ceiling: 2 * 3600 * 1000 },
+  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000, delegation_ceiling: 2 * 3600 * 1000, deadline_kill: 2 * 3600 * 1000 },
   recoveryGreenRuns: 3,
   // A shared break "explains" the reds when at least this share of red runs
   // in the window collapsed one of its cases; below it the headline says "most".
@@ -620,6 +620,27 @@ function setupFacts(inc, inWindow) {
   ];
 }
 
+// health.Run.has_verdict: the eval's own verdict, or -- only for a record
+// from before `eval_verdict` existed, which is never a kill -- a concluded
+// run; either way with at least one graded repetition, since NOT EVALUATED
+// records as RED. A recorded null is no verdict whatever the run carries.
+const gradedAny = (r) => (r.cases || []).some((c) => c.outcome === "passed" || c.outcome === "partial" || c.outcome === "failed");
+function hasVerdict(r) {
+  if (!concluded(r) || !gradedAny(r)) return false;
+  return "eval_verdict" in r ? r.eval_verdict != null : true;
+}
+
+function deadlineFacts(inc, inWindow) {
+  const killed = inWindow.filter((r) => r.cls === "deadline-kill");
+  const prs = new Set(killed.map((r) => r.pr).filter((p) => p != null));
+  const graded = inWindow.filter(hasVerdict);
+  return [
+    fact(true, `<b>${plural(killed.length, "run")}</b> on ${plural(prs.size, "PR")} ran to the job deadline and ended with no verdict.`),
+    fact(prs.size > 1, prs.size > 1 ? "More than one PR, so not one slow branch." : "Only one PR so far; it may be that branch."),
+    fact(graded.length > 0, graded.length ? `Runs that reached a verdict in the same window: ${graded.length}.` : "No run in this window has reached a verdict."),
+  ];
+}
+
 function mergesFact(inc, inWindow) {
   if (!Array.isArray(brief.merges)) return null;
   const firstRed = inWindow.find((r) => gateFailures(r).some((c) => inc.cases.includes(c)));
@@ -695,12 +716,36 @@ function briefHeadline(inc, inWindow) {
       lede: `${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `Since ${esc(et(inc.sinceMs))}`}. The front door delegated and the card was still running when the eval stopped waiting, so nothing was graded; those runs read not evaluated, not red. The gateway log in a run's artifacts says whether the dispatcher stalled (#1879).`,
     };
   }
+  if (inc.condition === "deadline_kill") {
+    return {
+      head: inc.past ? "Runs were killed at the job deadline with nothing graded" : "Runs are being killed at the job deadline with nothing graded",
+      lede: `${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `Since ${esc(et(inc.sinceMs))}`}. Prow ended each run at the job's timeout before the eval reached a verdict, so no pull request can pass; nothing about those pull requests is implied.`,
+    };
+  }
   return { head: inc.past ? "A past gate incident" : "The gate is degraded", lede: esc(inc.cause || "") };
 }
+
+// The bar out of a deadline-kill outage is a verdict either way (health.py
+// `recovered`): a red that graded proves the gate grades again.
+function verdictRecovery(inc) { return inc.condition === "deadline_kill"; }
+function recoveryBarText(inc) { return verdictRecovery(inc) ? "runs with a verdict" : "clean runs"; }
 
 function recoveryProgress(inc) {
   // No start on record: nothing is "after" the incident, so no run counts.
   if (inc.sinceMs == null) return 0;
+  if (verdictRecovery(inc)) {
+    // health.recovered's deadline branch: the newest RECOVERY_GREEN_RUNS
+    // verdict runs must all follow the last kill and sit on distinct PRs. A
+    // zero-task kill is in the list because it is what stops the count.
+    const later = runs().filter((r) => (hasVerdict(r) || r.cls === "deadline-kill") && runFinish(r) > inc.sinceMs).sort((a, b) => runFinish(b) - runFinish(a));
+    const newest = [];
+    for (const run of later) {
+      if (run.cls === "deadline-kill") break;
+      newest.push(run);
+      if (newest.length >= PAGE.recoveryGreenRuns) break;
+    }
+    return new Set(newest.map((r) => r.pr)).size;
+  }
   const later = runs().filter((r) => measured(r) && concluded(r) && runFinish(r) > inc.sinceMs).sort((a, b) => runFinish(b) - runFinish(a));
   const prs = new Set();
   let count = 0;
@@ -719,6 +764,7 @@ function whyTitle(inc) {
   if (inc.condition === "storm") return "Why we think it's a quota storm";
   if (inc.condition === "setup_deaths") return "Why we think it's the setup, not the PRs";
   if (inc.condition === "delegation_ceiling") return "Why we think it's the workers, not the PRs";
+  if (inc.condition === "deadline_kill") return "Why we think it's the gate, not the PRs";
   return "What the data shows";
 }
 
@@ -733,6 +779,11 @@ function agentSawHtml(inc, inWindow) {
       }
     }
     if (pick) break;
+  }
+  if (inc.condition === "deadline_kill") {
+    const killed = [...inWindow].reverse().find((r) => r.cls === "deadline-kill");
+    const url = killed ? buildUrl(killed) : null;
+    return `<p>No verdict was reached. The build log is the evidence${url ? `: <a href="${esc(url)}">${esc(prText(killed.pr))} at ${esc(et(runFinish(killed)))}</a>` : ""}; it shows how far the units got (on 2026-09-22 every unit ended at the delegation ceiling, #1880).</p>`;
   }
   if (inc.condition === "setup_deaths") {
     const death = [...inWindow].reverse().find((r) => r.setup_death);
@@ -750,7 +801,7 @@ function agentSawHtml(inc, inWindow) {
 
 function changedBeforeHtml(inc, inWindow) {
   if (!Array.isArray(brief.merges)) return "";
-  const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : inc.condition === "delegation_ceiling" ? (r.ceiling_reps || 0) > 0 : (r.storm_reps || 0) > 0));
+  const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : inc.condition === "delegation_ceiling" ? (r.ceiling_reps || 0) > 0 : inc.condition === "deadline_kill" ? r.cls === "deadline-kill" : (r.storm_reps || 0) > 0));
   const firstRedMs = firstRed ? runFinish(firstRed) : inc.sinceMs;
   if (firstRedMs == null) {
     // Same anchor as mergesFact: without it there is no "before" to show.
@@ -766,14 +817,15 @@ function changedBeforeHtml(inc, inWindow) {
 
 function beingDoneHtml(inc) {
   const lines = [];
-  if (inc.tracking.length) lines.push(`<p>Tracking ${inc.tracking.map(issueLink).join(", ")}. The gate comes back on its own once the fix lands: the bot reports healthy after ${PAGE.recoveryGreenRuns} clean runs on different PRs.</p>`);
-  if (inc.recovering) lines.push(`<p><b>The condition has cleared.</b> A retest is reasonable now; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} clean runs on distinct PRs so far.</p>`);
+  if (inc.tracking.length) lines.push(`<p>Tracking ${inc.tracking.map(issueLink).join(", ")}. The gate comes back on its own once the fix lands: the bot reports healthy after ${PAGE.recoveryGreenRuns} ${recoveryBarText(inc)} on different PRs.</p>`);
+  if (inc.recovering) lines.push(`<p><b>The condition has cleared.</b> A retest is reasonable now; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} ${recoveryBarText(inc)} on distinct PRs so far.</p>`);
   else if (isBreak(inc) && !inc.tracking.length && !inc.past) lines.push(`<p>No issue is filed yet. File one with the <code>presubmit-gate</code> label and link this page. Demoting the case in <code>hack/eval/blocking-roster.txt</code> unblocks merges while the fixture is fixed; re-admit it afterwards.</p>`);
   else if (inc.condition === "storm" && !inc.past) {
     const retest = stormRetestMs(inc);
     lines.push(`<p>Wait it out${retest != null ? `: retest after ${esc(et(retest))}` : ""}. The API quota is fixed, so fewer runs at once is the only lever; a retest inside the storm loses repetitions the same way.</p>`);
   } else if (inc.condition === "setup_deaths" && !inc.past) lines.push(`<p>Check the leased pool projects before spending another run: a stuck Helm release or a failing image pull is the usual cause. Retest once the deaths stop.</p>`);
   else if (inc.condition === "delegation_ceiling" && !inc.past) lines.push(`<p>Retest once workers are finishing again. Read <code>platform-agent-gateway.log</code> in a run's artifacts for <code>kanban dispatcher stuck</code> and <code>RESOURCE_EXHAUSTED</code> lines: a stalled dispatcher is #1879, starved workers are the quota.</p>`);
+  else if (inc.condition === "deadline_kill" && !inc.past) lines.push(`<p>Don't retest: a run started now ends the same way. Each killed run's <code>build-log.txt</code> shows how far its units got, and the gateway and dispatcher lines in the eval project's Cloud Logging say what the workers were doing. The bot reports healthy once the newest ${PAGE.recoveryGreenRuns} runs with a verdict, green or red, are on distinct PRs and all follow the last kill.</p>`);
   if (inc.past) lines.push(`<p class="mut">This incident is over${inc.untilMs != null ? `; the gate was reported healthy again at ${esc(et(inc.untilMs))}` : ""}.</p>`);
   if (inc.stale) lines.push(`<p class="stale">The data behind this state stopped refreshing; the state is as old as the data.</p>`);
   if (!lines.length) return "";
@@ -789,7 +841,11 @@ function runsListHtml(inWindow, inc, title) {
     const held = heldOutFailures(run).length;
     const chips = failed.map((c) => `<span class="chip ${cases.has(c) ? "hit" : "miss"}">${esc(c)}</span>`).join("");
     let note = "";
-    if (run.setup_death) note = '<span class="chip inf">died in setup</span>';
+    // A deadline kill's row says so, cases recorded or not: the chips alone
+    // would read "no cases recorded" or, for a #1875 kill whose recorded
+    // cases all passed, "all gate cases passed".
+    if (run.cls === "deadline-kill") note = `<span class="chip inf">killed at the deadline${measured(run) ? `, ${plural((run.cases || []).length, "case")} recorded first` : ""}</span>`;
+    else if (run.setup_death) note = '<span class="chip inf">died in setup</span>';
     else if (!measured(run)) note = `<span class="chip inf">${run.result === "ABORTED" ? "aborted" : "no cases recorded"}</span>`;
     // A run whose every recorded case went ungraded (a storm, or every
     // worker at the delegation ceiling) passed nothing; the chips say why.
@@ -840,7 +896,7 @@ function lastIncidentHtml() {
   const past = historyIncidents().map(incidentFromHistory).filter((inc) => inc.sinceMs != null).sort((a, b) => b.sinceMs - a.sinceMs);
   if (!past.length) return brief.history ? `<p class="mut">No incident on record yet.</p>` : `<p class="mut">No incident history is published yet, so only the current state is shown.</p>`;
   const inc = past[0];
-  const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : inc.condition === "delegation_ceiling" ? "workers not finishing (delegation ceiling)" : "a degraded gate";
+  const what = isBreak(inc) ? `${plural(inc.cases.length, "gate case")} failing on every PR` : inc.condition === "storm" ? "a quota storm" : inc.condition === "setup_deaths" ? "runs dying in setup" : inc.condition === "delegation_ceiling" ? "workers not finishing (delegation ceiling)" : inc.condition === "deadline_kill" ? "runs killed at the job deadline" : "a degraded gate";
   return `<p>${pillHtml(inc.state, `PAST ${inc.state}`)} <b>${esc(etSpan(inc.sinceMs, inc.untilMs))}</b> — ${what}${inc.cases.length ? ` (<code>${inc.cases.map(esc).join("</code>, <code>")}</code>)` : ""}. <a href="${esc(incidentHref(inc))}">Open the brief for it →</a> <a href="${esc(trendHref(inc.cases, inc.sinceMs, inc.untilMs))}">The record on main around the night it started →</a></p>`;
 }
 
@@ -925,7 +981,7 @@ function briefHtml(link) {
       nightlyBriefHtml() + releasesHtml() + footHtml();
   }
   const inWindow = windowRuns(incidentStartMs(inc), inc.untilMs);
-  if (!inWindow.some(measured) && !inWindow.some((r) => r.setup_death)) {
+  if (!inWindow.some(measured) && !inWindow.some((r) => r.setup_death || r.cls === "deadline-kill")) {
     // Nothing on record for the window (older than brief.json's run_days, or
     // the link points at a time with no runs): say so instead of counting zeros.
     const pillText = `${stateWord(inc)} · ${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `since ${et(inc.sinceMs)}`}`;
@@ -934,10 +990,10 @@ function briefHtml(link) {
       beingDoneHtml(inc) + footHtml();
   }
   const { head, lede } = briefHeadline(inc, inWindow);
-  const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : inc.condition === "delegation_ceiling" ? ceilingFacts(inc, inWindow) : [];
+  const facts = isBreak(inc) ? breakFacts(inc, inWindow) : inc.condition === "storm" ? stormFacts(inc, inWindow) : inc.condition === "setup_deaths" ? setupFacts(inc, inWindow) : inc.condition === "deadline_kill" ? deadlineFacts(inc, inWindow) : inc.condition === "delegation_ceiling" ? ceilingFacts(inc, inWindow) : [];
   const pillText = `${stateWord(inc)} · ${inc.past ? esc(etSpan(inc.sinceMs, inc.untilMs)) : `since ${et(inc.sinceMs)}`}${inc.stale ? " · STALE" : ""}`;
   let recoveringLine = "";
-  if (inc.recovering) recoveringLine = `<div class="lede">The condition has cleared; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} clean runs on distinct PRs so far. A retest is reasonable.</div>`;
+  if (inc.recovering) recoveringLine = `<div class="lede">The condition has cleared; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} ${recoveryBarText(inc)} on distinct PRs so far. A retest is reasonable.</div>`;
   return `<div class="sec head">${pillHtml(inc.recovering ? "DEGRADED" : inc.state, pillText)}<h1>${head}</h1><div class="lede">${lede}</div>${recoveringLine}</div>` +
     (facts.length ? `<div class="sec" id="gate"><h2>${esc(whyTitle(inc))}</h2>${factsHtml(facts)}</div>` : "") +
     `<div class="sec"><h2>What the agent saw</h2>${agentSawHtml(inc, inWindow)}</div>` +
@@ -972,6 +1028,8 @@ function bannerHtml(run) {
   else if (h.condition === "storm") text = `<b>Quota storm ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs lose repetitions to 429s and empty records. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "setup_deaths") text = `<b>Setup failures ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs die before any case runs. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "lost_pods") text = `<b>Build nodes lost ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs died with the node under them; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
+  else if (h.condition === "deadline_kill" && h.recovering) text = `<b>Deadline-kill outage recovering ${when}</b>: runs are reaching verdicts again, so a kill now may be the branch. <a href="${esc(href)}">Read the brief →</a>`;
+  else if (h.condition === "deadline_kill") text = `<b>Runs killed at the deadline ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs reach the job timeout with no verdict, so nothing can pass; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "delegation_ceiling") text = `<b>Workers not finishing ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: repetitions end at the harness's delegation wait with the card still running; those runs read not evaluated, not red. <a href="${esc(href)}">Read the brief →</a>`;
   else text = `<b>Gate ${h.recovering ? "recovering" : "outage"} ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: ${cases.length ? `<code>${cases.map(esc).join("</code>, <code>")}</code> fail${cases.length === 1 ? "s" : ""} on every PR` : esc(h.cause || "a shared break")}. <a href="${esc(href)}">Read the brief →</a>`;
   const state = h.recovering ? "DEGRADED" : h.state;
@@ -1037,7 +1095,8 @@ function runDoHtml(text) {
 
 function whatToDoHtml(run) {
   const items = [];
-  if (!measured(run) && run.do) items.push(runDoHtml(run.do));
+  // A deadline kill keeps its `do` whether or not cases finished before it.
+  if ((!measured(run) || run.cls === "deadline-kill") && run.do) items.push(runDoHtml(run.do));
   else if (run.setup_death || (!measured(run) && run.verdict === "infra")) items.push("<li><b>Retest.</b> Nothing ran, so nothing here is about your change.</li>");
   else if (!measured(run) && run.verdict === "green") items.push("<li><b>Nothing.</b> The gate revalidated this branch's earlier green run.</li>");
   else if (!measured(run)) items.push("<li><b>Read the build log.</b> The failure is before the eval loop; a broken image build or deploy on this branch looks like this.</li>");
@@ -1277,7 +1336,7 @@ function gridMarkers(win, cols) {
       seen.push({ t, cls });
       markers.push({ t, cls, label, title: `${et(t)} · ${label}` });
     };
-    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : inc.condition === "delegation_ceiling" ? "delegation ceiling" : "degraded");
+    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : inc.condition === "delegation_ceiling" ? "delegation ceiling" : inc.condition === "deadline_kill" ? "deadline kills" : "degraded");
     for (const inc of historyIncidents().map(incidentFromHistory)) {
       add(inc.sinceMs, "incident", `${inc.state.toLowerCase()}: ${what(inc)}`);
       add(inc.untilMs, "recovered", "healthy again");

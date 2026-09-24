@@ -112,21 +112,23 @@ MINTER_KSA = "kubeagents-system/kubeagents-github-minter"
 # is what makes it a usable identity probe rather than just a reachability test.
 GITHUB_APP_URL = "https://api.github.com/app"
 
-# The App the EVAL RUNNER grades ledger issues with, which is not the minter App
-# above. hack/ci-eval-pr.sh mints an installation token from it into
-# BENCH_GITHUB_TOKEN before each devops-bench invocation; a test pins these two
-# to that script, so changing the App there cannot leave this check attesting a
-# credential CI no longer uses.
+# The App the EVAL RUNNER grades ledger issues with (a mint pinned to reads; its
+# installation also holds issues: write, for hack/ci-eval-pr.sh's ledger reset),
+# which is not the minter App above. hack/ci-eval-pr.sh mints an installation
+# token from it into BENCH_GITHUB_TOKEN before each devops-bench invocation; a
+# test pins these two to that script, so changing the App there cannot leave
+# this check attesting a credential CI no longer uses.
 LEDGER_APP_ID = 4739812
 LEDGER_INSTALLATION_ID = 157029058
 GITHUB_INSTALLATION_TOKEN_URL = (
     "https://api.github.com/app/installations/{installation}/access_tokens"
 )
-
-# All this check does with the token is read one repository's issues, so that is
-# all it asks for. A token that inherited the installation whole would carry
-# every permission the App is ever granted into a read-only probe.
-LEDGER_GRADING_PERMISSIONS = {"issues": "read"}
+# What this script's probe mint asks for: the same three reads the eval's
+# grading mint pins (LEDGER_GRADING_MINT_BODY in hack/ci-eval-pr.sh; a test
+# holds the two equal). An omitted body would mint the installation's whole
+# grant, which since 2026-09-22 includes issues: write on every pool repository
+# for the ledger reset; a read probe has no business holding that.
+LEDGER_READ_PERMISSIONS = {"issues": "read", "pull_requests": "read", "metadata": "read"}
 
 # Its private key, read from the cluster rather than the operator's disk: a
 # local copy answers a question nobody asked. `build-kube-agents` is the Prow
@@ -1921,8 +1923,8 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     returned, never logged: it is a live credential for every repository in the
     installation.
 
-    The token is narrowed to LEDGER_GRADING_PERMISSIONS: this check reads one
-    repository's issues, and asks for exactly that whatever the App is granted.
+    The token is narrowed to LEDGER_READ_PERMISSIONS, the three reads grading
+    pins, whatever the App is granted.
     """
 
     def _b64(raw: bytes) -> bytes:
@@ -1974,7 +1976,7 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
             "Content-Type": "application/json",
             "User-Agent": "kube-agents-verify-ci-pool-project",
         },
-        data=json.dumps({"permissions": LEDGER_GRADING_PERMISSIONS}).encode(),
+        data=json.dumps({"permissions": LEDGER_READ_PERMISSIONS}).encode(),
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -1991,10 +1993,16 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
                 "uninstalled from gke-agentic, or the id moved; ledger grading is broken pool-wide"
             )
         if exc.code == 422:
+            # The body asked for a permission the installation does not hold.
+            # hack/ci-eval-pr.sh's preflight mint sends the same body and exits
+            # on this answer, so every run on every pool project would stop.
+            wanted = ", ".join(f"{k}: {v}" for k, v in LEDGER_READ_PERMISSIONS.items())
             return None, "failed", (
-                f"App {LEDGER_APP_ID}'s installation cannot grant "
-                f"{sorted(LEDGER_GRADING_PERMISSIONS)} (422), which is what grading reads a "
-                "ledger with. An organisation owner accepts it on the App's installation"
+                f"GitHub refused to mint {wanted} for App {LEDGER_APP_ID}'s installation "
+                f"{LEDGER_INSTALLATION_ID} (422): the installation no longer holds one of them. "
+                "hack/ci-eval-pr.sh's preflight mint asks for exactly these and stops the run on "
+                "this answer, so ledger grading is broken pool-wide until an organisation owner "
+                "restores the permission (or accepts a pending permission change) on the installation"
             )
         return None, "unverified", (
             f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of minting a token"
@@ -2085,9 +2093,10 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
             response.read()
     except urllib.error.HTTPError as exc:
         # A 403 is two different answers. Rate limiting is a limit of the moment
-        # and leaves the question open; anything else is the token reaching the
-        # repository without `issues: read`, which is a real failure and the one
-        # a blanket "403 is unverified" would hide.
+        # and leaves the question open; anything else is a token that was just
+        # minted WITH `issues: read` being refused the repository anyway (a
+        # suspended installation, an organisation access setting), which is a
+        # real failure and the one a blanket "403 is unverified" would hide.
         if exc.code == 403 and (exc.headers or {}).get("x-ratelimit-remaining") == "0":
             return CheckResult(
                 name,
@@ -2101,8 +2110,10 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
         if exc.code == 403:
             return CheckResult(name, False, "Ledger issues not readable", details=[
                 f"App {LEDGER_APP_ID} reaches {repo_slug} but is refused its issues "
-                f"(403 {exc.reason}). Its installation needs `issues: read`, which is a pool-wide "
-                f"permission rather than anything about {project_id}; accept it and re-run"
+                f"(403 {exc.reason}). The token was just minted with `issues: read`, so this is "
+                "not a missing permission: the installation is suspended, or an organisation "
+                "IP allow list or SAML setting blocks App tokens from here. Pool-wide rather than "
+                f"anything about {project_id}; clear it and re-run"
             ])
         if exc.code == 404:
             return CheckResult(name, False, "Ledger issues not readable", details=[

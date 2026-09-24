@@ -177,6 +177,12 @@ def lost_pods(since="2026-09-11T14:05:52+00:00", prs=PRS_0911, nodes=None, windo
     return doc
 
 
+def deadline_kill(since="2026-09-22T19:00:00+00:00", prs=(1826, 1838, 1877), runs=3, window=("2026-09-22T19:40:00+00:00", "2026-09-22T20:00:00+00:00"), evidence=()):
+    doc = health("OUTAGE", f"deadline kills: {runs} runs on {len(prs)} PRs killed at the 360-minute deadline with no verdict 19:40–20:00 UTC", since=since, condition="deadline_kill", prs=prs, runs=runs, window=window)
+    doc["evidence"] = list(evidence)
+    return doc
+
+
 class FakeResponse:
     def __init__(self, status=200):
         self.status = status
@@ -380,7 +386,7 @@ class Shapes(RunHarness):
         self.tick(slow(), T0)
         self.assertEqual(
             self.opener.texts[0],
-            "🐢 *Smoke gate: slow* — the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s."
+            "🐢 *Smoke gate: slow* — the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s or empty records."
             " Not a break, and /retest won't make yours faster.\n"
             f"{URL}#view=agent",
         )
@@ -751,7 +757,7 @@ class Digest(RunHarness):
         self.tick(slow(), self.at(DIGEST_UTC, 5))
         self.assertEqual(
             self.opener.texts[1].split("\n")[1],
-            "🐢 Slow since 2:00 PM ET: the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s.",
+            "🐢 Slow since 2:00 PM ET: the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s or empty records.",
         )
         self.tick(health(), self.at(DIGEST_UTC, 5, day=5))
         self.assertEqual(len(self.opener.texts), 3, "clearing is not a message")
@@ -1765,6 +1771,85 @@ class FixtureDrift(RunHarness):
         self.tick(health("GREEN"), T14)
         self.assertEqual(self.opener.texts, [])
         self.assertFalse(self.recorded()["fixture_unknown"])
+
+
+class DeadlineKillMessages(RunHarness):
+    """#1894: runs killed at the job deadline with no verdict are an OUTAGE
+    with their own sentence, an issue for the gate's owner, and a recovery
+    line that names what cleared."""
+
+    def environ(self):
+        return {post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN, **GH_ENV}
+
+    def test_the_outage_message_names_the_kills_and_files_an_issue(self):
+        doc = deadline_kill(evidence=["deadline kills: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict 19:40–20:00 UTC (#1826, #1838, #1877)"])
+        rc, _ = self.tick(doc, T0.replace(day=22, hour=20, minute=5), environ=self.environ())
+        self.assertEqual(rc, 0)
+        first = self.opener.texts[0].split("\n")
+        self.assertTrue(first[0].startswith("🔴 *Smoke gate: broken* — 3 runs on 3 PRs were killed at the 360-minute deadline with no verdict"), first[0])
+        self.assertIn("nothing is being graded, so the gate cannot pass anyone.", first[0])
+        self.assertTrue(first[1].startswith("Don't retest yet. Tracking #1300."), first[1])
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
+        _, _, body = self.gh.calls[-1]
+        self.assertTrue(body["title"].startswith("Smoke gate outage: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict since"), body["title"])
+        self.assertIn("ran to Prow's 360-minute deadline and were killed with no eval verdict", body["body"])
+        self.assertIn("#1826, #1838, #1877", body["body"])
+        # The span of the kills, not the incident's start twice over; and the
+        # opening "since" pairs the first kill's clock time with its own ISO
+        # stamp, not with the tick that declared the state (19:00Z here).
+        self.assertIn("**Window:** 3:40 PM–4:00 PM ET (2026-09-22T19:40:00+00:00 – 2026-09-22T20:00:00+00:00).", body["body"])
+        self.assertIn("since Tue 3:40 PM ET (2026-09-22T19:40:00+00:00), 3 runs on 3 pull requests", body["body"])
+        self.assertNotIn("(2026-09-22T19:00:00+00:00)", body["body"])  # the brief link may carry the tick; the parenthetical must not
+        self.assertIn("presubmit-gate", body["labels"])
+
+    def test_the_body_quotes_the_deadline_evidence_and_no_case_names(self):
+        # health.py's evidence carries a per-case collapse line whenever a case
+        # clears the shared-break floors; quoted here it would make this issue
+        # the tracker of a break that fires later (Tracker.existing matches
+        # bodies for case names).
+        doc = deadline_kill(evidence=[
+            "cost-idle-pool-probe failed all graded reps on 3 runs from 3 PRs (#1, #2, #3)",
+            "deadline kills: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict 19:40–20:00 UTC (#1826, #1838, #1877)",
+        ])
+        self.tick(doc, T0.replace(day=22, hour=20, minute=5), environ=self.environ())
+        _, _, body = self.gh.calls[-1]
+        self.assertIn("- deadline kills: 3 runs on 3 PRs", body["body"])
+        self.assertNotIn("cost-idle-pool-probe", body["body"])
+        self.assertIn("The rest of the evidence (any case collapsing underneath the kills) is in the brief.", body["body"])
+
+    def test_a_humans_issue_titled_for_the_deadline_kills_is_adopted(self):
+        human = {"number": 1894, "html_url": "https://github.com/gke-labs/kube-agents/issues/1894", "title": "Smoke Health bot stayed GREEN through a 12 h gate outage: deadline-killed runs with no verdict match no condition", "body": ""}
+        gh = FakeGh(open_issues=[human])
+        self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [], "nothing filed")
+        self.assertIn("Tracking #1894.", self.opener.texts[0])
+
+    def test_a_break_issue_whose_body_quotes_the_kills_is_not_adopted(self):
+        # Every bot-filed body names the job and quotes the evidence block,
+        # which mentions deadline kills whenever one sits in the window; only
+        # the title decides, or a shared-break issue becomes the tracker.
+        bot = {
+            "number": 1793,
+            "html_url": "https://github.com/gke-labs/kube-agents/issues/1793",
+            "title": "Smoke gate outage: 2 cases failing on every PR since Fri 9:00 AM ET",
+            "body": "The smoke gate (`pull-kube-agents-smoke-test`) is in OUTAGE.\n- deadline kills: 1 runs on 1 PRs killed at the 360-minute deadline with no verdict 12:40–12:40 UTC (#1)",
+        }
+        gh = FakeGh(open_issues=[bot])
+        self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
+        self.assertNotIn("#1793", self.opener.texts[0])
+
+    def test_the_copied_constants_are_healths(self):
+        from eval_dashboard import gate_issue, health
+
+        # post_health derives its copy from health; gate_issue's is written
+        # out (it imports nothing), so it is pinned here.
+        self.assertEqual(gate_issue.DEADLINE_MINUTES, int(health.PROW_JOB_TIMEOUT.total_seconds() // 60))
+        self.assertEqual(gate_issue.RECOVERY_RUNS, health.RECOVERY_GREEN_RUNS)
+
+    def test_the_recovery_names_the_kills(self):
+        self.assertEqual(post_health.short_cause({"condition": "deadline_kill"}), "runs were being killed at the deadline")
+
 
 
 if __name__ == "__main__":

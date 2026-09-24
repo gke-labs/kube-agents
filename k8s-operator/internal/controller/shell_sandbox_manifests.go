@@ -94,6 +94,11 @@ const (
 	// pod it is running in.
 	shellSandboxCredentialProxyTokenVolume = "credential-proxy-token" // #nosec G101 -- Volume name, not a credential
 
+	envGKEProjectID    = "GKE_PROJECT_ID"
+	envGKEClusterName  = "GKE_CLUSTER_NAME"
+	envGKELocation     = "GKE_LOCATION"
+	envKubeContextName = "KUBE_CONTEXT_NAME"
+
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
 	// that half works, which is the intended failure mode.
@@ -436,6 +441,14 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 			Value: credentialProxyTokenMountPath + "/token",
 		})
+	}
+	if harness := agent.Spec.Harness; harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
+		env = append(env,
+			corev1.EnvVar{Name: envGKEProjectID, Value: harness.ProjectID},
+			corev1.EnvVar{Name: envGKEClusterName, Value: harness.ClusterName},
+			corev1.EnvVar{Name: envGKELocation, Value: harness.Location},
+			corev1.EnvVar{Name: envKubeContextName, Value: fmt.Sprintf("gke_%s_%s_%s", harness.ProjectID, harness.Location, harness.ClusterName)},
+		)
 	}
 
 	containers := buildShellSandboxContainers(agent, env)

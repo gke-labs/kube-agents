@@ -44,7 +44,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -293,6 +293,19 @@ LEDGER_AUDIT_IDS = frozenset(
 # LedgerIssueContainsVerifier's docstring for what it has to be.
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
+# The first line of the closing comment hack/ci_reset_audit_ledgers.py leaves
+# on a ledger it retires before a repetition (RESET_MARKER there;
+# scripts/test_ci_eval_ledger_reset.py pins the two literals equal). A closed
+# ledger a report still cites is read for it, so the harness's own close is
+# named as such rather than blamed on the run.
+LEDGER_RESET_MARKER = "<!-- kube-agents-eval-ledger-reset -->"
+# How far back from a ledger's closed_at that comment is asked for, and the
+# page it is asked for on. The reset posts the comment and closes seconds
+# later; an hour is generous and keeps the read to one page.
+_RESET_COMMENT_LOOKBACK = timedelta(hours=1)
+_GITHUB_PAGE_SIZE = 100
+_GITHUB_SINCE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
 # github.com only, and issues only: `/pull/<n>` is a remediation pull request,
 # which every audit report also links and which is not the ledger.
 _ISSUE_URL_RE = re.compile(
@@ -346,6 +359,16 @@ _MAX_LEDGER_CANDIDATES = 8
 _CLEAN_CLOSE_RE = re.compile(
     r"ledger[^\n.]{0,80}?\bclosed\b|\bclosed\b[^\n.]{0,80}?\bledger\b"
     r"|\b0 findings\b|\bfound nothing\b|\bno findings\b|\bis now clean\b",
+    re.IGNORECASE,
+)
+
+# Matches when the worker queued the audit for a future cron schedule or reported
+# that the on-demand trigger was unavailable (#1876), instead of running the audit.
+_QUEUED_INSTEAD_OF_RUN_RE = re.compile(
+    r"\b(?:queued\s+(?:to\s+run|for\s+its\s+next|for\s+the\s+next|the\s+stream)|"
+    r"on-demand\s+trigger\s+is\s+unavailable|"
+    r"stream\s+will\s+run\s+on\s+its\s+\d{2}:\d{2}\s+schedule|"
+    r"will\s+run\s+on\s+its\s+next\s+cron\s+schedule)\b",
     re.IGNORECASE,
 )
 
@@ -676,6 +699,22 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     did exactly that and shared its reason with a delegation that never
     returned (#1683). Neither is a new pass or fail; both are the same fail
     with a reason a reader can act on.
+
+    THE HARNESS'S OWN CLOSE IS NAMED AS SUCH. ``hack/ci-eval-pr.sh`` retires
+    the stream's open ledger before every repetition
+    (``hack/ci_reset_audit_ledgers.py``), seconds before devops-bench starts
+    the run, so that ``closed_at`` falls inside the same window a false clean
+    would. A worker that cites the retired ledger instead of the fresh one it
+    should have opened did not close it: when a closed ledger carries a
+    ``LEDGER_RESET_MARKER`` comment posted within ``max_clock_skew_sec`` of
+    its ``closed_at``, the reason says the harness reset it before this run
+    started. Bound to the close on purpose: the reset comments first and
+    closes second, so a reset whose close failed leaves the marker on an OPEN
+    ledger, and a worker's genuine false clean on it later must not inherit
+    the harness's name from a comment that is minutes or hours older than the
+    close. Still a fail, since the run published nothing to the ledger it
+    named; only the sentence changes, whichever side of ``started_at`` the
+    close fell on.
     """
 
     type: Literal["ledger_issue_contains"]
@@ -704,6 +743,44 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     # same stream -- the six audit scenarios use six DIFFERENT streams, so
     # even back-to-back tasks in one presubmit never share a ledger.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    def _closed_by_the_reset(
+        self, api_url: str, closed_at: datetime, token: str, budget: float
+    ) -> bool | None:
+        """Whether the harness's reset marker was posted alongside this close.
+
+        ``True`` or ``False`` when the comments were read; ``None`` when they
+        could not be (a transport fault or a non-200), which the caller
+        reports instead of treating it as either answer. Only comments from
+        the hour before the close are asked for, and only a marker comment
+        created within ``max_clock_skew_sec`` of ``closed_at`` counts: the
+        reset posts its comment and closes seconds later, so a marker that is
+        older than that belongs to a reset whose close failed, not to this
+        close.
+        """
+        closed_at = closed_at.astimezone(timezone.utc)
+        since = (closed_at - _RESET_COMMENT_LOOKBACK).strftime(_GITHUB_SINCE_FORMAT)
+        try:
+            status_code, payload = _http_get_json(
+                f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={since}",
+                token,
+                budget,
+            )
+        except OSError:
+            return None
+        if status_code != 200 or not isinstance(payload, list):
+            return None
+        for comment in payload:
+            if not isinstance(comment, dict):
+                continue
+            if LEDGER_RESET_MARKER not in str(comment.get("body") or ""):
+                continue
+            created_at = _parse_github_time(comment.get("created_at"))
+            if created_at is None:
+                continue
+            if abs((closed_at - created_at).total_seconds()) <= self.max_clock_skew_sec:
+                return True
+        return False
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -740,6 +817,15 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             if key not in seen:
                 seen.append(key)
         if not seen:
+            queued = _QUEUED_INSTEAD_OF_RUN_RE.search(snap.final_message)
+            if queued:
+                return done(
+                    False,
+                    "the run's report names no github.com issue URL because the worker queued "
+                    f"the audit for later instead of running it ({queued.group(0).strip()!r}): "
+                    "when asked to run an audit following its SOP, the worker must execute "
+                    "the audit now via audit_report.py start/finish rather than deferring to cron (#1876)",
+                )
             clean = _CLEAN_CLOSE_RE.search(snap.final_message)
             if clean:
                 return done(
@@ -825,6 +911,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             matches.append(
                 {
                     "slug": f"{owner}/{repo}#{number}",
+                    "api_url": url,
                     "body": body,
                     "generated_at": footer[1],
                     # Read here, decided below: a closed issue is only telling
@@ -855,28 +942,56 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         age = (started - generated_at).total_seconds()
         if age > self.max_clock_skew_sec:
             closed_at: datetime | None = ledger["closed_at"]
-            closed_by_this_run = (
-                ledger["state"] == "closed"
-                and closed_at is not None
-                and (started - closed_at).total_seconds() <= self.max_clock_skew_sec
-            )
-            if closed_by_this_run:
-                assert closed_at is not None
-                return done(
-                    False,
-                    f"{ledger['slug']} was closed as "
-                    f"{ledger['state_reason'] or 'completed'} at "
-                    f"{closed_at.isoformat()}, during this run, with its body still "
-                    f"carrying the previous run's stamp ({generated_at.isoformat()}): "
-                    "the audit reported the stream clean and retired the ledger "
-                    "while this case expected a finding on it -- a false clean, not "
-                    "an absent report",
-                    raw={
-                        "generated_at": generated_at.isoformat(),
-                        "closed_at": closed_at.isoformat(),
-                        "state_reason": ledger["state_reason"],
-                    },
-                )
+            if ledger["state"] == "closed" and closed_at is not None:
+                state_reason = ledger["state_reason"] or "completed"
+                raw = {
+                    "generated_at": generated_at.isoformat(),
+                    "closed_at": closed_at.isoformat(),
+                    "state_reason": ledger["state_reason"],
+                }
+                # One more read, only for a closed ledger: was the close the
+                # harness's own reset? None means the comments could not be
+                # read, which is said rather than taken for either answer.
+                reset = self._closed_by_the_reset(ledger["api_url"], closed_at, token, budget)
+                raw["reset_by_harness"] = reset
+                if reset:
+                    # The per-unit reset runs before the harness's clock starts,
+                    # so "before" is the expected reading; a reset close after
+                    # it would be another lane's, and is said as what it is.
+                    when = (
+                        f"before this run started ({started.isoformat()})"
+                        if closed_at <= started
+                        else f"{(closed_at - started).total_seconds():.0f}s after this run "
+                        f"started ({started.isoformat()})"
+                    )
+                    return done(
+                        False,
+                        f"{ledger['slug']} was closed as {state_reason} at "
+                        f"{closed_at.isoformat()} by the eval harness's ledger reset, "
+                        f"{when}: the report cites the ledger the reset retired so a "
+                        "repetition would open a fresh one, and its body still carries "
+                        f"the previous run's stamp ({generated_at.isoformat()}), so this "
+                        "run published nothing to it -- a stale pointer to the harness's "
+                        "close, not a false clean",
+                        raw=raw,
+                    )
+                if (started - closed_at).total_seconds() <= self.max_clock_skew_sec:
+                    unread = (
+                        ""
+                        if reset is False
+                        else " (its comments could not be read, so the harness's own "
+                        "ledger reset is not ruled out)"
+                    )
+                    return done(
+                        False,
+                        f"{ledger['slug']} was closed as {state_reason} at "
+                        f"{closed_at.isoformat()}, during this run, with its body still "
+                        f"carrying the previous run's stamp ({generated_at.isoformat()}): "
+                        "the audit reported the stream clean and retired the ledger "
+                        "while this case expected a finding on it -- a false clean, not "
+                        f"an absent report{unread}",
+                        raw=raw,
+                    )
             return done(
                 False,
                 f"{ledger['slug']} was generated at {generated_at.isoformat()}, "
