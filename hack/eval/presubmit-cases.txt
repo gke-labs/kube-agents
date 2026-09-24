@@ -89,12 +89,6 @@
 # healthy-namespace-silence) -- run in the nightly.
 ./tasks/obtainability-remediation-proposal/task.yaml
 
-# TEMP (#1877): seated here for the observed run of the on-demand in-session
-# rule, the way #1625 measured before merge. Not on the blocking roster, so
-# it cannot red the pull request. Its permanent home is the nightly file
-# (#1878); this line and its note are reverted before the PR is merged.
-./tasks/compliance-rbac-overgrant/task.yaml
-
 # Activated by #939, the first Phase 2 domain scenario to run. It was blocked
 # on A5 and nothing else -- no GitHub write, so no A1 and no A4 -- and it
 # exercises the whole of the script's step 2b end to end: label discovery,

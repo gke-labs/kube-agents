@@ -339,8 +339,7 @@
 # 2074s p90, over 903 repetitions 2026-09-04 to 09-15. Priced at 700s, with
 # the 3000s delegation ceiling the full audits get. Re-admission bar: #1171's
 # (delegation fixed and a clean 3-day graded record).
-# TEMP (#1877): the entry sits in presubmit-cases.txt for one observed run and
-# returns here before that PR merges.
+./tasks/compliance-rbac-overgrant/task.yaml
 
 # Held out on #1010 (the delegation receipt graded as the answer -- fixed by
 # #1174 on 2026-09-03 for the capacity probe, but this case's record after

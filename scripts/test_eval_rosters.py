@@ -138,13 +138,9 @@ HELD_OUT_TO_NIGHTLY = [
     "obtainability-fleet-exposure-sweep",  # #1049, never admitted
     "obtainability-healthy-namespace-silence",  # #1049, never admitted
     "rca-remediation-pr",  # demoted 2026-09-02, #1189
+    "compliance-rbac-overgrant",  # demoted 2026-09-02, #1171
     "cluster-agent-healthy-workload-no-finding",  # held out on #1010
 ]
-# TEMP (#1877): compliance-rbac-overgrant (demoted 2026-09-02, #1171) is
-# seated in the presubmit file, not on the roster, for one observed run of
-# the on-demand in-session rule; it returns to HELD_OUT_TO_NIGHTLY, and this
-# block goes, before that PR merges.
-TEMP_SEATED = ["compliance-rbac-overgrant"]
 
 
 def with_insertions(base, insertions):
@@ -210,14 +206,7 @@ class SplitLostNothingTest(unittest.TestCase):
         # Decided 2026-09-22 (#1023): a case that cannot red a pull request
         # does not run on one. The script checks only that the roster is a
         # subset of the presubmit; the equality is policy, pinned here.
-        self.assertEqual(
-            [c for c in eval_rosters.presubmit_cases() if c not in TEMP_SEATED],
-            eval_rosters.blocking_roster(),
-        )
-        for case in TEMP_SEATED:
-            with self.subTest(case=case):
-                self.assertIn(case, eval_rosters.presubmit_cases())
-                self.assertNotIn(case, eval_rosters.blocking_roster())
+        self.assertEqual(eval_rosters.presubmit_cases(), eval_rosters.blocking_roster())
         for case in HELD_OUT_TO_NIGHTLY:
             with self.subTest(case=case):
                 self.assertNotIn(case, eval_rosters.presubmit_cases())
