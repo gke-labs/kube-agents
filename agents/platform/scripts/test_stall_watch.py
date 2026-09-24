@@ -100,35 +100,45 @@ class FakeFleet:
     an exit code cannot be read, one mapped to a string returns that text, one
     mapped to (rows, stderr) returns both; a cluster mapped to an exception
     cannot be reached; Unlisted(status) is listed but not swept; a key
-    `name@location` or a Located value puts it somewhere else."""
+    `name@location` or a Located value puts it somewhere else, and a key
+    `project:name` or `project:name@location` in another project. A project
+    in `listing_fails` cannot be listed; `listing_stderr` is a string for
+    every project or a {project: stderr} map."""
 
-    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False):
+    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, listing_fails=()):
         self.api_resources_rc_one = api_resources_rc_one
         self.listing_stderr = listing_stderr
+        self.listing_fails = set(listing_fails)
         self.hidden = set(hidden)
         self.served = served
         self.sandbox_dies_at = sandbox_dies_at
         self.fleet = {}
         for key, spec in fleet.items():
-            name, _, location = key.partition(stall_watch.CLUSTER_ID_SEPARATOR)
+            head, _, location = key.partition(stall_watch.CLUSTER_ID_SEPARATOR)
+            project, _, name = head.rpartition(stall_watch.PROJECT_SEPARATOR)
             if isinstance(spec, Located):
                 location, status, namespaces = spec.location, spec.status, spec.namespaces
             else:
                 status = spec.status if isinstance(spec, Unlisted) else "RUNNING"
                 namespaces = spec
-            self.fleet[(name, location or LOCATION)] = (status, namespaces)
+            self.fleet[(project or PROJECT, name, location or LOCATION)] = (status, namespaces)
         self.namespaces_extra = list(namespaces_extra)
         self.calls = []
 
     def __call__(self, argv, *, timeout, kubeconfig=None, stdin=None):
         self.calls.append((argv, kubeconfig, stdin))
         if argv[:4] == ["gcloud", "container", "clusters", "list"]:
-            body = [{"name": n, "location": l, "status": status} for (n, l), (status, _) in self.fleet.items() if n not in self.hidden]
-            return completed(argv, json.dumps(body), stderr=self.listing_stderr)
+            project = argv[4].split("=", 1)[1]
+            if project in self.listing_fails:
+                return completed(argv, "", returncode=1, stderr=f"ERROR: (gcloud.container.clusters.list) PERMISSION_DENIED on {project}")
+            body = [{"name": n, "location": l, "status": status} for (pr, n, l), (status, _) in self.fleet.items() if pr == project and n not in self.hidden]
+            stderr = self.listing_stderr.get(project, "") if isinstance(self.listing_stderr, dict) else self.listing_stderr
+            return completed(argv, json.dumps(body), stderr=stderr)
         if argv[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
             name = argv[4]
             location = argv[5].split("=", 1)[1]
-            _, namespaces = self.fleet[(name, location)]
+            project = argv[6].split("=", 1)[1]
+            _, namespaces = self.fleet[(project, name, location)]
             if isinstance(namespaces, Exception):
                 raise namespaces
             return completed(argv)
@@ -144,7 +154,7 @@ class FakeFleet:
             return completed(argv, "".join(f"{n}\n" for n in served), returncode=rc, stderr="error: unable to retrieve the complete list of server APIs: metrics.k8s.io/v1beta1" if rc else "")
         if argv[:3] == [stall_watch.PYTHON_EXECUTABLE, stall_watch.PYTHON_ISOLATED_FLAG, stall_watch.STDIN_SCRIPT_ARG]:
             namespace = argv[argv.index("--namespace") + 1]
-            if self.sandbox_dies_at == (self._cluster_from(kubeconfig)[0], namespace):
+            if self.sandbox_dies_at == (self._cluster_from(kubeconfig)[1], namespace):
                 raise stall_watch.sandbox_exec.SandboxUnavailable("ssh: connect to host sandbox port 22: Connection refused")
             result = namespaces[namespace]
             if isinstance(result, Exception):
@@ -162,11 +172,8 @@ class FakeFleet:
     def scanned(self):
         return [argv[argv.index("--namespace") + 1] for argv, _, _ in self.calls if argv[:1] == [stall_watch.PYTHON_EXECUTABLE]]
 
-    @staticmethod
-    def _cluster_from(kubeconfig):
-        slug = Path(kubeconfig).name[len(stall_watch.KUBECONFIG_FILE_PREFIX):-len(stall_watch.KUBECONFIG_FILE_SUFFIX)]
-        _, name, location = slug.split(stall_watch.KUBECONFIG_SLUG_SEPARATOR)
-        return name, location
+    def _cluster_from(self, kubeconfig):
+        return next(key for key in self.fleet if Path(stall_watch.kubeconfig_path(*key)).name == Path(kubeconfig).name)
 
 
 class FakeBoard:
@@ -238,8 +245,12 @@ class FakeBoard:
         return [c for c in self.calls if c.startswith("create ")]
 
 
-def label(name, location=LOCATION):
-    return f"`{name}` ({location})"
+def label(name, location=LOCATION, project=PROJECT):
+    return f"`{project}/{name}` ({location})"
+
+
+def cid(name, location=LOCATION, project=PROJECT):
+    return stall_watch.cluster_id(project, name, location)
 
 
 class Base(unittest.TestCase):
@@ -284,26 +295,31 @@ class Base(unittest.TestCase):
 
         (self.home / stall_watch.CONFIG_FILE_NAME).write_text(yaml.safe_dump(config))
 
-    def profile_dir(self, name, location=LOCATION):
+    def profile_dir(self, name, location=LOCATION, project=PROJECT):
         from cluster_agent_profile import profile_name
 
-        return self.home / stall_watch.PROFILES_DIR / profile_name(PROJECT, name, location)
+        return self.home / stall_watch.PROFILES_DIR / profile_name(project, name, location)
 
-    def scaffold(self, *clusters, location=LOCATION):
-        """What cluster_agent_reconcile leaves for a cluster on its roster."""
+    def scaffold(self, *clusters, location=LOCATION, project=PROJECT):
+        """What cluster_agent_reconcile leaves for a cluster on its roster:
+        the profile and the identity naming its cluster."""
+        import yaml
+
         for name in clusters:
-            self.profile_dir(name, location).mkdir(parents=True, exist_ok=True)
+            home = self.profile_dir(name, location, project)
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "config.yaml").write_text(yaml.safe_dump({"cluster_identity": {"project": project, "cluster": name, "location": location}}))
 
     def run_tick(self, fleet, unmanaged=(), now=None, **kw):
         """Every cluster in the fleet has a Cluster Agent profile unless
         `unmanaged` names it, the way the reconciler prunes one. `now` pins
         the tick's clock, for tests about the order of first sightings."""
         fake = FakeFleet(fleet, **kw)
-        for name, location in fake.fleet:
+        for project, name, location in fake.fleet:
             if name in unmanaged:
-                shutil.rmtree(self.profile_dir(name, location), ignore_errors=True)
+                shutil.rmtree(self.profile_dir(name, location, project), ignore_errors=True)
             else:
-                self.scaffold(name, location=location)
+                self.scaffold(name, location=location, project=project)
         with patch.object(stall_watch, "run_sandbox", fake), patch.object(stall_watch, "now_iso", side_effect=lambda: now or stall_watch.datetime.now(stall_watch.timezone.utc).replace(microsecond=0).isoformat()):
             lines = stall_watch.tick(self.state, dry_run=False)
         return lines, fake
@@ -332,32 +348,32 @@ class Cards(Base):
         tid, card = next(iter(self.board.cards.items()))
         profile = self.profile_dir("support-eval-cluster").name
         self.assertEqual(card["assignee"], profile)
-        self.assertIn("Stalled controllers in storefront on support-eval-cluster: Gateway/storefront-gateway", card["title"])
+        self.assertIn(f"Stalled controllers in storefront on {PROJECT}/support-eval-cluster: Gateway/storefront-gateway", card["title"])
         self.assertIn(f"`{stall_watch.SKILL_NAME}` skill", card["body"])
         self.assertNotIn(GATEWAY_SECRET, card["body"])
         self.assertIn("- Gateway/storefront-gateway: stale-condition (", card["body"])
         self.assertIn("not instructions", card["body"])
         self.assertIn("`storefront`", card["body"])
-        self.assertEqual(card["key"], f"{stall_watch.CARD_IDEMPOTENCY_PREFIX}-support-eval-cluster@{LOCATION}-storefront-g0")
+        self.assertEqual(card["key"], f"{stall_watch.CARD_IDEMPOTENCY_PREFIX}-{cid('support-eval-cluster')}-storefront-g0")
         self.assertEqual(lines[0], f"{stall_watch.NOTICED_PREFIX} in {label('support-eval-cluster')} / `storefront`: Gateway/storefront-gateway; card `{tid}` opened for `{profile}`")
 
     def test_the_card_gets_a_home_channel_subscription_seeded_at_its_event_head(self):
         self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
         tid = next(iter(self.board.cards))
         self.assertEqual(self.subs(tid), [("google_chat", HOME_CHANNEL, "", stall_watch.NOTIFIER_PROFILE, stall_watch.DELIVERY_MODE, 1)])
-        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/storefront"]["card"], tid)
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/storefront"]["card"], tid)
 
     def test_a_cluster_without_a_cluster_agent_profile_is_neither_read_nor_filed_for(self):
-        # RECONCILE_EXCLUDE prunes the profile to keep a model turn off that
-        # cluster; the watch follows the same roster rather than handing the
-        # cluster's rows to another profile.
+        # The scope's exclude.clusters prunes the profile to keep a model turn
+        # off that cluster; the watch follows the same roster rather than
+        # handing the cluster's rows to another profile.
         lines, fake = self.run_tick({"c": {"storefront": GATEWAY_ROWS}, "mgmt": {"checkout": [DEPLOYMENT_ROW]}}, unmanaged=("mgmt",))
         self.assertEqual(len(self.board.opened()), 1)
         self.assertEqual(fake.scanned(), ["storefront"])
         self.assertNotIn("mgmt", [argv[4] for argv, _, _ in fake.calls if argv[:4] == ["gcloud", "container", "clusters", "get-credentials"]])
         self.assertEqual(len(lines), 1)
         self.assertIn("storefront", lines[0])
-        self.assertEqual(self.ledger()["unreadable"][f"mgmt@{LOCATION}"], stall_watch.NO_PROFILE_REASON)
+        self.assertEqual(self.ledger()["unreadable"][f"{cid('mgmt')}"], stall_watch.NO_PROFILE_REASON)
 
     def test_a_cluster_that_leaves_the_roster_clears_its_rows_and_closes_its_card_as_such(self):
         fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
@@ -365,7 +381,7 @@ class Cards(Base):
         tid = next(iter(self.board.cards))
         lines, _ = self.run_tick(fleet, unmanaged=("c",))
         self.assertEqual(self.ledger()["stalls"], {})
-        self.assertNotIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.assertNotIn(f"{cid('c')}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
         self.assertEqual(self.board.cards[tid]["status"], "done")
         self.assertIn("left the Cluster Agent roster", self.board.cards[tid]["result"])
         self.assertNotIn("cleared at", self.board.cards[tid]["comments"][0])
@@ -463,7 +479,7 @@ class Cards(Base):
         card = next(iter(self.board.cards.values()))
         self.assertEqual(len(card["comments"]), 1)
         self.assertIn("Deployment/cart-api", card["comments"][0])
-        self.assertIn("Deployment/cart-api", self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["objects"])
+        self.assertIn("Deployment/cart-api", self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/checkout"]["objects"])
 
     def test_a_new_object_after_the_agent_completed_the_card_opens_a_new_card(self):
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
@@ -484,7 +500,7 @@ class Cards(Base):
         self.assertEqual(card["status"], "done")
         self.assertIn("cleared", card["result"])
         self.assertEqual(len(card["comments"]), 1)
-        self.assertNotIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.assertNotIn(f"{cid('c')}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
         lines, _ = self.run_tick({"c": {"checkout": []}})
         self.assertEqual(lines, [])
 
@@ -501,7 +517,7 @@ class Cards(Base):
         self.board.fail_complete = True
         lines, _ = self.run_tick({"c": {"checkout": []}})
         self.assertEqual(lines, [], "nothing is said to have closed")
-        self.assertIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.assertIn(f"{cid('c')}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
         self.assertEqual(len(self.board.cards[tid]["comments"]), 1)
         self.board.fail_complete = False
         lines, _ = self.run_tick({"c": {"checkout": []}})
@@ -520,7 +536,7 @@ class Cards(Base):
         self.board.cards[tid]["status"] = "done"
         lines, _ = self.run_tick({"c": {"checkout": []}})
         self.assertEqual(len(self.cleared(lines)), 1)
-        self.assertNotIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.assertNotIn(f"{cid('c')}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
 
     def test_a_board_that_cannot_show_the_card_keeps_the_rows_and_the_comment_pending(self):
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
@@ -530,14 +546,14 @@ class Cards(Base):
         self.assertEqual(lines, [])
         self.assertEqual(len(self.board.cards), 1, "no second card while the first cannot be read")
         self.assertEqual(len(self.ledger()["stalls"]), 2, "the rows stay ledgered")
-        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["pending"], ["Deployment/cart-api"])
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/checkout"]["pending"], ["Deployment/cart-api"])
         self.board.fail_show = False
         lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW, other]}})
         self.assertEqual(lines, [])
         card = next(iter(self.board.cards.values()))
         self.assertEqual(len(card["comments"]), 1)
         self.assertIn("Deployment/cart-api", card["comments"][0])
-        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["pending"], [])
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/checkout"]["pending"], [])
 
     def test_a_pending_comment_after_a_board_hiccup_survives_an_unreadable_tick(self):
         # The bot's scenario: hiccup on the tick a new object joins, then the
@@ -551,7 +567,7 @@ class Cards(Base):
         self.assertEqual(lines, [])
         card = next(iter(self.board.cards.values()))
         self.assertEqual(card["status"], "ready")
-        self.assertIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.assertIn(f"{cid('c')}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
         self.assertEqual(len(card["comments"]), 1, "the pending comment went out once the board answered, even on an unreadable tick")
 
     def test_a_card_gone_from_the_board_ends_its_episode_and_a_new_stall_opens_a_new_card(self):
@@ -577,7 +593,7 @@ class Cards(Base):
         self.board.fail_show = True
         for _ in range(stall_watch.MAX_UNKNOWN_CARD_TICKS - 1):
             self.run_tick({"c": {"checkout": []}})
-            self.assertIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+            self.assertIn(f"{cid('c')}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
         self.run_tick({"c": {"checkout": []}})
         self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY], {})
 
@@ -589,7 +605,7 @@ class Cards(Base):
         self.board.fail_show = False
         self.board.fail_complete = True
         self.run_tick({"c": {"checkout": []}})
-        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["unknown"], 0)
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/checkout"]["unknown"], 0)
 
     def test_one_failed_comment_does_not_complete_the_card_as_cleared(self):
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
@@ -610,7 +626,7 @@ class Cards(Base):
         with patch.object(stall_watch, "subscribe_card", return_value=0):
             self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         tid = next(iter(self.board.cards))
-        self.assertFalse(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["subscribed"])
+        self.assertFalse(self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/checkout"]["subscribed"])
         self.assertEqual(self.subs(tid), [])
         conn = sqlite3.connect(self.db)
         created = conn.execute("SELECT MIN(id) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0]
@@ -619,7 +635,7 @@ class Cards(Base):
         conn.commit()
         conn.close()
         self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
-        self.assertTrue(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["subscribed"])
+        self.assertTrue(self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/checkout"]["subscribed"])
         rows = self.subs(tid)
         self.assertEqual(len(rows), 1)
         # A cursor seeded at the current head would swallow the completion.
@@ -637,7 +653,7 @@ class Cards(Base):
         self.assertEqual(len(self.noticed(lines)), 1)
         self.assertEqual(len(self.board.cards), 2)
         self.assertNotIn(f"card `{first}`", lines[0])
-        self.assertEqual(self.ledger()[stall_watch.GENERATIONS_KEY][f"c@{LOCATION}/checkout"], 1)
+        self.assertEqual(self.ledger()[stall_watch.GENERATIONS_KEY][f"{cid('c')}/checkout"], 1)
 
     def test_a_card_the_agent_completed_early_is_not_reused_for_a_peer_that_appears_later(self):
         # Two objects from one apply, different thresholds: the Deployment's
@@ -655,15 +671,15 @@ class Cards(Base):
         # A repeated key can hand back a finished card; with `show` failing
         # there is no telling, so nothing is adopted until the board answers.
         old = "t_old0001"
-        self.board.by_key[stall_watch.card_key(f"c@{LOCATION}", "checkout", 0)] = old
+        self.board.by_key[stall_watch.card_key(f"{cid('c')}", "checkout", 0)] = old
         self.board.cards[old] = {"status": "done", "assignee": "", "title": "", "body": "", "key": "", "comments": []}
         self.board.fail_show = True
         lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         self.assertEqual(self.noticed(lines), [])
-        self.assertNotIn(f"c@{LOCATION}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        self.assertNotIn(f"{cid('c')}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
         self.board.fail_show = False
         lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
-        self.assertNotEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["card"], old)
+        self.assertNotEqual(self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/checkout"]["card"], old)
         self.assertEqual(len(self.noticed(lines)), 1)
 
     def test_cards_the_board_cannot_describe_still_count_against_the_ceiling(self):
@@ -692,20 +708,20 @@ class Cards(Base):
         self.assertEqual(len(self.board.cards), 3)
         self.assertNotIn(f"card `{first}`", lines[0])
         self.assertNotIn(f"card `{second}`", lines[0])
-        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["card"], [t for t in self.board.cards if t not in (first, second)][0])
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/checkout"]["card"], [t for t in self.board.cards if t not in (first, second)][0])
 
     def test_finished_cards_handed_back_past_the_bound_leave_the_scope_for_the_next_tick(self):
         for g in range(stall_watch.MAX_FINISHED_CARDS_SKIPPED + 1):
             tid = f"t_old{g:05d}"
-            self.board.by_key[stall_watch.card_key(f"c@{LOCATION}", "checkout", g)] = tid
+            self.board.by_key[stall_watch.card_key(f"{cid('c')}", "checkout", g)] = tid
             self.board.cards[tid] = {"status": "done", "assignee": "", "title": "", "body": "", "key": "", "comments": []}
         lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         self.assertEqual(lines, [])
         self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY], {})
-        self.assertEqual(self.ledger()[stall_watch.GENERATIONS_KEY][f"c@{LOCATION}/checkout"], stall_watch.MAX_FINISHED_CARDS_SKIPPED + 1)
+        self.assertEqual(self.ledger()[stall_watch.GENERATIONS_KEY][f"{cid('c')}/checkout"], stall_watch.MAX_FINISHED_CARDS_SKIPPED + 1)
         lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         self.assertEqual(len(self.noticed(lines)), 1)
-        self.assertEqual(self.board.cards[self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/checkout"]["card"]]["status"], "ready")
+        self.assertEqual(self.board.cards[self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/checkout"]["card"]]["status"], "ready")
 
     def test_the_idempotency_key_carries_no_clock_so_a_retry_reuses_it(self):
         # The stall's reported age and the scan clock both move between the
@@ -720,7 +736,7 @@ class Cards(Base):
             second = shlex.split([c for c in self.board.calls if c.startswith("create ")][-1])
         key = lambda argv: argv[argv.index("--idempotency-key") + 1]
         self.assertEqual(key(first), key(second))
-        self.assertEqual(key(first), f"{stall_watch.CARD_IDEMPOTENCY_PREFIX}-c@{LOCATION}-checkout-g0")
+        self.assertEqual(key(first), f"{stall_watch.CARD_IDEMPOTENCY_PREFIX}-{cid('c')}-checkout-g0")
 
     def test_a_card_the_agent_already_completed_is_not_completed_again_on_clear(self):
         self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})
@@ -804,14 +820,14 @@ class Subscriptions(Base):
         self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
         tid = next(iter(self.board.cards))
         self.assertEqual(self.subs(tid)[0][:2], ("google_chat", HOME_CHANNEL))
-        self.assertTrue(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/storefront"]["subscribed"])
+        self.assertTrue(self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/storefront"]["subscribed"])
 
     def test_without_any_home_channel_no_row_is_written_and_the_card_still_opens(self):
         (self.home / stall_watch.CONFIG_FILE_NAME).unlink()
         lines, _ = self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
         self.assertEqual(len(self.noticed(lines)), 1)
         self.assertEqual(self.subs(next(iter(self.board.cards))), [])
-        self.assertFalse(self.ledger()[stall_watch.EPISODES_KEY][f"c@{LOCATION}/storefront"]["subscribed"])
+        self.assertFalse(self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/storefront"]["subscribed"])
 
     def test_a_card_not_on_the_board_gets_no_row(self):
         self.assertEqual(stall_watch.subscribe_card("t_deadbeef", self.db), 0)
@@ -901,7 +917,7 @@ class Ledger(Base):
         self.assertEqual(lines, [], "the Deployment row is unknown; the Gateway row cleared but the object list is not empty yet")
         kinds_left = sorted(e["object"].split("/")[0] for e in self.ledger()["stalls"].values())
         self.assertEqual(kinds_left, ["Deployment"], "deployments were not scanned, gateways were")
-        self.assertIn("partial: deployments not read", self.ledger()["unreadable"][f"c@{LOCATION}/checkout"])
+        self.assertIn("partial: deployments not read", self.ledger()["unreadable"][f"{cid('c')}/checkout"])
         self.assertEqual(self.run_tick({"c": {"checkout": [DEADLINE_ROW]}})[0], [], "never cleared, so not new")
         lines, _ = self.run_tick({"c": {"checkout": []}})
         self.assertEqual(len(self.cleared(lines)), 1)
@@ -952,7 +968,7 @@ class Gone(Base):
     def test_a_deleted_cluster_clears_its_objects(self):
         self.run_tick({"a": {"storefront": GATEWAY_ROWS}, "b": {"catalog": []}})
         self.run_tick({"a": TIMEOUT, "b": {"catalog": []}})
-        self.assertIn(f"a@{LOCATION}", self.ledger()["unreadable"])
+        self.assertIn(f"{cid('a')}", self.ledger()["unreadable"])
         lines, _ = self.run_tick({"b": {"catalog": []}})
         self.assertEqual(len(self.cleared(lines)), 1)
         self.assertEqual(self.ledger()["stalls"], {})
@@ -965,7 +981,7 @@ class Gone(Base):
         self.assertEqual(fake.scanned(), ["storefront"])
         lines, _ = self.run_tick({"c": Unlisted("PROVISIONING")})
         self.assertEqual(lines, [])
-        self.assertEqual(self.ledger()["unreadable"], {f"c@{LOCATION}": "status=PROVISIONING"})
+        self.assertEqual(self.ledger()["unreadable"], {f"{cid('c')}": "status=PROVISIONING"})
         self.assertEqual(len(self.ledger()["stalls"]), 2)
 
     def test_a_listing_gcloud_calls_incomplete_clears_nothing(self):
@@ -973,7 +989,7 @@ class Gone(Base):
         partial = "WARNING: The following zones did not respond: us-central1-a. List results may be incomplete."
         lines, _ = self.run_tick({"a": {"storefront": GATEWAY_ROWS}, "b": {"catalog": []}}, listing_stderr=partial, hidden=["a"])
         self.assertEqual(lines, [])
-        self.assertIn(stall_watch.LISTING_SCOPE, self.ledger()["unreadable"])
+        self.assertIn(f"{stall_watch.LISTING_SCOPE} {PROJECT}", self.ledger()["unreadable"])
         self.assertEqual(len(self.ledger()["stalls"]), 2)
         lines, _ = self.run_tick({"b": {"catalog": []}})
         self.assertEqual(len(self.cleared(lines)), 1, "a complete listing without the cluster is a deletion")
@@ -984,14 +1000,14 @@ class Unreadable(Base):
         self.run_tick({"c": {"storefront": GATEWAY_ROWS}})
         lines, _ = self.run_tick({"c": TIMEOUT})
         self.assertEqual(lines, [])
-        self.assertEqual(self.ledger()["unreadable"], {f"c@{LOCATION}": "timed out after 60s"})
+        self.assertEqual(self.ledger()["unreadable"], {f"{cid('c')}": "timed out after 60s"})
         self.assertEqual(len(self.ledger()["stalls"]), 2)
 
     def test_unreadable_namespace_keeps_its_rows(self):
         self.run_tick({"c": {"storefront": GATEWAY_ROWS, "checkout": [DEADLINE_ROW]}})
         lines, _ = self.run_tick({"c": {"storefront": stall_watch.REPORT_UNREADABLE_EXIT, "checkout": []}})
         self.assertEqual(len(self.cleared(lines)), 1, "checkout cleared; storefront was not read")
-        self.assertIn(f"c@{LOCATION}/storefront", self.ledger()["unreadable"])
+        self.assertIn(f"{cid('c')}/storefront", self.ledger()["unreadable"])
         self.assertEqual(len(self.ledger()["stalls"]), 2)
 
     def test_a_scan_timeout_ends_that_clusters_sweep_for_the_tick(self):
@@ -1000,21 +1016,21 @@ class Unreadable(Base):
         lines, fake = self.run_tick({"c": {"a": [], "b": scan_timeout, "d": []}})
         self.assertEqual(fake.scanned(), ["a", "b"], "the namespace after the timeout is not scanned")
         self.assertEqual(lines, [])
-        self.assertIn("namespace b timed out after 300s", self.ledger()["unreadable"][f"c@{LOCATION}"])
+        self.assertIn("namespace b timed out after 300s", self.ledger()["unreadable"][f"{cid('c')}"])
         self.assertEqual(len(self.ledger()["stalls"]), 1)
 
     def test_an_api_resources_timeout_is_confined_to_its_cluster(self):
         self.run_tick({"a": {"ns": [DEPLOYMENT_ROW]}, "b": {"ns": []}})
         lines, _ = self.run_tick({"a": {"ns": [DEPLOYMENT_ROW]}, "b": {"ns": []}}, served=subprocess.TimeoutExpired("kubectl", stall_watch.API_RESOURCES_TIMEOUT_SECONDS))
         self.assertEqual(lines, [])
-        self.assertEqual(set(self.ledger()["unreadable"]), {f"a@{LOCATION}", f"b@{LOCATION}"})
+        self.assertEqual(set(self.ledger()["unreadable"]), {f"{cid('a')}", f"{cid('b')}"})
         self.assertEqual(len(self.ledger()["stalls"]), 1)
 
     def test_unparsable_output_marks_one_scope_not_the_sweep(self):
         self.run_tick({"c": {"storefront": GATEWAY_ROWS, "checkout": [DEADLINE_ROW]}})
         lines, _ = self.run_tick({"c": {"storefront": '{"namespace": "storefront", "find', "checkout": []}})
         self.assertEqual(len(self.cleared(lines)), 1)
-        self.assertIn("unparsable", self.ledger()["unreadable"][f"c@{LOCATION}/storefront"])
+        self.assertIn("unparsable", self.ledger()["unreadable"][f"{cid('c')}/storefront"])
         self.assertIsNone(self.ledger()["sweep_error"])
 
     def test_a_lost_sandbox_is_one_sweep_failure(self):
@@ -1060,11 +1076,11 @@ class Unreadable(Base):
         with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, over] + [over] * 8):
             _, fake = self.run_tick(fleet)
         self.assertEqual(fake.scanned(), ["n1"])
-        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY], {"cluster": stall_watch.cluster_id("a", LOCATION), "namespace": "n2"})
+        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY], {"cluster": stall_watch.cluster_id(PROJECT, "a", LOCATION), "namespace": "n2"})
         with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, 3, 4, over] + [over] * 8):
             _, fake = self.run_tick(fleet)
         self.assertEqual(fake.scanned(), ["n2", "n3"])
-        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY]["cluster"], stall_watch.cluster_id("c", LOCATION))
+        self.assertEqual(self.ledger()[stall_watch.CURSOR_KEY]["cluster"], stall_watch.cluster_id(PROJECT, "c", LOCATION))
         lines, fake = self.run_tick(fleet)
         self.assertEqual(fake.scanned(), ["n4", "n1", "n2", "n3"])
         self.assertIsNone(self.ledger()[stall_watch.CURSOR_KEY])
@@ -1189,6 +1205,97 @@ class Scope(Base):
     def test_a_ledger_from_another_version_is_discarded(self):
         self.state.write_text(json.dumps({"version": 2, "stalls": {"x": {}}}))
         self.assertEqual(stall_watch.load_state(self.state)["stalls"], {})
+
+
+
+class Projects(Base):
+    """The management project and every project a Cluster Agent profile's
+    identity names are swept; a cluster is keyed by all three of project,
+    name and location."""
+
+    OTHER = "other-proj"
+
+    def projectless(self):
+        """The ledger as the version that keyed clusters without a project wrote it."""
+        text = self.state.read_text().replace(f"{PROJECT}{stall_watch.PROJECT_SEPARATOR}", "")
+        data = json.loads(text)
+        data["version"] = stall_watch.PROJECTLESS_SCHEMA_VERSION
+        self.state.write_text(json.dumps(data))
+
+    def test_same_named_clusters_in_two_projects_each_get_their_own_card(self):
+        lines, fake = self.run_tick({"c": {"storefront": GATEWAY_ROWS}, f"{self.OTHER}:c": {"checkout": [DEPLOYMENT_ROW]}})
+        listed = [argv[4] for argv, _, _ in fake.calls if argv[:4] == ["gcloud", "container", "clusters", "list"]]
+        self.assertEqual(listed, [f"--project={self.OTHER}", f"--project={PROJECT}"])
+        self.assertEqual(len(self.noticed(lines)), 2)
+        cards = {c["assignee"]: c for c in self.board.cards.values()}
+        other = cards[self.profile_dir("c", project=self.OTHER).name]
+        self.assertIn(f"project `{self.OTHER}`", other["body"])
+        self.assertIn(f"{self.OTHER}/c", other["title"])
+        self.assertTrue(lines[0].startswith(f"{stall_watch.NOTICED_PREFIX} in {label('c', project=self.OTHER)} / `checkout`: "), lines[0])
+        self.assertEqual(set(self.ledger()[stall_watch.EPISODES_KEY]), {f"{cid('c')}/storefront", f"{cid('c', project=self.OTHER)}/checkout"})
+
+    def test_a_projectless_ledger_moves_under_the_management_project_without_a_second_card(self):
+        fleet = {"c": {"storefront": GATEWAY_ROWS}}
+        self.run_tick(fleet)
+        tid = self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/storefront"]["card"]
+        self.projectless()
+        lines, _ = self.run_tick(fleet)
+        self.assertEqual(lines, [])
+        self.assertEqual(len(self.board.opened()), 1)
+        self.assertEqual(self.ledger()["version"], stall_watch.STATE_SCHEMA_VERSION)
+        self.assertEqual(self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/storefront"]["card"], tid)
+        self.assertEqual({e["cluster"] for e in self.ledger()["stalls"].values()}, {cid("c")})
+
+    def test_a_projectless_ledger_is_kept_when_the_project_cannot_be_found(self):
+        fleet = {"c": {"storefront": GATEWAY_ROWS}}
+        self.run_tick(fleet)
+        self.projectless()
+        with patch.dict(os.environ, {stall_watch.PROJECT_ENVS[0]: ""}), patch.object(stall_watch, "run_sandbox", lambda argv, **kw: completed(argv, "")):
+            lines = stall_watch.tick(self.state, dry_run=False)
+        self.assertTrue(lines[0].startswith(stall_watch.SWEEP_FAILED_PREFIX), lines)
+        self.assertEqual(self.ledger()["version"], stall_watch.PROJECTLESS_SCHEMA_VERSION)
+        self.assertEqual(len(self.ledger()["stalls"]), 2)
+        lines, _ = self.run_tick(fleet)
+        self.assertEqual(lines, [stall_watch.SWEEP_RECOVERED_LINE])
+        self.assertEqual(len(self.board.opened()), 1)
+
+    def test_one_projects_failed_listing_holds_only_that_projects_rows(self):
+        self.run_tick({"c": {"storefront": GATEWAY_ROWS}, f"{self.OTHER}:d": {"checkout": [DEPLOYMENT_ROW]}})
+        lines, _ = self.run_tick({"c": {"catalog": []}, f"{self.OTHER}:d": {"checkout": []}}, listing_fails=[self.OTHER])
+        self.assertEqual(len(self.cleared(lines)), 1)
+        self.assertIn("PERMISSION_DENIED", self.ledger()["unreadable"][f"{stall_watch.LISTING_SCOPE} {self.OTHER}"])
+        self.assertIsNone(self.ledger()["sweep_error"])
+        self.assertEqual({e["cluster"] for e in self.ledger()["stalls"].values()}, {cid("d", project=self.OTHER)})
+
+    def test_every_listing_failing_is_one_sweep_failure_naming_the_management_project(self):
+        fleet = {"c": {"storefront": GATEWAY_ROWS}, f"{self.OTHER}:d": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet)
+        lines, _ = self.run_tick(fleet, listing_fails=[PROJECT, self.OTHER])
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(stall_watch.SWEEP_FAILED_PREFIX), lines[0])
+        self.assertIn(f"PERMISSION_DENIED on {PROJECT}", lines[0])
+        self.assertEqual(len(self.ledger()["stalls"]), 3)
+
+    def test_a_project_that_leaves_the_roster_closes_its_cards_as_left_roster(self):
+        self.run_tick({"c": {"catalog": []}, f"{self.OTHER}:d": {"checkout": [DEPLOYMENT_ROW]}})
+        (tid,) = self.board.cards
+        shutil.rmtree(self.profile_dir("d", project=self.OTHER))
+        lines, fake = self.run_tick({"c": {"catalog": []}})
+        self.assertNotIn(f"--project={self.OTHER}", [argv[4] for argv, _, _ in fake.calls if argv[:4] == ["gcloud", "container", "clusters", "list"]])
+        self.assertEqual(self.cleared(lines), [f"{stall_watch.CLEARED_PREFIX} in {label('d', project=self.OTHER)} / `checkout`: the cluster left the Cluster Agent roster; card `{tid}` closed"])
+        self.assertEqual(self.ledger()["stalls"], {})
+
+    def test_a_profile_whose_identity_cannot_be_read_holds_its_rows(self):
+        self.run_tick({"c": {"catalog": []}, f"{self.OTHER}:d": {"checkout": [DEPLOYMENT_ROW]}})
+        (self.profile_dir("d", project=self.OTHER) / "config.yaml").write_text("{}\n")
+        lines, fake = self.run_tick({"c": {"catalog": []}})
+        self.assertEqual(lines, [])
+        self.assertEqual({e["cluster"] for e in self.ledger()["stalls"].values()}, {cid("d", project=self.OTHER)})
+        self.assertEqual(next(iter(self.board.cards.values()))["status"], "ready")
+
+    def test_a_domain_scoped_project_splits_back_out_of_its_key(self):
+        project = "example.com:proj"
+        self.assertEqual(stall_watch.split_cluster_id(stall_watch.cluster_id(project, "c", LOCATION)), (project, "c", LOCATION))
 
 
 class Output(Base):
