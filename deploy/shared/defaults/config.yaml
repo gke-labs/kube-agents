@@ -5,6 +5,16 @@ model:
   base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
   api_key: none
 
+# Context file character cap. Hermes dynamically scales the cap to 6% of the
+# model's context window, but falls back to a 20,000-char floor whenever
+# context_length is unknown (e.g. custom LiteLLM endpoints with model aliases).
+# Both shipped personas exceed that floor (agents/chat/SOUL.md is ~36k chars,
+# agents/platform/SOUL.md is ~50k chars). Without this explicit cap, prompt
+# building truncates the middle chunk (70% head, 20% tail) of SOUL.md whenever
+# model context length is missing from LiteLLM / custom gateway metadata (issue #1957).
+# Pinned to 100,000 chars to cover both personas with headroom for >=128k models.
+context_file_max_chars: 100000
+
 # MCP Servers configuration.
 #
 # `agent_common` (the `call_agent` A2A tool) was declared here and is not any

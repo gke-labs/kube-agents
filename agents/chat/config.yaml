@@ -90,6 +90,13 @@ model:
   # key so `/model … --global` cannot persist a different one.
   api_mode: chat_completions
 
+# Context file character cap. Hermes dynamically scales the cap to 6% of the
+# model's context window, but falls back to a 20,000-char floor whenever
+# context_length is unknown (as on custom LiteLLM endpoints).
+# agents/chat/SOUL.md is ~36k chars and gets truncated without this pin, dropping
+# hand-off templates and delegation protocols in §4 (issue #1957).
+context_file_max_chars: 100000
+
 # MCP Servers configuration. Routing/relay surface only.
 #
 # `args` is a ${HERMES_HOME} placeholder rather than a path because this file is
