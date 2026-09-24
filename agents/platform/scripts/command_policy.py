@@ -69,10 +69,13 @@ _ALLOWED = Decision(allowed=True, rule_id="", message="")
 # help delete`, `gcloud topic formats`, `cluster-info dump` -- where the
 # permitted outcome is an allowed spelling (`--help` where an escape exists,
 # the granular reads a dump decomposes into) or a report, and an
-# unconditional "never retry however spelled" was measured talking the model
-# out of exactly those retries. Likewise the flag notice sanctions
-# policy-allowed retries by name, because the sanctioned route often exists:
-# `get-credentials` then `--context` is the answer to a refused `--server`.
+# unconditional "never retry however spelled" forbade exactly those
+# permitted retries -- confirmed by executing this module during the pre-PR
+# adversarial passes, not by observing a model. Likewise the flag notice
+# blesses whatever this policy allows rather than naming routes, because the
+# sanctioned route often exists but differs per flag: `get-credentials` then
+# `--context` is the answer to a refused `--server`, and no fixed sentence
+# could name every such route.
 # The two unreadable-command refusals carry neither notice, on purpose:
 # re-running with a spelling this module can read is the legitimate outcome
 # there, and calling that a boundary would stop retries the policy permits.
@@ -86,7 +89,7 @@ _ACTION_BOUNDARY_NOTICE = (
 _FLAG_BOUNDARY_NOTICE = (
     "This is a permission boundary, not an error to work around: the "
     "command may be retried without the flag, but what the flag itself does "
-    "is withheld, so do not look for another way to do it. A retry this "
+    "is withheld, so do not look for another way to do it. Anything this "
     "policy allows is not a workaround."
 )
 
@@ -1094,8 +1097,9 @@ def evaluate(argv: list[str]) -> Decision:
                 allowed=False,
                 rule_id="kubernetes.file-write-forbidden",
                 message=(
-                    "--profile, --profile-output and --cache-dir write to a path of "
-                    "the caller's choosing inside the credential sidecar. Remove them. "
+                    "--profile, --profile-output, --cache-dir and --output-directory "
+                    "write to a path of the caller's choosing inside the credential "
+                    "sidecar. Remove them. "
                     + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=file_write_flag,
@@ -1155,7 +1159,8 @@ def evaluate(argv: list[str]) -> Decision:
                 rule_id="gcp.identity-change-forbidden",
                 message=(
                     "Identity belongs to the broker. Remove --access-token-file, "
-                    "--configuration, and --account to use the default identity. "
+                    "--configuration, --account and the other identity flags to "
+                    "use the default identity. "
                     + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=identity_flag,
