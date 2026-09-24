@@ -659,17 +659,31 @@ start_drift_detector() {
     # loop launching a replacement while the drain is still waiting.
     trap 'exit 0' TERM
 
-    # Inside the subshell, not before it. This is the last launcher, so nothing
-    # is waiting behind it to be started — what a foreground wait would delay is
-    # the script's arrival at the `wait -n` on the credential path at the bottom
-    # of this file. For as long as the deadline ran, a dead credential runtime
-    # or Envoy would not end the container, and the restart that is their whole
-    # failure contract would not happen.
-    wait_for_drift_daemon
-
     delay="${DRIFT_RETRY_MIN_SECONDS}"
     consecutive=0
     while true; do
+      # Inside the subshell, not before it. This is the last launcher, so nothing
+      # is waiting behind it to be started — what a foreground wait would delay is
+      # the script's arrival at the `wait -n` on the credential path at the bottom
+      # of this file. For as long as the deadline ran, a dead credential runtime
+      # or Envoy would not end the container, and the restart that is their whole
+      # failure contract would not happen.
+      #
+      # Inside the loop, and not only ahead of it, because the cold start is not
+      # the only time the daemon is missing. It runs in the platform-agent
+      # container and this one is a native sidecar that outlives it, so an agent
+      # restart at any point in the pod's life takes the daemon away while this
+      # supervisor keeps going. A wait that ran once would leave every relaunch
+      # after that going straight to a connection-refused the detector treats as
+      # fatal — the same three short exits and the same "NO out-of-band changes
+      # are being detected" as a cold start without the wait, which is the thing
+      # the wait exists to stop. Costs nothing when the daemon is up: the first
+      # /dev/tcp probe connects and the function returns without sleeping.
+      wait_for_drift_daemon
+
+      # After the wait, not before it, so that time spent waiting is not counted
+      # as run time. Counting it would let a long wait followed by an immediate
+      # failure clear `consecutive` and suppress the ALERT.
       started=$SECONDS
       /usr/local/bin/drift-detector "${detector_args[@]}" || true
       ran=$(( SECONDS - started ))

@@ -29,7 +29,7 @@ has not finished with so that they redeliver rather than each costing a
 duplicate inject, and the watcher's, which writes its dedup snapshot so that a
 restart does not replay every event still inside the API server's TTL.
 
-`wait_for_drift_daemon` has to wait for the Session KV server before the first
+`wait_for_drift_daemon` has to wait for the Session KV server before every
 launch, and has to do it inside the supervisor subshell. This container is a
 native sidecar, so it starts before the platform-agent container the daemon runs
 in; the detector's startup check against the daemon is fatal by design, so
@@ -39,6 +39,12 @@ while nothing is wrong. Waiting in the foreground instead would trade that for a
 script that does not reach its `wait -n` on the credential path for as long as
 the deadline runs, during which a dead credential runtime or Envoy would not end
 the container.
+
+Every launch rather than the first, because being a native sidecar cuts the
+other way too: this container outlives the platform-agent container, so an agent
+restart at any point takes the daemon away while the supervisor keeps going. A
+wait above the loop would cover the cold start and leave every relaunch after
+that reaching the same connection-refused by the same fatal path.
 
 The intervals both of those sleep on arrive from the environment unfiltered, so
 the last class here holds the clamp that keeps a hand-typed value from turning a
@@ -621,6 +627,30 @@ class WaitForDriftDaemon(_ScriptCase):
             subshell_at,
             "the daemon wait runs before the supervisor subshell is backgrounded, so the script "
             "does not reach its `wait -n` on the credential path until the deadline expires",
+        )
+
+    def test_the_wait_runs_before_every_launch_and_not_only_the_first(self) -> None:
+        """Above the loop it covers the cold start and nothing after it."""
+        launcher = self.lift("start_drift_detector")
+        loop_at = launcher.find("while true; do")
+        call_at = launcher.find("wait_for_drift_daemon")
+        clock_at = launcher.find("started=$SECONDS")
+
+        self.assertNotEqual(loop_at, -1, "start_drift_detector no longer has a supervisor loop")
+        self.assertNotEqual(call_at, -1, "start_drift_detector no longer waits for the daemon")
+        self.assertNotEqual(clock_at, -1, "the supervisor no longer times the runs it supervises")
+        self.assertGreater(
+            call_at,
+            loop_at,
+            "the daemon wait sits above the loop, so only the first launch waits; a relaunch "
+            "while the platform-agent container is down exits on connection-refused and three "
+            "of those print NO out-of-band changes are being detected with nothing wrong",
+        )
+        self.assertLess(
+            call_at,
+            clock_at,
+            "the run clock starts before the wait, so waiting counts as running and a long wait "
+            "followed by an immediate failure clears the short-exit count that raises the ALERT",
         )
 
 
