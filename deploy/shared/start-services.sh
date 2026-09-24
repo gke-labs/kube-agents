@@ -91,7 +91,26 @@ DRIFT_SHORT_EXIT_ALERT_COUNT="${DRIFT_SHORT_EXIT_ALERT_COUNT:-3}"
 # written into the flag list below because a literal there would be the one
 # piece of this container's internal wiring that is only discoverable by
 # reading a command line.
-readonly DRIFT_DAEMON_URL=http://127.0.0.1:8699
+readonly DRIFT_DAEMON_HOST=127.0.0.1
+readonly DRIFT_DAEMON_PORT=8699
+readonly DRIFT_DAEMON_URL="http://${DRIFT_DAEMON_HOST}:${DRIFT_DAEMON_PORT}"
+
+# How long to wait for that daemon to start listening before launching the
+# detector anyway. This container is a native sidecar, so it starts before the
+# platform-agent container the daemon runs in, and the detector's startup check
+# against the daemon is fatal by design — it refuses to run against a daemon
+# that does not advertise the drift kind, because such a daemon answers 200 to
+# every record while misfiling it. Without a wait the detector therefore exits
+# on connection-refused two or three times on every cold start, and the third
+# short exit prints the ALERT below, which says out-of-band changes are not
+# being detected when in fact nothing is wrong yet.
+#
+# Five minutes because the thing being waited for is the whole agent image
+# coming up, not a socket bind. Overshooting costs a silent detector for as long
+# as the daemon is genuinely down; undershooting costs the false ALERT this
+# exists to remove, on an install where everything is working.
+DRIFT_DAEMON_WAIT_SECONDS="${DRIFT_DAEMON_WAIT_SECONDS:-300}"
+DRIFT_DAEMON_POLL_SECONDS="${DRIFT_DAEMON_POLL_SECONDS:-2}"
 
 # Where the watcher keeps its dedup snapshots. Without them the cache starts
 # empty on every restart, and an empty cache is not a neutral state: the
@@ -165,14 +184,27 @@ drift_pid=""
 
 terminate() {
   trap - EXIT INT TERM
-  # The supervisors first, so neither restarts its process on the way down.
+  # Each supervised process before the subshell supervising it, and not the
+  # other way round: killing the subshell first reparents the process it is
+  # waiting on to PID 1, after which `pkill -P` on the dead subshell's pid
+  # matches nothing and the process runs on until the kubelet's grace period
+  # expires. The drift-detector's shutdown NACKs the records it has not
+  # finished with, so that they redeliver rather than being lost, and it only
+  # does that on a SIGTERM it actually receives.
+  #
+  # Signalling the child first leaves a window in which the supervisor could
+  # notice the exit and restart it. It does not, in practice or in principle:
+  # the supervisor is blocked in `wait`, and the `kill` on the next line is
+  # already queued behind the child's own shutdown. Even if the supervisor were
+  # to win that race, the child has its signal by then, which is what the
+  # shutdown contract needs.
   if [[ -n "${watcher_pid}" ]]; then
+    pkill -TERM -P "${watcher_pid}" 2>/dev/null || true
     kill "${watcher_pid}" 2>/dev/null || true
-    pkill -P "${watcher_pid}" 2>/dev/null || true
   fi
   if [[ -n "${drift_pid}" ]]; then
+    pkill -TERM -P "${drift_pid}" 2>/dev/null || true
     kill "${drift_pid}" 2>/dev/null || true
-    pkill -P "${drift_pid}" 2>/dev/null || true
   fi
   [[ -z "${runtime_pid}" ]] || kill "${runtime_pid}" 2>/dev/null || true
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
@@ -375,6 +407,37 @@ drift_detector_enabled() {
   esac
 }
 
+# Block until the Session KV server accepts a connection, or the deadline
+# passes. A plain TCP connect rather than a GET /healthz: the detector makes
+# that request itself and acts on the answer, and what is being waited for here
+# is only the thing it cannot act on usefully — a daemon that is not listening
+# yet because the container it runs in has not got there. A daemon that is
+# listening and answers wrongly is a real incompatibility, and the detector's
+# refusal to start, and eventually the ALERT, are the right report of it.
+#
+# Bash's /dev/tcp rather than curl, so that the wait does not depend on a
+# package this image installs for other reasons.
+#
+# Returning after the deadline rather than giving up on the detector: a wait
+# that outlived its usefulness should not be the reason drift goes undetected,
+# and every failure path after this point is already reported.
+wait_for_drift_daemon() {
+  local waited=0
+  while [[ "${waited}" -lt "${DRIFT_DAEMON_WAIT_SECONDS}" ]]; do
+    if (exec 3<>"/dev/tcp/${DRIFT_DAEMON_HOST}/${DRIFT_DAEMON_PORT}") 2>/dev/null; then
+      return 0
+    fi
+    sleep "${DRIFT_DAEMON_POLL_SECONDS}"
+    waited=$((waited + DRIFT_DAEMON_POLL_SECONDS))
+  done
+
+  # Said once, and not as an ALERT: the supervisor's own ALERT is the report of
+  # a detector that cannot start, and this line is the context for it — whether
+  # the daemon was ever there matters when reading the exits that follow.
+  echo "start-services: the Session KV server at ${DRIFT_DAEMON_URL} was not listening after ${DRIFT_DAEMON_WAIT_SECONDS}s; starting drift-detector anyway" >&2
+  return 0
+}
+
 start_drift_detector() {
   # Silent when off, unlike the watcher's disabled branch, which is loud. Off is
   # this one's ordinary state — every install that has not applied the
@@ -441,6 +504,11 @@ start_drift_detector() {
   fi
 
   (
+    # Inside the subshell, not before it: the wait is up to five minutes long
+    # and this function is called on the container's startup path, so doing it
+    # in the foreground would hold up everything started after it.
+    wait_for_drift_daemon
+
     delay="${DRIFT_RETRY_MIN_SECONDS}"
     consecutive=0
     while true; do

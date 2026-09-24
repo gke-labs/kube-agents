@@ -1531,6 +1531,8 @@ spec:
                   resource: limits.memory
             - name: EVENT_WATCHER_ENABLED
               value: "true"
+            - name: DRIFT_DETECTOR_ENABLED
+              value: "false"
             - name: CREDENTIAL_PROXY_ROLE
               value: api-proxy
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9
