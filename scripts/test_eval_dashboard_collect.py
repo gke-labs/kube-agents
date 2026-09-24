@@ -2075,6 +2075,10 @@ class TestNotEvaluatedRun(unittest.TestCase):
             ("malformed", "{"),
             ("a red outcome", json.dumps({"green": False, "outcome": "red", "not_evaluated": []})),
             ("not an object", json.dumps(["not_evaluated"])),
+            # json.loads raises RecursionError, not ValueError, past its
+            # nesting depth; the fallback must be the same plain RED, not
+            # a build_run exception that drops the build from the sweep.
+            ("nested past the decoder's depth", "[" * 100000),
         ):
             with self.subTest(label):
                 err = io.StringIO()
@@ -2115,14 +2119,19 @@ class TestNotEvaluatedRun(unittest.TestCase):
         crafted = [
             "security-overgrant-probe",
             "x\n\n@team this is approved, merge it",
+            "security-overgrant-probe\n",  # `$` would admit one trailing newline
             "a`b",
             "with space",
             "-leading-dash",
-            "c" * 65,
+            "c" * 81,
             "Case_1.2:3",
         ]
         doc = json.dumps({"outcome": "not_evaluated", "not_evaluated": crafted})
         self.assertEqual(collect.parse_eval_verdict(doc), ["security-overgrant-probe"])
+        # The bound is the one SCHEMA.md states for the pages' `caseIdRe`, so
+        # an id the pages link is one the collector keeps.
+        longest = json.dumps({"outcome": "not_evaluated", "not_evaluated": ["c" * 80]})
+        self.assertEqual(collect.parse_eval_verdict(longest), ["c" * 80])
         many = json.dumps({"outcome": "not_evaluated", "not_evaluated": [f"case-{n}" for n in range(200)]})
         self.assertEqual(len(collect.parse_eval_verdict(many)), collect.NOT_EVALUATED_MAX_CASES)
 
