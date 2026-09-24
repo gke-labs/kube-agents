@@ -60,9 +60,7 @@
 # the infra lock with the two incumbents) and consistency-no-environment-label
 # (#1818, ~28min at its measured 381s/385s/880s -- a full fleet audit, and the
 # spread is the audit band's, not this case's, so it takes the 900s hint the
-# band uses rather than its mean). Forty-two cases, ~921-941min serial
-# (forty-three with cluster-agent-unlocated-crashloop-debug, ~10min each at
-# three repetitions).
+# band uses rather than its mean). Forty-two cases, ~921-941min serial.
 # 2026-09-22 moved incident-triage-oom-event-probe from this file to the
 # presubmit one (#1023): the nightly runs both files, so it still runs the
 # same forty-two cases at the same price. The

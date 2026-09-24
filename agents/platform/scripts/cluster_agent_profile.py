@@ -39,6 +39,9 @@ DEFAULT_DATA_ROOT = Path("/opt/data")
 PROFILES_DIR_NAME = "profiles"
 CLUSTER_PROFILE_PREFIX = "cluster-"
 IDENTITY_FILE = "USER.md"
+# Non-cluster profiles that live under $HERMES_HOME/profiles but are never
+# managed as Cluster Agents: the front-door router (`default`) and the Platform
+# Agent itself (`platform`). Reconciliation must never touch these.
 RESERVED_PROFILES = frozenset({"default", "platform"})
 
 
