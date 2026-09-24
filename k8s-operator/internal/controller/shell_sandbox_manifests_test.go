@@ -468,6 +468,34 @@ func TestShellSandboxCredentialProxyURLIsOptional(t *testing.T) {
 	}
 }
 
+func TestShellSandboxHostContextAndGKEEnv(t *testing.T) {
+	agent := shellSandboxTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID:   "test-project",
+		Location:    "us-central1-c",
+		ClusterName: "test-cluster",
+	}
+
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+	envMap := make(map[string]string)
+	for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+		envMap[env.Name] = env.Value
+	}
+
+	if got := envMap["GKE_PROJECT_ID"]; got != "test-project" {
+		t.Errorf("GKE_PROJECT_ID = %q, want test-project", got)
+	}
+	if got := envMap["GKE_CLUSTER_NAME"]; got != "test-cluster" {
+		t.Errorf("GKE_CLUSTER_NAME = %q, want test-cluster", got)
+	}
+	if got := envMap["GKE_LOCATION"]; got != "us-central1-c" {
+		t.Errorf("GKE_LOCATION = %q, want us-central1-c", got)
+	}
+	if got := envMap["KUBE_CONTEXT_NAME"]; got != "gke_test-project_us-central1-c_test-cluster" {
+		t.Errorf("KUBE_CONTEXT_NAME = %q, want gke_test-project_us-central1-c_test-cluster", got)
+	}
+}
+
 func TestShellSandboxServiceIsHeadlessAndPublishesTheStableName(t *testing.T) {
 	agent := shellSandboxTestAgent()
 	svc := buildShellSandboxService(agent)

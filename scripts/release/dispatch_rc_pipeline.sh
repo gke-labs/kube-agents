@@ -8,7 +8,7 @@
 # GITHUB_TOKEN is enough here, and the scheduler passes it. GitHub suppresses
 # workflow runs triggered by the default token to stop recursion, but names
 # `workflow_dispatch` and `repository_dispatch` as the two exempt events — they
-# always create a run. That is why nightly-pipeline.yml's tag push needs a PAT
+# always create a run. That is why staging-promotion-pipeline.yml's tag push needs a PAT
 # and this dispatch does not.
 set -euo pipefail
 

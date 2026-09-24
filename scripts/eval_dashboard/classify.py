@@ -15,7 +15,7 @@ interface::
                    "pass_rate_30d", "reason", "excerpt", "rep_n", "do",
                    "admitted", "reps"}],
         "matches_incident": bool,
-        # run-level detail: "setup_death", "storm_reps", "cls", "do"
+        # run-level detail: "setup_death", "storm_reps", "ceiling_reps", "cls", "do"
     }
 
 The first line of keys is the contract other callers rely on; the rest is
@@ -42,6 +42,12 @@ Per failed admitted case, in priority order:
   runs of other pull requests inside ONLY_PR_WINDOW and failed here.
 * ``None`` -- nothing above fits; the page says it cannot tell.
 
+An ungraded case (outcome ``infra``) is ``storm`` under the same storm
+tests, or ``delegation-ceiling`` when every one of its ungraded repetitions
+carries the scorer's DELEGATION_CEILING_MARKER: the harness's delegation
+wait ran out with the worker still running (#1874). Ceiling repetitions
+are outside the storm count and every pass-rate denominator.
+
 ``setup`` is a run-level class: no tasks, a FAILURE verdict, under
 SETUP_DEATH_MAX_DURATION (#1172). A lost pod -- the same zero-task FAILURE
 at any duration, with a NodeNotReady pod event or no build log at all
@@ -49,7 +55,11 @@ at any duration, with a NodeNotReady pod event or no build log at all
 ``do``. A conflicted merge (``is_merge_conflict``, #1608) is the same shape
 again and is neither: it is the branch's own, so it is ``red`` and the
 ``do`` is a rebase rather than a retest. None of the three has cases to
-classify.
+classify. ``deadline-kill`` (``is_deadline_kill``, #1894) is the fourth
+run-level class -- a FAILURE with no eval verdict that ran to the job's
+timeout -- and the one that may carry cases: the harness records each case
+as it finishes (#1875), so the cases graded before Prow stopped the run are
+classified and shown, under the kill's headline and ``do``.
 
 ``runs`` may carry the nightly periodic's runs beside the presubmit's
 (SCHEMA.md: ``runs[].tier``; ``tiers.py``). Every rule above reads the
@@ -117,10 +127,26 @@ STORM_REASON_RE = re.compile(
     re.IGNORECASE,
 )
 
+# --- Delegation ceiling (#1874) -----------------------------------------------
+# The marker bench/kube_agents_bench/scoring.py leads a repetition's reason
+# with when the harness's delegation wait ran out before the worker delivered
+# anything: the record holds the front door's acknowledgement alone. The
+# scorer grades it `infra`, but it is not a storm rep -- the agent ran and its
+# worker was still going when the eval stopped watching -- so it is counted
+# apart: out of the storm signature and out of every pass-rate denominator.
+# test_eval_dashboard_classify.py reads the literal out of the scorer so the
+# two cannot drift.
+DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
+
 # --- Setup death (#1172, #1176) -----------------------------------------------
 # Zero tasks, concluded FAILURE, and over inside this long: the run died at
 # clone or deploy before any case ran (the adjudicator's setup-death rule).
 SETUP_DEATH_MAX_DURATION = timedelta(minutes=5)
+# health.py's rule 3d (#1894): a FAILURE with no verdict that lasted the job's
+# timeout was killed by Prow, not by the eval. Copied from health.py, which
+# owns them; the timeout is the presubmit's decoration_config in oss-test-infra.
+PROW_JOB_TIMEOUT = timedelta(minutes=360)
+DEADLINE_KILL_MARGIN = timedelta(minutes=15)
 
 # --- Pass rate ---------------------------------------------------------------
 # The per-case pass rate the PR view quotes is over runs started inside
@@ -131,6 +157,12 @@ RUN_EVENT_FAIL_FRACTION = 0.8
 # Repetition results the collector writes (SCHEMA.md); anything else is
 # "not measured".
 REP_RESULTS = ("pass", "fail", "infra")
+# The four kinds `rep_kind` sorts repetitions into. `storm` is a repetition
+# the harness could not grade; `ceiling` is one it stopped watching (above).
+REP_PASS = "pass"
+REP_FAIL = "fail"
+REP_STORM = "storm"
+REP_CEILING = "ceiling"
 # Memo bounds for the per-run derivations and the 30-day pass rates.
 RUN_CACHE_MAX = 4096
 RATE_CACHE_MAX = 8
@@ -147,6 +179,8 @@ CONDITION_SHARED_BREAK = "shared_break"
 CONDITION_STORM = "storm"
 CONDITION_SETUP_DEATHS = "setup_deaths"
 CONDITION_LOST_PODS = "lost_pods"
+CONDITION_DELEGATION_CEILING = "delegation_ceiling"
+CONDITION_DEADLINE_KILL = "deadline_kill"
 # The pod event health.py's rule 3b reads (runs[].pod_last_event).
 POD_EVENT_NODE_NOT_READY = "NodeNotReady"
 RUN_SUCCESS = "SUCCESS"
@@ -160,7 +194,9 @@ OUTCOME_INFRA = "infra"
 CLS_SHARED = "shared"
 CLS_ONLY_THIS_PR = "only-this-pr"
 CLS_STORM = "storm"
+CLS_CEILING = "delegation-ceiling"
 CLS_SETUP = "setup"
+CLS_DEADLINE = "deadline-kill"
 VERDICT_RED = "red"
 VERDICT_GREEN = "green"
 VERDICT_INFRA = "infra"
@@ -184,6 +220,11 @@ DO_STORM = "Retest after the storm clears; a run started inside it loses repetit
 DO_ONLY_THIS_PR = "Fix the PR. Read the transcript first; it usually names the problem."
 DO_SETUP = "Retest. If it dies the same way again, the leased project is the suspect, not your change."
 DO_LOST_POD = "Retest once new jobs are progressing; the build node died under this run, not your change."
+DO_CEILING = "Retest. The worker was still running when the harness's delegation wait ran out; nothing about your change was graded."
+DO_DEADLINE_KILL = "Retest once the brief says runs are finishing again. Prow killed the run at its deadline before a verdict; if other PRs' runs are finishing, a change on this branch that hangs the eval looks like this too."
+# The outage's recovering hold: other PRs' runs are finishing, so a kill
+# arriving now may be the branch, and it holds the gate out of GREEN.
+DO_DEADLINE_KILL_RECOVERING = "Read the build log before retesting. Other PRs' runs are finishing, so this kill may be the branch: a change that hangs the eval ends this way, and each kill holds the gate out of GREEN."
 DO_MERGE_CONFLICT = "Rebase on main and push. A retest re-runs the same conflicted merge."
 DO_UNCLEAR = "Read the transcript. Nothing else on the gate matches this failure yet, so it may be yours."
 DO_HELD_OUT = "Nothing for the gate; this case is held out and does not block."
@@ -226,37 +267,42 @@ def task_reps(task: dict) -> list[dict]:
 
 
 def rep_kind(rep: dict) -> str:
-    """'pass' | 'fail' | 'storm' -- the adjudicator's three kinds. A storm rep is
-    one the harness could not grade: an infra verdict, or a fail whose
-    reason is a never-ran phrasing."""
+    """'pass' | 'fail' | 'storm' | 'ceiling' -- the adjudicator's kinds. A storm
+    rep is one the harness could not grade: an infra verdict, or a fail whose
+    reason is a never-ran phrasing. A ceiling rep is one the harness stopped
+    watching with the worker still running (its reason leads with
+    DELEGATION_CEILING_MARKER); it reads `infra` too, but is not a storm."""
     result = str(rep.get("result") or "").lower()
     if result == "pass":
-        return "pass"
+        return REP_PASS
+    if DELEGATION_CEILING_MARKER in (rep.get("reason") or ""):
+        return REP_CEILING
     if result == "infra":
-        return "storm"
+        return REP_STORM
     if STORM_REASON_RE.search(rep.get("reason") or ""):
-        return "storm"
-    return "fail"
+        return REP_STORM
+    return REP_FAIL
 
 
 def rep_counts(task: dict) -> dict:
-    counts = {"pass": 0, "fail": 0, "infra": 0}
+    counts = {"pass": 0, "fail": 0, "infra": 0, "ceiling": 0}
     for rep in task_reps(task):
         kind = rep_kind(rep)
-        counts["infra" if kind == "storm" else kind] += 1
+        counts["infra" if kind == REP_STORM else kind] += 1
     return counts
 
 
 def outcome_of(counts: dict) -> str | None:
     """passed (every graded rep passed), partial, failed (every graded rep
-    failed), infra (nothing graded), None (no reps at all)."""
+    failed), infra (nothing graded: storm or ceiling reps only), None (no
+    reps at all)."""
     if counts["pass"] and counts["fail"]:
         return OUTCOME_PARTIAL
     if counts["fail"]:
         return OUTCOME_FAILED
     if counts["pass"]:
         return OUTCOME_PASSED
-    if counts["infra"]:
+    if counts["infra"] or counts.get("ceiling"):
         return OUTCOME_INFRA
     return None
 
@@ -267,7 +313,7 @@ _RUN_CACHE: dict[int, tuple[dict, dict]] = {}
 
 
 def _run_facts(run: dict) -> dict:
-    """{outcomes: {case: outcome}, collapsed: set, storm: int} for a run."""
+    """{outcomes: {case: outcome}, collapsed: set, storm: int, ceiling: int} for a run."""
     key = id(run)
     hit = _RUN_CACHE.get(key)
     if hit is not None and hit[0] is run:
@@ -275,18 +321,21 @@ def _run_facts(run: dict) -> dict:
     outcomes = {}
     counts_by_case = {}
     storm = 0
+    ceiling = 0
     for task in run_tasks(run):
         counts = rep_counts(task)
         name = str(task.get("name"))
         counts_by_case[name] = counts
         outcomes[name] = outcome_of(counts)
         storm += counts["infra"]
+        ceiling += counts["ceiling"]
     started = parse_iso(run.get("started"))
     facts = {
         "outcomes": outcomes,
         "counts": counts_by_case,
         "collapsed": {c for c, o in outcomes.items() if o == OUTCOME_FAILED},
         "storm": storm,
+        "ceiling": ceiling,
         "started": started,
         "finished": parse_iso(run.get("finished")) or started,
     }
@@ -303,6 +352,12 @@ def collapsed_cases(run: dict) -> set[str]:
 
 def storm_reps(run: dict) -> int:
     return _run_facts(run)["storm"]
+
+
+def ceiling_reps(run: dict) -> int:
+    """Repetitions the harness stopped watching at its delegation ceiling
+    (#1874); apart from `storm_reps`, never inside it."""
+    return _run_facts(run)["ceiling"]
 
 
 def run_length(run: dict) -> timedelta | None:
@@ -332,6 +387,49 @@ def is_merge_conflict(run: dict) -> bool:
     """A zero-task FAILURE the collector recorded as a clone that could not
     merge the pull request into its base (SCHEMA.md, `merge_conflict`)."""
     return not run_tasks(run) and str(run.get("result") or "").upper() == RUN_FAILURE and run.get("merge_conflict") is True
+
+
+def is_deadline_kill(run: dict) -> bool:
+    """health.py's rule 3d unit: a FAILURE with no eval verdict that ran to
+    the job's deadline. Tasks or not: since #1875 a killed run may carry the
+    cases that finished before Prow stopped it."""
+    length = run_length(run)
+    # The key has to be there: a record from before the collector wrote it
+    # is unknown, not "no verdict" (SCHEMA.md), as health.Run reads it.
+    return (
+        str(run.get("result") or "").upper() == RUN_FAILURE
+        and "eval_verdict" in run
+        and run.get("eval_verdict") is None
+        and not is_lost_pod(run)
+        and not is_merge_conflict(run)
+        and length is not None
+        and length >= PROW_JOB_TIMEOUT - DEADLINE_KILL_MARGIN
+    )
+
+
+def _deadline_verdict(base: dict, condition: str | None, cases: list[dict], holding: bool = False) -> dict:
+    """The kill's verdict. `holding`: the deadline-kill outage is in its
+    recovering hold, so this kill is not part of a wave -- the same reading
+    the gate comment gives it -- and it is not the incident's."""
+    graded = f"{len(cases)} case(s) finished before that; the rest were never graded." if cases else "Nothing was graded."
+    live = condition == CONDITION_DEADLINE_KILL and not holding
+    recovering = condition == CONDITION_DEADLINE_KILL and holding
+    tail = (
+        " Other PRs are being killed the same way right now." if live
+        else " The gate's deadline-kill outage is recovering; this kill holds it back, and with other PRs' runs finishing it may be the branch." if recovering
+        else ""
+    )
+    return dict(
+        base,
+        headline=f"Prow killed this run at its {int(PROW_JOB_TIMEOUT.total_seconds() // 60)}-minute deadline.",
+        lede=f"The run outlived the job's timeout before the eval reached a verdict. {graded}{tail}",
+        verdict=VERDICT_INFRA,
+        setup_death=False,
+        cls=CLS_DEADLINE,
+        do=DO_DEADLINE_KILL_RECOVERING if recovering else DO_DEADLINE_KILL,
+        cases=cases,
+        matches_incident=live,
+    )
 
 
 def is_setup_death(run: dict) -> bool:
@@ -606,7 +704,12 @@ def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset
         if not is_admitted:
             do = DO_HELD_OUT
     elif outcome == OUTCOME_INFRA:
-        if run_storm or condition == CONDITION_STORM:
+        if counts["ceiling"] and not counts["infra"]:
+            # Every ungraded rep hit the delegation ceiling: the eval's wait,
+            # not the storm's 429s, and never the pull request's.
+            cls = CLS_CEILING
+            do = DO_CEILING
+        elif run_storm or condition == CONDITION_STORM:
             cls = CLS_STORM
             do = DO_STORM
     return {
@@ -643,7 +746,14 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
         else ""
     )
     if not gate:
-        if any(c["outcome"] == OUTCOME_INFRA for c in cases):
+        ungraded = [c for c in cases if c["outcome"] == OUTCOME_INFRA]
+        if ungraded and all(c["cls"] == CLS_CEILING for c in ungraded):
+            return (
+                "Nothing was graded: every repetition hit the delegation ceiling with its worker still running.",
+                "The harness stopped waiting before any worker delivered; that is the eval's wait, not a verdict on your change." + held_note,
+                VERDICT_INFRA,
+            )
+        if ungraded:
             return (
                 "Nothing was graded: every repetition was lost before the agent ran.",
                 "That is the quota storm's shape, not a verdict on your change." + held_note,
@@ -667,6 +777,17 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
             "The run is red, but no gate case failed outright.",
             "An absolute rule tripped or the log was cut short; the build log has the reason, the case list does not." + held_note,
             VERDICT_RED,
+        )
+    if not failed and str(run.get("result") or "").upper() == RUN_ABORTED:
+        # Since the fan-out grades each case as it finishes, a run a newer
+        # push superseded carries the blocks of the cases graded before Prow
+        # stopped it. They are real; "all n passed" is not, since the rest
+        # never got their turn.
+        return (
+            "Aborted before it finished.",
+            f"Usually a newer push superseded this run; {_plural(n, 'gate case')} had been graded by then, and the next run carries the verdict."
+            + held_note,
+            VERDICT_INFRA,
         )
     if not failed:
         partial = [c for c in gate if c["outcome"] == OUTCOME_PARTIAL]
@@ -719,6 +840,10 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
     anchor = now or finish or datetime.now(UTC)
     state, condition, named = _health_fields(health_at)
     has_incident = state is not None and state != STATE_GREEN
+    # The hysteresis hold after an incident: the state is kept, the rule has
+    # stopped firing (health.json `recovering`). Read for the deadline kill,
+    # whose reading turns on whether a wave is live.
+    holding = has_incident and isinstance(health_at, dict) and bool(health_at.get("recovering"))
     build = str(run.get("build_id") or "")
     base = {"build": build, "pr": run.get("pr"), "cases": [], "matches_incident": False}
 
@@ -741,6 +866,8 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
                 do=DO_LOST_POD,
                 matches_incident=condition == CONDITION_LOST_PODS,
             )
+        if is_deadline_kill(run):
+            return _deadline_verdict(base, condition, [], holding)
         if is_merge_conflict(run):
             return dict(
                 base,
@@ -785,14 +912,24 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
     others = _other_pr_runs(run, gate)
     rates = case_pass_rates(gate, anchor)
     run_storm = storm_reps(run) >= STORM_RUN_SIGNATURE_REPS
+    # The delegation-ceiling wave's run signature is the storm's (health.py
+    # aliases the thresholds): five ceiling reps tie a run to a declared wave.
+    run_ceiling = ceiling_reps(run) >= STORM_RUN_SIGNATURE_REPS
     cases = [classify_case(t, run, others, admitted, health_at, rates, run_storm, nightly) for t in tasks]
     cases = [c for c in cases if c["outcome"] is not None]
+    if is_deadline_kill(run):
+        # #1875: the cases that finished before Prow stopped it are recorded,
+        # the verdict never was. The kill is the run's class; the cases stay
+        # on the page for what they are worth.
+        return dict(_deadline_verdict(base, condition, cases, holding), storm_reps=storm_reps(run), ceiling_reps=ceiling_reps(run))
 
     failed_names = {c["case"] for c in cases if c["outcome"] == OUTCOME_FAILED and c["admitted"]}
     if condition == CONDITION_SHARED_BREAK:
         matches = bool(failed_names & named)
     elif condition == CONDITION_STORM:
         matches = run_storm
+    elif condition == CONDITION_DELEGATION_CEILING:
+        matches = run_ceiling
     elif condition == CONDITION_SETUP_DEATHS:
         matches = False
     else:
@@ -809,4 +946,5 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
         cls=None,
         do="",
         storm_reps=storm_reps(run),
+        ceiling_reps=ceiling_reps(run),
     )

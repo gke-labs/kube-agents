@@ -115,6 +115,27 @@ GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET = """          > {output_file_pa
         refuses it.
 """
 
+# gke-basics' cluster credentials example upstream runs `gcloud container clusters get-credentials`
+# without isolating KUBECONFIG, which overwrites the default kubeconfig context and breaks the Platform
+# Agent's ambient host cluster context. The replacement isolates credentials to a per-target KUBECONFIG
+# under $HERMES_HOME/.kubeconfigs/, in the form agents/platform/AGENTS.md ("Cluster Credentials")
+# gives: `export`, so the pin survives to the kubectl calls that follow rather than scoping to the
+# gcloud, and one file per project/cluster/location, the naming _thread_kubeconfig_path in
+# agents/platform/scripts/platform_mcp_server.py builds and is the source of truth for.
+GKE_BASICS_OLD_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
+   - Always explicitly specify `--region` (for regional clusters) or `--zone` (for zonal clusters) when fetching credentials:
+     ```bash
+     gcloud container clusters get-credentials CLUSTER_NAME --region=REGION --quiet
+     ```"""
+
+GKE_BASICS_NEW_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
+   - Always explicitly specify the cluster's location (`--region` for regional clusters, `--zone` for zonal, or `--location` for either) when fetching credentials, and `export` a per-target `KUBECONFIG` under `$HERMES_HOME/.kubeconfigs/` first, so the pin survives to every `kubectl` that follows and concurrent reads of different clusters do not race on one `current-context`:
+     ```bash
+     PROJECT="$GKE_PROJECT_ID"   # CLUSTER and LOCATION come from the request
+     export KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml"
+     gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION" --project="$PROJECT" --quiet
+     ```"""
+
 # In-place content substitutions applied to freshly-synced skills to correct upstream defects
 # where an appended footer is insufficient (e.g. multi-step remediation commands), to route to a
 # skill only this repository has from a passage upstream cannot know about, or to drop a name this
@@ -139,6 +160,12 @@ SKILL_SUBSTITUTIONS = {
         (
             GKE_MANIFEST_GENERATION_OLD_OUTPUT_PATH_SNIPPET,
             GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET,
+        ),
+    ],
+    "gke-basics": [
+        (
+            GKE_BASICS_OLD_CREDENTIALS_SNIPPET,
+            GKE_BASICS_NEW_CREDENTIALS_SNIPPET,
         ),
     ],
 }
@@ -173,7 +200,7 @@ python3 /opt/data/scripts/cluster_agent_profile.py create \\
 
 The command is idempotent, so it is safe to re-run. This gives the new cluster an agent
 immediately. (The `cluster-agent-reconcile` cron would also pick it up on its next run — it
-manages every cluster in the project, so no labeling is required.)
+manages every cluster in every project in scope, so no labeling is required.)
 
 ## Cluster Agent Profile Teardown
 

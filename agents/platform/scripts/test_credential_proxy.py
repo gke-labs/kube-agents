@@ -2080,12 +2080,18 @@ class CommandExecutorTest(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def executor(self, timeout_seconds=5, max_output_bytes=1024):
+    def executor(
+        self,
+        timeout_seconds=5,
+        max_output_bytes=1024,
+        kubectl_timeout_seconds=credential_proxy.DEFAULT_KUBECTL_TIMEOUT_SECONDS,
+    ):
         return CommandExecutor(
             timeout_seconds=timeout_seconds,
             max_output_bytes=max_output_bytes,
             state_dir=self.temp_dir.name,
             scoped_pool=None,
+            kubectl_timeout_seconds=kubectl_timeout_seconds,
         )
 
     def caller_kubeconfig(self, executor, name="kubeconfig.yaml", body=None):
@@ -2156,6 +2162,40 @@ class CommandExecutorTest(unittest.TestCase):
         stub.chmod(0o755)
         executor.executables["git"] = str(stub)
         return executor
+
+    def fake_kubectl(self, executor, body="exit 0"):
+        """Swap in a kubectl that does whatever the test needs it to do.
+
+        Named `kubectl` in a directory of its own for the same reason `fake_git`
+        is: a suffixed filename would not be the executable the proxy resolves.
+        """
+        stub_dir = Path(self.temp_dir.name) / "fake-kubectl-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "kubectl"
+        stub.write_text(f"#!/bin/bash\n{body}\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor.executables["kubectl"] = str(stub)
+        return executor
+
+    def dispatched(self, executor, argv):
+        """The argv and per-command deadline `execute` settles on for `argv`.
+
+        Both halves of the timeout decision are made in `execute` and are
+        invisible from the outside, so the assertions need the call it makes
+        rather than the result it returns.
+        """
+        seen = []
+        original = executor._execute
+
+        def record(inner_argv, **kwargs):
+            seen.append((list(inner_argv), kwargs.get("timeout_seconds")))
+            return original(inner_argv, **kwargs)
+
+        with mock.patch.object(executor, "_execute", record):
+            executor.execute(list(argv))
+
+        self.assertEqual(1, len(seen))
+        return seen[0]
 
     def dumped_environment(self, result):
         """Parse an `env` dump, insisting it arrived whole.
@@ -2367,6 +2407,34 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(1, len(seen))
         self.assertFalse(executor._within_workspace(seen[0]))
 
+    def test_get_credentials_uses_scratch_even_when_no_kubeconfig_is_wanted(self):
+        # This path used to skip the scratch file and let gcloud write whatever
+        # `KUBECONFIG` named -- the broker's own base config. Asserted on the
+        # base file rather than on the routing: that write is what must not
+        # happen.
+        executor = self.fake_gcloud(self.executor())
+        base = Path(executor.environment["KUBECONFIG"])
+        base.parent.mkdir(parents=True, exist_ok=True)
+        before = f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n"
+        base.write_text(before, encoding="utf-8")
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(kwargs.get("kubeconfig_path"))
+            return original(argv, **kwargs)
+
+        with mock.patch.object(executor, "_execute", record):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+
+        self.assertEqual(1, len(seen))
+        self.assertIsNotNone(seen[0])
+        self.assertNotEqual(base, seen[0])
+        self.assertEqual(before, base.read_text(encoding="utf-8"))
+
     # ---- Choosing the control-plane endpoint --------------------------------
 
     def test_cache_miss_passes_dns_endpoint_when_the_cluster_needs_it(self):
@@ -2439,6 +2507,123 @@ class CommandExecutorTest(unittest.TestCase):
             result = self.executor(timeout_seconds=1).execute_internal(["command"])
         self.assertTrue(result.timed_out)
         self.assertEqual(124, result.exit_code)
+
+    # ---- Bounding a kubectl that cannot reach its control plane -------------
+
+    def test_kubectl_read_is_given_a_request_timeout_and_the_short_deadline(self):
+        # kubectl's own client default is 300s, so an unreachable control plane
+        # holds a broker worker for five minutes without these two bounds.
+        executor = self.fake_kubectl(self.executor())
+
+        argv, deadline = self.dispatched(executor, ["kubectl", "get", "pods"])
+
+        self.assertIn(
+            f"--request-timeout={credential_proxy.DEFAULT_KUBECTL_REQUEST_TIMEOUT}", argv
+        )
+        self.assertEqual(executor.kubectl_timeout_seconds, deadline)
+
+    def test_kubectl_keeps_the_request_timeout_its_caller_chose(self):
+        # A caller who named a bound has answered the question; overriding it
+        # with a shorter one would make the flag a lie.
+        executor = self.fake_kubectl(self.executor())
+
+        argv, deadline = self.dispatched(
+            executor, ["kubectl", "get", "pods", "--request-timeout=5m"]
+        )
+
+        self.assertEqual(
+            1, len([arg for arg in argv if arg.startswith("--request-timeout")])
+        )
+        self.assertIn("--request-timeout=5m", argv)
+        self.assertIsNone(deadline)
+
+    def test_kubectl_commands_that_are_meant_to_block_keep_the_broker_deadline(self):
+        # `logs`, `wait` and `rollout status` are permitted by command_policy
+        # and instructed by a shipped skill, so bounding them at 30s/60s does
+        # not turn a hang into a fast failure, it turns a working command into
+        # a broken one. The rest are refused a layer earlier today and are here
+        # so the deadline stays right if that ever changes.
+        executor = self.fake_kubectl(self.executor())
+        blocking = (
+            ["kubectl", "logs", "-f", "pod/api"],
+            ["kubectl", "logs", "--follow", "pod/api"],
+            ["kubectl", "get", "pods", "-w"],
+            ["kubectl", "get", "pods", "--watch"],
+            ["kubectl", "rollout", "status", "deployment/api"],
+            ["kubectl", "wait", "--for=condition=Ready", "pod/api"],
+            ["kubectl", "delete", "namespace", "scratch"],
+            ["kubectl", "exec", "pod/api", "--", "true"],
+            ["kubectl", "port-forward", "pod/api", "8080:80"],
+            ["kubectl", "--namespace=demo", "wait", "--for=delete", "pod/api"],
+            ["kubectl", "-n", "kube-system", "logs", "-f", "pod/api"],
+            ["kubectl", "logs", "--follow=true", "pod/api"],
+            ["kubectl", "get", "pods", "--watch=true"],
+            ["kubectl", "get", "pods", "--watch-only=true"],
+            ["kubectl", "-n", "demo", "rollout", "status", "deployment/api"],
+            ["kubectl", "--namespace", "demo", "wait", "--for=condition=Ready", "pod/x"],
+            ["kubectl", "--context", "foo", "wait", "--for=delete", "pod/api"],
+        )
+
+        for command in blocking:
+            with self.subTest(command=" ".join(command)):
+                argv, deadline = self.dispatched(executor, command)
+                self.assertNotIn(
+                    f"--request-timeout={credential_proxy.DEFAULT_KUBECTL_REQUEST_TIMEOUT}",
+                    argv,
+                )
+                self.assertIsNone(deadline)
+
+    def test_kubectl_detached_global_flag_does_not_exempt_ordinary_reads(self):
+        executor = self.fake_kubectl(self.executor())
+        argv, deadline = self.dispatched(
+            executor, ["kubectl", "-n", "kube-system", "get", "pods"]
+        )
+        self.assertIn(
+            f"--request-timeout={credential_proxy.DEFAULT_KUBECTL_REQUEST_TIMEOUT}",
+            argv,
+        )
+        self.assertEqual(executor.kubectl_timeout_seconds, deadline)
+
+    def test_kubectl_filename_flag_is_not_mistaken_for_logs_follow(self):
+        # `-f` is `--filename` on every verb except `logs`. Reading it as "this
+        # streams" would exempt most of the write path from the bound.
+        executor = self.fake_kubectl(self.executor())
+
+        argv, deadline = self.dispatched(
+            executor, ["kubectl", "apply", "-f", "manifest.yaml"]
+        )
+
+        self.assertIn(
+            f"--request-timeout={credential_proxy.DEFAULT_KUBECTL_REQUEST_TIMEOUT}", argv
+        )
+        self.assertEqual(executor.kubectl_timeout_seconds, deadline)
+
+    def test_hanging_kubectl_read_is_killed_at_the_short_deadline(self):
+        # The end-to-end shape of the fix: the broker-wide deadline is long, the
+        # kubectl one is short, and a read that cannot answer takes the short one.
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="sleep 10",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertEqual(124, result.exit_code)
+        self.assertIn("kubectl command timed out after 1s", result.stderr)
+
+    def test_blocking_kubectl_outlives_the_short_deadline(self):
+        # The other side of the same knob: with the short deadline set to 1s, a
+        # command that is meant to block still gets the broker-wide budget.
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="sleep 2",
+        )
+
+        result = executor.execute(["kubectl", "wait", "--for=condition=Ready", "pod/api"])
+
+        self.assertFalse(result.timed_out)
+        self.assertEqual(0, result.exit_code)
 
     def test_command_environment_excludes_sidecar_tokens(self):
         import os
@@ -6391,6 +6576,55 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         result = executor.execute(["kubectl", "get", "pods"])
         self.assertEqual(0, result.exit_code, result.stderr)
         self.assertIn("token: TOKEN-1", result.stdout)
+
+    def host_context_executor(self, pool, context):
+        """An executor built with the operator's host-cluster pin in place.
+
+        Read in `__init__`, so the environment has to be patched around
+        construction rather than assigned afterwards.
+        """
+        with mock.patch.dict(os.environ, {"KUBE_CONTEXT_NAME": context}):
+            return self.executor(pool)
+
+    def test_the_host_context_beats_a_base_kubeconfig_that_has_drifted(self):
+        """The pin is what makes the default survive a rewrite of that file.
+
+        The base kubeconfig names a cluster the pool does not cover, which is
+        what `get-credentials` for another cluster used to leave behind. Reading
+        the file refuses; reading the environment runs. Asserted through the
+        mint, because a refusal and a mint for the wrong cluster both come back
+        as "it did not work" otherwise.
+        """
+        executor = self.host_context_executor(
+            self.pool(), f"gke_{self.PROJECT}_{self.LOCATION}_{self.MAPPED}"
+        )
+        self.ambient_kubeconfig(executor, self.UNMAPPED)
+        result = executor.execute(["kubectl", "get", "pods"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual([self.EMAIL], self.minted)
+
+    def test_without_a_host_context_the_base_kubeconfig_still_answers(self):
+        """A broker started outside the operator keeps the old behaviour."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("KUBE_CONTEXT_NAME", None)
+            executor = self.executor(self.pool())
+        self.ambient_kubeconfig(executor, self.MAPPED)
+        result = executor.execute(["kubectl", "get", "pods"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual([self.EMAIL], self.minted)
+
+    def test_a_host_context_that_is_not_a_gke_name_falls_back(self):
+        """`minikube` is a legitimate context and names no GKE cluster.
+
+        Trusting it blindly would strand the ambient path on a value
+        `parse_gke_context` cannot use, refusing every request that names no
+        cluster.
+        """
+        executor = self.host_context_executor(self.pool(), "minikube")
+        self.ambient_kubeconfig(executor, self.MAPPED)
+        result = executor.execute(["kubectl", "get", "pods"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual([self.EMAIL], self.minted)
 
     def test_the_kubeconfig_flag_goes_through_selection_too(self):
         """`--kubeconfig` outranks the environment in kubectl.

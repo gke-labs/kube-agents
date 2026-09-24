@@ -1,4 +1,4 @@
-"""Invariants of the nightly pipeline that only the workflow YAML can carry.
+"""Invariants of the staging promotion pipeline that only the workflow YAML can carry.
 
 Six of these are failures that would be silent in CI — a green run that did the
 wrong thing — which is why they are pinned here rather than left to review:
@@ -27,7 +27,7 @@ from tests.testing.common import create_mock_git_repo, get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
-_NIGHTLY = _WORKFLOWS / "nightly-pipeline.yml"
+_PROMOTION = _WORKFLOWS / "staging-promotion-pipeline.yml"
 _COMMON_SH = _REPO_ROOT / "scripts" / "release" / "common.sh"
 
 _STAGING_DEPLOY = "staging-deploy.yml"
@@ -37,9 +37,9 @@ def _doc(path: pathlib.Path) -> dict:
     return yaml.safe_load(path.read_text())
 
 
-class NightlyPipelineWiringTest(unittest.TestCase):
+class PromotionPipelineWiringTest(unittest.TestCase):
     def setUp(self):
-        self.doc = _doc(_NIGHTLY)
+        self.doc = _doc(_PROMOTION)
         self.jobs = self.doc["jobs"]
 
     def test_every_called_workflow_targets_the_environment_it_is_named_for(self):
@@ -401,7 +401,7 @@ class ReleaseBotTokenWiringTest(unittest.TestCase):
 
     def test_every_release_bot_token_mint_requests_workflows_write(self):
         workflows = [
-            "nightly-pipeline.yml",
+            "staging-promotion-pipeline.yml",
             "release-publish.yml",
             "rc-create-tag.yml",
             "rc-tag-validated.yml",

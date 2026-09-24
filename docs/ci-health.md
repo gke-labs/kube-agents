@@ -47,8 +47,8 @@ every other page unaffected; a tick that cannot download that last read at all
 (anything but a NotFound, retried three times) reads nothing, the page says the
 store was not read for that tick, and the next tick recovers. The read reaches two weeks past the page's 90-day
 window so the first drawn night's admission window is as whole as the gate's.
-The same tick comments on each pull request whose run went red or whose
-build node went away (`gate_comment.py`), files the tracking issue a new
+The same tick comments on each pull request whose run went red, whose
+build node went away, or whose run Prow killed at the deadline (`gate_comment.py`), files the tracking issue a new
 OUTAGE lacks or the one a build-cluster node loss or a seeded-fixture drift
 owes its owner (`gate_issue.py`), and appends `health.json` to a history
 feed. A second job in the same workflow, on its own hourly cron, scans every
@@ -100,6 +100,24 @@ concluded runs (#1278, #1171). Don't retest: the reds share a cause. The message
 names the cases, the pull requests, and the tracking issue when
 `case-notes.yaml` has one.
 
+**OUTAGE** also when runs are being killed at the job deadline (#1894): 3+
+runs on 2+ pull requests among those finishing in the last 2 hours concluded
+`FAILURE` with no eval verdict after running to within 15 minutes of the
+presubmit's 360-minute Prow timeout (the job's `timeout` in `oss-test-infra`'s
+`kube-agents-presubmits.yaml`; `health.py` owns the copy, `post_health.py`
+imports it, and the copies in `classify.py` and `gate_issue.py` are pinned to
+it by tests), and were neither
+lost pods nor conflicted merges. Nothing was graded, so nothing can pass; a
+killed run that recorded some cases before Prow stopped it still counts, and
+its run page and comment read as the kill's, with the finished cases listed.
+The message says how many runs on how many pull requests, an issue is filed
+for whoever owns the gate (below, "The tracking issue"), and recovery is 3
+runs with a verdict — green or red — on distinct pull requests after the last
+kill, because a red that graded proves the gate grades again (a NOT EVALUATED
+red, which records `eval_verdict: RED` with no graded repetition, is not a
+verdict here). It ranks below a
+shared break (which names cases) and above every DEGRADED condition.
+
 **DEGRADED** — lost pods (the build cluster lost the node under the job:
 3+ runs that concluded `FAILURE` with no tasks and either a `NodeNotReady` pod
 event or no build log at all, finishing within 30 minutes of each other, among
@@ -107,18 +125,26 @@ the runs of the last 2 hours, #1478; 8+ is announced as a build-cluster event,
 and the cluster owner's issue below is filed on any new `lost_pods`
 condition), a quota storm (15+
 repetitions lost to 429s or empty records across 3+ pull requests among the
-runs that finished in the last 2 hours, #1225 / #1214), or setup deaths (3+ runs
-that concluded `FAILURE` under 5 minutes with no tasks, on 2+ pull requests, in
-2 hours, #1172; an aborted zero-task run is a superseded push), or seeded
+runs that finished in the last 2 hours, #1225 / #1214), a delegation-ceiling
+wave (15+ repetitions across 3+ pull requests, among the runs that finished in
+the last 2 hours, ended at the harness's delegation wait with the worker still
+running, #1874; the dispatcher stall of #1879 is its usual cause, and it ranks
+below a storm because a 429-starved worker hits the same wait), or setup
+deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
+pull requests, in 2 hours, #1172; an aborted zero-task run is a superseded
+push), or seeded
 fixture drift (the hourly scan found the same fixture role out of its designed
 state on the same pool project on two consecutive scans, or on 3+ projects in
 one scan; #1550, below). A zero-task run
-is at most one of a lost pod, a conflicted merge (below) and a setup death, in
-that order: a lost pod is never a setup death, whatever its duration. When more
+is at most one of a lost pod, a conflicted merge (below), a deadline kill
+(above) and a setup death, in that order: a lost pod is never a setup death,
+whatever its duration. When more
 than one condition fires, the order
 above decides which one the message carries; the others stay in the evidence.
 For a storm, retest after the time the message gives; for lost pods, once new
-jobs are progressing; for fixture drift, once the fleet owner has re-applied
+jobs are progressing; for a delegation-ceiling wave, once workers are
+finishing again (the gateway log in a run's artifacts says whether the
+dispatcher stalled); for fixture drift, once the fleet owner has re-applied
 the stack — a red on a case that depends on the drifted fixture, from a run
 that leased one of those projects, is the fixture's, not the change's.
 
@@ -131,15 +157,18 @@ the run page says to rebase.
 A run collected before the collector recorded how a build ended (SCHEMA.md,
 `has_build_log`, `pod_*`) is unknown and is never a lost pod. An unknown
 `merge_conflict` defaults the other way and reads as a setup death, which is
-what keeps the replay fixtures cut before the field valid.
+what keeps the replay fixtures cut before the field valid. A run without the
+`eval_verdict` key is unknown too, and is never a deadline kill: only a
+recorded `null` is "no verdict".
 
 **GREEN** — none of the above. No message of its own beyond the recovery that
 announces it; the daily digest carries the last 24 hours' runs, greens,
-PR-caused reds and infra reds (setup deaths and lost pods are folded into the
-infra count), the typical run length and the typical wait before a run starts.
-`health.json`'s `metrics` keeps the rest — green rate, wall clock p50/p90,
-`queue_wait_p50_s` and whether it was read at all, the infra-rep rate,
-`setup_deaths`, `lost_pods`.
+PR-caused reds and infra reds (setup deaths, lost pods and deadline kills that
+graded nothing are folded into the infra count), the typical run length and the typical wait before a run starts,
+and the delegation-ceiling repetitions on a day that had any. `health.json`'s
+`metrics` keeps the rest — green rate, wall clock p50/p90, `queue_wait_p50_s`
+and whether it was read at all, the infra-rep rate, `setup_deaths`,
+`lost_pods`, `deadline_kills`, `ceiling_reps`.
 
 A case failing on exactly one pull request while passing elsewhere is that pull
 request's problem and moves no state; the message lists it as "PR-caused".
@@ -153,12 +182,15 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 ## Hysteresis
 
 A single bad tick does not change the state, and a single lucky green does not
-end an incident. Entering OUTAGE or a storm DEGRADED needs the condition to be
-current: one of the three newest completed runs carries it (setup deaths and
-lost pods are not completed runs, so their count is the currency). Returning to GREEN needs 3
+end an incident. Entering a shared-break OUTAGE or a storm or delegation-ceiling DEGRADED needs the condition to be
+current: one of the three newest completed runs carries it. Setup deaths,
+lost pods, deadline kills and fixture drift have no such signature on a
+completed run; their count is the currency. Returning to GREEN needs 3
 consecutive green runs on distinct pull requests, all finished after the
 incident began and none carrying its signature — the runs that made the
-incident cannot end it. Until then `health.json` reports `recovering`, its
+incident cannot end it. The one exception is a deadline-kill OUTAGE, left
+after 3 runs with a verdict, green or red, on distinct pull requests after
+the last kill. Until then `health.json` reports `recovering`, its
 advice says a retest is reasonable, and nothing is posted. The adjudicator's
 only state between ticks is the previous `health.json`; the poster keeps what
 it last told the space in `health-state.json` beside it.
@@ -183,7 +215,7 @@ latency (#1586). The wall clock is therefore a note beside the state, never a
 state, and only beside a GREEN one: inside a storm or an outage the long runs
 are the incident's symptom, and the incident's advice stands alone.
 `health.json`'s `slow` is set, while the state is GREEN, when the median wall
-clock of the last 5 full runs — a concluded run of 15+ cases, all five
+clock of the last 5 full runs — a concluded run of at least one case fewer than `hack/eval/presubmit-cases.txt` lists (11+ today), all five
 finished in the last 6 hours — is at least 1.2× the median of the trailing 7
 days' full runs (at least 20 of them), and stays set until that median is back
 under 1.1×. Wall clock is a run's finish minus its start, the digest's
@@ -191,8 +223,8 @@ measure. The poster sends one line the first tick the note appears:
 
 ```text
 🐢 Smoke gate: slow — the last 5 full runs took 152–213 min (median 183)
-against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s. Not a
-break, and /retest won't make yours faster.
+against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s or empty
+records. Not a break, and /retest won't make yours faster.
 ```
 
 and not again until the note has cleared and come back. The digest repeats
@@ -321,7 +353,8 @@ Each tick, `scripts/eval_dashboard/gate_comment.py` finds the
 tick and concluded `FAILURE` with at least one graded repetition — not aborted
 runs, not setup deaths, not a suite that lost every repetition to a storm — and
 leaves one comment on each pull request (the newest red run per pull request
-when there are several):
+when there are several). Two shapes outside that filter also get one, below:
+a lost pod and a deadline kill.
 
 - a heading, `❌ Smoke gate: failed · 3 of 14 cases`, or `· hard failure` when
   the run failed with no gate case failing all of its repetitions (an absolute
@@ -338,9 +371,32 @@ when there are several):
   build log, `run.html#build=<build id>` on the dashboard, and the incident
   brief when there is an incident.
 
+An ordinary red that reaches a verdict during a deadline-kill OUTAGE gets the
+outage box with the kills' sentence ("N runs on M PRs were killed at the
+360-minute deadline …") whatever its failures are classed — the shared break's
+"fail on every PR" needs failing cases, and this condition names none — dated
+from the outage's first kill. During the hold the box says the gate is
+recovering and runs are reaching verdicts again, and a red whose failures are
+all the gate's is told a retest is reasonable rather than "don't retest yet".
+
 Which class a case gets — `shared`, `only-this-pr`, `storm`, unexplained — is
 `scripts/eval_dashboard/classify.py`'s `classify_run`, the same rules the
 dashboard's run page and the incident brief use; the comment only phrases it.
+
+A repetition the scorer graded `infra` under a reason that leads with
+`KUBE_AGENTS_DELEGATION_CEILING` is a delegation-ceiling repetition: the
+harness's wait for the delegated worker (`AGENT_DELEGATION_TIMEOUT`) ran out
+with the card still running and nothing delivered, so what the judge saw was
+the front door's acknowledgement. It is not a storm repetition — the agent ran
+and nothing was lost to 429s — so the storm rule above does not count it, no
+pass rate has it in the denominator, and a case whose ungraded repetitions are
+all of this kind is classed `delegation-ceiling` on the run page (its Do is a
+retest). `health.json`'s `metrics.ceiling_reps` counts them apart from
+`infra_reps`, and the daily digest carries that count on any day it is not
+zero. Fifteen of them across three pull requests in two hours are the
+delegation-ceiling condition above: DEGRADED under its own name, its own
+message and advice, so a fleet-wide worker stall (#1879) is named here rather
+than read only as "not evaluated" on every pull request.
 
 A run the suite marked **not evaluated** because one admitted case lost every
 repetition to infrastructure while other cases were graded is, to this filter,
@@ -349,8 +405,9 @@ repetitions, so it draws the comment with the hard-failure heading. The comment
 does not read the suite's `outcome`; the banner at the top of that run's
 `eval-verdict.md` is what says the run is not a finding against the change.
 
-One zero-task run does get a comment: a lost pod (the build node went away
-under the job, #1478). It is one line, same marker and dedupe:
+Two shapes the red comment does not cover get one of their own. The first is a lost pod (the
+build node went away under the job, #1478). It is one line, same marker and
+dedupe:
 
 ```text
 ### ⚪ Smoke gate: run lost
@@ -367,6 +424,23 @@ build-cluster event: N runs on M PRs" (below the 8-run event bar, "one of N
 runs on M PRs that lost their build node") and the incident brief link. Prow's
 build-log page shows the pod's events. Setup deaths and conflicted merges stay
 silent; the build log says which it was.
+
+The second is a run Prow killed at the job deadline with no verdict (#1894),
+whether or not some cases finished first: the same one-line shape under `⚪
+Smoke gate: run killed at the deadline`, saying when it was killed and that no
+verdict was reached. While `health.json`'s condition is `deadline_kill` the box
+says the gate is down — "N runs on M PRs have been killed at the deadline since
+⟨time⟩; your run's failure is not your diff" (the time is the outage's first
+kill, which `health.json`'s `incident.first_kill` keeps as the rule's 2-hour
+window slides) — with the brief link, and asks
+the author not to retest yet. During the hold that follows the outage
+(`recovering`) it says instead that the outage is recovering and this kill
+holds it back, and that with other pull requests' runs finishing it may be the
+branch; the run page reads the same way, from the same `recovering` flag, and
+does not count that kill as the incident's. With no deadline-kill outage declared it does not
+clear the branch: one pull request looping to the deadline is that pull request's
+problem (a change that hangs the eval ends the same way), so the box says it
+may be the branch and points at the build log.
 
 The comment starts with a hidden marker (`<!-- smoke-gate-comment -->`); a
 later red on the same pull request edits it in place, and a build already
@@ -413,6 +487,19 @@ once per event. Each issue records the condition it was filed for (`{number,
 url, condition}`): an outage's issue is never cited as the lost pods' tracking,
 nor the reverse, so a break followed by a node loss files both, and both are
 commented on when the gate recovers.
+
+A new `deadline_kill` OUTAGE files one for whoever owns the gate: `Smoke gate
+outage: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict
+since Tue 3:40 PM ET`, with the window of the kills, the affected pull
+requests, the deadline evidence lines (not the per-case ones: a body naming
+cases would be adopted as a later break's tracker), the advice for authors
+(don't retest until the space reports the gate healthy), where to look (each killed run's `build-log.txt`
+and the eval project's Cloud Logging), and the recovery bar of 3 runs with a
+verdict. An open `presubmit-gate` issue whose **title** carries "deadline" and
+"smoke" is adopted instead — the title only, because every bot-filed body
+names the job and quotes the evidence, which mentions deadline kills whenever
+one sits in the window. The Chat message reads `Tracking #NNN`, the issue
+rides in the state the same way, and the recovery comments on it.
 
 ## The seeded-fleet scan
 
@@ -562,7 +649,12 @@ as `lost_pods` with 12 runs on 12 pull requests, and that the setup-death rule
 no longer claims them. A third, `testdata_health/slow-gate-2026-09-14.json.gz`,
 is the week ending 2026-09-14 18:20Z (#1586), the seven days the slow-gate
 baseline needs; the test asserts the `slow` note appears at 18:00Z that day
-with the day's numbers and never over the 09-12/13 weekend.
+with the day's numbers and never over the 09-12/13 weekend. A fourth,
+`testdata_health/deadline-kills-2026-09-22.json.gz`, is 2026-09-22 12:00Z →
+09-23 20:00Z, the day the Hermes bump wedged the workers and 33 runs were
+killed at the deadline (#1880, #1894); the test asserts GREEN until 20:00Z on
+the 22nd, OUTAGE `deadline_kill` from the third kill, and that a lull in kills
+reads as recovering rather than green.
 
 ## The Chat space
 

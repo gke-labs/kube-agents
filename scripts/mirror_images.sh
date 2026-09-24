@@ -11,8 +11,8 @@
 #
 # Destination naming is flat: "<prefix>/<the inventory entry's .name>".
 #
-#   quay.io/jetstack/cert-manager-controller:v1.21.1
-#     -> ${MIRROR_THIRD_PARTY_PREFIX}/cert-manager-controller:v1.21.1
+#   quay.io/jetstack/cert-manager-controller:v1.21.2
+#     -> ${MIRROR_THIRD_PARTY_PREFIX}/cert-manager-controller:v1.21.2
 #
 # The name, not the repository's trailing segment. For most entries they are
 # the same word, which is why this is easy to state wrong; where they are not,

@@ -163,6 +163,12 @@ KNOWN_UNREGISTERED = {
 # the issue; the entry goes when the fixture lands and the case moves to the
 # nightly file in the same pull request.
 FIXTURE_NOT_READY = {
+    "scope-second-project-denied": (
+        "#1865: needs a second GCP project per pool project, declared in the "
+        "harness install's spec.scope.projects, whose listing the agent's service "
+        "account is denied, as a fixture role of its own; the evaluation fleet has "
+        "one project per install today, so the case cannot be red on main"
+    ),
     "obtainability-declared-intent-no-finding": (
         "#1341: needs a second multi-replica workload as a fixture role of its "
         "own in bench/tf/fleet/fixtures.json (a declaration for checkout-gateway "

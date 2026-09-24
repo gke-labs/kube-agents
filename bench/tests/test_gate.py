@@ -43,7 +43,8 @@ from pathlib import Path
 
 import pytest
 
-from kube_agents_bench import evidence_store
+from kube_agents_bench import evidence_store, gate
+from kube_agents_bench.baselines import CaseOutOfScope
 from kube_agents_bench.gate import REPORT_EXCERPT_MAX_CHARS, _report_excerpt, main
 from kube_agents_bench.scoring import MISSING
 
@@ -774,6 +775,109 @@ def test_record_says_so_when_a_run_produced_nothing_worth_keeping(tmp_path, caps
     assert "produced no evidence" in capsys.readouterr().out
 
 
+# One run, several calls (module docstring of gate.py): the shell records each
+# case inside its fan-out as soon as the case is graded, then once more after
+# the fan-out for whatever it left. The manifest is what keeps that from
+# appending a case twice; --lines-out appends so the artefact is the whole run.
+
+
+def _store_lines(store: Path, case: str) -> list[dict]:
+    return [json.loads(l) for l in (store / f"{case}.jsonl").read_text().splitlines() if l.strip()]
+
+
+def test_a_manifest_makes_a_second_call_for_the_same_case_a_no_op(tmp_path, capsys):
+    store = store_with(tmp_path)
+    doc = case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}])
+    manifest = tmp_path / "artifacts" / "baseline-recorded.jsonl"
+    extra = ["--recorded-manifest", str(manifest)]
+    assert run_record(store, doc, extra=extra) == 0
+    assert run_record(store, doc, extra=extra) == 0
+    assert len(_store_lines(store, "a")) == 1
+    out = capsys.readouterr().out
+    assert out.count("  recorded a: 1/1") == 1
+    assert "already recorded a this run" in out
+    (entry,) = [json.loads(l) for l in manifest.read_text().splitlines()]
+    assert entry["case"] == "a" and entry["key"] == KEY
+    assert entry["written_to"].endswith("a.jsonl")
+
+
+def test_the_manifest_is_keyed_on_the_case_and_its_version_key(tmp_path):
+    """The same case measured at another key is other evidence, not a repeat."""
+    store = store_with(tmp_path)
+    manifest = tmp_path / "baseline-recorded.jsonl"
+    extra = ["--recorded-manifest", str(manifest)]
+    assert run_record(store, case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}]), extra=extra) == 0
+    bumped = dict(KEY, scoring_version="v2")
+    assert run_record(store, case_file(tmp_path, "a", version_key=bumped, reps=[{"outcome": "fail"}]), extra=extra) == 0
+    assert [l["key"]["scoring_version"] for l in _store_lines(store, "a")] == ["v1", "v2"]
+    assert len(manifest.read_text().splitlines()) == 2
+
+
+def test_without_a_manifest_every_call_is_the_only_call(tmp_path):
+    """The flag is opt-in; a caller that never passes it keeps appending."""
+    store = store_with(tmp_path)
+    doc = case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}])
+    assert run_record(store, doc) == 0
+    assert run_record(store, doc) == 0
+    assert len(_store_lines(store, "a")) == 2
+
+
+def test_a_half_written_manifest_line_costs_at_most_one_duplicate(tmp_path, capsys):
+    store = store_with(tmp_path)
+    manifest = tmp_path / "baseline-recorded.jsonl"
+    manifest.write_text('{"case": "a", "key": ' + json.dumps(KEY) + ', "written_to": "x"}\n{"case": "b", "ke', encoding="utf-8")
+    docs = [
+        case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}]),
+        case_file(tmp_path, "b", version_key=KEY, reps=[{"outcome": "pass"}]),
+    ]
+    assert run_record(store, *docs, extra=["--recorded-manifest", str(manifest)]) == 0
+    out = capsys.readouterr().out
+    assert "already recorded a this run -> x" in out
+    assert "  recorded b: 1/1" in out
+    assert not (store / "a.jsonl").exists() and len(_store_lines(store, "b")) == 1
+
+
+def test_lines_out_accumulates_across_the_runs_calls(tmp_path):
+    store = store_with(tmp_path)
+    lines_out = tmp_path / "artifacts" / "baseline-append.jsonl"
+    for name in ("a", "b"):
+        doc = case_file(tmp_path, name, version_key=KEY, reps=[{"outcome": "pass"}])
+        assert run_record(store, doc, extra=["--lines-out", str(lines_out)]) == 0
+    assert [json.loads(l)["case"] for l in lines_out.read_text().splitlines()] == ["a", "b"]
+
+
+# --------------------------------------------------------------------------
+# `bench-gate suite --partial`: the table the shell's EXIT trap writes for a
+# run the deadline ended before its suite step. Not the run's verdict.
+# --------------------------------------------------------------------------
+
+
+def test_a_partial_suite_says_so_first_in_the_markdown_and_in_the_json(tmp_path, capsys):
+    md = tmp_path / "eval-verdict.md"
+    js = tmp_path / "eval-verdict.json"
+    note = "this run ended before its verdict; 2 of 41 cases had every repetition graded by then"
+    rc = main([
+        "suite", "--case-result", str(case_file(tmp_path, "a")),
+        "--partial", note, "--markdown-out", str(md), "--json-out", str(js),
+    ])
+    assert rc == 0, "the status of the cases it does cover; the trap warns only when no table landed"
+    text = md.read_text(encoding="utf-8")
+    assert text.startswith("> **PARTIAL — not this run's verdict.** " + note + ". Only the cases graded before the run ended")
+    assert "this table gates nothing" in text
+    assert "**GREEN**" in text
+    assert "PARTIAL" in capsys.readouterr().out
+    doc = json.loads(js.read_text(encoding="utf-8"))
+    assert doc["partial"] is True and doc["partial_note"] == note
+    assert doc["green"] is True
+
+
+def test_a_suite_without_the_flag_carries_no_partial_marker(tmp_path):
+    js = tmp_path / "eval-verdict.json"
+    main(["suite", "--case-result", str(case_file(tmp_path, "a")), "--json-out", str(js)])
+    doc = json.loads(js.read_text(encoding="utf-8"))
+    assert "partial" not in doc and "partial_note" not in doc
+
+
 # --------------------------------------------------------------------------
 # The loop closing: collect, then compare.
 # --------------------------------------------------------------------------
@@ -1184,3 +1288,89 @@ def test_a_capped_read_says_so_in_the_verdict(tmp_path, monkeypatch, gcloud):
     text = md.read_text(encoding="utf-8")
     assert "NOTE — truncated read" in text
     assert "`a`: the 3 oldest" in text
+
+
+# --------------------------------------------------------------------------
+# gcs: reading only the cases being graded
+# --------------------------------------------------------------------------
+
+
+def test_grading_one_case_reads_one_case(kanban_task, tmp_path, monkeypatch, gcloud):
+    """The gate runs `case` once per task and each one read the whole store.
+
+    Eighteen tasks against thirty-eight case prefixes is thirty-seven wasted
+    reads per task, and the verdict never depended on one of them.
+    """
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")
+    seed_gcs(
+        gcloud,
+        *[
+            baseline_line(
+                "agent-kanban-smoke", runs=3, passes=3,
+                judged={"OutcomeValidity": {"mean": 1.0, "n": 3}},
+                at=f"2026-08-0{i + 1}T00:00:00Z",
+            )
+            for i in range(7)
+        ],
+        *[baseline_line(f"other-{i}", runs=3, passes=3) for i in range(5)],
+    )
+
+    out = tmp_path / "case.json"
+    doc = graded_case(
+        kanban_task, [FIXTURE_RUNS / n for n in RED_RUNS], out, store_with(tmp_path)
+    )
+    # Unchanged by the narrowing: same 21/21 window, same admission, same rung.
+    assert doc["admitted"] is True and doc["rung"] == 4
+
+    (listed,) = [c for c in gcloud.calls if c[2] == "ls"]
+    assert listed[3] == "gs://b/evidence/agent-kanban-smoke/**"
+    read = [u for c in gcloud.calls if c[2] == "cat" for u in c[3:]]
+    assert read and not [u for u in read if "/other-" in u]
+
+
+def test_the_suite_reads_the_cases_it_graded_and_no_others(tmp_path, monkeypatch, gcloud):
+    """`suite` pools a baseline rate over the cases in its own inputs, so a
+    case absent from this run can never enter the number."""
+    monkeypatch.setenv("EVAL_AGGREGATE_ARMED", "1")
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")
+    seed_gcs(
+        gcloud,
+        baseline_line("a", runs=20, passes=20),
+        *[baseline_line(f"other-{i}", runs=20, passes=0) for i in range(5)],
+    )
+    doc = case_file(tmp_path, "a", version_key=KEY, passes=1, scored=4)
+
+    # Reds on main's 100% against this run's 25% -- the ungraded cases' 0/20
+    # would have dragged the comparator down had they been pooled in.
+    assert main([
+        "suite", "--case-result", str(doc), "--baseline-dir", str(store_with(tmp_path)),
+        "--min-scored", "1",
+    ]) == 1
+    read = [u for c in gcloud.calls if c[2] == "cat" for u in c[3:]]
+    assert read and not [u for u in read if "/other-" in u]
+
+
+def test_a_case_outside_the_scope_raises_instead_of_reading_as_unscreened(tmp_path):
+    """The guard that makes the narrowing safe, reached through the gate.
+
+    A scoped store asked about a case it never read would otherwise answer
+    "no evidence", which de-admits a passing case and reds nothing.
+    """
+    store, fatal, degraded = gate._load_store(str(store_with(tmp_path)), only={"a"})
+    assert (fatal, degraded) == (None, None)
+    with pytest.raises(CaseOutOfScope):
+        store.history_for("b")
+
+
+def test_an_unreachable_store_keeps_its_scope(tmp_path, monkeypatch, gcloud):
+    """The degraded path returns an empty store, and it is scoped like the
+    successful one -- otherwise an outage would be the one way a caller bug
+    slipped through."""
+    gcloud.fail = "ERROR: (gcloud.storage.ls) 503 Backend Error"
+    store, fatal, degraded = gate._load_store("gs://b/evidence", only={"a"})
+    assert fatal is None and degraded is not None
+    assert store.history_for("a") == []
+    with pytest.raises(CaseOutOfScope):
+        store.history_for("b")

@@ -25,19 +25,29 @@ truncated log, and says so. The nightly periodic's runs share data.json
 (`tier: nightly`, no pull request) and are dropped before anything is
 counted, so a green night never reads as another PR's pass (tiers.py).
 
-One zero-task run does get a comment: a lost pod -- the build node went
-away under the job (health.py rule 3b, #1478). Twelve authors saw a red
-with no log and no explanation on 2026-09-11; the comment is one line
-saying the node died, nothing was graded, and to /retest, with the same
-marker, edit-in-place and per-build dedupe as the red comment:
+Two shapes the red comment does not cover get one of their own. A lost pod -- the
+build node went away under the job (health.py rule 3b, #1478): twelve
+authors saw a red with no log and no explanation on 2026-09-11, so the
+comment is one line saying the node died, nothing was graded, and to
+/retest, with the same marker, edit-in-place and per-build dedupe as the
+red comment:
 
     ### ⚪ Smoke gate: run lost
     > The Prow build node running this job went away at 10:19 AM ET (...).
 
+And a deadline kill -- Prow ended the run at the job timeout with no
+verdict (rule 3d, #1894), tasks or not: one line saying when, and -- while
+health.json's condition is deadline_kill -- that the gate is down and the
+red is not the author's diff:
+
+    ### ⚪ Smoke gate: run killed at the deadline
+    > Prow killed this run at its 360-minute deadline at 10:19 AM ET; ...
+
 Which words: classify.py's `classify_run` -- the same rules the dashboard's
 run.html and the incident brief use -- decides per case whether it is
-`shared` (the gate's), `only-this-pr` (yours), `storm` or unexplained; this
-module only phrases it.
+`shared` (the gate's), `only-this-pr` (yours), `storm`, `delegation-ceiling`
+(the harness's wait, nothing graded) or unexplained; this module only phrases
+it.
 
 One comment per pull request, found by a hidden marker and edited in place
 on later runs; a build already commented on is never commented on twice.
@@ -118,6 +128,13 @@ UNKNOWN_PROJECT = "an unknown project"
 HEADING = "### ❌ Smoke gate: failed · {failed} of {total} cases"
 HEADING_HARD = "### ❌ Smoke gate: failed · hard failure"
 BOX_OUTAGE = "🔴 **Gate outage in progress** since {since}. {what} fail on every PR ({prs} PRs so far)."
+# An OUTAGE that is not a shared break (deadline kills, #1894) names no
+# failing case; post_health's sentence for the condition says what it is.
+# It is the state's sentence whatever this run's failures are classed, and
+# during the recovering hold it must not say nothing is being graded.
+BOX_OUTAGE_OTHER = "🔴 **Gate outage in progress** since {since}. {cause}"
+BOX_RECOVERING_OTHER = "🟡 **Gate recovering** from a deadline-kill outage that began {since}: runs are reaching verdicts again, and GREEN follows 3 of them on distinct PRs."
+ALL_THEIRS_RECOVERING = "**Your {n} {failures} {are} exactly {those}, so this red is likely the gate's.** A retest is reasonable now."
 BOX_DEGRADED = "🟡 **Gate degraded** since {since}. {cause}"
 BOX_HEALTHY = "🟢 **Gate healthy.**"
 ALL_THEIRS = "**Your {n} {failures} {are} exactly {those}, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
@@ -147,6 +164,31 @@ BOX_LOST_EVENT = " — part of a build-cluster event: {runs} runs on {prs} PRs"
 BOX_LOST_SOME = " — one of {runs} runs on {prs} PRs that lost their build node"
 LINK_DETAILS = "[Details →]({url})"
 FOOTER_LOST = "Ran {minutes} min before the node went away · [build log]({url})"
+# The deadline-kill comment (#1894): Prow ended the run at the job timeout with
+# no verdict. While health.json's condition is deadline_kill, the gate is down
+# and the box says so in the author's terms.
+HEADING_DEADLINE = "### ⚪ Smoke gate: run killed at the deadline"
+BOX_DEADLINE = "Prow killed this run at its {minutes}-minute deadline at {when}; no verdict was reached."
+BOX_DEADLINE_DOWN = (
+    " **The gate is down: {runs} runs on {prs} PRs have been killed at the deadline since {since}; your run's failure is not your diff.**"
+    " Don't retest yet; `/retest` once #kube-agents-ci-health says the gate is healthy again."
+)
+# The outage's hysteresis hold: the rule has stopped firing, the Brief and the
+# space say a retest is reasonable, and a kill arriving now is by construction
+# not part of a wave -- so it may be the branch, and it re-arms the hold.
+BOX_DEADLINE_RECOVERING = (
+    " **The gate's deadline-kill outage is recovering** ({runs} runs on {prs} PRs were killed since {since}); this kill holds it back."
+    " Other PRs' runs are finishing, so this may be the branch: the build log shows how far the units got."
+)
+# No deadline-kill outage is declared (the gate may be in another incident,
+# which the brief says), so the kill may be the branch's: a change that hangs
+# the eval or the harness ends the same way (health.py, "one PR looping to
+# the deadline is that PR's problem").
+BOX_DEADLINE_QUIET = (
+    " No deadline-kill outage is declared, so this may be the branch: a change that hangs the eval ends this way too."
+    " The build log shows how far the units got; `/retest` if other PRs' runs are finishing and yours has no reason not to."
+)
+FOOTER_DEADLINE = "Ran {minutes} min to the deadline · [build log]({url})"
 CONDITION_LOST_PODS = health.LOST_PODS
 TABLE_HEAD = "| Case | Result | Also failing on |\n| --- | --- | --- |"
 TABLE_ROW = "| `{case}`{note} | {result} | {also} |"
@@ -215,12 +257,12 @@ def is_red(run: health.Run) -> bool:
 
 
 def newest_red_per_pr(data: dict, since: datetime, now: datetime) -> list[dict]:
-    """The newest red or lost run per pull request among those finishing in
-    (since, now]."""
+    """The newest red, lost or deadline-killed run per pull request among
+    those finishing in (since, now]."""
     newest: dict = {}
     for raw in data.get("runs") or []:
         run = health.Run(raw)
-        if run.pr is None or not run.finished or not (since < run.finished <= now) or not (is_red(run) or run.lost_pod):
+        if run.pr is None or not run.finished or not (since < run.finished <= now) or not (is_red(run) or run.lost_pod or run.deadline_kill):
             continue
         current = newest.get(run.pr)
         if current is None or run.finished > health.Run(current).finished:
@@ -274,10 +316,15 @@ def also_text(count) -> str:
 
 def result_cell(case: dict) -> str:
     reps = case.get("reps") or {}
-    total = reps.get("pass", 0) + reps.get("fail", 0) + reps.get("infra", 0)
+    total = reps.get("pass", 0) + reps.get("fail", 0) + reps.get("infra", 0) + reps.get("ceiling", 0)
     cell = f"{reps.get('pass', 0)} / {total} reps"
+    notes = []
     if reps.get("infra"):
-        cell += f" ({reps['infra']} infra)"
+        notes.append(f"{reps['infra']} infra")
+    if reps.get("ceiling"):
+        notes.append(f"{reps['ceiling']} at the delegation ceiling")
+    if notes:
+        cell += f" ({', '.join(notes)})"
     return cell
 
 
@@ -302,14 +349,22 @@ def health_box(red: Red, health_doc: dict, runs: list[dict]) -> str:
     theirs, yours, unclear = red.theirs(), red.yours(), red.unclear()
     n = len(red.failed)
     sentences = []
+    incident_doc = health_doc.get("incident") or {}
+    recovering = bool(health_doc.get("recovering"))
+    other_outage = incident and state == health.OUTAGE and health_doc.get("condition") != health.SHARED_BREAK
+    if other_outage:
+        # Dated from the outage's first kill, as the deadline comment is.
+        start = post_health.parse_iso(incident_doc.get("first_kill") or incident_doc.get("window_start")) or since
+        sentences.append((BOX_RECOVERING_OTHER if recovering else BOX_OUTAGE_OTHER).format(since=post_health.clock(start, weekday=True), cause=post_health.cause_sentence(health_doc)))
     if incident and theirs:
-        if state == health.OUTAGE:
-            prs = len((health_doc.get("incident") or {}).get("prs") or [])
+        if state == health.OUTAGE and health_doc.get("condition") == health.SHARED_BREAK:
+            prs = len(incident_doc.get("prs") or [])
             sentences.append(BOX_OUTAGE.format(since=post_health.clock(since, weekday=True), what=capitalize(post_health.describe_cases(health_doc.get("failing_cases"))), prs=prs))
-        else:
+        elif not other_outage:
             sentences.append(BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=post_health.cause_sentence(health_doc)))
         if not yours and not unclear:
-            sentences.append(ALL_THEIRS.format(n=n, failures=plural(n, "failure"), are=plural(n, "is", "are"), those=f"those {n}" if n > 1 else "that one"))
+            theirs_all = ALL_THEIRS_RECOVERING if other_outage and recovering else ALL_THEIRS
+            sentences.append(theirs_all.format(n=n, failures=plural(n, "failure"), are=plural(n, "is", "are"), those=f"those {n}" if n > 1 else "that one"))
         else:
             yours_text = []
             if yours:
@@ -327,7 +382,8 @@ def health_box(red: Red, health_doc: dict, runs: list[dict]) -> str:
                 )
             )
     else:
-        sentences.append(BOX_HEALTHY if not incident else BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=post_health.cause_sentence(health_doc)))
+        if not other_outage:
+            sentences.append(BOX_HEALTHY if not incident else BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=post_health.cause_sentence(health_doc)))
         for case in theirs:
             sentences.append(SHARED_NO_INCIDENT.format(case=code(case["case"]), also=also_text(case.get("also_failing_prs"))))
         for case in yours:
@@ -366,6 +422,39 @@ def render_comment(red: Red, health_doc: dict, runs: list[dict]) -> str:
     minutes = int(wall.total_seconds() // 60) if wall else "?"
     passed = red.passed
     lines.append(FOOTER.format(passed=passed, cases=plural(passed, "case"), minutes=minutes, project=project, url=BUILD_LOG_URL.format(pr=red.run.pr, build_id=red.run.build_id)))
+    return "\n".join(lines) + "\n"
+
+
+def render_deadline_comment(run: health.Run, health_doc: dict) -> str:
+    """The deadline-kill comment: when Prow killed it, that no verdict was
+    reached, and -- while the health condition is `deadline_kill` -- that the
+    gate is down and the red is not the author's, or, during the hold that
+    follows the outage, that this kill holds the gate back and may be the
+    branch's."""
+    incident = health_doc.get("incident") or {}
+    on = health_doc.get("condition") == health.DEADLINE_KILL and health_doc.get("state") != health.GREEN
+    recovering = on and bool(health_doc.get("recovering"))
+    down = on and not recovering
+    # The outage's first kill (health.py keeps it across ticks as the window
+    # slides), as the issue title dates it; the document's `since` is the
+    # tick that declared the state, after the third kill.
+    since = post_health.clock(post_health.parse_iso(incident.get("first_kill") or incident.get("window_start") or health_doc.get("since")), weekday=True)
+    counts = dict(runs=incident.get("runs", 0), prs=len(incident.get("prs") or []), since=since)
+    tail = BOX_DEADLINE_DOWN.format(**counts) if down else BOX_DEADLINE_RECOVERING.format(**counts) if recovering else BOX_DEADLINE_QUIET
+    links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]
+    if on:
+        links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
+    box = BOX_DEADLINE.format(minutes=int(health.PROW_JOB_TIMEOUT.total_seconds() // 60), when=post_health.clock(run.finished)) + tail
+    wall = run.wall_clock
+    minutes = int(wall.total_seconds() // 60) if wall else "?"
+    lines = [
+        MARKER,
+        HEADING_DEADLINE,
+        "",
+        f"> {box} {' · '.join(links)}",
+        "",
+        FOOTER_DEADLINE.format(minutes=minutes, url=BUILD_LOG_URL.format(pr=run.pr, build_id=run.build_id)),
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -459,6 +548,8 @@ def tick(data: dict, health_doc: dict, state: dict | None, now: datetime, roster
             continue  # never twice for the same build (nor after giving up on it)
         if run.lost_pod:
             body = render_lost_comment(run, health_doc)
+        elif run.deadline_kill:
+            body = render_deadline_comment(run, health_doc)
         else:
             admitted = roster.at(run.started or run.finished)
             verdict = classify.classify_run(raw, runs, health_doc, now, admitted=admitted)
