@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 /**
  * App-level wiring the component tests below it can't see: the send gate
- * that withholds `onSend`/`onCommand` from the `web` user (M8), the refusal
- * to publish while the bus link is down (I1), and how the page finds its
+ * that withholds `onSend`/`onCommand` from the `web` user, the refusal
+ * to publish while the bus link is down, and how the page finds its
  * bus - a URL or stored config, the console server's `/config.json`, or the
  * port-forward guidance when neither is there. `./bus.ts` is mocked
  * throughout - this file is not a live test.
