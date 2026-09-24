@@ -711,7 +711,7 @@ func webIdentity() a2aIdentity {
 // bucket sizes wait for one.
 func consoleIdentity() a2aIdentity {
 	return a2aIdentity{
-		user:    "console",
+		user:    a2aConsoleConfUser,
 		account: a2aAccountApp,
 		comment: "the web console: web's read surface plus one publish, chat.console.*.in,\n" +
 			"which is the gateway's console adapter's inbound subject. STATIC for\n" +

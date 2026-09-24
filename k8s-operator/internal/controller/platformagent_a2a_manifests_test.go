@@ -1010,8 +1010,9 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		t.Errorf("policy types = %v, want ingress only", np.Spec.PolicyTypes)
 	}
 
-	if len(np.Spec.Ingress) != 1 {
-		t.Fatalf("expected exactly one ingress rule, got %d: %+v", len(np.Spec.Ingress), np.Spec.Ingress)
+	if len(np.Spec.Ingress) != 2 {
+		t.Fatalf("expected exactly two ingress rules (4222 for bus clients, 9222 for the console server), got %d: %+v",
+			len(np.Spec.Ingress), np.Spec.Ingress)
 	}
 	rule := np.Spec.Ingress[0]
 	if len(rule.Ports) != 1 || rule.Ports[0].Port.IntVal != 4222 || *rule.Ports[0].Protocol != corev1.ProtocolTCP {
@@ -1051,6 +1052,18 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		if peer.PodSelector == nil || !reflect.DeepEqual(peer.PodSelector.MatchLabels, want) {
 			t.Errorf("peer %d = %+v, want %v", i, peer.PodSelector, want)
 		}
+	}
+
+	// 9222 has exactly one pod-network peer, the console server. Anything
+	// wider makes the websocket an in-cluster door, which it is not.
+	ws := np.Spec.Ingress[1]
+	if len(ws.Ports) != 1 || ws.Ports[0].Port.IntVal != 9222 || *ws.Ports[0].Protocol != corev1.ProtocolTCP {
+		t.Errorf("second ingress rule is not exactly TCP 9222: %+v", ws.Ports)
+	}
+	if len(ws.From) != 1 || ws.From[0].IPBlock != nil || ws.From[0].NamespaceSelector != nil ||
+		ws.From[0].PodSelector == nil ||
+		!reflect.DeepEqual(ws.From[0].PodSelector.MatchLabels, map[string]string{"app": "test-agent-a2a-console"}) {
+		t.Errorf("9222 peers = %+v, want exactly the same-namespace pod selector app=test-agent-a2a-console", ws.From)
 	}
 }
 
@@ -1560,6 +1573,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
 	callout := buildA2ACalloutDeployment(agent)
+	console := buildA2AConsoleDeployment(agent)
 
 	cases := []struct {
 		render  string
@@ -1570,6 +1584,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 		{"provision", "buildA2AProvisionJob", job.Spec.Template.Spec},
 		{"gateway", "buildA2AGatewayDeployment", dep.Spec.Template.Spec},
 		{"callout", "buildA2ACalloutDeployment", callout.Spec.Template.Spec},
+		{"console", "buildA2AConsoleDeployment", console.Spec.Template.Spec},
 	}
 	builders := make([]string, 0, len(cases))
 	for _, tc := range cases {
@@ -1639,6 +1654,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
 	callout := buildA2ACalloutDeployment(agent)
+	console := buildA2AConsoleDeployment(agent)
 
 	cases := []struct {
 		render    string
@@ -1685,6 +1701,13 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// ends it would not announce itself. The callout writes nothing, so
 		// traversable is enough.
 		{render: "callout", builder: "buildA2ACalloutDeployment", container: "callout", spec: callout.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+		// Dockerfile.console ends on the same distroless static nonroot base
+		// as the gateway and the callout: WorkingDir /home/nonroot, User
+		// nonroot, and this pod imposes UID 1000. The server opens its static
+		// dir and credential file by absolute path and writes nothing, so
+		// traversable is enough.
+		{render: "console", builder: "buildA2AConsoleDeployment", container: "console", spec: console.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 	}
 	builders := make([]string, 0, len(cases))
@@ -4843,6 +4866,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		"provision Job":      buildA2AProvisionJob(agent).Spec.Template.Spec,
 		"callout Deployment": buildA2ACalloutDeployment(agent).Spec.Template.Spec,
 		"agent pod":          buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec,
+		"console Deployment": buildA2AConsoleDeployment(agent).Spec.Template.Spec,
 	} {
 		for _, ref := range a2aPodSpecEnvSecretRefs(spec) {
 			if ref.secret == credsSecret && (ref.key == a2aSysPasswordKey || ref.key == "*") {
