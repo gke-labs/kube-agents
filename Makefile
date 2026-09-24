@@ -168,11 +168,14 @@ RUFF_SELECT := E9,F63,F7,F82
 lint-python: ## Run ruff's error rules over every Python file (the set tests/test_lint_python.py enforces).
 	@python3 -m ruff check --isolated --select $(RUFF_SELECT) .
 
-# Unit tests for every Python helper outside k8s-operator/, which has its own
-# target. Mostly stdlib-only -- the skill helpers shell out to gh/kubectl
-# rather than importing SDKs -- but the agent scripts do import a few third
-# party packages, listed in requirements-test.txt and installed by
-# `make test-python-deps`. CI installs the same file.
+# Unit tests for every Python helper in the tree, the operator's leader-election
+# wrapper (k8s-operator/internal/controller) included. `make -C k8s-operator
+# test-python` runs that one too, so operator work stays self-contained; it is
+# eight tests, so the second run under `make verify` costs nothing. Mostly
+# stdlib-only -- the skill helpers shell out to gh/kubectl rather than importing
+# SDKs -- but the agent scripts do import a few third party packages, listed in
+# requirements-test.txt and installed by `make test-python-deps`. CI installs
+# the same file.
 #
 # The wildcards are what keep this honest: a new skill's tests are picked up
 # without editing this file. Several globs rather than one because the tests do
@@ -212,6 +215,7 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
+	$(wildcard k8s-operator/internal/controller/test_*.py) \
 	$(wildcard scripts/test_*.py) \
 	$(wildcard tests/integration/test_*.py) \
 	$(wildcard tests/test_*.py) \
@@ -346,7 +350,7 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 	@echo "==> conformance"; $(MAKE) --no-print-directory conformance
 	@echo "==> verify OK"
 
-test-python: ## Run the Python unit tests outside k8s-operator/.
+test-python: ## Run every Python unit-test directory in PYTHON_TEST_DIRS, the operator's included.
 	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \
 		echo "Error: no test_*.py files found under agents/, deploy/docker or scripts/."; \
 		echo "Either the tests moved or the globs are stale -- failing rather than reporting success."; \

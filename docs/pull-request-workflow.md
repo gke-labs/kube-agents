@@ -200,9 +200,9 @@ loop while you work:
   check; see **Shell scripts** above for the release to install.
 - `make validate` — the structure check in the `Validate Repo Structure` job; fails if skills
   live under `agents/*/defaults/skills/` instead of `agents/*/skills/`.
-- `make -C k8s-operator test` — manifests, generate, fmt, vet, the Python suites under
-  `k8s-operator/internal/controller` and `agents/platform/scripts`, then the envtest download and
-  `go test`; what the `Operator Tests` job runs.
+- `make -C k8s-operator test` — manifests, generate, fmt, vet, the Python suite under
+  `k8s-operator/internal/controller` (the gateway's leader-election wrapper; `make test-python`
+  runs it too), then the envtest download and `go test`; what the `Operator Tests` job runs.
 - `make test-integration` — the seam tier only, for a component another one talks to across a
   process or protocol boundary. Install a Go toolchain first: the injector seam compiles the real
   Go event-watcher client, and without `go` on `PATH` its tests skip and the run still prints

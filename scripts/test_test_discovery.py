@@ -35,9 +35,6 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 # not run under `make test-python`. Every entry carries its reason; an entry
 # without one should not survive review.
 EXCLUDED = {
-    # Has its own Makefile target (`make -C k8s-operator test-python`) and its
-    # own CI workflow; the root suite does not reach into the operator.
-    "k8s-operator": "own suite, k8s-operator-test.yml",
     # Has its own runner (`make conformance` -> tests/conformance/run.py) and
     # its own unfiltered workflow (conformance.yml), deliberately outside the
     # globs: the suite's premise is that its CI entry must not depend on a
