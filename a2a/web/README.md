@@ -8,7 +8,7 @@ The page connects to the bus's websocket listener as the `console` NATS user. Th
 
 The operator runs a small console server beside the bus (`<agent>-a2a-console`). It serves this page, hands it the `console` password from the creds Secret when the page loads, and proxies the page's websocket to the bus. There's no password to paste and one port-forward reaches everything.
 
-Port-forward only. The console server's Service is ClusterIP and its pod refuses all in-cluster traffic. The bus's websocket port admits the console server and nothing else in the pod network. Port-forwards work because they enter from the node, which NetworkPolicy doesn't govern. There's one shared `console` principal, no TLS, no ingress and no per-user identity. kubectl RBAC on the namespace is the authentication.
+Port-forward only. The console server's Service is ClusterIP and its pod refuses all in-cluster traffic. The bus's websocket port admits the console server and nothing else in the pod network. Port-forwards work because they enter from the node, which NetworkPolicy doesn't govern. There's one shared `console` principal, no TLS, no ingress and no per-user identity. kubectl RBAC on the namespace is the authentication, and in practice that gate is `pods/portforward` on the console pod: whoever holds that verb gets the console password from `/config.json` too, the same as anyone else running a process on the workstation while the forward is open.
 
 We expect this to grow into in-cluster ingress with per-user identity, which needs the NATS account split. The frame format, the reducer and the page shouldn't change when it does.
 

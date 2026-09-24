@@ -144,8 +144,8 @@ check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
-# The a2a images. All parameterize their builder bases: the auth callout on
-# this branch, the gateway on main in #1334, and the console image here.
+# The a2a images. Each parameterizes its bases: Dockerfile.authcallout,
+# Dockerfile.gateway, Dockerfile.worker, and Dockerfile.console.
 check_base_image golang a2a/Dockerfile.authcallout GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.authcallout DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION

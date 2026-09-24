@@ -559,7 +559,10 @@ Layout:
   sees the proxy's `Host`, not the browser's. The server answers only a `Host` naming that
   forwarded address, so a forward to any other local port gets a refusal naming the right
   one. The `web` user keeps the same posture it had: a 9222 port-forward and a page that
-  brings its own password.
+  brings its own password. The access gate moves with the credential: before this, reading
+  the `console` password needed `get` on the creds Secret, and now `pods/portforward` to
+  the console pod is enough, because `/config.json` hands the password to the page, and to
+  any other process running locally while the forward is open.
 
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
