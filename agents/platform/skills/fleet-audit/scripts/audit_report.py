@@ -691,6 +691,7 @@ DECLARED_INTENT_UNSEARCHED_KEY = "declared_intent_unsearched"
 REFUSED_REF_KEY = "refused_ref"
 RUN_RECORD_SEARCHED_KEY = "searched"
 RUN_RECORD_SOURCES_KEY = "sources"
+RUN_RECORD_ON_DEMAND_KEY = "on_demand"
 # When `start` opened this run. The collector manifest is the one input
 # `finish` takes from outside the run and the one `start` cannot scrub: its
 # path lives in the SOP's text rather than in code, so `start` does not know
@@ -8816,6 +8817,36 @@ def ack_remediate_requests(
         )
 
 
+def is_on_demand(
+    args: argparse.Namespace | None = None, record: dict | None = None
+) -> bool:
+    """Return whether this audit execution was dispatched on demand (#1929).
+
+    An on-demand run is never silent: someone asked for this run and is waiting
+    for an answer, so whoever asked must get the outcome and the ledger URL.
+
+    Checked in order:
+    1. Explicit CLI override: `--on-demand` / `--no-on-demand` on `start` or `finish`.
+    2. Run record: `start` records `on_demand` into scratch state so `finish`
+       preserves the flag even if the worker did not pass it to `finish`.
+    3. Environment markers:
+       - `HERMES_KANBAN_TASK` (the worker was spawned to work a kanban card;
+         scheduled cron runs have no kanban card)
+       - `AUDIT_ON_DEMAND` (explicit env override)
+    """
+    if args is not None:
+        flag = getattr(args, "on_demand", None)
+        if flag is not None:
+            return bool(flag)
+    if record and record.get(RUN_RECORD_ON_DEMAND_KEY):
+        return True
+    if os.environ.get("AUDIT_ON_DEMAND") in ("1", "true", "True", "yes"):
+        return True
+    if bool(os.environ.get("HERMES_KANBAN_TASK")):
+        return True
+    return False
+
+
 def write_run_record(
     audit_id: str,
     repo: str,
@@ -8823,6 +8854,7 @@ def write_run_record(
     *,
     searched: list[str] | None = None,
     sources: list[dict] | None = None,
+    on_demand: bool = False,
 ) -> str:
     """Record which repositories this run's declared-intent step must search.
 
@@ -8839,18 +8871,19 @@ def write_run_record(
     collector manifest's `finished_at` against, so this is also the moment the
     run becomes able to tell its own collection from the last one's.
     """
+    record_dict = {
+        "audit": audit_id,
+        "repo": repo,
+        "context_repos": list(context),
+        RUN_RECORD_SEARCHED_KEY: list(searched or []),
+        RUN_RECORD_SOURCES_KEY: list(sources or []),
+        RUN_RECORD_STARTED_KEY: datetime.now(timezone.utc).strftime(RUN_TIMESTAMP_FORMAT),
+    }
+    if on_demand:
+        record_dict[RUN_RECORD_ON_DEMAND_KEY] = True
     path = run_record_path_for(audit_id)
     Path(path).write_text(
-        json.dumps(
-            {
-                "audit": audit_id,
-                "repo": repo,
-                "context_repos": list(context),
-                RUN_RECORD_SEARCHED_KEY: list(searched or []),
-                RUN_RECORD_SOURCES_KEY: list(sources or []),
-                RUN_RECORD_STARTED_KEY: datetime.now(timezone.utc).strftime(RUN_TIMESTAMP_FORMAT),
-            }
-        ),
+        json.dumps(record_dict),
         encoding="utf-8",
     )
     return path
@@ -8915,7 +8948,7 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
     searched = data.get(RUN_RECORD_SEARCHED_KEY)
     sources = data.get(RUN_RECORD_SOURCES_KEY)
     started = data.get(RUN_RECORD_STARTED_KEY)
-    return {
+    record = {
         "repo": recorded,
         "context_repos": [str(slug) for slug in context],
         # Empty on a record an older `start` wrote. `manifest_predates_run` is
@@ -8933,6 +8966,9 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
             else []
         ),
     }
+    if bool(data.get(RUN_RECORD_ON_DEMAND_KEY, False)):
+        record[RUN_RECORD_ON_DEMAND_KEY] = True
+    return record
 
 
 def join_harness_declarations(
@@ -9548,7 +9584,15 @@ def handle_start(args: argparse.Namespace) -> None:
         audit_id, repo, root, context_entries
     )
     declarations_path = write_declarations(audit_id, repo, declarations)
-    write_run_record(audit_id, repo, context, searched=searched, sources=sources)
+    on_demand = is_on_demand(args)
+    write_run_record(
+        audit_id,
+        repo,
+        context,
+        searched=searched,
+        sources=sources,
+        on_demand=on_demand,
+    )
 
     print(
         json.dumps(
@@ -10435,6 +10479,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     # when `--repo` was given.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
     record = read_run_record(audit_id, repo=repo_hint)
+    on_demand = is_on_demand(args, record)
     # The harness's search first, then the withhold against the record. The
     # order matters: a posture a declaration covers moves to `declared[]`,
     # where it cites the file it was read from, and only what is left is
@@ -10977,8 +11022,14 @@ def handle_finish(args: argparse.Namespace) -> None:
                     # unconditionally: `resolved > 0` is the fleet getting
                     # better and is the best news this audit ever delivers, and
                     # a gap means it could not look rather than found nothing.
+                    # An on-demand run is never silent (#1929).
                     "silent_ok": not (
-                        clean_resolved or gaps or prs_closed or unaccounted or collector_speaks
+                        on_demand
+                        or clean_resolved
+                        or gaps
+                        or prs_closed
+                        or unaccounted
+                        or collector_speaks
                     ),
                     "partial": bool(gaps),
                     "coverage_gaps": gaps,
@@ -11354,12 +11405,12 @@ def handle_finish(args: argparse.Namespace) -> None:
                 # either, even at `new == 0`: a `/remediate` answered on an
                 # otherwise-unchanged ledger moves something a human asked for.
                 #
-                # This is the *scheduled* verdict. An operator who asked for a
-                # run off-schedule is waiting for an answer, and gets one
-                # regardless of what this says — see the dispatch rule in the
-                # Platform Agent's AGENTS.md.
+                # An on-demand run is never silent (#1929): an operator who
+                # asked for a run off-schedule is waiting for an answer, and
+                # [SILENT] drops it without an issue URL.
                 "silent_ok": not (
-                    reported_new
+                    on_demand
+                    or reported_new
                     or reported_resolved
                     or gaps
                     or prs_opened
@@ -11445,6 +11496,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo",
         help="Optional target GitOps repository (defaults to ConfigMap registered repo).",
     )
+    start_parser.add_argument(
+        "--on-demand",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether the audit was dispatched on demand (#1929).",
+    )
 
     finish_parser = subparsers.add_parser(
         "finish", help="Validate findings and publish/refresh/close the ledger issue."
@@ -11456,6 +11513,12 @@ def build_parser() -> argparse.ArgumentParser:
     finish_parser.add_argument(
         "--repo",
         help="Optional target GitOps repository (defaults to leased workspace repo or ConfigMap registered repo).",
+    )
+    finish_parser.add_argument(
+        "--on-demand",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether the audit was dispatched on demand (#1929; silent_ok will be false).",
     )
     finish_parser.add_argument(
         "--dry-run",

@@ -630,10 +630,10 @@ class BaseTestCase(unittest.TestCase):
         self.assertTrue(record.pop(audit_report.RUN_RECORD_STARTED_KEY))
         return record
 
-    def record_run(self, repo="acme/fleet", context=(), audit=DECLARING_AUDIT):
+    def record_run(self, repo="acme/fleet", context=(), audit=DECLARING_AUDIT, on_demand=False):
         """Leave the run record `start` would have, under the scratch directory."""
         Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
-        return audit_report.write_run_record(audit, repo, list(context))
+        return audit_report.write_run_record(audit, repo, list(context), on_demand=on_demand)
 
     def run_finish(self, doc, argv_extra=(), audit=AUDIT):
         findings_file = self.write_findings(doc)
@@ -5092,6 +5092,14 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         )
         payload = json.loads(self.out)
         self.assertEqual(payload["declared_intent_repos"], ["acme/fleet", "acme/terraform-live"])
+
+    def test_start_records_on_demand_when_requested(self):
+        self.assertEqual(
+            self.run_main(["start", "--audit", DECLARING_AUDIT, "--on-demand"]),
+            0,
+        )
+        record = self.record_without_stamp(DECLARING_AUDIT)
+        self.assertTrue(record.get(audit_report.RUN_RECORD_ON_DEMAND_KEY))
 
     def test_start_clears_yesterdays_record_before_anything_can_fail(self):
         # Every step between the top of `start` and the write can raise. A
@@ -11745,18 +11753,68 @@ class TestSilentVerdict(HarnessTestCase):
     every input; it should hold the verdict.
     """
 
-    def finish_json(self, doc, **replies):
+    def finish_json(self, doc, argv_extra=(), **replies):
         self.harness.replies = {
             "issue list": self.issue_list(),
             "--json body": json.dumps({"body": published_body(doc, generated_at=NOW)}),
             **replies,
         }
-        self.run_finish(doc)
+        self.run_finish(doc, argv_extra=argv_extra)
         return self.stdout_json()
 
     def test_an_unchanged_complete_clean_run_is_silent(self):
         doc = make_doc(findings=[])
         out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
+
+    def test_an_on_demand_unchanged_clean_run_is_never_silent(self):
+        """When an on-demand audit finds nothing new or resolved, silent_ok must be False (#1929)."""
+        doc = make_doc(findings=[])
+        out = self.finish_json(doc, argv_extra=["--on-demand"])
+        self.assertFalse(out["silent_ok"])
+
+    def test_an_on_demand_run_from_kanban_env_is_never_silent(self):
+        """A worker running under HERMES_KANBAN_TASK is on-demand and never silent (#1929)."""
+        doc = make_doc(findings=[])
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123"}):
+            out = self.finish_json(doc)
+        self.assertFalse(out["silent_ok"])
+
+    def test_an_on_demand_run_from_audit_on_demand_env_is_never_silent(self):
+        """A worker running with AUDIT_ON_DEMAND=1 is on-demand and never silent (#1929)."""
+        doc = make_doc(findings=[])
+        with patch.dict(os.environ, {"AUDIT_ON_DEMAND": "1"}):
+            out = self.finish_json(doc)
+        self.assertFalse(out["silent_ok"])
+
+    def test_an_on_demand_unchanged_updated_run_is_never_silent(self):
+        """An updated run with 0 new and 0 resolved is not silent when on demand (#1929)."""
+        finding = make_finding(fid="a")
+        doc = make_doc(findings=[finding])
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps(
+                {"body": published_body(make_doc(findings=[finding]), generated_at=NOW)}
+            ),
+        }
+        self.run_finish(doc, argv_extra=["--on-demand"])
+        out = self.stdout_json()
+        self.assertEqual(out["new"], 0)
+        self.assertEqual(out["resolved"], 0)
+        self.assertFalse(out["silent_ok"])
+
+    def test_an_on_demand_run_recorded_at_start_is_never_silent(self):
+        """Start recording on_demand into the run record keeps finish from being silent (#1929)."""
+        doc = make_doc(findings=[])
+        self.record_run(repo="acme/fleet", context=[], audit=AUDIT, on_demand=True)
+        out = self.finish_json(doc)
+        self.assertFalse(out["silent_ok"])
+
+    def test_an_explicit_no_on_demand_flag_overrides_env(self):
+        """Passing --no-on-demand explicitly forces scheduled evaluation even in kanban env (#1929)."""
+        doc = make_doc(findings=[])
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123"}):
+            out = self.finish_json(doc, argv_extra=["--no-on-demand"])
         self.assertTrue(out["silent_ok"])
 
     def test_a_partial_run_is_never_silent(self):

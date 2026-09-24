@@ -1279,6 +1279,16 @@ def test_a_report_that_queues_the_stream_gets_the_queued_reason(token, github):
     assert github.calls == []
 
 
+def test_a_report_that_answers_silent_gets_the_silent_reason(token, github):
+    """When an on-demand worker answers [SILENT] with no ledger URL (#1929)."""
+    _stash_report(final_message="[SILENT]")
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "fail" and not res.success
+    assert "was [SILENT] with no issue URL" in res.reason
+    assert "#1929" in res.reason
+    assert github.calls == []
+
+
 def test_clock_skew_tolerance_admits_a_slightly_early_stamp(token, github):
     # The Prow runner and the agent pod are different machines; a stamp 60s
     # before the run's own start is drift, not a previous run.

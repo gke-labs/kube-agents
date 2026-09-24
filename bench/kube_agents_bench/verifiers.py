@@ -811,6 +811,12 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             if key not in seen:
                 seen.append(key)
         if not seen:
+            if snap.final_message.strip() == "[SILENT]":
+                return done(
+                    False,
+                    "the run's report was [SILENT] with no issue URL: an on-demand "
+                    "audit run is never silent and must report the ledger URL (#1929)",
+                )
             queued = _QUEUED_INSTEAD_OF_RUN_RE.search(snap.final_message)
             if queued:
                 return done(
