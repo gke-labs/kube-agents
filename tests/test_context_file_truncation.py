@@ -25,9 +25,16 @@ These tests enforce:
    smaller than `context_file_max_chars`.
 4. Truncation logic preserves full persona content when `context_file_max_chars` is read
    from shipped configs, and truncates when the config key is removed (sabotage verification).
-5. When Hermes is available in the environment, real Hermes `_get_context_file_max_chars`
-   and `_truncate_content` honour the shipped config files and emit truncation warnings
-   only on unconfigured fallback.
+   The in-CI simulation mirrors Hermes `_truncate_content` byte-for-byte.
+5. Real Hermes prompt builder validation:
+   - In CI (`requirements-test.txt` excludes `hermes-agent` by design): test 5 skips
+     gracefully via `unittest.SkipTest`.
+   - In Docker image build: `deploy/docker/Dockerfile` asserts via real Hermes that
+     `/opt/platform-template`, `/opt/chat-template`, and `/opt/cluster-template`
+     each evaluate `_get_context_file_max_chars() == 100000`.
+   - In local / development environments: test 5 executes real Hermes
+     `_get_context_file_max_chars` and `_truncate_content`, confirming warning emissions
+     and asserting parity between `simulate_hermes_truncation` and real Hermes.
 """
 
 from __future__ import annotations
@@ -80,14 +87,24 @@ def load_configured_cap(profile: str) -> int | None:
     return doc.get("context_file_max_chars")
 
 
-def simulate_hermes_truncation(content: str, max_chars: int | None = None) -> tuple[str, bool]:
+def simulate_hermes_truncation(
+    content: str,
+    filename: str = "SOUL.md",
+    max_chars: int | None = None,
+) -> tuple[str, bool]:
     """Mirror Hermes _truncate_content behavior when context_length is unknown."""
     limit = max_chars if (isinstance(max_chars, int) and max_chars > 0) else HERMES_FLOOR_CHARS
     if len(content) <= limit:
         return content, False
     head_chars = int(limit * HERMES_HEAD_RATIO)
     tail_chars = int(limit * HERMES_TAIL_RATIO)
-    truncated = content[:head_chars] + "\n...[TRUNCATED]...\n" + content[-tail_chars:]
+    marker = (
+        f"\n\n[...truncated {filename}: kept {head_chars}+{tail_chars} of "
+        f"{len(content)} chars. The middle is omitted — if you need the full "
+        f"instructions, read the complete file with the read_file tool: "
+        f"{filename}]\n\n"
+    )
+    truncated = content[:head_chars] + marker + content[-tail_chars:]
     return truncated, True
 
 
@@ -224,6 +241,15 @@ class ContextFileTruncationTest(unittest.TestCase):
             self.assertIn("[...truncated SOUL.md", result_reverted)
             self.assertEqual(len(warnings_reverted), 1, "Must emit exactly 1 truncation warning")
             self.assertIn("TRUNCATED", warnings_reverted[0])
+
+            # 3. Assert in-CI simulation parity with real Hermes _truncate_content
+            sim_reverted, sim_was_truncated = simulate_hermes_truncation(chat_soul, "SOUL.md", max_chars=HERMES_FLOOR_CHARS)
+            self.assertTrue(sim_was_truncated, "simulate_hermes_truncation must mark content truncated")
+            self.assertEqual(
+                sim_reverted,
+                result_reverted,
+                "simulate_hermes_truncation must produce byte-for-byte identical output to Hermes _truncate_content",
+            )
 
         if orig_hermes_home is not None:
             os.environ["HERMES_HOME"] = orig_hermes_home

@@ -1893,6 +1893,14 @@ RUN set -eu; \
     rm -rf /tmp/repo-plugins; \
     /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
       || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2; \
+    for t in /opt/platform-template /opt/chat-template /opt/cluster-template; do \
+        HERMES_HOME="$t" /opt/hermes/.venv/bin/python3 -c "\
+from hermes_cli.config import load_config_readonly; \
+from agent.prompt_builder import _get_context_file_max_chars; \
+cfg = load_config_readonly(); \
+assert _get_context_file_max_chars() == 100000, '%s prompt_builder max chars: %r' % ('$t', _get_context_file_max_chars()); \
+assert cfg.get('context_file_max_chars') == 100000, '%s context_file_max_chars: %r' % ('$t', cfg.get('context_file_max_chars'))"; \
+    done; \
     for d in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/a2a-template/skills; do \
         [ -d "$d" ] \
             || { echo "$d does not exist at manifest generation; the boot check refuses to start a pod whose skill tree has no manifest inside it, so shipping this image would crash-loop the fleet" >&2; exit 1; }; \
