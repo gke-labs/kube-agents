@@ -50,6 +50,7 @@ test_audit_report.py; the thin shell below them owns all subprocess execution.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -876,6 +877,15 @@ class ValidationError(ValueError):
     """A findings.json (or audit id) that the harness refuses to publish."""
 
 
+class StartRefused(ValidationError):
+    """`start` did not run: the stream's in-flight guard held, or could not be taken.
+
+    A subclass so `main` can label it apart from a rejected document. Both
+    exit 2, but every SOP reads `FINDINGS REJECTED` as "fix the file and
+    re-run", and a refused `start` has no file to fix.
+    """
+
+
 class BodyTooLargeError(ValidationError):
     """A rendered body that still exceeds GitHub's limit after budgeting.
 
@@ -1453,6 +1463,185 @@ def run_record_path_for(audit_id: str) -> str:
 def declarations_path_for(audit_id: str) -> str:
     """Where `start` files the declarations it found for `finish` to join."""
     return f"{SCRATCH_DIR}/declarations_{audit_id}.json"
+
+
+def inflight_path_for(audit_id: str) -> str:
+    """Where `start` leaves the note that a run of this stream is under way."""
+    return f"{SCRATCH_DIR}/inflight_{audit_id}.json"
+
+
+# How long an in-flight note is believed. A full audit takes 600-1300 s; a
+# run that died without `finish` is forgotten after this, so a dead run costs
+# the stream at most the ticks that fall inside the next two hours. Releasing
+# it sooner is an operator's action from outside the session, described in
+# agents/platform/cron/README.md; the CLI has no flag for it on purpose.
+INFLIGHT_TTL_SECONDS = 2 * 60 * 60
+
+
+def _in_flight_since(path: Path) -> float | None:
+    """`started_at` of the note at `path`, or `None` when it is gone.
+
+    A note that exists but does not parse -- another `start` created it a
+    moment ago and has not written it yet -- counts from its mtime: an
+    unreadable note is a claim, not an absence.
+
+    The note is a lease on the stream, not a process. It names the stream
+    and the time and nothing else on purpose: the first shape carried
+    `start`'s pid, and `start` exits as soon as it has written the run
+    record, so that pid was always dead by the time anyone read it. On
+    2026-09-23 (build 2102875230451011584, rep 1) a refused worker read the
+    note, ran `ps` against that pid, took "not running" for "the run is
+    over" and passed the `--takeover` flag the CLI then had over its own
+    live run. Nothing in the note can tell a reader whether the run is
+    alive, because the run is a worker's session or a scheduled tick on
+    another pod; only its `finish` or the TTL ends the lease.
+    """
+    try:
+        note = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        note = None
+    started = note.get("started_at") if isinstance(note, dict) else None
+    if isinstance(started, (int, float)):
+        return float(started)
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def claim_in_flight(audit_id: str) -> None:
+    """Refuse a second `start` while a run of this stream is under way.
+
+    Every path `start` scrubs — the run record, the declarations, the
+    findings document, the workspace — is keyed by audit id alone, on one
+    volume every session's shell shares. The scheduler's per-job lock keeps
+    two ticks apart, but a run started from a session (the on-demand
+    interim, #1876) holds no such lock, so without this a tick landing
+    mid-sweep, or a second card for the same stream, wiped the first run's
+    state out from under it and both `finish` calls rewrote one ledger.
+
+    The read, the decision and the write happen under an exclusive lock on
+    a sibling file (flock; every session's shell runs on the one sandbox
+    pod, against the one volume), so two `start`s racing for one stream
+    cannot both pass, and a stale or taken-over note is replaced by exactly
+    one of them: the other reads the fresh note and is refused.
+
+    The guard fails closed. A lock that cannot be opened or taken, or a note
+    that cannot be written, is a `start` that cannot know whether a run is in
+    flight, and the thing it would do next is scrub that run's state; it
+    exits 2 instead and says why. Nothing else in `start` runs on a volume
+    that refuses these, so failing open would buy no run that failing closed
+    loses, and a `start` refused here wrote nothing, so it has nothing to
+    release.
+
+    What the guard is and is not. It keeps two well-behaved runs of one
+    stream apart, and it hands a refused worker nothing to act on: no
+    override flag (the CLI had `--takeover` until 2026-09-24, and both
+    observation runs of #1876 saw a refused worker pass it within a minute
+    over its own live run), no pid to test, no path to remove; the refusal
+    text names only the stream and the time. It is not a permission
+    boundary: the worker's shell is the same shell an operator would use
+    on the same volume (docs/designs/agent-shell-sandboxing.md), so a
+    worker set on removing a file it was never told about is outside what
+    a script can stop. Releasing a stream before the TTL is an operator's
+    action, described in agents/platform/cron/README.md and nowhere the
+    worker reads.
+
+    The lease spans one `start`-`finish` pair, not a loop. Eight of the nine
+    SOPs run a stream repository by repository (`start --repo A; finish
+    --repo A; start --repo B`), and each `finish` releases, so between two
+    repositories the stream is unclaimed and a rival `start` can take it;
+    the loop's next `start` is then refused. A refusal mid-loop means the
+    stream was taken between repositories: the run stops there and reports
+    itself partial with the remaining repositories named as not audited.
+    Holding the lease across the loop needs `finish` to know it is not the
+    last repository, which is the run identity that is out of scope here.
+    """
+    path = Path(inflight_path_for(audit_id))
+    # The guard-failure messages name the error and not the path: a path in
+    # a refusal reads as a file to remove.
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Read-only on purpose: flock(2) needs no writable descriptor, and
+        # the lock file is never removed, so one created by another uid (a
+        # hand-run `start` over `kubectl exec` lands as root; the tick and
+        # every session run as uid 1000) must still open for everyone after.
+        # O_RDWR made such a lock refuse the stream for good, before the TTL
+        # was ever read.
+        lock = os.open(f"{path}.lock", os.O_RDONLY | os.O_CREAT, 0o644)
+    except OSError as exc:
+        raise StartRefused(
+            f"could not take the in-flight guard for {audit_id} "
+            f"({exc.strerror or type(exc).__name__}); refusing to start rather "
+            f"than scrub a run that may be in flight. Report it."
+        ) from exc
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        started = _in_flight_since(path)
+        if started is not None and time.time() - started < INFLIGHT_TTL_SECONDS:
+            when = datetime.fromtimestamp(started, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            # Addressed to the worker that was refused: wait or report, and
+            # no third option. The first wording offered `--takeover` "if you
+            # know it is dead", and on 2026-09-23 a refused session took that
+            # as its cue and passed the flag 42 seconds later over a run that
+            # was alive. The second wording dropped the offer but printed the
+            # note's pid, and that evening a refused session ran `ps` on it,
+            # read `start`'s long-exited process as a dead run, and took over
+            # its own. The flag is gone; the refusal names the stream and the
+            # time and nothing that reads as a check or a thing to remove.
+            raise StartRefused(
+                f"a run of {audit_id} is in flight since {when}; wait for its "
+                f"`finish` or report it. A second `start` would scrub its run "
+                f"record, workspace and findings document. The note is a lease "
+                f"on the stream, not a process on this pod: nothing you can run "
+                f"here shows whether that run is alive, and this refusal is not "
+                f"a check to work around."
+            )
+        # Written beside and moved into place, so the note either holds a
+        # complete claim or is untouched. A plain write opens with O_TRUNC
+        # first, and a write that then fails (ENOSPC, EDQUOT, EIO on the
+        # shared volume) would leave an empty note with a fresh mtime, which
+        # `_in_flight_since` honours as a claim for the next two hours with
+        # no run behind it.
+        staged = Path(f"{path}.tmp")
+        try:
+            staged.write_text(
+                json.dumps({"audit": audit_id, "started_at": time.time()}),
+                encoding="utf-8",
+            )
+            os.replace(staged, path)
+        except OSError:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        raise StartRefused(
+            f"could not record the in-flight note for {audit_id} "
+            f"({exc.strerror or type(exc).__name__}); refusing to start rather "
+            f"than run unguarded against a run in flight. Report it."
+        ) from exc
+    finally:
+        os.close(lock)  # closing the descriptor drops the lock
+
+
+def release_in_flight(audit_id: str) -> None:
+    """`finish` is over, one way or the other: the stream is free for its next run.
+
+    Unconditional on purpose, and that is a known limit: `start` and `finish`
+    are separate processes, and every state they share is keyed by audit id,
+    so a `finish` cannot tell its own run's note from one a later `start`
+    wrote after an operator's release or the two-hour expiry. A run that
+    outlives that release and then finishes publishes over the later run's
+    record already; removing the later run's note is the smaller part of
+    that shape, and the fix for both is the same one: a run identity that
+    travels from `start` through the findings document to `finish`, which
+    is a change to the SOP contract and not made here.
+    """
+    Path(inflight_path_for(audit_id)).unlink(missing_ok=True)
 
 
 def base_branch() -> str:
@@ -9628,7 +9817,19 @@ def unsearched_intent_entries(
 
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
+    claim_in_flight(audit_id)
+    try:
+        _start(args, audit_id)
+    except BaseException:
+        # A `start` that raised left no run in flight, so the retry must not
+        # be refused for its own failure. The refusal above sits outside this
+        # block on purpose: a caller refused for another run's note must not
+        # remove that note on its way out.
+        release_in_flight(audit_id)
+        raise
 
+
+def _start(args: argparse.Namespace, audit_id: str) -> None:
     # Yesterday's run record goes first, before anything below can fail. Every
     # step from here to the write can raise, and a `start` that died between
     # them would otherwise leave the previous run's repository list for a
@@ -10524,6 +10725,33 @@ def handle_remediate(args: argparse.Namespace) -> None:
 
 def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
+    if getattr(args, "dry_run", False):
+        # A preview taken mid-run: the run is still in flight and keeps its note.
+        _finish(args, audit_id)
+        return
+    try:
+        _finish(args, audit_id)
+    except ValidationError:
+        # The validator rejected the document and nothing was published. Every
+        # SOP's next step is "fix the findings file and re-run `finish`", so
+        # the run is still in flight while the worker edits, and the note has
+        # to hold: a tick landing in that window would otherwise pass `start`
+        # and unlink the very document about to be resubmitted.
+        raise
+    except BaseException:
+        # A `finish` that died on a `gh` call or anything else is over; the
+        # retry loads the document afresh, and the SOP's next `start --repo B`
+        # is not refused for two hours by an attempt that already died. The
+        # cost, accepted: a rival `start` landing before the retry scrubs the
+        # document the retry needs. Holding the note instead would refuse the
+        # loop's next repository and the tick for two hours, since the note
+        # cannot tell whose it is; run identity decides this and is not here.
+        release_in_flight(audit_id)
+        raise
+    release_in_flight(audit_id)
+
+
+def _finish(args: argparse.Namespace, audit_id: str) -> None:
     data = load_findings(args.findings_file, audit_id)
     # The collector's side of the run, when there is one. Both flags are
     # optional: a stream whose SOP has no collector yet publishes on the
@@ -11760,6 +11988,11 @@ def main(argv: list[str] | None = None) -> int:
             handle_remediate(args)
         else:
             handle_finish(args)
+    except StartRefused as exc:
+        # Exit 2 like a rejected document, labelled apart from one: there
+        # is no document here to fix and re-run.
+        log(f"START REFUSED: {exc}")
+        return 2
     except ValidationError as exc:
         log(f"FINDINGS REJECTED: {exc}")
         return 2
