@@ -46,4 +46,11 @@ describe("NotConnected", () => {
     expect(screen.queryByRole("alert")).toBeNull();
     expect(document.querySelector("input")).toBeNull();
   });
+
+  it("tells the named-user screen's Retry to re-read the address, not to ask the server", () => {
+    render(<NotConnected error={null} namedUser="web" onRetry={() => {}} />);
+    expect(screen.getByText(/removing.*user.*from the url/i)).toBeTruthy();
+    expect(screen.getByText(/re-reads this address/i)).toBeTruthy();
+    expect(screen.queryByText(/asks the server/i)).toBeNull();
+  });
 });

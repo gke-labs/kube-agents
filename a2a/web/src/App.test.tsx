@@ -198,4 +198,27 @@ describe("App finds its bus", () => {
     await waitFor(() => expect(startBus).toHaveBeenCalledTimes(2));
     expect(startBus.mock.calls[1]![0].url).toBe(`ws://${window.location.host}/bus`);
   });
+
+  it("keeps the named-user screen on Retry when the URL still names a user, and doesn't ask the server", async () => {
+    startBus.mockRejectedValueOnce(new Error("websocket refused: 403"));
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    // scrubPasswordFromUrl only removes `pass`; `user=console` is still in the
+    // address bar after the failed connect, and Retry must not read that as
+    // "no user named" and quietly ask the server for the console credential.
+    setLocation("?user=console&pass=wrong");
+    render(<App />);
+    expect((await screen.findByRole("alert")).textContent).toContain("websocket refused: 403");
+    expect(fetch).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText(/user=console&pass=<password>/)).toBeTruthy();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(startBus).toHaveBeenCalledTimes(1);
+    // Removing `user` from the URL is what actually lets the page ask the
+    // server; Retry itself does not, and must not claim to.
+    expect(screen.getByText(/removing.*user.*from the url/i)).toBeTruthy();
+    expect(screen.getByText(/re-reads this address/i)).toBeTruthy();
+    expect(screen.queryByText(/asks the server/i)).toBeNull();
+  });
 });

@@ -24,6 +24,10 @@ export default function NotConnected({
   onRetry: () => void;
 }) {
   const missingCredential = error !== null && error.startsWith(MISSING_CREDENTIAL_PREFIX);
+  // error === null is what App.tsx sets alongside namedUser: a failed connect
+  // always carries its own error instead, even when the URL that failed also
+  // still names a user (scrubPasswordFromUrl removes only `pass`).
+  const namedUserScreen = namedUser !== null && error === null;
 
   return (
     <div className="connect-form">
@@ -32,15 +36,20 @@ export default function NotConnected({
         <p className="connect-error" role="alert">
           {error}
         </p>
-      ) : namedUser !== null ? (
-        <p className="connect-hint">
-          The URL asks for user <code>{namedUser}</code> with no password, so this page didn&apos;t ask the console
-          server for its own credential - that would connect as a different user than the one named.
-        </p>
+      ) : namedUserScreen ? (
+        <>
+          <p className="connect-hint">
+            The URL names user <code>{namedUser}</code> but gives no password for it, and connecting as that user
+            needs one.
+          </p>
+          <p className="connect-hint">
+            Removing user from the URL lets this page ask the console server for its own credential instead.
+          </p>
+        </>
       ) : (
         <p className="connect-hint">No console server answered, so there's no bus credential to connect with.</p>
       )}
-      {namedUser !== null && error === null ? (
+      {namedUserScreen ? (
         <p className="connect-hint">
           Port-forward the bus itself:
           <br />
@@ -62,10 +71,13 @@ export default function NotConnected({
           and open <code>{CONSOLE_URL}</code>. It only answers on local port 8080.
         </p>
       )}
-      {namedUser === null && !missingCredential && (
+      {!namedUserScreen && !missingCredential && (
         <p className="connect-hint">
           Local dev against <code>dev/nats.conf</code>: add <code>{LOCAL_DEV_QUERY}</code> to this page's URL.
         </p>
+      )}
+      {namedUserScreen && (
+        <p className="connect-hint">Retry re-reads this address; it doesn&apos;t ask the server.</p>
       )}
       <button type="button" onClick={onRetry}>
         Retry
