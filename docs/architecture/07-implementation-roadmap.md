@@ -126,6 +126,14 @@ acceptance criteria pass.
   `@cluster-<c>` handle routes to it **without** an inference call, and a message from a
   non-`allowedUsers` requester is **refused before dispatch**; RBAC granting an agent SA a write verb or a
   wrong-scope binding is **rejected at apply time by the `ValidatingAdmissionPolicy`**, even if merged.
+- **Update 2026-09-24: the ChatOps router items above and in Phase 3 are superseded**, deliverable
+  and acceptance criterion both. The model router
+  ([`../designs/spec-model-router.md`](../designs/spec-model-router.md)) reads every turn, including
+  one that spells a handle exactly, so "routes to it **without** an inference call" is not the
+  behaviour being built and "deterministic modes first, NL-inference mode later" is not the
+  sequence. What survives unchanged is the part these items share with the router's own rules: the
+  target CR's `allowedUsers` is enforced before dispatch, routing is never an authz signal, and
+  model output is never trusted for authorization. The router's build order is in its spec.
 
 ### Phase 3 — Developer Team Agent + isolation proof
 
@@ -239,12 +247,10 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
   single-agent Hermes fan-in exists. Build it incrementally (Phase 2 deterministic modes, Phase 3 NL
   fallback) and keep routing **out of the trust path**: a mis-route must never bypass an allowlist, and
   the per-pod gateway stays as an enforcement backstop ([03](03-security-model.md) §4a,
-  [06](06-api-and-data-contracts.md) §2b). **Update 2026-09-24:** the build order here is
-  superseded — the model router
-  ([`../designs/spec-model-router.md`](../designs/spec-model-router.md)) makes natural
-  language primary and the deterministic modes a debug side door, so "Phase 2
-  deterministic modes, Phase 3 NL fallback" is not the sequence being built. Routing
-  staying out of the trust path is unchanged and is the router's own rule.
+  [06](06-api-and-data-contracts.md) §2b). **Update 2026-09-24:** "Phase 2 deterministic modes,
+  Phase 3 NL fallback" is not the sequence being built; the note under Phase 2's **Accept** bullet
+  says what replaced it. Routing staying out of the trust path is unchanged and is the router's own
+  rule.
 - **Cross-cluster networking** — spoke agents depend on **private** reachability to the hub's inference
   - Minty ([05](05-system-architecture.md) §5); a missing egress-allowlist entry or VPC-peering gap
     silently pauses a spoke's agents (reconciled state keeps running). Validate hub connectivity as an
