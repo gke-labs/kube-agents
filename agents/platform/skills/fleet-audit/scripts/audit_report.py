@@ -1532,13 +1532,29 @@ def claim_in_flight(audit_id: str) -> None:
     a script can stop. Releasing a stream before the TTL is an operator's
     action, described in agents/platform/cron/README.md and nowhere the
     worker reads.
+
+    The lease spans one `start`-`finish` pair, not a loop. Eight of the nine
+    SOPs run a stream repository by repository (`start --repo A; finish
+    --repo A; start --repo B`), and each `finish` releases, so between two
+    repositories the stream is unclaimed and a rival `start` can take it;
+    the loop's next `start` is then refused. A refusal mid-loop means the
+    stream was taken between repositories: the run stops there and reports
+    itself partial with the remaining repositories named as not audited.
+    Holding the lease across the loop needs `finish` to know it is not the
+    last repository, which is the run identity that is out of scope here.
     """
     path = Path(inflight_path_for(audit_id))
     # The guard-failure messages name the error and not the path: a path in
     # a refusal reads as a file to remove.
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        lock = os.open(f"{path}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        # Read-only on purpose: flock(2) needs no writable descriptor, and
+        # the lock file is never removed, so one created by another uid (a
+        # hand-run `start` over `kubectl exec` lands as root; the tick and
+        # every session run as uid 1000) must still open for everyone after.
+        # O_RDWR made such a lock refuse the stream for good, before the TTL
+        # was ever read.
+        lock = os.open(f"{path}.lock", os.O_RDONLY | os.O_CREAT, 0o644)
     except OSError as exc:
         raise StartRefused(
             f"could not take the in-flight guard for {audit_id} "

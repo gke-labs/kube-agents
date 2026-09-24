@@ -4014,10 +4014,21 @@ class TestStart(HarnessTestCase):
         note.parent.mkdir(parents=True, exist_ok=True)
         theirs = json.dumps({"audit": AUDIT, "started_at": time.time()})
         note.write_text(theirs)
-        Path(f"{note}.lock").mkdir()  # os.open(O_RDWR) on a directory: EISDIR
-        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        real_open = os.open
+
+        def refuse_lock(path, flags, *rest):
+            # The lock itself cannot be opened (a directory in its place, a
+            # volume mounted read-only, a mode nobody can pass); everything
+            # else opens as usual.
+            if str(path).endswith(".lock"):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, flags, *rest)
+
+        with patch.object(audit_report.os, "open", side_effect=refuse_lock):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
         self.assertIn("START REFUSED:", self.err)
         self.assertIn("in-flight guard", self.err)
+        self.assertIn("Permission denied", self.err)
         # The error, not the path: a path in a refusal reads as a file to
         # remove.
         self.assertNotIn(str(note.parent), self.err)
@@ -4083,6 +4094,40 @@ class TestStart(HarnessTestCase):
         # Nothing to release, so the retry is not refused.
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+
+    def test_a_lock_file_left_by_another_uid_does_not_refuse_the_stream(self):
+        # The lock file beside the note is created once and never removed.
+        # The sandbox container starts as root and a hand-run `start` over
+        # `kubectl exec` lands there, while the tick and every session run
+        # as uid 1000: a root-owned 0644 lock opened O_RDWR gave uid 1000
+        # EACCES on every later `start`, before the TTL was read, for good.
+        # flock needs no writable descriptor, so the lock opens read-only;
+        # a lock nobody can write must not refuse anyone.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        lock = Path(f"{note}.lock")
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.touch()
+        lock.chmod(0o444)
+        real_open = os.open
+        seen = []
+
+        def read_only_open(path, flags, *rest):
+            if str(path).endswith(".lock"):
+                seen.append(flags & os.O_ACCMODE)
+            return real_open(path, flags, *rest)
+
+        # Root ignores mode bits, so the flags are checked as well as the
+        # outcome: the lock must be opened read-only.
+        with patch.object(audit_report.os, "open", side_effect=read_only_open):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(seen, [os.O_RDONLY])
+        self.assertNotIn("START REFUSED", self.err)
+        self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+        # And the guard still holds behind that lock.
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
 
     def test_a_start_that_fails_frees_the_stream_for_the_retry(self):
         # The note means a run is under way. A `start` that raised left none
@@ -12104,6 +12149,12 @@ class TestDispatchAndHandover(unittest.TestCase):
         # for two hours; the carve-out says continue that run to `finish`.
         self.assertIn("already succeeded in this session", bullet)
         self.assertIn("do not run `start` again", bullet)
+        # The carve-out is bounded: any `finish` released the lease, and a
+        # refusal after one is a rival's run, not the worker's own. Without
+        # the bound, a worker whose `finish` died and a rival took over could
+        # read the refusal as its run and publish over the rival's record.
+        self.assertIn("only while no `finish` for that stream has run since", bullet)
+        self.assertIn("stop and report the sweep as partial", bullet)
         # The sandbox carries the skills tree the bullet's path names; what
         # it lacks is `hermes` and the live profile state.
         self.assertNotIn("which has neither", bullet)
@@ -12159,6 +12210,13 @@ class TestDispatchAndHandover(unittest.TestCase):
         # Same carve-out and the same sandbox sentence as the AGENTS.md copy.
         self.assertIn("already succeeded in this session", one_stream)
         self.assertIn("do not run `start` again", one_stream)
+        self.assertIn("only while no `finish` for that stream has run since", one_stream)
+        self.assertIn("stop and report the sweep as partial", one_stream)
+        # The guard paragraph says what the lease spans: one pair, so a
+        # multi-repo loop reclaims per repository and a mid-loop refusal is
+        # a partial run, not "already running".
+        self.assertIn("one `start`-`finish` pair", section)
+        self.assertIn("taken between repositories", section)
         self.assertNotIn("which has neither", section)
         self.assertIn("live profile state", section)
         self.assertIn("More than one stream", section)

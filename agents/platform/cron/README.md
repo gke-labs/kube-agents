@@ -352,9 +352,13 @@ rule outlives the memory of why:
   stream through `audit_report.py start … finish` in the session, with every
   check it did not run declared as a coverage gap; several streams still queue.
   Such a run holds no per-job lock, so `start` keeps its own guard: an
-  in-flight note per stream under the agent volume's `scratch/`
-  (`inflight_<audit>.json`, the stream id and a start time), honoured for two
-  hours and removed by `finish`. A run that died without `finish` costs the
+  in-flight note per stream on the sandbox pod's own volume, at
+  `/opt/data/scratch/inflight_<audit>.json` in that pod (the script runs in
+  the sandbox shell, whose `/opt/data` is its own PVC, not the gateway volume
+  this README otherwise calls "the volume"), holding the stream id and a start
+  time, honoured for two hours and removed by `finish`. The note spans one
+  `start`-`finish` pair, so a multi-repository loop reclaims it at each
+  repository. A run that died without `finish` costs the
   stream at most the ticks inside those two hours. For the operator only:
   when you know from outside the run that it is over (its card is closed, its
   pod is gone), deleting that note releases the stream at once. The CLI has no

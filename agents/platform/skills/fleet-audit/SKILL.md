@@ -89,7 +89,9 @@ names:
   is your own: the note does not know sessions, so if your `start` for that stream
   already succeeded in this session, a second `start` is refused like anyone's and your first run
   is untouched — do not run `start` again; continue the sweep from the first `start`'s output to
-  `finish`. Run the
+  `finish`. That holds only while no `finish` for that stream has run since: any `finish` that
+  exited, published or died, released your lease, and a refusal after it is someone else's run —
+  stop and report the sweep as partial. Run the
   checks in the SOP's severity order, highest first — for the compliance stream, cluster-admin
   bindings, public control planes and privileged containers before NetworkPolicy gaps — so a run
   that runs out of turns has spent them where the findings are. A check whose finding class the
@@ -117,8 +119,11 @@ The scheduler holds a per-job lock for the length of a triggered run, so the tic
 stream twice. A stream run here holds no such lock, and the scheduler's ledger
 (`cronjob(action='runs')`) never sees it, so the guard lives in the script: `start` leaves an
 in-flight note for the stream and refuses while one younger than two hours exists, whichever side
-wrote it, and `finish` removes it when the run is over, published or died on a `gh` call, so a
-`finish` that died does not refuse the stream's next repository or your own retry. Two exits keep
+wrote it, and `finish` removes it when that `start`'s run is over, published or died on a `gh`
+call, so a `finish` that died does not refuse the stream's next repository or your own retry. The
+note spans one `start`-`finish` pair, not a loop: a stream run repository by repository reclaims it
+at each `start`, so a refusal at `start --repo B` means the stream was taken between repositories;
+stop there and report the sweep as partial with B named as not audited. Two exits keep
 it: `--dry-run`, a preview mid-run, and exit 2, a rejected document you are about to fix and
 resubmit, which is still the run in flight. If `start` cannot take the guard at all it exits 2 too,
 rather than run unguarded, also as `START REFUSED`. A run that died before `finish` is forgotten
