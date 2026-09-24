@@ -692,6 +692,10 @@ REFUSED_REF_KEY = "refused_ref"
 RUN_RECORD_SEARCHED_KEY = "searched"
 RUN_RECORD_SOURCES_KEY = "sources"
 RUN_RECORD_ON_DEMAND_KEY = "on_demand"
+ENV_AUDIT_ON_DEMAND = "AUDIT_ON_DEMAND"
+ENV_HERMES_KANBAN_TASK = "HERMES_KANBAN_TASK"
+TRUTHY_ENV_STRINGS = ("1", "true", "yes", "on")
+FALSY_ENV_STRINGS = ("0", "false", "no", "off")
 # When `start` opened this run. The collector manifest is the one input
 # `finish` takes from outside the run and the one `start` cannot scrub: its
 # path lives in the SOP's text rather than in code, so `start` does not know
@@ -8843,14 +8847,14 @@ def is_on_demand(
             return bool(flag)
     if record is not None and RUN_RECORD_ON_DEMAND_KEY in record:
         return bool(record[RUN_RECORD_ON_DEMAND_KEY])
-    env_override = os.environ.get("AUDIT_ON_DEMAND")
+    env_override = os.environ.get(ENV_AUDIT_ON_DEMAND)
     if env_override is not None and env_override.strip():
         norm = env_override.strip().lower()
-        if norm in ("1", "true", "yes", "on"):
+        if norm in TRUTHY_ENV_STRINGS:
             return True
-        if norm in ("0", "false", "no", "off"):
+        if norm in FALSY_ENV_STRINGS:
             return False
-    if bool(os.environ.get("HERMES_KANBAN_TASK")):
+    if bool(os.environ.get(ENV_HERMES_KANBAN_TASK)):
         return True
     return False
 

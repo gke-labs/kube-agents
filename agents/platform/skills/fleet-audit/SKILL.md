@@ -1092,9 +1092,9 @@ Two rules follow, and they are the whole rule:
 
 - On a **scheduled** run, `silent_ok: true` → the final response is exactly `[SILENT]`. Otherwise
   report, and every report carries `issue_url` in full.
-- **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
-  channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
-  kanban card or straight from chat, they are waiting on the answer and
+- **An on-demand run is never silent.** When started or finished with `--on-demand` (or under on-demand
+  environment markers), `audit_report.py finish` sets `silent_ok: false` (#1929). If someone dispatched
+  this job, from a kanban card or straight from chat, they are waiting on the answer and
   `[SILENT]` throws it away. Report the outcome and the ledger URL whatever the flag says.
 
 A zero-finding run comes back `silent_ok: false` in each of these cases, and all of them matter:

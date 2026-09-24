@@ -636,7 +636,7 @@ class BaseTestCase(unittest.TestCase):
         self.assertTrue(record.pop(audit_report.RUN_RECORD_STARTED_KEY))
         return record
 
-    def record_run(self, repo="acme/fleet", context=(), audit=DECLARING_AUDIT, on_demand=False):
+    def record_run(self, repo="acme/fleet", context=(), audit=DECLARING_AUDIT, on_demand=None):
         """Leave the run record `start` would have, under the scratch directory."""
         Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
         return audit_report.write_run_record(audit, repo, list(context), on_demand=on_demand)

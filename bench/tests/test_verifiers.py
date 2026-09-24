@@ -1281,7 +1281,18 @@ def test_a_report_that_queues_the_stream_gets_the_queued_reason(token, github):
 
 def test_a_report_that_answers_silent_gets_the_silent_reason(token, github):
     """When an on-demand worker answers [SILENT] with no ledger URL (#1929)."""
-    for variant in ("[SILENT]", "**[SILENT]**", "*[SILENT]*", "`[SILENT]`", "  `[SILENT]`\n"):
+    for variant in (
+        "[SILENT]",
+        "**[SILENT]**",
+        "*[SILENT]*",
+        "`[SILENT]`",
+        "  `[SILENT]`\n",
+        "[**SILENT**]",
+        "[SILENT]\n\nLedger unchanged.",
+        "Result of delegated task t_4f81:\n[SILENT]",
+        "<router closer>\n\nResult of delegated task t_abc:\n**[SILENT]**",
+        "### Status: [SILENT]",
+    ):
         _stash_report(final_message=variant)
         res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
         assert res.status == "fail" and not res.success
