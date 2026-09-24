@@ -214,12 +214,12 @@ export function parseSubject(subject: string): SubjectInfo {
   const t = subject.split(".");
   if (t[0] !== "a2a") return { plane: "other" };
   // All three classes, `supervisor` included. Nothing reads `dir`; what the
-  // rail gets out of this branch is `addressee`, and a class missing from the
-  // list falls through to `other`, where the addressee becomes "" -- so the
-  // `to`-vs-subject check (assertion 4) silently stops running on that class
-  // and a task first seen on it is filed against no addressee. The envelope
-  // is still folded either way, keyed on `taskId`, which is what makes the
-  // omission quiet.
+  // reducer gets out of this branch is `addressee`, and a class missing from
+  // the list falls through to `other`, where the addressee becomes "" -- so
+  // the `to`-vs-subject check (assertion 4) silently stops running on that
+  // class and a task first seen on it is filed against no addressee. The
+  // envelope is still folded either way, keyed on `taskId`, which is what
+  // makes the omission quiet.
   if (
     t[1] === "tasks" &&
     t.length === 5 &&

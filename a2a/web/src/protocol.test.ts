@@ -125,9 +125,9 @@ describe("parseSubject", () => {
     });
     // The supervisor class is a task subject like the other two. Asserted
     // here rather than left to the "anything else" case below, because that
-    // is where it landed: an unknown class parses as `other`, the rail folds
-    // the envelope anyway on its `taskId`, and the only visible effect is a
-    // protocol check quietly not running.
+    // is where it landed: an unknown class parses as `other`, the reducer
+    // folds the envelope anyway on its `taskId`, and the only visible effect
+    // is a protocol check quietly not running.
     expect(parseSubject("a2a.tasks.chat-otter.task-1.supervisor")).toEqual({
       plane: "tasks",
       addressee: "chat-otter",

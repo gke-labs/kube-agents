@@ -1,12 +1,12 @@
 /*
  * Mission control, instrument-panel dialect. Lifted from the demo UI.
  *
- * The rail is the only lit surface in the room: near-black field, one white-hot
- * trace with a cold halo, everything else in silkscreen grey. Hue is reserved —
- * correlation ids own the spectrum (via corrColor), and amber is spent on
- * exactly one thing, the browser's own link being down. Lifecycle is
- * otherwise expressed in luminance: active is bright, idle and done are dim,
- * closed fades off the trace.
+ * The dashboard is the only lit surface in the room: near-black field, one
+ * white-hot trace with a cold halo, everything else in silkscreen grey. Hue
+ * is reserved — correlation ids own the spectrum (via corrColor), and amber
+ * is spent on exactly one thing, the browser's own link being down.
+ * Lifecycle is otherwise expressed in luminance: active is bright, idle and
+ * done are dim, closed fades off the trace.
  */
 
 :root {
@@ -589,6 +589,18 @@ body {
   background: rgba(7, 8, 10, 0.6);
   font-family: var(--mono);
   font-size: 12px;
+}
+
+/* The sessions panel is first and has the widest rows (task ids, and the
+ * longer liveness sentences); giving it the full row instead of one grid
+ * cell is what keeps it from outgrowing a 340px-minimum cell. */
+[data-panel="sessions"] {
+  grid-column: 1 / -1;
+  overflow-x: auto;
+}
+
+.cell-nowrap {
+  white-space: nowrap;
 }
 
 .panel-focused {

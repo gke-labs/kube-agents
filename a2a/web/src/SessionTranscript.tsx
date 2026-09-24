@@ -1,6 +1,6 @@
 /**
  * One session's transcript, swapped into the dashboard body from the sessions
- * panel or /replay. It is the rail's replay without the ghost strip.
+ * panel or /replay: every chat entry this session produced or was asked for.
  */
 import { sessionEntries } from "./derive.ts";
 import type { UiState } from "./model.ts";
