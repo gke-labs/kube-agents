@@ -38,6 +38,7 @@ func TestConsoleGrantOnARealServer(t *testing.T) {
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
 	consolePW := string(creds.Data["console-password"])
 	seedPW := string(creds.Data["seed-password"])
+	gatewayPW := string(creds.Data["gateway-password"])
 
 	s, log := a2aStartRenderedServer(t, conf)
 	a2aProvisionLikeTheScript(t, s.ClientURL(), seedPW)
@@ -49,10 +50,12 @@ func TestConsoleGrantOnARealServer(t *testing.T) {
 	if err := nc.Publish("chat.console.tab-1.in", []byte(`{"messageId":"m1","text":"hi"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := nc.SubscribeSync("chat.console.tab-1.out"); err != nil {
+	outSub, err := nc.SubscribeSync("chat.console.tab-1.out")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := nc.SubscribeSync("a2a.>"); err != nil {
+	a2aSub, err := nc.SubscribeSync("a2a.>")
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := js.Stream(ctx, "KV_session-state"); err != nil {
@@ -63,7 +66,44 @@ func TestConsoleGrantOnARealServer(t *testing.T) {
 	}
 	time.Sleep(200 * time.Millisecond) // the log line is written on the server's read loop
 	if v := log.publishViolations("console"); len(v) != 0 {
-		t.Fatalf("allowed operations logged violations: %q", v)
+		t.Fatalf("allowed operations logged Publish Violation lines: %q", v)
+	}
+	if v := log.subscriptionViolations("console"); len(v) != 0 {
+		t.Fatalf("allowed operations logged Subscription Violation lines: %q", v)
+	}
+
+	// SubscribeSync's SUB frame is fire-and-forget: a server-side Subscription
+	// Violation never surfaces as an error from that call, and the zero-
+	// violation check above only proves the server accepted the SUB, not that
+	// a message addressed to it actually arrives. So each subscribe grant is
+	// proven by having a principal that may write there publish one frame,
+	// read back with NextMsg.
+	gw, _ := a2aConnectAs(t, s.ClientURL(), "gateway", gatewayPW)
+	if err := gw.Publish("chat.console.tab-1.out", []byte("hello from gateway")); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if msg, err := outSub.NextMsg(2 * time.Second); err != nil {
+		t.Fatalf("console did not receive on chat.console.tab-1.out: %v (server violations for gateway: %q)",
+			err, log.publishViolations("gateway"))
+	} else if string(msg.Data) != "hello from gateway" {
+		t.Fatalf("chat.console.tab-1.out delivered %q, want %q", msg.Data, "hello from gateway")
+	}
+
+	const consoleTaskSubmission = "a2a.tasks.platform.t-console.in"
+	if err := gw.Publish(consoleTaskSubmission, []byte(`{"kind":"message"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if msg, err := a2aSub.NextMsg(2 * time.Second); err != nil {
+		t.Fatalf("console did not receive on a2a.> (%s): %v (server violations for gateway: %q)",
+			consoleTaskSubmission, err, log.publishViolations("gateway"))
+	} else if msg.Subject != consoleTaskSubmission {
+		t.Fatalf("a2a.> delivered subject %q, want %q", msg.Subject, consoleTaskSubmission)
 	}
 
 	// Refused publishes, each read back from the server log.
