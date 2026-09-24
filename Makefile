@@ -171,7 +171,7 @@ lint-python: ## Run ruff's error rules over every Python file (the set tests/tes
 # Unit tests for every Python helper in the tree, the operator's leader-election
 # wrapper (k8s-operator/internal/controller) included. `make -C k8s-operator
 # test-python` runs that one too, so operator work stays self-contained; it is
-# eight tests, so the second run under `make verify` costs nothing. Mostly
+# one small file, so the second run under `make verify` costs nothing. Mostly
 # stdlib-only -- the skill helpers shell out to gh/kubectl rather than importing
 # SDKs -- but the agent scripts do import a few third party packages, listed in
 # requirements-test.txt and installed by `make test-python-deps`. CI installs
@@ -352,7 +352,7 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 
 test-python: ## Run every Python unit-test directory in PYTHON_TEST_DIRS, the operator's included.
 	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \
-		echo "Error: no test_*.py files found under agents/, deploy/docker or scripts/."; \
+		echo "Error: the PYTHON_TEST_DIRS globs matched no test_*.py files."; \
 		echo "Either the tests moved or the globs are stale -- failing rather than reporting success."; \
 		exit 1; \
 	fi
