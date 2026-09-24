@@ -166,11 +166,12 @@ BOX_DEADLINE_DOWN = (
     " **The gate is down: {runs} runs on {prs} PRs have been killed at the deadline since {since}; your run's failure is not your diff.**"
     " Don't retest yet; `/retest` once #kube-agents-ci-health says the gate is healthy again."
 )
-# No deadline outage is declared, so the kill may be the branch's: a change
-# that hangs the eval or the harness ends the same way (health.py, "one PR
-# looping to the deadline is that PR's problem").
+# No deadline-kill outage is declared (the gate may be in another incident,
+# which the brief says), so the kill may be the branch's: a change that hangs
+# the eval or the harness ends the same way (health.py, "one PR looping to
+# the deadline is that PR's problem").
 BOX_DEADLINE_QUIET = (
-    " No gate outage is declared, so this may be the branch: a change that hangs the eval ends this way too."
+    " No deadline-kill outage is declared, so this may be the branch: a change that hangs the eval ends this way too."
     " The build log shows how far the units got; `/retest` if other PRs' runs are finishing and yours has no reason not to."
 )
 FOOTER_DEADLINE = "Ran {minutes} min to the deadline · [build log]({url})"

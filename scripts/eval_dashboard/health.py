@@ -493,10 +493,11 @@ ADVICE_DEADLINE_KILL = (
 )
 ADVICE_RECOVERING = (
     "The condition has cleared; a retest is reasonable. GREEN is reported"
-    " after {count} consecutive {bar} on distinct PRs."
+    " after {count} consecutive green runs on distinct PRs."
 )
+# Leaving a deadline-kill outage: a verdict either way proves the gate grades
+# (`recovered`); the evidence line names the bar with recovery_bar().
 RECOVERY_BAR_GREEN = "green runs"
-# Leaving a deadline-kill outage: a verdict either way proves the gate grades.
 RECOVERY_BAR_VERDICT = "runs with a verdict"
 ADVICE_RECOVERING_VERDICT = (
     "The condition has cleared; a retest is reasonable. GREEN is reported once"
@@ -700,13 +701,18 @@ class Run:
 
     @property
     def has_verdict(self) -> bool:
-        """Reached a verdict: the eval's own, or -- only for a document
-        written before `eval_verdict` existed, which is never a kill -- a
-        concluded full run. A recorded null is no verdict whatever the run
-        carries: the harness died after some cases and before its line."""
+        """Reached a verdict, which is what proves the gate grades: the
+        eval's own, or -- only for a document written before `eval_verdict`
+        existed, which is never a kill -- a concluded run. Either way at
+        least one repetition has to have been graded: NOT EVALUATED records
+        as RED (SCHEMA.md; the collector reads the `Failed` word), and a red
+        whose every repetition was lost to infrastructure graded nothing. A
+        recorded null is no verdict whatever the run carries: the harness
+        died after some cases and before its line."""
+        graded = any(task.graded for task in self.tasks)
         if self.eval_verdict is not None:
-            return True
-        return not self.eval_verdict_recorded and self.full and self.result in (RUN_SUCCESS, RUN_FAILURE)
+            return graded
+        return not self.eval_verdict_recorded and self.result in (RUN_SUCCESS, RUN_FAILURE) and graded
 
     def collapsed_cases(self) -> set[str]:
         return {task.name for task in self.tasks if task.collapsed}
@@ -1598,7 +1604,7 @@ def advice_for(
     if recovering and condition == DEADLINE_KILL:
         return ADVICE_RECOVERING_VERDICT.format(count=RECOVERY_GREEN_RUNS)
     if recovering:
-        return ADVICE_RECOVERING.format(count=RECOVERY_GREEN_RUNS, bar=recovery_bar(condition))
+        return ADVICE_RECOVERING.format(count=RECOVERY_GREEN_RUNS)
     if condition == SHARED_BREAK:
         issues = all_tracking(cases, notes, issue)
         return ADVICE_OUTAGE.format(tracking=", ".join(issues) if issues else ADVICE_OUTAGE_NO_ISSUE)

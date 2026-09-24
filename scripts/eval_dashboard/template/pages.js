@@ -621,12 +621,13 @@ function setupFacts(inc, inWindow) {
 }
 
 // health.Run.has_verdict: the eval's own verdict, or -- only for a record
-// from before `eval_verdict` existed -- a concluded run with cases that is
-// not a kill. A recorded null is no verdict whatever the run carries.
+// from before `eval_verdict` existed, which is never a kill -- a concluded
+// run; either way with at least one graded repetition, since NOT EVALUATED
+// records as RED. A recorded null is no verdict whatever the run carries.
+const gradedAny = (r) => (r.cases || []).some((c) => c.outcome === "passed" || c.outcome === "partial" || c.outcome === "failed");
 function hasVerdict(r) {
-  if (!concluded(r)) return false;
-  if ("eval_verdict" in r) return r.eval_verdict != null;
-  return measured(r) && r.cls !== "deadline-kill";
+  if (!concluded(r) || !gradedAny(r)) return false;
+  return "eval_verdict" in r ? r.eval_verdict != null : true;
 }
 
 function deadlineFacts(inc, inWindow) {

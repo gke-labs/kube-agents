@@ -354,7 +354,7 @@ class DeadlineKillComment(Harness):
         # No outage is declared, so the comment does not clear the branch: a
         # change that hangs the eval ends the same way (health.py, one PR
         # looping to the deadline is that PR's problem).
-        self.assertIn("> Prow killed this run at its 360-minute deadline at 10:55 AM ET; no verdict was reached. No gate outage is declared, so this may be the branch", body)
+        self.assertIn("> Prow killed this run at its 360-minute deadline at 10:55 AM ET; no verdict was reached. No deadline-kill outage is declared, so this may be the branch", body)
         self.assertIn("Ran 363 min to the deadline", body)
         self.assertNotIn("gate is down", body)
         self.assertNotIn("not your diff", body)

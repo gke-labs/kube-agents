@@ -587,12 +587,30 @@ class DeadlineKills(unittest.TestCase):
         self.assertEqual((result["state"], result["recovering"]), ("GREEN", False))
 
     def test_verdicts_that_predate_the_last_kill_do_not_recover_it(self):
+        # Three verdicts on distinct PRs after the incident began, then one
+        # more kill: the verdicts sit before the last kill, so they are not
+        # its recovery (the guard after the `since` one).
         doc = self.kills([1, 1, 2])
-        doc["runs"] += [graded(400 + i, 40 + i, T0 - timedelta(minutes=60 + 5 * i)) for i in range(3)]
         prev = adjudicate(doc, T0)
         self.assertEqual(prev["state"], "OUTAGE")
+        doc["runs"] += [graded(400 + i, 40 + i, T0 + timedelta(minutes=30 + 5 * i)) for i in range(3)]
+        doc["runs"].append(kill(110, 3, T0 + timedelta(minutes=60)))
         later = T0 + timedelta(hours=3)
         self.assertEqual(adjudicate(doc, later, prev)["state"], "OUTAGE")
+
+    def test_not_evaluated_reds_are_not_verdicts_and_do_not_recover_it(self):
+        # NOT EVALUATED records eval_verdict RED with no graded repetition
+        # (SCHEMA.md): the delegation-ceiling shape when the suite finishes
+        # under the margin. Three of those must not end the outage as GREEN.
+        not_evaluated = dict(run(500, 50, T0, tasks=[task("agent-kanban-smoke", "ccc")], result="FAILURE"), eval_verdict="RED")
+        self.assertFalse(health.Run(not_evaluated).has_verdict)
+        self.assertTrue(health.Run(graded(501, 51, T0, "RED")).has_verdict, "a red that graded is a verdict")
+        doc = self.kills([1, 1, 2])
+        prev = adjudicate(doc, T0)
+        later = T0 + timedelta(hours=3)
+        doc["runs"] += [dict(run(500 + i, 50 + i, later - timedelta(minutes=2 + i), tasks=[task("agent-kanban-smoke", "ccc")], result="FAILURE"), eval_verdict="RED") for i in range(3)]
+        result = adjudicate(doc, later, prev)
+        self.assertNotEqual(result["state"], "GREEN", result)
 
     def test_kills_are_counted_on_the_infra_side_of_the_digest(self):
         result = adjudicate(self.kills([1, 1, 2]), T0)

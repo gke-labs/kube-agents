@@ -667,7 +667,14 @@ class BrowserTest(unittest.TestCase):
             for i, pr in enumerate([41, 41, 42])
         ]
         nulled = dict(after[0], build_id="2097282860221206620", pr=43, finished="2026-09-08T23:30:00+00:00", result="FAILURE", eval_verdict=None, duration_s=7200)
-        out = render_to(pathlib.Path(self.tmp.name) / "deadline-recovering-2", dict(data, runs=data["runs"] + [late, *after, nulled]), health=recovering)
+        # NOT EVALUATED: eval_verdict RED with every repetition lost to
+        # infrastructure. Not a verdict either (health.Run.has_verdict).
+        not_evaluated = copy.deepcopy(dict(after[0], build_id="2097282860221206621", pr=44, finished="2026-09-08T23:45:00+00:00", result="FAILURE", eval_verdict="RED"))
+        for t in not_evaluated["tasks"]:
+            t["result"] = "infra"
+            for rep in t.get("reps") or []:
+                rep.update(result="infra", reason="the harness exhausted its retries")
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-recovering-2", dict(data, runs=data["runs"] + [late, *after, nulled, not_evaluated]), health=recovering)
         app = dom_text(out / "index.html")
         self.assertIn("2 of 3 runs with a verdict on distinct PRs so far", app)
 

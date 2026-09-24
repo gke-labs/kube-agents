@@ -88,11 +88,11 @@ try:
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, minutes_text, pool_span, wait_text
+    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_span, wait_text
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import gate_issue, ghcli, nightly
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, minutes_text, pool_span, wait_text
+    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_span, wait_text
 
 STATE_SCHEMA_VERSION = 1
 
@@ -114,9 +114,8 @@ CONDITION_SHARED_BREAK = "shared_break"
 CONDITION_FIXTURE_DRIFT = "fixture_drift"
 CONDITION_DELEGATION_CEILING = "delegation_ceiling"
 CONDITION_DEADLINE_KILL = "deadline_kill"
-# The presubmit job's timeout in minutes (health.py PROW_JOB_TIMEOUT owns it;
-# copied so this module imports nothing that reads data.json).
-DEADLINE_MINUTES = 360
+# The presubmit job's timeout in minutes, as health.py owns it.
+DEADLINE_MINUTES = int(PROW_JOB_TIMEOUT.total_seconds() // 60)
 # health.json's summary of the hourly seeded-fleet scan (health.py,
 # fixture_state_block); absent before the scan has ever published.
 FIXTURE_STATE_KEY = "fixture_state"

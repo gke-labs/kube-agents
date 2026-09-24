@@ -112,7 +112,9 @@ its run page and comment read as the kill's, with the finished cases listed.
 The message says how many runs on how many pull requests, an issue is filed
 for whoever owns the gate (below, "The tracking issue"), and recovery is 3
 runs with a verdict — green or red — on distinct pull requests after the last
-kill, because a red that graded proves the gate grades again. It ranks below a
+kill, because a red that graded proves the gate grades again (a NOT EVALUATED
+red, which records `eval_verdict: RED` with no graded repetition, is not a
+verdict here). It ranks below a
 shared break (which names cases) and above every DEGRADED condition.
 
 **DEGRADED** — lost pods (the build cluster lost the node under the job:
@@ -420,8 +422,8 @@ Smoke gate: run killed at the deadline`, saying when it was killed and that no
 verdict was reached. While `health.json`'s condition is `deadline_kill` the box
 says the gate is down — "N runs on M PRs have been killed at the deadline since
 ⟨time⟩; your run's failure is not your diff" — with the brief link, and asks
-the author not to retest yet. With no outage declared it does not clear the
-branch: one pull request looping to the deadline is that pull request's
+the author not to retest yet. With no deadline-kill outage declared it does not
+clear the branch: one pull request looping to the deadline is that pull request's
 problem (a change that hangs the eval ends the same way), so the box says it
 may be the branch and points at the build log.
 
