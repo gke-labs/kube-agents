@@ -11,12 +11,12 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit fleet-consistency-drift [--repo "<owner>/<repo>"]
+./skills/fleet-audit/scripts/audit_report.py start --audit fleet-consistency-drift [--repo "<owner>/<repo>"] [--on-demand]
 ```
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
 
-- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
+- **Interactive / on-demand session:** Pass `--on-demand` (and `--repo` if ambiguous) so `finish` is never silent (#1929).
 - **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`. The audit is the whole of §1–§7 each time round, collector included — not one collection reused across the loop. `start` re-stamps the run record on every pass and `finish` refuses a manifest the collector finished before it (§4), so a manifest carried over from the previous repository is rejected as stale and that repository publishes with no cross-check at all.
 
 Returns `{"issue":…, "repo":…, "workspace":"/opt/data/gitops/fleet-consistency-drift/<owner>__<name>", "findings_path":"/opt/data/scratch/findings_fleet-consistency-drift.json", "pending_remediation_requests":[…]}`. Use the returned `findings_path` verbatim. `workspace` is the GitOps clone `start` made — the pod has no checkout of its own — and any `remediation.path` you emit in §5 is resolved against it. `issue` is this stream's open ledger issue, or `null` when it has none; `finish` opens or rewrites it either way. There is no audit branch and no report branch: do not create branches, commit, push, or call `gh` yourself — the helper owns every git and GitHub operation and renders the ledger issue body. You never hand-write it.

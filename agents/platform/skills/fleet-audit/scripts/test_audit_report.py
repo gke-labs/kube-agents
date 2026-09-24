@@ -2453,6 +2453,26 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"has {len(spec.checks)} checks",
                 )
 
+    def test_every_sop_documents_on_demand_in_start_command(self):
+        """Every SOP's step 0 must document --on-demand for on-demand audit runs (#1929).
+
+        Workers executing on-demand audits (such as from kanban cards or chat) follow
+        the SOP directly. If the SOP's start command omits `--on-demand`, start will
+        not record `on_demand: true` into the run record, and finish will evaluate
+        `silent_ok: true` on unchanged ledgers if the environment heuristic does not fire.
+        """
+        sop_dir = self.sop_dir()
+        pattern = re.compile(r"audit_report\.py start [^\n]*--on-demand")
+        for audit_id, spec in audit_report.AUDITS.items():
+            sop = sop_dir / spec.sop
+            with self.subTest(audit=audit_id):
+                text = sop.read_text(encoding="utf-8")
+                self.assertRegex(
+                    text,
+                    pattern,
+                    f"{spec.sop} start command does not document --on-demand",
+                )
+
     def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
         """A fix written into one SOP has to reach all the others.
 

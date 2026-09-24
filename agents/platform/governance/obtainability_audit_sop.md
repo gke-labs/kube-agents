@@ -13,12 +13,12 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit obtainability-audit [--repo "<owner>/<repo>"]
+./skills/fleet-audit/scripts/audit_report.py start --audit obtainability-audit [--repo "<owner>/<repo>"] [--on-demand]
 ```
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
 
-- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
+- **Interactive / on-demand session:** Pass `--on-demand` (and `--repo` if ambiguous) so `finish` is never silent (#1929).
 - **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/obtainability-audit/org__repo", "findings_path":"/opt/data/scratch/findings_obtainability-audit.json", "pending_remediation_requests":[…], "context_repos":["org/terraform-live"], "declared_intent_repos":["org/repo","org/terraform-live"], "declared_intent_searched":["org/repo@<sha>","org/terraform-live@<sha>"], "declared_intent_sources":[{"repo":"org/repo","ref":null,"paths":["knowledge"]},…], "declared_intent_unsearched":[{"repo":"org/terraform-live","ref":"release-2026"},…], "declarations_path":"/opt/data/scratch/declarations_obtainability-audit.json"}`. Keep `findings_path`, `workspace`, `context_repos`, `declared_intent_repos`, `declared_intent_searched` and `declared_intent_unsearched` from this call; you write into the first two and read the rest in §4a.
