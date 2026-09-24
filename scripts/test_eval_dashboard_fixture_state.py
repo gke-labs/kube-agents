@@ -198,6 +198,9 @@ def _cluster_b():
     return {
         "currentMasterVersion": "1.33.4-gke.1134000",
         "releaseChannel": {"channel": "REGULAR"},
+        # The no-surge pool as `clusters describe` reports it; the
+        # readiness-surge-blocked role asserts on maxUnavailable here.
+        "nodePools": [{"name": "default-pool", "upgradeSettings": {"maxSurge": 1}}, {"name": "no-surge-pool", "upgradeSettings": {"maxUnavailable": 1}}],
         "maintenancePolicy": {"window": {"maintenanceExclusions": {"hold-the-minor-lag": {"startTime": "2026-09-01T00:00:00Z", "endTime": _future(), "maintenanceExclusionOptions": {"scope": "NO_MINOR_UPGRADES"}}}}},
     }
 
@@ -220,6 +223,20 @@ def healthy_world(*projects):
             "poddisruptionbudget?": {"items": []},
             "clusterrolebinding/debug-binding": {"roleRef": {"name": "cluster-admin"}, "subjects": [{"kind": "ServiceAccount", "name": "default", "namespace": "seeded-security"}]},
             "node?cloud.google.com/gke-nodepool=idle-batch-pool": {"items": [{"spec": {"taints": [{"key": "seeded-role", "value": "idle-batch", "effect": "NoSchedule"}]}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
+            # seeded-b's upgrade-readiness trio: the pool that cannot surge,
+            # the workload pinned to it, and the fail-closed webhook. The
+            # first two gate on being up and Running respectively, because
+            # the finding is what a drain WOULD do, which is only meaningful
+            # while they are healthy.
+            "namespace/seeded-upgrade": {"metadata": {"name": "seeded-upgrade"}},
+            "poddisruptionbudget/pinned-batch-runner": {"spec": {"maxUnavailable": 0}, "status": {"disruptionsAllowed": 0, "currentHealthy": 1}},
+            "node?cloud.google.com/gke-nodepool=no-surge-pool": {"items": [{"spec": {}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
+            "deployment/pinned-batch-runner": {
+                "spec": {"template": {"spec": {"nodeSelector": {"seeded-role": "no-surge"}}}},
+                "status": {"readyReplicas": 1, "replicas": 1},
+            },
+            "pod?app=pinned-batch-runner": _pods(_pod(restarts=0, last_reason=None)),
+            "validatingwebhookconfiguration/seeded-fail-closed-gate": {"webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 30, "clientConfig": {"service": {"name": "nonexistent-admission-gate"}}}]},
         },
         "describe": {project: {"seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1"}} for project in projects},
         "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},
@@ -299,10 +316,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 7, "drifted": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 11, "drifted": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 7, "drifted": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 11, "drifted": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -356,7 +373,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 13, "drifted": 1, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 21, "drifted": 1, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):
