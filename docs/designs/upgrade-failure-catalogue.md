@@ -124,8 +124,14 @@ flowchart TD
 
 ## The scenarios
 
-Each section gives the mechanism, the signal before, the signal after, what already reads the
-signal in this repository, and why the entry is on the list. The
+Each section gives the mechanism, the signal before, where to look for it, the signal after, how
+to mitigate before and after, what already reads the signal in this repository, what GKE's own
+[recommender](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-with-recommenders)
+publishes for it, and why the entry is on the list. The recommender's insights all arrive through
+one call, `google.container.DiagnosisInsight` per location, are reassessed daily, and some are not
+shown in the console at all, so a check that reads them gets more than the console shows. One
+mitigation is general to every after-signal on a node pool: the blue-green upgrade strategy keeps
+the old nodes until a soak passes and can be rolled back until it completes. The
 [Scope table](upgrade-readiness-checks.md#scope) in the readiness requirements is the record of
 which audit or skill reads what; the "read today" lines here are the delta against it.
 
@@ -141,7 +147,10 @@ so the application goes down after an hour of stall instead of after a clean han
 - Where to look: the Kubernetes API: each budget's `spec` and `status`, and the owner's `.spec.replicas` behind it.
 - After: the node sits `SchedulingDisabled` with the pod still on it, `Cannot evict pod` events,
   the `UPGRADE_NODES` operation running far longer than one node should take, then the pod deleted.
+- Mitigate before: give the budget room: `maxUnavailable` at least 1 or `minAvailable` below the replica count, and a second replica so the budget can be honoured; for a true singleton, accept the outage inside a maintenance window or use the blue-green node upgrade strategy, whose soak gives the workload longer than one hour.
+- Mitigate after: fix the budget and the stalled drain resumes at once; never delete the budget without replacing it, since that trades a stall for an unprotected workload.
 - Read today: the readiness mode of `fleet-upgrade-verification` grades it `blocked`.
+- GKE recommender: `PDB_UNPERMISSIVE` flags a budget that allows zero evictions, naming the budget and its expected pod count; `DEPLOYMENT_MISSING_PDB` and `PDB_UNPROTECTED_STATEFULSET` flag the opposite gap. All from the [disruption-readiness insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/workload-disruption-readiness), reassessed daily.
 - Why it is on the list: the one-hour grace and the forced eviction are in GKE's
   [node upgrade strategies](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies).
   The seeded fleet plants no drain-blocking budget.
@@ -157,7 +166,10 @@ that was just taken away, and a single-replica application has a guaranteed outa
 - Where to look: the GKE API for the pool's `upgradeSettings`, autoscaler limits, and Compute Engine for accelerator quota; the Kubernetes API for the sum of requests against allocatable.
 - After: Pending pods with `Insufficient cpu` or `Insufficient nvidia.com/gpu`, autoscaler events
   citing quota.
+- Mitigate before: `maxSurge` at least 1, one node of headroom in the pool, an autoscaler ceiling and accelerator quota that allow it; for accelerator pools, blue-green upgrades so the new node exists before the old one goes.
+- Mitigate after: add a node or raise the ceiling and the Pending pods schedule.
 - Read today: nothing.
+- GKE recommender: partial: `CLUSTER_UNDERPROVISIONED` from the [utilisation insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-cluster-utilization) and the Network Analyzer's IP utilisation insight; nothing reads `maxSurge` or quota.
 - Why it is on the list: it follows from how a drain works, not from an incident; no public story
   verified and no fixture. Accelerator pools are the common case because their quota is small.
 
@@ -170,7 +182,10 @@ node, or a zone whose nodes roll together, the upgrade takes every replica at on
   anti-affinity.
 - Where to look: the Kubernetes API: each pod's node and zone, and the owning Deployment's spread and affinity terms.
 - After: availability falls to zero for a workload with more than one replica.
+- Mitigate before: `topologySpreadConstraints` across zones and hosts, or pod anti-affinity, and a budget so the drain waits between replicas.
+- Mitigate after: the next rollout re-spreads the pods once the constraints are in place.
 - Read today: the obtainability audit's spread and pinning checks.
+- GKE recommender: none.
 - Why it is on the list: a consequence of scheduling, not an incident; no fixture on the seeded
   fleet and no public story verified.
 
@@ -184,8 +199,11 @@ still loading.
   serve, or a model or image cache on an `emptyDir` that a rebuild empties.
 - Where to look: the Kubernetes API for probe specs and `emptyDir` volumes; the image, or the pod's own history of time from start to Ready, for how long the application really takes.
 - After: Ready flapping, 5xx from the load balancer immediately after the node returns.
+- Mitigate before: a `startupProbe` that covers the real load time, a readiness probe that checks serving rather than process liveness, `minReadySeconds`, and a cache that survives a rebuild (a PersistentVolume, or an image that carries the data).
+- Mitigate after: nothing shortens the load; the readiness probe is what keeps traffic away until it finishes.
 - Read today: the obtainability audit flags a missing readiness probe; a probe that passes too
   early is unread.
+- GKE recommender: `PDB_STATEFULSET_WITHOUT_PROBES`, for StatefulSets only.
 - Why it is on the list: no public incident verified. A model server that reloads its weights for
   minutes after every recreate is the common shape.
 
@@ -196,7 +214,10 @@ A rebuilt node is a new machine. Local SSD and `emptyDir` contents do not come b
 - Before: pods mounting Local SSD or `emptyDir` for anything they cannot rebuild.
 - Where to look: the Kubernetes API: volumes on Local SSD storage classes, `hostPath` and `emptyDir`.
 - After: application errors reading state, empty caches or queues.
+- Mitigate before: state on PersistentVolumes or object storage; Local SSD and `emptyDir` only for what the application can rebuild.
+- Mitigate after: restore from the source of truth.
 - Read today: nothing.
+- GKE recommender: none.
 - Why it is on the list: GKE's statement that Local SSD data does not survive a node upgrade is
   quoted at the end of the readiness requirements'
   [incidents section](upgrade-readiness-checks.md#upgrades-that-went-wrong-in-public); no public
@@ -214,8 +235,11 @@ back the automatic one, while a manual upgrade still runs, and one that ends ins
 - After: the operation still open after the window closes, with mixed node versions in one pool.
   Surge upgrades pause this way; blue-green ones
   [run to completion](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies).
+- Mitigate before: a window long enough for node count times drain time, exclusions that end outside the planned change, and blue-green upgrades where the window is tight.
+- Mitigate after: extend the window or finish the upgrade manually so the pool stops running two versions.
 - Read today: the readiness mode grades the covering exclusion; the security-patch orchestrator
   reads the window.
+- GKE recommender: `CLUSTER_MAINTENANCE_WINDOW_AND_EXCLUSIONS` recommends configuring a window and `CLUSTER_RELEASE_CHANNEL_UNSPECIFIED` a channel; neither checks a window's length against the pool.
 - Why it is on the list: a common support case; no single public story verified.
 
 ### 7. A served API version is removed
@@ -233,10 +257,13 @@ dropped `flowcontrol.apiserver.k8s.io/v1beta3`.
 - Where to look: the GKE Recommender for the insight; Cloud Logging for the audit entries labelled `k8s.io/removed-release`; the `apiserver_requested_deprecated_apis` metric; the GitOps repository's manifests and charts; the Kubernetes API for CRD `storedVersions`. Helm release state lives in Secrets, which this repository's agents may not read, so that part is a human's `helm get manifest` or a release storage driver other than Secrets.
 - After: controller logs full of 404s, `helm upgrade` refusing, the objects invisible to old
   clients.
+- Mitigate before: migrate the callers, not the objects: bump client libraries and `kubectl`, rewrite manifests to the new version, and rewrite Helm release state with `helm mapkubeapis`; GKE pauses the automatic upgrade for 30 days after the last call, so the pause clearing is the sign the migration is done.
+- Mitigate after: the stored objects still exist; re-apply them through the new version and rewrite release state, and the clients recover.
 - Read today: the deprecation scan in `fleet-upgrade-verification` reads the `apiVersion`s a
   linked GitOps repository declares in raw YAML and JSON, skipping Helm templates. The insights
   themselves are quoted by the skill as a command for a human, because the agent's `gcloud`
   allowlist excludes them; stored Helm release state and CRD `storedVersions` are unread.
+- GKE recommender: the [deprecation insights](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/viewing-deprecation-insights-and-recommendations), one subtype per removal (`DEPRECATION_K8S_1_32_API` and its predecessors), computed from the audit log and naming the calling user agents.
 - Why it is on the list: Helm and Spinnaker on 1.25 in the
   [incidents](upgrade-readiness-checks.md#upgrades-that-went-wrong-in-public); the 1.32 removal is
   in GKE's [deprecation notes](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/apis-1-32).
@@ -252,7 +279,10 @@ case `kube-system`.
   `namespaceSelector` exempting `kube-system`.
 - Where to look: the Kubernetes API: `ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` objects, the Services they name, and those Services' endpoints.
 - After: `failed calling webhook` events, Pending pods, drains that never finish.
+- Mitigate before: a `namespaceSelector` that excludes `kube-system`, a timeout of a few seconds, `failurePolicy: Ignore` for webhooks that are not security controls, at least two backend replicas behind a budget, and a valid backend certificate.
+- Mitigate after: set `failurePolicy: Ignore` or remove the webhook configuration to unwedge the cluster, then restore it once the backend is up.
 - Read today: nothing.
+- GKE recommender: `K8S_ADMISSION_WEBHOOK_UNAVAILABLE` flags a webhook whose Service has no endpoints and `K8S_ADMISSION_WEBHOOK_UNSAFE` one that intercepts `kube-system` or cluster-scoped system resources ([webhook insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-webhooks)); the certificate subtypes (`DEPRECATION_K8S_1_23_CERTIFICATE`, `_1_29_CERTIFICATE`, `DEPRECATION_K8S_SHA_1_CERTIFICATE`) cover a backend certificate the next version rejects; a further recommendation flags CRDs with an invalid CA bundle.
 - Why it is on the list: Jetstack's Open Policy Agent webhook outage in the incidents; no fixture
   on the seeded fleet.
 
@@ -265,7 +295,10 @@ without anyone changing it.
   enforcement, seccomp defaults, eviction thresholds, feature gates that flip on.
 - Where to look: the target minor's release notes, then the Kubernetes API for the objects each changed default touches (namespace Pod Security labels, pod security contexts).
 - After: rejections at admission, evictions nobody asked for.
+- Mitigate before: read the target minor's notes, run Pod Security Admission in `warn` and `audit` before `enforce`, and rehearse on a staging cluster already at the target version.
+- Mitigate after: the audit log names the rejecting rule; relabel the namespace or adjust the pod.
 - Read today: nothing.
+- GKE recommender: only where the default change is also a removal, such as `DEPRECATION_K8S_1_25_PODSECURITYPOLICY`.
 - Why it is on the list: the PodSecurityPolicy removal in 1.25; the `gitRepo` volume the kubelet
   refuses from [1.36](https://kubernetes.io/blog/2026/04/22/kubernetes-v1-36-release/).
 
@@ -279,7 +312,10 @@ count across runs is what turns a future removal from a surprise into a plan.
   planned for 1.43).
 - Where to look: Cloud Logging for audit entries carrying the `k8s.io/deprecated` annotation (a label there), or the `Warning` headers the API server returns to any client; the Kubernetes API for the objects still using the feature.
 - After: none yet.
+- Mitigate before: plan the migration while the feature still works: EndpointSlices for `Endpoints`, a LoadBalancer Service or the Gateway API for `externalIPs`.
+- Mitigate after: none needed yet.
 - Read today: nothing.
+- GKE recommender: none; the insights start when the removal is in the next minor.
 - Why it is on the list: the
   [1.36 externalIPs notice](https://kubernetes.io/blog/2026/05/14/kubernetes-v1-36-deprecation-and-removal-of-service-externalips/)
   is the current example of a deprecation with a removal date attached.
@@ -295,7 +331,10 @@ behind the control plane breaks the kubelet's own contract.
   plane than the skew policy allows.
 - Where to look: the Kubernetes API for the installed versions (image tags of the add-ons' Deployments) against each vendor's support matrix for the target minor; the GKE API for node-pool versions against the control plane.
 - After: controller crash loops; reconciles that stop.
+- Mitigate before: upgrade add-ons to a version whose matrix includes the target before the cluster moves; keep `kubectl` within one minor; keep node pools inside the skew window.
+- Mitigate after: upgrade the add-on.
 - Read today: the readiness mode grades node-pool skew; add-on skew is unread.
+- GKE recommender: `CLUSTER_VERSION_SKEW_UNSUPPORTED` for node pools too far behind and `CLUSTER_VERSION_END_OF_LIFE` for a control plane past standard support ([versioning](https://docs.cloud.google.com/kubernetes-engine/versioning)); nothing for add-ons.
 - Why it is on the list: the Calico teardown race on GKE 1.22 in the incidents, an add-on known
   issue.
 
@@ -307,7 +346,10 @@ that talks to the API without retrying fails for those minutes.
 - Before: the cluster is zonal. Whether its clients retry is not readable from the cluster, so the check reports the exposure and the operator answers the rest.
 - Where to look: the GKE API for the cluster's location type.
 - After: API 5xx for a few minutes, GitOps out of sync.
+- Mitigate before: a regional cluster for anything automation depends on, and retries with backoff in the clients that cannot tolerate a few minutes of 5xx.
+- Mitigate after: wait for the control plane; GitOps resyncs on its own.
 - Read today: nothing.
+- GKE recommender: none.
 - Why it is on the list: GKE's
   [cluster availability types](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters)
   document the behaviour.
@@ -321,7 +363,10 @@ schedule again.
   image stops setting.
 - Where to look: the Kubernetes API for every `nodeSelector` and affinity term in use, against the target minor's notes on labels dropped.
 - After: Pending with `didn't match node selector`.
+- Mitigate before: replace deprecated labels in selectors with their GA names (`kubernetes.io/arch`, `topology.kubernetes.io/zone`).
+- Mitigate after: patch the selector; the pods schedule.
 - Read today: nothing.
+- GKE recommender: none.
 - Why it is on the list: no GKE label removal verified. The public case, Reddit's 1.24 outage, was
   a kubeadm label read by a CNI selector rather than a pod selector, and is entry 18's evidence.
 
@@ -333,7 +378,10 @@ or shelled out to `docker` lost it.
 - Before: DaemonSets and pods mounting `docker.sock`; images built around Docker-only tooling.
 - Where to look: the Kubernetes API for volume mounts of `docker.sock`; the GKE API for the pool's node image type.
 - After: crash loops in logging and security agents.
+- Mitigate before: replace agents that mount the Docker socket with CRI-based ones.
+- Mitigate after: the same replacement, under pressure.
 - Read today: nothing.
+- GKE recommender: `DEPRECATION_K8S_1_24_DOCKERSHIM`, `DEPRECATION_CONTAINERD_V1_SCHEMA_IMAGES` and `DEPRECATION_CONTAINERD_V1ALPHA2_CRI_API`, for the migrations that have happened.
 - Why it is on the list: the Docker to containerd migration on GKE 1.19 to 1.24.
 
 ### 15. cgroup v2 under a runtime that cannot read it
@@ -350,7 +398,10 @@ so for such a pool the flip does arrive with the minor.
   the [cgroup v2 page](https://kubernetes.io/docs/concepts/architecture/cgroups/) names.
 - Where to look: the GKE API for each pool's `effectiveCgroupMode` and the target version; a read-only node check of the cgroup filesystem; the images for the runtime version they ship.
 - After: `OOMKilled` with no code change, on the migrated nodes only.
+- Mitigate before: a runtime that reads cgroup v2 (JDK 8u372 or 11.0.16 and later, .NET 5 and later), or explicit heap flags; until 1.35 a pool can be pinned to cgroup v1 through its node system config to buy time.
+- Mitigate after: the same, plus a temporary limit increase.
 - Read today: nothing.
+- GKE recommender: none verified.
 - Why it is on the list: the Kubernetes cgroup v2 documentation names the runtime versions; no
   public incident verified.
 
@@ -371,7 +422,10 @@ misreads its limit.
 - Where to look: the GKE API for the kubelet version and cgroup mode of each pool; a read-only look at `memory.oom.group` in a container; the images for entrypoints that run more than one process.
 - After: `OOMKilled` on containers whose logs previously showed worker restarts under the same
   load.
+- Mitigate before: raise the limit for multi-process containers, split workers into their own containers or pods, or set the kubelet's `singleProcessOOMKill` where the platform exposes it (1.32 and later).
+- Mitigate after: the same; the container's own logs before the upgrade show which worker used to die.
 - Read today: nothing.
+- GKE recommender: none.
 - Why it is on the list:
   [kubernetes#117070](https://github.com/kubernetes/kubernetes/issues/117070) is the change, the
   [write-up by the opt-out's authors](https://tech.preferred.jp/en/blog/kubernetes-single-process-oom-kill/)
@@ -387,7 +441,10 @@ specific flow is handled.
 - Before: dataplane and DNS provider, policy count, the known issues for the target version.
 - Where to look: the GKE API for the dataplane and DNS provider; the Kubernetes API for the policy count; the target version's known-issue notes.
 - After: connection resets, policy drops in flow logs, DNS timeouts.
+- Mitigate before: rehearse the target version on a staging cluster with the same dataplane, and keep NetworkPolicy explicit rather than relying on defaults.
+- Mitigate after: a node pool can be recreated at the previous version while GKE still offers it; the control plane cannot go back.
 - Read today: nothing.
+- GKE recommender: partial: the Network Analyzer's GKE connectivity insights cover control-plane and node reachability, not policy behaviour.
 - Why it is on the list: no public incident verified; the per-version known-issue notes are the
   signal.
 
@@ -402,7 +459,10 @@ CNI's own control components are hit, cluster-wide within minutes.
 - Where to look: the target node image's release notes and known issues; the Kubernetes API for what the CNI's components select on.
 - After: nodes `NotReady` or `NetworkUnavailable`, CNI or `kube-proxy` pods crash-looping, Service
   VIP probes failing from inside the cluster.
+- Mitigate before: upgrade a canary pool first and watch Service routing from inside the cluster before the rest; surge upgrades with `maxUnavailable` 0 so a broken node never takes capacity with it.
+- Mitigate after: recreate the pool at the previous version while it is offered, and fix whatever the CNI selected on.
 - Read today: nothing.
+- GKE recommender: none.
 - Why it is on the list: Reddit's 1.24 outage was the CNI losing its route reflectors when a node
   label went away; the Datadog and Heroku outages in the incidents are the same shape, triggered by
   an OS update rather than an upgrade.
@@ -415,7 +475,10 @@ is older than what the CUDA build requires, the device cannot be opened.
 - Before: the driver version the target node image ships against the CUDA version the images need.
 - Where to look: the GPU how-to page's table of driver versions per GKE version, for the target version, since the GKE API only records `DEFAULT` or `LATEST`; the images for the CUDA version they need.
 - After: pods Pending on `nvidia.com/gpu`, or crashing in `nvidia-smi`.
+- Mitigate before: match the driver to the images before the upgrade: the GPU how-to page's table gives the driver per GKE version, and CUDA forward compatibility gives the floor the images accept; upgrade a canary GPU pool first.
+- Mitigate after: recreate the pool with the driver version the images need.
 - Read today: nothing.
+- GKE recommender: none.
 - Why it is on the list: frequent on accelerator pools; no public incident verified.
 
 ### 20. In-tree volumes lose their CSI path
@@ -431,7 +494,10 @@ is the same.
   no longer exists.
 - Where to look: the GKE API for the `gcePersistentDiskCsiDriverConfig` add-on; the Kubernetes API for PersistentVolume specs and StorageClass provisioners.
 - After: attach errors, pods stuck `ContainerCreating`.
+- Mitigate before: enable the PD CSI driver add-on and move StorageClasses to `pd.csi.storage.gke.io`.
+- Mitigate after: enable the add-on; the volumes attach.
 - Read today: nothing.
+- GKE recommender: none.
 - Why it is on the list: the
   [1.25 CSI migration status](https://kubernetes.io/blog/2022/09/26/storage-in-tree-to-csi-migration-status-update-1.25/)
   and GKE's
@@ -446,7 +512,10 @@ stopped publishing, or an egress allowlist admits only the old hostname, only th
   such as `k8s.gcr.io`, and egress allowlists that admit only the old hostname.
 - Where to look: the Kubernetes API for the image references in use and the GitOps repository for the ones declared; the egress policy for what it admits: NetworkPolicy CIDRs, GKE's FQDN network policy on Dataplane V2, and Compute Engine firewall rules.
 - After: `ImagePullBackOff` only on new nodes.
+- Mitigate before: mirror every image the install pulls into a registry you own and pin it there, which is what `images.json` and `make mirror-images` do in this repository, and keep egress allowlists in step.
+- Mitigate after: retag or redirect the reference; the new nodes pull.
 - Read today: nothing.
+- GKE recommender: none.
 - Why it is on the list: the
   [`k8s.gcr.io` freeze](https://kubernetes.io/blog/2023/02/06/k8s-gcr-io-freeze-announcement/) and
   its [redirect](https://kubernetes.io/blog/2023/03/10/image-registry-redirect/): tags published
@@ -455,8 +524,9 @@ stopped publishing, or an egress allowlist admits only the old hostname, only th
 ## The order to add checks
 
 The order is by how often each failure appears in the public record and how cheap its signal is to
-read. Deprecation insights (7) come first: GKE already computes them, the same call reads every
-cluster in a project, and the readiness requirements'
+read. GKE's recommender comes first, because one call per location returns the deprecation
+insights (7) together with the budget (1), webhook (8), skew (11), runtime (14) and window (6)
+insights; the readiness requirements'
 [deprecation-insights section](upgrade-readiness-checks.md#gke-deprecation-insights) says what else
 the pause they put on automatic upgrades explains. Fail-closed webhooks (8) and capacity headroom
 (2) come next, because both turn a routine drain into an outage and both are a few list calls.
