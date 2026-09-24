@@ -6,33 +6,24 @@ The page connects to the bus's websocket listener as the `console` NATS user. Th
 
 ## Posture
 
-Port-forward only. The websocket listener is ClusterIP, the NATS pod's ingress policy refuses in-cluster 9222, and the port-forward works because it enters from the node, which NetworkPolicy doesn't govern. There is one shared `console` principal, no TLS, no ingress and no per-user identity. kubectl RBAC on the namespace is the authentication.
+The operator runs a small console server beside the bus (`<agent>-a2a-console`). It serves this page, hands it the `console` password from the creds Secret when the page loads, and proxies the page's websocket to the bus. There's no password to paste and one port-forward reaches everything.
 
-We expect this to move to in-cluster ingress with per-user identity, which needs the NATS account split. The frame format, the reducer and the page shouldn't change when it does.
+Port-forward only. The console server's Service is ClusterIP and its pod refuses all in-cluster traffic. The bus's websocket port admits the console server and nothing else in the pod network. Port-forwards work because they enter from the node, which NetworkPolicy doesn't govern. There's one shared `console` principal, no TLS, no ingress and no per-user identity. kubectl RBAC on the namespace is the authentication.
+
+We expect this to grow into in-cluster ingress with per-user identity, which needs the NATS account split. The frame format, the reducer and the page shouldn't change when it does.
 
 ## Against the install
 
 ```sh
-# 1. the password
-kubectl -n kubeagents-system get secret platform-agent-a2a-nats-creds \
-  -o jsonpath='{.data.console-password}' | base64 -d
-
-# 2. the transport
-kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-nats 9222:9222
-
-# 3. the page
-npm install --legacy-peer-deps && npm run dev
-# open http://localhost:5173 and paste the password into the connect form,
-# or pass it in the URL: /?ws=ws://localhost:9222&user=console&pass=...
+kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-console 8080:8080
+# open http://localhost:8080
 ```
+
+Use local port 8080. The bus only accepts the page from `http://localhost:8080` and `http://127.0.0.1:8080`, so the console server refuses any other port up front with a 421 that says so.
 
 Type into the chat pane. A turn shows as pending and attaches in place once its submission shows up on TASKS; a `delegate` turn attaches to the stripped task the gateway submits. A stop word, a bare `/session`, `/session off` and `/session stop` never become a task, so they show as sent at once and the gateway answers with a notice. A turn with no task after 30s gets a note saying so: status questions and refused turns get a gateway notice instead of a task, and if no notice came, the gateway may be slow or may have dropped it. After 10 minutes a pending turn stops waiting. `/help` lists the local commands, which are never published; any other slash line is sent.
 
-The read-only view still works with `user=web` and the install's `web-password`. It has no input box.
-
-## Serve it from localhost:5173, not another port
-
-The bus's websocket listener renders `allowed_origins: ["http://localhost:5173", "http://127.0.0.1:5173"]`, so a page served from any other origin is refused at the handshake with a 403. Vite is pinned with `strictPort`, so it fails loudly rather than drifting to 5174. Keep `server.host` unset; it would put the dev server on every interface.
+The read-only view still works: port-forward the bus itself (`svc/platform-agent-a2a-nats 9222:9222`) and open the page with `?ws=ws://localhost:9222&user=web&pass=<web-password>`. It has no input box. That page has to come from the console server too (`http://localhost:8080/?ws=...`), for the origin reason above.
 
 Origin is browser-asserted and non-browser clients omit it, so the allow-list is a second fence. The boundary is the grant list.
 
@@ -45,8 +36,11 @@ Node 22+ (`nats.ws` uses the global `WebSocket`). Install with `--legacy-peer-de
 ```sh
 nats-server -c dev/nats.conf     # terminal 1
 node dev/seed.mjs --live         # terminal 2: history + a task every ~20s
-npm run dev                      # terminal 3, user console, password dev-console
+npm run dev                      # terminal 3
+# open http://localhost:5173/?ws=ws://localhost:9222&user=console&pass=dev-console
 ```
+
+To run the console server itself against this file, build the page (`npm run build`) and start `go run ./cmd/console` from `a2a/` with `CONSOLE_STATIC_DIR=web/dist`, `CONSOLE_BUS_URL=http://localhost:9222` and `CONSOLE_PASSWORD_FILE` pointing at a file containing `dev-console`. Then open `http://localhost:8080`. `dev/nats.conf` allows that origin too.
 
 With no gateway running, a sent turn stays pending and gets the 30s note.
 

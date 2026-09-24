@@ -2,9 +2,9 @@ import { useCallback, useEffect, useReducer, useRef, useState, type KeyboardEven
 import { reduce, initialState, type UiState } from "./model.ts";
 import { durablesFor, startBus, type BusHandle } from "./bus.ts";
 import {
-  DEFAULT_USER,
-  DEFAULT_WS_URL,
   READ_ONLY_USER,
+  clearConfig,
+  fetchServedConfig,
   loadConfig,
   loadConversation,
   saveConfig,
@@ -12,6 +12,7 @@ import {
   scrubPasswordFromUrl,
   type BusConfig,
 } from "./config.ts";
+import NotConnected from "./NotConnected.tsx";
 import { mintConversation } from "./console.ts";
 import { commandEffect, type Command } from "./commands.ts";
 import { BAND_STEP, bandFromPointer, clampBand, loadBand, saveBand } from "./band.ts";
@@ -31,62 +32,25 @@ const PERCENT = 100;
 const LINK_DOWN_SEND_NOTE = "not sent: the bus link is down. Your text is still in the box.";
 
 /**
- * First load with no credentials shows this instead of a dead page. The
- * password is the install's `console-password` key; the recipe to fetch it and
- * start the port-forward is in the README and repeated here so the form is
- * self-explanatory in front of an audience.
+ * Where the page is in finding its bus. `remember` is false for a config the
+ * console server handed over: the server is the source of truth, and the
+ * credential shouldn't outlive the tab in storage when it doesn't have to.
  */
-function ConnectForm({
-  error,
-  onConnect,
-}: {
-  error: string | null;
-  onConnect: (config: BusConfig) => void;
-}) {
-  const params = new URLSearchParams(window.location.search);
-  const [url, setUrl] = useState(params.get("ws") ?? DEFAULT_WS_URL);
-  const [pass, setPass] = useState("");
-  // `?user=web` must reach the form's own submit, not silently connect as
-  // console with the web password pasted into it: the two credentials
-  // authorize different grants and the server refuses the mismatch.
-  const user = params.get("user") ?? DEFAULT_USER;
+type Stage =
+  | { kind: "looking" }
+  | { kind: "ready"; config: BusConfig; remember: boolean }
+  | { kind: "unconfigured"; error: string | null };
 
-  return (
-    <form
-      className="connect-form"
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (pass !== "") onConnect({ url, user, pass });
-      }}
-    >
-      <h1>a2a bus</h1>
-      <p className="connect-hint">
-        kubectl port-forward the NATS websocket port, then paste the install&apos;s
-        <code> {user}-password</code>.
-      </p>
-      <label>
-        websocket url
-        <input value={url} onChange={(e) => setUrl(e.target.value)} />
-      </label>
-      <label>
-        {user} password
-        <input
-          type="password"
-          value={pass}
-          onChange={(e) => setPass(e.target.value)}
-          autoFocus
-        />
-      </label>
-      <button type="submit">connect</button>
-      {error && <p className="connect-error">{error}</p>}
-    </form>
-  );
+// Pure, like loadConfig: it runs as a useState initializer, which StrictMode
+// calls twice.
+function initialStage(): Stage {
+  const config = loadConfig();
+  return config ? { kind: "ready", config, remember: true } : { kind: "looking" };
 }
 
 export default function App() {
   const [state, dispatch] = useReducer(reduce, initialState);
-  const [config, setConfig] = useState<BusConfig | null>(loadConfig);
-  const [connectError, setConnectError] = useState<string | null>(null);
+  const [stage, setStage] = useState<Stage>(initialStage);
   const [probePending, setProbePending] = useState(false);
   const [conversation, setConversation] = useState<string>(() => loadConversation() ?? mintConversation());
   const [session, setSession] = useState<string | null>(null);
@@ -102,6 +66,7 @@ export default function App() {
   const conversationRef = useRef(conversation);
   conversationRef.current = conversation;
 
+  const config = stage.kind === "ready" ? stage.config : null;
   const canSend = config !== null && config.user !== READ_ONLY_USER;
 
   useEffect(scrubPasswordFromUrl, []);
@@ -109,19 +74,37 @@ export default function App() {
   useEffect(() => saveBand(band), [band]);
 
   useEffect(() => {
-    if (!config) return;
+    if (stage.kind !== "looking") return;
+    let cancelled = false;
+    fetchServedConfig().then(
+      (served) => {
+        if (cancelled) return;
+        setStage(served ? { kind: "ready", config: served, remember: false } : { kind: "unconfigured", error: null });
+      },
+      (error: unknown) => {
+        if (!cancelled) setStage({ kind: "unconfigured", error: String(error) });
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [stage]);
+
+  useEffect(() => {
+    if (stage.kind !== "ready") return;
+    const { config: target, remember } = stage;
     // StrictMode runs this effect twice in dev, and cleanup fires before the
     // first `startBus` resolves - without this flag the first connection is
     // never closed and every envelope gets dispatched twice.
     let cancelled = false;
     const opts = {
-      conversation: config.user !== READ_ONLY_USER ? conversationRef.current : undefined,
+      conversation: target.user !== READ_ONLY_USER ? conversationRef.current : undefined,
       durables: () => durablesFor(stateRef.current.agents.values()),
     };
 
     void (async () => {
       try {
-        const handle = await startBus(config, dispatch, opts);
+        const handle = await startBus(target, dispatch, opts);
         if (cancelled) {
           void handle.close().catch(() => {
             /* already going away */
@@ -129,12 +112,14 @@ export default function App() {
           return;
         }
         busHandleRef.current = handle;
-        saveConfig(config);
+        if (remember) saveConfig(target);
       } catch (error) {
         console.error("Failed to connect to bus:", error);
         if (!cancelled) {
-          setConnectError(String(error));
-          setConfig(null);
+          // No retry on reload with the same bad config. Retry goes back to
+          // the server, which is what fixing a port-forward wants.
+          clearConfig();
+          setStage({ kind: "unconfigured", error: String(error) });
         }
       }
     })();
@@ -146,7 +131,7 @@ export default function App() {
       });
       busHandleRef.current = null;
     };
-  }, [config]);
+  }, [stage]);
 
   const local = useCallback((text: string) => dispatch({ type: "local", text, at: Date.now() }), []);
 
@@ -226,8 +211,11 @@ export default function App() {
     e.preventDefault();
   };
 
-  if (!config) {
-    return <ConnectForm error={connectError} onConnect={setConfig} />;
+  // A same-origin fetch of a small file. Nothing to show for the moment it
+  // takes.
+  if (stage.kind === "looking") return null;
+  if (stage.kind === "unconfigured") {
+    return <NotConnected error={stage.error} onRetry={() => setStage({ kind: "looking" })} />;
   }
 
   return (
@@ -262,7 +250,7 @@ export default function App() {
         <div className="app-chat">
           <Chat
             entries={state.chat}
-            user={config.user}
+            user={stage.config.user}
             conversation={canSend ? conversation : undefined}
             probe={state.probe}
             probePending={probePending}
