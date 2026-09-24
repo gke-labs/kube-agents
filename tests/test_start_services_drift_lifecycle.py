@@ -12,8 +12,16 @@ which `pkill -P` on the dead subshell's pid matches nothing. It then has to
 outlive the signal it sent: this script is the container's PID 1, so returning
 from `terminate` is the script exiting, and the kernel takes the PID namespace
 with it -- a SIGTERM delivered and not waited for buys nothing over a SIGKILL.
-And it must not orphan a process launched during the wait, which is what would
-happen if a supervisor in its backoff `sleep` were free to loop.
+And it must not orphan a process launched during the wait, which is what a
+supervisor free to go round its loop will do: the process it was supervising
+exits, the loop reaches its backoff `sleep`, and once that elapses it starts a
+replacement inside the drain that the drain then kills unsignalled.
+
+That last one is why every fake supervisor below is the shape the script ships --
+a `while true` loop that runs its process in the foreground and sleeps between
+runs -- and not the `( child & wait )` shape that is easier to write. Against the
+easier shape the supervisor exits when its child does, `pgrep -P` goes empty, and
+a drain that would loop forever against the real thing looks correct.
 
 What all three protect is the detector's shutdown, which NACKs the records it
 has not finished with so that they redeliver rather than each costing a
@@ -31,6 +39,10 @@ script that does not reach its `wait -n` on the credential path for as long as
 the deadline runs, during which a dead credential runtime or Envoy would not end
 the container.
 
+The intervals both of those sleep on arrive from the environment unfiltered, so
+the last class here holds the clamp that keeps a hand-typed value from turning a
+supervisor into a hot loop or the wait into a permanent one.
+
 These run bash against the functions and constants as they ship rather than
 against a copy, so a fix to the script cannot pass a test of last week's text.
 """
@@ -38,6 +50,7 @@ against a copy, so a fix to the script cannot pass a test of last week's text.
 import os
 import pathlib
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -76,6 +89,64 @@ _SHUTDOWN_FLOOR_SECONDS = 1.0
 _SHORT_DRAIN_SECONDS = 2
 _DRAIN_CEILING_SECONDS = 8.0
 
+# How long to give bash to reap a supervisor the drain has just killed. The wait
+# is what makes the check deterministic: SIGKILL is delivered synchronously but
+# the reap that makes `kill -0` fail is a SIGCHLD the shell handles when it next
+# runs a command, so testing once immediately after terminate() races it.
+_REAP_OBSERVATION_SECONDS = 2
+
+# The fake supervisor's backoff between runs of its process. Short enough that a
+# supervisor still free to go round its loop gets there well inside the drain
+# budget below, which is the whole point of the relaunch test: the defect has to
+# have room to happen, or the test passes on a broken drain by running out of
+# scenario rather than by being satisfied.
+_SUPERVISOR_BACKOFF_SECONDS = 2
+
+# The drain budget for the relaunch test. Comfortably longer than a backoff plus
+# the relaunch after it, so a drain that leaves the supervisor looping fails on
+# the replacement it orphaned rather than on the clock.
+_RELAUNCH_DRAIN_SECONDS = 8
+
+# How long that test's child takes to shut down, so that the drain's first poll
+# lands while it is still there. A child that dies the instant it is signalled
+# lets the drain finish before the supervisor has left its loop, which is a pass
+# for a reason the test is not making an assertion about.
+_RELAUNCH_SHUTDOWN_SECONDS = 1
+
+# What the drain should cost once the supervisor leaves its loop: its child exits
+# on the signal, so anything near the budget means the poll never went empty.
+_EARLY_BREAK_CEILING_SECONDS = 4.0
+
+# Every setting the clamp block covers, with a value the clamp leaves alone. The
+# harness sets all of them because `clamp_at_least` reads each by name under
+# `set -u`, and a test interested in one still has to supply the rest.
+_GOOD_INTERVAL_SECONDS = 10
+_CLAMPED_SETTINGS = (
+    "WATCHER_RETRY_MIN_SECONDS",
+    "WATCHER_RETRY_MAX_SECONDS",
+    "DRIFT_RETRY_MIN_SECONDS",
+    "DRIFT_RETRY_MAX_SECONDS",
+    "DRIFT_DAEMON_POLL_SECONDS",
+    "DRIFT_DAEMON_WAIT_SECONDS",
+    "WATCHER_HEALTHY_RUN_SECONDS",
+    "DRIFT_HEALTHY_RUN_SECONDS",
+    "DRIFT_SHORT_EXIT_ALERT_COUNT",
+)
+
+# A value that is all digits, in range, and still fatal: bash reads a leading
+# zero as octal, and 8 is not an octal digit, so `$(( 08 ))` is an error rather
+# than eight. `012` would be the quieter half of the same bug -- valid octal,
+# silently ten -- but an error is the half a test can assert on cheaply.
+_LEADING_ZERO_VALUE = "08"
+
+# The two ceilings and the settings that floor them. A test that hands a ceiling
+# a small value has to lower its floor too, or the clamp it is measuring is the
+# floor's rather than the one it meant to exercise.
+_CEILING_FLOORS = {
+    "WATCHER_RETRY_MAX_SECONDS": "WATCHER_RETRY_MIN_SECONDS",
+    "DRIFT_RETRY_MAX_SECONDS": "DRIFT_RETRY_MIN_SECONDS",
+}
+
 # The deadline handed to wait_for_drift_daemon when the test wants it to expire.
 # Two polls of one second: enough to prove it loops rather than falling straight
 # through, short enough to keep the suite fast.
@@ -111,6 +182,18 @@ def _run_bash(
     )
 
 
+def _interval_settings(**overrides: object) -> str:
+    """Bash assignments for every setting the clamp block reads.
+
+    All of them every time: `clamp_interval` dereferences each by name under
+    `set -u`, so a test interested in one still has to supply the rest, and the
+    ones it is not interested in get a value the clamp leaves alone.
+    """
+    values: dict[str, object] = dict.fromkeys(_CLAMPED_SETTINGS, _GOOD_INTERVAL_SECONDS)
+    values.update(overrides)
+    return "\n".join(f'{name}="{value}"' for name, value in values.items())
+
+
 def _kill_recorded(pidfile: pathlib.Path) -> None:
     """SIGKILL the process whose pid is in `pidfile`, if it is still there.
 
@@ -130,6 +213,23 @@ class _ScriptCase(unittest.TestCase):
 
     def lift(self, name: str) -> str:
         return lift_function(name, self.text, _SCRIPT)
+
+    def clamp_block(self) -> str:
+        """The shipped interval clamp: the floor, the helper, and the calls.
+
+        The three together, because each is inert without the others -- a helper
+        nobody calls clamps nothing, and the calls are what decide which settings
+        are covered and which floor each gets.
+        """
+        calls = re.findall(r"^clamp_at_least .*$", self.text, re.M)
+        assert calls, f"{_SCRIPT} no longer clamps anything"
+        return "\n".join(
+            [
+                lift_constant("MIN_SETTING_VALUE", self.text, _SCRIPT),
+                lift_function("clamp_at_least", self.text, _SCRIPT),
+                *calls,
+            ]
+        )
 
 
 class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
@@ -154,29 +254,59 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         {body}
         """
 
+    def _supervisor(
+        self,
+        child: str,
+        pidfile: pathlib.Path,
+        backoff: int = _SUPERVISOR_BACKOFF_SECONDS,
+    ) -> str:
+        """A fake supervisor of the shape both launchers ship, assigned to drift_pid.
+
+        A `while true` loop that runs its process in the *foreground* and sleeps
+        between runs, carrying the `trap 'exit 0' TERM` the real ones carry. Both
+        halves matter. The process is a real child, so `pkill -P` reaches it; the
+        loop means a drain that signals only the child does not end the
+        supervisor, which is the difference between this and a
+        `( child & wait )` stand-in that exits when its child does and makes a
+        broken drain look correct.
+
+        Its output goes to /dev/null and its pid to `pidfile`, both because a
+        drain under test may fail to end it: on the captured pipe it would block
+        `subprocess.run` until the timeout instead of failing an assertion, and
+        unrecorded it would loop for the rest of the session.
+        """
+        return f"""
+        (
+          trap 'exit 0' TERM
+          while true; do
+            bash -c {shlex.quote(child)} || true
+            sleep {backoff}
+          done
+        ) >/dev/null 2>&1 &
+        drift_pid=$!
+        echo "${{drift_pid}}" > {pidfile}
+        """
+
     def test_the_supervised_process_receives_sigterm(self) -> None:
         """The first regression: kill the subshell first and this never arrives."""
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = pathlib.Path(tmp)
             ready = tmpdir / "ready"
             signalled = tmpdir / "signalled"
+            supervisor = tmpdir / "supervisor"
 
-            # A supervisor of the shape start_drift_detector uses: a subshell
-            # whose only job is to run the process it launched. The process has
-            # to be a separate one -- `pkill -P` is how the supervisor's child is
-            # reached, and a subshell that traps for itself has no child to find.
+            child = f"""trap 'touch {signalled}; exit 0' TERM
+                        touch {ready}
+                        for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done"""
             body = f"""
-            (
-              bash -c 'trap "touch {signalled}; exit 0" TERM
-                       touch {ready}
-                       for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done' &
-              wait
-            ) &
-            drift_pid=$!
+            {self._supervisor(child, supervisor)}
             while [ ! -e {ready} ]; do sleep {_MARKER_POLL_SECONDS}; done
             terminate
             """
-            _run_bash(self._harness(body))
+            try:
+                _run_bash(self._harness(body))
+            finally:
+                _kill_recorded(supervisor)
 
             self.assertTrue(
                 signalled.exists(),
@@ -197,29 +327,24 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
             ready = tmpdir / "ready"
             done = tmpdir / "done"
             returned = tmpdir / "returned"
+            supervisor = tmpdir / "supervisor"
 
-            # The child's output goes to /dev/null rather than the captured
-            # pipe. A child that outlives the harness holds that pipe open, and
-            # `subprocess.run` then blocks until it closes -- which would make
-            # this test pass on a terminate() that waited for nothing, the
-            # waiting having been done by the test.
+            child = f"""trap 'sleep {_CHILD_SHUTDOWN_SECONDS}; touch {done}; exit 0' TERM
+                        touch {ready}
+                        for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done"""
             body = f"""
-            (
-              bash -c 'trap "sleep {_CHILD_SHUTDOWN_SECONDS}; touch {done}; exit 0" TERM
-                       touch {ready}
-                       for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done' \
-                >/dev/null 2>&1 &
-              wait
-            ) &
-            drift_pid=$!
+            {self._supervisor(child, supervisor)}
             while [ ! -e {ready} ]; do sleep {_MARKER_POLL_SECONDS}; done
             terminate
             touch {returned}
             echo "terminate-returned"
             """
-            started = time.monotonic()
-            result = _run_bash(self._harness(body, drain=_CHILD_SHUTDOWN_SECONDS * 5))
-            elapsed = time.monotonic() - started
+            try:
+                started = time.monotonic()
+                result = _run_bash(self._harness(body, drain=_CHILD_SHUTDOWN_SECONDS * 5))
+                elapsed = time.monotonic() - started
+            finally:
+                _kill_recorded(supervisor)
 
             self.assertIn("terminate-returned", result.stdout)
             self.assertTrue(
@@ -243,22 +368,33 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
     def test_it_gives_up_on_a_process_that_ignores_sigterm(self) -> None:
         """The drain is bounded: the pod's grace period is not ours to spend."""
         with tempfile.TemporaryDirectory() as tmp:
-            pidfile = pathlib.Path(tmp) / "pid"
+            tmpdir = pathlib.Path(tmp)
+            pidfile = tmpdir / "pid"
+            supervisor = tmpdir / "supervisor"
 
             # This child outlives the harness by design, so it records its pid
-            # for the cleanup below rather than being left to the reaper.
+            # for the cleanup below rather than being left to the reaper. Its
+            # supervisor outlives it too: bash runs the trap between commands, so
+            # a supervisor whose foreground child never returns never reaches it.
+            child = f"""trap '' TERM
+                        echo $$ > {pidfile}
+                        for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done"""
+            # Whether the supervisor is gone afterwards is the other half of the
+            # claim, and the poll is why it is not a race: SIGKILL lands at once
+            # but the reap that makes `kill -0` fail is a SIGCHLD this shell
+            # handles between commands.
+            reap_polls = int(_REAP_OBSERVATION_SECONDS / _MARKER_POLL_SECONDS)
             body = f"""
-            (
-              bash -c 'trap "" TERM
-                       echo $$ > {pidfile}
-                       for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done' \
-                >/dev/null 2>&1 &
-              wait
-            ) &
-            drift_pid=$!
+            {self._supervisor(child, supervisor)}
             while [ ! -s {pidfile} ]; do sleep {_MARKER_POLL_SECONDS}; done
             terminate
             echo "terminate-returned"
+            reaped=no
+            for _ in $(seq 1 {reap_polls}); do
+              kill -0 "$(cat {supervisor})" 2>/dev/null || {{ reaped=yes; break; }}
+              sleep {_MARKER_POLL_SECONDS}
+            done
+            echo "supervisor-reaped=${{reaped}}"
             """
             try:
                 started = time.monotonic()
@@ -266,6 +402,7 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                 elapsed = time.monotonic() - started
             finally:
                 _kill_recorded(pidfile)
+                _kill_recorded(supervisor)
 
             self.assertIn("terminate-returned", result.stdout)
             self.assertLess(
@@ -274,67 +411,103 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                 "terminate() outlasted its drain budget waiting on a process that "
                 "will never exit",
             )
+            self.assertIn(
+                "supervisor-reaped=yes",
+                result.stdout,
+                "the drain gave up without ending the supervisor. Its last resort "
+                "has to be SIGKILL: the trap defers a second SIGTERM exactly as it "
+                "deferred the first, and a supervisor still running at the budget "
+                "is by definition one whose process did not return",
+            )
 
-    def test_a_supervisor_in_its_backoff_sleep_does_not_relaunch(self) -> None:
-        """The third: killing the backoff `sleep` must end the supervisor.
+    def test_the_supervisor_does_not_relaunch_inside_the_drain(self) -> None:
+        """The third: the drain must end the loop, not just the process in it.
 
-        A crash-looping detector spends most of its time here, so this is the
-        ordinary state at shutdown rather than an edge. `set -e` is what stops
-        the loop from starting a replacement the drain would then orphan, which
-        makes the shell option load-bearing -- hence a test rather than a
-        comment.
+        Signalling only the child leaves the supervisor going round: the child
+        exits, the loop reaches its backoff `sleep`, and when that elapses it
+        starts a replacement *inside* the drain -- which the drain then kills
+        without signalling, since its one round of `pkill` is long past. The
+        symptom on a pod is a detector that is SIGKILLed mid-flight on every
+        shutdown, redelivering whatever it was holding, and a drain that always
+        costs its full budget because `pgrep -P` keeps finding the backoff
+        `sleep` and never goes empty.
         """
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = pathlib.Path(tmp)
-            ready = tmpdir / "ready"
-            relaunched = tmpdir / "relaunched"
+            launches = tmpdir / "launches"
+            supervisor = tmpdir / "supervisor"
 
+            child = f"""trap 'sleep {_RELAUNCH_SHUTDOWN_SECONDS}; exit 0' TERM
+                        echo started >> {launches}
+                        for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done"""
             body = f"""
-            (
-              while true; do
-                touch {ready}
-                sleep {_CHILD_LIFETIME_SECONDS}
-                touch {relaunched}
-              done
-            ) &
-            drift_pid=$!
-            while [ ! -e {ready} ]; do sleep {_MARKER_POLL_SECONDS}; done
-            sleep {_MARKER_POLL_SECONDS}
+            {self._supervisor(child, supervisor)}
+            while [ ! -s {launches} ]; do sleep {_MARKER_POLL_SECONDS}; done
             terminate
+            echo "terminate-returned"
             """
-            _run_bash(self._harness(body))
-            time.sleep(_MARKER_POLL_SECONDS * 4)
+            try:
+                started = time.monotonic()
+                result = _run_bash(self._harness(body, drain=_RELAUNCH_DRAIN_SECONDS))
+                elapsed = time.monotonic() - started
+                # The replacement, if there is one, may still be starting as
+                # terminate() returns.
+                time.sleep(_SUPERVISOR_BACKOFF_SECONDS)
+            finally:
+                _kill_recorded(supervisor)
 
-            self.assertFalse(
-                relaunched.exists(),
-                "the supervisor looped after its backoff sleep was killed, so the "
-                "process it started next was never signalled",
+            self.assertIn("terminate-returned", result.stdout)
+            self.assertEqual(
+                launches.read_text().count("started"),
+                1,
+                "the supervisor went round its loop during the drain and started a "
+                "replacement, which terminate() then killed without signalling",
+            )
+            self.assertLess(
+                elapsed,
+                _EARLY_BREAK_CEILING_SECONDS,
+                "the drain ran for most of its budget although the supervised process "
+                "exited at once, so the poll was finding something other than it -- the "
+                "backoff `sleep` of a supervisor still in its loop",
             )
 
-        # The above proves the mechanism against a supervisor of the same shape.
-        # This proves the two real ones still have that shape: a `|| true` on
-        # either backoff sleep would leave errexit with nothing to act on, and
-        # the orphan would come back with every test above still green.
+    def test_both_launchers_leave_their_loop_on_sigterm(self) -> None:
+        """The mechanism above, asserted against the two real supervisors.
+
+        bash defers a trap until the foreground command returns, which is what
+        makes this safe: the supervised process still gets its full shutdown, and
+        the supervisor then exits instead of reaching its backoff `sleep`. Drop
+        the trap from either launcher and the orphan comes back with every test
+        above still green, because they run a fake supervisor rather than these.
+        """
         for name in ("start_event_watcher", "start_drift_detector"):
             with self.subTest(launcher=name):
-                self.assertRegex(
+                self.assertIn(
+                    "trap 'exit 0' TERM",
                     self.lift(name),
-                    re.compile(r'^ *sleep "\$\{delay\}"$', re.M),
-                    f"{name}'s backoff sleep no longer fails the supervisor, so "
-                    "terminate() can orphan the process it relaunches",
+                    f"{name}'s supervisor no longer leaves its loop on SIGTERM, so "
+                    "terminate() can orphan the replacement it starts mid-drain",
                 )
 
     def test_both_supervisors_are_drained_and_the_signal_precedes_the_kill(self) -> None:
         drain = self.lift("drain_supervised")
         pkill_at = drain.find("pkill -TERM -P")
-        wait_at = drain.find("pgrep -P")
-        kill_at = drain.find("\n    kill ")
+        term_at = drain.find('kill -TERM "${pid}"')
+        wait_at = drain.find('kill -0 "${pid}"')
+        kill_at = drain.find('kill -KILL "${pid}"')
 
         self.assertNotEqual(pkill_at, -1, "drain_supervised no longer signals children")
+        self.assertNotEqual(term_at, -1, "drain_supervised no longer signals the supervisors")
         self.assertNotEqual(wait_at, -1, "drain_supervised no longer waits for them to exit")
-        self.assertNotEqual(kill_at, -1, "drain_supervised no longer kills the supervisors")
+        self.assertNotEqual(
+            kill_at,
+            -1,
+            "drain_supervised's last resort is no longer SIGKILL; a second SIGTERM is "
+            "deferred by the supervisor's trap exactly as the first was, so it cannot "
+            "end a supervisor whose process is ignoring the signal",
+        )
         self.assertLess(
-            pkill_at,
+            max(pkill_at, term_at),
             wait_at,
             "drain_supervised waits before it signals, so it waits for nothing",
         )
@@ -362,27 +535,12 @@ class WaitForDriftDaemon(_ScriptCase):
         readonly KV_DAEMON_HOST=127.0.0.1
         readonly KV_DAEMON_PORT={port}
         readonly KV_DAEMON_URL="http://127.0.0.1:{port}"
-        DRIFT_DAEMON_WAIT_SECONDS={wait}
-        DRIFT_DAEMON_POLL_SECONDS={poll}
-        {self._clamp()}
+        {_interval_settings(DRIFT_DAEMON_WAIT_SECONDS=wait, DRIFT_DAEMON_POLL_SECONDS=poll)}
+        {self.clamp_block()}
         {self.lift("wait_for_drift_daemon")}
         wait_for_drift_daemon
         echo "returned=$?"
         """
-
-    def _clamp(self) -> str:
-        """The shipped guard on DRIFT_DAEMON_POLL_SECONDS, lifted as text.
-
-        It is an `if` at file scope rather than a function, so there is nothing
-        for `lift_function` to take.
-        """
-        match = re.search(
-            r"^if \[\[ ! \"\$\{DRIFT_DAEMON_POLL_SECONDS\}\".*?^fi$",
-            self.text,
-            re.S | re.M,
-        )
-        assert match is not None, f"{_SCRIPT} no longer clamps DRIFT_DAEMON_POLL_SECONDS"
-        return match.group(0)
 
     def test_it_returns_as_soon_as_the_daemon_is_listening(self) -> None:
         with socket.socket() as listener:
@@ -461,6 +619,124 @@ class WaitForDriftDaemon(_ScriptCase):
             "the daemon wait runs before the supervisor subshell is backgrounded, so the script "
             "does not reach its `wait -n` on the credential path until the deadline expires",
         )
+
+
+class EveryTunableIsCorrectedBeforeAnythingReadsIt(_ScriptCase):
+    """The settings all arrive from the environment, unfiltered.
+
+    `spec.deployment.env` reaches this container as written, so a hand-typed
+    value is the realistic source of a bad one, and every way of getting one
+    wrong ends the same way: a container that stays Ready with nothing in the
+    log. Four shapes, each with its own route there.
+
+    Zero survives every check the retry loops already make: `sleep 0` returns at
+    once, `0 * 2` stays zero, and the cap comparison never lifts it, so a
+    detector that exits quickly is re-exec'd as fast as the kernel allows -- in
+    the same container as the API authenticator, for the life of the pod. A
+    ceiling below its floor is the same loop by a longer route, the cap line
+    dragging every backoff back down on the second failure. A non-numeric value
+    makes `sleep` fail and, worse, is read as a variable name by the bare-word
+    comparisons these feed, so under `set -u` it is a fatal "unbound variable" on
+    the loop's first pass. And a leading zero passes for a number right up until
+    the first `$(( ))` touches it, where bash reads it as octal.
+    """
+
+    def _clamped(self, **overrides: object) -> tuple[dict[str, str], str]:
+        script = "\n".join(
+            [
+                "set -u",
+                _interval_settings(**overrides),
+                self.clamp_block(),
+                *(f'echo "{name}=${{{name}}}"' for name in _CLAMPED_SETTINGS),
+            ]
+        )
+        result = _run_bash(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return dict(line.split("=", 1) for line in result.stdout.split()), result.stderr
+
+    def test_a_zero_retry_floor_cannot_become_a_hot_loop(self) -> None:
+        values, stderr = self._clamped(
+            WATCHER_RETRY_MIN_SECONDS=0, DRIFT_RETRY_MIN_SECONDS=0
+        )
+
+        for name in ("WATCHER_RETRY_MIN_SECONDS", "DRIFT_RETRY_MIN_SECONDS"):
+            with self.subTest(setting=name):
+                self.assertNotEqual(
+                    values[name],
+                    "0",
+                    f"{name}=0 reaches the supervisor's backoff, which then re-execs a "
+                    "fast-failing process as fast as the kernel allows",
+                )
+                self.assertIn(name, stderr, f"{name} was clamped without saying so")
+
+    def test_a_ceiling_below_its_floor_is_raised_to_it(self) -> None:
+        """Otherwise the cap line drags every backoff back down to the ceiling."""
+        floor = _GOOD_INTERVAL_SECONDS
+        overrides: dict[str, object] = {}
+        for ceiling, floor_name in _CEILING_FLOORS.items():
+            overrides[floor_name] = floor
+            overrides[ceiling] = 1
+        values, stderr = self._clamped(**overrides)
+
+        for ceiling, floor_name in _CEILING_FLOORS.items():
+            with self.subTest(setting=ceiling):
+                self.assertGreaterEqual(
+                    int(values[ceiling]),
+                    floor,
+                    f"{ceiling} stayed below its minimum, so the cap pulls the backoff "
+                    "down to it on the second failure and the retry never slows",
+                )
+                # The setting that was wrong is the ceiling; the one that set the
+                # floor is a different variable, and an operator debugging the
+                # message needs to be sent to both rather than to the default.
+                self.assertRegex(stderr, rf"{ceiling}=.*minimum {floor_name}={floor}")
+
+    def test_a_non_numeric_interval_never_reaches_sleep(self) -> None:
+        """`sleep abc` fails, errexit ends the supervisor, and nothing says so."""
+        for name in _CLAMPED_SETTINGS:
+            with self.subTest(setting=name):
+                values, stderr = self._clamped(**{name: "abc"})
+
+                self.assertRegex(
+                    values[name],
+                    r"^[0-9]+$",
+                    f"{name} would be passed to `sleep` as written",
+                )
+                self.assertIn(name, stderr, f"{name} was clamped without saying so")
+
+    def test_a_leading_zero_is_normalised_rather_than_passed_through(self) -> None:
+        """`08` is all digits and in range, and still kills the supervisor.
+
+        Every arithmetic expansion downstream reads it as octal -- `08: value too
+        great for base` -- which under errexit ends the subshell. A check that
+        tested only the shape would let it through, so the clamp rewrites the
+        value rather than merely accepting it.
+        """
+        for name in _CLAMPED_SETTINGS:
+            with self.subTest(setting=name):
+                overrides: dict[str, object] = {name: _LEADING_ZERO_VALUE}
+                if name in _CEILING_FLOORS:
+                    overrides[_CEILING_FLOORS[name]] = 1
+                values, _ = self._clamped(**overrides)
+                usable = _run_bash(f"set -e; echo $(( {values[name]} + 1 ))")
+
+                self.assertEqual(
+                    usable.returncode,
+                    0,
+                    f"{name}={values[name]} still fails bash arithmetic: "
+                    f"{usable.stderr.strip()}",
+                )
+                self.assertEqual(int(values[name]), int(_LEADING_ZERO_VALUE))
+
+    def test_usable_values_are_left_alone_and_say_nothing(self) -> None:
+        """The clamp is a floor, not a policy: it must not rewrite a good value."""
+        values, stderr = self._clamped()
+
+        self.assertEqual(
+            values,
+            {name: str(_GOOD_INTERVAL_SECONDS) for name in _CLAMPED_SETTINGS},
+        )
+        self.assertEqual(stderr.strip(), "")
 
 
 class TheDaemonAddressIsDeclaredOnceAndUsedByBoth(_ScriptCase):

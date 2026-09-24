@@ -641,9 +641,13 @@ restructured payload arrives looking exactly like an empty one.
 Shutdown is the fourth way, and the entrypoint has to cooperate with it. On SIGTERM the subscriber
 stops pulling and spends `settleGracePeriod` nacking what it has not finished with, so those
 records redeliver to the next pod rather than each costing a duplicate inject. `terminate()` in
-`start-services.sh` therefore signals the detector before the subshell supervising it — the other
-order reparents the process and never reaches it — and then waits for it to exit, because that
-script is the container's PID 1 and returning from the trap is the container going away.
+`start-services.sh` therefore signals the detector and the subshell supervising it together, and
+waits for that subshell to exit — the supervisor's own `trap 'exit 0' TERM` is deferred until the
+detector returns, so the detector still gets its whole grace period and the supervisor then leaves
+its retry loop rather than starting a replacement mid-drain. Signalling the supervisor first and
+alone would reparent the detector and never reach it; signalling only the detector leaves the loop
+free to go round again. The wait is not optional: that script is the container's PID 1, and
+returning from the trap is the container going away.
 
 **The `resourceName` grammar has two ambiguous shapes**, both handled explicitly in
 `resourcename.go`: the namespace object itself (`core/v1/namespaces/foo`, where `namespaces/<ns>`

@@ -112,16 +112,80 @@ readonly KV_DAEMON_URL="http://${KV_DAEMON_HOST}:${KV_DAEMON_PORT}"
 DRIFT_DAEMON_WAIT_SECONDS="${DRIFT_DAEMON_WAIT_SECONDS:-300}"
 DRIFT_DAEMON_POLL_SECONDS="${DRIFT_DAEMON_POLL_SECONDS:-2}"
 
-# A non-positive poll interval would leave the wait loop's counter where it
-# started, so it would probe forever and the detector would never be launched at
-# all. That failure is silent in the worst way: a detector that never started has
-# no short exits, so the supervisor's ALERT never fires either, and the container
-# stays Ready with drift detection off and nothing in the log. Clamp rather than
-# reject — these two are an escape hatch for a slow cluster, not a configuration
-# surface anyone is expected to get right.
-if [[ ! "${DRIFT_DAEMON_POLL_SECONDS}" =~ ^[0-9]+$ ]] || [[ "${DRIFT_DAEMON_POLL_SECONDS}" -lt 1 ]]; then
-  DRIFT_DAEMON_POLL_SECONDS=1
-fi
+# The floor under every tunable above. All of them arrive from the environment,
+# and `spec.deployment.env` reaches this container unfiltered, so a hand-written
+# value is the realistic source of a bad one. Every way of getting one wrong ends
+# with the same symptom -- a container that stays Ready with nothing in the log --
+# which is why they are corrected here rather than acted on where they are read.
+#
+# Zero is the dangerous value in a backoff, because it survives every check the
+# retry loops already make: `sleep 0` returns at once, `0 * 2` stays 0, and the
+# cap comparison never lifts it, so a detector or watcher that exits quickly is
+# re-exec'd as fast as the kernel allows, for the life of the pod, in the same
+# container as the API authenticator. A zero daemon poll never advances the wait
+# loop's counter, so the detector is never launched at all — silent in the worst
+# way, because a process that never started has no short exits and the
+# supervisor's ALERT below cannot fire either.
+#
+# A non-numeric value fails harder and just as quietly. `sleep abc` returns
+# non-zero and errexit ends the supervisor subshell; worse, the bare-word
+# comparisons these feed (`[[ "${ran}" -ge "${WATCHER_HEALTHY_RUN_SECONDS}" ]]`)
+# treat the value as a variable name, so under `set -u` it is a fatal
+# "abc: unbound variable" on the loop's first pass.
+#
+# A leading zero is the quiet one. It satisfies `^[0-9]+$`, so a check that only
+# tested the shape would pass it through, and then every later `$(( ))` that
+# touches it fails as a bad octal literal — `08: value too great for base` — which
+# under errexit is the same dead supervisor by a third route. Normalising here is
+# the fix; testing for it at each use site is the bug waiting to be reintroduced.
+#
+# Correct rather than reject. These are an escape hatch for a slow cluster, not a
+# configuration surface anyone is expected to get right, and a container that
+# refuses to start over a mistyped backoff is a worse outcome than one that backs
+# off differently than intended. A substitution says so on stderr so the
+# difference is discoverable; a normalisation does not, because `08` and `8` are
+# the same request.
+# shellcheck disable=SC2034  # read indirectly, as clamp_at_least's default floor name
+readonly MIN_SETTING_VALUE=1
+
+# Rewrite the *named* variable, in place, to a decimal integer of at least the
+# value held by $2 (default MIN_SETTING_VALUE). By name on both sides because the
+# point is to correct what the rest of the script reads, and because the message
+# has to name the setting that was wrong and the setting that set the floor —
+# which are not the same one when a ceiling is raised to meet its minimum.
+clamp_at_least() {
+  local name="$1"
+  local floor_name="${2:-MIN_SETTING_VALUE}"
+  local floor="${!floor_name}"
+  local value="${!name}"
+
+  # Short-circuit order matters: the arithmetic on the right is only reached for
+  # a value the pattern already proved is all digits.
+  if [[ "${value}" =~ ^[0-9]+$ ]] && [[ "$((10#${value}))" -ge "${floor}" ]]; then
+    printf -v "${name}" '%s' "$((10#${value}))"
+    return 0
+  fi
+
+  printf -v "${name}" '%s' "${floor}"
+  echo "start-services: ${name}=${value} is not usable (minimum ${floor_name}=${floor}); using ${floor}" >&2
+}
+
+clamp_at_least WATCHER_RETRY_MIN_SECONDS
+clamp_at_least DRIFT_RETRY_MIN_SECONDS
+# The ceilings are floored at their own minimum, not at MIN_SETTING_VALUE: a
+# maximum below the minimum makes the cap line drag every backoff back down to it
+# on the second failure, which is the same hot loop by a longer route.
+clamp_at_least WATCHER_RETRY_MAX_SECONDS WATCHER_RETRY_MIN_SECONDS
+clamp_at_least DRIFT_RETRY_MAX_SECONDS DRIFT_RETRY_MIN_SECONDS
+clamp_at_least DRIFT_DAEMON_POLL_SECONDS
+clamp_at_least DRIFT_DAEMON_WAIT_SECONDS
+# Not intervals — a run length and a count — but read by the same bare-word
+# comparisons from the same unfiltered environment, and they fail worse than the
+# ones above: the supervisor dies on its first pass rather than backing off wrong,
+# before the process has run once.
+clamp_at_least WATCHER_HEALTHY_RUN_SECONDS
+clamp_at_least DRIFT_HEALTHY_RUN_SECONDS
+clamp_at_least DRIFT_SHORT_EXIT_ALERT_COUNT
 
 # How long terminate() waits for a signalled process to exit before killing the
 # subshell supervising it and returning.
@@ -210,28 +274,43 @@ envoy_pid=""
 watcher_pid=""
 drift_pid=""
 
-# Shut down every supervised process, then the subshells supervising them, given
-# the supervisors' pids. That order matters and so does the wait between the two
-# halves; both are load-bearing and neither is obvious.
+# Shut down every supervised process and the subshell supervising it, given the
+# supervisors' pids. Three things here are load-bearing and none is obvious: what
+# gets signalled, that the wait exists at all, and what the wait watches.
 #
-# The supervised process first, because killing the subshell first reparents the
-# process it launched to PID 1, after which `pkill -P` on the dead subshell's pid
-# matches nothing. The process then never sees SIGTERM at all and is SIGKILLed
-# when this script exits.
+# **Signal both, per supervisor.** The supervised process needs SIGTERM because it
+# is the one with shutdown work to do. The supervisor needs it because otherwise
+# its `while true` loop simply goes round again: the process exits, the loop
+# computes `ran`, logs, and reaches its backoff `sleep`, and once that sleep
+# elapses it launches a *replacement* underneath this very function. Its
+# `trap 'exit 0' TERM` is deferred by bash until the foreground process returns,
+# so signalling the two together costs the supervised process nothing -- it still
+# gets its full shutdown, and the supervisor then leaves the loop instead of
+# restarting it.
 #
-# The wait, because a SIGTERM this script does not outlive is not a shutdown. The
-# drift-detector's handler NACKs the records it has not finished with so that
+# Signalling the supervisor is not the same as ending it, which is why the kill
+# is at the bottom rather than here. Ending the subshell reparents the process it
+# launched to PID 1, after which `pkill -P` on the dead subshell's pid matches
+# nothing; the process never sees SIGTERM and is SIGKILLed when this script exits.
+#
+# **The wait**, because a SIGTERM this script does not outlive is not a shutdown.
+# The drift-detector's handler NACKs the records it has not finished with so that
 # they redeliver rather than each costing a duplicate inject, and the watcher's
 # writes its dedup snapshot so that a restart does not replay every event still
 # inside the API server's TTL. Both take seconds; this script exits milliseconds
 # after terminate() returns, and takes the PID namespace with it.
 #
-# Nothing relaunches underneath the wait. A supervisor between runs has the
-# backoff `sleep` as its only child, the pkill below kills that sleep, and
-# `set -e` (line 38) ends the supervisor on the non-zero status rather than
-# letting its loop start a replacement. That is load-bearing rather than
-# incidental: a `|| true` added to either supervisor's sleep would reintroduce
-# the orphan this function exists to prevent, silently.
+# **The wait watches the supervisors, not their children.** With the trap above, a
+# supervisor exits only once its foreground process has returned, so its own exit
+# is the completion signal and it arrives no earlier -- whereas its child set goes
+# empty in the instant between the process returning and the trap running, which
+# is a break before the loop has actually been left. Bash reaps its own background
+# jobs, so `kill -0` on an exited supervisor fails rather than finding a zombie.
+#
+# **The bottom kill is SIGKILL**, and only reached when the budget ran out. A
+# second SIGTERM would be deferred by the trap exactly as the first one was, so it
+# could not end a supervisor whose process is ignoring the signal -- which is the
+# only state a supervisor can still be in by the time the loop above gives up.
 drain_supervised() {
   local pid
   local waited=0
@@ -239,12 +318,13 @@ drain_supervised() {
 
   for pid in "$@"; do
     pkill -TERM -P "${pid}" 2>/dev/null || true
+    kill -TERM "${pid}" 2>/dev/null || true
   done
 
   while [[ "${waited}" -lt "${SHUTDOWN_DRAIN_SECONDS}" ]]; do
     running=""
     for pid in "$@"; do
-      if pgrep -P "${pid}" >/dev/null 2>&1; then
+      if kill -0 "${pid}" 2>/dev/null; then
         running=yes
         break
       fi
@@ -255,7 +335,7 @@ drain_supervised() {
   done
 
   for pid in "$@"; do
-    kill "${pid}" 2>/dev/null || true
+    kill -KILL "${pid}" 2>/dev/null || true
   done
 }
 
@@ -394,6 +474,13 @@ start_event_watcher() {
   fi
 
   (
+    # Leave the loop on SIGTERM instead of going round it again. bash runs a trap
+    # between commands, so this one is deferred until the foreground watcher below
+    # returns -- which is what makes it safe to signal the watcher and its
+    # supervisor at the same time: the watcher gets its full shutdown, and the
+    # supervisor then exits rather than reaching the backoff `sleep` and starting
+    # a replacement underneath terminate()'s drain. See drain_supervised.
+    trap 'exit 0' TERM
     delay="${WATCHER_RETRY_MIN_SECONDS}"
     consecutive=0
     while true; do
@@ -567,6 +654,11 @@ start_drift_detector() {
   fi
 
   (
+    # The same trap as the watcher's supervisor, for the same reason: it is what
+    # lets terminate() signal the detector and this subshell together without the
+    # loop launching a replacement while the drain is still waiting.
+    trap 'exit 0' TERM
+
     # Inside the subshell, not before it. This is the last launcher, so nothing
     # is waiting behind it to be started — what a foreground wait would delay is
     # the script's arrival at the `wait -n` on the credential path at the bottom
