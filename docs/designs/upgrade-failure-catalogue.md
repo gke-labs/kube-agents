@@ -219,7 +219,7 @@ that was just taken away, and a single-replica application has a guaranteed outa
   citing quota.
 - Mitigate before: `maxSurge` at least 1, one node of headroom in the pool, an autoscaler ceiling and accelerator quota that allow it; for accelerator pools surge is the strategy that fits a small quota, since `maxSurge` 1 needs one extra node's quota while blue-green needs a whole second pool's.
 - Mitigate after: add a node or raise the ceiling and the Pending pods schedule.
-- Read today: nothing.
+- Read today: the stockout-prevention audit flags regional GPU, TPU and CPU quota near exhaustion and pools near `autoscaling.maxNodeCount`; `maxSurge` and headroom against allocatable are unread.
 - GKE recommender: partial: `CLUSTER_UNDERPROVISIONED` from the [utilisation insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-cluster-utilization); nothing reads `maxSurge` or quota. The Network Analyzer's separate `google.networkanalyzer.container.ipAddressInsight` covers pod IP exhaustion.
 - Why it is on the list: it follows from how a drain works, not from an incident; no public story
   verified and no fixture. Accelerator pools are the common case because their quota is small.
@@ -403,7 +403,7 @@ that talks to the API without retrying fails for those minutes.
 - GKE recommender: none.
 - Why it is on the list: GKE's
   [cluster availability types](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters)
-  document the behaviour.
+  document the behaviour; no public incident verified and no fixture.
 
 ### 13. A node label or taint is removed
 
@@ -552,7 +552,8 @@ is the same.
 - Why it is on the list: the
   [1.25 CSI migration status](https://kubernetes.io/blog/2022/09/26/storage-in-tree-to-csi-migration-status-update-1.25/)
   and GKE's
-  [PD CSI driver page](https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/gce-pd-csi-driver).
+  [PD CSI driver page](https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/gce-pd-csi-driver);
+  no public incident verified and no fixture.
 
 ### 21. Images on a retired registry
 
@@ -579,10 +580,10 @@ read. GKE's recommender comes first, because one call per location returns the d
 insights (7) together with the budget (1), webhook (8), skew (11), runtime (14) and window (6)
 insights; the readiness requirements'
 [deprecation-insights section](upgrade-readiness-checks.md#gke-deprecation-insights) says what else
-the pause the deprecation family puts on automatic upgrades explains. Fail-closed webhooks (8) and capacity headroom
-(2) come next, because both turn a routine drain into an outage and both are a few list calls.
-Replica placement (3) follows, and then the node-image entries (13 to 21), which need the target
-version to be known before they mean anything. Post-upgrade detection is one mechanism for every
+the pause the deprecation family puts on automatic upgrades explains. Fail-closed webhooks (8) and the unread half of capacity headroom (2), surge settings and headroom
+against allocatable, come next, because both turn a routine drain into an outage and both are a few
+list calls. Replica placement (3) is already read. The node-image entries (13 to 21) follow, which
+need the target version to be known before they mean anything. Post-upgrade detection is one mechanism for every
 entry: watch the operation, then compare Pending and crash-looping pod counts, readiness flapping
 and a live service probe against the same measurements taken before the upgrade started, as the
 readiness requirements' [rollout section](upgrade-readiness-checks.md#rollout-and-verification)
