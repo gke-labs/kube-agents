@@ -194,6 +194,24 @@ def test_an_archive_that_fails_is_a_warning_naming_the_card(monkeypatch, caplog)
     assert "could not archive stalled card t_stuck" in caplog.text
 
 
+def test_a_refused_archive_warns_with_hermes_reason(monkeypatch, caplog):
+    # Review finding: hermes prints its refusal on stderr and exits 1, which
+    # _agent_shell turns into "", so the warning always read "no output". The
+    # script folds stderr in and exits 0 so the reason reaches the log.
+    scripts = []
+
+    def fake_shell(script, timeout):
+        scripts.append(script)
+        return "Error: task t_gone not found\n"
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._archive_stalled_cards(["t_gone"], 5.0)
+    assert scripts[0].endswith("2>&1 || true")
+    assert "could not archive stalled card t_gone" in caplog.text
+    assert "task t_gone not found" in caplog.text
+
+
 def test_a_card_that_settled_is_not_archived(monkeypatch):
     calls = []
     monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: calls.append(script) or "")

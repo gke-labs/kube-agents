@@ -134,10 +134,12 @@ _ATTACHMENTS_DIR = "/opt/data/kanban/attachments"
 _LOGS_DIR = "/opt/data/kanban/logs"
 # The hermes CLI in the agent pod, for when it is not on the exec shell's PATH.
 _HERMES_BIN_FALLBACK = "/opt/hermes/.venv/bin/hermes"
-# What ``hermes kanban archive <id>`` prints on success; a failure goes to
-# stderr with exit 1, which ``_agent_shell`` returns as an empty string.
+# What ``hermes kanban archive <id>`` prints on success. A refusal goes to
+# stderr with exit 1, so the archive script folds stderr in and exits 0:
+# ``_agent_shell`` returns nothing for a non-zero exit, and the reason is
+# what the warning is for.
 _ARCHIVED_PREFIX = "Archived "
-# How much of an unexpected archive reply the warning quotes.
+# How much of a refused archive's reply the warning quotes.
 _LOG_EXCERPT_CHARS = 200
 # One terminal command per line in a card's worker log, as hermes renders it:
 # ``  ┊ 💻 $         <command>  0.6s [exit 1]``. The timing and exit suffixes
@@ -860,13 +862,14 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     One exec per card, so a card the dispatcher already archived does not
     fail the batch for the rest, and each kill has the whole exec timeout.
     Best effort, like the rest of :meth:`KubeAgentsHarness._settle`, but a
-    card that did not archive is warned about by name: its worker may still
-    hold a slot, and the run log should not say otherwise.
+    card that did not archive is warned about by name, with hermes's reason:
+    its worker may still hold a slot, and the run log should not say
+    otherwise.
     """
     for tid in stalled:
         script = (
             f'H=$(command -v hermes || echo {_HERMES_BIN_FALLBACK}); '
-            f'"$H" kanban archive {_shell_quote(tid)}'
+            f'"$H" kanban archive {_shell_quote(tid)} 2>&1 || true'
         )
         out = _agent_shell(script, timeout).strip()
         if out.startswith(_ARCHIVED_PREFIX):
