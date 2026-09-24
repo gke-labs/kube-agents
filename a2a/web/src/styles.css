@@ -52,284 +52,40 @@ body {
   width: 100%;
 }
 
-.app-topology {
-  flex: 0 0 45%;
+.app-main {
+  flex: 1 1 auto;
   min-height: 0;
-  border-bottom: 1px solid var(--edge);
-  background:
-    radial-gradient(120% 90% at 50% 0%, #101520 0%, var(--panel) 55%, var(--void) 100%);
+  display: flex;
+  flex-direction: column;
+}
+
+.app-body {
+  flex: 0 0 auto;
+  min-height: 0;
   overflow: hidden;
 }
 
+.app-band {
+  flex: 0 0 6px;
+  border-top: 1px solid var(--edge);
+  border-bottom: 1px solid var(--edge);
+  background: var(--panel);
+  cursor: row-resize;
+  touch-action: none;
+}
+
+.app-band:hover,
+.app-band:focus-visible {
+  background: var(--edge);
+  outline: none;
+}
+
 .app-chat {
-  flex: 1 1 55%;
+  flex: 1 1 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--void);
-}
-
-/* --- rail panel ----------------------------------------------------------- */
-
-.rail-panel {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  padding: 18px 0 12px;
-}
-
-.rail-head,
-.rail-foot {
-  display: flex;
-  align-items: baseline;
-  gap: 14px;
-  padding: 0 24px;
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-}
-
-.rail-title {
-  color: var(--ink-bright);
-  font-weight: 600;
-}
-
-.rail-subject {
-  color: var(--ink-dim);
-  letter-spacing: 0.08em;
-  text-transform: none;
-}
-
-/* Centred in whatever height the panel has: the trace should sit on the
-   panel's optical midline, not float under the title. */
-.rail-svg {
-  display: block;
-  flex: 0 0 auto;
-  margin: auto 0;
-  width: 100%;
-  overflow: visible;
-}
-
-.rail-foot {
-  justify-content: space-between;
-  color: var(--ink-dim);
-  letter-spacing: 0.08em;
-  text-transform: none;
-}
-
-.rail-replay {
-  color: var(--ink);
-  letter-spacing: 0.1em;
-  text-transform: none;
-}
-
-/* --- the trace ------------------------------------------------------------ */
-
-.rail-trace {
-  stroke: var(--trace);
-  stroke-width: 1.25;
-  opacity: 0.9;
-}
-
-.rail-trace-halo {
-  stroke: var(--halo);
-  stroke-width: 9;
-  filter: blur(4px);
-}
-
-.rail-terminator {
-  stroke: var(--trace);
-  stroke-width: 1;
-  opacity: 0.35;
-}
-
-/* --- taps ----------------------------------------------------------------- */
-
-.tap {
-  animation: tap-arrive 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
-}
-
-@keyframes tap-arrive {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-}
-
-.tap-lead {
-  stroke: var(--ink-dim);
-  stroke-width: 1;
-}
-
-.tap-dot {
-  fill: var(--trace);
-}
-
-.tap-port {
-  fill: none;
-  stroke: var(--trace);
-  stroke-width: 1.25;
-}
-
-.tap-hub {
-  fill: none;
-  stroke: var(--trace);
-  stroke-width: 1;
-  opacity: 0.3;
-}
-
-.tap-ripple {
-  fill: none;
-  stroke: var(--trace);
-  stroke-width: 1;
-}
-
-.tap-name {
-  fill: var(--ink-bright);
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.02em;
-}
-
-.tap-status {
-  fill: var(--ink-dim);
-  font-family: var(--mono);
-  font-size: 9.5px;
-  letter-spacing: 0.06em;
-}
-
-/* lifecycle, in luminance */
-
-.tap-done .tap-dot,
-.tap-absent .tap-dot {
-  fill: var(--ink-dim);
-}
-
-.tap-done .tap-name,
-.tap-absent .tap-name {
-  fill: var(--ink);
-}
-
-.tap-done,
-.tap-absent {
-  opacity: 0.62;
-}
-
-/* Idle is quieter than active but not retired: the pod is there, the bus is
-   just silent. */
-.tap-idle {
-  opacity: 0.8;
-}
-
-.tap-idle .tap-dot {
-  fill: var(--ink);
-}
-
-.tap-stale {
-  opacity: 0.75;
-}
-
-.tap-stale .tap-dot {
-  fill: var(--warn);
-}
-
-.tap-stale .tap-name,
-.tap-stale .tap-status {
-  fill: var(--warn);
-}
-
-.tap-closed {
-  animation: tap-retire 2s ease-in forwards;
-}
-
-@keyframes tap-retire {
-  0% {
-    opacity: 0.6;
-  }
-  100% {
-    opacity: 0;
-    transform: translateY(14px);
-  }
-}
-
-.tap-clickable {
-  cursor: pointer;
-}
-
-.tap-clickable:hover .tap-dot {
-  r: 5.5;
-}
-
-.tap-clickable:hover .tap-name {
-  fill: #fff;
-}
-
-.tap-clickable:focus {
-  outline: none;
-}
-
-.tap-clickable:focus-visible .tap-name {
-  fill: #fff;
-}
-
-.tap-clickable:focus-visible .tap-dot,
-.tap-clickable:focus-visible .tap-port {
-  stroke: var(--trace);
-  stroke-width: 1;
-  paint-order: stroke;
-}
-
-.tap-clickable:focus-visible .tap-lead {
-  stroke: var(--trace);
-}
-
-/* --- pulses --------------------------------------------------------------- */
-
-.pulse-wake {
-  stroke-linecap: round;
-  opacity: 0.38;
-}
-
-.pulse-ghost .pulse-wake,
-.pulse-ghost .pulse-head {
-  stroke: var(--ghost);
-  fill: var(--ghost);
-}
-
-/* --- ghost replay strip ---------------------------------------------------- */
-
-.ghost-strip {
-  animation: strip-in 220ms ease-out both;
-}
-
-@keyframes strip-in {
-  from {
-    opacity: 0;
-    transform: translateY(-6px);
-  }
-}
-
-.chip rect {
-  fill: #141b25;
-  stroke: #38424f;
-  stroke-width: 1;
-}
-
-.chip text {
-  fill: #8d97a6;
-  font-family: var(--mono);
-  font-size: 9px;
-  letter-spacing: 0.06em;
-}
-
-.chip-on rect {
-  fill: #202b3a;
-  stroke: #7d8898;
-}
-
-.chip-on text {
-  fill: var(--ink-bright);
 }
 
 /* --- chat ------------------------------------------------------------------ */
@@ -956,28 +712,12 @@ body {
 /* --- narrow screens -------------------------------------------------------- */
 
 @media (max-width: 720px) {
-  .rail-head,
-  .rail-foot,
   .chat-pane {
     padding-left: 14px;
     padding-right: 14px;
   }
-
-  .rail-foot {
-    flex-direction: column;
-    gap: 4px;
-    align-items: flex-start;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .tap,
-  .ghost-strip,
-  .tap-closed {
-    animation-duration: 1ms;
-  }
-
-  .tap-closed {
-    opacity: 0;
-  }
+  .led { animation: none; }
 }

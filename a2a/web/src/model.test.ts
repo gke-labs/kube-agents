@@ -277,8 +277,8 @@ describe("directory and topics", () => {
   });
 });
 
-describe("pulses and liveness", () => {
-  it("only live envelopes pulse; replayed history does not", () => {
+describe("liveness", () => {
+  it("only live envelopes blink the type LED; replayed history does not", () => {
     let state = submission(); // live
     state = onSubject(
       state,
@@ -291,7 +291,7 @@ describe("pulses and liveness", () => {
       }),
       false, // replay
     );
-    expect(state.pulses).toHaveLength(1);
+    expect(state.typePulses.get("a2a-gateway")).toBe(1);
     expect(state.streamMsgCount).toBe(2);
   });
 

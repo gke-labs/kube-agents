@@ -18,7 +18,6 @@ import {
   type Artifact,
   type ArtifactUpdate,
   type Envelope,
-  type Kind,
   type Message,
   type StatusUpdate,
   type SubjectInfo,
@@ -26,14 +25,10 @@ import {
 } from "./protocol.ts";
 import type { ConsoleOutFrame } from "./console.ts";
 
-/** The rail tap for this browser. Not an agent; it reports the websocket. */
-export const WEB_SESSION = "you";
 /** The chatops gateway's session name (a2a/gateway/gateway.go). */
 export const GATEWAY_SESSION = "gateway";
 /** No traffic for longer than this and a standing agent reads as idle. */
 export const IDLE_MS = 60_000;
-/** The rail only ever animates a recent window of traffic. */
-export const MAX_PULSES = 200;
 /** A sent turn with no submission on TASKS after this long gets a note. */
 export const PENDING_STALE_MS = 30_000;
 /** Local lines (command output) share one correlation group. */
@@ -174,15 +169,6 @@ export interface ChatEntry {
   note?: string;
 }
 
-export interface Pulse {
-  /** Monotonically increasing; the rail's animation loop uses it as a watermark. */
-  id: number;
-  fromSession: string;
-  correlationId: string;
-  kind: Kind;
-  at: number;
-}
-
 export type ProbeOutcome = "refused" | "sent" | "error";
 
 export interface ProbeResult {
@@ -249,7 +235,6 @@ export interface UiState {
   agents: Map<string, AgentView>;
   tasks: Map<string, TaskView>;
   chat: ChatEntry[];
-  pulses: Pulse[];
   streamMsgCount: number;
   connection: ConnectionState;
   /** JetStream taps attached, out of `streamsTotal`. */
@@ -291,7 +276,6 @@ export const initialState: UiState = {
   agents: new Map(),
   tasks: new Map(),
   chat: [],
-  pulses: [],
   streamMsgCount: 0,
   connection: "connecting",
   streamsUp: 0,
@@ -310,7 +294,7 @@ export const initialState: UiState = {
 
 /**
  * Correlation ids get a stable hue so one conversational thread reads as one
- * colour everywhere — chat chips, rail pulses, replay strips. FNV-1a keeps
+ * colour everywhere — chat chips, task rows, transcripts. FNV-1a keeps
  * neighbouring uuids far apart in hue space.
  */
 export function corrColor(corrId: string): string {
@@ -603,8 +587,8 @@ function reduceArtifactUpdate(
     });
     next.agents = withAgent(next.agents, env.from.session, { statusLine: text });
   }
-  // thinking/activity stay out of the transcript; they still pulse the rail
-  // and count on the task for replay.
+  // thinking/activity stay out of the transcript; they still count toward the
+  // type's activity LED and count on the task for replay.
 }
 
 /**
@@ -649,16 +633,6 @@ function reduceEnvelope(
   const anomaly = anomalyOf(state, env, subject);
 
   if (live) {
-    const pulse: Pulse = {
-      id: next.streamMsgCount,
-      fromSession: env.from.session,
-      correlationId: env.correlationId,
-      kind: env.kind,
-      at: tsMs(env),
-    };
-    const pulses = [...state.pulses, pulse];
-    next.pulses = pulses.length > MAX_PULSES ? pulses.slice(pulses.length - MAX_PULSES) : pulses;
-
     const type = env.from.agentType;
     if (type !== undefined && type !== "") {
       const typePulses = new Map(state.typePulses);
