@@ -128,10 +128,10 @@ Each section gives the mechanism, the signal before, where to look for it, the s
 to mitigate before and after, what already reads the signal in this repository, what GKE's own
 [recommender](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-with-recommenders)
 publishes for it, and why the entry is on the list. The recommender's insights all arrive through
-one call, `google.container.DiagnosisInsight` per location, are reassessed daily, and some are not
-shown in the console at all, so a check that reads them gets more than the console shows. One
+one call, `google.container.DiagnosisInsight` per location, and the disruption-readiness family is
+not shown in the console at all, so a check that reads them gets more than the console shows. One
 mitigation is general to every after-signal on a node pool: the blue-green upgrade strategy keeps
-the old nodes until a soak passes and can be rolled back until it completes. The
+the old nodes until a soak passes and can be rolled back until the blue pool's deletion begins. The
 [Scope table](upgrade-readiness-checks.md#scope) in the readiness requirements is the record of
 which audit or skill reads what; the "read today" lines here are the delta against it.
 
@@ -147,10 +147,10 @@ so the application goes down after an hour of stall instead of after a clean han
 - Where to look: the Kubernetes API: each budget's `spec` and `status`, and the owner's `.spec.replicas` behind it.
 - After: the node sits `SchedulingDisabled` with the pod still on it, `Cannot evict pod` events,
   the `UPGRADE_NODES` operation running far longer than one node should take, then the pod deleted.
-- Mitigate before: give the budget room: `maxUnavailable` at least 1 or `minAvailable` below the replica count, and a second replica so the budget can be honoured; for a true singleton, accept the outage inside a maintenance window or use the blue-green node upgrade strategy, whose soak gives the workload longer than one hour.
+- Mitigate before: give the budget room: `maxUnavailable` at least 1 or `minAvailable` below the replica count, and a second replica so the budget can be honoured; for a true singleton, accept the outage inside a maintenance window; blue-green with a longer soak postpones it, since the blue pool's deletion phase ignores budgets, but never avoids it.
 - Mitigate after: fix the budget and the stalled drain resumes at once; never delete the budget without replacing it, since that trades a stall for an unprotected workload.
 - Read today: the readiness mode of `fleet-upgrade-verification` grades it `blocked`.
-- GKE recommender: `PDB_UNPERMISSIVE` flags a budget that allows zero evictions, naming the budget and its expected pod count; `DEPLOYMENT_MISSING_PDB` and `PDB_UNPROTECTED_STATEFULSET` flag the opposite gap. All from the [disruption-readiness insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/workload-disruption-readiness), reassessed daily.
+- GKE recommender: `PDB_UNPERMISSIVE` flags a budget that allows zero evictions; `DEPLOYMENT_MISSING_PDB` and `PDB_UNPROTECTED_STATEFULSET` flag the opposite gap. All from the [disruption-readiness insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/workload-disruption-readiness), reassessed daily.
 - Why it is on the list: the one-hour grace and the forced eviction are in GKE's
   [node upgrade strategies](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies).
   The seeded fleet plants no drain-blocking budget.
@@ -166,10 +166,10 @@ that was just taken away, and a single-replica application has a guaranteed outa
 - Where to look: the GKE API for the pool's `upgradeSettings`, autoscaler limits, and Compute Engine for accelerator quota; the Kubernetes API for the sum of requests against allocatable.
 - After: Pending pods with `Insufficient cpu` or `Insufficient nvidia.com/gpu`, autoscaler events
   citing quota.
-- Mitigate before: `maxSurge` at least 1, one node of headroom in the pool, an autoscaler ceiling and accelerator quota that allow it; for accelerator pools, blue-green upgrades so the new node exists before the old one goes.
+- Mitigate before: `maxSurge` at least 1, one node of headroom in the pool, an autoscaler ceiling and accelerator quota that allow it; for accelerator pools surge is the strategy that fits a small quota, since `maxSurge` 1 needs one extra node's quota while blue-green needs a whole second pool's.
 - Mitigate after: add a node or raise the ceiling and the Pending pods schedule.
 - Read today: nothing.
-- GKE recommender: partial: `CLUSTER_UNDERPROVISIONED` from the [utilisation insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-cluster-utilization) and the Network Analyzer's IP utilisation insight; nothing reads `maxSurge` or quota.
+- GKE recommender: partial: `CLUSTER_UNDERPROVISIONED` from the [utilisation insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-cluster-utilization); nothing reads `maxSurge` or quota. The Network Analyzer's separate `google.networkanalyzer.container.ipAddressInsight` covers pod IP exhaustion.
 - Why it is on the list: it follows from how a drain works, not from an incident; no public story
   verified and no fixture. Accelerator pools are the common case because their quota is small.
 
@@ -203,7 +203,7 @@ still loading.
 - Mitigate after: nothing shortens the load; the readiness probe is what keeps traffic away until it finishes.
 - Read today: the obtainability audit flags a missing readiness probe; a probe that passes too
   early is unread.
-- GKE recommender: `PDB_STATEFULSET_WITHOUT_PROBES`, for StatefulSets only.
+- GKE recommender: `PDB_STATEFULSET_WITHOUT_PROBES`, for StatefulSets only and for the missing-probe case only.
 - Why it is on the list: no public incident verified. A model server that reloads its weights for
   minutes after every recreate is the common shape.
 
@@ -263,7 +263,7 @@ dropped `flowcontrol.apiserver.k8s.io/v1beta3`.
   linked GitOps repository declares in raw YAML and JSON, skipping Helm templates. The insights
   themselves are quoted by the skill as a command for a human, because the agent's `gcloud`
   allowlist excludes them; stored Helm release state and CRD `storedVersions` are unread.
-- GKE recommender: the [deprecation insights](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/viewing-deprecation-insights-and-recommendations), one subtype per removal (`DEPRECATION_K8S_1_32_API` and its predecessors), computed from the audit log and naming the calling user agents.
+- GKE recommender: the [deprecation insights](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/viewing-deprecation-insights-and-recommendations), one subtype per removal (`DEPRECATION_K8S_1_32_API` and its predecessors), generated from observed API calls and naming the calling user agents.
 - Why it is on the list: Helm and Spinnaker on 1.25 in the
   [incidents](upgrade-readiness-checks.md#upgrades-that-went-wrong-in-public); the 1.32 removal is
   in GKE's [deprecation notes](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/apis-1-32).
@@ -282,7 +282,7 @@ case `kube-system`.
 - Mitigate before: a `namespaceSelector` that excludes `kube-system`, a timeout of a few seconds, `failurePolicy: Ignore` for webhooks that are not security controls, at least two backend replicas behind a budget, and a valid backend certificate.
 - Mitigate after: set `failurePolicy: Ignore` or remove the webhook configuration to unwedge the cluster, then restore it once the backend is up.
 - Read today: nothing.
-- GKE recommender: `K8S_ADMISSION_WEBHOOK_UNAVAILABLE` flags a webhook whose Service has no endpoints and `K8S_ADMISSION_WEBHOOK_UNSAFE` one that intercepts `kube-system` or cluster-scoped system resources ([webhook insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-webhooks)); the certificate subtypes (`DEPRECATION_K8S_1_23_CERTIFICATE`, `_1_29_CERTIFICATE`, `DEPRECATION_K8S_SHA_1_CERTIFICATE`) cover a backend certificate the next version rejects; a further recommendation flags CRDs with an invalid CA bundle.
+- GKE recommender: `K8S_ADMISSION_WEBHOOK_UNAVAILABLE` flags a webhook whose Service has no endpoints and `K8S_ADMISSION_WEBHOOK_UNSAFE` one that intercepts `kube-system` or cluster-scoped system resources ([webhook insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-webhooks)); the certificate subtypes (`DEPRECATION_K8S_1_23_CERTIFICATE`, `DEPRECATION_K8S_SHA_1_CERTIFICATE`) covered backend certificates the 1.23 and 1.29 removals rejected; `K8S_CRD_WITH_INVALID_CA_BUNDLE` flags CRDs with an invalid CA bundle.
 - Why it is on the list: Jetstack's Open Policy Agent webhook outage in the incidents; no fixture
   on the seeded fleet.
 
@@ -398,7 +398,7 @@ so for such a pool the flip does arrive with the minor.
   the [cgroup v2 page](https://kubernetes.io/docs/concepts/architecture/cgroups/) names.
 - Where to look: the GKE API for each pool's `effectiveCgroupMode` and the target version; a read-only node check of the cgroup filesystem; the images for the runtime version they ship.
 - After: `OOMKilled` with no code change, on the migrated nodes only.
-- Mitigate before: a runtime that reads cgroup v2 (JDK 8u372 or 11.0.16 and later, .NET 5 and later), or explicit heap flags; until 1.35 a pool can be pinned to cgroup v1 through its node system config to buy time.
+- Mitigate before: a runtime that reads cgroup v2 (JDK 8u372 or 11.0.16 and later, and the other runtimes the cgroup v2 page names), or explicit heap flags; until 1.35 a pool can be pinned to cgroup v1 through its node system config to buy time.
 - Mitigate after: the same, plus a temporary limit increase.
 - Read today: nothing.
 - GKE recommender: none verified.
@@ -422,7 +422,7 @@ misreads its limit.
 - Where to look: the GKE API for the kubelet version and cgroup mode of each pool; a read-only look at `memory.oom.group` in a container; the images for entrypoints that run more than one process.
 - After: `OOMKilled` on containers whose logs previously showed worker restarts under the same
   load.
-- Mitigate before: raise the limit for multi-process containers, split workers into their own containers or pods, or set the kubelet's `singleProcessOOMKill` where the platform exposes it (1.32 and later).
+- Mitigate before: raise the limit for multi-process containers, split workers into their own containers or pods, or set `singleProcessOOMKill` in the pool's node system config, available from GKE 1.32.4-gke.1132000 and 1.33.0-gke.1748000.
 - Mitigate after: the same; the container's own logs before the upgrade show which worker used to die.
 - Read today: nothing.
 - GKE recommender: none.
@@ -442,9 +442,9 @@ specific flow is handled.
 - Where to look: the GKE API for the dataplane and DNS provider; the Kubernetes API for the policy count; the target version's known-issue notes.
 - After: connection resets, policy drops in flow logs, DNS timeouts.
 - Mitigate before: rehearse the target version on a staging cluster with the same dataplane, and keep NetworkPolicy explicit rather than relying on defaults.
-- Mitigate after: a node pool can be recreated at the previous version while GKE still offers it; the control plane cannot go back.
+- Mitigate after: a completed node pool can be downgraded in place to the previous version while GKE still offers it; the control plane cannot go back.
 - Read today: nothing.
-- GKE recommender: partial: the Network Analyzer's GKE connectivity insights cover control-plane and node reachability, not policy behaviour.
+- GKE recommender: none. The Network Analyzer's separate connectivity insight covers control-plane and node reachability, not policy behaviour.
 - Why it is on the list: no public incident verified; the per-version known-issue notes are the
   signal.
 
@@ -460,7 +460,7 @@ CNI's own control components are hit, cluster-wide within minutes.
 - After: nodes `NotReady` or `NetworkUnavailable`, CNI or `kube-proxy` pods crash-looping, Service
   VIP probes failing from inside the cluster.
 - Mitigate before: upgrade a canary pool first and watch Service routing from inside the cluster before the rest; surge upgrades with `maxUnavailable` 0 so a broken node never takes capacity with it.
-- Mitigate after: recreate the pool at the previous version while it is offered, and fix whatever the CNI selected on.
+- Mitigate after: downgrade the pool to the previous version while it is offered, and fix whatever the CNI selected on.
 - Read today: nothing.
 - GKE recommender: none.
 - Why it is on the list: Reddit's 1.24 outage was the CNI losing its route reflectors when a node
@@ -475,7 +475,7 @@ is older than what the CUDA build requires, the device cannot be opened.
 - Before: the driver version the target node image ships against the CUDA version the images need.
 - Where to look: the GPU how-to page's table of driver versions per GKE version, for the target version, since the GKE API only records `DEFAULT` or `LATEST`; the images for the CUDA version they need.
 - After: pods Pending on `nvidia.com/gpu`, or crashing in `nvidia-smi`.
-- Mitigate before: match the driver to the images before the upgrade: the GPU how-to page's table gives the driver per GKE version, and CUDA forward compatibility gives the floor the images accept; upgrade a canary GPU pool first.
+- Mitigate before: match the driver to the images before the upgrade: the GPU how-to page's table gives the driver per GKE version, and NVIDIA's minimum-driver matrix per CUDA major gives the floor the images accept; upgrade a canary GPU pool first.
 - Mitigate after: recreate the pool with the driver version the images need.
 - Read today: nothing.
 - GKE recommender: none.
@@ -512,7 +512,7 @@ stopped publishing, or an egress allowlist admits only the old hostname, only th
   such as `k8s.gcr.io`, and egress allowlists that admit only the old hostname.
 - Where to look: the Kubernetes API for the image references in use and the GitOps repository for the ones declared; the egress policy for what it admits: NetworkPolicy CIDRs, GKE's FQDN network policy on Dataplane V2, and Compute Engine firewall rules.
 - After: `ImagePullBackOff` only on new nodes.
-- Mitigate before: mirror every image the install pulls into a registry you own and pin it there, which is what `images.json` and `make mirror-images` do in this repository, and keep egress allowlists in step.
+- Mitigate before: mirror every image a default install pulls into a registry you own, which is what `images.json` and `make mirror-images` do in this repository, and keep egress allowlists in step.
 - Mitigate after: retag or redirect the reference; the new nodes pull.
 - Read today: nothing.
 - GKE recommender: none.
@@ -528,7 +528,7 @@ read. GKE's recommender comes first, because one call per location returns the d
 insights (7) together with the budget (1), webhook (8), skew (11), runtime (14) and window (6)
 insights; the readiness requirements'
 [deprecation-insights section](upgrade-readiness-checks.md#gke-deprecation-insights) says what else
-the pause they put on automatic upgrades explains. Fail-closed webhooks (8) and capacity headroom
+the pause the deprecation family puts on automatic upgrades explains. Fail-closed webhooks (8) and capacity headroom
 (2) come next, because both turn a routine drain into an outage and both are a few list calls.
 Replica placement (3) follows, and then the node-image entries (13 to 21), which need the target
 version to be known before they mean anything. Post-upgrade detection is one mechanism for every
