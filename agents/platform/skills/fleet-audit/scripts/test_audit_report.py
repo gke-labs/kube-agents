@@ -2463,6 +2463,9 @@ class TestAuditCatalogue(unittest.TestCase):
         """
         sop_dir = self.sop_dir()
         pattern = re.compile(r"audit_report\.py start [^\n]*--on-demand")
+        unconditional_pattern = re.compile(
+            r"Pass `--on-demand` on interactive, chat, or kanban-dispatched audit runs so `finish` is never silent"
+        )
         for audit_id, spec in audit_report.AUDITS.items():
             sop = sop_dir / spec.sop
             with self.subTest(audit=audit_id):
@@ -2471,6 +2474,11 @@ class TestAuditCatalogue(unittest.TestCase):
                     text,
                     pattern,
                     f"{spec.sop} start command does not document --on-demand",
+                )
+                self.assertRegex(
+                    text,
+                    unconditional_pattern,
+                    f"{spec.sop} step 0 does not unconditionally explain --on-demand",
                 )
 
     def test_multi_repo_sops_document_interactive_repo_prompt(self):
@@ -2488,6 +2496,14 @@ class TestAuditCatalogue(unittest.TestCase):
                     pattern,
                     f"{spec.sop} does not instruct prompting the user to choose a repository",
                 )
+                # Verify --on-demand is not buried inside the multi-repo interactive bullet
+                for line in text.splitlines():
+                    if "prompt the user to choose which repository" in line:
+                        self.assertNotIn(
+                            "--on-demand",
+                            line,
+                            f"{spec.sop} buries --on-demand inside multi-repo interactive prompt",
+                        )
 
     def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
         """A fix written into one SOP has to reach all the others.

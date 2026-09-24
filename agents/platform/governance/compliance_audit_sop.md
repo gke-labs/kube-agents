@@ -10,6 +10,8 @@
 
 ### 0. Open the audit run
 
+Pass `--on-demand` on interactive, chat, or kanban-dispatched audit runs so `finish` is never silent even on an unchanged ledger (#1929). Scheduled cron jobs omit `--on-demand`.
+
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit [--repo "<owner>/<repo>"] [--on-demand]
 # -> {"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/compliance-audit/org__repo",
@@ -19,7 +21,7 @@
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
 
-- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding. Pass `--on-demand` so `finish` is never silent (#1929).
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
 - **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
 
 `findings_path` is the only file you write findings to. `issue` is the stream's open ledger issue, or `null` when the stream has none. `pending_remediation_requests` is the set of finding ids a repo writer asked for with a `/remediate` comment on the ledger — write a `kind: manifest` file for every one of them during §2 and §3, whether or not this SOP would have promoted it on its own.

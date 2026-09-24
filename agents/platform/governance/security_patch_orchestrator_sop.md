@@ -12,13 +12,15 @@
 
 ### 0. Open the audit run
 
+Pass `--on-demand` on interactive, chat, or kanban-dispatched audit runs so `finish` is never silent even on an unchanged ledger (#1929). Scheduled cron jobs omit `--on-demand`.
+
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py start --audit security-patch-orchestrator [--repo "<owner>/<repo>"] [--on-demand]
 ```
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
 
-- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding. Pass `--on-demand` so `finish` is never silent (#1929).
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
 - **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/security-patch-orchestrator/org__repo", "findings_path":"/opt/data/scratch/findings_security-patch-orchestrator.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace`. The audit pod does not start inside a git checkout: `start` clones the GitOps repository to `workspace` itself, and that clone is where every `remediation.path` in step 4 is resolved and where every grep for an existing declaration belongs. `start` creates and resets no branch; there is no report branch. `issue` is this stream's open ledger issue, or `null` when it has none — either way you never create it. `pending_remediation_requests` lists finding ids a repo writer asked for with a `/remediate` comment on the ledger; write the manifest for each of those in step 4. The helper owns all git/`gh` work and renders the ledger issue body and every remediation PR body — **never hand-write a body, never run `git commit`/`gh issue create`/`gh pr create`/`gh issue comment` yourself.** **Never comment on the ledger yourself:** `/remediate` is a human reviewer's instruction to this harness, not a step in the audit, and an agent that posts it — including when someone asks for a fix in chat — is authorizing its own pull request. `finish` ignores a `/remediate` from a machine account, so posting one achieves nothing but noise on the issue.

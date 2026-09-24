@@ -14,13 +14,15 @@
 
 ### 0. Open the audit run
 
+Pass `--on-demand` on interactive, chat, or kanban-dispatched audit runs so `finish` is never silent even on an unchanged ledger (#1929). Scheduled cron jobs omit `--on-demand`.
+
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py start --audit ai-security-audit [--repo "<owner>/<repo>"] [--on-demand]
 ```
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
 
-- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding. Pass `--on-demand` so `finish` is never silent (#1929).
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
 - **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/ai-security-audit/org__repo", "findings_path":"/opt/data/scratch/findings_ai-security-audit.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace` from this call; you write into both.
