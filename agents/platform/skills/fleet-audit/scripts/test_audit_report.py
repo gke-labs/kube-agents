@@ -3942,9 +3942,10 @@ class TestStart(HarnessTestCase):
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
 
     def test_a_half_written_note_is_a_claim_not_an_absence(self):
-        # The claim is the exclusive create. Between another `start`'s create
-        # and its write the file exists and is empty; a reader that took
-        # "does not parse" for "no note" would let both runs through.
+        # A note that exists but does not parse (debris from a crash, an
+        # older shape, a hand edit) is a claim until its mtime ages out; a
+        # reader that took "does not parse" for "no note" would let two runs
+        # through on it.
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
         self.harness.replies = {"issue list": self.issue_list()}
         note = Path(audit_report.inflight_path_for(AUDIT))
@@ -4057,6 +4058,31 @@ class TestStart(HarnessTestCase):
         rc = self.run_finish(make_doc())
         self.assertEqual(rc, 0, self.err)
         self.assertFalse(note.is_file())
+
+    def test_a_note_write_that_fails_leaves_no_phantom_claim(self):
+        # `write_text` opens O_TRUNC and then writes. A write that fails on
+        # the shared volume (ENOSPC, EDQUOT, EIO) must not leave an empty
+        # note with a fresh mtime: `_in_flight_since` would honour it from
+        # the mtime and refuse every `start` of the stream, the scheduled
+        # tick's included, for two hours with no run behind it. The note is
+        # staged beside and moved into place, so a failure leaves nothing.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        with patch.object(
+            audit_report.os, "replace",
+            side_effect=OSError(28, "No space left on device"),
+        ):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+        self.assertIn("could not record the in-flight note", self.err)
+        self.assertIn("No space left on device", self.err)
+        self.assertFalse(note.exists(), "an empty note is a two-hour phantom claim")
+        self.assertFalse(Path(f"{note}.tmp").exists())
+        self.assertFalse(Path(audit_report.run_record_path_for(AUDIT)).exists())
+        # Nothing to release, so the retry is not refused.
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
 
     def test_a_start_that_fails_frees_the_stream_for_the_retry(self):
         # The note means a run is under way. A `start` that raised left none
@@ -12072,6 +12098,16 @@ class TestDispatchAndHandover(unittest.TestCase):
         # `--takeover` 42 s after being told it was "not for you".
         self.assertIn("refuses while a run of that stream is in flight", bullet)
         self.assertNotIn("--takeover", bullet)
+        # The note does not know sessions, so a worker's own second `start`
+        # is refused like a rival's (run 2, rep 1 of #1876's observation did
+        # exactly that). "Stop" then abandons a live run and leaves the note
+        # for two hours; the carve-out says continue that run to `finish`.
+        self.assertIn("already succeeded in this session", bullet)
+        self.assertIn("do not run `start` again", bullet)
+        # The sandbox carries the skills tree the bullet's path names; what
+        # it lacks is `hermes` and the live profile state.
+        self.assertNotIn("which has neither", bullet)
+        self.assertIn("live profile state", bullet)
         # A partial run is allowed; a partial run that spent its turns on the
         # low-severity checks is not. Rep 3 of build 2102781983259103232 ran
         # `netpol-missing` and `public-control-plane` and skipped
@@ -12120,6 +12156,11 @@ class TestDispatchAndHandover(unittest.TestCase):
         self.assertIn("START REFUSED", section)
         self.assertIn("severity order", one_stream)
         self.assertIn("`carried`", one_stream)
+        # Same carve-out and the same sandbox sentence as the AGENTS.md copy.
+        self.assertIn("already succeeded in this session", one_stream)
+        self.assertIn("do not run `start` again", one_stream)
+        self.assertNotIn("which has neither", section)
+        self.assertIn("live profile state", section)
         self.assertIn("More than one stream", section)
         self.assertIn("2026-08-03", section)
         self.assertIn("cronjob(action='run')", section)

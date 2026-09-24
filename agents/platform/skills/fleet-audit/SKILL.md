@@ -69,8 +69,9 @@ returns a handle; that is closer to what you want, but `hermes cron run` is the 
 behaves identically on every runtime and always runs in a fresh process.
 
 **Your shell cannot reach that command, and there is no substitute yet.** It runs on the gateway pod,
-where `hermes` and `/opt/data/profiles` are; your shell runs in the sandbox pod, which has neither, so
-`command not found` there is the split working as designed rather than a broken install
+with `hermes` and the live profile state under `/opt/data/profiles`; your shell runs in the sandbox
+pod, which carries this skills tree (the path the bullet below names exists there) but neither
+`hermes` nor that state, so `command not found` there is the split working as designed
 ([#1876](https://github.com/gke-labs/kube-agents/issues/1876) tracks the missing on-demand path). It
 does not license `cronjob(action='run')`. What you do instead depends on how many streams the request
 names:
@@ -84,7 +85,11 @@ names:
   `start` refuses while a run of that stream is in flight, whether a scheduled tick's or another
   session's: it exits 2 with a `START REFUSED` line that names the run (not a `FINDINGS REJECTED`
   line; there is no document to fix). If it refuses, say the stream is already running and
-  stop; there is no override for you, and the refusal is not a problem to work around. Run the
+  stop; there is no override for you, and the refusal is not a problem to work around. One refusal
+  is your own: the note does not know sessions, so if your `start` for that stream
+  already succeeded in this session, a second `start` is refused like anyone's and your first run
+  is untouched — do not run `start` again; continue the sweep from the first `start`'s output to
+  `finish`. Run the
   checks in the SOP's severity order, highest first — for the compliance stream, cluster-admin
   bindings, public control planes and privileged containers before NetworkPolicy gaps — so a run
   that runs out of turns has spent them where the findings are. A check whose finding class the

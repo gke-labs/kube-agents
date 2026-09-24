@@ -1567,10 +1567,25 @@ def claim_in_flight(audit_id: str) -> None:
                 f"here shows whether that run is alive, and this refusal is not "
                 f"a check to work around."
             )
-        path.write_text(
-            json.dumps({"audit": audit_id, "started_at": time.time()}),
-            encoding="utf-8",
-        )
+        # Written beside and moved into place, so the note either holds a
+        # complete claim or is untouched. A plain write opens with O_TRUNC
+        # first, and a write that then fails (ENOSPC, EDQUOT, EIO on the
+        # shared volume) would leave an empty note with a fresh mtime, which
+        # `_in_flight_since` honours as a claim for the next two hours with
+        # no run behind it.
+        staged = Path(f"{path}.tmp")
+        try:
+            staged.write_text(
+                json.dumps({"audit": audit_id, "started_at": time.time()}),
+                encoding="utf-8",
+            )
+            os.replace(staged, path)
+        except OSError:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+            raise
     except OSError as exc:
         raise StartRefused(
             f"could not record the in-flight note for {audit_id} "
