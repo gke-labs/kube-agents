@@ -5,8 +5,9 @@
  * `steer` a follow-up into a running task, `answer` the result artifact
  * streaming in, `progress`/`status`/`topic`/`cancel` the quieter lines,
  * `pending` a console turn not yet seen on the bus, `notice` a gateway line
- * from the console door, `local` the page's own output. Each exchange group
- * gets one correlation chip colored by corrColor.
+ * from the console door, `local` the page's own output, `anomaly` an
+ * envelope that broke the protocol, reported rather than folded in. Each
+ * exchange group gets one correlation chip colored by corrColor.
  */
 import { useEffect, useRef, useState } from "react";
 import type { ChatEntry } from "./model.ts";
