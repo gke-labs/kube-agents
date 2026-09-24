@@ -266,9 +266,10 @@ EPISODES_KEY = "episodes"
 #: filed for: the exclusion is the operator keeping a model turn off that
 #: cluster, and a card would hand its rows to another profile instead.
 NO_PROFILE_REASON = "no Cluster Agent profile; not read"
-#: A profile whose cluster_identity cannot be read names no project, so its
-#: cluster's rows are held rather than cleared.
-NO_IDENTITY_REASON = "no readable cluster_identity; its cluster's rows are held"
+#: A profile whose cluster_identity cannot be read adds no project to the
+#: roster. Its cluster is swept when its project is listed anyway, and otherwise
+#: keeps its rows.
+NO_IDENTITY_REASON = "no readable cluster_identity; adds no project to the sweep"
 #: The ledger's key for such a profile.
 PROFILE_SCOPE = "profile"
 #: Cards opened per tick. Each is a Cluster Agent turn, and the number of

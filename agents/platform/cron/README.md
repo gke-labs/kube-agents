@@ -87,11 +87,10 @@ notifier. The row targets every shipped chat platform with a home channel in the
 ...; card `<id>` closed" and "stall noticed in `<n>` more namespaces; cards
 follow on later ticks", each naming at most eight objects, plus the sweep-failed
 and sweep-recovered lines every roster entry owes. A clean tick prints nothing. Anything a tick could not read (a
-cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a project whose listing failed or that gcloud called incomplete, a profile whose `cluster_identity` could not be read, a sweep that hit its
+cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a project whose listing failed or that gcloud called incomplete, a cluster whose profile's `cluster_identity` could not be read and whose project nothing else lists, a sweep that hit its
 25-minute budget) keeps its rows and is recorded in the ledger, not posted, and
-an exhausted sweep resumes where it stopped. A project whose listing fails is
-held the same way; listing becomes the sweep-failed line only when every
-project's listing fails at once.
+an exhausted sweep resumes where it stopped. The sweep fails, and posts the
+sweep-failed line, only when every project's listing fails at once.
 
 Every `gcloud`, `kubectl` and `stall_report.py` call runs in the shell sandbox
 through `sandbox_exec`, because the agent container carries no kubectl (with the
