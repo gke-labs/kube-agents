@@ -442,8 +442,10 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     )
     suite.record(
         "ac03-multi-region-windows-evaluated",
-        bool(windows)
-        and len(valid_windows) == len(windows)
+        # No bool(windows) guard: a day with no window anywhere is covered
+        # by a complete zoneStatuses map, and covered_regions is empty when
+        # both windows and zoneStatuses are.
+        len(valid_windows) == len(windows)
         and covered_regions == ALLOWED_REGIONS,
         {
             "windows": windows,

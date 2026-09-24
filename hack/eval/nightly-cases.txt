@@ -21,7 +21,7 @@
 # presubmit" and "not admitted" are the same set and this file is where a
 # held-out case lives: the seven cases the presubmit had been running
 # without letting them block moved here that day, each with its hold-out
-# reason as the # line above it (the last section of this file). This is
+# reason as the # line above it (their own section of this file). This is
 # the default home for a new case too (decided 2026-09-15 on #1546 and
 # #1564): it lands here, the nightly builds its record in the evidence
 # store -- one data point a night, three repetitions -- and a presubmit

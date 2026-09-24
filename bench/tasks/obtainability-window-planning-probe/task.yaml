@@ -9,8 +9,8 @@
 # ProvisioningRequest + LocalQueue. The live sibling is
 # bench/cuj/obtainability/test_03_workload_obtainability_planning.py, which
 # needs a full install and grades the portal projection; this case grades
-# the same behavior's report through the eval harness so a regression reds
-# CI.
+# the same behavior's report through the eval harness, so a regression
+# shows in the nightly record (a nightly-only case cannot red a presubmit).
 #
 # The window verdict is live capacity weather: the report may honestly find
 # no window in a zone (v5e is a thin pool), so no check here demands one.

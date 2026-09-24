@@ -202,11 +202,13 @@ FOOTER_MARKER = "<!-- kube-agents: local addition (auto-injected by sync-upstrea
 # Upstream skills are copied over verbatim on every sync (the local dir is rmtree'd first), so any
 # local edits are wiped. Anything this repository needs an upstream skill to say therefore belongs
 # here rather than in the skill file: these footers are the single source of truth for it and are
-# re-appended after each sync. Three things need saying today — the GKE create/lifecycle skills must
+# re-appended after each sync. Four things need saying today — the GKE create/lifecycle skills must
 # keep pointing at this repo's Cluster Agent profile lifecycle, which upstream knows nothing about
 # (see agents/platform/skills/cluster-agent-lifecycle/SKILL.md for the mechanics they reference),
-# gke-networking must not present `--dns-endpoint` as unconditionally safe, and gke-upgrades must
-# point at this repo's fleet-upgrade-verification skill for executed per-member version checks.
+# gke-networking must not present `--dns-endpoint` as unconditionally safe, gke-upgrades must
+# point at this repo's fleet-upgrade-verification skill for executed per-member version checks, and
+# gke-batch-hpc and gke-workload-scaling must preflight GPU/TPU and large-shape requests into
+# capacity-obtainability.
 SKILL_FOOTERS = {
     "gke-cluster-creation": f"""{FOOTER_MARKER}
 

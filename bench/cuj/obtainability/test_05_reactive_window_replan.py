@@ -13,6 +13,7 @@ manifests, and no clarifying question back to a session with no person in it.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -34,8 +35,11 @@ INVALIDATED_ZONE = "us-central1-a"
 REMAINING_ZONE = "europe-west4-b"
 REMAINING_REGION = REMAINING_ZONE.rsplit("-", 1)[0]
 INVALIDATED_START_LEAD = timedelta(hours=20)
-JOB_DURATION = timedelta(hours=12)
-PLANNING_HORIZON = timedelta(hours=48)
+# A revised start is a concrete moment: date and clock. A timestamp echoed
+# back from the incident text is not a new recommendation, and an RFC 3339
+# Z suffix is itself a UTC statement (test_03 accepts the same).
+TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{1,2}:\d{2}")
+ZULU_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z")
 OBTAINABILITY_PLANNING_METHODS = {
     "compute.beta.AdviceService.CalendarMode",
     "compute.advice.calendarMode",
@@ -111,9 +115,6 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
 
     answer = delivered_answer(interaction)
     folded_answer = answer.casefold()
-    revised_or_honest = (
-        REMAINING_ZONE in answer and "utc" in folded_answer
-    ) or ("no window" in folded_answer and REMAINING_ZONE in answer)
     asked_nothing = not any(
         phrase in folded_answer for phrase in CLARIFYING_PHRASES
     )
@@ -142,6 +143,16 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     )
     folded_input = input_text.casefold()
 
+    # Naming the zone and the letters "UTC" is not a revised verdict: an
+    # answer that only restates the incident carries both. A revision names
+    # a start the incident did not, or the honest no-window statement.
+    new_start_named = bool(
+        set(TIMESTAMP_RE.findall(answer)) - set(TIMESTAMP_RE.findall(input_text))
+    ) and ("utc" in folded_answer or bool(ZULU_RE.search(answer)))
+    revised_or_honest = REMAINING_ZONE in answer and (
+        new_start_named or "no window" in folded_answer
+    )
+
     suite = AcceptanceCriteria(
         (
             AcceptanceCriterion(
@@ -160,7 +171,8 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
                 "ac03-revised-recommendation-delivered",
                 "The answer names a new UTC start in the remaining zone, or "
                 "states honestly that no window exists there.",
-                "the delivered answer carries the revised verdict",
+                "a start timestamp the incident did not carry, or the "
+                "no-window verdict, with the remaining zone named",
             ),
             AcceptanceCriterion(
                 "ac04-artifacts-retargeted",

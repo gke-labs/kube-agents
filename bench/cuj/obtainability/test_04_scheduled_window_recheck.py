@@ -7,8 +7,11 @@ asked for rather than scheduled, and gets a schedule only as a re-check the
 user opts into, reporting into the conversation that asked. The test acts as
 that user: it asks for a window plan plus a one-time re-check shortly before
 the recommended window, and scores only what the portal returns — the
-schedule commitment must be real (a completed cron-create in tool evidence),
-not prose.
+delivered commitment: a fire time exactly the lead before a stated start,
+the destination, a single firing. The tool-evidence proof of the created
+schedule is a diagnostic milestone, not an acceptance criterion, until the
+portal projects worker tool calls with their actions: tool names alone
+cannot tell a cron create from a cron list.
 """
 
 from __future__ import annotations
@@ -29,11 +32,16 @@ from cuj.utils.scenario import Scenario
 
 RECHECK_LEAD = timedelta(hours=2)
 RECHECK_LEAD_HOURS = int(RECHECK_LEAD.total_seconds() // 3600)
+RECHECK_LEAD_MINUTES = int(RECHECK_LEAD.total_seconds() // 60)
 # The lead spelled both ways an answer may echo it.
 LEAD_PHRASES = (f"{RECHECK_LEAD_HOURS} hours", "two hours")
 REQUIRED_SKILLS = {"capacity-obtainability"}
-# The spellings a completed schedule-creation tool call may normalize to.
-SCHEDULE_OPERATIONS = {"cronjob", "cronjob_create", "schedule_create"}
+# The one scheduling tool the runtime exposes. The projection carries tool
+# names without arguments, so a match shows scheduling activity, not a
+# create; the milestone that reads this says so, and the acceptance
+# criterion it replaced returns when worker tool calls project with their
+# actions.
+SCHEDULE_OPERATIONS = {"cronjob"}
 FORBIDDEN_OPERATIONS = {
     "apply_manifest",
     "create_cluster",
@@ -44,9 +52,25 @@ FORBIDDEN_OPERATIONS = {
 # One UTC clock time in the delivered answer: "22:00 UTC", "9:30 UTC", or
 # inside an ISO-8601 timestamp ("2026-09-22T22:00:00Z"). No leading word
 # boundary — a digit inside a timestamp has none.
-UTC_TIME_RE = re.compile(r"(?<!\d)\d{1,2}:\d{2}")
-ONE_SHOT_RE = re.compile(r"\b(once|one-time|one time|single)\b")
-RECURRING_RE = re.compile(r"\b(every|recurring|repeatedly|hourly|daily|weekly)\b")
+UTC_TIME_RE = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})")
+# The one-shot verdict is judged per sentence: a recurrence word counts
+# against the answer only when its sentence is about the schedule and does
+# not negate ("never a recurring schedule" echoes the request and is a
+# confirmation, not a commitment). Bare "single" is not a firing commitment
+# ("the single best zone"), so it counts only bound to the re-check.
+ONE_SHOT_RE = re.compile(
+    r"\b(once|one[- ]time|single\s+(?:re-?check|firing|run|execution))\b"
+)
+SCHEDULE_TERM_RE = re.compile(r"\b(re-?check|schedul\w*|cron\w*|fires?|firing)\b")
+RECURRENCE_RE = re.compile(
+    r"\b(recurring|repeat\w*|hourly|daily|weekly|nightly"
+    r"|every\s+\d+\s*(?:minutes?|hours?|days?|weeks?)"
+    r"|every\s+(?:minute|hour|day|week|night|morning))\b"
+)
+NEGATION_RE = re.compile(
+    r"\b(not|never|no|won'?t|will not|isn'?t|is not|rather than|instead of)\b"
+)
+SENTENCE_SPLIT_RE = re.compile(r"[.!?\n]+")
 
 PROMPT = f"""Act as my batch scheduling partner. Plan a 64-node TPU v5e \
 training job that must run for 12 hours and finish within the next 48 hours, \
@@ -68,16 +92,11 @@ ACCEPTANCE_CRITERIA = (
         "projected user input carries the plan and the re-check opt-in",
     ),
     AcceptanceCriterion(
-        "ac02-recheck-schedule-created",
-        "The re-check is a real schedule, not prose: a completed "
-        "schedule-creation tool call is in the interaction's tool evidence.",
-        "completed tool operations include a cron/schedule create",
-    ),
-    AcceptanceCriterion(
         "ac03-recheck-fire-time-stated",
         "The user is told the re-check's exact UTC fire time, two hours "
         "before the recommended window's start.",
-        "the delivered answer names a UTC fire time and the two-hour lead",
+        "the answer names the lead and two UTC times exactly two hours "
+        "apart: the start and the fire time",
     ),
     AcceptanceCriterion(
         "ac04-recheck-reports-to-thread",
@@ -87,8 +106,8 @@ ACCEPTANCE_CRITERIA = (
     ),
     AcceptanceCriterion(
         "ac05-recheck-is-one-shot",
-        "The re-check fires once: the answer states it, and no recurring "
-        "schedule is described.",
+        "The re-check fires once: the answer states it, and no "
+        "non-negated schedule sentence describes a recurrence.",
         "the delivered answer commits to a single firing",
     ),
 )
@@ -117,6 +136,14 @@ MILESTONES = (
         "complete normalized tool evidence contains no forbidden mutation",
         ("interaction-completed",),
     ),
+    Milestone(
+        "m4-recheck-schedule-observed",
+        "The re-check left tool evidence: a completed cronjob call in the "
+        "interaction. Names only — the projection carries no arguments, so "
+        "this cannot tell a create from a list.",
+        "completed tool operations include cronjob",
+        ("interaction-completed",),
+    ),
 )
 
 
@@ -127,24 +154,28 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         and interaction.get("terminal") is True
         else ("interaction did not complete successfully",)
     )
-    tool_evidence_blocker = (
-        ()
-        if interaction.get("toolEvidenceComplete") is True
-        else ("portal projection omits complete tool evidence",)
-    )
     final_output_blocker = (
         ()
         if "output" in interaction
         else ("portal interaction projection omits output",)
     )
 
-    completed_operations = tool_operations(interaction, completed_only=True)
-    schedule_created = bool(SCHEDULE_OPERATIONS.intersection(completed_operations))
-
     answer = delivered_answer(interaction)
     folded_answer = answer.casefold()
+    # A fire time cannot be told apart from the plan's own start by its
+    # presence alone — every correct plan states a start. What only a fire
+    # time produces is a second clock time exactly the lead earlier.
+    clock_minutes = {
+        int(hour) * 60 + int(minute)
+        for hour, minute in UTC_TIME_RE.findall(answer)
+        if int(hour) < 24 and int(minute) < 60
+    }
     fire_time_stated = (
-        bool(UTC_TIME_RE.search(answer))
+        any(
+            (start - fire) % (24 * 60) == RECHECK_LEAD_MINUTES
+            for start in clock_minutes
+            for fire in clock_minutes
+        )
         and "utc" in folded_answer
         and any(phrase in folded_answer for phrase in LEAD_PHRASES)
     )
@@ -154,9 +185,13 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         or "same conversation" in folded_answer
         or "same thread" in folded_answer
     )
-    one_shot = bool(ONE_SHOT_RE.search(folded_answer)) and not RECURRING_RE.search(
-        folded_answer
+    recurring_committed = any(
+        SCHEDULE_TERM_RE.search(sentence)
+        and RECURRENCE_RE.search(sentence)
+        and not NEGATION_RE.search(sentence)
+        for sentence in SENTENCE_SPLIT_RE.split(folded_answer)
     )
+    one_shot = bool(ONE_SHOT_RE.search(folded_answer)) and not recurring_committed
 
     input_value = interaction.get("input")
     input_text = str(
@@ -174,14 +209,6 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         and "this conversation" in folded_input
         and "exactly once" in folded_input,
         input_text,
-    )
-    suite.record(
-        "ac02-recheck-schedule-created",
-        schedule_created,
-        {"completedOperations": sorted(completed_operations)},
-        blocked_by=tuple(
-            dict.fromkeys((*interaction_blocker, *tool_evidence_blocker))
-        ),
     )
     suite.record(
         "ac03-recheck-fire-time-stated",
@@ -284,6 +311,15 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
             )
             if condition
         ),
+    )
+    suite.record(
+        "m4-recheck-schedule-observed",
+        interaction.get("toolEvidenceComplete") is True
+        and bool(SCHEDULE_OPERATIONS.intersection(completed_operations)),
+        {"completedOperations": sorted(completed_operations)},
+        blocked_by=()
+        if "toolEvidenceComplete" in interaction
+        else ("portal interaction projection omits toolEvidenceComplete",),
     )
     return suite
 
