@@ -7,8 +7,10 @@
   pre-amendment draft, never implemented; 0.3 added the ratified `authority` rules; 0.4
   moves the addressee into the task subjects, which is what makes connection-time
   authorization expressible on the task plane. Amended 9/9 without a version bump: the
-  supervisor gets its own task subject, and the identity half of the consumer rule flips
-  to subject-derived identity (the Verified identity section).
+  supervisor gets its own task subject, the identity half of the consumer rule flips
+  to subject-derived identity (the Verified identity section), and - once the capability
+  envelope armed later the same day - the authority half flips too, so `authority.grants`
+  becomes decision-grade by resolution (the Authority section).
 
 ## Purpose
 
@@ -62,8 +64,10 @@ right now. There are four things it does not have. The bus needs all four:
 
 A2A has a named construct for each: durable status/artifact update events, the task state
 machine, typed Parts (text, data, file), and taskId/contextId. It also has `auth-required`
-as a first-class task state, which gives the parked authority work somewhere to land
-without a protocol rev.
+as a first-class task state, which gave the parked authority work somewhere to land
+without a protocol rev. It did not need it (9/9): the capability envelope refuses with a
+terminal `rejected` instead, because there is nothing the requester could supply to make
+the answer different - `auth-required` promises a retry that does not exist here.
 
 The honest counterargument: adoption surveys consistently show A2A being used at trust
 boundaries between organizations, while teams that own all their agents in one process use
@@ -143,7 +147,7 @@ lacked.
 | `from`                 | Required; only `from.session` is a presence rule. Never the source of identity or authority - both come from the subject an envelope was delivered on (Verified identity, below). On an identity-bearing subject `from` MUST agree with the writer the subject implies, and a disagreement is a protocol error, never a re-attribution. Refused on `…supervisor`, `…in` and the directory; on `…events` advisory as shipped - counted, and the envelope still published, delivered and folded - and hard only once an operator sets `A2A_STRICT_EVENTS_WRITER=true`. `from.profile` names the AgentProfile a worker runs as; mandatory (9/9) on the directory, where it is the profile binding. On a profile-addressed executor's events either it or `from.session` may carry the addressee token; neither alone is required. Display reads it; nothing decides on it. |
 | `to`                   | Optional, on every class - nothing requires it to be present. Addresses an envelope to a named session, and consumers on a wildcard MUST ignore envelopes addressed elsewhere. Where it IS present on any task subject it MUST agree with that subject's addressee token. Event envelopes carry no `to`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `identity`             | **Reserved and permanently null** (decided 9/9). Verified identity is a property of the delivery, not a field. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `authority`            | **Reserved**, advisory. Populated by the chatops gateway only. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `authority`            | Populated by the chatops gateway only. `requester` and `audience` stay advisory forever. `grants` is decision-grade **by resolution, never by reading it** - it carries a capability reference, and a consumer hands that reference to the verifier rather than trusting the block. See below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `kind`                 | Required. Enum below; selects the payload type.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `payload`              | The A2A object, per kind.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
@@ -166,26 +170,74 @@ One of them is now decided the other way.
   definition, which is the property being refused. So the library exposes verified
   identity as a property of the delivery, never as a field it parses. The rules are in
   the Verified identity section below.
-- `authority` will carry a _reference_ to an attenuating capability held in KV - who
+- `authority` carries a _reference_ to an attenuating capability held in KV - who
   originally asked, what scope they hold, what this hop is permitted to do, each further
   hop a strict subset - per the capability envelope design
   (`docs/architecture/09-capability-envelope.md`): no token format, nothing signed in the
   envelope, the message carries a lookup id. The A2A `auth-required` task state is
-  reserved alongside it.
+  reserved alongside it. **Armed 9/9**; the Authority section below states the rule.
 
 Rules (**amended 8/24**, ratified from the gateway design; **the identity half flipped
-9/9**): `identity` MUST NOT be populated by anyone, and an emitter that populates it is
-non-conforming. `authority` is populated by the chatops gateway at ingress and by nothing
-else - the verified requester and the audience snapshot, carried for audit and parity
-testing. It is advisory: nothing yet stops a bus client from inventing an `authority`
-block, so consumers MUST NOT make any authorization decision on it, and libraries MUST
-pass it through untouched. Consumers MAY decide on the **subject-derived identity** of an
-envelope on the task plane, under exactly the conditions the Verified identity section
-states; that is the identity half of the old "neither field" rule, and it is the only
-half that has flipped. The authority half flips when the capability envelope arms
-(`docs/architecture/09-capability-envelope.md`) and not before: a flip that read as
-covering both would license consumers to trust `authority.grants` while it is still
-null.
+9/9**, **the authority half 9/9 as well, once the envelope armed**): `identity` MUST NOT
+be populated by anyone, and an emitter that populates it is non-conforming. `authority`
+is populated by the chatops gateway at ingress and by nothing else. Consumers MAY decide
+on the **subject-derived identity** of an envelope on the task plane, under exactly the
+conditions the Verified identity section states, and MAY decide on `authority.grants`
+under exactly the conditions the Authority section states. Neither `requester` nor
+`audience` is ever decision-grade, and libraries MUST pass the whole block through
+untouched.
+
+### Authority
+
+`authority.requester` and `authority.audience` **stay advisory permanently**, for the
+same reason `identity` stays null: nothing stops a bus client from inventing them, so a
+consumer that authorizes on them is authorizing on attacker-supplied bytes. They are the
+audit trail, and they are pseudonymized. No conformance assertion may be written against
+them, and one written that way is a bug in the test.
+
+`authority.grants` is different, and the difference is the whole design. It carries a
+reference and nothing else:
+
+```json
+"grants": { "capability": { "key": "root.task-9f3c…", "revision": 412 } }
+```
+
+The tier and the scope are **deliberately not on the wire**. Putting them there would let
+a consumer authorize on content it did not verify, in the shape that looks most like
+working code - and that is the one thing 09 forbids.
+
+**The rule.** A consumer MAY treat `authority.grants` as decision-grade, subject to all
+four of:
+
+1. **It resolves the reference; it never reads it.** The decision is the verifier's
+   answer to "does this permit verb V on resource R", obtained over
+   `a2a.cap.verify.<caller>`. A consumer that parses the reference and infers anything
+   from its shape is non-conforming.
+2. **Absent or unresolvable is a refusal, not a pass.** `grants: null` on a task
+   submission means the executor refuses the task. This is the fail-closed direction and
+   it is the direction a relaxed implementation gets wrong; an executor MAY be configured
+   to relax it for a migration window, and MUST default to refusing.
+3. **The refusal is a terminal task event, not a log line.** A refused submission goes to
+   `rejected` on the task's own event subject with a machine-readable reason, before any
+   model spend. A refusal only an operator can see is not a refusal the protocol can be
+   tested against.
+4. **The verifier authenticates the caller from the subject, so the consumer must be the
+   principal it claims to be.** This is the identity half, and it is why the authority
+   half could not flip first: the verifier's answer is "does this capability permit this
+   caller", and without subject-derived identity there is no trustworthy caller to name.
+   A consumer resolving over another principal's verify token is refused by the server,
+   not by the verifier.
+
+**`grants: null` is not deprecated.** A turn with no task behind it - a status ask, a
+refusal the gateway answers itself - carries null and always will. Null means "no
+capability accompanies this", which rule 2 turns into a refusal wherever a capability is
+required. It does not mean "unarmed".
+
+**What this does not give a consumer.** It does not answer "who is the human". The chain
+terminates at a request id, not a person; `authority.requester` names a pseudonymized
+principal and is advisory. It does not expire - 09 §5 is explicit that nothing carries an
+issue time or a use count, so a resolvable reference is resolvable indefinitely, and a
+consumer MUST NOT read a successful resolution as evidence the request is still live.
 
 ### Kinds and payload types
 
@@ -218,13 +270,15 @@ starting it.
 
 ### Subjects
 
-| Subject                                     | Carries                                                                                                                                                                                                                                                                                                                                                                                                                |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `a2a.tasks.{addressee}.{taskId}.in`         | `message` (submission and follow-up input) and `cancel`, requester to executor. Two reader roles by design: the dispatcher consumes new-task submissions; the executor's own ephemeral consumer takes everything after the submission (follow-ups, steers, cancels).                                                                                                                                                   |
-| `a2a.tasks.{addressee}.{taskId}.events`     | `status-update` and `artifact-update`, executor to anyone. **The executor and only the executor writes here** (9/9): the addressee's own principal is the subject's writer set, which is what makes its identity subject-derived.                                                                                                                                                                                      |
-| `a2a.tasks.{addressee}.{taskId}.supervisor` | Added 9/9. The one terminal `status-update` a task's supervisor synthesizes for an executor that died or that it is tearing down on the requester's cancel - the gateway for chat sessions it spawned, the dispatcher's janitor for profile-addressed tasks. Supervisor to anyone; the executor's grant never reaches it. Same token count as `events`, so it shares the `TASKS` stream, its filters and its sequence. |
-| `a2a.agents.{profile}`                      | `agent-card` when a profile is created, `agent-closed` tombstone on delete - published by the profile's owner (the operator once profiles are CRs), not by workers. Chat sessions are not discoverable services and publish no card.                                                                                                                                                                                   |
-| `agents.hb.{agentType}.{owner}.{session}`   | Core-NATS heartbeat every 15 s, Synadia-compatible shape, outside the stream. `owner` is the owning scope/account name - a single fixed value until the multi-scope split is exercised.                                                                                                                                                                                                                                |
+| Subject                                     | Carries                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `a2a.tasks.{addressee}.{taskId}.in`         | `message` (submission and follow-up input) and `cancel`, requester to executor. Two reader roles by design: the dispatcher consumes new-task submissions; the executor's own ephemeral consumer takes everything after the submission (follow-ups, steers, cancels).                                                                                                                                                                                                             |
+| `a2a.tasks.{addressee}.{taskId}.events`     | `status-update` and `artifact-update`, executor to anyone. **The executor and only the executor writes here** (9/9): the addressee's own principal is the subject's writer set, which is what makes its identity subject-derived.                                                                                                                                                                                                                                                |
+| `a2a.tasks.{addressee}.{taskId}.supervisor` | Added 9/9. The one terminal `status-update` a task's supervisor synthesizes for an executor that died or that it is tearing down on the requester's cancel - the gateway for chat sessions it spawned, the dispatcher's janitor for profile-addressed tasks. Supervisor to anyone; the executor's grant never reaches it. Same token count as `events`, so it shares the `TASKS` stream, its filters and its sequence.                                                           |
+| `a2a.cap.verify.{caller}`                   | Added 9/9 with the capability envelope. An executor's request to resolve a capability reference, executor to the verifier. `{caller}` is the asking principal's name and the verifier reads its identity off that token rather than off the payload, which is sound only because each principal's grant is exactly one subject: a `a2a.cap.verify.*` grant would turn the identity check into a self-assertion. The `cap` KV bucket behind it is readable by the verifier alone. |
+| `a2a.cap.reply.{caller}.{inbox}`            | Added 9/9. The verifier's answer, verifier to the one executor that asked. Scoped under `{caller}` so a principal's reply grant cannot reach another's - a subscribe permission on a reply space is interception and not observation, because any subscriber may join a queue group on it.                                                                                                                                                                                       |
+| `a2a.agents.{profile}`                      | `agent-card` when a profile is created, `agent-closed` tombstone on delete - published by the profile's owner (the operator once profiles are CRs), not by workers. Chat sessions are not discoverable services and publish no card.                                                                                                                                                                                                                                             |
+| `agents.hb.{agentType}.{owner}.{session}`   | Core-NATS heartbeat every 15 s, Synadia-compatible shape, outside the stream. `owner` is the owning scope/account name - a single fixed value until the multi-scope split is exercised.                                                                                                                                                                                                                                                                                          |
 
 **The addressee token (added in 0.4) is the authorization seam.** `{addressee}` is the
 executor's name - a profile, or a chat session. With it in the subject, connection-time
@@ -239,7 +293,9 @@ are NATS token separators, and a dotted value silently changes the subject's tok
 count out from under every wildcard filter. (Topic tokens already carry this rule; it
 is the same rule.) Session names (`<profile>-<animal>`) and sanitized profile names
 comply by construction; the library enforces it anyway. Per-task (rather than
-per-executor) scoping stays the parked tightening with the authority work.
+per-executor) scoping is still parked: the authority work landed the capability
+envelope above, which answers "may this task do this" per task without narrowing the
+subject grants, and narrowing them remains a separate tightening nobody has needed yet.
 
 (0.1's `.request` becomes `.in` because it now carries follow-up input and cancel, not just
 the one submission.)
@@ -607,9 +663,26 @@ Verified identity (added 9/9):
     an identity-bearing subject - are permissions invariants, and per `AGENTS.md` they
     belong in `tests/conformance/` rather than in the library suite. That is a placement
     rule and not a pointer to existing coverage: read `tests/conformance/` itself before
-    relying on any of them being asserted. One of the three cannot pass as stated in any
-    case - the static `worker` user holds publish on every addressee's `…events`, so
-    that writer set is not yet single-writer, and it closes when `worker` is retired.
+    relying on any of them being asserted. The `…events` caveat this item used to carry
+    is closed: retiring the static `worker` user took away the one publish grant that
+    wildcarded the addressee token, and the writer set is asserted empty by
+    `test_A3_the_events_subject_has_no_rendered_writer`. The static half went to
+    `bridge`, whose grant names its one addressee literally; the callout half went to
+    `agent`, which holds no task-plane publish at all.
+25. A submission whose `authority.grants` is null, names a key the gateway never wrote,
+    or names a capability whose `delegate` is a different principal is refused, and the
+    refusal is a `rejected` terminal on the task's event subject rather than a log line.
+    Assert all three separately: the null case is the one a relaxed configuration turns
+    off, and the forged-reference cases are the ones a suite built only from
+    well-formed capabilities never reaches.
+26. A capability narrowed at one hop cannot be widened at the next - by tier, by scope,
+    or by replacing the payload wholesale - demonstrated against a running verifier
+    rather than against the resolver in-process. Like 24 these are permissions
+    invariants as much as protocol ones: no principal but the gateway may write under
+    `$KV.cap.root.*`, and no principal but the verifier may read the store by any JetStream
+    path that returns a capability (the provisioner's `STREAM.INFO` on the bucket is the one
+    carve-out, and it returns stream state rather than an entry). Per `AGENTS.md` those belong
+    in `tests/conformance/`.
 
 ## Open Questions
 

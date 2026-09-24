@@ -355,9 +355,16 @@ verified how, in front of whom:
     "roster": ["hmac:9f4c21…", "hmac:77d0e2…"],
     "rosterComplete": true
   },
-  "grants": null
+  "grants": {
+    "capability": { "key": "root.task-9f3c4b…", "revision": 412 }
+  }
 }
 ```
+
+`grants` is `null` on a turn with no task behind it - a status ask, a refusal the gateway
+answers itself. On a submission it carries the reference above and nothing else: not the
+tier, not the scope. See the payload spec's Authority section for what a consumer may do
+with it, which is resolve it, never read it.
 
 **Identifiers in `authority` are pseudonymous (decided 8/24).** Principals, subjects,
 and roster entries are HMAC-SHA256 with the install's salt before anything is written to
@@ -366,7 +373,10 @@ metadata (`docs/designs/audit-logging-user-attribution.md`). The bus holds label
 content at rest for the whole retention window, so it gets the same treatment as the
 session KV. The plaintext join lives in the gateway's local ingress log, and the
 gateway resolves plaintext at the boundaries that need it - `openDirect` now, the
-lowest-common-denominator grant computation when the authority work lands.
+lowest-common-denominator grant computation if it is ever built. That one is still
+unbuilt (9/9): the authority work landed as the capability envelope, which answers
+"may this task do this" per task rather than computing a grant set per principal, so
+it does not reach this boundary.
 
 **The salt is `SESSION_KV_SALT`, the one the install already provisions** (settled
 8/31). It is generated once into `platform-agent-secrets`, deliberately never
@@ -419,8 +429,10 @@ there are what carry it.
   the two hashes are equal there (as in the example above). `verifiedBy`
   names the mechanism that checked it at ingress.
 - `audience` is a snapshot of the room at the moment of the ask (see group chats below).
-- `grants` is reserved for the attenuating capability token when the authority work
-  lands. Until then it is null and the field is advisory.
+- `grants` carries the attenuating capability's **reference** - a key in the `cap` bucket
+  and the revision the write returned - and never the capability itself. Armed 9/9. It is
+  null on any turn with no task behind it, and null on a submission is a refusal, not a
+  pass.
 
 How `principal` gets established depends on the backend, and the three are not equal:
 
@@ -443,21 +455,32 @@ How `principal` gets established depends on the backend, and the three are not e
 
 **What advisory means, stated plainly:** the gateway verifies the requester at ingress,
 but nothing stops another bus client from publishing an envelope with an invented
-`authority` block. So consumers MUST NOT authorize on it yet. It is carried now for the
-audit trail and for parity testing.
+`authority` block. **That is still true of `requester` and `audience`, permanently.**
+They are the audit trail and consumers MUST NOT authorize on them, ever.
 
-**Corrected 9/9: it does not become decision-grade "when `identity` arms."** `identity`
+**Corrected 9/9: it did not become decision-grade "when `identity` arms."** `identity`
 never arms; see above. And subject-derived publisher identity, which did land for the
 task plane on 9/9, is not enough on its own either - it says which principal wrote the
 bytes, while `authority` claims which human asked. An executor writing its own
 `…events` subject is the legitimate writer of that subject and can still put any
-`authority` block it likes in the envelope. What `authority` needs is a rule binding
-the block to the one publisher entitled to originate it, on subjects only that
-publisher writes; that is the authority half of the consumer rule, and it is still
-owed.
+`authority` block it likes in the envelope.
 
-The payload spec has carried this rule since 0.3: `authority` is populate-by-gateway-only,
-consumers forbidden from deciding on it, libraries pass it through untouched.
+**Armed 9/9, and not by the rule that paragraph predicted.** The answer is not a rule
+about who may originate the block - such a rule would have to be enforced by consumers
+reading a field, which is the shape being refused. `grants` carries a reference to an
+entry in a KV bucket the gateway is the only principal permitted to write, and a consumer
+does not read the entry (no broker may read the store at all) or trust the block. It
+hands the reference to the verifier, which authenticates the caller from the subject it
+arrived on and answers whether a verb is permitted. So an executor is free to write any
+`authority` block it likes, and it buys nothing: an invented reference names a key the
+gateway never wrote, and a stolen one names a capability whose `delegate` is a different
+principal. Both are refused, by the verifier and by the server's own subject permissions
+rather than by an honour system.
+
+The payload spec's Authority section states the consumer rule and its four conditions;
+the mechanism is `docs/architecture/09-capability-envelope.md`. What survives from 0.3
+unchanged: `authority` is populate-by-gateway-only and libraries pass it through
+untouched.
 
 ## Group chats: who is in the room
 
@@ -658,12 +681,14 @@ as the primitive, unused, like the other backends.
 - The gateway: Discord and Google Chat adapters, session manager (spawn / stream / reap / rehydrate /
   sweep), bus client, KV session registry.
 - The session pod shim: bus-to-stream-json bridge, event mapping.
-- The `authority` block, populated at ingress, advisory.
+- The `authority` block, populated at ingress: `requester` and `audience` advisory,
+  `grants` decision-grade by resolution.
 - Roster tracking and the `openDirect` primitive.
 
-Not in stage 2: the classifier, the LCD permissions tool, the slack adapter, `grants`,
-and anything that makes `authority` decision-grade. (The gchat adapter was on this
-list until 9/5; it now has its own section above.)
+Not in stage 2: the classifier, the LCD permissions tool, and the slack adapter. (The
+gchat adapter was on this list until 9/5; it now has its own section above. `grants` and
+"anything that makes `authority` decision-grade" were on it until 9/9, when they landed
+— the bullet above is what replaced them.)
 
 ## Inherited from the kanban retirement (added 8/24)
 

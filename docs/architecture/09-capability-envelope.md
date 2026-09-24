@@ -1,16 +1,27 @@
 # Design 09: The Capability Envelope
 
-**Status:** ✅ Agreed
+**Status:** ✅ Agreed · **armed on the a2a plane 2026-09-09**
 
-> **Specifies the end state, not current behaviour.** Nothing here is implemented. See
-> [README.md](README.md) for the delta against what ships today.
+> **Partly implemented, and the boundary matters.** The mechanism below - the KV scheme, the
+> three rules, revision pinning, the chain walk, the verifier as its own workload, the subject
+> permissions - is built and enforcing on the a2a task plane. What is _not_ built is the topology
+> this design was written for. See "What shipped, and what did not" below before reading any
+> section as either aspirational or done.
 
-> **North star, not a build item.** This presumes agents are separate workloads, which is not the
-> current topology, so there is nothing here to build yet and no phase in
-> [07](07-implementation-roadmap.md) that builds it. The Verification suite below joins the phase
-> loop when one does. Core invariant #3 used to ban agent-to-agent calls outright and would have
-> ruled this out; #727 restated it as the property it protects, and section 1 states where the
-> mechanism stands against the revised version.
+> **Written as a north star; the a2a plane arrived under it.** This presumes agents are separate
+> workloads. That is now true of one hop - the chatops gateway spawns a session pod per task, and
+> the session pod is a separate workload with its own principal - and still false of the
+> multi-agent fan-out the worked example in §3 draws. So the design got a first hop to be real
+> about and no second one. Core invariant #3 used to ban agent-to-agent calls outright and would
+> have ruled this out; #727 restated it as the property it protects, and section 1 states where
+> the mechanism stands against the revised version.
+
+> **Two corrections this document owes to the build, both load-bearing.** §3's worked example
+> spelled keys with the bucket name repeated (`cap.root.…` in bucket `cap`, which is the subject
+> `$KV.cap.cap.root.…`) while §4 spelled the permission `$KV.cap.root.*`. Those cannot both be
+> right and §4 is the one that is: it is the security control. §3 is corrected below. And §5's
+> "neither side is carried" is no longer true - both delegate rules now have the per-request
+> principal they were missing, and §5 says which mechanism supplied it.
 
 **Overview:** [README.md](README.md) · **Depends on:** [02](02-agent-personas.md), [03](03-security-model.md),
 [05](05-system-architecture.md), [08](08-agent-runtime-and-identity.md) · **Tier:** Foundational
@@ -34,6 +45,41 @@ entry.
 
 This is the **deferred hardening** already named in [03](03-security-model.md) §4a and
 [08](08-agent-runtime-and-identity.md) §5, with a different mechanism.
+
+## 0. What shipped, and what did not
+
+Added 9/9, when the a2a plane armed this. Read it before treating any section below as either a
+plan or a fact.
+
+**Built and enforcing.** The `cap` bucket and its subject permissions; minting at ingress, so
+`authority.grants` on a task submission is a real reference and no longer null; the chain walk with
+its depth bound, visited set and revision pinning; both delegate rules; the verifier as its own
+Deployment with the only read on the store; and the executor refusing a verb its capability does
+not permit, as a terminal `rejected` event rather than a log line. The consumer rule in the payload
+spec flipped for `authority.grants` on the strength of it.
+
+**The per-request principal §4 and §5 both demand exists, and it was not new work.** The chatops
+gateway allocates a session pod name and a taskId in the same breath at spawn; one incarnation
+serves exactly one task; and the bus derives a pod's identity from the API server's attested
+`authentication.kubernetes.io/pod-name` claim rather than from anything the pod says. So the
+per-incarnation principal _is_ the per-request principal, the parent can predict its name because
+the parent allocates it, and §5's "read the last five words of the claim as the target" is
+discharged. That is a happier answer than §5 expected: it asked for a new credential-issuing
+mechanism and the runtime already had one.
+
+**Not built: the second hop.** §3 draws gateway → broker A → broker B, and the product has
+gateway → session pod. There is no stage-3 dispatcher; the gateway's delegate flow spawns a
+_successor_ session whose root the gateway mints itself, so it is hop 1 twice rather than hop 2.
+Attenuation therefore ships as library, permission and verifier support with **no production
+caller**, exercised by conformance tests and by a live probe holding two real session credentials.
+A reader must not take the narrowing demonstration as evidence that a shipped component narrows.
+Session pods deliberately hold no `$KV.cap.hop.<pod>.*` grant for the same reason: granting a
+capability nothing uses is how a hole gets in ahead of the code that would have justified it.
+
+**Not built, and still open: everything §5 lists.** Nothing expires. Revocation still names no
+actor. The envelope still has no requester field. And the auth callout's signing seed is still the
+largest concentration in the deployment - see the custody note at the end of §5, which is now
+measured against a live install rather than asserted.
 
 ## 1. What this decides, and what it supersedes
 
@@ -105,17 +151,19 @@ the same shape as the NATS auth callout 09 proposes alongside it, and it produce
 an entry rather than work product from a peer. If that reading is wrong the design has a problem,
 so it is stated here to be argued with rather than left implicit.
 
-**Three components here do not exist in the design set, and 09 introduces all three.** The bus, the
-per-agent broker in front of each agent, and the verification service are named throughout as
-though they were furniture, and they are not: [05](05-system-architecture.md)'s component inventory
-runs C1-C15 with no message bus and no verifier, and its "broker" (C6) is the GitHub token minter,
-which is a different thing wearing the same word. Read every "the broker" below as something this
-document proposes. Adding them to 05 with C-numbers, so 09 can cite them instead of describing
-them, is the first thing to do if this moves toward being built.
+**Three components here did not exist in the design set, and 09 introduced all three.** The bus,
+the per-agent broker in front of each agent, and the verification service were named throughout as
+though they were furniture. **Resolved 9/9:** [05](05-system-architecture.md)'s inventory now
+carries them as C16 (the bus), C18 (the session pod, which is the broker on the hop that exists)
+and C19 (the verifier), alongside C17 for the auth callout -- four missing rather than three, which
+is the sort of thing you find only by going to add one. 05's "broker" (C6) is still the GitHub
+token minter, a different thing wearing the same word, so read every "the broker" below as this
+document's sense of the word and not C6.
 
-**What is settled and what is not.** The mechanism is agreed as the design. The topology it
-presumes does not exist, so the open question is not whether to do this but when there is anything
-to do it to -- see the north-star note at the top.
+**What is settled and what is not.** The mechanism is agreed, and as of 9/9 the first hop is built
+and enforcing -- section 0 says exactly what shipped and what did not. The multi-hop topology the
+rest of this document presumes still does not exist, so everything below section 0 that describes a
+second hop is a design rather than a description.
 
 ## 2. The recommendation, first
 
@@ -123,7 +171,7 @@ to do it to -- see the north-star note at the top.
 
 The capability lives in NATS KV. The message on the bus carries only a lookup id.
 
-**"Key" below means a KV lookup key** -- a string like `cap.root.req-8f2a` -- and never a
+**"Key" below means a KV lookup key** -- a string like `root.req-8f2a` -- and never a
 cryptographic key. No capability is signed, and nothing has to hold a key to mint or verify one.
 
 **One cryptographic key does exist, and it is the most powerful thing in the design.** A NATS auth
@@ -142,13 +190,26 @@ the property §7's comparison turns on and it survives intact.
 What it does not buy is immunity to key compromise, and an earlier version of this paragraph
 claimed it did. The seed is the root of authority for the bus, so it wants gateway-grade custody, a
 rotation story and a compromise runbook -- not the handling a credential described as
-"authenticating connections" would get. §5 lists it with the other concentrations.
+"authenticating connections" would get. §5 lists it with the other concentrations, and since 9/9
+records what custody it **actually** has, measured against a live install: better than expected on
+RBAC, worse on delivery and rotation, and now guarding strictly more than it did before this design
+armed.
 
 ## 3. How it works
 
-**Gateway.** Mints the capability, writes it to KV under `cap.root.<request-id>`, and puts the id
-and the revision the write returned -- not the capability -- into the message. The entry names the
-one agent permitted to descend from it.
+**Gateway.** Mints the capability, writes it to KV under key `root.<request-id>` -- subject
+`$KV.cap.root.<request-id>`, the gateway's whole grant on this path -- and puts the id and the
+revision the write returned, not the capability, into the message. The entry names the one
+principal permitted to descend from it.
+
+> **Corrected 9/9: the key does not repeat the bucket name.** Earlier drafts wrote the key as
+> `cap.root.<request-id>`, which in bucket `cap` is the subject `$KV.cap.cap.root.<request-id>` --
+> a subject §4's `$KV.cap.root.*` permission does not match, so the gateway could not mint at all.
+> §4 was the correct half and the keys moved to meet it. Worth recording how it was found: the
+> entire capability unit suite passed with the wrong spelling, attacker tests included, because
+> not one of those tests crosses a subject permission. It took minting through the operator's real
+> rendered `nats.conf` to see it. §4's own warning about key space versus subject space is about
+> exactly this class, and the design tripped over it anyway.
 
 **Broker.** Reads the id off the message and asks the verifier to resolve it. The agent behind it
 sees neither the capability nor the store.
@@ -159,10 +220,19 @@ namespace, and passes the new id and revision downstream.
 
 **Verification.** Six checks, all required. Authenticate the caller and confirm the entry it is
 asking about names that caller as its delegate. Walk the chain to the root, refusing a chain that
-revisits an entry or exceeds a fixed depth bound. Confirm the root sits under `cap.root.*`. Confirm
-each link is narrower than its parent. Confirm **each link was written by the agent its parent
-named as delegate**. Fetch every link **at the revision its referrer pinned**, and refuse if that
-revision is no longer the one the store holds. Refuse otherwise.
+revisits an entry or exceeds a fixed depth bound. Confirm the root sits under the `root.` prefix.
+Confirm each link is narrower than its parent. Confirm **each link was written by the principal its
+parent named as delegate**. Fetch every link **at the revision its referrer pinned**, and refuse if
+that revision is no longer the one the store holds. Refuse otherwise.
+
+**What the caller is told, and why it is less than the verifier knows** (9/9). Every one of those
+six failures converges to a single answer -- "the capability does not authorize this caller" --
+rather than to the specific check that fired. The distinctions the verifier can draw are exactly
+the ones an attacker wants: whether a key exists, whether a pin is stale, whether a chain is deep
+or cyclic, whether the refusal was the delegate rule or the walk. Verb and scope refusals are the
+other way and keep their reasons, because those reach a legitimate caller holding a legitimate
+capability who needs to know what it lacks. The split is deliberate: chain shape is not the
+caller's business, and what a capability permits is.
 
 The caller identity in the first check **must be request-scoped**. An identity shared across
 concurrent requests cannot separate them, and the guarantee this design exists to make is void
@@ -173,24 +243,37 @@ The first is about the caller and the rest are about the chain, which is why an 
 only the chain ones. See "The subject prefix does not prove entitlement" below.
 
 ```
-   gateway   writes  cap.root.req-8f2a      = {tier: platform, scope: project-P,
-                                               delegate: fleet-recon}
+   gateway   writes  root.req-8f2a       = {tier: platform, scope: project/P,
+                                            delegate: recon-7fb2}
+                     └─ subject $KV.cap.root.req-8f2a
                      └─ the write returns revision 412
-                     └─ message carries "req-8f2a @412"
+                     └─ message carries "root.req-8f2a @412"
 
-   hop A     asks the verifier to resolve it, and is authenticated as fleet-recon --
-             the delegate the entry names, so it resolves and fleet-recon may descend
-             writes  cap.hop.fleet-recon.1  = {tier: cluster-admin, scope: cluster-C,
-                                               delegate: platform-a}
-                                              parent: cap.root.req-8f2a @412
-                     └─ message carries "cap.hop.fleet-recon.1 @418"
+   hop A     asks the verifier to resolve it over a2a.cap.verify.recon-7fb2, and is
+             authenticated as recon-7fb2 by that subject -- the delegate the entry
+             names, so it resolves and recon-7fb2 may descend
+             writes  hop.recon-7fb2.1    = {tier: cluster-admin,
+                                            scope: project/P/cluster/C,
+                                            delegate: plat-a-31d9}
+                                           parent: root.req-8f2a @412
+                     └─ subject $KV.cap.hop.recon-7fb2.1
+                     └─ message carries "hop.recon-7fb2.1 @418"
 
-   hop B     resolves that as platform-a: chain narrows, and platform-a is the delegate
-             the entry names.  fleet-recon asking for the same id would be refused
-             writes  cap.hop.platform-a.7   = {tier: developer-team,
-                                               scope: cluster-C/ns-web, ...}
+   hop B     resolves that as plat-a-31d9: chain narrows, and plat-a-31d9 is the
+             delegate the entry names.  recon-7fb2 asking for the same id would be
+             refused
+             writes  hop.plat-a-31d9.7   = {tier: developer-team,
+                                            scope: project/P/cluster/C/ns/web, ...}
                      └─ and so on
 ```
+
+Three things in that diagram are 9/9 corrections rather than cosmetic. Keys no longer repeat the
+bucket name, per the note above. **`delegate` holds a per-request principal, not an agent id** --
+`recon-7fb2` is one incarnation serving one request, which is what makes the two delegate rules
+separate anything (§5). And **scope is a `/`-segmented path**, because "narrower" needs a
+containment relation and the old shorthand did not have one: `project-P` narrowing to `cluster-C`
+had nothing linking the two, so a verifier could not tell containment from a sibling. Containment
+is segment-prefix on that path, and a sibling scope is refused.
 
 A hop delegating to several agents writes one child per recipient, each naming a single delegate.
 A list would also work; one child per recipient keeps the audit trail exact about who was handed
@@ -202,9 +285,40 @@ NATS KV keys live on subjects, and a client's subject permissions are **fixed wh
 authenticates and evaluated by the server on every operation**. So, writing a bucket named `cap`:
 
 - Only the gateway may publish under `$KV.cap.root.*`
-- Each broker may publish only under `$KV.cap.hop.<its-own-agent-id>.*`
-- **No broker may read the bucket at all.** Only the verification service holds read, and that
-  means both `$KV.cap.>` and the JetStream API subjects that serve the bucket.
+- Each broker may publish only under `$KV.cap.hop.<its-own-principal>.*`
+- **No broker may read the bucket at all.** Only the verification service holds read on
+  `$KV.cap.>` and on the JetStream API subjects that return a capability. One carve-out, stated
+  here rather than discovered: the seed Job holds `$JS.API.STREAM.INFO.KV_cap` and nothing else
+  on this path, because `kv info cap || kv add cap` is the provision script's idempotency guard.
+  `STREAM.INFO` returns stream state — a message count, a subject list, a first and last
+  sequence — and no capability. Every subject that does return one stays refused for seed as for
+  everyone else, which is what makes it a carve-out and not a hole, and it is asserted as an
+  allow in the conformance suite so that taking the grant away fails there instead of in an
+  install.
+
+> **The third bullet was false when it was first implemented, and it is worth knowing how** (9/9).
+> The verifier's own grants were correct. The hole was on the other side: the gateway, the worker
+> and the seed each held a broad `$JS.API.>` for the streams they legitimately provision and
+> consume, and `$JS.API.>` contains `$JS.API.DIRECT.GET.KV_cap` and
+> `$JS.API.STREAM.MSG.GET.KV_cap`. Three principals could read every capability in flight, with
+> nothing about the capability design misconfigured. Two lessons, and the second is the general
+> one. A read denial is not a property of the reader's grant, it is a property of every grant on
+> the bus - so it has to be tested as "nobody reads this", enumerated over principals, not as "the
+> verifier reads this and others were not given it." And a wildcard grant issued for one stream is
+> a grant on every stream that ever gets added afterwards; the capability bucket was added later
+> and walked straight into it. Closed with an explicit `deny`; re-scoping `$JS.API.>` itself is
+> the right fix and is separate work.
+
+**Writing a deny for a JetStream stream takes two wildcards, not one.** The stream name lands at
+different depths depending on the API call -- `$JS.API.STREAM.INFO.KV_cap` at depth 4,
+`$JS.API.CONSUMER.CREATE.KV_cap.<durable>` at depth 5 -- so a deny has to cover
+`$JS.API.*.*.KV_cap` and `$JS.API.*.*.*.KV_cap` and their `.>` forms. Positional wildcards, matched
+against the API's real shape, rather than one pattern that looks like it covers the space.
+
+**And a permission block with a deny and no allow is a widening, not a narrowing.** NATS reads it
+as everything-except-the-deny. So a renderer that emits `deny` lists must refuse to emit a block
+whose allow list is empty; the failure is silent, it looks like tightening, and it hands the
+principal the entire subject space.
 
 **Spell these in subject space, not key space.** A KV key does not live at its bare name: bucket
 `cap` is stream `KV_cap` on `$KV.cap.>`, and a get is a JetStream API call under `$JS.API.*` rather
@@ -278,8 +392,8 @@ and neither failure is obvious.
 
 Write permission proves who wrote a child. It proves nothing about whether that writer ever
 _received_ the parent the child names. Without a further rule, a compromised broker writes
-`cap.hop.<its-own-id>.N` naming `parent: cap.root.<somebody-else's-request>` -- a root minted for a
-more privileged human -- and every check passes. The root is under `cap.root.*`, each link narrows,
+`hop.<its-own-principal>.N` naming `parent: root.<somebody-else's-request>` -- a root minted for a
+more privileged human -- and every check passes. The root is under the `root.` prefix, each link narrows,
 and the prefix correctly proves who wrote the child. The hop has escalated by descending from
 someone else's origin. Request ids are not secrets, so naming one is no barrier.
 
@@ -293,7 +407,7 @@ from the child.
 **The verifier authenticates its caller.** A resolution is refused unless the entry names the
 caller as its delegate. The rule above closes descending from a root you were never handed. On its
 own it does nothing about simply _presenting_ that root, which reaches the same authority with less
-work. A broker puts `cap.root.<somebody-else's-request>` on its outbound message and skips writing
+work. A broker puts `root.<somebody-else's-request>` on its outbound message and skips writing
 a child entirely. Every chain check passes, and vacuously: a single-entry chain widens
 nothing, and a root has no parent whose delegate could be violated. Same precondition as above --
 ids are not secrets -- and the same escalation, on the read path.
@@ -320,18 +434,42 @@ against the wrong thing. This is a requirement 09 places on the runtime rather t
 KV scheme can fix from inside: whatever issues the broker's credential must issue a distinct one
 per request, so that "the caller" and "the request" are the same subject.
 
-**Nothing in the design set provides that today, and the nearest thing to it is deferred on
-purpose.** [08](08-agent-runtime-and-identity.md) §5 lists a scope broker issuing per-run ephemeral
-tokens among the options held out of v1, and its non-goals rule out "per-request credential
-enforcement" by name; [02](02-agent-personas.md) §8 and [06](06-api-and-data-contracts.md) §2 fix
-agent identity as one pre-created, tier-scoped ServiceAccount per agent. So this is a new
-requirement 09 raises and not a dependency on work already in flight -- which makes it a cost of
-the design rather than something arriving on its own.
+**~~Nothing in the design set provides that today~~ -- answered 9/9, and by something that was
+already there.** The paragraph that stood here reasoned from agent-granularity identity: [08](08-agent-runtime-and-identity.md)
+§5 holds a scope broker out of v1 and rules out "per-request credential enforcement" by name, and
+[02](02-agent-personas.md) §8 and [06](06-api-and-data-contracts.md) §2 fix agent identity as one
+pre-created, tier-scoped ServiceAccount per agent. All still true, and all about _agents_. The a2a
+plane does not authorize agents. It authorizes **session pods**, and the shape it already had is
+the shape this section asked for:
 
-**Until that exists the guarantee is weaker, and it is worth saying which weaker.** With a shared
-agent identity the bound is the widest capability concurrently delegated to that agent, not the
-authority of the human whose request is being served. That is still a bound and it is still worth
-having. It is not the sentence below, and 09 should not be built as though it were.
+- The chatops gateway allocates the session pod's name and the taskId **in the same breath at
+  spawn**, so the parent can predict the delegate's name -- which is precisely the derivability
+  this section identified as the real obstacle, rather than the credential existing yet.
+- **One incarnation serves exactly one task.** A session pod is spawned per task and reaped with
+  it, so per-incarnation and per-request are the same partition, not an approximation of it.
+- The bus derives a pod's principal from the API server's attested
+  `authentication.kubernetes.io/pod-name` claim on its ServiceAccount token, so the identity is
+  not something the pod asserts about itself.
+
+So the per-request principal is the session pod name, and the requirement is met by a runtime
+property rather than by the new credential-issuing component this section priced. The verifier
+authenticates its caller the same way the task plane does: the caller publishes on
+`a2a.cap.verify.<its-own-principal>`, the server refuses any principal publishing on another's
+token, and the verifier reads the caller off the subject rather than off anything in the request.
+
+**Two consequences worth stating.** A NATS message does not carry its publisher, so this only works
+because the subject is the identity -- a design that put the caller in the request body would be
+back to advisory bytes. And the reply subject has to be namespaced the same way: replies ride
+`a2a.cap.reply.<caller>.*` rather than `_INBOX`, because under `_INBOX` the verifier's publish
+grant would have to be `_INBOX.>`, which would let it forge JetStream API replies into any
+principal's inbox -- including the gateway's. The verifier also drops any request whose reply
+subject falls outside the caller's own reply namespace, since the reply-to is caller-chosen.
+
+**Where the weaker guarantee still applies.** With a shared agent identity the bound would be the
+widest capability concurrently delegated to that agent rather than the authority of the human whose
+request is being served. That is what the a2a plane escapes. Any _future_ consumer of this design
+running at agent granularity inherits the weaker bound, and the sentence in §5 is only true where a
+per-request principal is.
 
 **Only the verifier reads.** If every broker could walk the chain itself, every broker would need
 read across `cap.*`, which is what makes other agents' roots discoverable in the first place.
@@ -357,43 +495,42 @@ accepted limits, and they go to the downscoping design discussion together.
 KV scheme fixes that. Real tension with "structural, not behavioural."
 
 The bound that makes it survivable: a hop can only descend from a parent that named it, and every
-chain terminates at a root the gateway minted from the requester's own authority.
+chain terminates at a root the gateway minted for that one request.
 
 > **A broken hop cannot exceed what it was delegated for the request it is serving.** Worst case is
-> "narrowed less than intended", never "escalated past the human who asked."
+> "narrowed less than intended", never "widened past the root minted for this request."
 
-That is the sentence to have ready when someone probes the design, and it is worth knowing exactly
-what carries it: the two delegate rules above, a per-request principal both of them can name, and
-nothing else. The write half stops a hop descending from an origin it was never handed. The read
+That is the sentence to have ready when someone probes the design, and it is worth knowing both what
+carries it and what it does not say. It does not say "past the human who asked": the root is minted
+from the gateway's own install-wide tier and scope, the same pair for every requester, and nothing
+about who asked reaches the entry. §5's "the envelope has no requester field" below is the same fact
+stated from the other side. What carries what the bound does say: the two delegate rules above, a
+per-request principal both of them can name, and nothing else. The write half stops a hop descending from an origin it was never handed. The read
 half stops it presenting that origin directly. The principal is what makes "it" mean this request
-rather than this agent, and neither half has one today -- so read the last five words of the claim
-as the target. What follows is why. It holds under imperfect implementation, which is the only kind
-there is, but it does not hold under a missing rule.
+rather than this agent. It holds under imperfect implementation, which is the only kind there is,
+but it does not hold under a missing rule.
 
-**Neither side is carried, and the claim is ahead of the mechanism until they are.** The write side
-is proved by the subject prefix, which is per agent, so an agent that is concurrently the delegate
-of two roots can write a child descending from the wider one while serving the narrower one's
-request.
+**All three supports are now carried on the a2a plane** (9/9; this paragraph used to say the
+opposite and the correction is the substantive one in this revision). Both delegate rules are
+implemented and tested directly rather than through a correct hop, and the principal is the session
+pod name -- see "The identity the verifier authenticates" above for why that is per-request rather
+than per-agent, and why it needed no new component.
 
-The read side looks better and is not. The check compares the caller against the entry's `delegate`
-field, and that field holds an agent id written by the parent -- so making the caller's credential
-per-request changes one side of a comparison whose other side is still per-agent. Compare at agent
-granularity and the concurrent-capability escalation survives untouched, because the wider entry
-really does name that agent and the caller really is it. Demand exact equality and no legitimate
-resolution matches at all. A per-request caller identity on its own buys nothing.
+What made the old objection sharp is worth keeping, because it applies to any consumer of this
+design that does _not_ have a per-request principal. The write side is proved by the subject
+prefix; at agent granularity, an agent concurrently the delegate of two roots can write a child
+descending from the wider one while serving the narrower one's request. The read side looks better
+and is not: making the caller's credential per-request while `delegate` still holds an agent id
+changes one side of a comparison whose other side is per-agent, so compare at agent granularity and
+the escalation survives untouched, demand exact equality and no legitimate resolution matches at
+all. **Both sides have to move together.** They did here: the caller is an incarnation and
+`delegate` holds an incarnation.
 
-**What both sides actually need is a principal whose name the parent can predict.** The obstacle
-this paragraph used to give -- that the parent writes the entry before the downstream hop's
-credential exists -- is not the real one, and it applies equally to `delegate`, which the same
-parent writes at the same moment. The credential does not have to exist for the parent to name it;
-the _name_ has to be derivable. It is, if the principal is the pair of an agent and the request id,
-because the parent allocates the request id it is dispatching. Whether that is the right shape, and
-what issues such a principal, is the design question rather than this document's to settle.
-
-Treat the claim above as the target rather than as the current state, and as missing two of its
-three supports rather than one. This is going to the downscoping design discussion together with
-the three below, since all four turn on what "the request it is serving" means to a mechanism that
-cannot observe a request.
+**Both delegate rules are what carry the claim, so both are tested against directly.** A suite
+built from well-formed capabilities exercises neither: a correct hop satisfies both rules
+incidentally and would pass with either one deleted. The tests that matter are the two attacks --
+a broker writing a child of a root that names somebody else, and a broker presenting a root it was
+never handed -- and they were written before the verifier existed.
 
 **Chain depth is a refusal, not just a cost.** Resolution walks to the root, so a long chain is a
 lot of KV reads. Those are now the verifier's reads rather than every broker's, so caching them is
@@ -405,7 +542,7 @@ about the id in hand. Not a problem at three or four hops, so the honest advice 
 uncached until it measures.
 
 The reason the walk is bounded is the other one. A broker holds publish across
-`cap.hop.<its-own-id>.*`, so it can write two entries in its own namespace naming each other as
+`$KV.cap.hop.<its-own-principal>.*`, so it can write two entries in its own namespace naming each other as
 parent, each naming itself as delegate, with identical payloads. Every rule holds -- both writes
 are inside its permitted subject, each entry's parent names it as delegate, and `C_new ⊆ C_old` is
 satisfied by equality -- and the walk never reaches a terminal. One broker, using only the
@@ -415,8 +552,16 @@ compromised or simply buggy hop. Hence the depth bound and the visited set in th
 and the denial tests for both.
 
 **The verifier is trusted and on the request path.** It is the only component holding read across
-`cap.*`, so compromising it exposes every in-flight capability, and if it is down nothing
+`$KV.cap.>`, so compromising it exposes every in-flight capability, and if it is down nothing
 authorizes. That is a real concentration and it is the price of not distributing read.
+
+Now that it ships, say the operational half plainly: **a verifier outage refuses every task**, and
+it refuses them visibly, as `rejected` terminals rather than as a queue that drains later. It runs
+two replicas with a surge-only rollout and is the third workload on the a2a plane, but two replicas
+is availability engineering, not a different answer. An install that cannot tolerate that failure
+mode wants the relax switch (`A2A_CAPABILITY_REQUIRED=false`), and that switch is a decision to run
+without this control rather than a tuning knob. It is inverted in code so the enforcing behaviour is
+the zero value: a config that fails to parse, or an env var nobody set, enforces.
 
 **The auth callout's signing seed is a larger one.** It signs the user JWTs that carry the
 permissions §4 relies on, so its holder can grant itself publish under `$KV.cap.root.>` and read
@@ -431,16 +576,62 @@ detail. Rotation is not a credential refresh: the public half is in `nats.conf`,
 server refuses a config reload that touches the callout block at all, so rotating it is a
 bus restart.
 
+**Arming this design made that seed strictly more powerful, and the PR that armed it did not fix
+the custody** (9/9). Before, forging a user JWT bought the bus. Now the same forgery buys the
+capability store, and there is no crypto on the capability path to fall back on -- §4's whole claim
+is that subject permissions _are_ the integrity control, and this key is what signs them. So the
+one cryptographic key in a design that advertises no crypto is now also the capability system's
+root of trust.
+
+**What custody it actually has, measured rather than asserted.** Checked read-only against a live
+install on 9/9, because "check what it has" and "read what the design says it has" turned out to
+give different answers.
+
+Three properties hold, and the middle one is the strongest:
+
+- The seeds live in their own Secret, separate from the per-user NATS credentials the gateway, the
+  session spawner and the agent pod all read.
+- **No ServiceAccount in the namespace can read a Secret there except the operator's own** --
+  confirmed by impersonated `auth can-i` per ServiceAccount, not from the RBAC manifests. Not the
+  gateway, not the session pods, not the shell. None of them can `create pods/exec` either. The
+  agent cannot reach this seed through the API server, which is the path that matters most.
+- One consumer: a mount-and-env survey of every pod in the namespace found the Secret referenced
+  only by the callout.
+
+Three gaps stand open:
+
+- **It is delivered as an environment variable rather than a projected file**, and the code comment
+  claimed the opposite -- said "mounted", while the pod has no volumes at all. `secretKeyRef` does
+  keep the value out of the pod spec and out of `describe`, so this is narrower than it first
+  reads, but env is inherited by every child process and lands in core dumps. The comment is fixed;
+  the delivery is not.
+- **No application-layer secrets encryption.** The seed sits in etcd under disk encryption alone --
+  no KMS envelope, no external secret store. "Gateway-grade custody" should mean at least the
+  envelope.
+- **No rotation story and no compromise runbook**, and the reason is structural rather than an
+  oversight: rotation forces a NATS restart, because the server refuses a config reload that
+  touches `auth_callout`. Combined with "nothing expires" below, a JWT an attacker minted before a
+  rotation stays valid until its connection drops. There is no revocation of an issued user JWT.
+
 **Nothing expires.** No entry carries an issue time, a use count, or any notion of the request
 being over, and a TTL is rejected elsewhere in this document as a thing revocation saves us from. So
 a root minted at 10:00 for a request that finished at 10:01 is still a valid parent at 03:00, and a
 hop can write a fresh child of its own stale root and drive work attributed to a human who went
 home. "For the request it is serving" is not observable to the mechanism as specified.
 
+**Shipped unsolved, deliberately** (9/9). The bucket's history is one revision per key and nothing
+sweeps it, so every capability ever minted is still resolvable. What limits the blast radius today
+is only that the delegate is a session pod name and session pods are reaped: a stale root names a
+principal that no longer exists, so nothing can present it. That is an accident of the topology
+rather than a property of the design, and it stops being true the moment a delegate outlives the
+request. Do not read it as expiry.
+
 **Revocation names no actor.** Deleting an entry is a stated goal and nothing says who deletes. The
 verifier holds read only, so it cannot. The gateway holds `$KV.cap.root.*`, so it can revoke roots
 and nothing else. The only party that can delete a hop entry is the broker that wrote it, which is
-the party being revoked from.
+the party being revoked from. **Shipped in that state**: no component deletes a capability, so
+revocation -- the property this design prefers over TTLs, and the reason it can tolerate "nothing
+expires" -- is the one advertised feature with no implementation behind it.
 
 **The envelope has no requester field.** It carries a tier and a scope. [03](03-security-model.md)
 §4a stays canonical for the requirement and that requirement is authorization against the
@@ -542,6 +733,15 @@ Every check below asserts a **denial**. A test that only confirms an authorised 
 cannot distinguish a working control from an absent one, and several of the failure modes here are
 silent.
 
+**All of these now exist** (9/9), and the split between them turned out to matter more than the
+list did. The chain checks live in the capability package's own suite, written against an
+in-process resolver. Four of them -- everything phrased as "the server refuses", the tenth through
+thirteenth below -- live in the conformance suite, which starts a real `nats-server` from the config the operator actually renders
+and connects as the rendered principals. That boundary is not bookkeeping: the whole unit suite,
+attacker tests included, passed against a key scheme that made minting impossible, because not one
+unit test crosses a subject permission. **A denial that names a subject has to be tested against a
+server, and against the shipped render rather than a hand-written config.**
+
 - **Descent without delegation is refused:** a broker writes a child naming a parent that names a
   _different_ agent as delegate. Resolution fails. This is one of the two checks that carry the
   "cannot exceed what it was delegated" claim; without it the design is broken, so it is the first
@@ -549,8 +749,13 @@ silent.
 - **Resolving an id you were never handed is refused:** a broker asks the verifier to resolve an
   entry naming a different agent as delegate, and is refused. The one to write second, and the
   easier of the two to leave out: it needs no forged write, so a chain-only test suite passes with
-  the hole open. Assert it for a bare `cap.root.*` id in particular, where the other four checks
+  the hole open. Assert it for a bare `root.` id in particular, where the other four checks
   pass vacuously -- nothing widens in a one-entry chain, and a root has no parent to violate.
+- **A submission carrying a forged `authority` block is refused, and the refusal is a terminal task
+  event.** Not a variant of the two above: it is the product-level shape of them, and it is the one
+  a reviewer will ask for. Build the attacker before the verifier. A design that has only ever seen
+  well-formed capabilities has not been tested, and the tell is a suite where every capability was
+  minted by the code under test.
 - **Widening is refused:** a child granting a tier or scope its parent does not hold fails
   resolution, whether it widens by one field or replaces the payload wholesale.
 - **A concurrent capability belonging to another request is refused:** one agent is handed two
@@ -565,27 +770,38 @@ silent.
   tested is a verifier that never returns, so a test that only checks the verdict would hang with
   the bug present.
 - **An over-deep chain is refused:** a well-formed chain longer than the bound fails, terminal
-  `cap.root.*` and all.
+  `root.` prefix and all.
 - **A rewritten entry is refused, by either route:** write a link, resolve it once, then (a)
   overwrite it in place and (b) in a second run delete it and create the same key again with
   different content. Both resolutions fail on the pinned revision. Test both: create-only writes
   stop (a) and do nothing about (b), since the create succeeds once the key is gone, so a suite that
   only exercises the overwrite passes with the delete path open.
-- **An orphan root is refused:** a chain whose terminal entry does not sit under `cap.root.*` fails,
-  including one that terminates at a well-formed `cap.hop.*` entry.
+- **An orphan root is refused:** a chain whose terminal entry does not sit under the `root.` prefix
+  fails, including one that terminates at a well-formed `hop.` entry.
 - **Only the gateway mints roots:** any other connection publishing to `$KV.cap.root.*` gets a
   permissions violation **from the server**, not a rejection from application code. The connection
   is expected to succeed and stay open; the publish is what fails.
 - **No broker writes in another broker's namespace:** broker A publishing to `$KV.cap.hop.<B>.*` is
-  refused the same way.
+  refused the same way. Assert a dotted key too (`root.task.1` against a grant of `$KV.cap.root.*`):
+  a single-token wildcard does not span a dot, and a key scheme that lets an identifier carry one
+  escapes the namespace the permission was written to fence.
 - **No broker reads the store:** a broker attempting any read of the bucket is refused -- both a
   direct get on `$KV.cap.>` and the JetStream API path to the same stream,
   since denying only the first leaves the second open. Assert this for a broker that legitimately
   participates in a chain, since the whole point is that participation does not imply read.
+  **Enumerate over principals and over API subjects, not over the verifier's grant.** This is the
+  check that found three principals reading the store through a wildcard issued for other streams
+  (§4), and it only found them because it asked every principal rather than checking that the
+  verifier's own permissions were right. Cover both stream-name depths and every API verb that can
+  return message bodies -- direct get, message get, consumer create and next, snapshot -- since
+  denying the obvious two leaves the rest.
 - **The permissions are actually configured:** a connection with no capability permissions at all is
   refused the operations above. Written against bare key names rather than `$KV` subjects, each test
   above passes on a server where nothing was configured, so this one is what distinguishes the
-  control from its absence.
+  control from its absence. Two ways to satisfy it and both are worth having: give every refused
+  principal a **live control** on the same connection -- something it legitimately reaches, so a
+  refusal cannot be a broken connection -- and run the verifier's own happy path end to end under
+  its rendered grants, so "nobody can" is not accidentally "nothing works."
 - **Revocation is immediate:** delete an entry mid-flight; the next resolution of any id descending
   from it fails.
 - **The agent never sees the capability:** from inside an agent container, the capability id and the
