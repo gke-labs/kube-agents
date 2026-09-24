@@ -100,8 +100,13 @@ type ConsoleAdapter struct {
 	log *slog.Logger
 
 	subscribedFlag atomic.Bool
-	mu             sync.Mutex
-	nextID         uint64
+	// closingFlag distinguishes our own Close from a real drop: nats.go runs
+	// DisconnectErrHandler for a user-initiated Close too, with a nil err, so
+	// without this every orderly shutdown logs a reconnect that never comes.
+	// Same guard as the bus client's (lib/client.go).
+	closingFlag atomic.Bool
+	mu          sync.Mutex
+	nextID      uint64
 	// bootID is minted per adapter so notice ids (c-<boot>-<n>) do not
 	// repeat across gateway restarts, where a page still holding c-1 from
 	// the last boot would otherwise take a new c-1's edits as its own.
@@ -150,6 +155,9 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 				"subject", subject, "err", err)
 		}),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			if a.closingFlag.Load() {
+				return
+			}
 			log.Warn("console connection lost; reconnecting", "console", consoleConnName, "err", err)
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
@@ -170,6 +178,7 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 // IsClosed makes this idempotent.
 func (a *ConsoleAdapter) Close() {
 	if a.nc != nil && !a.nc.IsClosed() {
+		a.closingFlag.Store(true)
 		a.nc.Close()
 	}
 }

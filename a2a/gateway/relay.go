@@ -183,7 +183,11 @@ func (g *Gateway) applyArtifact(rec *SessionRecord, rs *relayState, taskID strin
 // the durable record; the index only exists to route live events.
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate) {
 	result := joinTextParts(rs.result)
-	if result == "" && s.Status.State == lib.StateCompleted {
+	// The console never posts the deliverable (see the StateCompleted arm), so
+	// replaying the stream to recover it would buy nothing. Checking here and
+	// not there is the difference between skipping the replay and paying for
+	// one whose result is then dropped.
+	if result == "" && s.Status.State == lib.StateCompleted && g.backendFor(rec.Key) != consoleBackend {
 		// Render state is cache; if a restart lost it, the stream still has
 		// everything. Replay against the addressee the task's own subjects
 		// carried - after a Delegate re-home, rec.Addressee is not it.
@@ -207,7 +211,8 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// (console.go and spec-chatops-gateway.md, "The console adapter").
 		// The other terminal arms below are notices, not answers, and go to
 		// every backend. Chat backends have no TASKS view, so for them this
-		// post IS the answer.
+		// post IS the answer. The replay above is skipped for the same
+		// backends, so reaching here with an empty result costs nothing.
 		if g.backendFor(rec.Key) != consoleBackend {
 			g.post(rec.Key, result)
 		}
@@ -316,7 +321,9 @@ func terminalLine(state lib.TaskState, progress string) string {
 	}[state]
 	line := fmt.Sprintf("%s **%s**", icon, state)
 	// No tail on completed: the result is posted as its own message right
-	// before this edit, and the worker adapter's progress deviation (no
+	// before this edit on every backend that posts one at all (the console
+	// does not - it reads answers off TASKS), and the worker adapter's
+	// progress deviation (no
 	// explicit progress tool — assistant text becomes `progress`, the final
 	// text becomes `result`) makes the last narration routinely BE the
 	// result on a single-turn task, so keeping it rendered the answer

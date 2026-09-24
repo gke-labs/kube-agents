@@ -464,3 +464,24 @@ func TestConsoleRecoversARefusedSubscriptionOnReconnect(t *testing.T) {
 		t.Errorf("delivered frame = %+v, want conversation console:tab-9 with the sent text", first)
 	}
 }
+
+// A deliberate Close is not a lost connection. nats.go runs
+// DisconnectErrHandler for a user-initiated Close too (with a nil err), so
+// without the closing guard every orderly gateway shutdown logs a reconnect
+// that is never coming - once per process, on every process.
+func TestConsoleCloseDoesNotLogAsALostConnection(t *testing.T) {
+	srv := startServer(t)
+	logs := &lockedBuffer{}
+	a, err := NewConsoleAdapter(srv.ClientURL(), nil, slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Close()
+	// The handler runs on nats.go's own goroutine, so give it room to be
+	// wrong rather than racing it to the assertion.
+	waitFor(t, "the connection to close", func() bool { return a.closed() })
+	time.Sleep(200 * time.Millisecond)
+	if got := logs.String(); strings.Contains(got, "console connection lost") {
+		t.Errorf("a deliberate Close logged as a lost connection:\n%s", got)
+	}
+}
