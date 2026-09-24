@@ -193,7 +193,7 @@ Two things to verify on the cluster, neither of which the operator can check for
 
 ### What it will cost, once it does block something
 
-**None of this happens today** — with the one exception above: a Helm install running `spec.networkPolicy.enabled: false` on an enforcing CNI pays this whole bill the moment the flag goes on. Everywhere else, every destination below is one `<name>-gateway-netpol` still permits to the same Pod, so you can enable the flag and observe no behaviour change in either direction. This is the bill that falls due once the gateway policy is narrowed, and it is here so that the narrowing is not a surprise.
+**None of this happens today** — with the one exception above: an install running `spec.networkPolicy.enabled: false` on an enforcing CNI pays this whole bill the moment the flag goes on. Everywhere else, every destination below is one `<name>-gateway-netpol` still permits to the same Pod, so you can enable the flag and observe no behaviour change in either direction. This is the bill that falls due once the gateway policy is narrowed, and it is here so that the narrowing is not a surprise.
 
 At that point the allowlist covers DNS (selector peers, the resolved cluster DNS ClusterIP, and the Cloud DNS resolver — the same ladder the gateway policy renders), the broker, LiteLLM, the OTel collector, the Hindsight memory API and (under the unsupported `mode: next` toggle) the A2A NATS pods, and everything the agent container reaches on its own would go away:
 

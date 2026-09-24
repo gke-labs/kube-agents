@@ -5,13 +5,13 @@ sidebar:
   order: 1
 ---
 
-The operator lays down every concrete Kubernetes object for the Platform Agent — the `Deployment`, `ConfigMap`s, RBAC, the `Service` and the `NetworkPolicy` — when it reconciles a `PlatformAgent` CR. No static copy of the Service or the network policies ships in the repository: the objects below exist only as the operator renders them, and each carries an owner reference to the CR that produced it.
+The operator lays down every concrete Kubernetes object for the Platform Agent — the `Deployment`, `ConfigMap`s, RBAC, the `Service` and the `NetworkPolicy` — when it reconciles a `PlatformAgent` CR. No static copy of the Service or the network policies ships in the repository: the objects below exist only as the operator renders them, and each carries an owner reference to the CR that produced it. The remote Kustomize base that used to ship at `deploy/kustomize/platform` is gone; an overlay that still lists it as a resource fails to build, and the fix is to drop that resource, because the gateway policy and Service the operator renders already cover what it applied.
 
 ## The gateway NetworkPolicy
 
 The operator renders one `NetworkPolicy` over the agent Pod, `<agent-name>-gateway-netpol`, covering:
 
-- **Ingress** — the Hermes API (`8642`), the credential proxy (`8643`) and the dashboard (`9119`) from Pods in the agent's own namespace.
+- **Ingress** — the Hermes API (`8642`), the credential proxy (`8643`) and, when `harness.hermes.dashboardEnabled` is set, the dashboard (`9119`), from Pods in the agent's own namespace.
 - **DNS and metadata egress** — CoreDNS and NodeLocal DNSCache, the cluster's DNS ClusterIP, and the GCP metadata server (`169.254.169.254/32` and `169.254.169.252/32`). The metadata address is also a DNS peer, on port `53` alone, because it is the resolver on a [Cloud DNS for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/cloud-dns) cluster.
 - **In-cluster egress** — LiteLLM, vLLM, the GitHub token minter, Hindsight and the managed OTel collector.
 - **Control-plane egress** — the Kubernetes API server, at the endpoints the operator discovers.
@@ -40,7 +40,7 @@ Do **not** edit the rendered policy in the cluster: the operator applies it with
 
 ## The Service
 
-The operator applies a `ClusterIP` Service named after the CR (`platform-agent` on a stock install) whose selector matches what it labels its gateway pods, `<agent-name>-gateway`. Its `app.kubernetes.io/*` labels follow the project-wide contract that makes the whole kube-agents footprint selectable in one query — [Resource labels](/kube-agents/reference/resource-labels/) is canonical for what each key means and why `component` and `version` are absent.
+The operator applies a `ClusterIP` Service named after the CR (`platform-agent` on a stock install) whose selector matches what it labels its gateway pods, `<agent-name>-gateway`, plus `kubeagents.io/is-leader: "true"` when the agent runs more than one replica. Its `app.kubernetes.io/*` labels follow the project-wide contract that makes the whole kube-agents footprint selectable in one query — [Resource labels](/kube-agents/reference/resource-labels/) is canonical for what each key means and why `component` and `version` are absent.
 
 The exposed ports:
 
