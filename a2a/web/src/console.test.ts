@@ -26,6 +26,7 @@ describe("console conversation ids", () => {
       "console:a.b",
       "console:ABC",
       "console:-abc",
+      "console:abc-",
       "console:a b",
       "console:>",
       `console:${"a".repeat(64)}`,
@@ -52,6 +53,17 @@ describe("console conversation ids", () => {
     const conv = mintConversation();
     expect(tokenOf(conv)).not.toBeNull();
     expect(mintConversation()).not.toBe(conv);
+  });
+
+  it("never mints a token ending in a hyphen", () => {
+    // Minted tokens are hex ([0-9a-f]) end to end, which can never produce a
+    // trailing hyphen -- but the rule that would reject one if it did is the
+    // same rule this asserts against, so a change to either stays honest.
+    for (const fill of [0x00, 0xff, 0xab, 0x0a, 0x1f]) {
+      const conv = mintConversation((buf) => buf.fill(fill));
+      expect(conv.endsWith("-")).toBe(false);
+      expect(tokenOf(conv)).not.toBeNull();
+    }
   });
 });
 

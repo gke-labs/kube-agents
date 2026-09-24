@@ -32,5 +32,7 @@ describe("config", () => {
   it("ignores a stored conversation id the gateway would reject", () => {
     sessionStorage.setItem("a2a-web-conversation", "console:Not.Valid");
     expect(loadConversation()).toBeNull();
+    sessionStorage.setItem("a2a-web-conversation", "console:abc-");
+    expect(loadConversation()).toBeNull();
   });
 });

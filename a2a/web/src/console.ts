@@ -7,8 +7,13 @@
  */
 
 export const CONSOLE_PREFIX = "console:";
-/** One dot-free DNS label, so `chat.console.*.in` covers every token. */
-export const TOKEN_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+/**
+ * Mirrors the gateway's `lib.ValidSubjectToken` -> `validDNS1123Label`
+ * (a2a/lib/envelope.go): 1-63 characters, lowercase alphanumeric or hyphen,
+ * and a hyphen may not lead or trail. A token this rejects but the gateway
+ * accepted (or vice versa) is a frame the gateway drops silently.
+ */
+export const TOKEN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 /** Bytes, not characters: the gateway measures len() of the UTF-8 string. */
 export const CONSOLE_TEXT_CAP = 16_384;
 /** 8 random bytes is 16 hex characters, well inside the 63-character label. */
