@@ -637,14 +637,15 @@ func seedIdentity() a2aIdentity {
 	}
 }
 
-// web: the read surface, the one user meant to face a browser, and the only
-// user whose credential is published to one by design.
+// web: the read surface, and one of the two users whose credential is
+// published to a browser by design - console is the other, and unlike this
+// one it can publish.
 //
 // STATIC, permanently. A browser holds no Kubernetes ServiceAccount token and
 // there is no mechanism by which it could, so this principal can never move to
 // the callout. It is not a residue awaiting a card; it is the shape of the
-// thing. What the callout does change is that this is now the ONLY credential
-// in the deployment a browser is ever handed.
+// thing. What the callout does change is that the credentials a browser is
+// ever handed are now exactly these two, both static for the same reason.
 //
 // "Read-only" is not expressible as a subject list — subject permissions cannot
 // see a request body, and JetStream puts the reach there — so the JS API grants

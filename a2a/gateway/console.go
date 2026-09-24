@@ -60,6 +60,15 @@ const (
 	// than the gateway should forward as a task; the ask echo in the
 	// session record is truncated anyway. 16 KiB is roomy for a chat turn.
 	consoleTextCap = 16 * bytesPerKiB
+
+	// consoleMessageIDCap bounds a frame's messageId. Unlike Discord's and
+	// Google Chat's, this id is chosen by the sender, and it reaches a log
+	// line on every drop path and the task ingress line on every accepted
+	// frame. Without a cap the only bound is the server's max_payload -- 1
+	// MiB by default, and the operator's render sets none -- so one frame
+	// could write a megabyte of log. An id is an identifier, not content;
+	// 256 bytes is far past any the page has reason to mint.
+	consoleMessageIDCap = 256
 )
 
 // ConsoleInFrame is what the browser publishes. Kind is empty or "text";
@@ -172,6 +181,16 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 			log.Info("console connection restored", "console", consoleConnName, "url", nc.ConnectedUrl())
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
+			// Wake Run either way, and let only the log line distinguish
+			// our own Close. MultiAdapter.Run cancels its siblings on a
+			// non-nil error and on nothing else (mux.go), so a Run still
+			// parked in its select - or one that returned nil - leaves the
+			// process up with a shut console door, which is the state this
+			// handler exists to prevent. That applies to a deliberate early
+			// Close too: Close's own doc offers it for an adapter that
+			// needs closing early, and an early close that never ends Run
+			// is the same half-deaf gateway by another route.
+			defer a.signalClosed()
 			if a.closingFlag.Load() {
 				return
 			}
@@ -186,7 +205,6 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 			// frame in silence.
 			log.Error("console connection closed for good; the gateway cannot serve the console door until it restarts",
 				"console", consoleConnName, "err", nc.LastError())
-			a.signalClosed()
 		}),
 	)
 	nc, err := nats.Connect(url, opts...)
@@ -258,9 +276,13 @@ func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) 
 		// Returning is the whole point: MultiAdapter.Run takes the first
 		// backend error and ends the process, which is how a dead console
 		// becomes a restart rather than a half-deaf gateway.
-		runErr = errors.New("console adapter: connection closed for good")
-		if last := a.nc.LastError(); last != nil {
+		switch last := a.nc.LastError(); {
+		case a.closingFlag.Load():
+			runErr = errors.New("console adapter: closed while running")
+		case last != nil:
 			runErr = fmt.Errorf("console adapter: connection closed for good: %w", last)
+		default:
+			runErr = errors.New("console adapter: connection closed for good")
 		}
 	}
 	_ = sub.Unsubscribe()
@@ -287,6 +309,12 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 	var f ConsoleInFrame
 	if err := json.Unmarshal(m.Data, &f); err != nil {
 		a.log.Warn("console frame dropped", "reason", "not a frame", "conversation", conversation, "err", err)
+		return InboundMessage{}, "", false
+	}
+	// Before any log line that carries the id: every drop below logs it,
+	// so checking it later would be logging the thing being refused.
+	if len(f.MessageID) > consoleMessageIDCap {
+		a.log.Warn("console frame dropped", "reason", "oversize messageId", "conversation", conversation, "bytes", len(f.MessageID))
 		return InboundMessage{}, "", false
 	}
 	if f.Kind != "" && f.Kind != "text" {

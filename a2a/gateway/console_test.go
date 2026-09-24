@@ -488,6 +488,61 @@ func TestConsoleCloseDoesNotLogAsALostConnection(t *testing.T) {
 	}
 }
 
+// Close's doc offers it for an adapter that "needs closing early". A caller
+// taking that at its word, then waiting on Run (or on MultiAdapter.Run, which
+// waits for every backend), must not hang: the mux cancels its siblings on a
+// non-nil error and on nothing else, so a Run left parked here is the same
+// half-deaf gateway the ClosedHandler exists to prevent.
+func TestConsoleCloseWhileRunningEndsRun(t *testing.T) {
+	srv := startServer(t)
+	a, err := NewConsoleAdapter(srv.ClientURL(), nil, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- a.Run(context.Background(), func(InboundMessage) {}) }()
+	waitFor(t, "console subscription", func() bool { return a.subscribed() })
+
+	a.Close()
+
+	select {
+	case runErr := <-done:
+		if runErr == nil {
+			t.Fatal("Run returned nil after an early Close; the mux does not cancel on nil")
+		}
+		if !strings.Contains(runErr.Error(), "closed while running") {
+			t.Errorf("Run error does not name a deliberate close: %v", runErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Close; a caller waiting on it hangs")
+	}
+}
+
+// A sender-chosen messageId reaches a log line on every drop path and the
+// ingress line on every accepted frame, so it needs the cap its neighbour
+// text already has - otherwise one frame writes up to max_payload of log.
+func TestConsoleDropsAnOversizeMessageIDWithoutLoggingIt(t *testing.T) {
+	r := startConsoleRig(t)
+	huge := strings.Repeat("z", consoleMessageIDCap+1)
+	r.send(t, "tab-9", ConsoleInFrame{MessageID: huge, Text: "hi"})
+	// Empty text is refused earlier than the cap, and that path logs the id too.
+	r.send(t, "tab-9", ConsoleInFrame{MessageID: huge, Text: "   "})
+	// A good frame last, so waiting on it proves the two before it are done.
+	r.send(t, "tab-9", ConsoleInFrame{MessageID: "m1", Text: "ok"})
+
+	waitFor(t, "the good frame", func() bool { return len(r.inbound()) == 1 })
+	if got := r.inbound()[0].MessageID; got != "m1" {
+		t.Errorf("forwarded %q, want only the frame with a sane id", got)
+	}
+	got := r.logs.String()
+	if !strings.Contains(got, "oversize messageId") {
+		t.Errorf("the oversize id was not refused:\n%s", got)
+	}
+	if strings.Contains(got, huge) {
+		t.Error("the oversize messageId was written to the log it exists to bound")
+	}
+}
+
 // A connection nats.go has given up on leaves the adapter subscribed to
 // nothing, with no reconnect coming. Run has to surface that: MultiAdapter
 // turns a backend error into a process restart, and a gateway that instead
