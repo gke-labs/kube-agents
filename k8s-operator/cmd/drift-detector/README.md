@@ -111,8 +111,11 @@ The detector runs where the daemon is: as a peer process inside the `agent-api-a
 gateway pod, alongside the API authenticator and the event watcher. Not alongside Envoy or the
 credential runtime — those moved to the credential pod, and `CREDENTIAL_PROXY_ROLE=api-proxy` is
 what tells the shared entrypoint not to start them here. It is not a container of its own, and the
-reason is the paragraph above — a container of its own would have its own network namespace and no
-route to the daemon.
+reason is not the paragraph above: containers in a Pod share one network namespace, so a sidecar
+container beside this one would reach the loopback daemon exactly as this process does. What rules
+it out is cost — a container of its own means an image of its own and an `images.json` entry, its
+own copy of the profiles volume and the token secret, and its own supervision, where the peer
+process inherits all four from the entrypoint that already runs the event watcher.
 
 Three pieces put it there — the same three that put the event watcher there, treating it slightly
 differently at each:

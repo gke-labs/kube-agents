@@ -185,7 +185,7 @@ def _run_bash(
 def _interval_settings(**overrides: object) -> str:
     """Bash assignments for every setting the clamp block reads.
 
-    All of them every time: `clamp_interval` dereferences each by name under
+    All of them every time: `clamp_at_least` dereferences each by name under
     `set -u`, so a test interested in one still has to supply the rest, and the
     ones it is not interested in get a value the clamp leaves alone.
     """
@@ -429,8 +429,9 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         without signalling, since its one round of `pkill` is long past. The
         symptom on a pod is a detector that is SIGKILLed mid-flight on every
         shutdown, redelivering whatever it was holding, and a drain that always
-        costs its full budget because `pgrep -P` keeps finding the backoff
-        `sleep` and never goes empty.
+        costs its full budget: the drain that had this bug polled the child set
+        with `pgrep -P`, and the backoff `sleep` is itself a child, so the poll
+        never went empty. The shipped drain polls the supervisors themselves.
         """
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = pathlib.Path(tmp)

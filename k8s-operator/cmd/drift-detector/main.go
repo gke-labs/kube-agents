@@ -32,10 +32,14 @@
 //
 // The inject is off unless --daemon-url is set, and off is the default. The
 // agent images carry this binary and the credential proxy's entrypoint starts
-// it, but only where the drift-pubsub Terraform module has been applied and the
-// PlatformAgent sets spec.harness.driftDetector.enabled; absent either, it ships
-// without running. See docs/designs/drift-detection.md for the design and
-// deploy/shared/start-services.sh for the flags it is started with.
+// it, but only where the PlatformAgent sets spec.harness.driftDetector.enabled;
+// absent that, it ships without running. The drift-pubsub Terraform module is a
+// precondition for it to work rather than a second start gate: nothing checks
+// at startup that the subscription exists, so on an install that enabled the
+// detector without applying the module it starts, fails its first Pull against
+// a subscription that is not there, and is retried by the entrypoint until the
+// short-exit count trips its ALERT. See docs/designs/drift-detection.md for the
+// design and deploy/shared/start-services.sh for the flags it is started with.
 package main
 
 import (
