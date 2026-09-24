@@ -96,6 +96,7 @@ ADDED_AFTER_THE_SPLIT = [
     "ai-security-planted-model-audit",  # #1023's fleet-audits second case, PR #1103
     "autoops-crashloop-config-triage",  # #1023's other incident-triage second case, PR #1103
     "consistency-no-environment-label",  # the drift collector's §4.14 check, with fleet_drift.py
+    "gitops-drift-out-of-band-triage",  # the drift half of incident-triage, PR #1827
     "cluster-agent-unlocated-crashloop-debug",  # #953 unlocated cluster discovery, PR #1670
 ]
 MOVED_TO_NIGHTLY = [

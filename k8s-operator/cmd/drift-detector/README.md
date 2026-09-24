@@ -2,7 +2,7 @@
 
 Pulls GKE audit records from the Pub/Sub subscription
 [`terraform/modules/drift-pubsub`](../../../terraform/modules/drift-pubsub/) provisions, parses
-them, and — eventually — turns out-of-band cluster changes into `gitops-drift` injects.
+them, and turns out-of-band cluster changes into `gitops-drift` injects.
 [`docs/designs/drift-detection.md`](../../../docs/designs/drift-detection.md) is the design; this
 file is how to work on the code.
 
@@ -13,10 +13,47 @@ why this is a Pub/Sub consumer and not an informer like its sibling
 
 ## What ships today
 
-Ingestion, classification, and the `managedFields` join: pull, parse, assign a tier, forward the
-records that represent a real human change, and enrich each with what the live object says owns the
-fields. Nothing builds this binary into an image and nothing launches it, so no installation runs it
-yet. The inject is still to come — `logDriftEvent` in `join.go` is the terminal handler it replaces.
+Ingestion, classification, the `managedFields` join, and the inject: pull, parse, assign a tier,
+forward the records that represent a real human change, enrich each with what the live object says
+owns the fields, and post the result to the core-agent daemon — `session_kv_server.py`, the Session
+KV server, which the sibling event watcher posts to under the same name — as a `gitops-drift` inject. Nothing
+builds this binary into an image and nothing launches it, so reaching that pipeline is something an
+operator does by hand today and no installation detects drift on its own.
+
+The inject is off unless `--daemon-url` is set, and off is the default. With it off the detector
+does everything else and stops at the `DRIFT` log line, which is how it ran before T4 and is what a
+local run against a real subscription wants. With it on, each surviving record opens a session and
+posts one payload into it; `logDriftEvent` still runs first either way, so the `DRIFT` line is
+emitted whether or not a daemon is configured and whether or not the inject lands.
+
+Two things about that are worth knowing before relying on it. A record whose inject fails is
+**acked anyway and never redelivered** — the handler signature returns nothing, so there is no way
+to tell the subscriber to nack, and the `INJECT FAILED` log line naming the `insert_id` is the only
+remaining trace of the change. And because Pub/Sub delivers at least once while the subscriber acks
+after the handler returns, redelivery is ordinary rather than exceptional: the detector remembers
+the last few thousand `insertId`s it has injected and suppresses a repeat before opening a second
+session, so one redelivered batch does not page a human twice for one change. That set is in memory
+and per-process, which leaves one case uncovered: a non-graceful exit leaves its batch unacked, and
+the next instance starts with an empty set and injects those records again. A climbing `duplicate=`
+count in the shutdown tally is a sign the ack deadline is too tight, not that the cluster is busy.
+Climbing alongside `failed=` means something else — a record is marked seen before its send, so a
+failed inject is not retried on redelivery either.
+
+What the daemon does with the payload is
+[`session_kv_server.py`](../../../agents/platform/scripts/session_kv_server.py)'s half: it routes on
+`kind`, so a `gitops-drift` payload gets its own chat alert and its own triage card — addressed to
+the agent for the cluster the change was made on, which the fan-in means is not necessarily the one
+the detector runs in — instead of being rendered through the event watcher's path, where the field
+defaults would describe it as a Pod. Drift is recorded as a `Warning` in the daemon's ledger — the
+chat line names no severity — but billed to a daily ceiling
+of its own rather than to the event watcher's, because one `kubectl apply` over a directory is one
+human action and several audit entries: sharing the bucket let routine use of this signal cap-drop
+the watcher's for the rest of the day. The two ceilings therefore add up, which is the cost of the
+split; what it does not fix is the fan-out itself, since the detector coalesces nothing. A record
+the ceiling refuses is lost rather than deferred: the daemon answers
+`suppressed`, the detector has already marked the `insertId` as seen, and the intercepted-events
+ledger row the daemon writes is the only place that change survives. `GET /v1/alert-quota` is where
+a spent budget shows up.
 
 The join has two credential sources and they are additive. `--in-cluster` or `--kubeconfig` gives it
 the one directly reachable cluster; `--profiles-dir` gives it every cluster in `--project` that has
@@ -32,6 +69,41 @@ clusters.
 ```bash
 go run ./k8s-operator/cmd/drift-detector --project "$PROJECT_ID"
 ```
+
+With escalation on, which is off unless you ask for it:
+
+```bash
+# The token is passed by the *name* of the variable holding it, never by value:
+# a flag is visible in the process table and in this binary's own startup line.
+export SESSION_KV_API_KEY=$(kubectl get secret platform-agent-secrets \
+  -n kubeagents-system -o jsonpath='{.data.SESSION_KV_API_KEY}' | base64 --decode)
+
+go run ./k8s-operator/cmd/drift-detector \
+  --project "$PROJECT_ID" \
+  --kubeconfig "$HOME/.kube/config" \
+  --cluster-name "$CLUSTER_NAME" \
+  --cluster-location "$CLUSTER_LOCATION" \
+  --daemon-url http://127.0.0.1:8699 \
+  --token-env SESSION_KV_API_KEY \
+  --owner drift-detector
+```
+
+`--kubeconfig` rather than `--in-cluster` because this is a `go run` on a workstation:
+`--in-cluster` reads the ServiceAccount token a Pod is given and finds nothing outside one. Swap it
+back for a run inside the agent Pod.
+
+`--cluster-name` and `--cluster-location` are not optional here: `--in-cluster` and `--kubeconfig`
+each give the join one cluster's credentials, and with `--project` these two are what name the
+cluster those credentials reach. Omit either and startup refuses the flags rather than joining
+against the wrong cluster.
+
+**The daemon is loopback-only**, and that decides where this binary can run. `docker-entrypoint.sh`
+starts it with `--host 127.0.0.1 --port 8699`, so `--daemon-url` has nothing to point at from
+outside the agent Pod's network namespace. For a local run against a real install, forward the port
+first — `kubectl port-forward -n kubeagents-system <agent-pod> 8699:8699`, which only works where the
+install does not sandbox the pod. For a deployed one, the detector has to be a container in that Pod;
+nothing builds or launches it there yet, which is why the flag defaults to empty and the inject is
+off.
 
 Application Default Credentials need `roles/pubsub.subscriber` on the subscription — inside the
 agent pod, the Workload Identity the `drift-pubsub` module grants it to. Add `roles/pubsub.viewer`
@@ -62,21 +134,24 @@ on every cluster in the fleet. A cluster where only the second is missing still 
 come out `failed` with the RBAC error, which is the difference between a cluster that was not
 addressed and one that was and refused.
 
-| Flag                      | Default                          | Notes                                                                                                                                                                                                                                                                 |
-| ------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--project`               | —                                | Required. The project holding the subscription. With the join on it must be the project **ID**, not the project number: a Pub/Sub path accepts either, but the join matches this against each record's `project_id`, so a number matches nothing. Refused at startup. |
-| `--subscription`          | `platform-agent-drift-audit-sub` | A bare id, or the module's fully qualified `subscription_id` output. Both work.                                                                                                                                                                                       |
-| `--max-messages`          | `100`                            | Messages per pull, 1 to 1000.                                                                                                                                                                                                                                         |
-| `--automation-principals` | empty                            | Comma-separated principals to treat as automation. Applies to every cluster the subscription carries.                                                                                                                                                                 |
-| `--human-domains`         | empty                            | Comma-separated domains whose accounts are human. Matched exactly, so subdomains are listed separately. Empty means any principal carrying a domain.                                                                                                                  |
-| `--log-dropped`           | `false`                          | A log line per filtered record. On a live cluster that is nearly the whole stream.                                                                                                                                                                                    |
-| `--in-cluster`            | `false`                          | Read live objects with the Pod's own ServiceAccount. Mutually exclusive with `--kubeconfig`.                                                                                                                                                                          |
-| `--kubeconfig`            | empty                            | Read live objects through this kubeconfig. Mutually exclusive with `--in-cluster`; with no `--profiles-dir` either, the join is disabled.                                                                                                                             |
-| `--cluster-name`          | empty                            | The GKE cluster those credentials reach. Required with either of the two above, and an error without them. Checked at startup against the cluster they actually reach; a disagreement stops the process.                                                              |
-| `--cluster-location`      | empty                            | That cluster's region or zone. Required with `--cluster-name`: a name is unique only within a project and location.                                                                                                                                                   |
-| `--profiles-dir`          | empty                            | Hermes profiles directory, normally `/opt/data/profiles`. Every Cluster Agent profile whose cluster is in `--project` becomes a joinable cluster. Combines with the two above; a profile naming the cluster they already reach is dropped in favour of them.          |
-| `--gitops-managers`       | empty                            | Comma-separated `managedFields` managers that are the GitOps controller. Matched exactly, and only on writes to the object rather than through a subresource, in a second later than the audited change. Empty means no reconciliation claim is made.                 |
-| `--batch-join-budget`     | `30s`                            | Longest one batch may spend on lookups; 1ns to 5m. Startup warns if it exceeds half the subscription's real ack deadline.                                                                                                                                             |
+| Flag                      | Default                          | Notes                                                                                                                                                                                                                                                                                            |
+| ------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--project`               | —                                | Required. The project holding the subscription. With the join on it must be the project **ID**, not the project number: a Pub/Sub path accepts either, but the join matches this against each record's `project_id`, so a number matches nothing. Refused at startup.                            |
+| `--subscription`          | `platform-agent-drift-audit-sub` | A bare id, or the module's fully qualified `subscription_id` output. Both work.                                                                                                                                                                                                                  |
+| `--max-messages`          | `100`                            | Messages per pull, 1 to 1000.                                                                                                                                                                                                                                                                    |
+| `--automation-principals` | empty                            | Comma-separated principals to treat as automation. Applies to every cluster the subscription carries.                                                                                                                                                                                            |
+| `--human-domains`         | empty                            | Comma-separated domains whose accounts are human. Matched exactly, so subdomains are listed separately. Empty means any principal carrying a domain.                                                                                                                                             |
+| `--log-dropped`           | `false`                          | A log line per filtered record. On a live cluster that is nearly the whole stream.                                                                                                                                                                                                               |
+| `--in-cluster`            | `false`                          | Read live objects with the Pod's own ServiceAccount. Mutually exclusive with `--kubeconfig`.                                                                                                                                                                                                     |
+| `--kubeconfig`            | empty                            | Read live objects through this kubeconfig. Mutually exclusive with `--in-cluster`; with no `--profiles-dir` either, the join is disabled.                                                                                                                                                        |
+| `--cluster-name`          | empty                            | The GKE cluster those credentials reach. Required with either of the two above, and an error without them. Checked at startup against the cluster they actually reach; a disagreement stops the process.                                                                                         |
+| `--cluster-location`      | empty                            | That cluster's region or zone. Required with `--cluster-name`: a name is unique only within a project and location.                                                                                                                                                                              |
+| `--profiles-dir`          | empty                            | Hermes profiles directory, normally `/opt/data/profiles`. Every Cluster Agent profile whose cluster is in `--project` becomes a joinable cluster. Combines with the two above; a profile naming the cluster they already reach is dropped in favour of them.                                     |
+| `--gitops-managers`       | empty                            | Comma-separated `managedFields` managers that are the GitOps controller. Matched exactly, and only on writes to the object rather than through a subresource, in a second later than the audited change. Empty means no reconciliation claim is made.                                            |
+| `--batch-join-budget`     | `30s`                            | Longest one batch may spend on lookups; 1ns to 5m. Startup warns if it exceeds half the subscription's real ack deadline.                                                                                                                                                                        |
+| `--daemon-url`            | empty                            | Core-agent daemon to post the `gitops-drift` inject to, without a trailing slash, query or fragment. Probed at startup and refused if it does not understand the kind. Empty disables the inject: records are still classified, joined and logged, and nothing is escalated.                     |
+| `--token-env`             | empty                            | **Name** of the environment variable holding the daemon's bearer token, not the token. Required with `--daemon-url`, and an error without it — a flag value is visible in the process table.                                                                                                     |
+| `--owner`                 | empty                            | `X-Asserted-Caller` for the session the inject opens. Sent, but not read: nothing in the daemon looks at the header today, and `POST /sessions` is guarded by the bearer token alone and stamps its own metadata. Set it anyway, so the value is on the wire before anything starts checking it. |
 
 ## Classification
 
@@ -409,6 +484,33 @@ something an operator would not put in a log. Worth knowing before pointing this
 CRDs you did not write; dropping the value half of a selector would cost the thing the selector is
 for, which is saying which entry drifted.
 
+## The startup handshake
+
+With `--daemon-url` set, the binary probes `GET /healthz` before it touches the subscription and
+refuses to start unless `gitops-drift` is on the `inject_kinds` the daemon advertises.
+
+The daemon dispatches on the payload's `kind` with an equality test, and a daemon predating that
+dispatch has no way to say so. The drift payload falls into its event path, where the defaults
+render it as a `Warning` Pod alert named `default/` for reason `Unknown`: it bills the event
+watcher's daily ceiling rather than drift's own, writes a ledger row the watcher's recap counts as
+one of its events, and answers `200` — so `Inject` here reports success, the `insertId` is marked
+seen, and the record is never re-offered. Silent at both ends, and one `kubectl apply` over six
+objects is six such alerts.
+
+The skew is an ordinary deployment window rather than a hypothetical. The daemon script is copied to
+the shared PVC from the agent image while this binary ships in its own, so the two roll
+independently — which is why the event watcher negotiates its own capabilities with
+`X-Watcher-Features`. This is the same trade in the other direction: there the daemon has to know
+what the producer can do, here the producer has to know what the daemon can.
+
+It fails closed. An unreachable daemon, a non-200, a body that will not parse, and a reply carrying
+no `inject_kinds` at all are all refusals, because treating any of them as permission is the
+behaviour the check exists to prevent. A startup check rather than a per-record one because the
+answer cannot change under a running process, and a refusal rather than a fall back to log-only
+because an operator who set `--daemon-url` asked for escalation and the two modes are
+indistinguishable in every later line. The error names dropping the flag as the way to get the
+degraded mode deliberately.
+
 ## Three things to know before changing it
 
 **The join happens before the ack, inside the batch's deadline.** Synchronous pull does not extend
@@ -425,6 +527,31 @@ other lookup error: the records that would have reached a `GET` come out `failed
 acked, while a delete or a foreign-cluster record is unaffected, since both are settled before the
 context is consulted. Adding retries, a second `GET`, or a per-record backoff means re-checking
 that arithmetic.
+
+**The inject spends that same budget, and it is the slowest thing in it.** With `--daemon-url` set,
+a surviving record makes two more calls after the join — `POST /sessions` then
+`POST /sessions/<id>/inject` — each with its own ten-second client timeout and one retry behind a
+250ms delay. How much of the batch one hung daemon spends depends on where it hangs, and the second
+call only adds to the bill if the first one leaves time for it. A daemon that never answers
+`POST /sessions` costs two client timeouts plus the retry delay, about 20.25s, because the inject is
+never reached; a daemon that answers the session instantly and then hangs the inject costs the same
+20.25s, for the mirror-image reason. Around forty seconds needs both ceilings paid on both attempts,
+which means a session answered just inside its own timeout and an inject that then hangs — the worst
+case, not the ordinary one. So one hung daemon costs most of a thirty-second batch on record one and
+can cost all of it, and every record behind it then fails its lookup on a context at or near expiry
+and is acked anyway. So the escalation gets a sub-budget of its own,
+`perRecordInjectBudget`, five seconds derived from the handler's context — small enough that a
+batch survives several slow records, and derived rather than independent so a SIGTERM or an
+exhausted batch still cuts it short.
+
+That bounds the blast radius rather than removing it. Six consecutive unresponsive records still
+exhaust a thirty-second budget between them, and what the operator sees when they do is a batch of
+`failed` **lookups** — every later record's `GET` returning a deadline error — which reads
+identically to a slow control plane and is not. Check the inject tally on the shutdown line before
+blaming the API server, and turn the inject off with an empty `--daemon-url` to tell the two apart.
+Sizing the budget for an install with the inject on still means budgeting for the daemon's latency
+as well as the control plane's; a per-record budget covering the whole handler, rather than the
+escalation alone, is the fix that would remove the coupling and is tracked separately.
 
 For the budget to be the bound, it has to be the only one, and client-go supplies a second by
 default: a `rest.Config` that leaves `QPS` unset gets 5 requests a second with a burst of 10, and
