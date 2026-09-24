@@ -196,6 +196,37 @@ func TestTheIndexIsServed(t *testing.T) {
 	}
 }
 
+func TestADirectoryPathOtherThanRootIs404(t *testing.T) {
+	cfg := fixture(t, "x")
+	assets := filepath.Join(cfg.StaticDir, "assets")
+	if err := os.Mkdir(assets, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(assets, "app.js"), []byte("console.log(1)"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := handler(t, cfg)
+
+	if rec := get(h, testHost, "/assets/", nil); rec.Code != http.StatusNotFound {
+		t.Errorf("GET /assets/ = %d, want 404 (no directory listing)", rec.Code)
+	}
+	if rec := get(h, testHost, "/assets/app.js", nil); rec.Code != http.StatusOK {
+		t.Errorf("GET /assets/app.js = %d, want 200", rec.Code)
+	}
+}
+
+func TestADotfileIs404(t *testing.T) {
+	cfg := fixture(t, "x")
+	if err := os.WriteFile(filepath.Join(cfg.StaticDir, ".hidden"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := handler(t, cfg)
+
+	if rec := get(h, testHost, "/.hidden", nil); rec.Code != http.StatusNotFound {
+		t.Errorf("GET /.hidden = %d, want 404", rec.Code)
+	}
+}
+
 func TestAPlainGETOnTheBusPathIsRefused(t *testing.T) {
 	h := handler(t, fixture(t, "x"))
 	rec := get(h, testHost, "/bus", nil)

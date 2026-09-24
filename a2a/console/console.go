@@ -48,6 +48,13 @@ const (
 	schemeHTTP  = "http"
 	schemeHTTPS = "https"
 
+	// pathSeparator splits a URL path into the segments hiddenSegmentPrefix
+	// checks.
+	pathSeparator = "/"
+	// hiddenSegmentPrefix marks a path segment as a dotfile, which the static
+	// server never has a reason to ship.
+	hiddenSegmentPrefix = "."
+
 	// lineEndings are trimmed off the password file. A Secret written with
 	// `kubectl create secret --from-file` keeps the file's trailing newline.
 	lineEndings = "\r\n"
@@ -121,8 +128,30 @@ func NewHandler(cfg Config, log *slog.Logger) (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+ConfigPath, configHandler(cfg, log))
 	mux.Handle("GET "+BusPath, busHandler(cfg, log))
-	mux.Handle("GET /", http.FileServer(http.Dir(cfg.StaticDir)))
+	mux.Handle("GET /", staticFileHandler(cfg.StaticDir))
 	return guard(cfg.AllowedHosts, mux), nil
+}
+
+// staticFileHandler wraps the built page's directory in a FileServer that
+// refuses two things a plain FileServer would otherwise serve: a directory
+// listing, for any path other than "/" that ends in "/" and has no
+// index.html, and a dotfile, for any path with a segment starting with ".".
+// Neither is ever something the built page ships on purpose.
+func staticFileHandler(dir string) http.Handler {
+	fs := http.FileServer(http.Dir(dir))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" && strings.HasSuffix(r.URL.Path, pathSeparator) {
+			http.NotFound(w, r)
+			return
+		}
+		for _, seg := range strings.Split(r.URL.Path, pathSeparator) {
+			if strings.HasPrefix(seg, hiddenSegmentPrefix) {
+				http.NotFound(w, r)
+				return
+			}
+		}
+		fs.ServeHTTP(w, r)
+	})
 }
 
 // guard refuses any Host the port-forward would not produce. A page on
