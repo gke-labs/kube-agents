@@ -33,8 +33,20 @@ export const IDLE_MS = 60_000;
 export const PENDING_STALE_MS = 30_000;
 /** Local lines (command output) share one correlation group. */
 export const LOCAL_CORRELATION = "local";
-const STALE_NOTE =
+const STALE_NOTE_GATEWAY =
   "no submission on the bus 30s after sending. The gateway may be down or may have dropped the turn - its notice, if any, is below";
+/**
+ * The link itself was down when this fired, so the gateway is not the likely
+ * cause the way `STALE_NOTE_GATEWAY` implies — this turn may never have left
+ * the browser at all.
+ */
+const STALE_NOTE_LINK_DOWN =
+  "no submission on the bus 30s after sending, and the bus link is down right now - that is the likely reason this turn never showed up";
+
+/** Picks the stale note by whether the link is up, so it never blames the gateway for a loss the link itself caused. */
+function staleNote(connection: ConnectionState): string {
+  return connection === "up" ? STALE_NOTE_GATEWAY : STALE_NOTE_LINK_DOWN;
+}
 
 export type AgentStatus = "active" | "idle" | "done" | "closed";
 
@@ -327,7 +339,7 @@ function withAgent(
 }
 
 /**
- * Every session heard from is a tap on the rail; traffic alone earns one.
+ * Every session heard from becomes an agent entry; traffic alone earns one.
  * Liveness uses the browser's receive clock for live traffic — a publisher
  * whose clock runs behind must not read as idle while it is streaming — and
  * the envelope's own ts for replayed history, which really is old.
@@ -446,12 +458,19 @@ function reduceMessage(
     taskId: env.taskId,
   };
   // A turn this page sent attaches in place: same id, now carrying the
-  // task's correlation. Only live traffic can match - anything replayed was
-  // on the stream before this page connected, so before anything it sent.
-  // FIFO within a conversation, so two identical texts attach in order.
+  // task's correlation. Live traffic always matches. Non-live traffic
+  // matches too, but only a pending turn sent before the envelope's own ts:
+  // a tap re-attach between the send and the submission re-snapshots
+  // lastSeqAtConnect after the submission has already landed, so a turn this
+  // tab really did just send can replay as non-live. Genuinely old history
+  // (from before this page connected) has a ts before any pending turn's
+  // send time, so it still can't match. FIFO within a conversation, so two
+  // identical texts attach in order.
   const match =
-    live && authority.conversation !== undefined
-      ? state.pending.findIndex((p) => p.conversation === authority.conversation && p.text === text)
+    authority.conversation !== undefined
+      ? state.pending.findIndex(
+          (p) => p.conversation === authority.conversation && p.text === text && (live || p.at < tsMs(env)),
+        )
       : -1;
   if (match >= 0) {
     const turn = state.pending[match];
@@ -536,6 +555,15 @@ function reduceStatusUpdate(
     const agent = next.agents.get(session);
     if (agent && agent.status !== "closed" && agent.perTask) {
       next.agents = withAgent(next.agents, session, { status: "done" });
+      // Its `-in` consumer is gone the moment it retires (durablesFor stops
+      // polling it), so the last reading is stale the instant it is taken.
+      // Dropping it here is belt-and-braces: livenessOf already reads the
+      // agent's status and never shows a retired session as live.
+      if (next.liveness.has(session)) {
+        const liveness = new Map(next.liveness);
+        liveness.delete(session);
+        next.liveness = liveness;
+      }
     }
   }
 }
@@ -761,7 +789,7 @@ function staleTurns(state: UiState, now: number): Pick<UiState, "pending" | "cha
   const pending = state.pending.map((p) => {
     if (p.stale || now - p.at <= PENDING_STALE_MS) return p;
     changed = true;
-    chat = withEntry(chat, `pending:${p.messageId}`, { note: STALE_NOTE });
+    chat = withEntry(chat, `pending:${p.messageId}`, { note: staleNote(state.connection) });
     return { ...p, stale: true };
   });
   return changed ? { pending, chat } : null;

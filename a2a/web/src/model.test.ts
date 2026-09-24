@@ -83,7 +83,7 @@ describe("message", () => {
     expect(state.chat[1]).toMatchObject({ kind: "steer", text: "focus on acme-prod" });
   });
 
-  it("puts the publisher on the rail", () => {
+  it("marks the publisher active in the agents map", () => {
     const state = submission();
     expect(state.agents.get(GATEWAY_SESSION)?.status).toBe("active");
   });
@@ -157,6 +157,46 @@ describe("status-update", () => {
       }),
     );
     expect(state.agents.get("chat-otter")?.status).toBe("done");
+  });
+
+  it("drops the retired session's liveness report along with retiring it", () => {
+    let state = onSubject(
+      initialState,
+      "a2a.tasks.chat-otter.task-2.in",
+      env({
+        kind: "message",
+        taskId: "task-2",
+        contextId: "ctx-2",
+        payload: { role: "user", parts: [{ text: "delegate: haiku" }] },
+      }),
+    );
+    state = reduce(state, {
+      type: "liveness",
+      report: {
+        session: "chat-otter",
+        durable: "chat-otter-in",
+        stream: "TASKS",
+        perTask: true,
+        found: true,
+        waiting: 1,
+        pending: 0,
+        checkedAt: 0,
+      },
+    });
+    expect(state.liveness.has("chat-otter")).toBe(true);
+    state = onSubject(
+      state,
+      "a2a.tasks.chat-otter.task-2.events",
+      env({
+        kind: "status-update",
+        taskId: "task-2",
+        contextId: "ctx-2",
+        from: { session: "chat-otter", agentType: "claude-code" },
+        payload: { taskId: "task-2", contextId: "ctx-2", status: { state: "completed" }, final: true },
+      }),
+    );
+    expect(state.agents.get("chat-otter")?.status).toBe("done");
+    expect(state.liveness.has("chat-otter")).toBe(false);
   });
 
   it("surfaces a status message (input-required's question) in the transcript", () => {
@@ -677,7 +717,7 @@ function consoleTurn(
   state: UiState,
   taskId: string,
   text: string,
-  opts: { live?: boolean; conversation?: string } = {},
+  opts: { live?: boolean; conversation?: string; ts?: string } = {},
 ): UiState {
   return onSubject(
     state,
@@ -687,6 +727,7 @@ function consoleTurn(
       taskId,
       contextId: "ctx",
       correlationId: `corr-${taskId}`,
+      ...(opts.ts !== undefined ? { ts: opts.ts } : {}),
       authority: {
         ...consoleAuthority,
         audience: { ...consoleAuthority.audience, conversation: opts.conversation ?? "console:abc" },
@@ -722,12 +763,27 @@ describe("pending console turns", () => {
     expect(state.tasks.get("task-1")?.backend).toBe("console");
   });
 
-  it("does not attach replayed history or another conversation's turn", () => {
+  it("does not attach replayed history from before the send, or another conversation's turn", () => {
     let state = sent(initialState, "m-1", "hi");
-    state = consoleTurn(state, "task-1", "hi", { live: false });
+    // Genuinely old history: its ts predates the send, so it cannot be this
+    // tab's own turn replaying after a re-attach (see the match-window test
+    // below for that case).
+    state = consoleTurn(state, "task-1", "hi", { live: false, ts: "2026-08-31T00:00:00Z" });
     state = consoleTurn(state, "task-2", "hi", { conversation: "console:other" });
     expect(state.pending).toHaveLength(1);
     expect(state.chat.map((c) => c.kind)).toEqual(["pending", "user", "user"]);
+  });
+
+  it("attaches a non-live submission whose ts is after the send, from a tap re-attach mid-flight", () => {
+    // A tap re-attach between the send and the submission re-snapshots
+    // lastSeqAtConnect after the submission already landed, so this tab's
+    // own turn can replay as non-live. Its ts is still after the send, which
+    // is what tells it apart from genuinely old history.
+    let state = sent(initialState, "m-1", "hi");
+    state = consoleTurn(state, "task-1", "hi", { live: false, ts: "2026-08-31T12:00:00Z" });
+    expect(state.pending).toEqual([]);
+    expect(state.chat).toHaveLength(1);
+    expect(state.chat[0]).toMatchObject({ id: "pending:m-1", kind: "user", taskId: "task-1" });
   });
 
   it("attaches two identical texts in the order they were sent", () => {
@@ -762,6 +818,13 @@ describe("pending console turns", () => {
     state = consoleTurn(again, "task-1", "hello?");
     expect(state.chat[0]).toMatchObject({ kind: "user", taskId: "task-1" });
     expect(state.chat[0].note).toBeUndefined();
+  });
+
+  it("blames the link, not the gateway, for a stale turn while the link is down", () => {
+    let state: UiState = { ...sent(initialState, "m-1", "hello?"), connection: "down" };
+    state = reduce(state, { type: "tick", now: SENT_AT + PENDING_STALE_MS + 1 });
+    expect(state.chat[0].note).toMatch(/bus link is down/);
+    expect(state.chat[0].note).not.toMatch(/gateway/);
   });
 
   it("says a send failed, and never attaches it later", () => {
