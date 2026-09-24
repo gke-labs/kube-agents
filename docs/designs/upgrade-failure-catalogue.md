@@ -13,15 +13,66 @@ cited below.
 
 ## For a reader who does not run Kubernetes
 
-A cluster is a set of rented machines, called nodes, running an application in small units called
-pods, coordinated by a control program called the API server. Upgrading the cluster means
-replacing the control program with a newer edition and then rebuilding every machine while the
-application keeps running. Two things can go wrong. The newer control program may no longer
-understand a request the application still makes, in the way a newer form may drop a field an old
-script still fills in. And rebuilding a machine means stopping the pods on it and starting them
-somewhere else, which only works if there is somewhere else to start them and if nothing forbids
-stopping them. Each entry below is one way those two steps fail, what an operator can look at
-beforehand to see it coming, and what they see afterwards when it has happened.
+A cluster is a group of rented computers, called nodes, that run an application in small pieces,
+called pods, under a control program called the API server. An upgrade replaces the control
+program with a newer edition and then rebuilds every computer, one at a time, while the
+application keeps running. Each rebuild stops the application's pieces on that computer and starts
+them again somewhere else. Almost every upgrade outage is one of two things: the newer control
+program refuses a request the old one accepted, or the stop-and-restart lands on a piece that
+cannot be stopped or restarted safely.
+
+In plain words, here is what can go wrong. The numbers match the technical list further down, so
+each item can be followed to its detail.
+
+While the computers are being rebuilt:
+
+1. A safety rule says "never stop this piece". The rebuild waits an hour, then stops it anyway,
+   and the application goes down.
+2. There is no free computer to move a piece to, so it waits, offline, until its old computer is
+   back.
+3. All copies of a piece live on the same computer or in the same building, so one rebuild takes
+   them all down at once.
+4. A piece takes minutes to warm up after a restart but reports itself ready at once, so users
+   reach it while it is still loading.
+5. A piece kept data on the computer's own disk, and the rebuild wipes that disk.
+6. The allowed maintenance hours are too short for the number of computers, so the fleet sits
+   half-upgraded for days.
+
+Once the newer control program is in charge:
+
+7. Tools still speak an old dialect the new control program dropped, and fail with "I do not
+   understand that request". The application itself keeps running; the tools that manage it do
+   not.
+8. A gatekeeper that inspects every change is offline, and it was set to "block everything if I
+   cannot answer", so nothing new can start, including the pieces the rebuild is trying to move.
+9. A rule that used to be off is now on by default, and it rejects or removes pieces that were
+   fine yesterday.
+10. A feature is marked "going away later". Nothing breaks yet, but it will if nobody moves off
+    it in time.
+11. Add-ons and tools are too old for the new control program and stop working.
+12. On a single-location cluster the control program is unreachable for a few minutes during its
+    swap, and automation that does not retry fails.
+
+On the freshly rebuilt computers:
+
+13. A label that pieces used to choose their computer is gone, so they can never be placed.
+14. The engine that runs the pieces changed, and tools that talked to the old engine break.
+15. The new computers account for memory differently, and older programs misjudge how much they
+    may use and are killed for using too much.
+16. When one part of a piece runs out of memory, the system now kills the whole piece instead of
+    that one part.
+17. Network rules or name lookup behave differently, and some connections drop.
+18. The networking helper on each computer fails on the new build, and traffic stops reaching
+    the application.
+19. The graphics-card driver on the new computers does not match what the application was built
+    for.
+20. Older storage attachments rely on a helper that is switched off, and the disks cannot be
+    attached.
+21. The new computers must download their software images from a source that has since closed,
+    and cannot.
+
+The rest of this document says, for each of these, how to see it coming, how to recognise it
+afterwards, how to prevent or repair it, and whether Google's own advisor for GKE reports it.
 
 ## The list
 
