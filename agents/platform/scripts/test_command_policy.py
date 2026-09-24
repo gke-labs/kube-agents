@@ -1729,5 +1729,79 @@ class TheConfigConnectorSkillStaysInsideThePolicy(unittest.TestCase):
                 self.assertFalse(evaluate(argv).allowed, desc)
 
 
+class RefusalsSayTheBoundaryIsFinal(unittest.TestCase):
+    """Every categorical refusal says it is a boundary, not an error to fix.
+
+    A refusal that only said what was wrong with this argv read as a failed
+    command, and a model retried the same action through another spelling --
+    another verb, another tool, another identity (#1945). The phrase is
+    asserted literally rather than by importing the constant, so rewording
+    the notice away fails here instead of passing tautologically.
+    """
+
+    BOUNDARY_PHRASE = "permission boundary, not an error to work around"
+    # The two shapes permit different retries, and carrying the wrong one is
+    # itself the defect: a verb refusal telling the model "re-run without the
+    # flag" names a flag the argv does not have. Each shape is pinned by a
+    # phrase the other must not carry, so swapping the constants fails here.
+    ACTION_PHRASE = "stays refused however it is spelled"
+    FLAG_PHRASE = "re-run without the flag"
+
+    ACTION_REFUSALS = (
+        (["kubectl", "delete", "pod", "web-0"], "kubernetes.read-only"),
+        (["kubectl", "cluster-info", "dump"], "kubernetes.read-only"),
+        (["gcloud", "projects", "delete", "p"], "gcp.read-only"),
+    )
+    FLAG_REFUSALS = (
+        (["kubectl", "get", "pods", "--as", "system:admin"],
+         "identity.caller-supplied-impersonation"),
+        (["kubectl", "--kuberc", "/workspace/kr.yaml", "get", "pods"],
+         "kubernetes.kuberc-forbidden"),
+        (["kubectl", "get", "pods", "--token", "t"],
+         "kubernetes.identity-change-forbidden"),
+        (["kubectl", "get", "pods", "--profile-output", "/workspace/x"],
+         "kubernetes.file-write-forbidden"),
+        (["gcloud", "--flags-file", "/workspace/f.yaml", "info"],
+         "gcp.flags-file-forbidden"),
+        (["gcloud", "info", "--account", "x@example.com"],
+         "gcp.identity-change-forbidden"),
+        (["gcloud", "info", "--log-http-log-file", "/workspace/l"],
+         "gcp.file-write-forbidden"),
+    )
+
+    def test_action_refusals_state_finality_for_the_action(self):
+        for argv, rule_id in self.ACTION_REFUSALS:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(rule_id, decision.rule_id)
+                self.assertIn(self.BOUNDARY_PHRASE, decision.message)
+                self.assertIn(self.ACTION_PHRASE, decision.message)
+                self.assertNotIn(self.FLAG_PHRASE, decision.message)
+
+    def test_flag_refusals_permit_only_the_flagless_retry(self):
+        for argv, rule_id in self.FLAG_REFUSALS:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(rule_id, decision.rule_id)
+                self.assertIn(self.BOUNDARY_PHRASE, decision.message)
+                self.assertIn(self.FLAG_PHRASE, decision.message)
+                self.assertNotIn(self.ACTION_PHRASE, decision.message)
+
+    def test_unreadable_refusals_do_not_claim_a_boundary(self):
+        # Re-running with a spelling the parser can read is the legitimate
+        # retry for these two, so calling them a boundary would stop retries
+        # the policy permits.
+        for argv in (
+            ["kubectl", "--unknown-flag", "get", "pods"],
+            ["gcloud", "--unknown-flag", "container", "clusters", "list"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertNotIn(self.BOUNDARY_PHRASE, decision.message)
+
+
 if __name__ == "__main__":
     unittest.main()
