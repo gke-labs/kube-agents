@@ -135,6 +135,7 @@ readonly MINTER_KEY_ABSENT_PATTERN='NOT_FOUND|SERVICE_DISABLED|has not been used
 readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
 readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
+readonly STATE_LOCK_MESSAGE_PATTERN='(Acquiring|Releasing) state lock\.'
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -237,7 +238,7 @@ tfvar() {
     warn "could not evaluate var.$1 (see the terraform error above)"
     exit 1
   fi
-  value=$(printf '%s\n' "$out" | tail -1 | tr -d '"')
+  value=$(printf '%s\n' "$out" | grep -vE "$STATE_LOCK_MESSAGE_PATTERN" | grep -v '^[[:space:]]*$' | tail -1 | tr -d '"')
   case "$value" in
     null | "tostring(null)") value="" ;;
   esac

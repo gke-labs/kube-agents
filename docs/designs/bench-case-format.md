@@ -298,8 +298,10 @@ A new case lands in the nightly file (decided 2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
 the night it merges, its record accrues in the evidence store, and a presubmit seat is a
-later pull request that moves its line to the presubmit file and cites that record —
-never the pull request that makes it pass. Cases that stay in the nightly for good are
+later pull request that moves its line to the presubmit file, adds its name to
+`hack/eval/blocking-roster.txt` in the same edit (since 2026-09-22 the presubmit runs the
+blocking roster and nothing else, and `scripts/test_eval_rosters.py` pins the two files as
+equal) and cites that record — never the pull request that makes it pass. Cases that stay in the nightly for good are
 the ones kept out of the presubmit for cost, because a cheaper probe holds their presubmit
 seat, or because what they grade is not one of the core journeys the presubmit gate is
 for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`, and a case

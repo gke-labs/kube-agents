@@ -1,6 +1,10 @@
-# ACTIVE — an entry in hack/eval/presubmit-cases.txt, one of the three
-# activations that take the reliability domain to five enabled tasks
-# (#1049). The two parking reasons from #984 are both answered: the prompt
+# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-09-22,
+# a presubmit entry from 2026-08-31 until then, one of the three activations
+# that took the reliability domain to five enabled tasks (#1049). The
+# presubmit runs the blocking roster only (#1023) and this case was never
+# admitted: 69/684 graded presubmit repetitions 2026-09-15 to 09-22, so it
+# fails on a correct agent today and the nightly record is what shows a fix
+# landing. The two parking reasons from #984 are both answered: the prompt
 # below uses the located pattern (its 0.0 was the unlocated-prompt failure
 # measured 2026-08-25 — the agent asked which cluster instead of searching),
 # and the objective is an OUTPUT CONTRACT. Two presubmit runs (builds
@@ -25,7 +29,7 @@
 # about disruption/PDB issues walks past a CrashLoopBackOff on purpose;
 # "clean" here means clean of missing-PDB findings only.
 # Isolation class: read-only.
-# Eligible tier: presubmit.
+# Eligible tier: presubmit once admitted; nightly since 2026-09-22.
 id: obtainability-healthy-namespace-silence
 name: Reliability inspection of a single-replica namespace flags no missing PDB
 prompt: >-

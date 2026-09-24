@@ -1,4 +1,4 @@
-name: "Nightly: Pipeline"
+name: "Staging: Promotion Pipeline"
 
 # Builds a nightly environment from nothing, runs the full E2E matrix on it,
 # rolls it back to the previous GA and forward again (reported, not gating),
@@ -19,7 +19,7 @@ name: "Nightly: Pipeline"
 # three-hourly RC pipeline. Step 1 binds `nightly` for its variables without
 # taking the lock; the promotion only pushes a Git tag, so it does neither.
 #
-# Dispatch-only on purpose: scheduled execution is owned by nightly-scheduler.yml
+# Dispatch-only on purpose: scheduled execution is owned by staging-promotion-scheduler.yml
 # so that a daily tick with nothing to promote produces no pipeline run at all.
 # Candidate overrides (`rc_tag`) are accepted for manual dispatches.
 
@@ -43,7 +43,7 @@ on:
 # group is held for the whole run, and it is what keeps the only thing that
 # drives the environment end to end, another nightly, out of those gaps.
 concurrency:
-  group: nightly-pipeline
+  group: staging-promotion-pipeline
   cancel-in-progress: false
 
 jobs:
@@ -108,7 +108,7 @@ jobs:
           SKIP_PIPELINE: ${{ steps.resolve.outputs.skip_pipeline }}
           SKIP_PROMOTION: ${{ steps.resolve.outputs.skip_promotion }}
           SKIP_REASON: ${{ steps.resolve.outputs.skip_reason }}
-        run: ./scripts/release/record_nightly_candidate_summary.sh
+        run: ./scripts/release/record_promotion_candidate_summary.sh
 
   step-2-deploy-env:
     name: Step 2 - Provision Nightly Environment
@@ -273,7 +273,7 @@ jobs:
         if: always() && steps.rollback.outputs.diagnostics_dir != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nightly-rollback-leg
+          name: promotion-rollback-leg
           path: ${{ steps.rollback.outputs.diagnostics_dir }}
           if-no-files-found: warn
           retention-days: 14

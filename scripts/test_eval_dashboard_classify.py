@@ -409,9 +409,73 @@ class StormAndSetupTest(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "red")
         self.assertEqual(verdict["headline"], "The run failed before any case ran 25 minutes in.")
 
+    def test_a_deadline_kill_is_run_level_and_named_as_prows(self):
+        # #1894: a FAILURE with no verdict that ran to the job's timeout is
+        # Prow's kill, not the branch's failure -- and not a setup death.
+        target = run(1, 913, T0, minutes=363, result="FAILURE", tasks=[])
+        target.update({"eval_verdict": None, "has_build_log": True, "pod_last_event": None, "merge_conflict": False})
+        verdict = classify_run(target, [target])
+        self.assertEqual((verdict["verdict"], verdict["cls"], verdict["do"]), ("infra", classify.CLS_DEADLINE, classify.DO_DEADLINE_KILL))
+        self.assertEqual(verdict["headline"], "Prow killed this run at its 360-minute deadline.")
+        self.assertFalse(verdict["setup_death"])
+        self.assertFalse(verdict["matches_incident"])
+        during = classify_run(target, [target], health_at={"state": "OUTAGE", "condition": "deadline_kill", "failing_cases": []})
+        self.assertTrue(during["matches_incident"])
+        self.assertIn("Other PRs are being killed the same way", during["lede"])
+        # The recovering hold: the rule has stopped firing, so this kill is not
+        # a wave's -- the reading the gate comment gives the same build.
+        held = classify_run(target, [target], health_at={"state": "OUTAGE", "condition": "deadline_kill", "failing_cases": [], "recovering": True})
+        self.assertFalse(held["matches_incident"])
+        self.assertIn("outage is recovering; this kill holds it back", held["lede"])
+        self.assertNotIn("Other PRs are being killed", held["lede"])
+        self.assertEqual(held["do"], classify.DO_DEADLINE_KILL_RECOVERING)
+        # 344 minutes is under the margin: still the branch's own failure.
+        short = dict(target, duration_s=344 * 60)
+        self.assertEqual(classify_run(short, [short])["headline"], "The run failed before any case ran 344 minutes in.")
+
+    def test_a_deadline_kill_that_recorded_cases_is_still_the_kill(self):
+        # #1875: the cases graded before Prow stopped the run are shown, but
+        # the run's class, verdict and `do` are the kill's -- the same reading
+        # health.py counts and the gate comment gives it.
+        target = run(1, 913, T0, minutes=363, result="FAILURE", tasks=[task(n, "ppp") for n in sorted(ADMITTED)[:2]])
+        target.update({"eval_verdict": None, "has_build_log": True, "pod_last_event": None, "merge_conflict": False})
+        verdict = classify_run(target, [target], health_at={"state": "OUTAGE", "condition": "deadline_kill", "failing_cases": []})
+        self.assertEqual((verdict["verdict"], verdict["cls"], verdict["do"]), ("infra", classify.CLS_DEADLINE, classify.DO_DEADLINE_KILL))
+        self.assertEqual(verdict["headline"], "Prow killed this run at its 360-minute deadline.")
+        self.assertIn("2 case(s) finished before that; the rest were never graded.", verdict["lede"])
+        self.assertTrue(verdict["matches_incident"])
+        self.assertEqual([c["outcome"] for c in verdict["cases"]], ["passed", "passed"])
+
+    def test_a_record_without_the_verdict_field_is_not_a_kill(self):
+        # SCHEMA.md: no key is unknown, not "no verdict". The 2026-09-04
+        # long zero-task failures in testdata_classify predate the field and
+        # must keep reading as the branch's own, as health.Run reads them.
+        target = run(1, 913, T0, minutes=363, result="FAILURE", tasks=[])
+        target.update({"has_build_log": True, "pod_last_event": None, "merge_conflict": False})
+        self.assertNotIn("eval_verdict", target)
+        self.assertFalse(classify.is_deadline_kill(target))
+        self.assertEqual(classify_run(target, [target])["headline"], "The run failed before any case ran 363 minutes in.")
+
+    def test_the_deadline_constants_are_healths(self):
+        from eval_dashboard import health
+
+        self.assertEqual((classify.PROW_JOB_TIMEOUT, classify.DEADLINE_KILL_MARGIN), (health.PROW_JOB_TIMEOUT, health.DEADLINE_KILL_MARGIN))
+
     def test_an_aborted_run_is_not_a_verdict(self):
         verdict = classify_run(run(1, 913, T0, minutes=8, result="ABORTED"), [])
         self.assertEqual((verdict["verdict"], verdict["headline"]), ("infra", "Aborted before it finished."))
+
+    def test_an_aborted_run_with_graded_cases_is_still_not_a_verdict(self):
+        """Since the fan-out grades each case as it finishes (#1491), a
+        presubmit a newer push superseded uploads the blocks of the cases
+        that finished before Prow stopped it. Five passing cases out of a
+        matrix the run never completed must not read as "all passed"."""
+        graded = [task(n, "ppp") for n in sorted(ADMITTED)[:5]]
+        target = run(1, 913, T0, minutes=40, result="ABORTED", tasks=graded)
+        verdict = classify_run(target, [target])
+        self.assertEqual((verdict["verdict"], verdict["headline"]), ("infra", "Aborted before it finished."))
+        self.assertIn("5 gate cases had been graded by then", verdict["lede"])
+        self.assertEqual(len(verdict["cases"]), 5, "the graded cases still travel with the run")
 
     def test_prows_green_wins_over_collapsed_cases(self):
         target = run(1, 1, T0, result="SUCCESS", tasks=gate_tasks(["agent-kanban-smoke"], letters="ffi"))

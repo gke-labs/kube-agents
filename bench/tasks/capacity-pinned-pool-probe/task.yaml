@@ -1,5 +1,11 @@
 # ACTIVE — an entry in hack/eval/presubmit-cases.txt, and what takes
-# `capacity` off the coverage allowlist in docs/designs/domains.yaml.
+# `capacity` off the coverage allowlist in docs/designs/domains.yaml. On the
+# blocking roster since 2026-09-22 (#1023), on its presubmit record after
+# #1626: 529 of 570 graded repetitions (92.8%) over 196 runs, no all-reps
+# collapse. The 41 misses are mostly the delegation acknowledgement or a
+# blocked delegation delivered as the answer (#1840, #1874; 31 of the 41),
+# the rest a missing ceiling value; docs/eval-gate-roster.md carries the
+# numbers.
 #
 # A PROBE, not the audit. The full stockout-prevention sweep exists and is
 # spec-ready (stockout-pinned-pool); on 2026-08-26 its run failed on transport
@@ -7,9 +13,9 @@
 # write — budgets like the other audits at 600-1300s. Presubmit coverage of
 # this domain is therefore a targeted question about the planted defect,
 # answered from observed evidence and graded on the reply. Full audit SOP
-# fidelity lives in the fleet-audits canary (compliance-rbac-overgrant, 606s
-# measured 2026-08-26) and in the future nightly tier, where
-# stockout-pinned-pool is parked. Cost: the ~150-350s bracket the probes
+# fidelity lives in the nightly tier: the fleet-audits canary
+# (compliance-rbac-overgrant, 606s measured 2026-08-26; nightly since
+# 2026-09-22) and stockout-pinned-pool. Cost: the ~150-350s bracket the probes
 # were promised is not what this one costs. Measured over its 1155 presubmit
 # repetitions from 2026-09-04 to 2026-09-15 (after #1174): median 540s, p10
 # 248s, p90 1318s, the ~2960s maxima being AGENT_DELEGATION_TIMEOUT plus

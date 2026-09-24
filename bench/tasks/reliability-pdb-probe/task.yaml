@@ -8,8 +8,8 @@
 # domain is a targeted question about the planted defect, answered from
 # observed evidence and graded on the reply — the shape
 # cluster-agent-crashloop-debug proved at 142s. Full audit SOP fidelity lives
-# in the fleet-audits canary (compliance-rbac-overgrant, 606s measured) and in
-# the future nightly tier, where obtainability-planted-pdb is parked.
+# in the nightly tier: the fleet-audits canary (compliance-rbac-overgrant,
+# 606s measured; nightly since 2026-09-22) and obtainability-planted-pdb.
 # Expected cost bracket: ~150-350s (chat prompt, delegated worker, a handful
 # of cluster reads; no ledger write).
 #

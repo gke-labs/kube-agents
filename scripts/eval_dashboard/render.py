@@ -230,8 +230,11 @@ DEMOTED_RE = re.compile(r"\bdemoted (\d{4}-\d{2}-\d{2})")
 # rows are blocking). The words the pages print for each live in pages.js.
 STATUS_BLOCKING = "blocking"  # active and in hack/eval/blocking-roster.txt
 STATUS_HELD_OUT = "held_out"  # active, never admitted (or no date on record)
-STATUS_DEMOTED = "demoted"  # active, held out, with a demotion date
-STATUS_NIGHTLY_ONLY = "nightly_only"  # in hack/eval/nightly-cases.txt only
+# Off the roster with a demotion date on the roster page -- active or, since
+# 2026-09-22 (#1023: the presubmit runs the roster only, so a demoted case is
+# a nightly case), nightly-only.
+STATUS_DEMOTED = "demoted"
+STATUS_NIGHTLY_ONLY = "nightly_only"  # in hack/eval/nightly-cases.txt only, no demotion date
 STATUS_RETIRED = "retired"  # in neither matrix on this checkout
 # A case's state in one run, on the strip and in a Grid cell: every graded
 # rep passed, some failed (the gate counts that as a pass), every graded rep
@@ -800,9 +803,12 @@ def demotion_dates(doc: pathlib.Path = ROSTER_DOC) -> dict[str, str]:
 def case_status(case: dict, admitted: frozenset | None, demoted: dict[str, str]) -> tuple[str, str | None]:
     """(status, demoted_on). Blocking is active *and* on the roster; an
     active case off the roster is held out, "demoted" when the roster page
-    dates it; a case only the nightly runs is nightly-only; a case in
-    neither matrix on this checkout is retired. An unreadable roster
-    (``admitted`` None) reads every active case as blocking, which
+    dates it; a case only the nightly runs is "demoted" too when the roster
+    page dates it -- since 2026-09-22 the presubmit runs the roster only, so
+    a demoted case leaves the presubmit file for the nightly one and its
+    date would otherwise be read for nobody -- and nightly-only when it does
+    not; a case in neither matrix on this checkout is retired. An unreadable
+    roster (``admitted`` None) reads every active case as blocking, which
     over-reports rather than hides, as classify.py does."""
     name = str(case.get("name"))
     if case.get("active") is True:
@@ -812,6 +818,8 @@ def case_status(case: dict, admitted: frozenset | None, demoted: dict[str, str])
             return STATUS_DEMOTED, demoted[name]
         return STATUS_HELD_OUT, None
     if case.get("nightly_active") is True:
+        if name in demoted:
+            return STATUS_DEMOTED, demoted[name]
         return STATUS_NIGHTLY_ONLY, None
     return STATUS_RETIRED, None
 
@@ -823,7 +831,7 @@ def case_status(case: dict, admitted: frozenset | None, demoted: dict[str, str])
 def compact_run(run: dict, verdict: dict, at: dict | None) -> dict:
     """One run as the pages need it: identity, timing, and classify.py's
     result (SCHEMA.md, "brief.json")."""
-    return {
+    out = {
         "build": verdict["build"],
         "pr": run.get("pr"),
         "head_sha": run.get("head_sha") if isinstance(run.get("head_sha"), str) else None,
@@ -837,12 +845,22 @@ def compact_run(run: dict, verdict: dict, at: dict | None) -> dict:
         "lede": verdict.get("lede", ""),
         "matches_incident": verdict["matches_incident"],
         "setup_death": verdict.get("setup_death", False),
+        # The run-level class (a setup death or lost pod, a deadline kill, a
+        # conflicted merge), which the Brief's deadline facts and recovery
+        # count read; null for a run whose classes are per case.
+        "cls": verdict.get("cls"),
         "storm_reps": verdict.get("storm_reps", 0),
         "ceiling_reps": verdict.get("ceiling_reps", 0),
         "do": verdict.get("do", ""),
         "cases": verdict["cases"],
         "health_at": at,
     }
+    # Only when the record carries the key: the Brief's recovery count out of
+    # a deadline-kill outage reads it the way health.Run.has_verdict does,
+    # and an absent key means a pre-field record, not "no verdict".
+    if "eval_verdict" in run:
+        out["eval_verdict"] = run["eval_verdict"] if isinstance(run["eval_verdict"], str) else None
+    return out
 
 
 def appearances_by_case(runs: list[dict]) -> dict[str, list[tuple[dict, dict]]]:

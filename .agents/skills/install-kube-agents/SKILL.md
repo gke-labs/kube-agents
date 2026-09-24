@@ -1,6 +1,6 @@
 ---
 name: install-kube-agents
-description: Provision and install the Kubernetes Agentic Harness (kube-agents) onto a GKE cluster non-interactively or interactively.
+description: Install, set up, or deploy kube-agents (the Kubernetes Agentic Harness) and its Platform Agent onto a GKE cluster in a GCP project, interactively or non-interactively. Use when asked to install, bootstrap, or onboard kube-agents, or to plan one with a dry run.
 ---
 
 # `install-kube-agents` Skill

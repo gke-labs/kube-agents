@@ -63,7 +63,7 @@ problem is a harness-log warning.
 Capture is best effort in the same sense as the artifact read-back: a pod that
 cannot be reached costs the record its worker transcript, never the run. The
 difference between "nothing to read" and "could not read" is kept, as
-``_worker_commands`` keeps it: the in-pod script prints a sentinel before its
+``_worker_logs`` keeps it: the in-pod script prints a sentinel before its
 JSON, and a reply without it is reported as ``None``.
 """
 
