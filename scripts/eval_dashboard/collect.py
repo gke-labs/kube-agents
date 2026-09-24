@@ -274,6 +274,16 @@ BUILD_LOG_FILE = "build-log.txt"
 EVAL_VERDICT_FILE = "artifacts/eval-verdict.json"
 NOT_EVALUATED_MARKER = "NOT EVALUATED"
 EVAL_OUTCOME_NOT_EVALUATED = "not_evaluated"
+# The artifact is written by the checkout under test, so its `not_evaluated[]`
+# strings are the pull request's to choose, and they end up in backticks in
+# the comment the health bot posts. Only a string shaped like a case id is
+# kept -- the charset a `bench/tasks/<id>` directory name draws from, with
+# no whitespace, no backtick and no `@`, bounded in length -- and the list
+# is cut at the size a suite could name; the rest is dropped as malformed
+# detail, the way a non-string entry already is. Same idea as the log
+# parser's `\S+` task names and the excerpt scrub in gate_comment.py.
+_CASE_ID_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+NOT_EVALUATED_MAX_CASES = 64
 # Prow's clone-records.json: `[{refs, commands[], failed}]`. Read for the
 # zero-task FAILURE builds, to separate a pull request that would not merge
 # into its base from a setup crash.
@@ -568,8 +578,9 @@ def parse_eval_verdict(text: str | None) -> list[str] | None:
     None for a missing or malformed file and for any other `outcome`: the
     caller then records the run as the plain RED its final line's `Failed`
     word already says, never a not-evaluated one on the line's word alone.
-    A `not_evaluated` list that is absent or malformed reads as empty; the
-    outcome is the fact and the list is detail.
+    A `not_evaluated` list that is absent or malformed reads as empty, and an
+    entry that is not shaped like a case id (`_CASE_ID_SHAPE`) is dropped;
+    the outcome is the fact and the list is detail.
     """
     if text is None:
         return None
@@ -580,7 +591,9 @@ def parse_eval_verdict(text: str | None) -> list[str] | None:
     if not isinstance(doc, dict) or doc.get("outcome") != EVAL_OUTCOME_NOT_EVALUATED:
         return None
     named = doc.get("not_evaluated")
-    return [case for case in named if isinstance(case, str) and case] if isinstance(named, list) else []
+    if not isinstance(named, list):
+        return []
+    return [case for case in named if isinstance(case, str) and _CASE_ID_SHAPE.match(case)][:NOT_EVALUATED_MAX_CASES]
 
 
 def _iso(ts) -> str | None:
