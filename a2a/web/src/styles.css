@@ -670,6 +670,227 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* --- status strip --------------------------------------------------------- */
+
+.status-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--edge);
+  background: var(--panel);
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 96px;
+  padding: 6px 10px;
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  background: var(--void);
+  color: var(--ink-bright);
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.tile:hover,
+.tile:focus-visible {
+  border-color: var(--halo);
+  outline: none;
+}
+
+.tile-warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.tile-label {
+  color: var(--ink-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.tile-value {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tile-type {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tile-count {
+  color: var(--ink);
+}
+
+.led {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ink-dim);
+  animation: led-blink 600ms ease-out;
+}
+
+.led[data-pulses="0"] {
+  animation: none;
+}
+
+@keyframes led-blink {
+  from {
+    background: var(--trace);
+    box-shadow: 0 0 6px var(--trace);
+  }
+  to {
+    background: var(--ink-dim);
+    box-shadow: none;
+  }
+}
+
+/* --- dashboard ------------------------------------------------------------ */
+
+.dashboard {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 8px;
+  padding: 8px 10px;
+  overflow: auto;
+  height: 100%;
+  background:
+    radial-gradient(120% 90% at 50% 0%, #101520 0%, var(--panel) 55%, var(--void) 100%);
+}
+
+.panel {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  background: rgba(7, 8, 10, 0.6);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.panel-focused {
+  border-color: var(--halo);
+  box-shadow: 0 0 0 1px var(--halo);
+}
+
+.panel-title {
+  margin: 0 0 6px;
+  color: var(--ink-dim);
+  font-size: 10px;
+  font-weight: normal;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.panel-empty {
+  margin: 0;
+  color: var(--ink-dim);
+}
+
+.panel table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.panel th {
+  color: var(--ink-dim);
+  font-weight: normal;
+  text-align: left;
+}
+
+.panel td,
+.panel th {
+  padding: 2px 6px 2px 0;
+  vertical-align: top;
+}
+
+.row-click {
+  cursor: pointer;
+}
+
+.row-click:hover td {
+  color: var(--ink-bright);
+}
+
+.row-failed td {
+  color: var(--warn);
+}
+
+.live-live {
+  color: var(--trace);
+}
+
+.live-quiet,
+.live-gone,
+.live-error {
+  color: var(--warn);
+}
+
+.corr-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+}
+
+.conv-group h3 {
+  margin: 4px 0 2px;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: normal;
+}
+
+.conv-row,
+.topic-row,
+.anomaly-row,
+.cap-row {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding: 1px 0;
+}
+
+.cap-row {
+  justify-content: flex-start;
+  align-items: center;
+}
+
+.cap-bar {
+  flex: 0 0 60px;
+  height: 6px;
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+}
+
+.cap-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--ink);
+}
+
+.cap-warn {
+  color: var(--warn);
+}
+
+.cap-warn .cap-bar > span {
+  background: var(--warn);
+}
+
+.cap-tbd {
+  color: var(--ink-dim);
+}
+
 /* --- narrow screens -------------------------------------------------------- */
 
 @media (max-width: 720px) {
