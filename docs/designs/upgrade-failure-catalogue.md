@@ -431,7 +431,7 @@ or shelled out to `docker` lost it.
 - After: crash loops in logging and security agents.
 - Mitigate before: replace agents that mount the Docker socket with CRI-based ones.
 - Mitigate after: the same replacement, under pressure.
-- Read today: nothing.
+- Read today: the security-patch orchestrator flags a pool whose `config.imageType` is a pre-containerd `COS` or `UBUNTU` variant and names the `_CONTAINERD` move; `docker.sock` mounts and Docker-only images are unread.
 - GKE recommender: `DEPRECATION_K8S_1_24_DOCKERSHIM`, `DEPRECATION_CONTAINERD_V1_SCHEMA_IMAGES` and `DEPRECATION_CONTAINERD_V1ALPHA2_CRI_API`, for the migrations that have happened.
 - Why it is on the list: the Docker to containerd migration on GKE 1.19 to 1.24.
 
