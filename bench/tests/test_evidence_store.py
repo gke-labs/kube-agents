@@ -51,6 +51,7 @@ from kube_agents_bench.evidence_store import (
     StoreUnreachable,
     is_gcs,
     open_backend,
+    scope_of,
 )
 
 
@@ -584,3 +585,133 @@ def test_an_uncapped_multi_key_case_reports_no_truncation(gcloud):
     (source,) = backend.sources()
     assert backend.truncated == {}
     assert len(source.text.strip().splitlines()) == 2
+
+
+# --------------------------------------------------------------------------
+# scoping the read
+# --------------------------------------------------------------------------
+
+
+def test_a_bare_string_is_one_case_not_its_letters():
+    """The one way an ``only`` argument fails without saying anything.
+
+    Iterating ``"case-a"`` yields single characters, every one of them a case
+    id that matches nothing, so the read comes back empty and the gate reports
+    a screened case as never screened.
+    """
+    assert scope_of("case-a") == frozenset({"case-a"})
+    assert scope_of(["case-a", "case-b"]) == frozenset({"case-a", "case-b"})
+    assert scope_of(None) is None
+
+
+def test_local_reads_only_the_cases_asked_for(tmp_path):
+    backend = LocalBackend(tmp_path)
+    for name in ("case-a", "case-b", "case-c"):
+        backend.append(name, line(name))
+    assert [s.case_id for s in backend.sources(["case-a", "case-c"])] == [
+        "case-a",
+        "case-c",
+    ]
+    assert [s.case_id for s in backend.sources()] == ["case-a", "case-b", "case-c"]
+
+
+def test_local_still_refuses_a_stray_json_outside_the_scope(tmp_path):
+    """The format check is about the store, not about this read's cases.
+
+    A scoped read that skipped it would let a half-migrated store go unnoticed
+    for as long as nobody asked for the case that was left behind.
+    """
+    LocalBackend(tmp_path).append("case-a", line("case-a"))
+    (tmp_path / "case-b.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="rename it to case-b.jsonl"):
+        LocalBackend(tmp_path).sources(["case-a"])
+
+
+def test_one_case_is_listed_at_its_own_prefix(gcloud):
+    """The saving, and the whole reason for the argument.
+
+    Listing ``<prefix>/**`` walks every case in the store, and the gate does it
+    once per graded case. A single-case read asks the server for one case.
+    """
+    for name in ("case-a", "case-b", "case-c"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    (source,) = GcsBackend("gs://b/e").sources(["case-b"])
+    assert source.case_id == "case-b"
+
+    (listed,) = [c for c in gcloud.calls if c[2] == "ls"]
+    assert listed[3] == "gs://b/e/case-b/**"
+    # One `cat`, over case-b's objects alone.
+    cats = [c for c in gcloud.calls if c[2] == "cat"]
+    assert len(cats) == 1
+    assert all("case-b" in u for u in cats[0][3:])
+
+
+def test_a_case_with_no_objects_of_its_own_is_an_empty_store_not_an_outage(gcloud):
+    """The scoped read hits "matched no objects" as a matter of routine.
+
+    Every case the nightly has not reached yet has no prefix at all, so the
+    exit code that means "empty" must not be read as the bucket being gone --
+    that would degrade the gate on an ordinary new case.
+    """
+    url, text = nested("case-a", KEY_DIR, 1)
+    gcloud.objects[url] = text
+    assert GcsBackend("gs://b/e").sources(["case-zzz"]) == []
+
+
+def test_several_cases_are_filtered_from_one_listing(gcloud):
+    """A wider scope lists once and drops the rest.
+
+    One `ls` of everything is one process; one `ls` per case would cost more
+    than the filtering saves, and the `cat` fan-out is where the saving is.
+    """
+    for name in ("case-a", "case-b", "case-c", "case-d"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    sources = GcsBackend("gs://b/e").sources({"case-a", "case-c"})
+    assert [s.case_id for s in sources] == ["case-a", "case-c"]
+
+    (listed,) = [c for c in gcloud.calls if c[2] == "ls"]
+    assert listed[3] == "gs://b/e/**"
+    assert len([c for c in gcloud.calls if c[2] == "cat"]) == 2
+
+
+def test_an_empty_scope_reads_nothing_at_all(gcloud):
+    """Not even the listing. `bench-gate suite` with no case results lands here.
+
+    An empty scope is not `None`: it asks about no cases, so every object a
+    listing returned would be filtered straight back out again.
+    """
+    url, text = nested("case-a", KEY_DIR, 1)
+    gcloud.objects[url] = text
+
+    assert GcsBackend("gs://b/e").sources(set()) == []
+    assert gcloud.calls == []
+
+
+def test_a_scoped_read_returns_the_same_bytes_as_a_whole_one(gcloud):
+    """Scoping changes what is read, never what a case's read says.
+
+    The failure this guards is the quiet one: a scoped read is fast whether or
+    not it is correct, so speed cannot tell the two apart.
+    """
+    for name in ("case-a", "case-b"):
+        for day in (1, 2, 3):
+            url, text = nested(name, KEY_DIR, day, passes=day)
+            gcloud.objects[url] = text
+
+    whole = {s.case_id: s for s in GcsBackend("gs://b/e").sources()}
+    (scoped,) = GcsBackend("gs://b/e").sources(["case-a"])
+    assert scoped == whole["case-a"]
+
+
+def test_truncation_is_reported_for_a_scoped_case(gcloud):
+    for day in range(1, 6):
+        url, text = nested("case-a", KEY_DIR, day)
+        gcloud.objects[url] = text
+
+    backend = GcsBackend("gs://b/e", max_objects=2)
+    backend.sources(["case-a"])
+    assert backend.truncated == {"case-a": 3}

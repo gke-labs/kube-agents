@@ -22,9 +22,12 @@ func TestConsoleTurnCarriesTheConsoleBackendAndPrincipal(t *testing.T) {
 	// and its default roster ("1001") is that backend's, not the console's;
 	// a console conversation is a 1:1 DM, so the room is just the sender
 	// (mux_test.go:50 sets the same field the same way for the same reason).
+	// Backend is set on each message below because that is what the console
+	// adapter stamps (ConsoleAdapter.inbound); the fake does not derive it
+	// from the conversation id, and neither does the gateway.
 	r.adapter.roster = []string{consoleAuthor}
 	r.adapter.inbox <- InboundMessage{
-		Conversation: "console:tab-9", Kind: "dm",
+		Conversation: "console:tab-9", Kind: "dm", Backend: consoleBackend,
 		AuthorID: consoleAuthor, MessageID: "m1", Text: "console hello",
 	}
 	var auth Authority
@@ -173,7 +176,7 @@ func TestConsoleTerminalAnswerStaysOffTheNoticeSubject(t *testing.T) {
 	r := startRig(t)
 	r.adapter.roster = []string{consoleAuthor}
 	r.adapter.inbox <- InboundMessage{
-		Conversation: "console:tab-7", Kind: "dm",
+		Conversation: "console:tab-7", Kind: "dm", Backend: consoleBackend,
 		AuthorID: consoleAuthor, MessageID: "m1", Text: "how is the fleet",
 	}
 	origin := r.awaitTask(t, "platform")
@@ -207,7 +210,7 @@ func TestConsoleStillGetsTerminalNotices(t *testing.T) {
 	r := startRig(t)
 	r.adapter.roster = []string{consoleAuthor}
 	r.adapter.inbox <- InboundMessage{
-		Conversation: "console:tab-8", Kind: "dm",
+		Conversation: "console:tab-8", Kind: "dm", Backend: consoleBackend,
 		AuthorID: consoleAuthor, MessageID: "m1", Text: "how is the fleet",
 	}
 	origin := r.awaitTask(t, "platform")

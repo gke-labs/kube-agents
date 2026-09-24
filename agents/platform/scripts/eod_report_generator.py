@@ -27,6 +27,17 @@ from typing import Any, Dict, FrozenSet, List, Optional
 
 DEFAULT_EXCLUDE_NAMESPACES = frozenset({"kube-system", "kube-public", "kube-node-lease"})
 
+# The `reason` session_kv_server.py stamps on the drift detector's ledger rows.
+# This recap reads `intercepted_events` for the event watcher's rows only, and
+# this is the column value that separates the two writers.
+#
+# Copied rather than imported: importing session_kv_server pulls in FastAPI and
+# starts building an app, and this script runs from a cron job that has no
+# reason to carry either. The duplication is pinned by a test that asserts the
+# two spellings agree, so a rename that misses this copy fails there rather than
+# silently folding drift rows back into the watcher's totals.
+DRIFT_LEDGER_REASON = "OutOfBandChange"
+
 
 def excluded_namespaces() -> FrozenSet[str]:
     """Namespaces kept out of the breakdown and the headline counts.
@@ -224,13 +235,30 @@ def load_intercepted_events(
                 # checked, and the recap keeps working against a ledger written
                 # by an older session server mid-rollout.
                 delivery_col = "delivery_error" if "delivery_error" in columns else "''"
+                # `intercepted_events` has had a second writer since the drift
+                # detector landed: session_kv_server.py records every
+                # out-of-band-change inject in it too, under
+                # `reason = 'OutOfBandChange'`. Those rows are excluded here
+                # rather than counted, because every number this recap prints is
+                # labelled as the event watcher's — "Forwarded N events", "N
+                # alerts went to chat", the clusters in the fan-in header — and
+                # a drift record is not an event the watcher forwarded. Folding
+                # the two together would inflate all of them with no way for the
+                # reader to separate them again.
+                #
+                # Excluded rather than reported separately because this recap
+                # could not say anything useful about a drift row if it kept it:
+                # it lists only informational events, and a drift record is
+                # graded `Warning`. Reporting drift is its own job for whatever
+                # reads these rows next.
                 cursor.execute(
                     "SELECT cluster, namespace, workload, object_uid, object_kind, reason, message, "
                     f"severity, occurrences, notified, created_at, {delivery_col} "
                     "FROM intercepted_events "
                     "WHERE created_at >= datetime('now', ?) "
+                    "AND reason != ? "
                     "ORDER BY created_at DESC",
-                    (f"-{int(window_hours)} hours",),
+                    (f"-{int(window_hours)} hours", DRIFT_LEDGER_REASON),
                 )
                 rows = cursor.fetchall()
             finally:

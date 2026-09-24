@@ -41,6 +41,9 @@ from tests.testing.release import (
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALL_SH = _REPO_ROOT / "install.sh"
 _PRINT_NO_CHAT_SH = _REPO_ROOT / "scripts" / "installer" / "print_instructions_no_chat.sh"
+# The other two front doors, for the assertion that all three handlers share
+# the subshell rule.
+_FRONT_DOORS = (_INSTALL_SH, _REPO_ROOT / "upgrade.sh", _REPO_ROOT / "uninstall.sh")
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
 
 # install.sh sources the shared helpers from the acquired workspace partway
@@ -1823,6 +1826,78 @@ run_menu_system "."
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("RC=1", proc.stdout)
+
+    def test_wait_for_deployment_object_passes_context(self):
+        """Context argument must be forwarded as --context to kubectl."""
+        stub = 'case "$*" in *"--context my-ctx"*) exit 0 ;; *) exit 1 ;; esac'
+        proc = self._run_with_kubectl_stub(
+            'rc=0; wait_for_deployment_object dep ns 0 my-ctx || rc=$?; echo "RC=$rc"',
+            stub,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+
+    def test_wait_for_rollout_passes_context(self):
+        """Context argument must be forwarded as --context to kubectl rollout."""
+        stub = 'case "$*" in *"--context my-ctx"*) exit 0 ;; *) exit 1 ;; esac'
+        proc = self._run_with_kubectl_stub(
+            'rc=0; wait_for_rollout dep ns 0 my-ctx || rc=$?; echo "RC=$rc"',
+            stub,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+
+    # main() is not callable from here -- reaching step 13 means provisioning a
+    # cluster -- so its context gate is lifted out of the source and run in a
+    # function of its own. The anchors are checked in _context_gate_body, so a
+    # rewrite of the step fails loudly rather than leaving the two tests below
+    # asserting against an empty string.
+    _CONTEXT_GATE_START = '  local expected_ctx\n  expected_ctx="$(gke_context_name)"'
+    _CONTEXT_GATE_END = "    exit 1\n  fi\n"
+
+    def _context_gate_body(self):
+        source = _INSTALL_SH.read_text()
+        start = source.index(self._CONTEXT_GATE_START)
+        end = source.index(self._CONTEXT_GATE_END, start) + len(self._CONTEXT_GATE_END)
+        gate = source[start:end]
+        self.assertIn("kubectl config current-context", gate)
+        return (
+            _SOURCE_INSTALLER_COMMON
+            + '\nPROJECT_ID="a-project"; REGION="a-region"; CLUSTER_NAME="a-cluster"\n'
+            + "context_gate() {\n"
+            + gate
+            + "}\n"
+        )
+
+    def test_the_health_check_refuses_a_kubectl_pointed_elsewhere(self):
+        """Step 13 reads whatever context is current, so a get-credentials that
+        did not take must end the run rather than grade another cluster."""
+        proc = self._run_with_kubectl_stub(
+            self._context_gate_body() + 'context_gate; echo "REACHED_HEALTH_CHECKS"',
+            'echo "gke_another-project_another-region_another-cluster"',
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("REACHED_HEALTH_CHECKS", proc.stdout)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("gke_another-project_another-region_another-cluster", combined)
+        self.assertIn("gke_a-project_a-region_a-cluster", combined)
+
+    def test_the_health_check_continues_on_the_expected_context(self):
+        """The other half: the gate has to let the matching context through."""
+        proc = self._run_with_kubectl_stub(
+            self._context_gate_body() + 'context_gate; echo "REACHED_HEALTH_CHECKS"',
+            'echo "gke_a-project_a-region_a-cluster"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("REACHED_HEALTH_CHECKS", proc.stdout)
+
+    def test_step_13_namespace_check_passes_context(self):
+        """Step 13's namespace check must forward --context to avoid querying ambient context."""
+        source = _INSTALL_SH.read_text()
+        start = source.index(self._CONTEXT_GATE_START)
+        end = source.index("wait_for_deployment_object", start)
+        body = source[start:end]
+        self.assertIn('kubectl get ns "$namespace" --context "$expected_ctx"', body)
 
     def test_print_generate_only_handoff_renders_required_commands(self):
         """Verifies print_generate_only_handoff prints all out-of-Terraform and lifecycle commands."""
@@ -5251,7 +5326,10 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         proc = self._run_func(f'run_lifecycle_apply "{repo_dir}" "{log_file}"')
 
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("Error encountered at line", proc.stderr)
+        # on_error names the frame that called it: install.sh itself, in the
+        # dispatcher, since the failure is reported from there.
+        self.assertIn(f"Error encountered at {_INSTALL_SH}:", proc.stderr)
+        self.assertIn(" in handle_pipeline_status (exit code 1): ", proc.stderr)
         self.assertIn("./lifecycle.sh apply -auto-approve -input=false", proc.stderr)
         self.assertNotIn('tee "$log_file"', proc.stderr)
         self.assertNotIn("tee ", proc.stderr)
@@ -5270,6 +5348,129 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertEqual(proc.returncode, 0, f"Stderr: {proc.stderr}")
         self.assertTrue(log_file.exists())
         self.assertIn("Apply complete", log_file.read_text())
+
+    def test_a_failure_inside_a_sourced_library_names_its_file_and_function(self):
+        """The abort banner points at the frame that failed.
+
+        $LINENO counts from the top of whichever file the failing command sat
+        in. Printed alone, a failure inside a sourced helper read as a line of
+        install.sh, where that line is unrelated code (#1798). The banner now
+        carries the file and the function; the JSON report is unchanged and
+        still records the status alone.
+        """
+        lib = self._tmp_path / "helper_lib.sh"
+        lib.write_text("library_probe() {\n  false\n}\n")
+        # Same file the other write_json_report tests read, removed first so
+        # the assertions below read this run's report and not the one the
+        # previous test left behind.
+        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
+        report_file.unlink(missing_ok=True)
+        proc = self._run_func(f'source "{lib}"\nlibrary_probe\necho "NOT_REACHED"')
+
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("NOT_REACHED", proc.stdout)
+        self.assertIn(f"Error encountered at {lib}:", proc.stderr)
+        self.assertIn(" in library_probe (exit code 1): false", proc.stderr)
+        # The report the handler wrote on the way out.
+        self.assertTrue(report_file.exists(), proc.stderr)
+        report = json.loads(report_file.read_text())
+        self.assertEqual(report["status"], "FAILED")
+        for absent in ("message", "line", "line_no", "command", "function", "source_file"):
+            self.assertNotIn(absent, report)
+        for value in report.values():
+            self.assertNotIn("library_probe", str(value))
+            self.assertNotIn("Error encountered", str(value))
+
+    def test_a_failure_in_a_piped_script_names_install_sh_not_bash(self):
+        """The curl | bash entry has no file for bash to name a frame after.
+
+        Read from stdin, BASH_SOURCE for this script's own frames is `main` on
+        a modern bash and unset on bash 3.2, and $0 is `bash`. The banner
+        names the script instead, so the line number has a file to belong to.
+        """
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "piped_step() {\n  false\n}\n"
+            "piped_step\n"
+        )
+        proc = subprocess.run(
+            ["bash"],
+            input=script,
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+            ),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("Error encountered at install.sh:", proc.stderr)
+        self.assertIn(" in piped_step (exit code 1): false", proc.stderr)
+        self.assertNotIn(" at bash:", proc.stderr)
+        self.assertNotIn(" at main:", proc.stderr)
+
+    def test_a_handled_miss_inside_a_substitution_prints_no_banner_and_no_report(self):
+        """A probe whose miss the caller handles is not an abort.
+
+        `set -E` hands the ERR trap to the `$(...)`, and bash 3.2 fires it
+        there before the caller's `if !` is consulted (#1798). The handler
+        exits the subshell silently and leaves the verdict to the parent, which
+        handles the miss: no banner, no report. bash 4.4 and 5.x never fire the
+        inherited trap in this shape, so there this asserts the contract
+        without exercising the check; the unhandled case below does.
+        """
+        # Same file the other write_json_report tests read.
+        report = pathlib.Path("/tmp/kube-agents-install-report.json")
+        report.unlink(missing_ok=True)
+        proc = self._run_func(
+            "probe() { false; }\n"
+            'step() { if ! x="$(probe)"; then echo "handled"; fi; }\n'
+            "step\n"
+            'echo "done"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("handled", proc.stdout)
+        self.assertIn("done", proc.stdout)
+        self.assertNotIn("Error encountered", proc.stderr)
+        self.assertFalse(report.exists())
+
+    def test_an_unhandled_failure_inside_a_substitution_prints_one_banner_from_the_parent(self):
+        """A real failure inside a `$(...)` is reported once, by the parent.
+
+        Every bash fires the inherited trap inside an unhandled substitution.
+        The subshell's handler exits at the failing command rather than
+        printing: command substitution does not inherit errexit, so a handler
+        that merely returned would let the probe run on past its failure and
+        hand the caller a clean exit. The parent's trap then fires at the
+        assignment and prints the one banner.
+        """
+        # Same file the other write_json_report tests read, removed first so
+        # the report assertion reads this run's and not the previous test's.
+        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
+        report_file.unlink(missing_ok=True)
+        proc = self._run_func(
+            'probe() { false; echo "NOT_REACHED_IN_PROBE"; }\n'
+            'x="$(probe)"\n'
+            'echo "NOT_REACHED x=[$x]"'
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("NOT_REACHED", proc.stdout)
+        self.assertEqual(proc.stderr.count("Error encountered"), 1, proc.stderr)
+        self.assertIn(' in main (exit code 1): x="$(probe)"', proc.stderr)
+        self.assertTrue(report_file.exists(), proc.stderr)
+        report = json.loads(report_file.read_text())
+        self.assertEqual(report["status"], "FAILED")
+
+    def test_each_front_door_handler_exits_a_subshell_silently(self):
+        """The three handlers share the rule, and apply it before they print."""
+        check = 'if [ "${BASH_SUBSHELL:-0}" -gt 0 ]; then\n    exit "$exit_code"\n  fi'
+        for path in _FRONT_DOORS:
+            with self.subTest(file=path.name):
+                source = path.read_text()
+                handler = source[source.index("\non_error() {") :]
+                handler = handler[: handler.index("\n}\n")]
+                self.assertIn(check, handler)
+                self.assertLess(handler.index(check), handler.index("echo -e"))
 
     def test_pipeline_status_handles_empty_array_safely_under_set_u(self):
         source = _INSTALL_SH.read_text()

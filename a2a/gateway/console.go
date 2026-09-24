@@ -103,6 +103,17 @@ func consoleConversationToken(conversation string) (string, bool) {
 
 func consoleOutSubject(token string) string { return "chat.console." + token + ".out" }
 
+// isConsoleConversation reports whether a conversation is the console's, and
+// it is the key's prefix and nothing else. Which backend a MESSAGE came
+// through is the message's own (InboundMessage.Backend, Gateway.backendFor);
+// this is the outbound question, asked where there is no message to ask -
+// the relay holds a session record, and the record's key is
+// backend-qualified for exactly this, the same test MultiAdapter.pick and
+// the side door's forDoor make on the way out.
+func isConsoleConversation(conversation string) bool {
+	return strings.HasPrefix(conversation, consoleKeyPrefix)
+}
+
 // ConsoleAdapter is the five-operation Adapter over core NATS. It owns its
 // own connection: lib.Client is a JetStream envelope client and this is
 // plain pub/sub, and the two reconnect independently.
@@ -326,7 +337,14 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 		a.log.Warn("console frame dropped", "reason", "empty text", "conversation", conversation, "messageId", f.MessageID)
 		return InboundMessage{}, "", false
 	}
-	msg := InboundMessage{Conversation: conversation, Kind: "dm", AuthorID: consoleAuthor, MessageID: f.MessageID}
+	// Backend is stamped here rather than left to the gateway's configured
+	// one: the console runs beside whichever chat backend the process was
+	// configured for, so a frame that said nothing would be attributed to
+	// that backend and verified against its mapping table (Gateway.backendFor).
+	msg := InboundMessage{
+		Conversation: conversation, Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: f.MessageID,
+	}
 	if len(text) > consoleTextCap {
 		a.log.Warn("console frame dropped", "reason", "oversize", "conversation", conversation, "messageId", f.MessageID, "bytes", len(text))
 		return msg, fmt.Sprintf("⚠️ that message is %d bytes and the console takes at most %d KiB per turn; it was not sent", len(text), consoleTextCap/bytesPerKiB), false

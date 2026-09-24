@@ -1858,6 +1858,22 @@ class LedgerTokenMintTest(unittest.TestCase):
         self.assertIn(str(checker.LEDGER_INSTALLATION_ID), seen["url"])
         self.assertEqual("POST", seen["method"])
 
+    def test_the_probe_mint_pins_its_reads_rather_than_taking_the_whole_grant(self):
+        # A bodiless mint yields everything the installation holds, and since
+        # the ledger reset's grant that is issues: write on every pool
+        # repository. A read probe asks for its reads.
+        seen = {}
+
+        def urlopen(request, timeout=None):
+            seen["body"] = json.loads(request.data.decode())
+            seen["content_type"] = request.get_header("Content-type")
+            return _Response({"token": "ghs_minted"})
+
+        self._mint(urlopen=urlopen)
+        self.assertEqual({"permissions": checker.LEDGER_READ_PERMISSIONS}, seen["body"])
+        self.assertEqual("application/json", seen["content_type"])
+        self.assertNotIn("write", json.dumps(seen["body"]))
+
     def test_the_jwt_is_issued_by_the_ledger_app(self):
         captured = {}
 
@@ -1901,6 +1917,19 @@ class LedgerTokenMintTest(unittest.TestCase):
                 token, status, _ = self._mint(urlopen=lambda *a, **kw: _Response(dict(body)))
                 self.assertEqual("ghs_minted", token)
                 self.assertEqual("ok", status)
+
+    def test_a_refused_permission_fails_because_the_eval_preflight_would(self):
+        # The pinned body makes 422 possible: the installation no longer holds
+        # one of the three reads. hack/ci-eval-pr.sh sends the same body at
+        # preflight and exits on this answer, so it is a pool-wide failure,
+        # not an "unknown" to re-run later.
+        token, status, message = self._mint(urlopen=self._http_error(422, "Unprocessable Entity"))
+        self.assertIsNone(token)
+        self.assertEqual("failed", status)
+        self.assertIn("422", message)
+        for permission in checker.LEDGER_READ_PERMISSIONS:
+            self.assertIn(permission, message)
+        self.assertIn("preflight", message)
 
     def test_a_server_error_is_unverified_not_failed(self):
         _, status, _ = self._mint(urlopen=self._http_error(503, "Service Unavailable"))
@@ -1964,10 +1993,13 @@ class LedgerReadCredentialTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertIn("404", " ".join(result.details))
 
-    def test_repo_reachable_without_issues_read_fails(self):
+    def test_repo_reachable_but_refused_fails_and_does_not_blame_a_permission(self):
+        # The mint pinned `issues: read`, so a 403 on the read is not the grant.
         result = self._check(self._http_error(403, "Forbidden"))
         self.assertFalse(result.passed)
-        self.assertIn("issues: read", " ".join(result.details))
+        details = " ".join(result.details)
+        self.assertIn("issues: read", details)
+        self.assertIn("not a missing permission", details)
 
     def test_rate_limited_403_is_unverified_not_failed(self):
         result = self._check(self._http_error(403, "rate limit exceeded", {"x-ratelimit-remaining": "0"}))
@@ -2057,6 +2089,11 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
             str(checker.LEDGER_INSTALLATION_ID), self._default("EVAL_LEDGER_INSTALLATION_ID")
         )
 
+    def test_the_probe_asks_for_the_reads_the_grading_mint_asks_for(self):
+        m = re.search(r"^LEDGER_GRADING_MINT_BODY='(.+)'$", self.script, re.M)
+        self.assertIsNotNone(m, "could not find LEDGER_GRADING_MINT_BODY in hack/ci-eval-pr.sh")
+        self.assertEqual({"permissions": checker.LEDGER_READ_PERMISSIONS}, json.loads(m.group(1)))
+
     def test_the_script_mints_into_the_variable_bench_reads_first(self):
         text = (checker._ROOT / "bench" / "kube_agents_bench" / "verifiers.py").read_text()
         block = re.search(r"^LEDGER_TOKEN_ENV_VARS\s*=\s*\((.*?)\)", text, re.S | re.M)
@@ -2113,7 +2150,10 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
             r"^  if ! mint_ledger_token .*?^  fi", self._unit(), re.S | re.M
         )
         self.assertIsNotNone(branch, "could not find the unit's mint-failure branch")
-        self.assertEqual(2, branch.group(0).count("lock_release"))
+        # The task lock, the infra lock and, for a ledger-writing case, the
+        # stream lock: everything taken before the mint.
+        self.assertEqual(3, branch.group(0).count("lock_release"))
+        self.assertIn("lock-stream-", branch.group(0))
         self.assertIn("return 0", branch.group(0))
 
     def test_every_bench_invocation_is_preceded_by_a_mint(self):

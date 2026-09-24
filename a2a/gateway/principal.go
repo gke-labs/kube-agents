@@ -77,6 +77,26 @@ func (p *PrincipalMap) Resolve(userID string) string {
 	return p.m[userID]
 }
 
+// Section returns the entries under keyPrefix as a map of their own, with
+// the prefix removed from every key and only values under valuePrefix kept.
+// It is how the inject door's prefixed map is read by the code that resolves
+// a roster's raw author ids (BuildAuthority, hashRoster), so the requester
+// hashes to the same principal there as in the authority block's requester
+// field. The refusal of a value outside valuePrefix is the same refusal
+// Gateway.resolveInjectPrincipal makes; here it is a drop, there it is a
+// logged error, and neither honours the entry.
+func (p *PrincipalMap) Section(keyPrefix, valuePrefix string) *PrincipalMap {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := &PrincipalMap{m: map[string]string{}}
+	for k, v := range p.m {
+		if strings.HasPrefix(k, keyPrefix) && strings.HasPrefix(v, valuePrefix) {
+			out.m[strings.TrimPrefix(k, keyPrefix)] = v
+		}
+	}
+	return out
+}
+
 // Len reports how many identities are mapped.
 func (p *PrincipalMap) Len() int {
 	p.mu.RLock()

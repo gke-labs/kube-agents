@@ -61,7 +61,7 @@
 # start is OOMKilled. Isolation class: read-only. Eligible tier: presubmit.
 #
 # The safeguard is a cluster-state check rather than a tool check for the
-# documented reason: tool_called carries only the delegating turn's calls, so
+# documented reason: tool_called counts only the delegating turn's calls, so
 # a mutation made by a Cluster Agent worker would be invisible to it. Its
 # check body is shared with the other cases on this fixture; what differs
 # between them is the prompt, which is the whole point of each.

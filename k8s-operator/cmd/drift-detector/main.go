@@ -20,15 +20,20 @@
 // plane is managed, so the audit stream surfaces only in Cloud Logging. A Log
 // Router sink exports it to a topic, and this binary pulls the subscription.
 //
-// This is CUJ 3, built in four stages, of which three ship here. T1 is the
+// This is CUJ 3, built in four stages, all of which ship here. T1 is the
 // ingestion path (pull and parse), T2 is principal classification (assign a
 // tier, drop the calls that changed nothing), and T3 joins managedFields off
 // the live object -- on the cluster this process holds credentials for, and on
 // every cluster in the project that has a Cluster Agent profile under
 // --profiles-dir. A record naming a cluster in neither is still forwarded, and
-// counted unreachable. T4 emits the gitops-drift inject and is not built, so
-// nothing consumes what T3 produces beyond a log line. See
-// docs/designs/drift-detection.md for the design.
+// counted unreachable. With --daemon-url set, what survives is posted to the
+// core-agent daemon as a gitops-drift inject, which is where the pipeline the
+// design describes takes over: session, agent, chat, human approval, GitOps PR.
+//
+// The inject is off unless --daemon-url is set, and off is the default. No
+// image builds or launches this binary yet, so reaching that pipeline is
+// something an operator does by hand today. See docs/designs/drift-detection.md
+// for the design.
 package main
 
 import (
@@ -98,6 +103,27 @@ type flags struct {
 	// logDropped turns on a log line per filtered record.
 	logDropped bool
 
+	// daemonURL is the core-agent daemon the gitops-drift inject is posted to.
+	// Empty is a supported mode and the default: the detector classifies and
+	// joins exactly as before and stops at the DRIFT log line, which is how it
+	// has run since T1 and is what a local run against a real subscription
+	// wants. Setting it is what escalates drift to a human.
+	daemonURL string
+
+	// tokenEnv names the environment variable holding the daemon's bearer
+	// token, rather than carrying the token itself: a flag value is visible in
+	// the process table and in any log that echoes argv, and this binary's
+	// startup line prints its configuration. Required once daemonURL is set.
+	tokenEnv string
+
+	// owner is the X-Asserted-Caller the session is attributed to. The daemon
+	// does not read that header today: POST /sessions is guarded by the bearer
+	// token alone and stamps its own metadata. It is sent so the value is on
+	// the wire and in the daemon's request log from the first release, which is
+	// what makes turning it into an authorisation check later a daemon-side
+	// change rather than a flag day across both binaries.
+	owner string
+
 	// kubeconfig and inCluster select how the join reaches the live object.
 	// Neither set means no cluster access and no join, which is how the binary
 	// has run since T1.
@@ -155,6 +181,12 @@ func parseFlags(args []string) (*flags, error) {
 		"Comma-separated domains whose accounts count as human. Empty means any principal carrying a domain.")
 	fs.BoolVar(&f.logDropped, "log-dropped", false,
 		"Log every filtered record. Verbose: the drop rate exceeds 99% on a live cluster.")
+	fs.StringVar(&f.daemonURL, "daemon-url", "",
+		"Base URL of the core-agent daemon (http://... or https://..., no trailing slash) to post the "+injectKindDrift+" inject to. Empty disables the inject: records are still classified, joined and logged, and nothing is escalated to a human.")
+	fs.StringVar(&f.tokenEnv, "token-env", "",
+		"Name of the environment variable holding the daemon's bearer token. Required with --daemon-url. The variable's name rather than its value, because a flag is visible in the process table.")
+	fs.StringVar(&f.owner, "owner", "",
+		"X-Asserted-Caller for the session the inject opens. Sent, but nothing reads it today: the daemon guards POST /sessions with the bearer token alone.")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "",
 		"Path to a kubeconfig for the cluster whose live objects the join reads. An operator-supplied path for local runs, not a discovery mechanism. Mutually exclusive with --in-cluster; with no --profiles-dir either, the join is disabled.")
 	fs.BoolVar(&f.inCluster, "in-cluster", false,
@@ -188,9 +220,11 @@ func parseFlags(args []string) (*flags, error) {
 //
 // The cluster set is built by the caller rather than here, because discovering
 // the profile half of it needs a context and reaches the GKE API, and this has
-// to stay callable from a test that stands up neither.
-func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter) (*driftFilter, *joiner) {
-	join := newJoiner(clusters, parseGitopsManagers(f.gitopsManagers), logDriftEvent)
+// to stay callable from a test that stands up neither. onDrift arrives the same
+// way and for the same reason: building it needs a validated token out of the
+// environment, which a test should not have to set to exercise the wiring.
+func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter, onDrift driftEventHandler) (*driftFilter, *joiner) {
+	join := newJoiner(clusters, parseGitopsManagers(f.gitopsManagers), onDrift)
 	return newDriftFilter(NewClassifier(f.automationPrincipals, f.humanDomains), join.Handle, f.logDropped), join
 }
 
@@ -299,6 +333,19 @@ func realMain(argv []string) error {
 	if f.inCluster && f.kubeconfig != "" {
 		return errors.New("--in-cluster and --kubeconfig are mutually exclusive: both name the one cluster the join reads")
 	}
+	// The inject's flags are checked together, here, rather than when the first
+	// drift arrives. Every one of these is a startup-time fact, and a detector
+	// that pulls happily for an hour and then fails its first escalation has
+	// spent that hour looking correct.
+	if f.tokenEnv != "" && f.daemonURL == "" {
+		return errors.New("--token-env was given without --daemon-url, so nothing would be injected and the token would go unused")
+	}
+	if f.owner != "" && f.daemonURL == "" {
+		return errors.New("--owner was given without --daemon-url, so no session would be opened for it to be asserted on")
+	}
+	if f.daemonURL != "" && f.tokenEnv == "" {
+		return errors.New("--token-env is required with --daemon-url: the daemon rejects an unauthenticated session create")
+	}
 	// Refused rather than defaulted. Without the full identity the join cannot
 	// tell a record from this cluster from a record about a same-named object on
 	// another, and guessing wrong does not error -- it reads the wrong object
@@ -336,8 +383,11 @@ func realMain(argv []string) error {
 
 	// Cancelled on SIGINT or SIGTERM, which stops the pull loop. Settling the
 	// batch it was working on does not run on this context -- see
-	// subscriber.settleContext, which is why an interrupted batch is acked
-	// rather than redelivered.
+	// subscriber.settleContext -- so the records the loop had not reached when
+	// the signal arrived are nacked and redelivered to the next instance
+	// rather than acked undelivered. Only a non-graceful exit, where nothing
+	// settles at all, leaves the whole batch to the subscription's ack
+	// deadline.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -402,7 +452,55 @@ func realMain(argv []string) error {
 	}
 
 	clusters := buildClusterSet(getter, direct, scan.Clusters)
-	filter, join := newFilterFromFlags(f, clusters)
+
+	// The token is read here rather than inside the injector so that an empty
+	// one is a startup error naming the variable. Read from the environment and
+	// never logged: the startup line below prints the daemon URL and the owner,
+	// both of which are addresses, and neither is this.
+	var inject *driftInjector
+	if f.daemonURL != "" {
+		token := os.Getenv(f.tokenEnv)
+		if token == "" {
+			return fmt.Errorf("the bearer token environment variable named by --token-env=%s is unset or empty", f.tokenEnv)
+		}
+		inject, err = newDriftInjector(driftInjectorConfig{
+			daemonURL:      f.daemonURL,
+			bearerToken:    token,
+			assertedCaller: f.owner,
+		})
+		if err != nil {
+			return err
+		}
+
+		// Fatal, and for the same reason verifyClusterIdentity above is: the
+		// failure it prevents produces confident wrong output rather than a
+		// count. A daemon predating the drift dispatch answers 200 to every
+		// record while turning it into a Warning Pod alert billed to the event
+		// watcher's ceiling, so the run reports full delivery and degrades the
+		// signal an on-call human already depends on. See VerifyKindSupported.
+		//
+		// Refusing to start, rather than falling back to log-only, because the
+		// two are indistinguishable in every later line and an operator who set
+		// --daemon-url asked for escalation. The error names dropping the flag
+		// as the way to get the degraded mode deliberately.
+		if err := inject.VerifyKindSupported(ctx, injectKindDrift); err != nil {
+			return err
+		}
+	}
+
+	injectHandler := newDriftInjectHandler(inject)
+	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle)
+
+	// Said at startup, because the difference between the two modes is invisible
+	// in every later line: a run with the inject off emits exactly the DRIFT
+	// lines a run with it on does, and only the shutdown tally distinguishes
+	// them. An operator who expected escalation and did not get it should find
+	// the reason at launch rather than after the first change goes unreported.
+	if inject == nil {
+		log.Printf("%s: no --daemon-url; %s injects are disabled and drift will be logged only, not escalated to anyone", commandName, injectKindDrift)
+	} else {
+		log.Printf("%s: %s injects enabled, posting to %s (owner=%q, token from $%s)", commandName, injectKindDrift, f.daemonURL, f.owner, f.tokenEnv)
+	}
 
 	// Say which mode the join is in at startup rather than leaving it to be
 	// inferred from the counts at shutdown. An operator who forgot the
@@ -474,6 +572,14 @@ func realMain(argv []string) error {
 	log.Printf("%s: stopping (parsed=%d skipped=%d parse_failures=%d)", commandName, counts.Parsed, counts.Skipped, counts.Failed)
 	log.Printf("%s: tiers (%s)", commandName, filter.Counts())
 	log.Printf("%s: join (%s)", commandName, join.Counts())
+
+	// Only with the inject on. With it off every field is zero by construction,
+	// and a line of zeroes beside the join's real numbers reads as an inject
+	// that was tried and never worked -- the startup line already said it was
+	// never attempted.
+	if inject != nil {
+		log.Printf("%s: inject (%s)", commandName, injectHandler.Counts())
+	}
 
 	// The unreachable clusters are named on the way out, for the same reason the
 	// unattributed principals below are: the count says the join missed records,

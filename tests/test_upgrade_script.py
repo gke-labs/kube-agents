@@ -44,6 +44,20 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             cwd=str(cwd or _REPO_ROOT),
         )
 
+    def test_an_unhandled_failure_inside_a_substitution_prints_one_banner_from_the_parent(self):
+        # The handler exits a subshell silently and the parent reports once
+        # (#1798); command substitution does not inherit errexit, so the exit
+        # is also what stops the probe at its failing step.
+        proc = self._run_upgrade_func(
+            'probe() { false; echo "NOT_REACHED_IN_PROBE"; }\n'
+            'x="$(probe)"\n'
+            'echo "NOT_REACHED x=[$x]"'
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("NOT_REACHED", proc.stdout)
+        self.assertEqual(proc.stderr.count("Upgrade error encountered"), 1, proc.stderr)
+        self.assertIn(' in main (exit code 1): x="$(probe)"', proc.stderr)
+
     def test_validate_immutable_ref_accepts_valid_refs(self):
         for ref in VALID_IMMUTABLE_REFS:
             with self.subTest(ref=ref):

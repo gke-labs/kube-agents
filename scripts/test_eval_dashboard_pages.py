@@ -607,6 +607,86 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Workers not finishing", run_page)
         self.assertIn("those runs read not evaluated, not red", run_page)
 
+    def test_a_deadline_kill_outage_has_its_own_brief_and_banner(self):
+        # #1894: runs Prow killed at the job deadline with no verdict.
+        health = health_doc(
+            "OUTAGE", condition="deadline_kill", failing_cases=[], tracking_issues=[],
+            cause="deadline kills: 3 runs on 2 PRs killed at the 360-minute deadline with no verdict 12:00–14:00 UTC",
+            since="2026-09-08T12:00:00+00:00", advice=health_module_advice(),
+            incident={"prs": [1, 2], "runs": 3, "window_start": "2026-09-08T12:00:00+00:00", "window_end": "2026-09-08T14:00:00+00:00"},
+        )
+        data = json.loads(json.dumps(self.data))
+        killed = {
+            "build_id": "2097282860221206599", "pr": 1, "project": "kube-agents-evals-7", "tier": "presubmit",
+            "started": "2026-09-08T07:55:00+00:00", "finished": "2026-09-08T13:58:00+00:00",
+            "result": "FAILURE", "eval_verdict": None, "duration_s": 21780, "has_build_log": True,
+            "pod_phase": "Failed", "pod_last_event": None, "merge_conflict": False, "tasks": [],
+        }
+        data["runs"].append(killed)
+        # #1875: a killed run that recorded a case before Prow stopped it.
+        partial = dict(killed, build_id="2097282860221206600", pr=2, finished="2026-09-08T13:59:00+00:00", tasks=[copy.deepcopy(next(r for r in data["runs"] if r.get("tasks"))["tasks"][0])])
+        data["runs"].append(partial)
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-brief", data, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn("OUTAGE · since Tue 8:00 AM ET", app)
+        self.assertIn("Runs are being killed at the job deadline with nothing graded", app)
+        self.assertIn("Why we think it's the gate, not the PRs", app)
+        # Both kills count, the one with cases too (the Brief reads the run-level cls).
+        self.assertIn("<b>2 runs</b> on 2 PRs ran to the job deadline and ended with no verdict", app)
+        # The run list marks both kills; the one with a recorded case does not
+        # read "all gate cases passed".
+        self.assertEqual(app.count("killed at the deadline"), 2, app.count("killed at the deadline"))
+        self.assertIn("killed at the deadline, 1 case recorded first", app)
+        run_page = dom_text(out / "run.html", query="build=2097282860221206599")
+        self.assertIn("Prow killed this run at its 360-minute deadline", run_page)
+        self.assertIn("Runs killed at the deadline", run_page)
+        partial_page = dom_text(out / "run.html", query="build=2097282860221206600")
+        self.assertIn("Prow killed this run at its 360-minute deadline", partial_page)
+        self.assertIn("Retest once the brief says runs are finishing again", partial_page)
+        # The run-level item, not the copied case's own "Do:" line.
+        self.assertNotIn("<li><b>Fix the PR.</b>", partial_page)
+        # A lead window holding only zero-task kills is not an empty window.
+        only = dict(data, runs=[killed, dict(killed, build_id="2097282860221206601", pr=2, finished="2026-09-08T13:30:00+00:00"), dict(killed, build_id="2097282860221206602", finished="2026-09-08T13:00:00+00:00")])
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-brief-only", only, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn("Runs are being killed at the job deadline with nothing graded", app)
+        self.assertNotIn("No runs on record for this window", app)
+        # Recovering: a zero-task kill newer than every verdict run stops the
+        # count, as health.py counts only verdicts after the last kill -- the
+        # page must not say 3 of 3 while the bot holds.
+        late = dict(killed, build_id="2097282860221206603", started="2026-09-08T13:27:00+00:00", finished="2026-09-08T19:30:00+00:00")
+        recovering = health_doc(
+            "OUTAGE", condition="deadline_kill", failing_cases=[], tracking_issues=[], recovering=True,
+            since="2026-09-08T12:00:00+00:00", advice=health_module_advice(), incident=health["incident"],
+        )
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-recovering", dict(data, runs=data["runs"] + [late]), health=recovering)
+        app = dom_text(out / "index.html")
+        self.assertIn("0 of 3 runs with a verdict on distinct PRs so far", app)
+        # health.recovered's bar is the NEWEST three verdict runs on distinct
+        # PRs: greens on 41, 41, 42 after the kill are two PRs, not three, and
+        # a recorded null with cases is not a verdict at all.
+        green = copy.deepcopy(next(r for r in data["runs"] if str(r.get("result") or "").upper() == "SUCCESS" and r.get("tasks")))
+        after = [
+            dict(green, build_id=f"209728286022120661{i}", pr=pr, started=f"2026-09-08T{18 + i}:00:00+00:00", finished=f"2026-09-08T{20 + i}:00:00+00:00", eval_verdict="GREEN")
+            for i, pr in enumerate([41, 41, 42])
+        ]
+        nulled = dict(after[0], build_id="2097282860221206620", pr=43, finished="2026-09-08T23:30:00+00:00", result="FAILURE", eval_verdict=None, duration_s=7200)
+        # NOT EVALUATED: eval_verdict RED with every repetition lost to
+        # infrastructure. Not a verdict either (health.Run.has_verdict).
+        not_evaluated = copy.deepcopy(dict(after[0], build_id="2097282860221206621", pr=44, finished="2026-09-08T23:45:00+00:00", result="FAILURE", eval_verdict="RED"))
+        for t in not_evaluated["tasks"]:
+            t["result"] = "infra"
+            for rep in t.get("reps") or []:
+                rep.update(result="infra", reason="the harness exhausted its retries")
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-recovering-2", dict(data, runs=data["runs"] + [late, *after, nulled, not_evaluated]), health=recovering)
+        app = dom_text(out / "index.html")
+        self.assertIn("2 of 3 runs with a verdict on distinct PRs so far", app)
+        # The banner on a kill's page during the hold agrees with its lede.
+        late_page = dom_text(out / "run.html", query="build=2097282860221206603")
+        self.assertIn("Deadline-kill outage recovering", late_page)
+        self.assertIn("this kill holds it back", late_page)
+        self.assertNotIn("nothing about the branch", late_page)
+
     def test_a_run_of_ceiling_hits_is_not_a_pass_in_the_brief_and_counts_in_the_storms_totals(self):
         """A run whose every case ended at the ceiling passed nothing, so its row
         cannot read "all gate cases passed"; and the storm brief's totals count

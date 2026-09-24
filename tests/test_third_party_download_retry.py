@@ -80,6 +80,7 @@ DOWNLOAD_SOURCES = (
     REPO_ROOT / "deploy" / "docker" / "Dockerfile",
     REPO_ROOT / "deploy" / "sandbox" / "Dockerfile",
     REPO_ROOT / "hack" / "ci-env.sh",
+    WORKFLOWS_DIR / "validate.yml",
 )
 
 #: The start of a curl command. What follows it up to the next separator is
@@ -904,9 +905,9 @@ class ShippedDownloadsRetryTest(unittest.TestCase):
         ]
         self.assertGreaterEqual(
             len(fetches),
-            5,
-            "expected at least the apt key, gh, yq, helm and ci-env helm fetches; a "
-            "walk finding fewer is matching the wrong shape",
+            6,
+            "expected at least the apt key, gh, yq, helm, ci-env helm and shellcheck "
+            "fetches; a walk finding fewer is matching the wrong shape",
         )
         exempt = [number for number, _, piped in fetches if piped]
         self.assertEqual(

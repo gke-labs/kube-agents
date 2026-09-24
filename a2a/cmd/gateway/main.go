@@ -102,17 +102,34 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	}
 	defer client.Close()
 
-	// FromEnv already enforced exactly one backend.
+	// FromEnv already enforced at most one real backend, and that the door
+	// carries a token if it is armed at all.
+	backend := cfg.Backend()
 	var adapter gateway.Adapter
-	switch backend := cfg.Backend(); backend {
+	switch backend {
 	case "gchat":
 		adapter, err = gateway.NewGoogleChatAdapter(cfg.GchatRelayURL, cfg.GchatTokenPath, log)
+	case "":
+		// No real backend: the inject door is the only ingress, which is what
+		// lets an eval install's gateway start at all (#1660).
 	default:
 		adapter, err = gateway.NewDiscordAdapter(cfg.DiscordToken, log)
 	}
 	if err != nil {
-		log.Error("adapter", "backend", cfg.Backend(), "err", err)
+		log.Error("adapter", "backend", backend, "err", err)
 		return err
+	}
+	// The door is a side door, not a backend: it can be armed beside either
+	// of the above, and the composite routes by conversation key. Dev and
+	// eval installs only; the operator renders A2A_INJECT_LISTEN and the
+	// token only under its eval flag. See a2a/gateway/inject.go.
+	if cfg.InjectArmed() {
+		door, derr := gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
+		if derr != nil {
+			log.Error("inject door", "err", derr)
+			return derr
+		}
+		adapter = gateway.WithSideDoor(adapter, door, log)
 	}
 
 	adapter, err = buildAdapters(cfg, adapter, natsOpts, log)
@@ -126,7 +143,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		Adapter: adapter,
 		Config:  cfg,
 		Logger:  log,
-		Backend: cfg.Backend(),
+		Backend: backend,
 	})
 	if err != nil {
 		log.Error("gateway", "err", err)
@@ -135,6 +152,8 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 
 	log.Info("a2a gateway starting",
 		"nats", cfg.NATSURL,
+		"backend", backend,
+		"injectDoor", cfg.InjectArmed(),
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())

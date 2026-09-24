@@ -908,9 +908,11 @@ export BENCH_TF_ROOT="./tf"
 # passed every onboarding check, was registered, and 404'd on the first pull
 # request that leased it (gke-labs/kube-agents#994).
 #
-# EVAL_LEDGER_APP_KEY_FILE set: mint a read-only installation token from App
-# 4739812 instead, once per fan-out unit, because a token lasts an hour and
-# units launch across the whole run. Unset: the mounted PAT stands. A mint that
+# EVAL_LEDGER_APP_KEY_FILE set: mint an installation token from App 4739812
+# instead, once per fan-out unit, because a token lasts an hour and units
+# launch across the whole run; grading's mint asks for its three reads
+# explicitly (LEDGER_GRADING_MINT_BODY), and the ledger reset below mints its
+# own, narrowed to one repository and issues: write. Unset: the mounted PAT stands. A mint that
 # fails after its retries stops the run at preflight and costs a unit its
 # repetition inside the fan-out; it never falls back to the PAT, which would
 # let a smoke test pass while proving nothing about the credential it was added
@@ -930,6 +932,17 @@ LEDGER_MINT_RETRYABLE=75
 # the case this covers, and it costs 10s to rule out; a longer ladder would sit
 # inside a unit that is holding both locks.
 LEDGER_MINT_ATTEMPTS=3
+# The ledger reset's own mint (ledger_reset_token): one retry, 2s apart. It
+# runs under the task lock like the grading mint, and a reset that cannot
+# mint is reported and skipped rather than retried into the unit's budget.
+LEDGER_RESET_MINT_ATTEMPTS=2
+LEDGER_RESET_MINT_RETRY_DELAY=2
+# What the grading mint asks for: the three reads docs/ci-pool-projects.md 5.4
+# documents, requested explicitly so BENCH_GITHUB_TOKEN's reach is pinned at
+# mint rather than inherited from the installation's whole grant -- which,
+# since 2026-09-22, includes issues: write on every pool repository for the
+# ledger reset. An omitted body on this endpoint means "everything granted".
+LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","metadata":"read"}}'
 
 # Emits "<token> <expires_at>" on stdout, diagnostics on stderr, non-zero on
 # any failure -- LEDGER_MINT_RETRYABLE when another attempt could survive it,
@@ -960,6 +973,20 @@ def temporary(message):
 key_file = os.environ["EVAL_LEDGER_APP_KEY_FILE"]
 app_id = os.environ["EVAL_LEDGER_APP_ID"]
 installation_id = os.environ["EVAL_LEDGER_INSTALLATION_ID"]
+# What the token may reach. The grading mint asks for its three reads
+# (LEDGER_GRADING_MINT_BODY) and the ledger reset asks for one repository and
+# `issues: write` (ledger_reset_token). An empty body would mean the
+# installation's whole grant -- issues: write on every pool repository -- so
+# it is refused here rather than sent: a caller that forgets the body fails
+# to mint instead of silently holding the widest token there is. A token
+# narrowed at mint cannot be widened by whoever holds it afterwards.
+mint_body = os.environ.get("LEDGER_MINT_BODY", "").strip()
+if not mint_body:
+    sys.exit(
+        "LEDGER_MINT_BODY is empty; refusing to mint for App %s: a mint without a body "
+        "receives the installation's whole grant, and every caller names what it asks for"
+        % app_id
+    )
 
 
 def b64(raw):
@@ -989,14 +1016,12 @@ if signed.returncode != 0:
     )
 jwt = (signing_input + b"." + b64(signed.stdout)).decode("ascii")
 
+mint_headers = {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json", "Content-Type": "application/json", "User-Agent": "kube-agents-ci-eval-pr"}
 request = urllib.request.Request(
     "https://api.github.com/app/installations/%s/access_tokens" % installation_id,
     method="POST",
-    headers={
-        "Authorization": "Bearer " + jwt,
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "kube-agents-ci-eval-pr",
-    },
+    headers=mint_headers,
+    data=mint_body.encode(),
 )
 try:
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -1007,7 +1032,9 @@ except urllib.error.HTTPError as exc:
     # and a caller holding two locks should hear about them on the first.
     # 403 stays terminal with them: on this endpoint it is a suspended
     # installation as often as a secondary rate limit, and the two read alike
-    # from here.
+    # from here. 422 is terminal too: with a body it means the installation
+    # does not hold a permission or repository the body asked for, which is
+    # an organisation-settings change, not something a retry reaches.
     message = "GitHub answered HTTP %d (%s) minting for App %s installation %s" % (
         exc.code,
         exc.reason,
@@ -1053,7 +1080,7 @@ mint_ledger_token() { # <label>
   # arriving on the first attempt.
   local minted rc attempt=1 delay=2
   while :; do
-    minted="$(_ledger_token_mint)" && break
+    minted="$(LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint)" && break
     rc=$?
     if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_MINT_ATTEMPTS}" ]; then
       echo "ERROR: ${1}: could not mint a ledger read token from App ${EVAL_LEDGER_APP_ID}," \
@@ -1078,6 +1105,143 @@ if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
 else
   mint_ledger_token "preflight" || exit 1
 fi
+
+# ─── Empty ledgers: close what an earlier run left open ──────────────────────
+# A fleet-audit stream keeps one open ledger issue per audit in the leased
+# project's GitOps repository, and audit_report.py `start` finds it as the
+# highest open issue labelled audit:<id> -- since #1691 handing the worker
+# every finding its body carries, by name. Nothing closed it between runs, so
+# on a pool project every repetition of an audit case began with the ledger
+# the previous lease left, already carrying the planted defect; a repetition
+# could pass by keeping a carried finding rather than finding it, and a false
+# clean close by repetition 2 left repetition 3 a different start than 1.
+#
+# hack/ci_reset_audit_ledgers.py closes those issues (a comment naming this
+# build, then state closed; nothing deleted), and it is called twice: here,
+# once the lease is known and before any unit, for every stream; and in
+# run_one_unit, under the task lock and before devops-bench, for that unit's
+# stream alone -- so repetitions 2 and 3 start as repetition 1 did, and a
+# sibling lane's stream, which has its own label, is never touched. Every
+# repetition then opens a fresh ledger, one closed issue per repetition in a
+# repository that exists to be written to; the sibling that sweeps the
+# agent's leftover pull requests is #1832's.
+#
+# Never any repository but the leased project's: the repository is the one
+# gitops_repo_for_project() in hack/ci-deploy.sh maps for PROJECT_ID (lifted
+# from that file, the mapping's one home), the helper refuses a repository
+# that is not <org>/<PROJECT_ID>-infra, and the token is minted narrowed to
+# that repository and issues: write -- three guards that fail independently.
+# The reset token stays out of BENCH_GITHUB_TOKEN, and the grading mint asks
+# for its reads explicitly (LEDGER_GRADING_MINT_BODY), so the grant the reset
+# needs does not widen the token grading holds.
+# A reset that cannot run (no App key, an unmapped project, a mint the
+# installation refuses because App EVAL_LEDGER_APP_ID's installation no longer
+# holds issues: write -- granted 2026-09-22, docs/ci-pool-projects.md 5.4)
+# says so and the run goes on as it always did; it never reds a pull request.
+# The comment it leaves opens with a marker (RESET_MARKER in the helper) that
+# ledger_issue_contains reads back, so a report citing the retired ledger is
+# graded as a stale pointer to the harness's close, not as a false clean.
+eval_gitops_repo() { # <project-id>
+  # Lifted rather than sourced: sourcing hack/ci-deploy.sh would run the
+  # deploy. tests/test_ci_gitops_repo.py pins every pair of the mapping.
+  local body
+  body="$(sed -n '/^gitops_repo_for_project() {$/,/^}$/p' "${SCRIPT_DIR}/ci-deploy.sh")"
+  [ -n "${body}" ] || return 1
+  eval "${body}"
+  gitops_repo_for_project "$1"
+}
+
+# Emits the token on stdout, nothing else; diagnostics on stderr. Narrowed
+# twice at mint, to the one repository and to issues: write. One retry on a
+# transient failure, as mint_ledger_token does; a 422 comes back on the
+# first attempt and means the grant is missing.
+ledger_reset_token() { # <owner/repo>
+  local body minted rc attempt=1
+  body="{\"repositories\":[\"${1##*/}\"],\"permissions\":{\"issues\":\"write\"}}"
+  while :; do
+    # `&&` rather than `if`: the status of a failed `if` test is 0 by the
+    # time the body would read it, and this needs the mint's own.
+    minted="$(LEDGER_MINT_BODY="${body}" _ledger_token_mint)" && { printf '%s\n' "${minted%% *}"; return 0; }
+    rc=$?
+    if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_RESET_MINT_ATTEMPTS}" ]; then
+      return 1
+    fi
+    sleep "${LEDGER_RESET_MINT_RETRY_DELAY}"
+    attempt=$((attempt + 1))
+  done
+}
+
+# The audit id a case grades its ledger under: the `audit:` key of its
+# ledger_issue_contains checks in task.yaml (each of the eight audit cases
+# carries one; two consistency cases share fleet-consistency-drift, and the
+# reset is per stream, so both retire that one ledger). Empty for a case that
+# writes no ledger.
+ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
+  local file="$1"
+  case "${file}" in /*) ;; *) file="${BENCH_DIR}/${file}" ;; esac
+  [ -f "${file}" ] || return 0
+  # Reads the `audit:` key in the same mapping as the `type:
+  # ledger_issue_contains` line -- a later key at the same indentation, or
+  # the line just before -- so an `audit:` word in the prompt or a note
+  # elsewhere cannot retarget the reset at a label that does not exist; a
+  # quoted value is read without its quotes, a comment after it is dropped,
+  # and a dedent ends the mapping. A check laid out any other way is a loud
+  # skip, not a silent one. awk with `exit`, not `sed | head`: under pipefail
+  # a `head` that closes the pipe after the first of several matches can
+  # hand sed a SIGPIPE, and the caller assigns this inside `set -e`.
+  awk -v file="${file}" '
+    function value(line) {
+      sub(/^[[:space:]]*audit:[[:space:]]*/, "", line)
+      sub(/^[^A-Za-z0-9_.-]+/, "", line)
+      sub(/[^A-Za-z0-9_.-].*$/, "", line)
+      return line
+    }
+    function indent(line) { match(line, /^[[:space:]]*/); return RLENGTH }
+    /^[[:space:]]*(#|$)/ { next }
+    /^[[:space:]]*(- )?type:[[:space:]]*ledger_issue_contains[[:space:]]*(#.*)?$/ {
+      if (prev != "") { print prev; found = 1; exit }
+      seen = 1; armed = 1
+      depth = indent($0) + ($0 ~ /^[[:space:]]*- / ? 2 : 0)
+      next
+    }
+    armed && indent($0) < depth { armed = 0 }
+    armed && indent($0) == depth && /^[[:space:]]*audit:[[:space:]]*/ { print value($0); found = 1; exit }
+    /^[[:space:]]*audit:[[:space:]]*/ { prev = value($0); next }
+    { prev = "" }
+    END {
+      if (seen && !found) print "WARNING: " file " has a ledger_issue_contains check but no audit: key in the same mapping as its type: line; its ledger reset is skipped" > "/dev/stderr"
+    }
+  ' "${file}"
+}
+
+# Returns 0 whatever happens; the reason it could not reset is printed.
+reset_audit_ledgers() { # <label> [audit-id]
+  local label="$1" audit_id="${2:-}" scope token out rc=0
+  scope="every audit stream"
+  [ -n "${audit_id}" ] && scope="the ${audit_id} stream"
+  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+    echo "Ledger reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; ${scope} keeps whatever ledger is open"
+    return 0
+  fi
+  if [ -z "${EVAL_LEDGER_REPO:-}" ]; then
+    echo "Ledger reset (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitOps repository (gitops_repo_for_project in hack/ci-deploy.sh); ${scope} keeps whatever ledger is open"
+    return 0
+  fi
+  if ! token="$(ledger_reset_token "${EVAL_LEDGER_REPO}")"; then
+    echo "WARNING: Ledger reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint issues: write narrowed to ${EVAL_LEDGER_REPO}; ${scope} keeps whatever ledger is open. A 422 above means the installation no longer holds issues: write, which it was granted on 2026-09-22 (docs/ci-pool-projects.md 5.4)." >&2
+    return 0
+  fi
+  local args=(--repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}")
+  [ -n "${audit_id}" ] && args+=(--audit "${audit_id}")
+  # The token rides in the environment of this one process, never on argv.
+  out="$(LEDGER_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_audit_ledgers.py" "${args[@]}" 2>&1)" || rc=$?
+  [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Ledger reset (${label}): /"
+  [ "${rc}" -eq 0 ] || echo "WARNING: Ledger reset (${label}): the helper exited ${rc}; ${scope} may keep an open ledger and this run grades against it as every run before did." >&2
+  return 0
+}
+
+EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
+reset_audit_ledgers "lease"
 
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
@@ -1752,6 +1916,11 @@ unit_cost_hint() {
     # The two tofu incumbents, nightly-only since #1218: ~20 and ~15 min a
     # repetition on the infra lock.
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
+    # The third tofu case, nightly-only from the start (#1827). Unmeasured:
+    # priced with the two above it because it is the same shape -- infra lock,
+    # a plant that blocks on a card appearing, then an agent turn that waits on
+    # that card finishing. A wrong hint costs packing, not correctness.
+    gitops-drift-out-of-band-triage) echo 900 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the
@@ -1827,8 +1996,9 @@ unit_cost_hint() {
 # verifier an expired token and a rung-2 "checks errored" red on a run that
 # had done its work. 300s over 2700 covers all three cut reps above with
 # margin. The task lock a later repetition waits behind is sized from this
-# ceiling (run_one_unit), so a unit that uses all of it cannot make its
-# successor give up.
+# ceiling (run_one_unit), times the cases that share the unit's audit
+# stream, so a unit that uses all of it -- after waiting its turn on the
+# stream -- cannot make its successor give up.
 unit_delegation_timeout() {
   case "$1" in
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
@@ -1889,19 +2059,32 @@ STATE_DIR="$(mktemp -d)"
 # otherwise strand every contender in a silent spin that `wait` can never
 # collect past, so acquisition carries a deadline: a unit that gives up fails
 # loudly and grades as MISSING, which is a diagnosis the gate already
-# reports. Two locks serialize what genuinely cannot overlap while noop
+# reports. Three locks serialize what genuinely cannot overlap while noop
 # units fill the lanes:
-#   per task  -- repetitions of ONE task never overlap. Concurrent reps of a
-#                ledger-writing audit rewrite one shared ledger issue and
-#                grade each other's artifact; concurrent reps of the autoops
-#                task plant simultaneous incidents with no card attribution;
-#                and same-task reps share a tofu stack directory and cluster
-#                name. Serial reps are also what keeps them comparable.
-#   infra     -- at most one stack-bearing (tofu) unit runs at a time,
-#                across tasks: BENCH_PARALLEL stays false, so devops-bench's
-#                per-run isolation (own kubeconfig, gcloud config, tofu data
-#                dir) is off, and two concurrent tofu units would race the
-#                shared kubeconfig's current-context and their state locks.
+#   per task   -- repetitions of ONE task never overlap. Concurrent reps of a
+#                 ledger-writing audit rewrite one shared ledger issue and
+#                 grade each other's artifact; concurrent reps of the autoops
+#                 task plant simultaneous incidents with no card attribution;
+#                 and same-task reps share a tofu stack directory and cluster
+#                 name. Serial reps are also what keeps them comparable.
+#   per stream -- units that grade ONE audit stream never overlap, across
+#                 tasks: consistency-drift-outlier and
+#                 consistency-no-environment-label both write the
+#                 fleet-consistency-drift ledger, and audit_report.py finish
+#                 writes to the highest OPEN issue under the stream's label,
+#                 whichever unit opened it. Without this, one lane's ledger
+#                 reset closes the sibling's live ledger and the sibling's
+#                 finish lands in this lane's fresh one. Taken after the task
+#                 lock, keyed on the audit id, only by units that write one.
+#                 A task-lock holder on a shared stream waits its turn on
+#                 the stream before its own run, so both deadlines scale by
+#                 the cases on the stream (stream_case_count), as the infra
+#                 lock's does by contender.
+#   infra      -- at most one stack-bearing (tofu) unit runs at a time,
+#                 across tasks: BENCH_PARALLEL stays false, so devops-bench's
+#                 per-run isolation (own kubeconfig, gcloud config, tofu data
+#                 dir) is off, and two concurrent tofu units would race the
+#                 shared kubeconfig's current-context and their state locks.
 lock_acquire() { # <dir> [deadline-seconds]
   local waited=0 limit="${2:-1800}"
   until mkdir "$1" 2>/dev/null; do
@@ -1914,6 +2097,20 @@ lock_acquire() { # <dir> [deadline-seconds]
   done
 }
 lock_release() { rmdir "$1" 2>/dev/null || true; }
+
+# How many cases in this run write the given stream's ledger: 1 for an
+# empty id or a case alone on its stream, 2 for the two consistency cases.
+# A loop over TASKS rather than a map, since bash 3.2 (what `bash -n` runs
+# under on a contributor's Mac) has no associative arrays and TASKS is short.
+stream_case_count() { # <audit-id>
+  local n=0 t
+  if [ -n "$1" ]; then
+    for t in "${TASKS[@]}"; do
+      if [ "$(ledger_audit_id_for_task "${t}" 2>/dev/null)" = "$1" ]; then n=$((n + 1)); fi
+    done
+  fi
+  echo $(( n > 1 ? n : 1 ))
+}
 
 # ─── Per-case grading and recording, inside the fan-out ─────────────────────
 # A case is graded the moment its last repetition finishes, by the unit that
@@ -2025,15 +2222,28 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # listener under every sibling mid-conversation. On its own port, each
   # unit owns its own tunnel and keeps the harness's stale-tunnel recycling.
   export AGENT_LOCAL_PORT=$((28642 + seq))
-  # The task lock is held for the holder's whole unit, so the wait must
-  # outlast one: the unit's delegation ceiling plus grading and teardown
-  # (about 300s on the record; 600s here). A fixed 1800s deadline under a
-  # 3000s ceiling would make a same-task successor give up while its
-  # predecessor was still legitimately running -- 24% of presubmit runs
-  # launch compliance rep 2 within 2090s of rep 1 (385 logs, 09-04 to
-  # 09-15). The infra lock keeps its default: audit units carry no stack.
-  if ! lock_acquire "${STATE_DIR}/lock-task-${name}" \
-    "$(($(unit_delegation_timeout "${name}") + 600))"; then
+  # Which case and which repetition this unit is, for any transport that can
+  # carry an id into the agent's own records. The inject transport sends the
+  # pair as the backend message id, which the gateway's ingress log joins to
+  # the correlationId -- so the audit chain runs from this run directory to
+  # every hop the task took, with nothing else added.
+  export EVAL_CASE_ID="${name}" EVAL_REPETITION="${rep}"
+  # The stream this case writes its ledger under, empty for a case that
+  # writes none, and the deadline for the locks below. The task lock is held
+  # for the holder's whole unit, so the wait must outlast one: the unit's
+  # delegation ceiling plus grading and teardown (about 300s on the record;
+  # 600s here). A fixed 1800s deadline under a 3000s ceiling would make a
+  # same-task successor give up while its predecessor was still legitimately
+  # running -- 24% of presubmit runs launch compliance rep 2 within 2090s of
+  # rep 1 (385 logs, 09-04 to 09-15). On a stream another case in this run
+  # also writes, the holder first waits its turn on the stream lock, so the
+  # deadline is that figure times the cases on the stream; alone on its
+  # stream, or writing none, a case keeps the single-unit figure. The infra
+  # lock keeps its default: audit units carry no stack.
+  local audit_id lock_deadline
+  audit_id="$(ledger_audit_id_for_task "${task}")"
+  lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600) ))"
+  if ! lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"; then
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
   fi
@@ -2042,15 +2252,35 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
     return 0
   fi
+  # A ledger-writing unit also holds the stream lock from here until its
+  # state files are written, released with the task lock below: two cases on
+  # one stream (the two consistency cases) must not reset and rewrite each
+  # other's ledger mid-run. The same scaled
+  # deadline: a waiter here outlasts the other cases' units on the stream.
+  if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}" "${lock_deadline}"; then
+    [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${audit_id} stream lock" >&2
+    return 0
+  fi
   # This unit's own token, minted rather than inherited, and minted after the
   # waiting rather than before it: reps of one task serialize on the task lock,
   # so at the default EVAL_REPETITIONS=3 a unit can sleep past the hour a token
   # lasts and reach devops-bench holding a dead one.
   if ! mint_ledger_token "${name} rep ${rep}"; then
+    [ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"
     [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} could not mint a ledger token" >&2
     return 0
+  fi
+  # This stream's open ledger, closed before the unit runs and while the task
+  # lock keeps its sibling repetitions out and the stream lock keeps the other
+  # case on the same stream out: repetitions 2 and 3 audit from the empty
+  # ledger repetition 1 had (the lease-time reset above). Only this stream's
+  # label, so an audit case on another stream in another lane keeps its own.
+  if [ -n "${audit_id}" ]; then
+    reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
   fi
   if [ -n "${reuse}" ]; then
     export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
@@ -2088,6 +2318,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   for state in "${STATE_DIR}/${name}".rep*.end; do
     [ -e "${state}" ] && finished_reps=$((finished_reps + 1))
   done
+  [ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"
   [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
   lock_release "${STATE_DIR}/lock-task-${name}"
   # Copied here, not in the grading pass: a Prow deadline that kills the

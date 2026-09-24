@@ -116,12 +116,21 @@ func verifiedByFor(backend string) string {
 		return gchatVerifiedBy
 	case consoleBackend:
 		return consoleVerifiedBy
+	case injectBackend:
+		// Its own value, not "principal-map" and deliberately nothing a real
+		// backend stamps. The map is what resolves the author here too, but
+		// what checked the caller is the door's bearer token -- so a reader
+		// of an authority block downstream can tell an eval submission from
+		// a Chat message verified by the IAM-locked topic, which is the
+		// whole point of recording the mechanism rather than the table.
+		return injectVerifiedBy
 	}
 	return "principal-map"
 }
 
 // unverifiedRemedyFor names what an admin edits to admit a sender — the
-// allowlist on gchat, the mapping table everywhere else.
+// allowlist on gchat, the door's own map on inject, nothing at all on the
+// console, the mapping table everywhere else.
 func unverifiedRemedyFor(backend string) string {
 	switch backend {
 	case gchatBackend:
@@ -129,6 +138,8 @@ func unverifiedRemedyFor(backend string) string {
 	case consoleBackend:
 		// Cannot happen from a real console frame; a spoofed author id can.
 		return "nothing - only the console credential's own frames are accepted here"
+	case injectBackend:
+		return "the inject door's principal map"
 	}
 	return "the principal map"
 }
@@ -761,13 +772,18 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 
 // resolvePrincipal establishes the requester's principal from the backend's
 // identity mechanism. On gchat the Google-asserted email IS the principal,
-// gated by the allowlist. On the console the NATS grant is the mechanism:
-// only the console credential can publish on the console subject, so the
-// author is the console principal - but only on a console conversation, so
-// the string "console" arriving on any other backend is just an unmapped id.
-// Everything else goes through the principal map. Empty means drop.
+// gated by the allowlist (the mapping table other backends need is exactly
+// what that backend exists to not have). On the console the NATS grant is
+// the mechanism: only the console credential can publish on the console
+// subject, so the author is the console principal - but only on a console
+// conversation, so the string "console" arriving on any other backend is
+// just an unmapped id. The inject door has a map, but its own and prefixed
+// (resolveInjectPrincipal), never this one. Everything else goes through the
+// principal map. Empty means drop.
 func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 	switch backend {
+	case injectBackend:
+		return g.resolveInjectPrincipal(authorID)
 	case consoleBackend:
 		if authorID == consoleAuthor {
 			return consolePrincipal
@@ -785,6 +801,41 @@ func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 		return ""
 	}
 	return g.pm.Resolve(authorID)
+}
+
+// resolveInjectPrincipal resolves an author the side door delivered, and it
+// is where the door is made structurally incapable of asserting a principal
+// a real backend's sender could hold. Two rules, both refusals.
+//
+// The lookup is prefixed: the key is "inject:<author>", in the door's own
+// map. So an entry admitting a Discord snowflake or a Google-asserted email
+// cannot be reached from here even if someone writes one, and an author id
+// that collides with a real backend's resolves to nothing.
+//
+// And the value must be an eval identity. The door takes its author from a
+// request body, so the map is the only thing standing between a bearer-token
+// holder and a principal of their choosing; a map entry pointing at a cloud
+// identity would hand them one, today advisory and the day publisher identity
+// arms, real. An entry that does not conform is refused here rather than
+// honoured, which makes a mistake in the map a lockout instead of a
+// privilege.
+//
+// Empty means drop, exactly as an unmapped Discord sender drops: logged,
+// noticed once, no task. Nothing is defaulted.
+func (g *Gateway) resolveInjectPrincipal(authorID string) string {
+	if g.injectPM == nil {
+		return ""
+	}
+	principal := g.injectPM.Resolve(injectPrincipalPrefix + authorID)
+	if principal == "" {
+		return ""
+	}
+	if !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {
+		g.log.Error("the inject door's principal map maps an author to a principal that is not an eval identity; refusing it",
+			"author", authorID, "wantPrefix", injectEvalPrincipalPrefix)
+		return ""
+	}
+	return principal
 }
 
 // gchatConversationID mints the session key for one inbound message. space is
