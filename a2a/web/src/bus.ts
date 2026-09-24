@@ -63,10 +63,18 @@ const PROBE_WAIT_MS = 2_000;
 const PROBE_SUBJECT = "a2a.topics.shared.probe";
 /** Redelivery and tap restarts both repeat envelopes; this caps the dedup set. */
 const DEDUP_MAX = 8_192;
-/** How often the STREAM.INFO and CONSUMER.INFO pollers run. */
-const POLL_MS = 5_000;
+/** How often the STREAM.INFO and CONSUMER.INFO pollers run. Exported: derive.ts's
+ * liveness staleness threshold is a multiple of this. */
+export const POLL_MS = 5_000;
 /** Prefix every console subject shares; a refusal under it is a send failure. */
 const CONSOLE_SUBJECT_PREFIX = "chat.console.";
+/**
+ * How long a send's post-publish flush is given before the link is reported
+ * dropped. A flush issued during a disconnect is rejected by the same
+ * `resetOutbound` the file doc comment describes, so this reports the loss
+ * within one reconnect attempt rather than waiting for the 30s stale note.
+ */
+const SEND_FLUSH_WAIT_MS = 2_000;
 /** A consumer name must be one subject token, or the INFO request goes elsewhere. */
 const CONSUMER_NAME_RE = /^[A-Za-z0-9_-]+$/;
 /** The gateway's relay durable (a2a/gateway/gateway.go relayDurable). */
@@ -187,6 +195,19 @@ export interface BusHandle {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * True once `flush` settles within `ms`; false if it rejects or times out.
+ * Never rejects itself, so a caller can race it without a try/catch. Exported
+ * for the unit test — exercising the real rejection nats.ws produces needs a
+ * live server, which lives in livebus.test.ts instead.
+ */
+export async function raceFlush(flush: Promise<void>, ms: number): Promise<boolean> {
+  return Promise.race([
+    flush.then(() => true).catch(() => false),
+    sleep(ms).then(() => false),
+  ]);
+}
 
 export async function startBus(
   config: BusConfig,
@@ -492,7 +513,21 @@ export async function startBus(
       } catch (error) {
         lastSent = null;
         dispatch({ type: "sendFailed", messageId, error: String(error) });
+        return;
       }
+      // The publish itself never throws mid-reconnect - it just buffers into
+      // an outbound the next dial attempt discards (file doc comment). Racing
+      // the flush is what turns a socket that dies unnoticed into a reported
+      // failure within one reconnect attempt instead of the 30s stale note.
+      void raceFlush(nc.flush(), SEND_FLUSH_WAIT_MS).then((flushed) => {
+        if (!flushed) {
+          dispatch({
+            type: "sendFailed",
+            messageId,
+            error: "the link dropped before the server saw this turn - send it again",
+          });
+        }
+      });
     },
     setConversation(next: string): void {
       conversation = next;

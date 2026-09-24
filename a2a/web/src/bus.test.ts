@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { StreamInfo } from "nats.ws";
-import { durablesFor, isNotFound, makeDedup, parseLastActive, streamStatOf } from "./bus.ts";
+import { durablesFor, isNotFound, makeDedup, parseLastActive, raceFlush, streamStatOf } from "./bus.ts";
 import type { AgentView } from "./model.ts";
 
 describe("makeDedup", () => {
@@ -113,5 +113,22 @@ describe("poller helpers", () => {
       state: { bytes: 0, messages: 0, consumer_count: 0, first_ts: "0001-01-01T00:00:00Z", last_seq: 0 },
     } as unknown as StreamInfo;
     expect(streamStatOf(info).firstTs).toBeUndefined();
+  });
+});
+
+describe("raceFlush", () => {
+  it("is true once the flush settles in time", async () => {
+    await expect(raceFlush(Promise.resolve(), 50)).resolves.toBe(true);
+  });
+
+  it("is false when the flush rejects — the same failure a disconnect's resetOutbound produces", async () => {
+    await expect(raceFlush(Promise.reject(new Error("draining")), 50)).resolves.toBe(false);
+  });
+
+  it("is false when the flush never settles before the timeout", async () => {
+    const never = new Promise<void>(() => {
+      /* simulates a flush the reconnect loop never resolves */
+    });
+    await expect(raceFlush(never, 10)).resolves.toBe(false);
   });
 });
