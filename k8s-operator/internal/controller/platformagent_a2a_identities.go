@@ -702,17 +702,20 @@ func webIdentity() a2aIdentity {
 // subject-derived identity every other writer on this bus has). One shared
 // principal is the posture until the account split makes it one per person.
 //
-// The three STREAM.INFO.KV_* grants are sizes and counts for the capacity
-// tiles. The data plane ($KV.*) and every consumer verb on KV_* stay off, so
-// the bucket contents do not follow the size grant in.
+// The console holds no JetStream verb on any KV_* stream, STREAM.INFO
+// included: STREAM.INFO accepts a subjects_filter in its request body and
+// answers with one entry per matching subject, so {"subjects_filter":">"} on
+// KV_session-state lists every key, which is every conversation and task id.
+// There is no sizes-only route to grant, so the capacity tiles that wanted
+// bucket sizes wait for one.
 func consoleIdentity() a2aIdentity {
 	return a2aIdentity{
 		user:    "console",
 		account: a2aAccountApp,
 		comment: "the web console: web's read surface plus one publish, chat.console.*.in,\n" +
 			"which is the gateway's console adapter's inbound subject. STATIC for\n" +
-			"web's reason. STREAM.INFO on the KV streams is sizes only; no $KV data\n" +
-			"plane and no consumer verbs on KV_*.",
+			"web's reason. No JetStream verb on any KV_* stream: STREAM.INFO's\n" +
+			"subjects_filter would list every key.",
 		auth:     a2aAuthStatic,
 		credsKey: a2aConsolePasswordKey,
 		publish: []string{
@@ -721,9 +724,6 @@ func consoleIdentity() a2aIdentity {
 			"$JS.API.STREAM.INFO.DIRECTORY",
 			"$JS.API.STREAM.INFO.TOPICS-STATE",
 			"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
-			"$JS.API.STREAM.INFO.KV_session-state",
-			"$JS.API.STREAM.INFO.KV_runtime-state",
-			"$JS.API.STREAM.INFO.KV_cap",
 			"$JS.API.CONSUMER.CREATE.TASKS.>",
 			"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
 			"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",

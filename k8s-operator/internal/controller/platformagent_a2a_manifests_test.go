@@ -710,9 +710,6 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 		"$JS.API.STREAM.INFO.DIRECTORY",
 		"$JS.API.STREAM.INFO.TOPICS-STATE",
 		"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
-		"$JS.API.STREAM.INFO.KV_session-state",
-		"$JS.API.STREAM.INFO.KV_runtime-state",
-		"$JS.API.STREAM.INFO.KV_cap",
 		"$JS.API.CONSUMER.CREATE.TASKS.>",
 		"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
 		"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
@@ -735,10 +732,9 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	if !reflect.DeepEqual(gotSub, wantSub) {
 		t.Errorf("console subscribe allow-list changed.\n got: %q\nwant: %q", gotSub, wantSub)
 	}
-	// STREAM.INFO on a KV stream is sizes and counts. The data plane and the
-	// consumer-create verbs on KV_* stay off, so the bucket contents do not
-	// follow the size grant in.
-	for _, gone := range []string{"$KV.", "$JS.API.CONSUMER.CREATE.KV_", "$JS.API.DIRECT.GET.KV_", "$JS.ACK.", "$JS.FC.", "$JS.API.>", "a2a.tasks"} {
+	// No verb on any KV_* stream, STREAM.INFO included: its subjects_filter
+	// body lists every key. Nor the KV data plane.
+	for _, gone := range []string{"$KV.", "KV_", "$JS.ACK.", "$JS.FC.", "$JS.API.>", "a2a.tasks"} {
 		if strings.Contains(pub, gone) {
 			t.Errorf("console publish list contains %q", gone)
 		}
@@ -4090,14 +4086,11 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 
 	kvSessionState := a2aKVStreamPrefix + "session-state"
 	kvRuntimeState := a2aKVStreamPrefix + a2aRuntimeStateBucket
-	// console holds web's four streams and verbs plus STREAM.INFO on all
-	// three KV buckets, the capacity tiles' size-and-count read.
+	// console holds web's four streams and verbs and nothing on any KV_*
+	// stream: STREAM.INFO's subjects_filter body would list every key.
 	consoleStreams := a2aSameVerbsOn(
 		[]string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream},
 		"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT")
-	for _, kv := range []string{kvSessionState, kvRuntimeState, "KV_cap"} {
-		consoleStreams[kv] = []string{"STREAM.INFO"}
-	}
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{
@@ -4330,6 +4323,90 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	}
 }
 
+// subjectPatternsOverlap reports whether some concrete subject matches both
+// NATS subject patterns a and b. It walks the two token by token: "*" on
+// either side matches any single token, ">" on either side matches the
+// remainder (one or more tokens, whatever the other side holds there), and
+// two literals overlap only when they are equal. Unlike subjectMatches, both
+// sides may carry wildcards, so a literal grant (chat.console.abc.in), a
+// partial wildcard (chat.*.*.in) and a tail wildcard (chat.>) all register
+// against the pattern chat.console.*.in.
+func subjectPatternsOverlap(a, b string) bool {
+	at := strings.Split(a, ".")
+	bt := strings.Split(b, ".")
+	for i := 0; i < len(at) && i < len(bt); i++ {
+		if at[i] == ">" || bt[i] == ">" {
+			return true
+		}
+		if at[i] != "*" && bt[i] != "*" && at[i] != bt[i] {
+			return false
+		}
+	}
+	return len(at) == len(bt)
+}
+
+func TestSubjectPatternsOverlap(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"chat.console.abc.in", "chat.console.*.in", true},
+		{"chat.>", "chat.console.*.in", true},
+		{"chat.console.*.out", "chat.console.*.in", false},
+		{"a2a.>", "chat.console.*.in", false},
+		{"chat.*.*.in", "chat.console.*.in", true},
+		{">", "chat.console.*.in", true},
+		{"chat.console.*.in", "chat.console.>", true},
+		{"chat.console.in", "chat.console.*.in", false},
+		{"chat.console.*.in.x", "chat.console.*.in", false},
+		{"chat.console", "chat.console.>", false},
+		{"*.*.*.*", "chat.console.*.in", true},
+	}
+	for _, c := range cases {
+		if got := subjectPatternsOverlap(c.a, c.b); got != c.want {
+			t.Errorf("subjectPatternsOverlap(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+		if got := subjectPatternsOverlap(c.b, c.a); got != c.want {
+			t.Errorf("subjectPatternsOverlap(%q, %q) = %v, want %v (not symmetric)", c.b, c.a, got, c.want)
+		}
+	}
+}
+
+// consoleDoorViolations returns one line per grant, across ids, that
+// overlaps a console door subject pattern on a principal other than that
+// side's one intended holder: publish on chat.console.*.in is console's
+// alone, subscribe there is gateway's alone, and the reverse for
+// chat.console.*.out.
+func consoleDoorViolations(ids []a2aIdentity) []string {
+	const (
+		consoleInbound  = "chat.console.*.in"
+		consoleOutbound = "chat.console.*.out"
+	)
+	rules := []struct {
+		verb, pattern, owner string
+		grants               func(a2aIdentity) []string
+	}{
+		{"publish", consoleInbound, "console", func(id a2aIdentity) []string { return id.publish }},
+		{"publish", consoleOutbound, "gateway", func(id a2aIdentity) []string { return id.publish }},
+		{"subscribe", consoleInbound, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", consoleOutbound, "console", func(id a2aIdentity) []string { return id.subscribe }},
+	}
+	var out []string
+	for _, id := range ids {
+		for _, r := range rules {
+			if id.user == r.owner {
+				continue
+			}
+			for _, g := range r.grants(id) {
+				if subjectPatternsOverlap(g, r.pattern) {
+					out = append(out, fmt.Sprintf("%s %s %q overlaps %s; only %s may %s it", id.user, r.verb, g, r.pattern, r.owner, r.verb))
+				}
+			}
+		}
+	}
+	return out
+}
+
 // TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader is the property the
 // console identity's security claim rests on (consoleIdentity's own comment):
 // the gateway takes a frame on chat.console.*.in as coming from nats:console
@@ -4339,33 +4416,35 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 // rule 2 above stopped refusing any chat.* grant on any principal by
 // spelling alone, so this is what holds the two subjects to their one
 // intended writer and one intended reader: every principal's publish and
-// subscribe lists are matched, wildcard-aware (subjectMatches, the same
-// helper the topics check above uses), against one concrete subject per
-// door. A future chat.> or chat.console.> grant on any other principal --
-// bridge, seed, the callout-issued agent or provision, even a widened web --
-// trips here.
+// subscribe lists are checked for pattern overlap (subjectPatternsOverlap,
+// wildcards on either side) against chat.console.*.in and
+// chat.console.*.out. A literal chat.console.abc.in, a chat.*.*.in, or a
+// chat.> on any other principal -- bridge, seed, the callout-issued agent or
+// provision, even a widened web -- trips here; the mutation half below
+// proves the check would.
 func TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
-	const (
-		consoleInbound  = "chat.console.tok.in"
-		consoleOutbound = "chat.console.tok.out"
-	)
-	for _, id := range a2aIdentities(a2aTestAgent()) {
-		for _, g := range id.publish {
-			if subjectMatches(g, consoleInbound) && id.user != "console" {
-				t.Errorf("%s publish %q reaches %s; only console may publish the console door's inbound subject", id.user, g, consoleInbound)
-			}
-			if subjectMatches(g, consoleOutbound) && id.user != "gateway" {
-				t.Errorf("%s publish %q reaches %s; only gateway may publish the console door's outbound subject", id.user, g, consoleOutbound)
-			}
+	ids := a2aIdentities(a2aTestAgent())
+	for _, v := range consoleDoorViolations(ids) {
+		t.Error(v)
+	}
+
+	// Mutation: one non-console principal gains a literal-token grant on
+	// the inbound subject. The same check over the modified set must report
+	// it, or the check above proves nothing.
+	mutated := slices.Clone(ids)
+	found := false
+	for i := range mutated {
+		if mutated[i].user == a2aBridgeUser {
+			mutated[i].publish = append(slices.Clone(mutated[i].publish), "chat.console.abc.in")
+			found = true
 		}
-		for _, g := range id.subscribe {
-			if subjectMatches(g, consoleInbound) && id.user != "gateway" {
-				t.Errorf("%s subscribe %q reaches %s; only gateway may hear the console door's inbound subject", id.user, g, consoleInbound)
-			}
-			if subjectMatches(g, consoleOutbound) && id.user != "console" {
-				t.Errorf("%s subscribe %q reaches %s; only console may hear the console door's outbound subject", id.user, g, consoleOutbound)
-			}
-		}
+	}
+	if !found {
+		t.Fatalf("no %s identity to mutate", a2aBridgeUser)
+	}
+	v := consoleDoorViolations(mutated)
+	if len(v) != 1 || !strings.Contains(v[0], a2aBridgeUser+" publish \"chat.console.abc.in\"") {
+		t.Errorf("a literal chat.console.abc.in publish grant on %s was not reported exactly once; got %q", a2aBridgeUser, v)
 	}
 }
 
