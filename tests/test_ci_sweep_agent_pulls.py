@@ -98,9 +98,13 @@ class _GitHub:
     `pulls` is one list served for every repository, or a dict by repository.
     """
 
-    def __init__(self, pulls=None, mint_error=None, close_errors=None, odd_bodies=None, slug=BOT_SLUG, delete_errors=None):
+    def __init__(self, pulls=None, mint_error=None, close_errors=None, odd_bodies=None, slug=BOT_SLUG, delete_errors=None, branches=None):
         self.calls = []
         self.pulls = pulls if pulls is not None else []
+        # Branch names under the agent's prefix the repository holds, as
+        # GET /git/matching-refs/heads/platform-agent/ lists them; by default
+        # exactly the heads of `pulls` that carry the prefix.
+        self.branches = branches
         self.mint_error = mint_error
         # What GET /app answers for the App the JWT names.
         self.slug = slug
@@ -143,6 +147,14 @@ class _GitHub:
             if failure is not None:
                 raise failure
             return io.BytesIO(b"{}")
+        if key.startswith("GET /repos/") and key.endswith("/git/matching-refs/heads/" + sweeper.AGENT_BRANCH_PREFIX):
+            repo = path[len("/repos/") :].split("/git/matching-refs/")[0]
+            if self.branches is None:
+                pulls = self.pulls.get(repo, []) if isinstance(self.pulls, dict) else self.pulls
+                names = [p["head"]["ref"] for p in pulls if str(p["head"]["ref"]).startswith(sweeper.AGENT_BRANCH_PREFIX) and (p.get("head") or {}).get("repo", {}) and p["head"]["repo"]["full_name"] == repo]
+            else:
+                names = list(self.branches)
+            return io.BytesIO(json.dumps([{"ref": "refs/heads/" + n} for n in names]).encode())
         if key.startswith("DELETE /repos/") and "/git/refs/heads/" in key:
             branch = urllib.parse.unquote(key.split("/git/refs/heads/", 1)[1])
             failure = self.delete_errors.get(branch)
@@ -424,7 +436,7 @@ class ClosingTest(unittest.TestCase):
         github = _GitHub(pulls=[agent_pull(number=1), agent_pull(number=2, branch="platform-agent/other")], delete_errors={"platform-agent/fix-the-thing": _http_error(403)})
         with self.assertRaises(sweeper.SweepError) as caught:
             run_repo(github)
-        self.assertIn("left 1 branch(es) behind closed pull requests: platform-agent/fix-the-thing", str(caught.exception))
+        self.assertIn("left 1 branch(es): platform-agent/fix-the-thing", str(caught.exception))
         self.assertNotIn("open", str(caught.exception))
         self.assertEqual(len(github.keys("PATCH ")), 2, "both closed")
         self.assertEqual(len(github.keys("DELETE ")), 2, "the second branch still went")
@@ -434,6 +446,38 @@ class ClosingTest(unittest.TestCase):
         with self.assertRaises(sweeper.SweepError):
             run_repo(github)
         self.assertEqual(github.keys("DELETE "), [])
+
+    def test_a_branch_an_earlier_run_left_behind_is_deleted(self):
+        # A delete that failed, or a run killed between the close and the
+        # delete: the pull request is closed, so no listing of open ones finds
+        # it again. The branch listing does.
+        github = _GitHub(pulls=[], branches=["platform-agent/orphan-1", "platform-agent/orphan-2"])
+        self.assertEqual(run_repo(github), 0)
+        self.assertEqual(sorted(github.keys("DELETE ")), ["DELETE /repos/%s/git/refs/heads/platform-agent/orphan-%d" % (REPO, n) for n in (1, 2)])
+
+    def test_a_branch_behind_someone_elses_open_pull_request_stays(self):
+        # Not the agent's pull request, so not closed -- and its branch is in
+        # use, whatever its name says.
+        github = _GitHub(pulls=[agent_pull(number=9, author="a-human", branch="platform-agent/theirs")], branches=["platform-agent/theirs", "platform-agent/orphan"])
+        run_repo(github)
+        self.assertEqual(github.keys("DELETE "), ["DELETE /repos/%s/git/refs/heads/platform-agent/orphan" % REPO])
+
+    def test_a_branch_whose_close_failed_this_run_is_not_deleted_from_under_it(self):
+        github = _GitHub(pulls=[agent_pull()], close_errors={1: _http_error(409)}, branches=["platform-agent/fix-the-thing"])
+        with self.assertRaises(sweeper.SweepError):
+            run_repo(github)
+        self.assertEqual(github.keys("DELETE "), [])
+
+    def test_dry_run_lists_leftover_branches_without_deleting(self):
+        github = _GitHub(pulls=[], branches=["platform-agent/orphan"])
+        run_repo(github, dry_run=True)
+        self.assertEqual(github.keys("DELETE "), [])
+
+    def test_a_branch_listing_that_is_not_a_list_is_a_fault(self):
+        github = _GitHub(pulls=[], odd_bodies={"GET /repos/%s/git/matching-refs/" % REPO: b'{"message": "moved"}'})
+        with self.assertRaises(sweeper.SweepError) as caught:
+            run_repo(github)
+        self.assertIn("list of refs", str(caught.exception))
 
     def test_an_empty_repository_closes_nothing(self):
         github = _GitHub(pulls=[])

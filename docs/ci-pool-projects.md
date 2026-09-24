@@ -296,7 +296,7 @@ gcloud kms keys add-iam-policy-binding github-token-minter-key \
 
 `scripts/verify_ci_pool_project.py` fails a project whose key lacks it and prints that command. Until it is run, every sweep of that project fails at signing and the periodic exits 1 naming it; the presubmit is not affected. The presubmit's runner is not granted it: a presubmit runs the pull request's code, and a signer there would hand every change under test a pool-wide write. That runner does hold project IAM admin for the deploy, so the line is policy and the verifier, not a fence GitHub enforces.
 
-The head branch goes with the pull request, which is why the mint also asks for `contents: write` (a ref delete is a contents write): `submit_suggestion.py` starts from the remote branch when it exists and refuses "nothing to commit" when the new tree matches it, so a closed pull request whose branch stayed would still cost the next lease a repetition — #1755's second item.
+The head branch goes with the pull request, which is why the mint also asks for `contents: write` (a ref delete is a contents write): `submit_suggestion.py` starts from the remote branch when it exists and refuses "nothing to commit" when the new tree matches it, so a closed pull request whose branch stayed would still cost the next lease a repetition — #1755's second item. Branches under the agent's prefix with no open pull request are deleted too, so a delete that failed, or a run killed between a close and its delete, is caught up by the next run rather than left for good.
 
 ## 6. The seeded dirty fleet
 

@@ -1518,6 +1518,7 @@ class TokenMinterTest(unittest.TestCase):
         # The headline names the one missing thing; "not provisioned / PEM
         # missing" would send the operator to the key and the PEM instead.
         self.assertEqual(result.message, "Minter provisioned; the pull-request sweeper lacks signer on the key (the detail has the one-off grant)")
+        self.assertFalse(any(self._GSA in d and "lacks" in d for d in result.details), result.details)
         # With the minter's own grant missing too, the minter headline stands.
         both = self._run(key_policy=_ok(self._key_policy(members=[])))
         self.assertEqual(both.message, "Token minter not provisioned / PEM key missing or wrong")
@@ -1532,7 +1533,6 @@ class TokenMinterTest(unittest.TestCase):
         # And it does not call the sweeper's rights verified in the same breath.
         self.assertIn("the minter GSA's signing rights, the minter GSA's Workload Identity binding verified", unread.message)
         self.assertNotIn("sweeper's signing rights", unread.message)
-        self.assertFalse(any(self._GSA in d and "lacks" in d for d in result.details), result.details)
 
     def test_missing_minter_gsa_fails(self):
         result = self._run(gsa_policy=_fail("NOT_FOUND"))
