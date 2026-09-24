@@ -6,7 +6,9 @@ import {
   fmtAgo,
   fmtBytes,
   fmtDuration,
+  fmtRetention,
   livenessOf,
+  LIVENESS_STALE_MS,
   QUIET_MS,
   typesOf,
   worstCapacity,
@@ -64,6 +66,12 @@ describe("formatters", () => {
     expect(fmtDuration(12_400)).toBe("12s");
     expect(fmtDuration(184_000)).toBe("3m 4s");
     expect(fmtDuration(2 * 3_600_000 + 5 * 60_000)).toBe("2h 5m");
+    expect(fmtDuration(7 * 24 * 3_600_000)).toBe("7d 0h");
+  });
+
+  it("names the retention horizon, or says there isn't one", () => {
+    expect(fmtRetention(7 * 24 * 3_600_000)).toBe("keeps 7d 0h");
+    expect(fmtRetention(0)).toBe("no age limit");
   });
 
   it("says ago, and never a negative ago", () => {
@@ -104,6 +112,21 @@ describe("capacity", () => {
     expect(c.text).toBe("TASKS: stream info failed: permissions violation");
   });
 
+  it("shows the retention horizon alongside the oldest-retained message", () => {
+    const c = capacityOf(
+      "TASKS",
+      { stat: stat({ bytes: 10, maxBytes: 100, maxAgeMs: 7 * 24 * 3_600_000 }), at: NOW },
+      undefined,
+      NOW,
+    );
+    expect(c.text).toContain("keeps 7d");
+  });
+
+  it("says there is no age limit when max_age is zero", () => {
+    const c = capacityOf("TASKS", { stat: stat({ bytes: 10, maxBytes: 100 }), at: NOW }, undefined, NOW);
+    expect(c.text).toContain("no age limit");
+  });
+
   it("picks the worst stream for the strip", () => {
     const state: UiState = {
       ...initialState,
@@ -119,40 +142,71 @@ describe("capacity", () => {
 
 describe("liveness", () => {
   it("is live with a pull outstanding", () => {
-    expect(livenessOf(report({ waiting: 1 }), NOW, false)).toEqual({ kind: "live", text: "live - pulling" });
+    expect(livenessOf(report({ waiting: 1 }), NOW, false, "active")).toEqual({
+      kind: "live",
+      text: "live - pulling",
+    });
   });
 
   it("is live with a recent delivery", () => {
-    expect(livenessOf(report({ lastActive: NOW - 3_000 }), NOW, false).kind).toBe("live");
+    expect(livenessOf(report({ lastActive: NOW - 3_000 }), NOW, false, "active").kind).toBe("live");
   });
 
   it("is quiet, and says since when, after QUIET_MS with no pull", () => {
-    const l = livenessOf(report({ lastActive: NOW - QUIET_MS - 1_000 }), NOW, false);
+    const l = livenessOf(report({ lastActive: NOW - QUIET_MS - 1_000 }), NOW, false, "active");
     expect(l.kind).toBe("quiet");
     expect(l.text).toBe("quiet since 2m 1s ago - no pull outstanding");
   });
 
   it("is gone when a standing durable is missing", () => {
-    expect(livenessOf(report({ found: false }), NOW, false)).toEqual({
+    expect(livenessOf(report({ found: false }), NOW, false, "active")).toEqual({
       kind: "gone",
       text: "consumer gateway-relay not found on TASKS",
     });
   });
 
   it("is idle, not gone, when a per-task consumer is missing with no task running", () => {
-    expect(livenessOf(report({ perTask: true, found: false }), NOW, false).kind).toBe("idle");
-    expect(livenessOf(report({ perTask: true, found: false }), NOW, true).kind).toBe("gone");
+    expect(livenessOf(report({ perTask: true, found: false }), NOW, false, "active").kind).toBe("idle");
+    expect(livenessOf(report({ perTask: true, found: false }), NOW, true, "active").kind).toBe("gone");
   });
 
   it("says the lookup failed rather than guessing", () => {
-    expect(livenessOf(report({ found: false, error: "timeout" }), NOW, false)).toEqual({
+    expect(livenessOf(report({ found: false, error: "timeout" }), NOW, false, "active")).toEqual({
       kind: "error",
       text: "could not check consumer gateway-relay: timeout",
     });
   });
 
-  it("is unknown for a session with no durable the page knows", () => {
-    expect(livenessOf(undefined, NOW, false)).toEqual({ kind: "unknown", text: "no consumer known for this session" });
+  it("is unknown for a session with no durable the page knows, with the full sentence as a title", () => {
+    expect(livenessOf(undefined, NOW, false, "active")).toEqual({
+      kind: "unknown",
+      text: "no consumer known",
+      title: "no consumer known for this session",
+    });
+  });
+
+  it("reads finished for a done or closed session, ignoring what the last report said", () => {
+    // A pull was outstanding when the last check ran, which would otherwise
+    // read as "live - pulling" forever: the session has already retired.
+    expect(livenessOf(report({ waiting: 1 }), NOW, false, "done")).toEqual({
+      kind: "finished",
+      text: "finished - no consumer expected",
+    });
+    expect(livenessOf(undefined, NOW, false, "closed")).toEqual({
+      kind: "finished",
+      text: "finished - no consumer expected",
+    });
+  });
+
+  it("goes stale, not live, once the report is older than LIVENESS_STALE_MS", () => {
+    const stale = livenessOf(report({ waiting: 1, checkedAt: NOW - LIVENESS_STALE_MS - 1 }), NOW, false, "active");
+    expect(stale.kind).toBe("stale");
+    expect(stale.text).toMatch(/^last checked/);
+  });
+
+  it("still reads live just under the staleness threshold", () => {
+    const fresh = livenessOf(report({ waiting: 1, checkedAt: NOW - LIVENESS_STALE_MS + 1 }), NOW, false, "active");
+    expect(fresh.kind).toBe("live");
   });
 });
 

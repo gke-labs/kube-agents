@@ -1,7 +1,7 @@
 /**
  * The dashboard body: seven panels in a grid that reflows with the window.
  * Every panel renders a sentence when it has nothing, and every failure
- * renders what failed (legibility's rule).
+ * renders what failed.
  */
 import { useEffect, useRef } from "react";
 import {
@@ -71,10 +71,20 @@ export default function Dashboard({
           <Empty text="no sessions seen on the bus yet" />
         ) : (
           <table>
+            <thead>
+              <tr>
+                <th>session</th>
+                <th>type</th>
+                <th>status</th>
+                <th>liveness</th>
+                <th>task</th>
+                <th>last activity</th>
+              </tr>
+            </thead>
             <tbody>
               {agents.map((a) => {
                 const current = currentTaskOf(state, a.session);
-                const live = livenessOf(state.liveness.get(a.session), state.now, current !== undefined);
+                const live = livenessOf(state.liveness.get(a.session), state.now, current !== undefined, a.status);
                 return (
                   <tr
                     key={a.session}
@@ -91,9 +101,9 @@ export default function Dashboard({
                     <td>{a.session}</td>
                     <td>{a.agentType}{a.profile ? `/${a.profile}` : ""}</td>
                     <td>{a.status}</td>
-                    <td className={`live-${live.kind}`}>{live.text}</td>
-                    <td>{current ? current.taskId : ""}</td>
-                    <td>{a.lastActivity ? fmtAgo(a.lastActivity, state.now) : ""}</td>
+                    <td className={`live-${live.kind}`} title={live.title}>{live.text}</td>
+                    <td className="cell-nowrap">{current ? current.taskId : ""}</td>
+                    <td className="cell-nowrap">{a.lastActivity ? fmtAgo(a.lastActivity, state.now) : ""}</td>
                   </tr>
                 );
               })}

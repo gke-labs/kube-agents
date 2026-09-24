@@ -56,6 +56,42 @@ describe("Dashboard", () => {
     expect(screen.getByText("consumer gateway-relay not found on TASKS")).toBeTruthy();
   });
 
+  it("gives the sessions table a header row", () => {
+    render(<Dashboard state={state} focus={null} onSession={() => {}} />);
+    const header = document.querySelector('[data-panel="sessions"] thead tr')!;
+    expect(header.textContent).toContain("session");
+    expect(header.textContent).toContain("liveness");
+  });
+
+  it("reads a finished session as finished, not by its last liveness report", () => {
+    const done: UiState = {
+      ...state,
+      agents: new Map([
+        ["gateway", { session: "gateway", agentType: "a2a-gateway", status: "idle", lastActivity: NOW - 5_000 }],
+        ["w-1", { session: "w-1", agentType: "claude-code", status: "done", lastActivity: NOW - 5_000, perTask: true }],
+      ]),
+      liveness: new Map([
+        ...state.liveness,
+        [
+          "w-1",
+          {
+            session: "w-1",
+            durable: "w-1-in",
+            stream: "TASKS",
+            perTask: true,
+            found: true,
+            waiting: 1,
+            pending: 0,
+            checkedAt: NOW,
+          },
+        ],
+      ]),
+    };
+    render(<Dashboard state={done} focus={null} onSession={() => {}} />);
+    expect(screen.getByText("finished - no consumer expected")).toBeTruthy();
+    expect(screen.queryByText("live - pulling")).toBeNull();
+  });
+
   it("says which stream is not attached and why", () => {
     render(<Dashboard state={state} focus={null} onSession={() => {}} />);
     expect(screen.getByText("TOPICS-STATE not attached since 1m 0s ago: stream not found")).toBeTruthy();

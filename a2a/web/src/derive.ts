@@ -3,9 +3,11 @@
  * Every failure state gets a sentence here, so a component never renders a
  * blank where something went wrong.
  */
+import { POLL_MS } from "./bus.ts";
 import {
   durationMs,
   queueMs,
+  type AgentStatus,
   type ChatEntry,
   type ConversationView,
   type LivenessReport,
@@ -20,6 +22,10 @@ import { STREAMS, TERMINAL_STATES } from "./protocol.ts";
 export const CAPACITY_WARN = 0.8;
 /** A standing consumer with no pull and no delivery for this long reads as quiet. */
 export const QUIET_MS = 120_000;
+/** A liveness report older than this many polls is stale data, not a live signal. */
+export const LIVENESS_STALE_POLLS = 3;
+/** `LIVENESS_STALE_POLLS` * the poller's own interval. */
+export const LIVENESS_STALE_MS = LIVENESS_STALE_POLLS * POLL_MS;
 
 export const SPEND_TBD_REASON =
   "tbd: the worker adapter parses the harness result line and drops usage, total_cost_usd and duration_ms (a2a/worker-adapter/harness.go), so tokens, cost, model and duration never reach the bus";
@@ -31,6 +37,7 @@ const UNITS = ["B", "KiB", "MiB", "GiB", "TiB"];
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
 const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
 const FAILED_STATES = ["failed", "rejected"];
 
 export function fmtBytes(n: number): string {
@@ -49,7 +56,13 @@ export function fmtDuration(ms: number): string {
   if (ms < SECOND) return `${Math.round(ms)}ms`;
   if (ms < MINUTE) return `${Math.floor(ms / SECOND)}s`;
   if (ms < HOUR) return `${Math.floor(ms / MINUTE)}m ${Math.floor((ms % MINUTE) / SECOND)}s`;
-  return `${Math.floor(ms / HOUR)}h ${Math.floor((ms % HOUR) / MINUTE)}m`;
+  if (ms < DAY) return `${Math.floor(ms / HOUR)}h ${Math.floor((ms % HOUR) / MINUTE)}m`;
+  return `${Math.floor(ms / DAY)}d ${Math.floor((ms % DAY) / HOUR)}h`;
+}
+
+/** The retention horizon `max_age` sets: "keeps 7d" or "no age limit" for zero. */
+export function fmtRetention(maxAgeMs: number): string {
+  return maxAgeMs > 0 ? `keeps ${fmtDuration(maxAgeMs)}` : "no age limit";
 }
 
 export function fmtAgo(at: number, now: number): string {
@@ -86,7 +99,7 @@ export function capacityOf(
   const byBytes = limited(s.maxBytes) ? s.bytes / s.maxBytes : null;
   const byConsumers = limited(s.maxConsumers) ? s.consumers / s.maxConsumers : null;
   const horizon = s.firstTs !== undefined ? `, oldest ${fmtAgo(s.firstTs, now)}` : "";
-  const msgs = `${s.msgs} msgs${horizon}`;
+  const msgs = `${s.msgs} msgs${horizon}, ${fmtRetention(s.maxAgeMs)}`;
   if (byBytes === null && byConsumers === null) {
     return { ...none, text: `${stream}: ${fmtBytes(s.bytes)}, ${s.consumers} consumers, no limit set (${msgs})` };
   }
@@ -166,17 +179,42 @@ export function taskTimes(t: TaskView): string {
     .join(", ");
 }
 
-export type LivenessKind = "live" | "quiet" | "gone" | "idle" | "unknown" | "error";
+export type LivenessKind = "live" | "quiet" | "gone" | "idle" | "unknown" | "error" | "finished" | "stale";
 
 export interface Liveness {
   kind: LivenessKind;
   text: string;
+  /** The full sentence, when `text` is shortened for the table. */
+  title?: string;
 }
 
-export function livenessOf(report: LivenessReport | undefined, now: number, hasTaskInFlight: boolean): Liveness {
-  if (report === undefined) return { kind: "unknown", text: "no consumer known for this session" };
+/**
+ * `status` and `checkedAt` keep a finished or link-starved session from
+ * reading as live forever. A `done`/`closed` session's `-in` consumer is
+ * gone the moment it retires (durablesFor stops polling it), so the last
+ * report is stale from the instant it is taken and must never be shown as
+ * current. A report older than `LIVENESS_STALE_MS` is the same problem for
+ * any session: the poller dispatches nothing while the link is down, so an
+ * old "live - pulling" would otherwise freeze on the page for the whole
+ * outage.
+ */
+export function livenessOf(
+  report: LivenessReport | undefined,
+  now: number,
+  hasTaskInFlight: boolean,
+  status: AgentStatus,
+): Liveness {
+  if (status === "done" || status === "closed") {
+    return { kind: "finished", text: "finished - no consumer expected" };
+  }
+  if (report === undefined) {
+    return { kind: "unknown", text: "no consumer known", title: "no consumer known for this session" };
+  }
   if (report.error !== undefined) {
     return { kind: "error", text: `could not check consumer ${report.durable}: ${report.error}` };
+  }
+  if (now - report.checkedAt > LIVENESS_STALE_MS) {
+    return { kind: "stale", text: `last checked ${fmtAgo(report.checkedAt, now)}` };
   }
   if (!report.found) {
     // A worker's -in consumer exists only while it runs a task (5s inactive
