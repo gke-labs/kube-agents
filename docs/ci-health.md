@@ -422,7 +422,10 @@ Smoke gate: run killed at the deadline`, saying when it was killed and that no
 verdict was reached. While `health.json`'s condition is `deadline_kill` the box
 says the gate is down — "N runs on M PRs have been killed at the deadline since
 ⟨time⟩; your run's failure is not your diff" — with the brief link, and asks
-the author not to retest yet. With no deadline-kill outage declared it does not
+the author not to retest yet. During the hold that follows the outage
+(`recovering`) it says instead that the outage is recovering and this kill
+holds it back, and that with other pull requests' runs finishing it may be the
+branch. With no deadline-kill outage declared it does not
 clear the branch: one pull request looping to the deadline is that pull request's
 problem (a change that hangs the eval ends the same way), so the box says it
 may be the branch and points at the build log.

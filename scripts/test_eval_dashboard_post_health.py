@@ -1794,8 +1794,12 @@ class DeadlineKillMessages(RunHarness):
         self.assertTrue(body["title"].startswith("Smoke gate outage: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict since"), body["title"])
         self.assertIn("ran to Prow's 360-minute deadline and were killed with no eval verdict", body["body"])
         self.assertIn("#1826, #1838, #1877", body["body"])
-        # The span of the kills, not the incident's start twice over.
+        # The span of the kills, not the incident's start twice over; and the
+        # opening "since" pairs the first kill's clock time with its own ISO
+        # stamp, not with the tick that declared the state (19:00Z here).
         self.assertIn("**Window:** 3:40 PM–4:00 PM ET (2026-09-22T19:40:00+00:00 – 2026-09-22T20:00:00+00:00).", body["body"])
+        self.assertIn("since Tue 3:40 PM ET (2026-09-22T19:40:00+00:00), 3 runs on 3 pull requests", body["body"])
+        self.assertNotIn("(2026-09-22T19:00:00+00:00)", body["body"])  # the brief link may carry the tick; the parenthetical must not
         self.assertIn("presubmit-gate", body["labels"])
 
     def test_the_body_quotes_the_deadline_evidence_and_no_case_names(self):
@@ -1838,8 +1842,9 @@ class DeadlineKillMessages(RunHarness):
     def test_the_copied_constants_are_healths(self):
         from eval_dashboard import gate_issue, health
 
-        self.assertEqual(post_health.DEADLINE_MINUTES, int(health.PROW_JOB_TIMEOUT.total_seconds() // 60))
-        self.assertEqual(gate_issue.DEADLINE_MINUTES, post_health.DEADLINE_MINUTES)
+        # post_health derives its copy from health; gate_issue's is written
+        # out (it imports nothing), so it is pinned here.
+        self.assertEqual(gate_issue.DEADLINE_MINUTES, int(health.PROW_JOB_TIMEOUT.total_seconds() // 60))
         self.assertEqual(gate_issue.RECOVERY_RUNS, health.RECOVERY_GREEN_RUNS)
 
     def test_the_recovery_names_the_kills(self):

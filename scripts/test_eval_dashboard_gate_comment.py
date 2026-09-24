@@ -328,11 +328,14 @@ def killed(build, pr, finished, minutes=363, **fields):
     return raw
 
 
-def deadline_health(prs=(1826, 1838, 1877)):
+def deadline_health(prs=(1826, 1838, 1877), recovering=False):
+    # `since` is the tick that declared the state, after the third kill; the
+    # first kill is the incident's window_start, 55 minutes earlier.
     return {
         "state": "OUTAGE",
         "condition": "deadline_kill",
-        "since": "2026-09-08T14:05:52+00:00",  # Tue 10:05 AM EDT
+        "since": "2026-09-08T15:00:00+00:00",  # Tue 11:00 AM EDT
+        "recovering": recovering,
         "failing_cases": [],
         "tracking_issues": [],
         "incident": {"prs": list(prs), "runs": len(prs), "window_start": "2026-09-08T14:05:52+00:00", "window_end": "2026-09-08T14:50:00+00:00"},
@@ -363,10 +366,27 @@ class DeadlineKillComment(Harness):
         mine = killed(100, 1300, NOW - timedelta(minutes=5))
         self.tick(data(mine, *green_others()), deadline_health())
         body = self.gh.bodies()[0]
+        # Dated from the first kill (incident.window_start), not from the
+        # tick that declared the state after the third.
         self.assertIn("**The gate is down: 3 runs on 3 PRs have been killed at the deadline since Tue 10:05 AM ET; your run's failure is not your diff.**", body)
+        self.assertNotIn("11:00 AM", body)
         self.assertIn("Don't retest yet", body)
         self.assertIn("[Incident brief →]", body)
         self.assertNotIn("may be the branch", body)
+
+    def test_during_the_recovering_hold_it_does_not_say_the_gate_is_down(self):
+        # The rule has stopped firing and the space says a retest is
+        # reasonable; a kill arriving now is not part of a wave, so it may be
+        # the branch, and it holds the gate out of GREEN.
+        mine = killed(100, 1300, NOW - timedelta(minutes=5))
+        self.tick(data(mine, *green_others()), deadline_health(recovering=True))
+        body = self.gh.bodies()[0]
+        self.assertIn("**The gate's deadline-kill outage is recovering** (3 runs on 3 PRs were killed since Tue 10:05 AM ET); this kill holds it back.", body)
+        self.assertIn("this may be the branch", body)
+        self.assertIn("[Incident brief →]", body)
+        self.assertNotIn("gate is down", body)
+        self.assertNotIn("Don't retest yet", body)
+        self.assertNotIn("No deadline-kill outage is declared", body)
 
     def test_a_long_red_with_a_verdict_is_not_a_kill(self):
         # Ran just as long, but graded: the ordinary red comment, not this one.

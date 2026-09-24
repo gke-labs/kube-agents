@@ -166,6 +166,13 @@ BOX_DEADLINE_DOWN = (
     " **The gate is down: {runs} runs on {prs} PRs have been killed at the deadline since {since}; your run's failure is not your diff.**"
     " Don't retest yet; `/retest` once #kube-agents-ci-health says the gate is healthy again."
 )
+# The outage's hysteresis hold: the rule has stopped firing, the Brief and the
+# space say a retest is reasonable, and a kill arriving now is by construction
+# not part of a wave -- so it may be the branch, and it re-arms the hold.
+BOX_DEADLINE_RECOVERING = (
+    " **The gate's deadline-kill outage is recovering** ({runs} runs on {prs} PRs were killed since {since}); this kill holds it back."
+    " Other PRs' runs are finishing, so this may be the branch: the build log shows how far the units got."
+)
 # No deadline-kill outage is declared (the gate may be in another incident,
 # which the brief says), so the kill may be the branch's: a change that hangs
 # the eval or the harness ends the same way (health.py, "one PR looping to
@@ -403,18 +410,22 @@ def render_comment(red: Red, health_doc: dict, runs: list[dict]) -> str:
 
 
 def render_deadline_comment(run: health.Run, health_doc: dict) -> str:
-    """The deadline-kill comment: when Prow killed it, that nothing was graded,
-    and -- while the health condition is `deadline_kill` -- that the gate is
-    down and the red is not the author's."""
+    """The deadline-kill comment: when Prow killed it, that no verdict was
+    reached, and -- while the health condition is `deadline_kill` -- that the
+    gate is down and the red is not the author's, or, during the hold that
+    follows the outage, that this kill holds the gate back and may be the
+    branch's."""
     incident = health_doc.get("incident") or {}
-    down = health_doc.get("condition") == health.DEADLINE_KILL and health_doc.get("state") != health.GREEN
-    tail = (
-        BOX_DEADLINE_DOWN.format(runs=incident.get("runs", 0), prs=len(incident.get("prs") or []), since=post_health.clock(post_health.parse_iso(health_doc.get("since")), weekday=True))
-        if down
-        else BOX_DEADLINE_QUIET
-    )
+    on = health_doc.get("condition") == health.DEADLINE_KILL and health_doc.get("state") != health.GREEN
+    recovering = on and bool(health_doc.get("recovering"))
+    down = on and not recovering
+    # The first kill, as the Chat sentence and the issue title date it; the
+    # document's `since` is the tick that declared the state, after the third.
+    since = post_health.clock(post_health.parse_iso(incident.get("window_start") or health_doc.get("since")), weekday=True)
+    counts = dict(runs=incident.get("runs", 0), prs=len(incident.get("prs") or []), since=since)
+    tail = BOX_DEADLINE_DOWN.format(**counts) if down else BOX_DEADLINE_RECOVERING.format(**counts) if recovering else BOX_DEADLINE_QUIET
     links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]
-    if down:
+    if on:
         links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
     box = BOX_DEADLINE.format(minutes=int(health.PROW_JOB_TIMEOUT.total_seconds() // 60), when=post_health.clock(run.finished)) + tail
     wall = run.wall_clock
