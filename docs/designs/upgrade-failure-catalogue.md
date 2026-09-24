@@ -29,7 +29,7 @@ A signal marked _before_ is something a read-only check can observe on the clust
 API or in the target version's release notes before any upgrade is scheduled. A signal marked
 _after_ is what an operator watching the operation, the pods and a service probe sees when the
 failure happens. The tag after each entry says where the before-signal is read: `GKE` is the GKE
-API and Recommender through `gcloud`, `k8s` is the Kubernetes API through `kubectl get`, `logs` is
+and Compute Engine APIs and Recommender through `gcloud`, `k8s` is the Kubernetes API through `kubectl get`, `logs` is
 Cloud Logging audit logs, `metrics` is the API server's own counters, `git` is the manifests and
 charts a GitOps repository declares, `image` is what a container image contains (its runtime,
 CUDA build or entrypoint), `notes` is the target version's release notes, node image notes and
@@ -63,9 +63,9 @@ Once the control plane moves:
 10. [A feature is deprecated but still served](#10-a-feature-is-deprecated-but-still-served):
     nothing breaks yet; the count is what to track. `logs, k8s`
 11. [Add-on and client skew](#11-add-on-and-client-skew): operators and tools that do not support
-    the new server. `k8s, notes`
+    the new server. `k8s, GKE, notes`
 12. [The control plane is unreachable for minutes on a zonal cluster](#12-the-control-plane-is-unreachable-for-minutes-on-a-zonal-cluster):
-    clients without retry fail during the control-plane step. `GKE, image`
+    clients without retry fail during the control-plane step. `GKE`
 
 On the new node image:
 
@@ -78,10 +78,10 @@ On the new node image:
 16. [The OOM killer starts killing the whole container](#16-the-oom-killer-starts-killing-the-whole-container):
     multi-process containers that used to lose one worker now die outright. `GKE, node, image`
 17. [The network dataplane changes](#17-the-network-dataplane-changes): policy, DNS or specific
-    flows behave differently. `GKE, notes`
+    flows behave differently. `GKE, k8s, notes`
 18. [A node networking agent fails on the new image](#18-a-node-networking-agent-fails-on-the-new-image):
     Service routing stops on rebuilt nodes, or cluster-wide. `notes, k8s`
-19. [GPU driver mismatch](#19-gpu-driver-mismatch): CUDA containers cannot open the device. `GKE, image`
+19. [GPU driver mismatch](#19-gpu-driver-mismatch): CUDA containers cannot open the device. `notes, image`
 20. [In-tree volumes lose their CSI path](#20-in-tree-volumes-lose-their-csi-path): old
     PersistentVolumes stop attaching. `GKE, k8s`
 21. [Images on a retired registry](#21-images-on-a-retired-registry): new nodes cannot pull what
@@ -154,7 +154,7 @@ that was just taken away, and a single-replica application has a guaranteed outa
 
 - Before: the pool's `maxSurge` is 0, requests already close to allocatable minus one node, the
   autoscaler at its maximum, or accelerator quota exhausted.
-- Where to look: the GKE API for the pool's `upgradeSettings`, autoscaler limits and accelerator quota; the Kubernetes API for the sum of requests against allocatable.
+- Where to look: the GKE API for the pool's `upgradeSettings`, autoscaler limits, and Compute Engine for accelerator quota; the Kubernetes API for the sum of requests against allocatable.
 - After: Pending pods with `Insufficient cpu` or `Insufficient nvidia.com/gpu`, autoscaler events
   citing quota.
 - Read today: nothing.
@@ -205,8 +205,8 @@ A rebuilt node is a new machine. Local SSD and `emptyDir` contents do not come b
 ### 6. Maintenance window too short, or an exclusion ends mid-roll
 
 A surge upgrade pauses when the maintenance window closes and resumes at the next one, so a large
-pool can run two versions for days. An exclusion whose scope covers the needed upgrade holds it
-back entirely, and one that ends inside a planned change lets an unplanned upgrade start.
+pool can run two versions for days. An exclusion whose scope covers the needed upgrade holds
+back the automatic one, while a manual upgrade still runs, and one that ends inside a planned change lets an unplanned upgrade start.
 
 - Before: window length against node count times drain time; an exclusion in effect whose scope
   covers the upgrade the target needs; exclusion end dates inside the planned change.
@@ -227,10 +227,10 @@ dropped `flowcontrol.apiserver.k8s.io/v1beta3`.
 
 - Before: GKE's deprecation insight for the target minor (`google.container.DiagnosisInsight`,
   subtypes `DEPRECATION_K8S_*` for API and feature removals and `DEPRECATION_CONTAINERD_*` for the
-  runtime), the audit-log label `k8s.io/removed-release`, the `apiserver_requested_deprecated_apis`
+  runtime), the audit annotation `k8s.io/removed-release`, a label in Cloud Logging, the `apiserver_requested_deprecated_apis`
   metric, and a scan of Helm release manifests and stored CRD versions. GKE pauses the cluster's
   automatic upgrade while it sees the calls, so the pause itself is a signal.
-- Where to look: the GKE Recommender for the insight; Cloud Logging for the audit entries labelled `k8s.io/removed-release`; the `apiserver_requested_deprecated_apis` metric; the GitOps repository's manifests and charts; the Kubernetes API for CRD `storedVersions` and Helm release secrets.
+- Where to look: the GKE Recommender for the insight; Cloud Logging for the audit entries labelled `k8s.io/removed-release`; the `apiserver_requested_deprecated_apis` metric; the GitOps repository's manifests and charts; the Kubernetes API for CRD `storedVersions`. Helm release state lives in Secrets, which this repository's agents may not read, so that part is a human's `helm get manifest` or a release storage driver other than Secrets.
 - After: controller logs full of 404s, `helm upgrade` refusing, the objects invisible to old
   clients.
 - Read today: the deprecation scan in `fleet-upgrade-verification` reads the `apiVersion`s a
@@ -277,7 +277,7 @@ count across runs is what turns a future removal from a surprise into a plan.
 - Before: warnings in the API server's response headers and audit logs for `Endpoints`
   (deprecated in 1.33), kube-proxy IPVS mode (1.35) and Service `externalIPs` (1.36, removal
   planned for 1.43).
-- Where to look: Cloud Logging for audit entries carrying the `k8s.io/deprecated` annotation, or the `Warning` headers the API server returns to any client; the Kubernetes API for the objects still using the feature.
+- Where to look: Cloud Logging for audit entries carrying the `k8s.io/deprecated` annotation (a label there), or the `Warning` headers the API server returns to any client; the Kubernetes API for the objects still using the feature.
 - After: none yet.
 - Read today: nothing.
 - Why it is on the list: the
@@ -304,8 +304,8 @@ behind the control plane breaks the kubelet's own contract.
 A zonal cluster has one control-plane replica, and it is replaced during the upgrade. Anything
 that talks to the API without retrying fails for those minutes.
 
-- Before: the cluster is zonal and clients lack retry.
-- Where to look: the GKE API for the cluster's location type; whether clients retry is a property of their code or their observed behaviour during a previous control-plane operation.
+- Before: the cluster is zonal. Whether its clients retry is not readable from the cluster, so the check reports the exposure and the operator answers the rest.
+- Where to look: the GKE API for the cluster's location type.
 - After: API 5xx for a few minutes, GitOps out of sync.
 - Read today: nothing.
 - Why it is on the list: GKE's
@@ -385,7 +385,7 @@ A new version can change how NetworkPolicy is enforced, which DNS serves the clu
 specific flow is handled.
 
 - Before: dataplane and DNS provider, policy count, the known issues for the target version.
-- Where to look: the GKE API for the dataplane and DNS provider; the target version's known-issue notes.
+- Where to look: the GKE API for the dataplane and DNS provider; the Kubernetes API for the policy count; the target version's known-issue notes.
 - After: connection resets, policy drops in flow logs, DNS timeouts.
 - Read today: nothing.
 - Why it is on the list: no public incident verified; the per-version known-issue notes are the
@@ -413,7 +413,7 @@ The node image ships a GPU driver; the containers ship a CUDA version. When the 
 is older than what the CUDA build requires, the device cannot be opened.
 
 - Before: the driver version the target node image ships against the CUDA version the images need.
-- Where to look: the GKE API for the driver the target node image ships; the images for the CUDA version they need.
+- Where to look: the GPU how-to page's table of driver versions per GKE version, for the target version, since the GKE API only records `DEFAULT` or `LATEST`; the images for the CUDA version they need.
 - After: pods Pending on `nvidia.com/gpu`, or crashing in `nvidia-smi`.
 - Read today: nothing.
 - Why it is on the list: frequent on accelerator pools; no public incident verified.
@@ -444,7 +444,7 @@ stopped publishing, or an egress allowlist admits only the old hostname, only th
 
 - Before: image references on a registry hostname that has stopped publishing or is being retired,
   such as `k8s.gcr.io`, and egress allowlists that admit only the old hostname.
-- Where to look: the Kubernetes API for the image references in use and the GitOps repository for the ones declared; the egress policy, in NetworkPolicy objects and VPC firewall rules, for the hostnames it admits.
+- Where to look: the Kubernetes API for the image references in use and the GitOps repository for the ones declared; the egress policy for what it admits: NetworkPolicy CIDRs, GKE's FQDN network policy on Dataplane V2, and Compute Engine firewall rules.
 - After: `ImagePullBackOff` only on new nodes.
 - Read today: nothing.
 - Why it is on the list: the
