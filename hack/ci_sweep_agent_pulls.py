@@ -128,9 +128,11 @@ DEFAULT_BOSKOS_OWNER = "ci-kube-agents-pull-sweep"
 # A sweep killed mid-hold (deadline, node loss) would leave its project in
 # BOSKOS_SWEEP_STATE: not free, not busy, unusable. Each run starts by asking
 # Boskos to return anything that has sat there longer than this to free -- its
-# own /reset, a Go duration -- so a strand outlives at most one interval. A
-# sweep holds a project for seconds, so nothing live is inside the window.
-BOSKOS_STRANDED_AFTER = "15m"
+# own /reset, a Go duration. Under the periodic's ten-minute interval, so the
+# very next run returns a strand (15m would have let one sit for two or three
+# runs). A sweep holds a project for seconds, so nothing live is inside the
+# window.
+BOSKOS_STRANDED_AFTER = "5m"
 # Prow ends a job with SIGTERM and a grace period before SIGKILL. Python's
 # default SIGTERM action skips `finally`, which is where a held project is
 # released; converting it to an exception is what lets the release run.

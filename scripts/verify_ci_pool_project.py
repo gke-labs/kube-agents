@@ -2539,10 +2539,13 @@ def check_token_minter(
     )
     signing_version = f" v{probe_version}" if probe_version else ""
     if not passed and sweeper_missing and len(details) == 1:
-        # The minter itself is whole; the one thing missing is the grant a
-        # project registered before the sweep existed never got (5.5). The
-        # headline says so, or an operator scanning it goes looking at the PEM.
-        message = "Minter provisioned; the pull-request sweeper lacks signer on the key (the detail has the one-off grant)"
+        # The one failed item is the grant a project registered before the
+        # sweep existed never got (5.5). The headline says so, or an operator
+        # scanning it goes looking at the PEM -- and it calls the minter whole
+        # only when every read that would say so happened; a denied read
+        # leaves `details` empty and `partial` naming what went unchecked.
+        sweeper = "the pull-request sweeper lacks signer on the key (the detail has the one-off grant)"
+        message = f"Minter provisioned; {sweeper}" if not partial else f"{sweeper[0].upper()}{sweeper[1:]}; {partial}"
     elif not passed:
         message = "Token minter not provisioned / PEM key missing or wrong"
     elif partial:

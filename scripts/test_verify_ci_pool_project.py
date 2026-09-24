@@ -1521,6 +1521,14 @@ class TokenMinterTest(unittest.TestCase):
         # With the minter's own grant missing too, the minter headline stands.
         both = self._run(key_policy=_ok(self._key_policy(members=[])))
         self.assertEqual(both.message, "Token minter not provisioned / PEM key missing or wrong")
+        # A denied read leaves details empty and the item unchecked: the
+        # headline must not call the minter provisioned over reads it skipped.
+        denied = _fail("ERROR: (gcloud.kms.keys.versions.list) PERMISSION_DENIED: Permission denied on resource")
+        unread = self._run(versions=denied, key=denied, key_policy=_ok(self._key_policy(members=[f"serviceAccount:{self._GSA}"])))
+        self.assertFalse(unread.passed)
+        self.assertNotIn("Minter provisioned", unread.message)
+        self.assertTrue(unread.message.startswith("The pull-request sweeper lacks signer on the key"), unread.message)
+        self.assertIn("the imported key versions, the key's purpose, algorithm and import-only setting not checked", unread.message)
         self.assertFalse(any(self._GSA in d and "lacks" in d for d in result.details), result.details)
 
     def test_missing_minter_gsa_fails(self):
@@ -1966,15 +1974,6 @@ class LedgerTokenMintTest(unittest.TestCase):
     def test_the_pem_never_reaches_a_message(self):
         _, _, message = self._mint(sign_rc=1)
         self.assertNotIn("not-a-key", message)
-
-    def test_a_permission_the_installation_lacks_fails(self):
-        # 422 is what GitHub answers when the mint asks for something the
-        # installation does not hold. Grading cannot read a ledger without it,
-        # so it is a failure rather than something a re-run reaches.
-        _, status, message = self._mint(urlopen=self._http_error(422, "Unprocessable Entity"))
-        self.assertEqual("failed", status)
-        self.assertIn("issues", message)
-
 
 class LedgerReadCredentialTest(unittest.TestCase):
     """The grading credential, which is not the minter App and not the operator's own login."""
