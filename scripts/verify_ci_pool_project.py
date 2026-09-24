@@ -2413,8 +2413,8 @@ def check_token_minter(
         if not _record_unreadable(
             err,
             f"Failed reading IAM policy for KMS key {key}: {err.strip()[:160]}",
-            f"Could not read the IAM policy on KMS key {key}, so the minter GSA's signing rights were "
-            "not checked",
+            f"Could not read the IAM policy on KMS key {key}, so the minter GSA's and the pull-request "
+            "sweeper's signing rights were not checked",
             details,
             warnings,
         ):
@@ -2531,7 +2531,7 @@ def check_token_minter(
         [
             ("the imported key versions", versions_checked),
             ("the key's purpose, algorithm and import-only setting", key_checked),
-            ("the minter GSA's signing rights", signer_checked),
+            ("the minter GSA's and the sweeper's signing rights", signer_checked),
             ("the minter GSA's Workload Identity binding", gsa_checked),
         ]
     )

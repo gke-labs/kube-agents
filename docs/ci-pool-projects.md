@@ -265,7 +265,7 @@ Only then does `EVAL_GITHUB_APP_ID`, set to that App's ID, belong in the Prow jo
 
 The GitHub App's installation list, and nothing else. A presubmit runs the pull request's code, so a pull request can in principle edit the resolution table or the minty rule ConfigMap — but it cannot make the App mint a token for a repository the App is not installed on. Keep the installation scoped to the pool's GitOps repositories, and treat any change to that list as the security review.
 
-The two Apps are bounded differently. The minter's repository list is a minty policy the broker enforces. The ledger App's PEM is mounted in the presubmit, and its mint is narrowed only by the code asking. Because a presubmit runs the pull request's own scripts, that App stays read-only. The one write outside a run, closing the agent's leftover pull requests, happens in a periodic that runs only `main` and signs the minter App with the swept project's KMS key (5.5).
+The two Apps are bounded differently. The minter's repository list is a minty policy the broker enforces. The ledger App's PEM is mounted in the presubmit, and its mint is narrowed only by the code asking — and a presubmit runs the pull request's own scripts. Its installation holds `issues: write` since 2026-09-22 for the ledger reset (5.4), so a change under test can reach that write across the pool repositories; that exposure is accepted and documented there. What the presubmit does not hold is anything that closes pull requests: the one `pull_requests: write` outside a run happens in a periodic that runs only `main` and signs the minter App with the swept project's KMS key (5.5).
 
 ### 5.4 The credential that reads the ledger back
 

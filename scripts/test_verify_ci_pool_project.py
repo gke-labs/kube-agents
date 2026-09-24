@@ -1438,7 +1438,7 @@ class TokenMinterTest(unittest.TestCase):
         # thing. Nothing was verified here, so the first half is absent.
         self.assertEqual(
             "the imported key versions, the key's purpose, algorithm and import-only setting, "
-            "the minter GSA's signing rights, the minter GSA's Workload Identity binding "
+            "the minter GSA's and the sweeper's signing rights, the minter GSA's Workload Identity binding "
             "not checked",
             result.message,
         )
