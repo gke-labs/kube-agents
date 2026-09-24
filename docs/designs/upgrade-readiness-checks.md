@@ -12,6 +12,8 @@ deletes, are the add-ons compatible, will the pods survive nodes being drained o
 then repeating all of it for the next group of clusters. A team running hundreds of clusters does
 this over and over. This document lists the checks an agent should run on a schedule instead, so
 the answer is waiting for them.
+The failures those checks are chosen from, each with its pre- and post-upgrade signal, are
+catalogued in [`upgrade-failure-catalogue.md`](upgrade-failure-catalogue.md).
 
 Two things to know about the checks. They are **read-only**: they look and report, and never
 upgrade anything — that stays a human's decision. And they are **grouped by cluster family**, a
