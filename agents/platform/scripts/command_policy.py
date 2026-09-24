@@ -1050,7 +1050,8 @@ def evaluate(argv: list[str]) -> Decision:
             rule_id="identity.caller-supplied-impersonation",
             message=(
                 "Impersonation is set by the credential proxy, not by the "
-                "caller. Remove --as/--as-group/--impersonate-service-account. "
+                "caller. Remove --as, --as-group, --as-uid, --as-user-extra and "
+                "--impersonate-service-account. "
                 + _FLAG_BOUNDARY_NOTICE
             ),
             offending_flag=impersonation_flag,

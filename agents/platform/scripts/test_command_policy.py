@@ -1755,6 +1755,11 @@ class RefusalsSayTheBoundaryIsFinal(unittest.TestCase):
     FLAG_REFUSALS = (
         (["kubectl", "get", "pods", "--as", "system:admin"],
          "identity.caller-supplied-impersonation"),
+        # Bare --as-uid, with none of the other impersonation flags: the
+        # refusal must name the flag family completely, or "the flag" in the
+        # notice refers to nothing the caller can see.
+        (["kubectl", "get", "pods", "--as-uid", "1000"],
+         "identity.caller-supplied-impersonation"),
         (["kubectl", "--kuberc", "/workspace/kr.yaml", "get", "pods"],
          "kubernetes.kuberc-forbidden"),
         (["kubectl", "get", "pods", "--token", "t"],
