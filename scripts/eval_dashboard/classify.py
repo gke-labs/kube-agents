@@ -391,8 +391,11 @@ def is_deadline_kill(run: dict) -> bool:
     the job's deadline. Tasks or not: since #1875 a killed run may carry the
     cases that finished before Prow stopped it."""
     length = run_length(run)
+    # The key has to be there: a record from before the collector wrote it
+    # is unknown, not "no verdict" (SCHEMA.md), as health.Run reads it.
     return (
         str(run.get("result") or "").upper() == RUN_FAILURE
+        and "eval_verdict" in run
         and run.get("eval_verdict") is None
         and not is_lost_pod(run)
         and not is_merge_conflict(run)

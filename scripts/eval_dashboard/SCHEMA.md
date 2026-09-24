@@ -401,7 +401,8 @@ what the renderer does with them.
 - `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
   it; a night that is not a `SUCCESS` and carries `null` was ended before
   its verdict and is reported as truncated. `health.py` reads a presubmit
-  `FAILURE` with `null` that ran to the job's deadline as a deadline kill
+  `FAILURE` with `null` that ran to the job's deadline — and is neither a
+  lost pod nor a conflicted merge — as a deadline kill
   (rule 3d), `classify.py` classes the run `deadline-kill`, and
   `gate_comment.py` gives it the one-line deadline comment. Absent means
   unknown: never a kill.

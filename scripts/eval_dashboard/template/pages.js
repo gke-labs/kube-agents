@@ -723,7 +723,10 @@ function recoveryBarText(inc) { return verdictRecovery(inc) ? "runs with a verdi
 function recoveryProgress(inc) {
   // No start on record: nothing is "after" the incident, so no run counts.
   if (inc.sinceMs == null) return 0;
-  const later = runs().filter((r) => measured(r) && concluded(r) && runFinish(r) > inc.sinceMs).sort((a, b) => runFinish(b) - runFinish(a));
+  // Out of a deadline-kill outage a zero-task kill has to be in the list too:
+  // it is what stops the count, as health.py counts only verdicts after it.
+  const counts = (r) => (verdictRecovery(inc) ? measured(r) || r.cls === "deadline-kill" : measured(r));
+  const later = runs().filter((r) => counts(r) && concluded(r) && runFinish(r) > inc.sinceMs).sort((a, b) => runFinish(b) - runFinish(a));
   const prs = new Set();
   let count = 0;
   for (const run of later) {
@@ -778,7 +781,7 @@ function agentSawHtml(inc, inWindow) {
 
 function changedBeforeHtml(inc, inWindow) {
   if (!Array.isArray(brief.merges)) return "";
-  const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : inc.condition === "delegation_ceiling" ? (r.ceiling_reps || 0) > 0 : (r.storm_reps || 0) > 0));
+  const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : inc.condition === "delegation_ceiling" ? (r.ceiling_reps || 0) > 0 : inc.condition === "deadline_kill" ? r.cls === "deadline-kill" : (r.storm_reps || 0) > 0));
   const firstRedMs = firstRed ? runFinish(firstRed) : inc.sinceMs;
   if (firstRedMs == null) {
     // Same anchor as mergesFact: without it there is no "before" to show.

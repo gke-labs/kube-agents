@@ -647,6 +647,17 @@ class BrowserTest(unittest.TestCase):
         app = dom_text(out / "index.html")
         self.assertIn("Runs are being killed at the job deadline with nothing graded", app)
         self.assertNotIn("No runs on record for this window", app)
+        # Recovering: a zero-task kill newer than every verdict run stops the
+        # count, as health.py counts only verdicts after the last kill -- the
+        # page must not say 3 of 3 while the bot holds.
+        late = dict(killed, build_id="2097282860221206603", started="2026-09-08T13:27:00+00:00", finished="2026-09-08T19:30:00+00:00")
+        recovering = health_doc(
+            "OUTAGE", condition="deadline_kill", failing_cases=[], tracking_issues=[], recovering=True,
+            since="2026-09-08T12:00:00+00:00", advice=health_module_advice(), incident=health["incident"],
+        )
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-recovering", dict(data, runs=data["runs"] + [late]), health=recovering)
+        app = dom_text(out / "index.html")
+        self.assertIn("0 of 3 runs with a verdict on distinct PRs so far", app)
 
     def test_a_run_of_ceiling_hits_is_not_a_pass_in_the_brief_and_counts_in_the_storms_totals(self):
         """A run whose every case ended at the ceiling passed nothing, so its row

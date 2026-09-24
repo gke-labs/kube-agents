@@ -268,10 +268,11 @@ LOST_POD_EVENT_MIN = 8
 POD_EVENT_NODE_NOT_READY = "NodeNotReady"
 
 # --- Rule 3d: deadline kills -> OUTAGE (#1894) -------------------------------
-# Incident: from 2026-09-22 17:00Z to 2026-09-23 10:00Z seventeen presubmit
-# runs were killed at Prow's 360m deadline with every unit at the delegation
-# ceiling (#1880) and nothing graded, and the bot stayed GREEN: a deadline
-# death after a successful deploy matched no rule.
+# Incident: from the evening of 2026-09-22 (UTC) the Hermes bump wedged the
+# workers (#1880) and presubmit runs were killed at Prow's 360m deadline with
+# every unit at the delegation ceiling and nothing graded -- 33 kills against
+# 10 verdicts in the fixture's 32 hours -- and the bot stayed GREEN: a
+# deadline death after a successful deploy matched no rule.
 #
 # The rule: a run is a deadline kill when it concluded FAILURE with no eval
 # verdict, is neither a lost pod nor a conflicted merge, and lasted at least
@@ -344,13 +345,15 @@ EVIDENCE_MAX_PRS = 6
 # Entering OUTAGE or DEGRADED needs the condition to be current, not merely
 # inside the window: one of the last TRANSITION_MIN_RUNS completed full runs
 # has to carry the condition's signature (the rules themselves already need
-# three runs' worth of evidence). Setup deaths are exempt -- they are not
-# full runs, so the count is the currency. Leaving for GREEN needs
+# three runs' worth of evidence). COUNTED_CONDITIONS are exempt -- setup
+# deaths, lost pods, deadline kills and fixture drift have no signature on a
+# full run, so the count is the currency. Leaving for GREEN needs
 # RECOVERY_GREEN_RUNS consecutive green runs on distinct pull requests, all
 # finished after the incident began and none carrying the signature of the
 # condition being left -- a single lucky green does not declare victory, and
 # the runs that made the incident cannot end it (#1213 is the false-green
-# risk in the other direction).
+# risk in the other direction). A deadline-kill OUTAGE is left on the same
+# count of runs WITH A VERDICT, green or red (`recovered`).
 TRANSITION_MIN_RUNS = 3
 RECOVERY_GREEN_RUNS = 3
 
@@ -692,12 +695,13 @@ class Run:
 
     @property
     def has_verdict(self) -> bool:
-        """Reached a verdict: the eval's own, or -- for a document written
-        before `eval_verdict` existed -- a concluded full run that was not
-        killed."""
+        """Reached a verdict: the eval's own, or -- only for a document
+        written before `eval_verdict` existed -- a concluded full run that
+        was not killed. A recorded null is no verdict whatever the run
+        carries: the harness died after some cases and before its line."""
         if self.eval_verdict is not None:
             return True
-        return self.full and self.result in (RUN_SUCCESS, RUN_FAILURE) and not self.deadline_kill
+        return not self.eval_verdict_recorded and self.full and self.result in (RUN_SUCCESS, RUN_FAILURE) and not self.deadline_kill
 
     def collapsed_cases(self) -> set[str]:
         return {task.name for task in self.tasks if task.collapsed}
@@ -1133,11 +1137,13 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
     reps = sum(run.total_reps for run in full)
     storm_reps = sum(run.storm_reps for run in full)
     reds = len(concluded) - len(green)
-    own = pr_caused_reds(full, roster)
+    kills = [run for run in window if run.deadline_kill]
+    # A killed run that recorded cases (#1875) is already among the full
+    # reds, and is the gate's whatever those cases did: it is kept out of
+    # the pull request's own.
+    own = pr_caused_reds([run for run in full if not run.deadline_kill], roster)
     deaths = sum(1 for run in window if run.setup_death)
     lost = sum(1 for run in window if run.lost_pod)
-    kills = [run for run in window if run.deadline_kill]
-    # A killed run that recorded cases (#1875) is already among the full reds.
     kills_not_counted = sum(1 for run in kills if not run.full)
     out = {
         "window_hours": int(METRICS_WINDOW.total_seconds() // 3600),
@@ -1740,7 +1746,9 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
     of its cases for a shared break, STORM_RUN_SIGNATURE_REPS storm
     repetitions for a storm, CEILING_RUN_SIGNATURE_REPS ceiling repetitions
     for a delegation-ceiling wave, a setup death after it for setup deaths,
-    a lost pod after it for lost pods. Judged from the runs themselves rather than
+    a lost pod after it for lost pods. A deadline-kill outage is the one
+    exception: the same count of runs with a verdict, green or red, after the
+    last kill. Judged from the runs themselves rather than
     from the rule's window, so the runs that constituted the incident never
     count as its recovery once the window has rolled past them."""
     if prev.get("condition") == DEADLINE_KILL:

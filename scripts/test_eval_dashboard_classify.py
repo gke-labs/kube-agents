@@ -439,6 +439,16 @@ class StormAndSetupTest(unittest.TestCase):
         self.assertTrue(verdict["matches_incident"])
         self.assertEqual([c["outcome"] for c in verdict["cases"]], ["passed", "passed"])
 
+    def test_a_record_without_the_verdict_field_is_not_a_kill(self):
+        # SCHEMA.md: no key is unknown, not "no verdict". The 2026-09-04
+        # long zero-task failures in testdata_classify predate the field and
+        # must keep reading as the branch's own, as health.Run reads them.
+        target = run(1, 913, T0, minutes=363, result="FAILURE", tasks=[])
+        target.update({"has_build_log": True, "pod_last_event": None, "merge_conflict": False})
+        self.assertNotIn("eval_verdict", target)
+        self.assertFalse(classify.is_deadline_kill(target))
+        self.assertEqual(classify_run(target, [target])["headline"], "The run failed before any case ran 363 minutes in.")
+
     def test_the_deadline_constants_are_healths(self):
         from eval_dashboard import health
 

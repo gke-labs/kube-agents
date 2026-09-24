@@ -25,7 +25,7 @@ truncated log, and says so. The nightly periodic's runs share data.json
 (`tier: nightly`, no pull request) and are dropped before anything is
 counted, so a green night never reads as another PR's pass (tiers.py).
 
-Two runs without a graded repetition do get a comment. A lost pod -- the
+Two shapes the red comment does not cover get one of their own. A lost pod -- the
 build node went away under the job (health.py rule 3b, #1478): twelve
 authors saw a red with no log and no explanation on 2026-09-11, so the
 comment is one line saying the node died, nothing was graded, and to
@@ -242,8 +242,8 @@ def is_red(run: health.Run) -> bool:
 
 
 def newest_red_per_pr(data: dict, since: datetime, now: datetime) -> list[dict]:
-    """The newest red or lost run per pull request among those finishing in
-    (since, now]."""
+    """The newest red, lost or deadline-killed run per pull request among
+    those finishing in (since, now]."""
     newest: dict = {}
     for raw in data.get("runs") or []:
         run = health.Run(raw)

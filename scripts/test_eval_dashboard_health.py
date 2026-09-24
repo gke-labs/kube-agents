@@ -609,6 +609,20 @@ class DeadlineKills(unittest.TestCase):
         self.assertFalse(health.Run(raw).deadline_kill)
         self.assertTrue(health.Run(dict(raw, tasks=[task("agent-kanban-smoke", "ppp")])).has_verdict)
 
+    def test_a_recorded_null_is_no_verdict_even_with_cases(self):
+        # The harness died after some cases and before its verdict line: the
+        # collector wrote null. Three of these must not end a deadline outage.
+        short = kill(1, 1, T0, minutes=120, tasks=[task("agent-kanban-smoke", "ppp")])
+        self.assertFalse(health.Run(short).deadline_kill)
+        self.assertFalse(health.Run(short).has_verdict)
+
+    def test_a_killed_run_with_cases_is_never_the_pull_requests_own_red(self):
+        # #1875: its collapsed case may be unique to the PR, but the kill is
+        # the gate's; the digest's split says infra, as the run page does.
+        partial = kill(1, 1, T0, tasks=[task("agent-kanban-smoke", "fff")])
+        out = adjudicate(data(partial, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"], out["deadline_kills"]), (0, 1, 1))
+
     def test_recovering_advice_names_the_bar_the_condition_is_left_on(self):
         self.assertIn("3 consecutive runs with a verdict on distinct PRs", health.advice_for("DEGRADED", "deadline_kill", [], None, {}, recovering=True))
         self.assertIn("3 consecutive green runs on distinct PRs", health.advice_for("DEGRADED", "shared_break", [], None, {}, recovering=True))

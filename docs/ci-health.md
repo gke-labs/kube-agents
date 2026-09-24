@@ -104,7 +104,8 @@ names the cases, the pull requests, and the tracking issue when
 runs on 2+ pull requests among those finishing in the last 2 hours concluded
 `FAILURE` with no eval verdict after running to within 15 minutes of the
 presubmit's 360-minute Prow timeout (the job's `timeout` in `oss-test-infra`'s
-`kube-agents-presubmits.yaml`; `health.py` copies the number), and were neither
+`kube-agents-presubmits.yaml`; `health.py` owns the copy, and the three
+message modules' copies are pinned to it by tests), and were neither
 lost pods nor conflicted merges. Nothing was graded, so nothing can pass; a
 killed run that recorded some cases before Prow stopped it still counts, and
 its run page and comment read as the kill's, with the finished cases listed.
@@ -132,8 +133,8 @@ push), or seeded
 fixture drift (the hourly scan found the same fixture role out of its designed
 state on the same pool project on two consecutive scans, or on 3+ projects in
 one scan; #1550, below). A zero-task run
-is at most one of a lost pod, a deadline kill (above), a conflicted merge
-(below) and a setup death, in that order: a lost pod is never a setup death,
+is at most one of a lost pod, a conflicted merge (below), a deadline kill
+(above) and a setup death, in that order: a lost pod is never a setup death,
 whatever its duration. When more
 than one condition fires, the order
 above decides which one the message carries; the others stay in the evidence.
@@ -180,8 +181,8 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 A single bad tick does not change the state, and a single lucky green does not
 end an incident. Entering a shared-break OUTAGE or a storm or delegation-ceiling DEGRADED needs the condition to be
 current: one of the three newest completed runs carries it. Setup deaths,
-lost pods and deadline kills have no such signature on a completed run; their
-count is the currency. Returning to GREEN needs 3
+lost pods, deadline kills and fixture drift have no such signature on a
+completed run; their count is the currency. Returning to GREEN needs 3
 consecutive green runs on distinct pull requests, all finished after the
 incident began and none carrying its signature — the runs that made the
 incident cannot end it. The one exception is a deadline-kill OUTAGE, left
@@ -349,8 +350,8 @@ Each tick, `scripts/eval_dashboard/gate_comment.py` finds the
 tick and concluded `FAILURE` with at least one graded repetition — not aborted
 runs, not setup deaths, not a suite that lost every repetition to a storm — and
 leaves one comment on each pull request (the newest red run per pull request
-when there are several). Two runs without a graded repetition also get one,
-below: a lost pod and a deadline kill.
+when there are several). Two shapes outside that filter also get one, below:
+a lost pod and a deadline kill.
 
 - a heading, `❌ Smoke gate: failed · 3 of 14 cases`, or `· hard failure` when
   the run failed with no gate case failing all of its repetitions (an absolute
@@ -393,7 +394,7 @@ repetitions, so it draws the comment with the hard-failure heading. The comment
 does not read the suite's `outcome`; the banner at the top of that run's
 `eval-verdict.md` is what says the run is not a finding against the change.
 
-Two runs that graded nothing do get a comment. The first is a lost pod (the
+Two shapes the red comment does not cover get one of their own. The first is a lost pod (the
 build node went away under the job, #1478). It is one line, same marker and
 dedupe:
 

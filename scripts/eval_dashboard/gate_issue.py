@@ -332,9 +332,10 @@ class Tracker:
 
     def ensure(self, health: dict, now, since_text: str, brief_link: str, window_text: str | None = None) -> dict | None:
         """The issue to cite: a human's if one names these cases (or, for
-        lost pods, these nodes), else a new one. `since_text` is the
-        incident's start on the reader's clock; `window_text` the span of
-        the losses, for the lost-pod body."""
+        lost pods, these nodes; for deadline kills, the two title words),
+        else a new one. `since_text` is the incident's start on the reader's
+        clock; `window_text` the span of the losses or kills, for those two
+        bodies."""
         condition = health.get("condition")
         if condition == CONDITION_LOST_PODS:
             return self._ensure_lost_pods(health, since_text, window_text or since_text, brief_link)
