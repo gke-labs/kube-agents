@@ -5534,6 +5534,55 @@ func TestDriftDetectorStaysOffWithoutTheWholeHarnessTriple(t *testing.T) {
 	}
 }
 
+// A populated projectId is not a usable one. The detector refuses an all-digits
+// --project before it starts any loop, and start-services.sh always passes
+// --in-cluster and --profiles-dir, so that refusal is always reachable in the
+// shipped path -- which makes a numeric projectId the restart loop the gate's own
+// doc comment says it prevents. Nothing else reading the harness triple minds a
+// number, so the install is otherwise healthy and nothing else would catch it.
+//
+// The pairs below are the detector's own boundary, not a restatement of the gate:
+// a project ID must begin with a lowercase letter, so all-digits is the whole test
+// and anything with one non-digit is an ID. The mixed cases are what a mutation
+// widening the check to "contains a digit" would take down.
+func TestDriftDetectorGateRejectsAProjectNumber(t *testing.T) {
+	for _, tc := range []struct {
+		project string
+		want    bool
+	}{
+		{"123456789012", false},
+		{"0", false},
+		{"test-project", true},
+		{"project-123456789012", true},
+		{"123456789012-project", true},
+		{"my-project-2", true},
+	} {
+		t.Run(tc.project, func(t *testing.T) {
+			agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+			agent.Spec.Harness.ProjectID = tc.project
+			if got := driftDetectorEnabled(agent); got != tc.want {
+				t.Errorf("driftDetectorEnabled with projectId %q = %v, want %v", tc.project, got, tc.want)
+			}
+		})
+	}
+}
+
+// The gate must refuse exactly what the detector refuses, and the two implement
+// the test separately -- isProjectNumber here, looksLikeProjectNumber in
+// cmd/drift-detector/main.go, each with its own copy of the digit set. A gate that
+// drifted narrower would admit a project the binary rejects, which is the defect
+// above returning; one that drifted wider would report a working install as off,
+// which is silent. This pins the character set rather than the two functions,
+// because the operator does not import the detector's package.
+func TestDriftDetectorGateUsesTheDetectorsDigitSet(t *testing.T) {
+	if driftDetectorProjectNumberDigits != "0123456789" {
+		t.Errorf("digit set = %q, want the detector's 0123456789", driftDetectorProjectNumberDigits)
+	}
+	if isProjectNumber("") {
+		t.Error("an empty project is absent, not a number; the triple check reports that")
+	}
+}
+
 // The entrypoint reads these six and nothing else carries the configuration into
 // the pod. Written on every reconcile rather than only when the detector is on,
 // for the same reason the watcher's switch is: from outside the container an

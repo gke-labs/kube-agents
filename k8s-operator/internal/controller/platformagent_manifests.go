@@ -141,6 +141,17 @@ const (
 	driftDetectorSubscriptionEnv   = "DRIFT_DETECTOR_SUBSCRIPTION"
 	driftDetectorGitopsManagersEnv = "DRIFT_DETECTOR_GITOPS_MANAGERS"
 
+	// driftDetectorProjectNumberDigits is the character set a GCP project number
+	// is made of, and the whole of the test for one: a project ID must start with
+	// a lowercase letter, so a value that is nothing but digits cannot be an ID.
+	//
+	// Duplicated from projectNumberDigits in cmd/drift-detector/main.go rather
+	// than shared, because the operator does not import the detector's package
+	// and adding the dependency to reuse ten characters is the worse trade. The
+	// two are held in step by TestDriftDetectorGateRejectsAProjectNumber below,
+	// which asserts the gate refuses exactly what the detector refuses.
+	driftDetectorProjectNumberDigits = "0123456789"
+
 	// sqliteJournalModeDelete is the rollback-journal mode Hermes accepts as
 	// `database.journal_mode`, rendered into the managed scope by renderConfigYAML
 	// when the agent pod has a runtime class. Under gVisor the data volume is a 9p
@@ -3470,6 +3481,24 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 // actually reach, exiting on a mismatch. An install that asks for the detector
 // without naming its cluster would therefore get a restart loop for as long as the
 // pod lives, so the operator reports it as off and leaves the pod quiet.
+//
+// Populated is not sufficient for projectId, which is why isProjectNumber is here
+// and not only a non-empty check. The detector refuses an all-digits --project
+// outright (looksLikeProjectNumber in cmd/drift-detector/main.go), because the
+// join matches it against each audit record's project_id, which is always the ID;
+// start-services.sh always passes --in-cluster and --profiles-dir, so the join is
+// always on and that refusal is always reachable. Nothing else reading the triple
+// minds a number -- the gcloud bootstrap in buildCredentialProxyEnv takes one, and
+// so do GKE_PROJECT_ID and KUBE_CONTEXT_NAME -- so an install can carry a numeric
+// projectId, be healthy in every other respect, and get the restart loop the
+// paragraph above says this gate prevents. The check belongs here rather than as a
+// CRD pattern on HarnessSpec.ProjectID: that field predates the detector and is
+// shared by those other consumers, so constraining it would reject configurations
+// that work today for everything except this one sidecar.
+//
+// The zone-versus-region mismatch is the other half of this class and is not
+// covered, deliberately: deciding whether a location is the one the cluster
+// actually reports needs a GKE API call per reconcile. This half needs no call.
 func driftDetectorEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	harness := agent.Spec.Harness
 	if harness == nil || harness.DriftDetector == nil || harness.DriftDetector.Enabled == nil {
@@ -3478,7 +3507,16 @@ func driftDetectorEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	if !*harness.DriftDetector.Enabled {
 		return false
 	}
+	if isProjectNumber(harness.ProjectID) {
+		return false
+	}
 	return harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != ""
+}
+
+// isProjectNumber reports whether a project was given as a project number rather
+// than a project ID. Mirrors looksLikeProjectNumber in cmd/drift-detector/main.go.
+func isProjectNumber(project string) bool {
+	return project != "" && strings.TrimLeft(project, driftDetectorProjectNumberDigits) == ""
 }
 
 // driftDetectorSubscription and driftDetectorGitopsManagers read their fields
