@@ -88,3 +88,38 @@ export function streamsText(state: UiState): string {
   const up = STREAMS.filter((s) => state.streamAttach.get(s)?.error === null).length;
   return [`${up} of ${STREAMS.length} streams attached`, ...lines].join("\n");
 }
+
+/** What App does with a command. Only `new`, `replay` and `clear` touch state beyond a line. */
+export type Effect =
+  | { kind: "local"; text: string }
+  | { kind: "new" }
+  | { kind: "replay"; session: string }
+  | { kind: "clear" };
+
+export function tooBigText(bytes: number): string {
+  return `not sent: ${bytes} bytes is over the gateway's ${CONSOLE_TEXT_CAP}-byte limit. Trim it and send again.`;
+}
+
+export function commandEffect(command: Command, state: UiState): Effect {
+  switch (command.name) {
+    case "new":
+    case "clear":
+      return { kind: command.name };
+    case "replay":
+      if (!state.agents.has(command.session)) {
+        return {
+          kind: "local",
+          text: `no session named ${command.session} on the bus. The sessions panel lists the ones seen.`,
+        };
+      }
+      return { kind: "replay", session: command.session };
+    case "tasks":
+      return { kind: "local", text: tasksText(state) };
+    case "streams":
+      return { kind: "local", text: streamsText(state) };
+    case "help":
+      return { kind: "local", text: HELP_TEXT };
+    case "error":
+      return { kind: "local", text: command.text };
+  }
+}

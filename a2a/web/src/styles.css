@@ -448,6 +448,7 @@ body {
 
 .chat-local {
   color: var(--ghost);
+  white-space: pre-wrap;
 }
 
 .chat-note {
@@ -515,6 +516,62 @@ body {
 .probe-button:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.chat-input {
+  margin: 0;
+  padding: 6px 10px;
+  border: 0;
+  border-top: 1px solid var(--edge);
+  background: var(--void);
+  color: var(--ink-bright);
+  font-family: var(--mono);
+  font-size: 13px;
+  resize: none;
+}
+
+.chat-input:focus {
+  outline: none;
+  border-top-color: var(--halo);
+}
+
+.session-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.session-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--edge);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.session-back {
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.session-back:hover {
+  border-color: var(--halo);
+}
+
+.session-name {
+  color: var(--ink-bright);
+}
+
+.session-type,
+.session-status {
+  color: var(--ink-dim);
 }
 
 /* --- crash pane ------------------------------------------------------------- */

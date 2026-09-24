@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyInput, goTrim, HELP_TEXT } from "./commands.ts";
+import { classifyInput, commandEffect, goTrim, HELP_TEXT, tooBigText } from "./commands.ts";
 import { initialState } from "./model.ts";
 import { streamsText, tasksText } from "./commands.ts";
 
@@ -80,5 +80,45 @@ describe("command output", () => {
     });
     expect(text).toMatch(/^1 of 4 streams attached/);
     for (const s of ["TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL"]) expect(text).toContain(s);
+  });
+});
+
+describe("commandEffect", () => {
+  const withGateway = {
+    ...initialState,
+    agents: new Map([["gateway", { session: "gateway", agentType: "a2a-gateway", status: "idle" as const }]]),
+  };
+
+  it("turns the text commands into local lines", () => {
+    expect(commandEffect({ name: "help" }, initialState)).toEqual({ kind: "local", text: HELP_TEXT });
+    expect(commandEffect({ name: "tasks" }, initialState)).toEqual({ kind: "local", text: "no tasks on the bus yet" });
+    expect(commandEffect({ name: "streams" }, initialState).kind).toBe("local");
+    expect(commandEffect({ name: "error", text: "usage: /replay <session>" }, initialState)).toEqual({
+      kind: "local",
+      text: "usage: /replay <session>",
+    });
+  });
+
+  it("passes new and clear through for App to carry out", () => {
+    expect(commandEffect({ name: "new" }, initialState)).toEqual({ kind: "new" });
+    expect(commandEffect({ name: "clear" }, initialState)).toEqual({ kind: "clear" });
+  });
+
+  it("replays a session the page has seen", () => {
+    expect(commandEffect({ name: "replay", session: "gateway" }, withGateway)).toEqual({
+      kind: "replay",
+      session: "gateway",
+    });
+  });
+
+  it("says so when the session was never seen, instead of opening an empty view", () => {
+    expect(commandEffect({ name: "replay", session: "nope" }, withGateway)).toEqual({
+      kind: "local",
+      text: "no session named nope on the bus. The sessions panel lists the ones seen.",
+    });
+  });
+
+  it("names the size and the cap in the refusal", () => {
+    expect(tooBigText(20_000)).toBe("not sent: 20000 bytes is over the gateway's 16384-byte limit. Trim it and send again.");
   });
 });

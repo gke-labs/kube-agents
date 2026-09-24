@@ -1,8 +1,7 @@
 // @vitest-environment jsdom
-import { describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach } from "vitest";
 import Chat from "./Chat.tsx";
 import type { ChatEntry } from "./model.ts";
 
@@ -26,16 +25,30 @@ const entries: ChatEntry[] = [
   },
 ];
 
+function consoleChat(onSend = vi.fn(), onCommand = vi.fn()) {
+  render(
+    <Chat
+      entries={[]}
+      user="console"
+      conversation="console:abc123"
+      onProbe={() => {}}
+      onSend={onSend}
+      onCommand={onCommand}
+    />,
+  );
+  return { onSend, onCommand, box: screen.getByRole("textbox") as HTMLTextAreaElement };
+}
+
 describe("Chat", () => {
-  it("renders the transcript read-only: no input, no send", () => {
-    render(<Chat entries={entries} user="web" onProbe={() => {}} />);
+  it("renders the transcript read-only for web: no input, no send", () => {
+    render(<Chat entries={entries} user="web" onProbe={() => {}} onSend={() => {}} />);
     expect(screen.getByText("are we ready?")).toBeTruthy();
     expect(screen.getByText("acme-prod is ready")).toBeTruthy();
+    expect(document.querySelector("textarea")).toBeNull();
     expect(document.querySelector("input")).toBeNull();
-    expect(screen.queryByText(/send/i)).toBeNull();
   });
 
-  it("fires the read-only probe from the verify button", async () => {
+  it("fires the probe from the verify button", async () => {
     const onProbe = vi.fn();
     render(<Chat entries={[]} user="web" onProbe={onProbe} />);
     await userEvent.click(screen.getByRole("button", { name: /verify/i }));
@@ -61,7 +74,7 @@ describe("Chat", () => {
       <Chat
         entries={[]}
         user="web"
-        probe={{ outcome: "sent", detail: "no refusal within 2s — the publish went through; the web grant is broken", at: 2 }}
+        probe={{ outcome: "sent", detail: "no refusal within 2s - the publish went through; the web grant is broken", at: 2 }}
         onProbe={() => {}}
       />,
     );
@@ -83,5 +96,71 @@ describe("Chat", () => {
   it("groups by correlation with one chip per exchange", () => {
     const { container } = render(<Chat entries={entries} user="web" onProbe={() => {}} />);
     expect(container.querySelectorAll(".corr-chip")).toHaveLength(1);
+  });
+
+  it("shows the conversation in the footer", () => {
+    consoleChat();
+    expect(screen.getByText("console:abc123")).toBeTruthy();
+  });
+
+  it("sends on Enter, trimmed the gateway's way, and clears the box", async () => {
+    const { onSend, box } = consoleChat();
+    await userEvent.type(box, "  is acme-prod ready?  {Enter}");
+    expect(onSend).toHaveBeenCalledWith("is acme-prod ready?");
+    expect(box.value).toBe("");
+  });
+
+  it("keeps Shift+Enter as a newline", async () => {
+    const { onSend, box } = consoleChat();
+    await userEvent.type(box, "line one{Shift>}{Enter}{/Shift}line two");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(box.value).toBe("line one\nline two");
+  });
+
+  it("does not send the Enter that closes an IME composition", () => {
+    const { onSend, box } = consoleChat();
+    fireEvent.change(box, { target: { value: "日本" } });
+    fireEvent.keyDown(box, { key: "Enter", isComposing: true });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(box.value).toBe("日本");
+  });
+
+  it("sends nothing for a blank line", async () => {
+    const { onSend, onCommand, box } = consoleChat();
+    await userEvent.type(box, "   {Enter}");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onCommand).not.toHaveBeenCalled();
+  });
+
+  it("routes a slash line to onCommand and never to onSend", async () => {
+    const { onSend, onCommand, box } = consoleChat();
+    await userEvent.type(box, "/replay gateway{Enter}");
+    expect(onCommand).toHaveBeenCalledWith({ name: "replay", session: "gateway" });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(box.value).toBe("");
+  });
+
+  it("refuses a turn over the cap locally and keeps the text", () => {
+    const { onSend, onCommand, box } = consoleChat();
+    const big = "x".repeat(16385);
+    fireEvent.change(box, { target: { value: big } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onCommand).toHaveBeenCalledWith({
+      name: "error",
+      text: "not sent: 16385 bytes is over the gateway's 16384-byte limit. Trim it and send again.",
+    });
+    expect(box.value).toBe(big);
+  });
+
+  it("renders a failed turn's note under its text", () => {
+    render(
+      <Chat
+        entries={[{ id: "local:1", kind: "local", text: "hello", note: "not sent: disconnected", correlationId: "local" }]}
+        user="console"
+        onProbe={() => {}}
+      />,
+    );
+    expect(screen.getByText("not sent: disconnected")).toBeTruthy();
   });
 });
