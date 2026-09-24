@@ -25,7 +25,7 @@ const entries: ChatEntry[] = [
   },
 ];
 
-function consoleChat(onSend = vi.fn(), onCommand = vi.fn()) {
+function consoleChat(onSend = vi.fn().mockReturnValue(true), onCommand = vi.fn()) {
   render(
     <Chat
       entries={[]}
@@ -41,7 +41,7 @@ function consoleChat(onSend = vi.fn(), onCommand = vi.fn()) {
 
 describe("Chat", () => {
   it("renders the transcript read-only for web: no input, no send", () => {
-    render(<Chat entries={entries} user="web" onProbe={() => {}} onSend={() => {}} />);
+    render(<Chat entries={entries} user="web" onProbe={() => {}} onSend={() => true} />);
     expect(screen.getByText("are we ready?")).toBeTruthy();
     expect(screen.getByText("acme-prod is ready")).toBeTruthy();
     expect(document.querySelector("textarea")).toBeNull();
@@ -123,6 +123,22 @@ describe("Chat", () => {
     fireEvent.keyDown(box, { key: "Enter", isComposing: true });
     expect(onSend).not.toHaveBeenCalled();
     expect(box.value).toBe("日本");
+  });
+
+  it("does not send WebKit's keyCode-229 Enter either, even with isComposing false", () => {
+    const { onSend, box } = consoleChat();
+    fireEvent.change(box, { target: { value: "日本" } });
+    fireEvent.keyDown(box, { key: "Enter", isComposing: false, keyCode: 229 });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(box.value).toBe("日本");
+  });
+
+  it("keeps the draft in the box when onSend refuses the turn", async () => {
+    const onSend = vi.fn().mockReturnValue(false);
+    const { box } = consoleChat(onSend);
+    await userEvent.type(box, "hello{Enter}");
+    expect(onSend).toHaveBeenCalledWith("hello");
+    expect(box.value).toBe("hello");
   });
 
   it("sends nothing for a blank line", async () => {

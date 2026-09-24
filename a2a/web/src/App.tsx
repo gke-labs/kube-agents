@@ -22,6 +22,13 @@ import Chat from "./Chat.tsx";
 import "./styles.css";
 
 const PERCENT = 100;
+/**
+ * Shown, and the box left alone, when Enter is pressed while the bus link is
+ * down. Refusing here rather than publishing keeps the turn from being
+ * silently dropped by nats.ws's own reconnect bookkeeping (bus.ts's file
+ * doc comment) with no record it ever happened.
+ */
+const LINK_DOWN_SEND_NOTE = "not sent: the bus link is down. Your text is still in the box.";
 
 /**
  * First load with no credentials shows this instead of a dead page. The
@@ -39,26 +46,30 @@ function ConnectForm({
   const params = new URLSearchParams(window.location.search);
   const [url, setUrl] = useState(params.get("ws") ?? DEFAULT_WS_URL);
   const [pass, setPass] = useState("");
+  // `?user=web` must reach the form's own submit, not silently connect as
+  // console with the web password pasted into it: the two credentials
+  // authorize different grants and the server refuses the mismatch.
+  const user = params.get("user") ?? DEFAULT_USER;
 
   return (
     <form
       className="connect-form"
       onSubmit={(e) => {
         e.preventDefault();
-        if (pass !== "") onConnect({ url, user: DEFAULT_USER, pass });
+        if (pass !== "") onConnect({ url, user, pass });
       }}
     >
       <h1>a2a bus</h1>
       <p className="connect-hint">
         kubectl port-forward the NATS websocket port, then paste the install&apos;s
-        <code> console-password</code>.
+        <code> {user}-password</code>.
       </p>
       <label>
         websocket url
         <input value={url} onChange={(e) => setUrl(e.target.value)} />
       </label>
       <label>
-        console password
+        {user} password
         <input
           type="password"
           value={pass}
@@ -152,13 +163,23 @@ export default function App() {
   }, [probePending]);
 
   const handleSend = useCallback(
-    (text: string) => {
+    (text: string): boolean => {
       const handle = busHandleRef.current;
       if (handle === null) {
         local(`not sent: not connected to the bus yet. "${text}"`);
-        return;
+        return false;
+      }
+      // Refuse rather than publish while the link is down: nats.ws buffers a
+      // publish made mid-reconnect and then drops it on the next dial
+      // attempt (bus.ts's file doc comment), so a send here would look
+      // pending and then vanish with no record. Chat only clears the box
+      // when this returns true, so the text survives to be sent again.
+      if (stateRef.current.connection !== "up") {
+        local(LINK_DOWN_SEND_NOTE);
+        return false;
       }
       handle.send(text);
+      return true;
     },
     [local],
   );

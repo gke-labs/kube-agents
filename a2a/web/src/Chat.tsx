@@ -20,6 +20,12 @@ import Transcript from "./Transcript.tsx";
 const EMPTY_READ_ONLY = "watching the bus - ask the agent something in chat";
 const EMPTY_CONSOLE = "watching the bus - type below to ask the agent something, or /help";
 const INPUT_ROWS = 2;
+/**
+ * Some WebKit versions report `isComposing: false` on the Enter that commits
+ * an IME composition, but still carry the legacy `keyCode` for it - this is
+ * the fallback check for those.
+ */
+const IME_COMMIT_KEYCODE = 229;
 
 interface ChatProps {
   entries: ChatEntry[];
@@ -30,7 +36,8 @@ interface ChatProps {
   probe?: ProbeResult;
   probePending?: boolean;
   onProbe: () => void;
-  onSend?: (text: string) => void;
+  /** True if the turn was accepted; the box is cleared only then. */
+  onSend?: (text: string) => boolean;
   onCommand?: (command: Command) => void;
 }
 
@@ -72,15 +79,19 @@ export default function Chat({
         setDraft("");
         return;
       case "send":
-        onSend?.(c.text);
-        setDraft("");
+        // Only clear the box once the turn was actually accepted - refused
+        // (the link is down) or not, the caller decides, and a refused turn
+        // must stay in the box rather than vanish.
+        if (onSend?.(c.text) === true) setDraft("");
         return;
     }
   };
 
   const handleKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     // An Enter during IME composition picks a candidate; it is not a submit.
-    if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing) return;
+    // Some WebKit versions clear isComposing early but still report the
+    // legacy keyCode for it.
+    if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing || e.keyCode === IME_COMMIT_KEYCODE) return;
     e.preventDefault();
     submit();
   };
