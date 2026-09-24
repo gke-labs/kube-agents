@@ -546,6 +546,30 @@ variable "stockout_pubsub_sink" {
   default     = "gke-stockout-alerts-sink"
 }
 
+variable "enable_drift_pubsub" {
+  description = "Provision the drift detector's audit-log ingress (drift-pubsub module): the GKE audit-log Log Router sink, the drift-audit Pub/Sub topic and pull subscription, and the sink-writer publisher and agent-GSA subscriber/viewer IAM. Exports every GKE cluster in the project (the module's cluster_names default). The three names are the drift_pubsub_topic, drift_pubsub_subscription and drift_pubsub_sink variables below; the module's retention, backoff and cluster_names knobs are not re-exposed here. Nothing consumes the subscription yet: the detector, k8s-operator/cmd/drift-detector, is not built into any image or launched by any install (docs/designs/drift-detection.md). The installer front doors write no value for this variable into terraform.tfvars; through them it is a TF_VAR_enable_drift_pubsub line in install.env, as agent_ksa_name is."
+  type        = bool
+  default     = false
+}
+
+variable "drift_pubsub_topic" {
+  description = "Pub/Sub topic the drift audit-log sink publishes to. Only used when enable_drift_pubsub is true. One fixed default per project: lifecycle.sh apply adopts a topic of this name that exists but is not in state, and cannot tell one another live install in the project owns from one an earlier install left behind, so a second install that turns the flag on names its own topic, subscription and sink."
+  type        = string
+  default     = "platform-agent-drift-audit"
+}
+
+variable "drift_pubsub_subscription" {
+  description = "Pub/Sub pull subscription the drift detector reads from. Only used when enable_drift_pubsub is true. Adopted by name the way drift_pubsub_topic is, so a second install in the project names its own."
+  type        = string
+  default     = "platform-agent-drift-audit-sub"
+}
+
+variable "drift_pubsub_sink" {
+  description = "Log Router sink exporting mutating GKE audit-log calls to the drift topic. Only used when enable_drift_pubsub is true. Adopted by name the way drift_pubsub_topic is, so a second install in the project names its own."
+  type        = string
+  default     = "platform-agent-drift-audit-sink"
+}
+
 variable "extra_helm_values" {
   description = "Extra values for the kube-agents Helm release, covering chart settings this composition does not expose as its own variable (telemetry.otlpEndpoint, litellm.otel, the resource blocks, the PlatformAgent harness knobs). Passed as a second values document, so Helm deep-merges it key by key over the ones computed here and anything set wins. Setting a key the composition also computes — platformAgent.harness.clusterName, say — overrides it, which is rarely what you want."
   type        = any

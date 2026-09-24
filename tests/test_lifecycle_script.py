@@ -36,7 +36,11 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    gcloud_kms_notice="",
                    tfvar_enable_google_chat="true",
                    tfvar_chat_sub_name='"platform-agent-chat-events-sub"',
-                   tfvar_chat_topic_name='"platform-agent-chat-events"'):
+                   tfvar_chat_topic_name='"platform-agent-chat-events"',
+                   tfvar_enable_drift_pubsub="false",
+                   tfvar_drift_topic='"platform-agent-drift-audit"',
+                   tfvar_drift_sub='"platform-agent-drift-audit-sub"',
+                   tfvar_drift_sink='"platform-agent-drift-audit-sink"'):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -117,6 +121,18 @@ elif [[ "$cmd" == "console" ]]; then
         exit 0
     elif [[ "$expr" == *"chat_topic_name"* ]]; then
         echo '{tfvar_chat_topic_name}'
+        exit 0
+    elif [[ "$expr" == *"enable_drift_pubsub"* ]]; then
+        echo '{tfvar_enable_drift_pubsub}'
+        exit 0
+    elif [[ "$expr" == *"drift_pubsub_topic"* ]]; then
+        echo '{tfvar_drift_topic}'
+        exit 0
+    elif [[ "$expr" == *"drift_pubsub_subscription"* ]]; then
+        echo '{tfvar_drift_sub}'
+        exit 0
+    elif [[ "$expr" == *"drift_pubsub_sink"* ]]; then
+        echo '{tfvar_drift_sink}'
         exit 0
     fi
     echo 'null'
@@ -586,6 +602,79 @@ resource "google_service_account" "agent" {
         )
         self.assertEqual(proc.returncode, 1)
         self.assertIn("has no ENABLED version.", proc.stderr)
+
+    # adopt_kms's drift-pubsub block. create_cluster is false in both so the
+    # cluster CMEK half adds no targets, and the minter and stockout flags stay
+    # off, so what adopt_kms imports is exactly what the drift flag adds.
+    # gcloud exits 0, so every describe reports its resource present.
+
+    def test_adopt_kms_imports_the_drift_pubsub_trio_when_the_flag_is_on(self):
+        """The composition's default names under the module's addresses, so a
+        re-install after a partial teardown adopts rather than 409s."""
+        proc = self._run_guard(
+            "adopt_kms",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("adopting pre-existing resource: projects/test-project/topics/platform-agent-drift-audit", proc.stdout)
+        self.assertIn("adopting pre-existing resource: projects/test-project/subscriptions/platform-agent-drift-audit-sub", proc.stdout)
+        self.assertIn("adopting pre-existing resource: projects/test-project/sinks/platform-agent-drift-audit-sink", proc.stdout)
+        self.assertIn("resource adoption complete: 3 imported", proc.stdout)
+        self.assertEqual(proc.stderr, "")
+
+    def test_adopt_kms_adopts_the_drift_pubsub_trio_under_the_names_this_state_would_create(self):
+        """A second install in the project names its own trio through the
+        drift_pubsub_* variables; adopt_kms reads those, never the module's
+        defaults, so the names it imports are the ones this state owns and
+        the first install's default-named trio is left alone."""
+        proc = self._run_guard(
+            "adopt_kms",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_topic='"second-drift-audit"',
+            tfvar_drift_sub='"second-drift-audit-sub"',
+            tfvar_drift_sink='"second-drift-audit-sink"',
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("adopting pre-existing resource: projects/test-project/topics/second-drift-audit", proc.stdout)
+        self.assertIn("adopting pre-existing resource: projects/test-project/subscriptions/second-drift-audit-sub", proc.stdout)
+        self.assertIn("adopting pre-existing resource: projects/test-project/sinks/second-drift-audit-sink", proc.stdout)
+        self.assertNotIn("platform-agent-drift-audit", proc.stdout)
+        self.assertIn("resource adoption complete: 3 imported", proc.stdout)
+
+    def test_adopt_kms_skips_the_drift_pubsub_trio_already_in_state(self):
+        proc = self._run_guard(
+            "adopt_kms",
+            state_list="module.drift_pubsub[0].google_pubsub_topic.drift_audit\n"
+                       "module.drift_pubsub[0].google_pubsub_subscription.drift_audit\n"
+                       "module.drift_pubsub[0].google_logging_project_sink.drift_audit",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("adopting", proc.stdout)
+        self.assertIn("resource adoption complete: 0 imported", proc.stdout)
+
+    def test_adopt_kms_never_names_the_drift_pubsub_trio_when_the_flag_is_off(self):
+        """Off is the default; an install that never set the flag must not
+        import a topic, subscription or sink that happens to share the name."""
+        proc = self._run_guard(
+            "adopt_kms",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="false",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("drift-audit", proc.stdout)
+        self.assertNotIn("drift_pubsub", proc.stdout)
+        self.assertIn("resource adoption complete: 0 imported", proc.stdout)
 
 
 if __name__ == "__main__":
