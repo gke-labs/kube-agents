@@ -1,0 +1,44 @@
+# The a2a console image: the console page (a2a/web) built to static files,
+# and the Go server that serves them, hands the page its bus credential and
+# proxies its websocket to the bus.
+#
+# Build from the a2a/ module root:
+#   docker build --platform linux/amd64 -f Dockerfile.console -t <registry>/console:<tag> .
+
+# Bases come from images.json, spelled the way Dockerfile.gateway and
+# Dockerfile.worker spell them, so `make mirror-images` and
+# hack/check-image-inventory.sh cover this build too.
+ARG NODE_IMAGE=node
+ARG NODE_VERSION=22-slim
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.27-alpine
+ARG DISTROLESS_IMAGE=gcr.io/distroless/static
+ARG DISTROLESS_VERSION=nonroot
+
+FROM ${NODE_IMAGE}:${NODE_VERSION} AS page
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+# --legacy-peer-deps because @vitejs/plugin-react@4's peer range stops at
+# vite 7. The registry flag keeps a build machine's own npm mirror config
+# out of the build.
+RUN npm ci --legacy-peer-deps --registry=https://registry.npmjs.org
+COPY web/ ./
+RUN npm run build
+
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
+# Refuse to download a toolchain the pin above does not name (#1138).
+ENV GOTOOLCHAIN=local
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/console ./cmd/console
+
+# Distroless nonroot is USER 65532 and the Deployment imposes 1000, so the
+# Deployment sets WorkingDir explicitly -- WORKDIR /home/nonroot is 0700
+# owned by 65532. See hardenedSecurityContext() and #1259.
+FROM ${DISTROLESS_IMAGE}:${DISTROLESS_VERSION}
+COPY --from=build /out/console /console
+COPY --from=page /web/dist /srv/console
+USER nonroot
+ENTRYPOINT ["/console"]
