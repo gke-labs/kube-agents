@@ -125,6 +125,11 @@ func TestTheConsoleCredentialVolumeProjectsOneKey(t *testing.T) {
 	if src.Items[0].Mode == nil || *src.Items[0].Mode != 0o440 {
 		t.Errorf("item mode = %v, want 0440", src.Items[0].Mode)
 	}
+	// Optional, so a Secret missing the key lets the pod start instead of
+	// sitting in ContainerCreating; the server answers with its designed 503.
+	if src.Optional == nil || !*src.Optional {
+		t.Errorf("optional = %v, want true", src.Optional)
+	}
 
 	mounts := pod.Containers[0].VolumeMounts
 	if len(mounts) != 1 {
@@ -172,6 +177,9 @@ func TestBuildA2AConsoleNetworkPolicy(t *testing.T) {
 	}
 	if len(np.Spec.Ingress) != 0 {
 		t.Errorf("ingress = %+v, want none (deny all)", np.Spec.Ingress)
+	}
+	if got := np.Labels[a2aComponentLabel]; got != "console-netpol" {
+		t.Errorf("component label = %q, want %q", got, "console-netpol")
 	}
 }
 

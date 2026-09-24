@@ -53,6 +53,9 @@ const (
 	a2aConsoleContainer    = "console"
 	a2aConsoleNameSuffix   = "-a2a-console"
 	a2aConsoleNetpolSuffix = "-a2a-console-netpol"
+	// a2aConsoleNetpolComponent labels the console's deny-all NetworkPolicy;
+	// derived from a2aConsoleComponent so the two can't drift apart.
+	a2aConsoleNetpolComponent = a2aConsoleComponent + "-netpol"
 
 	// Untyped on purpose, like a2aNATSClientPort: the host list wants an int
 	// and the container port wants an int32.
@@ -183,12 +186,17 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							SecretName: a2aCredsSecretName(agent),
 							// One key out of a Secret that holds every static
 							// user's password. TestTheConsoleCredentialVolumeProjectsOneKey
-							// pins it.
+							// pins it. Optional, so a Secret missing the key
+							// still lets the pod start: the file is then
+							// absent and the server answers /config.json with
+							// its designed 503 instead of the pod sitting in
+							// ContainerCreating.
 							Items: []corev1.KeyToPath{{
 								Key:  a2aConsolePasswordKey,
 								Path: a2aConsolePasswordKey,
 								Mode: ptr.To(a2aConsoleCredsFileMode),
 							}},
+							Optional: ptr.To(true),
 						}},
 					}},
 					Containers: []corev1.Container{{
@@ -279,7 +287,7 @@ func buildA2AConsoleNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      a2aConsoleNetpolName(agent),
 			Namespace: agent.Namespace,
-			Labels:    a2aLabels(agent, a2aConsoleComponent+"-netpol"),
+			Labels:    a2aLabels(agent, a2aConsoleNetpolComponent),
 		},
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aConsoleName(agent)}},
