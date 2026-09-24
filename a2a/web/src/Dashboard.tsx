@@ -76,7 +76,18 @@ export default function Dashboard({
                 const current = currentTaskOf(state, a.session);
                 const live = livenessOf(state.liveness.get(a.session), state.now, current !== undefined);
                 return (
-                  <tr key={a.session} className="row-click" onClick={() => onSession(a.session)}>
+                  <tr
+                    key={a.session}
+                    className="row-click"
+                    tabIndex={0}
+                    onClick={() => onSession(a.session)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        if (e.key === " ") e.preventDefault();
+                        onSession(a.session);
+                      }
+                    }}
+                  >
                     <td>{a.session}</td>
                     <td>{a.agentType}{a.profile ? `/${a.profile}` : ""}</td>
                     <td>{a.status}</td>

@@ -93,6 +93,15 @@ describe("Dashboard", () => {
     expect(onSession).toHaveBeenCalledWith("gateway");
   });
 
+  it("opens a session's transcript from the keyboard", async () => {
+    const onSession = vi.fn();
+    render(<Dashboard state={state} focus={null} onSession={onSession} />);
+    const row = screen.getByText("gateway", { selector: "td" }).closest("tr")!;
+    row.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(onSession).toHaveBeenCalledWith("gateway");
+  });
+
   it("scrolls to the focused panel, every time it is focused", () => {
     const scroll = vi.fn();
     Element.prototype.scrollIntoView = scroll;

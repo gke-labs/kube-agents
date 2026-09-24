@@ -822,6 +822,11 @@ body {
   color: var(--ink-bright);
 }
 
+.row-click:focus-visible {
+  outline: 1px solid var(--halo);
+  outline-offset: -1px;
+}
+
 .row-failed td {
   color: var(--warn);
 }
