@@ -248,10 +248,10 @@ ServiceAccount token: the bus provisioning Job, every spawned session pod, and t
 platform agent container. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
 gateway, purely as sequencing, since it has a ServiceAccount and its client program
-lands separately from this render; `web`, because a browser never can; `seed`, because
-the hand-applied seed tooling is applied rather than rendered and dropping its user
-would refuse an object already running; `sys`, a human at a port-forward; and `bridge`,
-the Hermes bridge sidecar.
+lands separately from this render; `web` and `console`, because a browser never can;
+`seed`, because the hand-applied seed tooling is applied rather than rendered and
+dropping its user would refuse an object already running; `sys`, a human at a
+port-forward; and `bridge`, the Hermes bridge sidecar.
 
 The shared `worker` user is gone. It was one credential held by two workloads that
 happen to share a pod — the bridge sidecar, which drives the task plane, and the `a2a`
@@ -259,23 +259,23 @@ CLI in the agent container, which reads and writes the topic blackboard — so i
 set was the union of two unrelated jobs, and either workload could do the other's. It
 split into `agent` and `bridge`, and neither holds the other's streams.
 
-Four of those static users are permanent - the callout, which cannot authenticate
-through itself; `web`, because a browser never can; `sys`, which is a human rather than
-a workload; and `bridge`, for a reason worth stating because it looks like an omission.
-The callout keys its map on the ServiceAccount username `TokenReview` returns, and a
-sidecar shares its pod's ServiceAccount. A token presented by the bridge would therefore
-resolve to the `agent` entry rendered for the container beside it, and each would hold
-the union of the two grant sets - `worker` rebuilt under a new name, arrived at by
-moving the bridge onto the mechanism meant to narrow it. `Narrowing` does not help: it
-is pod-scoped, and both workloads are in the same pod. The bridge gets a token when it
-stops sharing a pod with the agent, which is the same event that retires it. The rest
-are waiting on something nameable. The single
-source for all of it - the config's APP and `$SYS` static user blocks, the callout's map,
-and the `NATS_USER` a client is handed so it can set its inbox prefix - is
-`platformagent_a2a_identities.go`; before the callout those three lived in a config
-string, a Secret and a container env block with nothing but review connecting them. The
-one static block not in that file is the callout's own, rendered in the AUTH account
-template in `platformagent_a2a_manifests.go`.
+Five of those static users are permanent - the callout, which cannot authenticate
+through itself; `web` and `console`, because a browser never can; `sys`, which is a
+human rather than a workload; and `bridge`, for a reason worth stating because it looks
+like an omission. The callout keys its map on the ServiceAccount username `TokenReview`
+returns, and a sidecar shares its pod's ServiceAccount. A token presented by the bridge
+would therefore resolve to the `agent` entry rendered for the container beside it, and
+each would hold the union of the two grant sets - `worker` rebuilt under a new name,
+arrived at by moving the bridge onto the mechanism meant to narrow it. `Narrowing` does
+not help: it is pod-scoped, and both workloads are in the same pod. The bridge gets a
+token when it stops sharing a pod with the agent, which is the same event that retires
+it. The rest are waiting on something nameable. The single source for all of it - the
+config's APP and `$SYS` static user blocks, the callout's map, and the `NATS_USER` a
+client is handed so it can set its inbox prefix - is `platformagent_a2a_identities.go`;
+before the callout those three lived in a config string, a Secret and a container env
+block with nothing but review connecting them. The one static block not in that file is
+the callout's own, rendered in the AUTH account template in
+`platformagent_a2a_manifests.go`.
 
 Those credentials belong in Secret data and nowhere else in the render: no rendered
 object name, label, or annotation may carry a password or a digest of one, truncated or
@@ -371,12 +371,12 @@ Layout:
   agent can subscribe to any inbox and the whole property above leaks through the reply
   path.
 - **The web read surface (amended 8/31; rewritten the same day after review).** One
-  `web` user for the read-only web UI, and the only bus credential that is published to
-  a browser by design. Subscribe on `a2a.>` and its own inbox; publish only the JetStream
-  read API - account-level `INFO`, and `STREAM.INFO`, `CONSUMER.CREATE`, `CONSUMER.INFO`,
-  `CONSUMER.MSG.NEXT` **enumerated per stream** over the four message streams - plus its
-  own inbox. It rides a websocket listener on 9222 rendered plain (`no_tls: true`) with
-  an `allowed_origins` allow-list.
+  `web` user for the read-only web UI, one of the two bus credentials published to a
+  browser by design (the other is `console`, below). Subscribe on `a2a.>` and its own
+  inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
+  `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
+  the four message streams - plus its own inbox. It rides a websocket listener on 9222
+  rendered plain (`no_tls: true`) with an `allowed_origins` allow-list.
 
   **"Read-only" is not expressible as a subject list, and the first version of this user
   proved it.** Subject permissions cannot see a request BODY, and JetStream puts the
@@ -492,11 +492,12 @@ Layout:
 
 - **The console surface (added 9/23).** One `console` user for the web console: the `web`
   read surface exactly, plus publish on `chat.console.*.in` (the gateway's console adapter's
-  inbound subject, spec-chatops-gateway.md), subscribe on `chat.console.*.out`, and
-  `STREAM.INFO` on the three `KV_*` streams. The KV grant is sizes and counts for the
-  console's capacity tiles; the `$KV` data plane and every consumer verb on `KV_*` stay off,
-  so the bucket contents do not follow the size grant in. The gateway user gains the
-  matching pair (subscribe `.in`, publish `.out`). The console subjects are core NATS, so
+  inbound subject, spec-chatops-gateway.md), and subscribe on `chat.console.*.out`. The
+  console holds no verb on any `KV_*` stream, because `STREAM.INFO` accepts a
+  `subjects_filter` in its body and returns every key, which for `session-state` is the
+  conversation and task ids; the capacity tiles that wanted bucket sizes are deferred until
+  a sizes-only route exists. The gateway user gains the matching pair (subscribe `.in`,
+  publish `.out`). The console subjects are core NATS, so
   the provision Job is untouched and an existing install picks the door up on operator
   upgrade. Same posture as `web` and stated in the same places: static, published to a
   browser by design, port-forward only.

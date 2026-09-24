@@ -67,7 +67,9 @@ the same).
 matter: the ws listener and the `web` user's exact grant list. Mirrored from
 `webIdentity()` in
 `k8s-operator/internal/controller/platformagent_a2a_identities.go` —
-re-mirror if that list moves, and re-run the live suite against it.
+re-mirror if that list moves, and re-run the live suite against it. The file
+also carries the `console` user and a dev `gateway` user, so a local gateway
+binary can run against it.
 
 ```sh
 nats-server -c dev/nats.conf     # terminal 1

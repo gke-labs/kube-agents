@@ -666,7 +666,10 @@ the adapter posts the gateway's own notices back as `{"messageId","text","edit"}
 `chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus
 protocol, and the payload spec's agreement rules do not apply to it. The answers never
 travel here. They stream through TASKS, which the console page renders directly, so a lost
-`.out` frame across a reconnect costs a notice and never an answer.
+`.out` frame across a reconnect costs a notice and never an answer. An `.in` frame published
+while no gateway subscription is live (the gateway restarting, or the NATS config not yet
+rolled) is dropped by core NATS without trace; the browser sees only a pending entry that
+never attaches. A receipt frame on `.out` is the natural follow-up for the page.
 
 **Conversation.** `console:<token>`, one dot-free DNS-1123 label per browser tab, kind `dm`.
 The gateway treats it like any DM: one session per conversation, spawned on the first turn,
@@ -690,9 +693,10 @@ the fallback for an unprefixed id. `openDirect` takes a bare user id and goes to
 configured backend.
 
 **Bounds.** A frame's text is capped at 16 KiB; over it, the frame is refused with a notice
-naming the cap. Empty, malformed and mis-shaped frames drop with a log line each. A NATS
-render that predates the console identity refuses the adapter's subscription asynchronously;
-the adapter logs that with the remedy (upgrade the operator) rather than boot-failing,
+naming the cap. Empty, malformed and mis-shaped frames drop with a log line each, as does a
+frame whose `kind` is anything but `text`. A NATS render that predates the console identity,
+or a NATS pod not yet rolled onto the new one, refuses the adapter's subscription
+asynchronously; the adapter logs that with the remedy rather than boot-failing,
 because the chat backend beside it is still good.
 
 ## What stage 2 builds from this doc
