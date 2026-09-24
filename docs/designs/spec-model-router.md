@@ -445,9 +445,15 @@ injection can and cannot do:
   bound on that is the executor's own ceiling, not the requester's permissions. Every
   allowlisted human runs under one shared Google service account and one Kubernetes
   identity. A rewrite is not bounded by who asked. Against that example the ceiling does
-  hold today: the argv allowlist in `agents/platform/scripts/command_policy.py` refuses a
-  `kubectl delete`, and on the customer-cluster path that allowlist is the only thing
-  enforcing it. It is not a blanket read-only bound. `/v1/vcs/` carries forge writes on
+  hold today, and on the default install it holds twice. The argv allowlist in
+  `agents/platform/scripts/command_policy.py` refuses a `kubectl delete`. Underneath it,
+  the customer-cluster kubeconfig authenticates as the pod's Google service account,
+  which on the default `read-only` permission set carries viewer roles only, so the same
+  call fails at IAM - the canonical
+  [security reference](../site/src/content/docs/reference/security-and-iam.md) is the
+  page to read, and `terraform/modules/kube-agents-iam/variables.tf` pins the role list.
+  The allowlist stands alone only on an install that has chosen `custom` and named a
+  write role. Neither layer is a blanket read-only bound. `/v1/vcs/` carries forge writes on
   the broker's own credential, bounded by a managed-repository allowlist rather than by
   the requester. What would make the requester's permissions the bound is per-request
   down-scoping, which is deferred (section 4a of
