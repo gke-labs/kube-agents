@@ -1,108 +1,69 @@
-# a2a/web — the bus, watched from a browser
+# a2a/web - the console
 
-The demo's web UI (`a2a-stream-demo/web`, an external playground repo),
-lifted and adapted to
-`a2a-jetstream/0.4`. The rail and the visual design came across intact; the
-protocol underneath changed completely: addressee-scoped task subjects, the
-0.4 envelope, the four reserved artifact names, four provisioned streams
-instead of one, and — the point — a **read-only** connection. This page holds
-the `web` NATS user's credential, whose grants stop at the JetStream read
-API. It cannot publish, and the probe bar in the footer demonstrates that
-live instead of asserting it.
+A status dashboard and a chat pane over the a2a bus. The top strip and the dashboard panels show what the bus knows: sessions and their liveness, recent tasks and why they failed, conversations by backend, blackboard topics, stream capacity and protocol anomalies. The chat pane at the bottom talks to the chatops gateway through its console door, the same way a Discord or Google Chat user would.
 
-PLAYGROUND POSTURE, stated out loud: static `web` credential from the creds
-Secret, plain ws, no TLS, no ingress — the listener is ClusterIP and
-`kubectl port-forward` is the only transport. That is an enforced
-property, not a convention: the NATS pod's ingress policy refuses
-in-cluster 9222 outright, and the port-forward still works because it
-enters from the node, which NetworkPolicy does not govern. Production
-terminates TLS in front of the bus or keeps the listener off
-(spec-nats-deployment.md, web read surface).
+The page connects to the bus's websocket listener as the `console` NATS user. That user has the read grants the old `web` view had, plus one publish (`chat.console.*.in`) and one subscribe (`chat.console.*.out`). It can't write anywhere on `a2a.>`, and the verify button in the footer shows the server refusing it. Answers never come back on the console subjects. They arrive through the TASKS stream like every other backend's.
+
+## Posture
+
+Port-forward only. The websocket listener is ClusterIP, the NATS pod's ingress policy refuses in-cluster 9222, and the port-forward works because it enters from the node, which NetworkPolicy doesn't govern. There is one shared `console` principal, no TLS, no ingress and no per-user identity. kubectl RBAC on the namespace is the authentication.
+
+We expect this to move to in-cluster ingress with per-user identity, which needs the NATS account split. The frame format, the reducer and the page shouldn't change when it does.
 
 ## Against the install
 
 ```sh
 # 1. the password
 kubectl -n kubeagents-system get secret platform-agent-a2a-nats-creds \
-  -o jsonpath='{.data.web-password}' | base64 -d
+  -o jsonpath='{.data.console-password}' | base64 -d
 
 # 2. the transport
 kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-nats 9222:9222
 
 # 3. the page
-npm install && npm run dev
+npm install --legacy-peer-deps && npm run dev
 # open http://localhost:5173 and paste the password into the connect form,
-# or pass it in the URL: /?ws=ws://localhost:9222&user=web&pass=...
+# or pass it in the URL: /?ws=ws://localhost:9222&user=console&pass=...
 ```
 
-Ask the agent something through its chat front door; the rail lights,
-events tick, and clicking a tap replays that session's events from the
-stream — no live executor asked.
+Type into the chat pane. The turn shows as pending, the gateway's `⏳ submitted…` notice arrives, and the pending line attaches to the task once the submission shows up on TASKS. `/help` lists the local commands. None of them is ever published.
+
+The read-only view still works with `user=web` and the install's `web-password`. It has no input box.
 
 ## Serve it from localhost:5173, not another port
 
-The bus's websocket listener renders
-`allowed_origins: ["http://localhost:5173", "http://127.0.0.1:5173"]`, so a
-page served from any other origin is refused at the handshake with a 403 —
-the connect form with a `WebSocket ... 403` in the console, not a hang.
-Vite is pinned with `strictPort`, so it fails loudly rather than drifting to
-5174 and leaving that failure to be diagnosed live.
+The bus's websocket listener renders `allowed_origins: ["http://localhost:5173", "http://127.0.0.1:5173"]`, so a page served from any other origin is refused at the handshake with a 403. Vite is pinned with `strictPort`, so it fails loudly rather than drifting to 5174. Keep `server.host` unset; it would put the dev server on every interface.
 
-Use `http://localhost:5173`. The `127.0.0.1` entry covers the same page
-opened as `http://127.0.0.1:5173` — vite's localhost bind serves loopback
-under either name, and the browser asserts whichever origin is in the
-address bar. Keep `server.host` unset; it would put the dev server on
-every interface.
-
-Origin is browser-asserted and non-browser clients omit it entirely, so the
-allow-list is defense in depth. The boundary is the grant list.
+Origin is browser-asserted and non-browser clients omit it, so the allow-list is a second fence. The boundary is the grant list.
 
 ## Local dev (no cluster)
 
-Node 22+ (`nats.ws` uses the global `WebSocket`, so the seeder and the live
-suites fail on 20 with a bare ReferenceError; `engines` in package.json says
-the same).
+Node 22+ (`nats.ws` uses the global `WebSocket`). Install with `--legacy-peer-deps` until `@vitejs/plugin-react`'s peer range covers vite 8.
 
-`dev/nats.conf` mirrors the operator's rendered config on the points that
-matter: the ws listener and the `web` user's exact grant list. Mirrored from
-`webIdentity()` in
-`k8s-operator/internal/controller/platformagent_a2a_identities.go` —
-re-mirror if that list moves, and re-run the live suite against it. The file
-also carries the `console` user and a dev `gateway` user, so a local gateway
-binary can run against it.
+`dev/nats.conf` mirrors the operator's rendered config on the points that matter: the ws listener and the exact grant lists for `web` and `console` (from `webIdentity()` and `consoleIdentity()` in `k8s-operator/internal/controller/platformagent_a2a_identities.go`). Re-mirror if those lists move, and re-run the live suite against it. It also carries a dev `gateway` user, so a local gateway binary or the live suite's fake gateway can answer console turns.
 
 ```sh
 nats-server -c dev/nats.conf     # terminal 1
 node dev/seed.mjs --live         # terminal 2: history + a task every ~20s
-npm run dev                      # terminal 3, password dev-web
+npm run dev                      # terminal 3, user console, password dev-console
 ```
+
+With no gateway running, a sent turn stays pending and gets a note after 30s saying no submission showed up.
 
 ## Tests
 
 ```sh
-npm test          # unit: protocol, reducer, rail geometry, components
+npm test          # unit: protocol, reducer, derived views, commands, components
 npx tsc --noEmit  # strict, browser-shaped
 # live, against a real server over real ws:
-A2A_WS_URL=ws://localhost:9222 A2A_WEB_PASS=dev-web npm test -- livebus
+A2A_WS_URL=ws://localhost:9222 npm test -- livebus
 ```
 
-The live suite drives the real bus layer — all four taps attach, seeded
-history replays as non-live, a fresh publish arrives exactly once (the
-redelivery half of that claim is `makeDedup`'s unit test in `bus.test.ts`;
-a live tap restart cannot be forced deterministically), and the read-only
-probe comes back `refused`. Against the
-install, set `A2A_SKIP_SEED=1` (no seed user in hand) and the same suite
-checks everything but the live-publish leg.
+The live suite has two cases. The read-only one: all four taps attach, seeded history replays as non-live, a fresh publish arrives exactly once, and the `web` probe is refused. The console one: a sent turn gets a notice and a submission, the pending line attaches, a durable that doesn't exist reads as not-found, TASKS stream info comes back, and the `console` probe is refused. Locally a fake gateway answers the turn.
 
-`livesequence` is the headless rail: it attaches the same way the page
-does, waits for a NEW task to run somewhere on the install, and asserts
-the event sequence the rail would draw — submission first, `working`
-before terminal, exactly one `final` with nothing after it, a non-empty
-`result` — then folds everything through the real reducer and asserts the
-UI model agrees. It cannot create the task (the web user cannot publish;
-that is the point), so drive one from the other side while it waits: ask
-the agent in chat, or run the worker adapter's live test over a 4222
-port-forward.
+Against the install, set `A2A_SKIP_SEED=1` (no seed user in hand), `A2A_WEB_PASS` and `A2A_CONSOLE_PASS` from the creds Secret, and `A2A_FAKE_GATEWAY=0` so the real gateway answers. That sends one real turn to the agent.
+
+`livesequence` watches a new task run somewhere on the install and asserts the event sequence the page renders: submission first, `working` before terminal, exactly one `final` with nothing after it, a non-empty `result`. Drive the task from chat while it waits.
 
 ```sh
 A2A_WS_URL=ws://localhost:9222 A2A_WEB_PASS=... npm test -- livesequence
@@ -110,21 +71,10 @@ A2A_WS_URL=ws://localhost:9222 A2A_WEB_PASS=... npm test -- livesequence
 
 ## Shape notes, for whoever touches this next
 
-- **The grants dictate the client.** `_INBOX.web` must be the inbox prefix
-  or every JS API reply is unsubscribable; consumers are ephemeral ordered
-  _pull_ consumers because the grant enumerates
-  `$JS.API.CONSUMER.CREATE.<stream>.>` and `MSG.NEXT.<stream>.*` per stream
-  and nothing wider. Four attach loops, one per
-  stream (`TASKS`/`DIRECTORY`/`TOPICS-STATE`/`TOPICS-JOURNAL`), each
-  retrying independently so a fresh install lights up as provisioning runs.
-- **No heartbeats.** Nothing on the install publishes `agents.hb.>` yet and
-  the `web` user couldn't subscribe it anyway (`a2a.>` only). Rail liveness
-  derives from stream traffic; `active` decays to `idle` after 60s quiet.
-- **Retirement is data-driven.** A session that answers as the addressee of
-  its own task subject (the session worker pods) retires to `done` on
-  terminal; a standing service answering for a profile under its own name
-  (the bridge:
-  addressee `platform`, session `platform-bridge`) does not.
-- **The transcript is the reserved artifact names.** `result` chunks merge
-  into one answer entry, `progress` lines the transcript and the tap's
-  status, `thinking`/`activity` stay off the transcript but count in replay.
+- **The grants dictate the client.** `_INBOX.<user>` must be the inbox prefix or every JS API reply is unsubscribable. Consumers are ephemeral ordered pull consumers because the grant enumerates `$JS.API.CONSUMER.CREATE.<stream>.>` and `MSG.NEXT.<stream>.*` per stream and nothing wider. Four attach loops, one per stream, each retrying on its own so a fresh install lights up as provisioning runs. A stream that won't attach says which one and the last error.
+- **Liveness is CONSUMER.INFO.** Nothing publishes heartbeats. The page polls the durables it can name (`gateway-relay`, `bridge-<profile>`, `<session>-in`) every 5s. A pull outstanding or a recent delivery means a live process. A worker's `-in` consumer only exists while it runs a task, so a missing one with nothing in flight reads as idle, not gone.
+- **Capacity is STREAM.INFO.** Bytes against `max_bytes` and consumers against `max_consumers`, whichever is fuller. KV sizes aren't shown: the only read that returns them also lists every key.
+- **Spend is tbd on purpose.** The worker adapter drops `usage`, `total_cost_usd` and `duration_ms` from the harness result line (`a2a/worker-adapter/harness.go`), so none of it reaches the bus. The tiles and the cost column say so.
+- **The trim and the cap match the gateway's.** The input trims with Go's `strings.TrimSpace` set, not JS `trim()`, and refuses over 16384 bytes before publishing, so the page never shows a turn as sent that the gateway would drop.
+- **Retirement is data-driven.** A session that answers as the addressee of its own task subject (the session worker pods) retires to `done` on terminal. A standing service answering for a profile under its own name (the bridge: addressee `platform`, session `platform-bridge`) does not.
+- **The transcript is the reserved artifact names.** `result` chunks merge into one answer entry, `progress` lines go in the transcript, and `thinking`/`activity` stay off it but count toward the type's activity LED.
