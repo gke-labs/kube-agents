@@ -4,7 +4,7 @@
 
 **Cron:** id `obtainability-audit`, schedule `50 6 * * *` (daily 06:50 UTC). The id is a stable observability identifier and does not change even though the audit is named "Workload Reliability".
 
-**Data sources:** `kubectl` read verbs, `gcloud container ...`, the `gke` MCP server, and the Config Controller MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`). **Nothing else** — no BigQuery, no Prometheus/GMP, no VPA recommendations, no Policy Controller, no external blueprint, no delegation to Cluster Agents via kanban. Every conclusion is derived from live cluster reads you performed in this run. The one thing a repository may decide is whether a posture is a finding: §4a reads the GitOps clone and the registered `context_repos` for a declaration that justifies it, and nothing else about a verdict comes from a repository.
+**Data sources:** `kubectl` read verbs, `gcloud container ...`, the `gke` MCP server, and the Config Controller MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`). **Nothing else** — no BigQuery, no Prometheus/GMP, no VPA recommendations, no Policy Controller, no external blueprint, no delegation to Cluster Agents via kanban. Every conclusion is derived from live cluster reads you performed in this run. The one thing a repository may decide is whether a posture is a finding: §4a reads the GitOps clone and the registered `context_repos` for a declaration that justifies it, and nothing else about a verdict comes from a repository. Every collection command runs once per project in the resolved project scope (§1).
 
 ---
 
@@ -37,10 +37,19 @@ The helper owns every `git`/`gh` operation and renders the ledger issue body and
 
 ### 1. Enumerate the target fleet
 
+**Resolve the project scope first.** The scope is the host project (`gcloud config get-value project`) plus every project `gcloud projects list --format="value(projectId)"` returns. Run every collection command once per project, passing `--project` explicitly — the ambient default silently audits one project and reports the result as a fleet sweep. The scope is what the agent's identity can read, so an operator narrows it by narrowing the IAM grant. A listing that exits non-zero, or that returns without the host project, cannot say how many other projects exist: sweep the projects you have and add one `scope.skipped` entry, `{"cluster": "project/UNENUMERATED_PROJECTS", "reason": "<the listing's rc and stderr excerpt, or the host project it omitted>"}`, so the run publishes as partial rather than as the whole fleet. A project where the API this audit reads is disabled (`SERVICE_DISABLED`, `accessNotConfigured`, `has not been used in project`) holds nothing to audit and counts as empty, not skipped: recording it as a loss would pin every run partial for as long as the project exists.
+
 ```bash
-gcloud container clusters list --format=json
+HOST=$(gcloud config get-value project)
+LISTED=$(gcloud projects list --format="value(projectId)"); LIST_RC=$?
+PROJECTS=$(printf '%s\n' "$HOST" $LISTED | sort -u)
+for PROJECT in $PROJECTS; do
+  gcloud container clusters list --project="$PROJECT" --format=json
+done
 ```
 
+- A project whose `clusters list` fails for any reason but a disabled API is one `scope.skipped` entry, `{"cluster": "project/<id>", "reason": "<stderr excerpt>"}`, and the sweep carries on into the next project. One project's permission error never decides the outcome for the rest of the fleet.
+- **Name every cluster `<project>/<cluster>`, always.** `scope.clusters[].name` and every `findings[].cluster` carry that qualified name. A fleet spanning projects can hold two clusters called `prod`, the finding id is derived from the cluster name, and two `prod` entries would merge into one identity and under-report the ledger. Qualify unconditionally rather than only when a collision exists today: a name that changes the day a second `prod` appears is a finding announced as fixed. The entry's `project` field keeps its bare project ID, and `object` keeps the bare workload reference it already carries.
 - Target every cluster with `status == "RUNNING"`. Record `{name, location, project, checks_run}` into `scope.clusters`. Note each cluster's `autopilot.enabled` — Step 3 changes behaviour on Autopilot. Carry that in each affected finding's `impact` (§3.1 and §3.2 are the two it moves), and surface it in `evidence.excerpt` where it changes a verdict. **Not in `limitations`:** every non-empty `limitations` string is read as a coverage gap, and a fleet with one Autopilot cluster would then publish `partial: true` on every run it ever makes, with the ledger permanently unclosable. Autopilot changes how severe a finding is, not how much of the cluster you saw.
 - **`checks_run` is mandatory on every cluster,** and each entry is an object, never a bare string:
 

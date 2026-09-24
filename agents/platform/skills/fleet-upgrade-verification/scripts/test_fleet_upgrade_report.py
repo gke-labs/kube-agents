@@ -316,6 +316,19 @@ class ProjectFailureTest(unittest.TestCase):
         text = report.render_table(result)
         self.assertIn("read failed for bad", text)
 
+    def test_api_disabled_project_is_ignored_without_error(self):
+        target = "1.31.0-gke.1"
+
+        def fake_run(cmd, *args, **kwargs):
+            if "project=no-gke" in " ".join(cmd):
+                return (1, "", "ERROR: (gcloud.container.clusters.list) SERVICE_DISABLED: Kubernetes Engine API has not been used in project no-gke")
+            return (0, json.dumps([cluster("a", "us-central1", target, [("p", target)])]), "")
+
+        with patch.object(report, "run_cmd", side_effect=fake_run):
+            result = report.build_report(["no-gke", "good"], target)
+        self.assertEqual([m["cluster"] for m in result["members"]], ["a"])
+        self.assertEqual(result["errors"], [])
+
 
 class ProjectResolutionTest(unittest.TestCase):
     def test_cli_projects_win(self):
@@ -327,10 +340,36 @@ class ProjectResolutionTest(unittest.TestCase):
         with patch.dict(os.environ, env, clear=False):
             self.assertEqual(report.get_target_projects(None), ["g1", "m1", "m2"])
 
+    def test_env_projects_whitespace_and_commas(self):
+        env = {report.MONITORED_PROJECTS_ENV: "m1 m2, m3", "GCP_PROJECT_ID": "g1", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
+        with patch.dict(os.environ, env, clear=False):
+            self.assertEqual(report.get_target_projects(None), ["g1", "m1", "m2", "m3"])
+
     def test_gcloud_default_when_nothing_set(self):
         env = {report.MONITORED_PROJECTS_ENV: "", "GCP_PROJECT_ID": "", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
         with patch.dict(os.environ, env, clear=False), patch.object(report, "run_cmd", return_value=(0, "from-gcloud\n", "")):
             self.assertEqual(report.get_target_projects(None), ["from-gcloud"])
+
+    def test_projects_list_discovered_when_monitored_not_set(self):
+        env = {report.MONITORED_PROJECTS_ENV: "", "GCP_PROJECT_ID": "p-host", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
+        def fake_run(cmd, **kwargs):
+            if "projects" in cmd and "list" in cmd:
+                return (0, "p-host\np-extra\n", "")
+            return (0, "", "")
+        with patch.dict(os.environ, env, clear=False), patch.object(report, "run_cmd", side_effect=fake_run):
+            self.assertEqual(report.get_target_projects(None), ["p-extra", "p-host"])
+
+    def test_listing_that_omits_the_host_project_is_reported_as_filtered(self):
+        env = {report.MONITORED_PROJECTS_ENV: "", "GCP_PROJECT_ID": "p-host", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
+        def fake_run(cmd, **kwargs):
+            if "projects" in cmd and "list" in cmd:
+                return (0, "p-extra\n", "")
+            return (0, "", "")
+        errors: list[str] = []
+        with patch.dict(os.environ, env, clear=False), patch.object(report, "run_cmd", side_effect=fake_run):
+            self.assertEqual(report.get_target_projects(None, errors), ["p-extra", "p-host"])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("did not name p-host", errors[0])
 
 
 class OutputShapeTest(unittest.TestCase):
@@ -390,6 +429,20 @@ class OutputShapeTest(unittest.TestCase):
         with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()):
             rc = report.main(["--project", "p1", "--target-version", self.target])
         self.assertEqual(rc, report.EXIT_PARTIAL)
+
+    def test_main_returns_partial_when_projects_list_failed(self):
+        def fake_run(cmd, **kwargs):
+            if "projects" in cmd and "list" in cmd:
+                return (1, "", "ERROR: PERMISSION_DENIED resourcemanager.projects.list")
+            return self.fake(cmd, **kwargs)
+
+        env = {report.MONITORED_PROJECTS_ENV: "", "GCP_PROJECT_ID": "p1", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
+        stdout = io.StringIO()
+        with patch.dict(os.environ, env, clear=False), patch.object(report, "run_cmd", fake_run), redirect_stdout(stdout):
+            rc = report.main(["--target-version", self.target])
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        self.assertIn(f"read failed for {report.PROJECTS_LIST_ERROR_SCOPE}", stdout.getvalue())
+        self.assertIn("PERMISSION_DENIED", stdout.getvalue())
 
     def test_main_returns_partial_when_output_cannot_be_written(self):
         out_dir = tempfile.mkdtemp()

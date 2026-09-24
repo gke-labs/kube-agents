@@ -13715,6 +13715,7 @@ class TestScopedCoverage(unittest.TestCase):
         self.assertEqual(audit_report.target_kind("project/acme-prod"), "project")
         self.assertEqual(audit_report.target_kind("acme-prod/us-east4/gke-nodes"), "subnet")
         self.assertEqual(audit_report.target_kind("prod-us-east"), "cluster")
+        self.assertEqual(audit_report.target_kind("acme-prod/prod-us-east"), "cluster")
 
     def test_a_project_target_owes_only_the_project_scoped_checks(self):
         gaps = audit_report.coverage_gaps(self._doc([self._clean_project(), self._clean_cluster()]))
@@ -16160,9 +16161,10 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
 
     One deviation is deliberate and is recorded in the transcripts rather than
     excused: `ID_SCHEME` went from 2 to 3 because the drift collector now
-    qualifies cluster names, and the stamp is global, so every stream's bodies
-    carry the new number. That is the whole of the change here -- five lines,
-    one per body -- and this class is what proves it.
+    qualifies cluster names, and from 3 to 4 when the other governance streams
+    did the same; the stamp is global, so every stream's bodies carry the new
+    number. That is the whole of the change here -- five lines, one per body --
+    and this class is what proves it.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,
@@ -16281,5 +16283,34 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
 
 
 
+    def test_scheme_three_bare_cluster_names_withhold_resolved_under_scheme_four(self):
+        previous_body = published_body(
+            make_doc(findings=[make_finding(fid="a", cluster="prod-us-east", title="Alpha finding")]),
+            generated_at=NOW,
+        ).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            "<!-- audit-id-scheme: 3 -->",
+        )
+        self.assertEqual(audit_report.parse_id_scheme(previous_body), 3)
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        qualified_doc = make_doc(
+            clusters=[{"name": "acme-prod/prod-us-east", "location": "us-east1", "project": "acme-prod"}],
+            findings=[
+                make_finding(
+                    fid="a",
+                    cluster="acme-prod/prod-us-east",
+                    title="Alpha finding",
+                )
+            ],
+        )
+        rc = self.run_finish(qualified_doc)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["resolved"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
+

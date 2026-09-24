@@ -4,7 +4,7 @@
 
 **Cron:** id `gcp-networking-fabric-audit`, schedule `0 8 * * *` (daily 08:00 UTC).
 
-**Data sources:** `gcloud compute networks ...`, `gcloud compute routers ...`, `gcloud compute forwarding-rules ...`, and `gcloud compute security-policies ...` across all managed fleet projects (`GCP_PROJECT_ID` and `MONITORED_PROJECT_IDS`).
+**Data sources:** `gcloud compute networks ...`, `gcloud compute routers ...`, `gcloud compute forwarding-rules ...`, and `gcloud compute security-policies ...`, run once per project in the resolved project scope (§1).
 
 ---
 
@@ -27,15 +27,24 @@ If `pending_remediation_requests` is non-empty, inspect each requested finding i
 
 ### 1. Enumerate the target fleet
 
+**Resolve the project scope first.** The scope is the host project (`gcloud config get-value project`) plus every project `gcloud projects list --format="value(projectId)"` returns. Run every collection command once per project, passing `--project` explicitly — the ambient default silently audits one project and reports the result as a fleet sweep. The scope is what the agent's identity can read, so an operator narrows it by narrowing the IAM grant. A listing that exits non-zero, or that returns without the host project, cannot say how many other projects exist: sweep the projects you have and add one `scope.skipped` entry, `{"cluster": "project/UNENUMERATED_PROJECTS", "reason": "<the listing's rc and stderr excerpt, or the host project it omitted>"}`, so the run publishes as partial rather than as the whole fleet. A project where the API this audit reads is disabled (`SERVICE_DISABLED`, `accessNotConfigured`, `has not been used in project`) holds nothing to audit and counts as empty, not skipped: recording it as a loss would pin every run partial for as long as the project exists.
+
 ```bash
-gcloud compute networks subnets list --format=json
+HOST=$(gcloud config get-value project)
+LISTED=$(gcloud projects list --format="value(projectId)"); LIST_RC=$?
+PROJECTS=$(printf '%s\n' "$HOST" $LISTED | sort -u)
+for PROJECT in $PROJECTS; do
+  gcloud compute networks subnets list --project="$PROJECT" --format=json
+done
 ```
 
-- Target every VPC subnet across fleet projects. Record `{name, location, project, checks_run}` into `scope.clusters`, formatting `name` as unique `<project>/<region>/<subnet>` (or project-scoped target `project/<project-id>`).
+- Target every VPC subnet across the resolved projects. Record `{name, location, project, checks_run}` into `scope.clusters`, formatting `name` as unique `<project>/<region>/<subnet>` (or project-scoped target `project/<project-id>`).
 - **`checks_run` is mandatory on every scope entry:** Each entry is an object `{"check": "<slug>", "command": "<literal command>"}` naming the exact inspection command executed on that target.
-- A project or target you cannot reach goes in `scope.skipped` with a reason string. If a target is partially readable, record the refusal in its `limitations` string. Declare structurally inapplicable checks in `checks_not_applicable`.
+- A project or target you cannot reach goes in `scope.skipped` with a reason string, **and the sweep continues** — one project's permission error never decides the outcome for the rest of the fleet. If a target is partially readable, record the refusal in its `limitations` string. Declare structurally inapplicable checks in `checks_not_applicable`.
 
 ### 2. Diagnostic checks roster
+
+Run every check once per project in §1's scope, with `$PROJECT` set to that project for the whole pass. After §1's loop the variable holds the last project listed, so a check run outside a per-project pass reads that one project and reports it as the fleet.
 
 #### 2.1 Subnet primary and secondary IP range exhaustion (`subnet-ip-exhaustion`)
 

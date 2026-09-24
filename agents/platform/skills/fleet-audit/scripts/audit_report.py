@@ -449,7 +449,14 @@ DELTA_RE = re.compile(
 # stream pays one run of withheld `resolved` for a rename in this one; a
 # per-stream stamp would be the alternative, and it is a bigger change than
 # the single run it would save.
-ID_SCHEME = 3
+#
+# 4: the remaining eight governance audit SOPs and scripts now qualify their
+# cluster names as `<project>/<cluster>` so multi-project runs do not collapse
+# identically named clusters across projects. Any install that ran a governance
+# cron under scheme 3 already stamped its ledgers `3` with bare cluster names,
+# so bumping to 4 withholds `resolved` for one transition run as those eight
+# streams rewrite their finding IDs to `<project>/<cluster>`.
+ID_SCHEME = 4
 ID_SCHEME_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-id-scheme:[ \t]*(\d+)[ \t]*-->[ \t]*$", re.M
 )
@@ -1308,13 +1315,13 @@ def target_kind(name: str) -> str:
     """Which kind of thing a `scope.clusters` entry names.
 
     The SOPs already encode this in the name they ask for, so nothing new has to
-    be carried per entry: `project/<id>` is the project-scoped entry, a name with
-    a `/` in it is a `<project>/<region>/<subnet>` target, and a bare name is a
-    cluster.
+    be carried per entry: `project/<id>` is the project-scoped entry, a three-part
+    `<project>/<region>/<subnet>` path is a subnet target, and a bare `<cluster>`
+    or `<project>/<cluster>` name is a cluster.
     """
     if name.startswith(PROJECT_TARGET_PREFIX):
         return TARGET_KIND_PROJECT
-    return TARGET_KIND_SUBNET if "/" in name else TARGET_KIND_CLUSTER
+    return TARGET_KIND_SUBNET if name.count("/") >= 2 else TARGET_KIND_CLUSTER
 
 
 def audit_target_checks(audit_id: str, target_name: str) -> tuple[str, ...]:
@@ -1889,24 +1896,28 @@ def validate_findings(data: object, audit_id: str) -> dict:
             _require_str(
                 cluster.get(field), f"scope.clusters[{i}].{field}", allow_empty=False
             )
-        # A finding names its cluster by bare name, and so does every lookup
-        # that resolves one back to this table. Two same-named clusters in two
-        # projects make that name ambiguous, and the ambiguity is already
-        # load-bearing today: `coverage_gaps` and the scope table resolve by
-        # name, and the derived finding id has `cluster` as its second segment,
-        # so a collision merges two clusters' findings into one identity. The
-        # SPO SOP used to paper over this by putting the project in the id
-        # string it hand-wrote, which made the id more unique than the data
-        # behind it. Refuse the document instead: a fleet audit that cannot say
-        # which `prod` it means should not publish a ledger about `prod`.
+        # A finding names its cluster by the name in this table, and so does
+        # every lookup that resolves one back to it. Two same-named clusters
+        # make that name ambiguous, and the ambiguity is load-bearing:
+        # `coverage_gaps` and the scope table resolve by name, and the derived
+        # finding id has `cluster` as its second segment, so a collision merges
+        # two clusters' findings into one identity. Every audit SOP therefore
+        # names a cluster `<project>/<cluster>`, which is what lets one run span
+        # projects; a duplicate reaching here means a scope entry was written
+        # with a bare name instead. The SPO SOP used to paper over this by
+        # putting the project in the id string it hand-wrote, which made the id
+        # more unique than the data behind it. Refuse the document instead: a
+        # fleet audit that cannot say which `prod` it means should not publish a
+        # ledger about `prod`.
         name = str(cluster["name"])
         if name in audited_names:
             raise ValidationError(
                 f"scope.clusters[{i}].name: duplicate cluster {name!r}. Findings "
-                "reference a cluster by bare name, so two clusters sharing one "
+                "reference a cluster by this name, so two clusters sharing one "
                 "name cannot be told apart — their findings would merge into a "
-                "single identity and the ledger would under-report. Audit the "
-                "projects in separate runs."
+                "single identity and the ledger would under-report. Name every "
+                "cluster '<project>/<cluster>', which is what the SOP's §1 "
+                "requires and what keeps a multi-project run unambiguous."
             )
         audited_names.add(name)
         # Optional, but non-empty when present: "I read this cluster fine, but

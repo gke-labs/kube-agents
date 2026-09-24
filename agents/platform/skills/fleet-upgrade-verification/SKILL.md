@@ -32,8 +32,10 @@ Neither reads versions against a target.
 ```
 
 - `--project` is repeatable and, when given, is the whole scope. Without it the script takes the
-  union of `MONITORED_PROJECT_IDS` (comma-separated), `GCP_PROJECT_ID`, `GKE_PROJECT_ID` and
-  `PROJECT_ID`, and asks gcloud for its configured project only when all four are empty.
+  union of `GCP_PROJECT_ID`, `GKE_PROJECT_ID` and `PROJECT_ID` with `MONITORED_PROJECT_IDS`
+  (comma- or whitespace-separated) when set, or with every project visible to
+  `gcloud projects list` when `MONITORED_PROJECT_IDS` is unset, and asks gcloud for its configured
+  project only when none of those are set.
 - `--target-version` sets one target for every member, in the `MAJOR.MINOR.PATCH-gke.BUILD` form
   the fleet reports (`1.31.4-gke.1183000`); the `-gke.BUILD` suffix is optional and reads as build
   0 without it. Without the flag, each member is measured against its own release channel's
@@ -45,10 +47,10 @@ Neither reads versions against a target.
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
   `--at` and `--kubeconfig-dir` to the readiness check, below that.
 
-The script runs `gcloud container clusters list`, `gcloud container get-server-config` and
-`gcloud config get-value project`, each with a 60-second timeout, and with `--readiness` one
-`gcloud container clusters get-credentials` and one `kubectl get` per member. It changes nothing
-in GCP or in any cluster; the only things it writes are its own record under
+The script runs `gcloud container clusters list`, `gcloud container get-server-config`,
+`gcloud projects list` and `gcloud config get-value project`, each with a 60-second timeout, and
+with `--readiness` one `gcloud container clusters get-credentials` and one `kubectl get` per member.
+It changes nothing in GCP or in any cluster; the only things it writes are its own record under
 `/opt/data/state/fleet-upgrade-verification/`, the per-member kubeconfig files `--readiness`
 needs, and the `--output` file. A failed or timed-out read is listed under the table and sets
 exit code 1; the other projects, locations and members are still reported.

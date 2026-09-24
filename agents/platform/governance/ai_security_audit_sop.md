@@ -6,7 +6,7 @@
 
 **Scope boundary — this audit owns the _AI-specific_ security surface and nothing else.** Every check below applies only to a workload the §2 discriminator identifies as an AI workload, and every one of them asks a question no other stream asks. The generic container-hardening questions — privileged containers, host namespaces, hostPath mounts, wildcard RBAC, missing NetworkPolicy, default-ServiceAccount automounting, Workload Identity — belong to the **Security & RBAC Posture Audit** (`compliance-audit`) and are audited there on every workload including the AI ones. Do not re-report them here. Two ledgers carrying one verdict on one object is the failure mode this boundary exists to prevent: the object gets fixed once and reported as resolved twice, or gets fixed in one stream's PR and re-flagged forever by the other.
 
-**Data sources:** `kubectl` read verbs, `gcloud container clusters list|describe`, `gcloud container node-pools list|describe` (Standard clusters only; skip `node-pools` commands where `autopilot.enabled` is true), and the `gke` MCP server. **Nothing else** — no BigQuery, no Prometheus/GMP, no Policy Controller / Gatekeeper, no Security Command Center, no Model Armor or Vertex AI API calls, no external model registry, no blueprint, no kanban delegation to Cluster Agents. Every conclusion is derived from live cluster reads you performed in this run. In particular: **this audit does not evaluate the model.** Prompt-injection resistance, jailbreak susceptibility, output filtering quality, and training-data provenance are all real AI risks and none of them are visible to `kubectl`; a stream that guessed at them would publish unfalsifiable findings into a public issue. What is auditable here is the workload's _configuration_, and that is the whole remit.
+**Data sources:** `kubectl` read verbs, `gcloud container clusters list|describe`, `gcloud container node-pools list|describe` (Standard clusters only; skip `node-pools` commands where `autopilot.enabled` is true), and the `gke` MCP server. **Nothing else** — no BigQuery, no Prometheus/GMP, no Policy Controller / Gatekeeper, no Security Command Center, no Model Armor or Vertex AI API calls, no external model registry, no blueprint, no kanban delegation to Cluster Agents. Every conclusion is derived from live cluster reads you performed in this run. In particular: **this audit does not evaluate the model.** Prompt-injection resistance, jailbreak susceptibility, output filtering quality, and training-data provenance are all real AI risks and none of them are visible to `kubectl`; a stream that guessed at them would publish unfalsifiable findings into a public issue. What is auditable here is the workload's _configuration_, and that is the whole remit. Every collection command runs once per project in the resolved project scope (§1).
 
 ---
 
@@ -36,9 +36,18 @@ The helper owns every `git`/`gh` operation and renders the ledger issue body and
 
 ### 1. Enumerate the target fleet
 
+**Resolve the project scope first.** The scope is the host project (`gcloud config get-value project`) plus every project `gcloud projects list --format="value(projectId)"` returns. Run every collection command once per project, passing `--project` explicitly — the ambient default silently audits one project and reports the result as a fleet sweep. The scope is what the agent's identity can read, so an operator narrows it by narrowing the IAM grant. A listing that exits non-zero, or that returns without the host project, cannot say how many other projects exist: sweep the projects you have and add one `scope.skipped` entry, `{"cluster": "project/UNENUMERATED_PROJECTS", "reason": "<the listing's rc and stderr excerpt, or the host project it omitted>"}`, so the run publishes as partial rather than as the whole fleet. A project where the API this audit reads is disabled (`SERVICE_DISABLED`, `accessNotConfigured`, `has not been used in project`) holds nothing to audit and counts as empty, not skipped: recording it as a loss would pin every run partial for as long as the project exists.
+
 ```bash
-gcloud container clusters list --format=json
+HOST=$(gcloud config get-value project)
+LISTED=$(gcloud projects list --format="value(projectId)"); LIST_RC=$?
+PROJECTS=$(printf '%s\n' "$HOST" $LISTED | sort -u)
+for PROJECT in $PROJECTS; do
+  gcloud container clusters list --project="$PROJECT" --format=json
+done
 ```
+
+**Name every cluster `<project>/<cluster>`, always.** `scope.clusters[].name` and every `findings[].cluster` carry that qualified name. A fleet spanning projects can hold two clusters called `prod`, the finding id is derived from the cluster name, and two `prod` entries would merge into one identity and under-report the ledger. Qualify unconditionally rather than only when a collision exists today: a name that changes the day a second `prod` appears is a finding announced as fixed. A project you cannot read, for any reason but a disabled API, goes in `scope.skipped` as `{cluster: "project/<id>", reason: "..."}` and the sweep continues — one project's permission error never decides the outcome for the rest of the fleet.
 
 - Target every cluster with `status == "RUNNING"`. Record `{name, location, project, checks_run}` into `scope.clusters`.
 - **`checks_run` is mandatory on every cluster,** and each entry is an object, never a bare string:

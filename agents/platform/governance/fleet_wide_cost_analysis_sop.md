@@ -4,7 +4,7 @@
 
 **Cron:** id `fleet-wide-cost-analysis`, schedule `50 7 * * 1` (Mondays, 07:50 UTC).
 
-**Data sources:** `kubectl` read verbs (including `kubectl top`), `gcloud compute` / `gcloud container`, and the `gke` MCP server. **Nothing else.** This environment has no GCP Billing BigQuery export, no GKE Cost Allocation data, no Recommender API, and no Prometheus — so this audit observes _physical_ waste directly and reports it in **resource units** (GiB, vCPU, disk count, node count, object count). **Never state a dollar amount, a monthly saving, or a percentage saving — you have no pricing data.** Where a price would help the reviewer decide, say so in the remediation note and point at the GCP console; never invent the number. (`list_cc_pods` / `get_cc_pod_diagnostics` are scoped to `krmapihosting-system` on the Config Controller management cluster and are not used by this audit.)
+**Data sources:** `kubectl` read verbs (including `kubectl top`), `gcloud compute` / `gcloud container`, and the `gke` MCP server. **Nothing else.** This environment has no GCP Billing BigQuery export, no GKE Cost Allocation data, no Recommender API, and no Prometheus — so this audit observes _physical_ waste directly and reports it in **resource units** (GiB, vCPU, disk count, node count, object count). **Never state a dollar amount, a monthly saving, or a percentage saving — you have no pricing data.** Where a price would help the reviewer decide, say so in the remediation note and point at the GCP console; never invent the number. (`list_cc_pods` / `get_cc_pod_diagnostics` are scoped to `krmapihosting-system` on the Config Controller management cluster and are not used by this audit.) Every collection command runs once per project in the resolved project scope (§1).
 
 ---
 
@@ -39,8 +39,25 @@ There is no report branch. Do not create branches, commit, push, or call `gh` yo
 
 ### 1. Enumerate the target fleet
 
-1. `gcloud config get-value project`, then `gcloud container clusters list --project=<p> --format="json(name,location,status,autopilot.enabled,currentNodeCount)"` for every project the agent can see.
+**Resolve the project scope first.** The scope is the host project (`gcloud config get-value project`) plus every project `gcloud projects list --format="value(projectId)"` returns. Run every collection command once per project, passing `--project` explicitly — the ambient default silently audits one project and reports the result as a fleet sweep. The scope is what the agent's identity can read, so an operator narrows it by narrowing the IAM grant. A listing that exits non-zero, or that returns without the host project, cannot say how many other projects exist: sweep the projects you have and add one `scope.skipped` entry, `{"cluster": "project/UNENUMERATED_PROJECTS", "reason": "<the listing's rc and stderr excerpt, or the host project it omitted>"}`, so the run publishes as partial rather than as the whole fleet. A project where the API this audit reads is disabled (`SERVICE_DISABLED`, `accessNotConfigured`, `has not been used in project`) holds nothing to audit and counts as empty, not skipped: recording it as a loss would pin every run partial for as long as the project exists.
+
+1. List the clusters in every resolved project:
+
+   ```bash
+   HOST=$(gcloud config get-value project)
+   LISTED=$(gcloud projects list --format="value(projectId)"); LIST_RC=$?
+   PROJECTS=$(printf '%s\n' "$HOST" $LISTED | sort -u)
+   for PROJECT in $PROJECTS; do
+     gcloud container clusters list --project="$PROJECT" \
+       --format="json(name,location,status,autopilot.enabled,currentNodeCount)"
+   done
+   ```
+
+   A project whose `clusters list` fails for any reason but a disabled API is one `scope.skipped` entry, `{cluster: "project/<id>", reason: "<stderr excerpt>"}`, and the sweep carries on into the next project. One project's permission error never decides the outcome for the rest of the fleet.
+
 2. `scope.clusters` = every cluster with `status: RUNNING` that you could read. Record every cluster you could **not** read in `scope.skipped` with its status or the stderr excerpt as the reason (`"cluster STOPPING"`, `"no kubeconfig: <stderr excerpt>"`).
+
+   **Name every cluster `<project>/<cluster>`, always.** `scope.clusters[].name` and every `findings[].cluster` carry that qualified name. A fleet spanning projects can hold two clusters called `prod`, the finding id is derived from the cluster name, and two `prod` entries would merge into one identity and under-report the ledger. Qualify unconditionally rather than only when a collision exists today: a name that changes the day a second `prod` appears is a finding announced as fixed. The entry's `project` field keeps its bare project ID, and a project-scoped GCP object keeps the distinct `project/<project-id>` form of §3 — that names a project, not a cluster in one.
 
    **The one-question scope rule.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; if some checks did not run there, name them in that cluster's `limitations`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator enforces all three.
 
@@ -135,7 +152,7 @@ Identity is only as stable as those four fields, so **never** let a timestamp, a
 
 - **Command:** `gcloud compute disks list --project=<p> --filter="-users:* AND creationTimestamp<-P30D" --format="json(name,sizeGb,type,zone,region,creationTimestamp,labels,description)"`
 - **Flag when:** the disk has no `users` and `AGE ≥ 30d`. _Justification:_ PD-CSI detaches and reattaches during node upgrades, pod rescheduling, and maintenance windows; 30 days outlives a full monthly GKE maintenance cycle, so this is not churn.
-- **Attribution decides what the finding says, not whether it is emitted.** Try the `goog-k8s-cluster-name` / `goog-k8s-cluster-location` labels, a `gke-<cluster>-` name prefix, and a `kubernetes.io-created-for/pv-name` entry in the description, in that order. If one of them names a cluster you audited, set `cluster` to that cluster's real name. If none does, set `cluster` to the literal `project/<project-id>` per §3's project-scoped rule, with `object: Disk/<name>`, and say in the impact line that ownership could not be determined.
+- **Attribution decides what the finding says, not whether it is emitted.** Try the `goog-k8s-cluster-name` / `goog-k8s-cluster-location` labels, a `gke-<cluster>-` name prefix, and a `kubernetes.io-created-for/pv-name` entry in the description, in that order. If one of them names a cluster you audited, set `cluster` to that cluster's qualified `<project>/<cluster>` name per §1. If none does, set `cluster` to the literal `project/<project-id>` per §3's project-scoped rule, with `object: Disk/<name>`, and say in the impact line that ownership could not be determined.
 - **Do NOT flag:** disks whose name or handle matches a live PV's `spec.csi.volumeHandle` (claimed, just not currently attached); node boot disks for a pool that is mid-upgrade or mid-scale (`gcloud container operations list` shows an in-flight operation); disks with labels from a managed service (`goog-composer-*`, `goog-dataproc-*`, `goog-gke-node` on a live pool); disks in a project where no cluster reached `scope.clusters`.
 - **Severity:** `major` if `sizeGb ≥ 500` or the type contains `ssd`/`extreme`; else `minor`. `critical` under severity rule (b), which reaches only the attributable case — rule (b) is about a deletion recommendation, and an unattributable disk never carries one.
 - **Impact:** attributable — "3 unattached `pd-ssd` disks in `us-central1` totalling 1,500 GiB, unattached since 2026-05-30, all labelled for cluster `prod-usc1`." Unattributable — "Unattached 500 GiB `pd-ssd` disk `data-2024` in `us-central1`, unattached since 2026-05-30; no label, name prefix, or description ties it to any cluster this audit read, so its owner is unknown."

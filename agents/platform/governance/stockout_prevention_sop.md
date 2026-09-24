@@ -4,7 +4,7 @@
 
 **Cron:** id `stockout-prevention`, schedule `20 9 * * *` (daily 09:20 UTC). The id is a stable observability identifier and does not change.
 
-**Data sources:** `kubectl` read verbs, `gcloud compute ...`, `gcloud container ...`, GCP reservations API (`gcloud compute reservations list`), Spot capacity advice APIs (`gcloud beta compute advice capacity`, `gcloud beta compute advice capacity-history`), and Cloud Logging autoscaler visibility logs (`container.googleapis.com/cluster-autoscaler-visibility`). **Nothing else** — no external blueprints, no manual assumptions. Every conclusion is derived from live cluster and cloud reads you performed in this run.
+**Data sources:** `kubectl` read verbs, `gcloud compute ...`, `gcloud container ...`, GCP reservations API (`gcloud compute reservations list`), Spot capacity advice APIs (`gcloud beta compute advice capacity`, `gcloud beta compute advice capacity-history`), and Cloud Logging autoscaler visibility logs (`container.googleapis.com/cluster-autoscaler-visibility`). **Nothing else** — no external blueprints, no manual assumptions. Every conclusion is derived from live cluster and cloud reads you performed in this run. Every collection command runs once per project in the resolved project scope (§1).
 
 ---
 
@@ -34,10 +34,21 @@ The helper owns every `git`/`gh` operation and renders the ledger issue body and
 
 ### 1. Enumerate the target fleet
 
+**Resolve the project scope first.** The scope is the host project (`gcloud config get-value project`) plus every project `gcloud projects list --format="value(projectId)"` returns. Run every collection command once per project, passing `--project` explicitly — the ambient default silently audits one project and reports the result as a fleet sweep. The scope is what the agent's identity can read, so an operator narrows it by narrowing the IAM grant. A listing that exits non-zero, or that returns without the host project, cannot say how many other projects exist: sweep the projects you have and add one `scope.skipped` entry, `{"cluster": "project/UNENUMERATED_PROJECTS", "reason": "<the listing's rc and stderr excerpt, or the host project it omitted>"}`, so the run publishes as partial rather than as the whole fleet. A project where the API this audit reads is disabled (`SERVICE_DISABLED`, `accessNotConfigured`, `has not been used in project`) holds nothing to audit and counts as empty, not skipped: recording it as a loss would pin every run partial for as long as the project exists.
+
+The fan-out covers the regional and quota reads of Step 2 as much as the cluster enumeration — a quota headroom figure read from one project says nothing about the next.
+
 ```bash
-gcloud container clusters list --format=json
+HOST=$(gcloud config get-value project)
+LISTED=$(gcloud projects list --format="value(projectId)"); LIST_RC=$?
+PROJECTS=$(printf '%s\n' "$HOST" $LISTED | sort -u)
+for PROJECT in $PROJECTS; do
+  gcloud container clusters list --project="$PROJECT" --format=json
+done
 ```
 
+- A project whose `clusters list` fails for any reason but a disabled API is one `scope.skipped` entry, `{"cluster": "project/<id>", "reason": "<stderr excerpt>"}`, and the sweep carries on into the next project. One project's permission error never decides the outcome for the rest of the fleet.
+- **Name every cluster `<project>/<cluster>`, always.** `scope.clusters[].name` and every `findings[].cluster` carry that qualified name. A fleet spanning projects can hold two clusters called `prod`, the finding id is derived from the cluster name, and two `prod` entries would merge into one identity and under-report the ledger. Qualify unconditionally rather than only when a collision exists today: a name that changes the day a second `prod` appears is a finding announced as fixed. The entry's `project` field keeps its bare project ID, and `object` keeps the bare workload or ComputeClass reference it already carries.
 - Target every cluster with `status == "RUNNING"`. Record `{name, location, project, checks_run}` into `scope.clusters`.
 - Obtain per-cluster credentials into an isolated kubeconfig so clusters cannot bleed into each other:
   ```bash

@@ -4,7 +4,7 @@
 
 **Purpose:** Report whether every GKE cluster in the fleet runs a version its release channel still offers, and whether it is configured to _stay_ current on its own. This audit is **read-only and reports readiness**. It never upgrades anything: upgrading is a human decision, and the audit's job is to make that decision cheap, evidence-backed, and repeatable week over week.
 
-**Data sources:** `gcloud container ...`, read-only `kubectl`, the `gke` MCP server, and the `platform_control` MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`, `audit_log_searcher`). **Nothing else.** No BigQuery, no Prometheus, no Container Analysis or Artifact Registry vulnerability scanning, no Security Command Center, no external blueprint or CVE feed, and no delegation to Cluster Agents via kanban. **You have no vulnerability feed, so you never enumerate CVEs** — every finding here is version currency or upgrade-policy hygiene, and must be worded that way.
+**Data sources:** `gcloud container ...`, read-only `kubectl`, the `gke` MCP server, and the `platform_control` MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`, `audit_log_searcher`). **Nothing else.** No BigQuery, no Prometheus, no Container Analysis or Artifact Registry vulnerability scanning, no Security Command Center, no external blueprint or CVE feed, and no delegation to Cluster Agents via kanban. **You have no vulnerability feed, so you never enumerate CVEs** — every finding here is version currency or upgrade-policy hygiene, and must be worded that way. Every collection command runs once per project in the resolved project scope (§1).
 
 ---
 
@@ -25,12 +25,17 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
 
 ### 1. Enumerate the target fleet
 
-1. Resolve the project scope: `gcloud config get-value project`. If `gcloud projects list --format="value(projectId)"` succeeds, include every additional project where `gcloud container clusters list` returns at least one cluster.
-2. Snapshot each project once — `clusters list` returns the **full** Cluster resources, node pools included, so one call is the whole inventory:
+**Resolve the project scope first.** The scope is the host project (`gcloud config get-value project`) plus every project `gcloud projects list --format="value(projectId)"` returns. Run every collection command once per project, passing `--project` explicitly — the ambient default silently audits one project and reports the result as a fleet sweep. The scope is what the agent's identity can read, so an operator narrows it by narrowing the IAM grant. A listing that exits non-zero, or that returns without the host project, cannot say how many other projects exist: sweep the projects you have and add one `scope.skipped` entry, `{"cluster": "project/UNENUMERATED_PROJECTS", "reason": "<the listing's rc and stderr excerpt, or the host project it omitted>"}`, so the run publishes as partial rather than as the whole fleet. A project where the API this audit reads is disabled (`SERVICE_DISABLED`, `accessNotConfigured`, `has not been used in project`) holds nothing to audit and counts as empty, not skipped: recording it as a loss would pin every run partial for as long as the project exists.
+
+Then, across that scope:
+
+1. Snapshot each project once — `clusters list` returns the **full** Cluster resources, node pools included, so one call is the whole inventory:
    ```bash
    gcloud container clusters list --project=<project> --format=json
    ```
-3. Record every cluster you audit in `scope.clusters` as `{name, location, project, checks_run}`, plus an optional non-empty `limitations` string when some checks did not run or do not apply there. `scope.clusters` must be non-empty; if the fleet is genuinely empty, that is a hard failure of discovery, not a clean run — stop and report the error rather than emitting an empty scope.
+2. Record every cluster you audit in `scope.clusters` as `{name, location, project, checks_run}`, plus an optional non-empty `limitations` string when some checks did not run or do not apply there. `scope.clusters` must be non-empty; if the fleet is genuinely empty, that is a hard failure of discovery, not a clean run — stop and report the error rather than emitting an empty scope.
+
+   **Name every cluster `<project>/<cluster>`, always.** `scope.clusters[].name` and every `findings[].cluster` carry that qualified name. A fleet spanning projects can hold two clusters called `prod`, the finding id is derived from the cluster name, and two `prod` entries would merge into one identity and under-report the ledger. Qualify unconditionally rather than only when a collision exists today: a name that changes the day a second `prod` appears is a finding announced as fixed. The entry's `project` field keeps its bare project ID, and `object` keeps the bare `Cluster/<cluster>` or `NodePool/<pool>` of §2.
 
    **`checks_run` is mandatory on every cluster,** and each entry is an object, never a bare string:
 
@@ -56,12 +61,12 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
 
    Same slugs as `checks_run`, and the `reason` must say why the check _cannot_ apply here — "N/A" and "not applicable" are rejected; name the property of the cluster that rules it out. Those checks leave the denominator instead of counting as missing, so an Autopilot cluster reads as complete at six of six rather than forever-incomplete at six of ten. This matters more here than anywhere: on a fleet that is mostly Autopilot, without it every run is partial forever, `resolved` is pinned at `0`, the ledger can never close, and no stale remediation PR is ever cleaned up. Use it only for checks the cluster's shape rules out. A check you could have run and did not is a `limitations` note and a real gap, and the validator rejects a slug in both lists, a duplicate, an unknown slug, and a reason under sixteen characters.
 
-4. **One question decides the scope list.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; if some checks did not run there, name them in that cluster's `limitations`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator rejects a document whose two lists overlap, and any finding whose `cluster` names a `scope.skipped` entry.
-5. Record every cluster you could **not** read in `scope.skipped` with a specific reason. Skip, do not flag:
+3. **One question decides the scope list.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; if some checks did not run there, name them in that cluster's `limitations`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator rejects a document whose two lists overlap, and any finding whose `cluster` names a `scope.skipped` entry.
+4. Record every cluster you could **not** read in `scope.skipped` with a specific reason. Skip, do not flag:
    - `status` is `PROVISIONING`, `STOPPING`, or `ERROR` — the object is mid-flight or broken; version data is meaningless.
    - `enableKubernetesAlpha: true` — alpha clusters cannot be upgraded and auto-expire by design.
-   - A project that errors on list (permission, API disabled). Record it as `{"cluster": "<project>/*", "reason": "…"}`.
-6. Record every cluster you **could** read but could not fully check in `scope.clusters`, with the gap in its `limitations`. Autopilot (`autopilot.enabled: true`) is the standard case and is **never** skipped: Google manages those node pools, so run 3.1, 3.3, 3.4, 3.7, 3.8, 3.10 there and declare the four node-pool checks inapplicable rather than missing —
+   - A project that errors on list for any reason but a disabled Kubernetes Engine API. Record it as `{"cluster": "project/<id>", "reason": "…"}`. A disabled API means the project holds no cluster, so it is empty rather than skipped (§1).
+5. Record every cluster you **could** read but could not fully check in `scope.clusters`, with the gap in its `limitations`. Autopilot (`autopilot.enabled: true`) is the standard case and is **never** skipped: Google manages those node pools, so run 3.1, 3.3, 3.4, 3.7, 3.8, 3.10 there and declare the four node-pool checks inapplicable rather than missing —
 
    ```json
    {
@@ -114,7 +119,7 @@ Use `channels[]` (each entry: `channel`, `defaultVersion`, `validVersions[]`, an
 
 That leaves `object` carrying the whole distinction between one node pool and the next, so a per-pool finding must name the pool — `NodePool/<pool>`, not `Cluster/<cluster>`, or every pool in the cluster collapses into one finding and the harness refuses the document. A cluster-wide check names `Cluster/<cluster>`. **Never embed a version string, timestamp, date, or count in `object`**: the same problem must keep the same identity across weeks, or the new/resolved delta is worthless — and worse than worthless, because a problem that changes identity is announced as fixed.
 
-The project is deliberately not part of the identity. Two clusters sharing a name across two projects cannot be told apart by any of these fields, so the harness rejects a scope that contains both; audit those projects in separate runs.
+The project enters the identity through the cluster name, which §1 requires to be `<project>/<cluster>`. That is what lets one run span projects: two clusters both called `prod` stay distinct because their scope entries and findings name them `acme-prod/prod` and `acme-staging/prod`. A bare cluster name in either field collapses them into one identity, which is why §1 qualifies unconditionally.
 
 ### 3. Checks
 

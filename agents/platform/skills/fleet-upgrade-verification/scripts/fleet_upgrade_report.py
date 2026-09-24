@@ -46,6 +46,17 @@ MONITORED_PROJECTS_ENV = "MONITORED_PROJECT_IDS"
 PROJECT_ENV_VARS = ("GCP_PROJECT_ID", "GKE_PROJECT_ID", "PROJECT_ID")
 GCLOUD = "gcloud"
 JSON_FORMAT_FLAG = "--format=json"
+PROJECTS_LIST_CMD = (GCLOUD, "projects", "list", "--format=value(projectId)")
+# The `project` a failed or filtered `gcloud projects list` is reported under: it is
+# no one project, so `compute_progress` leaves it out of the projects that failed.
+PROJECTS_LIST_ERROR_SCOPE = "(all projects: gcloud projects list)"
+PROJECTS_LIST_ERROR_CHARS = 300
+CONFIG_PROJECT_CMD = (GCLOUD, "config", "get-value", "project")
+API_DISABLED_MARKERS = (
+    "SERVICE_DISABLED",
+    "accessNotConfigured",
+    "has not been used in project",
+)
 # A stalled API call is reported as a failed read for its project or location rather
 # than blocking the agent turn; the same budget compute_fleet_audit.py gives gcloud.
 GCLOUD_TIMEOUT_SECONDS = 60
@@ -251,24 +262,48 @@ def run_gcloud_json(cmd: list[str]) -> tuple[list | dict | None, str | None]:
         return None, f"{' '.join(cmd)} returned unparsable JSON: {e}"
 
 
-def get_target_projects(cli_projects: list[str] | None = None) -> list[str]:
-    """Resolves the projects to enumerate; --project wins, then env, then gcloud."""
+def get_target_projects(cli_projects: list[str] | None = None, listing_errors: list[str] | None = None) -> list[str]:
+    """Resolves the projects to enumerate; --project wins, then env, then gcloud.
+
+    A failed `gcloud projects list` is appended to `listing_errors` when the
+    caller passes one, so the narrowed scope reads as a failed read rather than
+    as the whole fleet. So is a listing that succeeds without naming the
+    configured project: it is filtered, not complete, as fleet_drift.py treats it.
+    """
     if cli_projects:
         return sorted(set(p.strip() for p in cli_projects if p.strip()))
 
     projects = set()
-    for p in os.environ.get(MONITORED_PROJECTS_ENV, "").split(","):
-        p = p.strip()
-        if p:
-            projects.add(p)
+    monitored = os.environ.get(MONITORED_PROJECTS_ENV, "")
+    if monitored:
+        for p in monitored.replace(",", " ").split():
+            p = p.strip()
+            if p:
+                projects.add(p)
     for env_var in PROJECT_ENV_VARS:
         val = os.environ.get(env_var, "").strip()
         if val:
             projects.add(val)
     if not projects:
-        rc, stdout, _ = run_cmd([GCLOUD, "config", "get-value", "project"])
+        rc, stdout, _ = run_cmd(list(CONFIG_PROJECT_CMD))
         if rc == 0 and stdout.strip():
             projects.add(stdout.strip())
+    if not monitored:
+        rc, stdout, stderr = run_cmd(list(PROJECTS_LIST_CMD))
+        if rc != 0 and listing_errors is not None:
+            listing_errors.append(
+                f"rc={rc}: {(stderr or '').strip()[:PROJECTS_LIST_ERROR_CHARS] or 'no stderr'}; "
+                "the scope fell back to the configured project and other projects were not read"
+            )
+        if rc == 0:
+            listed = {line.strip() for line in stdout.splitlines() if line.strip()}
+            omitted = sorted(projects - listed)
+            if omitted and listing_errors is not None:
+                listing_errors.append(
+                    f"rc=0 but did not name {', '.join(omitted)}; the listing is filtered, "
+                    "so other projects may not have been read"
+                )
+            projects |= listed
     return sorted(projects)
 
 
@@ -554,6 +589,8 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
         cmd = [GCLOUD, "container", "clusters", "list", f"--project={project}", JSON_FORMAT_FLAG]
         clusters, error = run_gcloud_json(cmd)
         if error is not None or not isinstance(clusters, list):
+            if error is not None and any(marker in error for marker in API_DISABLED_MARKERS):
+                continue
             errors.append({"project": project, "location": None, "message": error or f"{' '.join(cmd)} returned no list"})
             continue
         for cluster in clusters:
@@ -824,7 +861,11 @@ def compute_progress(report: dict, previous: dict | None, now: datetime, rollout
     """
     now_text = format_timestamp(now)
     prior_members = previous["members"] if previous else {}
-    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None}
+    failed_projects = {
+        e["project"]
+        for e in report["errors"]
+        if e.get("location") is None and e["project"] != PROJECTS_LIST_ERROR_SCOPE
+    }
     read_projects = set(report["projects"]) - failed_projects
 
     record: dict[str, dict] = {}
@@ -960,12 +1001,18 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("--at and --kubeconfig-dir need --readiness\n")
         return EXIT_USAGE
 
-    projects = get_target_projects(args.project)
+    listing_errors: list[str] = []
+    projects = get_target_projects(args.project, listing_errors)
     if not projects:
+        for error in listing_errors:
+            sys.stderr.write(f"gcloud projects list: {error}\n")
         sys.stderr.write("no project: pass --project, or set MONITORED_PROJECT_IDS or GCP_PROJECT_ID\n")
         return EXIT_USAGE
 
     report = build_report(projects, args.target_version, readiness_options)
+    report["errors"][:0] = [
+        {"project": PROJECTS_LIST_ERROR_SCOPE, "location": None, "message": error} for error in listing_errors
+    ]
     path = state_path(args.state_dir, args.target_version)
     previous, state_error = load_state(path)
     state = compute_progress(report, previous, utc_now(), args.rollout_in_progress, path)

@@ -2,7 +2,7 @@
 
 **Purpose:** A read-only, fleet-wide security sweep of every managed GKE cluster. Detects privilege-escalation surfaces, over-broad RBAC, missing network isolation, and cluster-level identity misconfiguration, then emits reproducible findings into one GitHub issue — the stream's ledger — with narrow remediation Pull Requests hung off it. Cron id `compliance-audit`, schedule `20 6 * * *` (daily 06:20 UTC).
 
-**Data sources:** `kubectl` read verbs, `gcloud container clusters|node-pools list|describe`, and the `gke` MCP server. Nothing else. There are **no external inputs** — no blueprint, no CMDB, no BigQuery, no Prometheus, no Policy Controller / Gatekeeper, no Security Command Center, no kanban delegation to Cluster Agents. Every finding comes from a command this SOP runs itself, in this run.
+**Data sources:** `kubectl` read verbs, `gcloud container clusters|node-pools list|describe`, and the `gke` MCP server. Nothing else. There are **no external inputs** — no blueprint, no CMDB, no BigQuery, no Prometheus, no Policy Controller / Gatekeeper, no Security Command Center, no kanban delegation to Cluster Agents. Every finding comes from a command this SOP runs itself, in this run. Every collection command runs once per project in the resolved project scope (§1).
 
 ---
 
@@ -28,13 +28,21 @@ If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_r
 
 ### 1. Enumerate the target fleet
 
+**Resolve the project scope first.** The scope is the host project (`gcloud config get-value project`) plus every project `gcloud projects list --format="value(projectId)"` returns. Run every collection command once per project, passing `--project` explicitly — the ambient default silently audits one project and reports the result as a fleet sweep. The scope is what the agent's identity can read, so an operator narrows it by narrowing the IAM grant. A listing that exits non-zero, or that returns without the host project, cannot say how many other projects exist: sweep the projects you have and add one `scope.skipped` entry, `{"cluster": "project/UNENUMERATED_PROJECTS", "reason": "<the listing's rc and stderr excerpt, or the host project it omitted>"}`, so the run publishes as partial rather than as the whole fleet. A project where the API this audit reads is disabled (`SERVICE_DISABLED`, `accessNotConfigured`, `has not been used in project`) holds nothing to audit and counts as empty, not skipped: recording it as a loss would pin every run partial for as long as the project exists.
+
 ```bash
-PROJECT=$(gcloud config get-value project)
-gcloud container clusters list --project="$PROJECT" \
-  --format='json(name,location,status,autopilot.enabled,currentMasterVersion)'
+HOST=$(gcloud config get-value project)
+LISTED=$(gcloud projects list --format="value(projectId)"); LIST_RC=$?
+PROJECTS=$(printf '%s\n' "$HOST" $LISTED | sort -u)
+for PROJECT in $PROJECTS; do
+  gcloud container clusters list --project="$PROJECT" \
+    --format='json(name,location,status,autopilot.enabled,currentMasterVersion)'
+done
 ```
 
-For each cluster with `status == RUNNING`, pin a per-cluster kubeconfig (local-only, mutates nothing) the way `platform_mcp_server.switch_kube_context` does — see `AGENTS.md` ("Cluster Credentials") for why the path must sit under `$HERMES_HOME` — then confirm read access:
+A project whose `clusters list` fails for any reason but a disabled API is one `scope.skipped` entry, `{"cluster": "project/<id>", "reason": "<stderr excerpt>"}`, and the sweep carries on into the next project. One project's permission error never decides the outcome for the rest of the fleet.
+
+For each cluster with `status == RUNNING`, set `PROJECT`, `C` and `L` from that cluster's own entry — the project whose `clusters list` returned it, its `name`, its `location`. Do not reuse the loop variable: after the loop `$PROJECT` holds the last project listed, and every command below would then run against it. Pin a per-cluster kubeconfig (local-only, mutates nothing) the way `platform_mcp_server.switch_kube_context` does — see `AGENTS.md` ("Cluster Credentials") for why the path must sit under `$HERMES_HOME` — then confirm read access:
 
 ```bash
 export KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_${PROJECT}_${C}_${L}.yaml"
@@ -43,6 +51,8 @@ kubectl auth can-i list pods --all-namespaces
 ```
 
 Every cluster you actually query goes in `scope.clusters` as `{name, location, project, checks_run}`. `scope.clusters` must be non-empty — if enumeration returns nothing or every cluster fails, do **not** emit an empty-scope file; stop and report the enumeration failure.
+
+**Name every cluster `<project>/<cluster>`, always.** `scope.clusters[].name` and every `findings[].cluster` carry that qualified name. A fleet spanning projects can hold two clusters called `prod`, the finding id is derived from the cluster name, and two `prod` entries would merge into one identity and under-report the ledger. Qualify unconditionally rather than only when a collision exists today: a name that changes the day a second `prod` appears is a finding announced as fixed. The entry's `project` field keeps its bare project ID, and `object` keeps the bare Kubernetes object reference it already carries.
 
 **`checks_run` is mandatory on every cluster, and it is the record of what you actually did.** Each entry is an object, never a bare string:
 
@@ -106,7 +116,7 @@ Same slugs as `checks_run`, and the `reason` has to say why the check _cannot_ a
 
 ### 2. Checks
 
-Shared setup, evaluated once per cluster. `$PRE` normalises every auditable workload to `{kind, ns, name, spec}` and applies the universal suppressions, so each workload check below is `$WL | jq -r --arg sys "$SYS" "$PRE"'| <filter>'`.
+Shared setup, evaluated once per cluster, with `PROJECT`, `C` and `L` still bound to that cluster by §1. `$PRE` normalises every auditable workload to `{kind, ns, name, spec}` and applies the universal suppressions, so each workload check below is `$WL | jq -r --arg sys "$SYS" "$PRE"'| <filter>'`.
 
 ```bash
 SYS='^(kube-system|kube-public|kube-node-lease|gke-.*|gmp-system|gmp-public|gke-gmp-system|gke-managed-.*|cnrm-system|configconnector-operator-system|krmapihosting-system|istio-system|asm-system|anthos-identity-service|config-management-.*|gatekeeper-system|composer-system)$'
