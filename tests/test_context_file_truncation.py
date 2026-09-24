@@ -23,14 +23,19 @@ These tests enforce:
    in the platform profile template.
 3. Every shipped context file (SOUL.md, AGENTS.md) across all profiles is strictly
    smaller than `context_file_max_chars`.
-4. Truncation logic preserves the full content when `context_file_max_chars` is set,
-   and demonstrably truncates when unset (sabotage verification).
+4. Truncation logic preserves full persona content when `context_file_max_chars` is read
+   from shipped configs, and truncates when the config key is removed (sabotage verification).
+5. When Hermes is available in the environment, real Hermes `_get_context_file_max_chars`
+   and `_truncate_content` honour the shipped config files and emit truncation warnings
+   only on unconfigured fallback.
 """
 
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
+import tempfile
 import unittest
 import yaml
 
@@ -47,6 +52,32 @@ HERMES_FLOOR_CHARS = 20_000
 HERMES_HEAD_RATIO = 0.70
 HERMES_TAIL_RATIO = 0.20
 MINIMUM_PINNED_CAP = 100_000
+
+
+def get_merged_platform_config() -> dict:
+    """Merge deploy/shared/defaults/config.yaml with agents/platform/config.yaml."""
+    sys.path.insert(0, str(REPO_ROOT / "deploy" / "docker"))
+    try:
+        from merge_configs import merge
+    finally:
+        sys.path.pop(0)
+
+    base = yaml.safe_load(SHARED_DEFAULTS.read_text(encoding="utf-8")) or {}
+    overlay = yaml.safe_load(PLATFORM_OVERLAY.read_text(encoding="utf-8")) or {}
+    return merge(base, overlay)
+
+
+def load_configured_cap(profile: str) -> int | None:
+    """Read context_file_max_chars from the profile's on-disk configuration."""
+    if profile == "chat":
+        doc = yaml.safe_load(CHAT_CONFIG.read_text(encoding="utf-8")) or {}
+    elif profile == "cluster":
+        doc = yaml.safe_load(CLUSTER_CONFIG.read_text(encoding="utf-8")) or {}
+    elif profile == "platform":
+        doc = get_merged_platform_config()
+    else:
+        raise ValueError(f"Unknown profile: {profile}")
+    return doc.get("context_file_max_chars")
 
 
 def simulate_hermes_truncation(content: str, max_chars: int | None = None) -> tuple[str, bool]:
@@ -87,16 +118,7 @@ class ContextFileTruncationTest(unittest.TestCase):
 
     def test_platform_merged_config_preserves_context_file_max_chars(self):
         """The Dockerfile build-time merge preserves context_file_max_chars for platform."""
-        sys.path.insert(0, str(REPO_ROOT / "deploy" / "docker"))
-        try:
-            from merge_configs import merge
-        finally:
-            sys.path.pop(0)
-
-        base = yaml.safe_load(SHARED_DEFAULTS.read_text(encoding="utf-8")) or {}
-        overlay = yaml.safe_load(PLATFORM_OVERLAY.read_text(encoding="utf-8")) or {}
-        merged = merge(base, overlay)
-
+        merged = get_merged_platform_config()
         val = merged.get("context_file_max_chars")
         self.assertIsNotNone(
             val,
@@ -128,7 +150,7 @@ class ContextFileTruncationTest(unittest.TestCase):
                 )
 
     def test_sabotage_proof_pre_fix_behavior_truncates_souls(self):
-        """Prove that without the pin (pre-fix code), both shipped SOULs are truncated."""
+        """Prove that configs on disk prevent truncation, and revert causes truncation."""
         chat_soul = (REPO_ROOT / "agents" / "chat" / "SOUL.md").read_text(encoding="utf-8")
         plat_soul = (REPO_ROOT / "agents" / "platform" / "SOUL.md").read_text(encoding="utf-8")
 
@@ -136,21 +158,77 @@ class ContextFileTruncationTest(unittest.TestCase):
         self.assertGreater(len(chat_soul), HERMES_FLOOR_CHARS)
         self.assertGreater(len(plat_soul), HERMES_FLOOR_CHARS)
 
-        # Unset / default limit triggers truncation
+        # Unset / default limit (pre-fix) triggers truncation
         _, chat_truncated = simulate_hermes_truncation(chat_soul, max_chars=None)
         _, plat_truncated = simulate_hermes_truncation(plat_soul, max_chars=None)
-
         self.assertTrue(chat_truncated, "chat SOUL.md must truncate under pre-fix floor")
         self.assertTrue(plat_truncated, "platform SOUL.md must truncate under pre-fix floor")
 
-        # With pinned limit (post-fix), neither truncates
-        res_chat, chat_trunc_pinned = simulate_hermes_truncation(chat_soul, max_chars=MINIMUM_PINNED_CAP)
-        res_plat, plat_trunc_pinned = simulate_hermes_truncation(plat_soul, max_chars=MINIMUM_PINNED_CAP)
+        # Read actual configured caps from shipped profile configs on disk
+        chat_cap = load_configured_cap("chat")
+        plat_cap = load_configured_cap("platform")
 
-        self.assertFalse(chat_trunc_pinned)
-        self.assertFalse(plat_trunc_pinned)
+        self.assertIsNotNone(chat_cap, "chat config must declare context_file_max_chars")
+        self.assertIsNotNone(plat_cap, "platform config must declare context_file_max_chars")
+
+        # With the on-disk config applied, neither truncates
+        res_chat, chat_trunc_pinned = simulate_hermes_truncation(chat_soul, max_chars=chat_cap)
+        res_plat, plat_trunc_pinned = simulate_hermes_truncation(plat_soul, max_chars=plat_cap)
+
+        self.assertFalse(chat_trunc_pinned, "chat SOUL.md must not truncate with configured cap")
+        self.assertFalse(plat_trunc_pinned, "platform SOUL.md must not truncate with configured cap")
         self.assertEqual(res_chat, chat_soul)
         self.assertEqual(res_plat, plat_soul)
+
+    def test_hermes_prompt_builder_honours_shipped_configs(self):
+        """If Hermes is available, assert real prompt_builder honours context_file_max_chars."""
+        try:
+            import agent.prompt_builder as pb
+        except ImportError:
+            raise unittest.SkipTest("Hermes agent.prompt_builder not available in environment")
+
+        chat_soul = (REPO_ROOT / "agents" / "chat" / "SOUL.md").read_text(encoding="utf-8")
+        orig_hermes_home = os.environ.get("HERMES_HOME")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = pathlib.Path(tmp)
+
+            # 1. Configured state (post-fix): context_file_max_chars: 100000
+            shipped_chat = yaml.safe_load(CHAT_CONFIG.read_text(encoding="utf-8")) or {}
+            (tmp_dir / "config.yaml").write_text(yaml.safe_dump(shipped_chat), encoding="utf-8")
+            os.environ["HERMES_HOME"] = str(tmp_dir)
+
+            cap = pb._get_context_file_max_chars()
+            self.assertEqual(cap, 100_000)
+
+            pb.drain_truncation_warnings()
+            result = pb._truncate_content(chat_soul, "SOUL.md")
+            warnings = pb.drain_truncation_warnings()
+
+            self.assertEqual(result, chat_soul, "Hermes must not truncate when cap is pinned")
+            self.assertEqual(len(warnings), 0, "No truncation warnings should be emitted")
+
+            # 2. Unconfigured state (pre-fix / reverted sabotage): context_file_max_chars removed
+            reverted_chat = dict(shipped_chat)
+            reverted_chat.pop("context_file_max_chars", None)
+            (tmp_dir / "config.yaml").write_text(yaml.safe_dump(reverted_chat), encoding="utf-8")
+
+            cap_reverted = pb._get_context_file_max_chars()
+            self.assertEqual(cap_reverted, HERMES_FLOOR_CHARS)
+
+            pb.drain_truncation_warnings()
+            result_reverted = pb._truncate_content(chat_soul, "SOUL.md")
+            warnings_reverted = pb.drain_truncation_warnings()
+
+            self.assertNotEqual(result_reverted, chat_soul, "Hermes must truncate under 20k floor")
+            self.assertIn("[...truncated SOUL.md", result_reverted)
+            self.assertEqual(len(warnings_reverted), 1, "Must emit exactly 1 truncation warning")
+            self.assertIn("TRUNCATED", warnings_reverted[0])
+
+        if orig_hermes_home is not None:
+            os.environ["HERMES_HOME"] = orig_hermes_home
+        else:
+            os.environ.pop("HERMES_HOME", None)
 
 
 if __name__ == "__main__":

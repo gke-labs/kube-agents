@@ -1663,6 +1663,9 @@ cfg = load_config_readonly(); \
 caps = ToolCallGuardrailConfig.from_mapping(cfg.get('tool_loop_guardrails', {})).loop_caps; \
 assert caps.max_web_searches == 200, 'per-card web_search budget lost: %r' % caps.max_web_searches; \
 assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.max_subagents; \
+from agent.prompt_builder import _get_context_file_max_chars; \
+assert _get_context_file_max_chars() == 100000, 'hermes context_file_max_chars not honoured: %r' % _get_context_file_max_chars(); \
+assert cfg.get('context_file_max_chars') == 100000, 'context_file_max_chars lost: %r' % cfg.get('context_file_max_chars'); \
 assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     rm -rf /tmp/platform-config
