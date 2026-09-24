@@ -24,6 +24,7 @@ import {
   type SubjectInfo,
   type TaskState,
 } from "./protocol.ts";
+import type { ConsoleOutFrame } from "./console.ts";
 
 /** The rail tap for this browser. Not an agent; it reports the websocket. */
 export const WEB_SESSION = "you";
@@ -33,6 +34,12 @@ export const GATEWAY_SESSION = "gateway";
 export const IDLE_MS = 60_000;
 /** The rail only ever animates a recent window of traffic. */
 export const MAX_PULSES = 200;
+/** A sent turn with no submission on TASKS after this long gets a note. */
+export const PENDING_STALE_MS = 30_000;
+/** Local lines (command output) share one correlation group. */
+export const LOCAL_CORRELATION = "local";
+const STALE_NOTE =
+  "no submission on the bus 30s after sending. The gateway may be down or may have dropped the turn - its notice, if any, is below";
 
 export type AgentStatus = "active" | "idle" | "done" | "closed";
 
@@ -148,7 +155,13 @@ export type ChatKind =
   | "status"
   | "topic"
   | "cancel"
-  | "anomaly";
+  | "anomaly"
+  /** Sent from this page, not yet seen on TASKS. */
+  | "pending"
+  /** A frame the gateway posted on this conversation's `.out` subject. */
+  | "notice"
+  /** Produced by the page itself: command output, a send that never left. */
+  | "local";
 
 export interface ChatEntry {
   id: string;
@@ -157,6 +170,8 @@ export interface ChatEntry {
   text: string;
   correlationId: string;
   taskId?: string;
+  /** A sentence about the entry's delivery, shown under it. */
+  note?: string;
 }
 
 export interface Pulse {
@@ -174,6 +189,60 @@ export interface ProbeResult {
   outcome: ProbeOutcome;
   detail: string;
   at: number;
+}
+
+/** One CONSUMER.INFO answer for a durable the page knows a session by. */
+export interface LivenessReport {
+  session: string;
+  durable: string;
+  stream: string;
+  /** The consumer exists only while its worker runs a task. */
+  perTask: boolean;
+  found: boolean;
+  /** Pull requests outstanding: a process is waiting on the consumer right now. */
+  waiting: number;
+  pending: number;
+  /** ms, the consumer's last delivery. */
+  lastActive?: number;
+  /** Set when the lookup itself failed (not for not-found). */
+  error?: string;
+  checkedAt: number;
+}
+
+export interface StreamStat {
+  bytes: number;
+  /** -1 or 0 means unlimited. */
+  maxBytes: number;
+  msgs: number;
+  consumers: number;
+  /** -1 or 0 means unlimited. */
+  maxConsumers: number;
+  /** ms, the oldest retained message. */
+  firstTs?: number;
+  /** 0 means no age limit. */
+  maxAgeMs: number;
+}
+
+export interface StreamStatView {
+  stat: StreamStat | null;
+  error?: string;
+  at: number;
+}
+
+export interface StreamAttachView {
+  /** null while attached. */
+  error: string | null;
+  /** ms, when the current state (attached, or failing) began. */
+  since: number;
+}
+
+export interface PendingTurn {
+  messageId: string;
+  /** Trimmed, exactly as sent - the gateway's submission carries it verbatim. */
+  text: string;
+  conversation: string;
+  at: number;
+  stale: boolean;
 }
 
 export interface UiState {
@@ -195,6 +264,11 @@ export interface UiState {
   topics: Map<string, TopicView>;
   /** The last tick's wall clock, ms. Zero until the first tick. */
   now: number;
+  liveness: Map<string, LivenessReport>;
+  streamStats: Map<string, StreamStatView>;
+  streamAttach: Map<string, StreamAttachView>;
+  pending: PendingTurn[];
+  localSeq: number;
 }
 
 export type BusEvent =
@@ -203,7 +277,15 @@ export type BusEvent =
   | { type: "tick"; now: number }
   | { type: "connection"; state: ConnectionState }
   | { type: "streams"; up: number; total: number }
-  | { type: "probe"; result: ProbeResult };
+  | { type: "probe"; result: ProbeResult }
+  | { type: "liveness"; report: LivenessReport }
+  | { type: "streamStat"; name: string; stat: StreamStat | null; error?: string; at: number }
+  | { type: "streamAttach"; stream: string; error: string | null; at: number }
+  | { type: "consoleSent"; messageId: string; text: string; conversation: string; at: number }
+  | { type: "sendFailed"; messageId: string; error: string }
+  | { type: "notice"; frame: ConsoleOutFrame; conversation: string; at: number }
+  | { type: "local"; text: string; at: number }
+  | { type: "clear" };
 
 export const initialState: UiState = {
   agents: new Map(),
@@ -219,6 +301,11 @@ export const initialState: UiState = {
   conversations: new Map(),
   topics: new Map(),
   now: 0,
+  liveness: new Map(),
+  streamStats: new Map(),
+  streamAttach: new Map(),
+  pending: [],
+  localSeq: 0,
 };
 
 /**
@@ -344,7 +431,13 @@ function appendChunk(
   return merged;
 }
 
-function reduceMessage(next: UiState, state: UiState, env: Envelope, subject: SubjectInfo): void {
+function reduceMessage(
+  next: UiState,
+  state: UiState,
+  env: Envelope,
+  subject: SubjectInfo,
+  live: boolean,
+): void {
   const payload = env.payload as Message;
   const text = partsText(payload.parts);
   const known = state.tasks.get(env.taskId ?? "");
@@ -361,13 +454,36 @@ function reduceMessage(next: UiState, state: UiState, env: Envelope, subject: Su
       ? { backend: authority.backend, conversation: authority.conversation, askAt: tsMs(env) }
       : undefined,
   );
-  next.chat = pushChat(state, env, {
+  const entry: Omit<ChatEntry, "id"> = {
     kind: isSubmission ? "user" : "steer",
     session: env.from.session,
     text,
     correlationId: env.correlationId,
     taskId: env.taskId,
-  });
+  };
+  // A turn this page sent attaches in place: same id, now carrying the
+  // task's correlation. Only live traffic can match - anything replayed was
+  // on the stream before this page connected, so before anything it sent.
+  // FIFO within a conversation, so two identical texts attach in order.
+  const match =
+    live && authority.conversation !== undefined
+      ? state.pending.findIndex((p) => p.conversation === authority.conversation && p.text === text)
+      : -1;
+  if (match >= 0) {
+    const turn = state.pending[match];
+    next.pending = state.pending.filter((_, i) => i !== match);
+    const id = `pending:${turn.messageId}`;
+    const at = state.chat.findIndex((c) => c.id === id);
+    if (at >= 0) {
+      const chat = [...state.chat];
+      chat[at] = { id, ...entry };
+      next.chat = chat;
+    } else {
+      next.chat = pushChat(state, env, entry);
+    }
+  } else {
+    next.chat = pushChat(state, env, entry);
+  }
 
   if (authority.conversation !== undefined) {
     const prev = state.conversations.get(authority.conversation);
@@ -570,7 +686,7 @@ function reduceEnvelope(
 
   switch (env.kind) {
     case "message":
-      reduceMessage(next, touched, env, subject);
+      reduceMessage(next, touched, env, subject, live);
       break;
 
     case "status-update":
@@ -656,6 +772,27 @@ function reduceEnvelope(
   return next;
 }
 
+function withEntry(chat: ChatEntry[], id: string, patch: Partial<ChatEntry>): ChatEntry[] {
+  const at = chat.findIndex((c) => c.id === id);
+  if (at < 0) return chat;
+  const next = [...chat];
+  next[at] = { ...chat[at], ...patch };
+  return next;
+}
+
+/** Marks pending turns that have waited too long. Returns null if none changed. */
+function staleTurns(state: UiState, now: number): Pick<UiState, "pending" | "chat"> | null {
+  let chat = state.chat;
+  let changed = false;
+  const pending = state.pending.map((p) => {
+    if (p.stale || now - p.at <= PENDING_STALE_MS) return p;
+    changed = true;
+    chat = withEntry(chat, `pending:${p.messageId}`, { note: STALE_NOTE });
+    return { ...p, stale: true };
+  });
+  return changed ? { pending, chat } : null;
+}
+
 export function reduce(state: UiState, event: BusEvent): UiState {
   switch (event.type) {
     case "envelope":
@@ -672,7 +809,12 @@ export function reduce(state: UiState, event: BusEvent): UiState {
         agents ??= new Map(state.agents);
         agents.set(session, { ...agent, status: want });
       }
-      return { ...state, now: event.now, ...(agents ? { agents } : {}) };
+      return {
+        ...state,
+        now: event.now,
+        ...(agents ? { agents } : {}),
+        ...(staleTurns(state, event.now) ?? {}),
+      };
     }
 
     case "connection":
@@ -685,5 +827,94 @@ export function reduce(state: UiState, event: BusEvent): UiState {
 
     case "probe":
       return { ...state, probe: event.result };
+
+    case "liveness": {
+      const liveness = new Map(state.liveness);
+      liveness.set(event.report.session, event.report);
+      return { ...state, liveness };
+    }
+
+    case "streamStat": {
+      const streamStats = new Map(state.streamStats);
+      streamStats.set(event.name, { stat: event.stat, error: event.error, at: event.at });
+      return { ...state, streamStats };
+    }
+
+    case "streamAttach": {
+      const prev = state.streamAttach.get(event.stream);
+      // While failing, keep when the failure started, so the panel can say
+      // "not attached since 12:04" rather than restarting the clock every retry.
+      const since =
+        event.error !== null && prev !== undefined && prev.error !== null ? prev.since : event.at;
+      const streamAttach = new Map(state.streamAttach);
+      streamAttach.set(event.stream, { error: event.error, since });
+      return { ...state, streamAttach };
+    }
+
+    case "consoleSent": {
+      const id = `pending:${event.messageId}`;
+      return {
+        ...state,
+        pending: [
+          ...state.pending,
+          {
+            messageId: event.messageId,
+            text: event.text,
+            conversation: event.conversation,
+            at: event.at,
+            stale: false,
+          },
+        ],
+        chat: [...state.chat, { id, kind: "pending", text: event.text, correlationId: id }],
+      };
+    }
+
+    case "sendFailed":
+      return {
+        ...state,
+        pending: state.pending.filter((p) => p.messageId !== event.messageId),
+        chat: withEntry(state.chat, `pending:${event.messageId}`, {
+          kind: "local",
+          note: `not sent: ${event.error}`,
+        }),
+      };
+
+    case "notice": {
+      const id = `notice:${event.frame.messageId}`;
+      if (state.chat.some((c) => c.id === id)) {
+        return { ...state, chat: withEntry(state.chat, id, { text: event.frame.text }) };
+      }
+      return {
+        ...state,
+        chat: [
+          ...state.chat,
+          {
+            id,
+            kind: "notice",
+            session: GATEWAY_SESSION,
+            text: event.frame.text,
+            correlationId: event.conversation,
+          },
+        ],
+      };
+    }
+
+    case "local":
+      return {
+        ...state,
+        localSeq: state.localSeq + 1,
+        chat: [
+          ...state.chat,
+          {
+            id: `local:${state.localSeq}`,
+            kind: "local",
+            text: event.text,
+            correlationId: LOCAL_CORRELATION,
+          },
+        ],
+      };
+
+    case "clear":
+      return { ...state, chat: [], pending: [] };
   }
 }

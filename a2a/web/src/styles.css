@@ -437,6 +437,26 @@ body {
   letter-spacing: 0.02em;
 }
 
+.chat-pending .chat-text {
+  color: var(--ink-dim);
+  font-style: italic;
+}
+
+.chat-notice {
+  color: var(--ink-dim);
+}
+
+.chat-local {
+  color: var(--ghost);
+}
+
+.chat-note {
+  display: block;
+  margin-top: 2px;
+  color: var(--warn);
+  font-size: 11px;
+}
+
 /* The progress glyph is the one full-colour emoji on the page; drain it. */
 .chat-progress > .chat-glyph {
   filter: grayscale(1);

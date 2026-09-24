@@ -4,6 +4,7 @@ import { parseSubject } from "./protocol.ts";
 import {
   GATEWAY_SESSION,
   IDLE_MS,
+  PENDING_STALE_MS,
   durationMs,
   initialState,
   queueMs,
@@ -663,5 +664,179 @@ describe("types, conversations and topics", () => {
 
   it("a tick records the clock", () => {
     expect(reduce(initialState, { type: "tick", now: 1234 }).now).toBe(1234);
+  });
+});
+
+const SENT_AT = Date.parse("2026-08-31T11:59:59Z");
+
+function sent(state: UiState, messageId: string, text: string, conversation = "console:abc"): UiState {
+  return reduce(state, { type: "consoleSent", messageId, text, conversation, at: SENT_AT });
+}
+
+function consoleTurn(
+  state: UiState,
+  taskId: string,
+  text: string,
+  opts: { live?: boolean; conversation?: string } = {},
+): UiState {
+  return onSubject(
+    state,
+    `a2a.tasks.platform.${taskId}.in`,
+    env({
+      kind: "message",
+      taskId,
+      contextId: "ctx",
+      correlationId: `corr-${taskId}`,
+      authority: {
+        ...consoleAuthority,
+        audience: { ...consoleAuthority.audience, conversation: opts.conversation ?? "console:abc" },
+      },
+      payload: { role: "user", parts: [{ text }] },
+    }),
+    opts.live ?? true,
+  );
+}
+
+describe("pending console turns", () => {
+  it("shows a sent turn at once, then attaches it in place to the gateway's submission", () => {
+    let state = sent(initialState, "m-1", "is acme-prod ready?");
+    expect(state.chat).toEqual([
+      {
+        id: "pending:m-1",
+        kind: "pending",
+        text: "is acme-prod ready?",
+        correlationId: "pending:m-1",
+      },
+    ]);
+    state = consoleTurn(state, "task-1", "is acme-prod ready?");
+    expect(state.chat).toHaveLength(1);
+    expect(state.chat[0]).toMatchObject({
+      id: "pending:m-1",
+      kind: "user",
+      session: GATEWAY_SESSION,
+      text: "is acme-prod ready?",
+      correlationId: "corr-task-1",
+      taskId: "task-1",
+    });
+    expect(state.pending).toEqual([]);
+    expect(state.tasks.get("task-1")?.backend).toBe("console");
+  });
+
+  it("does not attach replayed history or another conversation's turn", () => {
+    let state = sent(initialState, "m-1", "hi");
+    state = consoleTurn(state, "task-1", "hi", { live: false });
+    state = consoleTurn(state, "task-2", "hi", { conversation: "console:other" });
+    expect(state.pending).toHaveLength(1);
+    expect(state.chat.map((c) => c.kind)).toEqual(["pending", "user", "user"]);
+  });
+
+  it("attaches two identical texts in the order they were sent", () => {
+    let state = sent(initialState, "m-1", "status?");
+    state = sent(state, "m-2", "status?");
+    state = consoleTurn(state, "task-1", "status?");
+    state = consoleTurn(state, "task-2", "status?");
+    expect(state.chat.map((c) => [c.id, c.taskId])).toEqual([
+      ["pending:m-1", "task-1"],
+      ["pending:m-2", "task-2"],
+    ]);
+    expect(state.pending).toEqual([]);
+  });
+
+  it("attaches a follow-up on a running task as a steer", () => {
+    let state = consoleTurn(initialState, "task-1", "first");
+    state = sent(state, "m-2", "also check staging");
+    state = consoleTurn(state, "task-1", "also check staging");
+    expect(state.chat[1]).toMatchObject({ id: "pending:m-2", kind: "steer", taskId: "task-1" });
+  });
+
+  it("notes a turn with no submission after 30s, and a late submission still attaches", () => {
+    let state = sent(initialState, "m-1", "hello?");
+    state = reduce(state, { type: "tick", now: SENT_AT + PENDING_STALE_MS - 1 });
+    expect(state.chat[0].note).toBeUndefined();
+    state = reduce(state, { type: "tick", now: SENT_AT + PENDING_STALE_MS + 1 });
+    expect(state.chat[0].note).toMatch(/no submission on the bus 30s after sending/);
+    expect(state.pending[0].stale).toBe(true);
+    // A second tick does not rewrite the entry again.
+    const again = reduce(state, { type: "tick", now: SENT_AT + PENDING_STALE_MS + 5_000 });
+    expect(again.chat[0]).toBe(state.chat[0]);
+    state = consoleTurn(again, "task-1", "hello?");
+    expect(state.chat[0]).toMatchObject({ kind: "user", taskId: "task-1" });
+    expect(state.chat[0].note).toBeUndefined();
+  });
+
+  it("says a send failed, and never attaches it later", () => {
+    let state = sent(initialState, "m-1", "hi");
+    state = reduce(state, { type: "sendFailed", messageId: "m-1", error: "Permissions Violation" });
+    expect(state.chat[0]).toMatchObject({ kind: "local", text: "hi", note: "not sent: Permissions Violation" });
+    expect(state.pending).toEqual([]);
+    state = consoleTurn(state, "task-1", "hi");
+    expect(state.chat).toHaveLength(2);
+  });
+});
+
+describe("console notices and local lines", () => {
+  it("renders a notice as a gateway line and replaces it on edit", () => {
+    let state = reduce(initialState, {
+      type: "notice",
+      frame: { messageId: "c-1", text: "⏳ submitted…", edit: false },
+      conversation: "console:abc",
+      at: 1,
+    });
+    expect(state.chat[0]).toEqual({
+      id: "notice:c-1",
+      kind: "notice",
+      session: GATEWAY_SESSION,
+      text: "⏳ submitted…",
+      correlationId: "console:abc",
+    });
+    state = reduce(state, {
+      type: "notice",
+      frame: { messageId: "c-1", text: "⚙️ working", edit: true },
+      conversation: "console:abc",
+      at: 2,
+    });
+    expect(state.chat).toHaveLength(1);
+    expect(state.chat[0].text).toBe("⚙️ working");
+  });
+
+  it("gives local lines unique ids, and clear empties the transcript and pending turns", () => {
+    let state = reduce(initialState, { type: "local", text: "one", at: 1 });
+    state = reduce(state, { type: "local", text: "two", at: 2 });
+    expect(state.chat.map((c) => c.id)).toEqual(["local:0", "local:1"]);
+    state = sent(state, "m-1", "hi");
+    state = reduce(state, { type: "clear" });
+    expect(state.chat).toEqual([]);
+    expect(state.pending).toEqual([]);
+    state = reduce(state, { type: "local", text: "three", at: 3 });
+    expect(state.chat[0].id).toBe("local:2");
+  });
+});
+
+describe("poller events", () => {
+  it("keeps the first failure time while a stream stays unattached", () => {
+    let state = reduce(initialState, { type: "streamAttach", stream: "TASKS", error: "not found", at: 10 });
+    state = reduce(state, { type: "streamAttach", stream: "TASKS", error: "timeout", at: 20 });
+    expect(state.streamAttach.get("TASKS")).toEqual({ error: "timeout", since: 10 });
+    state = reduce(state, { type: "streamAttach", stream: "TASKS", error: null, at: 30 });
+    expect(state.streamAttach.get("TASKS")).toEqual({ error: null, since: 30 });
+  });
+
+  it("stores liveness reports by session and stream stats by name", () => {
+    let state = reduce(initialState, {
+      type: "liveness",
+      report: {
+        session: "gateway",
+        durable: "gateway-relay",
+        stream: "TASKS",
+        perTask: false,
+        found: true,
+        waiting: 1,
+        pending: 0,
+        checkedAt: 5,
+      },
+    });
+    expect(state.liveness.get("gateway")?.waiting).toBe(1);
+    state = reduce(state, { type: "streamStat", name: "TASKS", stat: null, error: "denied", at: 6 });
+    expect(state.streamStats.get("TASKS")).toEqual({ stat: null, error: "denied", at: 6 });
   });
 });

@@ -34,6 +34,9 @@ const GLYPH: Record<ChatEntry["kind"], string> = {
   topic: "⊙",
   cancel: "✕",
   anomaly: "⚠",
+  pending: "ask>",
+  notice: "gw",
+  local: "›",
 };
 
 function probeText(probe: ProbeResult): string {
@@ -85,6 +88,7 @@ export default function Chat({ entries, user, probe, probePending, onProbe }: Ch
           {(entry.kind === "progress" || entry.kind === "topic" || entry.kind === "anomaly") &&
             entry.session && <span className="chat-session">[{entry.session}]</span>}
           <span className="chat-text">{entry.text}</span>
+          {entry.note && <span className="chat-note">{entry.note}</span>}
         </div>
       </div>
     );
