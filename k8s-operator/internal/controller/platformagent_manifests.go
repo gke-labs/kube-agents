@@ -1076,7 +1076,10 @@ var frontDoorPlugins = []string{
 // block to the platform profile; nothing renders them for the default profile, whose
 // copy is the image's. TestFrontDoorKanbanMatchesChatConfig fails the build when the two
 // drift, and the note beside each key in that file is the reasoning for its value.
-const kanbanDispatchIntervalSeconds = 5
+const (
+	kanbanDispatchIntervalSeconds     = 5
+	kanbanDispatchStaleTimeoutSeconds = 1800
+)
 
 var kanbanWakeOnEvents = []string{"gave_up", "crashed", "timed_out", "blocked"}
 
@@ -1110,11 +1113,12 @@ func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
 // quietly having no effect at all.
 func frontDoorKanban(agent *agentv1alpha1.PlatformAgent) map[string]any {
 	return map[string]any{
-		"dispatch_in_gateway":       true,
-		"auto_subscribe_on_create":  true,
-		"dispatch_interval_seconds": kanbanDispatchIntervalSeconds,
-		"wake_on_events":            slices.Clone(kanbanWakeOnEvents),
-		"max_in_progress":           resolveKanbanMaxInProgress(agent),
+		"dispatch_in_gateway":            true,
+		"auto_subscribe_on_create":       true,
+		"dispatch_interval_seconds":      kanbanDispatchIntervalSeconds,
+		"dispatch_stale_timeout_seconds": kanbanDispatchStaleTimeoutSeconds,
+		"wake_on_events":                 slices.Clone(kanbanWakeOnEvents),
+		"max_in_progress":                resolveKanbanMaxInProgress(agent),
 	}
 }
 
@@ -3916,7 +3920,14 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// script arms or prints, so an arbitrary value reaches nothing but that
 	// one message and its own failure report.
 	allowed := map[string]struct{}{
-		"ALERT_DAILY_LIMIT_CRITICAL":  {},
+		"ALERT_DAILY_LIMIT_CRITICAL": {},
+		// Not a severity, unlike its three neighbours: the drift detector's
+		// records display as Warning and bill a bucket of their own, so
+		// `alert_quota` is keyed on "GitOpsDrift" and this is the variable that
+		// tunes it (DRIFT_QUOTA_KEY in session_kv_server.py). It earns the same
+		// place here for the same reason the others do — it bounds a count of
+		// chat messages and reaches nothing else.
+		"ALERT_DAILY_LIMIT_DRIFT":     {},
 		"ALERT_DAILY_LIMIT_INFO":      {},
 		"ALERT_DAILY_LIMIT_WARNING":   {},
 		"EOD_EXCLUDE_NAMESPACES":      {},

@@ -150,8 +150,12 @@ incident rather than forty.
 **A new domain supplies:** an adapter that detects its signal, filters its own noise, and emits the
 inject envelope with its own `kind`.
 
-> **Honest state:** the envelope is still k8s-shaped — `reason`, `namespace`, `kind_of_object`, `name`,
-> `message`. Generalizing it is part of the work of landing the second source, not a box already ticked.
+> **Honest state:** the event envelope is still k8s-shaped — `reason`, `namespace`, `kind_of_object`,
+> `name`, `message`. The second source did not generalize it; it landed alongside it. The drift
+> detector sends its own `kind: gitops-drift` envelope with its own fields, and the inject route
+> dispatches on `kind` rather than reconciling the two. So the pattern a third domain now follows is
+> "add a kind and a branch", which works and does not scale — a shared envelope is still owed, and is
+> now a refactor of two producers rather than a design decision about one.
 
 ---
 
@@ -320,8 +324,11 @@ Platform Agent `SOUL.md` §7, which the prompt template above mirrors.
 **So a new domain supplies two things: a skill and a judgment prompt.** The skill is _how to investigate_;
 the prompt is _what to decide and how to say it_.
 
-> **Honest state:** `_build_agent_query()` is hardcoded k8s-event-shaped, so today a second domain means
-> a second query builder. Making it pluggable is the same piece of work as generalizing the envelope.
+> **Honest state:** this is what the second domain actually cost. `_build_agent_query()` is hardcoded
+> k8s-event-shaped, so drift got a second query builder and a second card body rather than a plugged-in
+> prompt, dispatched on `kind` at the top of the function. Making it pluggable is still the same piece
+> of work as generalizing the envelope, and there are now two implementations to fold in rather than
+> one to parameterize.
 
 ---
 
@@ -422,6 +429,12 @@ optional enrichment, never a prerequisite. It has a full design doc and a comple
 `managedFields` gives field-level ownership, the audit log gives the principal, and the two-signal join
 separates a human out-of-band change from CI and from controller churn (~99% noise reduction with two
 static filters).
+
+The adapter is now built end to end — ingestion, classification, the `managedFields` join across
+every cluster the Platform Agent has onboarded, and the inject itself — and the daemon routes the
+kind to its own chat alert and its own triage card. It stays a candidate rather than going live for
+one reason: no image builds or launches the detector, so an operator runs it by hand and no
+installation detects drift on its own. What the domain is waiting on is deployment, not design.
 
 **Obtainability governance — the same two contracts.** A completely different domain, engineered
 independently, arrived at the same shape. It also closes the quota and capacity gap that previously

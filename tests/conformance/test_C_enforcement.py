@@ -1499,6 +1499,10 @@ class C3UntrustedByDefault(unittest.TestCase):
         self.assertLessEqual(len(sanitize("A" * 4096)), 64)
 
 
+# A Dockerfile `RUN` wrapped over several lines is one command; join it
+# before reading, or a flag on the second line is invisible.
+_CONTINUATION_RE = re.compile(r"\\\s*\n\s*")
+
 class C4ProvenanceOfExecutableContent(unittest.TestCase):
     """C4: skills, plugins, actions and images are pinned, signed and owned."""
 
@@ -1559,6 +1563,39 @@ class C4ProvenanceOfExecutableContent(unittest.TestCase):
         """
         self.assertRegex(h.text("tags_env"), r"HERMES_AGENT_TAG=\S+@sha256:[0-9a-f]{64}")
         self.assertIn("${HERMES_AGENT_TAG}", h.text("dockerfile"))
+
+    def test_C4_every_hermes_plugin_install_is_pinned_to_a_commit(self) -> None:
+        """A plugin installed from a third-party default branch is unpinned
+        upstream content executed inside the agent process.
+
+        `hermes plugins install <spec>` with no `--ref` resolves against
+        whatever that repository's default branch holds at build time, so the
+        image changes without a commit here and the build can break on a
+        morning nobody touched it. Asserted so that dropping the ref back to a
+        floating branch is a red test rather than a diff nobody reads.
+
+        Deliberately tolerant about spelling: the ref may sit before or after
+        the plugin spec, may be `--ref X` or `--ref=X`, and may be a variable
+        so long as an `ARG` in the same file binds it to a full SHA. What it
+        will not accept is a branch, a tag, or nothing -- the three things
+        that leave the build reading a moving target.
+        """
+        dockerfile = _CONTINUATION_RE.sub(" ", h.text("dockerfile"))
+        args = dict(re.findall(r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)=(\S+)", dockerfile, re.M))
+        installs = re.findall(r"hermes\s+plugins\s+install\s+(.*?)(?:&&|;|$)", dockerfile, re.M)
+        self.assertTrue(installs, "no `hermes plugins install` found; this test is vacuous")
+        for command in installs:
+            ref = re.search(r"--ref[=\s]+(\S+)", command)
+            self.assertIsNotNone(ref, f"`hermes plugins install{command}` carries no --ref")
+            value = ref.group(1).strip("\"'")
+            var = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", value)
+            if var:
+                value = args.get(var.group(1), "").strip("\"'")
+            self.assertRegex(
+                value,
+                r"(?i)^[0-9a-f]{40}$",
+                f"`hermes plugins install{command}` is not pinned to a full commit SHA",
+            )
 
     def test_C4_precondition_the_chart_still_names_images(self) -> None:
         self.assertIn("repository:", h.text("chart_values"))

@@ -5,7 +5,7 @@ NOT WIRED YET, in the same sense as the evalcand_ helpers in common.sh: no
 workflow in this repository runs this script, and the paragraph below describes
 where it is going rather than what runs tonight. Tonight the nightly still
 pushes staging_ straight off a green matrix, and the eval still fires on that
-tag. The pull request that changes nightly-pipeline.yml is what joins the pieces
+tag. The pull request that changes staging-promotion-pipeline.yml is what joins the pieces
 up. Everything after this paragraph is true of the script itself and can be
 relied on now.
 

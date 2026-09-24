@@ -416,8 +416,10 @@ _REP_RESULT_BY_VERDICT = {"pass": "pass", "infra": "infra"}
 # The final verdict line's word, as runs[].eval_verdict records it (the
 # release record's GREEN/RED vocabulary). The run gets None when the log has
 # no such line: the job ended before its verdict -- Prow's deadline (SIGTERM;
-# hack/ci-eval-pr.sh's EXIT trap prints no banner), a death before the
-# cases, or step 0's revalidation, which is a SUCCESS.
+# hack/ci-eval-pr.sh's EXIT trap prints `Eval ended before its verdict: N of
+# M cases graded ...`, which carries neither anchor word on purpose, so the
+# night reads as truncated with its graded cases counted), a death before
+# the cases, or step 0's revalidation, which is a SUCCESS.
 _EVAL_VERDICT_BY_WORD = {"Succeeded": "GREEN", "Failed": "RED"}
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Renders step 1 of the nightly pipeline into the job summary: which candidate
+# Renders step 1 of the staging promotion pipeline into the job summary: which candidate
 # the run picked, and whether a green matrix will move staging.
 #
 # The two skips it reports are different things, and conflating them is the
@@ -24,7 +24,7 @@ SKIP_PROMOTION="${SKIP_PROMOTION:-}"
 SKIP_REASON="${SKIP_REASON:-}"
 
 render_summary() {
-  echo "### Nightly candidate"
+  echo "### Promotion candidate"
   echo ""
   if [ "${SKIP_PIPELINE}" = "true" ]; then
     echo "No matrix this run: ${SKIP_REASON}"

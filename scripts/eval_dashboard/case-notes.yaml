@@ -21,7 +21,8 @@ notes:
   agent-kanban-smoke:
     note: redesigned 08-27
   capacity-pinned-pool-probe:
-    issues: ["#1010"]
+    # #1010 closed 09-04; the residual misses since #1626 are these two shapes.
+    issues: ["#1840", "#1874"]
   cluster-agent-stalled-controller-healthy-silence:
     note: new case, earning its record
   compliance-rbac-overgrant:

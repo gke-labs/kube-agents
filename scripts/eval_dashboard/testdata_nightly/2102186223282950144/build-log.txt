@@ -1,0 +1,112 @@
+=== [2026-09-22T00:01:15Z] Leasing GCP Project from Boskos ===
+✓ Successfully leased project: kube-agents-evals-27
+=== [2026-09-22T00:18:17Z] Running PR Smoke Test Evaluation for PR #local in Namespace: kubeagents-system ===
+boskos-heartbeat: started for kube-agents-evals-27 (owner ci-kube-agents-eval-nightly-2102186223282950144, every 30s, detail: /logs/artifacts/boskos-heartbeat.log)
+--- [PROFILE 2026-09-22T00:19:00Z] step: task fan-out: 123 units, parallelism=6 ---
+>>> [2026-09-22T00:19:00Z] launching ai-security-planted-model-audit rep 1/3
+Ledger token (ai-security-planted-model-audit rep 1): minted from App 4739812, installation 157029058, expires 2026-09-22T01:19:00Z
+>>> [2026-09-22T00:19:05Z] launching pdb-remediation-pr rep 1/3
+Ledger token (pdb-remediation-pr rep 1): minted from App 4739812, installation 157029058, expires 2026-09-22T01:19:05Z
+>>> [2026-09-22T00:19:10Z] launching obtainability-planted-pdb rep 1/3
+Ledger token (obtainability-planted-pdb rep 1): minted from App 4739812, installation 157029058, expires 2026-09-22T01:19:10Z
+>>> [2026-09-22T00:19:15Z] launching stockout-pinned-pool rep 1/3
+Ledger token (stockout-pinned-pool rep 1): minted from App 4739812, installation 157029058, expires 2026-09-22T01:19:15Z
+heartbeat sent for resource "kube-agents-evals-27"
+>>> [2026-09-22T00:19:20Z] launching upgrade-readiness-lagging-cluster rep 1/3
+Ledger token (upgrade-readiness-lagging-cluster rep 1): minted from App 4739812, installation 157029058, expires 2026-09-22T01:19:20Z
+>>> [2026-09-22T00:19:25Z] launching consistency-drift-outlier rep 1/3
+Ledger token (consistency-drift-outlier rep 1): minted from App 4739812, installation 157029058, expires 2026-09-22T01:19:25Z
+heartbeat sent for resource "kube-agents-evals-27"
+heartbeat sent for resource "kube-agents-evals-27"
+heartbeat sent for resource "kube-agents-evals-27"
+heartbeat sent for resource "kube-agents-evals-27"
+heartbeat sent for resource "kube-agents-evals-27"
+heartbeat sent for resource "kube-agents-evals-27"
+<<< [2026-09-22T06:26:08Z] finished autoops-crashloop-config-triage rep 3 in 1048s
+>>> [2026-09-22T06:26:08Z] launching capacity-pinned-pool-probe rep 3/3
+Ledger token (capacity-pinned-pool-probe rep 3): minted from App 4739812, installation 157029058, expires 2026-09-22T07:26:09Z
+<<< [2026-09-22T06:37:23Z] finished rca-remediation-pr rep 3 in 2182s
+>>> [2026-09-22T06:37:24Z] Grading Task: rca-remediation-pr (./tasks/rca-remediation-pr/task.yaml) x3 <<<
+    ── devops-bench phase breakdown for rca-remediation-pr rep 1 ──
+    no phase markers found in the log; cannot split the run
+Task rca-remediation-pr Result: [PASSED] passed all 2 repetitions
+  deployer: noop
+  rep 1: infra -- the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+heartbeat sent for resource "kube-agents-evals-27"
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: collecting: 5/6 runs recorded at this key across 2 recorded run(s), 14 more needed before this case can collapse
+  recorded rca-remediation-pr: 2/2 -> gs://kube-agents-evals-bench/evidence/rca-remediation-pr/gemini-3-1-pro-preview-kubeagents-mcp/gemini-3.1-pro-preview/v1-f1-v1/2026-09-22T06-38-19Z-2102186223282950144.jsonl (+1 infra)
+>>> [2026-09-22T06:37:24Z] launching consistency-authorized-networks-probe rep 3/3
+Ledger token (consistency-authorized-networks-probe rep 3): minted from App 4739812, installation 157029058, expires 2026-09-22T07:37:24Z
+<<< [2026-09-22T06:44:11Z] finished fleet-cost-idle-pool rep 3 in 2595s
+>>> [2026-09-22T07:42:53Z] launching cost-idle-pool-probe rep 3/3
+Ledger token (cost-idle-pool-probe rep 3): minted from App 4739812, installation 157029058, expires 2026-09-22T08:42:53Z
+<<< [2026-09-22T07:43:47Z] finished upgrades-fleet-version-table rep 3 in 270s
+>>> [2026-09-22T07:43:49Z] launching security-overgrant-remediation-proposal rep 3/3
+Ledger token (security-overgrant-remediation-proposal rep 3): minted from App 4739812, installation 157029058, expires 2026-09-22T08:43:49Z
+<<< [2026-09-22T07:45:31Z] finished upgrades-fleet-readiness-exclusion rep 3 in 262s
+>>> [2026-09-22T07:45:33Z] launching obtainability-pdb-semantics rep 3/3
+Ledger token (obtainability-pdb-semantics rep 3): minted from App 4739812, installation 157029058, expires 2026-09-22T08:45:34Z
+<<< [2026-09-22T07:45:37Z] finished upgrades-fleet-rollout-stall rep 3 in 370s
+>>> [2026-09-22T07:45:38Z] launching obtainability-fleet-exposure-sweep rep 3/3
+Ledger token (obtainability-fleet-exposure-sweep rep 3): minted from App 4739812, installation 157029058, expires 2026-09-22T08:45:39Z
+{"component":"entrypoint","file":"sigs.k8s.io/prow/pkg/entrypoint/run.go:169","func":"sigs.k8s.io/prow/pkg/entrypoint.Options.ExecuteProcess","level":"error","message":"Process did not finish before 8h0m0s timeout","severity":"error","time":"2026-09-22T08:00:37Z"}
+=== [2026-09-22T08:00:37Z] Running CI Teardown ===
+Installed helm v3.21.4 (amd64) to /tmp/kube-agents-helm-v3.21.4-amd64
+=== Target Cluster Context ===
+Project:   kube-agents-evals-27
+Cluster:   platform-agent-host
+Location:  us-central1
+Namespace: kubeagents-system
+
+=== Step timing profile (exit code 143) ===
+  start(s)     dur(s)       %  step
+       0.0        0.1    0.0%  bootstrap: source ci-env.sh
+       0.1        6.7    0.0%  cluster-auth: gcloud get-credentials
+       6.8       19.7    0.1%  fleet-kubeconfigs: seeded-fleet credentials
+      26.4       16.5    0.1%  config: env, platform-agent token fetch, prereqs
+      42.9    27699.1   99.8%  task fan-out: 123 units, parallelism=6
+              27742.0  100.0%  TOTAL
+=== [2026-09-22T08:00:41Z] Eval ended before its verdict: 1 of 41 cases graded, 1 recorded to the baseline store; partial table in /logs/artifacts/eval-verdict.md ===
+⚠️ Script failed (exit code 143). Dumping diagnostics and logs to Prow artifacts (/logs/artifacts)...
+Fetching cluster endpoint and auth data.
+kubeconfig entry generated for platform-agent-host.
+=== [2026-09-22T08:00:42Z] Cleaning Up GKE Resources ===
+=== [2026-09-22T08:00:42Z] Step 1: Uninstalling the kube-agents release ===
+=== [2026-09-22T08:01:30Z] Cleanup Complete (Total Duration: 48s) ===
+=== [2026-09-22T08:01:30Z] Releasing Boskos Project: kube-agents-evals-27 ===
+released resource "kube-agents-evals-27"
+boskos-heartbeat: stopping for kube-agents-evals-27: 2 beats sent, 0 failed (detail: /logs/artifacts/boskos-heartbeat.log)
+<<< [2026-09-22T08:02:33Z] finished cluster-agent-crashloop-fix-request rep 3 in 1223s
+<<< [2026-09-22T08:02:46Z] finished security-overgrant-remediation-proposal rep 3 in 1136s
+>>> [2026-09-22T08:02:47Z] Grading Task: security-overgrant-remediation-proposal (./tasks/security-overgrant-remediation-proposal/task.yaml) x3 <<<
+Task security-overgrant-remediation-proposal Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  admission: collecting: 5/6 runs recorded at this key across 2 recorded run(s), 14 more needed before this case can collapse
+  recorded security-overgrant-remediation-proposal: 3/3 -> gs://kube-agents-evals-bench/evidence/security-overgrant-remediation-proposal/gemini-3-1-pro-preview-kubeagents-mcp/gemini-3.1-pro-preview/v1-f1-v1/2026-09-22T08-03-05Z-2102186223282950144.jsonl
+<<< [2026-09-22T08:03:11Z] finished obtainability-pdb-semantics rep 3 in 1056s
+>>> [2026-09-22T08:03:12Z] Grading Task: obtainability-pdb-semantics (./tasks/obtainability-pdb-semantics/task.yaml) x3 <<<
+Task obtainability-pdb-semantics Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: collecting: 5/6 runs recorded at this key across 2 recorded run(s), 14 more needed before this case can collapse
+  recorded obtainability-pdb-semantics: 3/3 -> gs://kube-agents-evals-bench/evidence/obtainability-pdb-semantics/gemini-3-1-pro-preview-kubeagents-mcp/gemini-3.1-pro-preview/v1-f1-v1/2026-09-22T08-03-27Z-2102186223282950144.jsonl
+<<< [2026-09-22T08:03:27Z] finished upgrades-api-deprecation-clean-repo rep 3 in 1333s
+<<< [2026-09-22T08:03:32Z] finished obtainability-fleet-exposure-sweep rep 3 in 1073s
+<<< [2026-09-22T08:03:38Z] finished cost-idle-pool-probe rep 3 in 1244s
+>>> [2026-09-22T08:03:39Z] Grading Task: cost-idle-pool-probe (./tasks/cost-idle-pool-probe/task.yaml) x3 <<<
+Task cost-idle-pool-probe Result: [UNSTABLE] passed 2 of 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.6 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.7 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- the-probe-names-the-idle-pool: required phrases absent from the report: ['idle-batch-pool'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 3 report: > 🔀 Delegated to the **platform** agent I've started this as task `t_5b539fcd`. The answer will post into this thread as soon as it's ready. > ⚠️ **Task Update:** Task `t_5b539fcd` (Audit fleet node pools for zero non-DaemonSet workloads) encountered a blocker on the **platform** agent. The agent a…
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge); the record cannot judge it yet: collecting: 6/6 runs recorded at this key across 2 recorded run(s), 14 more needed before this case can collapse
+  recorded cost-idle-pool-probe: 2/3 -> gs://kube-agents-evals-bench/evidence/cost-idle-pool-probe/gemini-3-1-pro-preview-kubeagents-mcp/gemini-3.1-pro-preview/v1-f1-v1/2026-09-22T08-03-55Z-2102186223282950144.jsonl
+{"component":"entrypoint","file":"sigs.k8s.io/prow/pkg/entrypoint/run.go:264","func":"sigs.k8s.io/prow/pkg/entrypoint.gracefullyTerminate","level":"error","message":"Process gracefully exited before 5m0s grace period","severity":"error","time":"2026-09-22T08:03:38Z"}
