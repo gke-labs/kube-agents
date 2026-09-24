@@ -606,9 +606,9 @@ config_is_pristine_upstream_example() {
 # Fill the keys an image template declares and the live config.yaml does not, at any
 # depth, and change nothing the file already says. $1 = the template, $2 = the live file.
 #
-# A function because two profiles need it: the default profile immediately below, and —
-# when the front-door flag makes the gateway write to it — the platform profile at step
-# 2.6b. One copy so the two cannot drift, and one heredoc so the tests can go on lifting
+# A function because three profiles need it: the default profile immediately below,
+# cluster profiles at step 2.6, and — when the front-door flag makes the gateway write
+# to it — the platform profile at step 2.6b. One copy so the two cannot drift, and one heredoc so the tests can go on lifting
 # this program out by its marker and running it against real files.
 #
 # The caller reports its own failure: which file the fill was for is the whole of what a
