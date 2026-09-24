@@ -598,6 +598,20 @@ class DeadlineKills(unittest.TestCase):
         later = T0 + timedelta(hours=3)
         self.assertEqual(adjudicate(doc, later, prev)["state"], "OUTAGE")
 
+    def test_the_first_kill_is_kept_while_the_window_slides(self):
+        # The rule's 2-hour window slides, so window_start is the oldest kill
+        # still inside it; the comment and the issue date the whole outage
+        # from its first kill, which the incident keeps across ticks.
+        doc = self.kills([1, 1, 2])
+        prev = adjudicate(doc, T0)
+        first = prev["incident"]["first_kill"]
+        self.assertEqual(first, prev["incident"]["window_start"])
+        later = T0 + timedelta(hours=3)
+        doc["runs"] += [kill(200 + i, 60 + i, later - timedelta(minutes=5 * i)) for i in range(3)]
+        result = adjudicate(doc, later, prev)
+        self.assertEqual((result["state"], result["incident"]["first_kill"]), ("OUTAGE", first))
+        self.assertGreater(result["incident"]["window_start"], first)
+
     def test_not_evaluated_reds_are_not_verdicts_and_do_not_recover_it(self):
         # NOT EVALUATED records eval_verdict RED with no graded repetition
         # (SCHEMA.md): the delegation-ceiling shape when the suite finishes
@@ -1871,6 +1885,8 @@ class DeadlineKillsReplay(unittest.TestCase):
         tick = self.tick(day("09-23", 6, 0))
         self.assertEqual((tick["state"], tick["condition"], tick["recovering"]), ("OUTAGE", "deadline_kill", True))
         self.assertIn("waiting for 3 consecutive runs with a verdict on distinct PRs", " ".join(tick["evidence"]))
+        # Ten hours in, the incident still dates from the outage's first kill.
+        self.assertTrue(tick["incident"]["first_kill"].startswith("2026-09-22T18:49"), tick["incident"])
 
 
 class LostPodsReplay(unittest.TestCase):

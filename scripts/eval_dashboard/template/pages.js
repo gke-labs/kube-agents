@@ -841,7 +841,11 @@ function runsListHtml(inWindow, inc, title) {
     const held = heldOutFailures(run).length;
     const chips = failed.map((c) => `<span class="chip ${cases.has(c) ? "hit" : "miss"}">${esc(c)}</span>`).join("");
     let note = "";
-    if (run.setup_death) note = '<span class="chip inf">died in setup</span>';
+    // A deadline kill's row says so, cases recorded or not: the chips alone
+    // would read "no cases recorded" or, for a #1875 kill whose recorded
+    // cases all passed, "all gate cases passed".
+    if (run.cls === "deadline-kill") note = `<span class="chip inf">killed at the deadline${measured(run) ? `, ${plural((run.cases || []).length, "case")} recorded first` : ""}</span>`;
+    else if (run.setup_death) note = '<span class="chip inf">died in setup</span>';
     else if (!measured(run)) note = `<span class="chip inf">${run.result === "ABORTED" ? "aborted" : "no cases recorded"}</span>`;
     // A run whose every recorded case went ungraded (a storm, or every
     // worker at the delegation ceiling) passed nothing; the chips say why.
@@ -1024,6 +1028,7 @@ function bannerHtml(run) {
   else if (h.condition === "storm") text = `<b>Quota storm ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs lose repetitions to 429s and empty records. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "setup_deaths") text = `<b>Setup failures ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs die before any case runs. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "lost_pods") text = `<b>Build nodes lost ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs died with the node under them; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
+  else if (h.condition === "deadline_kill" && h.recovering) text = `<b>Deadline-kill outage recovering ${when}</b>: runs are reaching verdicts again, so a kill now may be the branch. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "deadline_kill") text = `<b>Runs killed at the deadline ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs reach the job timeout with no verdict, so nothing can pass; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "delegation_ceiling") text = `<b>Workers not finishing ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: repetitions end at the harness's delegation wait with the card still running; those runs read not evaluated, not red. <a href="${esc(href)}">Read the brief →</a>`;
   else text = `<b>Gate ${h.recovering ? "recovering" : "outage"} ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: ${cases.length ? `<code>${cases.map(esc).join("</code>, <code>")}</code> fail${cases.length === 1 ? "s" : ""} on every PR` : esc(h.cause || "a shared break")}. <a href="${esc(href)}">Read the brief →</a>`;

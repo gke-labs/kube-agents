@@ -328,9 +328,13 @@ def killed(build, pr, finished, minutes=363, **fields):
     return raw
 
 
-def deadline_health(prs=(1826, 1838, 1877), recovering=False):
+def deadline_health(prs=(1826, 1838, 1877), recovering=False, first_kill=None):
     # `since` is the tick that declared the state, after the third kill; the
-    # first kill is the incident's window_start, 55 minutes earlier.
+    # first kill is the incident's window_start, 55 minutes earlier -- or,
+    # once the window has slid, the `first_kill` health.py keeps.
+    incident = {"prs": list(prs), "runs": len(prs), "window_start": "2026-09-08T14:05:52+00:00", "window_end": "2026-09-08T14:50:00+00:00"}
+    if first_kill:
+        incident["first_kill"] = first_kill
     return {
         "state": "OUTAGE",
         "condition": "deadline_kill",
@@ -338,7 +342,7 @@ def deadline_health(prs=(1826, 1838, 1877), recovering=False):
         "recovering": recovering,
         "failing_cases": [],
         "tracking_issues": [],
-        "incident": {"prs": list(prs), "runs": len(prs), "window_start": "2026-09-08T14:05:52+00:00", "window_end": "2026-09-08T14:50:00+00:00"},
+        "incident": incident,
     }
 
 
@@ -409,6 +413,33 @@ class DeadlineKillComment(Harness):
         self.assertIn("> 🔴 **Gate outage in progress** since Tue 10:05 AM ET. 3 runs on 3 PRs were killed at the 360-minute deadline", body)
         self.assertNotIn("fail on every PR", body)
         self.assertIn("[Incident brief →]", body)
+
+    def test_a_red_that_is_its_own_still_gets_the_outage_box_not_a_degraded_one(self):
+        # No failure classed the gate's, so the case sentences are the PR's;
+        # the state sentence is still the outage's, not "degraded".
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=(TRIO[0],))
+        self.tick(data(mine, *green_others()), deadline_health())
+        body = self.gh.bodies()[0]
+        self.assertIn("> 🔴 **Gate outage in progress** since Tue 10:05 AM ET. 3 runs on 3 PRs were killed at the 360-minute deadline", body)
+        self.assertNotIn("Gate degraded", body)
+        self.assertIn("This looks specific to your PR", body)
+
+    def test_a_red_during_the_recovering_hold_is_told_a_retest_is_reasonable(self):
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO)
+        self.tick(data(mine, *other_runs()), deadline_health(recovering=True))
+        body = self.gh.bodies()[0]
+        self.assertIn("> 🟡 **Gate recovering** from a deadline-kill outage that began Tue 10:05 AM ET: runs are reaching verdicts again", body)
+        self.assertIn("so this red is likely the gate's.** A retest is reasonable now.", body)
+        self.assertNotIn("Don't retest yet", body)
+        self.assertNotIn("nothing is being graded", body)
+        self.assertNotIn("outage in progress", body)
+
+    def test_the_box_dates_the_outage_from_its_first_kill_once_the_window_has_slid(self):
+        mine = killed(100, 1300, NOW - timedelta(minutes=5))
+        self.tick(data(mine, *green_others()), deadline_health(first_kill="2026-09-08T12:00:00+00:00"))
+        body = self.gh.bodies()[0]
+        self.assertIn("killed at the deadline since Tue 8:00 AM ET", body)
+        self.assertNotIn("10:05 AM", body)
 
     def test_a_long_red_with_a_verdict_is_not_a_kill(self):
         # Ran just as long, but graded: the ordinary red comment, not this one.

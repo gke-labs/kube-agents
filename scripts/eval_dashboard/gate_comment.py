@@ -130,7 +130,11 @@ HEADING_HARD = "### ❌ Smoke gate: failed · hard failure"
 BOX_OUTAGE = "🔴 **Gate outage in progress** since {since}. {what} fail on every PR ({prs} PRs so far)."
 # An OUTAGE that is not a shared break (deadline kills, #1894) names no
 # failing case; post_health's sentence for the condition says what it is.
+# It is the state's sentence whatever this run's failures are classed, and
+# during the recovering hold it must not say nothing is being graded.
 BOX_OUTAGE_OTHER = "🔴 **Gate outage in progress** since {since}. {cause}"
+BOX_RECOVERING_OTHER = "🟡 **Gate recovering** from a deadline-kill outage that began {since}: runs are reaching verdicts again, and GREEN follows 3 of them on distinct PRs."
+ALL_THEIRS_RECOVERING = "**Your {n} {failures} {are} exactly {those}, so this red is likely the gate's.** A retest is reasonable now."
 BOX_DEGRADED = "🟡 **Gate degraded** since {since}. {cause}"
 BOX_HEALTHY = "🟢 **Gate healthy.**"
 ALL_THEIRS = "**Your {n} {failures} {are} exactly {those}, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
@@ -345,18 +349,22 @@ def health_box(red: Red, health_doc: dict, runs: list[dict]) -> str:
     theirs, yours, unclear = red.theirs(), red.yours(), red.unclear()
     n = len(red.failed)
     sentences = []
+    incident_doc = health_doc.get("incident") or {}
+    recovering = bool(health_doc.get("recovering"))
+    other_outage = incident and state == health.OUTAGE and health_doc.get("condition") != health.SHARED_BREAK
+    if other_outage:
+        # Dated from the outage's first kill, as the deadline comment is.
+        start = post_health.parse_iso(incident_doc.get("first_kill") or incident_doc.get("window_start")) or since
+        sentences.append((BOX_RECOVERING_OTHER if recovering else BOX_OUTAGE_OTHER).format(since=post_health.clock(start, weekday=True), cause=post_health.cause_sentence(health_doc)))
     if incident and theirs:
         if state == health.OUTAGE and health_doc.get("condition") == health.SHARED_BREAK:
-            prs = len((health_doc.get("incident") or {}).get("prs") or [])
+            prs = len(incident_doc.get("prs") or [])
             sentences.append(BOX_OUTAGE.format(since=post_health.clock(since, weekday=True), what=capitalize(post_health.describe_cases(health_doc.get("failing_cases"))), prs=prs))
-        elif state == health.OUTAGE:
-            # Dated from the first kill, as the deadline comment is.
-            start = post_health.parse_iso((health_doc.get("incident") or {}).get("window_start")) or since
-            sentences.append(BOX_OUTAGE_OTHER.format(since=post_health.clock(start, weekday=True), cause=post_health.cause_sentence(health_doc)))
-        else:
+        elif not other_outage:
             sentences.append(BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=post_health.cause_sentence(health_doc)))
         if not yours and not unclear:
-            sentences.append(ALL_THEIRS.format(n=n, failures=plural(n, "failure"), are=plural(n, "is", "are"), those=f"those {n}" if n > 1 else "that one"))
+            theirs_all = ALL_THEIRS_RECOVERING if other_outage and recovering else ALL_THEIRS
+            sentences.append(theirs_all.format(n=n, failures=plural(n, "failure"), are=plural(n, "is", "are"), those=f"those {n}" if n > 1 else "that one"))
         else:
             yours_text = []
             if yours:
@@ -374,7 +382,8 @@ def health_box(red: Red, health_doc: dict, runs: list[dict]) -> str:
                 )
             )
     else:
-        sentences.append(BOX_HEALTHY if not incident else BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=post_health.cause_sentence(health_doc)))
+        if not other_outage:
+            sentences.append(BOX_HEALTHY if not incident else BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=post_health.cause_sentence(health_doc)))
         for case in theirs:
             sentences.append(SHARED_NO_INCIDENT.format(case=code(case["case"]), also=also_text(case.get("also_failing_prs"))))
         for case in yours:
@@ -426,9 +435,10 @@ def render_deadline_comment(run: health.Run, health_doc: dict) -> str:
     on = health_doc.get("condition") == health.DEADLINE_KILL and health_doc.get("state") != health.GREEN
     recovering = on and bool(health_doc.get("recovering"))
     down = on and not recovering
-    # The first kill, as the Chat sentence and the issue title date it; the
-    # document's `since` is the tick that declared the state, after the third.
-    since = post_health.clock(post_health.parse_iso(incident.get("window_start") or health_doc.get("since")), weekday=True)
+    # The outage's first kill (health.py keeps it across ticks as the window
+    # slides), as the issue title dates it; the document's `since` is the
+    # tick that declared the state, after the third kill.
+    since = post_health.clock(post_health.parse_iso(incident.get("first_kill") or incident.get("window_start") or health_doc.get("since")), weekday=True)
     counts = dict(runs=incident.get("runs", 0), prs=len(incident.get("prs") or []), since=since)
     tail = BOX_DEADLINE_DOWN.format(**counts) if down else BOX_DEADLINE_RECOVERING.format(**counts) if recovering else BOX_DEADLINE_QUIET
     links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]

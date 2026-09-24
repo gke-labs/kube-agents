@@ -273,9 +273,9 @@ def render_deadline_kill_body(health: dict, since_text: str, window_text: str, b
     return DEADLINE_KILL_BODY.format(
         job=JOB_NAME,
         since=since_text,
-        # The same instant as `since_text`: the first kill, not the tick that
-        # declared the state after the third.
-        since_iso=incident.get("window_start") or health.get("since") or "?",
+        # The same instant as `since_text`: the outage's first kill, not the
+        # tick that declared the state after the third.
+        since_iso=incident.get("first_kill") or incident.get("window_start") or health.get("since") or "?",
         runs=incident.get("runs", 0),
         prs=len(prs),
         minutes=DEADLINE_MINUTES,

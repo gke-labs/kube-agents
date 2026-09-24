@@ -820,8 +820,10 @@ ended at the harness's delegation wait with the worker still running, #1874)
 the `incident` also carries `reps`, and the pages give it the storm's 2-hour
 lead, a Brief headline and a run-page banner of its own. `deadline_kill` (3+ runs on 2+ PRs in 2 hours that concluded `FAILURE`
 with `eval_verdict` `null` after running to the job's 360-minute deadline,
-#1894) is an OUTAGE with the storm's incident keys; the pages give it a
-Brief headline and a run-page banner of its own. `issue` (`{number, url}`) may carry `condition`, the one it was
+#1894) is an OUTAGE with the storm's incident keys plus `first_kill` — the
+outage's first kill, kept across ticks while `window_start` slides with the
+rule's 2-hour window, for the surfaces that date the whole episode; the pages
+give it a Brief headline and a run-page banner of its own. `issue` (`{number, url}`) may carry `condition`, the one it was
 filed for. `fixture_drift` (the hourly seeded-fleet scan found a fixture
 role out of its designed state; docs/ci-health.md, "The seeded-fleet scan")
 carries `roles`, `projects` and `drift` in its `incident` and a

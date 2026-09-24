@@ -104,8 +104,9 @@ names the cases, the pull requests, and the tracking issue when
 runs on 2+ pull requests among those finishing in the last 2 hours concluded
 `FAILURE` with no eval verdict after running to within 15 minutes of the
 presubmit's 360-minute Prow timeout (the job's `timeout` in `oss-test-infra`'s
-`kube-agents-presubmits.yaml`; `health.py` owns the copy, and the three
-message modules' copies are pinned to it by tests), and were neither
+`kube-agents-presubmits.yaml`; `health.py` owns the copy, `post_health.py`
+imports it, and the copies in `classify.py` and `gate_issue.py` are pinned to
+it by tests), and were neither
 lost pods nor conflicted merges. Nothing was graded, so nothing can pass; a
 killed run that recorded some cases before Prow stopped it still counts, and
 its run page and comment read as the kill's, with the finished cases listed.
@@ -372,8 +373,11 @@ a lost pod and a deadline kill.
 
 An ordinary red that reaches a verdict during a deadline-kill OUTAGE gets the
 outage box with the kills' sentence ("N runs on M PRs were killed at the
-360-minute deadline …"), not the shared break's "fail on every PR", since no
-case is failing everywhere.
+360-minute deadline …") whatever its failures are classed — the shared break's
+"fail on every PR" needs failing cases, and this condition names none — dated
+from the outage's first kill. During the hold the box says the gate is
+recovering and runs are reaching verdicts again, and a red whose failures are
+all the gate's is told a retest is reasonable rather than "don't retest yet".
 
 Which class a case gets — `shared`, `only-this-pr`, `storm`, unexplained — is
 `scripts/eval_dashboard/classify.py`'s `classify_run`, the same rules the
@@ -426,7 +430,9 @@ whether or not some cases finished first: the same one-line shape under `⚪
 Smoke gate: run killed at the deadline`, saying when it was killed and that no
 verdict was reached. While `health.json`'s condition is `deadline_kill` the box
 says the gate is down — "N runs on M PRs have been killed at the deadline since
-⟨time⟩; your run's failure is not your diff" — with the brief link, and asks
+⟨time⟩; your run's failure is not your diff" (the time is the outage's first
+kill, which `health.json`'s `incident.first_kill` keeps as the rule's 2-hour
+window slides) — with the brief link, and asks
 the author not to retest yet. During the hold that follows the outage
 (`recovering`) it says instead that the outage is recovering and this kill
 holds it back, and that with other pull requests' runs finishing it may be the

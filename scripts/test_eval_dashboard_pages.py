@@ -633,6 +633,10 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Why we think it's the gate, not the PRs", app)
         # Both kills count, the one with cases too (the Brief reads the run-level cls).
         self.assertIn("<b>2 runs</b> on 2 PRs ran to the job deadline and ended with no verdict", app)
+        # The run list marks both kills; the one with a recorded case does not
+        # read "all gate cases passed".
+        self.assertEqual(app.count("killed at the deadline"), 2, app.count("killed at the deadline"))
+        self.assertIn("killed at the deadline, 1 case recorded first", app)
         run_page = dom_text(out / "run.html", query="build=2097282860221206599")
         self.assertIn("Prow killed this run at its 360-minute deadline", run_page)
         self.assertIn("Runs killed at the deadline", run_page)
@@ -677,6 +681,11 @@ class BrowserTest(unittest.TestCase):
         out = render_to(pathlib.Path(self.tmp.name) / "deadline-recovering-2", dict(data, runs=data["runs"] + [late, *after, nulled, not_evaluated]), health=recovering)
         app = dom_text(out / "index.html")
         self.assertIn("2 of 3 runs with a verdict on distinct PRs so far", app)
+        # The banner on a kill's page during the hold agrees with its lede.
+        late_page = dom_text(out / "run.html", query="build=2097282860221206603")
+        self.assertIn("Deadline-kill outage recovering", late_page)
+        self.assertIn("this kill holds it back", late_page)
+        self.assertNotIn("nothing about the branch", late_page)
 
     def test_a_run_of_ceiling_hits_is_not_a_pass_in_the_brief_and_counts_in_the_storms_totals(self):
         """A run whose every case ended at the ceiling passed nothing, so its row

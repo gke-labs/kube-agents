@@ -1934,6 +1934,13 @@ def adjudicate(
     # the previous tick's numbers: the assessment's incident describes the
     # raw state, not the one being reported.
     incident = assessed["incident"] if decided["state"] == assessed["state"] else (prev or {}).get("incident")
+    if decided["condition"] == DEADLINE_KILL and decided["state"] != GREEN and isinstance(incident, dict):
+        # The rule's window slides, so `window_start` is the oldest kill still
+        # inside it; the outage's first kill is kept across ticks for the
+        # surfaces that date the whole episode (the comment, the issue).
+        previous = (prev or {}).get("incident") if (prev or {}).get("condition") == DEADLINE_KILL and (prev or {}).get("state") != GREEN else None
+        starts = [s for s in ((previous or {}).get("first_kill"), (previous or {}).get("window_start"), incident.get("window_start")) if s]
+        incident = dict(incident, first_kill=min(starts) if starts else None)
     advice = advice_for(
         decided["state"], decided["condition"], decided["failing_cases"], assessed["storm_end"], notes or {}, decided["recovering"], issue, incident
     )
