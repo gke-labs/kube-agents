@@ -1889,6 +1889,45 @@ def test_a_ceiling_hit_on_a_readable_board_costs_no_status_turn(
     assert reads
 
 
+def test_a_ceiling_hit_keeps_the_stalled_cards_transcript_under_artifacts(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The deadline path is the one that names stalled cards to ``_settle``."""
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
+    monkeypatch.setenv("ARTIFACTS", str(tmp_path))
+    _board(monkeypatch, "running")
+    board_shell = harness._agent_shell
+
+    def _shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script and "head -c" in script:
+            return f"{harness._LOG_PRESENT} 1758579012 4096\nworker was here\n"
+        return board_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("running")]
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.errors[0].startswith(harness.DELEGATION_CEILING_MARKER)
+    index = (tmp_path / "worker-logs" / "index.txt").read_text().splitlines()
+    assert index[1] == f"{_TASK_ID}\t1758579012\t4096\t{harness._LOG_PRESENT}"
+    assert (tmp_path / "worker-logs" / f"{_TASK_ID}.log").read_text() == "worker was here\n"
+
+
+def test_a_mute_agent_leaves_no_transcript_behind(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A wait the silent-turn ceiling ended did not stall, so nothing is dumped."""
+    monkeypatch.setenv("ARTIFACTS", str(tmp_path))
+    stub_agent.turns = [_create_turn(), _turn(_text("I would rather not."))]
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert "reported no status" in result.errors[0]
+    assert not (tmp_path / "worker-logs").exists()
+
+
 def test_a_card_the_board_does_not_know_is_asked_of_the_agent(
     stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

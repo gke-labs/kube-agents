@@ -1,7 +1,7 @@
 """The eval fan-out's scheduler is model-free shell, so it is testable here.
 
 `hack/ci-eval-pr.sh` launches one background unit per (task, repetition) and
-serializes the collisions with two mkdir mutexes. Three properties carry the
+serializes the collisions with three mkdir mutexes (task, stream, infra). Three properties carry the
 correctness of that scheme and each is exercised against the REAL text lifted
 out of the script, in the same style as test_ci_eval_trap.py:
 
@@ -183,21 +183,25 @@ class DelegationCeilingTest(unittest.TestCase):
         # A same-task repetition waits on the task lock for the holder's whole
         # unit. With a 3000s ceiling, a fixed 1800s wait would make it give
         # up while the holder was still legitimately running.
+        # And on a stream another case in the run also writes, the holder
+        # waits its turn on the stream lock first, so the wait is that figure
+        # times the cases on the stream (stream_case_count); a case alone on
+        # its stream, or writing none, keeps the single-unit figure.
         unit = lifted("run_one_unit")
-        wait = (
-            'lock_acquire "${STATE_DIR}/lock-task-${name}" \\\n'
-            '    "$(($(unit_delegation_timeout "${name}") + 600))"'
-        )
-        self.assertIn(wait, unit)
+        deadline = 'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600) ))"'
+        self.assertIn(deadline, unit)
+        self.assertIn('lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"', unit)
         body = "\n".join(
             [
                 lifted("unit_delegation_timeout"),
                 'export AGENT_DELEGATION_TIMEOUT="2700"',
-                'name=compliance-rbac-overgrant; echo "$(($(unit_delegation_timeout "${name}") + 600))"',
-                'name=capacity-pinned-pool-probe; echo "$(($(unit_delegation_timeout "${name}") + 600))"',
+                'stream_case_count() { echo "${CASES_ON_STREAM}"; }',
+                'CASES_ON_STREAM=1 name=compliance-rbac-overgrant audit_id=compliance-audit; ' + deadline + '; echo "${lock_deadline}"',
+                'CASES_ON_STREAM=1 name=capacity-pinned-pool-probe audit_id=; ' + deadline + '; echo "${lock_deadline}"',
+                'CASES_ON_STREAM=2 name=consistency-drift-outlier audit_id=fleet-consistency-drift; ' + deadline + '; echo "${lock_deadline}"',
             ]
         )
-        self.assertEqual(run_bash(body).stdout.split(), ["3600", "3300"])
+        self.assertEqual(run_bash(body).stdout.split(), ["3600", "3300", "7200"])
 
 
 class PerCaseGradingTest(unittest.TestCase):
@@ -218,6 +222,8 @@ lock_acquire() { mkdir "$1" 2>/dev/null; }
 lock_release() { rmdir "$1" 2>/dev/null || true; }
 mint_ledger_token() { return 0; }
 unit_delegation_timeout() { echo 1800; }
+ledger_audit_id_for_task() { echo ""; }
+stream_case_count() { echo 1; }
 _ts_lines() { cat; }
 uv() { echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }
 finish_case() { echo "FINISH_CASE $2 after rep ${rep}"; }

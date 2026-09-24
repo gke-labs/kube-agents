@@ -525,8 +525,9 @@ type driftFilter struct {
 	// because it advances even for a tier that is not being counted yet.
 	handled int
 
-	// next receives the records that survive. T3's joiner.Handle sits here;
-	// T4 replaces the terminal handler behind it with the inject.
+	// next receives the records that survive. joiner.Handle sits here, and the
+	// terminal handler behind it is logDriftEvent, or driftInjectHandler.Handle
+	// when --daemon-url is set.
 	next recordHandler
 
 	// logDropped reports every record the filter discards. Off by default:

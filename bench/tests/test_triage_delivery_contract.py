@@ -23,13 +23,23 @@ exactly one the template forbids the letter outright and labels that bullet
 single-option shape is those two bullets and nothing else — which is why
 ``To authorize:`` is the line both shapes carry.
 
+``_drift_task_body``, in the same module, writes the card for an out-of-band
+change to a live object and reaches the same contract by its own route: same
+three ``##`` sections, same two shapes, same authorize bullet, different prose
+around all of it. It is a second source of the same literals rather than a
+caller of the first, so every join below is per template, and a case is pinned
+to whichever template writes the card it grades. Pinning them all to one would
+pass for as long as the two agreed on the phrase in question and stop asserting
+anything on the day they did not — which is the day the join was supposed to
+fire.
+
 Two gates read the result, and neither is written in the same language as the
 template:
 
 * ``actionable_report`` (deploy/docker/patches/kanban_notifier.py) decides in
   production whether a completed card earns an ``incidents`` row — whether a
   reply saying ``apply`` will find a report to act on. Three regexes.
-* The delivery objective of each case in ``CASE_PATHS`` decides whether that
+* The delivery objective of each case in ``CONTRACTS`` decides whether that
   eval case passes. Phrase lists in a task.yaml.
 
 So one decision lives in three files, joined by string literals. **The
@@ -37,7 +47,9 @@ template↔notifier half of that join is already held**, by
 ``test_the_gate_recognises_the_shape_the_template_asks_the_agent_for`` in
 agents/platform/scripts/test_triage_reply_roundtrip.py, which calls the real
 ``_triage_task_body`` and drives ``actionable_report`` on both shapes; it runs
-on every pull request. The half nobody held is task.yaml↔template — a reword
+on every pull request. For ``_drift_task_body`` there is no such test, so the
+notifier assertions below are that template's only hold on the notifier rather
+than a cross-check. The half nobody held is task.yaml↔template — a reword
 there leaves the eval check asserting a string nothing writes, and a check no
 report can satisfy reds the case rather than the reword, so the diagnosis lands
 a long way from the edit. That is what this module is for.
@@ -88,22 +100,36 @@ from kube_agents_bench.verifiers import ReportContainsVerifier, _normalize
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: The cases whose delivery objective this module pins. Named, not globbed: a
-#: glob over the directory would cover exactly these files today and silently
-#: cover nothing on the day one is renamed. `incident-triage-oom-event-probe`
-#: (#1023) and `autoops-crashloop-config-triage` (#1103) carry the incumbent's
-#: check verbatim; a further case adopting the delivery contract is added here
-#: rather than left to a pattern.
-CASE_PATHS = [
-    REPO_ROOT / "bench" / "tasks" / "autoops-warning-event-triage" / "task.yaml",
-    REPO_ROOT / "bench" / "tasks" / "incident-triage-oom-event-probe" / "task.yaml",
-    REPO_ROOT / "bench" / "tasks" / "autoops-crashloop-config-triage" / "task.yaml",
+#: The template's home. Two functions in it write card bodies that carry this
+#: contract, and a case is pinned to whichever one writes the card it grades --
+#: pinning a drift case to the event template would assert a join that does not
+#: exist, and would keep passing right up until the two templates diverge on the
+#: phrase in question, which is the day the assertion was supposed to fire.
+TEMPLATE_MODULE = REPO_ROOT / "agents" / "platform" / "scripts" / "session_kv_server.py"
+TRIAGE_TEMPLATE = "_triage_task_body"
+DRIFT_TEMPLATE = "_drift_task_body"
+
+#: The cases whose delivery objective this module pins, each with the template
+#: that writes its card. Named, not globbed: a glob over the directory would
+#: cover exactly these files today and silently cover nothing on the day one is
+#: renamed, and it could not supply the second half of the pair anyway.
+#: `incident-triage-oom-event-probe` (#1023) and
+#: `autoops-crashloop-config-triage` (#1103) carry the incumbent's check
+#: verbatim; a further case adopting the delivery contract is added here rather
+#: than left to a pattern.
+TASKS = REPO_ROOT / "bench" / "tasks"
+CONTRACTS = [
+    (TASKS / "autoops-warning-event-triage" / "task.yaml", TRIAGE_TEMPLATE),
+    (TASKS / "incident-triage-oom-event-probe" / "task.yaml", TRIAGE_TEMPLATE),
+    (TASKS / "autoops-crashloop-config-triage" / "task.yaml", TRIAGE_TEMPLATE),
+    (TASKS / "gitops-drift-out-of-band-triage" / "task.yaml", DRIFT_TEMPLATE),
 ]
 CHECK_NAME = "triage-delivers-an-actionable-report"
 
-#: The template's home, and the function inside it that returns the card body.
-TEMPLATE_MODULE = REPO_ROOT / "agents" / "platform" / "scripts" / "session_kv_server.py"
-TEMPLATE_FUNCTION = "_triage_task_body"
+#: The distinct templates the cases above reach, for the assertions that are
+#: about a template rather than about a case. Sorted so the parametrize ids are
+#: stable between runs.
+TEMPLATES = sorted({template for _, template in CONTRACTS})
 
 #: The notifier is a Dockerfile-applied patch that lands flat at
 #: ``/opt/hermes/gateway/`` in the image and has no package in the checkout, so
@@ -120,7 +146,17 @@ SINGLE_OPTION_ANCHOR = "- **Proposed fix ("
 SINGLE_OPTION_BULLETS = 2
 WHAT_TO_DO_PHRASE = "What to do"
 WHAT_TO_DO_HEADING = f"## {WHAT_TO_DO_PHRASE}"
-LETTERED_END_ANCHOR = "\U0001f517"  # the console-links line that follows the section
+
+#: Where the lettered section stops, per template. The two differ because what
+#: follows the section differs: the event template prints a console-links line
+#: and the drift template goes straight to the horizontal rule, there being no
+#: console view of "someone edited this object". Both anchors are the first
+#: thing after the section rather than the last thing in it, so a bullet added
+#: to the section travels into the exemplar instead of being cut off by it.
+LETTERED_END_ANCHORS = {
+    TRIAGE_TEMPLATE: "\U0001f517",  # the console-links line that follows the section
+    DRIFT_TEMPLATE: "\n\n---",  # the rule before the "Who acts on this" footer
+}
 
 #: A report the front door might deliver instead of the card's own: true about
 #: the incident, actionable by nobody. Both gates must reject it, and the eval
@@ -166,29 +202,56 @@ def _load(name: str, path: Path):
 actionable_report = _load("kanban_notifier", NOTIFIER_PATH).actionable_report
 
 
-def _template_text() -> str:
-    """The literal half of ``_triage_task_body``'s returned f-string.
+def _literal_parts(node: ast.AST) -> str:
+    """The string literals of an expression, in source order.
 
-    The interpolations are dropped rather than rendered — every one of them is
-    an event detail (namespace, object name, project id), and none carries any
-    part of the report template.
+    Both templates return one expression built entirely out of string literals
+    and interpolations. The interpolations are dropped rather than rendered —
+    every one of them is a record detail (namespace, object name, project id,
+    principal), and none carries any part of the report template.
+
+    The recursion exists because the two return expressions are not the same
+    shape. ``_triage_task_body`` returns a single implicitly-concatenated
+    f-string, which is one ``JoinedStr``; ``_drift_task_body`` splices a
+    conditional clause into the middle of its body, which makes its return an
+    ``Add`` chain with an ``IfExp`` in it. Both branches of that conditional are
+    walked, because template text on the road not taken is still template text
+    someone can reword.
     """
+    if isinstance(node, ast.JoinedStr):
+        return "".join(v.value for v in node.values if isinstance(v, ast.Constant))
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _literal_parts(node.left) + _literal_parts(node.right)
+    if isinstance(node, ast.IfExp):
+        return _literal_parts(node.body) + _literal_parts(node.orelse)
+    return ""
+
+
+def _template_text(template: str) -> str:
+    """The literal half of ``template``'s returned expression."""
     tree = ast.parse(TEMPLATE_MODULE.read_text())
     fn = next(
         (
             node
             for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == TEMPLATE_FUNCTION
+            if isinstance(node, ast.FunctionDef) and node.name == template
         ),
         None,
     )
-    assert fn is not None, f"{TEMPLATE_FUNCTION} is gone from {TEMPLATE_MODULE}"
+    assert fn is not None, f"{template} is gone from {TEMPLATE_MODULE}"
     ret = next((n for n in ast.walk(fn) if isinstance(n, ast.Return)), None)
-    assert ret is not None and isinstance(ret.value, ast.JoinedStr), (
-        f"{TEMPLATE_FUNCTION} no longer returns one f-string; this extraction "
-        "reads the literal parts of a JoinedStr and needs rewriting"
+    assert ret is not None, f"{template} no longer returns anything"
+    text = _literal_parts(ret.value)
+    assert WHAT_TO_DO_HEADING in text, (
+        f"{template}'s return yielded no {WHAT_TO_DO_HEADING!r}. Either the "
+        "template was reworded, or its return is a shape _literal_parts does "
+        "not walk and this extraction needs a branch for it — the second reads "
+        "as an empty template, which would pass every phrase assertion below "
+        "vacuously if it were not for this check."
     )
-    return "".join(v.value for v in ret.value.values if isinstance(v, ast.Constant))
+    return text
 
 
 def _slice_unique(text: str, start: str, stop: str | None) -> str:
@@ -202,20 +265,20 @@ def _slice_unique(text: str, start: str, stop: str | None) -> str:
     return text[begin:] if stop is None else text[begin : text.index(stop, begin)]
 
 
-def _report_shapes() -> dict[str, str]:
-    """One exemplar report per shape the template permits.
+def _report_shapes(template: str) -> dict[str, str]:
+    """One exemplar report per shape ``template`` permits.
 
     Composed from the template's own lines rather than transcribed, so a reword
     moves these with it. The single-option shape gets the heading prepended
     because the template supplies its bullets as a replacement for the ones
     under an existing ``## What to do`` — "these two bullets and nothing else".
     """
-    text = _template_text()
+    text = _template_text(template)
     single = "\n".join(
         _slice_unique(text, SINGLE_OPTION_ANCHOR, None).splitlines()[:SINGLE_OPTION_BULLETS]
     )
     return {
-        "lettered": _slice_unique(text, WHAT_TO_DO_HEADING, LETTERED_END_ANCHOR),
+        "lettered": _slice_unique(text, WHAT_TO_DO_HEADING, LETTERED_END_ANCHORS[template]),
         "single-option": f"{WHAT_TO_DO_HEADING}\n\n{single}\n",
     }
 
@@ -228,14 +291,19 @@ def _delivery_check(case_path: Path) -> dict:
     assert entry is not None, (
         f"{case_path.parent.name} has no {CHECK_NAME!r} objective. If it was "
         "renamed, rename CHECK_NAME with it; if it was deleted, remove the case "
-        "from CASE_PATHS rather than leaving this module asserting nothing."
+        "from CONTRACTS rather than leaving this module asserting nothing."
     )
     return entry["check"]
 
 
-@pytest.fixture(params=CASE_PATHS, ids=lambda p: p.parent.name)
-def case_path(request) -> Path:
-    """Every test below runs once per case that carries the contract."""
+@pytest.fixture(params=CONTRACTS, ids=lambda c: c[0].parent.name)
+def contract(request) -> tuple[Path, str]:
+    """Every case-level test below runs once per case that carries the contract.
+
+    The pair, not the path: a case is only pinned to a template, so a test that
+    took the path alone would have to guess which one, and guessing wrong is the
+    failure this parameter exists to make impossible.
+    """
     return request.param
 
 
@@ -258,7 +326,7 @@ def _eval_check_accepts(report: str, case_path: Path) -> bool:
 
 
 @pytest.mark.parametrize("shape", ["lettered", "single-option"])
-def test_the_eval_check_accepts_both_template_shapes(shape, case_path):
+def test_the_eval_check_accepts_both_template_shapes(shape, contract):
     """The regression #1101 was filed for.
 
     The objective used to require "Option A", a token the single-option shape is
@@ -266,23 +334,29 @@ def test_the_eval_check_accepts_both_template_shapes(shape, case_path):
     a rule the template had already decided the other way. #1057 lost three
     graded repetitions to it.
     """
-    assert _eval_check_accepts(_report_shapes()[shape], case_path)
+    case_path, template = contract
+    assert _eval_check_accepts(_report_shapes(template)[shape], case_path)
 
 
+@pytest.mark.parametrize("template", TEMPLATES)
 @pytest.mark.parametrize("shape", ["lettered", "single-option"])
-def test_the_notifier_gate_accepts_both_template_shapes(shape):
+def test_the_notifier_gate_accepts_both_template_shapes(shape, template):
     """The other side of the same bar, and the reason the eval check reads it.
 
     ``actionable_report`` is what decides whether a reply of ``apply`` finds
     anything; a shape it rejects is delivered to the user and then unactionable.
+
+    Per template rather than per case: the notifier does not know which case a
+    report came from, and two cases sharing a template would otherwise assert
+    the same thing twice.
     """
-    assert actionable_report(_report_shapes()[shape])
+    assert actionable_report(_report_shapes(template)[shape])
 
 
 @pytest.mark.parametrize(
     "report", [SUMMARY_ONLY_REPORT, EMPTY_SECTION_REPORT, NO_HEADING_REPORT]
 )
-def test_both_gates_reject_a_report_with_nothing_to_act_on(report, case_path):
+def test_both_gates_reject_a_report_with_nothing_to_act_on(report, contract):
     """Neither gate may be satisfiable by everything.
 
     Without this the module would pass just as happily against a check that
@@ -291,11 +365,12 @@ def test_both_gates_reject_a_report_with_nothing_to_act_on(report, case_path):
     under it, and a call to action with no section — so a relaxation on either
     side of the contract trips at least one of them.
     """
+    case_path, _template = contract
     assert not _eval_check_accepts(report, case_path)
     assert not actionable_report(report)
 
 
-def test_every_phrase_the_case_requires_is_still_in_the_template(case_path):
+def test_every_phrase_the_case_requires_is_still_in_the_template(contract):
     """The join itself, stated directly.
 
     The tests above would catch a template reword through the shapes it
@@ -308,7 +383,8 @@ def test_every_phrase_the_case_requires_is_still_in_the_template(case_path):
     # template emitting `**To authorize**:` still satisfies the eval check but
     # would fail a literal `in` -- and a false red on a case that works is the
     # one failure mode this module must not introduce.
-    text = _normalize(_template_text())
+    case_path, template = contract
+    text = _normalize(_template_text(template))
     check = _delivery_check(case_path)
     required = check.get("required_phrases", [])
     assert WHAT_TO_DO_PHRASE in required, (
