@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -102,6 +103,22 @@ func TestConsoleDropsEmptyMalformedAndOversizeFrames(t *testing.T) {
 	}
 }
 
+// A frame whose kind is neither empty nor "text" is a command the gateway
+// does not interpret yet; it is dropped, not forwarded as an ask.
+func TestConsoleDropsAnUnknownKind(t *testing.T) {
+	r := startConsoleRig(t)
+	r.send(t, "tab-6", ConsoleInFrame{MessageID: "m6", Text: "/restart everything", Kind: "command"})
+	r.send(t, "tab-6", ConsoleInFrame{MessageID: "m7", Text: "a real ask", Kind: "text"})
+	waitFor(t, "the text frame", func() bool { return len(r.inbound()) == 1 })
+	time.Sleep(100 * time.Millisecond) // a late delivery of m6 would land now
+	if got := r.inbound(); len(got) != 1 || got[0].MessageID != "m7" {
+		t.Errorf("got %+v, want only m7", got)
+	}
+	if !strings.Contains(r.logs.String(), `console frame dropped`) || !strings.Contains(r.logs.String(), `unknown kind \"command\"`) {
+		t.Errorf("unknown-kind drop not logged with its kind:\n%s", r.logs.String())
+	}
+}
+
 func TestConsoleOversizeFrameGetsANotice(t *testing.T) {
 	r := startConsoleRig(t)
 	sub, err := r.browser.SubscribeSync("chat.console.tab-3.out")
@@ -181,6 +198,33 @@ func TestConsolePostAndEditArriveAsOutFrames(t *testing.T) {
 	}
 }
 
+// Notice ids carry a per-adapter random component, so a restarted gateway's
+// first notice is not c-1 again and a page holding the last boot's c-1 does
+// not take the new one's edits as its own.
+func TestConsoleNoticeIDsDifferAcrossAdapters(t *testing.T) {
+	s := startServer(t)
+	idRe := regexp.MustCompile(`^c-[0-9a-f]{8}-1$`)
+	var first []string
+	for range 2 {
+		a, err := NewConsoleAdapter(s.ClientURL(), nil, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(a.Close)
+		id, err := a.Post("console:tab-7", "hello")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !idRe.MatchString(id) {
+			t.Errorf("notice id %q does not match c-<boot>-<n>", id)
+		}
+		first = append(first, id)
+	}
+	if first[0] == first[1] {
+		t.Errorf("two adapters minted the same first notice id %q", first[0])
+	}
+}
+
 // TestConsoleRunClosesTheConnectionOnCtxCancellation guards Close's doc
 // comment: Run is documented to close the connection itself once ctx is
 // cancelled, so a caller that trusts that and skips an explicit Close does
@@ -223,9 +267,29 @@ func TestConsoleRosterIsTheOneAuthorAndOpenDirectIsNotOffered(t *testing.T) {
 	}
 }
 
-// Review focus 3: the render predates the console grants. The subscribe is
-// refused asynchronously; the adapter must say so with the remedy.
-func TestConsoleLogsARefusedSubscriptionWithTheRemedy(t *testing.T) {
+// lockedBuffer is a bytes.Buffer safe to write from nats.go's callback
+// goroutine while the test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// startRestrictedServer runs a server whose one user, gateway, holds only
+// a2a.> both ways: a render that predates the console identity.
+func startRestrictedServer(t *testing.T) *natsserver.Server {
+	t.Helper()
 	opts := &natsserver.Options{
 		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true,
 		Users: []*natsserver.User{{
@@ -245,9 +309,19 @@ func TestConsoleLogsARefusedSubscriptionWithTheRemedy(t *testing.T) {
 		t.Fatal("server")
 	}
 	t.Cleanup(s.Shutdown)
+	return s
+}
 
-	logs := &bytes.Buffer{}
-	a, err := NewConsoleAdapter(s.ClientURL(), []nats.Option{nats.UserInfo("gateway", "pw")}, slog.New(slog.NewTextHandler(logs, nil)))
+// Review focus 3: the render predates the console grants. The subscribe is
+// refused asynchronously; the adapter must say so with the remedy. The
+// caller passes its own ErrorHandler, which must not displace the
+// adapter's, and nats.go hands the handler a nil subscription, so the
+// subject logged is the adapter's one wildcard.
+func TestConsoleLogsARefusedSubscriptionWithTheRemedy(t *testing.T) {
+	s := startRestrictedServer(t)
+	logs := &lockedBuffer{}
+	callerHandler := nats.ErrorHandler(func(*nats.Conn, *nats.Subscription, error) {})
+	a, err := NewConsoleAdapter(s.ClientURL(), []nats.Option{nats.UserInfo("gateway", "pw"), callerHandler}, slog.New(slog.NewTextHandler(logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,5 +332,51 @@ func TestConsoleLogsARefusedSubscriptionWithTheRemedy(t *testing.T) {
 	waitFor(t, "the refusal in the log", func() bool {
 		return strings.Contains(logs.String(), "console subscription refused") &&
 			strings.Contains(logs.String(), "predates the console identity")
+	})
+	if !strings.Contains(logs.String(), `subject=chat.console.*.in`) {
+		t.Errorf("refusal log does not name the subscription subject:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "console publish refused") {
+		t.Errorf("a subscribe refusal was logged as a publish refusal:\n%s", logs.String())
+	}
+}
+
+// A refused notice publish (the gateway grant lacks chat.console.*.out) is
+// logged as a publish refusal naming the subject, not as a subscription one.
+func TestConsoleLogsARefusedPublishAsAPublish(t *testing.T) {
+	s := startRestrictedServer(t)
+	logs := &lockedBuffer{}
+	a, err := NewConsoleAdapter(s.ClientURL(), []nats.Option{nats.UserInfo("gateway", "pw")}, slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.Close)
+	if _, err := a.Post("console:tab-8", "hello"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the publish refusal in the log", func() bool {
+		return strings.Contains(logs.String(), "console publish refused") &&
+			strings.Contains(logs.String(), `subject=chat.console.tab-8.out`)
+	})
+	if strings.Contains(logs.String(), "console subscription refused") {
+		t.Errorf("a publish refusal was logged as a subscription refusal:\n%s", logs.String())
+	}
+}
+
+// The connection-state handlers are the adapter's own: a disconnect is
+// logged even when the caller passed its own DisconnectErrHandler.
+func TestConsoleLogsADisconnect(t *testing.T) {
+	s := startServer(t)
+	logs := &lockedBuffer{}
+	callerHandler := nats.DisconnectErrHandler(func(*nats.Conn, error) {})
+	a, err := NewConsoleAdapter(s.ClientURL(), []nats.Option{callerHandler}, slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.Close)
+	s.Shutdown()
+	waitFor(t, "the disconnect in the log", func() bool {
+		return strings.Contains(logs.String(), "console connection lost") &&
+			strings.Contains(logs.String(), "console="+consoleConnName)
 	})
 }

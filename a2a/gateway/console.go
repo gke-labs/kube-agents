@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +40,14 @@ const (
 
 	consoleInSubjectWildcard = "chat.console.*.in"
 
+	// consoleConnName is the adapter's NATS connection name, and the
+	// "console" field on its connection-state log lines.
+	consoleConnName = "a2a-gateway-console"
+
+	// consoleBootIDBytes is the random prefix on notice ids, per adapter:
+	// 4 bytes (8 hex characters) keeps ids from repeating across restarts.
+	consoleBootIDBytes = 4
+
 	// bytesPerKiB names the unit consoleTextCap is expressed in, so the
 	// oversize notice's "N KiB" can be derived from the cap rather than
 	// hardcoded and left free to drift from it.
@@ -54,8 +64,9 @@ const (
 // subscription covers exactly one conversation.
 var consoleTokenRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
-// ConsoleInFrame is what the browser publishes. Kind defaults to "text";
-// it is the seam for gateway-side commands later and is not interpreted yet.
+// ConsoleInFrame is what the browser publishes. Kind is empty or "text";
+// it is the seam for gateway-side commands later, and a frame of any other
+// kind is dropped (logged, no notice) rather than forwarded as an ask.
 type ConsoleInFrame struct {
 	MessageID string `json:"messageId"`
 	Text      string `json:"text"`
@@ -91,33 +102,60 @@ type ConsoleAdapter struct {
 	subscribedFlag atomic.Bool
 	mu             sync.Mutex
 	nextID         uint64
+	// bootID is minted per adapter so notice ids (c-<boot>-<n>) do not
+	// repeat across gateway restarts, where a page still holding c-1 from
+	// the last boot would otherwise take a new c-1's edits as its own.
+	bootID string
 }
+
+// consolePublishViolationRe pulls the subject out of nats-server's
+// "Permissions Violation for Publish to \"<subject>\"" line.
+var consolePublishViolationRe = regexp.MustCompile(`for Publish to "(\S+)"`)
 
 // NewConsoleAdapter dials the bus with the gateway's own options. The async
 // error handler is the whole point of owning the connection: a subscribe
 // refused by the server (a NATS render that predates the console identity)
-// arrives there and nowhere else, and silence would be the failure mode.
+// arrives there and nowhere else, and silence would be the failure mode. The
+// adapter's own handlers are appended after natsOpts, so a caller's options
+// cannot replace them.
 func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*ConsoleAdapter, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	a := &ConsoleAdapter{log: log}
-	opts := append([]nats.Option{
-		nats.Name("a2a-gateway-console"),
-		nats.MaxReconnects(-1),
+	boot := make([]byte, consoleBootIDBytes)
+	if _, err := rand.Read(boot); err != nil {
+		return nil, fmt.Errorf("console adapter: boot id: %w", err)
+	}
+	a := &ConsoleAdapter{log: log, bootID: hex.EncodeToString(boot)}
+	opts := append([]nats.Option{nats.Name(consoleConnName), nats.MaxReconnects(-1)}, natsOpts...)
+	opts = append(opts,
 		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
-			if errors.Is(err, nats.ErrPermissionViolation) || strings.Contains(err.Error(), "Permissions Violation") {
-				subject := ""
-				if sub != nil {
-					subject = sub.Subject
-				}
-				log.Error("console subscription refused: the NATS config predates the console identity; upgrade the operator so the gateway grant carries chat.console.*.in",
-					"subject", subject, "err", err)
+			if !errors.Is(err, nats.ErrPermissionViolation) && !strings.Contains(err.Error(), "Permissions Violation") {
+				log.Warn("console connection error", "console", consoleConnName, "err", err)
 				return
 			}
-			log.Warn("console connection error", "err", err)
+			// nats.go's transient-error path hands a nil sub for every
+			// permissions violation, so the subject comes from the error
+			// text, or from the one subscription this adapter makes.
+			if m := consolePublishViolationRe.FindStringSubmatch(err.Error()); m != nil {
+				log.Error("console publish refused: the NATS config predates the console identity, or the NATS pod has not rolled onto the new config yet; notices are lost until the config carries chat.console.*.out for the gateway",
+					"subject", m[1], "err", err)
+				return
+			}
+			subject := consoleInSubjectWildcard
+			if sub != nil {
+				subject = sub.Subject
+			}
+			log.Error("console subscription refused: the NATS config predates the console identity, or the NATS pod has not rolled onto the new config yet; the subscription is resent on reconnect and recovers once the config carries chat.console.*.in for the gateway",
+				"subject", subject, "err", err)
 		}),
-	}, natsOpts...)
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			log.Warn("console connection lost; reconnecting", "console", consoleConnName, "err", err)
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			log.Info("console connection restored", "console", consoleConnName, "url", nc.ConnectedUrl())
+		}),
+	)
 	nc, err := nats.Connect(url, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("console adapter: connect: %w", err)
@@ -190,6 +228,10 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 		a.log.Warn("console frame dropped", "reason", "not a frame", "conversation", conversation, "err", err)
 		return InboundMessage{}, "", false
 	}
+	if f.Kind != "" && f.Kind != "text" {
+		a.log.Warn("console frame dropped", "reason", fmt.Sprintf("unknown kind %q", f.Kind), "conversation", conversation, "messageId", f.MessageID)
+		return InboundMessage{}, "", false
+	}
 	text := strings.TrimSpace(f.Text)
 	if text == "" {
 		a.log.Warn("console frame dropped", "reason", "empty text", "conversation", conversation, "messageId", f.MessageID)
@@ -220,7 +262,7 @@ func (a *ConsoleAdapter) publish(conversation, messageID, text string, edit bool
 func (a *ConsoleAdapter) Post(conversation, text string) (string, error) {
 	a.mu.Lock()
 	a.nextID++
-	id := fmt.Sprintf("c-%d", a.nextID)
+	id := fmt.Sprintf("c-%s-%d", a.bootID, a.nextID)
 	a.mu.Unlock()
 	if err := a.publish(conversation, id, text, false); err != nil {
 		return "", err

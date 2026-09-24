@@ -3,29 +3,14 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
-
-// latestSubmission reads the newest task submission on the platform inbound
-// subjects and decodes its authority block.
-func latestSubmission(t *testing.T, bus *lib.Client) (*lib.Envelope, Authority) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	env, err := bus.ReadTopicLatest(ctx, "TASKS", "a2a.tasks.platform.*.in")
-	if err != nil {
-		t.Fatalf("read submission: %v", err)
-	}
-	var a Authority
-	if err := json.Unmarshal(env.Authority, &a); err != nil {
-		t.Fatalf("authority block: %v\n%s", err, env.Authority)
-	}
-	return env, a
-}
 
 // A console turn on a gateway configured for discord: the backend on the
 // authority block is console, the principal is the fixed console principal,
@@ -141,4 +126,32 @@ func latestSubmissionOrNil(bus *lib.Client) (*lib.Envelope, Authority) {
 	var a Authority
 	_ = json.Unmarshal(env.Authority, &a)
 	return env, a
+}
+
+// With the console running beside the configured backend, an empty
+// principal map no longer drops every inbound message, only the configured
+// backend's: the warning names that backend.
+func TestEmptyPrincipalMapWarningNamesTheBackend(t *testing.T) {
+	s := startServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("gateway-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Close)
+	logs := &lockedBuffer{}
+	cfg := &Config{
+		NATSURL:          s.ClientURL(),
+		PrincipalMapPath: filepath.Join(t.TempDir(), "absent"),
+		DefaultAddressee: "platform",
+		IdleTTL:          30 * time.Minute,
+		AttributionSalt:  []byte("test-salt"),
+	}
+	if _, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg, Backend: "discord", Logger: slog.New(slog.NewTextHandler(logs, nil))}); err != nil {
+		t.Fatal(err)
+	}
+	if want := "principal map is empty; every discord message will be dropped at verification"; !strings.Contains(logs.String(), want) {
+		t.Errorf("log lacks %q:\n%s", want, logs.String())
+	}
 }

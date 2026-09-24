@@ -158,7 +158,7 @@ func New(o Options) (*Gateway, error) {
 	// gchat resolves identity from the Google-asserted email, not from the
 	// map — an empty map is only a lockout on the backends that use one.
 	if backend != gchatBackend && pm.Len() == 0 {
-		log.Warn("principal map is empty; every inbound message will be dropped at verification",
+		log.Warn(fmt.Sprintf("principal map is empty; every %s message will be dropped at verification", backend),
 			"path", o.Config.PrincipalMapPath)
 	}
 	gchatAllowed := map[string]bool{}
