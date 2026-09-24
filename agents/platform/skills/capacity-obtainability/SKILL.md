@@ -72,7 +72,7 @@ fenced YAML there, so the record still reaches the reader.
   request fits, and the reservations found, in `analysis` — this record is
   the On-Demand assessment;
 - after the capacity advice calls: `type: advice_service_capacity` with
-  `api_method: compute.beta.AdviceService.Capacity`, shaped exactly as below.
+  `apiMethod: compute.beta.AdviceService.Capacity`, shaped exactly as below.
 
 For `advice_service_capacity`, use **exactly** these key names and shapes for
 `request` and `analysis` — do not rename keys, do not replace object entries
@@ -111,7 +111,7 @@ under its own path below:
 
 Use the `attach_artifact` tool — the parsed object, not YAML text:
 `type: computeclass` for a ComputeClass, `type: node_auto_provisioning` for a
-NAP specification; use one shared `pair_id` for a design's set.
+NAP specification; use one shared `pairId` for a design's set.
 
 ### Name all three provisioning paths in the report
 
@@ -263,7 +263,7 @@ nodes the aggregate is 256 chips and the durations are `86400s`:
 }
 ```
 
-Set `api_method: compute.beta.AdviceService.CalendarMode` and put the
+Set `apiMethod: compute.beta.AdviceService.CalendarMode` and put the
 structured findings from the real response in `analysis`. Then exactly one
 `type: workload_obtainability_planning_analysis` record whose `analysis`
 carries two keys: `windows`, every schedulable window **in rank order,
@@ -275,7 +275,7 @@ status the API gave (`NO_CAPACITY`, `NOT_SUPPORTED`, ...), so the analysis
 covers every allowed zone whether or not it is obtainable.
 
 **Attach the paired manifests.** A Dynamic Workload Scheduler request and
-its Kueue queue, both under one `pair_id`, both carrying a `target` of the
+its Kueue queue, both under one `pairId`, both carrying a `target` of the
 rank-one window's `region`, `zone`, and `startTime`, and both in the same
 namespace. The shapes are pinned; adjust values only:
 
@@ -312,7 +312,7 @@ spec:
 
 Attach each with `attach_artifact` (`type: provisioning_request`,
 `type: local_queue`) as parsed objects with `machineSpec` (for a TPU job,
-`acceleratorType: tpu-v5e` and the chip arithmetic), `pair_id`, and
+`acceleratorType: tpu-v5e` and the chip arithmetic), `pairId`, and
 `target`. Planning only: hand both manifests to the user, apply nothing,
 submit nothing.
 
@@ -439,11 +439,13 @@ version, chip count, and workload type; VM shapes take a machine type and VM
 count (plus `--local-ssd` where the shape has one):
 
 ```bash
+FROM="$(date -u +%Y-%m-%dT%H:%M:%SZ)"              # now, this probe's clock
+TO="$(date -u -d '+36 hours' +%Y-%m-%dT%H:%M:%SZ)" # horizon minus job duration
 gcloud beta compute advice calendar-mode \
     --region=us-central1 \
     --tpu-version=V5E --chip-count=256 --workload-type=BATCH \
     --duration-range=min=1d,max=1d \
-    --start-time-range=from=<now>,to=<now plus horizon minus job duration> \
+    --start-time-range=from="$FROM",to="$TO" \
     --location-policy=us-central1-a=ALLOW \
     --format=json
 ```
