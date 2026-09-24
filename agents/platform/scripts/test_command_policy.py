@@ -1744,8 +1744,8 @@ class RefusalsSayTheBoundaryIsFinal(unittest.TestCase):
     # itself the defect: a verb refusal telling the model "re-run without the
     # flag" names a flag the argv does not have. Each shape is pinned by a
     # phrase the other must not carry, so swapping the constants fails here.
-    ACTION_PHRASE = "stays refused however it is spelled"
-    FLAG_PHRASE = "re-run without the flag"
+    ACTION_PHRASE = "refused however it is attempted"
+    FLAG_PHRASE = "may be retried without the flag"
 
     ACTION_REFUSALS = (
         (["kubectl", "delete", "pod", "web-0"], "kubernetes.read-only"),

@@ -58,27 +58,36 @@ class Decision:
 
 _ALLOWED = Decision(allowed=True, rule_id="", message="")
 
-# Appended to every refusal of something that stays refused however it is
-# attempted. A refusal that only says what was wrong with this argv reads as
-# an error to correct, and a model reading it that way reasonably tries the
-# same action through another verb, another tool, or another identity (#1945).
-# Two spellings because the refusals come in two shapes: an action refusal
-# means the action itself is off-limits, while a flag refusal leaves re-running
-# without the flag as the legitimate retry, and only the flag's effect is
-# off-limits. The two unreadable-command refusals carry neither, on purpose:
+# Appended to the categorical refusals. A refusal that only says what was
+# wrong with this argv reads as an error to correct, and a model reading it
+# that way reasonably tries the same action through another verb, another
+# tool, or another identity (#1945). Two spellings because the refusals come
+# in two shapes: an action refusal means a state change is off-limits, while
+# a flag refusal leaves re-running without the flag as the legitimate retry,
+# and only the flag's effect is off-limits. Every claim is conditional on
+# purpose. The read-only fallbacks also fire on unlisted reads -- `kubectl
+# help delete`, `gcloud topic formats`, `cluster-info dump` -- where the
+# permitted outcome is an allowed spelling (`--help` where an escape exists,
+# the granular reads a dump decomposes into) or a report, and an
+# unconditional "never retry however spelled" was measured talking the model
+# out of exactly those retries. Likewise the flag notice sanctions
+# policy-allowed retries by name, because the sanctioned route often exists:
+# `get-credentials` then `--context` is the answer to a refused `--server`.
+# The two unreadable-command refusals carry neither notice, on purpose:
 # re-running with a spelling this module can read is the legitimate outcome
 # there, and calling that a boundary would stop retries the policy permits.
 _ACTION_BOUNDARY_NOTICE = (
-    "This is a permission boundary, not an error to work around: the action "
-    "stays refused however it is spelled, so do not retry it through another "
-    "command, tool, flag, or identity. Reading documentation is not the "
-    "refused action: a --help read stays available where the policy allows "
-    "one."
+    "This is a permission boundary, not an error to work around: if this "
+    "command would change cluster or cloud state, that change is refused "
+    "however it is attempted, so do not retry it through another command, "
+    "tool, flag, or identity. If it only reads, use a spelling this policy "
+    "allows or report the gap instead of working around it."
 )
 _FLAG_BOUNDARY_NOTICE = (
-    "This is a permission boundary, not an error to work around: re-run "
-    "without the flag, or use the alternative this message names, and do not "
-    "seek any other route to what the flag was refused for."
+    "This is a permission boundary, not an error to work around: the "
+    "command may be retried without the flag, but what the flag itself does "
+    "is withheld, so do not look for another way to do it. A retry this "
+    "policy allows is not a workaround."
 )
 
 # Only these two reach a cluster or a cloud project. Everything else the proxy
@@ -1159,8 +1168,9 @@ def evaluate(argv: list[str]) -> Decision:
                 rule_id="gcp.file-write-forbidden",
                 message=(
                     "This flag writes a file inside the credential proxy's own "
-                    "container, not the agent workspace. Drop it and redirect "
-                    "the command's stdout instead. "
+                    "container, not the agent workspace. Drop it; where the "
+                    "command offers the same content on standard output, "
+                    "redirect that instead. "
                     + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=write_flag,
