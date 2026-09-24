@@ -474,8 +474,9 @@ commented on when the gate recovers.
 A new `deadline_kill` OUTAGE files one for whoever owns the gate: `Smoke gate
 outage: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict
 since Tue 3:40 PM ET`, with the window of the kills, the affected pull
-requests, the evidence, the advice for authors (don't retest until the space
-reports the gate healthy), where to look (each killed run's `build-log.txt`
+requests, the deadline evidence lines (not the per-case ones: a body naming
+cases would be adopted as a later break's tracker), the advice for authors
+(don't retest until the space reports the gate healthy), where to look (each killed run's `build-log.txt`
 and the eval project's Cloud Logging), and the recovery bar of 3 runs with a
 verdict. An open `presubmit-gate` issue whose **title** carries "deadline" and
 "smoke" is adopted instead — the title only, because every bot-filed body

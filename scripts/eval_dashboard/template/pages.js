@@ -620,10 +620,19 @@ function setupFacts(inc, inWindow) {
   ];
 }
 
+// health.Run.has_verdict: the eval's own verdict, or -- only for a record
+// from before `eval_verdict` existed -- a concluded run with cases that is
+// not a kill. A recorded null is no verdict whatever the run carries.
+function hasVerdict(r) {
+  if (!concluded(r)) return false;
+  if ("eval_verdict" in r) return r.eval_verdict != null;
+  return measured(r) && r.cls !== "deadline-kill";
+}
+
 function deadlineFacts(inc, inWindow) {
   const killed = inWindow.filter((r) => r.cls === "deadline-kill");
   const prs = new Set(killed.map((r) => r.pr).filter((p) => p != null));
-  const graded = inWindow.filter((r) => measured(r) && concluded(r) && r.cls !== "deadline-kill");
+  const graded = inWindow.filter(hasVerdict);
   return [
     fact(true, `<b>${plural(killed.length, "run")}</b> on ${plural(prs.size, "PR")} ran to the job deadline and ended with no verdict.`),
     fact(prs.size > 1, prs.size > 1 ? "More than one PR, so not one slow branch." : "Only one PR so far; it may be that branch."),
@@ -723,14 +732,24 @@ function recoveryBarText(inc) { return verdictRecovery(inc) ? "runs with a verdi
 function recoveryProgress(inc) {
   // No start on record: nothing is "after" the incident, so no run counts.
   if (inc.sinceMs == null) return 0;
-  // Out of a deadline-kill outage a zero-task kill has to be in the list too:
-  // it is what stops the count, as health.py counts only verdicts after it.
-  const counts = (r) => (verdictRecovery(inc) ? measured(r) || r.cls === "deadline-kill" : measured(r));
-  const later = runs().filter((r) => counts(r) && concluded(r) && runFinish(r) > inc.sinceMs).sort((a, b) => runFinish(b) - runFinish(a));
+  if (verdictRecovery(inc)) {
+    // health.recovered's deadline branch: the newest RECOVERY_GREEN_RUNS
+    // verdict runs must all follow the last kill and sit on distinct PRs. A
+    // zero-task kill is in the list because it is what stops the count.
+    const later = runs().filter((r) => (hasVerdict(r) || r.cls === "deadline-kill") && runFinish(r) > inc.sinceMs).sort((a, b) => runFinish(b) - runFinish(a));
+    const newest = [];
+    for (const run of later) {
+      if (run.cls === "deadline-kill") break;
+      newest.push(run);
+      if (newest.length >= PAGE.recoveryGreenRuns) break;
+    }
+    return new Set(newest.map((r) => r.pr)).size;
+  }
+  const later = runs().filter((r) => measured(r) && concluded(r) && runFinish(r) > inc.sinceMs).sort((a, b) => runFinish(b) - runFinish(a));
   const prs = new Set();
   let count = 0;
   for (const run of later) {
-    if (verdictRecovery(inc) ? run.cls === "deadline-kill" : (!isGreen(run) || run.matches_incident)) break;
+    if (!isGreen(run) || run.matches_incident) break;
     if (run.pr != null && prs.has(run.pr)) continue;
     prs.add(run.pr);
     count += 1;

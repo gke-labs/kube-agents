@@ -622,9 +622,14 @@ class DeadlineKills(unittest.TestCase):
         partial = kill(1, 1, T0, tasks=[task("agent-kanban-smoke", "fff")])
         out = adjudicate(data(partial, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"], out["deadline_kills"]), (0, 1, 1))
+        # And it stays in the population: another PR's red collapsing the
+        # same case is shared, not that PR's own, as the run page says.
+        other = run(3, 3, T0 - timedelta(minutes=10), tasks=[task("agent-kanban-smoke", "fff")], result="FAILURE")
+        out = adjudicate(data(partial, other, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 2))
 
     def test_recovering_advice_names_the_bar_the_condition_is_left_on(self):
-        self.assertIn("3 consecutive runs with a verdict on distinct PRs", health.advice_for("DEGRADED", "deadline_kill", [], None, {}, recovering=True))
+        self.assertIn("the newest 3 runs with a verdict, green or red, are on distinct PRs and all finished after the last kill", health.advice_for("DEGRADED", "deadline_kill", [], None, {}, recovering=True))
         self.assertIn("3 consecutive green runs on distinct PRs", health.advice_for("DEGRADED", "shared_break", [], None, {}, recovering=True))
 
     def test_deadline_advice(self):
@@ -1826,7 +1831,9 @@ class DeadlineKillsReplay(unittest.TestCase):
         self.assertEqual(sum(1 for r in runs if r.lost_pod), 0, "none of the kills reads as a lost pod")
 
     def test_green_until_the_third_kill_then_outage_under_its_own_name(self):
-        self.assertEqual(at(self.timeline, day("09-22", 19, 30))["state"], "GREEN")
+        before = [h for now, h in self.every if now <= day("09-22", 19, 30)]
+        self.assertGreater(len(before), 10)
+        self.assertEqual({(h["state"], h["condition"]) for h in before}, {("GREEN", None)}, "every tick before the third kill")
         entry = at(self.timeline, day("09-22", 20, 0))
         self.assertEqual((entry["state"], entry["condition"]), ("OUTAGE", "deadline_kill"), entry)
         self.assertEqual(entry["cause"], "deadline kills: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict 18:49–19:49 UTC")

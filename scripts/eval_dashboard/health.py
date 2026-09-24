@@ -498,6 +498,11 @@ ADVICE_RECOVERING = (
 RECOVERY_BAR_GREEN = "green runs"
 # Leaving a deadline-kill outage: a verdict either way proves the gate grades.
 RECOVERY_BAR_VERDICT = "runs with a verdict"
+ADVICE_RECOVERING_VERDICT = (
+    "The condition has cleared; a retest is reasonable. GREEN is reported once"
+    " the newest {count} runs with a verdict, green or red, are on distinct PRs"
+    " and all finished after the last kill."
+)
 ADVICE_STALE = "data.json last refreshed {generated_at} ({age} ago); the dashboard refresh is stalled and this state is that old."
 ADVICE_GREEN = ""
 
@@ -696,12 +701,12 @@ class Run:
     @property
     def has_verdict(self) -> bool:
         """Reached a verdict: the eval's own, or -- only for a document
-        written before `eval_verdict` existed -- a concluded full run that
-        was not killed. A recorded null is no verdict whatever the run
+        written before `eval_verdict` existed, which is never a kill -- a
+        concluded full run. A recorded null is no verdict whatever the run
         carries: the harness died after some cases and before its line."""
         if self.eval_verdict is not None:
             return True
-        return not self.eval_verdict_recorded and self.full and self.result in (RUN_SUCCESS, RUN_FAILURE) and not self.deadline_kill
+        return not self.eval_verdict_recorded and self.full and self.result in (RUN_SUCCESS, RUN_FAILURE)
 
     def collapsed_cases(self) -> set[str]:
         return {task.name for task in self.tasks if task.collapsed}
@@ -1119,7 +1124,10 @@ def pr_caused_reds(full_runs, roster: Roster) -> int:
             prs_by_case.setdefault(case, set()).add(run.pr)
     count = 0
     for run in full_runs:
-        if run.result != RUN_FAILURE:
+        # A killed run that recorded cases (#1875) stays in the population --
+        # its collapse still makes another PR's red shared -- but is never the
+        # PR's own: the kill is the gate's, whatever those cases did.
+        if run.result != RUN_FAILURE or run.deadline_kill:
             continue
         mine = run.collapsed_cases() & roster.at(run.started or run.finished)
         if mine and all(prs_by_case[case] == {run.pr} for case in mine):
@@ -1137,13 +1145,12 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
     reps = sum(run.total_reps for run in full)
     storm_reps = sum(run.storm_reps for run in full)
     reds = len(concluded) - len(green)
-    kills = [run for run in window if run.deadline_kill]
-    # A killed run that recorded cases (#1875) is already among the full
-    # reds, and is the gate's whatever those cases did: it is kept out of
-    # the pull request's own.
-    own = pr_caused_reds([run for run in full if not run.deadline_kill], roster)
+    own = pr_caused_reds(full, roster)
     deaths = sum(1 for run in window if run.setup_death)
     lost = sum(1 for run in window if run.lost_pod)
+    kills = [run for run in window if run.deadline_kill]
+    # A killed run that recorded cases (#1875) is already among the full
+    # reds (and never among the PR's own, see pr_caused_reds).
     kills_not_counted = sum(1 for run in kills if not run.full)
     out = {
         "window_hours": int(METRICS_WINDOW.total_seconds() // 3600),
@@ -1588,6 +1595,8 @@ def advice_for(
     the lost-pod advice's nodes, time and count."""
     if state == GREEN:
         return ADVICE_GREEN
+    if recovering and condition == DEADLINE_KILL:
+        return ADVICE_RECOVERING_VERDICT.format(count=RECOVERY_GREEN_RUNS)
     if recovering:
         return ADVICE_RECOVERING.format(count=RECOVERY_GREEN_RUNS, bar=recovery_bar(condition))
     if condition == SHARED_BREAK:

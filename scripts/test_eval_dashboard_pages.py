@@ -658,6 +658,18 @@ class BrowserTest(unittest.TestCase):
         out = render_to(pathlib.Path(self.tmp.name) / "deadline-recovering", dict(data, runs=data["runs"] + [late]), health=recovering)
         app = dom_text(out / "index.html")
         self.assertIn("0 of 3 runs with a verdict on distinct PRs so far", app)
+        # health.recovered's bar is the NEWEST three verdict runs on distinct
+        # PRs: greens on 41, 41, 42 after the kill are two PRs, not three, and
+        # a recorded null with cases is not a verdict at all.
+        green = copy.deepcopy(next(r for r in data["runs"] if str(r.get("result") or "").upper() == "SUCCESS" and r.get("tasks")))
+        after = [
+            dict(green, build_id=f"209728286022120661{i}", pr=pr, started=f"2026-09-08T{18 + i}:00:00+00:00", finished=f"2026-09-08T{20 + i}:00:00+00:00", eval_verdict="GREEN")
+            for i, pr in enumerate([41, 41, 42])
+        ]
+        nulled = dict(after[0], build_id="2097282860221206620", pr=43, finished="2026-09-08T23:30:00+00:00", result="FAILURE", eval_verdict=None, duration_s=7200)
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-recovering-2", dict(data, runs=data["runs"] + [late, *after, nulled]), health=recovering)
+        app = dom_text(out / "index.html")
+        self.assertIn("2 of 3 runs with a verdict on distinct PRs so far", app)
 
     def test_a_run_of_ceiling_hits_is_not_a_pass_in_the_brief_and_counts_in_the_storms_totals(self):
         """A run whose every case ended at the ceiling passed nothing, so its row

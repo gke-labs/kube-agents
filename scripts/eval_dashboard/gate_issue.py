@@ -73,6 +73,11 @@ RECOVERY_RUNS = 3
 # evidence block, which mentions deadline kills whenever one sits in the
 # window, so a body match would adopt a shared-break issue.
 DEADLINE_KILL_NAMES = ("deadline", "smoke")
+# The other direction: the deadline body quotes only the deadline evidence
+# lines. health.py's evidence also carries per-case collapse lines whenever a
+# case clears the shared-break floors, and a body naming those cases would
+# be adopted as the tracker of a break that fires later.
+DEADLINE_EVIDENCE_PREFIX = "deadline kills:"
 # GitHub rejects a longer title; the node list is compacted, then dropped
 # for a count, to stay under it.
 TITLE_MAX_CHARS = 256
@@ -129,6 +134,8 @@ The smoke gate (`{job}`) is in OUTAGE: since {since} ({since_iso}), {runs} runs 
 {evidence}
 
 **Advice for authors:** don't retest until the Chat space reports the gate healthy; a run started now ends the same way.
+
+The rest of the evidence (any case collapsing underneath the kills) is in the brief.
 
 **For whoever picks this up:** each killed run's `build-log.txt` shows how far its units got (on 2026-09-22 every unit reached the delegation ceiling, #1880); the gateway and dispatcher lines in the eval project's Cloud Logging say what the workers were doing. Recovery is reported after {recovery} runs with a verdict, green or red, on distinct PRs.
 
@@ -262,7 +269,7 @@ def render_deadline_kill_title(health: dict, since_text: str) -> str:
 def render_deadline_kill_body(health: dict, since_text: str, window_text: str, brief_link: str) -> str:
     incident = health.get("incident") or {}
     prs = incident.get("prs") or []
-    evidence = [f"- {line}" for line in health.get("evidence") or []]
+    evidence = [f"- {line}" for line in health.get("evidence") or [] if str(line).startswith(DEADLINE_EVIDENCE_PREFIX)]
     return DEADLINE_KILL_BODY.format(
         job=JOB_NAME,
         since=since_text,

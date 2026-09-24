@@ -1798,6 +1798,21 @@ class DeadlineKillMessages(RunHarness):
         self.assertIn("**Window:** 3:40 PM–4:00 PM ET (2026-09-22T19:40:00+00:00 – 2026-09-22T20:00:00+00:00).", body["body"])
         self.assertIn("presubmit-gate", body["labels"])
 
+    def test_the_body_quotes_the_deadline_evidence_and_no_case_names(self):
+        # health.py's evidence carries a per-case collapse line whenever a case
+        # clears the shared-break floors; quoted here it would make this issue
+        # the tracker of a break that fires later (Tracker.existing matches
+        # bodies for case names).
+        doc = deadline_kill(evidence=[
+            "cost-idle-pool-probe failed all graded reps on 3 runs from 3 PRs (#1, #2, #3)",
+            "deadline kills: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict 19:40–20:00 UTC (#1826, #1838, #1877)",
+        ])
+        self.tick(doc, T0.replace(day=22, hour=20, minute=5), environ=self.environ())
+        _, _, body = self.gh.calls[-1]
+        self.assertIn("- deadline kills: 3 runs on 3 PRs", body["body"])
+        self.assertNotIn("cost-idle-pool-probe", body["body"])
+        self.assertIn("The rest of the evidence (any case collapsing underneath the kills) is in the brief.", body["body"])
+
     def test_a_humans_issue_titled_for_the_deadline_kills_is_adopted(self):
         human = {"number": 1894, "html_url": "https://github.com/gke-labs/kube-agents/issues/1894", "title": "Smoke Health bot stayed GREEN through a 12 h gate outage: deadline-killed runs with no verdict match no condition", "body": ""}
         gh = FakeGh(open_issues=[human])

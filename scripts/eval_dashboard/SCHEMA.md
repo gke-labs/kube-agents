@@ -635,7 +635,9 @@ not listed — each carrying its identity and timing plus
 `setup_death`, `storm_reps`, `ceiling_reps`, `do`, the run-level `cls`
 (`setup` for a setup death or a lost pod, `deadline-kill`, `only-this-pr`
 for a conflicted merge, else `null` — a run whose classes are per case),
-`cases[]` (`{case, outcome, cls,
+`eval_verdict` (present only when the `data.json` record carries the key,
+so the Brief's recovery count out of a deadline-kill outage can tell a
+recorded `null` from a pre-field record), `cases[]` (`{case, outcome, cls,
 also_failing_prs, pass_rate_30d, reason, excerpt, rep_n, do, admitted, reps,
 nightly_failed_recent}`, `reps` being `{pass, fail, infra, ceiling}`) and
 `health_at` (the verdict in force when it
