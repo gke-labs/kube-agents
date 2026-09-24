@@ -18,7 +18,7 @@
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
 
-- **Interactive / on-demand session:** Pass `--on-demand` (and `--repo` if ambiguous) so `finish` is never silent (#1929).
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding. Pass `--on-demand` so `finish` is never silent (#1929).
 - **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/gcp-networking-fabric-audit/org__repo", "findings_path":"/opt/data/scratch/findings_gcp-networking-fabric-audit.json", "pending_remediation_requests": [<finding_id>, ...]}`.

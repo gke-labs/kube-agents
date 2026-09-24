@@ -8829,10 +8829,13 @@ def is_on_demand(
     1. Explicit CLI override: `--on-demand` / `--no-on-demand` on `start` or `finish`.
     2. Run record: `start` records `on_demand` into scratch state so `finish`
        preserves the flag even if the worker did not pass it to `finish`.
-    3. Environment markers:
+    3. Environment markers (secondary fallbacks; in the deployed sandbox,
+       the SSH crossing drops dispatcher environment variables when commands
+       run from profile home per deploy/sandbox/session-command.sh, so callers
+       cannot rely on ambient env and must pass `--on-demand` to `start` explicitly):
        - `AUDIT_ON_DEMAND` (explicit env override: 1/true/yes/on vs 0/false/no/off)
-       - `HERMES_KANBAN_TASK` (the worker was spawned to work a kanban card;
-         scheduled cron runs have no kanban card)
+       - `HERMES_KANBAN_TASK` (present when run with cwd under a kanban workspace
+         directory or in local testing)
     """
     if args is not None:
         flag = getattr(args, "on_demand", None)

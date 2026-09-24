@@ -16,7 +16,7 @@
 ./skills/fleet-audit/scripts/audit_report.py start --audit gce-compute-fleet-audit [--on-demand]
 ```
 
-Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/gce-compute-fleet-audit/org__repo", "findings_path":"/opt/data/scratch/findings_gce-compute-fleet-audit.json", "pending_remediation_requests": [<finding_id>, ...]}`. Pass `--on-demand` on on-demand runs so `finish` is never silent (#1929).
+Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/gce-compute-fleet-audit/org__repo", "findings_path":"/opt/data/scratch/findings_gce-compute-fleet-audit.json", "pending_remediation_requests": [<finding_id>, ...]}`. Pass `--on-demand` on interactive, chat, or kanban-dispatched audit runs so `finish` is never silent even on an unchanged ledger (#1929). Scheduled cron jobs omit `--on-demand`.
 
 If `pending_remediation_requests` is non-empty, inspect each requested finding in the open issue and write the updated manifest or Terraform file to `workspace` at `remediation.path` before proceeding to step 3 (`finish`).
 

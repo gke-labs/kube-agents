@@ -2473,6 +2473,22 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"{spec.sop} start command does not document --on-demand",
                 )
 
+    def test_multi_repo_sops_document_interactive_repo_prompt(self):
+        """Every SOP with managed_repos must prompt the user when repo is omitted in interactive sessions."""
+        sop_dir = self.sop_dir()
+        pattern = re.compile(r"prompt the user to choose which repository to target before proceeding")
+        for audit_id, spec in audit_report.AUDITS.items():
+            if audit_id == "gce-compute-fleet-audit":
+                continue
+            sop = sop_dir / spec.sop
+            with self.subTest(audit=audit_id):
+                text = sop.read_text(encoding="utf-8")
+                self.assertRegex(
+                    text,
+                    pattern,
+                    f"{spec.sop} does not instruct prompting the user to choose a repository",
+                )
+
     def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
         """A fix written into one SOP has to reach all the others.
 

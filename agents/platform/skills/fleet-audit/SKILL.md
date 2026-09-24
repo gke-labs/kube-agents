@@ -144,7 +144,7 @@ Before inspecting anything, claim the workspace:
   [--on-demand]
 ```
 
-Pass `--on-demand` whenever executing an on-demand or delegated audit run (such as from a kanban card or chat request). This persists `on_demand: true` into the scratch run record so that `audit_report.py finish` never suppresses output with `[SILENT]` even if the ledger is unchanged (#1929).
+Pass `--on-demand` whenever executing an on-demand or delegated audit run (such as from a kanban card or chat request). In the deployed sandbox, the SSH crossing drops ambient dispatcher environment variables when running commands from the profile directory, so `--on-demand` must be passed explicitly to `start`. This persists `on_demand: true` into the scratch run record so that `audit_report.py finish` never suppresses output with `[SILENT]` even if the ledger is unchanged (#1929).
 
 This resolves the target repository (using `--repo` if specified, falling back to the single
 configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), mints
