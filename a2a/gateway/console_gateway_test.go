@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +51,16 @@ func TestConsoleTurnCarriesTheConsoleBackendAndPrincipal(t *testing.T) {
 	}
 	if auth.Audience.Kind != "dm" || len(auth.Audience.Roster) != 1 {
 		t.Errorf("audience = %+v", auth.Audience)
+	}
+	// The requester is always present in its own audience snapshot
+	// (spec-chatops-gateway.md, "Roster"). Console roster ids arrive as
+	// "console" and the principal map does not know that name, so before
+	// rosterResolver the snapshot held H("console") against a requester
+	// principal of H("nats:console") - the one backend where the invariant
+	// forked. Comparing the two is what pins it; a length check cannot.
+	if !slices.Contains(auth.Audience.Roster, auth.Requester.Principal) {
+		t.Errorf("requester %q absent from its own roster %v",
+			auth.Requester.Principal, auth.Audience.Roster)
 	}
 	for _, p := range r.adapter.postTexts() {
 		if strings.Contains(p, "can't verify") {
@@ -154,4 +165,62 @@ func TestEmptyPrincipalMapWarningNamesTheBackend(t *testing.T) {
 	if want := "principal map is empty; every discord message will be dropped at verification"; !strings.Contains(logs.String(), want) {
 		t.Errorf("log lacks %q:\n%s", want, logs.String())
 	}
+}
+
+// The console renders answers off TASKS, so the terminal deliverable must not
+// also go out as a notice on chat.console.<token>.out.
+func TestConsoleTerminalAnswerStaysOffTheNoticeSubject(t *testing.T) {
+	r := startRig(t)
+	r.adapter.roster = []string{consoleAuthor}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-7", Kind: "dm",
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "how is the fleet",
+	}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+
+	const answer = "the fleet is fine"
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: answer}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	// Anchor on the rolling line reaching completed before asserting the
+	// absence - without it this test passes just as well when the terminal
+	// was never processed at all.
+	waitFor(t, "the rolling line to reach completed", func() bool {
+		edits := r.adapter.editTexts()
+		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], string(lib.StateCompleted))
+	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, answer) {
+			t.Errorf("the answer was posted as a console notice: %q", p)
+		}
+	}
+}
+
+// Failures are notices, not answers, so suppressing the answer must not take
+// them with it: a console page has no other way to learn the task died.
+func TestConsoleStillGetsTerminalNotices(t *testing.T) {
+	r := startRig(t)
+	r.adapter.roster = []string{consoleAuthor}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-8", Kind: "dm",
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "how is the fleet",
+	}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateFailed, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the failure notice on the console", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "the task failed") {
+				return true
+			}
+		}
+		return false
+	})
 }

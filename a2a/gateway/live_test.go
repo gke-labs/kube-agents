@@ -81,6 +81,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 	}
 	adapter := newFakeAdapter()
 	var gwAdapter Adapter = adapter
+	var inProcConsole *ConsoleAdapter
 	if consolePass != "" {
 		console, err := NewConsoleAdapter(url,
 			[]nats.Option{nats.UserInfo("gateway", gwPass), nats.CustomInboxPrefix("_INBOX.gateway")}, slog.Default())
@@ -88,6 +89,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 			t.Fatalf("console adapter: %v", err)
 		}
 		defer console.Close()
+		inProcConsole = console
 		gwAdapter, err = NewMultiAdapter("discord", map[string]Adapter{"discord": adapter, "console": console})
 		if err != nil {
 			t.Fatal(err)
@@ -207,11 +209,40 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 		if err := json.Unmarshal(consoleTask.Authority, &auth); err != nil || auth.Requester.Backend != consoleBackend {
 			t.Errorf("console task authority = %+v (%v)", auth, err)
 		}
-		// The placeholder / progress notice reaches the browser on .out.
-		if _, err := out.NextMsg(30 * time.Second); err != nil {
-			t.Errorf("no notice on the console .out subject: %v", err)
+		// The placeholder / progress notice reaches the browser on .out —
+		// and it has to be THIS adapter's. `chat.console.*.in` is core NATS
+		// with no queue group, so the install's own gateway holds an equal
+		// subscription and answers the same frame; accepting any frame here
+		// would let the deployed gateway satisfy a beat that is supposed to
+		// exercise the in-process adapter's subscription under the console
+		// grants. Notice ids are `c-<bootID>-<n>` with bootID minted per
+		// adapter (console.go:105), so the prefix is the discriminator.
+		wantPrefix := "c-" + inProcConsole.bootID + "-"
+		deadline := time.Now().Add(30 * time.Second)
+		sawForeign := false
+		held := false
+		for time.Now().Before(deadline) {
+			m, err := out.NextMsg(time.Until(deadline))
+			if err != nil {
+				break
+			}
+			var f ConsoleOutFrame
+			if json.Unmarshal(m.Data, &f) != nil {
+				continue
+			}
+			if strings.HasPrefix(f.MessageID, wantPrefix) {
+				held = true
+				break
+			}
+			sawForeign = true
 		}
-		t.Log("console beat held: frame under console grants -> task with backend console -> notice on .out")
+		if !held {
+			t.Errorf("no notice from the in-process console adapter on .out (saw a frame from another gateway: %v)", sawForeign)
+		}
+		if sawForeign {
+			t.Logf("note: another gateway answered the same frame on %s — expected against an install running this branch", token)
+		}
+		t.Log("console beat held: frame under console grants -> task with backend console -> notice on .out from this adapter")
 	}
 
 	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "live result: grants hold"}}}); err != nil {

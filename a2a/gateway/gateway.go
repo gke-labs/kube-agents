@@ -356,9 +356,10 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	if !slices.Contains(rosterIDs, msg.AuthorID) {
 		rosterIDs = append(rosterIDs, msg.AuthorID)
 	}
-	authority := BuildAuthority(g.ps, g.pm, principal, backend, msg.AuthorID,
+	resolveRoster := g.rosterResolver(backend)
+	authority := BuildAuthority(g.ps, resolveRoster, principal, backend, msg.AuthorID,
 		verifiedByFor(backend), msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
-	rec.Roster = hashRoster(g.ps, g.pm, rosterIDs)
+	rec.Roster = hashRoster(g.ps, resolveRoster, rosterIDs)
 
 	// Heal a stale ActiveTask before routing: if the task is already
 	// terminal on the stream (the relay's ack raced a transient failure, or
@@ -798,14 +799,29 @@ func messagePayload(text, taskID, contextID string) ([]byte, error) {
 	})
 }
 
-func hashRoster(ps *Pseudonymizer, pm *PrincipalMap, ids []string) []string {
+// rosterResolver picks the principal resolution to apply to one backend's
+// roster ids. Roster ids arrive in AuthorID vocabulary, so the console's
+// fixed author has to resolve the way its requester does: resolvePrincipal
+// maps "console" to "nats:console", while the principal map knows nothing
+// about it and would leave H("console") in a snapshot whose
+// requester.principal is H("nats:console") - the requester missing from its
+// own audience. Every other backend keeps the principal map alone, which is
+// the vocabulary its roster ids already speak.
+func (g *Gateway) rosterResolver(backend string) func(string) string {
+	if backend == consoleBackend {
+		return func(id string) string { return g.resolvePrincipal(consoleBackend, id) }
+	}
+	return g.pm.Resolve
+}
+
+func hashRoster(ps *Pseudonymizer, resolve func(string) string, ids []string) []string {
 	out := make([]string, 0, min(len(ids), rosterCap))
 	for _, id := range ids {
 		if len(out) >= rosterCap {
 			break
 		}
 		entry := id
-		if p := pm.Resolve(id); p != "" {
+		if p := resolve(id); p != "" {
 			entry = p
 		}
 		out = append(out, ps.Hash(entry))

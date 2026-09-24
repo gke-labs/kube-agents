@@ -201,7 +201,16 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if result == "" {
 			result = "(completed with a non-text result; see the stream)"
 		}
-		g.post(rec.Key, result)
+		// The console renders answers straight off TASKS, so posting the
+		// deliverable here too would show it twice and put a burst of
+		// answer-sized frames on a subject documented to carry only notices
+		// (console.go and spec-chatops-gateway.md, "The console adapter").
+		// The other terminal arms below are notices, not answers, and go to
+		// every backend. Chat backends have no TASKS view, so for them this
+		// post IS the answer.
+		if g.backendFor(rec.Key) != consoleBackend {
+			g.post(rec.Key, result)
+		}
 	case lib.StateFailed:
 		reason := ""
 		if s.Status.Message != nil {

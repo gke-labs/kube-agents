@@ -183,6 +183,15 @@ func (a *ConsoleAdapter) closed() bool { return a.nc != nil && a.nc.IsClosed() }
 // Run delivers frames as InboundMessages until ctx is done. It owns the
 // connection's lifecycle from here: on ctx cancellation it unsubscribes and
 // closes the connection, so a caller does not leak it by trusting Run alone.
+//
+// The subscription is plain core NATS with no queue group, so every gateway
+// process holding the console identity answers every frame rather than one
+// of them taking it. The deployment is single-replica with a Recreate
+// strategy (platformagent_a2a_manifests.go, a2aGatewayRecreateStrategyPatch),
+// which is what keeps that from double-handling today - so for the console
+// that replica count is an invariant, not a capacity setting. A second
+// replica, or a developer's gateway on a port-forward, becomes a second
+// subscriber on the same door.
 func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
 	sub, err := a.nc.Subscribe(consoleInSubjectWildcard, func(m *nats.Msg) {
 		msg, notice, ok := a.inbound(m)
