@@ -56,7 +56,7 @@ When you are delegated a task or kanban card to execute an audit stream followin
 
 - **You are the audit worker.** You have been given a dedicated worker session and turn budget for this specific audit stream.
 - **Execute the audit following its SOP (mapped in `AUDITS` at the top of `audit_report.py`, e.g. `governance/compliance_audit_sop.md` for `compliance-audit`) directly.** Use the two-command lifecycle below:
-  1. `./skills/fleet-audit/scripts/audit_report.py start --audit <stream> [--repo "<owner>/<repo>"]`
+  1. `./skills/fleet-audit/scripts/audit_report.py start --audit <stream> --on-demand [--repo "<owner>/<repo>"]`
   2. Enumerate clusters and run the checks per the SOP.
   3. `./skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
 - **Do not reach for `hermes cron run` or say "queued for the next cron tick":** This request is an explicit on-demand audit execution, not a request to trigger the scheduled cron job. Execute the SOP directly and report the ledger issue URL in your result.
@@ -140,8 +140,11 @@ Before inspecting anything, claim the workspace:
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py start \
   --audit <audit-id> \
-  [--repo "<owner>/<repo>"]
+  [--repo "<owner>/<repo>"] \
+  [--on-demand]
 ```
+
+Pass `--on-demand` whenever executing an on-demand or delegated audit run (such as from a kanban card or chat request). This persists `on_demand: true` into the scratch run record so that `audit_report.py finish` never suppresses output with `[SILENT]` even if the ledger is unchanged (#1929).
 
 This resolves the target repository (using `--repo` if specified, falling back to the single
 configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), mints
@@ -318,8 +321,11 @@ All three exit 2 in directory mode, where the clone already holds the file.
   --audit <audit-id> \
   --findings-file <findings_path> \
   [--repo "<owner>/<repo>"] \
+  [--on-demand | --no-on-demand] \
   [--manifest-file <path> | --no-collector-manifest "<why>"]
 ```
+
+`--on-demand` is preserved automatically from the run record if passed to `start`; it may also be passed directly to `finish` to ensure `silent_ok` is false.
 
 The last pair is optional and belongs to a stream whose SOP runs a collector (the repository's
 collector-manifest design says what the manifest holds): `--manifest-file` names the manifest the

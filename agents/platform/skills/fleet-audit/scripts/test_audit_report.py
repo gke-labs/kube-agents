@@ -582,7 +582,13 @@ class BaseTestCase(unittest.TestCase):
         # would otherwise put the whole suite on a different code path than CI.
         # Directory mode has to be the explicit state, not the ambient one.
         env = patch.dict(
-            os.environ, {"GITOPS_BASE_BRANCH": "", "CREDENTIAL_PROXY_URL": ""}
+            os.environ,
+            {
+                "GITOPS_BASE_BRANCH": "",
+                "CREDENTIAL_PROXY_URL": "",
+                "HERMES_KANBAN_TASK": "",
+                "AUDIT_ON_DEMAND": "",
+            },
         )
         env.start()
         self.addCleanup(env.stop)
@@ -5100,6 +5106,34 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         )
         record = self.record_without_stamp(DECLARING_AUDIT)
         self.assertTrue(record.get(audit_report.RUN_RECORD_ON_DEMAND_KEY))
+
+    def test_start_records_no_on_demand_when_requested(self):
+        self.assertEqual(
+            self.run_main(["start", "--audit", DECLARING_AUDIT, "--no-on-demand"]),
+            0,
+        )
+        record = self.record_without_stamp(DECLARING_AUDIT)
+        self.assertIn(audit_report.RUN_RECORD_ON_DEMAND_KEY, record)
+        self.assertFalse(record[audit_report.RUN_RECORD_ON_DEMAND_KEY])
+
+    def test_start_records_on_demand_from_kanban_env(self):
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123"}):
+            self.assertEqual(
+                self.run_main(["start", "--audit", DECLARING_AUDIT]),
+                0,
+            )
+        record = self.record_without_stamp(DECLARING_AUDIT)
+        self.assertTrue(record.get(audit_report.RUN_RECORD_ON_DEMAND_KEY))
+
+    def test_start_no_on_demand_overrides_kanban_env_in_record(self):
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123"}):
+            self.assertEqual(
+                self.run_main(["start", "--audit", DECLARING_AUDIT, "--no-on-demand"]),
+                0,
+            )
+        record = self.record_without_stamp(DECLARING_AUDIT)
+        self.assertIn(audit_report.RUN_RECORD_ON_DEMAND_KEY, record)
+        self.assertFalse(record[audit_report.RUN_RECORD_ON_DEMAND_KEY])
 
     def test_start_clears_yesterdays_record_before_anything_can_fail(self):
         # Every step between the top of `start` and the write can raise. A
@@ -11816,6 +11850,30 @@ class TestSilentVerdict(HarnessTestCase):
         with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123"}):
             out = self.finish_json(doc, argv_extra=["--no-on-demand"])
         self.assertTrue(out["silent_ok"])
+
+    def test_an_explicit_no_on_demand_persisted_in_record_overrides_kanban_env(self):
+        """A run record recording on_demand=False keeps finish from being on-demand (#1929)."""
+        doc = make_doc(findings=[])
+        self.record_run(repo="acme/fleet", context=[], audit=AUDIT, on_demand=False)
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123"}):
+            out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
+
+    def test_audit_on_demand_normalized_truth_grammar(self):
+        """AUDIT_ON_DEMAND accepts normalized truthy strings (1, true, TRUE, yes, on) (#1929)."""
+        doc = make_doc(findings=[])
+        for val in ("1", "true", "True", "TRUE", "yes", "YES", "on", "ON"):
+            with patch.dict(os.environ, {"AUDIT_ON_DEMAND": val}):
+                out = self.finish_json(doc)
+            self.assertFalse(out["silent_ok"], f"Expected silent_ok=False for AUDIT_ON_DEMAND={val!r}")
+
+    def test_audit_on_demand_negative_overrides_kanban_env(self):
+        """AUDIT_ON_DEMAND with negative values overrides HERMES_KANBAN_TASK (#1929)."""
+        doc = make_doc(findings=[])
+        for val in ("0", "false", "False", "FALSE", "no", "NO", "off", "OFF"):
+            with patch.dict(os.environ, {"AUDIT_ON_DEMAND": val, "HERMES_KANBAN_TASK": "t_audit_card_123"}):
+                out = self.finish_json(doc)
+            self.assertTrue(out["silent_ok"], f"Expected silent_ok=True for AUDIT_ON_DEMAND={val!r}")
 
     def test_a_partial_run_is_never_silent(self):
         """The exact shape that went silent on 2026-08-03."""

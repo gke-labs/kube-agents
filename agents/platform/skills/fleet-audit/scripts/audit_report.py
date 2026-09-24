@@ -8830,18 +8830,23 @@ def is_on_demand(
     2. Run record: `start` records `on_demand` into scratch state so `finish`
        preserves the flag even if the worker did not pass it to `finish`.
     3. Environment markers:
+       - `AUDIT_ON_DEMAND` (explicit env override: 1/true/yes/on vs 0/false/no/off)
        - `HERMES_KANBAN_TASK` (the worker was spawned to work a kanban card;
          scheduled cron runs have no kanban card)
-       - `AUDIT_ON_DEMAND` (explicit env override)
     """
     if args is not None:
         flag = getattr(args, "on_demand", None)
         if flag is not None:
             return bool(flag)
-    if record and record.get(RUN_RECORD_ON_DEMAND_KEY):
-        return True
-    if os.environ.get("AUDIT_ON_DEMAND") in ("1", "true", "True", "yes"):
-        return True
+    if record is not None and RUN_RECORD_ON_DEMAND_KEY in record:
+        return bool(record[RUN_RECORD_ON_DEMAND_KEY])
+    env_override = os.environ.get("AUDIT_ON_DEMAND")
+    if env_override is not None and env_override.strip():
+        norm = env_override.strip().lower()
+        if norm in ("1", "true", "yes", "on"):
+            return True
+        if norm in ("0", "false", "no", "off"):
+            return False
     if bool(os.environ.get("HERMES_KANBAN_TASK")):
         return True
     return False
@@ -8854,7 +8859,7 @@ def write_run_record(
     *,
     searched: list[str] | None = None,
     sources: list[dict] | None = None,
-    on_demand: bool = False,
+    on_demand: bool | None = None,
 ) -> str:
     """Record which repositories this run's declared-intent step must search.
 
@@ -8879,8 +8884,8 @@ def write_run_record(
         RUN_RECORD_SOURCES_KEY: list(sources or []),
         RUN_RECORD_STARTED_KEY: datetime.now(timezone.utc).strftime(RUN_TIMESTAMP_FORMAT),
     }
-    if on_demand:
-        record_dict[RUN_RECORD_ON_DEMAND_KEY] = True
+    if on_demand is not None:
+        record_dict[RUN_RECORD_ON_DEMAND_KEY] = bool(on_demand)
     path = run_record_path_for(audit_id)
     Path(path).write_text(
         json.dumps(record_dict),
@@ -8966,8 +8971,8 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
             else []
         ),
     }
-    if bool(data.get(RUN_RECORD_ON_DEMAND_KEY, False)):
-        record[RUN_RECORD_ON_DEMAND_KEY] = True
+    if RUN_RECORD_ON_DEMAND_KEY in data:
+        record[RUN_RECORD_ON_DEMAND_KEY] = bool(data[RUN_RECORD_ON_DEMAND_KEY])
     return record
 
 
@@ -9584,7 +9589,12 @@ def handle_start(args: argparse.Namespace) -> None:
         audit_id, repo, root, context_entries
     )
     declarations_path = write_declarations(audit_id, repo, declarations)
-    on_demand = is_on_demand(args)
+    if getattr(args, "on_demand", None) is not None:
+        on_demand = bool(args.on_demand)
+    elif is_on_demand(args):
+        on_demand = True
+    else:
+        on_demand = None
     write_run_record(
         audit_id,
         repo,

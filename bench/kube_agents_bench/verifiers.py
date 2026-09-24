@@ -372,6 +372,10 @@ _QUEUED_INSTEAD_OF_RUN_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Marker produced when a scheduled or quiet task emits silence.
+# Matched case-insensitively and stripped of Markdown formatting noise (#1929).
+SILENT_MARKER = "[silent]"
+
 _NO_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
     "is unset), so this check cannot tell this run's ledger from a previous "
@@ -811,7 +815,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             if key not in seen:
                 seen.append(key)
         if not seen:
-            if snap.final_message.strip() == "[SILENT]":
+            if _normalize(snap.final_message).strip() == SILENT_MARKER:
                 return done(
                     False,
                     "the run's report was [SILENT] with no issue URL: an on-demand "
