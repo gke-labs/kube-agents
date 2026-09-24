@@ -227,6 +227,23 @@ def _is_tpu_v5e(value: Any) -> bool:
     return re.sub(r"[^a-z0-9]", "", str(value or "").casefold()) == "tpuv5e"
 
 
+def _zone_evaluated(spec: dict[str, Any], details: dict[str, Any], zone: str) -> bool:
+    # Proof the probe evaluated the user's zone, in either of the two honest
+    # forms a worker records: the request scoped to it via locationPolicy, or
+    # a region-wide probe whose recorded analysis names the zone (as the
+    # recommended location or with a per-zone status). Exact-match after
+    # stripping the "zones/" prefix, so us-central1-a never matches
+    # us-central1-ai1a.
+    locations = _mapping(_mapping(spec.get("locationPolicy")).get("locations"))
+    preference = _mapping(locations.get(f"zones/{zone}")).get("preference")
+    if str(preference or "").upper() == "ALLOW":
+        return True
+    analysis = _mapping(details.get("analysis"))
+    named = [str(analysis.get("location") or "")]
+    named.extend(str(key) for key in _mapping(analysis.get("otherLocations")))
+    return any(name.removeprefix("zones/") == zone for name in named)
+
+
 def _valid_obtainability_planning_call(
     item: dict[str, Any], created_at: datetime | None
 ) -> bool:
@@ -237,9 +254,7 @@ def _valid_obtainability_planning_call(
     if len(specs) != 1:
         return False
     spec = _mapping(next(iter(specs.values())))
-    locations = _mapping(_mapping(spec.get("locationPolicy")).get("locations"))
     zone = next((zone for zone in ALLOWED_ZONES if zone.startswith(region + "-")), "")
-    location = _mapping(locations.get(f"zones/{zone}"))
     time_range = _mapping(spec.get("timeRangeSpec"))
     earliest = _timestamp(time_range.get("startTimeNotEarlierThan"))
     latest = _timestamp(time_range.get("startTimeNotLaterThan"))
@@ -251,7 +266,7 @@ def _valid_obtainability_planning_call(
         details.get("apiMethod") in OBTAINABILITY_PLANNING_METHODS
         and region in ALLOWED_REGIONS
         and bool(zone)
-        and str(location.get("preference") or "").upper() == "ALLOW"
+        and _zone_evaluated(spec, details, zone)
         and created_at is not None
         and earliest is not None
         and latest is not None
