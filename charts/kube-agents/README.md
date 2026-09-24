@@ -495,7 +495,7 @@ node's cache. The chart and the Terraform composition agree on `Always` for the
 mutable-tag case they were both written for; an install at a pinned release
 tag is the case that wants the override.
 
-Four knobs need context beyond the chart:
+Five knobs need context beyond the chart:
 
 - `deployment.availability.runtimeClassName` defaults to `gvisor`, because the
   agent executes model-authored commands and an unsandboxed pod shares the node
@@ -529,6 +529,12 @@ Four knobs need context beyond the chart:
 - `harness.hermes.dashboardEnabled` defaults to `null`, which leaves the field
   out of the CR so the CRD default (`true`) applies. Set it explicitly when an
   install must pin the dashboard on or off rather than float with the CRD.
+- `harness.driftDetector.enabled` needs
+  [`terraform/modules/drift-pubsub`](../../terraform/modules/drift-pubsub/)
+  applied against the project first. The chart does not check, and neither does
+  the detector: enabled without a subscription to read, it comes up and retries
+  a pull that cannot succeed for the life of the pod, never exits, and leaves
+  the pod Ready. That is why it defaults to off.
 
 ### Plugins & Runtime Tuning
 

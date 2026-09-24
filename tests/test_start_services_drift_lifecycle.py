@@ -20,8 +20,9 @@ replacement inside the drain that the drain then kills unsignalled.
 That last one is why every fake supervisor below is the shape the script ships --
 a `while true` loop that runs its process in the foreground and sleeps between
 runs -- and not the `( child & wait )` shape that is easier to write. Against the
-easier shape the supervisor exits when its child does, `pgrep -P` goes empty, and
-a drain that would loop forever against the real thing looks correct.
+easier shape the supervisor exits as soon as its child does, so the drain's poll
+goes empty on its own and a drain that would loop forever against the real thing
+looks correct.
 
 What all three protect is the detector's shutdown, which NACKs the records it
 has not finished with so that they redeliver rather than each costing a
@@ -468,8 +469,9 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                 elapsed,
                 _EARLY_BREAK_CEILING_SECONDS,
                 "the drain ran for most of its budget although the supervised process "
-                "exited at once, so the poll was finding something other than it -- the "
-                "backoff `sleep` of a supervisor still in its loop",
+                "exited at once, so the poll kept finding the supervisor alive -- still "
+                "in its loop, waiting out the backoff `sleep` rather than leaving on the "
+                "trap",
             )
 
     def test_both_launchers_leave_their_loop_on_sigterm(self) -> None:

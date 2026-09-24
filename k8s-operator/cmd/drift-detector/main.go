@@ -34,12 +34,13 @@
 // agent images carry this binary and the credential proxy's entrypoint starts
 // it, but only where the PlatformAgent sets spec.harness.driftDetector.enabled;
 // absent that, it ships without running. The drift-pubsub Terraform module is a
-// precondition for it to work rather than a second start gate: nothing checks
-// at startup that the subscription exists, so on an install that enabled the
-// detector without applying the module it starts, fails its first Pull against
-// a subscription that is not there, and is retried by the entrypoint until the
-// short-exit count trips its ALERT. See docs/designs/drift-detection.md for the
-// design and deploy/shared/start-services.sh for the flags it is started with.
+// precondition for the detector to work rather than a second start gate: nothing
+// fails closed on a missing subscription, so a detector enabled without one comes
+// up and retries a pull that cannot succeed for the life of the pod. It never
+// exits, so the entrypoint's short-exit ALERT cannot fire and the pod stays
+// Ready. DriftDetectorSpec.Enabled in api/v1alpha1/common_types.go owns that
+// fact and states it in full. See docs/designs/drift-detection.md for the design
+// and deploy/shared/start-services.sh for the flags it is started with.
 package main
 
 import (

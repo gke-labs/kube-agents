@@ -113,9 +113,11 @@ credential runtime — those moved to the credential pod, and `CREDENTIAL_PROXY_
 what tells the shared entrypoint not to start them here. It is not a container of its own, and the
 reason is not the paragraph above: containers in a Pod share one network namespace, so a sidecar
 container beside this one would reach the loopback daemon exactly as this process does. What rules
-it out is cost — a container of its own means an image of its own and an `images.json` entry, its
-own copy of the profiles volume and the token secret, and its own supervision, where the peer
-process inherits all four from the entrypoint that already runs the event watcher.
+it out is the wiring it would have to duplicate. A container of its own needs its own copy of the
+`platform-agent-data-vol` mount and of the `SESSION_KV_API_KEY` reference the `agent-api-auth`
+sidecar already carries, and it loses the supervision below — the backoff and the short-exit ALERT,
+neither of which the kubelet's CrashLoopBackOff reproduces. It would not need a new image: the
+binary is in `agent-base` already, as the build bullet below says.
 
 Three pieces put it there — the same three that put the event watcher there, treating it slightly
 differently at each:
