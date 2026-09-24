@@ -861,6 +861,15 @@ class ValidationError(ValueError):
     """A findings.json (or audit id) that the harness refuses to publish."""
 
 
+class StartRefused(ValidationError):
+    """`start` did not run: the stream's in-flight guard held, or could not be taken.
+
+    A subclass so `main` can label it apart from a rejected document. Both
+    exit 2, but every SOP reads `FINDINGS REJECTED` as "fix the file and
+    re-run", and a refused `start` has no file to fix.
+    """
+
+
 class BodyTooLargeError(ValidationError):
     """A rendered body that still exceeds GitHub's limit after budgeting.
 
@@ -1446,9 +1455,10 @@ def inflight_path_for(audit_id: str) -> str:
 
 
 # How long an in-flight note is believed. A full audit takes 600-1300 s; a
-# run that died without `finish` is forgotten after this, so a crash never
-# blocks the stream's next daily tick, and only an operator retrying within
-# the window has to say `--takeover`.
+# run that died without `finish` is forgotten after this, so a dead run costs
+# the stream at most the ticks that fall inside the next two hours. Releasing
+# it sooner is an operator's action from outside the session, described in
+# agents/platform/cron/README.md; the CLI has no flag for it on purpose.
 INFLIGHT_TTL_SECONDS = 2 * 60 * 60
 
 
@@ -1465,10 +1475,10 @@ def _in_flight_since(path: Path) -> float | None:
     record, so that pid was always dead by the time anyone read it. On
     2026-09-23 (build 2102875230451011584, rep 1) a refused worker read the
     note, ran `ps` against that pid, took "not running" for "the run is
-    over" and passed `--takeover` over its own live run. Nothing in the note
-    can tell a reader whether the run is alive, because the run is a
-    worker's session or a scheduled tick on another pod; only its `finish`
-    or the TTL ends the lease.
+    over" and passed the `--takeover` flag the CLI then had over its own
+    live run. Nothing in the note can tell a reader whether the run is
+    alive, because the run is a worker's session or a scheduled tick on
+    another pod; only its `finish` or the TTL ends the lease.
     """
     try:
         note = json.loads(path.read_text(encoding="utf-8"))
@@ -1485,7 +1495,7 @@ def _in_flight_since(path: Path) -> float | None:
         return None
 
 
-def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
+def claim_in_flight(audit_id: str) -> None:
     """Refuse a second `start` while a run of this stream is under way.
 
     Every path `start` scrubs — the run record, the declarations, the
@@ -1510,26 +1520,35 @@ def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
     loses, and a `start` refused here wrote nothing, so it has nothing to
     release.
 
-    `takeover` is an operator's flag and nobody else's. A worker or a
-    session that was refused does not pass it: the refusal gives it no
-    liveness test to run (see `_in_flight_since`), so any reading of "that
-    run is dead" it arrives at from inside the sandbox is a guess, and the
-    cost of a wrong guess is the other run's state. The refusal text names
-    neither the flag nor anything a reader could check.
+    What the guard is and is not. It keeps two well-behaved runs of one
+    stream apart, and it hands a refused worker nothing to act on: no
+    override flag (the CLI had `--takeover` until 2026-09-24, and both
+    observation runs of #1876 saw a refused worker pass it within a minute
+    over its own live run), no pid to test, no path to remove; the refusal
+    text names only the stream and the time. It is not a permission
+    boundary: the worker's shell is the same shell an operator would use
+    on the same volume (docs/designs/agent-shell-sandboxing.md), so a
+    worker set on removing a file it was never told about is outside what
+    a script can stop. Releasing a stream before the TTL is an operator's
+    action, described in agents/platform/cron/README.md and nowhere the
+    worker reads.
     """
     path = Path(inflight_path_for(audit_id))
+    # The guard-failure messages name the error and not the path: a path in
+    # a refusal reads as a file to remove.
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         lock = os.open(f"{path}.lock", os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as exc:
-        raise ValidationError(
-            f"could not take the in-flight guard for {audit_id} at {path}.lock ({exc}); "
-            f"refusing to start rather than scrub a run that may be in flight."
+        raise StartRefused(
+            f"could not take the in-flight guard for {audit_id} "
+            f"({exc.strerror or type(exc).__name__}); refusing to start rather "
+            f"than scrub a run that may be in flight. Report it."
         ) from exc
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         started = _in_flight_since(path)
-        if not takeover and started is not None and time.time() - started < INFLIGHT_TTL_SECONDS:
+        if started is not None and time.time() - started < INFLIGHT_TTL_SECONDS:
             when = datetime.fromtimestamp(started, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             # Addressed to the worker that was refused: wait or report, and
             # no third option. The first wording offered `--takeover` "if you
@@ -1538,9 +1557,9 @@ def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
             # was alive. The second wording dropped the offer but printed the
             # note's pid, and that evening a refused session ran `ps` on it,
             # read `start`'s long-exited process as a dead run, and took over
-            # its own. The override stays on the CLI for an operator; the
-            # refusal names neither it nor anything that reads as a check.
-            raise ValidationError(
+            # its own. The flag is gone; the refusal names the stream and the
+            # time and nothing that reads as a check or a thing to remove.
+            raise StartRefused(
                 f"a run of {audit_id} is in flight since {when}; wait for its "
                 f"`finish` or report it. A second `start` would scrub its run "
                 f"record, workspace and findings document. The note is a lease "
@@ -1553,9 +1572,10 @@ def claim_in_flight(audit_id: str, *, takeover: bool = False) -> None:
             encoding="utf-8",
         )
     except OSError as exc:
-        raise ValidationError(
-            f"could not record the in-flight note for {audit_id} at {path} ({exc}); "
-            f"refusing to start rather than run unguarded against a run in flight."
+        raise StartRefused(
+            f"could not record the in-flight note for {audit_id} "
+            f"({exc.strerror or type(exc).__name__}); refusing to start rather "
+            f"than run unguarded against a run in flight. Report it."
         ) from exc
     finally:
         os.close(lock)  # closing the descriptor drops the lock
@@ -1566,13 +1586,13 @@ def release_in_flight(audit_id: str) -> None:
 
     Unconditional on purpose, and that is a known limit: `start` and `finish`
     are separate processes, and every state they share is keyed by audit id,
-    so a `finish` cannot tell its own run's note from one a `--takeover` (or
-    the two-hour expiry) wrote after it. A run that outlives its takeover and
-    then finishes publishes over the takeover's run record already; removing
-    the takeover's note is the smaller part of that shape, and the fix for
-    both is the same one: a run identity that travels from `start` through
-    the findings document to `finish`, which is a change to the SOP contract
-    and not made here.
+    so a `finish` cannot tell its own run's note from one a later `start`
+    wrote after an operator's release or the two-hour expiry. A run that
+    outlives that release and then finishes publishes over the later run's
+    record already; removing the later run's note is the smaller part of
+    that shape, and the fix for both is the same one: a run identity that
+    travels from `start` through the findings document to `finish`, which
+    is a change to the SOP contract and not made here.
     """
     Path(inflight_path_for(audit_id)).unlink(missing_ok=True)
 
@@ -9621,14 +9641,14 @@ def unsearched_intent_entries(
 
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
-    claim_in_flight(audit_id, takeover=bool(getattr(args, "takeover", False)))
+    claim_in_flight(audit_id)
     try:
         _start(args, audit_id)
     except BaseException:
         # A `start` that raised left no run in flight, so the retry must not
-        # be told to --takeover its own failure. The refusal above sits outside
-        # this block on purpose: a caller refused for another run's note must
-        # not remove that note on its way out.
+        # be refused for its own failure. The refusal above sits outside this
+        # block on purpose: a caller refused for another run's note must not
+        # remove that note on its way out.
         release_in_flight(audit_id)
         raise
 
@@ -11619,17 +11639,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo",
         help="Optional target GitOps repository (defaults to ConfigMap registered repo).",
     )
-    start_parser.add_argument(
-        "--takeover",
-        action="store_true",
-        help="Operator override, and an operator's only: a worker or session "
-        "that was refused does not pass it. Starts even though a run of this "
-        "stream is recorded as in flight. The note is a lease, not a process: "
-        "it names no pid and no `ps` can show the run dead, so only an "
-        "operator who knows the run is over from outside (its card closed, "
-        "its pod gone) passes this. The note expires by itself after "
-        f"{INFLIGHT_TTL_SECONDS // 60} minutes.",
-    )
 
     finish_parser = subparsers.add_parser(
         "finish", help="Validate findings and publish/refresh/close the ledger issue."
@@ -11800,6 +11809,11 @@ def main(argv: list[str] | None = None) -> int:
             handle_remediate(args)
         else:
             handle_finish(args)
+    except StartRefused as exc:
+        # Exit 2 like a rejected document, labelled apart from one: there
+        # is no document here to fix and re-run.
+        log(f"START REFUSED: {exc}")
+        return 2
     except ValidationError as exc:
         log(f"FINDINGS REJECTED: {exc}")
         return 2

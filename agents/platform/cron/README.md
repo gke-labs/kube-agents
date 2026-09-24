@@ -351,6 +351,16 @@ rule outlives the memory of why:
   cannot reach `hermes`, so a request naming exactly one stream runs that
   stream through `audit_report.py start … finish` in the session, with every
   check it did not run declared as a coverage gap; several streams still queue.
+  Such a run holds no per-job lock, so `start` keeps its own guard: an
+  in-flight note per stream under the agent volume's `scratch/`
+  (`inflight_<audit>.json`, the stream id and a start time), honoured for two
+  hours and removed by `finish`. A run that died without `finish` costs the
+  stream at most the ticks inside those two hours. For the operator only:
+  when you know from outside the run that it is over (its card is closed, its
+  pod is gone), deleting that note releases the stream at once. The CLI has no
+  override flag on purpose; the one it had was taken by refused workers over
+  their own live runs (#1876), and a worker's shell is the same shell you
+  would use, so the release lives here and not where a worker reads.
 - **Overlap is held per job, not per profile.** Holding the profile lock across
   execution — the upstream default — meant a fleet audit blocked every dispatch
   for its whole run; three `github-issue-resolver` firings were measured 418s,

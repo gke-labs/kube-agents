@@ -3897,29 +3897,49 @@ class TestStart(HarnessTestCase):
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
         self.assertIn("is in flight since", self.err)
         self.assertIn("wait for its `finish` or report it", self.err)
+        # Labelled as a refused `start`, not a rejected document: every SOP
+        # reads `FINDINGS REJECTED` as "fix the file and re-run", and there
+        # is no file here.
+        self.assertIn("START REFUSED:", self.err)
+        self.assertNotIn("FINDINGS REJECTED", self.err)
         # The refusal is addressed to the worker, and a worker has two
-        # options. The first wording offered the override "if you know it is
+        # options. The first wording offered an override "if you know it is
         # dead"; on 2026-09-23 a refused session passed it 42 seconds later
-        # over a run that was alive. The flag is documented for an operator
-        # and stays off the message, and so does anything that reads as a
-        # hint that it exists.
+        # over a run that was alive. The flag is gone from the CLI, and the
+        # message carries nothing that reads as a hint that a way past
+        # exists.
         self.assertNotIn("takeover", self.err.lower())
         self.assertNotIn("override", self.err.lower())
-        # Nor does the message hand the worker a liveness test. The second
-        # wording printed the note's pid, which is `start`'s own and always
-        # exited; that evening (build 2102875230451011584, rep 1) a refused
-        # worker ran `ps` on it, read the run as dead, and took over its own
-        # run. The note is a lease, not a process: no pid in the note, none
-        # in the refusal, and the message says so.
+        # Nor does the message hand the worker a liveness test or a file.
+        # The second wording printed the note's pid, which is `start`'s own
+        # and always exited; that evening (build 2102875230451011584, rep 1)
+        # a refused worker ran `ps` on it, read the run as dead, and took
+        # over its own run. The note is a lease, not a process: no pid in
+        # the note, none in the refusal, no path either, and the message
+        # says so. (The pid is pinned by the word, not the number: the log
+        # prefix and the refusal both carry timestamps a small pid would
+        # match by accident.)
         self.assertNotIn("pid", self.err.lower())
-        self.assertNotIn(str(os.getpid()), self.err)
-        self.assertIn("a lease on the stream, not a process", self.err)
         note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertNotIn(str(note.parent), self.err)
+        self.assertIn("a lease on the stream, not a process", self.err)
         self.assertEqual(set(json.loads(note.read_text())), {"audit", "started_at"})
         # Refused means refused: the other run's note is still there.
         self.assertTrue(note.is_file())
-        # The note names the stream, not the caller's guess about it.
-        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--takeover"]), 0)
+        # There is no flag past the guard. The CLI had `--takeover` until
+        # 2026-09-24; both observation runs of #1876 saw a refused worker
+        # pass it within a minute over its own live run, and the sandbox
+        # shell cannot tell a worker from an operator, so the lever left the
+        # script. Releasing the stream early is an operator's action on the
+        # volume, documented in the cron README and not here.
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                audit_report.build_parser().parse_args(
+                    ["start", "--audit", AUDIT, "--takeover"]
+                )
+        self.assertNotIn("takeover", audit_report.build_parser().format_help().lower())
+        note.unlink()
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
 
     def test_a_half_written_note_is_a_claim_not_an_absence(self):
         # The claim is the exclusive create. Between another `start`'s create
@@ -3995,7 +4015,11 @@ class TestStart(HarnessTestCase):
         note.write_text(theirs)
         Path(f"{note}.lock").mkdir()  # os.open(O_RDWR) on a directory: EISDIR
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
         self.assertIn("in-flight guard", self.err)
+        # The error, not the path: a path in a refusal reads as a file to
+        # remove.
+        self.assertNotIn(str(note.parent), self.err)
         self.assertEqual(note.read_text(), theirs)
         self.assertFalse(Path(audit_report.run_record_path_for(AUDIT)).exists())
 
@@ -4036,7 +4060,7 @@ class TestStart(HarnessTestCase):
 
     def test_a_start_that_fails_frees_the_stream_for_the_retry(self):
         # The note means a run is under way. A `start` that raised left none
-        # behind, so the operator's retry must not need --takeover.
+        # behind, so the operator's retry must not be refused for it.
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
         self.harness.failures = {"issue list": 1}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
@@ -12083,13 +12107,19 @@ class TestDispatchAndHandover(unittest.TestCase):
             section,
         )
         self.assertNotIn('"$HERMES_HOME"/skills/fleet-audit', section)
-        # The worker's bullet says wait or report; the override is named once,
-        # in the paragraph about the guard, as an operator's.
+        # The worker's bullet says wait or report. No override is named
+        # anywhere in the file: the CLI flag is gone (2026-09-24), and the
+        # operator's release lives in the cron README, which the worker does
+        # not read. The guard paragraph promises what the TTL delivers (a
+        # dead run costs at most the ticks inside two hours), not "never".
         one_stream = section.split("- **Exactly one stream:**", 1)[1].split("\n- ", 1)[0]
-        self.assertNotIn("--takeover", one_stream)
+        self.assertNotIn("takeover", text.lower())
+        self.assertNotIn("never blocks", section)
+        self.assertIn("at most the ticks", section)
+        self.assertIn("operator's action", section)
+        self.assertIn("START REFUSED", section)
         self.assertIn("severity order", one_stream)
         self.assertIn("`carried`", one_stream)
-        self.assertIn("operator", section.split("--takeover", 1)[0][-400:])
         self.assertIn("More than one stream", section)
         self.assertIn("2026-08-03", section)
         self.assertIn("cronjob(action='run')", section)

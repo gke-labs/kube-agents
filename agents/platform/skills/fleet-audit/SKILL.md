@@ -82,7 +82,8 @@ names:
   resolve, and the sandbox's command guard blocks the `"$HERMES_HOME"/skills/...` form ("Nested
   executable body could not be resolved"); the `python3` leader with the literal path runs.
   `start` refuses while a run of that stream is in flight, whether a scheduled tick's or another
-  session's: it exits 2 and names the run. If it refuses, say the stream is already running and
+  session's: it exits 2 with a `START REFUSED` line that names the run (not a `FINDINGS REJECTED`
+  line; there is no document to fix). If it refuses, say the stream is already running and
   stop; there is no override for you, and the refusal is not a problem to work around. Run the
   checks in the SOP's severity order, highest first — for the compliance stream, cluster-admin
   bindings, public control planes and privileged containers before NetworkPolicy gaps — so a run
@@ -115,14 +116,14 @@ wrote it, and `finish` removes it when the run is over, published or died on a `
 `finish` that died does not refuse the stream's next repository or your own retry. Two exits keep
 it: `--dry-run`, a preview mid-run, and exit 2, a rejected document you are about to fix and
 resubmit, which is still the run in flight. If `start` cannot take the guard at all it exits 2 too,
-rather than run unguarded. A run that died before `finish` is forgotten after those two hours, so
-a crash never blocks the stream's next tick; an operator who knows a run is dead sooner than that
-can pass `--takeover` to `start`. That flag is an operator's and nobody else's: a worker or a
-session that was refused does not pass it. The note is a lease on the stream, not a process: it
-names the stream and the time and no pid, because the run it stands for is another session's or a
-tick's on another pod, and nothing a worker can run in its shell (`ps`, the note's contents, the
-kanban board) says whether that run is alive. The refusal a worker sees does not offer the flag
-and is not a check to work around.
+rather than run unguarded, also as `START REFUSED`. A run that died before `finish` is forgotten
+after those two hours, so a dead run costs the stream at most the ticks that fall inside them;
+releasing it sooner is an operator's action from outside the session, and neither this skill nor
+the script's help names it. The note is a lease on the stream, not a process: it names the stream
+and the time and no pid, because the run it stands for is another session's or a tick's on another
+pod, and nothing a worker can run in its shell (`ps`, the note's contents, the kanban board) says
+whether that run is alive. The refusal a worker sees offers nothing and is not a check to work
+around.
 
 **Each run reports on itself. Your own answer is a roll-up, not a copy.** Answer with one line per
 stream: for a stream you queued, that it is queued for the next tick; for the one stream you ran
@@ -392,7 +393,9 @@ the directory you happen to be standing in, so "the manifest is missing" is a fi
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.
 
 Exit 0 means published. **Exit 2 means the run was rejected before publishing anything** — fix what
-the message names and re-run; never delete the finding that tripped it. What reaches exit 2: the
+the message names and re-run; never delete the finding that tripped it. One exit 2 is not a document
+to fix: a `START REFUSED` line from `start` means the stream's in-flight guard held (see "Running a
+stream on demand"); say so and stop. What reaches exit 2 as `FINDINGS REJECTED`: the
 document failed a field rule, the file named by `--findings-file` is missing or is not valid JSON,
 `--audit` is not one of the registered ids above, the document contradicts the collector manifest
 named by `--manifest-file`, that manifest is missing or malformed, `--manifest-file` was given an
