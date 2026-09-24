@@ -169,7 +169,8 @@ MUTATIONS: list[Mutation] = [
          '                    "Identity and API server address belong to the broker. Remove "\n'
          '                    "--server, --token, --user, --client-certificate, "\n'
          '                    "--insecure-skip-tls-verify and the other credential flags to "\n'
-         '                    "use the cluster and identity the proxy configured."\n'
+         '                    "use the cluster and identity the proxy configured. "\n'
+         '                    + _FLAG_BOUNDARY_NOTICE\n'
          '                ),\n',
          '                message="",\n'),
         "test_A1_a_refusal_names_the_rule_that_fired",

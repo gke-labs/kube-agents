@@ -58,6 +58,41 @@ class Decision:
 
 _ALLOWED = Decision(allowed=True, rule_id="", message="")
 
+# Appended to the categorical refusals. A refusal that only says what was
+# wrong with this argv reads as an error to correct, and a model reading it
+# that way reasonably tries the same action through another verb, another
+# tool, or another identity (#1945). Two spellings because the refusals come
+# in two shapes: an action refusal means a state change is off-limits, while
+# a flag refusal leaves re-running without the flag as the legitimate retry,
+# and only the flag's effect is off-limits. Every claim is conditional on
+# purpose. The read-only fallbacks also fire on unlisted reads -- `kubectl
+# help delete`, `gcloud topic formats`, `cluster-info dump` -- where the
+# permitted outcome is an allowed spelling (`--help` where an escape exists,
+# the granular reads a dump decomposes into) or a report, and an
+# unconditional "never retry however spelled" forbade exactly those
+# permitted retries -- confirmed by executing this module during the pre-PR
+# adversarial passes, not by observing a model. Likewise the flag notice
+# blesses whatever this policy allows rather than naming routes, because the
+# sanctioned route often exists but differs per flag: `get-credentials` then
+# `--context` is the answer to a refused `--server`, and no fixed sentence
+# could name every such route.
+# The two unreadable-command refusals carry neither notice, on purpose:
+# re-running with a spelling this module can read is the legitimate outcome
+# there, and calling that a boundary would stop retries the policy permits.
+_ACTION_BOUNDARY_NOTICE = (
+    "This is a permission boundary, not an error to work around: if this "
+    "command would change cluster or cloud state, that change is refused "
+    "however it is attempted, so do not retry it through another command, "
+    "tool, flag, or identity. If it only reads, use a spelling this policy "
+    "allows or report the gap instead of working around it."
+)
+_FLAG_BOUNDARY_NOTICE = (
+    "This is a permission boundary, not an error to work around: the "
+    "command may be retried without the flag, but what the flag itself does "
+    "is withheld, so do not look for another way to do it. Anything this "
+    "policy allows is not a workaround."
+)
+
 # Only these two reach a cluster or a cloud project. Everything else the proxy
 # executes is governed elsewhere.
 _GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
@@ -1015,7 +1050,9 @@ def evaluate(argv: list[str]) -> Decision:
             rule_id="identity.caller-supplied-impersonation",
             message=(
                 "Impersonation is set by the credential proxy, not by the "
-                "caller. Remove --as/--as-group/--impersonate-service-account."
+                "caller. Remove --as, --as-group, --as-uid, --as-user-extra and "
+                "--impersonate-service-account. "
+                + _FLAG_BOUNDARY_NOTICE
             ),
             offending_flag=impersonation_flag,
         )
@@ -1034,7 +1071,8 @@ def evaluate(argv: list[str]) -> Decision:
                     "--kuberc reads options from a file under the agent's control, "
                     "including impersonation defaults that never appear in the "
                     "command line. We cannot read that file without a race "
-                    "condition, so we refuse it outright."
+                    "condition, so we refuse it outright. "
+                    + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=kuberc_flag,
             )
@@ -1048,7 +1086,8 @@ def evaluate(argv: list[str]) -> Decision:
                     "Identity and API server address belong to the broker. Remove "
                     "--server, --token, --user, --client-certificate, "
                     "--insecure-skip-tls-verify and the other credential flags to "
-                    "use the cluster and identity the proxy configured."
+                    "use the cluster and identity the proxy configured. "
+                    + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=identity_flag,
             )
@@ -1059,8 +1098,10 @@ def evaluate(argv: list[str]) -> Decision:
                 allowed=False,
                 rule_id="kubernetes.file-write-forbidden",
                 message=(
-                    "--profile, --profile-output and --cache-dir write to a path of "
-                    "the caller's choosing inside the credential sidecar. Remove them."
+                    "--profile, --profile-output, --cache-dir and --output-directory "
+                    "write to a path of the caller's choosing inside the credential "
+                    "sidecar. Remove them. "
+                    + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=file_write_flag,
             )
@@ -1079,7 +1120,8 @@ def evaluate(argv: list[str]) -> Decision:
                 rule_id="kubernetes.read-only",
                 message=(
                     "Agents hold read-only access to Kubernetes. Propose this change "
-                    "as a pull request instead."
+                    "as a pull request instead. "
+                    + _ACTION_BOUNDARY_NOTICE
                 ),
                 verb_tuple=verb,
             )
@@ -1090,7 +1132,8 @@ def evaluate(argv: list[str]) -> Decision:
             rule_id="kubernetes.read-only",
             message=(
                 "Agents hold read-only access to Kubernetes. Propose this change "
-                "as a pull request instead."
+                "as a pull request instead. "
+                + _ACTION_BOUNDARY_NOTICE
             ),
             verb_tuple=verb,
         )
@@ -1104,7 +1147,8 @@ def evaluate(argv: list[str]) -> Decision:
                 message=(
                     "--flags-file reads from a file under the agent's control. "
                     "We cannot read that file without a race condition, so we refuse "
-                    "it outright. Expand flags manually instead of using a file."
+                    "it outright. Expand flags manually instead of using a file. "
+                    + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=flags_file,
             )
@@ -1116,7 +1160,9 @@ def evaluate(argv: list[str]) -> Decision:
                 rule_id="gcp.identity-change-forbidden",
                 message=(
                     "Identity belongs to the broker. Remove --access-token-file, "
-                    "--configuration, and --account to use the default identity."
+                    "--configuration, --account and the other identity flags to "
+                    "use the default identity. "
+                    + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=identity_flag,
             )
@@ -1128,8 +1174,10 @@ def evaluate(argv: list[str]) -> Decision:
                 rule_id="gcp.file-write-forbidden",
                 message=(
                     "This flag writes a file inside the credential proxy's own "
-                    "container, not the agent workspace. Drop it and redirect "
-                    "the command's stdout instead."
+                    "container, not the agent workspace. Drop it; where the "
+                    "command offers the same content on standard output, "
+                    "redirect that instead. "
+                    + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=write_flag,
             )
@@ -1178,7 +1226,8 @@ def evaluate(argv: list[str]) -> Decision:
                     "change as a pull request instead. If this is a read the "
                     "product runs on its own, it is missing from "
                     "GCLOUD_READ_COMMANDS in command_policy.py -- report it "
-                    "rather than working around it."
+                    "rather than working around it. "
+                    + _ACTION_BOUNDARY_NOTICE
                 ),
                 verb_tuple=tuple(words[:3]),  # Cap at 3 words to exclude positionals
             )
