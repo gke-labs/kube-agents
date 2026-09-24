@@ -76,23 +76,42 @@ func (l *a2aServerLog) publishViolations(user string) []string {
 	return out
 }
 
-// refusedPublish reports whether the server logged a publish violation for
-// user on exactly subject. It waits briefly: the line is written on the
-// server's read loop, and the caller has only seen its own request time out.
-func (l *a2aServerLog) refusedPublish(user, subject string) bool {
-	needle := fmt.Sprintf("Subject %q", subject)
+// refused reports whether the server logged a violation of kind ("Publish" or
+// "Subscription") for user on exactly subject. It waits briefly: the line is
+// written on the server's read loop, and the caller has only seen its own
+// request time out or its subscription silently receive nothing.
+func (l *a2aServerLog) refused(kind, user, subject string) bool {
+	kindNeedle := kind + " Violation"
+	subjectNeedle := fmt.Sprintf("Subject %q", subject)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		for _, line := range l.publishViolations(user) {
-			if strings.Contains(line, needle) {
+		l.mu.Lock()
+		for _, line := range l.lines {
+			if strings.Contains(line, kindNeedle) && strings.Contains(line, subjectNeedle) &&
+				(strings.Contains(line, "user:"+user) || strings.Contains(line, fmt.Sprintf("User %q", user))) {
+				l.mu.Unlock()
 				return true
 			}
 		}
+		l.mu.Unlock()
 		if time.Now().After(deadline) {
 			return false
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// refusedPublish reports whether the server logged a publish violation for
+// user on exactly subject.
+func (l *a2aServerLog) refusedPublish(user, subject string) bool {
+	return l.refused("Publish", user, subject)
+}
+
+// refusedSubscribe is refusedPublish for the subscribe side: it reports
+// whether the server logged a subscription violation for user on exactly
+// subject.
+func (l *a2aServerLog) refusedSubscribe(user, subject string) bool {
+	return l.refused("Subscription", user, subject)
 }
 
 // a2aStartRenderedServer runs an embedded nats-server on conf, the nats.conf
