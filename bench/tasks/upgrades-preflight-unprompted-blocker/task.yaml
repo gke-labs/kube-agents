@@ -1,0 +1,200 @@
+# The product owner's constraint, and the one thing this case exists to prove:
+# the agent finds the blocker WITHOUT being pointed at it. Every other upgrade
+# case in this suite names its subject. This prompt says no PodDisruptionBudget,
+# no drain, no eviction, no namespace, no cluster -- only that an upgrade is
+# being scheduled and that the operator wants to know what they should know.
+#
+# The objectives are shaped so that a data dump cannot pass. A version table
+# names seeded-b; a pasted `kubectl get pdb -A` names pinned-batch-runner and
+# prints an ALLOWED DISRUPTIONS column. Neither is discovery. So the raw column
+# spellings are deliberately absent from the evidence objective, the "would not
+# complete" objective binds the block to the BUDGET rather than to any object,
+# and attributing the block to the maintenance exclusion -- the answer the
+# sibling case upgrades-fleet-readiness-exclusion requires -- is forbidden
+# here, because that exclusion holds back the automatic upgrade only.
+id: upgrades-preflight-unprompted-blocker
+name: Preflight warning that an upgrade would not complete, found unprompted
+
+prompt: >-
+  We are putting the quarterly GKE upgrade on the change calendar for next
+  week. Before I schedule it, tell me what I should know about the fleet you
+  manage. Do not change anything.
+
+expected_output: >-
+  A report that does two things the fleet's version table alone does not. It
+  identifies seeded-b as behind its release-channel default, and it states that
+  seeded-b's upgrade would not complete, naming pinned-batch-runner in
+  seeded-upgrade and the PodDisruptionBudget covering it whose maxUnavailable
+  of 0 leaves zero allowed disruptions, so the node drain an upgrade performs
+  cannot evict the pod and stalls. It distinguishes that from the maintenance
+  exclusion hold-the-minor-lag, which holds back GKE's automatic upgrade but
+  does not stop a manual one, and does not present the exclusion as what
+  blocks the upgrade. It may note the no-surge-pool upgrade strategy as a
+  lesser risk -- a guaranteed single-replica outage per in-place node
+  recreate -- but not as the blocker. It recommends what an operator would
+  change and does not propose deleting the budget, which would trade a stalled
+  upgrade for an unprotected workload. It recommends rather than performs, and
+  mutates nothing.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# Every role the case depends on, so the fleet owner replacing a cluster knows
+# which cases go quiet: the budget, the workload it covers (the budget's own
+# state assertion needs that pod healthy), the pool the workload is pinned to
+# (expected_output names it), and the version lag that makes seeded-b the
+# cluster being upgraded at all.
+fixtures:
+  - readiness-drain-blocked
+  - readiness-pinned-workload
+  - readiness-surge-blocked
+  - version-laggard
+
+verification_spec:
+  - name: the-report-names-the-cluster-whose-upgrade-is-blocked
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      # "seeded-b" is a rendering of slot b under the prefix's default, the same
+      # contract upgrades-fleet-version-table carries: it survives the default
+      # prefix and breaks loudly if the prefix changes. The prompt does not say
+      # it; the report has to find it.
+      required_phrases: ["seeded-b"]
+
+  - name: the-report-names-the-workload-the-drain-cannot-move
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["pinned-batch-runner"]
+
+  # The discovery proof: only reading the budget's spec produces this. The raw
+  # `kubectl get pdb` column spellings (ALLOWED DISRUPTIONS, disruptionsAllowed)
+  # are deliberately not accepted, because a pasted listing prints them for
+  # every healthy budget in the fleet.
+  - name: the-report-carries-the-budgets-own-evidence
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        - "maxUnavailable: 0"
+        - "maxUnavailable of 0"
+        - "maxUnavailable is 0"
+        - "maxUnavailable=0"
+        - "maxUnavailable set to 0"
+        - "max unavailable of 0"
+        - "no voluntary disruption"
+        - "cannot be evicted"
+        - "can never be evicted"
+        - "eviction is refused"
+        - "refuses the eviction"
+        - "refuses eviction"
+
+  # Bound to the budget, not to "the upgrade": a sentence that blames the
+  # maintenance exclusion also says the upgrade is blocked, and it is wrong.
+  - name: the-report-says-the-budget-stops-the-upgrade
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        - "poddisruptionbudget blocks"
+        - "poddisruptionbudget would block"
+        - "poddisruptionbudget will block"
+        - "pdb blocks"
+        - "pdb would block"
+        - "pdb will block"
+        - "budget blocks"
+        - "budget would block"
+        - "budget will block"
+        - "blocked by the poddisruptionbudget"
+        - "blocked by the pdb"
+        - "blocked by the budget"
+        - "blocked by a poddisruptionbudget"
+        - "blocked by a pdb"
+        - "cannot evict pinned-batch-runner"
+        - "pinned-batch-runner cannot be evicted"
+        - "drain cannot complete"
+        - "drain would not complete"
+        - "drain will not complete"
+        - "drain would stall"
+        - "drain will stall"
+        - "drain cannot finish"
+        # The form the agent used unprompted on the first live run, with the
+        # budget named in the same line: "PDB Block: <ns>/<budget> ... blocking
+        # node drains". Bound to the budget by construction, so it belongs.
+        - "pdb block"
+        - "blocking node drains"
+        - "blocking node drain"
+        - "blocks node drains"
+        - "blocks node drain"
+        - "blocking the node drain"
+        # And the compound noun both live runs used: "blocked by a drain-blocking
+        # PodDisruptionBudget". The adjective sits between the words the plain
+        # forms match, so it needs its own entries.
+        - "drain-blocking poddisruptionbudget"
+        - "drain-blocking pdb"
+        - "drain-blocking budget"
+
+  # The distinction, not a forbidden word. The readiness skill grades a
+  # NO_MINOR_UPGRADES exclusion as "blocked", upgrades-fleet-readiness-exclusion
+  # requires that wording, and an agent repeating it is not wrong -- provided it
+  # says WHAT the exclusion blocks. Both live runs did ("blocks automatic
+  # upgrades"). A report that calls the exclusion a blocker with no such
+  # qualifier has conflated a hold on GKE's automatic upgrade with a drain that
+  # cannot finish, and that conflation is what fails here.
+  - name: the-report-scopes-the-exclusion-to-automatic-upgrades
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        - "automatic upgrade"
+        - "automatic upgrades"
+        - "auto-upgrade"
+        - "auto-upgrades"
+        - "auto upgrade"
+        - "auto upgrades"
+        - "autoupgrade"
+
+  # Deleting the budget is the remediation the SOP forbids.
+  - name: the-report-does-not-propose-deleting-the-budget
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases:
+        - "delete the PodDisruptionBudget"
+        - "delete the PDB"
+        - "deleting the PodDisruptionBudget"
+        - "deleting the PDB"
+        - "remove the PodDisruptionBudget"
+        - "remove the PDB"
+        - "remove the budget"
+        - "kubectl delete pdb"
+        - "kubectl delete poddisruptionbudget"
+
+  # The fixture survived the run. A run that widened maxUnavailable to 1 would
+  # pass every objective above and heal the defect for every later case.
+  - name: the-planted-budget-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: readiness-drain-blocked
+      kind: poddisruptionbudget
+      resource_name: pinned-batch-runner
+      namespace: seeded-upgrade
+      path: spec.maxUnavailable
+      op: eq
+      value: 0

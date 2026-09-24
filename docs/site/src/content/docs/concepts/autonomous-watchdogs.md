@@ -34,17 +34,17 @@ The rosters, with exact cron expressions, enabled state, and prompts, are genera
 
 Each audit reads its SOP, executes read-only checks against the fleet, writes a validated findings file, and hands it to the [`fleet-audit`](/kube-agents/skills/) skill's `audit_report.py` helper. The helper owns every git and `gh` operation and renders every body itself — the model never writes one.
 
-| Job                           | SOP                                  | Audits                                                                                           |
-| ----------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------ |
-| `compliance-audit`            | `compliance_audit_sop.md`            | Security and RBAC posture across the fleet                                                       |
-| `obtainability-audit`         | `obtainability_audit_sop.md`         | Workload reliability: requests, PDBs, HPAs, probes, scheduling rigidity                          |
-| `security-patch-orchestrator` | `security_patch_orchestrator_sop.md` | Version currency and upgrade-policy hygiene against the cluster's channel                        |
-| `fleet-wide-cost-analysis`    | `fleet_wide_cost_analysis_sop.md`    | Observable waste, in resource units — no billing export required                                 |
-| `fleet-consistency-drift`     | `fleet_consistency_drift_sop.md`     | Clusters diverging from a baseline derived from the fleet itself                                 |
-| `ai-security-audit`           | `ai_security_audit_sop.md`           | AI inference and training workloads: exposure, model provenance, weights                         |
-| `stockout-prevention`         | `stockout_prevention_sop.md`         | Capacity obtainability, ComputeClass resilience, and single-zone stockouts                       |
-| `gcp-networking-fabric-audit` | `gcp_networking_fabric_sop.md`       | GCP networking fabric: subnet IP exhaustion, Cloud NAT, PSC, MTU, Cloud Armor                    |
-| `gce-compute-fleet-audit`     | `gce_compute_fleet_sop.md`           | GCE Compute Engine and MIG fleet: startup scripts, autoscaler, Ops Agent, sole-tenant, snapshots |
+| Job                           | SOP                                  | Audits                                                                                                                            |
+| ----------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `compliance-audit`            | `compliance_audit_sop.md`            | Security and RBAC posture across the fleet                                                                                        |
+| `obtainability-audit`         | `obtainability_audit_sop.md`         | Workload reliability: requests, PDBs, HPAs, probes, scheduling rigidity                                                           |
+| `security-patch-orchestrator` | `security_patch_orchestrator_sop.md` | Version currency and upgrade-policy hygiene against the cluster's channel, and whether a lagging cluster's upgrade would complete |
+| `fleet-wide-cost-analysis`    | `fleet_wide_cost_analysis_sop.md`    | Observable waste, in resource units — no billing export required                                                                  |
+| `fleet-consistency-drift`     | `fleet_consistency_drift_sop.md`     | Clusters diverging from a baseline derived from the fleet itself                                                                  |
+| `ai-security-audit`           | `ai_security_audit_sop.md`           | AI inference and training workloads: exposure, model provenance, weights                                                          |
+| `stockout-prevention`         | `stockout_prevention_sop.md`         | Capacity obtainability, ComputeClass resilience, and single-zone stockouts                                                        |
+| `gcp-networking-fabric-audit` | `gcp_networking_fabric_sop.md`       | GCP networking fabric: subnet IP exhaustion, Cloud NAT, PSC, MTU, Cloud Armor                                                     |
+| `gce-compute-fleet-audit`     | `gce_compute_fleet_sop.md`           | GCE Compute Engine and MIG fleet: startup scripts, autoscaler, Ops Agent, sole-tenant, snapshots                                  |
 
 Two properties matter more than the check lists:
 

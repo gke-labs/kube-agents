@@ -90,24 +90,67 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Eight fixtures: seven across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
-four seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security` and
-`seeded-capacity`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
-only and no workloads at all: `b` is the held-back control plane, `c` is the configuration
-outlier. Every cluster is labelled `environment=seeded`, which is what confines the drift
+Twelve fixtures: eleven across the three cluster slots and one project-scoped. Most in-cluster
+fixtures are on slot `a`, across the four seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security` and `seeded-capacity`, plus both defect node pools.
+Slot `c` carries a GKE-level defect only and no workloads at all: it is the configuration
+outlier. Slot `b` is the held-back control plane, and now also the upgrade-readiness drain
+defects — they belong with the cluster whose subject is upgrading.
+
+### Slot `b`: the drain that never starts
+
+Upgrading a node means draining it, and most upgrade failures are really drain failures. What
+the fleet could already show was a workload that resists eviction — `obtainability-audit`'s
+PodDisruptionBudget checks, on slot `a`. What it could not show is the two cases where the drain
+never begins:
+
+| Role | What it plants |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- | --- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `readiness-surge-blocked` | A node pool with `max_surge: 0`, so an upgrade recreates its only node in place rather than adding a replacement first. Not a retirement, and not always wrong — the `gke-upgrades` skill prescribes it for reservation-bound pools |
+| `readiness-pinned-workload` | A single-replica Deployment whose `nodeSelector` names that pool alone, so it is down for the whole of each in-place node recreate rather than falling back to the default pool |
+| `readiness-drain-blocked` | A PodDisruptionBudget with `maxUnavailable: 0` matching that workload, so `disruptionsAllowed` is 0 permanently and no drain that touches it can finish |
+| `readiness-failclosed-webhook` | A `ValidatingWebhookConfiguration` whose `clientConfig` names a Service that does not exist, with `failurePolicy: Fail` and the API's maximum 30-second `timeoutSeconds`. The unresolvable backend is the defect; Fail alone is set by healthy webhooks throughout the fleet |
+
+The first three are a chain, and that is the point. The surge setting alone is a configuration the
+`gke-upgrades` skill sometimes prescribes; joining it to the single replica pinned there is a
+guaranteed outage per node recreate; adding the budget that refuses the eviction is an upgrade that
+cannot finish at all. Three tiers from three objects, and a case can ask which one the agent
+reached. Only the budget is a Blocker — reporting the surge setting as one is the mistake this
+arrangement exists to catch.
+
+The webhook's planted property is its unresolvable backend, not its failure policy. `failurePolicy:
+Fail` on its own is set by cert-manager, GKE's managed Prometheus, and this repository's own
+operator webhook, so a check that fires on the policy alone reports every healthy cluster. What
+this fixture has that those do not is a `clientConfig` naming a Service that does not exist: fail
+closed onto a backend that can never answer is what turns a drain into a deadlock.
+
+The other dimension of the real finding — a rule matching cluster-wide — is deliberately not
+planted. A fail-closed cluster-wide webhook on a standing shared cluster would reject writes for
+every scenario that touches slot `b`, so a `namespaceSelector` and an `objectSelector` confine it.
+That dimension belongs in a unit test with a recorded manifest, where nothing can be broken by
+it.
+
+A second pool rather than a setting on the default one, because the default pool's version
+pinning is what makes `version-laggard` exact, and a scenario that reds because this fixture
+disturbed that pin would point at the wrong place. Both new pool settings — `version` and
+`auto_upgrade` — follow the default pool for the same reason it carries them. Every cluster is labelled `environment=seeded`, which is what confines the drift
 cohort to these three and keeps `platform-agent-host` and transient `eval-pr*` clusters
 from voting on the baseline.
 
-| Role                 | Slot    | Day | What is planted                                                                       |
-| -------------------- | ------- | --- | ------------------------------------------------------------------------------------- |
-| `rbac-overgrant`     | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA |
-| `no-pdb-workload`    | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB           |
-| `crashloop-workload` | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop |
-| `hpa-saturated`      | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                 |
-| `idle-nodepool`      | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                   |
-| `orphan-disks`       | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                      |
-| `version-laggard`    | b       | 0   | Control plane one minor behind the REGULAR channel default                            |
-| `drift-outlier`      | c       | 1   | Master authorized networks absent, where a and b carry an open block                  |
+| Role                           | Slot    | Day | What is planted                                                                                                              |
+| ------------------------------ | ------- | --- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `rbac-overgrant`               | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                        |
+| `no-pdb-workload`              | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                  |
+| `crashloop-workload`           | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                        |
+| `hpa-saturated`                | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                        |
+| `idle-nodepool`                | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                          |
+| `orphan-disks`                 | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                             |
+| `version-laggard`              | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                   |
+| `drift-outlier`                | c       | 1   | Master authorized networks absent, where a and b carry an open block                                                         |
+| `readiness-surge-blocked`      | b       | 0   | `no-surge-pool`, `maxSurge 0` / `maxUnavailable 1`, tainted `seeded-role=no-surge`                                           |
+| `readiness-pinned-workload`    | b       | 0   | `deployment/pinned-batch-runner` in `seeded-upgrade`, one replica pinned to that pool                                        |
+| `readiness-drain-blocked`      | b       | 0   | `poddisruptionbudget/pinned-batch-runner` in `seeded-upgrade`, `maxUnavailable: 0`, so `disruptionsAllowed` is 0 permanently |
+| `readiness-failclosed-webhook` | b       | 0   | `seeded-fail-closed-gate`, `failurePolicy: Fail` with a 30-second timeout and no backend                                     |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
@@ -128,7 +171,7 @@ neither is going to be obvious from a slug.
 
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
-`seeded-role=idle-batch` on the idle pool's taint — so two of the eight roles are called
+`seeded-role=idle-batch` on the idle pool's taint — so two of the eleven roles are called
 one thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the

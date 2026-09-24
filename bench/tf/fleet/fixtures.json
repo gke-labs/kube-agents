@@ -5,7 +5,7 @@
   "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]` or `[?(@.key=='value')]` steps; `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), or `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit does not run this pass and never acts on a drift; a scheduled scan of every pool project from the CI health bot is the follow-up on #1550. A role with an empty list asserts nothing beyond presence.",
   "cluster_slots": {
     "a": "Every namespace-level defect, plus the idle and pinned node pools.",
-    "b": "Control plane held one minor behind the REGULAR channel default.",
+    "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects.",
     "c": "The consistency outlier: no master authorized networks."
   },
   "roles": {
@@ -168,6 +168,107 @@
           "op": "none_eq",
           "value": true,
           "why": "the outlier facet. Anyone enabling authorized networks on slot c gives the drift cohort a 3/3 agreement and consistency-authorized-networks-probe nothing to find"
+        }
+      ]
+    },
+    "readiness-surge-blocked": {
+      "cluster_slot": "b",
+      "namespace": null,
+      "probes": ["node?cloud.google.com/gke-nodepool=no-surge-pool"],
+      "fixture": "no-surge-pool node pool with max_surge 0 and max_unavailable 1, so an upgrade recreates its only node in place rather than adding a replacement first -- a guaranteed outage for anything pinned there, not a retirement",
+      "state": [
+        {
+          "subject": "node?cloud.google.com/gke-nodepool=no-surge-pool",
+          "path": "status.conditions[?(@.type=='Ready')].status",
+          "op": "any_eq",
+          "value": "True",
+          "why": "The pool's upgrade settings are readable from the GKE API whether or not its node is up, but the pinned workload below can only be Running if the node is, and the finding these two fixtures exist for is the pair. A NotReady node makes the workload Pending for a reason that is not the fixture"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='no-surge-pool')].upgradeSettings.maxUnavailable",
+          "op": "any_eq",
+          "value": 1,
+          "why": "half of the defect, as clusters describe exposes it: the pool upgrades by taking its only node away. Raising maxSurge back to 1 heals the fixture while every probe still passes, which is what this and the next assertion exist to catch"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='no-surge-pool')].upgradeSettings.maxSurge",
+          "op": "absent",
+          "why": "the other half. The API omits maxSurge when it is 0 (confirmed against a live apply: the pool's upgradeSettings carry maxUnavailable and strategy only), so its presence at any value means someone gave the pool surge capacity and the fixture is healed"
+        }
+      ]
+    },
+    "readiness-pinned-workload": {
+      "cluster_slot": "b",
+      "namespace": "seeded-upgrade",
+      "probes": ["deployment/pinned-batch-runner"],
+      "fixture": "pinned-batch-runner Deployment (one replica), nodeSelector seeded-role=no-surge, so it runs only on the pool that upgrades in place and is down for the whole of each node recreate rather than falling back to the default pool",
+      "state": [
+        {
+          "subject": "pod?app=pinned-batch-runner",
+          "path": "status.phase",
+          "op": "any_eq",
+          "value": "Running",
+          "why": "The defect is that these pods have nowhere else to go, which is only true while they are somewhere. Pods already Pending carry no information about what a drain would do to them"
+        },
+        {
+          "subject": "deployment/pinned-batch-runner",
+          "path": "spec.template.spec.nodeSelector.seeded-role",
+          "op": "eq",
+          "value": "no-surge",
+          "why": "the pin is the defect. Drop the selector and the pod schedules onto the default pool, where a drain of the no-surge pool costs it nothing -- the fixture is healed and every probe still passes"
+        }
+      ]
+    },
+    "readiness-failclosed-webhook": {
+      "cluster_slot": "b",
+      "namespace": null,
+      "probes": ["validatingwebhookconfiguration/seeded-fail-closed-gate"],
+      "fixture": "seeded-fail-closed-gate ValidatingWebhookConfiguration: failurePolicy Fail with the API's maximum 30-second timeout, pointing at a Service that does not exist -- the unresolvable backend is the defect, since Fail alone is set by healthy webhooks throughout the fleet -- confined by namespace and object selectors",
+      "state": [
+        {
+          "subject": "validatingwebhookconfiguration/seeded-fail-closed-gate",
+          "path": "webhooks[*].failurePolicy",
+          "op": "any_eq",
+          "value": "Fail",
+          "why": "Fail-closed is the whole defect: the same webhook with failurePolicy Ignore stalls no drain, so a run that read it as Ignore would be asserting against an object that is no longer the fixture"
+        },
+        {
+          "subject": "validatingwebhookconfiguration/seeded-fail-closed-gate",
+          "path": "webhooks[*].timeoutSeconds",
+          "op": "any_eq",
+          "value": 30,
+          "why": "the second half of the defect. An omitted timeout is defaulted to 10 by the API server, so the long wait is only present while it is set explicitly, and a check that grades how long a drain can stall has nothing to read if someone drops it"
+        },
+        {
+          "subject": "validatingwebhookconfiguration/seeded-fail-closed-gate",
+          "path": "webhooks[*].clientConfig.service.name",
+          "op": "any_eq",
+          "value": "nonexistent-admission-gate",
+          "why": "the property that makes this dangerous rather than ordinary. failurePolicy Fail is set by cert-manager, managed-prometheus and this repository's own operator webhook; Fail onto a backend that cannot answer is what deadlocks a drain. Point the clientConfig at a Service that resolves and the fixture is healed while the policy and the timeout still read as planted"
+        }
+      ]
+    },
+    "readiness-drain-blocked": {
+      "cluster_slot": "b",
+      "namespace": "seeded-upgrade",
+      "probes": ["poddisruptionbudget/pinned-batch-runner"],
+      "fixture": "pinned-batch-runner PodDisruptionBudget with maxUnavailable 0, so no pod it matches may ever be evicted voluntarily and every node drain that touches one blocks indefinitely",
+      "state": [
+        {
+          "subject": "poddisruptionbudget/pinned-batch-runner",
+          "path": "status.disruptionsAllowed",
+          "op": "eq",
+          "value": 0,
+          "why": "the defect as the API reports it. Widen maxUnavailable to 1 and this becomes 1 while the pod is healthy, so the assertion catches the one edit that heals the fixture -- which no probe would, since the budget still exists"
+        },
+        {
+          "subject": "poddisruptionbudget/pinned-batch-runner",
+          "path": "status.currentHealthy",
+          "op": "ge",
+          "value": 1,
+          "why": "the half that separates the defect from an unhealthy workload. disruptionsAllowed is also 0 when nothing is running, which is not this fixture; requiring a healthy pod alongside it means the zero is the spec's doing. hpa-saturated pairs its assertion the same way"
         }
       ]
     }

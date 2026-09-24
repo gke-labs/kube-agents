@@ -27,9 +27,9 @@ Invoked by the `obtainability-audit` watchdog. The cron id predates the rename.
 
 ### `security_patch_orchestrator_sop.md`
 
-Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared against `gcloud container get-server-config` for each cluster's release channel, node skew against GKE's two-minor ceiling, fleet-wide minor spread, clusters on no release channel, `autoUpgrade`/`autoRepair` off, missing maintenance windows, upgrade-blocking maintenance exclusions, deprecated node image variants, and absent upgrade notifications.
+Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared against `gcloud container get-server-config` for each cluster's release channel, node skew against GKE's two-minor ceiling, fleet-wide minor spread, clusters on no release channel, `autoUpgrade`/`autoRepair` off, missing maintenance windows, upgrade-blocking maintenance exclusions, deprecated node image variants, and absent upgrade notifications. For a cluster found behind, it also runs the `fleet-upgrade-verification` readiness grade and reports the upgrade as blocked when a drain-blocking PodDisruptionBudget or node-pool skew would stop it from completing.
 
-The SOP forbids the words "vulnerable", "unpatched", and "CVE" in its findings: there is no vulnerability feed in this environment, so every finding is version currency or upgrade-policy hygiene. Invoked by the `security-patch-orchestrator` watchdog.
+The SOP forbids the words "vulnerable", "unpatched", and "CVE" in its findings: there is no vulnerability feed in this environment, so every finding is version currency or upgrade-policy hygiene — or, for the one check that asks whether the upgrade would complete, a drain that cannot finish. Invoked by the `security-patch-orchestrator` watchdog.
 
 ### `fleet_wide_cost_analysis_sop.md`
 
@@ -88,7 +88,7 @@ The cron watchdog invokes the SOP by prompting the agent to read `governance/<so
 
 The division of labour in the audit streams is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` and `gh` call and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the nine ledgers uniform and their run-to-run deltas computable.
 
-The audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`). An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
+The audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`; the upgrade audit also preloads `fleet-upgrade-verification`, whose readiness grade its last check reads). An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
 
 ## Where to go next
 
