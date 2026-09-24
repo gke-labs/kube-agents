@@ -222,6 +222,9 @@ def _encode_interaction(interaction: Interaction) -> str:
                 "summary": task.summary,
                 "error": task.error,
                 "run_count": task.run_count,
+                "result": task.result,
+                "evidence": list(task.evidence),
+                "artifacts": list(task.artifacts),
             }
             for task in interaction.tasks
         ],
@@ -247,6 +250,17 @@ def _decode_task_projection(payload: dict) -> TaskProjection:
         summary=str(payload.get("summary") or ""),
         error=str(payload.get("error") or ""),
         run_count=int(payload.get("run_count") or 0),
+        result=str(payload.get("result") or ""),
+        evidence=tuple(
+            item
+            for item in (payload.get("evidence") or [])
+            if isinstance(item, dict)
+        ),
+        artifacts=tuple(
+            item
+            for item in (payload.get("artifacts") or [])
+            if isinstance(item, dict)
+        ),
     )
 
 
