@@ -2032,7 +2032,6 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     token = body.get("token")
     if not token:
         return None, "unverified", "GitHub's mint response carried no token"
-
     return token, "ok", ""
 
 
@@ -2545,7 +2544,20 @@ def check_token_minter(
         # only when every read that would say so happened; a denied read
         # leaves `details` empty and `partial` naming what went unchecked.
         sweeper = "the pull-request sweeper lacks signer on the key (the detail has the one-off grant)"
-        message = f"Minter provisioned; {sweeper}" if not partial else f"{sweeper[0].upper()}{sweeper[1:]}; {partial}"
+        if not partial:
+            message = f"Minter provisioned; {sweeper}"
+        else:
+            # The signer row is the minter's alone here: the sweeper's half of
+            # it is the failure, and cannot sit in the "verified" list.
+            rest = _partial_summary(
+                [
+                    ("the imported key versions", versions_checked),
+                    ("the key's purpose, algorithm and import-only setting", key_checked),
+                    ("the minter GSA's signing rights", signer_checked),
+                    ("the minter GSA's Workload Identity binding", gsa_checked),
+                ]
+            )
+            message = f"{sweeper[0].upper()}{sweeper[1:]}; {rest}"
     elif not passed:
         message = "Token minter not provisioned / PEM key missing or wrong"
     elif partial:

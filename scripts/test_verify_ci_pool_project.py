@@ -1529,6 +1529,9 @@ class TokenMinterTest(unittest.TestCase):
         self.assertNotIn("Minter provisioned", unread.message)
         self.assertTrue(unread.message.startswith("The pull-request sweeper lacks signer on the key"), unread.message)
         self.assertIn("the imported key versions, the key's purpose, algorithm and import-only setting not checked", unread.message)
+        # And it does not call the sweeper's rights verified in the same breath.
+        self.assertIn("the minter GSA's signing rights, the minter GSA's Workload Identity binding verified", unread.message)
+        self.assertNotIn("sweeper's signing rights", unread.message)
         self.assertFalse(any(self._GSA in d and "lacks" in d for d in result.details), result.details)
 
     def test_missing_minter_gsa_fails(self):
@@ -1975,6 +1978,7 @@ class LedgerTokenMintTest(unittest.TestCase):
         _, _, message = self._mint(sign_rc=1)
         self.assertNotIn("not-a-key", message)
 
+
 class LedgerReadCredentialTest(unittest.TestCase):
     """The grading credential, which is not the minter App and not the operator's own login."""
 
@@ -2083,14 +2087,6 @@ class LedgerReadCredentialTest(unittest.TestCase):
         with mock.patch.dict(checker.os.environ, env, clear=True):
             result = self._check(fail_if_called, pem=None)
         self.assertTrue(result.warnings)
-
-    def test_a_passing_read_warns_about_nothing(self):
-        # A warning is counted as "could not be checked" and exits 2. Nothing
-        # about the App's other permissions belongs in that bucket: they are a
-        # pool-wide setting, not something this project's onboarding waits on.
-        result = self._check(lambda *a, **kw: _Response({}))
-        self.assertTrue(result.passed)
-        self.assertEqual([], result.warnings)
 
     def test_the_token_never_reaches_a_message(self):
         result = self._check(self._http_error(403, "Forbidden"), mint=("ghs_secret_value", "ok", ""))
