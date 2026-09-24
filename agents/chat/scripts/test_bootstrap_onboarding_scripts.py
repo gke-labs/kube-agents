@@ -17,19 +17,24 @@ again.
 
 import contextlib
 import io
-import os
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
+# The gate imports cluster_agent_profile, which the image copies beside it from here.
+sys.path.insert(1, str(Path(__file__).resolve().parents[2] / "platform" / "scripts"))
 
 import bootstrap_delivery  # noqa: E402
 import bootstrap_scan_gate  # noqa: E402
+import cluster_agent_profile  # noqa: E402
 
 INVENTORY = "INVENTORY.md"
 DELIVERED = "INVENTORY.delivered.md"
@@ -169,6 +174,10 @@ class ScanGateTest(unittest.TestCase):
             return "t_test"
 
         bootstrap_scan_gate.file_scan_task = _fake_file
+        # Where the pod keeps the profiles, relative to the data dir the gate is given.
+        profiles = mock.patch.object(cluster_agent_profile, "PROFILES_BASE", self.d / "profiles")
+        profiles.start()
+        self.addCleanup(profiles.stop)
 
     def tearDown(self):
         bootstrap_scan_gate.file_scan_task = self._orig
@@ -179,6 +188,19 @@ class ScanGateTest(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             rc = bootstrap_scan_gate.main(self.d)
         return rc, buf.getvalue().strip()
+
+    def _cluster_agent(self, project, cluster, location):
+        # Named and stamped by the functions create_profile uses, so the fixture
+        # carries the identity block the reconcile actually writes.
+        name = cluster_agent_profile.profile_name(project, cluster, location)
+        home = cluster_agent_profile.profile_home(name)
+        home.mkdir(parents=True)
+        cluster_agent_profile._inject_cluster_identity(home, project, cluster, location)
+        return name
+
+    @staticmethod
+    def _step_2(body):
+        return body[body.index("**Step 2") : body.index("**Step 3")]
 
     def test_files_task_when_no_inventory(self):
         self.assertFalse(bootstrap_scan_gate.should_skip(self.d))
@@ -308,41 +330,120 @@ class ScanGateTest(unittest.TestCase):
         self.assertNotIn("aggregation card", body)
         self.assertIn("metadata", body)  # structured child results
 
-    def test_roster_command_carries_both_fixes(self):
-        """A bare `hermes profile list` has two distinct failure modes.
+    def test_step_2_lists_one_exact_call_per_cluster_agent(self):
+        """The gate reads the roster because the sweep's worker cannot (#1872).
 
-        Without the absolute path it exits 127: the kanban worker's terminal runs
-        with a stripped environment where /opt/hermes/.venv/bin is not on PATH,
-        though it works fine from an interactive shell.
-
-        Without a pinned HERMES_HOME it is worse than that — it exits 0 and prints
-        a roster that is missing profiles. The pin must be unconditional: the
-        worker HAS a HERMES_HOME, set to its own profile home, so a defaulted
-        expansion (${HERMES_HOME:-...}) keeps the wrong value and reproduces the
-        quiet failure. A loud failure gets retried; a quiet wrong answer gets
-        believed, and on a multi-cluster fleet it drops clusters from the sweep
-        with no trace. Both halves must survive.
+        The worker's terminal runs in the shell sandbox, which has no `hermes`,
+        and whose /opt/data/profiles is a mirror without any config.yaml. Sent to
+        read the roster there, the worker blocked on 0.6.0; on main it listed the
+        mirror's directories and fanned out from that.
         """
-        cmd = bootstrap_scan_gate._roster_command()
-        self.assertIn("/opt/hermes/.venv/bin/hermes", cmd)
-        self.assertTrue(
-            cmd.startswith(f"HERMES_HOME={bootstrap_scan_gate._data_dir()} ")
+        short = self._cluster_agent("proj", "prod", "us-east4")
+        # Long enough that profile_name() truncates and hashes it: the assignee is
+        # the profile name, and the key comes from the stamped identity.
+        hashed = self._cluster_agent(
+            "proj", "a-cluster-name-long-enough-to-be-hashed", "us-central1-a"
         )
-        self.assertNotIn(":-", cmd)  # no defaulted expansion — see docstring
-        self.assertIn(cmd, bootstrap_scan_gate._task_body())
+        self.assertNotIn("us-central1-a", hashed)
+        step2 = self._step_2(bootstrap_scan_gate._task_body())
+        prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
+        self.assertIn(
+            f"kanban_create(assignee='{short}', idempotency_key='{prefix}proj-prod-us-east4'", step2
+        )
+        self.assertIn(
+            f"kanban_create(assignee='{hashed}', "
+            f"idempotency_key='{prefix}proj-a-cluster-name-long-enough-to-be-hashed-us-central1-a'",
+            step2,
+        )
+        self.assertEqual(step2.count("kanban_create("), 2)
+        self.assertNotIn("/opt/hermes", step2)
+        self.assertNotIn("profile list", step2)
 
-    def test_roster_command_tracks_a_custom_agent_home(self):
-        """/opt/data is the default data root, not a constant.
+    def test_same_named_clusters_in_two_projects_get_distinct_keys(self):
+        # The board matches an idempotency key alone, whatever the assignee, so a
+        # shared key hands the second Cluster Agent the first one's card.
+        self._cluster_agent("proj-a", "prod", "us-central1")
+        self._cluster_agent("proj-b", "prod", "us-central1")
+        step2 = self._step_2(bootstrap_scan_gate._task_body())
+        keys = re.findall(r"idempotency_key='([^']+)'", step2)
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(len(set(keys)), 2)
 
-        With spec.harness.hermes.agentHome set, this gate's HERMES_HOME is that
-        home and the profiles live under it. A literal /opt/data would point
-        hermes at a tree with no profiles — the same quiet empty roster the pin
-        exists to prevent, one configuration over.
+    def test_step_2_leaves_out_what_is_not_a_cluster_agent(self):
+        # `default` and `platform` share the directory; stamped here so that only the
+        # reserved-name rule can be what drops them. An unstamped profile has no
+        # cluster to key its card by, and the reconcile skips it for the same reason.
+        for reserved, cluster in (("default", "a"), ("platform", "b")):
+            home = self.d / "profiles" / reserved
+            home.mkdir(parents=True)
+            cluster_agent_profile._inject_cluster_identity(home, "p", cluster, "l")
+        (self.d / "profiles" / "cluster-p-unstamped-l").mkdir()
+        step2 = self._step_2(bootstrap_scan_gate._task_body())
+        self.assertNotIn("kanban_create(", step2)
+        self.assertIn("    (none)", step2)
+        self.assertIn("If no calls are listed above", step2)
+
+    def test_the_fan_out_calls_carry_no_parents(self):
+        # A card whose parent is the sweep card cannot start until the sweep card
+        # completes, so the #1174 guard lets the sweep card complete over it: the
+        # sweep closed on a dispatch receipt and nothing read the audits (#1872).
+        self._cluster_agent("proj", "prod", "us-east4")
+        step2 = self._step_2(bootstrap_scan_gate._task_body())
+        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("parents", calls[0])
+        self.assertIn("Pass no `parents`", step2)
+
+    def test_an_unreadable_roster_files_the_solo_sweep(self):
+        # A scripts directory without cluster_agent_profile must not fail the cron
+        # run. The card then reads as having no Cluster Agents, the same answer the
+        # gate gives when the reconcile script itself is absent.
+        with mock.patch.dict(sys.modules, {"cluster_agent_profile": None}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            step2 = self._step_2(bootstrap_scan_gate._task_body())
+        self.assertIn("    (none)", step2)
+
+    def test_an_unreadable_profile_does_not_drop_the_others(self):
+        # A config.yaml that parses to a list makes read_cluster_identity raise.
+        good = self._cluster_agent("proj", "prod", "us-east4")
+        bad = cluster_agent_profile.profile_home("cluster-broken")
+        bad.mkdir(parents=True)
+        (bad / "config.yaml").write_text("- a\n")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            step2 = self._step_2(bootstrap_scan_gate._task_body())
+        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
+        self.assertEqual(len(calls), 1)
+        self.assertIn(f"assignee='{good}'", calls[0])
+        self.assertIn("cluster-broken", stderr.getvalue())
+
+    def test_the_card_lists_the_roster_the_reconcile_left(self):
+        """The roster is read after the gate's own reconcile, not before it.
+
+        On a fresh install no profile exists until that reconcile creates it, so
+        a list taken any earlier is empty and the sweep fans out to nobody.
         """
-        with mock.patch.dict(os.environ, {"HERMES_HOME": "/var/agent"}):
-            cmd = bootstrap_scan_gate._roster_command()
-            self.assertTrue(cmd.startswith("HERMES_HOME=/var/agent "))
-            self.assertIn(cmd, bootstrap_scan_gate._task_body())
+        bootstrap_scan_gate.file_scan_task = self._orig
+        script = self.d / "scripts" / bootstrap_scan_gate.RECONCILE_SCRIPT_NAME
+        script.parent.mkdir()
+        script.touch()
+        created = []
+
+        def fake_reconcile(cmd, **kwargs):
+            created.append(self._cluster_agent("proj", "prod", "us-east4"))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        filed = []
+        kanban = types.ModuleType("hermes_cli.kanban")
+        kanban.run_slash = lambda cmd: filed.append(cmd) or '{"id": "t_real"}'
+        modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.kanban": kanban}
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_reconcile), \
+                mock.patch.dict(sys.modules, modules), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self._run()
+        self.assertEqual(len(filed), 1)
+        args = shlex.split(filed[0])
+        self.assertIn(f"kanban_create(assignee='{created[0]}'", args[args.index("--body") + 1])
 
     def test_body_forbids_improvising_around_a_failed_step(self):
         """The 32-call roster loop is what this prevents.
@@ -566,8 +667,9 @@ class ScanGateTest(unittest.TestCase):
         # (The aggregation card's key went with the fan-in shape, #1010: the
         # sweep card now waits for its children and writes the findings itself,
         # so the only spawned cards left are per-cluster and prioritize.)
+        self._cluster_agent("proj", "prod", "us-east4")
         body = bootstrap_scan_gate._task_body()
-        self.assertIn(bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX, body)
+        self.assertIn(f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}proj-prod-us-east4", body)
         self.assertIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
 
     def test_parses_task_id_from_either_response_shape(self):

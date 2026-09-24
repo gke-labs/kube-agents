@@ -1,4 +1,4 @@
-# Single-Cluster Inventory Audit (`bootstrap-inventory-cluster-<cluster-name>-<location>`)
+# Single-Cluster Inventory Audit (`bootstrap-inventory-cluster-<project>-<cluster>-<location>`)
 
 **Purpose:** The per-cluster half of first-time environment discovery, performed by a Cluster Agent
 on the one cluster it is pinned to. The Platform Agent fans this out during

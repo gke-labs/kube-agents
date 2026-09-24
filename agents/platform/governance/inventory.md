@@ -46,7 +46,7 @@ burst and with no `parents`**, so the dispatcher runs them concurrently:
 ```
 kanban_create(
   assignee='<that cluster's Cluster Agent profile>',
-  idempotency_key='bootstrap-inventory-cluster-<cluster>-<location>',
+  idempotency_key='bootstrap-inventory-cluster-<project>-<cluster>-<location>',
   title='Report cluster inventory: <cluster>',
   body=<the instructions below>,
 )

@@ -160,36 +160,56 @@ def _reconcile_script(data_dir: Path) -> Path:
     return data_dir / "scripts" / RECONCILE_SCRIPT_NAME
 
 
-def _roster_command() -> str:
-    """The one command that answers "which Cluster Agents exist".
+def _cluster_agent_calls() -> list[str]:
+    """One exact ``kanban_create`` call per Cluster Agent, for Step 2 of the card.
 
-    Both halves are load-bearing and were learned the hard way.
+    The gate reads the roster because the sweep's worker cannot. The worker's
+    ``terminal`` runs in the shell sandbox, which has no ``hermes``, and whose
+    ``/opt/data/profiles`` is a mirror that leaves out every ``config.yaml``
+    (so no ``cluster_identity``) and keeps profiles the reconcile has pruned.
+    This process runs in the agent pod next to the real profiles, and only
+    after ``ensure_cluster_agents`` returns True, so the list is the roster the
+    reconcile left, or once it has given up, whatever roster exists.
 
-    Absolute path, because the kanban worker's terminal runs with a stripped
-    environment in which ``/opt/hermes/.venv/bin`` is not on PATH — a bare
-    ``hermes profile list`` exits 127 there while working fine from an
-    interactive shell, which is why this was not obvious.
+    ``cluster_agent_profile`` resolves the profiles under this process's
+    ``HERMES_HOME``, the same root the markers and the reconcile use, so it
+    follows ``spec.harness.hermes.agentHome``.
 
-    HERMES_HOME pinned unconditionally, because the absolute path ALONE is
-    worse than the 127. The worker is not missing a HERMES_HOME — it has one,
-    pinned to its own profile home, and profiles resolve at
-    ``$HERMES_HOME/profiles/<name>``. Under the worker's value hermes exits 0
-    and prints a plausible roster that is missing profiles (observed:
-    ``default`` only, with ``platform`` absent — the view from inside a
-    profile home). A defaulted expansion like ``${HERMES_HOME:-...}``
-    preserves exactly that wrong value; only an unconditional pin gives the
-    fleet-wide view. A loud failure gets retried; a quiet wrong answer gets
-    believed, and on a real fleet it silently drops clusters from the sweep.
+    A profile without a readable ``cluster_identity`` is left out, as the
+    reconcile neither counts nor prunes one: there is no cluster to key its card
+    by, and the card already sends every cluster the list misses to Step 4. A
+    profile whose config cannot be read at all is skipped the same way: a file
+    like that is what keeps the reconcile failing until it gives up and files
+    the sweep, so it must not take the other profiles with it.
 
-    The pinned value is this gate's own data root, resolved when the card is
-    filed — not a literal ``/opt/data``. The gate's HERMES_HOME IS the root
-    the profiles live under (the same one the marker files rely on), while
-    the root itself moves with ``spec.harness.hermes.agentHome``. A hardcoded
-    ``/opt/data`` under a custom home points hermes at a tree with no
-    profiles — the same quiet empty roster, one configuration over; this repo
-    has hit that twice before (see the notes in agents/platform/config.yaml).
+    Failing to list the profiles returns an empty list, which files the solo
+    sweep. Raising would fail the run before the card is filed, on every tick
+    for as long as the failure lasts; like the give-up in
+    ``ensure_cluster_agents``, this gate prefers a degraded report to none.
     """
-    return f"HERMES_HOME={_data_dir()} /opt/hermes/.venv/bin/hermes profile list"
+    try:
+        import cluster_agent_profile as cap  # beside this script in the pod, as for the reconcile
+
+        names = cap.list_profiles()
+    except Exception as e:  # noqa: BLE001 - never fail the cron run; see the docstring
+        sys.stderr.write(f"bootstrap_scan_gate: could not read the Cluster Agent roster: {e}\n")
+        return []
+    calls = []
+    for name in names:
+        try:
+            identity = cap.read_cluster_identity(cap.profile_home(name))
+        except Exception as e:  # noqa: BLE001 - see the docstring
+            sys.stderr.write(f"bootstrap_scan_gate: skipping Cluster Agent {name}: {e}\n")
+            continue
+        if identity is None:
+            continue
+        project, cluster, location = identity["project"], identity["cluster"], identity["location"]
+        calls.append(
+            f"kanban_create(assignee='{name}', "
+            f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}{project}-{cluster}-{location}', "
+            f"title='Report cluster inventory: {cluster}', body=<the instructions below>)"
+        )
+    return calls
 
 
 def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
@@ -434,6 +454,7 @@ def _task_body() -> str:
     instruction_list = "\n".join(f"  - {p}" for p in INSTRUCTIONS_PATHS)
     prioritize_list = "\n".join(f"  - {p}" for p in PRIORITIZE_INSTRUCTIONS_PATHS)
     cluster_audit_list = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
+    calls = "\n".join(f"    {c}" for c in _cluster_agent_calls()) or "    (none)"
     return (
         "First-time onboarding discovery sweep. Follow the inventory SOP, reading whichever "
         "of these exists:\n"
@@ -467,19 +488,20 @@ def _task_body() -> str:
         "onboarding runs once, and a report saying discovery failed is worth more than a thin "
         "one that reads as a clean fleet.\n\n"
         f"{_scope_gap_paragraph(_data_dir())}"
-        "**Step 2 — fan out.** Read the roster with exactly this command, exactly once:\n\n"
-        f"    {_roster_command()}\n\n"
-        "Cluster Agents are the profiles whose names start `cluster-`. **If that command "
-        "fails or lists no `cluster-` profiles, there are no Cluster Agents: skip the rest of "
+        "**Step 2 — fan out.** These are the Cluster Agents, one card each, read from the "
+        "profiles when this card was filed. Make every call below exactly once, all of them "
+        "up front:\n\n"
+        f"{calls}\n\n"
+        "This list is the roster. Do not look it up yourself: your terminal runs in a sandbox "
+        "that has neither `hermes` nor the profiles' configuration, so anything you list there "
+        "is incomplete. Pass no `parents` on these calls: a card with this one as its parent "
+        "cannot start until this card completes, and this card waits for them in Step 3. "
+        "**If no calls are listed above, there are no Cluster Agents: skip the rest of "
         "this step and do the whole sweep yourself in Step 4, following Steps 2 to 4 of the "
         "single-cluster audit SOP (its own numbering) for each cluster so the topology and the "
         "workload checks both happen.** That is the normal case for a "
-        "single-cluster install and it is not an error. Use the command as written — the "
-        "absolute path and the `HERMES_HOME` are both required, and a bare `hermes profile "
-        "list` will either fail or quietly return an incomplete roster.\n\n"
-        "For every cluster that has an agent, open one child card per cluster with "
-        "`kanban_create(assignee=<that agent>, "
-        f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}<cluster-name>-<location>', ...)`. The body must "
+        "single-cluster install and it is not an error.\n\n"
+        "Each card's body must "
         "send that agent to the single-cluster audit SOP, reading whichever of these exists:\n"
         f"{cluster_audit_list}\n\n"
         "and tell it to complete its card with the structured `metadata` that SOP specifies. "
