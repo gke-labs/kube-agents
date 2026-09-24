@@ -811,8 +811,9 @@ that file is now the one `/sethome` and the monitoring policy write to. It leave
 list and is back-filled from the image template instead, on exactly the terms `default` gets — keys
 the template declares and the live file has lost are restored, keys it already holds are left
 alone. Its overlay merges after that back-fill as it always did. Everything else the image owns in
-that profile — the persona files, `cron/`, `skills/`, `governance/`, `hindsight/` — still
-force-syncs either way.
+that profile — the persona files, `cron/`, `skills/`, `governance/`, `hindsight/`,
+`capabilities/` — still force-syncs either way (`cron/` and `capabilities/` as merges: the image
+wins the roster's keys, the volume wins the criteria's).
 
 One value inside both of these files does follow the image: the `User-Agent` header that the
 remote MCP servers' `args` carry (see [the config reference](/kube-agents/reference/config/)). The

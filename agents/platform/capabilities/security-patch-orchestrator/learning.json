@@ -1,0 +1,9 @@
+{
+  "default": "propose",
+  "keys": {
+    "blocking_exclusion_min_days": "propose",
+    "deprecated_image_types": "propose",
+    "fleet_spread_min_minors": "propose",
+    "pool_skew_critical_minors": "propose"
+  }
+}
