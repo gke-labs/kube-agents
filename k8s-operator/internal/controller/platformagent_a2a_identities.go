@@ -657,8 +657,8 @@ func webIdentity() a2aIdentity {
 	return a2aIdentity{
 		user:    "web",
 		account: a2aAccountApp,
-		comment: "the read surface, and the only credential published to a browser by\n" +
-			"design. STATIC permanently: a browser holds no ServiceAccount token and\n" +
+		comment: "the read surface, and one of the two credentials published to a\n" +
+			"browser by design - console is the other. STATIC permanently: a browser holds no ServiceAccount token and\n" +
 			"there is no mechanism by which it could. Read-only is not expressible as\n" +
 			"a subject list - JetStream puts the reach in the request BODY - so the JS\n" +
 			"API grants are enumerated per stream and there is no ack grant.",
