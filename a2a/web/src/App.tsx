@@ -35,17 +35,30 @@ const LINK_DOWN_SEND_NOTE = "not sent: the bus link is down. Your text is still 
  * Where the page is in finding its bus. `remember` is false for a config the
  * console server handed over: the server is the source of truth, and the
  * credential shouldn't outlive the tab in storage when it doesn't have to.
+ * `unconfigured`'s `namedUser` is set only when the URL asked for a specific
+ * user and gave no password for it: that request must not be answered by
+ * quietly asking the server for a different user's credential instead.
  */
 type Stage =
   | { kind: "looking" }
   | { kind: "ready"; config: BusConfig; remember: boolean }
-  | { kind: "unconfigured"; error: string | null };
+  | { kind: "unconfigured"; error: string | null; namedUser: string | null };
 
-// Pure, like loadConfig: it runs as a useState initializer, which StrictMode
-// calls twice.
+/**
+ * Pure, like loadConfig: it runs as a useState initializer, which StrictMode
+ * calls twice, and Retry calls it again to re-check the same way.
+ *
+ * A URL or stored config wins outright. Short of that, a `?user=` with no
+ * password is a request to connect as that user by hand - falling through to
+ * `/config.json` here would silently authenticate as the server's `console`
+ * user instead, which is a different (and more capable) identity than the
+ * one asked for. Only a bare load, naming no user at all, goes looking.
+ */
 function initialStage(): Stage {
   const config = loadConfig();
-  return config ? { kind: "ready", config, remember: true } : { kind: "looking" };
+  if (config) return { kind: "ready", config, remember: true };
+  const namedUser = new URLSearchParams(window.location.search).get("user");
+  return namedUser !== null ? { kind: "unconfigured", error: null, namedUser } : { kind: "looking" };
 }
 
 export default function App() {
@@ -79,10 +92,14 @@ export default function App() {
     fetchServedConfig().then(
       (served) => {
         if (cancelled) return;
-        setStage(served ? { kind: "ready", config: served, remember: false } : { kind: "unconfigured", error: null });
+        setStage(
+          served
+            ? { kind: "ready", config: served, remember: false }
+            : { kind: "unconfigured", error: null, namedUser: null },
+        );
       },
       (error: unknown) => {
-        if (!cancelled) setStage({ kind: "unconfigured", error: String(error) });
+        if (!cancelled) setStage({ kind: "unconfigured", error: String(error), namedUser: null });
       },
     );
     return () => {
@@ -119,7 +136,7 @@ export default function App() {
           // No retry on reload with the same bad config. Retry goes back to
           // the server, which is what fixing a port-forward wants.
           clearConfig();
-          setStage({ kind: "unconfigured", error: String(error) });
+          setStage({ kind: "unconfigured", error: String(error), namedUser: null });
         }
       }
     })();
@@ -215,7 +232,10 @@ export default function App() {
   // takes.
   if (stage.kind === "looking") return null;
   if (stage.kind === "unconfigured") {
-    return <NotConnected error={stage.error} onRetry={() => setStage({ kind: "looking" })} />;
+    // initialStage(), not a bare `{ kind: "looking" }`: it re-reads the URL,
+    // so a namedUser screen stays put on Retry instead of quietly falling
+    // through to the served credential the URL asked to avoid.
+    return <NotConnected error={stage.error} namedUser={stage.namedUser} onRetry={() => setStage(initialStage())} />;
   }
 
   return (

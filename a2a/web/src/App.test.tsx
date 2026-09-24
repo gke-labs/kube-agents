@@ -120,6 +120,16 @@ describe("App", () => {
     expect(config).toEqual({ url: "ws://localhost:9222", user: "web", pass: "the-web-password" });
     expect(fetch).not.toHaveBeenCalled();
   });
+
+  it("shows read-only guidance for a bare ?user=web, and never falls through to the served console credential", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    setLocation("?user=web");
+    render(<App />);
+    expect(await screen.findByText(/user=web&pass=/)).toBeTruthy();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(startBus).not.toHaveBeenCalled();
+  });
 });
 
 describe("App finds its bus", () => {
@@ -174,7 +184,11 @@ describe("App finds its bus", () => {
     });
     const fetch = respond(200, "application/json", '{"user":"console","pass":"served"}');
     vi.stubGlobal("fetch", fetch);
-    setLocation("?ws=ws://localhost:9222&user=console&pass=wrong");
+    // A stored config, not a URL one: a URL config is never saved (config.ts's
+    // saveConfig only runs when `remember` is set), so sessionStorage would be
+    // null here either way and the assertion below couldn't fail. Seeding
+    // storage directly is what actually exercises clearConfig().
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ url: "ws://localhost:9222", user: "console", pass: "wrong" }));
     render(<App />);
     expect((await screen.findByRole("alert")).textContent).toContain("websocket refused: 403");
     expect(sessionStorage.getItem(STORAGE_KEY)).toBeNull();

@@ -26,4 +26,24 @@ describe("NotConnected", () => {
     await userEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
+
+  it("blames the credential Secret, not the port-forward, on a 503", () => {
+    render(
+      <NotConnected
+        error="503: no console credential at /var/run/secrets/a2a-console/console-password"
+        onRetry={() => {}}
+      />,
+    );
+    expect(screen.getByText(/has no credential yet/)).toBeTruthy();
+    expect(
+      screen.queryByText("kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-console 8080:8080"),
+    ).toBeNull();
+  });
+
+  it("shows the read-only recipe for a named user with no password, and no inputs", () => {
+    render(<NotConnected error={null} namedUser="web" onRetry={() => {}} />);
+    expect(screen.getByText(/user=web&pass=/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(document.querySelector("input")).toBeNull();
+  });
 });
