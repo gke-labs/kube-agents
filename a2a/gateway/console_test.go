@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"regexp"
 	"strings"
 	"sync"
@@ -379,4 +380,87 @@ func TestConsoleLogsADisconnect(t *testing.T) {
 		return strings.Contains(logs.String(), "console connection lost") &&
 			strings.Contains(logs.String(), "console="+consoleConnName)
 	})
+}
+
+// The refusal log promises the subscription is resent on reconnect. Pin
+// that promise: a gateway refused on a render that predates the console
+// identity starts receiving frames, with no restart, once the server comes
+// back holding the grant. nats.go keeps a refused subscription in its own
+// table and resends it on reconnect. A server that only reloads its
+// config in place would not drop the connection, so this recovery rides on
+// the NATS pod rolling, which is what the operator does on a render change.
+func TestConsoleRecoversARefusedSubscriptionOnReconnect(t *testing.T) {
+	s := startRestrictedServer(t)
+	port := s.Addr().(*net.TCPAddr).Port
+	logs := &lockedBuffer{}
+	a, err := NewConsoleAdapter(s.ClientURL(),
+		[]nats.Option{nats.UserInfo("gateway", "pw"), nats.ReconnectWait(50 * time.Millisecond)},
+		slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.Close)
+	var mu sync.Mutex
+	var got []InboundMessage
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		_ = a.Run(ctx, func(m InboundMessage) {
+			mu.Lock()
+			got = append(got, m)
+			mu.Unlock()
+		})
+	}()
+	waitFor(t, "the refusal in the log", func() bool {
+		return strings.Contains(logs.String(), "console subscription refused")
+	})
+
+	// The pod rolls onto the new render: same address, gateway now holds
+	// the console subscribe, and a second user stands in for the browser.
+	s.Shutdown()
+	s.WaitForShutdown()
+	granted := &natsserver.Options{
+		Host: "127.0.0.1", Port: port, NoLog: true, NoSigs: true,
+		Users: []*natsserver.User{
+			{Username: "gateway", Password: "pw", Permissions: &natsserver.Permissions{
+				Subscribe: &natsserver.SubjectPermission{Allow: []string{"a2a.>", "chat.console.*.in"}},
+				Publish:   &natsserver.SubjectPermission{Allow: []string{"a2a.>", "chat.console.*.out"}},
+			}},
+			{Username: "browser", Password: "pw"},
+		},
+	}
+	s2, err := natsserver.NewServer(granted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s2.Start()
+	if !s2.ReadyForConnections(10 * time.Second) {
+		t.Fatal("second server")
+	}
+	t.Cleanup(s2.Shutdown)
+	waitFor(t, "the reconnect in the log", func() bool {
+		return strings.Contains(logs.String(), "console connection restored")
+	})
+
+	browser, err := nats.Connect(s2.ClientURL(), nats.UserInfo("browser", "pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(browser.Close)
+	data, _ := json.Marshal(ConsoleInFrame{MessageID: "m-1", Text: "hello after the roll"})
+	// The resent SUB and the browser's PUB travel on different connections,
+	// so publish until one lands rather than guess at ordering.
+	waitFor(t, "a frame delivered after the reconnect", func() bool {
+		_ = browser.Publish("chat.console.tab-9.in", data)
+		_ = browser.Flush()
+		mu.Lock()
+		defer mu.Unlock()
+		return len(got) > 0
+	})
+	mu.Lock()
+	first := got[0]
+	mu.Unlock()
+	if first.Conversation != "console:tab-9" || first.Text != "hello after the roll" {
+		t.Errorf("delivered frame = %+v, want conversation console:tab-9 with the sent text", first)
+	}
 }
