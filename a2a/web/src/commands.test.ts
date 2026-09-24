@@ -76,10 +76,23 @@ describe("command output", () => {
   it("names every stream, attached or not", () => {
     const text = streamsText({
       ...initialState,
+      connection: "up",
       streamAttach: new Map([["TASKS", { error: null, since: 1 }]]),
     });
     expect(text).toMatch(/^1 of 4 streams attached/);
     for (const s of ["TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL"]) expect(text).toContain(s);
+  });
+
+  it("says streams unknown instead of a stale attach count while the link is down", () => {
+    const text = streamsText({
+      ...initialState,
+      connection: "down",
+      // Recorded while up; an ordered consumer's iterator survives a
+      // reconnect, so this would otherwise still read as attached.
+      streamAttach: new Map([["TASKS", { error: null, since: 1 }]]),
+    });
+    expect(text).toMatch(/^streams unknown/);
+    expect(text).not.toContain("attached");
   });
 });
 

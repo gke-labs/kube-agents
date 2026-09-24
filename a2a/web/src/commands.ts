@@ -85,6 +85,12 @@ export function tasksText(state: UiState): string {
 
 export function streamsText(state: UiState): string {
   const lines = capacities(state).map((c) => c.text);
+  // Ordered consumers survive a reconnect and their iterators never end, so
+  // an attach recorded before the drop still reads as attached: while the
+  // link is down the count above would be stale, not current.
+  if (state.connection !== "up") {
+    return ["streams unknown - the bus link is down", ...lines].join("\n");
+  }
   const up = STREAMS.filter((s) => state.streamAttach.get(s)?.error === null).length;
   return [`${up} of ${STREAMS.length} streams attached`, ...lines].join("\n");
 }

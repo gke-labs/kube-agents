@@ -59,6 +59,13 @@ describe("StatusStrip", () => {
     expect(screen.getByTestId("tile-link").className).toContain("tile-warn");
   });
 
+  it("says streams unknown instead of the stale count while the link is down", () => {
+    const down: UiState = { ...state, connection: "down" };
+    render(<StatusStrip state={down} onFocus={() => {}} />);
+    expect(screen.getByTestId("tile-link").textContent).toContain("streams unknown");
+    expect(screen.queryByText("3/4 streams")).toBeNull();
+  });
+
   it("turns the capacity tile amber past 80% and names the stream", () => {
     render(<StatusStrip state={state} onFocus={() => {}} />);
     const tile = screen.getByTestId("tile-capacity");

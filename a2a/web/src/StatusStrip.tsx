@@ -59,7 +59,12 @@ export default function StatusStrip({ state, onFocus }: { state: UiState; onFocu
         title={linkDown ? `link ${state.connection}` : undefined}
         onFocus={onFocus}
       >
-        <span>{state.connection}</span> <span>{`${state.streamsUp}/${state.streamsTotal} streams`}</span>
+        <span>{state.connection}</span>{" "}
+        {/* Ordered consumers survive a reconnect and their iterators never
+            end, so streamsUp does not shrink on its own while the link is
+            down - showing it here would repeat a count from before the
+            drop as though it were current. */}
+        <span>{linkDown ? "streams unknown" : `${state.streamsUp}/${state.streamsTotal} streams`}</span>
       </Tile>
       <Tile id="types" label="agents" panel="sessions" onFocus={onFocus}>
         {typesOf(state).length === 0 && <span>none seen</span>}
