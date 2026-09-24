@@ -239,7 +239,12 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
   single-agent Hermes fan-in exists. Build it incrementally (Phase 2 deterministic modes, Phase 3 NL
   fallback) and keep routing **out of the trust path**: a mis-route must never bypass an allowlist, and
   the per-pod gateway stays as an enforcement backstop ([03](03-security-model.md) §4a,
-  [06](06-api-and-data-contracts.md) §2b).
+  [06](06-api-and-data-contracts.md) §2b). **Update 2026-09-24:** the build order here is
+  superseded — the model router
+  ([`../designs/spec-model-router.md`](../designs/spec-model-router.md)) makes natural
+  language primary and the deterministic modes a debug side door, so "Phase 2
+  deterministic modes, Phase 3 NL fallback" is not the sequence being built. Routing
+  staying out of the trust path is unchanged and is the router's own rule.
 - **Cross-cluster networking** — spoke agents depend on **private** reachability to the hub's inference
   - Minty ([05](05-system-architecture.md) §5); a missing egress-allowlist entry or VPC-peering gap
     silently pauses a spoke's agents (reconciled state keeps running). Validate hub connectivity as an

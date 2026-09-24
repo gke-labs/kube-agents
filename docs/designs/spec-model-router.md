@@ -28,6 +28,15 @@ Here natural language is primary and slash commands are a debug side door. The a
 record that architecture asks for (which agent resolved, by what routing mode) is the
 published decision below.
 
+That is the end state changing rather than a first version on the way to the older order,
+and both architecture documents carry a dated note saying so. `@handle` addressing - the
+architecture's mode 2, which this document otherwise never mentions - goes through the
+model rather than ahead of it. A handle is a name on the destination list, and a turn that
+spells one exactly is the easy case for a router that has to resolve the turns that do
+not. In the first version the list holds two entries and no handles exist, so the choice
+costs nothing; it is worth revisiting when profiles add entries and a second, deterministic
+dispatch path for an exact handle starts to earn its keep.
+
 Companion documents, and what each owns that this one uses: the payload spec owns the
 envelope, the task lifecycle, what each subject class admits, and the verified-identity
 table that a new KV subject needs a row in ([`spec-a2a-payloads.md`](spec-a2a-payloads.md));
@@ -149,8 +158,15 @@ spec already has.
 The gateway's deterministic interceptors stay ahead of the router
 ([`spec-chatops-gateway.md`](spec-chatops-gateway.md), "The deterministic interceptors"):
 the stop words after normalisation (`stop`, `cancel`, `abort`) and the exact status
-phrase set. The wide interrogative heuristic retires into the model, which is what it was
-approximating. The one thing a user must always be able to do when the model is slow or
+phrase set. That is two of the three interceptors the gateway spec defines, and inside the
+status one the wide interrogative heuristic retires into the model, which is what it was
+approximating.
+
+The third interceptor, the `delegate:` prefix, retires as well, at build step 4 with the
+call. It is a hand-rolled choice between the two entries on the destination list, which is
+the router's whole job, so keeping it would mean two mechanisms deciding the same thing
+from the same text. The gateway spec's Delegate flow carries a dated line saying the
+prefix is what the gateway does until step 4 lands. The one thing a user must always be able to do when the model is slow or
 wrong is stop, and that path has no model in it.
 
 ### Invalid output and policy violations are different
@@ -166,6 +182,26 @@ wrong is stop, and that path has no model in it.
   destination was after. The gateway replies with a templated refusal, routes nothing,
   logs at ERROR, and publishes the decision as dropped (below). A dropped decision is a
   signal: either the catalog render is wrong or someone is trying something.
+
+**What a person sees.** While the router is thinking, nothing. The ~4.4 s call lands ahead
+of the task placeholder the gateway already posts, and a second spinner in front of the
+first one is noise. That is a choice rather than a measurement, and the first install to
+run the router is where it gets tested on real people.
+
+A fallback is not silent, because the matcher may take the turn literally and answer
+something nobody asked - "same thing again for the staging cluster" becomes a new task at
+the default addressee, and the reply reads as nonsense. So a turn that falls back carries
+a gateway-authored notice: one line saying the router did not answer and the message was
+routed by the old rules. It is a deterministic template over a fact the gateway owns, so
+it belongs in the gateway spec's gateway-authored posts beside the placeholder and the
+failure notices, and that file lists it. A policy violation already has its templated
+refusal, which is the same shape.
+
+The operator's half is the fallback rate, not the notice. A dropped decision is someone
+probing; a fallback rate that moves is the router slow, down, or pointed at a `model-router`
+alias a LiteLLM config edit just broke - an outage with no deploy event behind it, which
+is why the alert belongs beside the dropped-decision one in build step 5 rather than
+waiting for a user to report a strange answer.
 
 ## Conversation context
 
@@ -223,6 +259,17 @@ record. Two hard reasons and one structural one:
   gateway holds `$KV.session-state.>` on either side, so nothing leaks; the point is that
   a transcript in its own bucket can never be swept into a future reader grant on the
   registry. Nobody but the gateway principal is granted the `conversation` bucket.
+
+**Which layer owns the idle horizon.** The bucket's `--ttl` is the ceiling and nothing
+else: `168h`, install-wide, chosen once and chosen as a ceiling, and that is the number
+the provision Job's owner is being asked to agree. Every horizon shorter than it is the
+gateway enforcing the configured window on read - the small window's 24 hours, a shorter
+default for a group room if that open question lands that way - and those are gateway
+code, not bucket properties. The first bullet above is about the outer bound, which is the
+one that has to run correctly forever and therefore the one that belongs in the bucket.
+The consequence to agree with the ceiling: no install can raise it without recreating the
+bucket by hand, so a window longer than a week is a change to this document rather than a
+configuration knob.
 
 **What cannot be changed after creation is the bucket's properties, not its existence.**
 The operator's provision Job runs as the `provision` principal, which holds stream create
@@ -455,8 +502,8 @@ reach for when it fails.
    check on every cancel path; the destination list rendered from the routing table; the
    first read of `DIRECTORY` for the catalog. All model-free.
 4. **The router call**, behind a flag, with the matcher as the enforced fallback.
-5. **Decision publishing** on the subject the payload spec defines, and the
-   dropped-decision alert.
+5. **Decision publishing** on the subject the payload spec defines, the dropped-decision
+   alert, and a fallback-rate condition beside it.
 
 Steps 1 to 3 are ordinary Go with no dependency on the `model-router` alias.
 

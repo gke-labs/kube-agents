@@ -239,6 +239,17 @@ confidence is low it **asks a clarifying question rather than guessing**. Once a
 follow-ups **stick to the same agent** (thread affinity via the session store,
 [06](06-api-and-data-contracts.md) §6) unless re-addressed.
 
+**Update 2026-09-24: the end state inverts this precedence.** The model router
+([`../designs/spec-model-router.md`](../designs/spec-model-router.md)) makes natural
+language primary and slash commands a debug side door, on the argument that teaching
+people to `/route` their way around their own fleet is a regression from what the agent
+gives them today. This is a change to the target, not a first version on the way to the
+order above. Mode 2 survives as an addressing scheme - a handle is a name the router
+resolves - but it no longer dispatches ahead of the model. The rest of this section,
+including the derived handle grammar and thread affinity, is unaffected. The routing mode
+recorded in the audit trail becomes the router's published decision, which carries the
+same two facts (which agent resolved, and how).
+
 **Direct handles _are_ the per-audience entrypoints.** Mode 2 is exactly the "own human chat
 entrypoint, one per audience" above: cluster admins reach `@cluster-<cluster>`, dev teams reach
 `@devteam-<namespace>`. The `@kage` gateway (modes 1 and 3) is a **routing front door over the

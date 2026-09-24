@@ -168,6 +168,11 @@ which owns the rule and the reasoning for it. None of it is implemented yet. The
 spec carries the gateway half as build step 3, so until that lands the bullet above is
 what the code does.
 
+**Amended 2026-09-24.** Three interceptors becomes two. The **Delegate** bullet retires
+into the router at its build step 4; the Delegate flow section below says why. **Status**
+and **Stop** stay ahead of the model, and inside **Status** the wide interrogative rule
+goes with Delegate, leaving the exact phrase set.
+
 Two routes exist, and the terms recur below: a conversation is **fixed-routed** when
 its tasks address the standing executor configured at deploy time (the platform front
 door), and **session-routed** when they address the conversation's own spawned worker.
@@ -203,6 +208,17 @@ absorbed, which the gateway cannot know. The payload spec's refusal posture - bo
 the fixed-route refusal and the race-window one - is what closes the loop on the
 stream.
 
+**Amended 2026-09-24.** Two changes the model router makes to this paragraph
+([`spec-model-router.md`](spec-model-router.md)). It adds a post: a one-line notice on a
+turn the router failed to answer, saying the message was routed by the old rules. That one
+is a deterministic template like the rest. The other is an exception to the rule. A
+`reply` decision is model-authored text the gateway posts into the room, so the sentence
+above about deterministic templates being "what keeps them inside the no-model rule" is
+not true of every gateway post once the router lands. What still holds is the reason the
+rule exists: the gateway authors nothing from a context window of its own, and a `reply`
+is a proposal it validated, not something it composed. Neither post exists until the
+router's build steps 4 and 5.
+
 ## The Delegate flow (added 8/31)
 
 A turn starting with the word "delegate" plus a separator routes that one task to a
@@ -219,6 +235,14 @@ and stops first and steers everything else, and the delegate prefix is consulted
 only when the turn would start a task. A bare "delegate" with nothing after it is
 not a delegation, and while the spawner is dark the prefix is not an affordance at
 all: the text passes through as an ordinary turn.
+
+**Amended 2026-09-24.** The prefix retires into the model at the router's build step 4
+([`spec-model-router.md`](spec-model-router.md), "What bypasses the model"). It is a
+hand-rolled choice between the two entries on the router's destination list, and the
+conversation's own session is one of them, so the router makes the same choice from the
+text without a prefix to type. The flow below - fresh bus session name, the previous
+incarnation deleted, the one-task rule - is unchanged; what goes is the way a user asks
+for it. Everything in this section is what the gateway does until step 4 lands.
 
 Two rules keep the conversation's route coherent:
 
