@@ -45,6 +45,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 	url := os.Getenv("A2A_LIVE_NATS_URL")
 	gwPass := os.Getenv("A2A_LIVE_GATEWAY_PASSWORD")
 	brPass := os.Getenv("A2A_LIVE_BRIDGE_PASSWORD")
+	consolePass := os.Getenv("A2A_LIVE_CONSOLE_PASSWORD") // empty: install predates the console identity; beat 3 skips
 	if url == "" || gwPass == "" || brPass == "" {
 		t.Skip("live NATS env not set; see comment")
 	}
@@ -79,6 +80,19 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 		t.Fatal(err)
 	}
 	adapter := newFakeAdapter()
+	var gwAdapter Adapter = adapter
+	if consolePass != "" {
+		console, err := NewConsoleAdapter(url,
+			[]nats.Option{nats.UserInfo("gateway", gwPass), nats.CustomInboxPrefix("_INBOX.gateway")}, slog.Default())
+		if err != nil {
+			t.Fatalf("console adapter: %v", err)
+		}
+		defer console.Close()
+		gwAdapter, err = NewMultiAdapter("discord", map[string]Adapter{"discord": adapter, "console": console})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	cfg := &Config{
 		NATSURL:          url,
 		PrincipalMapPath: mapFile,
@@ -86,7 +100,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("live-test-salt"),
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "discord", RelayDurable: liveTestRelayDurable})
+	g, err := New(Options{Client: client, Adapter: gwAdapter, Config: cfg, Backend: "discord", RelayDurable: liveTestRelayDurable})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +168,51 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 		}
 		return false
 	})
+
+	// Beat 3 shape: a console frame under the console user's real grants
+	// becomes a task with backend console, and the gateway's notice lands on
+	// the conversation's .out subject.
+	if consolePass != "" {
+		browser, err := nats.Connect(url, nats.UserInfo("console", consolePass), nats.CustomInboxPrefix("_INBOX.console"))
+		if err != nil {
+			t.Fatalf("connect as console: %v", err)
+		}
+		defer browser.Close()
+		token := "livetest-" + strings.ToLower(randHex(4))
+		out, err := browser.SubscribeSync("chat.console." + token + ".out")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = browser.Flush()
+		consoleMarker := "console live " + time.Now().UTC().Format(time.RFC3339)
+		frame, _ := json.Marshal(ConsoleInFrame{MessageID: "c1", Text: consoleMarker})
+		if err := browser.Publish("chat.console."+token+".in", frame); err != nil {
+			t.Fatal(err)
+		}
+		_ = browser.Flush()
+		var consoleTask *lib.Envelope
+		waitFor(t, "console task on the real TASKS stream", func() bool {
+			task, err := findLatestLiveTask("bridge", brPass, url)
+			if err != nil || task == nil {
+				return false
+			}
+			var m lib.Message
+			if json.Unmarshal(task.Payload, &m) != nil || joinTextParts(m.Parts) != consoleMarker {
+				return false
+			}
+			consoleTask = task
+			return true
+		})
+		var auth Authority
+		if err := json.Unmarshal(consoleTask.Authority, &auth); err != nil || auth.Requester.Backend != consoleBackend {
+			t.Errorf("console task authority = %+v (%v)", auth, err)
+		}
+		// The placeholder / progress notice reaches the browser on .out.
+		if _, err := out.NextMsg(30 * time.Second); err != nil {
+			t.Errorf("no notice on the console .out subject: %v", err)
+		}
+		t.Log("console beat held: frame under console grants -> task with backend console -> notice on .out")
+	}
 
 	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "live result: grants hold"}}}); err != nil {
 		t.Fatal(err)
