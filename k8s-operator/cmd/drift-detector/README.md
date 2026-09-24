@@ -114,7 +114,8 @@ what tells the shared entrypoint not to start them here. It is not a container o
 reason is the paragraph above — a container of its own would have its own network namespace and no
 route to the daemon.
 
-Three pieces put it there, and each is the same one that puts the event watcher there:
+Three pieces put it there — the same three that put the event watcher there, treating it slightly
+differently at each:
 
 - [`deploy/docker/Dockerfile`](../../../deploy/docker/Dockerfile) builds it in the
   `watcher-builder` stage and copies it into `agent-base`, so it is in every image derived from
@@ -122,14 +123,23 @@ Three pieces put it there, and each is the same one that puts the event watcher 
   `images.json`.
 - [`deploy/shared/start-services.sh`](../../../deploy/shared/start-services.sh) supervises it,
   retried in place on the watcher's backoff curve so that a detector that cannot start never takes
-  the credential path down with it.
+  the credential path down with it. Before the first launch it waits for the Session KV server to
+  start listening, which the watcher's launcher does not do: this sidecar is a native sidecar, so
+  it starts before the container the daemon runs in, and the detector's startup check against the
+  daemon is fatal by design. Without the wait it exits on connection-refused two or three times on
+  every cold start, and the third short exit prints an ALERT saying out-of-band changes are not
+  being detected when nothing is wrong yet. The watcher needs no equivalent because it negotiates
+  with the daemon per request rather than at startup.
 - The operator writes the `DRIFT_DETECTOR_*` environment into that sidecar and the entrypoint turns
-  it into the flags above. Two of the six come from `spec.harness.driftDetector`; the project,
-  location and cluster name come from `spec.harness` itself, because this sidecar does not get the
-  `GKE_*` triple the agent container has.
+  it into the flags above. Three of the six come from `spec.harness.driftDetector` — the switch,
+  the subscription and the GitOps manager list; the project, location and cluster name come from
+  `spec.harness` itself, because this sidecar does not get the `GKE_*` triple the agent container
+  has. Only the switch is written on every reconcile. The other five appear when it is on, so that
+  an install that will never run the detector does not carry the harness triple twice under a
+  second set of names.
 
-**It is off unless an install asks for it**, which is the one place it differs from the watcher.
-`spec.harness.driftDetector.enabled` defaults to `false`, and the chart's
+**It is off unless an install asks for it**, where the watcher is on unless an install switches it
+off. `spec.harness.driftDetector.enabled` defaults to `false`, and the chart's
 `platformAgent.harness.driftDetector.enabled` leaves the field out altogether until it is set. The
 reason is the subscription: it exists only where
 [`terraform/modules/drift-pubsub`](../../../terraform/modules/drift-pubsub/) was applied. The
@@ -627,6 +637,13 @@ stopped matching does not read as a quiet cluster. Anything else is nacked, so a
 change on Google's side redelivers rather than silently acking drift away. A payload the parser
 cannot recognise at all is a nack, not a drop: `json.Unmarshal` zeroes what it cannot match, so a
 restructured payload arrives looking exactly like an empty one.
+
+Shutdown is the fourth way, and the entrypoint has to cooperate with it. On SIGTERM the subscriber
+stops pulling and spends `settleGracePeriod` nacking what it has not finished with, so those
+records redeliver to the next pod rather than each costing a duplicate inject. `terminate()` in
+`start-services.sh` therefore signals the detector before the subshell supervising it — the other
+order reparents the process and never reaches it — and then waits for it to exit, because that
+script is the container's PID 1 and returning from the trap is the container going away.
 
 **The `resourceName` grammar has two ambiguous shapes**, both handled explicitly in
 `resourcename.go`: the namespace object itself (`core/v1/namespaces/foo`, where `namespaces/<ns>`

@@ -17,12 +17,12 @@
 # processes to launch and that function decides which halves of the runtime to
 # serve. `broker` is the credential pod: Envoy and the credential runtime, which
 # the sandbox reaches over a Service. `api-proxy` is what is left in the gateway
-# pod — the watcher, which posts to the Session KV server on that pod's
-# loopback, and the API authenticator, which forwards to the Hermes gateway on
-# the same loopback. Neither of those is a credential path the agent container
-# can drive, which is the point of the split. `combined` is the sidecar
-# arrangement and stays the default so an image paired with an older operator
-# behaves as it did.
+# pod — the watcher and the drift detector, which both post to the Session KV
+# server on that pod's loopback, and the API authenticator, which forwards to
+# the Hermes gateway on the same loopback. None of those is a credential path
+# the agent container can drive, which is the point of the split. `combined` is
+# the sidecar arrangement and stays the default so an image paired with an older
+# operator behaves as it did.
 #
 # They differ in how their failure is treated. Envoy and the credential runtime
 # are the container's reason to exist: if either dies the agent loses every
@@ -84,16 +84,16 @@ DRIFT_HEALTHY_RUN_SECONDS="${DRIFT_HEALTHY_RUN_SECONDS:-120}"
 # ordinary during startup, and by the third the cause is not transient.
 DRIFT_SHORT_EXIT_ALERT_COUNT="${DRIFT_SHORT_EXIT_ALERT_COUNT:-3}"
 
-# Where the detector posts its drift injects. Not overridable, unlike the
-# values above: it is the Session KV server on this pod's loopback, which the
-# watcher reaches at the same address, and it is fixed by where the two
-# processes run rather than by anything an operator chooses. Named rather than
-# written into the flag list below because a literal there would be the one
-# piece of this container's internal wiring that is only discoverable by
-# reading a command line.
-readonly DRIFT_DAEMON_HOST=127.0.0.1
-readonly DRIFT_DAEMON_PORT=8699
-readonly DRIFT_DAEMON_URL="http://${DRIFT_DAEMON_HOST}:${DRIFT_DAEMON_PORT}"
+# Where the watcher and the detector post. Not overridable, unlike the values
+# above: it is the Session KV server on this pod's loopback, fixed by where those
+# two processes run rather than by anything an operator chooses. Named rather
+# than written into the two flag lists below because a literal there would be the
+# one piece of this container's internal wiring that is only discoverable by
+# reading a command line — and because the same address written twice is the
+# second copy nobody updates.
+readonly KV_DAEMON_HOST=127.0.0.1
+readonly KV_DAEMON_PORT=8699
+readonly KV_DAEMON_URL="http://${KV_DAEMON_HOST}:${KV_DAEMON_PORT}"
 
 # How long to wait for that daemon to start listening before launching the
 # detector anyway. This container is a native sidecar, so it starts before the
@@ -111,6 +111,34 @@ readonly DRIFT_DAEMON_URL="http://${DRIFT_DAEMON_HOST}:${DRIFT_DAEMON_PORT}"
 # exists to remove, on an install where everything is working.
 DRIFT_DAEMON_WAIT_SECONDS="${DRIFT_DAEMON_WAIT_SECONDS:-300}"
 DRIFT_DAEMON_POLL_SECONDS="${DRIFT_DAEMON_POLL_SECONDS:-2}"
+
+# A non-positive poll interval would leave the wait loop's counter where it
+# started, so it would probe forever and the detector would never be launched at
+# all. That failure is silent in the worst way: a detector that never started has
+# no short exits, so the supervisor's ALERT never fires either, and the container
+# stays Ready with drift detection off and nothing in the log. Clamp rather than
+# reject — these two are an escape hatch for a slow cluster, not a configuration
+# surface anyone is expected to get right.
+if [[ ! "${DRIFT_DAEMON_POLL_SECONDS}" =~ ^[0-9]+$ ]] || [[ "${DRIFT_DAEMON_POLL_SECONDS}" -lt 1 ]]; then
+  DRIFT_DAEMON_POLL_SECONDS=1
+fi
+
+# How long terminate() waits for a signalled process to exit before killing the
+# subshell supervising it and returning.
+#
+# It has to wait at all because this script is the container's PID 1: the
+# `wait -n` at the bottom of the file is its last command, so terminate()
+# returning is the script exiting, and the kernel SIGKILLs everything left in the
+# PID namespace the moment it does. Delivering SIGTERM without waiting for it
+# delivers the signal and not the shutdown.
+#
+# Fifteen seconds because the detector budgets ten to settle its in-flight
+# records (settleGracePeriod, k8s-operator/cmd/drift-detector/subscriber.go) and
+# the pod takes Kubernetes' default thirty-second grace period, so this leaves
+# half of it unspent for the credential runtime and Envoy. The poll is whole
+# seconds: the drain is bounded by the settle, not by how often it is checked.
+readonly SHUTDOWN_DRAIN_SECONDS=15
+readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
 
 # Where the watcher keeps its dedup snapshots. Without them the cache starts
 # empty on every restart, and an empty cache is not a neutral state: the
@@ -182,30 +210,65 @@ envoy_pid=""
 watcher_pid=""
 drift_pid=""
 
+# Shut down every supervised process, then the subshells supervising them, given
+# the supervisors' pids. That order matters and so does the wait between the two
+# halves; both are load-bearing and neither is obvious.
+#
+# The supervised process first, because killing the subshell first reparents the
+# process it launched to PID 1, after which `pkill -P` on the dead subshell's pid
+# matches nothing. The process then never sees SIGTERM at all and is SIGKILLed
+# when this script exits.
+#
+# The wait, because a SIGTERM this script does not outlive is not a shutdown. The
+# drift-detector's handler NACKs the records it has not finished with so that
+# they redeliver rather than each costing a duplicate inject, and the watcher's
+# writes its dedup snapshot so that a restart does not replay every event still
+# inside the API server's TTL. Both take seconds; this script exits milliseconds
+# after terminate() returns, and takes the PID namespace with it.
+#
+# Nothing relaunches underneath the wait. A supervisor between runs has the
+# backoff `sleep` as its only child, the pkill below kills that sleep, and
+# `set -e` (line 38) ends the supervisor on the non-zero status rather than
+# letting its loop start a replacement. That is load-bearing rather than
+# incidental: a `|| true` added to either supervisor's sleep would reintroduce
+# the orphan this function exists to prevent, silently.
+drain_supervised() {
+  local pid
+  local waited=0
+  local running
+
+  for pid in "$@"; do
+    pkill -TERM -P "${pid}" 2>/dev/null || true
+  done
+
+  while [[ "${waited}" -lt "${SHUTDOWN_DRAIN_SECONDS}" ]]; do
+    running=""
+    for pid in "$@"; do
+      if pgrep -P "${pid}" >/dev/null 2>&1; then
+        running=yes
+        break
+      fi
+    done
+    [[ -n "${running}" ]] || break
+    sleep "${SHUTDOWN_DRAIN_POLL_SECONDS}"
+    waited=$((waited + SHUTDOWN_DRAIN_POLL_SECONDS))
+  done
+
+  for pid in "$@"; do
+    kill "${pid}" 2>/dev/null || true
+  done
+}
+
 terminate() {
   trap - EXIT INT TERM
-  # Each supervised process before the subshell supervising it, and not the
-  # other way round: killing the subshell first reparents the process it is
-  # waiting on to PID 1, after which `pkill -P` on the dead subshell's pid
-  # matches nothing and the process runs on until the kubelet's grace period
-  # expires. The drift-detector's shutdown NACKs the records it has not
-  # finished with, so that they redeliver rather than being lost, and it only
-  # does that on a SIGTERM it actually receives.
-  #
-  # Signalling the child first leaves a window in which the supervisor could
-  # notice the exit and restart it. It does not, in practice or in principle:
-  # the supervisor is blocked in `wait`, and the `kill` on the next line is
-  # already queued behind the child's own shutdown. Even if the supervisor were
-  # to win that race, the child has its signal by then, which is what the
-  # shutdown contract needs.
-  if [[ -n "${watcher_pid}" ]]; then
-    pkill -TERM -P "${watcher_pid}" 2>/dev/null || true
-    kill "${watcher_pid}" 2>/dev/null || true
-  fi
-  if [[ -n "${drift_pid}" ]]; then
-    pkill -TERM -P "${drift_pid}" 2>/dev/null || true
-    kill "${drift_pid}" 2>/dev/null || true
-  fi
+
+  local supervisors=()
+  [[ -z "${watcher_pid}" ]] || supervisors+=("${watcher_pid}")
+  [[ -z "${drift_pid}" ]] || supervisors+=("${drift_pid}")
+  # One shared drain budget, not one each: the two run concurrently and the pod's
+  # grace period does not grow with the number of processes in the container.
+  [[ "${#supervisors[@]}" -eq 0 ]] || drain_supervised "${supervisors[@]}"
+
   [[ -z "${runtime_pid}" ]] || kill "${runtime_pid}" 2>/dev/null || true
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
 }
@@ -341,7 +404,7 @@ start_event_watcher() {
         --dedup-persist="${dedup_persist}" \
         --dedup-window="${WATCHER_DEDUP_WINDOW}" \
         --in-cluster \
-        --daemon-url=http://127.0.0.1:8699 \
+        --daemon-url="${KV_DAEMON_URL}" \
         --token-env=SESSION_KV_API_KEY \
         --owner=platform \
         --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled \
@@ -424,7 +487,7 @@ drift_detector_enabled() {
 wait_for_drift_daemon() {
   local waited=0
   while [[ "${waited}" -lt "${DRIFT_DAEMON_WAIT_SECONDS}" ]]; do
-    if (exec 3<>"/dev/tcp/${DRIFT_DAEMON_HOST}/${DRIFT_DAEMON_PORT}") 2>/dev/null; then
+    if (exec 3<>"/dev/tcp/${KV_DAEMON_HOST}/${KV_DAEMON_PORT}") 2>/dev/null; then
       return 0
     fi
     sleep "${DRIFT_DAEMON_POLL_SECONDS}"
@@ -434,7 +497,7 @@ wait_for_drift_daemon() {
   # Said once, and not as an ALERT: the supervisor's own ALERT is the report of
   # a detector that cannot start, and this line is the context for it — whether
   # the daemon was ever there matters when reading the exits that follow.
-  echo "start-services: the Session KV server at ${DRIFT_DAEMON_URL} was not listening after ${DRIFT_DAEMON_WAIT_SECONDS}s; starting drift-detector anyway" >&2
+  echo "start-services: the Session KV server at ${KV_DAEMON_URL} was not listening after ${DRIFT_DAEMON_WAIT_SECONDS}s; starting drift-detector anyway" >&2
   return 0
 }
 
@@ -482,7 +545,7 @@ start_drift_detector() {
     # together for that reason, and are set here rather than left to the
     # operator because they describe how processes inside this container reach
     # each other, exactly as the watcher's equivalents do.
-    --daemon-url="${DRIFT_DAEMON_URL}"
+    --daemon-url="${KV_DAEMON_URL}"
     --token-env=SESSION_KV_API_KEY
     --owner=platform
   )
@@ -504,9 +567,12 @@ start_drift_detector() {
   fi
 
   (
-    # Inside the subshell, not before it: the wait is up to five minutes long
-    # and this function is called on the container's startup path, so doing it
-    # in the foreground would hold up everything started after it.
+    # Inside the subshell, not before it. This is the last launcher, so nothing
+    # is waiting behind it to be started — what a foreground wait would delay is
+    # the script's arrival at the `wait -n` on the credential path at the bottom
+    # of this file. For as long as the deadline ran, a dead credential runtime
+    # or Envoy would not end the container, and the restart that is their whole
+    # failure contract would not happen.
     wait_for_drift_daemon
 
     delay="${DRIFT_RETRY_MIN_SECONDS}"

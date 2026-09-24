@@ -523,11 +523,15 @@ type EventWatcherSpec struct {
 }
 
 // DriftDetectorSpec configures the drift-detector, which runs as a peer service
-// inside the credential-proxy sidecar alongside Envoy, the credential runtime and
-// the k8s-event-watcher. It pulls GKE admin-activity audit records from a Pub/Sub
-// subscription, drops the ones no human made, joins each survivor against the live
-// object to see whether the change still stands, and posts what is left to the
-// pod-local Session KV server as a gitops-drift inject.
+// inside the gateway pod's agent-api-auth sidecar alongside the API authenticator
+// and the k8s-event-watcher. Not alongside Envoy or the credential runtime: those
+// moved to the credential pod, and CREDENTIAL_PROXY_ROLE=api-proxy is what tells
+// the shared entrypoint not to start them here.
+//
+// It pulls GKE admin-activity audit records from a Pub/Sub subscription, drops
+// the ones no human made, joins each survivor against the live object to see
+// whether the change still stands, and posts what is left to the pod-local
+// Session KV server as a gitops-drift inject.
 //
 // It answers a different question from the watcher beside it. An event says
 // Kubernetes is unhappy; a drift record says a person changed a live object outside
