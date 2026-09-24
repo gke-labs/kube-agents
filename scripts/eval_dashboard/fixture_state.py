@@ -82,6 +82,9 @@ IMPERSONATE_ENV = "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT"
 RUNNER_PROJECT_ENV = "FLEET_PROJECT_ID"
 RUNNER_DIR_ENV = "BENCH_FLEET_KUBECONFIG_DIR"
 RUNNER_READER_ENV = "FLEET_READONLY_SA"
+# The runner refuses to run without a reader unless told the caller's own
+# credential is acceptable; --no-impersonate (a laptop) is that case.
+RUNNER_ALLOW_OWN_CREDENTIAL_ENV = "FLEET_ALLOW_RUNNER_CREDENTIAL"
 RUNNER_CATALOG_ENV = "FLEET_CATALOG"
 # Both scripts shell out to these; without either nothing can be checked.
 REQUIRED_BINARIES = ("gcloud", "kubectl")
@@ -299,6 +302,8 @@ def scan_project(
         if rc != 0:
             reason = REASON_CANNOT_IMPERSONATE.format(reader=reader, error=_error_summary(err))
             return _project_entry(_all_roles(roles, ROLE_NOT_CHECKED, [reason]), reader, started, reason)
+    else:
+        env[RUNNER_ALLOW_OWN_CREDENTIAL_ENV] = "1"
 
     deadline = time.monotonic() + timeout
     rc, _, runner_err = _run(["bash", str(runner_script)], env, timeout, runner)

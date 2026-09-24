@@ -424,6 +424,10 @@ class SeededFleetFixturesTest(unittest.TestCase):
         env = run.call_args_list[1].kwargs["env"]
         self.assertEqual("kube-agents-evals-5", env["FLEET_PROJECT_ID"])
         self.assertTrue(env["BENCH_FLEET_KUBECONFIG_DIR"].startswith("/"))
+        # The runner refuses to run without a reader; the check names the
+        # project's own rather than inheriting whatever the operator's shell
+        # has, or nothing.
+        self.assertEqual("seeded-fleet-reader@kube-agents-evals-5.iam.gserviceaccount.com", env["FLEET_READONLY_SA"])
         # The state pass reads the directory the presence pass wrote, inside
         # the same temporary directory, and is told how long it may wait.
         state_cmd = run.call_args_list[2].args[0]

@@ -32,6 +32,10 @@ _UPSTREAM_SLUG = "gke-labs/kube-agents"
 _CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
 _CHART_VALUES = _ROOT / "charts" / "kube-agents" / "values.yaml"
 _FLEET_KUBECONFIGS = _ROOT / "hack" / "fleet-kubeconfigs.sh"
+# The read-only account bench/tf/fleet provisions. The runner refuses to write
+# kubeconfigs without one, so the fleet check names the project's unless the
+# operator set FLEET_READONLY_SA.
+FLEET_READER_SA_TEMPLATE = "seeded-fleet-reader@{project_id}.iam.gserviceaccount.com"
 _FLEET_CATALOG = _ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 
 # The summary hack/fleet-kubeconfigs.sh prints to stderr on its way out. It is
@@ -1497,6 +1501,7 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
             FLEET_PROJECT_ID=project_id,
             BENCH_FLEET_KUBECONFIG_DIR=target,
         )
+        env.setdefault("FLEET_READONLY_SA", FLEET_READER_SA_TEMPLATE.format(project_id=project_id))
         rc, _, err = run_cmd(
             ["bash", str(_FLEET_KUBECONFIGS)], timeout=FLEET_TIMEOUT_SECONDS, env=env
         )

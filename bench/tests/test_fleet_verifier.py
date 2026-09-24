@@ -1225,6 +1225,7 @@ users:
 YAML
     ;;
   "auth print-access-token "*)
+    [ -n "${STUB_TOKEN_FAIL:-}" ] && { echo "$STUB_TOKEN_FAIL" >&2; exit 1; }
     [ -n "${STUB_TOKEN_WARNING:-}" ] && echo "$STUB_TOKEN_WARNING" >&2
     printf '%s\\n' "${STUB_TOKEN:-ya29.a0AfB_byTOKEN}"
     ;;
@@ -1423,6 +1424,7 @@ def test_a_listing_that_fails_is_a_warning_and_not_a_dead_job(shell, tmp_path):
         FLEET_PROJECT_ID="p",
         FLEET_CATALOG=str(_CATALOG),
         BENCH_FLEET_KUBECONFIG_DIR=str(out),
+        FLEET_ALLOW_RUNNER_CREDENTIAL="1",
         STUB_LIST_FAIL="ERROR: (gcloud.container.clusters.list) PERMISSION_DENIED",
     )
     assert done.returncode == 0, done.stderr
@@ -1444,6 +1446,7 @@ def test_labelled_clusters_that_all_resolve_to_nothing_say_so(shell, tmp_path):
         FLEET_PROJECT_ID="p",
         FLEET_CATALOG=str(_CATALOG),
         BENCH_FLEET_KUBECONFIG_DIR=str(out),
+        FLEET_ALLOW_RUNNER_CREDENTIAL="1",
         STUB_CLUSTERS=(
             "seeded-a\tus-central1-a\nold-a\tus-central1-a\n"
             "seeded-b\tus-central1-a\nold-b\tus-central1-a\n"
@@ -1606,6 +1609,9 @@ def _provision(shell, tmp_path, **env) -> Path:
         "STUB_NAMESPACES": (
             "seeded-debug seeded-reliability seeded-security seeded-capacity"
         ),
+        # Most tests are about discovery and presence, not the credential, so
+        # they run the way a laptop does; the credential tests override this.
+        "FLEET_ALLOW_RUNNER_CREDENTIAL": "1",
     }
     settings.update(env)
     _provision.last = shell("write_fleet_kubeconfigs", **settings)  # type: ignore[attr-defined]
@@ -1661,27 +1667,90 @@ def test_a_read_only_service_account_reaches_every_role_file(shell, tmp_path):
     assert "--impersonate-service-account=seeded-fleet-reader@p" in call
 
 
-def test_an_unusable_read_only_account_warns_and_keeps_running(shell, tmp_path):
-    """Loudly degraded, not dead: the checks still need to run, and a write
-    credential reading a fixture is a smaller problem than no result at all."""
+def test_a_reader_that_cannot_be_minted_stops_the_runner_before_any_file(shell, tmp_path):
+    """The warn-and-fall-back this replaces ran unread on two pool projects for
+    a day: a check made with the runner's write credential proves nothing, so
+    the run stops instead, with nothing written."""
+    out = _provision(
+        shell,
+        tmp_path,
+        FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
+        STUB_TOKEN_FAIL="ERROR: (gcloud.auth.print-access-token) PERMISSION_DENIED: Failed to impersonate",
+    )
+    done = _provision.last
+    assert done.returncode == 3, done.stderr
+    assert not out.exists()
+    assert "seeded-fleet-reader@p" in done.stderr
+    assert "PERMISSION_DENIED" in done.stderr
+    assert "roles/iam.serviceAccountTokenCreator" in done.stderr
+
+
+def test_a_token_that_is_not_a_token_stops_the_runner(shell, tmp_path):
     out = _provision(
         shell,
         tmp_path,
         FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
         STUB_TOKEN="ERROR: (gcloud.auth) Permission denied",
     )
+    assert _provision.last.returncode == 3, _provision.last.stderr
+    assert not out.exists()
+    assert "other than a bare access token" in _provision.last.stderr
+
+
+def test_no_read_only_account_and_no_opt_in_stops_the_runner(shell, tmp_path):
+    out = _provision(shell, tmp_path, FLEET_ALLOW_RUNNER_CREDENTIAL="")
     done = _provision.last
-    assert done.returncode == 0, done.stderr
-    assert "could not be used" in done.stderr
+    assert done.returncode == 3, done.stderr
+    assert not out.exists()
+    assert "FLEET_READONLY_SA=seeded-fleet-reader@kube-agents-evals" in done.stderr
+    assert "FLEET_ALLOW_RUNNER_CREDENTIAL=1" in done.stderr
+
+
+def test_the_opt_in_still_says_the_credential_can_write(shell, tmp_path):
+    """A fleet only you use may be read with your own credential, but the
+    script keeps saying what that credential can do."""
+    out = _provision(shell, tmp_path)
+    assert _provision.last.returncode == 0, _provision.last.stderr
     assert (out / "crashloop-workload.kubeconfig").exists()
-    assert "gke-gcloud-auth-plugin" in (out / "crashloop-workload.kubeconfig").read_text()
-
-
-def test_no_read_only_account_says_the_credential_can_write(shell, tmp_path):
-    """The honest default. These kubeconfigs can delete the shared fleet."""
-    _provision(shell, tmp_path)
     assert "the runner's own credential" in _provision.last.stderr
     assert "can WRITE to the shared fleet" in _provision.last.stderr
+
+
+def test_a_rewrite_that_fails_drops_the_cluster_rather_than_keeping_the_credential(
+    shell, tmp_path
+):
+    """Past the gate the mint is good, so a rewrite can only fail on the
+    kubeconfig gcloud wrote (here: no server). The file goes rather than
+    staying on the runner's identity; its roles report status=error."""
+    out = _provision(
+        shell,
+        tmp_path,
+        FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
+        STUB_SERVER="",
+    )
+    done = _provision.last
+    assert done.returncode == 0, done.stderr
+    assert list(out.glob("*.kubeconfig")) == []
+    assert "dropped" in done.stderr
+    assert "0 role(s) written" in done.stderr
+
+
+def test_the_executed_form_exits_with_the_gate_code(tmp_path):
+    done = subprocess.run(
+        ["bash", str(_SCRIPT)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            "PATH": os.environ["PATH"],
+            "HOME": str(tmp_path),
+            "FLEET_PROJECT_ID": "some-project",
+            "FLEET_CATALOG": str(_CATALOG),
+            "BENCH_FLEET_KUBECONFIG_DIR": str(tmp_path / "out"),
+        },
+    )
+    assert done.returncode == 3, done.stderr
+    assert done.stdout == ""
 
 
 def test_every_file_the_runner_writes_is_readable_only_by_the_runner(shell, tmp_path):
@@ -1814,6 +1883,7 @@ def test_a_project_with_no_seeded_fleet_says_so_and_still_exits_zero(shell, tmp_
         FLEET_PROJECT_ID="kube-agents-evals-3",
         FLEET_CATALOG=str(_CATALOG),
         BENCH_FLEET_KUBECONFIG_DIR=str(out),
+        FLEET_ALLOW_RUNNER_CREDENTIAL="1",
         STUB_CLUSTERS="",
     )
     assert done.returncode == 0, done.stderr
@@ -1831,6 +1901,7 @@ def test_gclouds_own_words_survive_into_the_warning(shell, tmp_path):
         FLEET_PROJECT_ID="kube-agents-evals",
         FLEET_CATALOG=str(_CATALOG),
         BENCH_FLEET_KUBECONFIG_DIR=str(out),
+        FLEET_ALLOW_RUNNER_CREDENTIAL="1",
         STUB_CLUSTERS="seeded-a\tus-central1-a\n",
         STUB_CREDS_FAIL="ERROR: (gcloud.container.clusters.get-credentials) ResponseError: code=403",
     )

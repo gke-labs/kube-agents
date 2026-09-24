@@ -68,9 +68,16 @@
 #   FLEET_CATALOG             path to fixtures.json
 #   BENCH_FLEET_KUBECONFIG_DIR  where to write; defaults under TMPDIR
 #   FLEET_READONLY_SA         service account to mint a read-only token for
+#   FLEET_ALLOW_RUNNER_CREDENTIAL  1 to run without FLEET_READONLY_SA on a
+#                             fleet only you use (the files then carry your
+#                             own credential; the script says so)
 #
 # Output: exports BENCH_FLEET_KUBECONFIG_DIR when sourced; prints it on stdout
 # when executed. Everything else this script says goes to stderr.
+#
+# Exit status: 0; 1 for bad inputs or a malformed catalog;
+# _FLEET_EXIT_READONLY_UNAVAILABLE when the read-only credential is unset or
+# cannot be minted -- nothing is written then.
 # ==============================================================================
 
 _FLEET_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -79,6 +86,10 @@ _FLEET_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # caller-supplied path is otherwise one typo'd BENCH_FLEET_KUBECONFIG_DIR away
 # from deleting something that matters.
 _FLEET_MARKER=".kube-agents-fleet-kubeconfigs"
+
+# Read-only credential unset or unmintable. Distinct from 1 so ci-eval-pr.sh
+# stops on this and still only warns on an unusable catalog or directory.
+_FLEET_EXIT_READONLY_UNAVAILABLE=3
 
 # The exec-credential plugin each rewritten kubeconfig points at, and the
 # schema its reply speaks. Absolute, because kubectl resolves `command`
@@ -279,10 +290,7 @@ _fleet_use_readonly_token() {
     return 1
   }
   rm -f "$errors"
-  # Belt and braces for the same failure: an OAuth2 bearer token is a run of
-  # unreserved characters, so anything with whitespace or punctuation in it is
-  # diagnostic text that leaked into stdout, not a credential.
-  if [ -z "$token" ] || printf '%s' "$token" | LC_ALL=C grep -q '[^A-Za-z0-9._~+/=-]'; then
+  if ! _fleet_bare_token "$token"; then
     echo "WARNING: what gcloud returned for ${sa} is not a bare access token; refusing to write it" >&2
     return 1
   fi
@@ -334,6 +342,39 @@ _fleet_use_readonly_token() {
   return 0
 }
 
+# An OAuth2 bearer token is a run of unreserved characters; anything else is
+# gcloud's stderr leaked into stdout.
+_fleet_bare_token() {
+  [ -n "$1" ] && ! printf '%s' "$1" | LC_ALL=C grep -q '[^A-Za-z0-9._~+/=-]'
+}
+
+# Refuse to write kubeconfigs that would carry the caller's own credential.
+# The runner's identity holds container.admin on a fleet every open PR shares,
+# so a check made with it proves nothing; the old warn-and-fall-back ran
+# unread on two pool projects for a day. The mint is checked once, here: the
+# token-creator binding is per account, not per cluster.
+# FLEET_ALLOW_RUNNER_CREDENTIAL=1 opts out, for a fleet only you use.
+_fleet_require_readonly_credential() {
+  local sa="$1" project="$2" errors token
+  if [ -z "$sa" ]; then
+    [ "${FLEET_ALLOW_RUNNER_CREDENTIAL:-}" = "1" ] && return 0
+    echo "ERROR: FLEET_READONLY_SA is unset; refusing to write kubeconfigs that carry the runner's own credential, which can WRITE to the shared fleet. Set FLEET_READONLY_SA=seeded-fleet-reader@${project}.iam.gserviceaccount.com, or FLEET_ALLOW_RUNNER_CREDENTIAL=1 on a fleet only you use." >&2
+    return "$_FLEET_EXIT_READONLY_UNAVAILABLE"
+  fi
+  errors="$(mktemp)" || return 1
+  if ! token="$(gcloud auth print-access-token --impersonate-service-account="$sa" 2>"$errors")"; then
+    echo "ERROR: cannot mint a read-only token as ${sa}: $(tr '\n' ' ' <"$errors"). Nothing written. Grant this caller roles/iam.serviceAccountTokenCreator on that account: re-apply bench/tf/fleet against ${project}, or bind it by hand." >&2
+    rm -f "$errors"
+    return "$_FLEET_EXIT_READONLY_UNAVAILABLE"
+  fi
+  rm -f "$errors"
+  if ! _fleet_bare_token "$token"; then
+    echo "ERROR: gcloud returned something other than a bare access token for ${sa}; nothing written." >&2
+    return "$_FLEET_EXIT_READONLY_UNAVAILABLE"
+  fi
+  return 0
+}
+
 write_fleet_kubeconfigs() {
   local catalog project dir sa
   catalog="${FLEET_CATALOG:-${_FLEET_SCRIPT_DIR}/../bench/tf/fleet/fixtures.json}"
@@ -376,6 +417,7 @@ write_fleet_kubeconfigs() {
     echo "ERROR: ${dir} exists and was not written by this script; refusing to remove it" >&2
     return 1
   fi
+  _fleet_require_readonly_credential "$sa" "$project" || return $?
   rm -rf "$dir"
   (umask 077 && mkdir -p "$dir/clusters") || return 1
   : >"${dir}/${_FLEET_MARKER}"
@@ -420,7 +462,11 @@ write_fleet_kubeconfigs() {
     fi
     rm -f "$errors"
     if [ -n "$sa" ] && ! _fleet_use_readonly_token "$slot_config" "$sa"; then
-      echo "WARNING: ${cluster} kubeconfig keeps the runner's own credential; FLEET_READONLY_SA=${sa} could not be used" >&2
+      # The mint passed the gate, so this is gcloud's kubeconfig being
+      # unreadable. Drop it: a role file is a read-only credential or absent.
+      echo "WARNING: ${cluster} kubeconfig could not be rewritten to ${sa}; dropped. Every check naming a role on slot '${slot}' will report status=error." >&2
+      rm -f "$slot_config"
+      continue
     fi
     chmod 600 "$slot_config"
     # Which cluster each resolved slot IS, for hack/fleet-fixture-state.py:

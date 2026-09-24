@@ -266,8 +266,9 @@ account, and `hack/fleet-kubeconfigs.sh` writes each kubeconfig with an `exec:` 
 naming `hack/fleet-reader-credential.sh`, which mints a token as that account whenever
 `kubectl` asks for one.
 
-Without the grant the script warns loudly on every run and the kubeconfigs carry the
-runner's own identity, which holds `roles/container.admin` among the twelve project roles
+Without the grant the script writes nothing and exits 3, and the presubmit stops at that
+step (`FLEET_ALLOW_RUNNER_CREDENTIAL=1` opts out, for a fleet only you use). The alternative
+was reading the fleet as the runner's own identity, which holds `roles/container.admin` among the twelve project roles
 `scripts/provision_ci_pool_project.sh` grants at onboarding (`PROW_RUNNER_ROLES` in
 `scripts/verify_ci_pool_project.py` is the list) — measured, not assumed:
 `kubectl auth can-i delete deployments -n seeded-debug` answers yes. There are zero
