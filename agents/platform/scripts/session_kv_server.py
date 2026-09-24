@@ -528,6 +528,19 @@ _DRIFT_UNSAFE_CHARS_RE = re.compile(r"[`\r\n]")
 # is in the inject payload for anything that needs it.
 DRIFT_MAX_RENDERED_PATHS = 12
 
+# How many managers the ownership block renders, for the same reason and with the
+# same "and N more" tail. Capping the paths per manager bounds each bullet and
+# leaves the number of bullets to the object, which is the wrong half to leave
+# open: the API server keeps a separate `managedFields` entry per (manager,
+# operation, subresource), and `manager` is whatever the client declared, so a
+# principal who can write the object chooses both the text of each bullet and how
+# many there are. Eight is roughly twice what the comment above describes as a
+# busy object -- three or four controllers plus the apply and update entries a
+# person's own `kubectl` leaves -- so a real card is never cut, and the ones that
+# are get a count instead of tens of kilobytes. The full set is in the inject
+# payload either way.
+DRIFT_MAX_RENDERED_MANAGERS = 8
+
 
 def init_db() -> None:
     db_dir = os.path.dirname(SESSION_KV_DB_PATH)
@@ -1651,7 +1664,7 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
         )
 
     lines = ["- **Field ownership** (read from the live object's `managedFields`):"]
-    for owner in owners:
+    for owner in owners[:DRIFT_MAX_RENDERED_MANAGERS]:
         manager = _defang_drift_field(owner.get("manager")) or DRIFT_UNKNOWN_FIELD
         operation = _defang_drift_field(owner.get("operation"))
         updated_at = _defang_drift_field(owner.get("updated_at"))
@@ -1667,6 +1680,13 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
         else:
             owns = "no recorded paths"
         lines.append(f"  - `{manager}`{f' ({qualifiers})' if qualifiers else ''} owns {owns}")
+
+    hidden = len(owners) - DRIFT_MAX_RENDERED_MANAGERS
+    if hidden > 0:
+        # Said as a line of the list rather than folded into the bullet above, so
+        # that an agent reading only the ownership block cannot mistake the eighth
+        # manager for the last one.
+        lines.append(f"  - and {hidden} more manager{'s' if hidden > 1 else ''}, not shown")
 
     return "\n".join(lines)
 

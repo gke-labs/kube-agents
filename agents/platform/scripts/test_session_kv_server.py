@@ -4143,6 +4143,44 @@ class TestDriftInject(unittest.TestCase):
         self.assertIn("`spec.replicas`", block)
         self.assertNotIn("more", block)
 
+    def test_an_object_with_many_managers_does_not_land_in_the_card(self):
+        """Capping paths per manager leaves the bullet count to the object.
+
+        `ownership()` emits one entry per `managedFields` entry and forwards
+        them all, and the API server keeps a separate entry per (manager,
+        operation, subresource) with `manager` whatever the client declared. So
+        the principal being reported on chooses how many bullets the card has,
+        and each of them carries up to the per-manager cap.
+        """
+        payload = copy.deepcopy(self.DRIFT_PAYLOAD)
+        payload["owners"] = [
+            {"manager": f"manager-{n}", "operation": "Update", "paths": ["spec.replicas"]}
+            for n in range(40)
+        ]
+
+        block = session_kv_server._drift_ownership_block(payload)
+
+        cap = session_kv_server.DRIFT_MAX_RENDERED_MANAGERS
+        self.assertIn(f"manager-{cap - 1}", block, "the cap dropped a manager it should have kept")
+        self.assertNotIn(f"manager-{cap}", block, "the manager list was not capped")
+        # As with the path cap, the count is what stops the reader concluding
+        # that these are all of the managers the object has.
+        self.assertIn(f"and {40 - cap} more manager", block)
+
+    def test_a_short_manager_list_is_shown_whole_with_no_count(self):
+        """The cap must not announce itself on an object it did not cut."""
+        payload = copy.deepcopy(self.DRIFT_PAYLOAD)
+        payload["owners"] = [
+            {"manager": "flux", "operation": "Apply", "paths": ["spec.replicas"]},
+            {"manager": "kubectl-edit", "operation": "Update", "paths": ["spec.replicas"]},
+        ]
+
+        block = session_kv_server._drift_ownership_block(payload)
+
+        self.assertIn("`flux`", block)
+        self.assertIn("`kubectl-edit`", block)
+        self.assertNotIn("not shown", block)
+
     def test_the_kind_constant_matches_the_detector(self):
         """One decision in two languages; the Go side is the other half."""
         source = (

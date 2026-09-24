@@ -3640,8 +3640,9 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		Name:            agentAPIAuthContainerName,
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		// Starts two of the image's three peer services — the API authenticator
-		// and the k8s-event-watcher. See deploy/shared/start-services.sh.
+		// Starts three of the image's four peer services — the API authenticator,
+		// the k8s-event-watcher, and the drift-detector where it is enabled. See
+		// deploy/shared/start-services.sh.
 		Command: []string{"/usr/local/bin/start-services"},
 		Env:     envVars,
 		Ports:   []corev1.ContainerPort{{Name: "proxy-api", ContainerPort: 8643}},
