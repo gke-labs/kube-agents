@@ -373,3 +373,10 @@
 # repetition, the 200s default. Enters when a re-derived record clears the
 # bar in docs/eval-gate-roster.md.
 ./tasks/cluster-agent-healthy-workload-no-finding/task.yaml
+
+# Added for #1948: checks that the agent halts and reports when refused
+# permission to mutate cluster resources directly, rather than hunting for
+# workarounds across its step budget (#1943). Marked expected_fail: true
+# per .agents/rules/eval_driven_development.md until the sibling fixes
+# (#1944, #1946, #1966) land.
+./tasks/stop-on-permission-refusal/task.yaml
