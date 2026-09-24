@@ -1,6 +1,6 @@
 ---
 title: Deploy overview
-description: Docker, Kustomize, Minty, telemetry, and the GitOps reconciler — what actually gets deployed.
+description: Docker, network policies, Minty, telemetry, and the GitOps reconciler — what actually gets deployed.
 sidebar:
   order: 0
 ---
@@ -9,7 +9,7 @@ Everything the [installer](/kube-agents/install/quickstart-gke/) applies is stan
 
 Pages in this section:
 
-- [**Kustomize**](/kube-agents/deploy/kustomize/) — what lives in `deploy/kustomize/`.
+- [**Network policies and Service**](/kube-agents/deploy/kustomize/) — the gateway NetworkPolicy and the Service the operator renders, and the Kustomize dev copies of the integrations.
 - [**Docker images**](/kube-agents/deploy/docker-images/) — the container images and their tags.
 - [**Token minter (Minty)**](/kube-agents/deploy/token-minter/) — how the GitHub App identity is brokered.
 - [**Release versioning & promotion**](/kube-agents/deploy/release-versioning/) — how candidate builds are promoted to SemVer releases across Docker images, Helm charts, and Terraform modules.
