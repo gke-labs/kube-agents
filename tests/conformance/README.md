@@ -261,13 +261,12 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-106 mutations: 81 KILLED, 22 NOISY, one STALE (`A3-supervisor-terminal-back-on-events`, whose
-target text left `main` before this change; it is not this change's to rewrite), two `must_survive` controls (one on the
+106 mutations: 81 KILLED, 23 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-23 against
+handling), zero genuine survivors, zero stale — measured 2026-09-24 against
 this branch merged with `main`; re-run the harness rather than trusting
 these numbers, which is the sentence this paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 103 of the 105: a
+Note that the summary line the harness prints accounts for 104 of the 106: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is

@@ -1137,6 +1137,11 @@ Mutation(
     Mutation(
         "A3-supervisor-terminal-back-on-events",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        # Two tabs, not three. The gateway's publish list moved out of the
+        # struct literal into a local `publish :=`, which de-indented every
+        # entry, and the anchor went STALE -- the same failure its neighbour
+        # below carries a paragraph about, for the same reason: STALE reports
+        # as a mutation with nothing to say, not as a mutation that missed.
         ('\t\t"a2a.tasks.*.*.in",\n\t\t"a2a.tasks.*.*.supervisor",',
          '\t\t"a2a.tasks.*.*.in",\n\t\t"a2a.tasks.*.*.events",'),
         "test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject",
