@@ -3313,6 +3313,7 @@ func TestARefusalDoesNotSuspendTheA2AFences(t *testing.T) {
 			for _, fence := range []types.NamespacedName{
 				{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace},
 				{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace},
+				{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace},
 			} {
 				err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{})
 				if !tc.expected {

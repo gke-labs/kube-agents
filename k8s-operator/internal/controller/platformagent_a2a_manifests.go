@@ -3752,8 +3752,9 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	fences := []*networkingv1.NetworkPolicy{
 		buildA2ANATSNetworkPolicy(agent),
 		buildA2ASessionNetworkPolicy(agent, r.a2aSessionDNSClusterIPs(ctx, agent)),
+		buildA2AConsoleNetworkPolicy(agent),
 	}
-	// The gateway fence rides here with the other two, for the reason this
+	// The gateway fence rides here with the others, for the reason this
 	// function exists: it is what withholds a task-submission endpoint from
 	// the pod network, so that the door's token is presented only from the
 	// node path its caller uses, and a refused CR must
@@ -3848,6 +3849,13 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// running bus keeps its ingress policy and the workers on it keep their
 	// egress one.
 	if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		return state, err
+	}
+
+	// The console server: the page, its credential, and its websocket proxy.
+	// After the fences, so its pod never runs unfenced, and ahead of the
+	// gateway's hold, because serving the page doesn't need the gateway.
+	if err := r.reconcileA2AConsole(ctx, agent); err != nil {
 		return state, err
 	}
 
@@ -4491,6 +4499,13 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		{&corev1.ConfigMap{ObjectMeta: injectMeta}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: injectMeta}, r.Client},
 		{&corev1.Secret{ObjectMeta: injectMeta}, r.a2aReader()},
+		// The console server, with the gateway: both are front doors onto
+		// the bus, and both go before the bus they front. Its fence goes
+		// with it rather than with the NATS and session fences below, so
+		// there's never a console pod without one.
+		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The auth callout, before the bus it authorizes for. Its Deployment
 		// goes first so it stops answering while there is still a server to
 		// answer for; the keys Secret goes with it rather than surviving like

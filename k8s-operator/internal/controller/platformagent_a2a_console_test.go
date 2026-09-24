@@ -17,12 +17,20 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 func consoleEnv(t *testing.T, c corev1.Container) map[string]string {
@@ -183,5 +191,69 @@ func TestTheWebsocketOriginsAreTheConsoleServers(t *testing.T) {
 	}
 	if strings.Contains(conf, "5173") {
 		t.Error("rendered nats.conf still names the Vite port; the install's page is served by the console server")
+	}
+}
+
+// The console server renders with the rest of the next stack, before the
+// gateway's hold (it serves the page whether or not the gateway is up), and
+// goes away with the stack on a flip back to today. Its fence goes with it.
+func TestReconcileA2ARendersAndRemovesTheConsole(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+
+	// finalizer pass, then the real one
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i+1, err)
+		}
+	}
+
+	name := types.NamespacedName{Name: a2aConsoleName(agent), Namespace: agent.Namespace}
+	netpol := types.NamespacedName{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); !errors.IsNotFound(err) {
+		t.Fatalf("the gateway rendered before its hold (err=%v); this test needs the hold in place to show the console doesn't wait on it", err)
+	}
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, name, dep); err != nil {
+		t.Fatalf("console Deployment not rendered under next, ahead of the gateway: %v", err)
+	}
+	if len(dep.OwnerReferences) != 1 || dep.OwnerReferences[0].Name != agent.Name {
+		t.Errorf("console Deployment owner refs = %+v, want the PlatformAgent", dep.OwnerReferences)
+	}
+	if err := cl.Get(ctx, name, &corev1.Service{}); err != nil {
+		t.Errorf("console Service not rendered under next: %v", err)
+	}
+	if err := cl.Get(ctx, netpol, &networkingv1.NetworkPolicy{}); err != nil {
+		t.Errorf("console NetworkPolicy not rendered under next: %v", err)
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	fresh.Spec.Mode = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatalf("failed to update agent: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flip failed: %v", err)
+	}
+	if err := cl.Get(ctx, name, &appsv1.Deployment{}); !errors.IsNotFound(err) {
+		t.Errorf("console Deployment still present under today (err=%v)", err)
+	}
+	if err := cl.Get(ctx, name, &corev1.Service{}); !errors.IsNotFound(err) {
+		t.Errorf("console Service still present under today (err=%v)", err)
+	}
+	if err := cl.Get(ctx, netpol, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+		t.Errorf("console NetworkPolicy still present under today (err=%v)", err)
 	}
 }

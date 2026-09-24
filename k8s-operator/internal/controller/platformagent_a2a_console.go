@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -31,6 +32,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -283,4 +286,22 @@ func buildA2AConsoleNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 		},
 	}
+}
+
+// reconcileA2AConsole applies the console server. Its fence is applied by
+// reconcileA2ANetworkFences with the bus's and the sessions', so that it
+// holds through the skew freeze like they do.
+func (r *PlatformAgentReconciler) reconcileA2AConsole(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	for _, obj := range []client.Object{
+		buildA2AConsoleDeployment(agent),
+		buildA2AConsoleService(agent),
+	} {
+		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.applyManaged(ctx, agent, obj); err != nil {
+			return fmt.Errorf("failed to apply A2A console %T: %w", obj, err)
+		}
+	}
+	return nil
 }
