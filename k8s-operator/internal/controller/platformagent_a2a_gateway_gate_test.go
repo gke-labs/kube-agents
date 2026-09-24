@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -483,14 +484,126 @@ func TestAReapWindowHoldsTheGatewayForOnePass(t *testing.T) {
 	}
 }
 
+// The read behind the rule, through Reconcile: the gate reads the callout from
+// the informer after the same pass applied it, and the informer learns of the
+// apply by watch event, so on the pass that changes the callout's pod template
+// it can still hold the object from before the write. That copy is not merely
+// late. It carries the previous Generation with ObservedGeneration equal to it
+// and both replicas ready and updated on the template the apply just replaced,
+// so the counts read serving and the ObservedGeneration guard cannot tell. The
+// apply's response carries the Generation the write produced, and the gate
+// refuses a copy that has not reached it.
+//
+// The fake client has read-your-writes, so the staleness is staged: the apply
+// of the callout reports the new Generation on the object it returns, as the
+// API server does, while every Get of the callout answers with the previous
+// one until the test lets the "informer" catch up.
+type staleCalloutInformer struct {
+	callout types.NamespacedName
+	// The Generation the apply reports, and the one the Get still answers.
+	applied, cached int64
+	// The counts the cached copy carries: fully serving, on the old template.
+	replicas int32
+}
+
+func (f *staleCalloutInformer) isCallout(obj client.Object) bool {
+	_, isDeployment := obj.(*appsv1.Deployment)
+	return isDeployment && client.ObjectKeyFromObject(obj) == f.callout
+}
+
+func (f *staleCalloutInformer) funcs() interceptor.Funcs {
+	ssa := fakeServerSideApplyInterceptors().Patch
+	return interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if err := ssa(ctx, cl, obj, patch, opts...); err != nil {
+				return err
+			}
+			if f.isCallout(obj) && patch.Type() == types.ApplyPatchType {
+				// What the server's response says after the write; the
+				// fake's stored copy is what the Get below reads.
+				obj.(*appsv1.Deployment).Generation = f.applied
+			}
+			return nil
+		},
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := cl.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if f.isCallout(obj) {
+				dep := obj.(*appsv1.Deployment)
+				dep.Generation = f.cached
+				dep.Status.ObservedGeneration = f.cached
+				dep.Status.Replicas = f.replicas
+				dep.Status.ReadyReplicas = f.replicas
+				dep.Status.UpdatedReplicas = f.replicas
+			}
+			return nil
+		},
+	}
+}
+
+func TestAnInformerCopyOlderThanThisPassesApplyHoldsTheGateway(t *testing.T) {
+	agent := a2aTestAgent()
+	stale := &staleCalloutInformer{
+		callout:  types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace},
+		applied:  2,
+		cached:   1,
+		replicas: 2,
+	}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, sandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(stale.funcs()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+
+	// Two passes: the first renders the stack, and on both the informer
+	// answers with a callout at Generation 1, fully serving, while the apply
+	// has just produced Generation 2. Without the Generation check the
+	// counts alone (2 + 2 - 2 = 2) let the gateway through on the first.
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d on the stale copy: %v", i+1, err)
+		}
+	}
+	completeTheProvisionJob(t, ctx, cl, agent)
+	res, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile on the stale copy with provisioning complete: %v", err)
+	}
+	gwKey := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, gwKey, &appsv1.Deployment{}); !errors.IsNotFound(err) {
+		t.Fatalf("the A2A gateway exists (err=%v) on a callout copy at Generation 1 while this pass's apply returned Generation 2; every replica that copy counts is on the template the apply replaced", err)
+	}
+	if res.RequeueAfter != 30*time.Second {
+		t.Errorf("a gateway held on a stale callout copy requeued after %s, want 30s", res.RequeueAfter)
+	}
+
+	// The informer delivers the write: the same object at Generation 2,
+	// observed, with the second replica still coming up on the new template.
+	stale.cached = 2
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile once the informer caught up: %v", err)
+	}
+	if err := cl.Get(ctx, gwKey, &appsv1.Deployment{}); err != nil {
+		t.Errorf("the A2A gateway is still withheld (err=%v) on a callout copy at the applied Generation with every replica ready and updated; the hold was meant to last until the informer caught up", err)
+	}
+}
+
 // The predicate on its own, over the Deployment states the tests above drive
-// through Reconcile and the ones they do not.
+// through Reconcile and the ones they do not. applied is the Generation the
+// pass's own apply of the callout returned; 0 is a caller with no apply in
+// hand, and the rows that carry it are about the counts alone.
 func TestACalloutCanServeANewGatewayFromOneReadyUpdatedReplica(t *testing.T) {
 	for _, tc := range []struct {
-		name                     string
-		generation, observed     int64
-		replicas, ready, updated int32
-		want                     bool
+		name                          string
+		generation, observed, applied int64
+		replicas, ready, updated      int32
+		want                          bool
 	}{
 		{name: "fully serving", generation: 1, observed: 1, replicas: 2, ready: 2, updated: 2, want: true},
 		{name: "second replica Pending", generation: 1, observed: 1, replicas: 2, ready: 1, updated: 2, want: true},
@@ -502,6 +615,8 @@ func TestACalloutCanServeANewGatewayFromOneReadyUpdatedReplica(t *testing.T) {
 		{name: "outage, both pods present", generation: 1, observed: 1, replicas: 2, ready: 0, updated: 0, want: false},
 		{name: "no status yet", generation: 0, observed: 0, replicas: 0, ready: 0, updated: 0, want: false},
 		{name: "spec change not yet observed", generation: 2, observed: 1, replicas: 2, ready: 2, updated: 2, want: false},
+		{name: "informer copy is the one this pass applied", generation: 2, observed: 2, applied: 2, replicas: 2, ready: 1, updated: 2, want: true},
+		{name: "informer copy predates this pass's apply", generation: 1, observed: 1, applied: 2, replicas: 2, ready: 2, updated: 2, want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dep := &appsv1.Deployment{
@@ -513,9 +628,9 @@ func TestACalloutCanServeANewGatewayFromOneReadyUpdatedReplica(t *testing.T) {
 					UpdatedReplicas:    tc.updated,
 				},
 			}
-			if got := a2aCalloutCanServeANewGateway(dep); got != tc.want {
-				t.Errorf("a2aCalloutCanServeANewGateway(gen %d observed %d, replicas %d ready %d updated %d) = %v, want %v",
-					tc.generation, tc.observed, tc.replicas, tc.ready, tc.updated, got, tc.want)
+			if got := a2aCalloutCanServeANewGateway(dep, tc.applied); got != tc.want {
+				t.Errorf("a2aCalloutCanServeANewGateway(gen %d observed %d, replicas %d ready %d updated %d; applied %d) = %v, want %v",
+					tc.generation, tc.observed, tc.replicas, tc.ready, tc.updated, tc.applied, got, tc.want)
 			}
 		})
 	}

@@ -774,8 +774,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// has to be a pass that happens. The callout Deployment is owned and its
 	// status changes do trigger one, but a gate that only converges because
 	// something else is watched is a gate with a hidden dependency -- and the
-	// predicate's one false negative, a terminated pod still counted, clears
-	// on a status change the requeue does not need to wait for.
+	// predicate's false negatives, a terminated pod still counted and an
+	// informer copy older than the pass's own apply, clear on a Deployment
+	// event the requeue does not need to wait for.
 	if a2aNext && (!a2aState.done || a2aState.gatewayHeld) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}

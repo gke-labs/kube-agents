@@ -2726,7 +2726,8 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// connection, so a bus standing up without it accepts only the static
 	// users and refuses everything else — and refuses it as an Authorization
 	// Violation, which reads exactly like a credential problem.
-	if err := r.reconcileA2ACallout(ctx, agent); err != nil {
+	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent)
+	if err != nil {
 		return state, err
 	}
 
@@ -2942,13 +2943,14 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// gate reads the Deployment itself rather than the condition because
 	// syncBusCredentialsReady is deferred to the way out of Reconcile, so the
 	// condition is one pass old both ways; the predicate is as current as the
-	// informer, and its only error direction is a false negative that
-	// gatewayHeld's requeue clears.
+	// informer, and once the informer's copy is known to be the one this pass
+	// applied (calloutGeneration, below) its only error direction is a false
+	// negative that gatewayHeld's requeue clears.
 	dep := buildA2AGatewayDeployment(agent)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
 	}
-	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep); err != nil {
+	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep, calloutGeneration); err != nil {
 		return state, err
 	} else if hold {
 		state.gatewayHeld = true
@@ -3111,13 +3113,31 @@ func (r *PlatformAgentReconciler) deleteOwnedA2AObject(ctx context.Context, agen
 // current-template pod is serving. It admits the second replica Pending
 // (1 + 2 - 2 = 1) and rejects the wedged roll (2 + 1 - 3 = 0).
 //
-// The one error direction is a false negative while a terminated pod is still
+// The arithmetic holds for the object it is given; appliedGeneration says
+// whether that object is the right one. The caller reads dep from the informer
+// after applying the callout in the same pass, and the informer learns of the
+// apply by watch event, so the copy can still be the object BEFORE the write.
+// On a pass that changed the callout's pod template -- a bump of
+// a2aIdentityMapSchema, a new callout image, an operator upgrade -- that copy
+// carries the previous Generation with ObservedGeneration equal to it and every
+// replica ready and updated on the template the apply just replaced, so the
+// counts read serving and the ObservedGeneration guard cannot tell: both
+// numbers come from the same stale object. Requiring dep.Generation to have
+// reached the Generation the apply's response reported closes that, and a
+// caller with no apply in hand passes 0.
+//
+// The error directions are then both false negatives, each costing the held
+// pass and the requeue that gatewayHeld already pays: a terminated pod still
 // counted in Status.Replicas -- a reap window, where one ready updated replica
-// beside a dying one reads 1 + 1 - 2 = 0 -- and it costs the held pass and the
-// requeue that gatewayHeld already pays. ObservedGeneration is required first
-// for the reason setBusCredentialsReady gives: until the Deployment controller
-// has seen the current spec, every count describes the spec before it.
-func a2aCalloutCanServeANewGateway(dep *appsv1.Deployment) bool {
+// beside a dying one reads 1 + 1 - 2 = 0 -- and an informer that has not yet
+// delivered this pass's apply, which the watch event for that apply clears.
+// ObservedGeneration is required for the reason setBusCredentialsReady gives:
+// until the Deployment controller has seen the current spec, every count
+// describes the spec before it.
+func a2aCalloutCanServeANewGateway(dep *appsv1.Deployment, appliedGeneration int64) bool {
+	if dep.Generation < appliedGeneration {
+		return false
+	}
 	if dep.Status.ObservedGeneration < dep.Generation {
 		return false
 	}
@@ -3127,22 +3147,33 @@ func a2aCalloutCanServeANewGateway(dep *appsv1.Deployment) bool {
 // a2aGatewayWaitsForCallout reports whether the gateway Deployment must be
 // withheld this pass. See the call site for why the gate is creation-only and
 // why it computes its own answer rather than reading BusCredentialsReady.
+// calloutGeneration is the callout Deployment's Generation as this pass's
+// apply of it returned.
 //
 // The callout is read from the informer, as syncBusCredentialsReady reads it,
 // not live: the steady state of every next install passes through here on
 // every pass, and a lower bound that lags the cache by a moment can only hold
-// the gateway one pass longer than the truth would.
-func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment) (bool, error) {
+// the gateway one pass longer than the truth would -- with one exception,
+// which is why the apply's Generation comes along. A cached copy that predates
+// this pass's apply is not merely late, it describes the callout on the
+// template the apply replaced, and on that copy the counts can read serving
+// while no replica is on the current one. The predicate refuses a copy whose
+// Generation is below the applied one; in the steady state the two are equal
+// and the check costs nothing, and on the pass that changed the template it
+// holds the gateway until the informer has delivered the write, which the
+// watch event for that write triggers a pass for.
+func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment, calloutGeneration int64) (bool, error) {
 	callout := &appsv1.Deployment{}
 	err := r.Get(ctx, types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}, callout)
-	if err == nil && a2aCalloutCanServeANewGateway(callout) {
+	if err == nil && a2aCalloutCanServeANewGateway(callout, calloutGeneration) {
 		return false, nil
 	}
 	if client.IgnoreNotFound(err) != nil {
 		return false, err
 	}
-	// A callout the cache does not hold yet, or one short of a serving
-	// replica, holds the gate the same way; both are "not serving".
+	// A callout the cache does not hold yet, one it holds as of before this
+	// pass's apply, or one short of a serving replica, holds the gate the
+	// same way; all three are "not serving".
 	//
 	// Already there: reconcile it. A gateway that exists was let through by
 	// an earlier pass, and withholding its updates now would freeze its image

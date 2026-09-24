@@ -608,16 +608,28 @@ The rule is `ObservedGeneration >= Generation` and
 `ReadyReplicas + UpdatedReplicas - Replicas >= 1`: an inclusion-exclusion lower bound on
 the pods that are both ready and on the current template, so it can never read true when
 none is. It admits the second replica Pending (`1 + 2 - 2 = 1`) and rejects the wedged
-roll (`2 + 1 - 3 = 0`). Its only error direction is a false negative while a terminated
-pod is still counted in `Status.Replicas` (`1 + 1 - 2 = 0`), which costs exactly the held
-pass and requeue that the gate already pays, and the callout Deployment is owned, so the
-status change that closes the window triggers the pass that clears it. The two signals
-now disagree on purpose, and only in the safe direction: the gate never passes on a
-callout the condition's `False` describes as having no current-template replica serving,
-and a gateway let through beside a `False` condition has a serving replica to mint
-against. The stale-true paragraph above no longer applies to the gate, which reads the
-Deployment from the informer rather than a condition written a pass earlier; the live
-read for "already there" is unchanged. The delay also stopped being invisible. Under
+roll (`2 + 1 - 3 = 0`). The arithmetic holds for the object it is given, and the gate
+also has to know it is given the right one: it reads the callout from the informer after
+the same pass server-side-applied it, and the informer learns of that write by watch
+event, so on a pass that changes the callout's pod template (a schema bump of the
+identity map, a new callout image, an operator upgrade) the informer can still hold the
+copy from before the write - previous `Generation`, `ObservedGeneration` equal to it,
+every replica ready and updated on the template just replaced - and the counts on that
+copy read serving while no replica is on the current template. The apply's response
+carries the `Generation` the write produced, and the gate refuses a copy whose
+`Generation` has not reached it. Its error directions are then both false negatives, each
+costing exactly the held pass and requeue that the gate already pays: a terminated pod
+still counted in `Status.Replicas` (`1 + 1 - 2 = 0`), and an informer that has not yet
+delivered the pass's own apply. The callout Deployment is owned, so the status change
+that closes the first window and the watch event that closes the second each trigger the
+pass that clears it. The two signals now disagree on purpose, and only in the safe
+direction: the gate never passes on a callout the condition's `False` describes as having
+no current-template replica serving, and a gateway let through beside a `False` condition
+has a serving replica to mint against. The stale-true paragraph above no longer applies
+to the gate: it reads the Deployment from the informer rather than a condition written a
+pass earlier, and the `Generation` check is what keeps a stale informer copy from
+standing in for a stale condition; the live read for "already there" is unchanged. The
+delay also stopped being invisible. Under
 `mode: next` the A2A gateway is one of the workloads `Ready` is computed from
 (`readSplitWorkloads`), so an install held at the gate reads `Provisioning` with a
 message naming the Deployment - rather than a `Ready: True` sitting above an absent
