@@ -524,7 +524,7 @@ export async function startBus(
           dispatch({
             type: "sendFailed",
             messageId,
-            error: "the link dropped before the server saw this turn - send it again",
+            error: "the link dropped before the server confirmed this turn, so it may or may not have arrived - check the transcript before sending it again",
           });
         }
       });

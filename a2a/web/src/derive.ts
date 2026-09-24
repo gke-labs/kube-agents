@@ -22,8 +22,8 @@ import { STREAMS, TERMINAL_STATES } from "./protocol.ts";
 export const CAPACITY_WARN = 0.8;
 /** A standing consumer with no pull and no delivery for this long reads as quiet. */
 export const QUIET_MS = 120_000;
-/** A liveness report older than this many polls is stale data, not a live signal. */
-export const LIVENESS_STALE_POLLS = 3;
+/** A liveness report older than this many polls is stale data, not a live signal.  Wide enough that a cycle slowed by a request timeout or two does not flag every session. */
+export const LIVENESS_STALE_POLLS = 5;
 /** `LIVENESS_STALE_POLLS` * the poller's own interval. */
 export const LIVENESS_STALE_MS = LIVENESS_STALE_POLLS * POLL_MS;
 
