@@ -253,10 +253,12 @@ already have.
 
 They cannot go behind the proxy, because the sandbox is not the client — it is
 the server. `session_kv_server.py` runs in the sandbox and binds
-`127.0.0.1:8699`; its callers are the event watcher in `agent-api-auth`,
-the Platform MCP server, the `incident_context` plugin, and the gateway's
-kanban notifier, which keys a delivered triage report to the thread it went
-into. The key exists so
+`127.0.0.1:8699`; its callers are the event watcher and the drift detector in
+`agent-api-auth`, the Platform MCP server, the `incident_context` plugin, the
+gateway's kanban notifier, which keys a delivered triage report to the thread it
+went into, the chat adapter's scheduled-report relay, and the two findings
+scripts. Deliberately not stated as a total: the list has grown twice and a
+count is the part that goes stale first. The key exists so
 that the server can reject a request that did not come from one of them, which
 means the server has to hold it. The salt is read by the Chat Agent plugins,
 which also run in the sandbox, before any identity is written to disk; hashing
@@ -267,12 +269,13 @@ Deliberately _not_ `API_SERVER_KEY`: that value is the non-secret loopback
 sentinel `cluster-internal-trusted`, so reusing it here would authenticate
 nothing. Both keys are optional in the CRD, so a Secret without them yields
 containers without the variables rather than a pod that will not start. What
-that costs is worth stating precisely, because one of the three consequences is
-not a degradation: the `k8s-event-watcher` in `agent-api-auth`
+that costs is worth stating precisely, because two of the consequences are
+not degradations: the `k8s-event-watcher` in `agent-api-auth`
 authenticates to the Session KV server with `SESSION_KV_API_KEY` and treats an
 empty value as fatal, so it exits on every start and **no cluster events are
 watched at all** — silently, since the container stays Ready and no probe covers
-the watcher. The other two are degradations: the Session KV server refuses every
+the watcher. The drift detector, in the same container and on the same key,
+fails the same way and as quietly, where an install has enabled it. The rest are degradations: the Session KV server refuses every
 authenticated request with a 503 and says why, and identity hashing falls back
 to a per-process random salt with one warning.
 

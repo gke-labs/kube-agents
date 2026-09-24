@@ -4167,6 +4167,88 @@ class TestDriftInject(unittest.TestCase):
         # that these are all of the managers the object has.
         self.assertIn(f"and {40 - cap} more manager", block)
 
+    def test_exactly_the_cap_is_shown_whole_with_no_count(self):
+        """The boundary, where an off-by-one says managers were hidden and none were."""
+        payload = copy.deepcopy(self.DRIFT_PAYLOAD)
+        cap = session_kv_server.DRIFT_MAX_RENDERED_MANAGERS
+        payload["owners"] = [
+            {"manager": f"manager-{n}", "operation": "Update", "paths": ["spec.replicas"]}
+            for n in range(cap)
+        ]
+
+        block = session_kv_server._drift_ownership_block(payload)
+
+        self.assertIn(f"manager-{cap - 1}", block)
+        self.assertNotIn("not shown", block)
+
+    def test_one_hidden_manager_is_counted_in_the_singular(self):
+        """One over the cap. "and 1 more managers" is the tell for a plural bug."""
+        payload = copy.deepcopy(self.DRIFT_PAYLOAD)
+        cap = session_kv_server.DRIFT_MAX_RENDERED_MANAGERS
+        payload["owners"] = [
+            {"manager": f"manager-{n}", "operation": "Update", "paths": ["spec.replicas"]}
+            for n in range(cap + 1)
+        ]
+
+        block = session_kv_server._drift_ownership_block(payload)
+
+        self.assertIn("and 1 more manager, not shown", block)
+
+    def test_the_cap_keeps_the_most_recent_managers(self):
+        """Which managers the cap keeps is the whole question.
+
+        The API server returns `managedFields` ordered by operation and then by
+        time ascending, so the entry for the change being reported is last in the
+        list. A positional cut drops exactly the manager the Cluster Agent is
+        asked to compare against, and eight cheap applies arrange that on
+        purpose.
+        """
+        payload = copy.deepcopy(self.DRIFT_PAYLOAD)
+        cap = session_kv_server.DRIFT_MAX_RENDERED_MANAGERS
+        owners = [
+            {
+                "manager": f"flux-shard-{n}",
+                "operation": "Apply",
+                "updated_at": f"2026-09-0{n + 1}T00:00:00Z",
+                "paths": ["spec.replicas"],
+            }
+            for n in range(cap)
+        ]
+        owners.append(
+            {
+                "manager": "kubectl-edit",
+                "operation": "Update",
+                "updated_at": "2026-09-22T18:40:34Z",
+                "paths": ["spec.replicas"],
+            }
+        )
+        payload["owners"] = owners
+
+        block = session_kv_server._drift_ownership_block(payload)
+
+        self.assertIn("kubectl-edit", block, "the cap dropped the most recent write")
+        self.assertNotIn("flux-shard-0", block, "the oldest manager should have been the one cut")
+        self.assertIn("and 1 more manager, not shown", block)
+
+    def test_an_owner_with_no_timestamp_sorts_last_rather_than_raising(self):
+        """The detector omits `updated_at` when the API server recorded none."""
+        payload = copy.deepcopy(self.DRIFT_PAYLOAD)
+        payload["owners"] = [
+            {"manager": "undated", "operation": "Update", "paths": ["spec.replicas"]},
+            {
+                "manager": "dated",
+                "operation": "Update",
+                "updated_at": "2026-09-22T18:40:34Z",
+                "paths": ["spec.replicas"],
+            },
+            {"manager": "unparseable", "operation": "Update", "updated_at": "not a time", "paths": ["spec.replicas"]},
+        ]
+
+        block = session_kv_server._drift_ownership_block(payload)
+
+        self.assertLess(block.index("`dated`"), block.index("`undated`"))
+        self.assertLess(block.index("`dated`"), block.index("`unparseable`"))
+
     def test_a_short_manager_list_is_shown_whole_with_no_count(self):
         """The cap must not announce itself on an object it did not cut."""
         payload = copy.deepcopy(self.DRIFT_PAYLOAD)

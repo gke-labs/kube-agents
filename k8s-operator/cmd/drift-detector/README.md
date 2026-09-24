@@ -107,10 +107,12 @@ already inside that namespace, which is what the next section is about.
 
 ### Deployed
 
-The detector runs where the daemon is: as a peer process inside the credential-proxy sidecar,
-alongside Envoy, the credential runtime and the event watcher. It is not a container of its own,
-and the reason is the paragraph above — a container of its own would have its own network namespace
-and no route to the daemon.
+The detector runs where the daemon is: as a peer process inside the `agent-api-auth` sidecar of the
+gateway pod, alongside the API authenticator and the event watcher. Not alongside Envoy or the
+credential runtime — those moved to the credential pod, and `CREDENTIAL_PROXY_ROLE=api-proxy` is
+what tells the shared entrypoint not to start them here. It is not a container of its own, and the
+reason is the paragraph above — a container of its own would have its own network namespace and no
+route to the daemon.
 
 Three pieces put it there, and each is the same one that puts the event watcher there:
 

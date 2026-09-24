@@ -3538,12 +3538,12 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 
 // buildAgentAPIAuthSidecar returns what is left in the gateway pod after the
 // credential runtime moved out: the authenticated front door for the Hermes API,
-// and the k8s-event-watcher.
+// the k8s-event-watcher, and the drift-detector where an install has enabled it.
 //
-// Neither could follow the credential proxy into its own pod, and for the same
+// None could follow the credential proxy into its own pod, and for the same
 // reason. The API authenticator forwards to 127.0.0.1:8642, which is the Hermes
-// gateway in this pod; the watcher posts its events to the Session KV server on
-// 127.0.0.1:8699, which the agent container starts. Both are loopback peers of
+// gateway in this pod; the watcher and the detector post to the Session KV server
+// on 127.0.0.1:8699, which the agent container starts. All are loopback peers of
 // the agent, not of the credentials.
 //
 // What that leaves behind is a container with no credential path in it. It runs

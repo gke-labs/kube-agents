@@ -536,10 +536,20 @@ DRIFT_MAX_RENDERED_PATHS = 12
 # principal who can write the object chooses both the text of each bullet and how
 # many there are. Eight is roughly twice what the comment above describes as a
 # busy object -- three or four controllers plus the apply and update entries a
-# person's own `kubectl` leaves -- so a real card is never cut, and the ones that
-# are get a count instead of tens of kilobytes. The full set is in the inject
-# payload either way.
+# person's own `kubectl` leaves -- so a real card is never cut.
+#
+# What the cut ones get is a bound, not a small number: eight bullets of a
+# 128-character manager name (`FieldManagerMaxLength`) and twelve paths at
+# DRIFT_MAX_FIELD_CHARS each is about 21 KB of attacker-chosen text, against
+# roughly 5 KB for the rest of the card. Bounded beats unbounded and it does not
+# make the defang argument in `_defang_drift_field` hold in aggregate; a cap on
+# the block's total rendered length would, and is not this change.
 DRIFT_MAX_RENDERED_MANAGERS = 8
+
+# Where an owner with no usable `updated_at` sorts. Below every real timestamp,
+# because the cap above is only safe if it keeps the entries that matter, and
+# recency is what decides that -- see _drift_owner_recency.
+DRIFT_UNDATED_OWNER_RANK = float("-inf")
 
 
 def init_db() -> None:
@@ -1628,6 +1638,36 @@ def _defang_drift_field(value: Any) -> str:
     return text
 
 
+def _drift_owner_recency(owner: Dict[str, Any]) -> float:
+    """An owner's `updated_at` as a sort key, most recent highest.
+
+    The cap below drops managers, so which ones it keeps is the whole question.
+    `ownership()` returns them in the order the API server gave them, which
+    apimachinery orders by operation and then by time ascending -- so the entry
+    for the change being reported, the most recent write, is at the end of the
+    list and is the first thing a positional cut would drop. That is the one
+    entry the card cannot do without: the Cluster Agent's task is to compare the
+    manager that took the field against the manager that owns the declared spec,
+    and an ownership block missing the former presents half a comparison as a
+    whole one. It is also cheap to arrange deliberately -- eight server-side
+    applies push the update rows out of any positional window.
+
+    Sorting by recency instead keeps the newest eight. An owner the API server
+    recorded no time for sorts last rather than raising; the detector sends the
+    field only when it has one.
+    """
+    raw = owner.get("updated_at")
+    if not isinstance(raw, str) or not raw:
+        return DRIFT_UNDATED_OWNER_RANK
+    try:
+        # Go marshals the timestamp as RFC 3339, whose `Z` fromisoformat does not
+        # accept before Python 3.11. Lexicographic comparison is not the fallback:
+        # it orders "…00.5Z" before "…00Z", which is backwards within a second.
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return DRIFT_UNDATED_OWNER_RANK
+
+
 def _drift_ownership_block(payload: Dict[str, Any]) -> str:
     """What the live object's `managedFields` said, or why they were not read.
 
@@ -1663,8 +1703,10 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
             "Nothing is managing it declaratively."
         )
 
+    # Stable, so managers the API server recorded at the same instant -- and the
+    # undated ones, which all share a key -- keep the order it returned them in.
     lines = ["- **Field ownership** (read from the live object's `managedFields`):"]
-    for owner in owners[:DRIFT_MAX_RENDERED_MANAGERS]:
+    for owner in sorted(owners, key=_drift_owner_recency, reverse=True)[:DRIFT_MAX_RENDERED_MANAGERS]:
         manager = _defang_drift_field(owner.get("manager")) or DRIFT_UNKNOWN_FIELD
         operation = _defang_drift_field(owner.get("operation"))
         updated_at = _defang_drift_field(owner.get("updated_at"))
