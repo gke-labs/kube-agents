@@ -105,8 +105,14 @@ type ConsoleAdapter struct {
 	// without this every orderly shutdown logs a reconnect that never comes.
 	// Same guard as the bus client's (lib/client.go).
 	closingFlag atomic.Bool
-	mu          sync.Mutex
-	nextID      uint64
+	// closedCh is closed when nats.go abandons the connection for good, so
+	// Run can return instead of blocking on a door that will never open
+	// again. lib.Client rebuilds on the same event; this adapter cannot,
+	// because the mux owns the restart (mux.go Run).
+	closedCh   chan struct{}
+	closedOnce sync.Once
+	mu         sync.Mutex
+	nextID     uint64
 	// bootID is minted per adapter so notice ids (c-<boot>-<n>) do not
 	// repeat across gateway restarts, where a page still holding c-1 from
 	// the last boot would otherwise take a new c-1's edits as its own.
@@ -131,7 +137,7 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 	if _, err := rand.Read(boot); err != nil {
 		return nil, fmt.Errorf("console adapter: boot id: %w", err)
 	}
-	a := &ConsoleAdapter{log: log, bootID: hex.EncodeToString(boot)}
+	a := &ConsoleAdapter{log: log, bootID: hex.EncodeToString(boot), closedCh: make(chan struct{})}
 	opts := append([]nats.Option{nats.Name(consoleConnName), nats.MaxReconnects(-1)}, natsOpts...)
 	opts = append(opts,
 		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
@@ -163,6 +169,23 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			log.Info("console connection restored", "console", consoleConnName, "url", nc.ConnectedUrl())
 		}),
+		nats.ClosedHandler(func(nc *nats.Conn) {
+			if a.closingFlag.Load() {
+				return
+			}
+			// Terminal, and not the same event as a disconnect: nats.go
+			// abandons a connection for good even under MaxReconnects(-1)
+			// when the server refuses the credential twice running on a
+			// reconnect, which is the shape a gateway-password rotation
+			// takes while this pod still holds the old password. Nothing
+			// reconnects after this. The earlier "reconnecting" line is
+			// false from here on, and only Run returning can say so - a
+			// process left Running with a shut console door drops every
+			// frame in silence.
+			log.Error("console connection closed for good; the gateway cannot serve the console door until it restarts",
+				"console", consoleConnName, "err", nc.LastError())
+			a.signalClosed()
+		}),
 	)
 	nc, err := nats.Connect(url, opts...)
 	if err != nil {
@@ -183,14 +206,21 @@ func (a *ConsoleAdapter) Close() {
 	}
 }
 
+// signalClosed wakes Run once. nats.go can run ClosedHandler after Run has
+// already returned, so the close is guarded rather than repeated.
+func (a *ConsoleAdapter) signalClosed() {
+	a.closedOnce.Do(func() { close(a.closedCh) })
+}
+
 // subscribed reports whether Run has bound its subscription (tests).
 func (a *ConsoleAdapter) subscribed() bool { return a.subscribedFlag.Load() }
 
 // closed reports whether the connection has been closed (tests).
 func (a *ConsoleAdapter) closed() bool { return a.nc != nil && a.nc.IsClosed() }
 
-// Run delivers frames as InboundMessages until ctx is done. It owns the
-// connection's lifecycle from here: on ctx cancellation it unsubscribes and
+// Run delivers frames as InboundMessages until ctx is done, or until the
+// connection is closed for good, which it reports as an error. It owns the
+// connection's lifecycle from here: on either exit it unsubscribes and
 // closes the connection, so a caller does not leak it by trusting Run alone.
 //
 // The subscription is plain core NATS with no queue group, so every gateway
@@ -219,10 +249,21 @@ func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) 
 		return fmt.Errorf("console adapter: flush: %w", err)
 	}
 	a.subscribedFlag.Store(true)
-	<-ctx.Done()
+	var runErr error
+	select {
+	case <-ctx.Done():
+	case <-a.closedCh:
+		// Returning is the whole point: MultiAdapter.Run takes the first
+		// backend error and ends the process, which is how a dead console
+		// becomes a restart rather than a half-deaf gateway.
+		runErr = errors.New("console adapter: connection closed for good")
+		if last := a.nc.LastError(); last != nil {
+			runErr = fmt.Errorf("console adapter: connection closed for good: %w", last)
+		}
+	}
 	_ = sub.Unsubscribe()
 	a.Close()
-	return nil
+	return runErr
 }
 
 // inbound parses one frame. It returns the message, an optional notice to

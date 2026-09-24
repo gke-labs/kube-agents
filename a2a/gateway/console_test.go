@@ -481,7 +481,48 @@ func TestConsoleCloseDoesNotLogAsALostConnection(t *testing.T) {
 	// wrong rather than racing it to the assertion.
 	waitFor(t, "the connection to close", func() bool { return a.closed() })
 	time.Sleep(200 * time.Millisecond)
-	if got := logs.String(); strings.Contains(got, "console connection lost") {
-		t.Errorf("a deliberate Close logged as a lost connection:\n%s", got)
+	for _, bad := range []string{"console connection lost", "closed for good"} {
+		if got := logs.String(); strings.Contains(got, bad) {
+			t.Errorf("a deliberate Close logged %q:\n%s", bad, got)
+		}
+	}
+}
+
+// A connection nats.go has given up on leaves the adapter subscribed to
+// nothing, with no reconnect coming. Run has to surface that: MultiAdapter
+// turns a backend error into a process restart, and a gateway that instead
+// stays Running drops every console frame with no log line after the
+// (by then false) "reconnecting" one.
+func TestConsoleRunReturnsWhenTheConnectionIsClosedForGood(t *testing.T) {
+	srv := startServer(t)
+	logs := &lockedBuffer{}
+	a, err := NewConsoleAdapter(srv.ClientURL(), nil, slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.Close)
+
+	done := make(chan error, 1)
+	go func() { done <- a.Run(context.Background(), func(InboundMessage) {}) }()
+	waitFor(t, "console subscription", func() bool { return a.subscribed() })
+
+	// Close the connection underneath the adapter rather than through
+	// a.Close, which is what a terminal abort looks like from here: the
+	// closing flag stays unset, so this is not our own shutdown.
+	a.nc.Close()
+
+	select {
+	case runErr := <-done:
+		if runErr == nil {
+			t.Fatal("Run returned nil on a connection closed for good; the mux will not restart the gateway")
+		}
+		if !strings.Contains(runErr.Error(), "closed for good") {
+			t.Errorf("Run error does not name the cause: %v", runErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the connection was closed for good")
+	}
+	if got := logs.String(); !strings.Contains(got, "closed for good") {
+		t.Errorf("a terminal close was not logged as terminal:\n%s", got)
 	}
 }
