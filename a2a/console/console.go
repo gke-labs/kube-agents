@@ -60,7 +60,7 @@ const (
 	busDialTimeout = 2 * time.Second
 	// busResponseHeaderTimeout bounds the wait for the bus's upgrade response
 	// once the connection is up. A bus that accepts TCP but never answers the
-	// handshake — a stuck process, a proxy dropping the upgrade — would
+	// handshake (a stuck process, a proxy dropping the upgrade) would
 	// otherwise hang the browser's socket forever, since the default
 	// transport has no such timeout. It does not apply once the upgrade
 	// succeeds: the proxy hijacks the connection at that point.
@@ -187,6 +187,9 @@ func busTransport() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.DialContext = (&net.Dialer{Timeout: busDialTimeout}).DialContext
 	t.ResponseHeaderTimeout = busResponseHeaderTimeout
+	// The bus is in-cluster. An HTTP_PROXY in the pod's environment must not
+	// route the websocket out through it.
+	t.Proxy = nil
 	return t
 }
 
