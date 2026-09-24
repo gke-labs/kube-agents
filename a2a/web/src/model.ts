@@ -13,6 +13,7 @@ import {
   ARTIFACT_PROGRESS,
   ARTIFACT_RESULT,
   TERMINAL_STATES,
+  authorityOf,
   partsText,
   type Artifact,
   type ArtifactUpdate,
@@ -77,6 +78,66 @@ export interface TaskView {
   artifacts: Map<string, ArtifactView>;
   /** ms since epoch of the last event, from envelope ts. */
   lastEventAt: number;
+  /** authority.requester.backend on the submission, when it carried one. */
+  backend?: string;
+  /** authority.audience.conversation on the submission. */
+  conversation?: string;
+  /** ms, envelope ts of the submission. */
+  askAt?: number;
+  /** ms, envelope ts of the first status-update from anyone but the gateway. */
+  firstStatusAt?: number;
+  /** An executor published `submitted` for this task. Both executors do. */
+  sawSubmitted?: boolean;
+  /** ms, envelope ts of the event that first made the task terminal. */
+  endedAt?: number;
+  /** The message text on that terminal status: why the task ended. */
+  reason?: string;
+}
+
+export interface AnomalyCounts {
+  /** `to` disagreed with the subject's addressee. */
+  addressee: number;
+  /** An event arrived after the task's final one. */
+  postFinal: number;
+  /** A task went terminal without its executor ever saying `submitted`. */
+  missingSubmitted: number;
+}
+
+export interface ConversationView {
+  conversation: string;
+  backend: string;
+  /** ms, envelope ts of the newest turn. */
+  lastSeen: number;
+  turns: number;
+}
+
+export interface TopicView {
+  key: string;
+  topic: string;
+  owner?: string;
+  summary: string;
+  /** ms, envelope ts. */
+  at: number;
+  publisher: string;
+}
+
+/** ms from the ask to the executor's first status, once both are known. */
+export function queueMs(t: TaskView): number | undefined {
+  if (t.askAt === undefined || t.firstStatusAt === undefined) return undefined;
+  return Math.max(0, t.firstStatusAt - t.askAt);
+}
+
+/** ms from the executor's first status (or the ask) to the terminal event. */
+export function durationMs(t: TaskView): number | undefined {
+  const start = t.firstStatusAt ?? t.askAt;
+  if (t.endedAt === undefined || start === undefined) return undefined;
+  return Math.max(0, t.endedAt - start);
+}
+
+/** One key per topic subject: the owner's name scopes agent topics. */
+export function topicKey(subject: SubjectInfo, fallback: string): string {
+  if (subject.plane !== "topics") return fallback;
+  return subject.owner !== undefined ? `${subject.owner}/${subject.topic}` : subject.topic;
 }
 
 export type ChatKind =
@@ -127,6 +188,13 @@ export interface UiState {
   streamsTotal: number;
   /** Latest read-only probe result, if one was run. */
   probe?: ProbeResult;
+  /** Live envelopes seen per `from.agentType`. The strip's LED keys off it. */
+  typePulses: Map<string, number>;
+  anomalies: AnomalyCounts;
+  conversations: Map<string, ConversationView>;
+  topics: Map<string, TopicView>;
+  /** The last tick's wall clock, ms. Zero until the first tick. */
+  now: number;
 }
 
 export type BusEvent =
@@ -146,6 +214,11 @@ export const initialState: UiState = {
   connection: "connecting",
   streamsUp: 0,
   streamsTotal: 0,
+  typePulses: new Map(),
+  anomalies: { addressee: 0, postFinal: 0, missingSubmitted: 0 },
+  conversations: new Map(),
+  topics: new Map(),
+  now: 0,
 };
 
 /**
@@ -275,11 +348,19 @@ function reduceMessage(next: UiState, state: UiState, env: Envelope, subject: Su
   const payload = env.payload as Message;
   const text = partsText(payload.parts);
   const known = state.tasks.get(env.taskId ?? "");
-  // The first message on a task subject is the submission — the user's ask,
+  const authority = authorityOf(env);
+  // The first message on a task subject is the submission - the user's ask,
   // echoed from the stream so the transcript never trusts local state. A
   // later message on the same task is steering or follow-up input.
   const isSubmission = known === undefined;
-  next.tasks = upsertTask(state.tasks, env, subject, isSubmission ? {} : undefined);
+  next.tasks = upsertTask(
+    state.tasks,
+    env,
+    subject,
+    isSubmission
+      ? { backend: authority.backend, conversation: authority.conversation, askAt: tsMs(env) }
+      : undefined,
+  );
   next.chat = pushChat(state, env, {
     kind: isSubmission ? "user" : "steer",
     session: env.from.session,
@@ -287,6 +368,18 @@ function reduceMessage(next: UiState, state: UiState, env: Envelope, subject: Su
     correlationId: env.correlationId,
     taskId: env.taskId,
   });
+
+  if (authority.conversation !== undefined) {
+    const prev = state.conversations.get(authority.conversation);
+    const conversations = new Map(state.conversations);
+    conversations.set(authority.conversation, {
+      conversation: authority.conversation,
+      backend: authority.backend ?? prev?.backend ?? "unknown",
+      lastSeen: Math.max(prev?.lastSeen ?? 0, tsMs(env)),
+      turns: (prev?.turns ?? 0) + 1,
+    });
+    next.conversations = conversations;
+  }
 }
 
 function reduceStatusUpdate(
@@ -298,15 +391,32 @@ function reduceStatusUpdate(
   const payload = env.payload as StatusUpdate;
   const taskState = payload.status?.state ?? "working";
   const final = payload.final === true;
+  const prev = state.tasks.get(env.taskId ?? "");
+  const fromExecutor = env.from.session !== GATEWAY_SESSION;
+  const ts = tsMs(env);
+  const terminal = final || isTerminal(taskState);
+  const firstTerminal = terminal && prev?.endedAt === undefined;
+  const note = partsText(payload.status?.message?.parts);
+  const sawSubmitted = prev?.sawSubmitted === true || (fromExecutor && taskState === "submitted");
   next.tasks = upsertTask(state.tasks, env, subject, {
     state: taskState,
     final,
-    executor: state.tasks.get(env.taskId ?? "")?.executor ?? env.from.session,
+    executor: prev?.executor ?? env.from.session,
+    firstStatusAt: prev?.firstStatusAt ?? (fromExecutor ? ts : undefined),
+    sawSubmitted,
+    endedAt: prev?.endedAt ?? (terminal ? ts : undefined),
+    reason: firstTerminal && note !== "" ? note : prev?.reason,
   });
+  // Both executors publish `submitted` before anything else. A task that
+  // ended without one skipped a step the spec requires. Counted once, on the
+  // event that first makes it terminal, and only for tasks whose submission
+  // this page saw (a task first seen mid-flight proves nothing).
+  if (firstTerminal && prev?.askAt !== undefined && !sawSubmitted) {
+    next.anomalies = { ...next.anomalies, missingSubmitted: next.anomalies.missingSubmitted + 1 };
+  }
 
   // A status that carries a message (input-required's question, a supervisor's
   // reason) belongs in the transcript.
-  const note = partsText(payload.status?.message?.parts);
   if (note !== "") {
     next.chat = pushChat(state, env, {
       kind: "status",
@@ -388,17 +498,26 @@ function reduceArtifactUpdate(
  * addressee (assertion 4), and any event after the task's `final` one
  * (assertion 10).
  */
-function anomalyOf(state: UiState, env: Envelope, subject: SubjectInfo): string | null {
+type AnomalyKind = "addressee" | "postFinal";
+
+function anomalyOf(
+  state: UiState,
+  env: Envelope,
+  subject: SubjectInfo,
+): { kind: AnomalyKind; text: string } | null {
   if (
     subject.plane === "tasks" &&
     env.to?.session !== undefined &&
     env.to.session !== subject.addressee
   ) {
-    return `envelope addressed to "${env.to.session}" on ${subject.addressee}'s subject`;
+    return {
+      kind: "addressee",
+      text: `envelope addressed to "${env.to.session}" on ${subject.addressee}'s subject`,
+    };
   }
   const task = env.taskId ? state.tasks.get(env.taskId) : undefined;
   if (task?.final && (env.kind === "status-update" || env.kind === "artifact-update")) {
-    return `${env.kind} after the task's final event`;
+    return { kind: "postFinal", text: `${env.kind} after the task's final event` };
   }
   return null;
 }
@@ -423,15 +542,23 @@ function reduceEnvelope(
     };
     const pulses = [...state.pulses, pulse];
     next.pulses = pulses.length > MAX_PULSES ? pulses.slice(pulses.length - MAX_PULSES) : pulses;
+
+    const type = env.from.agentType;
+    if (type !== undefined && type !== "") {
+      const typePulses = new Map(state.typePulses);
+      typePulses.set(type, (typePulses.get(type) ?? 0) + 1);
+      next.typePulses = typePulses;
+    }
   }
 
   // An anomalous envelope is reported and not folded: it must not revive a
   // retired agent, retune a finished task, or append to an answer.
   if (anomaly !== null) {
+    next.anomalies = { ...state.anomalies, [anomaly.kind]: state.anomalies[anomaly.kind] + 1 };
     next.chat = pushChat(state, env, {
       kind: "anomaly",
       session: env.from.session,
-      text: `${anomaly} (${env.kind}, ${env.envelopeId})`,
+      text: `${anomaly.text} (${env.kind}, ${env.envelopeId})`,
       correlationId: env.correlationId,
       taskId: env.taskId,
     });
@@ -506,6 +633,22 @@ function reduceEnvelope(
         correlationId: env.correlationId,
         taskId: env.taskId,
       });
+      // No DIRECT.GET on these grants, so "latest" is the newest envelope ts
+      // seen per subject. A replay arriving after a live update never wins.
+      const key = topicKey(subject, topic);
+      const prevTopic = touched.topics.get(key);
+      if (prevTopic === undefined || tsMs(env) >= prevTopic.at) {
+        const topics = new Map(touched.topics);
+        topics.set(key, {
+          key,
+          topic,
+          owner: subject.plane === "topics" ? subject.owner : undefined,
+          summary,
+          at: tsMs(env),
+          publisher: env.from.session,
+        });
+        next.topics = topics;
+      }
       break;
     }
   }
@@ -529,7 +672,7 @@ export function reduce(state: UiState, event: BusEvent): UiState {
         agents ??= new Map(state.agents);
         agents.set(session, { ...agent, status: want });
       }
-      return agents ? { ...state, agents } : state;
+      return { ...state, now: event.now, ...(agents ? { agents } : {}) };
     }
 
     case "connection":

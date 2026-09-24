@@ -4,7 +4,9 @@ import { parseSubject } from "./protocol.ts";
 import {
   GATEWAY_SESSION,
   IDLE_MS,
+  durationMs,
   initialState,
+  queueMs,
   reduce,
   type BusEvent,
   type UiState,
@@ -474,5 +476,192 @@ describe("plumbing events", () => {
       result: { outcome: "refused", detail: "Permissions Violation for Publish", at: 1 },
     });
     expect(state.probe?.outcome).toBe("refused");
+  });
+});
+
+const consoleAuthority = {
+  requester: { principal: "p", backend: "console", subject: "s", verifiedBy: "nats-grant" },
+  audience: { conversation: "console:abc", kind: "dm", roster: ["s"], rosterComplete: true },
+  grants: null,
+};
+
+function status(
+  state: UiState,
+  taskState: string,
+  ts: string,
+  extra: { final?: boolean; text?: string; from?: Envelope["from"] } = {},
+): UiState {
+  return onSubject(
+    state,
+    "a2a.tasks.platform.task-1.events",
+    env({
+      kind: "status-update",
+      taskId: "task-1",
+      contextId: "ctx-1",
+      ts,
+      from: extra.from ?? bridge,
+      payload: {
+        taskId: "task-1",
+        contextId: "ctx-1",
+        final: extra.final ?? false,
+        status: {
+          state: taskState,
+          ...(extra.text ? { message: { role: "agent", parts: [{ text: extra.text }] } } : {}),
+        },
+      },
+    }),
+  );
+}
+
+describe("dashboard task fields", () => {
+  it("records backend, conversation and ask time from the submission's authority block", () => {
+    const state = onSubject(
+      initialState,
+      "a2a.tasks.platform.task-1.in",
+      env({
+        kind: "message",
+        taskId: "task-1",
+        contextId: "ctx-1",
+        ts: "2026-08-31T12:00:00Z",
+        authority: consoleAuthority,
+        payload: { role: "user", parts: [{ text: "hi" }] },
+      }),
+    );
+    const task = state.tasks.get("task-1")!;
+    expect(task.backend).toBe("console");
+    expect(task.conversation).toBe("console:abc");
+    expect(task.askAt).toBe(Date.parse("2026-08-31T12:00:00Z"));
+  });
+
+  it("derives queue time, duration and the terminal reason", () => {
+    let state = submission(); // ts 12:00:00
+    state = status(state, "submitted", "2026-08-31T12:00:04Z");
+    state = status(state, "working", "2026-08-31T12:00:05Z");
+    state = status(state, "failed", "2026-08-31T12:00:34Z", {
+      final: true,
+      text: "the session never started",
+    });
+    const task = state.tasks.get("task-1")!;
+    expect(queueMs(task)).toBe(4_000);
+    expect(durationMs(task)).toBe(30_000);
+    expect(task.reason).toBe("the session never started");
+    expect(task.sawSubmitted).toBe(true);
+  });
+
+  it("does not count a gateway status as the executor's first status", () => {
+    let state = submission();
+    state = status(state, "working", "2026-08-31T12:00:02Z", {
+      from: { session: GATEWAY_SESSION, agentType: "a2a-gateway" },
+    });
+    expect(state.tasks.get("task-1")!.firstStatusAt).toBeUndefined();
+    expect(queueMs(state.tasks.get("task-1")!)).toBeUndefined();
+  });
+
+  it("leaves queue time and duration undefined until the bus has said enough", () => {
+    const task = submission().tasks.get("task-1")!;
+    expect(queueMs(task)).toBeUndefined();
+    expect(durationMs(task)).toBeUndefined();
+  });
+});
+
+describe("anomaly counters", () => {
+  it("counts a task that went terminal without a submitted status, once", () => {
+    let state = submission();
+    state = status(state, "working", "2026-08-31T12:00:05Z");
+    state = status(state, "completed", "2026-08-31T12:00:09Z", { final: true });
+    expect(state.anomalies.missingSubmitted).toBe(1);
+    // A post-final event is its own anomaly and does not count the task again.
+    state = status(state, "completed", "2026-08-31T12:00:10Z", { final: true });
+    expect(state.anomalies.missingSubmitted).toBe(1);
+    expect(state.anomalies.postFinal).toBe(1);
+  });
+
+  it("does not count a task whose executor said submitted", () => {
+    let state = submission();
+    state = status(state, "submitted", "2026-08-31T12:00:01Z");
+    state = status(state, "completed", "2026-08-31T12:00:09Z", { final: true });
+    expect(state.anomalies.missingSubmitted).toBe(0);
+  });
+
+  it("counts addressee disagreement", () => {
+    const state = onSubject(
+      initialState,
+      "a2a.tasks.platform.task-1.in",
+      env({
+        kind: "message",
+        taskId: "task-1",
+        contextId: "ctx-1",
+        to: { session: "someone-else" },
+        payload: { role: "user", parts: [] },
+      }),
+    );
+    expect(state.anomalies).toEqual({ addressee: 1, postFinal: 0, missingSubmitted: 0 });
+  });
+});
+
+describe("types, conversations and topics", () => {
+  it("counts live envelopes per agent type and ignores replay", () => {
+    let state = submission(); // live, from the gateway
+    state = status(state, "working", "2026-08-31T12:00:05Z"); // live, from the bridge
+    state = onSubject(
+      state,
+      "a2a.tasks.platform.task-2.in",
+      env({ kind: "message", taskId: "task-2", contextId: "ctx-2", payload: { parts: [] } }),
+      false,
+    );
+    expect(state.typePulses.get("a2a-gateway")).toBe(1);
+    expect(state.typePulses.get("hermes-bridge")).toBe(1);
+  });
+
+  it("tracks conversations by the authority block, counting turns", () => {
+    const turn = (s: UiState, taskId: string, ts: string) =>
+      onSubject(
+        s,
+        `a2a.tasks.platform.${taskId}.in`,
+        env({
+          kind: "message",
+          taskId,
+          contextId: "ctx",
+          ts,
+          authority: consoleAuthority,
+          payload: { parts: [{ text: "x" }] },
+        }),
+      );
+    let state = turn(initialState, "task-1", "2026-08-31T12:00:00Z");
+    state = turn(state, "task-2", "2026-08-31T12:05:00Z");
+    expect(state.conversations.get("console:abc")).toEqual({
+      conversation: "console:abc",
+      backend: "console",
+      lastSeen: Date.parse("2026-08-31T12:05:00Z"),
+      turns: 2,
+    });
+    // A message with no authority block is not a conversation.
+    expect(submission().conversations.size).toBe(0);
+  });
+
+  it("keeps the newest value per topic, and an older replay does not overwrite it", () => {
+    const topic = (s: UiState, text: string, ts: string) =>
+      onSubject(
+        s,
+        "a2a.topics.agent.platform.upgrade-readiness",
+        env({
+          kind: "topic-update",
+          ts,
+          from: { session: "platform", agentType: "hermes" },
+          payload: { name: "upgrade-readiness", parts: [{ text }] },
+        }),
+      );
+    let state = topic(initialState, "3 of 4 ready", "2026-08-31T12:05:00Z");
+    state = topic(state, "1 of 4 ready", "2026-08-31T12:00:00Z");
+    expect(state.topics.get("platform/upgrade-readiness")).toMatchObject({
+      topic: "upgrade-readiness",
+      owner: "platform",
+      summary: "3 of 4 ready",
+      publisher: "platform",
+    });
+  });
+
+  it("a tick records the clock", () => {
+    expect(reduce(initialState, { type: "tick", now: 1234 }).now).toBe(1234);
   });
 });
