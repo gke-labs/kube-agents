@@ -758,6 +758,14 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         )
         # Must require identifying which cluster was picked in the report
         self.assertIn("Never resolve silently", self.content)
+        # Must guide keeping throwaway probe results silent / out of chat channel
+        self.assertIn("[SILENT]", self.content)
+        self.assertIn("metadata", self.content)
+        # Must forbid abandoning unsettled probes in ready
+        self.assertRegex(
+            self.content,
+            r"[Nn]ever abandon an unsettled probe queued in `ready`",
+        )
 
 
 if __name__ == "__main__":
