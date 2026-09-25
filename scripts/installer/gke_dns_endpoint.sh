@@ -77,11 +77,11 @@ gke_dns_endpoint_flag() {
   # `trap - ERR` inside the substitution: under bash 3.2 (macOS's default, and
   # the `curl | bash` audience) the caller's inherited ERR trap fires in this
   # subshell even though the failure is the tested condition of the `if`, and
-  # the `|| true` a caller adds outside it cannot reach that. install.sh's
-  # on_error then prints a fatal-looking abort banner and rewrites the install
-  # report as FAILED; its `exit` only leaves the subshell, so the run carries on
-  # having announced a death that did not happen, and any later failure is
-  # reported against this line.
+  # the `|| true` a caller adds outside it cannot reach that. The front doors'
+  # own `on_error` exits a subshell silently and leaves the verdict to the
+  # parent, but this file is also sourced by hack/ci-env.sh and
+  # scripts/release/common.sh and cannot know its caller's trap, so it guards
+  # itself. scripts/installer/README.md states the rule.
   #
   # A describe that fails is the NORMAL path here, not an edge. install.sh
   # resolves this flag in the chat interview to print a get-credentials command,
@@ -90,8 +90,7 @@ gke_dns_endpoint_flag() {
   # describe. That miss must stay what the contract above says it is: an empty
   # flag, and a printed command without --dns-endpoint.
   #
-  # Every other gcloud probe in install.sh and installer_common.sh clears the
-  # trap the same way.
+  # installer_common.sh's tolerated probes clear the trap the same way.
   local described endpoint external
   if ! described=$(trap - ERR; gcloud container clusters describe "$cluster" \
       --location "$location" --project "$project" \

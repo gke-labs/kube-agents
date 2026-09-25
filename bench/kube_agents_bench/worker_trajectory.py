@@ -48,7 +48,8 @@ scalar under ``data:``, and userinfo in a URL. Blanking is by shape, not by ``ki
 safe direction to err in. A pod whose redactor cannot be loaded withholds every
 result and argument rather than sending them unscrubbed; the call names, tags
 and statuses still come back. The tags are also how ``tool_called`` keeps its
-router-only contract: it skips every entry carrying ``agent``.
+default router-only contract: ``scope: router`` skips every entry carrying
+``agent`` and ``scope: workers`` counts only those.
 
 Two readers change with this. The record's ``trajectory`` is what devops-bench
 hands its judged metrics as the execution trace, so the judge now sees the

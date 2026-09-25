@@ -40,7 +40,7 @@ CONFIG = {
     "reviewers": {
         "defaults": ["repository-owners"],
         "groups": {
-            "repository-owners": ["bradhoekstra", "jayantid", "toshiowang", "dshnayder"],
+            "repository-owners": ["bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor"],
             "eval-crew": ["jayantid", "lapis2002"],
         },
     },
@@ -63,10 +63,13 @@ EVAL_CREW = CONFIG["reviewers"]["groups"]["eval-crew"]
 REPO_ROOT = _HERE.parent
 LIVE_CONFIG = REPO_ROOT / rr.DEFAULT_CONFIG_PATH
 
-# The OWNERS approvers the verdict check is handed in these tests. `bnaylor`
-# is deliberately not one of them: he is the colleague whose real approvals
-# are `COMMENTED`-equivalent for Tide, and the shape the fixtures below reuse.
-APPROVERS = {"bradhoekstra", "jayantid", "toshiowang", "dshnayder"}
+# The OWNERS approvers the verdict check is handed in these tests, plus one
+# login outside them. The set mirrors the `repository-owners` group. What the
+# fixtures below depend on is two memberships rather than the exact names:
+# `jayantid` is inside it, so an `APPROVED` review from him reads as an
+# approval, and `NON_APPROVER` is outside it, so the same review from him
+# does not.
+APPROVERS = {"bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor"}
 NON_APPROVER = "kyber775"
 
 # The root OWNERS, OWNERS_ALIASES and hack/OWNERS as they stand, for the walk
@@ -330,7 +333,9 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_fewer_candidates_than_requested_is_not_an_error(self):
-        config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=5))
+        # One more than the group holds, so the request stays short of the
+        # candidates however many names the group grows to.
+        config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=len(OWNERS) + 1))
         picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0))
         self.assertCountEqual(picked, OWNERS)
 

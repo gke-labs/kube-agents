@@ -51,8 +51,8 @@ name: Notify on Broken Main
 # from the first run. Prettier is also the check least exposed to the stale-base
 # merge this exists to catch: it reads file contents, which a stale merge base
 # does not change. `cla/google` is an external app with no run to watch, and
-# `Validate Conventional Commit PR Title` runs only on pull requests, so it has
-# no push run to watch either.
+# `Validate Conventional Commit PR Title` runs only on pull requests and
+# merge-queue runs, so it has no push run to watch either.
 
 on:
   # zizmor: ignore[dangerous-triggers] - workflow_run is only dangerous when it checks

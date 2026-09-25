@@ -1,13 +1,15 @@
 # Knowledge-grounding probe: a pure GKE documentation question, graded on
 # the grounding contract the personas carry (agents/platform/SOUL.md):
-# answer from a knowledge lookup — Developer Knowledge MCP first, active
-# web_search fallback — and conclude with a `## Sources` section naming the
-# tools queried. deploy/docker/patches/kanban_report_format.py carries the
-# same `## Sources` rule for delegated card reports, so the contract holds
+# answer from a knowledge lookup — Developer Knowledge MCP first, through
+# `search_documents` and never `answer_query` (#1765: a 50-a-day project
+# quota shared by every agent in the install), active web_search fallback —
+# and conclude with a `## Sources` section naming the tools queried.
+# deploy/docker/patches/kanban_report_format.py carries the same
+# `## Sources` rule for delegated card reports, so the contract holds
 # whether the front door answers directly or a specialist works the card.
 #
 # Planted defect required: none. The case reads no cluster and depends on no
-# fixture — both checks read the run's transcript, which is why there is no
+# fixture — every check reads the run's transcript, which is why there is no
 # `fixtures:` list (the agent-kanban-smoke precedent). The facts asserted are
 # not planted in a cluster but they are deterministic: the prompt asks for the
 # nodeSelector that selects the Performance compute class in GKE Autopilot,
@@ -34,6 +36,28 @@
 # holding, not failing. Asserting the MCP by name here would red every
 # pull request on the pool's provisioning date rather than on the diff.
 #
+# What the case CAN assert about the tool choice, since #1746 put the
+# workers' calls in the trajectory: that no worker called `answer_query`.
+# The lookup happens in the platform worker (the front door has no
+# knowledge tools), so the safeguard reads `scope: workers`. The worker
+# reaches an MCP tool through Hermes' `tool_call` wrapper -- the entry is
+# named `tool_call` and the tool invoked sits in its arguments -- and
+# tool_called reads through that wrapper. An attempted call counts whether
+# or not the API answered, so it holds in the pool projects too, where the
+# Developer Knowledge tools ARE listed but every call 403s (the pool's
+# agent identity lacks roles/serviceusage.serviceUsageConsumer for its own
+# project, the grant #945 added to full-install and the pool never got) and
+# the worker falls back to web search. Measured on build 2102459327938826240
+# (#1765, kube-agents-evals-8), rep 1, 221s: tool_search -> tool_describe
+# -> tool_call(mcp__developer_knowledge__search_documents) -> 403 ->
+# web_search x4 -> report; all four checks passed, VerificationCoverage
+# 1.0, so the capture runs in this case's shape. The red on main's personas
+# is a peer build the same day (2102475235713355776, PR #1652, GREEN): its
+# obtainability-pdb-semantics worker spent one
+# mcp__developer_knowledge__answer_query call through the same wrapper. If
+# the capture did not run the check errors rather than passing, which is
+# VerificationCoverage < 1.0.
+#
 # Isolation class: read-only (no cluster touched at all).
 # Tier: nightly -- registered in hack/eval/nightly-cases.txt since
 # 2026-09-09, after one presubmit cycle in TASKS (#945: 2/3 on the build
@@ -41,7 +65,10 @@
 # widened). Held out of presubmit deliberately, not for cost or flake:
 # knowledge grounding is a cross-cutting persona behavior rather than one of
 # the core kube-agents journeys the presubmit gate exists for, so it earns
-# its record in the nightly's full catalog. Cost: one delegation round trip
+# its record in the nightly's full catalog. #1765 gave it a temporary
+# presubmit seat to measure the answer_query safeguard on that pull
+# request's builds (2102459327938826240 and 2102768495748976640), reverted
+# before merge (the incident-triage-oom-event-probe precedent). Cost: one delegation round trip
 # plus one knowledge lookup; measured 166-1602s across six repetitions
 # (median ~600s), so unit_cost_hint in hack/ci-eval-pr.sh carries an entry
 # for it. No tofu, no fleet read.
@@ -56,8 +83,9 @@ prompt: >-
   I use to run a workload on the Performance compute class?
 expected_output: >-
   The agent answers from a knowledge lookup rather than training memory: it
-  queries the Developer Knowledge MCP (falling back to web search only where
-  that has no coverage), names the cloud.google.com/compute-class nodeSelector
+  queries the Developer Knowledge MCP through search_documents (never the
+  quota-limited answer_query; falling back to web search only where the MCP
+  has no coverage), names the cloud.google.com/compute-class nodeSelector
   key for selecting the Performance compute class, and concludes with a
   "## Sources" section naming the knowledge tools and documentation sources it
   queried.
@@ -119,3 +147,26 @@ verification_spec:
         # kanban_create, never the card-worker verbs.
         - type: tool_called
           tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # The Developer Knowledge tool the personas forbid (#1765): 50 calls
+        # a day for the whole project. scope: workers reads the platform
+        # worker's (and any Cluster Agent's) calls, which is where the lookup
+        # happens; no require_success, because the attempt is the spend and
+        # the pool projects' calls 403 anyway. The worker invokes it through
+        # the tool_call wrapper, which tool_called reads through (measured:
+        # the name inside is mcp__developer_knowledge__answer_query). Both
+        # separator spellings, the way scripts/test_integration_contracts.py
+        # registers every MCP tool; the server is a remote proxy, so the
+        # name is allowlisted there (REMOTE_MCP_TOOLS) with its evidence.
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]

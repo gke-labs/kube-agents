@@ -74,6 +74,10 @@ type SessionRecord struct {
 type TaskRef struct {
 	ID        string `json:"id"`
 	Addressee string `json:"addressee"`
+	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
+	// task the record has released can still ride the task's own chain.
+	// Empty on entries written before it was recorded.
+	CorrelationID string `json:"correlationId,omitempty"`
 	// Canceled records that the gateway published a cancel for this task —
 	// set only after the publish succeeded, so a true here means the cancel
 	// is on the stream. It is what lets a supervisor path reached long
@@ -91,6 +95,17 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 			return
 		}
 	}
+}
+
+// TaskRefFor returns the history entry for a task this conversation has
+// held, active or not.
+func (rec *SessionRecord) TaskRefFor(taskID string) (TaskRef, bool) {
+	for _, ref := range rec.Tasks {
+		if ref.ID == taskID {
+			return ref, true
+		}
+	}
+	return TaskRef{}, false
 }
 
 // TaskCanceled reports whether a cancel for the task is on the stream (see

@@ -150,7 +150,8 @@ after merge (#658). CI runs the same check in
 at and why — read it before changing the target.
 
 **Third-party download retries.** A non-piped `curl` that fetches over the network in
-`deploy/docker/Dockerfile`, `deploy/sandbox/Dockerfile` or `hack/ci-env.sh` needs both
+`deploy/docker/Dockerfile`, `deploy/sandbox/Dockerfile`, `hack/ci-env.sh` or
+`.github/workflows/validate.yml` needs both
 `--retry N` and `--retry-all-errors` — the count alone does not survive a connection reset
 mid-transfer, and without either a bad second from the upstream CDN fails a build that has
 nothing to do with the download. `tests/test_third_party_download_retry.py` fails the pull

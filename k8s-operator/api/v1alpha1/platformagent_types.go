@@ -46,12 +46,13 @@ type PlatformAgentSpec struct {
 	// alone, keeps the last declaration's exclusions and retires nothing; an empty
 	// projects list in a present block drops the projects an earlier block declared.
 	// The management project is always in scope and cannot be excluded. The design is docs/designs/multi-project-scope.md;
-	// this is its phase 1, explicit projects only.
+	// this is its phases 1 and 2: explicit projects, folders and organisations.
 	// +optional
 	Scope *ScopeSpec `json:"scope,omitempty"`
 }
 
-// ScopeSpec is the opt-in set of projects the Cluster Agent reconcile manages.
+// ScopeSpec is the opt-in set of projects, folders and organisations the Cluster Agent
+// reconcile manages.
 type ScopeSpec struct {
 	// Projects lists GCP project IDs whose GKE clusters get Cluster Agent
 	// profiles, in addition to the management project. The agent's service
@@ -64,6 +65,26 @@ type ScopeSpec struct {
 	// +listType=set
 	// +optional
 	Projects []string `json:"projects,omitempty"`
+
+	// Folders lists GCP folder IDs (numeric) whose every project, at any depth,
+	// contributes its GKE clusters, resolved through Cloud Asset Inventory on each
+	// run. The agent's service account needs roles/cloudasset.viewer and the read
+	// roles on the folder, granted by hand until the install's Terraform gains a
+	// scope input; a folder it cannot read freezes its previous members and is
+	// reported with the reason.
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:Pattern=`^[0-9]{1,20}$`
+	// +listType=set
+	// +optional
+	Folders []string `json:"folders,omitempty"`
+
+	// Organizations lists GCP organisation IDs (numeric), resolved the way Folders
+	// are.
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:Pattern=`^[0-9]{1,20}$`
+	// +listType=set
+	// +optional
+	Organizations []string `json:"organizations,omitempty"`
 
 	// Exclude subtracts projects and clusters after every selector has
 	// contributed.

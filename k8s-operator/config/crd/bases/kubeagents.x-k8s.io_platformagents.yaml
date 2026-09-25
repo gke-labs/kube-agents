@@ -9954,7 +9954,7 @@ spec:
                     alone, keeps the last declaration's exclusions and retires nothing; an empty
                     projects list in a present block drops the projects an earlier block declared.
                     The management project is always in scope and cannot be excluded. The design is docs/designs/multi-project-scope.md;
-                    this is its phase 1, explicit projects only.
+                    this is its phases 1 and 2: explicit projects, folders and organisations.
                   properties:
                     exclude:
                       description: |-
@@ -10011,6 +10011,30 @@ spec:
                           type: array
                           x-kubernetes-list-type: set
                       type: object
+                    folders:
+                      description: |-
+                        Folders lists GCP folder IDs (numeric) whose every project, at any depth,
+                        contributes its GKE clusters, resolved through Cloud Asset Inventory on each
+                        run. The agent's service account needs roles/cloudasset.viewer and the read
+                        roles on the folder, granted by hand until the install's Terraform gains a
+                        scope input; a folder it cannot read freezes its previous members and is
+                        reported with the reason.
+                      items:
+                        pattern: ^[0-9]{1,20}$
+                        type: string
+                      maxItems: 100
+                      type: array
+                      x-kubernetes-list-type: set
+                    organizations:
+                      description: |-
+                        Organizations lists GCP organisation IDs (numeric), resolved the way Folders
+                        are.
+                      items:
+                        pattern: ^[0-9]{1,20}$
+                        type: string
+                      maxItems: 100
+                      type: array
+                      x-kubernetes-list-type: set
                     projects:
                       description: |-
                         Projects lists GCP project IDs whose GKE clusters get Cluster Agent

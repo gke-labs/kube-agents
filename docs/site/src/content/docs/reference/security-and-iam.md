@@ -77,7 +77,7 @@ The default **read-only** set binds viewer roles only:
 - `roles/mcp.toolUser` — call the GKE MCP server.
 - `roles/serviceusage.serviceUsageConsumer` — consume API quota for Developer Knowledge MCP queries.
 
-`roles/container.viewer` is project-wide and unconditioned, so it reads Kubernetes objects in **every** cluster in the project. The [scoped service account pool](#the-scoped-service-account-pool) is where that narrowing is designed to land — suspended, so today nothing narrows it; the pool section says why.
+`roles/container.viewer` is project-wide and unconditioned, so it reads Kubernetes objects in **every** cluster in the project. The [scoped service account pool](#the-scoped-service-account-pool) is where that narrowing is designed to land — suspended, so today nothing narrows it; the pool section says why. A binding on a folder or organisation named in [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope) is inherited by every project beneath it, which is what makes a container worth declaring and also what a grant there reaches.
 
 The **custom** set binds exactly the roles listed in `--custom-roles` (space- or comma-separated; the installer prompts for it and requires a non-empty value when this set is selected), carried as the composition's `project_roles` list — none of the built-in role bundles are added.
 

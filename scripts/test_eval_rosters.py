@@ -97,6 +97,7 @@ ADDED_AFTER_THE_SPLIT = [
     "autoops-crashloop-config-triage",  # #1023's other incident-triage second case, PR #1103
     "consistency-no-environment-label",  # the drift collector's §4.14 check, with fleet_drift.py
     "gitops-drift-out-of-band-triage",  # the drift half of incident-triage, PR #1827
+    "upgrades-master-behind-offered-elsewhere",  # the patch collector's §3.1 route check, with patch_readiness.py
 ]
 MOVED_TO_NIGHTLY = [
     "cluster-agent-pending-replicas-capped-pool",
