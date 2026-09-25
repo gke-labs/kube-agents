@@ -316,7 +316,18 @@ worker adapter publishes `activity` and `progress` beside the result, so a case
 that gates on `tool_called` has no data on stage 1 until the bridge publishes activity or the
 persona moves to the worker path. `worker_commands` reads the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
-signals), and until then a case that gates on it has no data on stage 1 either.
+signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
+as a failure meanwhile: on a record whose trajectory is this transport's envelope with no tool
+call in it, the scorer sets every `tool_called` and `worker_commands` entry aside as not
+applicable and grades the checks that remain; a case with no other objective is not graded on
+the lane rather than collapsed, and the rule retires itself on the first record that carries a
+tool entry ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
+cannot show") — which, per the paragraph above, takes transport work beyond the executor
+publishing `activity`, since the relay never posts those to a conversation; that work is not
+filed. A case whose premise needs the front door — `agent-kanban-smoke`, which grades
+the chat profile's `kanban_create` — is a different matter: the door addresses `platform`
+directly, so `hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the
+reason, and the api lane's roster is untouched.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
@@ -509,7 +520,8 @@ operator, because the defaults point at a registry the pool projects cannot pull
 image is built in that step too, and the flip declares the bridge sidecar on the CR with it (the
 executor paragraph in stage 1 says what the sidecar carries), because a flip without the sidecar
 leaves a bus on which nobody consumes `platform` tasks. The eval matrix in `hack/ci-eval-pr.sh`
-is unchanged.
+is unchanged by the flag itself; the inject lane's exclusion list is keyed on the harness's
+`AGENT_TRANSPORT`, not on this flag, and applies once a lane exports it.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.

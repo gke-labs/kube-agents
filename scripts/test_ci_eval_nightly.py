@@ -274,5 +274,99 @@ class ArrayHygieneTest(unittest.TestCase):
                 )
 
 
+def exclusions_block() -> str:
+    """The inject lane's exclusion step (#2039): the read, the existence
+    check on every entry, and the AGENT_TRANSPORT-gated drop from TASKS."""
+    return lifted_block(r"^# ─── The inject lane's exclusions.*?^fi$")
+
+
+def lane_constants() -> str:
+    """The exclusion file's path and the lane's transport name: declared
+    beside the roster files, after a comment `roster_constants` stops at."""
+    return lifted_block(r"^readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE=[^\n]*\nreadonly EVAL_INJECT_LANE_TRANSPORT=[^\n]*\n")
+
+
+def load_matrix_through_the_lane_step(env: dict | None = None, hack_dir: pathlib.Path = HACK_DIR) -> subprocess.CompletedProcess:
+    """`load_matrix` with the exclusion step appended after the tier switch,
+    where the script runs it."""
+    section = matrix_section().replace('BENCH_DIR="${SCRIPT_DIR}/../bench"', f'BENCH_DIR="{BENCH_DIR}"')
+    body = "\n".join(
+        [f'SCRIPT_DIR="{hack_dir}"', roster_constants(), lane_constants(), section, exclusions_block(), roster_block(), PRINT_ARRAYS]
+    )
+    return run_bash(body, env)
+
+
+class InjectLaneExclusionTest(unittest.TestCase):
+    """Under AGENT_TRANSPORT=inject the excluded cases leave TASKS; on any
+    other transport the matrix is byte for byte the presubmit file."""
+
+    def excluded_entries(self) -> list[str]:
+        return [f"./tasks/{name}/task.yaml" for name in eval_rosters.inject_lane_exclusions()]
+
+    def test_the_api_lane_is_untouched(self):
+        for env in ({}, {"AGENT_TRANSPORT": "api"}):
+            with self.subTest(env=env):
+                result = load_matrix_through_the_lane_step(env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(lines_tagged(result, "TASK"), presubmit_entries())
+                self.assertNotIn("leaves the matrix", result.stdout)
+
+    def test_the_inject_lane_drops_the_excluded_cases_in_order(self):
+        result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "inject"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        excluded = self.excluded_entries()
+        self.assertTrue(excluded, "the exclusions file parsed to no entries")
+        self.assertEqual(lines_tagged(result, "TASK"), [e for e in presubmit_entries() if e not in excluded])
+        for name in eval_rosters.inject_lane_exclusions():
+            self.assertIn(f"AGENT_TRANSPORT=inject: {name} leaves the matrix", result.stdout)
+        # The roster export is the file's, unchanged: an exclusion is not a demotion.
+        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(eval_rosters.blocking_roster())])
+
+    def test_the_nightly_tier_is_filtered_too(self):
+        result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "inject", "EVAL_TIER": "nightly"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        excluded = self.excluded_entries()
+        self.assertEqual(lines_tagged(result, "TASK"), [e for e in presubmit_entries() + nightly_entries() if e not in excluded])
+
+    def scratch(self, mutate, env) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            mutate(hack / "eval")
+            return load_matrix_through_the_lane_step(env, hack_dir=hack)
+
+    def test_an_entry_naming_no_case_stops_the_job_on_every_lane(self):
+        for env in ({}, {"AGENT_TRANSPORT": "inject"}):
+            with self.subTest(env=env):
+                result = self.scratch(lambda d: (d / "inject-lane-exclusions.txt").write_text("# #1: typo\nagent-kanban-smok\n"), env)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("inject-lane-exclusions.txt", result.stderr)
+                self.assertIn("agent-kanban-smok", result.stderr)
+
+    def test_a_missing_file_stops_the_job(self):
+        result = self.scratch(lambda d: (d / "inject-lane-exclusions.txt").unlink(), {})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("inject-lane-exclusions.txt is missing", result.stderr)
+
+    def test_a_file_with_only_comments_excludes_nothing(self):
+        result = self.scratch(lambda d: (d / "inject-lane-exclusions.txt").write_text("# nobody\n"), {"AGENT_TRANSPORT": "inject"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), presubmit_entries())
+
+    def test_excluding_every_case_stops_the_lane(self):
+        everything = "".join(f"{name}\n" for name in eval_rosters.presubmit_cases())
+        result = self.scratch(lambda d: (d / "inject-lane-exclusions.txt").write_text("# #1: all\n" + everything), {"AGENT_TRANSPORT": "inject"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("would run nothing", result.stderr)
+
+    def test_the_step_runs_after_the_tier_switch_and_before_the_fan_out(self):
+        src = SCRIPT.read_text(encoding="utf-8")
+        tier = src.index('EVAL_TIER="${EVAL_TIER:-presubmit}"')
+        step = src.index("# ─── The inject lane's exclusions")
+        names = src.index("\nTASK_NAMES=()")
+        self.assertLess(tier, step)
+        self.assertLess(step, names, "TASK_NAMES is built from TASKS; the drop must come first")
+
+
 if __name__ == "__main__":
     unittest.main()

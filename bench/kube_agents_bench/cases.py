@@ -39,13 +39,27 @@ from typing import Any
 
 import yaml
 
-__all__ = ["CaseSpec", "CaseSpecError", "load_case"]
+__all__ = ["TRANSPORT_BLIND_CHECK_TYPES", "CaseSpec", "CaseSpecError", "load_case"]
 
 # A task that provisions nothing has no infra excuse for a missing record, so
 # the scorer refuses to classify its failures as INFRA. Matches the carve-out
 # ci-eval-pr.sh already applies, and the default devops-bench assumes when a
 # task declares no `infrastructure:` block at all.
 NOOP_DEPLOYER = "noop"
+
+# The check types that read the run's own tool calls or worker logs rather
+# than the answer or the cluster: ``tool_called`` reads the trajectory,
+# ``worker_commands`` the delegated cards' worker logs. On the inject
+# transport neither has a subject -- the record's trajectory is the task's
+# lifecycle envelope, and there are no card ids to read logs by -- so the
+# scorer reports such a check as not applicable there rather than failed
+# (``scoring.py``, the inject lane). Recorded per entry NAME, because the
+# report devops-bench writes carries the entry's name and not its check type.
+TRANSPORT_BLIND_CHECK_TYPES = frozenset({"tool_called", "worker_commands"})
+
+# The keys a check subtree nests children under: compound nodes carry
+# ``checks``; a single wrapped child would be ``check``.
+_CHECK_CHILD_KEYS = ("checks", "check")
 
 
 class CaseSpecError(ValueError):
@@ -88,6 +102,53 @@ class CaseSpec:
 
     path: Path
     """The task.yaml this was read from, for error messages."""
+
+    transport_blind_checks: frozenset[str] = frozenset()
+    """The names of the ``verification_spec`` entries whose check subtree is
+    made of leaves of a type in :data:`TRANSPORT_BLIND_CHECK_TYPES` and
+    nothing else -- a plain ``tool_called``, or a ``none``/``any``/``all``
+    compound of them. A compound that mixes a blind leaf with an applicable
+    one is NOT in the set: its applicable leaf can fail on any transport,
+    and setting the entry aside would hide that failure, so it grades as it
+    always has and fails on the inject transport the way it did before.
+    Empty for a task with no such check; never consulted for a record on the
+    api transport."""
+
+
+def _leaves(node: Any) -> list[str]:
+    """The ``type`` of every leaf check in a subtree, in order."""
+    if isinstance(node, dict):
+        children = [node.get(key) for key in _CHECK_CHILD_KEYS if node.get(key) is not None]
+        if not children:
+            return [str(node.get("type") or "")]
+        return [leaf for child in children for leaf in _leaves(child)]
+    if isinstance(node, list):
+        return [leaf for item in node for leaf in _leaves(item)]
+    return []
+
+
+def _every_leaf_transport_blind(node: Any) -> bool:
+    """Whether a check subtree's leaves are all of a transport-blind type."""
+    leaves = _leaves(node)
+    return bool(leaves) and all(leaf in TRANSPORT_BLIND_CHECK_TYPES for leaf in leaves)
+
+
+def _transport_blind_checks(spec: Any) -> frozenset[str]:
+    """The names of the spec's entries whose every leaf is transport-blind.
+
+    An entry without a ``name`` cannot be matched to its report line and is
+    left out: the scorer then grades it as it always has, which fails closed
+    rather than silently.
+    """
+    if not isinstance(spec, list):
+        return frozenset()
+    names: set[str] = set()
+    for entry in spec:
+        if not isinstance(entry, dict) or entry.get("name") is None:
+            continue
+        if _every_leaf_transport_blind(entry.get("check")):
+            names.add(str(entry["name"]))
+    return frozenset(names)
 
 
 def _coerce_bool(value: Any, *, field: str, path: Path) -> bool:
@@ -186,4 +247,5 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
         declares_verification_spec=declares_spec,
         expected_fail=expected_fail,
         path=path,
+        transport_blind_checks=_transport_blind_checks(spec),
     )

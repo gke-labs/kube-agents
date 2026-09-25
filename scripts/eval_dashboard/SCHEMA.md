@@ -119,9 +119,11 @@ the same layout and is collected from the moment it starts running.
   `hack/ci-eval-pr.sh`'s step-0 revalidation ended before the eval loop; then
   it falls back to `finished − started` (which also counts provisioning).
 - `tasks[]` — one entry per `Task <name> Result:` line, in log order (a
-  verdict outside the vocabulary below — only the currently-unreachable
-  `[EXPECTED_FAIL]`, which no `task.yaml` sets — does not parse and yields
-  no entry):
+  verdict outside the vocabulary below — `[EXPECTED_FAIL]`, which no
+  `task.yaml` sets, and `[NOT_GRADED_ON_TRANSPORT]`, the inject lane's word
+  for a case whose every objective check is not applicable on that
+  transport — does not parse and yields no entry, so such a case is missing
+  from `tasks[]` rather than misfiled; the next-mode key is #2008's):
   - `result` — `pass` for `[PASSED]`, `fail` for `[FAILED]` **and**
     `[UNSTABLE]` (a multi-repetition case that passed some but not all
     graded repetitions is not a clean pass; `reps` carries the split),
@@ -366,8 +368,9 @@ Additive, optional, and safe to omit — consumers must default them.
   neither is it a judgement on the candidate: the deploy failed, so nothing
   was measured; or the eval ran and could not be evaluated (`ci-eval-pr.sh`
   exited `2` and `eval-verdict.json` says `outcome: not_evaluated` — an
-  admitted case lost every repetition to infrastructure), so the candidate
-  was not measured on it.
+  admitted case lost every repetition to infrastructure, or every case the
+  run had was not graded on its transport), so the candidate was not
+  measured on it.
 - `pass_rate` / `baseline_rate` / `margin` — fractions in `0..1` (`margin`
   may be negative), from `bench-gate suite`'s `Admitted-case pass rate:`
   line. `baseline_rate` and `margin` are `null` while the baseline store

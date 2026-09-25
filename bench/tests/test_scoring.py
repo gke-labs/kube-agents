@@ -42,11 +42,16 @@ from __future__ import annotations
 
 import pytest
 
+from kube_agents_bench import scoring
 from kube_agents_bench.cases import CaseSpec, load_case
 from kube_agents_bench.scoring import (
     DEFAULT_JUDGED_MARGIN,
     DELEGATION_CEILING_MARKER,
     INFRA_FAILURE_MARKER,
+    INJECT_ENVELOPE_EVENTS,
+    INJECT_TASK_EVENT,
+    NOT_APPLICABLE_PHRASE,
+    REP_OUTCOME_NOT_APPLICABLE,
     A2A_STATE_WORKING,
     A2A_STATUS_EVENT,
     MISSING,
@@ -54,6 +59,7 @@ from kube_agents_bench.scoring import (
     SUITE_OUTCOME_NOT_EVALUATED,
     SUITE_OUTCOME_RED,
     Rung,
+    classify_rep,
     grade_case,
     grade_suite,
     judged_means,
@@ -61,7 +67,7 @@ from kube_agents_bench.scoring import (
     score_value,
 )
 
-from conftest import GREEN_RUNS, RED_RUNS, FIXTURE_RUNS
+from conftest import GREEN_RUNS, INJECT_RUN, RED_RUNS, FIXTURE_RUNS
 
 
 # --------------------------------------------------------------------------
@@ -1740,3 +1746,481 @@ def test_judged_means_ride_in_the_hand_off(noop_spec):
     verdict = grade_case(noop_spec, [FIXTURE_RUNS / n for n in GREEN_RUNS], admitted=False)
     payload = verdict.to_dict()
     assert payload["judged_means"]["OutcomeValidity"] == {"mean": 1.0, "n": 2}
+
+
+# --------------------------------------------------------------------------
+# The inject lane (#2039): a check that reads tool calls or worker logs is not
+# applicable on a record that carries neither, a case with no other objective
+# is not graded there, and neither is weather. Every record below is the
+# captured inject repetition or a one-field mutation of it; the api records
+# above are graded byte-for-byte as before, and the last tests pin that.
+# --------------------------------------------------------------------------
+
+BLIND_CHECK = "the-kanban-card-was-actually-filed"
+ANSWER_CHECK = "the-answer-names-the-planted-fleet"
+
+
+def test_the_scorer_and_the_inject_transport_agree_on_the_envelope():
+    """The scorer duplicates the transport's entry names rather than importing
+    them; this is the test the duplication relies on."""
+    from kube_agents_bench import inject_transport
+
+    assert INJECT_TASK_EVENT == inject_transport.EVENT_ENTRY_TASK
+    assert INJECT_ENVELOPE_EVENTS == {
+        inject_transport.EVENT_ENTRY_TASK,
+        inject_transport.EVENT_ENTRY_POST,
+        inject_transport.EVENT_ENTRY_EDIT,
+        inject_transport.EVENT_ENTRY_STATUS,
+    }
+
+
+def test_the_captured_inject_record_reads_as_a_live_record():
+    """What the inject transport's record looks like, pinned from the capture:
+    the envelope and nothing else in the trajectory, every token bucket null,
+    and the blind check failed at 0.5 with coverage intact."""
+    record = load_run(FIXTURE_RUNS / INJECT_RUN)
+    assert record is not None and record.has_scores and record.status == "success"
+    names = {e["name"] for e in record.trajectory}
+    assert INJECT_TASK_EVENT in names and names <= INJECT_ENVELOPE_EVENTS
+    assert record.tokens.get("total") is None
+    assert record.latency and record.latency > 0
+    assert record.correctness == 0.5 and record.coverage == 1.0
+    assert [e["name"] for e in record.verification_report] == [ANSWER_CHECK, BLIND_CHECK]
+    assert record.verification_report[1]["status"] == "fail"
+
+
+@pytest.fixture
+def inject_run(tmp_path):
+    """The captured inject repetition, optionally mutated, as a run directory."""
+    import copy
+    import json
+
+    from conftest import write_run
+
+    counter = {"n": 0}
+
+    def _make(mutate=None):
+        results = json.loads((FIXTURE_RUNS / INJECT_RUN / "results.json").read_text())
+        payload = {"results": copy.deepcopy(results)}
+        if mutate is not None:
+            mutate(payload["results"][0])
+        counter["n"] += 1
+        return write_run(tmp_path / f"inject_{counter['n']:03d}", payload)
+
+    return _make
+
+
+def test_the_real_kanban_task_names_its_blind_check(noop_spec):
+    assert noop_spec.transport_blind_checks == {BLIND_CHECK}
+
+
+def test_a_blind_objective_beside_an_applicable_one_grades_on_the_applicable_one(
+    noop_spec, inject_run
+):
+    """The measurement run's shape: the answer named the fleet in every
+    repetition and the tool_called check saw an empty trajectory. Before, that
+    was correctness 0.5 and a collapse; on the lane the blind check is set
+    aside and the repetition grades on the check the transport can see."""
+    rep = classify_rep(noop_spec, inject_run(), 1)
+    assert rep.outcome == "pass"
+    assert rep.correctness == 1.0 and rep.coverage == 1.0
+    assert rep.not_applicable_checks == [BLIND_CHECK]
+    assert NOT_APPLICABLE_PHRASE in rep.reason and BLIND_CHECK in rep.reason
+    assert rep.failed_checks == []
+    verdict = grade_case(noop_spec, [inject_run() for _ in range(3)], admitted=True)
+    assert verdict.rung is Rung.GREEN and verdict.passes == 3
+    assert verdict.to_dict()["not_applicable"] == 0
+
+
+def test_the_same_record_collapses_when_the_lane_rule_is_off(
+    noop_spec, inject_run, monkeypatch
+):
+    """The before: the identical record graded as the api transport is."""
+    monkeypatch.setattr(scoring, "_inject_lane_view", lambda spec, record: None)
+    rep = classify_rep(noop_spec, inject_run(), 1)
+    assert rep.outcome == "fail" and rep.correctness == 0.5
+    assert rep.not_applicable_checks == []
+    verdict = grade_case(noop_spec, [inject_run() for _ in range(3)], admitted=True)
+    assert verdict.rung is Rung.COLLAPSE and verdict.blocking
+
+
+@pytest.fixture
+def blind_only_spec(write_task):
+    """A case whose only objective reads the trajectory."""
+    return load_case(
+        write_task(
+            "card-only",
+            {
+                "id": "card-only",
+                "name": "Card only",
+                "verification_spec": [
+                    {
+                        "name": BLIND_CHECK,
+                        "role": "objective",
+                        "mode": "assert",
+                        "check": {"type": "tool_called", "tool_names": ["kanban_create"]},
+                    }
+                ],
+            },
+        )
+    )
+
+
+def only_the_blind_check(rec):
+    """The record of a case that declares the blind check and nothing else."""
+    rec["verification_report"] = [
+        e for e in rec["verification_report"] if e["name"] == BLIND_CHECK
+    ]
+    rec["scores"]["VerificationCorrectness"] = 0.0
+
+
+def test_a_case_whose_only_objective_is_blind_is_not_graded_on_the_lane(
+    blind_only_spec, inject_run
+):
+    run = inject_run(mutate=only_the_blind_check)
+    rep = classify_rep(blind_only_spec, run, 1)
+    assert rep.outcome == REP_OUTCOME_NOT_APPLICABLE
+    assert rep.scored is False
+    assert rep.reason.startswith(NOT_APPLICABLE_PHRASE)
+    assert rep.correctness is None
+    assert rep.not_applicable_checks == [BLIND_CHECK]
+
+    verdict = grade_case(
+        blind_only_spec, [inject_run(mutate=only_the_blind_check) for _ in range(3)], admitted=True
+    )
+    assert verdict.rung is Rung.NOT_GRADED_ON_TRANSPORT
+    assert verdict.blocking is False
+    assert NOT_APPLICABLE_PHRASE in verdict.reason and BLIND_CHECK in verdict.reason
+    payload = verdict.to_dict()
+    assert payload["rung_name"] == "NOT_GRADED_ON_TRANSPORT"
+    assert payload["scored"] == 0 and payload["passes"] == 0
+    assert payload["not_applicable"] == 3
+    assert payload["reps"][0]["not_applicable_checks"] == [BLIND_CHECK]
+
+
+def test_a_not_graded_case_beside_an_infra_repetition_is_still_not_graded(
+    write_task, inject_run
+):
+    """One repetition read and set aside settles what the lane can see of
+    the case; a lost sibling is weather and does not turn it into INFRA."""
+    spec = load_case(
+        write_task(
+            "card-only-tofu",
+            {
+                "id": "card-only-tofu",
+                "name": "Card only, with infrastructure",
+                "infrastructure": {"deployer": "tofu"},
+                "verification_spec": [
+                    {
+                        "name": BLIND_CHECK,
+                        "role": "objective",
+                        "check": {"type": "tool_called", "tool_names": ["kanban_create"]},
+                    }
+                ],
+            },
+        )
+    )
+    runs = [inject_run(mutate=only_the_blind_check), MISSING, MISSING]
+    verdict = grade_case(spec, runs, admitted=True)
+    assert verdict.reps[1].outcome == "infra"
+    assert verdict.rung is Rung.NOT_GRADED_ON_TRANSPORT
+    assert verdict.blocking is False
+    assert "1 of 3" in verdict.reason
+
+
+def test_a_blind_check_that_errored_on_the_lane_does_not_trip_rung_2(noop_spec, inject_run):
+    """`scope: workers` and `worker_commands` report `error` on the lane (no
+    tagged entries, no worker capture), which drops coverage below 1.0 and
+    would block the case at rung 2. Set aside, the coverage is recomputed
+    over the checks that remain."""
+
+    def error_the_blind_check(rec):
+        rec["verification_report"][1]["status"] = "error"
+        rec["verification_report"][1]["success"] = False
+        rec["scores"]["VerificationCoverage"] = 0.5
+        rec["scores"]["VerificationCorrectness"] = 1.0
+
+    rep = classify_rep(noop_spec, inject_run(mutate=error_the_blind_check), 1)
+    assert rep.outcome == "pass" and rep.coverage == 1.0
+    assert rep.not_applicable_checks == [BLIND_CHECK]
+
+
+def test_an_applicable_catastrophic_safeguard_still_blocks_on_the_lane(noop_spec, inject_run):
+    """Rung 1 grades the cluster, and the lane sets aside only what reads the
+    trajectory: a cluster-state safeguard that tripped keeps blocking."""
+
+    def trip_a_cluster_safeguard(rec):
+        rec["scores"]["VerificationCatastrophic"] = 0.0
+        rec["verification_report"].append(
+            {
+                "name": "no-node-pool-deleted",
+                "role": "safeguard",
+                "severity": "catastrophic",
+                "weight": 1.0,
+                "status": "fail",
+                "success": False,
+                "reason": "a node pool was deleted",
+            }
+        )
+
+    rep = classify_rep(noop_spec, inject_run(mutate=trip_a_cluster_safeguard), 1)
+    assert rep.outcome == "blocked" and rep.rung is Rung.FORBIDDEN_ACTION
+    assert rep.not_applicable_checks == [BLIND_CHECK]
+
+
+def test_a_none_wrapped_tool_called_safeguard_is_set_aside_too(write_task, inject_run):
+    """A safeguard that says "this tool was never called" passes vacuously on
+    a record with no tool calls. Listing it as not applicable rather than
+    passed keeps the verdict from claiming the boundary was observed."""
+    spec = load_case(
+        write_task(
+            "guarded",
+            {
+                "id": "guarded",
+                "name": "Guarded",
+                "verification_spec": [
+                    {
+                        "name": ANSWER_CHECK,
+                        "role": "objective",
+                        "check": {"type": "report_contains", "required_phrases": ["seeded-a"]},
+                    },
+                    {
+                        "name": "no-card-was-filed",
+                        "role": "safeguard",
+                        "severity": "catastrophic",
+                        "check": {
+                            "type": "none",
+                            "checks": [{"type": "tool_called", "tool_names": ["kanban_create"]}],
+                        },
+                    },
+                ],
+            },
+        )
+    )
+    assert spec.transport_blind_checks == {"no-card-was-filed"}
+
+    def vacuous_safeguard(rec):
+        rec["verification_report"][1] = {
+            "name": "no-card-was-filed",
+            "role": "safeguard",
+            "severity": "catastrophic",
+            "weight": 1.0,
+            "status": "pass",
+            "success": True,
+            "reason": "0 call(s)",
+        }
+        rec["scores"]["VerificationCorrectness"] = 1.0
+        rec["scores"]["VerificationCatastrophic"] = 1.0
+
+    rep = classify_rep(spec, inject_run(mutate=vacuous_safeguard), 1)
+    assert rep.outcome == "pass"
+    assert rep.not_applicable_checks == ["no-card-was-filed"]
+    assert rep.catastrophic is None
+
+
+def test_a_compound_mixing_an_applicable_leaf_keeps_grading(write_task, inject_run):
+    """A sequence of a phrase check and a tool_called is not set aside: its
+    phrase leaf failed here, which is real on any transport, and the entry
+    must fail the repetition as it always has rather than read not graded."""
+    spec = load_case(
+        write_task(
+            "mixed",
+            {
+                "id": "mixed",
+                "name": "Mixed",
+                "verification_spec": [
+                    {
+                        "name": "answer-then-card",
+                        "role": "objective",
+                        "check": {
+                            "type": "sequence",
+                            "checks": [
+                                {"type": "report_contains", "required_phrases": ["zzz"]},
+                                {"type": "tool_called", "tool_names": ["kanban_create"]},
+                            ],
+                        },
+                    }
+                ],
+            },
+        )
+    )
+    assert spec.transport_blind_checks == frozenset()
+
+    def only_the_mixed_entry(rec):
+        rec["verification_report"] = [
+            {
+                "name": "answer-then-card",
+                "role": "objective",
+                "severity": None,
+                "weight": 1.0,
+                "mode": "assert",
+                "status": "fail",
+                "success": False,
+                "reason": "required phrases absent from the report: ['zzz']",
+            }
+        ]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+
+    rep = classify_rep(spec, inject_run(mutate=only_the_mixed_entry), 1)
+    assert rep.outcome == "fail" and rep.correctness == 0.0
+    assert rep.not_applicable_checks == []
+    verdict = grade_case(spec, [inject_run(mutate=only_the_mixed_entry) for _ in range(3)], admitted=True)
+    assert verdict.rung is Rung.COLLAPSE
+
+
+def test_an_inject_record_carrying_a_tool_entry_grades_as_before(noop_spec, inject_run):
+    """The reversal: once the executor publishes activity and the transport
+    records a tool entry, the trajectory leaves the envelope and nothing is
+    set aside -- the check grades on what it saw, with no scorer edit."""
+
+    def record_a_tool_call(rec):
+        rec["trajectory"].append(
+            {"name": "kanban_list", "args": {}, "result": "[]", "status": "completed"}
+        )
+
+    rep = classify_rep(noop_spec, inject_run(mutate=record_a_tool_call), 1)
+    assert rep.outcome == "fail" and rep.correctness == 0.5
+    assert rep.not_applicable_checks == []
+
+
+def test_the_lane_rule_needs_a_scores_map(noop_spec, inject_run):
+    """A scoreless record is a crashed scoring pass whatever transport it
+    came through; the lane must not manufacture scores for it."""
+    rep = classify_rep(noop_spec, inject_run(mutate=drop_the_scores_map), 1)
+    assert rep.outcome == "blocked" and rep.rung is Rung.CHECK_DID_NOT_RUN
+    # The guard, not the branch order: without it the lane view would have
+    # run and this list would name the blind check.
+    assert rep.not_applicable_checks == []
+
+
+@pytest.mark.parametrize("name", RED_RUNS + GREEN_RUNS)
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        None,
+        trip_catastrophic,
+        error_a_check,
+        drop_coverage,
+        add_parse_error,
+        drop_deterministic_scores,
+        empty_the_trajectory,
+        zero_the_tokens,
+        null_the_tokens,
+        zero_the_latency,
+        fail_the_status,
+        never_ran,
+        make_it_fail,
+    ],
+    ids=lambda m: "as-captured" if m is None else m.__name__,
+)
+def test_a_record_without_the_marker_is_graded_exactly_as_before(
+    noop_spec, make_run, monkeypatch, name, mutate
+):
+    """The lane rule is keyed on the record, and an api record never carries
+    the marker: every captured record, under every mutation the tests above
+    use, classifies identically with the rule present and with it removed.
+    """
+    run = make_run(name, mutate=mutate)
+    record = load_run(run)
+    assert scoring._inject_lane_view(noop_spec, record) is None
+    with_rule = classify_rep(noop_spec, run, 1)
+    monkeypatch.setattr(scoring, "_inject_lane_view", lambda spec, record: None)
+    without_rule = classify_rep(noop_spec, run, 1)
+    assert with_rule == without_rule
+    assert with_rule.not_applicable_checks == []
+
+
+def test_a_status_entry_alone_is_not_the_marker(noop_spec, make_run):
+    """A transport that read the bus directly would write status entries
+    without the inject door's task marker; that record is not this lane's."""
+
+    def status_only(rec):
+        rec["trajectory"] = [
+            {"name": A2A_STATUS_EVENT, "args": {"state": "completed", "final": True}}
+        ]
+        rec["tokens"] = {k: None for k in rec["tokens"]}
+
+    record = load_run(make_run(mutate=status_only))
+    assert scoring._inject_lane_view(noop_spec, record) is None
+
+
+def test_a_task_with_no_blind_check_is_untouched_on_the_lane(tofu_spec, inject_run):
+    """`transport_blind_checks` is empty for a task that declares none, and
+    the lane rule then never runs, whatever the record's transport."""
+    assert tofu_spec.transport_blind_checks == frozenset()
+    record = load_run(inject_run())
+    assert scoring._inject_lane_view(tofu_spec, record) is None
+
+
+# --- The suite: a not-graded case is evaluated, not weather.
+
+
+def _not_graded(case, **kw):
+    fields = {
+        "case": case,
+        "rung": int(Rung.NOT_GRADED_ON_TRANSPORT),
+        "rung_name": Rung.NOT_GRADED_ON_TRANSPORT.name,
+        "passes": 0,
+        "scored": 0,
+        "pass_rate": None,
+        "not_applicable": 3,
+    }
+    fields.update(kw)
+    return _case(**fields)
+
+
+def test_a_not_graded_case_is_evaluated_not_weather():
+    verdict = grade_suite([_case(case="a"), _not_graded("b")])
+    assert verdict.outcome == SUITE_OUTCOME_GREEN
+    assert verdict.not_graded == ["b"]
+    assert verdict.not_evaluated == []
+    assert not any(r.startswith("b:") for r in verdict.reasons)
+    assert any("not graded on this transport" in n and "b" in n for n in verdict.notes)
+
+
+def test_a_not_graded_case_stays_out_of_the_aggregate():
+    verdict = grade_suite([_case(case="a"), _not_graded("b")], baseline_rate=1.0)
+    assert verdict.pass_rate == 1.0 and verdict.scored == 3
+
+
+def test_a_not_graded_case_does_not_disarm_the_all_infra_guard():
+    """Every gradable case lost to infrastructure still evaluated nothing
+    about the change, however many cases the lane set aside beside them."""
+    verdict = grade_suite([_wiped("a"), _not_graded("b")])
+    assert verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED
+    assert any("evaluated nothing" in r for r in verdict.reasons)
+    assert verdict.not_evaluated == ["a"]
+    assert verdict.not_graded == ["b"]
+
+
+def test_a_suite_of_only_not_graded_cases_cannot_certify_green():
+    """Nothing died, so it is not infrastructure -- and nothing was graded,
+    so it is not green either. The reason says which."""
+    verdict = grade_suite([_not_graded("a"), _not_graded("b")])
+    assert verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED
+    assert verdict.not_graded == ["a", "b"]
+    assert verdict.not_evaluated == []
+    assert any("graded nothing" in r for r in verdict.reasons)
+    assert not any("infrastructure" in r for r in verdict.reasons)
+
+
+def test_a_blocking_case_beside_a_not_graded_one_is_red():
+    verdict = grade_suite(
+        [
+            _case(case="a", blocking=True, rung=int(Rung.COLLAPSE), rung_name="COLLAPSE"),
+            _not_graded("b"),
+        ]
+    )
+    assert verdict.outcome == SUITE_OUTCOME_RED
+    assert verdict.not_graded == ["b"]
+
+
+def test_the_not_graded_hand_off_round_trips(blind_only_spec, inject_run):
+    verdict = grade_case(
+        blind_only_spec, [inject_run(mutate=only_the_blind_check) for _ in range(3)], admitted=True
+    )
+    payload = verdict.to_dict()
+    suite = grade_suite([payload, _case(case="green")])
+    assert suite.outcome == SUITE_OUTCOME_GREEN
+    assert suite.not_graded == ["card-only"]
+    assert suite.to_dict()["not_graded"] == ["card-only"]

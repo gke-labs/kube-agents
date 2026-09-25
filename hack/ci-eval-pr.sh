@@ -31,6 +31,12 @@ set -euo pipefail
 readonly EVAL_PRESUBMIT_CASES_FILE="eval/presubmit-cases.txt"
 readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
+# A fourth file, read beside them and applied on one lane only (#2039): the
+# cases the inject lane does not run, because their premise needs the chat
+# front door. The transport name is the harness's AGENT_TRANSPORT value for
+# that lane (bench/kube_agents_bench/harness.py, TRANSPORT_INJECT).
+readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
+readonly EVAL_INJECT_LANE_TRANSPORT="inject"
 
 # What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
 # when the run could not be evaluated: an admitted case lost every repetition
@@ -1560,6 +1566,52 @@ case "${EVAL_TIER}" in
     exit 1
     ;;
 esac
+
+# ─── The inject lane's exclusions (#2039) ────────────────────────────────────
+# Under AGENT_TRANSPORT=inject -- the harness's own switch; no job exports
+# it yet, so this step is inert until one does, before this point -- the
+# matrix goes through the gateway's inject door, which addresses `platform`
+# directly: a
+# case whose premise needs the chat front door cannot hold there whatever
+# the agent does. hack/eval/inject-lane-exclusions.txt names those cases,
+# each with its reason as the comment block above it (the file's header and
+# scripts/test_eval_rosters.py hold every entry to one), and this drops them
+# from TASKS before TASK_NAMES and the fan-out are built from it, so the
+# suite grades and reports the cases that ran. Read on every lane, so a
+# missing file or an entry naming no case fails here rather than on the
+# lane that needs it; applied on the inject lane only, so the api lane's
+# matrix stays byte for byte the presubmit file. Not a demotion: the roster
+# files are untouched, and an excluded case still on the roster arms
+# nothing here, which is harmless -- bench-gate arms rung 4 per case it
+# grades. A check the transport blinds (tool_called, worker_commands) is the
+# scorer's to set aside, not this file's: docs/designs/eval-scorer.md, "The
+# inject lane".
+INJECT_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
+INJECT_LANE_EXCLUDED="$(roster_entries "${INJECT_LANE_EXCLUSIONS_FILE}")"
+while IFS= read -r NAME; do
+  if [ -z "${NAME}" ]; then continue; fi
+  if [ ! -f "${BENCH_DIR}/tasks/${NAME}/task.yaml" ]; then
+    echo "ERROR: ${INJECT_LANE_EXCLUSIONS_FILE}: '${NAME}' names no case under bench/tasks/; an exclusion that matches nothing would leave the case it meant running on the inject lane." >&2
+    exit 1
+  fi
+done <<< "${INJECT_LANE_EXCLUDED}"
+if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_LANE_TRANSPORT}" ] && [ -n "${INJECT_LANE_EXCLUDED}" ]; then
+  INJECT_LANE_KEPT=()
+  for ENTRY in "${TASKS[@]}"; do
+    NAME="$(basename "$(dirname "${ENTRY}")")"
+    if grep -qxF -- "${NAME}" <<< "${INJECT_LANE_EXCLUDED}"; then
+      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${NAME} leaves the matrix -- its premise needs the chat front door (${EVAL_INJECT_LANE_EXCLUSIONS_FILE})"
+    else
+      INJECT_LANE_KEPT+=("${ENTRY}")
+    fi
+  done
+  TASKS=(${INJECT_LANE_KEPT[@]+"${INJECT_LANE_KEPT[@]}"})
+  if [ "${#TASKS[@]}" -eq 0 ]; then
+    echo "ERROR: every case in the matrix is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run nothing and report green." >&2
+    exit 1
+  fi
+  echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${#TASKS[@]} task(s) remain in the matrix"
+fi
 
 # Floor for VerificationCorrectness on a repetition of a task that declares a
 # verification_spec. 1.0 while every declared objective is meant to hold

@@ -1,0 +1,36 @@
+# The inject lane's exclusions: presubmit cases that do not run when the
+# matrix goes through the A2A gateway's inject door (the harness's
+# AGENT_TRANSPORT=inject; no job in this repository exports it yet, so this
+# file is inert until one does), because the case's premise needs the chat
+# front door and the door addresses `platform` directly.
+#
+# One case id per line; `#` starts a comment, blank lines are skipped. The
+# reason is the comment block directly above the id, and it names the issue
+# that decides when the entry goes: scripts/test_eval_rosters.py fails an
+# entry with no reason, with no issue number, or that names no registered
+# case. hack/ci-eval-pr.sh reads this file when it builds the matrix and,
+# only under AGENT_TRANSPORT=inject, drops the named cases from TASKS before the fan-out
+# and says so in the log; on the api transport the file changes nothing,
+# and the api lane's roster (presubmit-cases.txt, blocking-roster.txt) is
+# untouched -- an entry here is not a demotion. The same shape as the
+# validator's FIXTURE_NOT_READY: an exclusion with a reason, not a marker on
+# the case (docs/eval-gate-roster.md, "The inject lane").
+#
+# What does NOT belong here: a case whose only problem on the inject lane is
+# a `tool_called` or `worker_commands` check. The scorer sets such a check
+# aside as not applicable on that transport and grades the rest, so the
+# case still runs and still reports (docs/designs/eval-scorer.md). An entry
+# here is for a premise the transport removes, not a check it blinds.
+#
+# WHO APPROVES. The normal approvers: this file changes what the inject lane
+# runs, not what can red a pull request on the api lane, so hack/OWNERS
+# leaves it to the root OWNERS the way it leaves nightly-cases.txt.
+
+# #2039: grades delegation through the chat front door -- kanban_create by
+# the default profile, then the specialist's answer folded back into the
+# thread. The inject door addresses `platform` directly, so no front door
+# is in the path and the card is never filed by design; the answer alone
+# passes on this lane, which grades a premise the case does not have.
+# Returns to the lane when the door routes through the chat profile, or
+# when the case is rewritten for a transport-neutral premise.
+agent-kanban-smoke

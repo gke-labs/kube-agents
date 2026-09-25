@@ -67,9 +67,9 @@ import json
 import os
 import re
 import sys
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from kube_agents_bench.baselines import (
     ADMITTED_BY_RECORD,
@@ -110,6 +110,12 @@ _DEFAULT_BASELINE_DIR = "baselines"
 #: and what ``hack/ci-eval-pr.sh`` branches on before it announces the
 #: verdict. 0 green and 1 red are the literals they have always been.
 SUITE_EXIT_NOT_EVALUATED = 2
+
+#: The build-log word for a case the inject lane could not grade (rung
+#: NOT_GRADED_ON_TRANSPORT): every objective check set aside as not
+#: applicable on the record's transport. Beside PASSED, FAILED, UNSTABLE and
+#: RESOURCE_PREPARATION_FAILED, and distinct from all four on purpose.
+LABEL_NOT_GRADED_ON_TRANSPORT = "NOT_GRADED_ON_TRANSPORT"
 
 #: The verdict headline per outcome, the first thing the markdown says.
 SUITE_HEADLINES = {
@@ -287,10 +293,18 @@ def _label(case: dict[str, Any]) -> str:
     nothing, which is the sort of quiet lie that gets a gate switched off.
 
     FAILED and RESOURCE_PREPARATION_FAILED keep their historical spellings:
-    people and scripts grep build logs for both.
+    people and scripts grep build logs for both. NOT_GRADED_ON_TRANSPORT is
+    the inject lane's fifth word (#2039): the case ran and was read, and
+    every objective check it declares was set aside as not applicable on
+    that transport, so neither PASSED, UNSTABLE nor the infrastructure word
+    is true of it. The dashboard's collector does not know the word yet
+    (#2008); a line it cannot parse is left out rather than misread.
     """
-    if int(case.get("rung") or Rung.GREEN) == int(Rung.INFRA):
+    rung = int(case.get("rung") or Rung.GREEN)
+    if rung == int(Rung.INFRA):
         return "RESOURCE_PREPARATION_FAILED"
+    if rung == int(Rung.NOT_GRADED_ON_TRANSPORT):
+        return LABEL_NOT_GRADED_ON_TRANSPORT
     if case.get("blocking"):
         return "FAILED"
     scored = int(case.get("scored") or 0)
@@ -486,15 +500,28 @@ def _markdown(
         # The banner says what to do, because the headline alone invites the
         # wrong action: a pull request author who sees a red job debugs the
         # change, and there is nothing in this run about the change to debug.
-        named = ", ".join(f"`{case_id}`" for case_id in verdict.not_evaluated)
-        lines += [
-            "> **NOT EVALUATED — rerun when the environment is healthy.** "
-            f"{named}: every repetition was excluded as infrastructure, so this "
-            "run evaluated nothing about the case and cannot certify green. "
-            "This is not a finding against the change under test: do not debug "
-            "the change for it; rerun once the eval environment is healthy.",
-            "",
-        ]
+        if verdict.not_evaluated:
+            named = ", ".join(f"`{case_id}`" for case_id in verdict.not_evaluated)
+            banner = (
+                "> **NOT EVALUATED — rerun when the environment is healthy.** "
+                f"{named}: every repetition was excluded as infrastructure, so this "
+                "run evaluated nothing about the case and cannot certify green. "
+                "This is not a finding against the change under test: do not debug "
+                "the change for it; rerun once the eval environment is healthy."
+            )
+        else:
+            # Nothing was lost: every case the run had was set aside by the
+            # inject lane (#2039), so there is no environment to wait on and
+            # no change to debug -- the lane's roster is what to look at.
+            named = ", ".join(f"`{case_id}`" for case_id in verdict.not_graded)
+            banner = (
+                "> **NOT EVALUATED — nothing on this transport could be graded.** "
+                f"{named}: every objective check is not applicable on this "
+                "transport, so this run graded nothing and cannot certify green. "
+                "This is not a finding against the change under test and not "
+                "an environment failure: the lane's roster is what to fix."
+            )
+        lines += [banner, ""]
     if verdict.pass_rate is not None:
         rate = f"{verdict.pass_rate:.1%}"
         if verdict.baseline_rate is not None:

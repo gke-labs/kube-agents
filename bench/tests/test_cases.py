@@ -164,3 +164,111 @@ def test_yaml_is_loaded_safely(write_task):
     path = write_task("evil", "id: evil\nname: !!python/object/apply:os.system ['true']\n")
     with pytest.raises(CaseSpecError, match="not parseable as YAML"):
         load_case(path)
+
+
+# --------------------------------------------------------------------------
+# transport_blind_checks: the entries the inject lane sets aside (#2039).
+# --------------------------------------------------------------------------
+
+
+def test_the_kanban_smoke_names_its_tool_called_objective(kanban_task):
+    assert load_case(kanban_task).transport_blind_checks == {"the-kanban-card-was-actually-filed"}
+
+
+def test_a_task_with_no_such_check_has_an_empty_set(write_task):
+    path = write_task(
+        "phrases",
+        {
+            "id": "phrases",
+            "verification_spec": [
+                {"name": "a", "role": "objective", "check": {"type": "report_contains", "required_phrases": ["x"]}}
+            ],
+        },
+    )
+    assert load_case(path).transport_blind_checks == frozenset()
+
+
+def test_a_compound_is_blind_only_when_every_leaf_is(write_task):
+    """A none-wrapped tool_called (the documented "never called" safeguard)
+    and a worker_commands leaf are blind. A sequence mixing a phrase check
+    with a tool_called is NOT: its phrase leaf can fail on any transport, and
+    setting the entry aside would hide that failure, so it keeps grading as
+    it always has."""
+    path = write_task(
+        "compound",
+        {
+            "id": "compound",
+            "verification_spec": [
+                {
+                    "name": "never-filed",
+                    "role": "safeguard",
+                    "severity": "catastrophic",
+                    "check": {"type": "none", "checks": [{"type": "tool_called", "tool_names": ["kanban_create"]}]},
+                },
+                {
+                    "name": "route",
+                    "role": "objective",
+                    "check": {"type": "worker_commands", "required_patterns": ["git log"]},
+                },
+                {
+                    "name": "mixed",
+                    "role": "objective",
+                    "check": {
+                        "type": "sequence",
+                        "checks": [
+                            {"type": "report_contains", "required_phrases": ["x"]},
+                            {"type": "tool_called", "tool_names": ["kanban_list"], "scope": "workers"},
+                        ],
+                    },
+                },
+                {
+                    "name": "cluster",
+                    "role": "safeguard",
+                    "severity": "catastrophic",
+                    "check": {"type": "resource_property", "kind": "Deployment", "name": "x", "namespace": "y", "jsonpath": "{.spec.replicas}", "op": "eq", "value": 1},
+                },
+            ],
+        },
+    )
+    assert load_case(path).transport_blind_checks == {"never-filed", "route"}
+
+
+def test_an_unnamed_blind_entry_is_left_out(write_task):
+    """No name, no report line to match: the scorer then grades it as it
+    always has, which fails closed rather than silently."""
+    path = write_task(
+        "unnamed",
+        {
+            "id": "unnamed",
+            "verification_spec": [
+                {"role": "objective", "check": {"type": "tool_called", "tool_names": ["kanban_create"]}}
+            ],
+        },
+    )
+    assert load_case(path).transport_blind_checks == frozenset()
+
+
+@pytest.mark.parametrize("path", sorted(TASKS.glob("*/task.yaml")), ids=lambda p: p.parent.name)
+def test_every_shipped_blind_check_is_named(path):
+    """Every shipped entry with a tool_called or worker_commands leaf carries
+    a name, so the lane can match it; a nameless one would grade as a
+    failure on the inject transport with no way to say why."""
+    import json
+
+    import yaml
+
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    # Independently of the loader: an entry whose check subtree, serialised,
+    # names either type. Comments do not survive safe_load, so a task that
+    # only talks about tool_called in prose declares nothing here.
+    declared = [
+        e
+        for e in doc.get("verification_spec") or []
+        if isinstance(e, dict)
+        and any(f'"type": "{t}"' in json.dumps(e.get("check")) for t in ("tool_called", "worker_commands"))
+    ]
+    if not declared:
+        pytest.skip("no transport-blind check in this task")
+    unnamed = [e for e in declared if e.get("name") is None]
+    assert unnamed == [], f"{path}: transport-blind entries without a name"
+    assert load_case(path).transport_blind_checks == {str(e["name"]) for e in declared}
