@@ -231,6 +231,17 @@ a recurrence section left empty or answered "Not a bug fix" on a `fix` is the on
 Self-Review is the previous round's dispositions, and `review-preflight` §7 says a fresh pass is
 not handed those — read it on a reviewer's or a bot's pass, withhold it on a re-run of your own.
 
+A section that hands a required artifact to another pull request has not answered on the strength
+of the hand-off. "The PR that installs it carries the eval case", "live-tested in the next one" —
+the deferral is visible in the body alone, so raise it here whether or not you can reach the
+sibling, and name what would settle it. For the eval case that is the sibling's own body accepting
+the hand-off and the sibling merging first, the two conditions in
+`.agents/rules/eval_driven_development.md`, "What does not count"; Angle J follows it there where
+`gh` is available. For live validation nothing settles it, because no rule opens that route:
+`.agents/rules/pre_pr_review.md` gives "Not live-tested" and the reason as the only alternative to
+exercising the change, so a live test deferred to a sibling is unanswered however that sibling's
+body reads.
+
 Then check that the intent is actually tested: for each behaviour the change claims, name the test
 that would fail if that behaviour regressed. Where there is none, the candidate is the untested
 behaviour, not the absent test — say which regression would ship silently. Bug fixes without a
@@ -250,17 +261,28 @@ which it was. A red-then-green test is the one answer in this whole pass that do
 your own reading, which is what makes it worth more than any amount of staring at the diff.
 
 **Angle J — sibling pull requests.** Every angle so far has looked only at this change. Widen
-once, to the open pull requests touching adjacent paths:
+once, to the pull requests touching adjacent paths — the open ones, and any the body names:
 
 ```bash
 gh pr list --repo gke-labs/kube-agents --state open --limit 100 --json number,title,author,files
+# A sibling the body names may already have merged. Fetch it by number: `gh pr list --state merged`
+# orders by creation, so its limit reaches back days and can miss an old branch merged last week.
+gh pr view <number> --repo gke-labs/kube-agents --json number,title,state,files,body
 ```
 
-Three things come out of this that nothing else can see. A finding already accepted on a sibling
+Four things come out of this that nothing else can see. A finding already accepted on a sibling
 usually applies here unchanged — apply it rather than rediscovering it. A near-identical change
 that has diverged is itself a finding: name which copy carries the fix and which does not, because
-merge order then decides whether the fix survives. And where one change is a superset of another,
-say so — reviewing the subset in isolation spends effort on a diff that may never merge.
+merge order then decides whether the fix survives. Where one change is a superset of another,
+say so — reviewing the subset in isolation spends effort on a diff that may never merge. And where
+this body hands the eval case to a sibling, follow the hand-off instead of reading it as a
+disposition: open that sibling, check its body accepts it, and check it has merged — an open
+sibling's diff is a promise, and `.agents/rules/eval_driven_development.md`, "What does not count",
+is the rule to quote for both. Two bodies that each point at the other is the same finding, because
+both merge and the case reaches `main` in neither. A hand-off points backwards as often as
+forwards, so fetch a named sibling that has already merged rather than concluding from the listing
+that there is none, and check that what it carries exercises this diff rather than only the
+sibling's own. Angle I above covers the artifacts a hand-off cannot carry at all.
 
 For the cleanup, altitude, conventions, scope, and sibling candidates the `failure_scenario` states
 the concrete cost — what is duplicated, wasted, harder to maintain, out of scope, or which rule or
