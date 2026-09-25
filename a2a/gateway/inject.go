@@ -1713,7 +1713,12 @@ func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectC
 // whether any executor has touched its task, whether the task has sat queued
 // (submitted) or run (working), how old it is against the gateway's grace,
 // and what the run has called so far (the activity artifact, which the relay
-// never posts) -- and classifies for itself. The probe runs before the wait, so a
+// never posts) -- and classifies for itself. With task=, the probe reads that
+// task's stream whether or not the record still holds it as active: the
+// relay clears the active task when it posts the terminal, so this is how a
+// caller reads a finished run's trace after the relay has released it;
+// without task= the probe reads the record's active task, and a released
+// conversation reads as no stream at all. The probe runs before the wait, so a
 // caller that reads a terminal on the stream does not wait on the relay for
 // it, and again after any wait that blocked, so the probe in the reply
 // describes the same instant as the entries beside it: a caller classifying
@@ -1777,7 +1782,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 	}
 	var probed *probeReport
 	if probeAsked != 0 {
-		probed = a.runProbe(r.Context(), key)
+		probed = a.runProbe(r.Context(), key, taskID)
 		probed.LastPost = a.lastPost(key)
 		if probed.Final {
 			// A terminal on the stream is the answer; nothing the relay
@@ -1795,7 +1800,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 			if probeAsked != 0 && waited {
 				// Time moved on under the wait; the probe has to describe
 				// where the stream is now, beside the entries that are.
-				probed = a.runProbe(r.Context(), key)
+				probed = a.runProbe(r.Context(), key, taskID)
 				probed.LastPost = a.lastPost(key)
 			}
 			writeJSON(w, http.StatusOK, conversationResponse{
@@ -1821,17 +1826,18 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// runProbe asks the gateway about a conversation and puts the answer on the
-// wire. Never a failure status: the transcript half of the reply is good
-// whatever the probe found, and a caller reads "could not look" out of the
-// report's error rather than out of a 5xx it would retry the whole poll for.
-func (a *InjectAdapter) runProbe(ctx context.Context, key string) *probeReport {
+// runProbe asks the gateway about a conversation -- the task taskID names,
+// or its active task when taskID is "" -- and puts the answer on the wire.
+// Never a failure status: the transcript half of the reply is good whatever
+// the probe found, and a caller reads "could not look" out of the report's
+// error rather than out of a 5xx it would retry the whole poll for.
+func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probeReport {
 	if a.probe == nil {
 		return &probeReport{Error: "the gateway offered this door no probe"}
 	}
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	state, err := a.probe(ctx, key)
+	state, err := a.probe(ctx, key, taskID)
 	report := &probeReport{
 		Backend:        state.Backend,
 		InjectOnly:     state.InjectOnly,
