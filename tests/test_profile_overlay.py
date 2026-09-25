@@ -388,6 +388,89 @@ class DefaultProfileTest(unittest.TestCase):
             po.sync_profile(self.tmp / "profiles" / "default", self.overlay_dir)
 
 
+_REPO = pathlib.Path(__file__).resolve().parents[1]
+_PLATFORM_CONFIG = _REPO / "agents" / "platform" / "config.yaml"
+_HOOKS_FRAGMENT = _REPO / "a2a" / "persona" / "platform" / "hooks.overlay.yaml"
+
+
+class A2AHooksFragmentTest(unittest.TestCase):
+    """The bridge's webhook fragment, merged the way the entrypoint's step 2.7 merges it:
+    the real file, into the real platform config, as an extra --overlay in the same
+    invocation as the operator's directory.
+
+    What removal means here is decided by this module, not by step 2.6's force-sync: the
+    force-sync skips config.yaml when the platform profile is the front door, so the
+    last-applied record is the path that holds either way. A boot that no longer passes
+    the fragment has to leave the config exactly as the image shipped it.
+    """
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.profile = self.tmp / "profiles" / "platform"
+        self.profile.mkdir(parents=True)
+        shutil.copy(_PLATFORM_CONFIG, self.profile / "config.yaml")
+        self.shipped = read(_PLATFORM_CONFIG)
+        self.overlay_dir = self.tmp / "agent-config"
+        self.overlay_dir.mkdir()
+
+    def config(self):
+        return read(self.profile / "config.yaml")
+
+    def run_step(self, with_fragment):
+        argv = ["--profile-dir", str(self.profile), "--overlay-dir", str(self.overlay_dir)]
+        if with_fragment:
+            argv += ["--overlay", str(_HOOKS_FRAGMENT)]
+        self.assertEqual(po.main(argv), 0)
+
+    def test_the_fragment_adds_the_bridge_hook_and_nothing_else(self):
+        self.assertNotIn("hooks", self.shipped, "the shipped config must not carry the hook itself")
+        self.run_step(with_fragment=True)
+        merged = self.config()
+        (hook,) = merged["hooks"]["outbound"]
+        self.assertEqual(hook["url"], "http://127.0.0.1:8643/hermes/tool-events")
+        self.assertEqual(hook["secret_env"], "A2A_ACTIVITY_SECRET")
+        self.assertEqual(hook["events"], ["pre_tool_call", "post_tool_call"])
+        without = {k: v for k, v in merged.items() if k != "hooks"}
+        self.assertEqual(without, self.shipped)
+
+    def test_a_boot_without_the_fragment_removes_the_hook_from_the_record(self):
+        self.run_step(with_fragment=True)
+        self.run_step(with_fragment=False)
+        self.assertNotIn("hooks", self.config())
+        self.assertEqual(self.config(), self.shipped)
+        self.assertFalse((self.profile / po.STATE_FILENAME).exists())
+
+    def test_the_fragment_composes_with_the_operators_overlay_in_one_record(self):
+        """Both in one invocation, one record: withdrawing the fragment must leave the
+        operator's plugin enabled, and the other way round."""
+        write(
+            self.overlay_dir / "profile-platform.overlay.yaml",
+            {"plugins": {"enabled": ["targeted_plugin"]}},
+        )
+        self.run_step(with_fragment=True)
+        state = json.loads((self.profile / po.STATE_FILENAME).read_text())
+        self.assertEqual(sorted(state["overlay"]), ["hooks", "plugins"])
+        self.assertIn("targeted_plugin", self.config()["plugins"]["enabled"])
+        self.assertIn("hooks", self.config())
+
+        self.run_step(with_fragment=False)
+        self.assertNotIn("hooks", self.config())
+        self.assertIn("targeted_plugin", self.config()["plugins"]["enabled"])
+
+        (self.overlay_dir / "profile-platform.overlay.yaml").unlink()
+        self.run_step(with_fragment=True)
+        self.assertIn("hooks", self.config())
+        self.assertEqual(self.config()["plugins"]["enabled"], self.shipped["plugins"]["enabled"])
+
+    def test_applying_twice_is_idempotent(self):
+        self.run_step(with_fragment=True)
+        once = self.config()
+        self.run_step(with_fragment=True)
+        self.assertEqual(self.config(), once)
+        self.assertEqual(len(self.config()["hooks"]["outbound"]), 1)
+
+
 class ProfileNameValidationTest(unittest.TestCase):
     def test_names(self):
         cases = [

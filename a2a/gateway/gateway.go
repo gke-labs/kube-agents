@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -831,6 +832,17 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 		state.ExecutorState = task.State
 		state.Final = task.Final
 		state.ReachedWorking = slices.Contains(task.StatusHistory, lib.StateWorking)
+		// The trace and the progress line as they stand, final or not: a
+		// caller watching a running task reads what it has called so far.
+		// Non-nil from here on even when empty, because "read and found
+		// nothing" is a fact about the executor and nil is not.
+		state.Activity = make([]json.RawMessage, 0)
+		for _, p := range artifactParts(task, lib.ArtifactActivity) {
+			if p.Kind == "data" && len(p.Data) != 0 {
+				state.Activity = append(state.Activity, p.Data)
+			}
+		}
+		state.Progress = lastTextPart(artifactParts(task, lib.ArtifactProgress))
 		if task.Final {
 			// The fold's terminal, with whose word it is: the events
 			// subject is the executor's, the supervisor subject the
@@ -859,6 +871,23 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 		return state, fmt.Errorf("reading task %s on %s: %w", active.TaskID, addressee, terr)
 	}
 	return state, nil
+}
+
+// artifactParts is every part under one reserved artifact name, in stream
+// order, across every artifact the fold holds under it -- not the first
+// alone (Task.Artifact). The fold keys on artifactId when an update carries
+// one, so an executor that gives each activity update its own id leaves the
+// fold holding several artifacts named activity, and the trace is all of
+// them; an executor that appends onto one id leaves one, and this reads the
+// same.
+func artifactParts(task *lib.Task, name string) []lib.Part {
+	var parts []lib.Part
+	for i := range task.Artifacts {
+		if task.Artifacts[i].Name == name {
+			parts = append(parts, task.Artifacts[i].Parts...)
+		}
+	}
+	return parts
 }
 
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements

@@ -2130,6 +2130,171 @@ class A2AModeProbeTest(unittest.TestCase):
 
 
 
+_DOCKERFILE = _REPO / "deploy" / "docker" / "Dockerfile"
+_HOOKS_FRAGMENT = _REPO / "a2a" / "persona" / "platform" / "hooks.overlay.yaml"
+_HOOKS_IMAGE_PATH = "/opt/a2a-template/hooks.overlay.yaml"
+_OVERLAY_STEP_OPENER = 'if [ -f "$OVERLAY_SCRIPT" ] && [ -d "$OVERLAY_DIR" ]; then'
+_PROBE_BLOCK_OPENER = 'if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then'
+
+
+class A2AHooksOverlayImageTest(unittest.TestCase):
+    """The bridge's webhook fragment ships in the image beside the A2A skill tree.
+
+    The entrypoint names one path for it; the Dockerfile has to put the fragment there,
+    or step 2.7's `[ -f ]` guard turns the whole feature into a silent no-op — the
+    platform profile boots on the next stack with no `hooks.outbound`, the sidecar sees
+    no deliveries, and nothing in either log says why.
+    """
+
+    def _copy_lines(self):
+        return [
+            line for line in _DOCKERFILE.read_text(encoding="utf-8").splitlines()
+            if line.startswith("COPY ") and _HOOKS_IMAGE_PATH in line
+        ]
+
+    def test_the_dockerfile_copies_the_fragment_to_the_path_the_entrypoint_reads(self):
+        lines = self._copy_lines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertEqual(
+            lines[0],
+            f"COPY --chown=hermes:hermes a2a/persona/platform/hooks.overlay.yaml {_HOOKS_IMAGE_PATH}",
+        )
+        self.assertTrue(_HOOKS_FRAGMENT.is_file(), f"the COPY source {_HOOKS_FRAGMENT} is missing")
+        text = _ENTRYPOINT.read_text(encoding="utf-8")
+        self.assertEqual(text.count(f'A2A_HOOKS_OVERLAY="{_HOOKS_IMAGE_PATH}"'), 1)
+
+    def test_the_fragment_lands_beside_the_skill_tree_not_inside_it(self):
+        """The skills manifest and the boot-time provenance check enumerate
+        /opt/a2a-template/skills as a skill tree. A config fragment under that path
+        would be listed as a skill; beside it, it is not."""
+        self.assertFalse(_HOOKS_IMAGE_PATH.startswith("/opt/a2a-template/skills/"))
+        self.assertEqual(pathlib.PurePosixPath(_HOOKS_IMAGE_PATH).parent.as_posix(), "/opt/a2a-template")
+
+    def test_the_fragment_is_one_top_level_key(self):
+        """Removal relies on it: profile_overlay drops a container it created once it is
+        emptied, so a fragment that touched a second top-level key would leave a stub."""
+        data = yaml.safe_load(_HOOKS_FRAGMENT.read_text(encoding="utf-8"))
+        self.assertEqual(list(data), ["hooks"])
+        self.assertEqual(list(data["hooks"]), ["outbound"])
+
+
+class A2AHooksOverlayStepTest(unittest.TestCase):
+    """Step 2.7 passes the bridge's webhook fragment for the platform profile, on the next
+    stack only, in the same profile_overlay.py invocation as the operator's overlays.
+
+    Run against the shipped block with the overlay script replaced by a recorder, so what
+    is asserted is the argv the real shell builds — not a grep of the source that a
+    reworded line would still satisfy. The recorder is invoked once per profile, and the
+    test insists on seeing it: a block that skipped every profile would otherwise pass.
+
+    Same invocation, not a second one, because profile_overlay.py keeps ONE last-applied
+    record per profile and undoes it before applying: a second call would strip what the
+    first merged. Gated on 2.6a-bis's probe rather than a fresh one so the skill and the
+    hook cannot disagree about the mode on the same boot.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # The function extractor returns no trailing newline; the block one does.
+        cls._SCRIPT = (
+            "set -e\n"
+            + _extract_shell_function("merge_profile_overlays")
+            + "\n"
+            + _extract_shell_block(_OVERLAY_STEP_OPENER)
+            + "echo REACHED-EXEC\n"
+        )
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = pathlib.Path(self._tmp.name)
+        self.target = self.tmp / "data"
+        for profile in ("platform", "cluster-one"):
+            (self.target / "profiles" / profile).mkdir(parents=True)
+            (self.target / "profiles" / profile / "config.yaml").write_text("plugins: {}\n")
+        self.overlay_dir = self.tmp / "agent-config"
+        self.overlay_dir.mkdir()
+        (self.tmp / "hermes" / ".venv" / "bin").mkdir(parents=True)
+        (self.tmp / "hermes" / ".venv" / "bin" / "python3").symlink_to(sys.executable)
+        self.record = self.tmp / "record.jsonl"
+        self.recorder = self.tmp / "profile_overlay.py"
+        self.recorder.write_text(
+            "import json, os, sys\n"
+            "with open(os.environ['RECORD'], 'a') as f:\n"
+            "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        )
+        self.fragment = self.tmp / "hooks.overlay.yaml"
+        shutil.copy(_HOOKS_FRAGMENT, self.fragment)
+
+    def _run(self, mode_next, fragment=None):
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "RECORD": str(self.record),
+            "TARGET_DIR": str(self.target),
+            "INSTALL_DIR": str(self.tmp / "hermes"),
+            "OVERLAY_SCRIPT": str(self.recorder),
+            "OVERLAY_DIR": str(self.overlay_dir),
+            "A2A_MODE_NEXT": "1" if mode_next else "",
+            "A2A_HOOKS_OVERLAY": str(fragment if fragment is not None else self.fragment),
+        }
+        proc = subprocess.run(
+            ["sh", "-c", self._SCRIPT], capture_output=True, text=True, timeout=60, env=env
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        calls = {}
+        for line in self.record.read_text().splitlines():
+            argv = json.loads(line)
+            name = pathlib.Path(argv[argv.index("--profile-dir") + 1]).name
+            calls.setdefault(name, []).append(argv)
+        # Both profiles reconciled, each exactly once: the single-record constraint.
+        self.assertEqual({k: len(v) for k, v in calls.items()}, {"platform": 1, "cluster-one": 1}, proc.stderr)
+        return {k: v[0] for k, v in calls.items()}, proc
+
+    def test_next_passes_the_fragment_for_the_platform_profile_only(self):
+        calls, _ = self._run(mode_next=True)
+        platform = calls["platform"]
+        self.assertIn("--overlay", platform)
+        self.assertEqual(platform[platform.index("--overlay") + 1], str(self.fragment))
+        # After the operator's directory, which is the order main() documents: explicit
+        # --overlay files merge last and win a conflict.
+        self.assertEqual(platform[:4], ["--profile-dir", str(self.target / "profiles" / "platform"), "--overlay-dir", str(self.overlay_dir)])
+        self.assertNotIn("--overlay", calls["cluster-one"])
+
+    def test_today_passes_no_fragment(self):
+        calls, _ = self._run(mode_next=False)
+        self.assertNotIn("--overlay", calls["platform"])
+        self.assertNotIn("--overlay", calls["cluster-one"])
+
+    def test_a_missing_fragment_is_skipped_not_fatal(self):
+        """An image without the file is an older image, not a broken boot."""
+        calls, proc = self._run(mode_next=True, fragment=self.tmp / "absent.yaml")
+        self.assertNotIn("--overlay", calls["platform"])
+        self.assertNotIn("WARN", proc.stderr)
+
+    def test_the_flag_is_set_only_by_the_probes_next_arm_and_before_the_step(self):
+        """One decision, one writer: the flag is assigned inside `case $a2a_probe_rc`'s
+        `0)` arm and nowhere else, after being cleared, and all of it precedes step 2.7."""
+        text = _ENTRYPOINT.read_text(encoding="utf-8")
+        self.assertEqual(text.count("A2A_MODE_NEXT=1"), 1)
+        cleared = text.index('A2A_MODE_NEXT=""')
+        probe = text.index(_PROBE_BLOCK_OPENER)
+        case = text.index("case $a2a_probe_rc in", probe)
+        esac = text.index("esac", case)
+        assigned = text.index("A2A_MODE_NEXT=1")
+        step = text.index(_OVERLAY_STEP_OPENER)
+        self.assertLess(cleared, probe)
+        self.assertLess(case, assigned)
+        self.assertLess(assigned, esac)
+        self.assertLess(esac, step)
+        # The `0)` arm specifically: the assignment follows the arm's opener and comes
+        # before the next arm.
+        arm = text.index("0)", case)
+        self.assertLess(arm, assigned)
+        self.assertLess(assigned, text.index("2)", arm))
+
+
+
 def _extract_nested_block(opener, indent, closer="fi"):
     """Like `_extract_shell_block`, for a step written inside another block.
 

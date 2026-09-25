@@ -392,6 +392,9 @@ type conversationResponse struct {
 // probeReport is ConversationState on the wire, plus the door's own two
 // additions: the conversation's last post, which the gateway's record does
 // not hold and this transcript does, and an error for "could not look".
+// Beside the record and the terminal it carries the two artifacts the relay
+// keeps off the chat: the tool-call trace (activity) and the progress line,
+// as the stream holds them at the read.
 //
 // Nothing here is a verdict. A caller decides "nobody took this task" from
 // active, executorState "" and ageSeconds past graceSeconds; "queued and
@@ -423,6 +426,24 @@ type probeReport struct {
 	TerminalSource string `json:"terminalSource,omitempty"`
 	Result         string `json:"result,omitempty"`
 	Reason         string `json:"reason,omitempty"`
+	// Activity is the task's tool-call trace as its stream holds it, final
+	// or not: the data part of every part of the activity artifact, in
+	// stream order, each the executor's own JSON record of one invocation
+	// (tool, input, callId, status, durationMs, at). The relay never posts
+	// it, so this is the one place a caller sees what a run called. The
+	// key is present -- as [] when the executor called nothing -- whenever
+	// the task's stream was read, and absent when it was not (no active
+	// task, or the read failed) and on a door older than the field. A
+	// pointer to a slice rather than a slice because that is the only
+	// encoding in which those two are different things on the wire in a
+	// way every consumer keeps: a plain slice without omitempty writes
+	// null for "not read", and null and absent both decode to a nil slice
+	// in Go and to None under a Python .get, which would leave a harness
+	// unable to tell "this door cannot show calls" from "nobody called".
+	Activity *[]json.RawMessage `json:"activity,omitempty"`
+	// Progress is the last text part of the progress artifact -- the line
+	// the relay's rolling edit shows -- at the instant of the read.
+	Progress string `json:"progress,omitempty"`
 	// LastPost is the newest post entry on this conversation, if any: the
 	// last thing the relay said, for a caller deciding what a stalled task
 	// was doing.
@@ -1681,8 +1702,9 @@ func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectC
 // task's stream, read with nothing changed (ConversationProbe). It is how a
 // caller learns, without sending a message that would itself become a turn,
 // whether any executor has touched its task, whether the task has sat queued
-// (submitted) or run (working), and how old it is against the gateway's
-// grace -- and classifies for itself. The probe runs before the wait, so a
+// (submitted) or run (working), how old it is against the gateway's grace,
+// and what the run has called so far (the activity artifact, which the relay
+// never posts) -- and classifies for itself. The probe runs before the wait, so a
 // caller that reads a terminal on the stream does not wait on the relay for
 // it, and again after any wait that blocked, so the probe in the reply
 // describes the same instant as the entries beside it: a caller classifying
@@ -1817,6 +1839,12 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key string) *probeReport {
 		TerminalSource: string(state.TerminalSource),
 		Result:         truncateRunes(state.Result, injectMaxEntryBytes),
 		Reason:         truncateRunes(state.Reason, injectMaxEntryBytes),
+		Progress:       truncateRunes(state.Progress, injectMaxEntryBytes),
+	}
+	// Non-nil is the fact that the stream was read (ConversationState.
+	// Activity), and the pointer carries that fact onto the wire.
+	if state.Activity != nil {
+		report.Activity = &state.Activity
 	}
 	if !state.SubmittedAt.IsZero() {
 		report.SubmittedAt = state.SubmittedAt.UTC().Format(time.RFC3339Nano)

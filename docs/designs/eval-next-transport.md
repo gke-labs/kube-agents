@@ -312,11 +312,15 @@ gate, an `authority` block that names a real principal, and the reply rendered i
 **Which verifiers work.** `report_contains` reads the answer text and works unchanged.
 `resource_property` and `fleet_resource_property` read the cluster and never touched the
 transport. `tool_called` reads the trajectory, which on this path has tool-call data only when
-the executor publishes `activity` artifacts; the Hermes bridge publishes
-status updates and a `result` artifact and no `activity` or `progress` artifacts, while the
-worker adapter publishes `activity` and `progress` beside the result, so a case
-that gates on `tool_called` has no data on stage 1 until the bridge publishes activity or the
-persona moves to the worker path. `worker_commands` reads the kanban worker logs by card id; on
+the executor publishes `activity` artifacts and the harness maps them in. Both executors
+now publish them: the worker adapter from the harness's `tool_use` blocks, the Hermes bridge
+from hermes's outbound webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per
+invocation with the tool, its input, and the call's status, plus a `progress` heartbeat. The
+relay drops `activity` on purpose, so it reaches no conversation; the inject door's probe
+carries it instead (`activity` in the probe body, `[]` when the run called nothing, absent
+on a door that cannot show it), and the harness's fold maps each entry to a trajectory item
+in the api path's shape. Until that mapping lands, a case that gates on `tool_called` has no
+data on this path. `worker_commands` reads the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
 signals), and until then a case that gates on it has no data on stage 1 either.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so

@@ -181,8 +181,10 @@ returns nothing for entries written after the upgrade.
 ## Lifecycle, steering, cancel
 
 Per task: `submitted` on accept (before the consumer ack, so a bridge death before the
-ack just redelivers), `working` when the subprocess spawns, the stdout as a `result`
-artifact (chunked if large), one terminal `status-update` with `final: true`. A nonzero
+ack just redelivers), `working` when the subprocess spawns, the persona's tool calls as
+an `activity` artifact and a heartbeat as a `progress` artifact while it runs (next
+section), the stdout as a `result` artifact (chunked if large), one terminal
+`status-update` with `final: true`. A nonzero
 exit is terminal `failed` with the exit code and a stderr tail in the status message. A
 submission with no text parts is terminal `rejected`. New-task detection is the
 dispatcher's rule, and 9/9 widened it: BOTH event subjects empty means new, not `…events`
@@ -209,6 +211,61 @@ then terminal `canceled`. A task racing to completion may land `completed` first
 orders are legal and the terminal event wins. A per-task deadline (default 7200s,
 matching the profile's `activeDeadlineSeconds`) takes the same kill path and lands
 `failed`.
+
+## Activity: the persona's tool calls, and a heartbeat
+
+Under `-Q` hermes writes nothing to stdout until the final response, so the pipe the
+bridge holds says nothing about tool calls while the run is on. What hermes does offer is
+its outbound webhooks: a `hooks.outbound` entry in the profile's config POSTs every
+`pre_tool_call` and `post_tool_call` to a URL, fire-and-forget through a bounded queue,
+HMAC-SHA256 signed when the variable its `secret_env` names is set. The bridge listens
+for those on a loopback address in the pod (`BRIDGE_ACTIVITY_LISTEN`, default
+`127.0.0.1:8643`; `off` closes the door), and the platform profile carries the entry
+pointing at it — `a2a/persona/platform/hooks.overlay.yaml`, which the entrypoint merges
+into the profile only under `mode: next`, because in `mode: today` there is no sidecar and
+every tool call would otherwise try a dead port twice and log a warning.
+
+Nothing in a delivery names the A2A task: hermes's own `task_id` is the kanban card or a
+fresh UUID, `cwd` and `profile` are shared by every process under the profile, and the URL
+does not expand environment variables. So the bridge gives each child a random key in its
+environment under `A2A_ACTIVITY_SECRET`, and a delivery belongs to whichever in-flight
+task's key verifies its signature — at most `BRIDGE_CONCURRENCY` keys to try. Unsigned or
+unmatched deliveries (kanban workers and cron ticks under the same profile) are answered
+204 and dropped, so they cost their sender nothing per call beyond one "deliveries will be
+UNSIGNED" line at its start.
+
+What goes on the bus, one `data` part per invocation at `post_tool_call`, a superset of the
+worker adapter's `{"tool","input"}` so one fold reads both executors:
+
+```json
+{
+  "tool": "mcp__gke__list_clusters",
+  "input": { "project": "p" },
+  "callId": "call_01",
+  "status": "completed",
+  "durationMs": 2130,
+  "at": "2026-09-25T20:01:02Z"
+}
+```
+
+`status` is `completed` or `error` from the hook's own verdict. A call still open when the
+task finalizes — deadline, cancel, a crash mid-tool — is flushed as `interrupted` inside
+the finalize lock, ahead of the result and the terminal, so the trace is complete and
+nothing of it follows the final event. `input` is capped (2 KiB) and values under
+secret-looking keys (`token`, `secret`, `password`, `authorization`, `api_key`,
+`credential`) are replaced before publishing. Tool results are not published: no check
+reads them and they are the riskiest payload in the pod. The stream keeps every activity
+part; the relay drops the artifact on purpose (debug and audit views never render to
+chat), and the inject door's probe is where a reader sees it.
+
+The heartbeat is a `progress` text part every `BRIDGE_PROGRESS_INTERVAL_SECONDS` (default
+60): `running 1m30s, 3 tool call(s), last mcp__gke__list_clusters`. The relay renders
+progress as one edited rolling line, so this is one chat edit per minute, and it is what
+tells a stuck task from a slow one from outside the pod.
+
+Trust boundary, stated: everything in the pod is reachable from the persona's own terminal
+tool, its environment included. The trace is "as reported by the executor's process", the
+worker adapter's posture too; the key rejects cross-talk, not adversaries.
 
 ## Supervision
 
@@ -263,7 +320,9 @@ dispatcher, not to scaffolding with a demolition date.
 
 Honest gaps, accepted for the playground: no queue-staleness guard (the lib's subscribe
 path doesn't expose server ingest timestamps, and `queueTimeoutSeconds` is the
-dispatcher's job when it exists), no heartbeats on `agents.hb.>`, a submission whose
+dispatcher's job when it exists), no heartbeats on `agents.hb.>` (the `progress` heartbeat
+above is on the task's own subject, for its readers, not a liveness signal for a
+supervisor), a submission whose
 events lookup fails transiently is dropped with a log line rather than redelivered (the
 lib acks unconditionally after the handler; a nak path is a lib delta if it ever bites),
 and a terminal publish that fails outright - a bus outage outlasting the finalize

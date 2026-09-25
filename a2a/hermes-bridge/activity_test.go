@@ -1,0 +1,421 @@
+package hermesbridge
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"sigs.k8s.io/yaml"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
+)
+
+// The activity door, end to end: a stub standing in for hermes delivers the
+// outbound-webhook bodies hermes would (agent/outbound_webhooks.py, signed
+// with the key the bridge put in its environment), and the bridge turns them
+// into the task's activity and progress artifacts.
+
+// hermesStub writes a python3 executable standing in for hermes. The body
+// runs after a prelude that knows how to sign and POST a delivery the way
+// hermes does; the prompt is sys.argv[-1]. Skips when python3 is absent.
+func hermesStub(t *testing.T, body string) []string {
+	t.Helper()
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the hermes stub needs it")
+	}
+	prelude := `#!/usr/bin/env python3
+import hashlib, hmac, json, os, sys, time, urllib.request
+URL = os.environ.get("` + ActivityURLEnv + `", "")
+KEY = os.environ.get("` + ActivitySecretEnv + `", "")
+def post(event, tool, args, extra, sign=True):
+    body = json.dumps({"hook_event_name": event, "profile": "platform", "tool_name": tool,
+                       "tool_input": args, "session_id": "s1", "cwd": "/opt/data", "extra": extra,
+                       "delivery_id": "d", "timestamp": "2026-09-25T20:00:00Z"}).encode()
+    headers = {"Content-Type": "application/json", "X-Hermes-Event": event}
+    if sign and KEY:
+        headers["X-Hermes-Signature-256"] = "sha256=" + hmac.new(KEY.encode(), body, hashlib.sha256).hexdigest()
+    req = urllib.request.Request(URL, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return r.status
+def call(tool, args, call_id, status="ok", error_type=None, ms=12):
+    post("pre_tool_call", tool, args, {"tool_call_id": call_id, "task_id": "", "session_id": "s1"})
+    post("post_tool_call", tool, args, {"tool_call_id": call_id, "task_id": "", "session_id": "s1",
+                                         "duration_ms": ms, "status": status, "error_type": error_type,
+                                         "error_message": None, "result": "not published"})
+`
+	path := filepath.Join(t.TempDir(), "hermes-stub.py")
+	if err := os.WriteFile(path, []byte(prelude+body+"\n"), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	return []string{path}
+}
+
+// startBridgeCfg is startBridge with the caller's Config; the door is opened
+// on an ephemeral port unless the caller says otherwise.
+func startBridgeCfg(t *testing.T, url string, command []string, mutate func(*Config)) *Bridge {
+	t.Helper()
+	cfg := Config{
+		NATSURL:        url,
+		Command:        command,
+		TaskDeadline:   20 * time.Second,
+		KillGrace:      500 * time.Millisecond,
+		ActivityListen: "127.0.0.1:0",
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	b, err := New(ctx, cfg)
+	if err != nil {
+		cancel()
+		t.Fatalf("bridge new: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- b.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Logf("bridge exited: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("bridge did not shut down")
+		}
+	})
+	waitFor(t, 10*time.Second, "bridge durable consumer", func() bool {
+		c, err := lib.Connect(testCtx(t), url, lib.WithName("probe"))
+		if err != nil {
+			return false
+		}
+		defer c.Close()
+		return true
+	})
+	// The consumer bind is what startBridge waits on; reuse its check.
+	startBridgeWaitConsumer(t, url)
+	return b
+}
+
+func startBridgeWaitConsumer(t *testing.T, url string) {
+	t.Helper()
+	waitFor(t, 10*time.Second, "bridge durable consumer", func() bool {
+		c, err := lib.Connect(testCtx(t), url, lib.WithName("probe-consumer"))
+		if err != nil {
+			return false
+		}
+		defer c.Close()
+		_, err = c.TasksGet(testCtx(t), "platform", "task-none-"+t.Name())
+		// TaskNotFound means the stream is readable; the consumer itself is
+		// bound before Run logs "consuming", which precedes the first task
+		// by the submit's own round trip in every test here.
+		return isTaskNotFound(err) || err == nil
+	})
+}
+
+func activityEntries(t *testing.T, task *lib.Task) []ActivityEntry {
+	t.Helper()
+	art := task.Artifact(lib.ArtifactActivity)
+	if art == nil {
+		return nil
+	}
+	var out []ActivityEntry
+	for i, p := range art.Parts {
+		if p.Kind != "data" {
+			t.Fatalf("activity part %d is %q, want data (assertion 18)", i, p.Kind)
+		}
+		var e ActivityEntry
+		if err := json.Unmarshal(p.Data, &e); err != nil {
+			t.Fatalf("activity part %d: %v", i, err)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// artifactNames returns, in stream order, the artifact name of every
+// artifact-update and "<state>/final" for every status-update.
+func eventTrail(t *testing.T, events []*lib.Envelope) []string {
+	t.Helper()
+	var trail []string
+	for _, env := range events {
+		switch env.Kind {
+		case lib.KindArtifactUpdate:
+			var a lib.ArtifactUpdate
+			if err := json.Unmarshal(env.Payload, &a); err != nil {
+				t.Fatal(err)
+			}
+			trail = append(trail, a.Artifact.Name)
+		case lib.KindStatusUpdate:
+			state, final := statusState(t, env)
+			if final {
+				trail = append(trail, string(state)+"/final")
+			} else {
+				trail = append(trail, string(state))
+			}
+		}
+	}
+	return trail
+}
+
+func TestActivity_ToolCallsBecomeTheActivityArtifact(t *testing.T) {
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+call("kubectl", {"cmd": "get pods", "token": "hunter2", "nested": {"api_key": "k", "keep": 1}}, "call_1")
+call("mcp__gke__list_clusters", {"project": "p"}, "call_2", status="error", error_type="tool_error", ms=340)
+print("the answer")
+`), nil)
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-activity", "list the fleet")
+	task := waitTerminal(t, c, "task-activity")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+	if err := task.ValidateArtifacts(); err != nil {
+		t.Fatalf("assertion 18: %v", err)
+	}
+	entries := activityEntries(t, task)
+	if len(entries) != 2 {
+		t.Fatalf("activity entries = %d, want 2: %+v", len(entries), entries)
+	}
+	first := entries[0]
+	if first.Tool != "kubectl" || first.CallID != "call_1" || first.Status != ActivityStatusCompleted || first.DurationMs != 12 || first.At == "" {
+		t.Fatalf("first entry = %+v", first)
+	}
+	var input map[string]any
+	if err := json.Unmarshal(first.Input, &input); err != nil {
+		t.Fatal(err)
+	}
+	if input["cmd"] != "get pods" || input["token"] != redactedValue {
+		t.Fatalf("input not redacted as designed: %v", input)
+	}
+	if nested := input["nested"].(map[string]any); nested["api_key"] != redactedValue || nested["keep"] != float64(1) {
+		t.Fatalf("nested input not redacted as designed: %v", nested)
+	}
+	if second := entries[1]; second.Tool != "mcp__gke__list_clusters" || second.Status != ActivityStatusError || second.DurationMs != 340 {
+		t.Fatalf("second entry = %+v", second)
+	}
+	for _, e := range entries {
+		if strings.Contains(string(e.Input), "not published") {
+			t.Fatalf("a tool result reached the bus: %s", e.Input)
+		}
+	}
+
+	// Order on the wire: the trace precedes the result, and the result the
+	// final; the first activity part opens the artifact, the second appends.
+	trail := eventTrail(t, replayEvents(t, url, "task-activity"))
+	want := []string{"submitted", "working", "activity", "activity", "result", "completed/final"}
+	if strings.Join(trail, " ") != strings.Join(want, " ") {
+		t.Fatalf("event trail = %v, want %v", trail, want)
+	}
+}
+
+func TestActivity_UnsignedAndUnknownDeliveriesAreDropped(t *testing.T) {
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+# A kanban worker under the same profile: no key, unsigned delivery.
+post("post_tool_call", "terminal", {"cmd": "ls"}, {"tool_call_id": "c1", "status": "ok", "duration_ms": 1}, sign=False)
+# Signed with somebody else's key.
+KEY = "00" * 32
+post("post_tool_call", "terminal", {"cmd": "ls"}, {"tool_call_id": "c2", "status": "ok", "duration_ms": 1})
+print("done")
+`), nil)
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-unsigned", "hello")
+	task := waitTerminal(t, c, "task-unsigned")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+	if got := activityEntries(t, task); len(got) != 0 {
+		t.Fatalf("unsigned deliveries became activity: %+v", got)
+	}
+}
+
+func TestActivity_AnOpenCallIsReportedInterruptedAtTheDeadline(t *testing.T) {
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+post("pre_tool_call", "terminal", {"cmd": "sleep 60", "secret": "x"}, {"tool_call_id": "c-open", "task_id": ""})
+time.sleep(30)
+`), func(c *Config) {
+		c.TaskDeadline = 2 * time.Second
+		c.KillGrace = 200 * time.Millisecond
+	})
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-interrupted", "hang")
+	task := waitTerminal(t, c, "task-interrupted")
+	if task.State != lib.StateFailed || task.FinalMessage == nil || !strings.Contains(joinText(task.FinalMessage.Parts), "deadline-exceeded") {
+		t.Fatalf("state = %s msg = %v, want failed deadline-exceeded", task.State, task.FinalMessage)
+	}
+	entries := activityEntries(t, task)
+	if len(entries) != 1 || entries[0].Tool != "terminal" || entries[0].Status != ActivityStatusInterrupted || entries[0].CallID != "c-open" {
+		t.Fatalf("interrupted entry = %+v, want one interrupted terminal call", entries)
+	}
+	if !strings.Contains(string(entries[0].Input), redactedValue) {
+		t.Fatalf("interrupted entry input not redacted: %s", entries[0].Input)
+	}
+	trail := eventTrail(t, replayEvents(t, url, "task-interrupted"))
+	if got := trail[len(trail)-1]; got != "failed/final" {
+		t.Fatalf("last event = %s, want failed/final; trail %v", got, trail)
+	}
+	if trail[len(trail)-2] != "activity" {
+		t.Fatalf("the interrupted call did not precede the terminal: %v", trail)
+	}
+}
+
+func TestActivity_HeartbeatOnTheProgressArtifact(t *testing.T) {
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+call("kubectl", {"cmd": "get nodes"}, "c1")
+time.sleep(1.2)
+print("slow answer")
+`), func(c *Config) { c.ProgressInterval = 250 * time.Millisecond })
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-heartbeat", "take your time")
+	task := waitTerminal(t, c, "task-heartbeat")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+	if err := task.ValidateArtifacts(); err != nil {
+		t.Fatalf("assertion 18: %v", err)
+	}
+	progress := task.Artifact(lib.ArtifactProgress)
+	if progress == nil || len(progress.Parts) < 2 {
+		t.Fatalf("progress artifact = %+v, want at least two heartbeats", progress)
+	}
+	last := progress.Parts[len(progress.Parts)-1]
+	if last.Kind != "text" || !strings.HasPrefix(last.Text, "running ") || !strings.Contains(last.Text, "1 tool call(s), last kubectl") {
+		t.Fatalf("heartbeat = %q", last.Text)
+	}
+	trail := eventTrail(t, replayEvents(t, url, "task-heartbeat"))
+	if trail[len(trail)-1] != "completed/final" || trail[len(trail)-2] != "result" {
+		t.Fatalf("heartbeat landed after the result or the final: %v", trail)
+	}
+}
+
+func TestActivity_DoorClosedLeavesTheChildWithoutAKey(t *testing.T) {
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+print("key=" + ("set" if KEY else "unset") + " url=" + ("set" if URL else "unset"))
+`), func(c *Config) { c.ActivityListen = "" })
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-closed", "hello")
+	task := waitTerminal(t, c, "task-closed")
+	if got := task.Artifact(lib.ArtifactResult).Parts[0].Text; !strings.Contains(got, "key=unset url=unset") {
+		t.Fatalf("result = %q, want no door in the child's environment", got)
+	}
+	if err := task.ValidateArtifacts(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The profile's hook and the bridge's door are one contract in two files.
+func TestActivity_ProfileHookNamesTheDoor(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "persona", "platform", "hooks.overlay.yaml"))
+	if err != nil {
+		t.Fatalf("hooks.overlay.yaml: %v", err)
+	}
+	var cfg struct {
+		Hooks struct {
+			Outbound []struct {
+				Name      string   `json:"name"`
+				URL       string   `json:"url"`
+				Events    []string `json:"events"`
+				SecretEnv string   `json:"secret_env"`
+			} `json:"outbound"`
+		} `json:"hooks"`
+	}
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Hooks.Outbound) != 1 {
+		t.Fatalf("hooks.outbound has %d entries, want the bridge's one", len(cfg.Hooks.Outbound))
+	}
+	hook := cfg.Hooks.Outbound[0]
+	if want := "http://" + DefaultActivityListen + ActivityPath; hook.URL != want {
+		t.Fatalf("hook url = %q, bridge door = %q", hook.URL, want)
+	}
+	if hook.SecretEnv != ActivitySecretEnv {
+		t.Fatalf("hook secret_env = %q, bridge sets %q", hook.SecretEnv, ActivitySecretEnv)
+	}
+	if strings.Join(hook.Events, ",") != hookPreToolCall+","+hookPostToolCall {
+		t.Fatalf("hook events = %v", hook.Events)
+	}
+}
+
+func TestRedactInput(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want func(t *testing.T, out json.RawMessage)
+	}{
+		{"null is absent", "null", func(t *testing.T, out json.RawMessage) {
+			if out != nil {
+				t.Fatalf("got %s", out)
+			}
+		}},
+		{"secret keys at every depth", `{"Authorization":"Bearer x","list":[{"PASSWORD":"p","ok":true}],"cmd":"ls"}`, func(t *testing.T, out json.RawMessage) {
+			s := string(out)
+			if strings.Contains(s, "Bearer x") || strings.Contains(s, `"p"`) || !strings.Contains(s, `"cmd":"ls"`) || !strings.Contains(s, `"ok":true`) {
+				t.Fatalf("got %s", s)
+			}
+		}},
+		{"over the cap keeps a head", `{"blob":"` + strings.Repeat("é", activityInputCap) + `"}`, func(t *testing.T, out json.RawMessage) {
+			var v struct {
+				Truncated bool   `json:"truncated"`
+				Bytes     int    `json:"bytes"`
+				Head      string `json:"head"`
+			}
+			if err := json.Unmarshal(out, &v); err != nil || !v.Truncated || v.Bytes <= activityInputCap || len(v.Head) == 0 || len(v.Head) > activityInputHead {
+				t.Fatalf("got %s (%v)", out, err)
+			}
+			if !strings.HasPrefix(v.Head, `{"blob":"`) {
+				t.Fatalf("head = %q", v.Head)
+			}
+		}},
+		{"unparseable is named", `{not json`, func(t *testing.T, out json.RawMessage) {
+			if string(out) != `{"unparseable":true}` {
+				t.Fatalf("got %s", out)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { tc.want(t, redactInput(json.RawMessage(tc.in))) })
+	}
+}
+
+func TestActivityStatus(t *testing.T) {
+	mk := func(status, errType string) hookDelivery {
+		var d hookDelivery
+		d.Extra.Status, d.Extra.ErrorType = status, errType
+		return d
+	}
+	if got := activityStatus(mk("ok", "")); got != ActivityStatusCompleted {
+		t.Fatalf("ok -> %s", got)
+	}
+	if got := activityStatus(mk("", "")); got != ActivityStatusCompleted {
+		t.Fatalf("unset -> %s", got)
+	}
+	if got := activityStatus(mk("error", "tool_error")); got != ActivityStatusError {
+		t.Fatalf("error -> %s", got)
+	}
+	if got := activityStatus(mk("ok", "tool_error")); got != ActivityStatusError {
+		t.Fatalf("error_type alone -> %s", got)
+	}
+}
+
+func joinText(parts []lib.Part) string {
+	var b strings.Builder
+	for _, p := range parts {
+		b.WriteString(p.Text)
+	}
+	return b.String()
+}

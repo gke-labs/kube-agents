@@ -1610,6 +1610,15 @@ COPY --chown=hermes:hermes agents/platform/skills/ /opt/platform-template/skills
 # runtime_mode.is_next(). Step 2.6a's replace-from-image is also why the PVC
 # is not a place a skill can live: this template is the only route.
 COPY --chown=hermes:hermes a2a/persona/platform/skills/ /opt/a2a-template/skills/
+# The bridge's webhook fragment (hooks.outbound pointing Hermes at the
+# hermes-bridge sidecar's loopback port) is gated the same way, for the same
+# reason with a sharper edge: in mode today there is no sidecar, so a hook in
+# the shipped config would have every tool call try a dead port and log a
+# warning. Step 2.7 merges it into the platform profile's config.yaml only
+# when 2.6a-bis found the next stack. It sits BESIDE skills/, not inside it:
+# the skills manifest below covers skill trees the agent executes, and a
+# config fragment under that path would be enumerated as a skill.
+COPY --chown=hermes:hermes a2a/persona/platform/hooks.overlay.yaml /opt/a2a-template/hooks.overlay.yaml
 
 COPY --chown=hermes:hermes agents/platform/cron/ /opt/platform-template/cron/
 COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/governance/

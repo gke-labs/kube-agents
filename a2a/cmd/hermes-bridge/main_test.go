@@ -98,3 +98,14 @@ func TestEnvInt(t *testing.T) {
 		}
 	}
 }
+
+// The environment's "off" is the Config's empty string; anything else is an
+// address, passed through for net.Listen to judge.
+func TestActivityListenMapsOffToClosed(t *testing.T) {
+	if got := activityListen(activityListenOff); got != "" {
+		t.Errorf("activityListen(off) = %q, want empty", got)
+	}
+	if got := activityListen("127.0.0.1:9"); got != "127.0.0.1:9" {
+		t.Errorf("activityListen(addr) = %q, want the address back", got)
+	}
+}

@@ -6,6 +6,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -305,4 +306,16 @@ type ConversationState struct {
 	TerminalSource TerminalSource
 	Result         string
 	Reason         string
+	// Activity is the task's tool-call trace as the stream holds it: the
+	// data part of every part of the activity artifact, in stream order,
+	// each one the executor's own JSON record of one tool invocation. Set
+	// whenever the task's stream was read, final or not, and non-nil then
+	// even with no calls -- nil means the stream was not read (no active
+	// task, or the read failed), and a caller telling "this executor
+	// called nothing" from "nobody looked" needs the two kept apart. The
+	// relay deliberately never posts it; this is the only way a caller
+	// sees it. Progress is the last text part of the progress artifact,
+	// which is the line the relay's rolling edit shows.
+	Activity []json.RawMessage
+	Progress string
 }

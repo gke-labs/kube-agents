@@ -594,7 +594,11 @@ not be silent about it.
   fold of it: whose word the terminal is (`terminalSource`, the executor's for a terminal on the
   task's events subject and the supervisor's for one on its supervisor subject - distinct from
   the gateway's own source, which says it could not publish the task at all), the result
-  artifact's text and the terminal's status message; plus the conversation's last post, the
+  artifact's text and the terminal's status message; whenever the stream was read, final or
+  not, the task's tool-call trace (`activity`, the data parts of the activity artifact in
+  stream order, present as `[]` when the executor called nothing and absent when no stream was
+  read, because the relay never posts that artifact and this is the harness's only view of it)
+  and the progress artifact's latest line (`progress`); plus the conversation's last post, the
   gateway's configured first-event grace, and the armed backend with `injectOnly`. The gateway
   classifies nothing on it; the harness does. It is a pure read because the never-started heal
   is a write under the per-conversation lock inside the keyed queue, and a read that performed
