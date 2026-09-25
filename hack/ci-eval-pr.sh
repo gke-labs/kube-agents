@@ -874,7 +874,7 @@ STEP_START=$SECONDS
 write_fleet_kubeconfigs || {
   fleet_rc=$?
   if [ "$fleet_rc" -eq "$_FLEET_EXIT_READONLY_UNAVAILABLE" ]; then
-    echo "FATAL: the seeded fleet cannot be read as ${FLEET_READONLY_SA}; stopping rather than grading it with the runner's write credential. Re-apply bench/tf/fleet against ${PROJECT_ID} if it is a pool project; a project of your own takes FLEET_ALLOW_RUNNER_CREDENTIAL=1." >&2
+    echo "FATAL: stopping at the fleet step: the seeded fleet cannot be read as its reader, and it is not graded with the runner's write credential." >&2
     exit 1
   fi
   echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2

@@ -1666,6 +1666,27 @@ def test_a_reader_that_cannot_be_minted_stops_the_runner_before_any_file(shell, 
     done = _provision.last
     assert done.returncode == 3, done.stderr
     assert out == stale and not out.exists()
+    # Off Prow the message names the developer's route, not a repair to a
+    # pool project the operator's account was never meant to impersonate.
+    assert "FLEET_ALLOW_RUNNER_CREDENTIAL=1" in done.stderr
+    assert "re-apply" not in done.stderr
+
+
+def test_under_prow_the_gate_names_the_pool_repair_not_the_opt_in(shell, tmp_path):
+    """The same failure in a leased job is a project missing its binding; the
+    one message is the gate's, so the CI scripts add no repair of their own."""
+    _provision(
+        shell,
+        tmp_path,
+        FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
+        FLEET_ALLOW_RUNNER_CREDENTIAL="",
+        JOB_NAME="pull-kube-agents-smoke-test",
+        STUB_TOKEN_FAIL="ERROR: (gcloud.auth.print-access-token) PERMISSION_DENIED: Failed to impersonate",
+    )
+    done = _provision.last
+    assert done.returncode == 3, done.stderr
+    assert "re-apply bench/tf/fleet against kube-agents-evals" in done.stderr
+    assert "FLEET_ALLOW_RUNNER_CREDENTIAL" not in done.stderr
     assert "seeded-fleet-reader@p" in done.stderr
     assert "PERMISSION_DENIED" in done.stderr
     assert "roles/iam.serviceAccountTokenCreator" in done.stderr

@@ -1507,8 +1507,11 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
             FLEET_PROJECT_ID=project_id,
             BENCH_FLEET_KUBECONFIG_DIR=target,
         )
+        # Forced, not defaulted: this check has decided the operator's own
+        # credential is acceptable, and a shell that exports the opt-in blank
+        # or as 0 would otherwise turn a healthy project into exit 3.
         if not env.get("FLEET_READONLY_SA"):
-            env.setdefault(FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV, "1")
+            env[FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV] = "1"
         rc, _, err = run_cmd(
             ["bash", str(_FLEET_KUBECONFIGS)], timeout=FLEET_TIMEOUT_SECONDS, env=env
         )

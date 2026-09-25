@@ -349,12 +349,18 @@ _fleet_reader_for_run() {
   fi
 }
 
-# The opt-in is for a developer's own fleet. In a Prow job -- JOB_NAME or
-# PULL_NUMBER set, the signal hack/ci-deploy.sh derives IS_PROW_RUN from -- it
-# would quietly restore, for every leased run, the write-credential fallback
-# the gate replaces, so the CI scripts refuse it before choosing a reader.
+# A Prow job: JOB_NAME or PULL_NUMBER set, the signal hack/ci-deploy.sh
+# derives IS_PROW_RUN from. The gate's message and the opt-in refusal below
+# both turn on it.
+_fleet_under_prow() {
+  [ -n "${JOB_NAME:-}" ] || [ -n "${PULL_NUMBER:-}" ]
+}
+
+# The opt-in is for a developer's own fleet. In a Prow job it would quietly
+# restore, for every leased run, the write-credential fallback the gate
+# replaces, so the CI scripts refuse it before choosing a reader.
 _fleet_refuse_opt_in_under_prow() {
-  if { [ -n "${JOB_NAME:-}" ] || [ -n "${PULL_NUMBER:-}" ]; } && [ "${FLEET_ALLOW_RUNNER_CREDENTIAL:-}" = "1" ]; then
+  if _fleet_under_prow && [ "${FLEET_ALLOW_RUNNER_CREDENTIAL:-}" = "1" ]; then
     echo "ERROR: FLEET_ALLOW_RUNNER_CREDENTIAL=1 is set in a Prow job. The opt-in is for a developer's own fleet; a leased run reads the shared fleet as its reader or not at all. Remove it from the job's environment." >&2
     return 1
   fi
@@ -383,7 +389,15 @@ _fleet_require_readonly_credential() {
   fi
   errors="$(mktemp)" || return 1
   if ! token="$(gcloud auth print-access-token --impersonate-service-account="$sa" 2>"$errors")"; then
-    echo "ERROR: cannot mint a read-only token as ${sa}: $(tr '\n' ' ' <"$errors"). Nothing written. Grant this caller roles/iam.serviceAccountTokenCreator on that account: re-apply bench/tf/fleet against ${project}, or bind it by hand. On a fleet only you use, unset FLEET_READONLY_SA and set FLEET_ALLOW_RUNNER_CREDENTIAL=1 instead." >&2
+    # One message, owned here: the callers add no repair of their own. A job
+    # is told the pool repair; a laptop is not, since off Prow the mint fails
+    # because the operator's account cannot impersonate the reader, which is
+    # not a defect in the project.
+    if _fleet_under_prow; then
+      echo "ERROR: cannot mint a read-only token as ${sa}: $(tr '\n' ' ' <"$errors"). Nothing written. Grant this job's identity roles/iam.serviceAccountTokenCreator on that account: re-apply bench/tf/fleet against ${project}, or bind it by hand." >&2
+    else
+      echo "ERROR: cannot mint a read-only token as ${sa}: $(tr '\n' ' ' <"$errors"). Nothing written. Off Prow that is usually this account lacking roles/iam.serviceAccountTokenCreator on it (roles/owner does not include it); a pool project's fleet is read from Prow. On a fleet only you use, unset FLEET_READONLY_SA and set FLEET_ALLOW_RUNNER_CREDENTIAL=1." >&2
+    fi
     rm -f "$errors"
     return "$_FLEET_EXIT_READONLY_UNAVAILABLE"
   fi

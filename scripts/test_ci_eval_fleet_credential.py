@@ -58,6 +58,14 @@ def run_call_site(runner_exit: int) -> subprocess.CompletedProcess:
 DEPLOY = REPO_ROOT / "hack" / "ci-deploy.sh"
 PREFLIGHT = "preflight_fleet_reader"
 PROW_REFUSAL = "_fleet_refuse_opt_in_under_prow || exit 1"
+PROW_JOB = "pull-kube-agents-smoke-test"
+# The gate's one external call, as a shell function that shadows the binary,
+# so the pre-flight runs the real gate and the tests read its real message.
+GCLOUD_DENIES = 'gcloud() { echo "ERROR: (gcloud.auth.print-access-token) PERMISSION_DENIED: Failed to impersonate" >&2; return 1; }'
+GCLOUD_MINTS = "gcloud() { printf 'ya29.a-token'; }"
+# Neither caller adds a repair of its own: the gate's message is the one a
+# reader sees, and it already tells a job from a laptop.
+REPAIR_PHRASES = ("pply bench/tf/fleet", "FLEET_ALLOW_RUNNER_CREDENTIAL")
 
 
 def preflight_body() -> str:
@@ -68,16 +76,15 @@ def preflight_body() -> str:
     return match.group(0)
 
 
-def run_preflight(gate_exit: int | None, prow: bool = True, **env: str) -> subprocess.CompletedProcess:
-    """`gate_exit` stubs the credential gate; None runs the real one, which
-    passes without a mint only on the opt-in."""
+def run_preflight(gcloud: str, **env: str) -> subprocess.CompletedProcess:
+    """The real gate against a `gcloud` that mints or denies; whether the run
+    is a Prow job is whatever `env` says."""
     script = "\n".join(
         [
             "set -euo pipefail",
             f'source "{RUNNER}"',
-            "" if gate_exit is None else f"_fleet_require_readonly_credential() {{ return {gate_exit}; }}",
+            gcloud,
             "PROJECT_ID=p",
-            f"IS_PROW_RUN={'true' if prow else 'false'}",
             preflight_body(),
             PREFLIGHT,
             "echo reached-the-build",
@@ -91,28 +98,28 @@ class DeployPreflightTest(unittest.TestCase):
     reader cannot be impersonated fails in seconds -- inside the dashboard's
     setup-death bound -- rather than after twenty minutes of build and deploy."""
 
-    def test_an_unavailable_reader_stops_the_deploy(self):
-        done = run_preflight(3)
+    def test_an_unavailable_reader_stops_a_prow_deploy_with_the_pool_repair(self):
+        done = run_preflight(GCLOUD_DENIES, JOB_NAME=PROW_JOB)
         self.assertEqual(1, done.returncode, done.stderr)
+        self.assertIn("cannot mint a read-only token as seeded-fleet-reader@p.iam.gserviceaccount.com", done.stderr)
+        self.assertIn("re-apply bench/tf/fleet against p", done.stderr)
         self.assertIn("FATAL", done.stderr)
-        self.assertIn("seeded-fleet-reader@p.iam.gserviceaccount.com", done.stderr)
-        self.assertIn("Re-apply bench/tf/fleet against p", done.stderr)
         self.assertNotIn("reached-the-build", done.stdout)
 
     def test_a_laptop_is_sent_to_the_opt_in_not_to_a_pool_repair(self):
         """Off Prow the mint fails because roles/owner cannot impersonate the
         reader, not because the project drifted; re-applying the fleet stack
         against a shared pool project is the one repair a laptop must not be
-        told to make."""
-        done = run_preflight(3, prow=False)
+        told to make -- by the gate or by the caller, on the same stderr."""
+        done = run_preflight(GCLOUD_DENIES)
         self.assertEqual(1, done.returncode, done.stderr)
-        self.assertIn("FATAL", done.stderr)
         self.assertIn("FLEET_ALLOW_RUNNER_CREDENTIAL=1", done.stderr)
-        self.assertNotIn("Re-apply", done.stderr)
+        self.assertNotIn("pply bench/tf/fleet", done.stderr)
+        self.assertIn("FATAL", done.stderr)
         self.assertNotIn("reached-the-build", done.stdout)
 
     def test_a_laptop_that_opted_in_passes_on_its_own_credential(self):
-        done = run_preflight(None, prow=False, FLEET_ALLOW_RUNNER_CREDENTIAL="1")
+        done = run_preflight(GCLOUD_DENIES, FLEET_ALLOW_RUNNER_CREDENTIAL="1")
         self.assertEqual(0, done.returncode, done.stderr)
         self.assertIn("reached-the-build", done.stdout)
 
@@ -120,13 +127,13 @@ class DeployPreflightTest(unittest.TestCase):
         """Set in a job's environment, the opt-in would restore the fallback
         this gate replaces for every leased run; the deploy stops before it
         chooses a reader, whatever the gate would have said."""
-        done = run_preflight(0, JOB_NAME="pull-kube-agents-smoke-test", FLEET_ALLOW_RUNNER_CREDENTIAL="1")
+        done = run_preflight(GCLOUD_MINTS, JOB_NAME=PROW_JOB, FLEET_ALLOW_RUNNER_CREDENTIAL="1")
         self.assertEqual(1, done.returncode, done.stderr)
         self.assertIn("FLEET_ALLOW_RUNNER_CREDENTIAL=1 is set in a Prow job", done.stderr)
         self.assertNotIn("reached-the-build", done.stdout)
 
     def test_a_mintable_reader_lets_the_deploy_continue(self):
-        done = run_preflight(0)
+        done = run_preflight(GCLOUD_MINTS, JOB_NAME=PROW_JOB)
         self.assertEqual(0, done.returncode, done.stderr)
         self.assertIn("reached-the-build", done.stdout)
 
@@ -139,6 +146,11 @@ class DeployPreflightTest(unittest.TestCase):
             self.assertIn('_fleet_reader_for_run "${PROJECT_ID}"', text, path)
             self.assertNotIn("seeded-fleet-reader@${PROJECT_ID}", text, path)
             self.assertLess(text.index(PROW_REFUSAL), text.index('_fleet_reader_for_run "${PROJECT_ID}"'), path)
+
+    def test_the_callers_leave_the_repair_to_the_gate(self):
+        for lifted in (preflight_body(), call_site()):
+            for phrase in REPAIR_PHRASES:
+                self.assertNotIn(phrase, lifted)
 
     def test_the_developer_opt_in_leaves_the_reader_unset(self):
         """`FLEET_ALLOW_RUNNER_CREDENTIAL=1` on a developer's own project must
@@ -164,7 +176,6 @@ class FleetCredentialCallSiteTest(unittest.TestCase):
         done = run_call_site(3)
         self.assertEqual(1, done.returncode, done.stderr)
         self.assertIn("FATAL", done.stderr)
-        self.assertIn("reader@p.iam.gserviceaccount.com", done.stderr)
         self.assertNotIn("reached-the-next-step", done.stdout)
 
     def test_any_other_failure_is_still_a_warning(self):

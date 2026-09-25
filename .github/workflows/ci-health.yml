@@ -669,10 +669,10 @@ jobs:
           python-version-file: ".python-version"
 
       # kubectl for the presence probes and the state reads;
-      # gke-gcloud-auth-plugin for the kubeconfig gcloud writes before the
-      # runner rewrites it to the reader's exec credential (the plugin is the
-      # fallback when that rewrite cannot mint, and then every read fails as
-      # the publisher, which holds nothing on the project: "not checked").
+      # gke-gcloud-auth-plugin because the kubeconfig gcloud writes, before
+      # the runner rewrites it to the reader's exec credential, names it. The
+      # runner mints as the reader once, up front, and stops with nothing
+      # written when it cannot ("not checked" for the project).
       - name: Set up Cloud SDK (with kubectl and the GKE auth plugin)
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
         with:

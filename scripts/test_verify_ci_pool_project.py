@@ -447,6 +447,13 @@ class SeededFleetFixturesTest(unittest.TestCase):
             env = run.call_args_list[1].kwargs["env"]
         self.assertEqual("1", env["FLEET_ALLOW_RUNNER_CREDENTIAL"])
         self.assertNotIn("FLEET_READONLY_SA", env)
+        # Forced over whatever the shell exported: a blank or 0 left over
+        # from a runner session would otherwise fail a healthy project.
+        for exported in ("", "0"):
+            with mock.patch.dict(os.environ, {"FLEET_ALLOW_RUNNER_CREDENTIAL": exported}, clear=True), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles())), (0, "", self._state(self._roles()))]
+                checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+                self.assertEqual("1", run.call_args_list[1].kwargs["env"]["FLEET_ALLOW_RUNNER_CREDENTIAL"], repr(exported))
         with mock.patch.dict(os.environ, {"FLEET_READONLY_SA": "reader@p.iam.gserviceaccount.com"}, clear=True), mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles())), (0, "", self._state(self._roles()))]
             checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
