@@ -92,8 +92,10 @@ def run_section(mode_next: str | None, secret_missing: bool = False) -> subproce
         [
             "set -euo pipefail",
             # "Not exported by the test" has to mean unset, not whatever the
-            # shell running the tests happens to export.
-            "unset EVAL_MODE_NEXT",
+            # shell running the tests happens to export: the flag, and the two
+            # variables the flag-set path exports, which a developer who drove
+            # the door by hand has in their shell.
+            "unset EVAL_MODE_NEXT AGENT_TRANSPORT AGENT_INJECT_TOKEN",
             f'export TARGET_NAMESPACE="{_NAMESPACE}"',
             'export AGENT_SERVICE_NAME="platform-agent"',
             "" if mode_next is None else f'export EVAL_MODE_NEXT="{mode_next}"',

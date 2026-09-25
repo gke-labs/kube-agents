@@ -565,6 +565,80 @@ class FlagSetIsNextTest(unittest.TestCase):
                     if "rollout status" in line or "gate_mode_next_rollout" in line:
                         self.assertNotIn(never_gated, line)
 
+    def test_the_provisioning_job_gate_stops_on_either_terminal_condition(self) -> None:
+        """The gate polls the Job's True conditions and stops on Complete or
+        Failed; a Failed Job must not sit out the budget, and no condition at
+        all must. Lifted with its failure branch and run against a kubectl
+        stub, on a budget of a few seconds."""
+        gate = lifted_block("JOB_DEADLINE=$((SECONDS + MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS))", "  fi", "the provisioning Job gate")
+        consts = constants()
+        setup = "\n".join(
+            [
+                'NAMESPACE="kubeagents-system"',
+                'A2A_PROVISION_JOB_SELECTOR="kubeagents.x-k8s.io/a2a-component=provision"',
+                'A2A_NATS_POD_SELECTOR="app=platform-agent-a2a-nats"',
+                "MODE_NEXT_DIAG_LOG_LINES=5",
+                "MODE_NEXT_POLL_SECONDS=1",
+                "MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS=3",
+                f'JOB_CONDITION_COMPLETE="{consts["JOB_CONDITION_COMPLETE"]}"',
+                f'JOB_CONDITION_FAILED="{consts["JOB_CONDITION_FAILED"]}"',
+                "JOB_GATE_START=0; MODE_NEXT_START=0",
+                # The stub answers the conditions read with what the test set,
+                # in the shape the jsonpath emits (each type followed by a space).
+                'kubectl() { case "$*" in *"-o jsonpath="*) printf "%s" "${JOB_STUB}" ;; *) echo "kubectl $*" ;; esac; }',
+                'dump_mode_next_state() { echo "DUMPED"; }',
+                "SECONDS=0",
+            ]
+        )
+        cases = {
+            # what the jsonpath prints -> (exit status, fast, message fragment)
+            "SuccessCriteriaMet Complete ": (0, True, None),
+            "Failed ": (1, True, "conditions: Failed"),
+            "": (1, False, "conditions: none"),
+            "Suspended ": (1, False, "conditions: Suspended"),
+        }
+        for stub, (status, fast, fragment) in cases.items():
+            with self.subTest(conditions=stub):
+                result = run_bash(f'export JOB_STUB="{stub}"\n{setup}\n{gate}\necho "ELAPSED=${{SECONDS}}"')
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                if fragment is not None:
+                    self.assertIn(fragment, result.stdout)
+                    self.assertIn("DUMPED", result.stdout)
+                if status == 0:
+                    self.assertIn("ELAPSED=", result.stdout)
+                    elapsed = int(result.stdout.rsplit("ELAPSED=", 1)[1].split()[0])
+                else:
+                    # The failure branch exits before the echo; time it from the outside.
+                    elapsed = None
+                if fast and elapsed is not None:
+                    self.assertLess(elapsed, 2)
+
+    def test_a_failed_job_is_reported_within_one_poll_and_an_absent_one_at_the_deadline(self) -> None:
+        gate = lifted_block("JOB_DEADLINE=$((SECONDS + MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS))", "  done", "the provisioning Job poll")
+        consts = constants()
+        setup = "\n".join(
+            [
+                'NAMESPACE="kubeagents-system"',
+                'A2A_PROVISION_JOB_SELECTOR="kubeagents.x-k8s.io/a2a-component=provision"',
+                "MODE_NEXT_POLL_SECONDS=1",
+                "MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS=3",
+                f'JOB_CONDITION_COMPLETE="{consts["JOB_CONDITION_COMPLETE"]}"',
+                f'JOB_CONDITION_FAILED="{consts["JOB_CONDITION_FAILED"]}"',
+                'kubectl() { printf "%s" "${JOB_STUB}"; }',
+                "SECONDS=0",
+            ]
+        )
+        for stub, expected, bound in (("Failed ", "Failed", 2), ("", "", None)):
+            with self.subTest(conditions=stub):
+                result = run_bash(f'export JOB_STUB="{stub}"\n{setup}\n{gate}\necho "CONDITIONS=${{JOB_CONDITIONS}} ELAPSED=${{SECONDS}}"')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                conditions, elapsed = re.search(r"CONDITIONS=(.*) ELAPSED=(\d+)", result.stdout).groups()
+                self.assertEqual(conditions, expected)
+                if bound is None:
+                    self.assertGreaterEqual(int(elapsed), 3, "an absent Job runs the budget out")
+                else:
+                    self.assertLess(int(elapsed), bound, "a Failed Job is reported within one poll")
+
     def test_the_generation_is_read_before_each_patch(self) -> None:
         block = lifted(*_MODE_SECTION)
         self.assertLess(block.index("GEN_BEFORE="), block.index("kubectl patch platformagent"))
