@@ -426,6 +426,13 @@ func (b *Bridge) worker(ctx context.Context) {
 		// before, and the re-check below sees its finalize.
 		canceled, err := b.lookAhead(ctx, run)
 		switch {
+		case canceled:
+			// The requester's word, read in full, outranks a shutdown that
+			// lands the same instant: finalize publishes on its own context,
+			// so the cancel is recorded even then.
+			b.cfg.Logger.Info("cancel already on the stream; not spawning", "task", run.origin.TaskID)
+			b.finalize(run, lib.StateCanceled, canceledBeforeStartReason, nil)
+			continue
 		case ctx.Err() != nil:
 			// Shutdown reached the worker mid-read. Leave the run pending
 			// for shutdownTasks, whose terminal names the real cause; a
@@ -439,10 +446,6 @@ func (b *Bridge) worker(ctx context.Context) {
 			// with no terminal event.
 			b.cfg.Logger.Warn("cancel look-ahead failed; spawning anyway",
 				"task", run.origin.TaskID, "err", err)
-		case canceled:
-			b.cfg.Logger.Info("cancel already on the stream; not spawning", "task", run.origin.TaskID)
-			b.finalize(run, lib.StateCanceled, canceledBeforeStartReason, nil)
-			continue
 		}
 		run.mu.Lock()
 		if run.state != statePending {

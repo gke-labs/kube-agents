@@ -345,8 +345,8 @@ long as the two ahead of them run. The eval install's sidecar therefore sets
 `BRIDGE_CONCURRENCY` to at least `EVAL_TASK_PARALLELISM`, declared with the sidecar on the CR,
 and the `submitted`-only classification above is the backstop rather than the fix: a queued
 repetition that reaches the deadline is infrastructure, not a failed case, but it has still
-spent its budget waiting. Two pieces of stage-1 work follow from building against the bridge:
-nothing in this repository or the presubmit produces the bridge
+spent its budget waiting. Three pieces of stage-1 work follow from building against the bridge,
+two of them still to do: nothing in this repository or the presubmit produces the bridge
 image, and nothing declares the sidecar. The bridge doc says the image is fork-built for the
 playground, the platform-agent image plus the bridge binary, in neither `images.json` nor the
 release pipeline, and that it joins the release surface at stage-2 graduation or dies before it.
