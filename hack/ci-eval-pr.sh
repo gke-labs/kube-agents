@@ -22,6 +22,11 @@
 
 set -euo pipefail
 
+# MEASUREMENT ONLY, reverted before merge: force the next-mode flag on so this
+# pull request's presubmit runs the matrix once under spec.mode: next through
+# the inject door on a pool project (gke-labs/kube-agents#2007, phase 1 exit).
+export EVAL_MODE_NEXT=1
+
 # The eval rosters, three files beside this script under hack/eval/ (#1546):
 # what every pull request runs, what can red one on a graded failure, and
 # what the nightly adds. Section 6 reads the first and third into TASKS and
