@@ -259,21 +259,27 @@ def render_sidecar(deployment: dict, concurrency: str = "4") -> dict:
     return json.loads(result.stdout)
 
 
-def a2a_step() -> dict:
+def build_step(step_id: str) -> dict:
     steps = yaml.safe_load(text(_CLOUDBUILD))["steps"]
     for step in steps:
-        if step.get("id") == "a2a":
+        if step.get("id") == step_id:
             return step
-    raise AssertionError("cloudbuild-ci.yaml has no step with id a2a")
+    raise AssertionError(f"cloudbuild-ci.yaml has no step with id {step_id}")
 
 
-def run_a2a_step(subs: dict[str, str], docker_stub: str) -> subprocess.CompletedProcess:
-    """Run the a2a step's script as Cloud Build would: `$$` collapsed to `$`
-    and each `$_NAME` replaced by its substitution, with `docker` stubbed."""
-    script = a2a_step()["args"][1].replace("$$", "$")
+def run_build_step(step_id: str, subs: dict[str, str], docker_stub: str) -> subprocess.CompletedProcess:
+    """Run a step's script as Cloud Build would: `$$` collapsed to `$` and
+    each `$_NAME` replaced by its substitution, with `docker` stubbed."""
+    script = build_step(step_id)["args"][1].replace("$$", "$")
     for name, value in subs.items():
         script = script.replace(f"${name}", value)
     return run_bash(f"{docker_stub}\n{script}")
+
+
+def next_stack_substitutions() -> dict[str, str]:
+    subs = {name: f"{_AR_REPO}/{image}:{_TAG}" for name, image in zip(_A2A_SUBSTITUTIONS, _A2A_IMAGES, strict=True)}
+    subs["_PLATFORM_URI"] = _PLATFORM_URI
+    return subs
 
 
 class FlagUnsetIsTodayTest(unittest.TestCase):
@@ -296,13 +302,16 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
         for name in _A2A_SUBSTITUTIONS:
             self.assertEqual(config["substitutions"][name], "")
 
-    def test_the_a2a_step_is_a_no_op_with_its_substitutions_empty(self) -> None:
-        result = run_a2a_step(
-            {name: "" for name in (*_A2A_SUBSTITUTIONS, "_PLATFORM_URI")},
-            'docker() { echo "docker must not run with the substitutions empty: $*" >&2; exit 99; }',
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(result.stdout.splitlines()), 1, result.stdout)
+    def test_the_next_stack_steps_are_no_ops_with_their_substitutions_empty(self) -> None:
+        for step_id in ("a2a", "a2a-bridge"):
+            with self.subTest(step=step_id):
+                result = run_build_step(
+                    step_id,
+                    {name: "" for name in (*_A2A_SUBSTITUTIONS, "_PLATFORM_URI")},
+                    'docker() { echo "docker must not run with the substitutions empty: $*" >&2; exit 99; }',
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(result.stdout.splitlines()), 1, result.stdout)
 
     def test_step_6b_makes_no_kubectl_call(self) -> None:
         """The whole of step 6b sits inside the flag's guard: with it unset,
@@ -389,6 +398,14 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(consts["A2A_CREDS_SECRET_NAME"], "${A2A_NATS_SERVICE_NAME}" + creds_suffix)
         self.assertEqual(consts["A2A_NATS_POD_SELECTOR"], "app=${PLATFORM_AGENT_CR_NAME}" + nats_suffix)
         self.assertEqual(int(consts["A2A_NATS_CLIENT_PORT"]), go_int_constant(_A2A_MANIFESTS, "a2aNATSClientPort"))
+        # The URL format is the one the operator renders into the agent container
+        # (printf and Python's % agree on %s and %d), filled by the step's printf.
+        self.assertIn('Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace)', text(_AGENT_MANIFESTS))
+        self.assertEqual(
+            consts["A2A_NATS_URL_FORMAT"] % ("platform-agent-a2a-nats", "kubeagents-system", int(consts["A2A_NATS_CLIENT_PORT"])),
+            "nats://platform-agent-a2a-nats.kubeagents-system.svc:4222",
+        )
+        self.assertIn('printf -v A2A_NATS_URL "${A2A_NATS_URL_FORMAT}" "${A2A_NATS_SERVICE_NAME}" "${NAMESPACE}" "${A2A_NATS_CLIENT_PORT}"', lifted(*_MODE_SECTION))
         manifests = text(_A2A_MANIFESTS)
         self.assertRegex(manifests, r'func a2aGatewayName\(.*\) string\s*{\s*return agent\.Name \+ "-a2a-gateway"')
         self.assertRegex(manifests, r'func a2aInjectName\(.*\) string\s*{\s*return agent\.Name \+ "-a2a-inject"')
@@ -456,7 +473,7 @@ class FlagSetIsNextTest(unittest.TestCase):
         )
         markers = [
             'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"',
-            "kubectl wait --for=condition=complete jobs",
+            'case " ${JOB_CONDITIONS} " in',
             'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
             'kubectl get "service/${A2A_INJECT_NAME}" "secret/${A2A_INJECT_NAME}"',
             "render_mode_next_sidecar_patch \\",
@@ -558,15 +575,25 @@ class SidecarPatchTest(unittest.TestCase):
         self.assertEqual([e["name"] for e in sidecar["env"]], ["AGENT_SHARED_STATE_SETUP", "NATS_URL", "NATS_USER", "NATS_PASSWORD", "BRIDGE_CONCURRENCY"])
         self.assertEqual(sidecar["env"][-1]["value"], "6")
 
-    def test_the_webhook_would_admit_it(self) -> None:
-        """What platformagent_webhook.go checks on a sidecar: no privileged,
-        no privilege escalation, no root, no added capabilities, no reserved
-        volume mount. The copied context satisfies every one."""
-        sc = self.sidecar["securityContext"]
-        self.assertFalse(sc.get("privileged", False))
-        self.assertFalse(sc.get("allowPrivilegeEscalation", True))
-        self.assertNotEqual(sc.get("runAsUser"), 0)
-        self.assertEqual(sc.get("capabilities", {}).get("add", []), [])
+    def test_the_context_the_operator_renders_is_one_the_webhook_admits(self) -> None:
+        """The renderer copies the agent container's securityContext verbatim,
+        so what the webhook sees is what the operator rendered: pinned here
+        against hardenedSecurityContext() in the operator source (the fixture
+        above mirrors it), against the four sidecar rules in
+        platformagent_webhook.go: no privileged, no privilege escalation, no
+        root, no added capabilities."""
+        manifests = text(_AGENT_MANIFESTS)
+        body = re.search(r"func hardenedSecurityContext\(\) \*corev1\.SecurityContext \{\n(.*?)\n\}", manifests, re.DOTALL)
+        self.assertIsNotNone(body, "hardenedSecurityContext() not found in the operator source")
+        self.assertIn("AllowPrivilegeEscalation: ptr.To(false)", body.group(1))
+        self.assertIn('Drop: []corev1.Capability{"ALL"}', body.group(1))
+        self.assertNotIn("Privileged", body.group(1))
+        self.assertNotIn("RunAsUser", body.group(1))
+        self.assertNotIn("Add:", body.group(1))
+        webhook = text(_CONTROLLER.parent / "webhook" / "platformagent_webhook.go")
+        for rule in ("sc.Privileged", "sc.AllowPrivilegeEscalation", "*sc.RunAsUser == 0", "sc.Capabilities.Add"):
+            self.assertIn(rule, webhook)
+        self.assertEqual(self.sidecar["securityContext"], _AGENT_SECURITY_CONTEXT)
 
 
 class BridgeImageBuildTest(unittest.TestCase):
@@ -591,27 +618,35 @@ class BridgeImageBuildTest(unittest.TestCase):
         inventory = json.loads(text(_REPO_ROOT / "images.json"))
         self.assertNotIn("hermes-bridge", [image["name"] for image in inventory["images"]])
 
-    def test_the_a2a_step_waits_for_the_platform_image_and_builds_the_four_in_order(self) -> None:
-        self.assertEqual(a2a_step()["waitFor"], ["platform"])
-        subs = {name: f"{_AR_REPO}/{image}:{_TAG}" for name, image in zip(_A2A_SUBSTITUTIONS, _A2A_IMAGES, strict=True)}
-        subs["_PLATFORM_URI"] = _PLATFORM_URI
-        result = run_a2a_step(subs, 'docker() { echo "docker $*"; }')
+    def test_the_a2a_step_starts_at_once_and_builds_the_three_in_order(self) -> None:
+        """The three A2A images do not depend on the platform image, so their
+        step must not queue behind it; only the bridge does."""
+        self.assertEqual(build_step("a2a")["waitFor"], ["-"])
+        result = run_build_step("a2a", next_stack_substitutions(), 'docker() { echo "docker $*"; }')
         self.assertEqual(result.returncode, 0, result.stderr)
-        lines = result.stdout.splitlines()
         expected = []
-        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, _A2A_IMAGES, strict=True):
+        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES[:3], _A2A_IMAGES[:3], strict=True):
             uri = f"{_AR_REPO}/{image}:{_TAG}"
-            build_arg = f" --build-arg PLATFORM_AGENT_IMAGE={_PLATFORM_URI}" if image == "hermes-bridge" else ""
-            # The inspect that precedes the bridge build runs with its output
-            # discarded, so it leaves no line here; the refusal test below is
-            # where it is observed.
-            expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix}{build_arg} a2a")
+            expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix} a2a")
             expected.append(f"docker push {uri}")
-        self.assertEqual(lines, expected)
+        self.assertEqual(result.stdout.splitlines(), expected)
 
-    def test_the_a2a_step_refuses_a_platform_image_that_is_not_this_builds(self) -> None:
-        subs = {name: f"{_AR_REPO}/{image}:{_TAG}" for name, image in zip(_A2A_SUBSTITUTIONS, _A2A_IMAGES, strict=True)}
-        subs["_PLATFORM_URI"] = _PLATFORM_URI
+    def test_the_bridge_step_waits_for_the_platform_image_and_builds_from_it(self) -> None:
+        self.assertEqual(build_step("a2a-bridge")["waitFor"], ["platform", "a2a"])
+        result = run_build_step("a2a-bridge", next_stack_substitutions(), 'docker() { echo "docker $*"; }')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        uri = f"{_AR_REPO}/hermes-bridge:{_TAG}"
+        # The inspect that precedes the build runs with its output discarded, so
+        # it leaves no line here; the refusal test below is where it is observed.
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                f"docker build --platform linux/amd64 -t {uri} --build-arg PLATFORM_AGENT_IMAGE={_PLATFORM_URI} -f a2a/Dockerfile.hermes-bridge a2a",
+                f"docker push {uri}",
+            ],
+        )
+
+    def test_the_bridge_step_refuses_a_platform_image_that_is_not_this_builds(self) -> None:
         stub = textwrap.dedent(
             """\
             docker() {
@@ -620,11 +655,10 @@ class BridgeImageBuildTest(unittest.TestCase):
             }
             """
         )
-        result = run_a2a_step(subs, stub)
+        result = run_build_step("a2a-bridge", next_stack_substitutions(), stub)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("built FROM this run's platform image", result.stderr)
-        self.assertNotIn("Dockerfile.hermes-bridge", result.stdout)
-        self.assertEqual(len([line for line in result.stdout.splitlines() if " push " in line]), 3)
+        self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":

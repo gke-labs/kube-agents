@@ -60,7 +60,7 @@ bridge exists; the bridge's demolition removes the reason.
 
 One provenance note: the bridge image is CI-only. `a2a/Dockerfile.hermes-bridge` builds it
 (`FROM` the platform-agent image plus the one static binary above), and
-`deploy/docker/cloudbuild-ci.yaml` builds it in its `a2a` step when `hack/ci-deploy.sh`
+`deploy/docker/cloudbuild-ci.yaml` builds it in its `a2a-bridge` step when `hack/ci-deploy.sh`
 runs under `EVAL_MODE_NEXT=1`, `FROM` the platform-agent image that same build produced,
 by the tag it just pushed and never from a registry default, so the sidecar and the agent
 container it shares a pod with are one build; the deploy then declares it on the CR for

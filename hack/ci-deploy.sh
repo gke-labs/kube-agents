@@ -83,10 +83,10 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 # of this name (a2aNATSName, a2aCalloutName, a2aGatewayName, a2aInjectName and
 # the provision Job's component label in
 # k8s-operator/internal/controller/platformagent_a2a_manifests.go; the managed
-# .env rides the <cr>-config ConfigMap; the creds Secret and the bridge's user
-# and key in platformagent_a2a_identities.go and the API package). The CR name
-# is the chart's platformAgent.name default, which this deploy does not
-# override.
+# .env rides the <cr>-config ConfigMap; the creds Secret's name in the API
+# package, the bridge's user in platformagent_a2a_identities.go and its
+# password key in platformagent_a2a_manifests.go). The CR name is the chart's
+# platformAgent.name default, which this deploy does not override.
 readonly PLATFORM_AGENT_CR_NAME="platform-agent"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly AGENT_CONTAINER_NAME="platform-agent"
@@ -109,6 +109,11 @@ readonly A2A_INJECT_BACKEND_ON="true"
 # (A2ACredsSecretName), which is the env a2a/docs/hermes-bridge.md lists.
 readonly A2A_NATS_SERVICE_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-nats"
 readonly A2A_NATS_CLIENT_PORT=4222
+# The URL the operator renders into the agent container for the same bus:
+# service, namespace, port (a2aNATSURL and the NATS_URL env in
+# platformagent_manifests.go). The namespace is known only once ci-env.sh is
+# sourced, so this is a printf format, filled in step 6b.
+readonly A2A_NATS_URL_FORMAT='nats://%s.%s.svc:%d'
 readonly A2A_CREDS_SECRET_NAME="${A2A_NATS_SERVICE_NAME}-creds"
 readonly A2A_BRIDGE_USER="bridge"
 readonly A2A_BRIDGE_PASSWORD_KEY="bridge-password"
@@ -148,7 +153,13 @@ readonly MODE_NEXT_BRIDGE_LOG_ATTEMPTS=60
 # The provisioning Job depends on NATS and on the callout, and its retries
 # back off exponentially: 19.5 minutes to complete was measured under adverse
 # conditions (#1661), a few minutes on a healthy cluster.
-readonly MODE_NEXT_PROVISION_JOB_TIMEOUT="1500s"
+readonly MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS=1500
+# What the Job's status.conditions say when it is over, either way. A Job
+# that exhausts its backoff carries Failed and never Complete, so the gate
+# reads both rather than waiting the whole budget for a Complete that cannot
+# come.
+readonly JOB_CONDITION_COMPLETE="Complete"
+readonly JOB_CONDITION_FAILED="Failed"
 readonly A2A_PART_OF_SELECTOR="app.kubernetes.io/part-of=a2a-next"
 readonly A2A_PROVISION_JOB_SELECTOR="kubeagents.x-k8s.io/a2a-component=provision"
 readonly A2A_NATS_POD_SELECTOR="app=${PLATFORM_AGENT_CR_NAME}-a2a-nats"
@@ -591,7 +602,8 @@ else
   export BUILDCACHE_IMAGE="${BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:buildcache}"
   export PROXY_BUILDCACHE_IMAGE="${PROXY_BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/credential-proxy:buildcache}"
   # Under EVAL_MODE_NEXT=1 the same build also produces the three first-party
-  # A2A images and the Hermes bridge sidecar, in its `a2a` step; with the
+  # A2A images and the Hermes bridge sidecar, in its `a2a` and `a2a-bridge`
+  # steps; with the
   # substitutions absent that step is a no-op and the build is the four-image
   # one above. Empty otherwise, so the command below is byte-for-byte what it
   # was. The three references go to the operator through operator.extraEnv
@@ -848,7 +860,8 @@ wait_agent_generation_past() {
   local before="$1" what="$2"
   local after="${before}"
   for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
-    after="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
+    # A read the API drops is one more poll, not the end of the deploy.
+    after="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}' 2>/dev/null)" || after="${before}"
     [ "${after}" != "${before}" ] && break
     sleep "${MODE_NEXT_POLL_SECONDS}"
   done
@@ -940,8 +953,23 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     [ -n "$(kubectl get jobs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" -o name 2>/dev/null)" ] && break
     sleep "${MODE_NEXT_POLL_SECONDS}"
   done
-  if ! kubectl wait --for=condition=complete jobs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" --timeout="${MODE_NEXT_PROVISION_JOB_TIMEOUT}"; then
-    echo "ERROR: the A2A provisioning Job did not complete within ${MODE_NEXT_PROVISION_JOB_TIMEOUT}"
+  # Polled for either terminal condition rather than `kubectl wait
+  # --for=condition=complete`, which would sit out the whole budget on a Job
+  # that has already failed. The read lists every True condition on every Job
+  # the label matches; a Complete anywhere is the gate passing.
+  JOB_DEADLINE=$((SECONDS + MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS))
+  JOB_CONDITIONS=""
+  while :; do
+    JOB_CONDITIONS="$(kubectl get jobs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" -o jsonpath='{range .items[*]}{range .status.conditions[?(@.status=="True")]}{.type}{" "}{end}{end}' 2>/dev/null || true)"
+    case " ${JOB_CONDITIONS} " in
+    *" ${JOB_CONDITION_COMPLETE} "*) break ;;
+    *" ${JOB_CONDITION_FAILED} "*) JOB_CONDITIONS="${JOB_CONDITION_FAILED}"; break ;;
+    esac
+    [ "${SECONDS}" -ge "${JOB_DEADLINE}" ] && break
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  if [[ " ${JOB_CONDITIONS} " != *" ${JOB_CONDITION_COMPLETE} "* ]]; then
+    echo "ERROR: the A2A provisioning Job did not complete within ${MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS}s (conditions: ${JOB_CONDITIONS:-none})"
     kubectl describe jobs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" || true
     echo "--- provisioning Job pod logs ---"
     kubectl logs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
@@ -982,10 +1010,12 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     echo "ERROR: EVAL_TASK_PARALLELISM='${MODE_NEXT_BRIDGE_CONCURRENCY}' is not a concurrency the bridge can be given (1..${BRIDGE_QUEUE_CAPACITY})." >&2
     exit 1
   fi
+  # shellcheck disable=SC2059 -- the format is a named constant, the point of it.
+  printf -v A2A_NATS_URL "${A2A_NATS_URL_FORMAT}" "${A2A_NATS_SERVICE_NAME}" "${NAMESPACE}" "${A2A_NATS_CLIENT_PORT}"
   SIDECAR_PATCH="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o json |
     render_mode_next_sidecar_patch \
       "${AGENT_CONTAINER_NAME}" "${BRIDGE_SIDECAR_NAME}" "${A2A_BRIDGE_URI}" \
-      "${BRIDGE_NATS_URL_ENV_VAR}" "nats://${A2A_NATS_SERVICE_NAME}.${NAMESPACE}.svc:${A2A_NATS_CLIENT_PORT}" \
+      "${BRIDGE_NATS_URL_ENV_VAR}" "${A2A_NATS_URL}" \
       "${BRIDGE_NATS_USER_ENV_VAR}" "${A2A_BRIDGE_USER}" \
       "${BRIDGE_NATS_PASSWORD_ENV_VAR}" "${A2A_CREDS_SECRET_NAME}" "${A2A_BRIDGE_PASSWORD_KEY}" \
       "${BRIDGE_CONCURRENCY_ENV_VAR}" "${MODE_NEXT_BRIDGE_CONCURRENCY}" \

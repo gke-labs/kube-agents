@@ -332,7 +332,7 @@ session pod waits on the profile and dispatcher work, which has no date, and the
 none for the bridge's retirement: it goes when profiles land and the retirement ordering is
 written. Stage 1 builds against the bridge
 ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md)), a sidecar declared on the CR
-through `spec.deployment.sidecars` whose image has no build configuration in this repository. A
+through `spec.deployment.sidecars` whose image `a2a/Dockerfile.hermes-bridge` builds, CI-only. A
 case addresses `platform` and does not care who answers; when the persona moves to a worker the
 addressee stays `platform`, which is what the addressee token is for. An install under `next`
 with no sidecar declared has a bus with nobody consuming `platform` tasks, and every case on the
@@ -349,8 +349,9 @@ repetition that reaches the deadline is infrastructure, not a failed case, but i
 spent its budget waiting. Two pieces of stage-1 work follow from building against the bridge,
 and both are the CI flag's (decided 2026-09-18 by the A2A owner on gke-labs/kube-agents#1661,
 with the conditions below). `a2a/Dockerfile.hermes-bridge` sits beside the three A2A
-Dockerfiles: the platform-agent image plus the bridge binary, built in the same step the CI flag
-section gives the A2A images and tagged per pull request into the pool project's registry,
+Dockerfiles: the platform-agent image plus the bridge binary, built in the same Cloud Build as
+the A2A images (a step of its own, after the platform image) and tagged per pull request into the
+pool project's registry,
 `FROM` the platform-agent image that build produced by the tag it just pushed and never a
 registry default, so the sidecar and the agent container it shares a pod with are one build;
 CI-only, outside `images.json`, with the exclusion stated in `hack/check-image-inventory.sh`
@@ -360,7 +361,7 @@ that starts before NATS resolves crash-loops the agent's pod), with that image, 
 the `bridge` user's password from the operator's creds Secret as the bridge doc lists its env,
 and `BRIDGE_CONCURRENCY` set to `EVAL_TASK_PARALLELISM`, sized against the bridge's fixed queue
 as well: the queue behind the workers holds 1024 accepted tasks before the bridge finalizes one
-as `bridge-queue-overflow`, three orders of magnitude above any fan-out the job runs. The
+as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The
 sidecar also carries the agent container's own environment, mounts, security context and
 resources, derived from the rendered Deployment at deploy time rather than copied into the
 script: the bridge's subprocess stands in for the `hermes chat -q` a kanban worker spawns inside
@@ -521,8 +522,9 @@ issue): the door maps a body-supplied principal, and nothing a customer can set 
 `PlatformAgent` may render it. The rendered object set with the flag unset carries no inject
 Service, env or NetworkPolicy, and that is a property for the conformance suite to check rather
 than a comment to trust. The A2A images the flip needs, and the bridge image, are built in the
-same Cloud Build step as the other images and the three are set on the operator, because its
-defaults point at a registry the pool projects cannot pull from. Under the same flag
+same Cloud Build as the other images (two steps of their own, no-ops with the flag unset) and the
+three are set on the operator, because its defaults point at a registry the pool projects cannot
+pull from. Under the same flag
 `hack/ci-eval-pr.sh` runs the matrix through the door: it exports `AGENT_TRANSPORT=inject` and
 `AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door, and
 changes nothing else about the run. With the flag unset both scripts are byte for byte what

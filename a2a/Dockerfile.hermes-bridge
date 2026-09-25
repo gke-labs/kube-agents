@@ -2,7 +2,7 @@
 # hermes-bridge binary (a2a/docs/hermes-bridge.md, "Where it runs").
 #
 # CI-ONLY, and deliberately so. deploy/docker/cloudbuild-ci.yaml builds it in
-# its `a2a` step when hack/ci-deploy.sh runs under EVAL_MODE_NEXT=1, FROM the
+# its `a2a-bridge` step when hack/ci-deploy.sh runs under EVAL_MODE_NEXT=1, FROM the
 # platform-agent image the same build just produced, so the sidecar and the
 # agent container it shares a pod with are one build. It is not in images.json
 # (hack/check-image-inventory.sh says why) and not release surface: it joins at
