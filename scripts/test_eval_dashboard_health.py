@@ -660,6 +660,28 @@ class DeadlineKills(unittest.TestCase):
         out = adjudicate(data(partial, other, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 2))
 
+    def test_a_not_evaluated_run_with_a_collapsed_case_is_never_the_pull_requests_own_red(self):
+        # The suite certified nothing (SCHEMA.md, `eval_outcome`), and its
+        # roster may be older than the dashboard's: a gate case that failed
+        # every graded repetition on such a run, on no other PR, is still not
+        # the PR's own -- the run page says nothing about the change is
+        # implied, and the Reds tile counts the run among the gate's, so the
+        # digest's split must too.
+        lost = dict(run(1, 1, T0, tasks=[task("agent-kanban-smoke", "fff"), task("security-overgrant-probe", "iii")], result="FAILURE"), eval_verdict="RED", eval_outcome="not_evaluated", not_evaluated=["security-overgrant-probe"])
+        out = adjudicate(data(lost, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 1))
+        # And it stays in the population: another PR's red collapsing the
+        # same case is shared, not that PR's own.
+        other = run(3, 3, T0 - timedelta(minutes=10), tasks=[task("agent-kanban-smoke", "fff")], result="FAILURE")
+        out = adjudicate(data(lost, other, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 2))
+        # The same record without the suite's word is the PR's own red, as it
+        # always was: the field is what moves it.
+        graded_red = dict(lost)
+        del graded_red["eval_outcome"], graded_red["not_evaluated"]
+        out = adjudicate(data(graded_red, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (1, 0))
+
     def test_recovering_advice_names_the_bar_the_condition_is_left_on(self):
         self.assertIn("the newest 3 runs with a verdict, green or red, are on distinct PRs and all finished after the last kill", health.advice_for("DEGRADED", "deadline_kill", [], None, {}, recovering=True))
         self.assertIn("3 consecutive green runs on distinct PRs", health.advice_for("DEGRADED", "shared_break", [], None, {}, recovering=True))

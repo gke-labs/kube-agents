@@ -1230,8 +1230,12 @@ def pr_caused_reds(full_runs, roster: Roster) -> int:
     for run in full_runs:
         # A killed run that recorded cases (#1875) stays in the population --
         # its collapse still makes another PR's red shared -- but is never the
-        # PR's own: the kill is the gate's, whatever those cases did.
-        if run.result != RUN_FAILURE or run.deadline_kill:
+        # PR's own: the kill is the gate's, whatever those cases did. So does a
+        # run the suite could not evaluate (SCHEMA.md, `eval_outcome`): the
+        # suite certified nothing, its roster may not have counted the case
+        # the dashboard's admits, and the run page and the Reds tile already
+        # count it among the gate's.
+        if run.result != RUN_FAILURE or run.deadline_kill or run.not_evaluated:
             continue
         mine = run.collapsed_cases() & roster.at(run.started or run.finished)
         if mine and all(prs_by_case[case] == {run.pr} for case in mine):

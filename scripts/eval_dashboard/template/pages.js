@@ -873,8 +873,9 @@ function numbers(sinceMs, untilMs) {
   const reds = done.length - green.length;
   const own = done.filter((r) => !isGreen(r) && r.verdict === "red").length;
   // Named inside the gate's reds, where health.py's infra_reds (the daily
-  // digest's "N infra") also counts them, so the two surfaces agree on the
-  // number; the tile just says how many of them the suite could not evaluate.
+  // digest's "N infra") also counts them: its pr_caused_reds never takes a
+  // not-evaluated run, collapsed gate case or not, so the two surfaces agree
+  // on the number; the tile just says how many the suite could not evaluate.
   const notEvaluated = done.filter((r) => r.verdict === "not_evaluated").length;
   const deaths = all.filter((r) => r.setup_death).length;
   const walls = done.map((r) => (parseIso(r.finished) ?? 0) - (parseIso(r.started) ?? 0)).filter((w) => w > 0).sort((a, b) => a - b);
