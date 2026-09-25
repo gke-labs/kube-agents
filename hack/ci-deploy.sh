@@ -63,7 +63,8 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #   - section 2a refuses it on the release-candidate path (no A2A images are
 #     published to point the operator at) and section 2b refuses it on a Prow
 #     run that is not a pull request's (a periodic under it would append
-#     next-mode samples to main's baseline record);
+#     next-mode samples to main's baseline record), and refuses a fan-out the
+#     bridge cannot be given as its concurrency, before anything is built;
 #   - step 4 also builds the A2A gateway, auth callout and worker images from
 #     a2a/Dockerfile.* (the operator's defaults for them name a private dev
 #     registry, #1557, which a leased project cannot pull from) and the Hermes
@@ -443,6 +444,29 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${P
   echo "       The flag is for a pull request's presubmit; a periodic or postsubmit under it" >&2
   echo "       would record next-mode samples into main's baseline." >&2
   exit 1
+fi
+
+# The bridge sidecar's concurrency is the matrix's fan-out, read from the same
+# job environment hack/ci-eval-pr.sh reads it from (the constants block says
+# how it is sized). Checked here, at second zero, for the same reason the two
+# refusals above are: every input is known now, and step 6b, where the value
+# is written into the sidecar, is forty minutes and a leased project later.
+# Digits only, and at most four of them, before the numeric compare: bash's
+# `test` skips surrounding whitespace and the bridge's strconv.Atoi does not,
+# so " 4" would pass here and start the bridge at its default of 2 with a
+# warning nobody reads; and `test` cannot parse a digit string past int64 at
+# all, which would let it through the same way. Five digits or more can never
+# be within the queue's capacity, whatever they are.
+if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+  MODE_NEXT_BRIDGE_CONCURRENCY="${EVAL_TASK_PARALLELISM:-${EVAL_TASK_PARALLELISM_DEFAULT}}"
+  case "${MODE_NEXT_BRIDGE_CONCURRENCY}" in
+  '' | *[!0-9]* | ?????*) MODE_NEXT_BRIDGE_CONCURRENCY_OK="false" ;;
+  *) MODE_NEXT_BRIDGE_CONCURRENCY_OK="true" ;;
+  esac
+  if [ "${MODE_NEXT_BRIDGE_CONCURRENCY_OK}" != "true" ] || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -lt 1 ] || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -gt "${BRIDGE_QUEUE_CAPACITY}" ]; then
+    echo "ERROR: EVAL_TASK_PARALLELISM='${MODE_NEXT_BRIDGE_CONCURRENCY}' is not a concurrency the bridge can be given (an integer 1..${BRIDGE_QUEUE_CAPACITY})." >&2
+    exit 1
+  fi
 fi
 
 # The override exists for developers, and only for them. Under Boskos the
@@ -1001,25 +1025,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   fi
   echo "✓ inject door rendered (${A2A_INJECT_NAME} Service, and token Secret with key ${A2A_INJECT_TOKEN_KEY} for the eval) $((INJECT_GATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
 
-  # The bridge sidecar. Its concurrency is the matrix's fan-out, read from the
-  # same job environment hack/ci-eval-pr.sh reads it from (the constants block
-  # says how it is sized); refused outright rather than passed through when it
-  # is not a count the bridge can honour.
-  # Digits only, and at most four of them, before the numeric compare: bash's
-  # `test` skips surrounding whitespace and the bridge's strconv.Atoi does
-  # not, so " 4" would pass here and start the bridge at its default of 2
-  # with a warning nobody reads; and `test` cannot parse a digit string past
-  # int64 at all, which would let it through the same way. Five digits or
-  # more can never be within the queue's capacity, whatever they are.
-  MODE_NEXT_BRIDGE_CONCURRENCY="${EVAL_TASK_PARALLELISM:-${EVAL_TASK_PARALLELISM_DEFAULT}}"
-  case "${MODE_NEXT_BRIDGE_CONCURRENCY}" in
-  '' | *[!0-9]* | ?????*) MODE_NEXT_BRIDGE_CONCURRENCY_OK="false" ;;
-  *) MODE_NEXT_BRIDGE_CONCURRENCY_OK="true" ;;
-  esac
-  if [ "${MODE_NEXT_BRIDGE_CONCURRENCY_OK}" != "true" ] || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -lt 1 ] || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -gt "${BRIDGE_QUEUE_CAPACITY}" ]; then
-    echo "ERROR: EVAL_TASK_PARALLELISM='${MODE_NEXT_BRIDGE_CONCURRENCY}' is not a concurrency the bridge can be given (an integer 1..${BRIDGE_QUEUE_CAPACITY})." >&2
-    exit 1
-  fi
+  # The bridge sidecar, at the concurrency section 2b checked at second zero.
   # The format is a named constant, which is the point of it (SC2059 wants a literal).
   # shellcheck disable=SC2059
   printf -v A2A_NATS_URL "${A2A_NATS_URL_FORMAT}" "${A2A_NATS_SERVICE_NAME}" "${NAMESPACE}" "${A2A_NATS_CLIENT_PORT}"

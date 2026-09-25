@@ -170,9 +170,15 @@ def go_int_constant(path: pathlib.Path, name: str) -> int:
     return int(match.group(1))
 
 
+# The variables a lifted section reads from the job environment. Unset first,
+# so "not exported by the test" means unset rather than whatever the shell
+# running the tests happens to export (a developer reproducing a flag run).
+_AMBIENT_ENV = ("EVAL_MODE_NEXT", "EVAL_TASK_PARALLELISM", "RC_COMMIT_SHA", "PULL_NUMBER", "JOB_NAME")
+
+
 def run_bash(script: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["bash", "-c", f"set -euo pipefail\n{script}"],
+        ["bash", "-c", f"set -euo pipefail\nunset {' '.join(_AMBIENT_ENV)}\n{script}"],
         capture_output=True,
         text=True,
         check=False,
@@ -431,7 +437,11 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertIn('-a2a-callout"', block)
         self.assertEqual(callout_suffix, "-a2a-callout")
         self.assertIn('-a2a-gateway"', block)
-        self.assertRegex(manifests, r'podLabels := map\[string\]string{"app": name}')
+        # In the NATS StatefulSet's builder, not just somewhere in the file.
+        nats_builder = manifests[manifests.index("func buildA2ANATSStatefulSet(") :]
+        nats_builder = nats_builder[: nats_builder.index("\n}\n")]
+        self.assertRegex(nats_builder, r'podLabels := map\[string\]string{"app": name}')
+        self.assertIn("name := a2aNATSName(agent)", nats_builder)
         managed_env_key = go_constant(_AGENT_MANIFESTS, "managedEnvKey")
         self.assertIn(f"jsonpath='{{.data.{managed_env_key.replace('.', chr(92) + '.')}}}'", block)
 
@@ -453,8 +463,10 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertIsNotNone(eval_default, "hack/ci-eval-pr.sh no longer defaults EVAL_TASK_PARALLELISM where this test reads it")
         self.assertEqual(int(consts["EVAL_TASK_PARALLELISM_DEFAULT"]), int(eval_default.group(1)))
         self.assertLessEqual(int(consts["EVAL_TASK_PARALLELISM_DEFAULT"]), int(consts["BRIDGE_QUEUE_CAPACITY"]))
-        block = lifted(*_MODE_SECTION)
-        self.assertIn('MODE_NEXT_BRIDGE_CONCURRENCY="${EVAL_TASK_PARALLELISM:-${EVAL_TASK_PARALLELISM_DEFAULT}}"', block)
+        script = text(_CI_DEPLOY)
+        self.assertIn('MODE_NEXT_BRIDGE_CONCURRENCY="${EVAL_TASK_PARALLELISM:-${EVAL_TASK_PARALLELISM_DEFAULT}}"', script)
+        # And the value the guard admitted is what the sidecar gets.
+        self.assertIn('"${BRIDGE_CONCURRENCY_ENV_VAR}" "${MODE_NEXT_BRIDGE_CONCURRENCY}"', lifted(*_MODE_SECTION))
 
     def test_the_release_candidate_path_refuses_the_flag(self) -> None:
         script = text(_CI_DEPLOY)
@@ -489,7 +501,12 @@ class FlagSetIsNextTest(unittest.TestCase):
     def test_the_concurrency_guard_speaks_the_bridges_grammar(self) -> None:
         """What passes here is written into BRIDGE_CONCURRENCY verbatim and
         parsed by strconv.Atoi, which takes digits and nothing else; the guard
-        has to refuse whatever Atoi would, or the bridge falls back to 2."""
+        has to refuse whatever Atoi would, or the bridge falls back to 2. It
+        sits in section 2b, before anything is built, like the other refusals."""
+        script = text(_CI_DEPLOY)
+        guard_at = script.index('MODE_NEXT_BRIDGE_CONCURRENCY="${EVAL_TASK_PARALLELISM:-${EVAL_TASK_PARALLELISM_DEFAULT}}"')
+        self.assertLess(guard_at, script.index("# ─── 4. Build Container Images"), "the guard belongs before the build")
+        self.assertGreater(guard_at, script.index('[ -z "${PULL_NUMBER:-}" ]; then'), "the guard belongs beside the 2b refusal")
         guard = lifted_block(
             'MODE_NEXT_BRIDGE_CONCURRENCY="${EVAL_TASK_PARALLELISM:-${EVAL_TASK_PARALLELISM_DEFAULT}}"',
             "  fi",

@@ -91,6 +91,9 @@ def run_section(mode_next: str | None, secret_missing: bool = False) -> subproce
     script = "\n".join(
         [
             "set -euo pipefail",
+            # "Not exported by the test" has to mean unset, not whatever the
+            # shell running the tests happens to export.
+            "unset EVAL_MODE_NEXT",
             f'export TARGET_NAMESPACE="{_NAMESPACE}"',
             'export AGENT_SERVICE_NAME="platform-agent"',
             "" if mode_next is None else f'export EVAL_MODE_NEXT="{mode_next}"',
@@ -132,7 +135,13 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
         """The header promises one site; a second reader is a second behaviour
         under the flag that this test suite does not cover."""
         script = text(_CI_EVAL)
-        reads = [m.start() for m in re.finditer(r'\$\{EVAL_MODE_NEXT:-\}', script)]
+        # Any spelling of an expansion (`${EVAL_MODE_NEXT...}` or bare `$EVAL_MODE_NEXT`),
+        # on a line that is not a comment; the two log lines that name the flag
+        # as text are not reads.
+        reads = [
+            m.start()
+            for m in re.finditer(r"^[^#\n]*\$\{?EVAL_MODE_NEXT\b", script, re.MULTILINE)
+        ]
         self.assertEqual(len(reads), 1, "EVAL_MODE_NEXT is read at more than one site in hack/ci-eval-pr.sh")
         start = script.index(section())
         self.assertTrue(start <= reads[0] < start + len(section()))
