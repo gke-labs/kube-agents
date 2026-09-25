@@ -1487,11 +1487,13 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 6. Task Matrix Execution Loop
-# The matrix is data, not code: three files under hack/eval/, read here at
+# The matrix is data, not code: four files under hack/eval/, read here at
 # startup (#1546, 2026-09-15). presubmit-cases.txt is what every pull request
 # runs (TASKS), nightly-cases.txt is what EVAL_TIER=nightly appends
-# (NIGHTLY_TASKS), and blocking-roster.txt, read further down, is what can red
-# a pull request on a graded failure (BOOTSTRAP_ADMITTED). The split exists
+# (NIGHTLY_TASKS), blocking-roster.txt, read further down, is what can red
+# a pull request on a graded failure (BOOTSTRAP_ADMITTED), and
+# inject-lane-exclusions.txt, read after the tier switch, is what the inject
+# lane leaves out of both (#2039). The split exists
 # so OWNERS can tell them apart: hack/OWNERS puts the two presubmit files
 # under the eval-crew alias and lets the nightly file and this script fall
 # through to the root approvers. Each file's header says what belongs in it;

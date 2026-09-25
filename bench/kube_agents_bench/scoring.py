@@ -29,7 +29,12 @@ of a real agent run (rung 3). Rungs 1-3 are the reason the rate rules are safe
 happened. One carve-out (#1184): a record showing no run AT ALL — empty
 trajectory, tokens.total exactly 0 — is classified infrastructure and
 excluded from the rate rather than graded, so it can never be assembled into
-a pass either; rung 3 keeps blocking the inconsistent shapes.
+a pass either; rung 3 keeps blocking the inconsistent shapes. A second
+carve-out (#2039) is the inject lane's: on a record that is that transport's
+envelope with no tool call, a check that reads tool calls or worker logs is
+set aside as not applicable before the rungs -- failed or errored, it is
+neither a graded failure nor a rung-2 block there -- and the rungs grade
+what remains (see ``_inject_lane_view``).
 
 HOW THE JUDGE IS AND IS NOT USED. No judged score is ever compared against an
 absolute threshold, and the reason is measured rather than assumed: three
@@ -54,7 +59,6 @@ from typing import Any
 from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
 
 __all__ = [
-    "CHECK_STATUS_NOT_APPLICABLE",
     "DEFAULT_AGGREGATE_MIN_SCORED",
     "DEFAULT_JUDGED_MARGIN",
     "DEFAULT_JUDGED_METRICS",
@@ -198,21 +202,21 @@ INJECT_ENVELOPE_EVENTS = frozenset(
     {INJECT_TASK_EVENT, INJECT_POST_EVENT, INJECT_EDIT_EVENT, A2A_STATUS_EVENT}
 )
 
-#: The status the scorer reports for a check it set aside on the inject lane
-#: (beside devops-bench's ``pass`` / ``fail`` / ``error``, which the record
-#: keeps), the repetition outcome when every objective check was set aside,
-#: and the phrase both reasons carry. ``not_applicable`` is a fifth
+#: The repetition outcome when the inject lane set every objective check
+#: aside, and the phrase every reason about a set-aside check carries (the
+#: record itself keeps devops-bench's ``pass`` / ``fail`` / ``error`` for
+#: the entry; the scorer names the set-aside entries in
+#: ``RepResult.not_applicable_checks``). ``not_applicable`` is a fifth
 #: repetition outcome beside ``infra``, ``blocked``, ``pass`` and ``fail``:
 #: like ``infra`` it contributes nothing to a rate, unlike ``infra`` it is
 #: evaluated -- the run happened and the answer was read -- so the suite's
 #: coverage floor and its all-infrastructure guard both count it as
 #: evaluated and not as weather.
-CHECK_STATUS_NOT_APPLICABLE = "not_applicable"
 REP_OUTCOME_NOT_APPLICABLE = "not_applicable"
 NOT_APPLICABLE_PHRASE = "not applicable on this transport"
 
 #: The report-entry vocabulary devops-bench writes and ``_rollup`` reads
-#: back: the three statuses beside the one above, the two roles, the
+#: back: the three statuses, the two roles, the
 #: severity that gates, and the three score keys the rollup emits
 #: (``devops_bench/verification/rollup.py``, ``metrics/verification.py``).
 CHECK_STATUS_PASS = "pass"
@@ -764,8 +768,8 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     The rule (#2039): on a record that is the inject transport's envelope
     with no tool call in it (:func:`_inject_blind`), every report entry the
     task declares with only ``tool_called``, ``worker_commands`` or ``worker_agents`` leaves
-    (:attr:`CaseSpec.transport_blind_checks`) is set aside as
-    :data:`CHECK_STATUS_NOT_APPLICABLE` -- whatever devops-bench recorded
+    (:attr:`CaseSpec.transport_blind_checks`) is set aside as not
+    applicable -- whatever devops-bench recorded
     for it, a ``fail`` from an empty trajectory or an ``error`` from an
     absent worker capture -- and the three deterministic signals are
     recomputed over the entries that remain, so a blind check can neither

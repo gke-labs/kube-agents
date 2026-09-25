@@ -15,7 +15,7 @@
 """Shared fixtures for the scoring tests.
 
 EVERY failure mode is a MUTATION OF A REAL RECORD, never a hand-written dict.
-The five directories under ``fixtures/runs/`` are captured devops-bench output
+The six directories under ``fixtures/runs/`` are captured devops-bench output
 (see their README for provenance and the one redacted field), and the helpers
 here copy one and change
 exactly the field under test. That discipline is not stylistic: the first draft
