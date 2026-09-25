@@ -22,6 +22,10 @@
 
 set -euo pipefail
 
+# MEASUREMENT ONLY, never merged: force the next-mode flip so this run's matrix goes
+# through the inject door (kube-agents #2007, phase 1 exit). Reverted before any review.
+export EVAL_MODE_NEXT=1
+
 # The eval rosters, three files beside this script under hack/eval/ (#1546):
 # what every pull request runs, what can red one on a graded failure, and
 # what the nightly adds. Section 6 reads the first and third into TASKS and
