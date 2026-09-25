@@ -41,6 +41,24 @@ readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_SUITE_NOT_EVALUATED_STATUS=2
 readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 
+# release_inflight_note (beside the ledger reset, section 5): the sandbox
+# pod's shell container, the scratch directory audit_report.py writes its
+# in-flight note under, the bound on one `kubectl exec` round trip, and how
+# long a unit waits for a live run to release its own note before removing
+# it. The unit's delegation ceiling is not the worker's death -- the record
+# under AGENT_DELEGATION_TIMEOUT below shows a worker rewriting its ledger
+# five minutes after the wait gave up -- so a note found at the next unit's
+# start may still be a live run's; 300s covers that record. The lock
+# deadline in run_one_unit grants each unit this on top of its ceiling and
+# the 600s for grading and teardown, so a unit that spends the grace does
+# not push its same-task waiter past its deadline. The round-trip allowance
+# is what the outer timeout adds to the grace for the exec's own setup.
+readonly EVAL_SANDBOX_CONTAINER="shell"
+readonly EVAL_SANDBOX_SCRATCH_DIR="/opt/data/scratch"
+readonly EVAL_SANDBOX_EXEC_TIMEOUT="30s"
+readonly EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=60
+readonly EVAL_INFLIGHT_GRACE_SECONDS=300
+
 # ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
 # A push that changes only inert files re-runs this whole job and aborts the
 # run in flight -- #1127's comment-only push cost a 123-minute re-run. Prow's
@@ -1240,6 +1258,107 @@ reset_audit_ledgers() { # <label> [audit-id]
   return 0
 }
 
+# ─── In-flight notes: release what a dead repetition left on the sandbox ─────
+# `audit_report.py start` leaves an in-flight note for its stream on the
+# sandbox pod's own volume, /opt/data/scratch/inflight_<audit>.json, and
+# refuses while one younger than its TTL exists; `finish` removes it. A
+# repetition whose worker dies between the two -- max_turns, a pod restart,
+# a dispatcher that never served the card's retry -- leaves the note, and
+# inside one run the next repetition of the case starts inside that TTL
+# and is refused at `start`; on a stream two cases share (the
+# consistency pair, the patch pair) so is the sibling case's first
+# repetition, which waits on the stream lock and starts right after. That is
+# a 0/3 that reads as agent failure and was the harness's. The note is the
+# run's, not the ledger's, so the ledger reset above cannot clear it; this
+# does, per unit, from the same place the ledger reset runs (under the task
+# lock and the stream lock, before devops-bench), for that unit's stream
+# alone. Not at lease time: the per-unit release covers a note an earlier
+# lease left as well.
+#
+# A unit that ended on its delegation ceiling may have left a worker that is
+# still running, and its note is then a live run's: removing it at once would
+# start the next repetition over that worker, the overlap the note exists to
+# refuse (the ledger reset already rewrites that worker's ledger under it;
+# this must not add the collision). So a note that is present is given
+# EVAL_INFLIGHT_GRACE_SECONDS to be released by its own `finish` first, and
+# removed only if it is still there after that; the log line says which.
+#
+# The removal runs in the sandbox pod (`kubectl exec`; the harness holds
+# admin on the leased project's host cluster), pinned the way hack/ci-env.sh
+# pins its log collection: to AGENT_CLUSTER_CONTEXT, the host cluster of THIS
+# lease -- the task loop's tofu stacks repoint the ambient context at their
+# own clusters -- and it refuses a context that does not name PROJECT_ID, an
+# unset namespace, and an audit id that is not a bare label, so it cannot
+# reach another project's pod or a path outside scratch; the path is handed
+# to the pod's shell as a positional, never spliced into a command line. The
+# pod is the operator's StatefulSet for the agent, `<agent>-shell`
+# (shellSandboxName in k8s-operator/internal/controller/shell_sandbox_manifests.go;
+# hack/ci-deploy.sh waits on statefulset/platform-agent-shell), one replica,
+# container `shell`; EVAL_SANDBOX_POD names another. Only the note goes: the
+# `.lock` beside it is the guard's, created once and never removed.
+# A release that cannot run says so and the run goes on as it did before the
+# guard: the note expires on its own, and a repetition refused at `start`
+# prints `START REFUSED` naming the in-flight run, so the artifacts tell a
+# left note from a worker that never ran. It never reds a pull request. The
+# exec is bounded outside kubectl as well: --request-timeout covers the
+# upgrade round trip only, not the stream, and a stream hung on a wedged
+# volume would otherwise hold the task and stream locks until the sibling
+# units gave up on them.
+# Returns 0 whatever happens; the reason it could not release is printed.
+release_inflight_note() { # <label> <audit-id>
+  local label="$1" audit_id="$2" pod ns ctx note out rc=0
+  pod="${EVAL_SANDBOX_POD:-${AGENT_SERVICE_NAME}-shell-0}"
+  ns="${TARGET_NAMESPACE:-}"
+  ctx="${AGENT_CLUSTER_CONTEXT:-}"
+  case "${audit_id}" in
+    "" | *[!A-Za-z0-9_.-]*)
+      echo "In-flight note (${label}): skipped, audit id '${audit_id}' is not a bare label; the stream keeps whatever note is on the sandbox"
+      return 0 ;;
+  esac
+  if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ]; then
+    echo "In-flight note (${label}): skipped, PROJECT_ID, AGENT_CLUSTER_CONTEXT or TARGET_NAMESPACE is unset; the ${audit_id} stream keeps whatever note is on the sandbox"
+    return 0
+  fi
+  case "${ctx}" in
+    "gke_${PROJECT_ID}_"*) ;;
+    *)
+      echo "WARNING: In-flight note (${label}): skipped, AGENT_CLUSTER_CONTEXT=${ctx} does not name PROJECT_ID=${PROJECT_ID}; the ${audit_id} stream keeps whatever note is on the sandbox" >&2
+      return 0 ;;
+  esac
+  if ! command -v kubectl >/dev/null 2>&1; then
+    echo "In-flight note (${label}): skipped, no kubectl on PATH; the ${audit_id} stream keeps whatever note is on the sandbox"
+    return 0
+  fi
+  note="${EVAL_SANDBOX_SCRATCH_DIR}/inflight_${audit_id}.json"
+  # The grace wait plus one exec round trip; absent `timeout`, unbounded as
+  # the dashboard hook above is.
+  local budget=$((EVAL_INFLIGHT_GRACE_SECONDS + EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS))
+  local bound=(timeout --foreground "${budget}")
+  command -v timeout >/dev/null 2>&1 || bound=()
+  # Single quotes on purpose: $1 (the note) and $2 (the grace) are the pod
+  # shell's own positionals, so the path is never spliced into the script.
+  # shellcheck disable=SC2016
+  out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec "${pod}" -c "${EVAL_SANDBOX_CONTAINER}" \
+    --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
+    sh -c '
+      n=0
+      while [ -e "$1" ] && [ "$n" -lt "$2" ]; do sleep 5; n=$((n + 5)); done
+      if [ -e "$1" ]; then rm -f -- "$1" && echo "removed $1 after waiting ${n}s for its run"
+      elif [ "$n" -gt 0 ]; then echo "released by its own run after ${n}s: $1"
+      else echo "none at $1"; fi
+    ' sh "${note}" "${EVAL_INFLIGHT_GRACE_SECONDS}" 2>&1)" || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    echo "In-flight note (${label}): ${out}"
+  else
+    # 124 is timeout(1)'s own status for a command it had to stop. It stops
+    # kubectl; the shell loop in the pod is not signalled and ends at its
+    # next write to the closed stream, which comes after its rm.
+    [ "${rc}" -eq 124 ] && out="timed out after ${budget}s; the loop left in the pod may still remove the note${out:+; ${out}}"
+    echo "WARNING: In-flight note (${label}): kubectl exec into ${ns}/${pod} exited ${rc} (${out}); the ${audit_id} stream keeps whatever note is on the sandbox, and a repetition refused at start prints START REFUSED naming it." >&2
+  fi
+  return 0
+}
+
 EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 reset_audit_ledgers "lease"
 
@@ -2238,7 +2357,10 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # writes none, and the deadline for the locks below. The task lock is held
   # for the holder's whole unit, so the wait must outlast one: the unit's
   # delegation ceiling plus grading and teardown (about 300s on the record;
-  # 600s here). A fixed 1800s deadline under a 3000s ceiling would make a
+  # 600s here), plus the grace a ledger-writing unit may spend before its
+  # run waiting for a live predecessor to release its in-flight note
+  # (EVAL_INFLIGHT_GRACE_SECONDS; the 600 was sized before that wait
+  # existed and did not include it). A fixed 1800s deadline under a 3000s ceiling would make a
   # same-task successor give up while its predecessor was still legitimately
   # running -- 24% of presubmit runs launch compliance rep 2 within 2090s of
   # rep 1 (385 logs, 09-04 to 09-15). On a stream another case in this run
@@ -2248,7 +2370,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # lock keeps its default: audit units carry no stack.
   local audit_id lock_deadline
   audit_id="$(ledger_audit_id_for_task "${task}")"
-  lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600) ))"
+  lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) ))"
   if ! lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"; then
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
@@ -2285,8 +2407,12 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # case on the same stream out: repetitions 2 and 3 audit from the empty
   # ledger repetition 1 had (the lease-time reset above). Only this stream's
   # label, so an audit case on another stream in another lane keeps its own.
+  # And this stream's in-flight note on the sandbox pod, left by a repetition
+  # that died between `start` and `finish`, released under the same locks so
+  # the next `start` of the stream is not refused for a run that is over.
   if [ -n "${audit_id}" ]; then
     reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
+    release_inflight_note "${name} rep ${rep}" "${audit_id}"
   fi
   if [ -n "${reuse}" ]; then
     export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"

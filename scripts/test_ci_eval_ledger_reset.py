@@ -603,7 +603,7 @@ class CallSiteTest(unittest.TestCase):
         # its turn on the stream before its own run, so a same-task successor
         # has to outlast the sibling case's unit as well as the predecessor's.
         self.assertIn(
-            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600) ))"',
+            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) ))"',
             unit,
         )
         self.assertEqual(unit.count('"${lock_deadline}"'), 2)

@@ -186,14 +186,20 @@ class DelegationCeilingTest(unittest.TestCase):
         # And on a stream another case in the run also writes, the holder
         # waits its turn on the stream lock first, so the wait is that figure
         # times the cases on the stream (stream_case_count); a case alone on
-        # its stream, or writing none, keeps the single-unit figure.
+        # its stream, or writing none, keeps the single-unit figure. The
+        # in-flight grace a ledger-writing unit may spend before its run is
+        # in the figure too, so a holder that spends it does not push its
+        # waiter past the deadline.
         unit = lifted("run_one_unit")
-        deadline = 'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600) ))"'
+        deadline = 'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) ))"'
         self.assertIn(deadline, unit)
+        grace = re.search(r"^readonly EVAL_INFLIGHT_GRACE_SECONDS=\d+$", SCRIPT.read_text(encoding="utf-8"), re.M)
+        self.assertIsNotNone(grace)
         self.assertIn('lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"', unit)
         body = "\n".join(
             [
                 lifted("unit_delegation_timeout"),
+                grace.group(0),
                 'export AGENT_DELEGATION_TIMEOUT="2700"',
                 'stream_case_count() { echo "${CASES_ON_STREAM}"; }',
                 'CASES_ON_STREAM=1 name=compliance-rbac-overgrant audit_id=compliance-audit; ' + deadline + '; echo "${lock_deadline}"',
@@ -201,7 +207,7 @@ class DelegationCeilingTest(unittest.TestCase):
                 'CASES_ON_STREAM=2 name=consistency-drift-outlier audit_id=fleet-consistency-drift; ' + deadline + '; echo "${lock_deadline}"',
             ]
         )
-        self.assertEqual(run_bash(body).stdout.split(), ["3600", "3300", "7200"])
+        self.assertEqual(run_bash(body).stdout.split(), ["3900", "3600", "7800"])
 
 
 class PerCaseGradingTest(unittest.TestCase):
@@ -228,7 +234,8 @@ _ts_lines() { cat; }
 uv() { echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }
 finish_case() { echo "FINISH_CASE $2 after rep ${rep}"; }
 STATE_DIR="$(mktemp -d)"; ARTIFACT_DIR="$(mktemp -d)"; BENCH_DIR=/tmp
-EVAL_REPETITIONS=3; INFRA_LOCK_DEADLINE=1
+EVAL_REPETITIONS=3; INFRA_LOCK_DEADLINE=1; EVAL_INFLIGHT_GRACE_SECONDS=300
+release_inflight_note() { :; }
 EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_LOCATION=
 """
 
