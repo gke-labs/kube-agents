@@ -56,24 +56,27 @@ FORBIDDEN_OPERATIONS = {
 UTC_TIME_RE = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})")
 # The one-shot verdict is judged per recurrence mention: a recurrence word
 # counts against the answer only in a sentence about the schedule, and a
-# negation neutralizes it only when it sits just before it ("never a
-# recurring schedule") — a "no" elsewhere in the sentence ("with no end
-# date") does not un-say "hourly". Bare "once" is more often temporal
-# ("once the window is confirmed") and bare "single" descriptive ("the
-# single best zone"), so only firing-count shapes commit.
+# negation neutralizes it only when it ends immediately before it (an
+# article allowed: "never a recurring schedule", "non-recurring") — a "no"
+# merely near it ("with no end date, hourly") does not un-say "hourly".
+# Bare "once" is more often temporal ("once the window is confirmed"),
+# bare "single" descriptive ("the single best zone"), and bare "repeats"
+# an action verb ("the re-check repeats the probe"), so only firing-count
+# shapes commit and only schedule-recurrence shapes count against.
 ONE_SHOT_RE = re.compile(
     r"\b(exactly once|only once|fires? once|runs? once|one[- ]time"
     r"|single\s+(?:re-?check|firing|run|execution))\b"
 )
-NEGATION_WINDOW_CHARS = 20
+NEGATION_WINDOW_CHARS = 30
 SCHEDULE_TERM_RE = re.compile(r"\b(re-?check|schedul\w*|cron\w*|fires?|firing)\b")
 RECURRENCE_RE = re.compile(
-    r"\b(recurring|repeat\w*|hourly|daily|weekly|nightly"
+    r"\b(recurring|repeating\s+schedule|hourly|daily|weekly|nightly"
     r"|every\s+\d+\s*(?:minutes?|hours?|days?|weeks?)"
     r"|every\s+(?:minute|hour|day|week|night|morning))\b"
 )
-NEGATION_RE = re.compile(
-    r"\b(non|not|never|no|won'?t|will not|isn'?t|is not|rather than|instead of)\b"
+NEGATED_JUST_BEFORE_RE = re.compile(
+    r"\b(non|not|never|no|won'?t|will not|isn'?t|is not|rather than|instead of)"
+    r"[\s,;:–—-]*(?:a\s+|an\s+)?$"
 )
 SENTENCE_SPLIT_RE = re.compile(r"[.!?\n]+")
 
@@ -211,7 +214,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     )
     recurring_committed = any(
         SCHEDULE_TERM_RE.search(sentence)
-        and not NEGATION_RE.search(
+        and not NEGATED_JUST_BEFORE_RE.search(
             sentence[max(0, match.start() - NEGATION_WINDOW_CHARS) : match.start()]
         )
         for sentence in SENTENCE_SPLIT_RE.split(folded_answer)

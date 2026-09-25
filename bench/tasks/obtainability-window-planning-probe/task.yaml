@@ -87,7 +87,7 @@ verification_spec:
       any_of_phrases: ["UTC", "no window", "NO_CAPACITY", "NOT_SUPPORTED"]
       # Same shape as the design case: the banned word, negated uses allowed.
       forbidden_patterns:
-        - "(?:^|[.!?\\n])(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't|is not|isn't|aren't|won't|without|non|nothing|none|neither)\\b)[^.!?\\n])*guarant"
+        - "(?:^|[.!?](?=\\s|$)|\\n)(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't|is not|isn't|aren't|won't|without|non|nothing|none|neither)\\b)(?:[^.!?\\n]|[.!?](?!\\s|$)))*guarant"
   - name: report-carries-the-paired-manifests
     role: objective
     mode: assert

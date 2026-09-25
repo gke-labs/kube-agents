@@ -38,6 +38,10 @@ OBTAINABILITY_PLANNING_METHODS = {
     "compute.beta.AdviceService.CalendarMode",
     "compute.advice.calendarMode",
 }
+# The API's zone statuses that mean no schedulable window there; any other
+# status ("RECOMMENDED") says a window existed and is not an honest
+# no-window verdict.
+NO_WINDOW_STATUSES = {"NO_CAPACITY", "NOT_SUPPORTED", "CONDITIONS_NOT_MET"}
 REQUIRED_SKILLS = {"capacity-obtainability"}
 CLARIFYING_PHRASES = (
     "could you clarify",
@@ -145,7 +149,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     remaining_starts = [
         (str(item.get("startTime") or ""), _parse_timestamp(item.get("startTime")))
         for item in windows
-        if str(item.get("zone") or "") == REMAINING_ZONE
+        if str(item.get("zone") or "").removeprefix("zones/") == REMAINING_ZONE
     ]
 
     answer = delivered_answer(interaction)
@@ -195,19 +199,21 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     # The skill's report template always carries a "**No window**:" bullet,
     # so the phrase alone proves nothing; honesty only counts when exactly
     # one analysis record exists, it carries no remaining-zone window, and
-    # its zoneStatuses names the remaining zone — the shape the skill
-    # mandates for an honest no-window day. An absent or duplicated
-    # analysis record is not honesty.
+    # its zoneStatuses gives the remaining zone one of the API's no-window
+    # statuses — the shape the skill mandates for an honest no-window day.
+    # An absent or duplicated analysis record is not honesty, and neither
+    # is a zone status ("RECOMMENDED") that says a window existed.
     zone_statuses = (
         analysis.get("zoneStatuses") if isinstance(analysis, dict) else None
     )
+    remaining_status = ""
+    if isinstance(zone_statuses, dict):
+        for zone, status in zone_statuses.items():
+            if str(zone).removeprefix("zones/") == REMAINING_ZONE:
+                remaining_status = str(status or "").strip().upper()
     honest_no_window = (
         not remaining_starts
-        and isinstance(zone_statuses, dict)
-        and any(
-            str(zone).removeprefix("zones/") == REMAINING_ZONE
-            for zone in zone_statuses
-        )
+        and remaining_status in NO_WINDOW_STATUSES
         and "no window" in folded_answer
     )
     revised_or_honest = REMAINING_ZONE in answer and (

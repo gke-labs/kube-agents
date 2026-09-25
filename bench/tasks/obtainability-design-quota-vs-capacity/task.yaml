@@ -67,9 +67,10 @@ verification_spec:
       # permits ("no guarantee", "not guaranteed") are honest disclaimers.
       # A segment (sentence or Markdown line — the harness keeps newlines
       # for patterns) that reaches "guarant" with no negation before it
-      # fails.
+      # fails. Punctuation ends a segment only before whitespace or the
+      # end, so "99.9%" cannot split a negation from the word it negates.
       forbidden_patterns:
-        - "(?:^|[.!?\\n])(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't|is not|isn't|aren't|won't|without|non|nothing|none|neither)\\b)[^.!?\\n])*guarant"
+        - "(?:^|[.!?](?=\\s|$)|\\n)(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't|is not|isn't|aren't|won't|without|non|nothing|none|neither)\\b)(?:[^.!?\\n]|[.!?](?!\\s|$)))*guarant"
   - name: report-carries-a-computeclass-design
     role: objective
     mode: assert

@@ -396,10 +396,14 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     # it. Verified live 2026-09-22: us-central1-a returned NO_CAPACITY
     # while europe-west4-b returned a real window.
     zone_statuses = _mapping(analysis.get("zoneStatuses"))
+    # zoneStatuses keys may carry the API's "zones/" prefix — the spelling
+    # _named_zones and test_05 already strip — so strip it here too before
+    # the membership test.
     covered_regions = {str(item["region"]) for item in valid_windows} | {
-        str(zone).rsplit("-", 1)[0]
+        str(zone).removeprefix("zones/").rsplit("-", 1)[0]
         for zone, status in zone_statuses.items()
-        if str(zone) in ALLOWED_ZONES and str(status or "").strip()
+        if str(zone).removeprefix("zones/") in ALLOWED_ZONES
+        and str(status or "").strip()
     }
     ranks = [item.get("rank") for item in windows]
     ranked = (

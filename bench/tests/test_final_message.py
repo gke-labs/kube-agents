@@ -179,9 +179,9 @@ def test_a_delegated_audits_ledger_url_reaches_the_default_scope():
 
 
 GUARANTEE_PATTERN = (
-    "(?:^|[.!?\\n])(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't"
-    "|is not|isn't|aren't|won't|without|non|nothing|none|neither)\\b)"
-    "[^.!?\\n])*guarant"
+    "(?:^|[.!?](?=\\s|$)|\\n)(?:(?!\\b(?:no|not|never|cannot|can't|does not"
+    "|doesn't|is not|isn't|aren't|won't|without|non|nothing|none|neither)\\b)"
+    "(?:[^.!?\\n]|[.!?](?!\\s|$)))*guarant"
 )
 
 
@@ -241,6 +241,22 @@ def test_common_negations_beyond_test01s_list_are_recognized():
         type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
     )
     assert check.verify(5.0).status == "pass"
+
+
+def test_a_decimal_does_not_split_a_negation_from_the_word_it_negates():
+    _set_final("Flex-Start is not a 99.9% guarantee of a start.")
+    check = ReportContainsVerifier(
+        type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
+    )
+    assert check.verify(5.0).status == "pass"
+
+
+def test_a_real_sentence_end_after_a_decimal_still_arms_the_ban():
+    _set_final("Obtainability scored 0.9. Flex-Start guarantees the window.")
+    check = ReportContainsVerifier(
+        type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
+    )
+    assert check.verify(5.0).status == "fail"
 
 
 def test_an_uncompilable_forbidden_pattern_is_rejected_at_construction():
