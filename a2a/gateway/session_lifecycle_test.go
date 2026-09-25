@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -269,12 +270,16 @@ func TestGatewayDirectConfigDefaultsSessionTTL(t *testing.T) {
 // TestScanSessionsResumableCursor verifies Defect 2:
 // ScanSessions streams records via a callback and supports pausing and
 // resuming across a cursor without rescanning from the beginning.
+// Keys are sorted lexicographically so that regardless of insertion order
+// or mid-scan updates, the iteration order is deterministic and unvisited
+// records are never skipped.
 func TestScanSessionsResumableCursor(t *testing.T) {
 	r := startRig(t)
 	ctx := context.Background()
 
-	// Seed 6 sessions
-	for i := 1; i <= 6; i++ {
+	// Seed 6 sessions in non-lexicographic order
+	seedOrder := []int{6, 2, 5, 1, 4, 3}
+	for _, i := range seedOrder {
 		key := fmt.Sprintf("discord:g1/cursor-test-%02d", i)
 		rec := &SessionRecord{
 			Key:          key,
@@ -305,6 +310,28 @@ func TestScanSessionsResumableCursor(t *testing.T) {
 		t.Fatal("first scan returned empty nextCursor")
 	}
 
+	wantFirst := []string{
+		"discord:g1/cursor-test-01",
+		"discord:g1/cursor-test-02",
+		"discord:g1/cursor-test-03",
+	}
+	if !reflect.DeepEqual(firstBatch, wantFirst) {
+		t.Fatalf("first batch = %v, want %v", firstBatch, wantFirst)
+	}
+
+	// Re-Put an already-visited record before resuming. In JetStream KV,
+	// updating an existing key places it at the end of the revision sequence.
+	// Lexicographical sorting ensures the resumed pass still skips it and visits
+	// only the remaining unvisited records.
+	updatedRec := &SessionRecord{
+		Key:          "discord:g1/cursor-test-01",
+		ContextID:    "ctx-01-updated",
+		LastActivity: time.Now().UTC(),
+	}
+	if err := r.g.reg.Put(ctx, updatedRec); err != nil {
+		t.Fatal(err)
+	}
+
 	// Second pass: resume from nextCursor
 	var secondBatch []string
 	finalCursor, done, err := r.g.reg.ScanSessions(ctx, nextCursor, func(rec *SessionRecord) (bool, error) {
@@ -322,6 +349,15 @@ func TestScanSessionsResumableCursor(t *testing.T) {
 	}
 	if len(secondBatch) != 3 {
 		t.Fatalf("second batch processed %d records, want 3", len(secondBatch))
+	}
+
+	wantSecond := []string{
+		"discord:g1/cursor-test-04",
+		"discord:g1/cursor-test-05",
+		"discord:g1/cursor-test-06",
+	}
+	if !reflect.DeepEqual(secondBatch, wantSecond) {
+		t.Fatalf("second batch = %v, want %v", secondBatch, wantSecond)
 	}
 
 	// Ensure no duplicate keys between batches
@@ -725,19 +761,19 @@ func TestLiveSessionLifecycleAgainstCluster(t *testing.T) {
 
 	reg := NewRegistry(client)
 
-	expiredKey := "discord:g1/live-expired-conv"
+	expiredKey := fmt.Sprintf("discord:g1/live-expired-conv-%d", time.Now().UnixNano())
 	expiredRec := &SessionRecord{
 		Key:          expiredKey,
 		ContextID:    "ctx-live-expired",
 		Kind:         "group",
 		Addressee:    "platform",
-		LastActivity: time.Now().UTC().Add(-48 * time.Hour),
+		LastActivity: time.Now().UTC().Add(-8 * 24 * time.Hour), // 8 days ago > 7 days SessionTTL
 	}
 	if err := reg.Put(ctx, expiredRec); err != nil {
 		t.Fatalf("put expired: %v", err)
 	}
 
-	recentKey := "discord:g1/live-recent-conv"
+	recentKey := fmt.Sprintf("discord:g1/live-recent-conv-%d", time.Now().UnixNano())
 	recentRec := &SessionRecord{
 		Key:          recentKey,
 		ContextID:    "ctx-live-recent",
@@ -749,6 +785,13 @@ func TestLiveSessionLifecycleAgainstCluster(t *testing.T) {
 		t.Fatalf("put recent: %v", err)
 	}
 
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer ccancel()
+		_ = reg.DeleteSession(cctx, expiredKey)
+		_ = reg.DeleteSession(cctx, recentKey)
+	})
+
 	mapFile := filepath.Join(t.TempDir(), "principal-map")
 	if err := os.WriteFile(mapFile, []byte("1001 test:bnaylor\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -759,7 +802,7 @@ func TestLiveSessionLifecycleAgainstCluster(t *testing.T) {
 		PrincipalMapPath: mapFile,
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
-		SessionTTL:       24 * time.Hour,
+		SessionTTL:       7 * 24 * time.Hour,
 		AttributionSalt:  []byte("test-salt"),
 	}
 
@@ -773,8 +816,12 @@ func TestLiveSessionLifecycleAgainstCluster(t *testing.T) {
 		t.Fatalf("New gateway: %v", err)
 	}
 
-	// Run reap pass against the live cluster NATS
-	g.reapOnce(ctx)
+	// Exercise reapSession directly on the seeded synthetic records.
+	// We do NOT invoke reapOnce(ctx) against the live cluster install, as that
+	// would scan every real session across the shared session-state bucket and
+	// prune non-test records or leak unmanaged pods without a spawner.
+	g.reapSession(ctx, expiredRec)
+	g.reapSession(ctx, recentRec)
 
 	// Verify in KV bucket
 	gotExpired, err := reg.Get(ctx, expiredKey)
@@ -792,7 +839,4 @@ func TestLiveSessionLifecycleAgainstCluster(t *testing.T) {
 	if gotRecent == nil {
 		t.Fatal("expected recent session record to be retained in KV bucket, got nil")
 	}
-
-	// Clean up recent record
-	_ = reg.DeleteSession(ctx, recentKey)
 }
