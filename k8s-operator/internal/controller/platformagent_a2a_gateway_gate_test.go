@@ -696,6 +696,68 @@ func TestADarkGatewayKeepsTheReconcileRequeuing(t *testing.T) {
 	}
 }
 
+// TestADegradedPassStillMaintainsTheA2AConditions: a next install with no
+// sandbox keypair parks on ShellSandboxKeysMissing on every pass, through
+// the Degraded writer, which knows nothing about the A2A render. The render
+// still ran: the Job it saw complete is recorded, the gateway it withheld is
+// reported, and when a Secret arrives the condition clears on the same
+// parked path.
+func TestADegradedPassStillMaintainsTheA2AConditions(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent). // no sandbox keys, no discord-bot Secret
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if ready := meta.FindStatusCondition(stored.Status.Conditions, "Ready"); ready == nil || ready.Reason != reasonShellSandboxKeysMissing {
+		t.Fatalf("precondition: the install is not parked on the missing keypair: %+v", ready)
+	}
+	if !busProvisioned(stored) {
+		t.Error("the completion the parked pass saw was not recorded; the TTL re-run would count the Job again")
+	}
+	if cond := meta.FindStatusCondition(stored.Status.Conditions, a2aGatewayConditionType); cond == nil || cond.Reason != a2aGatewayDarkReason {
+		t.Errorf("the parked pass withheld the gateway and the CR does not say so: %+v", cond)
+	}
+
+	if err := cl.Create(ctx, discordBotSecret(agent)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d after the Secret: %v", i+1, err)
+		}
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the gateway did not render once the Secret existed: %v", err)
+	}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if cond := meta.FindStatusCondition(stored.Status.Conditions, a2aGatewayConditionType); cond != nil {
+		t.Errorf("the gateway is running and the CR still says it is withheld: %+v", cond)
+	}
+	if !busProvisioned(stored) {
+		t.Error("the record did not survive the gateway lighting up")
+	}
+}
+
 // TestARunningGatewayDoesNotReadTheSecret: the backend question costs an
 // uncached Secret read, and it is asked only on the pass that would create
 // the gateway. An install whose gateway exists pays nothing for the gate.

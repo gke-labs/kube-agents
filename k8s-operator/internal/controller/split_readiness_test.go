@@ -24,6 +24,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -116,12 +117,24 @@ func a2aStackUp(agent *agentv1alpha1.PlatformAgent) []client.Object {
 // a2aStateFrom is the provision state reconcileA2A would have handed the status
 // writer this pass: the Job's digest name, and done when the Job in the fake
 // client reports Complete. The status writer no longer reads the Job itself.
-func a2aStateFrom(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent) a2aProvisionState {
+func a2aStateFrom(t *testing.T, ctx context.Context, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) a2aProvisionState {
 	t.Helper()
+	cl := r.Client
 	if !a2aStackRendering(agent) {
 		return a2aProvisionState{}
 	}
 	state := a2aProvisionState{jobName: buildA2AProvisionJob(agent).Name}
+	// The gateway decision the render would have made: dark when the
+	// Deployment is absent and the install has no backend.
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); errors.IsNotFound(err) {
+		configured, why, berr := r.a2aGatewayBackend(ctx, agent)
+		if berr != nil {
+			t.Fatal(berr)
+		}
+		if !configured {
+			state.gatewayDark, state.gatewayDarkReason = true, why
+		}
+	}
 	job := &batchv1.Job{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: state.jobName, Namespace: agent.Namespace}, job); err != nil {
 		return state
@@ -146,7 +159,7 @@ func settleStatus(t *testing.T, agent *agentv1alpha1.PlatformAgent, objects ...c
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 
 	ctx := context.Background()
-	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, cl, agent))
+	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent))
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -558,7 +571,7 @@ func TestBusProvisionedIsPersistedWhenNothingElseChanged(t *testing.T) {
 	// Settle the rest of the status the writer compares, then take the
 	// record away and persist that, so the record is the only thing the
 	// next pass finds different.
-	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, cl, agent)); err != nil {
+	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
 		t.Fatal(err)
 	}
 	meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
@@ -570,7 +583,7 @@ func TestBusProvisionedIsPersistedWhenNothingElseChanged(t *testing.T) {
 		t.Fatalf("precondition: the settled CR is not Ready: %+v", ready)
 	}
 
-	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, cl, agent))
+	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -583,6 +596,37 @@ func TestBusProvisionedIsPersistedWhenNothingElseChanged(t *testing.T) {
 	}
 	if !busProvisioned(stored) {
 		t.Error("BusProvisioned was not persisted on a pass where nothing else about the status changed")
+	}
+}
+
+// TestTheStatusWriterReportsThePassesOwnGatewayDecision: the render decided
+// the gateway was dark; a Secret that landed after that decision and before
+// the status write does not make the writer report a gateway the pass did
+// not create. Same pass, one answer.
+func TestTheStatusWriterReportsThePassesOwnGatewayDecision(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := splitReadinessNextAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, discordBotSecret(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1),
+			a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, true)).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+	ctx := context.Background()
+	decided := a2aProvisionState{done: true, jobName: buildA2AProvisionJob(agent).Name, gatewayDark: true, gatewayDarkReason: "no chat backend is configured (decided before the Secret landed)"}
+	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), decided)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if phase != "Ready" {
+		t.Fatalf("got phase %q, want Ready: the pass withheld the gateway on purpose", phase)
+	}
+	cond := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType)
+	if cond == nil || cond.Message != decided.gatewayDarkReason {
+		t.Fatalf("the writer did not report the pass's own decision: %+v", cond)
 	}
 }
 
@@ -613,7 +657,7 @@ func TestTheDarkGatewayConditionClearsEvenWhenTheReadyMessageDoesNot(t *testing.
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 	ctx := context.Background()
-	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, cl, agent)); err != nil {
+	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
 		t.Fatal(err)
 	}
 	if meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType) == nil {
@@ -627,7 +671,7 @@ func TestTheDarkGatewayConditionClearsEvenWhenTheReadyMessageDoesNot(t *testing.
 	if err := cl.Create(ctx, a2aGatewayWorkload(agent, 1)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, cl, agent)); err != nil {
+	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, r, agent)); err != nil {
 		t.Fatal(err)
 	}
 	persisted := &agentv1alpha1.PlatformAgent{}

@@ -319,6 +319,31 @@ const (
 	a2aProvisionJobNameInfix      = "-a2a-provision-"
 	a2aProvisionJobNameHashLength = 8
 
+	// a2aDiscordBotSecretName is the hand-made Secret carrying the Discord bot
+	// token, the one chat backend the gateway can be given today without a door.
+	a2aDiscordBotSecretName = "discord-bot"
+	a2aDiscordBotTokenKey   = "token" // #nosec G101 -- Secret key name, not a credential
+
+	// The condition the status writers publish while a next install's gateway
+	// is withheld for want of a backend (#1660, option 1). Informational rather
+	// than Degraded: the install did nothing wrong, it configured no chat
+	// backend, and the rest of the stack is up. The message names what would
+	// render it.
+	a2aGatewayConditionType = "A2AGateway"
+	a2aGatewayDarkReason    = "NoChatBackend"
+
+	// The condition that records the bus having been provisioned once: written
+	// the first pass that sees the provisioning Job complete, whichever phase
+	// that pass ends on, kept through the Job's later lives (the 24h TTL
+	// removes a finished Job and create-if-absent runs it again; a digest
+	// change runs a new one), removed with the rest of the stack when the mode
+	// flips to today. It is what lets Ready stop counting the Job after the
+	// first completion. Only this code writes it, so a Ready inherited from an
+	// operator that never counted the Job cannot seed it: that operator is the
+	// one #1701 describes, and its Ready is exactly the claim not to trust.
+	busProvisionedConditionType = "BusProvisioned"
+	busProvisionedReason        = "ProvisionJobComplete"
+
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
 	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
@@ -2614,37 +2639,6 @@ type a2aProvisionState struct {
 	// and carrying it saves re-rendering the JobSpec to hash it again.
 	jobName string
 }
-
-// a2aDiscordBotSecretName is the hand-made Secret carrying the Discord bot
-// token, the one chat backend the gateway can be given today without a door.
-const (
-	a2aDiscordBotSecretName = "discord-bot"
-	a2aDiscordBotTokenKey   = "token" // #nosec G101 -- Secret key name, not a credential
-)
-
-// The condition the status writer publishes while a next install's gateway
-// is withheld for want of a backend (#1660, option 1). Informational rather
-// than Degraded: the install did nothing wrong, it configured no chat
-// backend, and the rest of the stack is up. The message names what would
-// render it.
-const (
-	a2aGatewayConditionType = "A2AGateway"
-	a2aGatewayDarkReason    = "NoChatBackend"
-)
-
-// The condition that records the bus having been provisioned once: written
-// the first pass that sees the provisioning Job complete, kept through the
-// Job's later lives (the 24h TTL removes a finished Job and create-if-absent
-// runs it again; a digest change runs a new one), removed with the rest of
-// the stack when the mode flips to today. It is what lets Ready stop
-// counting the Job after the first completion. Only this code writes it, so
-// a Ready inherited from an operator that never counted the Job cannot seed
-// it: that operator is the one #1701 describes, and its Ready is exactly the
-// claim not to trust.
-const (
-	busProvisionedConditionType = "BusProvisioned"
-	busProvisionedReason        = "ProvisionJobComplete"
-)
 
 // a2aGatewayBackend reports whether the install gives the gateway a chat
 // backend to start on, and if not, what would. The gateway binary refuses to
