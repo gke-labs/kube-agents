@@ -49,6 +49,9 @@ func (g *Gateway) reapOnce(ctx context.Context) {
 
 	nextCursor, done, err := g.reg.ScanSessions(ctx, cursor, func(rec *SessionRecord) (bool, error) {
 		g.reapSession(ctx, rec)
+		if g.reapScanHook != nil {
+			return g.reapScanHook(rec), nil
+		}
 		return true, nil
 	})
 	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
@@ -83,6 +86,13 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 				g.log.Error("reap: session record delete failed", "session", fresh.Key, "err", err)
 			} else {
 				g.log.Info("reaped expired session record", "session", fresh.Key, "lastActivity", fresh.LastActivity)
+				for _, t := range fresh.Tasks {
+					_ = g.reg.DropTask(ctx, t.ID)
+					g.mu.Lock()
+					delete(g.relays, t.ID)
+					delete(g.taskSessions, t.ID)
+					g.mu.Unlock()
+				}
 			}
 			l.Unlock()
 			return

@@ -112,6 +112,9 @@ type Gateway struct {
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
 	reapCursor string
+	// reapScanHook is an optional test hook invoked during reap passes on each visited record.
+	// Returning false halts the reap scan early.
+	reapScanHook func(rec *SessionRecord) bool
 	// taskSessions caches taskId -> session key; the KV task index is the
 	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string

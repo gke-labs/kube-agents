@@ -2,13 +2,19 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // TestSessionRecordDeletedAfterSessionTTL verifies Defect 1:
@@ -280,4 +286,310 @@ func TestIsMaxBytesDetection(t *testing.T) {
 			t.Errorf("isMaxBytes(%v) = %v, want %v", tc.err, got, tc.want)
 		}
 	}
+}
+
+// TestReapOnceResumableCursor verifies Defect 2:
+// Gateway.reapOnce carries the resumption cursor across passes in g.reapCursor,
+// so when a pass stops short, the next pass resumes without rescanning already-visited records.
+func TestReapOnceResumableCursor(t *testing.T) {
+	r := startRig(t)
+	ctx := context.Background()
+
+	// Seed 6 sessions
+	var seededKeys []string
+	for i := 1; i <= 6; i++ {
+		key := fmt.Sprintf("discord:g1/reap-cursor-%02d", i)
+		seededKeys = append(seededKeys, key)
+		rec := &SessionRecord{
+			Key:          key,
+			ContextID:    fmt.Sprintf("ctx-reap-%02d", i),
+			LastActivity: time.Now().UTC(),
+		}
+		if err := r.g.reg.Put(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// First pass: halt after 3 records via reapScanHook
+	var firstPass []string
+	r.g.reapScanHook = func(rec *SessionRecord) bool {
+		firstPass = append(firstPass, rec.Key)
+		return len(firstPass) < 3
+	}
+
+	r.g.reapOnce(context.Background())
+
+	if len(firstPass) != 3 {
+		t.Fatalf("first reap pass visited %d records, want 3", len(firstPass))
+	}
+
+	r.g.mu.Lock()
+	savedCursor := r.g.reapCursor
+	r.g.mu.Unlock()
+
+	if savedCursor == "" {
+		t.Fatal("expected reapCursor to be preserved after partial reap pass, got empty")
+	}
+
+	// Second pass: resume from reapCursor to completion
+	var secondPass []string
+	r.g.reapScanHook = func(rec *SessionRecord) bool {
+		secondPass = append(secondPass, rec.Key)
+		return true
+	}
+
+	r.g.reapOnce(context.Background())
+
+	if len(secondPass) != 3 {
+		t.Fatalf("second reap pass visited %d records, want 3", len(secondPass))
+	}
+
+	// Verify cursor was reset to empty upon completion
+	r.g.mu.Lock()
+	finalCursor := r.g.reapCursor
+	r.g.mu.Unlock()
+
+	if finalCursor != "" {
+		t.Fatalf("expected reapCursor to reset to empty on completion, got %q", finalCursor)
+	}
+
+	// Ensure no duplicate keys across passes (asserting resumption)
+	seen := make(map[string]bool)
+	for _, k := range firstPass {
+		seen[k] = true
+	}
+	for _, k := range secondPass {
+		if seen[k] {
+			t.Fatalf("record %q was visited in both reap passes", k)
+		}
+	}
+
+	// Also test the context-cancellation/deadline-exceeded path
+	// Seed 4 more sessions
+	for i := 1; i <= 4; i++ {
+		key := fmt.Sprintf("discord:g1/reap-timeout-%02d", i)
+		rec := &SessionRecord{
+			Key:          key,
+			ContextID:    fmt.Sprintf("ctx-timeout-%02d", i),
+			LastActivity: time.Now().UTC(),
+		}
+		if err := r.g.reg.Put(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	var timeoutPass []string
+	r.g.reapScanHook = func(rec *SessionRecord) bool {
+		timeoutPass = append(timeoutPass, rec.Key)
+		if len(timeoutPass) == 2 {
+			cancel() // simulate deadline exceeded / cancellation mid-scan
+		}
+		return true
+	}
+
+	r.g.reapOnce(cancelCtx)
+
+	r.g.mu.Lock()
+	timeoutCursor := r.g.reapCursor
+	r.g.mu.Unlock()
+
+	if timeoutCursor == "" {
+		t.Fatal("expected reapCursor to be saved when reap pass is interrupted by context cancellation")
+	}
+}
+
+// TestLateTaskEventForPrunedSessionDroppedWithoutRequeueLoop verifies that a late task
+// event for a session record pruned past SessionTTL drops the batch and cleans up the
+// task routing index instead of entering an unbounded 2-second requeue loop.
+func TestLateTaskEventForPrunedSessionDroppedWithoutRequeueLoop(t *testing.T) {
+	r := startRig(t)
+	ctx := context.Background()
+
+	conv := "discord:g1/pruned-conv"
+	taskID := "task-late-straggler"
+
+	// Index task in KV and cache in memory
+	if err := r.g.reg.IndexTask(ctx, taskID, conv); err != nil {
+		t.Fatal(err)
+	}
+	r.g.mu.Lock()
+	r.g.taskSessions[taskID] = conv
+	r.g.mu.Unlock()
+
+	// Ensure session record is absent
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec != nil {
+		t.Fatal("session record must not exist")
+	}
+
+	payload, err := json.Marshal(lib.StatusUpdate{
+		Status: lib.TaskStatus{State: lib.StateWorking},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(
+		lib.Party{Session: "platform"},
+		taskID,
+		"ctx-straggler",
+		"corr-straggler",
+		payload,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	item := relayItem{
+		env:     env,
+		subject: "a2a.tasks.platform." + taskID + ".events",
+	}
+
+	// Directly invoke relayBatch
+	r.g.relayBatch(conv, []relayItem{item})
+
+	// Wait briefly to ensure no requeue goroutine executes
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify in-memory task routing was retired
+	r.g.mu.Lock()
+	cached, ok := r.g.taskSessions[taskID]
+	r.g.mu.Unlock()
+	if ok || cached != "" {
+		t.Fatalf("taskSessions was not deleted: %q", cached)
+	}
+
+	// Verify KV task index was dropped
+	sessionFromKV, err := r.g.reg.SessionForTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("SessionForTask error: %v", err)
+	}
+	if sessionFromKV != "" {
+		t.Fatalf("KV task index was not dropped: %q", sessionFromKV)
+	}
+
+	// Verify sessionForTask resolves to empty
+	resolved := r.g.sessionForTask(ctx, taskID)
+	if resolved != "" {
+		t.Fatalf("sessionForTask resolved pruned task to %q", resolved)
+	}
+}
+
+// TestLiveSessionLifecycleAgainstCluster exercises session record pruning and retention against
+// a live NATS deployment when A2A_LIVE_NATS_URL is set (e.g. against kyber-test).
+func TestLiveSessionLifecycleAgainstCluster(t *testing.T) {
+	url := os.Getenv("A2A_LIVE_NATS_URL")
+	if url == "" {
+		t.Skip("A2A_LIVE_NATS_URL not set; skipping live cluster verification")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("nats connect: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+
+	_, _ = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:      lib.TasksStream,
+		Subjects:  []string{"a2a.tasks.>"},
+		Retention: jetstream.LimitsPolicy,
+		MaxAge:    72 * time.Hour,
+	})
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.SessionStateBucket})
+	if err != nil {
+		kv, err = js.KeyValue(ctx, lib.SessionStateBucket)
+		if err != nil {
+			t.Fatalf("kv session-state: %v", err)
+		}
+	}
+
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-livetest-client"))
+	if err != nil {
+		t.Fatalf("lib.Connect: %v", err)
+	}
+	defer client.Close()
+
+	reg := NewRegistry(client)
+
+	expiredKey := "discord:g1/live-expired-conv"
+	expiredRec := &SessionRecord{
+		Key:          expiredKey,
+		ContextID:    "ctx-live-expired",
+		Kind:         "group",
+		Addressee:    "platform",
+		LastActivity: time.Now().UTC().Add(-48 * time.Hour),
+	}
+	if err := reg.Put(ctx, expiredRec); err != nil {
+		t.Fatalf("put expired: %v", err)
+	}
+
+	recentKey := "discord:g1/live-recent-conv"
+	recentRec := &SessionRecord{
+		Key:          recentKey,
+		ContextID:    "ctx-live-recent",
+		Kind:         "group",
+		Addressee:    "platform",
+		LastActivity: time.Now().UTC().Add(-10 * time.Minute),
+	}
+	if err := reg.Put(ctx, recentRec); err != nil {
+		t.Fatalf("put recent: %v", err)
+	}
+
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("1001 test:bnaylor\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{
+		NATSURL:          url,
+		PrincipalMapPath: mapFile,
+		DefaultAddressee: "platform",
+		IdleTTL:          30 * time.Minute,
+		SessionTTL:       24 * time.Hour,
+		AttributionSalt:  []byte("test-salt"),
+	}
+
+	g, err := New(Options{
+		Client:  client,
+		Adapter: newFakeAdapter(),
+		Config:  cfg,
+		Backend: "discord",
+	})
+	if err != nil {
+		t.Fatalf("New gateway: %v", err)
+	}
+
+	// Run reap pass against the live cluster NATS
+	g.reapOnce(ctx)
+
+	// Verify in KV bucket
+	gotExpired, err := reg.Get(ctx, expiredKey)
+	if err != nil {
+		t.Fatalf("Get expired: %v", err)
+	}
+	if gotExpired != nil {
+		t.Fatalf("expected expired session record to be pruned from KV bucket, found: %+v", gotExpired)
+	}
+
+	gotRecent, err := reg.Get(ctx, recentKey)
+	if err != nil {
+		t.Fatalf("Get recent: %v", err)
+	}
+	if gotRecent == nil {
+		t.Fatal("expected recent session record to be retained in KV bucket, got nil")
+	}
+
+	// Clean up recent record
+	_ = kv.Delete(ctx, kvKey(recentKey))
 }
