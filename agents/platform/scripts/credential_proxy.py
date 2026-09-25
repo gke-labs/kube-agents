@@ -191,6 +191,17 @@ API_RELAY_PATH_LOG_LENGTH = 256
 # the same 512 as a literal.
 PRINCIPAL_LOG_LENGTH = 512
 MILLISECONDS_PER_SECOND = 1000
+# The label a client may attach to the content workspace it opens, so the
+# broker's reap and refusal lines can be read back to the session that opened
+# it. It reaches a log line and nothing else, and it is agent-controlled, so it
+# is held to a grammar here -- the one broker-side entry point -- rather than
+# sanitised: a value outside it is dropped to "" rather than trimmed into
+# shape, and nothing agent-controlled reaches the log unfiltered. Letters,
+# digits and `._:-`, one to 64 characters: a kanban card id is `t_<hex>`, a
+# Hermes session id and the `adhoc-<hex>` lease label fit too, and nothing in
+# the set is a line break or a log-field separator. `\A`/`\Z` with `fullmatch`,
+# for the reason `credential_proxy_client._GKE_CONTEXT_COMPONENT` gives.
+WORKSPACE_CALLER_SHAPE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
 
 
 def is_valid_repository(repository: Any) -> bool:
@@ -5390,11 +5401,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # clone would take the skill away rather than take a capability
             # away. The gate is on `commit` and `push` below, which are where
             # the installation token stops reading and starts writing.
+            #
+            # `caller` is optional -- a client older than the field sends none
+            # -- and it is the one agent-controlled value on this route that
+            # reaches a log line, so it is checked here and nowhere else.
+            caller = payload.get("caller")
+            if not isinstance(caller, str) or not WORKSPACE_CALLER_SHAPE.fullmatch(caller):
+                caller = ""
             workspace = store.open(
                 requested,
                 payload.get("base") or None,
                 payload.get("branch") or None,
                 payload.get("depth"),
+                caller=caller,
             )
             return {
                 "handle": workspace.handle,

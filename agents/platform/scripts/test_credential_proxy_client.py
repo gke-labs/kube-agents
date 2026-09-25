@@ -796,6 +796,55 @@ class WorkspaceClientTest(unittest.TestCase):
 
         return patch.object(credential_proxy_client, "open_broker_request", fake_open)
 
+    def test_open_labels_the_workspace_with_the_session_it_runs_under(self):
+        """The broker's reap and refusal lines name a caller only if one is sent.
+
+        The label defaults from the kanban card, then the chat session, and is
+        left off the wire when there is neither, so a session with no identity
+        sends the payload every broker has always accepted.
+        """
+        answers = {
+            "open": {
+                "handle": "a" * 32,
+                "repo": "acme/infra",
+                "base": "main",
+                "baseSha": "b" * 40,
+            }
+        }
+        scrubbed = patch.dict(os.environ)
+        scrubbed.start()
+        self.addCleanup(scrubbed.stop)
+        for name in credential_proxy_client.WORKSPACE_CALLER_ENV:
+            os.environ.pop(name, None)
+
+        with self._serve(answers):
+            with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_abc"}):
+                credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
+            with patch.dict(os.environ, {"HERMES_SESSION_ID": "s_def"}):
+                credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
+            # The card outranks the session when both are set.
+            with patch.dict(
+                os.environ, {"HERMES_KANBAN_TASK": "t_abc", "HERMES_SESSION_ID": "s_def"}
+            ):
+                credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
+                # An explicit label wins over both, and an explicit empty one
+                # sends none.
+                credential_proxy_client.Workspace.open(
+                    self.endpoint, "acme/infra", caller="adhoc-1"
+                )
+                credential_proxy_client.Workspace.open(
+                    self.endpoint, "acme/infra", caller=""
+                )
+            credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
+
+        payloads = [body for _, body in self.calls]
+        self.assertEqual("t_abc", payloads[0]["caller"])
+        self.assertEqual("s_def", payloads[1]["caller"])
+        self.assertEqual("t_abc", payloads[2]["caller"])
+        self.assertEqual("adhoc-1", payloads[3]["caller"])
+        self.assertEqual({"repo": "acme/infra"}, payloads[4])
+        self.assertEqual({"repo": "acme/infra"}, payloads[5])
+
     def test_open_commit_push_close(self):
         answers = {
             "open": {
@@ -1002,6 +1051,15 @@ class WorkspaceReadVerbsTest(unittest.TestCase):
     def setUp(self):
         self.endpoint = "http://127.0.0.1:8765"
         self.calls = []
+        # The open payload is asserted exactly below, and `Workspace.open`
+        # labels it from the session's environment when there is one, so the
+        # label's sources are cleared here rather than left to whatever shell
+        # runs the tests.
+        scrubbed = patch.dict(os.environ)
+        scrubbed.start()
+        self.addCleanup(scrubbed.stop)
+        for name in credential_proxy_client.WORKSPACE_CALLER_ENV:
+            os.environ.pop(name, None)
 
     def _workspace(self, answers, **opened):
         def fake_open(request, *args, **kwargs):

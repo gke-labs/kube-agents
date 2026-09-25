@@ -629,6 +629,17 @@ clone**, so the two defaults multiply out to about 2 GiB retained across eight
 open workspaces, by design. Size the node's ephemeral storage against the
 product, not against either number.
 
+The count is a ceiling on live work, not a lifetime quota, because a client
+that dies never sends `close`: a workspace that no verb has touched for
+`CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS` (30 minutes by default, the same
+bound the kanban dispatcher uses to reclaim a silent worker) is removed by the
+next `open`, and the root is emptied when the process starts, since the
+registry is process memory and nothing on disk at that point has a handle.
+Without either, eight abandoned handles would refuse every open until the Pod
+restarted. Both the reap and the refusal at the ceiling are logged with the
+handle's first eight characters, the repository, the caller label the client
+sent, and the idle time and age.
+
 The ceiling is also measured after the clone finishes, so it bounds what is
 _retained_ and not the peak: a repository far over the limit still lands on the
 disk before it is removed, and the only thing bounding that is the runtime's

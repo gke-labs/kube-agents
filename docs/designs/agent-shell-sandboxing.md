@@ -2460,7 +2460,13 @@ no way to know that reading somebody else's code is still possible. Its `clone` 
 pages the listing, batches the reads and writes the files into a scratch directory; what lands
 is source with no repository around it, which is the same property the write path has for the
 same reason. Its `open`/`grep`/`fetch`/`close` sequence is for repositories too large to copy,
-and the handle rather than a directory is what travels between the agent's turns. On a broker
+and the handle rather than a directory is what travels between the agent's turns. A handle that
+no verb has used for longer than the idle bound is reclaimed the next time any session opens a
+workspace, not on a timer, because a session that dies holding one never closes it and the count
+ceiling would otherwise fill with clones nothing can name; the next verb on it answers
+`workspace.unknown-handle` and the remedy is a fresh `open`. The bound, its default and the knob
+that sets it are beside the count ceiling in
+[`credential-isolation-design.md`](../credential-isolation-design.md). On a broker
 that has not been armed, `clone` falls back to the leased checkout and says `"mode":
 "directory"`; the handle subcommands say they cannot serve the request instead of pretending.
 

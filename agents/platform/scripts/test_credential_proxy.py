@@ -4328,6 +4328,12 @@ class WorkspaceGitPathTest(unittest.TestCase):
                 self.assertEqual(404, post(route, {})[0])
 
         # On, with a store whose git is a local repository rather than GitHub.
+        # The store is built before the tree is seeded under its root:
+        # construction removes every tree it finds there, since none can have
+        # a handle in a registry that did not exist yet.
+        store = content_workspace.ContentWorkspaceStore(
+            tree_root, executor.workspace_dir, executor.execute_workspace_git
+        )
         seeded = tree_root / "seed"
         seeded.mkdir(parents=True, exist_ok=True)
         subprocess.run(
@@ -4337,9 +4343,6 @@ class WorkspaceGitPathTest(unittest.TestCase):
         )
         (seeded / "manifests").mkdir(exist_ok=True)
         (seeded / "manifests" / "app.yaml").write_text("kind: Service\n")
-        store = content_workspace.ContentWorkspaceStore(
-            tree_root, executor.workspace_dir, executor.execute_workspace_git
-        )
         workspace = content_workspace.Workspace(
             handle="c" * 32, repo="acme/fleet", tree=seeded, base="main", base_sha=""
         )
@@ -4996,6 +4999,53 @@ class WorkspaceRouteTest(unittest.TestCase):
             store = self._route("open", {"repo": "kubernetes-sigs/kustomize"})
         gate.assert_not_called()
         self.assertEqual("open", store.method_calls[0][0])
+
+    def test_the_open_route_admits_a_caller_label_only_in_its_grammar(self):
+        # The label is agent-controlled and reaches a log line, so the route
+        # holds it to `WORKSPACE_CALLER_SHAPE` and passes "" for anything
+        # else. Dropped rather than trimmed: a label cut into shape is a label
+        # the agent still chose.
+        for caller, expected in (
+            ("t_1234", "t_1234"),
+            ("adhoc-9f3c1e07", "adhoc-9f3c1e07"),
+            ("t_1\nforged=1", ""),
+            ("x" * 200, ""),
+            ("", ""),
+            (42, ""),
+        ):
+            with self.subTest(caller=caller):
+                store = self._route("open", {"repo": "acme/fleet", "caller": caller})
+                self.assertEqual(expected, store.open.call_args.kwargs["caller"])
+        # A client older than the field sends none and keeps working.
+        store = self._route("open", {"repo": "acme/fleet"})
+        self.assertEqual("", store.open.call_args.kwargs["caller"])
+
+        # End to end against a real store: a forged label never reaches the
+        # refusal line, which is the only place the label goes.
+        import content_workspace
+
+        base = Path(self.temp_dir.name)
+        (base / "data").mkdir(exist_ok=True)
+        real = content_workspace.ContentWorkspaceStore(
+            base / "trees",
+            base / "data",
+            lambda argv, cwd: mock.Mock(exit_code=0, stdout="", stderr=""),
+        )
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.workspaces = real
+        with mock.patch.object(content_workspace, "max_workspaces", lambda: 1):
+            handler._workspace_route(
+                "open", {"repo": "acme/fleet", "caller": "t_1\nforged=1"}
+            )
+            with self.assertLogs("credential-proxy", level="WARNING") as captured:
+                with self.assertRaises(content_workspace.TooLarge):
+                    handler._workspace_route("open", {"repo": "acme/fleet", "caller": "t_2"})
+        messages = [record.getMessage() for record in captured.records]
+        self.assertEqual(1, len(messages), messages)
+        self.assertIn("open=1 limit=1", messages[0])
+        self.assertIn("repo=acme/fleet caller= idle=", messages[0])
+        self.assertNotIn("forged", messages[0])
+        self.assertNotIn("\n", messages[0])
 
     def test_the_read_verb_splits_on_paths_rather_than_on_a_second_route(self):
         # One verb, two shapes. Keyed on the presence of `paths` so that a

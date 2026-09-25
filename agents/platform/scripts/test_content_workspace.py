@@ -866,6 +866,254 @@ class ResourceCeilingTest(unittest.TestCase):
         self.assertEqual([workspace.handle], [p.name for p in store.tree_root.iterdir()])
 
 
+class FakeClock:
+    """`time.monotonic`, advanced by hand. Starts at a plausible uptime."""
+
+    def __init__(self, now: float = 52_431.117) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class IdleReapTest(unittest.TestCase):
+    """A dead client never sends `close`, so the ceiling filled and stayed full.
+
+    The registry is process memory and `close` was the only thing that removed
+    an entry. Under concurrent lanes, a worker killed holding a handle leaked
+    its clone for the life of the container, and eight such leaks refused every
+    later `open` until the Pod restarted. `open` now reaps whatever no verb has
+    touched within the idle bound, and construction empties the root.
+    """
+
+    IDLE = 1800
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+        self.clock = FakeClock()
+        for patcher in (
+            mock.patch.object(content_workspace, "max_workspaces", lambda: 3),
+            mock.patch.object(content_workspace, "workspace_idle_seconds", lambda: self.IDLE),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def store(self, runner=None):
+        return ContentWorkspaceStore(
+            self.base / "trees", self.agent, runner or RecordingRunner(), clock=self.clock
+        )
+
+    def test_an_idle_workspace_is_reaped_to_make_room_at_the_cap(self):
+        store = self.store()
+        opened = [store.open("acme/fleet", caller=f"t_{i}") for i in range(3)]
+        with self.assertRaises(TooLarge):
+            store.open("acme/fleet")
+
+        self.clock.advance(self.IDLE + 1)
+        fourth = store.open("acme/fleet", caller="t_late")
+        self.assertIsNotNone(fourth)
+        # All three idle ones went, not just enough to make room: an idle
+        # workspace holds disk whether or not anyone is at the ceiling.
+        self.assertEqual([fourth.handle], list(store._workspaces))
+        self.assertEqual([fourth.handle], [p.name for p in store.tree_root.iterdir()])
+        for workspace in opened:
+            self.assertFalse(workspace.tree.parent.exists(), "a reaped tree stayed on disk")
+
+        # Paired ordinary use: the room the reap made is real room, and the
+        # ceiling still holds against live workspaces.
+        store.open("acme/fleet")
+        store.open("acme/fleet")
+        with self.assertRaises(TooLarge):
+            store.open("acme/fleet")
+        self.assertEqual(3, len(store._workspaces))
+        self.assertEqual(3, len(list(store.tree_root.iterdir())))
+
+    def test_a_reaped_handle_raises_no_such_handle(self):
+        store = self.store()
+        stale = store.open("acme/fleet")
+        self.clock.advance(self.IDLE + 1)
+        store.open("acme/fleet")
+        for verb in (
+            lambda: store.get(stale.handle),
+            lambda: store.read(stale.handle, "a.yaml"),
+            lambda: store.list(stale.handle),
+            lambda: store.close(stale.handle),
+        ):
+            with self.assertRaises(NoSuchHandle):
+                verb()
+
+        # Paired: a handle that was not reaped still resolves to its workspace.
+        live = store.open("acme/fleet")
+        self.assertIs(live, store.get(live.handle))
+
+    def test_an_active_workspace_is_never_reaped(self):
+        """Idle, not age: a session that keeps talking keeps its clone.
+
+        The boundary is asserted from both sides in one run -- touched one
+        second inside the bound survives, untouched one second past it does
+        not -- so a reaper that measured age or used the wrong comparison
+        would fail here rather than in a nightly.
+        """
+        store = self.store()
+        active = store.open("acme/fleet", caller="t_active")
+        active.tree.mkdir(parents=True, exist_ok=True)
+        (active.tree / "a.yaml").write_bytes(b"kind: A\n")
+        idle = store.open("acme/fleet", caller="t_idle")
+        store.open("acme/fleet", caller="t_third")
+
+        self.clock.advance(self.IDLE - 1)
+        store.list(active.handle)
+        self.clock.advance(2)
+        # Now `idle` and the third are IDLE + 1 past their last verb and
+        # `active` is 2 s past its `list`.
+        newcomer = store.open("acme/fleet", caller="t_new")
+
+        self.assertNotIn(idle.handle, store._workspaces)
+        self.assertIn(active.handle, store._workspaces)
+        self.assertEqual(b"kind: A\n", store.read(active.handle, "a.yaml"))
+        self.assertEqual({active.handle, newcomer.handle}, set(store._workspaces))
+
+        # Exactly at the bound is not past it.
+        self.clock.advance(self.IDLE - 2)
+        store.open("acme/fleet")
+        self.assertIn(active.handle, store._workspaces)
+
+    def test_below_the_idle_bound_the_cap_still_refuses_and_says_why(self):
+        store = self.store()
+        for index in range(3):
+            store.open("acme/fleet", caller=f"t_{index}")
+            self.clock.advance(100)
+        # Idle 300 s, 200 s and 100 s: all well inside the bound, so the
+        # refusal stands and the log says who is holding the store.
+        with self.assertLogs("credential-proxy", level="WARNING") as captured:
+            with self.assertRaises(TooLarge) as caught:
+                store.open("acme/fleet", caller="t_refused")
+        self.assertEqual(3, len(store._workspaces))
+
+        message = str(caught.exception)
+        self.assertIn("3 workspaces are open, which is the limit of 3", message)
+        self.assertIn("idle between 100s and 300s", message)
+        self.assertIn(f"idle longer than {self.IDLE}s is reclaimed on the next open", message)
+        self.assertNotIn("close one", message)
+
+        lines = [record.getMessage() for record in captured.records]
+        self.assertEqual(1, len(lines), lines)
+        line = lines[0]
+        self.assertIn("content workspace limit reached open=3 limit=3", line)
+        for index in range(3):
+            self.assertIn(f"repo=acme/fleet caller=t_{index} idle=", line)
+        self.assertIn("idle=300s age=300s", line)
+        self.assertIn("idle=100s age=100s", line)
+        self.assertEqual(3, line.count("handle="))
+
+        # Neither the log nor the answer carries a path or a whole handle: the
+        # log leaves the Pod, the answer reaches the agent, and the handle is a
+        # bearer capability.
+        for text in (message, line):
+            self.assertNotIn(str(store.tree_root), text)
+            self.assertNotIn(str(self.base), text)
+            self.assertNotRegex(text, r"[0-9a-f]{32}")
+        self.assertNotIn("handle=", message)
+        for handle in store._workspaces:
+            self.assertIn(f"handle={handle[:8]} ", line)
+
+    def test_the_reap_is_logged_with_repo_caller_and_idle(self):
+        store = self.store()
+        store.open("acme/fleet", caller="t_abc123")
+        self.clock.advance(self.IDLE + 5)
+        with self.assertLogs("credential-proxy", level="WARNING") as captured:
+            store.open("acme/other")
+        lines = [record.getMessage() for record in captured.records]
+        self.assertEqual(1, len(lines), lines)
+        self.assertIn("content workspace reaped handle=", lines[0])
+        self.assertIn(
+            f"repo=acme/fleet caller=t_abc123 idle={self.IDLE + 5}s age={self.IDLE + 5}s open=0",
+            lines[0],
+        )
+        self.assertNotRegex(lines[0], r"[0-9a-f]{32}")
+        self.assertNotIn(str(store.tree_root), lines[0])
+
+        # Paired: an open that reaps nothing logs nothing at this level.
+        with self.assertNoLogs("credential-proxy", level="WARNING"):
+            store.open("acme/fleet")
+
+    def test_get_advances_last_used_on_every_verb_and_not_on_time_alone(self):
+        store = self.store()
+        workspace = store.open("acme/fleet")
+        workspace.tree.mkdir(parents=True, exist_ok=True)
+        (workspace.tree / "a.yaml").write_bytes(b"kind: A\n")
+        opened = workspace.last_used
+        self.assertEqual(self.clock.now, opened)
+
+        self.clock.advance(10)
+        self.assertEqual(opened, workspace.last_used, "time alone must not touch it")
+
+        for verb in (
+            lambda: store.list(workspace.handle),
+            lambda: store.read(workspace.handle, "a.yaml"),
+            lambda: store.grep(workspace.handle, "kind"),
+        ):
+            self.clock.advance(10)
+            verb()
+            self.assertEqual(self.clock.now, workspace.last_used)
+        self.assertEqual(opened + 40, workspace.last_used)
+
+    def test_orphan_trees_under_the_root_are_removed_at_construction(self):
+        """No handle survives a process restart, so no tree on disk should either.
+
+        The registry is memory. A container that crashed and restarted on the
+        same emptyDir has trees under the root that nothing can ever name, and
+        `close` cannot reach a tree it has no handle for.
+        """
+        root = self.base / "trees"
+        for name in ("a" * 32, "b" * 32):
+            (root / name / "repo" / "manifests").mkdir(parents=True)
+            (root / name / "repo" / "manifests" / "x.yaml").write_text("kind: X\n")
+        with self.assertLogs("credential-proxy", level="WARNING") as captured:
+            store = self.store()
+        self.assertEqual([], list(store.tree_root.iterdir()))
+        self.assertEqual({}, store._workspaces)
+        self.assertIn("held 2 entry(ies) from a previous process; removed 2", captured.output[0])
+        self.assertNotIn(str(root), captured.output[0])
+
+        # Paired: a workspace opened after construction stays on disk, and a
+        # store built over an empty root has nothing to say.
+        workspace = store.open("acme/fleet")
+        self.assertEqual([workspace.handle], [p.name for p in store.tree_root.iterdir()])
+        with self.assertNoLogs("credential-proxy", level="WARNING"):
+            ContentWorkspaceStore(self.base / "trees2", self.agent, RecordingRunner())
+
+    def test_the_sweep_unlinks_a_link_or_file_at_the_root_rather_than_walking_it(self):
+        """`open` creates directories, so anything else at the root is not a tree it left.
+
+        `_remove_tree` follows a symlink at its root into the target, so a link
+        handed to it had its target emptied while the link stayed, and a plain
+        file survived; the log line said "removed" either way.
+        """
+        root = self.base / "trees"
+        root.mkdir()
+        outside = self.base / "outside"
+        (outside / "sub").mkdir(parents=True)
+        (outside / "keep").write_text("kept\n")
+        (outside / "sub" / "keep").write_text("kept\n")
+        (root / "link").symlink_to(outside)
+        (root / "file").write_text("not a tree\n")
+        (root / ("d" * 32) / "repo").mkdir(parents=True)
+        with self.assertLogs("credential-proxy", level="WARNING") as captured:
+            store = self.store()
+        self.assertEqual([], list(store.tree_root.iterdir()))
+        self.assertTrue((outside / "keep").exists(), "the link's target was emptied")
+        self.assertTrue((outside / "sub" / "keep").exists(), "the link's target was walked")
+        self.assertIn("held 3 entry(ies) from a previous process; removed 3", captured.output[0])
+
+
 class ErrorRedactionTest(unittest.TestCase):
     """The invariant three docstrings assert: no response carries a path.
 

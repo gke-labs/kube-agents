@@ -99,6 +99,17 @@ END_OF_FLAGS = "--"
 CONTEXT_FLAG = "--context"
 KUBECONFIG_FLAG = "--kubeconfig"
 
+# Where `Workspace.open` takes its caller label from when the caller names
+# none, first match wins. `HERMES_KANBAN_TASK` is the card a dispatcher-spawned
+# worker runs under and the one identity the sandbox shell recovers for a
+# command; `HERMES_SESSION_ID` is the chat session, set on the agent Pod. The
+# same two, in the same order, key the directory-mode lease
+# (`gitops_workspace.session_lease`). The label reaches the broker's reap and
+# refusal log lines, which is what lets a full store be read back to the
+# sessions that filled it; with neither set the payload carries no `caller`
+# key at all.
+WORKSPACE_CALLER_ENV = ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID")
+
 
 class BrokerConnection(http.client.HTTPConnection):
     """Bound how long we wait to reach the broker, not how long it works.
@@ -915,6 +926,7 @@ class Workspace:
         base: str | None = None,
         branch: str | None = None,
         depth: int | None = None,
+        caller: str | None = None,
     ) -> "Workspace":
         """`branch` names the branch this session will commit to, if known.
 
@@ -925,6 +937,12 @@ class Workspace:
 
         `depth` opens a shallow single-branch clone for reading. The broker
         refuses `commit` on one and refuses `depth` together with `branch`.
+
+        `caller` labels the workspace in the broker's log, where it names this
+        session when the broker reaps the workspace as idle or refuses an open
+        at the ceiling. `None` takes it from `WORKSPACE_CALLER_ENV`; an empty
+        string sends none. Left off the wire rather than sent empty, so a
+        session with no label sends the payload it always has.
         """
         payload = {"repo": repo}
         if base:
@@ -933,6 +951,14 @@ class Workspace:
             payload["branch"] = branch
         if depth:
             payload["depth"] = depth
+        if caller is None:
+            caller = ""
+            for name in WORKSPACE_CALLER_ENV:
+                caller = os.environ.get(name, "").strip()
+                if caller:
+                    break
+        if caller:
+            payload["caller"] = caller
         return cls(endpoint, _workspace_call(endpoint, "open", payload))
 
     def read(self, path: str) -> bytes:

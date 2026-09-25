@@ -51,6 +51,16 @@ that a property rather than an intention, and it scrubs every absolute path
 rather than the two this module happens to know the names of. And every verb takes a lock for its
 whole duration, because the handler is threaded and each verb is a
 read-then-act on a tree another verb may delete or reset underneath it.
+
+The registry is process memory and `close` is the only verb a client sends to
+remove an entry. Several clients hold workspaces at once -- concurrent kanban
+workers, the audit crons, an eval install running several lanes -- and one of
+them dying with a handle open is ordinary: a worker archived at the delegation
+ceiling, a sandbox process killed mid-verb, a session that opened and never
+came back. A dead client never sends `close`, and `DEFAULT_MAX_WORKSPACES` such
+leaks refuse every later `open` until the Pod restarts. So `open` reaps any
+workspace no verb has touched within `workspace_idle_seconds`, and construction
+removes whatever a previous process left under the root.
 """
 
 from __future__ import annotations
@@ -61,6 +71,7 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
@@ -86,6 +97,32 @@ DEFAULT_MAX_TOTAL_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_CLONE_BYTES = 256 * 1024 * 1024
 DEFAULT_MAX_WORKSPACES = 8
 DEFAULT_MAX_ENTRIES = 256
+
+# How long a workspace may go without a verb before `open` reclaims it. Idle
+# rather than age, because every verb resolves its handle through `get` and
+# so touches it: a live session cannot be reaped however long its run, and a
+# dead one is one nothing touches. 1800 s is the kanban dispatcher's
+# stale-running reclaim bound (`dispatch_stale_timeout_seconds` in
+# agents/chat/config.yaml), the product's own threshold for "this worker has
+# stopped talking", so a workspace outlives its owner by at most the time the
+# product already allows the owner to be silent. It is six times the 300 s
+# per-verb git timeout, so a verb that is merely slow cannot read as a dead
+# client, and it is longer than any legitimate gap observed between two verbs
+# on one handle. Not 3000 s (the longest CI unit ceiling) or 3 h: an idle
+# bound does not have to cover a whole run, since verbs touch, and at 3000 s
+# eight leaks would keep an install write-dead for most of the next unit on
+# every lane, slower than whatever killed the owner. `_limit` maps a zero or
+# negative value to this default, so the reaper cannot be switched off by
+# misconfiguration. The broker reads the variable from its own environment;
+# the operator passes unreserved `spec.deployment.env` entries through to the
+# broker container unchanged, so setting it needs no operator change.
+DEFAULT_WORKSPACE_IDLE_SECONDS = 1800
+# How much of a handle a log line carries. Enough to tell two workspaces apart
+# in the broker log (32 bits; the entropy test asserts sixteen handles never
+# share a prefix) and far short of the 128 bits that make the handle a bearer
+# capability, because the log leaves the Pod and nothing in it may be replayed
+# against a workspace.
+HANDLE_LOG_CHARS = 8
 
 # Ceilings on a search rather than on a tree. A pattern that matches every line
 # of a vendored directory produces an answer that travels over the socket and
@@ -223,6 +260,10 @@ def max_clone_bytes() -> int:
 
 def max_workspaces() -> int:
     return _limit("CREDENTIAL_PROXY_MAX_WORKSPACES", DEFAULT_MAX_WORKSPACES)
+
+
+def workspace_idle_seconds() -> int:
+    return _limit("CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS", DEFAULT_WORKSPACE_IDLE_SECONDS)
 
 
 def max_matches() -> int:
@@ -573,6 +614,19 @@ class Workspace:
     # its own -- a managed repository on the ambient credential, or a public
     # one on none -- and never anything a response reports.
     credential: object | None = None
+    # How the client labelled itself at `open`: a kanban card id when the
+    # sandbox shell recovered one, otherwise whatever it sent that passed the
+    # broker's grammar, otherwise empty. `caller` rather than `owner`, which
+    # this module already uses for the half of `owner/name` that is a GitHub
+    # account. Diagnostic only -- it reaches the reap and refusal log lines so
+    # a full store can be read back to the sessions that filled it -- and not
+    # an ownership check, for the same reason the handle is not one.
+    caller: str = ""
+    # Readings of the store's clock, in seconds. `last_used` moves on every
+    # verb that resolves the handle and is what `_reap_idle` measures against;
+    # `opened_at` only ever reports an age.
+    opened_at: float = 0.0
+    last_used: float = 0.0
 
 
 GitRunner = Callable[..., object]
@@ -606,6 +660,7 @@ class ContentWorkspaceStore:
         runner: GitRunner,
         base_branch: str = "",
         credential_for: CredentialFor | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         # Resolved, because `assert_disjoint_roots` resolves both sides and
         # `_redact` matches this value against paths git prints -- which git
@@ -627,7 +682,42 @@ class ContentWorkspaceStore:
             # a control that fails silently is one nobody finds out about, and
             # the `git_hooks_dir` chmod in the executor already warns.
             LOGGER.warning("could not restrict the content workspace root %s", self.tree_root)
+        # Whatever is under the root now is unreachable. The registry below is
+        # process memory, so no handle survives a restart of this process, and
+        # a tree with no handle is one `close` can never remove. `open` already
+        # removes its own tree when a clone fails, so what this finds is the
+        # container crash-restart, where the emptyDir outlives the process that
+        # filled it. Removed rather than left to count against the ceiling.
+        # `open` creates directories and nothing else, so a symlink or a plain
+        # file here is not a tree it left; unlinked as itself rather than
+        # handed to `_remove_tree`, whose walk follows a link at its root into
+        # the target and would empty a directory elsewhere while the link
+        # stayed. Counted after the fact, because `_remove_tree` ignores what
+        # it cannot remove and the log line should not say otherwise.
+        held = removed = 0
+        for entry in list(self.tree_root.iterdir()):
+            held += 1
+            if entry.is_dir() and not entry.is_symlink():
+                _remove_tree(entry)
+            else:
+                try:
+                    entry.unlink()
+                except OSError:
+                    pass
+            if not (entry.is_symlink() or entry.exists()):
+                removed += 1
+        if held:
+            LOGGER.warning(
+                "content workspace root held %d entry(ies) from a previous process; removed %d",
+                held,
+                removed,
+            )
         self._runner = runner
+        # Injected for the tests; `time.monotonic` rather than the wall clock
+        # `scoped_sa_pool` injects, deliberately. Idle is a duration between
+        # two readings in one process, and a wall clock stepped by NTP or a
+        # host suspend would reap a live workspace or spare a dead one.
+        self._clock = clock or time.monotonic
         self.base_branch = (
             base_branch.strip()
             or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
@@ -662,10 +752,14 @@ class ContentWorkspaceStore:
         # gone. Note that `max_workspaces` advertises a concurrency this
         # forbids: eight may be open, one may be doing anything.
         #
-        # Still the right trade for a single agent Pod publishing one pull
-        # request at a time, and a per-workspace lock would still need this one
-        # to guard the dict it lives in. Worth revisiting the day a caller has
-        # a reason to run two workspaces at once, which nothing does today.
+        # Still the right trade, and not because only one workspace is ever
+        # open: several sessions hold them at once -- concurrent kanban
+        # workers, the audit crons, an eval install running several lanes --
+        # and any one of them can die holding a handle, which is why `open`
+        # reaps idle entries under this same lock. What the coarse lock buys
+        # is that a reap can never observe a workspace mid-verb, so "idle"
+        # means "no verb since", exactly. A per-workspace lock would still
+        # need this one to guard the dict it lives in.
         self._lock = threading.RLock()
 
     # -- git -------------------------------------------------------------
@@ -791,8 +885,13 @@ class ContentWorkspaceStore:
         base: str | None = None,
         branch: str | None = None,
         depth: int | None = None,
+        caller: str = "",
     ) -> Workspace:
         """Clone `repo` into a fresh tree and return its handle.
+
+        `caller` is the label the reap and refusal log lines carry for this
+        workspace; the broker route has already held it to a grammar, and this
+        module records what it is given.
 
         `branch` names the branch this session will commit to, when the caller
         already knows it. It decides what `read` and `list` answer with: a
@@ -830,10 +929,38 @@ class ContentWorkspaceStore:
         if base is not None:
             base = check_branch_name(base)
         with self._lock:
+            now = self._clock()
+            self._reap_idle(now)
             if len(self._workspaces) >= max_workspaces():
+                # Every open workspace on one line, so a full store reads back
+                # from the broker log to the sessions that filled it. Handle
+                # prefix only: the log leaves the Pod and the handle is a
+                # bearer capability. The response carries neither a handle nor
+                # a path, and its advice is what a caller can act on: not
+                # "close one", since a caller that owns none cannot, but how
+                # long until the reaper makes room.
+                idle_ages = sorted(
+                    int(now - workspace.last_used)
+                    for workspace in self._workspaces.values()
+                )
+                LOGGER.warning(
+                    "content workspace limit reached open=%d limit=%d%s",
+                    len(self._workspaces),
+                    max_workspaces(),
+                    "".join(
+                        f" [handle={workspace.handle[:HANDLE_LOG_CHARS]}"
+                        f" repo={workspace.repo} caller={workspace.caller}"
+                        f" idle={int(now - workspace.last_used)}s"
+                        f" age={int(now - workspace.opened_at)}s]"
+                        for workspace in self._workspaces.values()
+                    ),
+                )
                 raise TooLarge(
-                    f"{len(self._workspaces)} workspaces are already open, which is "
-                    f"the limit of {max_workspaces()}; close one before opening another"
+                    f"{len(self._workspaces)} workspaces are open, which is the "
+                    f"limit of {max_workspaces()}; they have been idle between "
+                    f"{idle_ages[0]}s and {idle_ages[-1]}s, and one idle longer "
+                    f"than {workspace_idle_seconds()}s is reclaimed on the next "
+                    "open, so a later retry can succeed"
                 )
             handle = os.urandom(16).hex()
             tree = self.tree_root / handle
@@ -873,6 +1000,11 @@ class ContentWorkspaceStore:
                         f"{repo} is {size} bytes cloned, over the "
                         f"{max_clone_bytes()}-byte limit; the tree was removed"
                     )
+                # Stamped after the clone rather than with `now`: the caller
+                # cannot use a handle it has not been given, and a clone runs
+                # for up to the executor's timeout, which would otherwise be
+                # idle time the workspace was born with.
+                opened = self._clock()
                 workspace = Workspace(
                     handle=handle,
                     repo=repo,
@@ -881,6 +1013,9 @@ class ContentWorkspaceStore:
                     base_sha="",
                     shallow=depth is not None,
                     credential=credential,
+                    caller=caller,
+                    opened_at=opened,
+                    last_used=opened,
                 )
                 workspace.default_branch = self._default_branch(workspace)
                 workspace.base = base or workspace.default_branch
@@ -946,9 +1081,49 @@ class ContentWorkspaceStore:
             raise NoSuchHandle("handle is not a workspace handle")
         with self._lock:
             workspace = self._workspaces.get(handle)
+            # Every verb resolves its handle here, so this one stamp is what
+            # `_reap_idle` measures against. Inside the lock: stamped after
+            # it, a concurrent `open` could reap between the lookup and the
+            # stamp and the verb would run on a tree that is gone.
+            if workspace is not None:
+                workspace.last_used = self._clock()
         if workspace is None:
             raise NoSuchHandle("no such workspace; open one first")
         return workspace
+
+    def _reap_idle(self, now: float) -> None:
+        """Drop every workspace no verb has touched within the idle bound.
+
+        Called by `open` with the lock held, which is what makes "idle" exact:
+        every verb holds the same lock and stamps `last_used` through `get`,
+        so nothing this sees is mid-verb and nothing it drops was about to be
+        used. The lock stays held across the removal, which walks each reaped
+        clone with `rglob` -- up to `max_workspaces` of them, each up to
+        `max_clone_bytes` -- so the `open` that reaps can hold every other
+        verb for that long. Accepted: the alternative is a store that answers
+        413 until the Pod restarts.
+
+        Every idle workspace goes, not just enough to make room. An idle
+        workspace holds disk whether or not anyone is at the ceiling, and
+        reaping one at a time would hand the same walk to the next `open`.
+        """
+        idle_limit = workspace_idle_seconds()
+        for handle, workspace in list(self._workspaces.items()):
+            idle = now - workspace.last_used
+            if idle <= idle_limit:
+                continue
+            self._workspaces.pop(handle)
+            _remove_tree(workspace.tree.parent)
+            LOGGER.warning(
+                "content workspace reaped handle=%s repo=%s caller=%s idle=%ds "
+                "age=%ds open=%d",
+                handle[:HANDLE_LOG_CHARS],
+                workspace.repo,
+                workspace.caller,
+                idle,
+                now - workspace.opened_at,
+                len(self._workspaces),
+            )
 
     def close(self, handle: str) -> None:
         with self._lock:
