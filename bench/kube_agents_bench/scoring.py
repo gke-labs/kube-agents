@@ -813,7 +813,13 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
             scores.pop(key, None)
         else:
             scores[key] = value
-    gate_ran = SCORE_KEY_CORRECTNESS in record.scores
+    # Coverage, not correctness, is the sign the deterministic gate ran:
+    # upstream emits VerificationCoverage whenever the verification metric
+    # applied, and omits VerificationCorrectness when every objective entry
+    # errored -- which on this transport is what a task whose objectives are
+    # all worker_commands / worker_agents looks like, and is exactly the case
+    # the lane exists to report as not graded rather than as rung 2.
+    gate_ran = SCORE_KEY_COVERAGE in record.scores
     # devops-bench's OutcomeScore composite was computed with the blind
     # check still counted (the capture reads ``c=0.500``). Rebuilt with
     # upstream's formula from the recomputed signals, so it agrees with the
@@ -1399,8 +1405,26 @@ def grade_case(
         )
 
     # --- Rung 5. An expected-fail case that passed. The marker is stale, or
-    # the change under test fixed it and the diff should say so.
+    # the change under test fixed it and the diff should say so. A pass the
+    # inject lane graded with a check set aside is not that evidence: the
+    # objective the marker was filed for may be the one the lane could not
+    # see, so the case did not start passing -- the lane stopped grading the
+    # half that fails. Such a case is green with the marker kept, never a
+    # demand to flip it.
+    passed_whole = [r for r in scored if r.outcome == "pass" and not r.not_applicable_checks]
     if spec.expected_fail and passes == len(scored) and complete:
+        if len(passed_whole) < passes:
+            set_aside = sorted(
+                {name for r in scored for name in r.not_applicable_checks}
+            )
+            return verdict(
+                Rung.GREEN,
+                False,
+                f"expected_fail: true, and it passed all {len(scored)} repetitions "
+                f"on the checks this transport can see, with {', '.join(set_aside)} "
+                f"{NOT_APPLICABLE_PHRASE}; the marker stays until the api lane "
+                "passes it whole",
+            )
         return verdict(
             Rung.EXPECTED_FAIL_PASSED,
             True,

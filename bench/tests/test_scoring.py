@@ -2131,6 +2131,95 @@ def test_the_lane_leaves_outcome_score_absent_when_the_record_had_none(noop_spec
     assert view is not None and "OutcomeScore" not in view.record.scores
 
 
+def test_an_expected_fail_case_passing_only_on_the_visible_checks_keeps_its_marker(
+    write_task, inject_run
+):
+    """The marker was filed for the tool_called objective that fails today.
+    On the lane that objective is set aside and the phrase check passes, so
+    every repetition reads `pass` -- but the case did not start passing, the
+    lane stopped grading the half that fails. Rung 5 must not demand a flip."""
+    spec = load_case(
+        write_task(
+            "edd-blind",
+            {
+                "id": "edd-blind",
+                "name": "A gap in the card path, filed red",
+                "expected_fail": True,
+                "verification_spec": [
+                    {
+                        "name": ANSWER_CHECK,
+                        "role": "objective",
+                        "check": {"type": "report_contains", "required_phrases": ["seeded-a"]},
+                    },
+                    {
+                        "name": BLIND_CHECK,
+                        "role": "objective",
+                        "check": {"type": "tool_called", "tool_names": ["kanban_create"]},
+                    },
+                ],
+            },
+        )
+    )
+    reps = [inject_run() for _ in range(3)]
+    verdict = grade_case(spec, reps, admitted=True)
+    assert all(r.outcome == "pass" and r.not_applicable_checks == [BLIND_CHECK] for r in verdict.reps)
+    assert verdict.rung is Rung.GREEN and verdict.blocking is False
+    assert "the marker stays" in verdict.reason and BLIND_CHECK in verdict.reason
+
+
+def test_an_expected_fail_case_passing_whole_still_demands_the_flip(expected_fail_spec, make_run):
+    """The api-lane behaviour rung 5 exists for is untouched: a pass with
+    nothing set aside is a pass, and three of them are the flip demand."""
+    verdict = grade_case(expected_fail_spec, [make_run() for _ in range(3)], admitted=True)
+    assert verdict.rung is Rung.EXPECTED_FAIL_PASSED and verdict.blocking
+
+
+def test_a_case_whose_blind_objectives_all_errored_is_not_graded_not_blocked(write_task, inject_run):
+    """worker_commands and worker_agents error rather than fail on the lane,
+    and upstream omits VerificationCorrectness when every objective errored
+    (coverage is still emitted). Such a record must land on not graded, not
+    on rung 2's declared-but-ungraded block."""
+    spec = load_case(
+        write_task(
+            "route-only",
+            {
+                "id": "route-only",
+                "name": "Route only",
+                "verification_spec": [
+                    {
+                        "name": "the-worker-took-the-git-route",
+                        "role": "objective",
+                        "check": {"type": "worker_commands", "required_patterns": ["git log"]},
+                    }
+                ],
+            },
+        )
+    )
+
+    def errored_route_check_only(rec):
+        rec["verification_report"] = [
+            {
+                "name": "the-worker-took-the-git-route",
+                "role": "objective",
+                "severity": None,
+                "weight": 1.0,
+                "mode": "assert",
+                "status": "error",
+                "success": False,
+                "reason": "no delegated worker's terminal commands were captured for this run",
+            }
+        ]
+        rec["scores"].pop("VerificationCorrectness", None)
+        rec["scores"].pop("OutcomeScore", None)
+        rec["scores"]["VerificationCoverage"] = 0.0
+
+    rep = classify_rep(spec, inject_run(mutate=errored_route_check_only), 1)
+    assert rep.outcome == REP_OUTCOME_NOT_APPLICABLE, rep.reason
+    assert rep.coverage == 1.0 and rep.correctness is None
+    verdict = grade_case(spec, [inject_run(mutate=errored_route_check_only) for _ in range(3)], admitted=True)
+    assert verdict.rung is Rung.NOT_GRADED_ON_TRANSPORT and verdict.blocking is False
+
+
 @pytest.mark.parametrize("correctness", [0.0, 0.25, 0.5, 1.0])
 @pytest.mark.parametrize("recoverable", [None, 0.0, 0.5, 1.0])
 @pytest.mark.parametrize("catastrophic", [False, True])
