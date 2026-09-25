@@ -75,21 +75,21 @@ func buildAdapters(cfg *gateway.Config, primary gateway.Adapter, natsOpts []nats
 }
 
 // composeAdapters is the whole stack the gateway drives: the chat backends
-// behind the mux, and the inject door, when armed, beside the mux rather
-// than inside it. The order matters. The gateway finds the door's
+// behind the mux, and the doors (inject, A2A), when armed, beside the mux
+// rather than inside it. The order matters. The gateway finds the door's
 // ProbeSink, TaskObserver and InboundObserver by type assertion on the top
 // of the stack, and the side door implements them for exactly that reason
 // (sidedoor.go); MultiAdapter implements none of them, and its prefix
 // dispatch has no key for an inject: conversation.
-func composeAdapters(cfg *gateway.Config, primary gateway.Adapter, door *gateway.InjectAdapter, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
+func composeAdapters(cfg *gateway.Config, primary gateway.Adapter, doors []gateway.DoorSpec, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
 	chat, err := buildAdapters(cfg, primary, natsOpts, log)
 	if err != nil {
 		return nil, err
 	}
-	if door == nil {
+	if len(doors) == 0 {
 		return chat, nil
 	}
-	return gateway.WithSideDoor(chat, door, log), nil
+	return gateway.WithSideDoors(chat, doors, log), nil
 }
 
 // realMain is the gateway from configuration to shutdown. Every failure is
@@ -147,16 +147,33 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// of the above, and the composite routes by conversation key. Dev and
 	// eval installs only; the operator renders A2A_INJECT_LISTEN and the
 	// token only under its eval flag. See a2a/gateway/inject.go.
-	var door *gateway.InjectAdapter
+	var doors []gateway.DoorSpec
 	if cfg.InjectArmed() {
-		door, err = gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
+		door, err := gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
 		if err != nil {
 			log.Error("inject door", "err", err)
 			return err
 		}
+		doors = append(doors, gateway.DoorSpec{Name: "inject", Prefix: "inject:", Door: door})
+	}
+	// The A2A door is the same kind of thing for an agent caller: armed
+	// beside either backend or alone, routed by its own key prefix, its
+	// callers resolved through its own map. See a2a/gateway/a2adoor.go.
+	if cfg.A2ADoorArmed() {
+		door, err := gateway.NewA2ADoor(cfg.A2ADoorListen, cfg.A2ADoorToken, gateway.A2ADoorOptions{
+			PublicURL:        cfg.A2ADoorPublicURL,
+			DefaultAddressee: cfg.DefaultAddressee,
+			FirstEventGrace:  cfg.FirstEventGrace,
+			Logger:           log,
+		})
+		if err != nil {
+			log.Error("A2A door", "err", err)
+			return err
+		}
+		doors = append(doors, gateway.DoorSpec{Name: "a2a", Prefix: "a2a:", Door: door})
 	}
 
-	adapter, err = composeAdapters(cfg, adapter, door, natsOpts, log)
+	adapter, err = composeAdapters(cfg, adapter, doors, natsOpts, log)
 	if err != nil {
 		log.Error("console adapter", "err", err)
 		return err
@@ -178,6 +195,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"nats", cfg.NATSURL,
 		"backend", backend,
 		"injectDoor", cfg.InjectArmed(),
+		"a2aDoor", cfg.A2ADoorArmed(),
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())

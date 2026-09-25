@@ -933,6 +933,98 @@ or a NATS pod not yet rolled onto the new one, refuses the adapter's subscriptio
 asynchronously; the adapter logs that with the remedy rather than boot-failing,
 because the chat backend beside it is still good.
 
+## The A2A door (added 9/24)
+
+The gateway's ingress for an agent caller: an A2A client (Antigravity, an ADK agent, the MCP
+bridge that fronts Claude, `curl`) that speaks the A2A protocol over HTTP. A second side door
+beside the inject door, built on the same contract, and differing in what it speaks rather
+than in what it may do. The design track behind it is round 3's external agents work; this
+section is the door as `a2a/gateway/a2adoor.go` implements it.
+
+**A side door, again.** The inject door's reasoning holds unchanged. The door holds no bus
+credential, mints no id the bus sees and writes no `authority` block; a verified caller's
+message becomes an `InboundMessage` into `handleInbound`, and from there the turn is a chat
+turn - routed by the same matcher, subject to the same first-event grace, relayed back through
+the same `post`/`edit`. It sits beside the mux with the inject door, under the composite that
+forwards the gateway's probe and observers by conversation prefix, and it is not counted by the
+one-real-backend guard for the reason the inject door is not. Either door alone starts a
+gateway; with both doors and no real backend the default attribution is the inject door's, and
+every message through either stamps its own backend.
+
+**Wire.** JSON-RPC 2.0 over HTTP at `/a2a`, and the agent card at
+`/.well-known/agent-card.json`. Four methods:
+
+- `message/send` is a turn. The door answers with the A2A `Task` once the submission is on the
+  bus (`TaskObserver.TaskAccepted`, the inject door's rule: a caller is never handed an id whose
+  terminal cannot come), or with the gateway's reply as an A2A `Message` when the turn started
+  no task (a status answer, a steer, a refusal). `configuration.blocking: true` holds the call
+  until the task's terminal, bounded, which is the one-call `curl` demo. `message.taskId` names
+  a running task of the caller's own and lands the text on its conversation, where the gateway
+  treats it as a steer. `message.messageId` is the dedupe key: a retry after a dropped
+  connection is answered with the task the first attempt started, and starts nothing.
+- `tasks/get` returns the `Task` as the door holds it. Scoped to the caller: a task another
+  caller started is not found rather than forbidden, so the door confirms no id it will not
+  serve.
+- `tasks/cancel` is a cancel turn on the task's conversation - the same `kind: cancel` envelope
+  the inject door's cancel route and the chat path's `stop` publish - answered once the cancel is
+  on the bus (`TaskObserver.CancelPublished`) with the `Task` as it stands. The executor decides
+  when the task is canceled; the client polls `tasks/get` for that terminal as for any other.
+- `message/stream` is refused as unsupported and the card says `streaming: false`. It lands
+  next, as SSE frames from the same observer hooks.
+
+Only text parts are accepted. A data or file part has no home on a chat turn, so it is refused
+at the door in the protocol's own terms rather than dropped.
+
+**The Task object** is assembled from what the relay posted on the door's conversation, which
+is what a chat user would have read. The rolling progress line (`startTask`'s placeholder, which
+the relay edits) is `status.message`; the state is `submitted` from `TaskStarted`, `working` from
+the first edit, and the terminal state from `TaskTerminal`, whose reason - the executor's
+`reason: <token>` line, verbatim - replaces the line on a failed terminal. Every other post under
+the task is an agent message in `history`, after the caller's own. On a completed terminal the
+last post before the terminal edit is the deliverable, and it is the task's one artifact, named
+`result` as the bus names it. `metadata.terminalSource` carries whose word the terminal is, for
+the reason the inject door's read route carries it. A2A clients read exactly `status`,
+`artifacts` and `history`, so nothing here is invented for them.
+
+**Conversation.** `a2a:<caller>:<contextId>`, kind `dm`. The caller is part of the key so two
+callers naming the same `contextId` do not share a conversation; a caller that sends none is
+minted one and reads it back on the `Task`. `Roster` is the caller alone, complete;
+`openDirect` returns the caller's last conversation, as on the inject door.
+
+**Identity, first version: the eval class.** The caller names itself - the `X-A2A-Caller` header,
+or `message.metadata.caller` for a client that cannot set headers - and is resolved through the
+door's **own** principal map at the prefixed key `a2a:<caller>`, whose value must be an eval
+identity. The three refusals are the inject door's, and for the same reason: the door takes its
+caller from the request, so the map is the only thing between a token holder and a principal of
+their choosing. An unmapped or unnamed caller is refused with a JSON-RPC error and starts nothing;
+nothing is defaulted. `verifiedBy` is `a2a-bearer`, its own value, so an external agent's
+submission and an eval harness's are distinguishable downstream even though both resolve into
+the eval namespace today.
+
+That is the demo answer and not the product answer. The developer class (an ID token for the
+person whose harness is calling, audience this install's door, principal the same email the
+Google Chat adapter carries) and the unattended class (an organisation's service identity,
+read-only against protected targets) arrive as verifiers beside this map, never as entries in
+it, and each gets its own `verifiedBy`. Validating a token at the door is not the per-user
+token brokerage the permission model declined: the door holds an audience and an allowlist,
+never a refresh token.
+
+**The card is the catalog.** One skill per destination this door routes to, which today is the
+gateway's default addressee. When profiles land the list is rendered from `DIRECTORY` and the
+caller's entitlements, per caller, and it is the same list the router's capability catalog is
+built from. The card is the one unauthenticated route, because discovery reads it to learn which
+security scheme to present; it discloses the endpoint URL, the scheme and the default
+destination's name, none of which a 401 hides.
+
+**Posture.** Every request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
+`A2A_DOOR_LISTEN` is set, no unauthenticated mode); the caller map is its own file
+(`A2A_DOOR_PRINCIPAL_MAP`); the card advertises `A2A_DOOR_PUBLIC_URL`, which behind a
+port-forward or an ingress is not the listen address. The operator does not render the door
+yet; when it does, it follows the inject door's pattern - an operator-level flag, a loopback
+bind, a ClusterIP Service for the port-forward, a token Secret, the NetworkPolicy edge - and
+the identity classes above are what let it be rendered on an install a customer reaches.
+Until then it is armed by hand on dev and eval installs.
+
 ## What stage 2 builds from this doc
 
 - The gateway: Discord and Google Chat adapters, session manager (spawn / stream / reap / rehydrate /

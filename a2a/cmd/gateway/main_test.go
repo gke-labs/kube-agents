@@ -230,6 +230,8 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 	}{
 		{"beside discord", &gateway.Config{NATSURL: s.ClientURL(), DiscordToken: "x", InjectListen: "127.0.0.1:0", InjectToken: "token"}, newFakePrimary()},
 		{"inject only", &gateway.Config{NATSURL: s.ClientURL(), InjectListen: "127.0.0.1:0", InjectToken: "token"}, nil},
+		{"both doors beside discord", &gateway.Config{NATSURL: s.ClientURL(), DiscordToken: "x", InjectListen: "127.0.0.1:0", InjectToken: "token", A2ADoorListen: "127.0.0.1:0", A2ADoorToken: "token"}, newFakePrimary()},
+		{"both doors alone", &gateway.Config{NATSURL: s.ClientURL(), InjectListen: "127.0.0.1:0", InjectToken: "token", A2ADoorListen: "127.0.0.1:0", A2ADoorToken: "token"}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			door, err := gateway.NewInjectAdapter(tc.cfg.InjectListen, tc.cfg.InjectToken, time.Second, slog.Default())
@@ -240,7 +242,15 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 			if tc.primary != nil {
 				primary = tc.primary
 			}
-			a, err := composeAdapters(tc.cfg, primary, door, nil, slog.Default())
+			doors := []gateway.DoorSpec{{Name: "inject", Prefix: "inject:", Door: door}}
+			if tc.cfg.A2ADoorArmed() {
+				a2a, err := gateway.NewA2ADoor(tc.cfg.A2ADoorListen, tc.cfg.A2ADoorToken, gateway.A2ADoorOptions{DefaultAddressee: "platform"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				doors = append(doors, gateway.DoorSpec{Name: "a2a", Prefix: "a2a:", Door: a2a})
+			}
+			a, err := composeAdapters(tc.cfg, primary, doors, nil, slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -259,6 +269,12 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 			}
 			if _, err := a.Post("console:tab-1", "hi"); err != nil {
 				t.Errorf("console not wired: %v", err)
+			}
+			if tc.cfg.A2ADoorArmed() {
+				id, err := a.Post("a2a:caller:ctx-1", "hi")
+				if err != nil || !strings.HasPrefix(id, "a2a-") {
+					t.Errorf("a2a post = %q, %v; want the A2A door's own message id", id, err)
+				}
 			}
 			if tc.primary != nil {
 				if _, err := a.Post("discord:g/c", "hi"); err != nil {

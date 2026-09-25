@@ -132,6 +132,10 @@ type Gateway struct {
 	// door is armed and never consulted for a message from a real backend.
 	// Separate from pm on purpose: see Config.InjectPrincipalMapPath.
 	injectPM *PrincipalMap
+	// a2aPM and a2aAudience are the A2A door's, built the same way from its
+	// own file (Config.A2ADoorPrincipalMapPath).
+	a2aPM       *PrincipalMap
+	a2aAudience *PrincipalMap
 	// gchatAllowed and gchatAllowAll gate the gchat backend's identity
 	// resolution (Config.GchatAllowedUsers, lowercased at build).
 	gchatAllowed  map[string]bool
@@ -188,6 +192,11 @@ func New(o Options) (*Gateway, error) {
 		// Backend would mean, and "" in an authority block is worse than
 		// the truth.
 		backend = injectBackend
+	} else if backend == "" && o.Config.A2ADoorArmed() {
+		// The A2A door alone, likewise. With both doors and no real
+		// backend the inject door wins the default, and every message
+		// through either stamps its own.
+		backend = a2aBackend
 	}
 	if backend == injectBackend {
 		// Said out loud, and repeated on the door's read route
@@ -223,6 +232,18 @@ func New(o Options) (*Gateway, error) {
 		if injectPM.Len() == 0 {
 			log.Warn("the inject door's principal map is empty; every injected message will be dropped at verification",
 				"path", o.Config.InjectPrincipalMapPath)
+		}
+	}
+	var a2aPM, a2aAudience *PrincipalMap
+	if o.Config.A2ADoorArmed() {
+		a2aPM, err = LoadPrincipalMap(o.Config.A2ADoorPrincipalMapPath)
+		if err != nil {
+			return nil, err
+		}
+		a2aAudience = a2aPM.Section(a2aPrincipalPrefix, injectEvalPrincipalPrefix)
+		if a2aPM.Len() == 0 {
+			log.Warn("the A2A door's principal map is empty; every message through it will be dropped at verification",
+				"path", o.Config.A2ADoorPrincipalMapPath)
 		}
 	}
 	gchatAllowed := map[string]bool{}
@@ -267,6 +288,8 @@ func New(o Options) (*Gateway, error) {
 		backend:        backend,
 		injectPM:       injectPM,
 		injectAudience: injectAudience,
+		a2aPM:          a2aPM,
+		a2aAudience:    a2aAudience,
 		gchatAllowed:   gchatAllowed,
 		gchatAllowAll:  o.Config.GchatAllowAllUsers,
 		droppedNotices: map[string]bool{},
@@ -383,7 +406,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	//
 	// A chat turn's caller is a person, for whom a late answer beats none:
 	// the lock first, then a whole turn, as before the door existed.
-	if backend == injectBackend {
+	if backend == injectBackend || backend == a2aBackend {
 		ctx, cancel := context.WithTimeout(g.runCtx, g.turnBudget)
 		defer cancel()
 		g.runTurn(ctx, msg, backend, principal)
@@ -730,6 +753,9 @@ func (g *Gateway) backendFor(msg InboundMessage) string {
 func (g *Gateway) principalMapFor(backend string) *PrincipalMap {
 	if backend == injectBackend && g.injectAudience != nil {
 		return g.injectAudience
+	}
+	if backend == a2aBackend && g.a2aAudience != nil {
+		return g.a2aAudience
 	}
 	return g.pm
 }

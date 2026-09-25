@@ -124,6 +124,12 @@ func verifiedByFor(backend string) string {
 		// a Chat message verified by the IAM-locked topic, which is the
 		// whole point of recording the mechanism rather than the table.
 		return injectVerifiedBy
+	case a2aBackend:
+		// The A2A door's own token, and its own value for the same reason:
+		// an external agent's submission and an eval harness's must be
+		// distinguishable downstream even though both resolve through a
+		// door-scoped map into the eval namespace.
+		return a2aVerifiedBy
 	}
 	return "principal-map"
 }
@@ -140,6 +146,8 @@ func unverifiedRemedyFor(backend string) string {
 		return "nothing - only the console credential's own frames are accepted here"
 	case injectBackend:
 		return "the inject door's principal map"
+	case a2aBackend:
+		return "the A2A door's principal map"
 	}
 	return "the principal map"
 }
@@ -784,6 +792,8 @@ func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 	switch backend {
 	case injectBackend:
 		return g.resolveInjectPrincipal(authorID)
+	case a2aBackend:
+		return g.resolveA2APrincipal(authorID)
 	case consoleBackend:
 		if authorID == consoleAuthor {
 			return consolePrincipal
@@ -833,6 +843,29 @@ func (g *Gateway) resolveInjectPrincipal(authorID string) string {
 	if !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {
 		g.log.Error("the inject door's principal map maps an author to a principal that is not an eval identity; refusing it",
 			"author", authorID, "wantPrefix", injectEvalPrincipalPrefix)
+		return ""
+	}
+	return principal
+}
+
+// resolveA2APrincipal is the same construction for the A2A door: its own
+// map, the a2a: prefix on the lookup, the eval namespace on the value, and a
+// refusal for anything else. The caller named itself in a header or the
+// message metadata, so the map is the only thing standing between a
+// bearer-token holder and a principal of their choosing, exactly as on the
+// inject door. The developer and unattended identity classes, when they
+// land, resolve through a verifier beside this and never through this map.
+func (g *Gateway) resolveA2APrincipal(authorID string) string {
+	if g.a2aPM == nil {
+		return ""
+	}
+	principal := g.a2aPM.Resolve(a2aPrincipalPrefix + authorID)
+	if principal == "" {
+		return ""
+	}
+	if !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {
+		g.log.Error("the A2A door's principal map maps a caller to a principal that is not an eval identity; refusing it",
+			"caller", authorID, "wantPrefix", injectEvalPrincipalPrefix)
 		return ""
 	}
 	return principal
