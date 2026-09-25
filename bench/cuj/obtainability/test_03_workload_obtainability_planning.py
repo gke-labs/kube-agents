@@ -227,21 +227,35 @@ def _is_tpu_v5e(value: Any) -> bool:
     return re.sub(r"[^a-z0-9]", "", str(value or "").casefold()) == "tpuv5e"
 
 
+def _named_zones(value: Any) -> set[str]:
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found |= _named_zones(key)
+            found |= _named_zones(item)
+    elif isinstance(value, list):
+        for item in value:
+            found |= _named_zones(item)
+    elif isinstance(value, str):
+        found.add(value.removeprefix("zones/"))
+    return found
+
+
 def _zone_evaluated(spec: dict[str, Any], details: dict[str, Any], zone: str) -> bool:
     # Proof the probe evaluated the user's zone, in either of the two honest
     # forms a worker records: the request scoped to it via locationPolicy, or
-    # a region-wide probe whose recorded analysis names the zone (as the
-    # recommended location or with a per-zone status). Exact-match after
-    # stripping the "zones/" prefix, so us-central1-a never matches
-    # us-central1-ai1a.
+    # a region-wide probe whose recorded analysis names the zone — as the
+    # recommended location, with a per-zone status, or anywhere inside the
+    # API's verbatim response shape (recommendations[].spec...), which is
+    # why the search walks the structure rather than fixed paths. Exact
+    # string match after stripping the "zones/" prefix, so us-central1-a
+    # never matches us-central1-ai1a. An analysis that names no zone at all
+    # fails: there is nothing to check.
     locations = _mapping(_mapping(spec.get("locationPolicy")).get("locations"))
     preference = _mapping(locations.get(f"zones/{zone}")).get("preference")
     if str(preference or "").upper() == "ALLOW":
         return True
-    analysis = _mapping(details.get("analysis"))
-    named = [str(analysis.get("location") or "")]
-    named.extend(str(key) for key in _mapping(analysis.get("otherLocations")))
-    return any(name.removeprefix("zones/") == zone for name in named)
+    return zone in _named_zones(_mapping(details.get("analysis")))
 
 
 def _valid_obtainability_planning_call(

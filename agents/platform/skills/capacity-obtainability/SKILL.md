@@ -264,7 +264,12 @@ nodes the aggregate is 256 chips and the durations are `86400s`:
 ```
 
 Set `apiMethod: compute.beta.AdviceService.CalendarMode` and put the
-structured findings from the real response in `analysis`. Then exactly one
+structured findings from the real response in `analysis` — copy them as
+the response gave them: the recommended `location`, `startTime`,
+`endTime`, and `otherLocations`, or the verbatim `recommendations` list.
+A region that returns no window still gets its `otherLocations` map with
+each zone's status; never record a null or empty `analysis` — a probe
+whose record names no zone cannot be checked and does not count. Then exactly one
 `type: workload_obtainability_planning_analysis` record whose `analysis`
 carries two keys: `windows`, every schedulable window **in rank order,
 rank one first**, each with `region`, `zone`, `startTime`, `endTime`,
