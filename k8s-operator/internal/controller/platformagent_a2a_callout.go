@@ -537,6 +537,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 								corev1.ResourceMemory: resource.MustParse("64Mi"),
 							},
 							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse(a2aCalloutCPULimit),
 								corev1.ResourceMemory: resource.MustParse("256Mi"),
 							},
 						},

@@ -5136,3 +5136,124 @@ func TestAnExtraVolumesEntryCannotShadowTheBusToken(t *testing.T) {
 			"surface, which is one more way to tell the next stack exists")
 	}
 }
+
+// ---- resources and ordering on the next-stack pods (#1700, #1702) ---------
+
+// TestA2ANextStackPodsCarryRequestsAndLimits: every container the operator
+// renders for the next stack (NATS, gateway, provision Job, callout) carries
+// CPU and memory requests and limits, so a namespace whose ResourceQuota
+// requires limits admits the stack, and Autopilot does not size the pods for
+// it. The session pods the gateway spawns are the gateway's (a2a/gateway).
+func TestA2ANextStackPodsCarryRequestsAndLimits(t *testing.T) {
+	agent := a2aTestAgent()
+	type container struct {
+		where string
+		c     corev1.Container
+	}
+	var containers []container
+	sts := buildA2ANATSStatefulSet(agent, "conf-hash")
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		containers = append(containers, container{"nats StatefulSet", c})
+	}
+	dep := buildA2AGatewayDeployment(agent)
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		containers = append(containers, container{"gateway Deployment", c})
+	}
+	job := buildA2AProvisionJob(agent)
+	for _, c := range job.Spec.Template.Spec.InitContainers {
+		containers = append(containers, container{"provision Job init", c})
+	}
+	for _, c := range job.Spec.Template.Spec.Containers {
+		containers = append(containers, container{"provision Job", c})
+	}
+	// The callout too: it is the provision Job's authentication path, and a
+	// quota that refused it would leave the Job's init container waiting on
+	// a Service with no endpoints.
+	for _, c := range buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers {
+		containers = append(containers, container{"callout Deployment", c})
+	}
+	if len(containers) < 5 {
+		t.Fatalf("expected at least five containers across the four renders, got %d", len(containers))
+	}
+	for _, entry := range containers {
+		for _, res := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			req, ok := entry.c.Resources.Requests[res]
+			if !ok || req.IsZero() {
+				t.Errorf("%s container %q: no %s request", entry.where, entry.c.Name, res)
+			}
+			lim, ok := entry.c.Resources.Limits[res]
+			if !ok || lim.IsZero() {
+				t.Errorf("%s container %q: no %s limit; a limits-requiring quota refuses the pod", entry.where, entry.c.Name, res)
+			}
+			if ok && req.Cmp(lim) > 0 {
+				t.Errorf("%s container %q: %s request %s exceeds limit %s", entry.where, entry.c.Name, res, req.String(), lim.String())
+			}
+		}
+	}
+	// The sizes are named constants, and NATS is the one that holds state.
+	nats := sts.Spec.Template.Spec.Containers[0].Resources
+	if got := nats.Limits[corev1.ResourceMemory]; got.String() != a2aNATSMemoryLimit {
+		t.Errorf("nats memory limit = %s, want %s", got.String(), a2aNATSMemoryLimit)
+	}
+	gw := dep.Spec.Template.Spec.Containers[0].Resources
+	if got := gw.Requests[corev1.ResourceCPU]; got.String() != a2aGatewayCPURequest {
+		t.Errorf("gateway cpu request = %s, want %s", got.String(), a2aGatewayCPURequest)
+	}
+}
+
+// TestA2AProvisionJobWaitsForTheCallout: the Job's provision container starts
+// only after an init container has seen the callout Service answer its
+// readiness endpoint, so the Job never spends its backoff on the callout not
+// being there yet.
+func TestA2AProvisionJobWaitsForTheCallout(t *testing.T) {
+	agent := a2aTestAgent()
+	job := buildA2AProvisionJob(agent)
+	inits := job.Spec.Template.Spec.InitContainers
+	if len(inits) != 1 || inits[0].Name != a2aProvisionWaitContainerName {
+		t.Fatalf("init containers = %+v, want one named %q", inits, a2aProvisionWaitContainerName)
+	}
+	wait := inits[0]
+	if wait.Image != a2aProvisionImage() {
+		t.Errorf("wait image = %q, want the provision image %q (no extra pull)", wait.Image, a2aProvisionImage())
+	}
+	script := strings.Join(wait.Command, "\n")
+	url := "http://" + a2aCalloutName(agent) + "." + agent.Namespace + ".svc:8080/readyz"
+	if !strings.Contains(script, url) {
+		t.Errorf("the wait does not poll the callout's readiness endpoint %q:\n%s", url, script)
+	}
+	if !strings.Contains(script, "until ") || !strings.Contains(script, "sleep ") {
+		t.Errorf("the wait is not a loop:\n%s", script)
+	}
+	if wait.SecurityContext == nil || wait.SecurityContext.ReadOnlyRootFilesystem == nil || !*wait.SecurityContext.ReadOnlyRootFilesystem {
+		t.Error("the wait container is not hardened like the provision container")
+	}
+	// Same writable cwd as the provision container: nats-box's WORKDIR is
+	// root-owned and the pod runs as 1000 (#1259).
+	if wait.WorkingDir != a2aProvisionWritablePath {
+		t.Errorf("wait WorkingDir = %q, want %q", wait.WorkingDir, a2aProvisionWritablePath)
+	}
+	var mounted bool
+	for _, m := range wait.VolumeMounts {
+		if m.MountPath == a2aProvisionWritablePath {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Errorf("nothing is mounted at %s in the wait container", a2aProvisionWritablePath)
+	}
+	// The bus token is not handed to the wait container: it talks HTTP to the
+	// callout, never to the bus.
+	for _, m := range wait.VolumeMounts {
+		if m.Name == a2aBusTokenVolumeSource().Name {
+			t.Errorf("the wait container mounts the bus token; it has no use for it")
+		}
+	}
+	// The change reaches an existing install: the digest-derived name moves
+	// when the pod spec does, so a new Job runs rather than the old one
+	// standing.
+	old := buildA2AProvisionJob(agent)
+	old.Spec.Template.Spec.InitContainers = nil
+	if a2aProvisionJobName(agent, old.Spec) == job.Name {
+		t.Error("the Job's name does not change with its init container, so an existing install would keep the unordered Job")
+	}
+}

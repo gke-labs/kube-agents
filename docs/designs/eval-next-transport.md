@@ -493,8 +493,9 @@ today-mode install has passed its own readiness and connectivity checks. It reco
 Deployment's generation, merge-patches the CR, and waits for the generation to move before
 asking any workload for status, because the flip is a rollout and a status read before it lands
 describes the old pods. It then gates, in order, on the NATS StatefulSet, the callout Deployment,
-the provisioning Job reaching `complete` (the Job depends on the callout and has been measured at
-19.5 minutes under adverse conditions, so its bound is generous), and the agent Deployment. It
+the provisioning Job reaching `complete` (the Job depends on the callout; before its init
+container waited for the callout it was measured at 19.5 minutes under adverse conditions, so its
+bound is generous), and the agent Deployment. It
 reports the A2A gateway's state and last log lines and never gates on it: the gateway refuses to
 start without a backend, and the eval install has none until the inject adapter is rendered. The
 same flag is what the operator renders the inject adapter's env, Service and NetworkPolicy
@@ -513,10 +514,8 @@ is unchanged.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.
-The next stack still has holes independent of any case (no resource requests on the NATS,
-gateway or provisioning pods, a gateway with no backend until the adapter lands, no executor
-until the sidecar is declared, images in a
-private registry), and a default-on flip would red every pull request for reasons none of them
+The next stack still has holes independent of any case (a gateway with no backend until the
+adapter lands, no executor until the sidecar is declared, images in a private registry), and a default-on flip would red every pull request for reasons none of them
 caused. And until a case sends through the gateway, a run under `next` measures nothing a run
 under `today` does not; the flag exists so the matrix can be run against `next` on demand while
 stage 1 lands.
