@@ -598,10 +598,19 @@ def _baseline_rate(
 
     Returns None when no admitted case has any evidence, which makes the
     aggregate advisory and says so.
+
+    A case the inject lane could not grade (rung NOT_GRADED_ON_TRANSPORT,
+    #2039) is out of the pull request's side already -- its ``scored`` is 0
+    -- and is left out of main's side here for the same reason: the version
+    key carries no transport, so main's api-lane evidence for it would be
+    pooled against a run that graded nothing of it, moving the comparison
+    for nothing.
     """
     passes = runs = 0
     for case in cases:
         if not case.get("admitted"):
+            continue
+        if int(case.get("rung") or Rung.GREEN) == int(Rung.NOT_GRADED_ON_TRANSPORT):
             continue
         raw_key = case.get("version_key")
         if not isinstance(raw_key, dict):

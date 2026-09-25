@@ -1079,6 +1079,29 @@ def test_the_suite_aggregate_comes_from_the_store_not_a_flag(
     assert "advisory" not in printed
 
 
+def test_the_baseline_leaves_out_a_case_the_lane_did_not_grade(tmp_path, capsys):
+    """An admitted case the inject lane could not grade is on neither side
+    of the aggregate: its `scored` is 0 on the run, and main's evidence for
+    it (api-lane, at a key that carries no transport) must not be pooled
+    against a run that graded nothing of it. Here `a` is 14/21 on main and
+    `c` 21/21; pooled the baseline would read 83.3%, and the run's 2/3 on
+    `a` alone would sit below the margin for nothing."""
+    store = store_with(
+        tmp_path,
+        *[baseline_line("a", runs=3, passes=2, at=f"2026-08-0{i + 1}T00:00:00Z") for i in range(7)],
+        *[baseline_line("c", runs=3, passes=3, at=f"2026-08-0{i + 1}T00:00:00Z") for i in range(7)],
+    )
+    a = case_file(tmp_path, "a", version_key=KEY, passes=2, scored=3, pass_rate=2 / 3)
+    c = not_graded_case_file(tmp_path, "c", version_key=KEY)
+    assert main([
+        "suite", "--case-result", str(a), "--case-result", str(c),
+        "--baseline-dir", str(store), "--min-scored", "1",
+    ]) == 0
+    printed = capsys.readouterr().out
+    assert "main: 66.7%" in printed
+    assert "BELOW the margin" not in printed
+
+
 def test_the_aggregate_reds_when_the_store_says_main_did_better(tmp_path, monkeypatch):
     monkeypatch.setenv("EVAL_AGGREGATE_ARMED", "1")
     store = store_with(
