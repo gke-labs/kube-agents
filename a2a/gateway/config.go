@@ -448,8 +448,11 @@ func FromEnv() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("A2A_SESSION_TTL %q: %w", sessionTTL, err)
 	}
-	if st < time.Hour {
-		return nil, fmt.Errorf("A2A_SESSION_TTL %q is under the 1h floor", sessionTTL)
+	if st < 72*time.Hour {
+		return nil, fmt.Errorf("A2A_SESSION_TTL %q is under the 72h floor; it must sit beyond TASKS stream retention (72h)", sessionTTL)
+	}
+	if st <= cfg.TaskDeadline {
+		return nil, fmt.Errorf("A2A_SESSION_TTL %q must exceed A2A_TASK_DEADLINE_SECONDS (%v)", sessionTTL, cfg.TaskDeadline)
 	}
 	cfg.SessionTTL = st
 

@@ -72,17 +72,26 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 
 	// Check if the session record itself has outlived the retention horizon.
 	// Prune records older than SessionTTL whose pod has been reaped (or never
-	// incarnated), even if an ActiveTask was left behind (e.g. executor died
-	// without a terminal or was never healed on next turn).
+	// incarnated). If an ActiveTask is present, only prune if it has also
+	// outlived its execution deadline (stale/abandoned executor).
 	if g.cfg.SessionTTL > 0 && rec.PodName == "" &&
 		!rec.LastActivity.IsZero() &&
 		time.Since(rec.LastActivity) >= g.cfg.SessionTTL {
+		if rec.ActiveTask != nil && !rec.ActiveTask.SubmittedAt.IsZero() &&
+			time.Since(rec.ActiveTask.SubmittedAt) < g.cfg.TaskDeadline {
+			return
+		}
 		l := g.lockSession(rec.Key)
 		l.Lock()
 		fresh, err := g.reg.Get(ctx, rec.Key)
 		if err == nil && fresh != nil && fresh.PodName == "" &&
 			!fresh.LastActivity.IsZero() &&
 			time.Since(fresh.LastActivity) >= g.cfg.SessionTTL {
+			if fresh.ActiveTask != nil && !fresh.ActiveTask.SubmittedAt.IsZero() &&
+				time.Since(fresh.ActiveTask.SubmittedAt) < g.cfg.TaskDeadline {
+				l.Unlock()
+				return
+			}
 			if err := g.reg.DeleteSession(ctx, fresh.Key); err != nil {
 				g.log.Error("reap: session record delete failed", "session", fresh.Key, "err", err)
 			} else {

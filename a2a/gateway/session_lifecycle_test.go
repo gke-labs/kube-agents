@@ -128,7 +128,7 @@ func TestSessionRecordPrunedWithStaleActiveTask(t *testing.T) {
 	recTask := &SessionRecord{
 		Key:          convTask,
 		ContextID:    "ctx-stale-task",
-		ActiveTask:   &ActiveTask{TaskID: taskID},
+		ActiveTask:   &ActiveTask{TaskID: taskID, SubmittedAt: time.Now().UTC().Add(-48 * time.Hour)},
 		Tasks:        []TaskRef{{ID: taskID}},
 		LastActivity: time.Now().UTC().Add(-48 * time.Hour),
 	}
@@ -150,6 +150,45 @@ func TestSessionRecordPrunedWithStaleActiveTask(t *testing.T) {
 	routedConv, err := r.g.reg.SessionForTask(ctx, taskID)
 	if err == nil && routedConv != "" {
 		t.Fatalf("stale task routing was retained for %s: %s", taskID, routedConv)
+	}
+}
+
+// TestSessionRecordRetainedWhileActiveTaskWithinDeadline verifies that a session whose pod
+// has been reaped (or never incarnated, as on the fixed route) and whose last activity is
+// older than SessionTTL is NOT pruned if an ActiveTask is still within TaskDeadline.
+func TestSessionRecordRetainedWhileActiveTaskWithinDeadline(t *testing.T) {
+	r := startRig(t)
+	r.g.cfg.SessionTTL = 24 * time.Hour
+	r.g.cfg.TaskDeadline = 30 * time.Minute
+	ctx := context.Background()
+
+	convTask := "discord:g1/running-task-conv"
+	taskID := "task-running-01"
+	recTask := &SessionRecord{
+		Key:          convTask,
+		ContextID:    "ctx-running-task",
+		ActiveTask:   &ActiveTask{TaskID: taskID, SubmittedAt: time.Now().UTC().Add(-10 * time.Minute)},
+		Tasks:        []TaskRef{{ID: taskID}},
+		LastActivity: time.Now().UTC().Add(-48 * time.Hour),
+	}
+	if err := r.g.reg.Put(ctx, recTask); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.g.reg.IndexTask(ctx, taskID, convTask); err != nil {
+		t.Fatal(err)
+	}
+
+	r.g.reapOnce(ctx)
+
+	gotTask, err := r.g.reg.Get(ctx, convTask)
+	if err != nil || gotTask == nil {
+		t.Fatalf("session with running active task was prematurely pruned: err=%v, rec=%+v", err, gotTask)
+	}
+
+	// Verify task routing was preserved
+	routedConv, err := r.g.reg.SessionForTask(ctx, taskID)
+	if err != nil || routedConv != convTask {
+		t.Fatalf("task routing was corrupted for running task %s: got %q, want %q", taskID, routedConv, convTask)
 	}
 }
 
@@ -424,6 +463,83 @@ func TestReapOnceResumableCursor(t *testing.T) {
 
 	if timeoutCursor == "" {
 		t.Fatal("expected reapCursor to be saved when reap pass is interrupted by context cancellation")
+	}
+}
+
+// TestReapOnceResumableCursorAfterDelete verifies that when a reap pass deletes
+// expired session records and stops short, the resumption cursor accurately resumes
+// across the deleted cursor on subsequent passes without skipping records or resetting prematurely.
+func TestReapOnceResumableCursorAfterDelete(t *testing.T) {
+	r := startRig(t)
+	r.g.cfg.SessionTTL = 24 * time.Hour
+	ctx := context.Background()
+
+	// Seed 6 expired sessions
+	var seededKeys []string
+	for i := 1; i <= 6; i++ {
+		key := fmt.Sprintf("discord:g1/reap-del-%02d", i)
+		seededKeys = append(seededKeys, key)
+		rec := &SessionRecord{
+			Key:          key,
+			ContextID:    fmt.Sprintf("ctx-del-%02d", i),
+			LastActivity: time.Now().UTC().Add(-48 * time.Hour),
+		}
+		if err := r.g.reg.Put(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// First pass: halt after deleting 2 records
+	var firstPass []string
+	r.g.reapScanHook = func(rec *SessionRecord) bool {
+		firstPass = append(firstPass, rec.Key)
+		return len(firstPass) < 2
+	}
+
+	r.g.reapOnce(context.Background())
+
+	if len(firstPass) != 2 {
+		t.Fatalf("first reap pass visited %d records, want 2", len(firstPass))
+	}
+
+	r.g.mu.Lock()
+	savedCursor := r.g.reapCursor
+	r.g.mu.Unlock()
+
+	if savedCursor == "" {
+		t.Fatal("expected reapCursor to be preserved after partial reap pass with deletions")
+	}
+
+	// Second pass: resume to completion
+	var secondPass []string
+	r.g.reapScanHook = func(rec *SessionRecord) bool {
+		secondPass = append(secondPass, rec.Key)
+		return true
+	}
+
+	r.g.reapOnce(context.Background())
+
+	if len(secondPass) != 4 {
+		t.Fatalf("second reap pass visited %d records, want 4", len(secondPass))
+	}
+
+	// Verify all 6 records were pruned from KV
+	for _, k := range seededKeys {
+		rec, err := r.g.reg.Get(ctx, k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec != nil {
+			t.Fatalf("record %q was not pruned from KV: %+v", k, rec)
+		}
+	}
+
+	r.g.mu.Lock()
+	finalCursor := r.g.reapCursor
+	r.g.mu.Unlock()
+
+	if finalCursor != "" {
+		t.Fatalf("expected reapCursor to reset to empty on completion, got %q", finalCursor)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -307,10 +308,11 @@ func (r *Registry) SessionForTask(ctx context.Context, taskID string) (string, e
 type SessionCallback func(rec *SessionRecord) (bool, error)
 
 // ScanSessions streams session records via a callback, starting from the given cursor.
-// When cursor is non-empty, records up to and including the cursor are skipped.
+// It supports cursor resumption across passes: keys are sorted lexicographically,
+// and when cursor is non-empty, records with keys <= cursor are skipped.
 // If the scan reaches the end of the bucket, it returns nextCursor="", done=true, err=nil.
 // If the scan is interrupted (by timeout, context cancellation, or callback returning false),
-// it returns the last processed key as nextCursor, done=false, and any error.
+// it returns the last successfully visited key as nextCursor, done=false, and any error.
 func (r *Registry) ScanSessions(ctx context.Context, cursor string, cb SessionCallback) (nextCursor string, done bool, err error) {
 	kv, err := r.kv(ctx)
 	if err != nil {
@@ -324,16 +326,18 @@ func (r *Registry) ScanSessions(ctx context.Context, cursor string, cb SessionCa
 		_ = lister.Stop()
 	}()
 
-	seeking := cursor != ""
-	foundCursor := false
-	lastVisited := ""
-
+	var keys []string
 	for key := range lister.Keys() {
-		if seeking {
-			if key == cursor {
-				seeking = false
-				foundCursor = true
-			}
+		if ctx.Err() != nil {
+			return cursor, false, ctx.Err()
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	lastVisited := cursor
+	for _, key := range keys {
+		if cursor != "" && key <= cursor {
 			continue
 		}
 		if ctx.Err() != nil {
@@ -350,19 +354,17 @@ func (r *Registry) ScanSessions(ctx context.Context, cursor string, cb SessionCa
 		if err := json.Unmarshal(entry.Value(), &rec); err != nil {
 			continue // a malformed record must not kill the reaper
 		}
-		lastVisited = key
 		cont, err := cb(&rec)
 		if err != nil {
 			return lastVisited, false, err
 		}
+		if ctx.Err() != nil {
+			return lastVisited, false, ctx.Err()
+		}
+		lastVisited = key
 		if !cont {
 			return lastVisited, false, nil
 		}
-	}
-	if cursor != "" && !foundCursor {
-		// If the cursor key was deleted between passes, we could not resume from it.
-		// Signal done=true so the next pass starts from the beginning.
-		return "", true, nil
 	}
 	return "", true, nil
 }

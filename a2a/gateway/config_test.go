@@ -297,7 +297,7 @@ func TestFromEnvAskTTL(t *testing.T) {
 }
 
 // TestFromEnvSessionTTL: the bound on idle session records in session-state —
-// absent means 7 days (well past TASKS 72h retention), and a sub-hour
+// absent means 7 days (well past TASKS 72h retention), and a sub-72h
 // value or invalid format refuses at boot.
 func TestFromEnvSessionTTL(t *testing.T) {
 	setBaseEnv(t)
@@ -310,16 +310,16 @@ func TestFromEnvSessionTTL(t *testing.T) {
 		t.Fatalf("default SessionTTL = %v, want 168h", cfg.SessionTTL)
 	}
 
-	t.Setenv("A2A_SESSION_TTL", "48h")
+	t.Setenv("A2A_SESSION_TTL", "96h")
 	cfg, err = FromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SessionTTL != 48*time.Hour {
-		t.Fatalf("SessionTTL = %v, want 48h", cfg.SessionTTL)
+	if cfg.SessionTTL != 96*time.Hour {
+		t.Fatalf("SessionTTL = %v, want 96h", cfg.SessionTTL)
 	}
 
-	for _, bad := range []string{"30m", "junk"} {
+	for _, bad := range []string{"71h", "48h", "30m", "junk"} {
 		t.Setenv("A2A_SESSION_TTL", bad)
 		if _, err := FromEnv(); err == nil {
 			t.Fatalf("A2A_SESSION_TTL=%q accepted", bad)
