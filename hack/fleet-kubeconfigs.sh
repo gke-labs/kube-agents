@@ -92,6 +92,15 @@ _FLEET_MARKER=".kube-agents-fleet-kubeconfigs"
 # Read-only credential unset or unmintable. Distinct from 1 so ci-eval-pr.sh
 # stops on this and still only warns on an unusable catalog or directory.
 _FLEET_EXIT_READONLY_UNAVAILABLE=3
+# The gate's one mint is retried on a transient: in the eval it runs 20-30
+# minutes into a leased job, after the deploy already proved the binding, and
+# a one-off IAM blip there would end a three-hour run charged to the branch.
+# The checks' own mints retry inside the verifier's poll loop, so the gate
+# should be no stricter than they are. A PERMISSION_DENIED is not retried:
+# it is the binding, and it will not change in fifteen seconds.
+_FLEET_MINT_ATTEMPTS=3
+_FLEET_MINT_RETRY_SECONDS=5
+_FLEET_MINT_DENIED_PATTERN="PERMISSION_DENIED"
 
 # The exec-credential plugin each rewritten kubeconfig points at, and the
 # schema its reply speaks. Absolute, because kubectl resolves `command`
@@ -388,7 +397,13 @@ _fleet_require_readonly_credential() {
     return "$_FLEET_EXIT_READONLY_UNAVAILABLE"
   fi
   errors="$(mktemp)" || return 1
-  if ! token="$(gcloud auth print-access-token --impersonate-service-account="$sa" 2>"$errors")"; then
+  local attempt=1
+  while ! token="$(gcloud auth print-access-token --impersonate-service-account="$sa" 2>"$errors")"; do
+    if [ "$attempt" -lt "$_FLEET_MINT_ATTEMPTS" ] && ! grep -q "$_FLEET_MINT_DENIED_PATTERN" "$errors"; then
+      attempt=$((attempt + 1))
+      sleep "$_FLEET_MINT_RETRY_SECONDS"
+      continue
+    fi
     # One message, owned here: the callers add no repair of their own. A job
     # is told the pool repair; a laptop is not, since off Prow the mint fails
     # because the operator's account cannot impersonate the reader, which is
@@ -400,7 +415,7 @@ _fleet_require_readonly_credential() {
     fi
     rm -f "$errors"
     return "$_FLEET_EXIT_READONLY_UNAVAILABLE"
-  fi
+  done
   rm -f "$errors"
   if ! _fleet_bare_token "$token"; then
     echo "ERROR: gcloud returned something other than a bare access token for ${sa}; nothing written." >&2

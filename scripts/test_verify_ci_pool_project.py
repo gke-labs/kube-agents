@@ -477,6 +477,28 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertTrue(any("exited 3 without reading the fleet" in w for w in result.warnings), result.warnings)
         self.assertEqual(2, len(run.call_args_list), "no state pass runs on a fleet that was not read")
 
+    def test_every_shape_of_the_gates_refusal_is_unverified_not_a_failure(self):
+        # Exit 3 is the gate in every wording it has -- the bare-token line
+        # carries no gcloud stderr for the denial patterns to find -- and is
+        # about the credential the verifier ran with, never the project.
+        stderr = (
+            "ERROR: gcloud returned something other than a bare access token for "
+            "seeded-fleet-reader@kube-agents-evals-5.iam.gserviceaccount.com; nothing written."
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (checker.FLEET_EXIT_READONLY_UNAVAILABLE, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result)
+        self.assertEqual("Not checked", result.message)
+        self.assertTrue(any("bare access token" in w for w in result.warnings), result.warnings)
+        # Any other non-zero exit with no known reason is still the project's.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (1, "", "ERROR: catalog is malformed")]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed, result)
+        with open(checker._FLEET_KUBECONFIGS, encoding="utf-8") as fh:
+            self.assertIn(f"_FLEET_EXIT_READONLY_UNAVAILABLE={checker.FLEET_EXIT_READONLY_UNAVAILABLE}", fh.read())
+
     def test_a_drifted_fixture_fails_and_names_the_role(self):
         # Presence passed -- payments-api's Deployment exists -- and the pod
         # has never restarted, so no OOMKilled evidence exists: the 2026-09-07

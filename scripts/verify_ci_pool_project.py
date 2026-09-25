@@ -39,6 +39,10 @@ _FLEET_KUBECONFIGS = _ROOT / "hack" / "fleet-kubeconfigs.sh"
 # operator owns is not the shared-fleet hazard the refusal exists for. The
 # reader's bindings are checked in check_iam_and_service_accounts instead.
 FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV = "FLEET_ALLOW_RUNNER_CREDENTIAL"
+# The runner's `_FLEET_EXIT_READONLY_UNAVAILABLE`: its credential gate refused
+# this caller before reading anything, whatever the line says. That is about
+# the credential the verifier ran with, never about the project.
+FLEET_EXIT_READONLY_UNAVAILABLE = 3
 _FLEET_CATALOG = _ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 
 # The summary hack/fleet-kubeconfigs.sh prints to stderr on its way out. It is
@@ -1645,7 +1649,11 @@ def _fleet_presence_result(
     if not match:
         last = (err.strip().splitlines() or ["no output"])[-1]
         if rc != 0:
+            # Exit 3 is the gate, before any read, in every shape it prints;
+            # the other codes are unread only when stderr says why.
             reason = _unread_reason(err)
+            if rc == FLEET_EXIT_READONLY_UNAVAILABLE:
+                reason = reason or last
             if reason:
                 return CheckResult(
                     name,

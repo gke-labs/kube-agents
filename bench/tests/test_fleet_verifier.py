@@ -1225,7 +1225,14 @@ users:
 YAML
     ;;
   "auth print-access-token "*)
-    [ -n "${STUB_TOKEN_FAIL:-}" ] && { echo "$STUB_TOKEN_FAIL" >&2; exit 1; }
+    # STUB_TOKEN_FAIL fails every mint; with STUB_TOKEN_FAIL_TIMES it fails
+    # only that many, counted off the calls already logged above.
+    if [ -n "${STUB_TOKEN_FAIL:-}" ]; then
+      prior=$(( $(grep -c '^auth print-access-token' "$STUB_LOG") - 1 ))
+      if [ -z "${STUB_TOKEN_FAIL_TIMES:-}" ] || [ "$prior" -lt "$STUB_TOKEN_FAIL_TIMES" ]; then
+        echo "$STUB_TOKEN_FAIL" >&2; exit 1
+      fi
+    fi
     [ -n "${STUB_TOKEN_WARNING:-}" ] && echo "$STUB_TOKEN_WARNING" >&2
     printf '%s\\n' "${STUB_TOKEN:-ya29.a0AfB_byTOKEN}"
     ;;
@@ -1670,6 +1677,43 @@ def test_a_reader_that_cannot_be_minted_stops_the_runner_before_any_file(shell, 
     # pool project the operator's account was never meant to impersonate.
     assert "FLEET_ALLOW_RUNNER_CREDENTIAL=1" in done.stderr
     assert "re-apply" not in done.stderr
+    # A denial is the binding, not weather: one attempt, no wait.
+    assert _mints(shell) == 1
+
+
+def _mints(shell) -> int:
+    return sum(1 for line in shell.log.read_text().splitlines() if line.startswith("auth print-access-token"))
+
+
+def test_a_transient_mint_failure_is_retried_and_the_run_goes_on(shell, tmp_path):
+    """In the eval the gate runs 20-30 minutes into a leased job; a one-off
+    IAM blip there must not end the run when the next attempt would pass."""
+    out = _provision(
+        shell,
+        tmp_path,
+        FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
+        STUB_TOKEN_FAIL="ERROR: (gcloud.auth.print-access-token) UNAVAILABLE: The service is currently unavailable.",
+        STUB_TOKEN_FAIL_TIMES="1",
+    )
+    done = _provision.last
+    assert done.returncode == 0, done.stderr
+    assert (out / "crashloop-workload.kubeconfig").exists()
+    assert _mints(shell) == 2
+
+
+def test_a_transient_that_never_clears_stops_after_the_attempts(shell, tmp_path):
+    out = _provision(
+        shell,
+        tmp_path,
+        FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
+        STUB_TOKEN_FAIL="ERROR: (gcloud.auth.print-access-token) UNAVAILABLE: The service is currently unavailable.",
+        STUB_TOKEN_FAIL_TIMES="9",
+    )
+    done = _provision.last
+    assert done.returncode == 3, done.stderr
+    assert not out.exists()
+    assert "UNAVAILABLE" in done.stderr
+    assert _mints(shell) == 3
 
 
 def test_under_prow_the_gate_names_the_pool_repair_not_the_opt_in(shell, tmp_path):
