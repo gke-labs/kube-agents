@@ -233,6 +233,12 @@ that would fail if that behaviour regressed. Where there is none, the candidate 
 behaviour, not the absent test — say which regression would ship silently. Bug fixes without a
 regression test, and new error paths nothing exercises, are the usual cases.
 
+On a bug fix, hold the body's **Bug Fix: Preventing Recurrence** section to the same standard: the
+test, case, or check it names must exist in the tree, reach the path the bug took, and fail with
+the fix reverted. A `fix:` pull request whose section is missing, empty, or answered "Not a bug
+fix" is a finding, and so is one that names a guard the diff does not add or that could not have
+caught the bug.
+
 **Do not treat green test suites as proof of correctness**: a passing suite proves only that the
 paths it exercises work on the fixtures it supplies. For every validation check, gate, and error
 path, check whether **negative inputs** (unresolvable identifiers, malformed strings, absent fields)

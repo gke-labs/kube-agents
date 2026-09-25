@@ -28,6 +28,26 @@ file matters.
 
 <!-- Include related issues, PRs, follow-up work, or other background. -->
 
+## Bug Fix: Preventing Recurrence
+
+<!--
+Required when this PR fixes a bug, which includes every `fix:` title. Otherwise write
+"Not a bug fix."
+
+- Why it shipped: the test, check, or review step that should have caught the bug, and
+  why it did not.
+- What catches it now: the test, eval case, or check that fails if the bug comes back,
+  and that you saw it fail without the fix. An eval case already named under Live
+  validation can be cited by name rather than repeated.
+- Where else it lives: other places the same mistake could be, and whether you checked
+  them or the new guard covers them.
+
+If nothing automated can catch it, say why and what stands in for it. "Added a test"
+without naming the test is not an answer.
+-->
+
+-
+
 ## Testing
 
 <!-- Automated checks: unit tests, builds, `make docs-check`, `prettier --check`. -->
