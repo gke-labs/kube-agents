@@ -558,8 +558,7 @@ def instruction_files() -> list[Path]:
         # `docs` is not a profile-home item and the layer does not take the
         # directory: the Dockerfile bakes named files out of it into
         # /opt/defaults/docs and leaves the rest. Those others are design docs
-        # -- docs/README.md calls them "not baked into the image despite its
-        # location" -- whose only reader is a human in a checkout, where their
+        # whose only reader is a human in a checkout, where their
         # `agents/<profile>/...` citations resolve exactly as written. Globbing
         # the directory swept them in and demanded the in-profile spelling for
         # a profile they never reach, which rewrites a working citation into
