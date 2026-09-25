@@ -390,6 +390,19 @@ class InjectLaneExclusionTest(unittest.TestCase):
         self.assertIn("rung 4 disarmed", result.stderr)
         self.assertNotIn("ROSTER ", result.stdout, "the roster must not be exported past the guard")
 
+    def test_an_explicit_roster_override_gets_past_the_guard(self):
+        # The guard's message offers BOOTSTRAP_ADMITTED as the way to mean
+        # it, so an explicit value -- empty included -- must reach the export.
+        everything = "".join(f"{name}\n" for name in eval_rosters.blocking_roster())
+        for override in ("x-probe,y-probe", ""):
+            with self.subTest(override=override):
+                result = self.scratch(
+                    lambda d: (d / "inject-lane-exclusions.txt").write_text("# #1: all\n" + everything),
+                    {"AGENT_TRANSPORT": "inject", "EVAL_TIER": "nightly", "BOOTSTRAP_ADMITTED": override},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(lines_tagged(result, "ROSTER"), [override])
+
     def test_excluding_one_roster_case_on_the_nightly_lane_keeps_the_rest(self):
         result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "inject", "EVAL_TIER": "nightly"})
         self.assertEqual(result.returncode, 0, result.stderr)

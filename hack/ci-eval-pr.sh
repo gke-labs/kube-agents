@@ -1938,8 +1938,9 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # keeps its own cases past the every-case-excluded stop) and no banner,
 # because no name is misspelled. Stop instead: the exclusion file needs only
 # the normal approvers, and it must not be able to do what the roster file
-# is guarded against.
-if [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ]; then
+# is guarded against. An explicit BOOTSTRAP_ADMITTED in the job's
+# environment, empty included, is the stated way to mean it, and wins below.
+if [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
   echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
   exit 1
 fi
