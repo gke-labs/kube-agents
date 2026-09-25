@@ -20,11 +20,6 @@
 
 set -euo pipefail
 
-# MEASUREMENT ONLY, reverted before merge: force the next-mode flag on so this
-# pull request's presubmit runs the matrix once under spec.mode: next through
-# the inject door on a pool project (gke-labs/kube-agents#2007, phase 1 exit).
-export EVAL_MODE_NEXT=1
-
 # The session daemon caps Warning alerts at 5 per UTC day, fleet-wide per
 # install (ALERT_DAILY_LIMIT_WARNING, #641). That cap is alert-storm
 # protection for a human-watched channel; an eval install's whole job is
