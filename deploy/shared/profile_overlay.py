@@ -130,8 +130,28 @@ def merge(base, overlay):
             base[k] = merge(base[k], v) if k in base else v
         return base
     if isinstance(base, list) and isinstance(overlay, list):
-        return list(dict.fromkeys(base + overlay))
+        return _union(base, overlay)
     return overlay
+
+
+def _union(base, overlay):
+    """base + overlay, first occurrence wins, order kept - dict.fromkeys for lists whose
+    items may be unhashable. `hooks.outbound` is a list of mappings; a mapping in a
+    set-keyed union raises, and one raise here used to fail the whole profile's merge,
+    taking the operator's own settings down with the entry that tripped it."""
+    seen = set()
+    out = []
+    for item in base + overlay:
+        try:
+            key = ("h", item)
+            hash(key)
+        except TypeError:
+            key = ("j", json.dumps(item, sort_keys=True, default=str))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
 
 
 def unapply(current, applied, before=_ABSENT):

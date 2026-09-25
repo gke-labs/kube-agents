@@ -470,6 +470,26 @@ class A2AHooksFragmentTest(unittest.TestCase):
         self.assertEqual(self.config(), once)
         self.assertEqual(len(self.config()["hooks"]["outbound"]), 1)
 
+    def test_a_second_hook_source_merges_beside_the_fragment(self):
+        """`hooks.outbound` is a list of mappings. An operator overlay carrying its own
+        entry, or a config that already has one, meets the fragment in a list union;
+        a union that needs hashable items would raise there and fail the whole
+        profile's merge, dropping the operator's settings along with the hook."""
+        theirs = {"name": "ops-audit", "url": "https://audit.example/hooks",
+                  "events": ["post_tool_call"], "secret_env": "OPS_AUDIT_SECRET"}
+        write(
+            self.overlay_dir / "profile-platform.overlay.yaml",
+            {"hooks": {"outbound": [theirs]}, "plugins": {"enabled": ["targeted_plugin"]}},
+        )
+        self.run_step(with_fragment=True)
+        hooks = self.config()["hooks"]["outbound"]
+        self.assertEqual([h["name"] for h in hooks], ["ops-audit", "a2a-bridge-activity"])
+        self.assertIn("targeted_plugin", self.config()["plugins"]["enabled"])
+
+        self.run_step(with_fragment=False)
+        self.assertEqual([h["name"] for h in self.config()["hooks"]["outbound"]], ["ops-audit"])
+        self.assertIn("targeted_plugin", self.config()["plugins"]["enabled"])
+
 
 class ProfileNameValidationTest(unittest.TestCase):
     def test_names(self):

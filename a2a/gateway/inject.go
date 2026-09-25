@@ -178,6 +178,12 @@ const (
 	// holds. It applies to what the GATEWAY posts, never to the prompt: the
 	// inbound text goes to the bus, not into this transcript.
 	injectMaxEntryBytes = 64 * 1024
+	// injectMaxActivityEntries bounds the trace a probe carries: the read
+	// route runs before and after every wait on the harness's hot loop, and
+	// a long run's trace would otherwise ride every poll whole. The newest
+	// entries are kept, since a caller reading a live run wants what it is
+	// doing now; ActivityDropped says how many older ones the cap cut.
+	injectMaxActivityEntries = 1000
 
 	// injectMaxEntries bounds one conversation's retained transcript and
 	// injectMaxConversations how many conversations are retained at once.
@@ -441,6 +447,9 @@ type probeReport struct {
 	// in Go and to None under a Python .get, which would leave a harness
 	// unable to tell "this door cannot show calls" from "nobody called".
 	Activity *[]json.RawMessage `json:"activity,omitempty"`
+	// ActivityDropped is how many of the oldest entries injectMaxActivityEntries
+	// cut from Activity; zero, and absent, when the whole trace fits.
+	ActivityDropped int `json:"activityDropped,omitempty"`
 	// Progress is the last text part of the progress artifact -- the line
 	// the relay's rolling edit shows -- at the instant of the read.
 	Progress string `json:"progress,omitempty"`
@@ -1844,7 +1853,12 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key string) *probeReport {
 	// Non-nil is the fact that the stream was read (ConversationState.
 	// Activity), and the pointer carries that fact onto the wire.
 	if state.Activity != nil {
-		report.Activity = &state.Activity
+		trace := state.Activity
+		if len(trace) > injectMaxActivityEntries {
+			report.ActivityDropped = len(trace) - injectMaxActivityEntries
+			trace = trace[len(trace)-injectMaxActivityEntries:]
+		}
+		report.Activity = &trace
 	}
 	if !state.SubmittedAt.IsZero() {
 		report.SubmittedAt = state.SubmittedAt.UTC().Format(time.RFC3339Nano)

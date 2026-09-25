@@ -26,4 +26,7 @@ hooks:
       url: http://127.0.0.1:8651/hermes/tool-events
       events: [pre_tool_call, post_tool_call]
       secret_env: A2A_ACTIVITY_SECRET
-      timeout: 2
+      # Longer than the bridge's publish budget (activityPublishTimeout),
+      # because the door publishes on the delivery and a timed-out delivery
+      # is retried, which would be a duplicate call in the trace.
+      timeout: 10

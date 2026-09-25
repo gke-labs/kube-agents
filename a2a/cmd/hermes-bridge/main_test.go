@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -107,5 +108,16 @@ func TestActivityListenMapsOffToClosed(t *testing.T) {
 	}
 	if got := activityListen("127.0.0.1:9"); got != "127.0.0.1:9" {
 		t.Errorf("activityListen(addr) = %q, want the address back", got)
+	}
+}
+
+// In the environment 0 seconds is the heartbeat off; the Config's own zero is
+// its default, so the daemon has to say off in the Config's word (negative).
+func TestProgressIntervalMapsZeroToOff(t *testing.T) {
+	if got := progressInterval(0); got >= 0 {
+		t.Errorf("progressInterval(0) = %v, want negative (off)", got)
+	}
+	if got := progressInterval(30); got != 30*time.Second {
+		t.Errorf("progressInterval(30) = %v, want 30s", got)
 	}
 }

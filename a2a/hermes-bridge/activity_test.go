@@ -29,13 +29,13 @@ func hermesStub(t *testing.T, body string) []string {
 		t.Skip("python3 not on PATH; the hermes stub needs it")
 	}
 	prelude := `#!/usr/bin/env python3
-import hashlib, hmac, json, os, sys, time, urllib.request
+import hashlib, hmac, json, os, sys, time, urllib.request, uuid
 URL = os.environ.get("` + ActivityURLEnv + `", "")
 KEY = os.environ.get("` + ActivitySecretEnv + `", "")
 def post(event, tool, args, extra, sign=True):
     body = json.dumps({"hook_event_name": event, "profile": "platform", "tool_name": tool,
                        "tool_input": args, "session_id": "s1", "cwd": "/opt/data", "extra": extra,
-                       "delivery_id": "d", "timestamp": "2026-09-25T20:00:00Z"}).encode()
+                       "delivery_id": uuid.uuid4().hex, "timestamp": "2026-09-25T20:00:00Z"}).encode()
     headers = {"Content-Type": "application/json", "X-Hermes-Event": event}
     if sign and KEY:
         headers["X-Hermes-Signature-256"] = "sha256=" + hmac.new(KEY.encode(), body, hashlib.sha256).hexdigest()
@@ -418,4 +418,93 @@ func joinText(parts []lib.Part) string {
 		b.WriteString(p.Text)
 	}
 	return b.String()
+}
+
+// Two tasks at once: each delivery lands on the task whose key signed it,
+// never on the other. The stubs overlap by sleeping after their calls.
+func TestActivity_ConcurrentTasksKeepTheirOwnTraces(t *testing.T) {
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+prompt = sys.argv[-1]
+tool = "tool-for-" + prompt
+call(tool, {"which": prompt}, "call-" + prompt)
+time.sleep(1.5)
+call(tool + "-again", {"which": prompt}, "call2-" + prompt)
+print("answer for " + prompt)
+`), func(c *Config) { c.Concurrency = 2 })
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-a", "A")
+	submit(t, c, "task-b", "B")
+	ta := waitTerminal(t, c, "task-a")
+	tb := waitTerminal(t, c, "task-b")
+	for _, tc := range []struct {
+		task *lib.Task
+		want string
+	}{{ta, "A"}, {tb, "B"}} {
+		entries := activityEntries(t, tc.task)
+		if len(entries) != 2 {
+			t.Fatalf("task %s: %d entries, want 2: %+v", tc.want, len(entries), entries)
+		}
+		for _, e := range entries {
+			if !strings.HasPrefix(e.Tool, "tool-for-"+tc.want) || !strings.Contains(string(e.Input), `"which":"`+tc.want+`"`) {
+				t.Fatalf("task %s carries another task's call: %+v", tc.want, e)
+			}
+		}
+	}
+}
+
+// hermes retries a timed-out delivery once with the same delivery_id; the
+// trace records the call once.
+func TestActivity_ARetriedDeliveryIsOneCall(t *testing.T) {
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+extra = {"tool_call_id": "c1", "status": "ok", "duration_ms": 3}
+body = json.dumps({"hook_event_name": "post_tool_call", "profile": "platform", "tool_name": "kubectl",
+                   "tool_input": {"cmd": "get ns"}, "session_id": "s1", "cwd": "/opt/data", "extra": extra,
+                   "delivery_id": "same-delivery", "timestamp": "2026-09-25T20:00:00Z"}).encode()
+sig = "sha256=" + hmac.new(KEY.encode(), body, hashlib.sha256).hexdigest()
+for _ in range(2):
+    req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json", "X-Hermes-Signature-256": sig}, method="POST")
+    urllib.request.urlopen(req, timeout=5).read()
+print("done")
+`), nil)
+	c := gatewayClient(t, url)
+	submit(t, c, "task-retry", "hello")
+	task := waitTerminal(t, c, "task-retry")
+	if got := activityEntries(t, task); len(got) != 1 {
+		t.Fatalf("entries = %d, want 1 (retry deduped): %+v", len(got), got)
+	}
+}
+
+func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
+	mk := func(status, errType string) hookDelivery {
+		var d hookDelivery
+		d.Event, d.ToolName = hookPostToolCall, "terminal"
+		d.Extra.Status, d.Extra.ErrorType = status, errType
+		return d
+	}
+	a, _ := newActivityState(false)
+	if e, _ := a.observe(mk("blocked", "")); e.Status != ActivityStatusError || e.ErrorType != "blocked" {
+		t.Fatalf("blocked -> %+v", e)
+	}
+	if e, _ := a.observe(mk("error", "tool_error")); e.Status != ActivityStatusError || e.ErrorType != "tool_error" {
+		t.Fatalf("error/tool_error -> %+v", e)
+	}
+	if e, _ := a.observe(mk("ok", "")); e.Status != ActivityStatusCompleted || e.ErrorType != "" {
+		t.Fatalf("ok -> %+v", e)
+	}
+}
+
+func TestRedactInput_ValuesUnderInnocentKeys(t *testing.T) {
+	in := `{"command": "curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' https://x; export GH=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345; gcloud --access-token=ya29.a0AfH6SMBxyzxyzxyzxyzxyzxyz ls", "plain": "kubectl get pods -n kube-system"}`
+	out := string(redactInput(json.RawMessage(in)))
+	for _, leaked := range []string{"abcdefghijklmnopqrstuvwxyz0123", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "ya29.a0AfH6SMB"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("leaked %q in %s", leaked, out)
+		}
+	}
+	if !strings.Contains(out, "kubectl get pods -n kube-system") {
+		t.Fatalf("innocent value was damaged: %s", out)
+	}
 }
