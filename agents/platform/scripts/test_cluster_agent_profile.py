@@ -754,7 +754,7 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         self.assertIn("sleep 60", self.content)
         # Must bound the polling loop and handle ready cards
         self.assertIn("5 polling rounds", self.content)
-        self.assertIn("ready", self.content)
+        self.assertIn("do not time out queued cards in `ready`", self.content)
         self.assertIn("timed out", self.content)
         # Must acknowledge configurable concurrency (spec.harness.tuning.maxInProgress) rather than assuming a static cap
         self.assertIn("spec.harness.tuning.maxInProgress", self.content)
@@ -776,6 +776,11 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         self.assertRegex(
             self.content,
             r"[Nn]ever abandon an unsettled probe queued in `ready`",
+        )
+        # Must instruct completing with the answer you have if a probe blocks or times out
+        self.assertRegex(
+            self.content,
+            r"[Cc]omplete with the answer you have",
         )
 
 
