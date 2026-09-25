@@ -561,6 +561,17 @@ class ResolveProfilesBaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="test-data-root-") as tmpdir:
             data_root = Path(tmpdir) / "profiles" / "default"
             (data_root / "profiles").mkdir(parents=True)
+            (data_root / "config.yaml").write_text("model: default\n", encoding="utf-8")
+            (data_root / "SOUL.md").write_text("Default persona\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"HERMES_HOME": str(data_root)}, clear=True):
+                self.assertEqual(cap._resolve_data_root(), data_root)
+                self.assertEqual(cap._resolve_profiles_base(), data_root / "profiles")
+
+        with tempfile.TemporaryDirectory(prefix="test-data-cluster-") as tmpdir:
+            data_root = Path(tmpdir) / "profiles" / "cluster-data"
+            (data_root / "profiles").mkdir(parents=True)
+            (data_root / "config.yaml").write_text("model: default\n", encoding="utf-8")
+            (data_root / "SOUL.md").write_text("Default persona\n", encoding="utf-8")
             with mock.patch.dict(os.environ, {"HERMES_HOME": str(data_root)}, clear=True):
                 self.assertEqual(cap._resolve_data_root(), data_root)
                 self.assertEqual(cap._resolve_profiles_base(), data_root / "profiles")

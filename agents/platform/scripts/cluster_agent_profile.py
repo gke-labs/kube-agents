@@ -62,13 +62,14 @@ def _resolve_data_root() -> Path:
     ):
         # Disambiguate a profile home from a real data root whose path ends with
         # `profiles/<reserved|cluster-*>`. If `raw_home / PROFILES_DIR_NAME` exists as a
-        # directory and `raw_home` carries no profile markers (`profile.yaml`, `USER.md`,
-        # `SOUL.md`, `config.yaml`), `raw_home` is itself a data root holding profiles,
-        # not a profile home.
+        # directory and `raw_home` carries no registered profile markers (`profile.yaml`,
+        # `USER.md`), `raw_home` is itself a data root holding profiles, not a profile home.
+        # (Note: a real data root is the `default` profile home and thus carries `SOUL.md`
+        # and `config.yaml`, so only registered profile markers indicate a profile home).
         if (raw_home / PROFILES_DIR_NAME).is_dir():
             has_profile_markers = any(
                 (raw_home / marker).is_file()
-                for marker in (PROFILE_MARKER, IDENTITY_FILE, "SOUL.md", "config.yaml")
+                for marker in (PROFILE_MARKER, IDENTITY_FILE)
             )
             if not has_profile_markers:
                 return raw_home
