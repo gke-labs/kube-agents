@@ -243,7 +243,12 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # for the same reason. See bench/kube_agents_bench/verifiers.py.
     "fleet_resource_property": ("op",),
     # This repository, run-reading.
-    "report_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
+    "report_contains": (
+        "required_phrases",
+        "forbidden_phrases",
+        "any_of_phrases",
+        "forbidden_patterns",
+    ),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.

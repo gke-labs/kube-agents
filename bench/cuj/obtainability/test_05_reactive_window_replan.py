@@ -193,11 +193,25 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         for raw, parsed in remaining_starts
     )
     # The skill's report template always carries a "**No window**:" bullet,
-    # so the phrase alone proves nothing; honesty only counts when the
-    # analysis genuinely has no remaining-zone window.
+    # so the phrase alone proves nothing; honesty only counts when exactly
+    # one analysis record exists, it carries no remaining-zone window, and
+    # its zoneStatuses names the remaining zone — the shape the skill
+    # mandates for an honest no-window day. An absent or duplicated
+    # analysis record is not honesty.
+    zone_statuses = (
+        analysis.get("zoneStatuses") if isinstance(analysis, dict) else None
+    )
+    honest_no_window = (
+        not remaining_starts
+        and isinstance(zone_statuses, dict)
+        and any(
+            str(zone).removeprefix("zones/") == REMAINING_ZONE
+            for zone in zone_statuses
+        )
+        and "no window" in folded_answer
+    )
     revised_or_honest = REMAINING_ZONE in answer and (
-        new_start_named
-        or (not remaining_starts and "no window" in folded_answer)
+        new_start_named or honest_no_window
     )
 
     suite = AcceptanceCriteria(

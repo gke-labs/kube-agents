@@ -78,6 +78,11 @@ NEGATION_RE = re.compile(
 SENTENCE_SPLIT_RE = re.compile(r"[.!?\n]+")
 
 
+# An RFC 3339 timestamp with a Z suffix IS a UTC statement — the same rule
+# test_03 and test_05 apply to their start times.
+ZULU_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z")
+
+
 def _clock_minutes(text: str) -> set[int]:
     return {
         int(hour) * 60 + int(minute)
@@ -195,7 +200,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
             for start in all_clocks
             for fire in recheck_clocks
         )
-        and "utc" in folded_answer
+        and ("utc" in folded_answer or bool(ZULU_RE.search(answer)))
         and bool(LEAD_RE.search(folded_answer))
     )
     reports_to_thread = (

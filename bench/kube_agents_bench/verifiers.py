@@ -117,6 +117,16 @@ def _normalize(text: str) -> str:
     return collapsed.lower()
 
 
+def _normalize_lines(text: str) -> str:
+    """``_normalize`` applied per line, newlines kept.
+
+    ``forbidden_patterns`` need a boundary a Markdown bullet or heading can
+    end on; the whitespace collapse above would otherwise fuse a negated
+    bullet into its unnegated neighbour before the regex runs.
+    """
+    return "\n".join(_normalize(line) for line in text.splitlines())
+
+
 @VERIFIERS.register("report_contains")
 class ReportContainsVerifier(BaseVerifier):
     """Exact phrase checks against the agent's answer.
@@ -126,8 +136,12 @@ class ReportContainsVerifier(BaseVerifier):
     Anything fuzzier belongs to the judge, not to a blocking check.
     ``forbidden_patterns`` is the one regex exception, for the shape a
     substring cannot express: a banned word whose negated uses are
-    legitimate ("no guarantee"). Each is ``re.search``ed against the same
-    normalized text as the phrases.
+    legitimate ("no guarantee"). Each is ``re.search``ed against a
+    line-preserving variant of the same normalization — newlines survive,
+    so a Markdown bullet or heading with no terminal punctuation is its own
+    segment and a pattern may anchor on ``\\n``; the flat collapse would
+    otherwise fuse a negated bullet into its unnegated neighbour before the
+    regex runs.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
     Markdown emphasis dropped, whitespace runs collapsed. These are the
@@ -175,12 +189,13 @@ class ReportContainsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=_NO_TRANSCRIPT_REASON,
             )
-        text = _normalize(
-            snap.final_message if self.scope == "final" else snap.output
-        )
+        raw = snap.final_message if self.scope == "final" else snap.output
+        text = _normalize(raw)
         missing = [p for p in self.required_phrases if _normalize(p) not in text]
         present = [p for p in self.forbidden_phrases if _normalize(p) in text]
-        pattern_hits = [p for p in self.forbidden_patterns if re.search(p, text)]
+        pattern_hits = [
+            p for p in self.forbidden_patterns if re.search(p, _normalize_lines(raw))
+        ]
         any_of_miss = bool(self.any_of_phrases) and not any(
             _normalize(p) in text for p in self.any_of_phrases
         )

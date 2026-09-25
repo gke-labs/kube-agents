@@ -179,8 +179,9 @@ def test_a_delegated_audits_ledger_url_reaches_the_default_scope():
 
 
 GUARANTEE_PATTERN = (
-    "(?:^|[.!?])(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't"
-    "|is not|isn't|without|non)\\b)[^.!?])*guarant"
+    "(?:^|[.!?\\n])(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't"
+    "|is not|isn't|aren't|won't|without|non|nothing|none|neither)\\b)"
+    "[^.!?\\n])*guarant"
 )
 
 
@@ -222,6 +223,24 @@ def test_a_forbidden_pattern_scopes_negation_to_its_own_sentence():
         type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
     )
     assert check.verify(5.0).status == "fail"
+
+
+def test_a_negated_bullet_does_not_mask_the_next_bullets_banned_word():
+    _set_final(
+        "- Spot: **not** a reserved path\n- Flex-Start guarantees the window"
+    )
+    check = ReportContainsVerifier(
+        type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
+    )
+    assert check.verify(5.0).status == "fail"
+
+
+def test_common_negations_beyond_test01s_list_are_recognized():
+    _set_final("Nothing here guarantees capacity; neither path is guaranteed.")
+    check = ReportContainsVerifier(
+        type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
+    )
+    assert check.verify(5.0).status == "pass"
 
 
 def test_an_uncompilable_forbidden_pattern_is_rejected_at_construction():

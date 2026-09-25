@@ -65,9 +65,11 @@ verification_spec:
       required_phrases: ["On-Demand", "Spot", "Flex-Start"]
       # The skill bans the word "guarantee"; the negated uses test_01
       # permits ("no guarantee", "not guaranteed") are honest disclaimers.
-      # A sentence that reaches "guarant" with no negation before it fails.
+      # A segment (sentence or Markdown line — the harness keeps newlines
+      # for patterns) that reaches "guarant" with no negation before it
+      # fails.
       forbidden_patterns:
-        - "(?:^|[.!?])(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't|is not|isn't|without|non)\\b)[^.!?])*guarant"
+        - "(?:^|[.!?\\n])(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't|is not|isn't|aren't|won't|without|non|nothing|none|neither)\\b)[^.!?\\n])*guarant"
   - name: report-carries-a-computeclass-design
     role: objective
     mode: assert

@@ -368,8 +368,14 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         for item in advice_calls
         if _valid_obtainability_planning_call(item, created_at)
     ]
+    # The same two-place read as the validator: the canonical record keeps
+    # region inside request, the live recorder projects it at the top too.
     call_regions = {
-        str(_mapping(item.get("details")).get("region") or "")
+        str(
+            _mapping(_mapping(item.get("details")).get("request")).get("region")
+            or _mapping(item.get("details")).get("region")
+            or ""
+        )
         for item in valid_calls
     }
     analysis_records = _completed_records(
