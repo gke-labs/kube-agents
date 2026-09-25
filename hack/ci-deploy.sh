@@ -71,6 +71,17 @@ source "${SCRIPT_DIR}/../tags.env"
 trap dump_prow_artifacts_on_failure EXIT
 ensure_helm
 
+# PULL_NUMBER and JOB_NAME are set by Prow and by nothing else, which is what
+# separates a leased CI run from a laptop. The two get different treatment
+# below, but neither gets a silent default: an unmapped project stops the
+# deploy rather than installing an agent that writes somewhere unintended or
+# nowhere at all.
+if [ -n "${PULL_NUMBER:-}" ] || [ -n "${JOB_NAME:-}" ]; then
+  IS_PROW_RUN="true"
+else
+  IS_PROW_RUN="false"
+fi
+
 # ─── 2d. The seeded fleet's read-only credential ──────────────────────────────
 # The gate hack/ci-eval-pr.sh applies before it writes the fleet kubeconfigs,
 # run here first: this script is the 20-30 minutes of build and deploy ahead
@@ -79,16 +90,21 @@ ensure_helm
 # dashboard's setup-death bound -- a zero-task FAILURE under five minutes of
 # whole job, scripts/eval_dashboard/classify.py -- so the health bot counts it
 # as infrastructure and points at the leased project; a run that waited longer
-# than that for its Boskos lease reads as a deploy break instead. A developer
-# running this against a project of their own sets
-# FLEET_ALLOW_RUNNER_CREDENTIAL=1, which leaves the reader unset here and lets
-# the gate pass on their own credential (roles/owner cannot impersonate it).
+# than that for its Boskos lease reads as a deploy break instead. A laptop
+# fails the same gate for a different reason -- roles/owner cannot impersonate
+# the reader -- so its message names the developer's route instead of a
+# repair to a pool project: FLEET_ALLOW_RUNNER_CREDENTIAL=1 leaves the reader
+# unset and lets the gate pass on the developer's own credential.
 # shellcheck source=hack/fleet-kubeconfigs.sh
 source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
-export FLEET_READONLY_SA="$(_fleet_reader_for_run "${PROJECT_ID}")"
+FLEET_READONLY_SA="$(_fleet_reader_for_run "${PROJECT_ID}")"
 preflight_fleet_reader() {
   _fleet_require_readonly_credential "${FLEET_READONLY_SA}" "${PROJECT_ID}" || {
-    echo "FATAL: the seeded fleet cannot be read as ${FLEET_READONLY_SA}; stopping before the build rather than grading the fleet with the runner's write credential. Re-apply bench/tf/fleet against ${PROJECT_ID}." >&2
+    if [ "${IS_PROW_RUN}" = "true" ]; then
+      echo "FATAL: the seeded fleet cannot be read as ${FLEET_READONLY_SA}; stopping before the build rather than grading the fleet with the runner's write credential. Re-apply bench/tf/fleet against ${PROJECT_ID}." >&2
+    else
+      echo "FATAL: not a Prow run, and this account cannot impersonate ${FLEET_READONLY_SA} (roles/owner does not include it; the project is not at fault). Set FLEET_ALLOW_RUNNER_CREDENTIAL=1 to deploy on your own credential against a project of your own, with PROJECT_ID pointing at it." >&2
+    fi
     exit 1
   }
 }
@@ -290,16 +306,9 @@ gitops_repo_for_project() {
   esac
 }
 
-# PULL_NUMBER and JOB_NAME are set by Prow and by nothing else, which is what
-# separates a leased CI run from a laptop. The two get different treatment
-# below, but neither gets a silent default: an unmapped project stops the
-# deploy rather than installing an agent that writes somewhere unintended or
-# nowhere at all.
-if [ -n "${PULL_NUMBER:-}" ] || [ -n "${JOB_NAME:-}" ]; then
-  IS_PROW_RUN="true"
-else
-  IS_PROW_RUN="false"
-fi
+# IS_PROW_RUN is set above section 2d. An unmapped project gets no silent
+# default on either side of it: the deploy stops rather than installing an
+# agent that writes somewhere unintended or nowhere at all.
 
 # The override exists for developers, and only for them. Under Boskos the
 # project is leased per run, so a value pinned in the job environment would

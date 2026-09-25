@@ -369,7 +369,7 @@ _fleet_require_readonly_credential() {
   fi
   errors="$(mktemp)" || return 1
   if ! token="$(gcloud auth print-access-token --impersonate-service-account="$sa" 2>"$errors")"; then
-    echo "ERROR: cannot mint a read-only token as ${sa}: $(tr '\n' ' ' <"$errors"). Nothing written. Grant this caller roles/iam.serviceAccountTokenCreator on that account: re-apply bench/tf/fleet against ${project}, or bind it by hand." >&2
+    echo "ERROR: cannot mint a read-only token as ${sa}: $(tr '\n' ' ' <"$errors"). Nothing written. Grant this caller roles/iam.serviceAccountTokenCreator on that account: re-apply bench/tf/fleet against ${project}, or bind it by hand. On a fleet only you use, unset FLEET_READONLY_SA and set FLEET_ALLOW_RUNNER_CREDENTIAL=1 instead." >&2
     rm -f "$errors"
     return "$_FLEET_EXIT_READONLY_UNAVAILABLE"
   fi

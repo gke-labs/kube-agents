@@ -10,6 +10,7 @@ the branch, or a reshuffle that puts the warning back on the credential path,
 fails here rather than on a pool project.
 """
 
+import os
 import pathlib
 import re
 import subprocess
@@ -55,7 +56,7 @@ def preflight_body() -> str:
     return match.group(0)
 
 
-def run_preflight(gate_exit: int) -> subprocess.CompletedProcess:
+def run_preflight(gate_exit: int, prow: bool = True) -> subprocess.CompletedProcess:
     script = "\n".join(
         [
             "set -euo pipefail",
@@ -63,6 +64,7 @@ def run_preflight(gate_exit: int) -> subprocess.CompletedProcess:
             f"_fleet_require_readonly_credential() {{ return {gate_exit}; }}",
             "FLEET_READONLY_SA=reader@p.iam.gserviceaccount.com",
             "PROJECT_ID=p",
+            f"IS_PROW_RUN={'true' if prow else 'false'}",
             preflight_body(),
             PREFLIGHT,
             "echo reached-the-build",
@@ -81,6 +83,19 @@ class DeployPreflightTest(unittest.TestCase):
         self.assertEqual(1, done.returncode, done.stderr)
         self.assertIn("FATAL", done.stderr)
         self.assertIn("reader@p.iam.gserviceaccount.com", done.stderr)
+        self.assertIn("Re-apply bench/tf/fleet against p", done.stderr)
+        self.assertNotIn("reached-the-build", done.stdout)
+
+    def test_a_laptop_is_sent_to_the_opt_in_not_to_a_pool_repair(self):
+        """Off Prow the mint fails because roles/owner cannot impersonate the
+        reader, not because the project drifted; re-applying the fleet stack
+        against a shared pool project is the one repair a laptop must not be
+        told to make."""
+        done = run_preflight(3, prow=False)
+        self.assertEqual(1, done.returncode, done.stderr)
+        self.assertIn("FATAL", done.stderr)
+        self.assertIn("FLEET_ALLOW_RUNNER_CREDENTIAL=1", done.stderr)
+        self.assertNotIn("Re-apply", done.stderr)
         self.assertNotIn("reached-the-build", done.stdout)
 
     def test_a_mintable_reader_lets_the_deploy_continue(self):
@@ -99,15 +114,18 @@ class DeployPreflightTest(unittest.TestCase):
     def test_the_developer_opt_in_leaves_the_reader_unset(self):
         """`FLEET_ALLOW_RUNNER_CREDENTIAL=1` on a developer's own project must
         reach the gate as no reader, or the gate cannot honour it."""
-        def reader(env: str) -> str:
+        def reader(**env: str) -> str:
+            # An explicit environment: the developer's shell may export the
+            # very variables under test, and the helper must not see them.
             done = subprocess.run(
-                ["bash", "-c", f'source "{RUNNER}"; {env} _fleet_reader_for_run p'],
+                ["bash", "-c", f'source "{RUNNER}"; _fleet_reader_for_run p'],
                 capture_output=True, text=True, check=False,
+                env={"PATH": os.environ["PATH"], **env},
             )
             return done.stdout
-        self.assertEqual("seeded-fleet-reader@p.iam.gserviceaccount.com", reader(""))
-        self.assertEqual("", reader("FLEET_ALLOW_RUNNER_CREDENTIAL=1"))
-        self.assertEqual("mine@p.iam.gserviceaccount.com", reader("FLEET_READONLY_SA=mine@p.iam.gserviceaccount.com FLEET_ALLOW_RUNNER_CREDENTIAL=1"))
+        self.assertEqual("seeded-fleet-reader@p.iam.gserviceaccount.com", reader())
+        self.assertEqual("", reader(FLEET_ALLOW_RUNNER_CREDENTIAL="1"))
+        self.assertEqual("mine@p.iam.gserviceaccount.com", reader(FLEET_READONLY_SA="mine@p.iam.gserviceaccount.com", FLEET_ALLOW_RUNNER_CREDENTIAL="1"))
 
 
 class FleetCredentialCallSiteTest(unittest.TestCase):

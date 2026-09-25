@@ -139,7 +139,6 @@ REASON_MAX_CHARS = 300
 # The runner's warnings that explain an unpublished role, most specific
 # first: a role named, its slot named, then the project-wide ones.
 RUNNER_WARNING_PREFIX = "WARNING: "
-RUNNER_MINT_WARNING = "could not mint a read-only token"
 RUNNER_LIST_WARNING = "could not list clusters"
 RUNNER_ROLE_WARNING = "fixture role '{role}'"
 RUNNER_SLOT_WARNING = "slot '{slot}'"
@@ -247,7 +246,7 @@ def runner_warnings(stderr: str) -> list[str]:
 
 def unpublished_reason(role: str, slot: str, warnings: list[str]) -> str:
     """Why the runner wrote no kubeconfig for `role`, from its own warnings."""
-    for needle in (RUNNER_LIST_WARNING, RUNNER_MINT_WARNING, RUNNER_ROLE_WARNING.format(role=role), RUNNER_SLOT_WARNING.format(slot=slot)):
+    for needle in (RUNNER_LIST_WARNING, RUNNER_ROLE_WARNING.format(role=role), RUNNER_SLOT_WARNING.format(slot=slot)):
         for warning in warnings:
             if needle in warning:
                 return warning
