@@ -9,11 +9,13 @@ step 6b makes no kubectl call at all. The positive half is pinned by the same
 lifting technique tests/test_ci_deploy_rc_images.py uses: section 4 run with
 the flag set names the four next-stack images and fills the operator.extraEnv
 values the release expands (the three image overrides and the inject door's
-flag), the Cloud Build `a2a` step run with `docker` stubbed builds and pushes
-those four in order with the bridge FROM this build's platform image, the
+flag), the Cloud Build's `a2a` and `a2a-bridge` steps run with `docker` stubbed
+build and push those four in order with the bridge FROM this build's platform
+image, the three guards (release-candidate path, Prow run with no pull request,
+the concurrency's grammar) run against the values they refuse and admit, the
 sidecar patch rendered from a fixture Deployment carries what the bridge doc
 lists and what the agent container had, and the two refusals (release-candidate
-path, Prow run with no pull request) are present where the script says they are.
+path, Prow run with no pull request) sit where the script says they are.
 
 The names the flag path hands the operator, or reads back from what it
 renders, are copied from the operator's Go source, the bridge's, and the eval
@@ -33,17 +35,12 @@ import json
 import pathlib
 import re
 import subprocess
-import sys
 import textwrap
 import unittest
 
 import yaml
 
-_HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE))
-
-
-_REPO_ROOT = _HERE.parent
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_DEPLOY = _REPO_ROOT / "hack" / "ci-deploy.sh"
 _CI_EVAL = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
 _CLOUDBUILD = _REPO_ROOT / "deploy" / "docker" / "cloudbuild-ci.yaml"
@@ -63,7 +60,7 @@ _AR_REPO = "us-central1-docker.pkg.dev/kube-agents-evals/kube-agents"
 _TAG = "pr-1686-abc1234"
 _A2A_SUBSTITUTIONS = ("_A2A_GATEWAY_URI", "_A2A_CALLOUT_URI", "_A2A_WORKER_URI", "_A2A_BRIDGE_URI")
 _A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "hermes-bridge")
-_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "hermes-bridge")
+_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 
@@ -173,13 +170,26 @@ def go_int_constant(path: pathlib.Path, name: str) -> int:
     return int(match.group(1))
 
 
-def run_bash(script: str, env_lines: list[str] | None = None) -> subprocess.CompletedProcess:
+def run_bash(script: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["bash", "-c", "\n".join(["set -euo pipefail", *(env_lines or []), script])],
+        ["bash", "-c", f"set -euo pipefail\n{script}"],
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def lifted_block(start: str, stop: str, what: str) -> str:
+    """The text from the first line containing `start` through the first line
+    containing `stop` after it, both included."""
+    lines = text(_CI_DEPLOY).splitlines()
+    for index, line in enumerate(lines):
+        if start in line:
+            for end in range(index, len(lines)):
+                if stop in lines[end]:
+                    return "\n".join(lines[index : end + 1])
+            break
+    raise AssertionError(f"{what} not found in {_CI_DEPLOY}")
 
 
 def flag_line(mode_next: str | None) -> str:
@@ -452,12 +462,55 @@ class FlagSetIsNextTest(unittest.TestCase):
         rc_branch = script.index('if [ -n "${RC_COMMIT_SHA:-}" ]; then')
         refusal = script.index('if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then', rc_branch)
         self.assertLess(refusal - rc_branch, 600, "the refusal belongs at the top of the RC branch")
+        # Run, not only read: the inner guard, lifted, refuses under the flag
+        # and lets an RC run through without it.
+        guard = script[refusal:]
+        guard = guard[: guard.index("\n  fi\n") + len("\n  fi\n")]
+        self.assertEqual(run_bash(f"export EVAL_MODE_NEXT=1\n{guard}").returncode, 1)
+        self.assertEqual(run_bash(guard).returncode, 0)
 
     def test_a_prow_run_without_a_pull_request_refuses_the_flag(self) -> None:
-        self.assertIn(
+        guard = lifted_block(
             'if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then',
-            text(_CI_DEPLOY),
+            "fi",
+            "the section 2b refusal",
         )
+        cases = {
+            # (flag, IS_PROW_RUN, PULL_NUMBER) -> refused
+            ("1", "true", ""): True,
+            ("1", "true", "1686"): False,
+            ("1", "false", ""): False,
+            ("", "true", ""): False,
+        }
+        for (flag, prow, pull), refused in cases.items():
+            with self.subTest(flag=flag, prow=prow, pull=pull):
+                env = f'export EVAL_MODE_NEXT="{flag}" IS_PROW_RUN="{prow}" PULL_NUMBER="{pull}" JOB_NAME="ci-x"\n'
+                self.assertEqual(run_bash(env + guard).returncode, 1 if refused else 0)
+
+    def test_the_concurrency_guard_speaks_the_bridges_grammar(self) -> None:
+        """What passes here is written into BRIDGE_CONCURRENCY verbatim and
+        parsed by strconv.Atoi, which takes digits and nothing else; the guard
+        has to refuse whatever Atoi would, or the bridge falls back to 2."""
+        guard = lifted_block(
+            'MODE_NEXT_BRIDGE_CONCURRENCY="${EVAL_TASK_PARALLELISM:-${EVAL_TASK_PARALLELISM_DEFAULT}}"',
+            "  fi",
+            "the concurrency guard",
+        )
+        # Unset and empty both mean the default, as `${VAR:-default}` reads them
+        # in hack/ci-eval-pr.sh too; everything else is the string, verbatim.
+        admitted = {"1": "1", "4": "4", "6": "6", "1024": "1024", None: "4", "": "4"}
+        refused = (" 4", "4 ", "0", "-1", "1025", "four", "4.0", "+4")
+        for value, expected in admitted.items():
+            with self.subTest(EVAL_TASK_PARALLELISM=value):
+                env = "" if value is None else f'export EVAL_TASK_PARALLELISM="{value}"\n'
+                result = run_bash(f'{env}{constants_block()}\n{guard}\necho "OUT=${{MODE_NEXT_BRIDGE_CONCURRENCY}}"')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"OUT={expected}", result.stdout)
+        for value in refused:
+            with self.subTest(EVAL_TASK_PARALLELISM=value):
+                result = run_bash(f'export EVAL_TASK_PARALLELISM="{value}"\n{constants_block()}\n{guard}')
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("is not a concurrency the bridge can be given", result.stderr)
 
     def test_the_gates_run_in_dependency_order_and_skip_the_two_that_cannot(self) -> None:
         block = lifted(*_MODE_SECTION)
@@ -612,8 +665,8 @@ class BridgeImageBuildTest(unittest.TestCase):
 
     def test_the_inventory_check_pins_its_builder_and_states_the_exclusion(self) -> None:
         script = text(_INVENTORY_CHECK)
+        # The go-directive call site is pinned by test_check_image_inventory_go_directive.
         self.assertIn("check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION", script)
-        self.assertIn("check_go_directive a2a/Dockerfile.hermes-bridge GOLANG_VERSION a2a/go.mod", script)
         self.assertIn("a2a/Dockerfile.hermes-bridge) is deliberately NOT", script)
         inventory = json.loads(text(_REPO_ROOT / "images.json"))
         self.assertNotIn("hermes-bridge", [image["name"] for image in inventory["images"]])
@@ -625,7 +678,7 @@ class BridgeImageBuildTest(unittest.TestCase):
         result = run_build_step("a2a", next_stack_substitutions(), 'docker() { echo "docker $*"; }')
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = []
-        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES[:3], _A2A_IMAGES[:3], strict=True):
+        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, _A2A_IMAGES[:3], strict=True):
             uri = f"{_AR_REPO}/{image}:{_TAG}"
             expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix} a2a")
             expected.append(f"docker push {uri}")

@@ -536,7 +536,12 @@ The next stack still has holes independent of any case (no resource requests on 
 gateway or provisioning pods, images in a private registry, and whatever the first runs through
 the door find), and a default-on flip would red every pull request for reasons none of them
 caused. And the record that earns `next` a place in what every pull request measures is built by
-running it: a scheduled lane on `main` under the flag, not the presubmit.
+running it: a scheduled lane on `main` under the flag, with a record of its own, not the
+presubmit. That lane is not built yet, and the flag does not admit it as it stands: section 2b of
+the deploy refuses `EVAL_MODE_NEXT=1` on a Prow run with no pull request, because `bench-gate`
+would append that run's samples to `main`'s baseline, the window every pull request is judged
+against. The lane's change is what gives such a run a store of its own and lifts that refusal for
+it; until then the flag runs on a pull request's presubmit, on demand.
 
 ## Open questions
 

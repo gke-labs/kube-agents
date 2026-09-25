@@ -153,6 +153,24 @@ class FlagSetIsInjectTest(unittest.TestCase):
             f"get secret platform-agent-a2a-inject -n {_NAMESPACE} -o jsonpath={{.data.token}}",
         )
 
+    def test_every_unit_gets_its_own_inject_tunnel(self) -> None:
+        """The harness owns one port-forward per process and tears it down at
+        exit, which is why run_one_unit gives each unit its own agent-API port;
+        the inject door reads a different variable, so it needs the same
+        treatment or every unit rides the first one's listener."""
+        script = text(_CI_EVAL)
+        unit = script[script.index("run_one_unit() {") :]
+        unit = unit[: unit.index("\n}\n")]
+        self.assertIn("export AGENT_LOCAL_PORT=$((28642 + seq))", unit)
+        self.assertIn("export AGENT_INJECT_LOCAL_PORT=$((EVAL_INJECT_LOCAL_PORT_BASE + seq))", unit)
+        harness = text(_HARNESS)
+        self.assertIn('"AGENT_INJECT_LOCAL_PORT"', harness)
+        base = int(constants()["EVAL_INJECT_LOCAL_PORT_BASE"])
+        default = int(re.search(r"^_INJECT_DEFAULT_LOCAL_PORT = (\d+)$", harness, re.MULTILINE).group(1))
+        self.assertNotEqual(base, default, "a base equal to the harness default hides a unit that lost the export")
+        # The two per-unit ranges cannot meet for any seq the matrix can reach.
+        self.assertGreater(abs(base - 28642), 400)
+
     def test_a_missing_token_secret_stops_the_run_before_the_matrix(self) -> None:
         result = run_section("1", secret_missing=True)
         self.assertNotEqual(result.returncode, 0)

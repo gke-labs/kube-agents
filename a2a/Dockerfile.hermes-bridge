@@ -42,4 +42,8 @@ RUN CGO_ENABLED=0 go build -trimpath -o /out/hermes-bridge ./cmd/hermes-bridge
 # container (deploy/shared/docker-entrypoint.sh, step 1.5).
 FROM ${PLATFORM_AGENT_IMAGE}
 COPY --from=build /out/hermes-bridge /usr/local/bin/hermes-bridge
+# The platform-agent image's own runtime user, restated: the base already ends
+# on it, and the pod imposes the same uid, but a Dockerfile scanner reads this
+# file alone.
+USER 10000:10000
 CMD ["/usr/local/bin/hermes-bridge"]

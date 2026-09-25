@@ -1005,12 +1005,20 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # same job environment hack/ci-eval-pr.sh reads it from (the constants block
   # says how it is sized); refused outright rather than passed through when it
   # is not a count the bridge can honour.
+  # Digits only, before the numeric compare: bash's `test` skips surrounding
+  # whitespace and the bridge's strconv.Atoi does not, so " 4" would pass
+  # here and start the bridge at its default of 2 with a warning nobody reads.
   MODE_NEXT_BRIDGE_CONCURRENCY="${EVAL_TASK_PARALLELISM:-${EVAL_TASK_PARALLELISM_DEFAULT}}"
-  if ! [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -ge 1 ] 2>/dev/null || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -gt "${BRIDGE_QUEUE_CAPACITY}" ]; then
-    echo "ERROR: EVAL_TASK_PARALLELISM='${MODE_NEXT_BRIDGE_CONCURRENCY}' is not a concurrency the bridge can be given (1..${BRIDGE_QUEUE_CAPACITY})." >&2
+  case "${MODE_NEXT_BRIDGE_CONCURRENCY}" in
+  '' | *[!0-9]*) MODE_NEXT_BRIDGE_CONCURRENCY_OK="false" ;;
+  *) MODE_NEXT_BRIDGE_CONCURRENCY_OK="true" ;;
+  esac
+  if [ "${MODE_NEXT_BRIDGE_CONCURRENCY_OK}" != "true" ] || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -lt 1 ] || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -gt "${BRIDGE_QUEUE_CAPACITY}" ]; then
+    echo "ERROR: EVAL_TASK_PARALLELISM='${MODE_NEXT_BRIDGE_CONCURRENCY}' is not a concurrency the bridge can be given (an integer 1..${BRIDGE_QUEUE_CAPACITY})." >&2
     exit 1
   fi
-  # shellcheck disable=SC2059 -- the format is a named constant, the point of it.
+  # The format is a named constant, which is the point of it (SC2059 wants a literal).
+  # shellcheck disable=SC2059
   printf -v A2A_NATS_URL "${A2A_NATS_URL_FORMAT}" "${A2A_NATS_SERVICE_NAME}" "${NAMESPACE}" "${A2A_NATS_CLIENT_PORT}"
   SIDECAR_PATCH="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o json |
     render_mode_next_sidecar_patch \

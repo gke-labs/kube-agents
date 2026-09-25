@@ -52,6 +52,12 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 readonly EVAL_INJECT_TRANSPORT="inject"
 readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
 readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
+# The inject door's port-forward is per unit for the same reason the agent
+# API's is (run_one_unit): the harness reads AGENT_INJECT_LOCAL_PORT for it,
+# not AGENT_LOCAL_PORT, and its default (28099) would put every unit of the
+# fan-out on one listener that the first unit to finish tears down. The base
+# sits clear of the API range (28642 + seq) for any matrix this job runs.
+readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
 
 # ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
 # A push that changes only inert files re-runs this whole job and aborts the
@@ -2253,6 +2259,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # listener under every sibling mid-conversation. On its own port, each
   # unit owns its own tunnel and keeps the harness's stale-tunnel recycling.
   export AGENT_LOCAL_PORT=$((28642 + seq))
+  # The inject door's tunnel, the same way; inert on the api transport.
+  export AGENT_INJECT_LOCAL_PORT=$((EVAL_INJECT_LOCAL_PORT_BASE + seq))
   # Which case and which repetition this unit is, for any transport that can
   # carry an id into the agent's own records. The inject transport sends the
   # pair as the backend message id, which the gateway's ingress log joins to
