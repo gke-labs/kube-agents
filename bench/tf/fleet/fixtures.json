@@ -179,7 +179,7 @@
         "service/legacy-endpoints-lane",
         "endpoints/legacy-endpoints-lane"
       ],
-      "fixture": "legacy-endpoints-writer CronJob merge-patches an annotation onto the hand-written Endpoints v1 object legacy-endpoints-lane every ten minutes. Endpoints has been deprecated since 1.33 and no release through 1.37 removes it, so on every fleet master each write is audit-stamped k8s.io/deprecated=true, with no k8s.io/removed-release label and no Recommender insight",
+      "fixture": "legacy-endpoints-writer CronJob merge-patches an annotation onto the hand-written Endpoints v1 object legacy-endpoints-lane every ten minutes. Endpoints is deprecated and still served (the fleet README says since when and for how long), so on every fleet master each write is audit-stamped k8s.io/deprecated=true, with no k8s.io/removed-release label and no Recommender insight",
       "state": [
         {
           "subject": "cronjob/legacy-endpoints-writer",

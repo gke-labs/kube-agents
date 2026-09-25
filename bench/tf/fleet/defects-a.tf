@@ -379,8 +379,8 @@ resource "kubernetes_pod_disruption_budget_v1" "inference_server" {
 # ---------------------------------------------------------------------------
 # Defect (upgrades, API deprecation): a permanent caller of a deprecated API.
 #
-# Endpoints (core v1) has been deprecated since Kubernetes 1.33 and no release
-# through 1.37 removes it, so on every master this fleet will run, each write
+# Endpoints (core v1) is deprecated and still served (the fleet README says since
+# when and for how long), so on every master this fleet will run, each write
 # to it is audit-stamped `k8s.io/deprecated=true` -- and never
 # `k8s.io/removed-release`, because core/v1 declares no removal. That is the
 # whole yield: an Admin Activity audit trail a case can read by principal

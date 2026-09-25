@@ -102,8 +102,8 @@ fixtures:
     namespace: seeded-deprecation
     defect: >-
       A CronJob on a dedicated ServiceAccount that merge-patches an annotation
-      onto a hand-written Endpoints v1 object every ten minutes. Endpoints has
-      been deprecated since 1.33 and no release through 1.37 removes it, so on
+      onto a hand-written Endpoints v1 object every ten minutes. Endpoints is
+      deprecated and still served (the fleet README says since when), so on
       every fleet master each write is audit-stamped k8s.io/deprecated=true
       with no k8s.io/removed-release label and no Recommender insight; a case
       reads the trail by principal plus methodName, never by the label alone,
