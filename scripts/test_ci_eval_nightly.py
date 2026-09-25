@@ -281,9 +281,12 @@ def exclusions_block() -> str:
 
 
 def lane_constants() -> str:
-    """The exclusion file's path and the lane's transport name: declared
-    beside the roster files, after a comment `roster_constants` stops at."""
-    return lifted_block(r"^readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE=[^\n]*\nreadonly EVAL_INJECT_LANE_TRANSPORT=[^\n]*\n")
+    """The exclusion file's path (declared beside the roster files, after a
+    comment `roster_constants` stops at) and the transport name the
+    EVAL_MODE_NEXT export uses, which the step compares against."""
+    return lifted_block(r"^readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE=[^\n]*\n") + lifted_block(
+        r"^readonly EVAL_INJECT_TRANSPORT=[^\n]*\n"
+    )
 
 
 def load_matrix_through_the_lane_step(env: dict | None = None, hack_dir: pathlib.Path = HACK_DIR) -> subprocess.CompletedProcess:

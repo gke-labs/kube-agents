@@ -171,11 +171,11 @@ const (
 	// are the right precedent: operator-scoped, set by whoever deploys the
 	// operator, invisible to the CR.
 	//
-	// Nothing in this repository sets it. A developer sets it by hand on the
-	// operator Deployment; a CI eval would set it through the chart's
-	// operator.extraEnv, where the A2A image overrides already go, and that
-	// wiring does not exist yet -- so `AGENT_TRANSPORT=inject` in a presubmit
-	// today would find no Service to reach.
+	// Nothing sets it by default. A developer sets it by hand on the operator
+	// Deployment; hack/ci-deploy.sh sets it through the chart's
+	// operator.extraEnv, where the A2A image overrides already go, under
+	// EVAL_MODE_NEXT=1 and only then -- so `AGENT_TRANSPORT=inject` on an
+	// install deployed without the flag finds no Service to reach.
 	//
 	// It is read the same way a2aStrictEventsWriter is: anything but an
 	// explicit "true" is off, so a typo leaves the door shut.

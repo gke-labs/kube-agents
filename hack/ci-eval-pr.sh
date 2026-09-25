@@ -33,10 +33,8 @@ readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 # A fourth file, read beside them and applied on one lane only (#2039): the
 # cases the inject lane does not run, because their premise needs the chat
-# front door. The transport name is the harness's AGENT_TRANSPORT value for
-# that lane (bench/kube_agents_bench/harness.py, TRANSPORT_INJECT).
+# front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
 readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
-readonly EVAL_INJECT_LANE_TRANSPORT="inject"
 
 # What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
 # when the run could not be evaluated: an admitted case lost every repetition
@@ -46,6 +44,24 @@ readonly EVAL_INJECT_LANE_TRANSPORT="inject"
 # together, because 2 alone is also what argparse exits on a bad flag.
 readonly EVAL_SUITE_NOT_EVALUATED_STATUS=2
 readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
+
+# EVAL_MODE_NEXT=1 is the flag hack/ci-deploy.sh flipped the install to
+# `spec.mode: next` under, in the same job environment. Under it the matrix
+# runs through the gateway's inject door (docs/designs/eval-next-transport.md,
+# stage 1): the harness's transport switch, and the door's bearer token read
+# from the Secret the operator renders beside the door -- <agent>-a2a-inject,
+# key `token` (a2aInjectName and a2aInjectTokenKey in the operator; the deploy
+# already waited for it). Unset, the matrix runs over the agent API exactly
+# as before; section 4 below is the only site that reads the flag.
+readonly EVAL_INJECT_TRANSPORT="inject"
+readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
+readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
+# The inject door's port-forward is per unit for the same reason the agent
+# API's is (run_one_unit): the harness reads AGENT_INJECT_LOCAL_PORT for it,
+# not AGENT_LOCAL_PORT, and its default (28099) would put every unit of the
+# fan-out on one listener that the first unit to finish tears down. The base
+# sits clear of the API range (28642 + seq) for any matrix this job runs.
+readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
 
 # ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
 # A push that changes only inert files re-runs this whole job and aborts the
@@ -113,7 +129,15 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 readonly REVALIDATION_INERT_PATHS='^((docs|\.github|examples)/|[^/]+\.md$|(LICENSE|OWNERS|OWNERS_ALIASES)$)'
 # Where the job history lives and how a human opens a build from the log.
 readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
-readonly REVALIDATION_JOB_NAME="pull-kube-agents-smoke-test"
+# The job whose history and status context step 0 reads: the running job's
+# own name, which Prow exports as JOB_NAME. Every presubmit that runs this
+# script has its own history path and its own status context, so keying the
+# reuse on a fixed name would let a second job (the next-mode lane runs this
+# same script under EVAL_MODE_NEXT=1) find the today job's green build at
+# the same head and run nothing. Outside Prow the default keeps the log
+# lines and the tests naming the job that exists.
+readonly REVALIDATION_DEFAULT_JOB_NAME="pull-kube-agents-smoke-test"
+readonly REVALIDATION_JOB_NAME="${JOB_NAME:-${REVALIDATION_DEFAULT_JOB_NAME}}"
 readonly REVALIDATION_SPYGLASS_PREFIX="https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
 # The started.json repos key naming this repository's clone record, and the
 # base ref assumed when the decoration did not export PULL_BASE_REF.
@@ -1400,6 +1424,23 @@ export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down Gemini 3.1
 PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
 export PLATFORM_AGENT_TOKEN
+# Under EVAL_MODE_NEXT=1 the deploy flipped the install to next, armed the
+# inject door and declared the bridge; the matrix goes through the door. The
+# agent token above is still fetched: the transport switch changes how a
+# prompt reaches the agent, not what else the run reads from the install.
+# Everything about the door the harness needs beyond these two it derives
+# from AGENT_SERVICE_NAME and AGENT_NAMESPACE, exported above.
+if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+  EVAL_INJECT_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_INJECT_TOKEN_SECRET_SUFFIX}"
+  if ! AGENT_INJECT_TOKEN="$(kubectl get secret "${EVAL_INJECT_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_INJECT_TOKEN_SECRET_KEY}}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
+    echo "ERROR: EVAL_MODE_NEXT=1 but the inject door's token Secret ${EVAL_INJECT_TOKEN_SECRET} (key ${EVAL_INJECT_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}." >&2
+    echo "       The operator renders it only when deployed with the inject door armed, which hack/ci-deploy.sh does under the same flag." >&2
+    exit 1
+  fi
+  export AGENT_INJECT_TOKEN
+  export AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"
+  echo "EVAL_MODE_NEXT=1: running the matrix through the inject door (AGENT_TRANSPORT=${AGENT_TRANSPORT}, token from ${EVAL_INJECT_TOKEN_SECRET})"
+fi
 export JUDGE_API_KEY="${GEMINI_API_KEY}"
 export JUDGE_PROVIDER="google"
 # The judge is pinned INDEPENDENTLY of the agent, and the invariant is:
@@ -1568,10 +1609,9 @@ case "${EVAL_TIER}" in
 esac
 
 # ─── The inject lane's exclusions (#2039) ────────────────────────────────────
-# Under AGENT_TRANSPORT=inject -- the harness's own switch; no job exports
-# it yet, so this step is inert until one does, before this point -- the
-# matrix goes through the gateway's inject door, which addresses `platform`
-# directly: a
+# Under AGENT_TRANSPORT=inject -- the harness's own switch, which the
+# EVAL_MODE_NEXT=1 block above exports before this point -- the matrix goes
+# through the gateway's inject door, which addresses `platform` directly: a
 # case whose premise needs the chat front door cannot hold there whatever
 # the agent does. hack/eval/inject-lane-exclusions.txt names those cases,
 # each with its reason as the comment block above it (the file's header and
@@ -1598,7 +1638,7 @@ while IFS= read -r NAME; do
     exit 1
   fi
 done <<< "${INJECT_LANE_EXCLUDED}"
-if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_LANE_TRANSPORT}" ] && [ -n "${INJECT_LANE_EXCLUDED}" ]; then
+if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LANE_EXCLUDED}" ]; then
   INJECT_LANE_KEPT=()
   for ENTRY in "${TASKS[@]}"; do
     NAME="$(basename "$(dirname "${ENTRY}")")"
@@ -2295,6 +2335,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # listener under every sibling mid-conversation. On its own port, each
   # unit owns its own tunnel and keeps the harness's stale-tunnel recycling.
   export AGENT_LOCAL_PORT=$((28642 + seq))
+  # The inject door's tunnel, the same way; inert on the api transport.
+  export AGENT_INJECT_LOCAL_PORT=$((EVAL_INJECT_LOCAL_PORT_BASE + seq))
   # Which case and which repetition this unit is, for any transport that can
   # carry an id into the agent's own records. The inject transport sends the
   # pair as the backend message id, which the gateway's ingress log joins to

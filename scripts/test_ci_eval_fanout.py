@@ -26,6 +26,7 @@ up on its lock leaves the case for the loop after the fan-out.
 import pathlib
 import re
 import subprocess
+import tempfile
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -35,9 +36,19 @@ SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 def lifted(name: str) -> str:
     """A top-level shell function as written, lifted from the script."""
     src = SCRIPT.read_text(encoding="utf-8")
-    match = re.search(rf"^{name}\(\) \{{.*?^\}}$|^{name}\(\) \{{[^\n]*\}}$", src, re.S | re.M)
+    match = re.search(rf"^{name}\(\) \{{.*?^\}}$|^{name}\(\) \{{[^\n]*\}}$", src, re.DOTALL | re.MULTILINE)
     if match is None:  # pragma: no cover - a rename should say so loudly
         raise AssertionError(f"{name}() not found in {SCRIPT}")
+    return match.group(0)
+
+
+def lifted_constant(name: str) -> str:
+    """A `readonly NAME=...` line as written, lifted from the script: the
+    function under test reads it, and a stub would hide a rename."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(rf"^readonly {name}=.*$", src, re.MULTILINE)
+    if match is None:  # pragma: no cover - a rename should say so loudly
+        raise AssertionError(f"readonly {name} not found in {SCRIPT}")
     return match.group(0)
 
 
@@ -97,7 +108,7 @@ class LockTest(unittest.TestCase):
 class QueueOrderTest(unittest.TestCase):
     def queue(self, reps: int) -> list[tuple[int, int, int]]:
         src = SCRIPT.read_text(encoding="utf-8")
-        match = re.search(r'^UNIT_QUEUE="\$\(\n.*?^\)"$', src, re.S | re.M)
+        match = re.search(r'^UNIT_QUEUE="\$\(\n.*?^\)"$', src, re.DOTALL | re.MULTILINE)
         if match is None:  # pragma: no cover
             raise AssertionError(f"UNIT_QUEUE block not found in {SCRIPT}")
         body = "\n".join(
@@ -234,6 +245,9 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
 
     def run_reps(self, extra: str = "") -> subprocess.CompletedProcess:
         body = "\n".join([
+            # The one constant the unit reads from the script's top: the base
+            # of its per-unit inject port.
+            lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
             lifted("run_one_unit"),
             self.UNIT_STUBS,
             extra,
@@ -258,6 +272,32 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertNotIn("FINISH_CASE", result.stdout)
         self.assertIn("case-x rep 2 gave up on its task lock", result.stderr)
         self.assertNotIn("case-x.rep2.end", result.stdout)
+
+    def test_every_repetition_gets_its_own_tunnels(self):
+        """The harness owns one port-forward per process and its atexit
+        teardown drops a shared listener under every sibling, so each unit
+        exports its own local port for the agent API and, from the script's
+        named base, for the inject door. Run, not read: the ports the bench
+        stub sees are the ones the harness would bind."""
+        # The unit sends the bench's stdout to its own log file, so the stub
+        # records what it saw in a file of this test's.
+        with tempfile.TemporaryDirectory() as tmp:
+            record = pathlib.Path(tmp) / "ports"
+            ports = (
+                f'uv() {{ echo "PORTS rep=${{rep}} api=${{AGENT_LOCAL_PORT}} inject=${{AGENT_INJECT_LOCAL_PORT}}" >> "{record}"; '
+                'echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }'
+            )
+            result = self.run_reps(ports)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            recorded = record.read_text(encoding="utf-8") if record.exists() else ""
+        seen = re.findall(r"^PORTS rep=(\d) api=(\d+) inject=(\d+)$", recorded, re.MULTILINE)
+        self.assertEqual([rep for rep, _, _ in seen], ["1", "2", "3"], recorded)
+        base = int(lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE").split("=")[1])
+        for rep, api, inject in seen:
+            self.assertEqual(int(api), 28642 + int(rep))
+            self.assertEqual(int(inject), base + int(rep))
+        self.assertEqual(len({inject for _, _, inject in seen}), 3)
+        self.assertFalse({api for _, api, _ in seen} & {inject for _, _, inject in seen})
 
     def test_the_state_files_are_written_under_the_task_lock(self):
         unit = lifted("run_one_unit")

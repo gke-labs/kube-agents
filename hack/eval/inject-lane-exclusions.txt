@@ -1,8 +1,8 @@
 # The inject lane's exclusions: presubmit cases that do not run when the
 # matrix goes through the A2A gateway's inject door (the harness's
-# AGENT_TRANSPORT=inject; no job in this repository exports it yet, so this
-# file is inert until one does), because the case's premise needs the chat
-# front door and the door addresses `platform` directly.
+# AGENT_TRANSPORT=inject, which hack/ci-eval-pr.sh exports under
+# EVAL_MODE_NEXT=1), because the case's premise needs the chat front door
+# and the door addresses `platform` directly.
 #
 # One case id per line; `#` starts a comment, blank lines are skipped. The
 # reason is the comment block directly above the id, and it names the issue

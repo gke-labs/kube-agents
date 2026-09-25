@@ -2265,7 +2265,7 @@ but it is still mintable from `169.254.169.254` by anything that gets execution 
 
 Emptying the gateway pod of credentials breaks the one class of work that still needs them
 there. A roster entry marked `no_agent` runs as a Python subprocess on the gateway rather
-than as a model turn, so it never touches the terminal backend and never reaches the
+than as a model turn, and at the time touched neither the terminal backend nor the
 sandbox. `refresh_git_credentials` in `agents/platform/scripts/github_token_refresh.py`
 prefers `CREDENTIAL_PROXY_URL` and falls back to `gcloud auth print-identity-token`; with
 the variable gone from the gateway and no `gcloud` in the agent image, both branches are
@@ -2285,8 +2285,10 @@ the gateway's managed Hermes config, which the sandbox image does not carry.
 
 What is still open is the wider question this exposed: what `no_agent` should mean once the
 gateway holds nothing. Either the entry declares that it needs credentials and is scheduled
-into the sandbox, or it is restricted to work that needs none. The forward above fixes the one
-credential a `no_agent` job actually asks for; it does not decide that.
+into the sandbox, or it is restricted to work that needs none. The forward above, `kanban-workspace-gc`'s
+listing and removal, `cluster-agent-reconcile`'s `gcloud` calls and `stall-watch`'s cluster
+sweep are among the `no_agent` jobs already scheduled into the sandbox through
+`sandbox_exec`; none of them decides that.
 
 ### Caller authentication
 
@@ -2771,21 +2773,24 @@ anyway is in [The Session KV store](#the-session-kv-store).
   container currently starts as uid 0. The risk is that dropbear has no `SetEnv`, and
   `SetEnv` is what carries `CREDENTIAL_PROXY_URL` into a non-login session. Worth a
   spike against `make docker-smoke-sandbox`; not worth assuming.
-- **The SSH helper reaches the sandbox; nothing behind it runs yet.**
-  `agents/platform/scripts/sandbox_exec.py` routes all fifteen agent-side call sites,
+- **The SSH helper reaches the sandbox, and the commands behind it now run.**
+  `agents/platform/scripts/sandbox_exec.py` routes every credentialed call site that
+  runs in the agent pod (the `gitops_workspace._read_state_key` kubectl fallback aside),
   and the `hermes` account, its authorised key and the `.bashrc` isolation are covered
-  by `make docker-smoke-sandbox`. Run from the agent pod against a live install it
-  connects as uid 1001 on the sandbox host, and a routed `gcloud` or `kubectl` stops at
-  `CREDENTIAL_PROXY_URL is not configured` — a message the agent pod cannot produce,
-  since the variable is set there. So the connection is proven and the command behind
-  it is not. The helper had to land before the agent image can drop
-  `credential-proxy-exec`, which makes it the gate on that change.
-- **The MCP server's kubeconfig has moved and the credential proxy does not know.**
-  `_thread_kubeconfig_path` writes into `/home/hermes/.kubeconfigs` when the sandbox is
-  on, because a kubeconfig names an `exec` credential plugin that kubectl runs, and any
-  path uid 1000 can write is code execution as the trusted principal. The proxy accepts
-  a caller-supplied `KUBECONFIG` only inside its workspace root, so that directory needs
-  standing there or the tools fail one step later than they do now.
+  by `make docker-smoke-sandbox`. When the helper landed, a routed `gcloud` or `kubectl`
+  stopped at `CREDENTIAL_PROXY_URL is not configured`, so the connection was proven and
+  the command behind it was not; since then `stall-watch`, a shipped roster entry, runs `gcloud container clusters
+get-credentials` and `kubectl` behind it on every tick, and `github_token_refresh.py`'s
+  forward mints through it. The helper had to land before
+  the agent image can drop `credential-proxy-exec`, which makes it the gate on that change.
+- **The MCP server's kubeconfig moved to `/home/hermes/.kubeconfigs`, and the proxy
+  never sees the path.** `_thread_kubeconfig_path` writes there when the sandbox is on,
+  because a kubeconfig names an `exec` credential plugin that kubectl runs, and any path
+  uid 1000 can write is code execution as the trusted principal. The shim resolves
+  `KUBECONFIG` to a context name on the sandbox side and forwards the name, never the
+  path (`credential_proxy_client.py`), so the proxy's workspace-root check does not apply
+  and `stall-watch` keeps its own files in the same directory. The docstring on
+  `_thread_kubeconfig_path` still describes the older check and is what is left to update.
 - **The cluster-agent kubeconfig has nowhere to go yet, and onboarding now fails
   earlier than that.** `cluster_agent_profile.py` writes a profile home on the agent
   pod's PVC and shells out to `hermes`, so it is one of the two scripts the sandbox
@@ -2795,11 +2800,13 @@ anyway is in [The Session KV store](#the-session-kv-store).
   MCP tool that lets the model ask the agent pod to create a profile rather than
   running a script that has to live there. Inventing that layout inside a call site was
   the alternative, and it is how two layouts end up shipping.
-- **Cron has not been exercised against a sandboxed agent.** The finding that
-  `no_agent` scripts stay in the agent pod is read from the scheduler and is not in
-  doubt, but no roster has run in this configuration, and the bootstrap handoff the
-  section above specifies is designed and unimplemented. Onboarding is broken until it
-  lands, and broken silently.
+- **The bootstrap handoff is designed and unimplemented.** `no_agent` scripts stay in the
+  agent pod, and six of them (`kanban-workspace-gc`, `cluster-agent-reconcile`,
+  `stall-watch`, `github-repo-watcher` and `chat-delivery-watch` through `forge.py`, and
+  `github_token_refresh.py`'s forward) reach the sandbox through `sandbox_exec` from a
+  shipped roster, so cron against a sandboxed agent is exercised.
+  What is not is the bootstrap handoff the section above specifies. Onboarding is broken
+  until it lands, and broken silently.
 - **Delegated subagents.** Whether a subagent spawned mid-turn inherits the SSH
   backend, or falls back to a local shell in the agent pod, is unexercised. A fallback
   would be a hole rather than a degradation.

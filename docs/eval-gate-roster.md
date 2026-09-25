@@ -236,9 +236,9 @@ exists a pull request that touches that path should say what it ran by hand.
 ## The inject lane
 
 When the presubmit matrix runs through the A2A gateway's inject door — the harness's
-`AGENT_TRANSPORT=inject` ([`docs/designs/eval-next-transport.md`](designs/eval-next-transport.md),
-"Stage 1: the gateway's inject adapter"); no job in this repository exports it today, so this
-section describes what the matrix does once one does — the roster above is still the roster:
+`AGENT_TRANSPORT=inject`, which `hack/ci-eval-pr.sh` exports under `EVAL_MODE_NEXT=1`
+([`docs/designs/eval-next-transport.md`](designs/eval-next-transport.md), "The CI flag") — the
+roster above is still the roster:
 nothing in the two roster files changes, and every case not named in the lane's exclusion list
 (below) runs and can red the job exactly as on the api lane. Two things differ, and they are
 kept apart on purpose.
