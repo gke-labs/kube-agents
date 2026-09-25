@@ -1506,63 +1506,42 @@ def test_the_kubeconfig_carries_no_baked_token(shell, tmp_path):
     assert "token:" not in body
 
 
-def test_the_mint_still_gates_the_rewrite(shell, tmp_path):
-    """The write-time mint survives the move to an exec entry, on purpose.
-
-    Nothing in the composed file needs the token any more, so the mint exists
-    only to prove the caller can impersonate the account before the credential
-    is committed to. Without it a project missing the token-creator binding
-    would get a well-formed kubeconfig that fails later, one check at a time,
-    instead of the warning and the fallback it gets today.
-    """
+def test_the_rewrite_mints_nothing(shell, tmp_path):
+    """The gate owns the one mint. The rewrite reads gcloud's server and CA
+    and writes the exec entry; a second mint here proved nothing (the binding
+    is per account) and was one more place for a transient to drop a slot."""
     target = tmp_path / "slot.kubeconfig"
     _kubeconfig_stub(target)
-    done = shell(
-        f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com',
-        STUB_TOKEN="ERROR: (gcloud.auth) Permission denied",
-    )
-    assert done.returncode != 0
-    assert "gke-gcloud-auth-plugin" in target.read_text()
-    assert "fleet-reader-credential.sh" not in target.read_text()
+    done = shell(f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com')
+    assert done.returncode == 0, done.stderr
+    assert "fleet-reader-credential.sh" in target.read_text()
+    assert not any("print-access-token" in line for line in shell.log.read_text().splitlines())
 
 
-def test_the_impersonation_warning_does_not_break_the_mint_probe(shell, tmp_path):
-    """A regression test for a bug this had.
+def test_the_impersonation_warning_does_not_break_the_gates_mint(shell):
+    """A regression test for a bug the mint had.
 
     `gcloud auth print-access-token --impersonate-service-account=...` prints
     "WARNING: This command is using service account impersonation..." to stderr
     on the SUCCESS path. Capturing it with `2>&1` made $token a multi-line blob
     that kubectl still accepted, so every API call 401'd while the script
-    reported success -- a silent read-only rollout that authenticated as
-    nobody. The token no longer reaches the file, but it still decides whether
-    the file is rewritten, so folding stderr in would now reject a mint that
-    succeeded.
+    reported success. The gate captures stderr apart, so the warning is not a
+    refusal.
     """
-    target = tmp_path / "slot.kubeconfig"
-    _kubeconfig_stub(target)
     done = shell(
-        f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com',
+        "_fleet_require_readonly_credential reader@x.iam.gserviceaccount.com p",
         STUB_TOKEN_WARNING="WARNING: This command is using service account impersonation.",
     )
     assert done.returncode == 0, done.stderr
-    assert "fleet-reader-credential.sh" in target.read_text()
-    assert "WARNING" not in target.read_text()
 
 
-def test_a_token_that_is_not_a_token_leaves_the_original_credential_alone(
-    shell, tmp_path
-):
-    target = tmp_path / "slot.kubeconfig"
-    _kubeconfig_stub(target)
+def test_the_gate_refuses_a_token_that_is_not_a_token(shell):
     done = shell(
-        f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com',
+        "_fleet_require_readonly_credential reader@x.iam.gserviceaccount.com p",
         STUB_TOKEN="ERROR: (gcloud.auth) Permission denied",
     )
-    assert done.returncode != 0
-    assert "not a bare access token" in done.stderr
-    # Not a broken file: the function leaves gcloud's own whole, and the
-    # caller removes it rather than keep a file on the runner's credential.
-    assert "gke-gcloud-auth-plugin" in target.read_text()
+    assert done.returncode == 3
+    assert "other than a bare access token" in done.stderr
 
 
 def test_a_kubeconfig_with_no_server_is_not_rewritten(shell, tmp_path):

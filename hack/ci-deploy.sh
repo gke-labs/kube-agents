@@ -71,6 +71,27 @@ source "${SCRIPT_DIR}/../tags.env"
 trap dump_prow_artifacts_on_failure EXIT
 ensure_helm
 
+# ─── 2d. The seeded fleet's read-only credential ──────────────────────────────
+# The gate hack/ci-eval-pr.sh applies before it writes the fleet kubeconfigs,
+# run here first: this script is the 20-30 minutes of build and deploy ahead
+# of it, and a project whose reader cannot be impersonated should fail in
+# seconds instead. Failing here also keeps the run inside the dashboard's
+# setup-death bound (a zero-task FAILURE under five minutes,
+# scripts/eval_dashboard/classify.py), so the health bot counts it as
+# infrastructure and points at the leased project rather than charging the
+# branch with a broken deploy. The presubmit always names the reader, so
+# FLEET_ALLOW_RUNNER_CREDENTIAL does not apply on this path.
+# shellcheck source=hack/fleet-kubeconfigs.sh
+source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
+export FLEET_READONLY_SA="${FLEET_READONLY_SA:-$(_fleet_default_reader "${PROJECT_ID}")}"
+preflight_fleet_reader() {
+  _fleet_require_readonly_credential "${FLEET_READONLY_SA}" "${PROJECT_ID}" || {
+    echo "FATAL: the seeded fleet cannot be read as ${FLEET_READONLY_SA}; stopping before the build rather than grading the fleet with the runner's write credential. Re-apply bench/tf/fleet against ${PROJECT_ID}." >&2
+    exit 1
+  }
+}
+preflight_fleet_reader
+
 RAW_PULL_SHA="${PULL_PULL_SHA:-latest}"
 PULL_SHA_SHORT="${RAW_PULL_SHA:0:7}"
 export TAG="pr-${PULL_NUMBER:-local}-${PULL_SHA_SHORT:-latest}"

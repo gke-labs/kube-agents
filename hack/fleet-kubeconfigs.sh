@@ -265,9 +265,9 @@ _fleet_discover_clusters() {
 # that read these kubeconfigs start hours after this runs, so a baked token
 # would be expired for most of them; the file carries an exec entry pointing at
 # fleet-reader-credential.sh instead, which mints against the clock of the check
-# and caches between them. The mint below repeats the gate's check per file:
-# it proves the caller can impersonate $2 before the credential is committed
-# to, and on a failure the caller drops the file.
+# and caches between them. Nothing is minted here: the gate above proved the
+# caller can impersonate $2, and this only reads gcloud's server and CA and
+# writes the exec entry.
 #
 # The replacement file is composed from scratch and moved into place, so a
 # failure at any step leaves the gcloud-written file whole for the caller to
@@ -276,22 +276,7 @@ _fleet_discover_clusters() {
 # puts a live bearer token in argv, where `ps` and `set -x` can both read it.
 _fleet_use_readonly_token() {
   local kubeconfig="$1" sa="$2"
-  local token server ca errors staged
-  errors="$(mktemp)" || return 1
-  # NOT 2>&1. On the SUCCESS path gcloud prints "WARNING: This command is using
-  # service account impersonation..." to stderr; folding that into stdout makes
-  # $token a multi-line blob that set-credentials still accepts, and every
-  # subsequent API call 401s while this script reports success.
-  token="$(gcloud auth print-access-token --impersonate-service-account="$sa" 2>"$errors")" || {
-    echo "WARNING: could not mint a read-only token for ${sa}: $(tr '\n' ' ' <"$errors")" >&2
-    rm -f "$errors"
-    return 1
-  }
-  rm -f "$errors"
-  if ! _fleet_bare_token "$token"; then
-    echo "WARNING: what gcloud returned for ${sa} is not a bare access token; refusing to write it" >&2
-    return 1
-  fi
+  local server ca staged
 
   server="$(KUBECONFIG="$kubeconfig" kubectl config view --raw --minify \
     -o jsonpath='{.clusters[0].cluster.server}')" || return 1
@@ -340,6 +325,12 @@ _fleet_use_readonly_token() {
   return 0
 }
 
+# The reader bench/tf/fleet provisions in $1, the one default every CI caller
+# shares (hack/ci-deploy.sh's pre-flight and hack/ci-eval-pr.sh's export).
+_fleet_default_reader() {
+  printf 'seeded-fleet-reader@%s.iam.gserviceaccount.com' "$1"
+}
+
 # An OAuth2 bearer token is a run of unreserved characters; anything else is
 # gcloud's stderr leaked into stdout.
 _fleet_bare_token() {
@@ -349,9 +340,9 @@ _fleet_bare_token() {
 # Refuse to write kubeconfigs that would carry the caller's own credential.
 # The runner's identity holds container.admin on a fleet every open PR shares,
 # so a check made with it proves nothing; the old warn-and-fall-back ran
-# unread on two pool projects for a day. One mint here settles the binding
-# (it is per account, not per cluster) before anything is written; the
-# per-file rewrite mints again to prove the credential it commits to.
+# unread on two pool projects for a day. This is the one mint: the binding is
+# per account, not per cluster, so it settles every slot before anything is
+# written, and the per-file rewrite below mints nothing.
 # FLEET_ALLOW_RUNNER_CREDENTIAL=1 opts out, for a fleet only you use.
 _fleet_require_readonly_credential() {
   local sa="$1" project="$2" errors token

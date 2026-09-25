@@ -862,12 +862,12 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # the grant is `fleet_reader_token_creators`, and
 # `scripts/verify_ci_pool_project.py` fails a project missing it. See
 # bench/tf/fleet/README.md, "A read-only credential for evaluations".
-export FLEET_READONLY_SA="${FLEET_READONLY_SA:-seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
+# shellcheck source=hack/fleet-kubeconfigs.sh
+source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
+export FLEET_READONLY_SA="${FLEET_READONLY_SA:-$(_fleet_default_reader "${PROJECT_ID}")}"
 
 profile_begin "fleet-kubeconfigs: seeded-fleet credentials"
 STEP_START=$SECONDS
-# shellcheck source=hack/fleet-kubeconfigs.sh
-source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
 write_fleet_kubeconfigs || {
   fleet_rc=$?
   if [ "$fleet_rc" -eq "$_FLEET_EXIT_READONLY_UNAVAILABLE" ]; then

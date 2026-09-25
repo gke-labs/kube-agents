@@ -6,8 +6,8 @@
 # an access token by impersonation and caching it on disk between calls.
 #
 # WHY A PLUGIN AND NOT A TOKEN IN THE KUBECONFIG. An impersonated access token
-# lives one hour. `hack/ci-eval-pr.sh` writes the fleet kubeconfigs once, before
-# the image build, and the task fan-out that reads them starts hours later --
+# lives one hour. `hack/ci-eval-pr.sh` writes the fleet kubeconfigs once, right
+# after the deploy, and the task fan-out that reads them runs for hours after --
 # recorded whole-job times in that file are 197.9, ~180 and 221.7 minutes
 # against a 360-minute deadline. A token baked into the file at write time is
 # therefore expired by the time most fleet checks run, and an expired credential

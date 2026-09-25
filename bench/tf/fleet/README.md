@@ -308,8 +308,10 @@ Three things about this are worth stating rather than assuming:
   `WARNING: This command is using service account impersonation...` to stderr. Capturing
   it with `2>&1` yields a two-line blob that `kubectl config set-credentials` accepts
   without complaint, after which every API call 401s while the script reports success —
-  a silent break of exactly the path this section recommends. The script captures stderr
-  separately and rejects anything that is not a bare token.
+  a silent break of exactly the path this section recommends. The gate captures stderr
+  separately and rejects anything that is not a bare token; it is the only mint the
+  runner makes, since the binding is per account and `fleet-reader-credential.sh` mints
+  its own at check time.
 
 ## Accepted background findings
 
