@@ -44,6 +44,24 @@ func TestSessionRecordDeletedAfterSessionTTL(t *testing.T) {
 		t.Fatalf("session record missing before reap: %v", err)
 	}
 
+	nc, err := nats.Connect(r.g.cfg.NATSURL)
+	if err != nil {
+		t.Fatalf("nats connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream new: %v", err)
+	}
+	stream, err := js.Stream(context.Background(), "KV_"+lib.SessionStateBucket)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	infoBefore, err := stream.Info(context.Background())
+	if err != nil {
+		t.Fatalf("stream info before: %v", err)
+	}
+
 	r.g.reapOnce(context.Background())
 
 	// Verify record was deleted by the reaper
@@ -53,6 +71,37 @@ func TestSessionRecordDeletedAfterSessionTTL(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("session record was not pruned after SessionTTL: %+v", got)
+	}
+
+	// Verify JetStream KV tombstone semantics: under --history=1, kv.Delete
+	// publishes a KV-Operation: DEL marker that displaces the payload rather
+	// than purging the subject, bounding bucket growth to a ~100-byte marker
+	// per conversation rather than accumulating full session records.
+	infoAfter, err := stream.Info(context.Background())
+	if err != nil {
+		t.Fatalf("stream info after: %v", err)
+	}
+	if infoAfter.State.Msgs != 1 {
+		t.Fatalf("expected 1 tombstone message in stream after delete under history=1, got %d", infoAfter.State.Msgs)
+	}
+	if infoAfter.State.Bytes >= infoBefore.State.Bytes {
+		t.Fatalf("expected tombstone marker bytes (%d) to be strictly smaller than full record payload bytes (%d)",
+			infoAfter.State.Bytes, infoBefore.State.Bytes)
+	}
+
+	// Verify ScanSessions ignores the deleted record (client-side IgnoreDeletes).
+	scannedCount := 0
+	_, _, err = r.g.reg.ScanSessions(context.Background(), "", func(rec *SessionRecord) (bool, error) {
+		if rec.Key == conv {
+			scannedCount++
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("ScanSessions failed: %v", err)
+	}
+	if scannedCount != 0 {
+		t.Fatalf("expected ScanSessions to ignore deleted record tombstone, scanned %d times", scannedCount)
 	}
 }
 

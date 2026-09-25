@@ -276,6 +276,10 @@ func (r *Registry) DropTask(ctx context.Context, taskID string) error {
 }
 
 // DeleteSession retires a session record once its retention horizon has passed.
+// In JetStream KV under --history=1, kv.Delete publishes a KV-Operation: DEL
+// marker that displaces the record value while retaining a ~100-byte tombstone
+// on the key's subject. This bounds bucket growth to a marker per conversation
+// rather than accumulating full records, rosters, and task histories.
 func (r *Registry) DeleteSession(ctx context.Context, sessionKey string) error {
 	kv, err := r.kv(ctx)
 	if err != nil {

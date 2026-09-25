@@ -196,11 +196,14 @@ type Config struct {
 	// SessionTTL bounds the lifetime of idle session records in session-state
 	// (A2A_SESSION_TTL). The session record holds contextId across pod
 	// incarnations. Once a session has no active pod and has seen no activity
-	// for longer than SessionTTL, its record is deleted from KV so session-state
-	// does not grow unbounded (including sessions with stale or abandoned active
-	// tasks whose executors never completed, while preserving tasks actively
-	// running within TaskDeadline). Unset means 7 days (168h), sitting
-	// comfortably past TASKS' 72h retention horizon.
+	// for longer than SessionTTL, its record is deleted from KV (leaving a
+	// ~100-byte tombstone marker under the bucket's --history=1 limit),
+	// bounding session-state growth to a marker per conversation rather than
+	// accumulating multi-KB session records, rosters, and task histories
+	// (including sessions with stale or abandoned active tasks whose executors
+	// never completed, while preserving tasks actively running within
+	// TaskDeadline). Unset means 7 days (168h), sitting comfortably past
+	// TASKS' 72h retention horizon.
 	SessionTTL time.Duration
 
 	// FirstEventGrace bounds how long an active task with NOTHING on its
