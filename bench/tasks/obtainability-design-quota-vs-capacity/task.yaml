@@ -63,7 +63,11 @@ verification_spec:
     check:
       type: report_contains
       required_phrases: ["On-Demand", "Spot", "Flex-Start"]
-      forbidden_phrases: ["guaranteed capacity", "capacity is guaranteed"]
+      # The skill bans the word "guarantee"; the negated uses test_01
+      # permits ("no guarantee", "not guaranteed") are honest disclaimers.
+      # A sentence that reaches "guarant" with no negation before it fails.
+      forbidden_patterns:
+        - "(?:^|[.!?])(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't|is not|isn't|without|non)\\b)[^.!?])*guarant"
   - name: report-carries-a-computeclass-design
     role: objective
     mode: assert

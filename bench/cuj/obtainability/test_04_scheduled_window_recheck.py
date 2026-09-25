@@ -73,9 +73,17 @@ RECURRENCE_RE = re.compile(
     r"|every\s+(?:minute|hour|day|week|night|morning))\b"
 )
 NEGATION_RE = re.compile(
-    r"\b(not|never|no|won'?t|will not|isn'?t|is not|rather than|instead of)\b"
+    r"\b(non|not|never|no|won'?t|will not|isn'?t|is not|rather than|instead of)\b"
 )
 SENTENCE_SPLIT_RE = re.compile(r"[.!?\n]+")
+
+
+def _clock_minutes(text: str) -> set[int]:
+    return {
+        int(hour) * 60 + int(minute)
+        for hour, minute in UTC_TIME_RE.findall(text)
+        if int(hour) < 24 and int(minute) < 60
+    }
 
 PROMPT = f"""Act as my batch scheduling partner. Plan a 64-node TPU v5e \
 training job that must run for 12 hours and finish within the next 48 hours, \
@@ -101,7 +109,7 @@ ACCEPTANCE_CRITERIA = (
         "The user is told the re-check's exact UTC fire time, two hours "
         "before the recommended window's start.",
         "the answer names the lead and two UTC times exactly two hours "
-        "apart: the start and the fire time",
+        "apart, the fire time in a sentence about the schedule",
     ),
     AcceptanceCriterion(
         "ac04-recheck-reports-to-thread",
@@ -168,18 +176,24 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     answer = delivered_answer(interaction)
     folded_answer = answer.casefold()
     # A fire time cannot be told apart from the plan's own start by its
-    # presence alone — every correct plan states a start. What only a fire
-    # time produces is a second clock time exactly the lead earlier.
-    clock_minutes = {
-        int(hour) * 60 + int(minute)
-        for hour, minute in UTC_TIME_RE.findall(answer)
-        if int(hour) < 24 and int(minute) < 60
+    # presence alone — every correct plan states a start, and the report
+    # format supplies more clock times (runner-up windows, the deadline,
+    # echoed probe ranges), any pair of which could sit two hours apart by
+    # coincidence. What only a stated fire time produces is a clock time in
+    # a sentence about the schedule that sits exactly the lead before some
+    # stated time.
+    all_clocks = _clock_minutes(answer)
+    recheck_clocks = {
+        clock
+        for sentence in SENTENCE_SPLIT_RE.split(folded_answer)
+        if SCHEDULE_TERM_RE.search(sentence)
+        for clock in _clock_minutes(sentence)
     }
     fire_time_stated = (
         any(
             (start - fire) % (24 * 60) == RECHECK_LEAD_MINUTES
-            for start in clock_minutes
-            for fire in clock_minutes
+            for start in all_clocks
+            for fire in recheck_clocks
         )
         and "utc" in folded_answer
         and bool(LEAD_RE.search(folded_answer))

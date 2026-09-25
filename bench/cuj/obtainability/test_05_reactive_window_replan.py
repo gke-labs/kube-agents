@@ -70,6 +70,15 @@ manifests, submit a provisioning request, create infrastructure, or mutate \
 Kubernetes or cloud state."""
 
 
+def _record_region(details: dict[str, Any]) -> str:
+    # The canonical record carries region inside `request`; the live
+    # recorder projects it at the top of `details` too. Accept both, as
+    # test_03's _valid_obtainability_planning_call does.
+    request = details.get("request")
+    nested = request.get("region") if isinstance(request, dict) else None
+    return str(nested or details.get("region") or "")
+
+
 def _parse_timestamp(value: Any) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -114,7 +123,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         and str(item.get("status") or "").casefold() in {"completed", "passed"}
         and isinstance(item.get("details"), dict)
         and item["details"].get("apiMethod") in OBTAINABILITY_PLANNING_METHODS
-        and item["details"].get("region") == REMAINING_REGION
+        and _record_region(item["details"]) == REMAINING_REGION
     ]
     analysis_records = [
         item
@@ -183,8 +192,12 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         and ("utc" in folded_answer or (raw and raw in answer))
         for raw, parsed in remaining_starts
     )
+    # The skill's report template always carries a "**No window**:" bullet,
+    # so the phrase alone proves nothing; honesty only counts when the
+    # analysis genuinely has no remaining-zone window.
     revised_or_honest = REMAINING_ZONE in answer and (
-        new_start_named or "no window" in folded_answer
+        new_start_named
+        or (not remaining_starts and "no window" in folded_answer)
     )
 
     suite = AcceptanceCriteria(

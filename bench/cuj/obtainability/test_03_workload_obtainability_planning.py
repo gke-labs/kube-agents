@@ -262,8 +262,13 @@ def _valid_obtainability_planning_call(
     item: dict[str, Any], created_at: datetime | None
 ) -> bool:
     details = _mapping(item.get("details"))
-    region = str(details.get("region") or "")
     request = _mapping(details.get("request"))
+    # The skill's canonical record carries region and nodeCount inside
+    # `request` (one object, "do not rename keys"); the recorder the live
+    # runs went through projects them at the top of `details` too. Both
+    # spellings of the same honest record are accepted; test_05 mirrors
+    # this in _record_region.
+    region = str(request.get("region") or details.get("region") or "")
     specs = _mapping(request.get("futureResourcesSpecs"))
     if len(specs) != 1:
         return False
@@ -296,7 +301,7 @@ def _valid_obtainability_planning_call(
         and aggregate.get("vmFamily") == TPU_V5E_VM_FAMILY
         and aggregate.get("workloadType") == "BATCH"
         and _integer(aggregate.get("acceleratorCount")) == CHIP_COUNT
-        and _integer(details.get("nodeCount")) == NODE_COUNT
+        and _integer(request.get("nodeCount", details.get("nodeCount"))) == NODE_COUNT
     )
 
 

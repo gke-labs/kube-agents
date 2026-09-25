@@ -74,15 +74,20 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      required_phrases: ["64"]
-      any_of_phrases: ["chips", "chip count", "chip-count"]
+      # "64" alone is satisfied by the record's own "86400s" duration and
+      # "chips" by the manifest comment; the conversion statement is the
+      # count and the unit together.
+      any_of_phrases:
+        ["64 chips", "64 v5e chips", "64 tpu chips", "= 64", "chip count of 64"]
   - name: report-delivers-a-window-verdict
     role: objective
     mode: assert
     check:
       type: report_contains
       any_of_phrases: ["UTC", "no window", "NO_CAPACITY", "NOT_SUPPORTED"]
-      forbidden_phrases: ["guaranteed capacity", "capacity is guaranteed"]
+      # Same shape as the design case: the banned word, negated uses allowed.
+      forbidden_patterns:
+        - "(?:^|[.!?])(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't|is not|isn't|without|non)\\b)[^.!?])*guarant"
   - name: report-carries-the-paired-manifests
     role: objective
     mode: assert

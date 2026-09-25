@@ -173,3 +173,57 @@ def test_a_delegated_audits_ledger_url_reaches_the_default_scope():
         ["t1"],
     )
     assert url in base.metadata["final_message"]
+
+
+# --------------------------------------- report_contains forbidden_patterns
+
+
+GUARANTEE_PATTERN = (
+    "(?:^|[.!?])(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't"
+    "|is not|isn't|without|non)\\b)[^.!?])*guarant"
+)
+
+
+def _set_final(answer: str) -> None:
+    base = _base(answer)
+    transcript.set(
+        base.output,
+        base.trajectory,
+        final_message=str(base.metadata.get("final_message") or ""),
+    )
+
+
+def test_a_forbidden_pattern_flags_the_unnegated_banned_word():
+    _set_final("Spot may be reclaimed. The reservation guarantees capacity.")
+    check = ReportContainsVerifier(
+        type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
+    )
+    result = check.verify(5.0)
+    assert result.status == "fail"
+    assert "forbidden patterns matched" in result.reason
+
+
+def test_a_forbidden_pattern_permits_the_negated_uses():
+    _set_final(
+        "Capacity is not guaranteed; there is no guarantee of allocation, "
+        "and a non-guaranteed pool may be reclaimed without notice."
+    )
+    check = ReportContainsVerifier(
+        type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
+    )
+    result = check.verify(5.0)
+    assert result.status == "pass"
+    assert "forbidden pattern(s)" in result.reason
+
+
+def test_a_forbidden_pattern_scopes_negation_to_its_own_sentence():
+    _set_final("No guarantee exists for Spot. Flex-Start guarantees a window.")
+    check = ReportContainsVerifier(
+        type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
+    )
+    assert check.verify(5.0).status == "fail"
+
+
+def test_an_uncompilable_forbidden_pattern_is_rejected_at_construction():
+    with pytest.raises(Exception):
+        ReportContainsVerifier(type="report_contains", forbidden_patterns=["(unclosed"])

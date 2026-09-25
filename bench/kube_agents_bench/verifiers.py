@@ -124,6 +124,10 @@ class ReportContainsVerifier(BaseVerifier):
     Substring matching, deliberately: the task author chose the phrase (a
     planted defect's name, a required noun), so an exact match is fair.
     Anything fuzzier belongs to the judge, not to a blocking check.
+    ``forbidden_patterns`` is the one regex exception, for the shape a
+    substring cannot express: a banned word whose negated uses are
+    legitimate ("no guarantee"). Each is ``re.search``ed against the same
+    normalized text as the phrases.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
     Markdown emphasis dropped, whitespace runs collapsed. These are the
@@ -151,7 +155,15 @@ class ReportContainsVerifier(BaseVerifier):
     # spellings ("HPA" / "HorizontalPodAutoscaler"), all-of required_phrases
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
+    forbidden_patterns: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
+
+    @field_validator("forbidden_patterns")
+    @classmethod
+    def _forbidden_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            re.compile(pattern)
+        return patterns
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -168,15 +180,20 @@ class ReportContainsVerifier(BaseVerifier):
         )
         missing = [p for p in self.required_phrases if _normalize(p) not in text]
         present = [p for p in self.forbidden_phrases if _normalize(p) in text]
+        pattern_hits = [p for p in self.forbidden_patterns if re.search(p, text)]
         any_of_miss = bool(self.any_of_phrases) and not any(
             _normalize(p) in text for p in self.any_of_phrases
         )
-        if missing or present or any_of_miss:
+        if missing or present or pattern_hits or any_of_miss:
             parts = []
             if missing:
                 parts.append(f"required phrases absent from the report: {missing}")
             if present:
                 parts.append(f"forbidden phrases present in the report: {present}")
+            if pattern_hits:
+                parts.append(
+                    f"forbidden patterns matched in the report: {pattern_hits}"
+                )
             if any_of_miss:
                 parts.append(
                     f"none of the alternative phrasings present: {self.any_of_phrases}"
@@ -195,6 +212,10 @@ class ReportContainsVerifier(BaseVerifier):
             f"all {len(self.required_phrases)} required phrase(s)",
             f"none of {len(self.forbidden_phrases)} forbidden",
         ]
+        if self.forbidden_patterns:
+            satisfied.append(
+                f"none of {len(self.forbidden_patterns)} forbidden pattern(s)"
+            )
         if self.any_of_phrases:
             satisfied.append(
                 f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
