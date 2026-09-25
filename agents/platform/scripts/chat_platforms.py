@@ -3,7 +3,7 @@
 #
 # One question, answered separately in several files, which is why the Cluster Agent
 # reconcile summary reached Google Chat and nothing else on every install (#989). The
-# other answers, and where each stands:
+# other answers, the callers that have converged on this one, and where each stands:
 #
 #   - `session_kv_server.enabled_chat_platforms` — the same three-source, per-platform
 #     resolution as this module, landed by #1111 for the cron report relay. It is the
@@ -11,8 +11,13 @@
 #     precedence; `get_active_platform` is now a single-destination reader on top of
 #     it, for the alert path, which needs exactly one platform because a thread
 #     belongs to one.
-#   - `platform_mcp_server.get_enabled_platforms` — still keyed on SLACK_BOT_TOKEN;
-#     #742/#743 record the defect and PR #735 is open against it.
+#   - `platform_mcp_server.send_notification` — a caller since #743, not an answer.
+#     It used to answer the question locally off CONFIG_PATH and then
+#     `SLACK_BOT_TOKEN or SLACK_HOME_CHANNEL` / `GOOGLE_CHAT_PROJECT_ID or
+#     GOOGLE_CHAT_HOME_CHANNEL`, never reading the managed scope. Under the
+#     credential proxy the token half is unsatisfiable and the home channel is
+#     rendered regardless, so on a managed pod it resolved off the environment and
+#     could disagree with the alert half of its own pipeline.
 #   - `profile_cron_tick.home_target_env` / `HOME_TARGET_ENV_KEYS` — a different
 #     question (which home *target* a cron child gets, re-read from config.yaml
 #     because the environment cannot carry it) but the same per-platform table.
