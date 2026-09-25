@@ -795,13 +795,29 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 }
 
 // probeConversation is the ConversationProbe the gateway offers a ProbeSink:
-// the session record for one conversation and the state of its active
-// task's stream, as they stand. A pure read, as ConversationProbe requires:
+// the session record for one conversation and the state of one task's
+// stream, as they stand. A pure read, as ConversationProbe requires:
 // no lock, no heal, no post, no publish, no write. It does not take the
 // session lock because it needs nothing the lock protects -- the KV read is
 // atomic and the stream replay is its own snapshot -- and holding it would
 // let a slow read delay the turn the caller is waiting on.
-func (g *Gateway) probeConversation(ctx context.Context, key string) (ConversationState, error) {
+//
+// Which task: the one taskID names when the caller gives one, else the
+// record's active task. A caller names the task it is grading, and the
+// record stops holding that task the moment the relay posts its terminal
+// (relayTerminal clears ActiveTask) -- which is exactly when an eval
+// harness assembles its record -- so a read of the active task alone
+// answers a finished run with no stream at all. The record's task history
+// still knows the addressee the task's subjects carried (AddresseeFor, the
+// relay's own replay choice) and the stream is durable, so the named read
+// is the same read the active one is. Active and the fields beside it
+// describe the record's active task only when it is the task being read; a
+// named task the record no longer holds reports Active false with zero
+// SubmittedAt and Age, and its stream. A conversation with no record has
+// had no turn, so no task of it was ever published: the empty state, not a
+// read against the configured default addressee, which may be the
+// RouteSession sentinel -- a route, never a subject.
+func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (ConversationState, error) {
 	state := ConversationState{
 		Backend:    g.backend,
 		InjectOnly: g.backend == injectBackend,
@@ -811,22 +827,32 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 	if err != nil {
 		return state, fmt.Errorf("session lookup: %w", err)
 	}
-	if rec == nil || rec.ActiveTask == nil {
+	if rec == nil {
 		return state, nil
 	}
 	active := rec.ActiveTask
-	state.Active = true
-	state.TaskID = active.TaskID
-	state.SubmittedAt = active.SubmittedAt
-	state.Detached = active.Detached
-	if !active.SubmittedAt.IsZero() {
-		state.Age = time.Since(active.SubmittedAt)
+	if taskID == "" {
+		if active == nil {
+			return state, nil
+		}
+		taskID = active.TaskID
+	}
+	state.TaskID = taskID
+	if active != nil && active.TaskID == taskID {
+		state.Active = true
+		state.SubmittedAt = active.SubmittedAt
+		state.Detached = active.Detached
+		if !active.SubmittedAt.IsZero() {
+			state.Age = time.Since(active.SubmittedAt)
+		}
 	}
 	// Against the addressee the task's own subjects carried: after a
 	// Delegate re-home rec.Addressee is not it (the relay's terminal replay
-	// makes the same choice).
-	addressee := rec.AddresseeFor(active.TaskID)
-	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, active.TaskID)
+	// makes the same choice). A task the history no longer lists (older
+	// than taskHistoryCap turns) reads against the record's current
+	// addressee, which is AddresseeFor's documented fallback.
+	addressee := rec.AddresseeFor(taskID)
+	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, taskID)
 	switch {
 	case terr == nil:
 		state.ExecutorState = task.State
@@ -850,7 +876,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 			// only the executor's; a supervisor terminal says an executor
 			// died or never ran, which is the install's.
 			state.TerminalSource = TerminalFromExecutor
-			if terminalSubject == lib.TaskSupervisorSubject(addressee, active.TaskID) {
+			if terminalSubject == lib.TaskSupervisorSubject(addressee, taskID) {
 				state.TerminalSource = TerminalFromSupervisor
 			}
 			if art := task.Artifact(lib.ArtifactResult); art != nil {
@@ -868,7 +894,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 		// A transport failure cannot rule out events, so it is not "no
 		// executor": the caller learns that the gateway could not look,
 		// never that nothing is there.
-		return state, fmt.Errorf("reading task %s on %s: %w", active.TaskID, addressee, terr)
+		return state, fmt.Errorf("reading task %s on %s: %w", taskID, addressee, terr)
 	}
 	return state, nil
 }

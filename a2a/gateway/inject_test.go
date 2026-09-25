@@ -1544,10 +1544,10 @@ func TestInjectReadRouteReportsATerminalOnTheStreamBeforeTheRelay(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	door.SetProbe(func(context.Context, string) (ConversationState, error) {
+	door.SetProbe(func(context.Context, string, string) (ConversationState, error) {
 		return ConversationState{Active: true, TaskID: "task-1", ExecutorState: lib.StateFailed, Final: true, Grace: injectTestGrace}, nil
 	})
-	report := door.runProbe(context.Background(), injectKeyPrefix+"any")
+	report := door.runProbe(context.Background(), injectKeyPrefix+"any", "")
 	if !report.Active || !report.Final || report.ExecutorState != string(lib.StateFailed) {
 		t.Fatalf("report = %+v, want an active task whose stream is final", report)
 	}
@@ -1589,15 +1589,15 @@ func TestInjectReadRouteSaysWhenItCannotLook(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	report := door.runProbe(context.Background(), injectKeyPrefix+"orphan")
+	report := door.runProbe(context.Background(), injectKeyPrefix+"orphan", "")
 	if report.Error == "" || report.Active {
 		t.Fatalf("probe with no gateway = %+v, want an error and nothing asserted", report)
 	}
-	failing := func(context.Context, string) (ConversationState, error) {
+	failing := func(context.Context, string, string) (ConversationState, error) {
 		return ConversationState{Active: true, TaskID: "task-1"}, fmt.Errorf("the stream is unreachable")
 	}
 	door.SetProbe(failing)
-	report = door.runProbe(context.Background(), injectKeyPrefix+"orphan")
+	report = door.runProbe(context.Background(), injectKeyPrefix+"orphan", "")
 	if !strings.Contains(report.Error, "unreachable") || !report.Active || report.TaskID != "task-1" {
 		t.Fatalf("probe that failed to look = %+v, want the error beside what was learned", report)
 	}
@@ -2121,10 +2121,10 @@ func TestInjectReadRouteOmitsTheTraceWhenNoStreamWasRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	door.SetProbe(func(context.Context, string) (ConversationState, error) {
+	door.SetProbe(func(context.Context, string, string) (ConversationState, error) {
 		return ConversationState{Active: true, TaskID: "task-1"}, fmt.Errorf("the stream is unreachable")
 	})
-	body, err := json.Marshal(door.runProbe(context.Background(), injectKeyPrefix+"orphan"))
+	body, err := json.Marshal(door.runProbe(context.Background(), injectKeyPrefix+"orphan", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2137,6 +2137,128 @@ func TestInjectReadRouteOmitsTheTraceWhenNoStreamWasRead(t *testing.T) {
 	}
 	if report["error"] == nil {
 		t.Fatalf("report = %s, want the error that says the read failed", body)
+	}
+}
+
+// TestInjectReadRouteReadsAFinishedTasksTraceByTaskID: the relay clears the
+// record's active task when it posts the terminal, which is exactly when a
+// harness assembles its record, so a probe that read only the active task
+// would answer a finished run with no stream at all. With task= the probe
+// reads the named task's stream off the addressee the record's history
+// kept for it: final, the executor's terminal, the trace and the result,
+// with active false and no age because the record no longer holds it.
+// Without task= the released conversation still reads as no stream (the
+// activity key absent), so "absent = not read" keeps holding.
+func TestInjectReadRouteReadsAFinishedTasksTraceByTaskID(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-trace-after-release", injectTestAuthor, "list the clusters")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	calls := []string{
+		`{"tool":"mcp__gke__list_clusters","input":{"project":"p"},"callId":"call_01","status":"completed","durationMs":2130,"at":"2026-09-25T10:00:00Z"}`,
+		`{"tool":"mcp__gke__get_cluster","input":{"name":"c1"},"callId":"call_02","status":"completed","durationMs":410,"at":"2026-09-25T10:00:03Z"}`,
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: lib.ArtifactActivity, Name: lib.ArtifactActivity,
+		Parts: []lib.Part{{Kind: "data", Data: json.RawMessage(calls[0])}, {Kind: "data", Data: json.RawMessage(calls[1])}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{
+		Name:  lib.ArtifactResult,
+		Parts: []lib.Part{{Kind: "text", Text: "two clusters, both healthy"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	// The instant the finding is about: the relay has posted the terminal
+	// and written the release, so the record holds no active task.
+	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+	r.awaitRecordRelease(t, reply.Conversation)
+
+	raw := r.probeRaw(t, reply.Conversation, reply.TaskID)
+	if active, ok := raw["active"]; ok && string(active) != "false" {
+		t.Fatalf("active = %s after the relay released the record; want false or absent", active)
+	}
+	if string(raw["final"]) != "true" || string(raw["executorState"]) != `"completed"` {
+		t.Fatalf("probe = %s, want the named task's stream: final, completed", raw)
+	}
+	if string(raw["taskId"]) != `"`+reply.TaskID+`"` {
+		t.Fatalf("taskId = %s, want the task the caller named %q", raw["taskId"], reply.TaskID)
+	}
+	if _, ok := raw["error"]; ok {
+		t.Fatalf("probe = %s, carries an error for a task the stream holds", raw)
+	}
+	if _, ok := raw["ageSeconds"]; ok {
+		t.Fatalf("probe = %s, carries an age for a task the record no longer holds", raw)
+	}
+	var trace []json.RawMessage
+	if err := json.Unmarshal(raw["activity"], &trace); err != nil || len(trace) != len(calls) {
+		t.Fatalf("activity = %s (err %v), want the %d calls the finished run made", raw["activity"], err, len(calls))
+	}
+	for i, want := range calls {
+		var got, exp bytes.Buffer
+		if err := json.Compact(&got, trace[i]); err != nil {
+			t.Fatalf("call %d is not JSON: %v", i, err)
+		}
+		if err := json.Compact(&exp, []byte(want)); err != nil {
+			t.Fatal(err)
+		}
+		if got.String() != exp.String() {
+			t.Fatalf("activity[%d] = %s, want %s", i, got.String(), exp.String())
+		}
+	}
+	if string(raw["result"]) != `"two clusters, both healthy"` {
+		t.Fatalf("result = %s, want the result artifact's text", raw["result"])
+	}
+	if string(raw["terminalSource"]) != `"`+string(TerminalFromExecutor)+`"` {
+		t.Fatalf("terminalSource = %s, want the executor's", raw["terminalSource"])
+	}
+
+	// Unchanged without task=: the record holds no active task, so no
+	// stream is read and the activity key stays absent.
+	raw = r.probeRaw(t, reply.Conversation, "")
+	if activity, ok := raw["activity"]; ok {
+		t.Fatalf("activity = %s with no task named on a released conversation; want the key absent", activity)
+	}
+	if active, ok := raw["active"]; ok && string(active) != "false" {
+		t.Fatalf("active = %s on a released conversation; want false or absent", active)
+	}
+}
+
+// TestInjectReadRouteOmitsTheTraceForAnUnknownTaskID: a task id the stream
+// has nothing for is the empty state, not a failure -- no activity key,
+// because no stream was read, and no error, because the gateway looked and
+// found nothing rather than failing to look. Both on a released
+// conversation, whose record knows no such task and falls back to its
+// current addressee, and on one that never had a turn, whose record does
+// not exist and which the probe does not read the bus for at all.
+func TestInjectReadRouteOmitsTheTraceForAnUnknownTaskID(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-unknown-task", injectTestAuthor, "think quietly")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+	r.awaitRecordRelease(t, reply.Conversation)
+
+	for _, key := range []string{reply.Conversation, injectKeyPrefix + "never-used"} {
+		raw := r.probeRaw(t, key, "task-nobody-published")
+		if activity, ok := raw["activity"]; ok {
+			t.Fatalf("activity = %s for an unknown task on %s; want the key absent", activity, key)
+		}
+		if errField, ok := raw["error"]; ok {
+			t.Fatalf("error = %s for an unknown task on %s; a task with no events is the empty state, not a failed read", errField, key)
+		}
+		if final, ok := raw["final"]; ok && string(final) != "false" {
+			t.Fatalf("final = %s for an unknown task on %s", final, key)
+		}
 	}
 }
 
