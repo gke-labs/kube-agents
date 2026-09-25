@@ -27,7 +27,7 @@ from pathlib import Path
 
 import sandbox_exec
 from gke_endpoint import dns_endpoint_args
-from profile_scaffold import HERMES_BIN, backfill_cron_file, ensure_profile, overlay_template
+from profile_scaffold import HERMES_BIN, backfill_cron_file, ensure_profile, is_scaffolded, overlay_template
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
@@ -517,28 +517,27 @@ def list_profiles() -> list[str]:
     )
 
 
-def list_ready_profiles() -> list[str]:
-    """Return sorted names of active, fully scaffolded Cluster Agent profiles.
+def is_ready_profile(home: Path) -> bool:
+    """A profile the dispatcher can hand a card to and its worker can serve.
 
-    Filters profiles on the agent pod PVC to ensure they:
-    - Start with 'cluster-' prefix and are not in RESERVED_PROFILES
-    - Have a stamped 'USER.md' identity file (written at step 4 after credentials fetch)
-    - Have a valid, readable cluster_identity in config.yaml
+    is_scaffolded, not is_dir: a plugin mount point can leave a directory under
+    profiles/ that Hermes never registered, and a card assigned to it never runs.
+    The scaffold artifacts too: create_profile registers the profile and stamps its
+    identity before it fetches the credential and writes USER.md, so a scaffold that
+    stopped in between is registered, and its worker blocks at preflight.
     """
-    valid = []
-    for name in list_profiles():
-        if not name.startswith(CLUSTER_PROFILE_PREFIX):
-            continue
-        try:
-            home = profile_home(name)
-            if not (home / IDENTITY_FILE).is_file():
-                continue
-            if read_cluster_identity(home) is None:
-                continue
-            valid.append(name)
-        except Exception:
-            continue
-    return sorted(valid)
+    return is_scaffolded(home) and (home / IDENTITY_FILE).is_file()
+
+
+def list_ready_profiles() -> list[str]:
+    """Return sorted names of active, fully scaffolded Cluster Agent profiles."""
+    if not PROFILES_BASE.is_dir():
+        return []
+    return sorted(
+        p.name
+        for p in PROFILES_BASE.iterdir()
+        if p.is_dir() and p.name not in RESERVED_PROFILES and is_ready_profile(p)
+    )
 
 
 def cmd_delete(args: argparse.Namespace) -> None:

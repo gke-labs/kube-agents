@@ -110,6 +110,12 @@
 # repetitions measured 710-1325s). With the 2026-09-23 additions above it
 # grows the matrix to forty-five cases and 135 units, ~1047-1067 serial
 # minutes, on nights the 2026-09-22 paragraph already says can truncate.
+#
+# 2026-09-25 adds cluster-agent-unlocated-crashloop-debug (#1670): one case,
+# three units, ~36 serial minutes at its 720s hint. With the 2026-09-23
+# additions above it grows the matrix to forty-six cases and 138 units,
+# ~1083-1103 serial minutes, on nights the 2026-09-22 paragraph already says
+# can truncate.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:

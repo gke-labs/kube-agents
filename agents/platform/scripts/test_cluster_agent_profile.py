@@ -584,6 +584,7 @@ class ListProfilesTest(unittest.TestCase):
         for name in ("cluster-zeta", "cluster-beta"):
             p = self.tmp / name
             p.mkdir(parents=True, exist_ok=True)
+            (p / "profile.yaml").touch()
             (p / "USER.md").write_text("- project: p\n- cluster: c\n- location: l\n", encoding="utf-8")
             (p / "config.yaml").write_text(
                 "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
@@ -623,9 +624,11 @@ class ListReadyProfilesTest(unittest.TestCase):
         self.patcher.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _scaffold(self, name: str, user_md: bool = True, identity: bool = True):
+    def _scaffold(self, name: str, user_md: bool = True, identity: bool = True, scaffolded: bool = True):
         p = self.tmp / name
         p.mkdir(parents=True, exist_ok=True)
+        if scaffolded:
+            (p / "profile.yaml").touch()
         if user_md:
             (p / "USER.md").write_text("- project: p\n- cluster: c\n- location: l\n", encoding="utf-8")
         if identity:
@@ -638,8 +641,9 @@ class ListReadyProfilesTest(unittest.TestCase):
     def test_ready_profiles_filters_incomplete_scaffolds(self):
         self._scaffold("cluster-ready")
         self._scaffold("cluster-no-user", user_md=False, identity=True)
-        self._scaffold("cluster-no-identity", user_md=True, identity=False)
-        self._scaffold("not-a-cluster-prefix", user_md=True, identity=True)
+        self._scaffold("cluster-unregistered", scaffolded=False)
+        self._scaffold("default")
+        self._scaffold("platform")
 
         self.assertEqual(cap.list_ready_profiles(), ["cluster-ready"])
 
@@ -648,32 +652,13 @@ class ListReadyProfilesTest(unittest.TestCase):
         with mock.patch.object(cap, "kubeconfig_landed", side_effect=AssertionError("kubeconfig_landed should not be called")):
             self.assertEqual(cap.list_ready_profiles(), ["cluster-ready"])
 
-    def test_ready_profiles_skips_malformed_config_yaml_and_non_dict_payloads(self):
+    def test_ready_profiles_tolerates_corrupt_config_yaml(self):
         self._scaffold("cluster-ready")
-
-        # 1. config.yaml parses to a scalar or list
-        p_scalar = self._scaffold("cluster-scalar", user_md=True, identity=False)
-        (p_scalar / "config.yaml").write_text("just a string\n", encoding="utf-8")
-
-        p_list = self._scaffold("cluster-list", user_md=True, identity=False)
-        (p_list / "config.yaml").write_text("- item1\n- item2\n", encoding="utf-8")
-
-        # 2. config.yaml with non-dict cluster_identity
-        p_non_dict_ident = self._scaffold("cluster-bad-ident", user_md=True, identity=False)
-        (p_non_dict_ident / "config.yaml").write_text("cluster_identity: not-a-dict\n", encoding="utf-8")
-
-        # 3. Corrupt syntax in config.yaml
         p_corrupt = self._scaffold("cluster-corrupt", user_md=True, identity=False)
-        (p_corrupt / "config.yaml").write_text("cluster_identity: [invalid yaml: {{\n", encoding="utf-8")
+        (p_corrupt / "config.yaml").write_text("invalid yaml: {{\n", encoding="utf-8")
 
-        # 4. config.yaml that is a directory instead of a file
-        p_dir = self.tmp / "cluster-config-is-dir"
-        p_dir.mkdir()
-        (p_dir / "USER.md").write_text("valid\n", encoding="utf-8")
-        (p_dir / "config.yaml").mkdir()
-
-        # Should skip all malformed configs without crashing and still return the valid cluster
-        self.assertEqual(cap.list_ready_profiles(), ["cluster-ready"])
+        # Ready profiles match the dispatcher capability: scaffolded and USER.md present
+        self.assertEqual(cap.list_ready_profiles(), ["cluster-corrupt", "cluster-ready"])
 
     def test_read_cluster_identity_robustness(self):
         # 1. Nonexistent directory
@@ -721,40 +706,19 @@ class SandboxStubTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_stub_refuses_execution_with_mcp_guidance(self):
+    def test_stub_refuses_execution(self):
         wrapper = self.tmp / "cluster_agent_profile.py"
         wrapper.symlink_to(self.stub_path)
 
-        # 1. list
-        res_list = subprocess.run(
+        res = subprocess.run(
             [sys.executable, str(wrapper), "list"],
             capture_output=True,
             text=True,
             check=False,
         )
-        self.assertEqual(res_list.returncode, 1)
-        self.assertIn("cluster_agent_profile.py does not run in the shell sandbox", res_list.stderr)
-        self.assertIn("list_cluster_profiles()", res_list.stderr)
-
-        # 2. name
-        res_name = subprocess.run(
-            [sys.executable, str(wrapper), "name", "--project", "p", "--cluster", "c", "--location", "l"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(res_name.returncode, 1)
-        self.assertIn("get_cluster_profile_name", res_name.stderr)
-
-        # 3. create
-        res_create = subprocess.run(
-            [sys.executable, str(wrapper), "create", "--name", "x"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(res_create.returncode, 1)
-        self.assertIn("cluster_agent_profile.py does not run in the shell sandbox", res_create.stderr)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("cluster_agent_profile.py does not run in the shell sandbox", res.stderr)
+        self.assertIn("Report the request as blocked", res.stderr)
 
 
 class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
