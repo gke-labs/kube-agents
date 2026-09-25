@@ -114,7 +114,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		// The activity door (a2a/hermes-bridge/activity.go): on by default at
 		// the address the platform profile's hooks.overlay.yaml names.
 		ActivityListen:   activityListen(envOr("BRIDGE_ACTIVITY_LISTEN", hermesbridge.DefaultActivityListen)),
-		ProgressInterval: time.Duration(envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)) * time.Second,
+		ProgressInterval: progressInterval(envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)),
 		Logger:           log,
 	}
 	if bin := os.Getenv("HERMES_BIN"); bin != "" {
@@ -139,6 +139,15 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	}
 	log.Info("bridge shut down cleanly")
 	return nil
+}
+
+// progressInterval maps the environment's seconds to the Config's duration:
+// 0 is off there (the Config's off is negative; its zero is the default).
+func progressInterval(seconds int) time.Duration {
+	if seconds <= 0 {
+		return -1
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // activityListen maps the environment's spelling of "off" to the Config's.

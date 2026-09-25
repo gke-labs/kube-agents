@@ -77,16 +77,26 @@ const (
 	// activityBodyCap bounds one delivery read; hermes's own payloads are
 	// tool inputs and results, never more than a few KiB.
 	activityBodyCap = 1 << 20
-	// activityQueueCapacity is the per-task backlog between the door and the
-	// publisher, matching hermes's outbound queue.
-	activityQueueCapacity = 256
 	// activityPublishTimeout bounds one artifact publish; the trace is
-	// telemetry and must never stall the run or the terminal.
+	// telemetry and must never stall the run or the terminal. hermes waits
+	// on the delivery for hooks.overlay.yaml's timeout, which is longer, so
+	// a slow publish is not a retried (duplicated) delivery.
 	activityPublishTimeout = 5 * time.Second
-	// activityDrainTimeout bounds finalize's flush of what is still queued
-	// and still open, so a slow bus cannot spend the terminal's budget.
+	// activityDrainTimeout bounds finalize's flush of the calls still open,
+	// so a slow bus cannot spend the terminal's budget.
 	activityDrainTimeout = 5 * time.Second
-	activityKeyBytes     = 32
+	// activitySeenCap bounds the delivery ids remembered per task for
+	// dedupe; hermes retries a delivery at most once, so the set only
+	// grows with the calls.
+	activitySeenCap  = 8192
+	activityKeyBytes = 32
+	// The door's HTTP timeouts: a client on loopback that has not sent its
+	// headers or body in these is broken, and the response is one status
+	// line. activityShutdownTimeout bounds Serve's drain on bridge exit.
+	activityReadHeaderTimeout = 5 * time.Second
+	activityReadTimeout       = 10 * time.Second
+	activityWriteTimeout      = 5 * time.Second
+	activityShutdownTimeout   = 2 * time.Second
 
 	hookPreToolCall     = "pre_tool_call"
 	hookPostToolCall    = "post_tool_call"
@@ -104,33 +114,52 @@ const (
 	redactedValue = "[redacted]"
 )
 
-// redactedKeyPattern names input keys whose values never go on the bus. The
-// worker adapter publishes tool_use input verbatim; the persona's terminal
-// and gcloud arguments can carry a token, and the stream is retained for
-// days and copied into eval records.
-var redactedKeyPattern = regexp.MustCompile(`(?i)token|secret|password|passwd|authorization|api[_-]?key|credential`)
+// Two redactions, because the worker adapter publishes tool_use input
+// verbatim and this stream is retained for days and copied into eval
+// records. redactedKeyPattern names input keys whose values never go on the
+// bus. redactedValuePatterns catch the credential shapes a value can carry
+// under an innocent key - a terminal command is one string under "command" -
+// and are best-effort by nature: a bearer token, Google OAuth access token,
+// Google API key, GitHub token, or a "key=value" pair whose key looks like
+// a secret. Anything else the model pastes into a command line ships.
+var (
+	redactedKeyPattern    = regexp.MustCompile(`(?i)token|secret|password|passwd|authorization|api[_-]?key|credential`)
+	redactedValuePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}`),
+		regexp.MustCompile(`ya29\.[A-Za-z0-9._-]{20,}`),
+		regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),
+		regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
+		regexp.MustCompile(`(?i)(token|secret|password|passwd|api[_-]?key|credential)s?[=:]\s*\S+`),
+	}
+)
 
 // ActivityEntry is one data part of the activity artifact: one tool
 // invocation. tool and input are the worker adapter's shape; the rest is
 // what hermes's hook adds. Results are deliberately absent - no check reads
 // them and they are the riskiest payload in the pod.
 type ActivityEntry struct {
-	Tool       string          `json:"tool"`
-	Input      json.RawMessage `json:"input,omitempty"`
-	CallID     string          `json:"callId,omitempty"`
-	Status     string          `json:"status,omitempty"`
-	DurationMs int64           `json:"durationMs,omitempty"`
-	At         string          `json:"at,omitempty"`
+	Tool   string          `json:"tool"`
+	Input  json.RawMessage `json:"input,omitempty"`
+	CallID string          `json:"callId,omitempty"`
+	Status string          `json:"status,omitempty"`
+	// ErrorType keeps hermes's own verdict when Status is error: its
+	// status word (blocked, cancelled, timeout, error) or error_type
+	// (tool_error), so a guardrail refusal stays distinguishable from a
+	// tool failure in the trace.
+	ErrorType  string `json:"errorType,omitempty"`
+	DurationMs int64  `json:"durationMs,omitempty"`
+	At         string `json:"at,omitempty"`
 }
 
 // hookDelivery is the subset of hermes's outbound webhook body the door
 // reads (agent/shell_hooks.py _payload_fields plus the delivery metadata).
 type hookDelivery struct {
-	Event     string          `json:"hook_event_name"`
-	ToolName  string          `json:"tool_name"`
-	ToolInput json.RawMessage `json:"tool_input"`
-	Timestamp string          `json:"timestamp"`
-	Extra     struct {
+	Event      string          `json:"hook_event_name"`
+	ToolName   string          `json:"tool_name"`
+	ToolInput  json.RawMessage `json:"tool_input"`
+	Timestamp  string          `json:"timestamp"`
+	DeliveryID string          `json:"delivery_id"`
+	Extra      struct {
 		ToolCallID string `json:"tool_call_id"`
 		DurationMs int64  `json:"duration_ms"`
 		Status     string `json:"status"`
@@ -148,12 +177,15 @@ type activityState struct {
 	mu        sync.Mutex
 	open      map[string]ActivityEntry // calls started and not yet ended
 	openOrder []string                 // their ids, in start order
+	seen      map[string]struct{}      // delivery ids, so a hermes retry is one call
 	calls     int
 	lastTool  string
 	startedAt time.Time
 	appended  map[string]bool // artifact name -> a first part went out
 
-	queue    chan ActivityEntry
+	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
+	// publishes each one on the delivering request, under run.mu, so no
+	// entry can sit between a queue and a drain when finalize runs.
 	stop     chan struct{}
 	stopOnce sync.Once
 	done     chan struct{}
@@ -162,9 +194,9 @@ type activityState struct {
 func newActivityState(withKey bool) (*activityState, error) {
 	a := &activityState{
 		open:      make(map[string]ActivityEntry),
+		seen:      make(map[string]struct{}),
 		startedAt: time.Now(),
 		appended:  make(map[string]bool),
-		queue:     make(chan ActivityEntry, activityQueueCapacity),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
 	}
@@ -217,6 +249,14 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if d.DeliveryID != "" {
+		if _, dup := a.seen[d.DeliveryID]; dup {
+			return ActivityEntry{}, false
+		}
+		if len(a.seen) < activitySeenCap {
+			a.seen[d.DeliveryID] = struct{}{}
+		}
+	}
 	a.lastTool = d.ToolName
 	switch d.Event {
 	case hookPreToolCall:
@@ -236,14 +276,19 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 			a.openOrder = removeString(a.openOrder, id)
 		}
 		a.calls++
-		return ActivityEntry{
+		status := activityStatus(d)
+		e := ActivityEntry{
 			Tool:       d.ToolName,
 			Input:      redactInput(d.ToolInput),
 			CallID:     d.Extra.ToolCallID,
-			Status:     activityStatus(d),
+			Status:     status,
 			DurationMs: d.Extra.DurationMs,
 			At:         d.Timestamp,
-		}, true
+		}
+		if status == ActivityStatusError {
+			e.ErrorType = activityErrorType(d)
+		}
+		return e, true
 	}
 	return ActivityEntry{}, false
 }
@@ -278,6 +323,15 @@ func (a *activityState) progressLine(now time.Time) string {
 
 func (a *activityState) signalStop() {
 	a.stopOnce.Do(func() { close(a.stop) })
+}
+
+// activityErrorType is hermes's own verdict for a failed call: its status
+// word when that is not the generic "error", else its error_type.
+func activityErrorType(d hookDelivery) string {
+	if d.Extra.Status != "" && d.Extra.Status != hookStatusOK && d.Extra.Status != ActivityStatusError {
+		return d.Extra.Status
+	}
+	return d.Extra.ErrorType
 }
 
 func activityStatus(d hookDelivery) string {
@@ -336,6 +390,11 @@ func redactValue(v any) any {
 			t[i] = redactValue(t[i])
 		}
 		return t
+	case string:
+		for _, re := range redactedValuePatterns {
+			t = re.ReplaceAllString(t, redactedValue)
+		}
+		return t
 	}
 	return v
 }
@@ -357,9 +416,9 @@ func (b *Bridge) listenActivity() error {
 	b.activityLn = ln
 	b.activitySrv = &http.Server{
 		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      5 * time.Second,
+		ReadHeaderTimeout: activityReadHeaderTimeout,
+		ReadTimeout:       activityReadTimeout,
+		WriteTimeout:      activityWriteTimeout,
 	}
 	return nil
 }
@@ -379,7 +438,7 @@ func (b *Bridge) serveActivity(ctx context.Context) {
 	}
 	go func() {
 		<-ctx.Done()
-		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		sctx, cancel := context.WithTimeout(context.Background(), activityShutdownTimeout)
 		defer cancel()
 		_ = b.activitySrv.Shutdown(sctx)
 	}()
@@ -394,7 +453,10 @@ func (b *Bridge) serveActivity(ctx context.Context) {
 // handleActivity is the door. Every answer past the method check is 204:
 // hermes retries connection errors and 5xx and warns on 4xx, and a delivery
 // the door cannot use (unsigned, unmatched, unparseable) is not the sender's
-// problem to hear about per call.
+// problem to hear about per call. An entry is published on this request,
+// under run.mu: hermes delivers from one background thread in order, so
+// the trace keeps call order, a publish costs the tool call nothing, and
+// there is no queue for finalize to race.
 func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -418,11 +480,13 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	}
 	act := run.act.Load()
 	if entry, ok := act.observe(d); ok {
-		select {
-		case act.queue <- entry:
-		default:
-			b.cfg.Logger.Warn("activity queue full; dropping call", "task", run.origin.TaskID, "tool", entry.Tool)
+		run.mu.Lock()
+		if run.state == stateRunning {
+			b.publishActivityEntry(run, entry)
+		} else {
+			b.cfg.Logger.Warn("activity delivery after the terminal; dropped", "task", run.origin.TaskID, "tool", entry.Tool)
 		}
+		run.mu.Unlock()
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -446,11 +510,11 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 	return nil
 }
 
-// --- the publisher ---
+// --- the heartbeat ---
 
-// runActivity is one task's publisher: entries as they arrive, a heartbeat
-// on the interval, until finalize stops it. Every publish takes run.mu and
-// checks the state, so nothing lands after the terminal.
+// runActivity is one task's heartbeat: a progress part on the interval
+// until finalize stops it. Each publish takes run.mu and checks the state,
+// so nothing lands after the terminal.
 func (b *Bridge) runActivity(run *taskRun) {
 	a := run.act.Load()
 	defer close(a.done)
@@ -464,12 +528,6 @@ func (b *Bridge) runActivity(run *taskRun) {
 		select {
 		case <-a.stop:
 			return
-		case e := <-a.queue:
-			run.mu.Lock()
-			if run.state == stateRunning {
-				b.publishActivityEntry(run, e)
-			}
-			run.mu.Unlock()
 		case <-tick:
 			run.mu.Lock()
 			if run.state == stateRunning {
@@ -481,9 +539,9 @@ func (b *Bridge) runActivity(run *taskRun) {
 }
 
 // drainActivity is finalize's half: with run.mu held and the state still
-// running, publish what is queued and report what is still open as
-// interrupted, then stop the publisher. Bounded, because the result and the
-// terminal are the publishes that matter.
+// running, report every call still open as interrupted, then stop the
+// heartbeat. Bounded, because the result and the terminal are the publishes
+// that matter.
 func (b *Bridge) drainActivity(run *taskRun) {
 	a := run.act.Load()
 	if a == nil {
@@ -491,15 +549,6 @@ func (b *Bridge) drainActivity(run *taskRun) {
 	}
 	a.signalStop()
 	deadline := time.Now().Add(activityDrainTimeout)
-	for time.Now().Before(deadline) {
-		select {
-		case e := <-a.queue:
-			b.publishActivityEntry(run, e)
-			continue
-		default:
-		}
-		break
-	}
 	for _, e := range a.interrupted() {
 		if !time.Now().Before(deadline) {
 			b.cfg.Logger.Warn("activity drain budget spent; interrupted calls not all reported", "task", run.origin.TaskID)

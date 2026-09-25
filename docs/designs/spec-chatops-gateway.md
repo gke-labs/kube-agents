@@ -597,7 +597,7 @@ not be silent about it.
   artifact's text and the terminal's status message; whenever the stream was read, final or
   not, the task's tool-call trace (`activity`, the data parts of the activity artifact in
   stream order, present as `[]` when the executor called nothing and absent when no stream was
-  read, because the relay never posts that artifact and this is the harness's only view of it)
+  read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
   and the progress artifact's latest line (`progress`); plus the conversation's last post, the
   gateway's configured first-event grace, and the armed backend with `injectOnly`. The gateway
   classifies nothing on it; the harness does. It is a pure read because the never-started heal

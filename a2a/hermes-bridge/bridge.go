@@ -78,8 +78,10 @@ type Config struct {
 	// to DefaultActivityListen; the zero value here is "off" so a bridge
 	// under test binds nothing it did not ask for.
 	ActivityListen string
-	// ProgressInterval is the heartbeat cadence on the progress artifact
-	// (default 60s); zero or negative turns the heartbeat off.
+	// ProgressInterval is the heartbeat cadence on the progress artifact.
+	// Zero takes the default (60s), as every other field here does; a
+	// negative value turns the heartbeat off. The daemon maps its
+	// environment's 0 to that, since "0 seconds" can only mean off there.
 	ProgressInterval time.Duration
 	// NATSOptions carries credentials etc; applied to both connections.
 	NATSOptions []nats.Option

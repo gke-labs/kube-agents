@@ -3417,3 +3417,39 @@ func TestInjectOneBoundCoversTheClaimAndTheWait(t *testing.T) {
 		t.Fatalf("the cancel's wait held for %s past its deadline; it took a bound of its own", elapsed)
 	}
 }
+
+// TestInjectReadRouteCapsTheTraceAndSaysSo: a probe rides every poll, so a
+// long run's trace is bounded to its newest injectMaxActivityEntries entries
+// and activityDropped counts what the cap cut, rather than the body growing
+// with the run.
+func TestInjectReadRouteCapsTheTraceAndSaysSo(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-long-trace", injectTestAuthor, "call many tools")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	const extra = 5
+	parts := make([]lib.Part, 0, injectMaxActivityEntries+extra)
+	for i := 0; i < injectMaxActivityEntries+extra; i++ {
+		parts = append(parts, lib.Part{Kind: "data", Data: json.RawMessage(fmt.Sprintf(`{"tool":"t%d"}`, i))})
+	}
+	if err := exec.PublishArtifact(context.Background(), lib.Artifact{ArtifactID: lib.ArtifactActivity, Name: lib.ArtifactActivity, Parts: parts}); err != nil {
+		t.Fatal(err)
+	}
+	raw := r.probeRaw(t, reply.Conversation, reply.TaskID)
+	var trace []json.RawMessage
+	if err := json.Unmarshal(raw["activity"], &trace); err != nil {
+		t.Fatal(err)
+	}
+	if len(trace) != injectMaxActivityEntries {
+		t.Fatalf("activity carries %d entries, want the cap %d", len(trace), injectMaxActivityEntries)
+	}
+	if got := string(trace[len(trace)-1]); got != fmt.Sprintf(`{"tool":"t%d"}`, injectMaxActivityEntries+extra-1) {
+		t.Fatalf("last entry = %s, want the newest", got)
+	}
+	if got := string(raw["activityDropped"]); got != fmt.Sprint(extra) {
+		t.Fatalf("activityDropped = %s, want %d", got, extra)
+	}
+}

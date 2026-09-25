@@ -221,8 +221,9 @@ its outbound webhooks: a `hooks.outbound` entry in the profile's config POSTs ev
 HMAC-SHA256 signed when the variable its `secret_env` names is set. The bridge listens
 for those on a loopback address in the pod (`BRIDGE_ACTIVITY_LISTEN`, default
 `127.0.0.1:8651`, clear of hermes's API server on 8642 and the agent-api-auth
-listener on 8643; `off` closes the door), and the platform profile carries the entry
-pointing at it — `a2a/persona/platform/hooks.overlay.yaml`, which the entrypoint merges
+listener on 8643; `off` closes the door; any other value has to match the URL in the
+profile's hook, or hermes delivers to a port with nobody behind it), and the platform
+profile carries the entry pointing at it — `a2a/persona/platform/hooks.overlay.yaml`, which the entrypoint merges
 into the profile only under `mode: next`, because in `mode: today` there is no sidecar and
 every tool call would otherwise try a dead port twice and log a warning.
 
@@ -250,18 +251,24 @@ worker adapter's `{"tool","input"}` so one fold reads both executors:
 }
 ```
 
-`status` is `completed` or `error` from the hook's own verdict. A call still open when the
+`status` is `completed` or `error` from the hook's own verdict, and on `error` an
+`errorType` keeps hermes's word for it (`blocked`, `cancelled`, `timeout`, `tool_error`),
+so a guardrail refusal stays distinguishable from a tool failure. hermes retries a delivery
+that timed out, so each is remembered by its id and a retry is one call. A call still open when the
 task finalizes — deadline, cancel, a crash mid-tool — is flushed as `interrupted` inside
 the finalize lock, ahead of the result and the terminal, so the trace is complete and
-nothing of it follows the final event. `input` is capped (2 KiB) and values under keys
+nothing of it follows the final event. `input` is capped (2 KiB); values under keys
 matching `token`, `secret`, `password`, `passwd`, `authorization`, `api_key`/`api-key` or
-`credential` are replaced before publishing. Tool results are not published: no check
+`credential` are replaced before publishing, and so are the credential shapes a value can
+carry under an innocent key (a bearer token, a Google OAuth or API key, a GitHub token, a
+`key=value` pair whose key looks like a secret) — a terminal command is one string, so this
+is best-effort, and anything else the model pastes into a command line ships. Tool results are not published: no check
 reads them and they are the riskiest payload in the pod. The stream keeps every activity
 part; the relay drops the artifact on purpose (debug and audit views never render to
 chat), and the inject door's probe is where a reader sees it.
 
 The heartbeat is a `progress` text part every `BRIDGE_PROGRESS_INTERVAL_SECONDS` (default
-60): `running 1m30s, 3 tool call(s), last mcp__gke__list_clusters`. The relay renders
+60; 0 turns it off): `running 1m30s, 3 tool call(s), last mcp__gke__list_clusters`. The relay renders
 progress as one edited rolling line, so this is one chat edit per minute, and it is what
 tells a stuck task from a slow one from outside the pod.
 

@@ -339,7 +339,8 @@ artifact, and four names are reserved so renderers and audit tooling can rely on
 Artifact names are data, so the set can grow without touching the envelope; only these
 four carry reserved semantics. An `activity` entry is one `data` part whose object carries
 `tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`, or
-`interrupted` for a call still open at the terminal), `durationMs` and `at`; the library
+`interrupted` for a call still open at the terminal), `errorType` (the executor's own word for
+an error), `durationMs` and `at`; the library
 validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
 
 ## Verified identity (added 9/9)
