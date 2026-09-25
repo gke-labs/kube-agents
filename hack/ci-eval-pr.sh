@@ -868,7 +868,6 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
 _fleet_refuse_opt_in_under_prow || exit 1
 FLEET_READONLY_SA="$(_fleet_reader_for_run "${PROJECT_ID}")"
-export FLEET_READONLY_SA
 
 profile_begin "fleet-kubeconfigs: seeded-fleet credentials"
 STEP_START=$SECONDS

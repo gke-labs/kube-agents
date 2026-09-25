@@ -1694,6 +1694,7 @@ def test_a_transient_mint_failure_is_retried_and_the_run_goes_on(shell, tmp_path
         FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
         STUB_TOKEN_FAIL="ERROR: (gcloud.auth.print-access-token) UNAVAILABLE: The service is currently unavailable.",
         STUB_TOKEN_FAIL_TIMES="1",
+        FLEET_MINT_RETRY_SECONDS="0",
     )
     done = _provision.last
     assert done.returncode == 0, done.stderr
@@ -1708,6 +1709,7 @@ def test_a_transient_that_never_clears_stops_after_the_attempts(shell, tmp_path)
         FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
         STUB_TOKEN_FAIL="ERROR: (gcloud.auth.print-access-token) UNAVAILABLE: The service is currently unavailable.",
         STUB_TOKEN_FAIL_TIMES="9",
+        FLEET_MINT_RETRY_SECONDS="0",
     )
     done = _provision.last
     assert done.returncode == 3, done.stderr

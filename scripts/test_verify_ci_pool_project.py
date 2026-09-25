@@ -555,6 +555,22 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(2, run.call_count)
 
+    def test_a_dropped_rewrite_is_unverified_not_an_incomplete_fleet(self):
+        # The runner now drops a slot's file when it cannot rewrite it to the
+        # reader's exec credential -- a local fault after the cluster was
+        # listed, reached and credentialed -- and every role on that slot
+        # counts as unresolved. That is unread, not a finding about the pool.
+        stderr = "\n".join([
+            "WARNING: seeded-a kubeconfig could not be rewritten to seeded-fleet-reader@kube-agents-evals-5.iam.gserviceaccount.com; "
+            "dropped. Every check naming a role on slot 'a' will report status=error.",
+            self._summary(self._roles() - 1, unresolved=1),
+        ])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr), (0, "", self._state(self._roles() - 1))]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result)
+        self.assertTrue(any("could not be rewritten" in w for w in result.warnings), result.warnings)
+
     def test_the_state_pass_is_skipped_when_no_role_was_published(self):
         stderr = "\n".join([
             f"WARNING: no credentials for seeded cluster seeded-{slot} in kube-agents-evals-5: "
@@ -816,7 +832,7 @@ class SeededFleetFixturesTest(unittest.TestCase):
         wrong = checker._FLEET_LOOKED_AND_FOUND_WRONG.pattern.split("|")
         unreachable = checker._FLEET_UNREACHABLE.pattern.split("|")
         self.assertEqual(4, len(wrong))
-        self.assertEqual(2, len(unreachable))
+        self.assertEqual(3, len(unreachable))
         for phrase in [*wrong, *unreachable, checker._FLEET_COULD_NOT_LOOK.pattern]:
             with self.subTest(phrase=phrase):
                 self.assertRegex(text, phrase)

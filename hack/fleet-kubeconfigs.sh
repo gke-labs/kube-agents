@@ -72,6 +72,8 @@
 #                             fleet only you use (the files then carry your
 #                             own credential; the script says so). The CI
 #                             scripts refuse it in a Prow job.
+#   FLEET_MINT_RETRY_SECONDS  wait between the gate's mint attempts (default
+#                             5; tests set 0)
 #
 # Output: exports BENCH_FLEET_KUBECONFIG_DIR when sourced; prints it on stdout
 # when executed. Everything else this script says goes to stderr.
@@ -99,7 +101,7 @@ _FLEET_EXIT_READONLY_UNAVAILABLE=3
 # should be no stricter than they are. A PERMISSION_DENIED is not retried:
 # it is the binding, and it will not change in fifteen seconds.
 _FLEET_MINT_ATTEMPTS=3
-_FLEET_MINT_RETRY_SECONDS=5
+_FLEET_MINT_RETRY_SECONDS="${FLEET_MINT_RETRY_SECONDS:-5}"
 _FLEET_MINT_DENIED_PATTERN="PERMISSION_DENIED"
 
 # The exec-credential plugin each rewritten kubeconfig points at, and the

@@ -443,7 +443,9 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # The listing is not the only thing that can be refused. A cluster that the
 # listing returned and `get-credentials` would not open is unread for the same
 # reason and to the same effect, and so is one skipped because a temporary file
-# could not be created. Sources: hack/fleet-kubeconfigs.sh lines 394 and 386.
+# could not be created, or dropped because the file gcloud wrote could not be
+# rewritten to the reader's exec credential (a local fault, not a pool state).
+# Sources: the three per-cluster WARNING lines in hack/fleet-kubeconfigs.sh.
 #
 # One of these, or _FLEET_COULD_NOT_LOOK, must be present before an unresolved
 # role may be excused. Excusing on the *absence* of a "looked and found wrong"
@@ -453,7 +455,8 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # stays non-zero so :406 is silent, something else resolves so :411 is silent,
 # and its roles increment `unresolved` with nothing printed at all.
 _FLEET_UNREACHABLE = re.compile(
-    r"no credentials for seeded cluster|could not create a temporary file", re.I
+    r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to",
+    re.I,
 )
 
 
@@ -1649,11 +1652,10 @@ def _fleet_presence_result(
     if not match:
         last = (err.strip().splitlines() or ["no output"])[-1]
         if rc != 0:
-            # Exit 3 is the gate, before any read, in every shape it prints;
-            # the other codes are unread only when stderr says why.
-            reason = _unread_reason(err)
-            if rc == FLEET_EXIT_READONLY_UNAVAILABLE:
-                reason = reason or last
+            # Exit 3 is the gate, before any read, in every shape it prints,
+            # and its one line is the reason whole; the other codes are unread
+            # only when stderr says why.
+            reason = last if rc == FLEET_EXIT_READONLY_UNAVAILABLE else _unread_reason(err)
             if reason:
                 return CheckResult(
                     name,
