@@ -555,8 +555,9 @@ func TestDriftSummaryReportsTheVerbInThePast(t *testing.T) {
 	}
 }
 
-// A verb the map does not name travels unchanged. It means the sink or the
-// subresource filter started forwarding something new, and the operator is
+// A verb the map does not name travels unchanged. It means the logging sink's
+// filter started forwarding something new -- not the subresource filter, which
+// keys on Resource.Subresource and never on the verb -- and the operator is
 // better served seeing that verbatim than reading a guessed conjugation.
 func TestDriftSummaryLeavesAnUnknownVerbAlone(t *testing.T) {
 	event := driftEvent("insert-1")
