@@ -454,6 +454,10 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertIn(f'"{consts["BRIDGE_CONCURRENCY_ENV_VAR"]}"', main_go)
         self.assertEqual(int(consts["BRIDGE_QUEUE_CAPACITY"]), go_int_constant(_BRIDGE_GO, "taskQueueCapacity"))
         self.assertIn('Info("hermes bridge consuming", "profile", b.cfg.Profile)', text(_BRIDGE_GO))
+        # The shape the deploy greps is the JSON handler's: `"msg":"..."` and
+        # `"profile":"..."`. A text handler would print the same words in a
+        # shape neither grep matches.
+        self.assertIn("slog.New(slog.NewJSONHandler(os.Stderr, nil))", main_go)
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_MSG"], '"msg":"hermes bridge consuming"')
         self.assertEqual(consts["BRIDGE_CONSUMING_LOG_PROFILE"], f'"profile":"{go_constant(_BRIDGE_MAIN, "defaultProfile")}"')
 
@@ -591,27 +595,23 @@ class FlagSetIsNextTest(unittest.TestCase):
             ]
         )
         cases = {
-            # what the jsonpath prints -> (exit status, fast, message fragment)
-            "SuccessCriteriaMet Complete ": (0, True, None),
-            "Failed ": (1, True, "conditions: Failed"),
-            "": (1, False, "conditions: none"),
-            "Suspended ": (1, False, "conditions: Suspended"),
+            # what the jsonpath prints -> (exit status, message fragment)
+            "SuccessCriteriaMet Complete ": (0, None),
+            "Failed ": (1, "conditions: Failed"),
+            "": (1, "conditions: none"),
+            "Suspended ": (1, "conditions: Suspended"),
         }
-        for stub, (status, fast, fragment) in cases.items():
+        for stub, (status, fragment) in cases.items():
             with self.subTest(conditions=stub):
-                result = run_bash(f'export JOB_STUB="{stub}"\n{setup}\n{gate}\necho "ELAPSED=${{SECONDS}}"')
+                result = run_bash(f'export JOB_STUB="{stub}"\n{setup}\n{gate}\necho "PASSED"')
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
-                if fragment is not None:
+                if fragment is None:
+                    self.assertIn("PASSED", result.stdout)
+                else:
                     self.assertIn(fragment, result.stdout)
                     self.assertIn("DUMPED", result.stdout)
-                if status == 0:
-                    self.assertIn("ELAPSED=", result.stdout)
-                    elapsed = int(result.stdout.rsplit("ELAPSED=", 1)[1].split()[0])
-                else:
-                    # The failure branch exits before the echo; time it from the outside.
-                    elapsed = None
-                if fast and elapsed is not None:
-                    self.assertLess(elapsed, 2)
+                    self.assertNotIn("PASSED", result.stdout)
+        # How long each takes is the next test's.
 
     def test_a_failed_job_is_reported_within_one_poll_and_an_absent_one_at_the_deadline(self) -> None:
         gate = lifted_block("JOB_DEADLINE=$((SECONDS + MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS))", "  done", "the provisioning Job poll")

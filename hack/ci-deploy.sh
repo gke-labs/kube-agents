@@ -970,17 +970,14 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"
 
   # The Job's name carries a digest of its rendered spec, so it is found by
-  # its component label. `kubectl wait` errors on a selector that matches
-  # nothing, hence the existence poll first.
+  # its component label. Polled for either terminal condition rather than
+  # `kubectl wait --for=condition=complete`, which would sit out the whole
+  # budget on a Job that has already failed and errors on a selector that
+  # matches nothing; this read prints nothing for a Job not yet created and
+  # the loop simply comes back, so the budget covers the Job's creation too.
+  # The read lists every True condition on every Job the label matches; a
+  # Complete anywhere is the gate passing.
   JOB_GATE_START=$SECONDS
-  for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
-    [ -n "$(kubectl get jobs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" -o name 2>/dev/null)" ] && break
-    sleep "${MODE_NEXT_POLL_SECONDS}"
-  done
-  # Polled for either terminal condition rather than `kubectl wait
-  # --for=condition=complete`, which would sit out the whole budget on a Job
-  # that has already failed. The read lists every True condition on every Job
-  # the label matches; a Complete anywhere is the gate passing.
   JOB_DEADLINE=$((SECONDS + MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS))
   JOB_CONDITIONS=""
   while :; do
