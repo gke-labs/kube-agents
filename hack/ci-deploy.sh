@@ -220,8 +220,8 @@ export SLACK_ENABLED="false"
 #
 # One GitOps repo per leasable project, so two concurrent leases can never
 # share a ledger issue or race on a remediation branch. Onboarding a further
-# project (issue #637, Boskos leasing) is one line here plus its row in that
-# same doc — no other edit in this file.
+# project (issue #637, Boskos leasing) is one line here plus the same pair in
+# _EXPECTED_MAPPING in tests/test_ci_gitops_repo.py — no other edit in this file.
 #
 # A mapping here is a claim that the repo exists and that App 4675512 is
 # installed on it. It is not self-verifying: with the line present and either

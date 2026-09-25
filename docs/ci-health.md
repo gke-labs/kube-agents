@@ -515,7 +515,7 @@ temporary directory of its own, runs `hack/fleet-kubeconfigs.sh` and then
 `hack/fleet-fixture-state.py --wait 0 --report`, six projects at a time, and
 publishes `gs://kube-agents-dashboards/evals/fixture-state.json`. It is its
 own job rather than a step on the top-of-hour tick because it needs `kubectl`
-and `gke-gcloud-auth-plugin`, runs thirty projects for a few minutes (a
+and `gke-gcloud-auth-plugin`, runs every mapped project for a few minutes (a
 healthy project takes about 20 s), and must never hold the 15-minute verdict:
 the tick reads whatever scan is published. The project list is
 `gitops_repo_for_project()` in `hack/ci-deploy.sh`, the one list of pool
