@@ -102,23 +102,24 @@ in `AGENTS.md` under Pull Request Hygiene.
 
 ## Preventing recurrence on a bug fix
 
-A pull request that fixes a bug — any `fix` type, with or without a scope — fills in the
-template's **Bug Fix: Preventing Recurrence** section. Any other pull request writes "Not a bug
-fix." there. The section answers three questions:
+A pull request that fixes a bug — every `fix` type, scoped or not, and any other that repairs a
+defect — fills in the template's **Bug Fix: Preventing Recurrence** section. Any other pull
+request writes "Not a bug fix." there. The section answers three questions:
 
 - **Why it shipped.** The test, check, or review step that should have caught the bug, and why it
   did not.
 - **What catches it now.** The test, eval case, or check that fails if the bug comes back, and
-  that you saw fail without the fix. It need not be new: an existing eval case run red against
-  `main`, or an `expected_fail` case this change flips
-  ([`eval_driven_development.md`](eval_driven_development.md), "When the fix is not yours"),
-  counts. A case already named under **Live validation** is cited by name, not repeated. "Added a
-  test" without naming it is not an answer.
+  that fails without the fix — seen by you, or on record for an `expected_fail` case this change
+  flips ([`eval_driven_development.md`](eval_driven_development.md), "When the fix is not
+  yours"). It need not be new: an existing eval case run red against `main` counts. A case already
+  named under **Live validation** is cited by name, not repeated. "Added a test" without naming it
+  is not an answer.
 - **Where else it lives.** Other places the same mistake could be, and whether you checked them or
   the guard covers them.
 
 When nothing automated can catch the bug, say why and what stands in for it.
 
-A reviewer, the automated one included, holds the section to the tree: the guard it names exists
-at the head, reaches the path the bug took, and fails with the fix reverted. A `fix` whose section
-is empty or answered "Not a bug fix" is a finding.
+A reviewer holds the section to the tree: the guard it names exists at the head, reaches the path
+the bug took, and fails with the fix reverted. A reviewer without a shell, the automated one
+included, reasons about the last of these and says it did not run it. A `fix` whose section is
+empty or answered "Not a bug fix" is a finding.

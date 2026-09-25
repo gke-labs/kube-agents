@@ -31,13 +31,14 @@ file matters.
 ## Bug Fix: Preventing Recurrence
 
 <!--
-Required when this PR fixes a bug: any `fix` type, with or without a scope. Otherwise
-write "Not a bug fix."
+Required when this PR fixes a bug, which includes every `fix` type, scoped or not.
+Otherwise write "Not a bug fix."
 
 - Why it shipped: the test, check, or review step that should have caught the bug, and
   why it did not.
 - What catches it now: the test, eval case, or check that fails if the bug comes back,
-  and that you saw fail without the fix. An existing case counts; name it.
+  and that fails without the fix: seen by you, or on record for an `expected_fail` case
+  this change flips. An existing case counts; name it.
 - Where else it lives: other places the same mistake could be, and whether you checked
   them or the guard covers them.
 
