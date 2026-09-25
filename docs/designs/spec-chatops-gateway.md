@@ -254,7 +254,10 @@ that translation lives in the shim, next to the process it translates for.
 **Reap.** Idle TTL since the last user message (30 minutes, config-backed). Reaping is
 deleting the pod. Nothing is saved first, because
 the stream already has everything - that's the whole point of the transcript of record.
-The KV entry stays, holding the `contextId`. Reap never deletes a pod out from under a
+The KV entry stays while active, holding the `contextId`. To bound bucket growth, an
+idle session whose pod has been reaped and whose last activity is older than `A2A_SESSION_TTL`
+(7 days by default, sitting well beyond the TASKS stream's 72-hour retention) has its
+KV session record pruned by the reaper. Reap never deletes a pod out from under a
 live task: an active task that has not detached (see Stop above) exempts the session
 from the idle TTL. The exemption is safe because the pod's end has owners. The session
 worker's adapter enforces a task deadline (30 minutes default, config-backed): at the

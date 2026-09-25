@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // turnTimeout bounds one handler turn — an inbound message or a relay
@@ -105,8 +106,12 @@ type Gateway struct {
 	mu sync.Mutex
 	// sessionLocks serializes work per conversation; tasks serialize per
 	// session by construction (a message during a running task is a steer,
-	// never a second task).
-	sessionLocks map[string]*sync.Mutex
+	// never a second task). Entries are refcounted and pruned when idle.
+	sessionLocks map[string]*sessionLockEntry
+	// reapCursor tracks the scan position in session-state across reap passes,
+	// so a scan that hits reapPassTimeout resumes from where it left off
+	// rather than restarting from the beginning.
+	reapCursor string
 	// taskSessions caches taskId -> session key; the KV task index is the
 	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string
@@ -254,7 +259,7 @@ func New(o Options) (*Gateway, error) {
 		ps:             NewPseudonymizer(o.Config.AttributionSalt),
 		log:            log,
 		runCtx:         context.Background(),
-		sessionLocks:   map[string]*sync.Mutex{},
+		sessionLocks:   map[string]*sessionLockEntry{},
 		taskSessions:   map[string]string{},
 		relays:         map[string]*relayState{},
 		backend:        backend,
@@ -331,16 +336,50 @@ func (g *Gateway) Run(ctx context.Context) error {
 	return g.adapter.Run(ctx, func(msg InboundMessage) { g.inbox.enqueue(msg.Conversation, msg) })
 }
 
-// lockSession returns the per-conversation mutex, minting it on first use.
-func (g *Gateway) lockSession(key string) *sync.Mutex {
+type sessionLockEntry struct {
+	mu       sync.Mutex
+	refcount int
+}
+
+// sessionLockHandle pairs a session lock with its release hook, refcounting
+// the entry so idle locks are pruned from memory when no longer referenced.
+type sessionLockHandle struct {
+	g        *Gateway
+	key      string
+	entry    *sessionLockEntry
+	unlocked bool
+}
+
+func (h *sessionLockHandle) Lock() {
+	h.entry.mu.Lock()
+}
+
+func (h *sessionLockHandle) Unlock() {
+	if h.unlocked {
+		return
+	}
+	h.unlocked = true
+	h.entry.mu.Unlock()
+	h.g.mu.Lock()
+	h.entry.refcount--
+	if h.entry.refcount <= 0 {
+		delete(h.g.sessionLocks, h.key)
+	}
+	h.g.mu.Unlock()
+}
+
+// lockSession returns the per-conversation mutex handle, refcounting the entry
+// so idle locks are pruned from memory when no longer referenced.
+func (g *Gateway) lockSession(key string) *sessionLockHandle {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	l, ok := g.sessionLocks[key]
+	entry, ok := g.sessionLocks[key]
 	if !ok {
-		l = &sync.Mutex{}
-		g.sessionLocks[key] = l
+		entry = &sessionLockEntry{}
+		g.sessionLocks[key] = entry
 	}
-	return l
+	entry.refcount++
+	return &sessionLockHandle{g: g, key: key, entry: entry}
 }
 
 // handleInbound is one user turn: verify the sender, resolve the session,
@@ -477,7 +516,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	if rec == nil {
 		rec, err = g.mintSession(ctx, msg)
 		if err != nil {
-			g.log.Error("session mint failed", "conversation", msg.Conversation, "err", err)
+			if isMaxBytes(err) {
+				g.log.Error("session mint failed: session-state bucket is full (max bytes reached)",
+					"conversation", msg.Conversation, "err", err)
+			} else {
+				g.log.Error("session mint failed", "conversation", msg.Conversation, "err", err)
+			}
 			return
 		}
 	}
@@ -957,6 +1001,19 @@ func (g *Gateway) mintSession(ctx context.Context, msg InboundMessage) (*Session
 		return nil, fmt.Errorf("lost the mint race but cannot read the winner: %v", gerr)
 	}
 	return winner, nil
+}
+
+// isMaxBytes reports whether err represents a NATS JetStream max_bytes limit
+// refusal (e.g. JSStreamMaxBytesErr, ErrMaxBytesExceeded).
+func isMaxBytes(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, jetstream.ErrMaxBytesExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "max bytes") || strings.Contains(msg, "maximum bytes") || strings.Contains(msg, "10047")
 }
 
 // startTask mints the identifiers, publishes the submission, and posts the
