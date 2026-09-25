@@ -68,6 +68,14 @@ const (
 	// names the token path and the impersonation target and is regenerated at
 	// every container start, so nothing is gained by letting it reach a disk.
 	credentialProxyWIFCredentialFile = "/var/run/credential-proxy/wif-credentials.json" // #nosec G101 -- File path, not a credential
+
+	// The CPU the broker container requests. Sized for a cold pod: after an
+	// eviction the replacement passes its readiness probe five seconds in, and
+	// the first mints then arrive while gcloud and the Minty client are still
+	// warming up, each under a five-second timeout. At 100m those calls timed
+	// out for minutes and one throttled pod kept timing out for over an hour;
+	// 500m lets a mint finish inside its timeout while the pod warms.
+	credentialProxyCPURequest = "500m"
 )
 
 // credentialProxyFederation returns the federation config when it is complete.
@@ -286,10 +294,12 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 			FailureThreshold:    3,
 		},
 		Resources: corev1.ResourceRequirements{
-			// Lower than the sidecar's, which sized for the event watcher's
-			// informer caches. Nothing here holds cluster state; the memory goes
-			// on Envoy and one Python process per in-flight command.
-			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("256Mi")},
+			// Memory lower than the sidecar's, which sized for the event
+			// watcher's informer caches. Nothing here holds cluster state; the
+			// memory goes on Envoy and one Python process per in-flight
+			// command. CPU is sized for the warm-up after an eviction; see
+			// credentialProxyCPURequest.
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(credentialProxyCPURequest), corev1.ResourceMemory: resource.MustParse("256Mi")},
 			Limits: corev1.ResourceList{
 				corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
 			},

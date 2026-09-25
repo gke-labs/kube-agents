@@ -1361,6 +1361,19 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	if len(container.Command) != 1 || container.Command[0] != "/usr/local/bin/start-services" {
 		t.Errorf("unexpected proxy command: %v", container.Command)
 	}
+	// Pinned here as well as in the goldens: a golden regeneration blesses
+	// whatever the builder renders, so a request that drifted back down would
+	// otherwise pass every test. 500m is what lets a mint finish inside its
+	// five-second timeouts while an evicted pod's replacement warms up.
+	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
+		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
+	}
+	if got := container.Resources.Requests.Memory().String(); got != "256Mi" {
+		t.Errorf("expected the proxy memory request left at 256Mi, got %s", got)
+	}
+	if got := container.Resources.Limits.Cpu().String(); got != "1" {
+		t.Errorf("expected the proxy CPU limit left at 1, got %s", got)
+	}
 	env := make(map[string]corev1.EnvVar)
 	for _, item := range container.Env {
 		env[item.Name] = item

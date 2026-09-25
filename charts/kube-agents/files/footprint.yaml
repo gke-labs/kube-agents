@@ -55,14 +55,14 @@ operatorRendered:
     pods: 1
   credentialProxy:
     requests:
-      cpu: 100m
+      cpu: 500m
       memory: 256Mi
       ephemeral-storage: 2Gi
     limits:
       cpu: "1"
       memory: 1Gi
       ephemeral-storage: 2Gi
-    cpuMillisRequest: 100
+    cpuMillisRequest: 500
     cpuMillisLimit: 1000
     memoryBytesRequest: 268435456
     memoryBytesLimit: 1073741824
