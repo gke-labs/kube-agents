@@ -122,8 +122,9 @@ _ABSENT = _Absent()
 def merge(base, overlay):
     """Recursive merge. Dicts merge, lists union (preserving order), scalars replace.
 
-    List union matches deploy/docker/merge_configs.py, and is what plugins.enabled
-    wants: the image's built-ins plus whatever the operator adds.
+    List union is what plugins.enabled wants: the image's built-ins plus whatever the
+    operator adds. It is deploy/docker/merge_configs.py's rule extended to items that
+    are not hashable (see _union).
     """
     if isinstance(base, dict) and isinstance(overlay, dict):
         for k, v in overlay.items():

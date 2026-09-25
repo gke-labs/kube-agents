@@ -90,6 +90,10 @@ const (
 	// grows with the calls.
 	activitySeenCap  = 8192
 	activityKeyBytes = 32
+	// activityTruncatedTool names the one entry published in place of the
+	// calls past the budget, with Dropped saying how many.
+	activityTruncatedTool   = "activity-budget"
+	ActivityStatusTruncated = "truncated"
 	// The door's HTTP timeouts: a client on loopback that has not sent its
 	// headers or body in these is broken, and the response is one status
 	// line. activityShutdownTimeout bounds Serve's drain on bridge exit.
@@ -122,6 +126,15 @@ const (
 // and are best-effort by nature: a bearer token, Google OAuth access token,
 // Google API key, GitHub token, or a "key=value" pair whose key looks like
 // a secret. Anything else the model pastes into a command line ships.
+// activityEntryBudget bounds the activity parts one task publishes. The
+// trace rides the task's own events subject, which the TASKS stream caps at
+// 4096 messages per subject with discard-old, so a run that published a part
+// per call without bound would evict its own submitted and working events and
+// read as never started. 3000 leaves room for the four lifecycle events, a
+// two-hour run's heartbeats (120 at the default interval), a chunked result
+// and the truncation marker. A variable only so a test can lower it.
+var activityEntryBudget = 3000
+
 var (
 	redactedKeyPattern    = regexp.MustCompile(`(?i)token|secret|password|passwd|authorization|api[_-]?key|credential`)
 	redactedValuePatterns = []*regexp.Regexp{
@@ -149,6 +162,9 @@ type ActivityEntry struct {
 	ErrorType  string `json:"errorType,omitempty"`
 	DurationMs int64  `json:"durationMs,omitempty"`
 	At         string `json:"at,omitempty"`
+	// Dropped is set only on the activityTruncatedTool entry: how many
+	// calls past activityEntryBudget were counted and not published.
+	Dropped int `json:"dropped,omitempty"`
 }
 
 // hookDelivery is the subset of hermes's outbound webhook body the door
@@ -179,6 +195,8 @@ type activityState struct {
 	openOrder []string                 // their ids, in start order
 	seen      map[string]struct{}      // delivery ids, so a hermes retry is one call
 	calls     int
+	published int // activity parts sent; the budget counts these
+	dropped   int // calls past the budget, reported once at the terminal
 	lastTool  string
 	startedAt time.Time
 	appended  map[string]bool // artifact name -> a first part went out
@@ -319,6 +337,32 @@ func (a *activityState) progressLine(now time.Time) string {
 		line += ", last " + a.lastTool
 	}
 	return line
+}
+
+// underBudget says whether the next activity part may go out, counting it
+// either way: past the budget the call is counted as dropped and reported
+// once by the marker finalize publishes. Caller holds run.mu, which is what
+// orders this against finalize's drain.
+func (a *activityState) underBudget() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.published < activityEntryBudget {
+		a.published++
+		return true
+	}
+	a.dropped++
+	return false
+}
+
+// truncationMarker is the entry that stands for the calls the budget cut,
+// or false when nothing was cut.
+func (a *activityState) truncationMarker() (ActivityEntry, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.dropped == 0 {
+		return ActivityEntry{}, false
+	}
+	return ActivityEntry{Tool: activityTruncatedTool, Status: ActivityStatusTruncated, Dropped: a.dropped, At: time.Now().UTC().Format(time.RFC3339)}, true
 }
 
 func (a *activityState) signalStop() {
@@ -482,7 +526,9 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	if entry, ok := act.observe(d); ok {
 		run.mu.Lock()
 		if run.state == stateRunning {
-			b.publishActivityEntry(run, entry)
+			if act.underBudget() {
+				b.publishActivityEntry(run, entry)
+			}
 		} else {
 			b.cfg.Logger.Warn("activity delivery after the terminal; dropped", "task", run.origin.TaskID, "tool", entry.Tool)
 		}
@@ -554,7 +600,12 @@ func (b *Bridge) drainActivity(run *taskRun) {
 			b.cfg.Logger.Warn("activity drain budget spent; interrupted calls not all reported", "task", run.origin.TaskID)
 			break
 		}
-		b.publishActivityEntry(run, e)
+		if a.underBudget() {
+			b.publishActivityEntry(run, e)
+		}
+	}
+	if marker, ok := a.truncationMarker(); ok && time.Now().Before(deadline) {
+		b.publishActivityEntry(run, marker)
 	}
 }
 
@@ -614,11 +665,14 @@ func (b *Bridge) publishArtifactPart(run *taskRun, name string, part lib.Part) {
 		b.cfg.Logger.Warn("artifact envelope failed", "task", run.origin.TaskID, "name", name, "err", err)
 		return
 	}
+	// Marked before the publish, as the worker adapter does: a publish whose
+	// ack times out after the server stored it (a reconnect) must not make
+	// the next part a non-append that replaces the artifact in every fold.
+	// A lost first part costs one entry; a reset costs the whole trace.
+	a.appended[name] = true
 	ctx, cancel := context.WithTimeout(context.Background(), activityPublishTimeout)
 	defer cancel()
 	if err := b.c.Publish(ctx, lib.TaskEventsSubject(b.cfg.Profile, run.origin.TaskID), env); err != nil {
 		b.cfg.Logger.Warn("artifact publish failed", "task", run.origin.TaskID, "name", name, "err", err)
-		return
 	}
-	a.appended[name] = true
 }

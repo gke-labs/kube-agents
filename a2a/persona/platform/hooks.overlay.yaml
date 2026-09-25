@@ -9,8 +9,8 @@
 # `activity` and `progress` artifacts (a2a/docs/hermes-bridge.md, "Activity").
 #
 # This file is not part of the platform profile's shipped config.yaml. The
-# entrypoint merges it into the profile only under mode: next (step 2.6a-bis,
-# gated on KUBEAGENTS_MODE from the managed scope), because in mode: today
+# entrypoint merges it into the profile only under mode: next (the probe in
+# step 2.6a-bis reads the mode from the managed scope), because in mode: today
 # there is no bridge sidecar and every tool call would otherwise try a dead
 # loopback port twice and log a warning. Processes under the same profile
 # that are not the bridge's children - kanban workers, cron ticks - have no

@@ -110,14 +110,24 @@ func startBridgeN(t *testing.T, url string, command []string, concurrency int) {
 // bridge's shutdown for a test that ends it early.
 func startBridgeWith(t *testing.T, url string, command []string, concurrency int, mutate func(*Bridge)) context.CancelFunc {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	b, err := New(ctx, Config{
+	_, cancel := startBridgeConfig(t, Config{
 		NATSURL:      url,
 		Command:      command,
 		Concurrency:  concurrency,
 		TaskDeadline: 20 * time.Second,
 		KillGrace:    500 * time.Millisecond,
-	})
+	}, mutate)
+	return cancel
+}
+
+// startBridgeConfig runs a bridge from the caller's Config until test cleanup
+// and waits for its durable consumer, so a submission published right after
+// cannot race the subscribe. mutate, when set, sees the bridge between New
+// and Run.
+func startBridgeConfig(t *testing.T, cfg Config, mutate func(*Bridge)) (*Bridge, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	b, err := New(ctx, cfg)
 	if err != nil {
 		cancel()
 		t.Fatalf("bridge new: %v", err)
@@ -139,7 +149,7 @@ func startBridgeWith(t *testing.T, url string, command []string, concurrency int
 		}
 	})
 	waitFor(t, 10*time.Second, "bridge durable consumer", func() bool {
-		nc, err := nats.Connect(url)
+		nc, err := nats.Connect(cfg.NATSURL)
 		if err != nil {
 			return false
 		}
@@ -153,7 +163,7 @@ func startBridgeWith(t *testing.T, url string, command []string, concurrency int
 		_, err = js.Consumer(ctx, lib.TasksStream, "bridge-platform")
 		return err == nil
 	})
-	return cancel
+	return b, cancel
 }
 
 func gatewayClient(t *testing.T, url string) *lib.Client {
