@@ -148,7 +148,7 @@ from devops_bench.agents import AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import board, transcript, worker_trajectory
+from kube_agents_bench import board, gitops, transcript, worker_trajectory
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
     delegated_task_ids,
@@ -1402,6 +1402,10 @@ class KubeAgentsHarness(AgentHarness):
         """
         transcript.clear()
         started_at = time.time()
+        # The GitOps wait uses it as a lower bound on PR creation time: a rerun
+        # that reuses a cluster name reuses the run branch, and the previous
+        # run's merged PR is still listed against it.
+        self._run_started_at = started_at
         result = super().run(prompt, workspace_path)
         transcript.set(
             result.output,
@@ -1558,6 +1562,18 @@ class KubeAgentsHarness(AgentHarness):
                 # partial result either: see _infra_failure. The wait died in
                 # transport, so this is the run class, not an answer.
                 return _infra_failure(str(exc))
+
+        # GitOps cases (GITOPS_RUN_BRANCH set): the agent's answer is a pull
+        # request, and the cluster the verifiers grade only changes once that
+        # PR has merged and Argo has synced it. Hold the run open for that, or
+        # for the evidence it will not happen; the outcome is recorded in
+        # metadata["gitops"] and, in the pilot, not scored. Never fatal: a poll
+        # failure must not turn a finished agent run into a crashed one.
+        try:
+            gitops.await_fix_cycle(result, since=getattr(self, "_run_started_at", None))
+        except Exception as exc:  # noqa: BLE001 - recorded, never raised past here
+            _log.error("gitops wait failed: %s", exc)
+            result.metadata.setdefault("gitops", {})["error"] = str(exc)
 
         # One lookup, after the last turn: the session row is cumulative over
         # the conversation, so it supersedes the summed envelopes outright.
