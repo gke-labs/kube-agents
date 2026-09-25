@@ -1,0 +1,27 @@
+{
+  "task": "b-0011",
+  "cluster": "gitops-pilot-20260918-170551",
+  "run_branch": "run/gitops-pilot-20260918-170551/b-0011",
+  "gitops_repo": "https://github.com/gke-agentic/kage-eval-20260918-gemini-1",
+  "gitops_repo_root_sha": "eb3d22fc6a8f97855d52bbb9a095e8f62a5b2736",
+  "agent_model": "gemini-3.7-flash",
+  "judge_model": "gemini-3.1-pro-preview",
+  "devops_bench_pin": "devops-bench @ git+https://github.com/pradeepvrd/devops-bench@9dedbc504a03a502c7fe7da533c2500eee46b77c",
+  "agent_image": "ghcr.io/gke-labs/kube-agents/platform-agent:0.5.0",
+  "operator_image": "ghcr.io/gke-labs/kube-agents/k8s-operator:0.5.0",
+  "kube_agents_commit": "8b71ad352e9dff410ac3320fbdb6c2b5daf942cd",
+  "agent_state_reset": "true",
+  "agent_stores_before_run": {
+    "kanban_cards": [],
+    "onboarding_cards": [],
+    "front_messages": 0,
+    "platform_messages": 0,
+    "platform_messages_outside_onboarding": 0,
+    "scratch": [],
+    "gitops": [],
+    "workspaces": [],
+    "profiles": [
+      "platform"
+    ]
+  }
+}

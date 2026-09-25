@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 2,
+  "runId": "run_20260918_210713_821053",
+  "t": "2026-09-18T21:39:46Z",
+  "setupId": "gemini-3-7-flash-kubeagents",
+  "model": "gemini-3.7-flash",
+  "harness": "kubeagents",
+  "augmentation": [],
+  "judgeModel": "gemini-3.1-pro-preview"
+}

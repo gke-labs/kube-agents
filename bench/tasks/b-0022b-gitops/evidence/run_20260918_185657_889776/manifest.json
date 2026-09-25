@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 2,
+  "runId": "run_20260918_185657_889776",
+  "t": "2026-09-18T19:35:53Z",
+  "setupId": "claude-opus-5-kubeagents",
+  "model": "claude-opus-5",
+  "harness": "kubeagents",
+  "augmentation": [],
+  "judgeModel": "gemini-3.1-pro-preview"
+}

@@ -46,3 +46,10 @@ agents/platform/skills/fleet-upgrade-verification/scripts/removed_apis.json
 # `.md`/`.yaml`/`.yml` and never sees JSON; this entry stops a wider local
 # invocation from rewriting them by accident.
 agents/platform/skills/fleet-audit/scripts/testdata/finish_without_manifest/*.json
+
+# The GitOps pilot's committed run records (devops-bench's results.json, rows.json,
+# manifest.json, the campaign stamp and the integrity sweep): what the harness and
+# the sweep wrote, kept as written. CI's prettier job filters to `.md`/`.yaml`/`.yml`
+# and never sees JSON; this entry stops a wider local invocation from rewriting
+# them by accident.
+bench/tasks/*/evidence/*/*.json

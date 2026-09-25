@@ -1,0 +1,14 @@
+{
+  "worker_entries": 90,
+  "agents": [
+    "cluster-fuxiaogao-gkedemos-gitops-pilot-20260918-17055-fdcb199a",
+    "platform"
+  ],
+  "delegated_to_cluster_agent": true,
+  "fix_submitted_at": "2026-09-18T21:23:27.721150+00:00",
+  "cluster_reads_before_fix": 17,
+  "repo_lookups_before_fix": 0,
+  "repo_lookups": [],
+  "gitops_outcome": "merged",
+  "pr_url": "https://github.com/gke-agentic/kage-eval-20260918-gemini-1/pull/1"
+}
