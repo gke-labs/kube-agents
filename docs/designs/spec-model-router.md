@@ -96,16 +96,16 @@ express a constraint that is better expressed by not having them:
 What tools would genuinely buy - the model discovering a capability it did not know
 about - comes from rendering the capability catalog from the live agent cards on the
 `DIRECTORY` stream. The gateway holds a core subscribe on `a2a.agents.>` and does not
-read it today.  That subscribe is not enough on its own.  A core subscribe sees only what
+read it today. That subscribe is not enough on its own. A core subscribe sees only what
 is published after it starts, and a card is published once, when its profile is created
-(`a2a/lib/client.go`), with nothing re-announcing it.  A gateway that restarts after its
+(`a2a/lib/client.go`), with nothing re-announcing it. A gateway that restarts after its
 profiles exist sees no card at all until somebody creates the next one, so the catalog
 has to come from what the stream retains rather than from the subscribe.
 
 That read needs JetStream grants on `DIRECTORY` the gateway does not have.
 `a2aGatewayJetStreamGrants` covers `TASKS` and `KV_session-state` and nothing else, and
 `platformagent_a2a_identities.go` spells the gap out - "nothing at all on DIRECTORY" -
-because #1666 scoped that grant to what the gateway emits, by name and by verb.  Widening
+because #1666 scoped that grant to what the gateway emits, by name and by verb. Widening
 it is a deliberate reversal of that scoping, so it is part of build step 3 rather than a
 detail inside it, and it wants the same review the original narrowing got.
 
@@ -540,8 +540,8 @@ stays natural language.
 5. **Decision publishing** on the subject the payload spec defines, the dropped-decision
    alert, and a fallback-rate condition beside it.
 
-Steps 1 to 3 have no dependency on the `model-router` alias.  Steps 1 and 2 are ordinary
-Go.  Step 3 is too, once its grant change lands; that change is an operator change, not a
+Steps 1 to 3 have no dependency on the `model-router` alias. Steps 1 and 2 are ordinary
+Go. Step 3 is too, once its grant change lands; that change is an operator change, not a
 gateway one, and it is the long pole in the step.
 
 ## Open questions
