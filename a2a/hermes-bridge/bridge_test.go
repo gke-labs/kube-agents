@@ -507,6 +507,15 @@ func bridgeDurableInfo(t *testing.T, url string) *jetstream.ConsumerInfo {
 // finds it behind the submission, the run ends canceled-before-start, no
 // working is ever published, and the durable's later delivery of the same
 // cancel to handle is a no-op (a read, not a consume).
+//
+// The durable's delivery of that cancel is held until the terminal has been
+// read. Its queued path in handleCancel writes the same record when it
+// reaches the run before the worker's read returns, and on an embedded
+// server it usually does; with the delivery held, the terminal can only be
+// the worker's, and the look-ahead's own answer is asserted too. A look-ahead
+// that read the subject and answered "no", or a worker that spawned
+// regardless of the answer, fails here instead of passing on the durable's
+// timing.
 func TestLookAhead_CancelOnStreamBeforeBindNeverSpawns(t *testing.T) {
 	_, url := startServer(t)
 	c := gatewayClient(t, url)
@@ -515,8 +524,35 @@ func TestLookAhead_CancelOnStreamBeforeBindNeverSpawns(t *testing.T) {
 	origin := submit(t, c, "task-stale", "the stale prompt")
 	publishCancel(t, c, origin)
 
-	startBridge(t, url, script(t, fmt.Sprintf(`touch %s
-echo never`, marker)))
+	type answer struct {
+		canceled bool
+		err      error
+		pending  bool // the run's state as the read returned
+	}
+	answers := make(chan answer, 1)
+	release := make(chan struct{})
+	var released atomic.Bool
+	releaseCancel := func() {
+		if released.CompareAndSwap(false, true) {
+			close(release)
+		}
+	}
+	t.Cleanup(releaseCancel)
+	startBridgeWith(t, url, script(t, fmt.Sprintf(`touch %s
+echo never`, marker)), 0, func(b *Bridge) {
+		realLookAhead, realDeliver := b.lookAhead, b.deliver
+		b.lookAhead = func(ctx context.Context, run *taskRun) (bool, error) {
+			canceled, err := realLookAhead(ctx, run)
+			answers <- answer{canceled: canceled, err: err, pending: run.pending()}
+			return canceled, err
+		}
+		b.deliver = func(ctx context.Context, env *lib.Envelope) {
+			if env.Kind == lib.KindCancel {
+				<-release
+			}
+			realDeliver(ctx, env)
+		}
+	})
 
 	task := waitTerminal(t, c, origin.TaskID)
 	if task.State != lib.StateCanceled {
@@ -534,8 +570,25 @@ echo never`, marker)))
 		t.Fatal("the stub ran: the stale prompt was spawned despite the cancel on the stream")
 	}
 
-	// The durable still reads the cancel: it is delivered and acked, and
+	// The terminal landed with the durable's cancel still held, so the
+	// worker wrote it, and it did so on the read's answer: the real replay
+	// of the in subject said "cancel" while the run was still pending.
+	var got answer
+	select {
+	case got = <-answers:
+	default:
+		t.Fatal("terminal written before the look-ahead returned: some path other than the worker's finalized the run")
+	}
+	if got.err != nil || !got.canceled {
+		t.Fatalf("look-ahead answered (canceled=%v, err=%v), want (true, nil)", got.canceled, got.err)
+	}
+	if !got.pending {
+		t.Fatal("the run was already finalized when the look-ahead answered, so the worker's branch was not what ended it")
+	}
+
+	// Now let the durable deliver the cancel: it is read and acked, and
 	// handle does nothing with it - no event after the terminal.
+	releaseCancel()
 	waitFor(t, 10*time.Second, "durable to consume the trailing cancel", func() bool {
 		info := bridgeDurableInfo(t, url)
 		return info.NumPending == 0 && info.NumAckPending == 0 && info.Delivered.Consumer >= 2

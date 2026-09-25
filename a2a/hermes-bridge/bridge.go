@@ -159,6 +159,11 @@ type Bridge struct {
 	// cancelInStream by default; a field so a test can stall it or make it
 	// fail without a bus that misbehaves on cue.
 	lookAhead func(ctx context.Context, run *taskRun) (bool, error)
+
+	// deliver is what the durable calls with each envelope on the in
+	// subject, handle by default; a field so a test can hold one delivery
+	// back and pin which path wrote a record.
+	deliver func(ctx context.Context, env *lib.Envelope)
 }
 
 // New connects and sweeps but does not consume yet; Run does.
@@ -175,6 +180,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		queue: make(chan *taskRun, taskQueueCapacity),
 	}
 	b.lookAhead = b.cancelInStream
+	b.deliver = b.handle
 	var err error
 	b.c, err = lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName(b.from.Session),
@@ -226,7 +232,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 		Subject: fmt.Sprintf("a2a.tasks.%s.*.in", b.cfg.Profile),
 		Durable: "bridge-" + b.cfg.Profile,
 		Session: b.cfg.Profile,
-	}, func(env *lib.Envelope) { b.handle(ctx, env) })
+	}, func(env *lib.Envelope) { b.deliver(ctx, env) })
 	if err != nil {
 		return fmt.Errorf("subscribe: %w", err)
 	}
