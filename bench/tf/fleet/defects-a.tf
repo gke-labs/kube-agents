@@ -568,6 +568,7 @@ resource "kubernetes_config_map_v1" "legacy_endpoints_writer" {
       ANNOTATION = "seeded-last-run"
       USER_AGENT = "legacy-endpoints-writer/1.0"
       DEPRECATED_FROM_MINOR = 33
+      DEFAULT_API_PORT = "443"
       REQUEST_TIMEOUT_SECONDS = 20
       JSON_TYPE = "application/json"
       MERGE_PATCH_TYPE = "application/merge-patch+json"
@@ -586,7 +587,7 @@ resource "kubernetes_config_map_v1" "legacy_endpoints_writer" {
 
       def main():
           host = os.environ["KUBERNETES_SERVICE_HOST"]
-          port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+          port = os.environ.get("KUBERNETES_SERVICE_PORT", DEFAULT_API_PORT)
           base = "https://" + host + ":" + port
           with open(TOKEN_PATH) as fh:
               token = fh.read().strip()
@@ -685,6 +686,7 @@ resource "kubernetes_cron_job_v1" "legacy_endpoints_writer" {
       }
       spec {
         backoff_limit              = 0
+        active_deadline_seconds    = 300
         ttl_seconds_after_finished = "900"
         # Keep this template byte-identical to the first-run Job's below.
         template {
