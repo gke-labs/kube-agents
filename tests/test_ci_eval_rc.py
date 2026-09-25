@@ -204,13 +204,15 @@ class RcEvalDriverTestCase(unittest.TestCase):
         self.assertIn(_DEPLOY_RC_MARKER, deploy)
 
     def test_the_exported_tier_is_the_presubmit_matrix(self):
-        """The lane grades 54 units, not 126, and the clock is why.
+        """The lane grades the merge-blocking matrix, not the full catalog.
 
-        Step 5 of nightly-pipeline.yml withdraws the nomination if no verdict
-        has arrived in 330 minutes, and it cannot wait longer: a GitHub-hosted
-        job is killed at 360. The nightly tier does not finish in that window —
-        ci-kube-agents-eval-nightly grades the same matrix and took 357 and 401
-        minutes on the two runs that finished in the week to 2026-09-23.
+        Step 5 of staging-promotion-pipeline.yml withdraws the nomination if no
+        verdict has arrived in 330 minutes, and it cannot wait longer: a
+        GitHub-hosted job is killed at 360. The nightly tier does not finish in
+        that window — ci-kube-agents-eval-nightly grades the same 126 units and
+        took 357 and 401 minutes on the two runs that finished in the week to
+        2026-09-23. The presubmit matrix does: the same fan-out took 83, 110 and
+        143 minutes on the three runs that reached a verdict on 2026-09-24.
 
         This pins the value rather than only checking the evaluator accepts it,
         because `nightly` is also accepted. It was `nightly` from #1230 until

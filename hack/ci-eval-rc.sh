@@ -5,11 +5,11 @@
 # Resolve the newest release candidate, check it out, deploy its published
 # images, and evaluate them. GATING: the verdict this writes is what decides
 # whether the candidate reaches the staging cluster. Step 5 of
-# staging-promotion-pipeline.yml polls this run's artifacts and pushes the staging_ tag
-# staging-deploy.yml triggers on only when the summary below says GREEN. How
-# wide that evaluation is, RC_EVAL_TIER below decides: the presubmit matrix,
-# and deliberately not the full catalog, because the step that waits for this
-# verdict gives up before the full catalog finishes.
+# staging-promotion-pipeline.yml polls this run's artifacts and pushes the
+# staging_ tag staging-deploy.yml triggers on only when the summary below says
+# GREEN. How wide that evaluation is, RC_EVAL_TIER below decides: the presubmit
+# matrix, and deliberately not the full catalog, because the step that waits
+# for this verdict gives up before the full catalog finishes.
 #
 # The word in the summary is the verdict, not this script's exit status, and the
 # three-way split is why. An exit status has two values and this lane has three
@@ -79,21 +79,29 @@
 set -euo pipefail
 
 # The tier exported to ci-eval-pr.sh, and so which matrix this lane grades:
-# `presubmit` is the 18-case merge-blocking set, `nightly` appends the 24
-# nightly-only cases for 42. At three repetitions, 54 units against 126.
+# `presubmit` is the merge-blocking set in eval/presubmit-cases.txt, `nightly`
+# appends eval/nightly-cases.txt. Counted from those files rather than stated
+# here, because both move: at the time of writing they are 12 and 30, so 42
+# cases, and at three repetitions 36 units against 126.
 #
 # It is the smaller one because of the clock, not because the other cases are
-# unwanted. Step 5 of nightly-pipeline.yml waits 330 minutes for this verdict
-# and then withdraws the nomination, and that 330 is the last of three
+# unwanted. Step 5 of staging-promotion-pipeline.yml waits 330 minutes for this
+# verdict and then withdraws the nomination, and that 330 is the last of three
 # ceilings: a GitHub-hosted job is killed at 360, so the waiting job is capped
 # at 345 to leave itself room to write a summary. The nightly tier does not fit
 # under it. ci-kube-agents-eval-nightly grades the same 126 units on the same
 # pool, and in the week to 2026-09-23 its two runs that finished took 357 and
-# 401 minutes while four were killed at its own 480-minute deadline. The rate
-# those two imply puts 54 units near 175 minutes, which would leave the poller
-# room for a slow night -- an estimate, not a measurement: no run of this lane
-# has graded the presubmit matrix since #1620, so the first one to do so is
-# what confirms the headroom.
+# 401 minutes while four were killed at its own 480-minute deadline.
+#
+# The 36-unit matrix does fit, and that is measured rather than derived. The
+# presubmit runs it on the same pool at the same repetition count, so its
+# fan-out is the same work this lane does: three runs that reached a verdict on
+# 2026-09-24 spent 83, 110 and 143 minutes in it. Add the ~20 minutes of lease,
+# build and deploy this lane pays before grading starts and the poller keeps
+# real headroom under 330 even on the slow end. What that does not cover is a
+# run whose cases stall rather than run: #1840's delegation block costs 45
+# minutes per repetition, and enough of those exceed any budget. That failure
+# is unsettled, so it withdraws the nomination and the next night asks again.
 #
 # This read `nightly` from #1230 until now, under a comment saying #1175's
 # switch was not on main so nothing read the export. That was true when it was

@@ -35,9 +35,9 @@ EXPECTED_DECK_URL = (
 DEPLOY_RC_MARKER = "RC_COMMIT_SHA"
 
 # The matrix the driver exports to the candidate's ci-eval-pr.sh. `presubmit`
-# and not `nightly` because step 5 of nightly-pipeline.yml stops waiting for
-# the verdict at 330 minutes and the full catalog does not finish in that;
-# hack/ci-eval-rc.sh's RC_EVAL_TIER block has the measurements.
+# and not `nightly` because step 5 of staging-promotion-pipeline.yml stops
+# waiting for the verdict at 330 minutes and the full catalog does not finish
+# in that; hack/ci-eval-rc.sh's RC_EVAL_TIER block has the measurements.
 EXPECTED_RC_EVAL_TIER = "presubmit"
 
 # bench-gate's per-case roll-up, which the real hack/ci-eval-pr.sh writes with

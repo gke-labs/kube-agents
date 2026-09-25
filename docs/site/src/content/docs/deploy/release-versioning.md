@@ -17,14 +17,14 @@ older release's checkout, and what they leave as it is.
 
 Every commit and build progresses through six distinct lifecycle tiers:
 
-| Tier                       | Format                                | Trigger                       | Purpose and guarantees                                                                                                      |
-| :------------------------- | :------------------------------------ | :---------------------------- | :-------------------------------------------------------------------------------------------------------------------------- |
-| **Candidate Build**        | `<COMMIT_SHA>` (bare 40-char SHA)     | Push to `main` branch         | Developer build in GHCR; container images built once.                                                                       |
-| **Release Candidate (RC)** | `rc_YYMMDDHHMM_<SHORT_SHA>`           | 3-hour cron / manual dispatch | Candidate build selected for live cluster testing.                                                                          |
-| **RC Validated**           | `rc_YYMMDDHHMM_<SHORT_SHA>_validated` | Successful GKE E2E suite      | Quality gate: proof that `install.sh` succeeded on a real GKE cluster.                                                      |
-| **Eval Candidate**         | `evalcand_YYMMDDHHMM_<SHORT_SHA>`     | Successful nightly matrix     | Nomination, not a promotion: starts the full-catalog agent eval against the candidate's images. Deploys nothing.            |
-| **Staging Promoted**       | `staging_YYMMDDHHMM_<SHORT_SHA>`      | Green eval on the nomination  | Quality gate for GA: the nightly E2E matrix and the agent eval both passed. Also the deploy trigger for the staging estate. |
-| **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Weekly cron / manual dispatch | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default).         |
+| Tier                       | Format                                | Trigger                       | Purpose and guarantees                                                                                                                                   |
+| :------------------------- | :------------------------------------ | :---------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Candidate Build**        | `<COMMIT_SHA>` (bare 40-char SHA)     | Push to `main` branch         | Developer build in GHCR; container images built once.                                                                                                    |
+| **Release Candidate (RC)** | `rc_YYMMDDHHMM_<SHORT_SHA>`           | 3-hour cron / manual dispatch | Candidate build selected for live cluster testing.                                                                                                       |
+| **RC Validated**           | `rc_YYMMDDHHMM_<SHORT_SHA>_validated` | Successful GKE E2E suite      | Quality gate: proof that `install.sh` succeeded on a real GKE cluster.                                                                                   |
+| **Eval Candidate**         | `evalcand_YYMMDDHHMM_<SHORT_SHA>`     | Successful nightly matrix     | Nomination, not a promotion: starts the agent eval against the candidate's images, over the same case matrix that gates a pull request. Deploys nothing. |
+| **Staging Promoted**       | `staging_YYMMDDHHMM_<SHORT_SHA>`      | Green eval on the nomination  | Quality gate for GA: the nightly E2E matrix and the agent eval both passed. Also the deploy trigger for the staging estate.                              |
+| **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Weekly cron / manual dispatch | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default).                                      |
 
 Only a staging-promoted commit is releasable. An `rc_*_validated` tag records the narrow
 three-hourly suite; the GA gate reads the `staging_<ts>_<sha>` tag, which the nightly pipeline
