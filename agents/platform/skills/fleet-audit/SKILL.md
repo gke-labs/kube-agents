@@ -118,7 +118,7 @@ is running and what each attempt did.
 A stream run as a delegated worker (form 1 above) holds no such lock, and the scheduler's ledger
 never sees it, so the guard lives in the script: `start` leaves an in-flight note for the stream and
 refuses while one younger than two hours exists, whichever side wrote it, and `finish` removes it
-when that `start`'s run is over, published or died on a `gh` call, so a `finish` that died does not
+when that `start`'s run is over, published (exit 0) or died (exit 1, whatever the cause), so a `finish` that died does not
 refuse the stream's next repository or your own retry. The note spans one `start`-`finish` pair, not
 a loop: a stream run repository by repository reclaims it at each `start`, so a refusal at
 `start --repo B` means the stream was taken between repositories; stop there and report the sweep

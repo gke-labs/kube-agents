@@ -342,7 +342,7 @@ on purpose, not shipped new, and is never reinstalled.
 Three rules on the site page came from measured failures, recorded here so the
 rule outlives the memory of why:
 
-- **On-demand runs are marked due, never re-enacted in the requesting session.**
+- **On-demand runs are marked due, not re-enacted in the requesting session; one delegated stream is the exception.**
   On 2026-08-03 a session asked to run several audits at once crammed them into
   one turn budget and produced five hand-typed empty findings documents and a
   fleet-wide all-clear, having issued no `kubectl` at all. That is why the
@@ -356,7 +356,9 @@ rule outlives the memory of why:
   `/opt/data/scratch/inflight_<audit>.json` in that pod (the script runs in
   the sandbox shell, whose `/opt/data` is its own PVC, not the gateway volume
   this README otherwise calls "the volume"), holding the stream id and a start
-  time, honoured for two hours and removed by `finish`. The note spans one
+  time, honoured for two hours and removed by a `finish` that published or
+  died (exit 0 or 1); `finish --dry-run` and a `finish` that exited 2 keep it,
+  so a note beside a rejected document is a live run, not a stale one. The note spans one
   `start`-`finish` pair, so a multi-repository loop reclaims it at each
   repository. A run that died without `finish` costs the
   stream at most the ticks inside those two hours. For the operator only:
