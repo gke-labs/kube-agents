@@ -13,6 +13,7 @@ manifests, and no clarifying question back to a session with no person in it.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -42,6 +43,15 @@ OBTAINABILITY_PLANNING_METHODS = {
 # status ("RECOMMENDED") says a window existed and is not an honest
 # no-window verdict.
 NO_WINDOW_STATUSES = {"NO_CAPACITY", "NOT_SUPPORTED", "CONDITIONS_NOT_MET"}
+# The canonical request shape test_03 pins for the original plan, applied
+# to the re-plan's record too: 64 nodes are 256 chips, the reservation
+# floor is one day, and the family/workload are the API's TPU v5e batch
+# spelling.
+NODE_COUNT = 64
+CHIP_COUNT = 256
+RESERVATION_FLOOR_SECONDS = 86400
+TPU_V5E_VM_FAMILY = "VM_FAMILY_CLOUD_TPU_LITE_POD_SLICE_CT5LP"
+DURATION_RE = re.compile(r"(\d+)(?:\.0+)?s")
 REQUIRED_SKILLS = {"capacity-obtainability"}
 CLARIFYING_PHRASES = (
     "could you clarify",
@@ -72,6 +82,68 @@ the paired Dynamic Workload Scheduler ProvisioningRequest and Kueue \
 LocalQueue for the new target. This is planning-only: do not apply \
 manifests, submit a provisioning request, create infrastructure, or mutate \
 Kubernetes or cloud state."""
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _integer(value: Any) -> int | None:
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _duration_seconds(value: Any) -> int | None:
+    match = DURATION_RE.fullmatch(str(value or "").strip())
+    return int(match.group(1)) if match else None
+
+
+def _named_zones(value: Any) -> set[str]:
+    # The same structural walk as test_03's: any string anywhere in the
+    # analysis, with the API's "zones/" prefix stripped.
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found |= _named_zones(key)
+            found |= _named_zones(item)
+    elif isinstance(value, list):
+        for item in value:
+            found |= _named_zones(item)
+    elif isinstance(value, str):
+        found.add(value.removeprefix("zones/"))
+    return found
+
+
+def _canonical_replan_call(details: dict[str, Any]) -> bool:
+    # The shape checks test_03 applies to the same record type: chips not
+    # nodes, the one-day floor, the v5e batch spelling, and proof the
+    # remaining zone was evaluated (a locationPolicy scoped to it, or an
+    # analysis that names it). Method and region are checked by the caller.
+    request = _mapping(details.get("request"))
+    specs = _mapping(request.get("futureResourcesSpecs"))
+    if len(specs) != 1:
+        return False
+    spec = _mapping(next(iter(specs.values())))
+    time_range = _mapping(spec.get("timeRangeSpec"))
+    aggregate = _mapping(_mapping(spec.get("targetResources")).get("aggregateResources"))
+    locations = _mapping(_mapping(spec.get("locationPolicy")).get("locations"))
+    preference = str(
+        _mapping(locations.get(f"zones/{REMAINING_ZONE}")).get("preference") or ""
+    )
+    zone_evaluated = preference.upper() == "ALLOW" or REMAINING_ZONE in _named_zones(
+        _mapping(details.get("analysis"))
+    )
+    return (
+        _duration_seconds(time_range.get("minDuration")) == RESERVATION_FLOOR_SECONDS
+        and _duration_seconds(time_range.get("maxDuration")) == RESERVATION_FLOOR_SECONDS
+        and _integer(aggregate.get("acceleratorCount")) == CHIP_COUNT
+        and aggregate.get("workloadType") == "BATCH"
+        and aggregate.get("vmFamily") == TPU_V5E_VM_FAMILY
+        and _integer(request.get("nodeCount", details.get("nodeCount"))) == NODE_COUNT
+        and zone_evaluated
+    )
 
 
 def _record_region(details: dict[str, Any]) -> str:
@@ -128,6 +200,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         and isinstance(item.get("details"), dict)
         and item["details"].get("apiMethod") in OBTAINABILITY_PLANNING_METHODS
         and _record_region(item["details"]) == REMAINING_REGION
+        and _canonical_replan_call(item["details"])
     ]
     analysis_records = [
         item
@@ -232,7 +305,9 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
                 "ac02-replan-probes-remaining-zone",
                 "The re-plan probes the remaining allowed zone with a "
                 "canonical CalendarMode call.",
-                "completed CalendarMode evidence names the remaining region",
+                "completed canonical CalendarMode evidence for the remaining "
+                "region: chips not nodes, the one-day floor, the v5e batch "
+                "spelling, and the remaining zone evaluated",
             ),
             AcceptanceCriterion(
                 "ac03-revised-recommendation-delivered",

@@ -42,6 +42,13 @@ domain: capacity
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: maintainers
 
+# What the deterministic checks below do NOT grade, and why: the
+# expected_output's "across at least two zones" is live capacity weather —
+# one region-level probe legitimately covers two zones when the API returns
+# them, and the per-zone follow-up only fires when it returns fewer — so
+# zone coverage is graded by the judge through expected_output, not by a
+# pattern. The live sibling (test_01) grades it deterministically from the
+# evidence records, which this harness path does not see.
 verification_spec:
   - name: the-quota-and-advice-probes-actually-ran
     role: objective
@@ -70,7 +77,7 @@ verification_spec:
       # fails. Punctuation ends a segment only before whitespace or the
       # end, so "99.9%" cannot split a negation from the word it negates.
       forbidden_patterns:
-        - "(?:^|[.!?](?=\\s|$)|\\n)(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't|is not|isn't|aren't|won't|without|non|nothing|none|neither)\\b)(?:[^.!?\\n]|[.!?](?!\\s|$)))*guarant"
+        - "(?:^|\\n|[.!?](?=\\s|$))(?:(?!\\b(?:no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|without|nothing|none|neither|nor|unable to|rather than|non(?=-?guarant))\\b)(?:[^.!?\\n]|[.!?](?!\\s|$)))*guarant|\\b(?:no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|without|nothing|none|neither|nor|unable to|rather than|non(?=-?guarant))\\b(?:(?!\\b(?:no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|without|nothing|none|neither|nor|unable to|rather than|non(?=-?guarant))\\b)(?:[^.!?\\n]|[.!?](?!\\s|$))){60,}guarant"
   - name: report-carries-a-computeclass-design
     role: objective
     mode: assert

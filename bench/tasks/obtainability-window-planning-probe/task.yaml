@@ -87,7 +87,7 @@ verification_spec:
       any_of_phrases: ["UTC", "no window", "NO_CAPACITY", "NOT_SUPPORTED"]
       # Same shape as the design case: the banned word, negated uses allowed.
       forbidden_patterns:
-        - "(?:^|[.!?](?=\\s|$)|\\n)(?:(?!\\b(?:no|not|never|cannot|can't|does not|doesn't|is not|isn't|aren't|won't|without|non|nothing|none|neither)\\b)(?:[^.!?\\n]|[.!?](?!\\s|$)))*guarant"
+        - "(?:^|\\n|[.!?](?=\\s|$))(?:(?!\\b(?:no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|without|nothing|none|neither|nor|unable to|rather than|non(?=-?guarant))\\b)(?:[^.!?\\n]|[.!?](?!\\s|$)))*guarant|\\b(?:no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|without|nothing|none|neither|nor|unable to|rather than|non(?=-?guarant))\\b(?:(?!\\b(?:no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|without|nothing|none|neither|nor|unable to|rather than|non(?=-?guarant))\\b)(?:[^.!?\\n]|[.!?](?!\\s|$))){60,}guarant"
   - name: report-carries-the-paired-manifests
     role: objective
     mode: assert

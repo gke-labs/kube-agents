@@ -94,7 +94,9 @@ _NO_WORKER_CALLS_REASON = (
 # (gke-labs/kube-agents#982) on a report the OutcomeValidity judge scored
 # 1.00, and enumerating markdown shapes in every task.yaml would only encode
 # one run's formatting.
-_MARKDOWN_NOISE = str.maketrans("", "", "*_`")
+# Markdown emphasis is dropped; the typographic apostrophe folds to ASCII
+# so a pattern spells each contraction ("don't") exactly once.
+_MARKDOWN_NOISE = str.maketrans({"*": None, "_": None, "`": None, "’": "'"})
 
 
 def _normalize(text: str) -> str:

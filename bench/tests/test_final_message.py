@@ -178,10 +178,20 @@ def test_a_delegated_audits_ledger_url_reaches_the_default_scope():
 # --------------------------------------- report_contains forbidden_patterns
 
 
+_NEGATORS = (
+    "no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t"
+    "|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t"
+    "|couldn'?t|without|nothing|none|neither|nor|unable to|rather than"
+    "|non(?=-?guarant)"
+)
+_SEGMENT_CHAR = "(?:[^.!?\\n]|[.!?](?!\\s|$))"
+# A segment with no negation before "guarant" fails, and a negation's
+# influence is bounded: 60 non-negation characters after it, the ban
+# re-arms. The task files must carry this exact pattern; a test below pins
+# them to it.
 GUARANTEE_PATTERN = (
-    "(?:^|[.!?](?=\\s|$)|\\n)(?:(?!\\b(?:no|not|never|cannot|can't|does not"
-    "|doesn't|is not|isn't|aren't|won't|without|non|nothing|none|neither)\\b)"
-    "(?:[^.!?\\n]|[.!?](?!\\s|$)))*guarant"
+    f"(?:^|\\n|[.!?](?=\\s|$))(?:(?!\\b(?:{_NEGATORS})\\b){_SEGMENT_CHAR})*guarant"
+    f"|\\b(?:{_NEGATORS})\\b(?:(?!\\b(?:{_NEGATORS})\\b){_SEGMENT_CHAR}){{60,}}guarant"
 )
 
 
@@ -204,17 +214,59 @@ def test_a_forbidden_pattern_flags_the_unnegated_banned_word():
     assert "forbidden patterns matched" in result.reason
 
 
-def test_a_forbidden_pattern_permits_the_negated_uses():
+def test_every_negator_is_load_bearing_one_sentence_each():
+    # One sentence per negator: dropping any word from the alternation
+    # makes its sentence flag and this test fail, which is what pins the
+    # list (a single multi-negator sentence tests only its first word).
+    for sentence in (
+        "Spot capacity is not guaranteed.",
+        "There is no guarantee of allocation.",
+        "We don't guarantee the window.",
+        "It cannot guarantee placement.",
+        "The API doesn't guarantee a start.",
+        "Reservations are without guarantee.",
+        "Nothing here guarantees capacity.",
+        "None of the paths guarantees a start.",
+        "Neither path is guaranteed.",
+        "A non-guaranteed pool may be reclaimed.",
+        "It wasn't guaranteed last week.",
+        "Flex-Start won't guarantee the slot.",
+        "Placement couldn't be guaranteed.",
+        "We are unable to guarantee a start.",
+        "It holds capacity rather than guarantees it.",
+    ):
+        _set_final(sentence)
+        check = ReportContainsVerifier(
+            type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
+        )
+        assert check.verify(5.0).status == "pass", sentence
+
+
+def test_a_typographic_apostrophe_negation_is_recognized():
+    _set_final("We don’t guarantee capacity in either zone.")
+    check = ReportContainsVerifier(
+        type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
+    )
+    assert check.verify(5.0).status == "pass"
+
+
+def test_a_non_compound_does_not_mask_a_later_banned_word():
+    _set_final("A non-preemptible reservation guarantees capacity.")
+    check = ReportContainsVerifier(
+        type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
+    )
+    assert check.verify(5.0).status == "fail"
+
+
+def test_a_negations_influence_expires_after_sixty_characters():
     _set_final(
-        "Capacity is not guaranteed; there is no guarantee of allocation, "
-        "and a non-guaranteed pool may be reclaimed without notice."
+        "No risk in Spot today, and the region has ample headroom across "
+        "all zones and families, so the reservation guarantees capacity."
     )
     check = ReportContainsVerifier(
         type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
     )
-    result = check.verify(5.0)
-    assert result.status == "pass"
-    assert "forbidden pattern(s)" in result.reason
+    assert check.verify(5.0).status == "fail"
 
 
 def test_a_forbidden_pattern_scopes_negation_to_its_own_sentence():
@@ -225,6 +277,26 @@ def test_a_forbidden_pattern_scopes_negation_to_its_own_sentence():
     assert check.verify(5.0).status == "fail"
 
 
+def test_the_task_files_carry_this_exact_pattern():
+    from pathlib import Path
+
+    import yaml
+
+    tasks = Path(__file__).resolve().parent.parent / "tasks"
+    for case in (
+        "obtainability-design-quota-vs-capacity",
+        "obtainability-window-planning-probe",
+    ):
+        doc = yaml.safe_load((tasks / case / "task.yaml").read_text())
+        patterns = [
+            check["check"]["forbidden_patterns"]
+            for check in doc["verification_spec"]
+            if isinstance(check.get("check"), dict)
+            and check["check"].get("forbidden_patterns")
+        ]
+        assert patterns == [[GUARANTEE_PATTERN]], case
+
+
 def test_a_negated_bullet_does_not_mask_the_next_bullets_banned_word():
     _set_final(
         "- Spot: **not** a reserved path\n- Flex-Start guarantees the window"
@@ -233,14 +305,6 @@ def test_a_negated_bullet_does_not_mask_the_next_bullets_banned_word():
         type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
     )
     assert check.verify(5.0).status == "fail"
-
-
-def test_common_negations_beyond_test01s_list_are_recognized():
-    _set_final("Nothing here guarantees capacity; neither path is guaranteed.")
-    check = ReportContainsVerifier(
-        type="report_contains", forbidden_patterns=[GUARANTEE_PATTERN]
-    )
-    assert check.verify(5.0).status == "pass"
 
 
 def test_a_decimal_does_not_split_a_negation_from_the_word_it_negates():

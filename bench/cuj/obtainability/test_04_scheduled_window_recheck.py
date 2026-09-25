@@ -33,9 +33,13 @@ from cuj.utils.scenario import Scenario
 RECHECK_LEAD = timedelta(hours=2)
 RECHECK_LEAD_HOURS = int(RECHECK_LEAD.total_seconds() // 3600)
 RECHECK_LEAD_MINUTES = int(RECHECK_LEAD.total_seconds() // 60)
-# The lead spelled both ways an answer may echo it. The digit form rejects
-# a preceding digit: "12 hours" is the job's duration, not the lead.
-LEAD_RE = re.compile(rf"(?<!\d)(?:{RECHECK_LEAD_HOURS}|two)\s+hours?\b")
+# The lead spelled the ways an answer may echo it — "2 hours", "two-hour",
+# "2h". The lookbehind rejects a preceding digit: "12 hours" is the job's
+# duration, not the lead.
+LEAD_RE = re.compile(
+    rf"(?<!\d)(?:{RECHECK_LEAD_HOURS}|two)[\s-]+hours?\b"
+    rf"|(?<!\d){RECHECK_LEAD_HOURS}h\b"
+)
 REQUIRED_SKILLS = {"capacity-obtainability"}
 # The one scheduling tool the runtime exposes. The projection carries tool
 # names without arguments, so a match shows scheduling activity, not a
@@ -64,7 +68,8 @@ UTC_TIME_RE = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})")
 # an action verb ("the re-check repeats the probe"), so only firing-count
 # shapes commit and only schedule-recurrence shapes count against.
 ONE_SHOT_RE = re.compile(
-    r"\b(exactly once|only once|fires? once|runs? once|one[- ]time"
+    r"\b(exactly once|only once|once only|just once|fires? once|runs? once"
+    r"|one[- ]time|one[- ]shot|one[- ]off"
     r"|single\s+(?:re-?check|firing|run|execution))\b"
 )
 NEGATION_WINDOW_CHARS = 30
@@ -74,9 +79,17 @@ RECURRENCE_RE = re.compile(
     r"|every\s+\d+\s*(?:minutes?|hours?|days?|weeks?)"
     r"|every\s+(?:minute|hour|day|week|night|morning))\b"
 )
+# A negation may reach its recurrence word through one linking verb of
+# occurrence ("does not RUN hourly") or "on a" ("not on a daily cadence"),
+# but not through an unrelated noun phrase ("with no END DATE, hourly").
+# A coordination tail ("hourly OR daily") is exempt outright: its head was
+# judged on its own, and a committed head already fails the answer.
 NEGATED_JUST_BEFORE_RE = re.compile(
-    r"\b(non|not|never|no|won'?t|will not|isn'?t|is not|rather than|instead of)"
-    r"[\s,;:–—-]*(?:a\s+|an\s+)?$"
+    r"\b(non|not|never|no|won'?t|will not|isn'?t|is not|doesn'?t|does not"
+    r"|rather than|instead of)\b"
+    r"[\s,;:–—-]*(?:(?:run|runs|repeat|repeats|fire|fires|recur|recurs"
+    r"|be|happen|occur)\s+)?(?:on\s+)?(?:a\s+|an\s+)?$"
+    r"|\b(?:recurring|hourly|daily|weekly|nightly)\s*,?\s*(?:or|nor|and)\s+$"
 )
 SENTENCE_SPLIT_RE = re.compile(r"[.!?\n]+")
 
