@@ -84,12 +84,14 @@ SITE_CONFIG_LINES = (
     "]",
 )
 # The same config with an entry and a group commented out, JavaScript-style,
-# and a URL whose `//` sits inside a string on a live line. Comments are not
-# navigation; the string is not a comment.
+# and a URL whose `//` sits inside a string on a live line, ahead of the
+# `link:` it shares the line with: a stripper that read the `//` as a comment
+# would cut the link off with it, and the index page would be reported.
+# Comments are not navigation; the string is not a comment.
 SITE_CONFIG_COMMENTED_LINES = (
     "sidebar: [",
     "  { label: 'Install', items: [",
-    "    { label: 'Home', link: '/', badge: 'https://example.invalid//x' },",
+    "    { label: 'Home', badge: 'https://example.invalid//x', link: '/' },",
     "    // { label: 'Listed', link: '/install/listed/' },",
     "  ] },",
     "  /* { label: 'Concepts', items: [{ autogenerate: { directory: 'concepts' } }] }, */",
