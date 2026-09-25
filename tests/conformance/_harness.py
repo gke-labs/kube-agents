@@ -250,6 +250,20 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveInjectPrincipal", "injectEvalPrincipalPrefix"),
     ),
+    # The A2A door is the inject door's sibling for an agent caller, gated and
+    # resolved the same way; A3 reads the same two seams for it.
+    "a2a_door_render": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        (
+            "func a2aAgentDoorEnabled",
+            ") applyA2AAgentDoor(",
+            "a2aAgentDoorEnvVar =",
+        ),
+    ),
+    "a2a_door_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) resolveA2APrincipal", "a2aPrincipalPrefix + authorID"),
+    ),
     # labelPartOf lives here rather than beside the fence, so resolving the
     # operator's side of the pair needs both files.
     "operator_labels": Source(

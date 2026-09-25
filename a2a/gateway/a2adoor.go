@@ -29,8 +29,8 @@ import (
 // holds no bus credential, mints no id the bus sees, writes no authority
 // block; it hands an InboundMessage to handleInbound and reads what the
 // gateway tells it back through TaskObserver and InboundObserver. That is the
-// one-chokepoint rule the design track set (round 3, external agents): the
-// door must deliver into handleInbound and nowhere else.
+// one-chokepoint rule (spec-chatops-gateway.md, "The A2A door"): the door
+// must deliver into handleInbound and nowhere else.
 //
 // What a caller sees is the A2A Task object, assembled from what the relay
 // posted on the door's conversation. The rolling progress line the relay

@@ -166,7 +166,7 @@ type a2aArtifactEvent struct {
 // The agent card. Skills are the catalog: destinations this door will route
 // to. In the first version that is the gateway's default addressee alone;
 // when profiles land, the same list is rendered from DIRECTORY and the
-// caller's entitlements (spec-model-router.md, "The destination list").
+// caller's entitlements, and the router reads the same list.
 type a2aAgentCard struct {
 	Name               string                `json:"name"`
 	Description        string                `json:"description"`

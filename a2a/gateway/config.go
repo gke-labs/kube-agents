@@ -381,8 +381,9 @@ func FromEnv() (*Config, error) {
 	if cfg.DiscordToken != "" {
 		armed = append(armed, "DISCORD_TOKEN")
 	}
-	// The inject door is NOT in that list, decided 2026-09-17 on the design
-	// doc's review. The guard exists so that arming two backends cannot leave
+	// The doors (inject, A2A) are NOT in that list, decided 2026-09-17 on
+	// the design doc's review for the inject door and holding for its
+	// sibling. The guard exists so that arming two backends cannot leave
 	// one of them silently unconsumed: two processes on one Chat relay
 	// durable split its event deliveries, and the symptom is a gateway that
 	// looks healthy and answers half the messages. A local HTTP door has no
@@ -403,10 +404,10 @@ func FromEnv() (*Config, error) {
 		// because a next install whose relay URL failed to render looks the
 		// same. The spec's test-backend section states the same decision.
 		if cfg.InjectListen == "" && cfg.A2ADoorListen == "" {
-			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), A2A_INJECT_LISTEN (the dev-only inject side door)")
+			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), A2A_INJECT_LISTEN (the dev-only inject side door), or A2A_DOOR_LISTEN (the A2A door for agent callers)")
 		}
 	default:
-		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The inject side door (A2A_INJECT_LISTEN) is not a backend in this sense and may sit beside either", strings.Join(armed, ", "))
+		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The side doors (A2A_INJECT_LISTEN, A2A_DOOR_LISTEN) are not backends in this sense and may sit beside either", strings.Join(armed, ", "))
 	}
 	// Fail closed: a door with no token would be reachable by anything that
 	// reaches the listener, and the port-forward path the runner uses is

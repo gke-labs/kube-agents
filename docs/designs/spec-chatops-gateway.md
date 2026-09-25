@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters, and the console adapter); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
 
 ## Purpose
 
@@ -938,8 +938,7 @@ because the chat backend beside it is still good.
 The gateway's ingress for an agent caller: an A2A client (Antigravity, an ADK agent, the MCP
 bridge that fronts Claude, `curl`) that speaks the A2A protocol over HTTP. A second side door
 beside the inject door, built on the same contract, and differing in what it speaks rather
-than in what it may do. The design track behind it is round 3's external agents work; this
-section is the door as `a2a/gateway/a2adoor.go` implements it.
+than in what it may do. This section is the door as `a2a/gateway/a2adoor.go` implements it.
 
 **A side door, again.** The inject door's reasoning holds unchanged. The door holds no bus
 credential, mints no id the bus sees and writes no `authority` block; a verified caller's
@@ -979,7 +978,8 @@ at the door in the protocol's own terms rather than dropped.
 is what a chat user would have read. The rolling progress line (`startTask`'s placeholder, which
 the relay edits) is `status.message`; the state is `submitted` from `TaskStarted`, `working` from
 the first edit, and the terminal state from `TaskTerminal`, whose reason - the executor's
-`reason: <token>` line, verbatim - replaces the line on a failed terminal. Every other post under
+terminal status message, verbatim, which is `reason: <token>` on a failure - replaces the line
+on a terminal that carries one. Every other post under
 the task is an agent message in `history`, after the caller's own. On a completed terminal the
 last post before the terminal edit is the deliverable, and it is the task's one artifact, named
 `result` as the bus names it. `metadata.terminalSource` carries whose word the terminal is, for
@@ -1016,14 +1016,16 @@ built from. The card is the one unauthenticated route, because discovery reads i
 security scheme to present; it discloses the endpoint URL, the scheme and the default
 destination's name, none of which a 401 hides.
 
-**Posture.** Every request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
+**Posture.** Every RPC request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
 `A2A_DOOR_LISTEN` is set, no unauthenticated mode); the caller map is its own file
 (`A2A_DOOR_PRINCIPAL_MAP`); the card advertises `A2A_DOOR_PUBLIC_URL`, which behind a
-port-forward or an ingress is not the listen address. The operator does not render the door
-yet; when it does, it follows the inject door's pattern - an operator-level flag, a loopback
-bind, a ClusterIP Service for the port-forward, a token Secret, the NetworkPolicy edge - and
-the identity classes above are what let it be rendered on an install a customer reaches.
-Until then it is armed by hand on dev and eval installs.
+port-forward or an ingress is not the listen address. The operator renders the door the way
+it renders the inject door, under its own operator-level flag (`A2A_AGENT_DOOR=true`, never a
+CRD field): a loopback bind on its own port, its own one-entry map admitting one caller, a
+token Secret minted once, a ClusterIP Service for the port-forward, and the gateway fence
+under the door's own name, so each door comes and goes with its own flag. The identity
+classes above are what will let it be rendered on an install a customer reaches; until then
+it is a dev and eval door like the other.
 
 ## What stage 2 builds from this doc
 

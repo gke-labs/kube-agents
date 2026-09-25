@@ -209,8 +209,8 @@ backend), and the eval install has none until stage 2 gives it one; the adapter'
 the guard say so in code and in the gateway spec's test-backend section. What that trades away is
 the guard's no-backend refusal, which on a gateway with the door rendered can no longer tell an
 install that wants no real backend from one whose relay URL failed to render. The adapter's
-guard change drops only that refusal, only when the door is rendered, and keeps the two-backend
-refusal. And the door-alone start is not silent: the gateway logs it and the read route reports
+guard change drops only that refusal, only when a door is rendered (the inject door, or the A2A
+door beside it, which shares the exemption), and keeps the two-backend refusal. And the door-alone start is not silent: the gateway logs it and the read route reports
 the armed backend as inject-only, so stage 2's preflight reads the armed backend and fails the
 run as infrastructure when Chat is not the one, before any case grades. The stage-2 change that
 renders the gateway's relay URL adds it to the operator's golden set, which is where a failed
