@@ -26,13 +26,10 @@ const (
 	a2aMethodCancel  = "tasks/cancel"
 	a2aKindTask      = "task"
 	a2aKindMessage   = "message"
-	a2aKindStatus    = "status-update"
-	a2aKindArtifact  = "artifact-update"
 	a2aRoleAgent     = "agent"
 	a2aRoleUser      = "user"
 	a2aPartKindText  = "text"
 	a2aContentType   = "application/json"
-	a2aSSEContent    = "text/event-stream"
 	a2aCardPath      = "/.well-known/agent-card.json"
 	a2aRPCPath       = "/a2a"
 	a2aTextMediaType = "text/plain"
@@ -95,7 +92,6 @@ func rpcFail(id json.RawMessage, code int, message string, data any) rpcResponse
 type a2aSendParams struct {
 	Message       a2aInboundMessage `json:"message"`
 	Configuration *a2aSendConfig    `json:"configuration,omitempty"`
-	Metadata      map[string]any    `json:"metadata,omitempty"`
 }
 
 // a2aInboundMessage is the caller's Message. Metadata is where a caller that
@@ -113,17 +109,17 @@ type a2aInboundMessage struct {
 type a2aSendConfig struct {
 	// Blocking asks message/send to wait for the task's terminal and return
 	// the finished Task, bounded by a2aBlockingWait. Absent, the door
-	// answers as soon as the submission is on the bus.
+	// answers as soon as the submission is on the bus. The card offers
+	// text/plain alone, so acceptedOutputModes is not read.
 	Blocking *bool `json:"blocking,omitempty"`
-	// AcceptedOutputModes is read for completeness and honoured only as
-	// text/plain, which is what the relay renders.
-	AcceptedOutputModes []string `json:"acceptedOutputModes,omitempty"`
 }
 
-// a2aIDParams is the params object of tasks/get and tasks/cancel.
+// a2aIDParams is the params object of tasks/get and tasks/cancel. Metadata
+// is where a client that cannot set headers names itself, as on a send.
 type a2aIDParams struct {
-	ID            string `json:"id"`
-	HistoryLength *int   `json:"historyLength,omitempty"`
+	ID            string         `json:"id"`
+	HistoryLength *int           `json:"historyLength,omitempty"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
 }
 
 // a2aTaskObject is the A2A Task as the door returns it.
@@ -148,19 +144,6 @@ type a2aMessageObject struct {
 	TaskID    string         `json:"taskId,omitempty"`
 	Metadata  map[string]any `json:"metadata,omitempty"`
 	Kind      string         `json:"kind"`
-}
-
-// a2aStatusEvent and a2aArtifactEvent are the two streaming frames, with the
-// `kind` discriminator the protocol puts on them. They embed the library's
-// views, which carry the standard fields.
-type a2aStatusEvent struct {
-	lib.StatusUpdate
-	Kind string `json:"kind"`
-}
-
-type a2aArtifactEvent struct {
-	lib.ArtifactUpdate
-	Kind string `json:"kind"`
 }
 
 // The agent card. Skills are the catalog: destinations this door will route

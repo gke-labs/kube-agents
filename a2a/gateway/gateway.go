@@ -204,8 +204,16 @@ func New(o Options) (*Gateway, error) {
 		// like this, but a `mode: next` install whose relay URL failed to
 		// render looks exactly the same, and the difference between the
 		// two must not be silence.
-		log.Warn("the gateway is running on the inject door alone: no Discord token and no Chat relay are armed, " +
-			"so nothing but the eval door can reach this install (inject-only)")
+		if o.Config.A2ADoorArmed() {
+			log.Warn("the gateway is running on the inject and A2A doors alone: no Discord token and no Chat relay are armed, " +
+				"so nothing but the two doors can reach this install (the read route still reports inject-only)")
+		} else {
+			log.Warn("the gateway is running on the inject door alone: no Discord token and no Chat relay are armed, " +
+				"so nothing but the eval door can reach this install (inject-only)")
+		}
+	} else if backend == a2aBackend {
+		log.Warn("the gateway is running on the A2A door alone: no Discord token and no Chat relay are armed, " +
+			"so nothing but the A2A door can reach this install")
 	}
 	// gchat resolves identity from the Google-asserted email, not from the
 	// map — an empty map is only a lockout on the backends that use one. The

@@ -154,7 +154,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 			log.Error("inject door", "err", err)
 			return err
 		}
-		doors = append(doors, gateway.DoorSpec{Name: "inject", Prefix: "inject:", Door: door})
+		doors = append(doors, gateway.InjectDoorSpec(door))
 	}
 	// The A2A door is the same kind of thing for an agent caller: armed
 	// beside either backend or alone, routed by its own key prefix, its
@@ -170,7 +170,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 			log.Error("A2A door", "err", err)
 			return err
 		}
-		doors = append(doors, gateway.DoorSpec{Name: "a2a", Prefix: "a2a:", Door: door})
+		doors = append(doors, gateway.A2ADoorSpec(door))
 	}
 
 	adapter, err = composeAdapters(cfg, adapter, doors, natsOpts, log)

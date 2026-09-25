@@ -52,6 +52,17 @@ type DoorSpec struct {
 	Door   SideDoor
 }
 
+// InjectDoorSpec and A2ADoorSpec are the two doors' specs, built here so the
+// prefix each door routes on is the constant the door's own keys carry and
+// not a second spelling of it in the main package.
+func InjectDoorSpec(door *InjectAdapter) DoorSpec {
+	return DoorSpec{Name: injectBackend, Prefix: injectKeyPrefix, Door: door}
+}
+
+func A2ADoorSpec(door *A2ADoor) DoorSpec {
+	return DoorSpec{Name: a2aBackend, Prefix: a2aKeyPrefix, Door: door}
+}
+
 // sideDoorAdapter pairs a real backend (or the mux in front of several) with
 // the doors. It is an Adapter like any half, so the gateway drives it without
 // knowing there are several.
@@ -67,7 +78,7 @@ type sideDoorAdapter struct {
 // the door #1660's answer. Kept for the callers that have one door; the
 // general form is WithSideDoors.
 func WithSideDoor(primary Adapter, door *InjectAdapter, log *slog.Logger) Adapter {
-	return WithSideDoors(primary, []DoorSpec{{Name: injectBackend, Prefix: injectKeyPrefix, Door: door}}, log)
+	return WithSideDoors(primary, []DoorSpec{InjectDoorSpec(door)}, log)
 }
 
 // WithSideDoors puts every door beside the primary. With no primary and one

@@ -242,13 +242,13 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 			if tc.primary != nil {
 				primary = tc.primary
 			}
-			doors := []gateway.DoorSpec{{Name: "inject", Prefix: "inject:", Door: door}}
+			doors := []gateway.DoorSpec{gateway.InjectDoorSpec(door)}
 			if tc.cfg.A2ADoorArmed() {
 				a2a, err := gateway.NewA2ADoor(tc.cfg.A2ADoorListen, tc.cfg.A2ADoorToken, gateway.A2ADoorOptions{DefaultAddressee: "platform"})
 				if err != nil {
 					t.Fatal(err)
 				}
-				doors = append(doors, gateway.DoorSpec{Name: "a2a", Prefix: "a2a:", Door: a2a})
+				doors = append(doors, gateway.A2ADoorSpec(a2a))
 			}
 			a, err := composeAdapters(tc.cfg, primary, doors, nil, slog.Default())
 			if err != nil {

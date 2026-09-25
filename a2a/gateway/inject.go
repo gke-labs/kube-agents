@@ -644,17 +644,23 @@ func NewInjectAdapter(listen, token string, firstEventGrace time.Duration, log *
 // oracle for a caller who can time it. The scheme is matched
 // case-insensitively, as RFC 7235 requires.
 func (a *InjectAdapter) authorized(w http.ResponseWriter, r *http.Request) bool {
+	return bearerAuthorized(w, r, a.token, "the inject door requires a bearer token")
+}
+
+// bearerAuthorized is the one bearer-token check both doors run: constant
+// time on the credential, case-insensitive on the scheme, and a 401 whose
+// body says a token is required and never whether one was presented or how
+// it was wrong.
+func bearerAuthorized(w http.ResponseWriter, r *http.Request, token, refusal string) bool {
 	header := r.Header.Get(authorizationHeader)
 	if len(header) > len(bearerScheme) && strings.EqualFold(header[:len(bearerScheme)], bearerScheme) {
 		presented := strings.TrimSpace(header[len(bearerScheme):])
-		if subtle.ConstantTimeCompare([]byte(presented), []byte(a.token)) == 1 {
+		if subtle.ConstantTimeCompare([]byte(presented), []byte(token)) == 1 {
 			return true
 		}
 	}
-	// No detail: the refusal says a token is required, never whether one was
-	// presented or how it was wrong.
 	w.Header().Set("WWW-Authenticate", "Bearer")
-	injectError(w, http.StatusUnauthorized, "the inject door requires a bearer token")
+	injectError(w, http.StatusUnauthorized, refusal)
 	return false
 }
 
