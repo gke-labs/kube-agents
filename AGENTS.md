@@ -442,8 +442,7 @@ Pushing fixes is also what makes the pull request body stale. Fixes that answer 
 live test you re-ran to confirm them, belong in **Self-Review** and **Live validation** — folded
 into what is already there, per "Keep these sections current, not chronological" above. Do it once
 the last `/review` pass has settled, for the reason the next paragraph gives about threads: a fresh
-review brings fresh findings, and folding them in twice is the same wasted round. Nothing else in
-this workflow reopens the body.
+review brings fresh findings, and folding them in twice is the same wasted round.
 
 **Then resolve the conversations.** Pull Request Hygiene says why an open thread both blocks the
 merge and keeps the change counted as its author's outstanding work; what belongs here is the

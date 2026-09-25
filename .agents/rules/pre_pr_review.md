@@ -7,10 +7,10 @@ paths:
 
 # Pre-PR review mechanics
 
-[`AGENTS.md`](../../AGENTS.md) owns the three rules below — that adversarial self-review and live
+[`AGENTS.md`](../../AGENTS.md) owns the rules below — that adversarial self-review and live
 validation are required before opening a pull request, that each is recorded in the pull request
 body, and that a bug fix must name what stops it recurring. This file holds the mechanics of
-carrying them out, and what the automated review shares with the first of them. Change those rules
+carrying them out, and what the automated review shares with the self-review. Change those rules
 in `AGENTS.md`; change how they are done here.
 
 ## Adversarial self-review
@@ -101,6 +101,9 @@ in `AGENTS.md` under Pull Request Hygiene.
   section is not an answer.
 
 ## Preventing recurrence on a bug fix
+
+The rule is in `AGENTS.md` under Pull Request Hygiene. Which pull requests it covers, and what
+the template's section owes, are here.
 
 A pull request that fixes a bug — every `fix` type, scoped or not, and any other that repairs a
 defect — fills in the template's **Bug Fix: Preventing Recurrence** section. Any other pull

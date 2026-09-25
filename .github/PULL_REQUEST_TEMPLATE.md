@@ -44,7 +44,8 @@ Otherwise write "Not a bug fix."
 
 If nothing automated can catch it, say why and what stands in for it.
 
-Full contract: .agents/rules/pre_pr_review.md.
+Full contract: AGENTS.md, "Pull Request Hygiene", plus .agents/rules/pre_pr_review.md
+for the mechanics.
 -->
 
 -

@@ -225,11 +225,11 @@ the live-validation bullet under Pull Request Hygiene with `.agents/rules/pre_pr
 Testing — and `pre_pr_review.md` for the third. What this angle adds is that they are claims
 the tree can check: every path, script, or command the Testing section credits must exist and do
 what it is credited with, and a guard or test the description says covers a case must reach that
-case. A claim the diff does not support is the finding "What any reviewer reads first" describes,
-and so is a recurrence section left empty or answered "Not a bug fix" on a `fix`. One exception: on
-a preflight re-run of your own branch the Self-Review is the previous round's dispositions, and
-`review-preflight` §7 says a fresh pass is not handed those — read it on a reviewer's or a bot's
-pass, withhold it on a re-run of your own.
+case. A claim the diff does not support is the finding "What any reviewer reads first" describes;
+a recurrence section left empty or answered "Not a bug fix" on a `fix` is the one
+`pre_pr_review.md` describes. One exception: on a preflight re-run of your own branch the
+Self-Review is the previous round's dispositions, and `review-preflight` §7 says a fresh pass is
+not handed those — read it on a reviewer's or a bot's pass, withhold it on a re-run of your own.
 
 Then check that the intent is actually tested: for each behaviour the change claims, name the test
 that would fail if that behaviour regressed. Where there is none, the candidate is the untested
