@@ -108,7 +108,7 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # fixture_drift condition, the digest carries one line of it, and a scan
 # that could check nothing is said once and is never a drift. Its own job
 # rather than a step gated on the top-of-hour tick, because it needs kubectl
-# and gke-gcloud-auth-plugin, runs thirty projects for a few minutes, and
+# and gke-gcloud-auth-plugin, runs every mapped project for a few minutes, and
 # must never delay the 15-minute verdict: the tick reads whatever scan is
 # published, and a late one is "stale" in health.json. Two crons fire at the
 # top of the hour; each run's `github.event.schedule` sends it to one job.

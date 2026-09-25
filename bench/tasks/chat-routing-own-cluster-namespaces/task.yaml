@@ -1,0 +1,21 @@
+# A simple eval that should run everywhere: it needs nothing but the cluster
+# the agent runs in.
+id: chat-routing-own-cluster-namespaces
+name: List the namespaces of the agent's own cluster
+prompt: >-
+  Which namespaces exist in the Kubernetes cluster you are running in?
+# The judge's reference; verification_spec below is what passes or fails the case.
+expected_output: >-
+  The cluster's namespaces, including kubeagents-system and kube-system.
+infrastructure:
+  deployer: noop
+validated: false
+domain: chat-and-routing
+owner: maintainers
+verification_spec:
+  - name: the-answer-names-the-agents-own-namespace
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["kubeagents-system", "kube-system"]
