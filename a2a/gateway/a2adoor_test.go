@@ -43,6 +43,13 @@ type a2aRig struct {
 
 func startA2ARig(t *testing.T) *a2aRig {
 	t.Helper()
+	return startA2ARigWith(t, func(door *A2ADoor) Adapter { return door })
+}
+
+// startA2ARigWith lets a test choose what the gateway drives: the door
+// itself, or the door under the composite the shipped gateway builds.
+func startA2ARigWith(t *testing.T, stack func(*A2ADoor) Adapter) *a2aRig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -96,7 +103,7 @@ func startA2ARig(t *testing.T) *a2aRig {
 		FirstEventGrace:         a2aTestGrace,
 		AttributionSalt:         salt,
 	}
-	g, err := New(Options{Client: client, Adapter: door, Config: cfg})
+	g, err := New(Options{Client: client, Adapter: stack(door), Config: cfg})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -575,5 +582,105 @@ func TestA2AConfigGuards(t *testing.T) {
 	}
 	if cfg.A2ADoorPrincipalMapPath != defaultA2ADoorPrincipalMapPath {
 		t.Errorf("map path = %q", cfg.A2ADoorPrincipalMapPath)
+	}
+}
+
+// TestA2AFollowUpOnARunningTaskReturnsTheGatewaysReply: a message/send that
+// names the caller's running task is a steer, which the gateway answers
+// with a notice and no new task. The door returns that notice as a Message
+// rather than an error, and the steer is on the bus.
+func TestA2AFollowUpOnARunningTaskReturnsTheGatewaysReply(t *testing.T) {
+	r := startA2ARig(t)
+	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("long job", "m-1", "ctx-1", false)))
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	r.getUntil(t, a2aTestCaller, task.ID, "the working event to reach the door", func(task a2aTaskObject) bool {
+		return task.Status.State == lib.StateWorking
+	})
+
+	params := sendParams("also check the PDBs", "m-2", "ctx-1", false)
+	params["message"].(map[string]any)["taskId"] = task.ID
+	resp := r.rpc(t, a2aTestCaller, a2aMethodSend, params)
+	if resp.Error != nil {
+		t.Fatalf("a follow-up on a running task was refused: %d %s", resp.Error.Code, resp.Error.Message)
+	}
+	raw, _ := json.Marshal(resp.Result)
+	var reply a2aMessageObject
+	if err := json.Unmarshal(raw, &reply); err != nil || reply.Kind != a2aKindMessage || reply.Role != a2aRoleAgent {
+		t.Fatalf("result = %s, want an agent Message", raw)
+	}
+	if text := joinTextParts(reply.Parts); !strings.Contains(text, "steer") {
+		t.Errorf("reply text = %q, want the gateway's steering notice", text)
+	}
+	// The steer reached the bus as a second message on the task.
+	waitFor(t, "the steer on the in subject", func() bool {
+		n := 0
+		for _, env := range inSubjectEnvelopes(t, r.url, "platform") {
+			if env.Kind == lib.KindMessage && env.TaskID == task.ID {
+				n++
+			}
+		}
+		return n >= 2
+	})
+	// And the task's history carries the notice too.
+	got := r.getUntil(t, a2aTestCaller, task.ID, "the notice in the task history", func(task a2aTaskObject) bool {
+		for _, m := range task.History {
+			if strings.Contains(joinTextParts(m.Parts), "steer") {
+				return true
+			}
+		}
+		return false
+	})
+	if got.Status.State != lib.StateWorking {
+		t.Errorf("the steer changed the task's state to %q", got.Status.State)
+	}
+}
+
+// TestA2AMetadataCallerReachesGetAndCancel: the client that cannot set
+// headers can poll and cancel what it started.
+func TestA2AMetadataCallerReachesGetAndCancel(t *testing.T) {
+	r := startA2ARig(t)
+	params := sendParams("hello from metadata", "m-1", "", false)
+	params["message"].(map[string]any)["metadata"] = map[string]any{a2aCallerMetadataKey: a2aTestCaller}
+	task := taskOf(t, r.rpc(t, "", a2aMethodSend, params))
+	got := r.rpc(t, "", a2aMethodGet, map[string]any{"id": task.ID, "metadata": map[string]any{a2aCallerMetadataKey: a2aTestCaller}})
+	if got.Error != nil {
+		t.Fatalf("tasks/get with a metadata caller: %+v", got.Error)
+	}
+	if bare := r.rpc(t, "", a2aMethodGet, map[string]any{"id": task.ID}); bare.Error == nil || bare.Error.Code != a2aErrAuthenticationFail {
+		t.Errorf("tasks/get with no caller at all: %+v", bare)
+	}
+	if colon := r.rpc(t, "alice:x", a2aMethodGet, map[string]any{"id": task.ID}); colon.Error == nil || colon.Error.Code != rpcInvalidParams {
+		t.Errorf("a caller with a colon was accepted: %+v", colon)
+	}
+}
+
+// TestA2ADoorUnderTheCompositeStillSeesItsTasks: the shipped topology. The
+// door sits under WithSideDoors beside a chat backend, and the gateway's
+// observers reach it only through the composite's prefix routing. A send
+// through that stack still returns the task, and the chat backend sees no
+// post for it.
+func TestA2ADoorUnderTheCompositeStillSeesItsTasks(t *testing.T) {
+	primary := newFakeAdapter()
+	r := startA2ARigWith(t, func(door *A2ADoor) Adapter {
+		return WithSideDoors(primary, []DoorSpec{A2ADoorSpec(door)}, nil)
+	})
+	go func() {
+		origin := r.awaitTask(t, "platform")
+		r.complete(t, origin, "through the composite")
+	}()
+	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("composite?", "m-1", "", true)))
+	if task.Status.State != lib.StateCompleted || len(task.Artifacts) != 1 || joinTextParts(task.Artifacts[0].Parts) != "through the composite" {
+		t.Fatalf("task through the composite = %+v", task)
+	}
+	primary.mu.Lock()
+	defer primary.mu.Unlock()
+	for _, p := range primary.posts {
+		if strings.HasPrefix(p.Conversation, a2aKeyPrefix) {
+			t.Errorf("the chat backend received a post for the door's conversation: %+v", p)
+		}
 	}
 }

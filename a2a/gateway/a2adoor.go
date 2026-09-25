@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -100,7 +99,7 @@ const (
 	a2aMaxTasks         = 4096
 	a2aMaxConversations = 1024
 	a2aMaxPostsPerTask  = 256
-	a2aMaxLoosePosts    = 64
+	a2aMaxTurnPosts     = 64
 	a2aMaxSubmissions   = injectSeenCap
 
 	// a2aSubmitWait bounds how long message/send waits for the gateway to
@@ -152,8 +151,8 @@ type a2aTask struct {
 }
 
 // a2aConversation is one caller's context: the turn accounting message/send
-// needs, and the posts that arrived with no task active (a reply, a refusal,
-// a status answer), which are the Message a taskless turn returns.
+// needs, and the posts the turn in flight produced, which are the Message a
+// turn that started no task returns.
 type a2aConversation struct {
 	key       string
 	caller    string
@@ -169,7 +168,13 @@ type a2aConversation struct {
 	// cleared at TaskTerminal. tasks is every task id in order.
 	active *a2aTask
 	tasks  []string
-	loose  []a2aPost
+	// turnPosts is every post the gateway made during the turn in flight,
+	// whatever task it was filed under, reset when a turn is claimed. It is
+	// what a turn that started no task answers with: a steer's
+	// acknowledgement, a status answer, a cancel's notice, a refusal. Posts
+	// under a running task are also that task's, so a follow-up on it is
+	// answered from here while the task keeps them in its history.
+	turnPosts []a2aPost
 	// pending is the inbound message of the turn in flight, which
 	// TaskStarted copies onto the task it mints.
 	pending lib.Message
@@ -178,7 +183,7 @@ type a2aConversation struct {
 // a2aPrior is a conversation's counters read before a turn is handed over,
 // so the wait for its answer cannot mistake an earlier turn's for it.
 type a2aPrior struct {
-	turns, drops, cancels, tasks, loose int
+	turns, drops, cancels, tasks int
 }
 
 // a2aOutcome is what a submission resolved to, kept by caller and message id
@@ -218,7 +223,10 @@ type A2ADoor struct {
 
 	handlerMu sync.RWMutex
 	handler   func(InboundMessage)
-	probe     ConversationProbe
+	// probe is the gateway's ConversationProbe (ProbeSink), set before Run
+	// and not read yet: the read that consults it, for a task the door
+	// stopped holding across a restart, is a later change.
+	probe ConversationProbe
 
 	// listener, when set, is an already-bound listener Run serves on. Test
 	// injection only.
@@ -287,9 +295,8 @@ func NewA2ADoor(listen, token string, o A2ADoorOptions) (*A2ADoor, error) {
 	}, nil
 }
 
-// SetProbe receives the gateway's ConversationProbe (ProbeSink). Held for
-// the read side; tasks/get answers from the door's own record today and the
-// probe is what a later change reads when that record is gone.
+// SetProbe receives the gateway's ConversationProbe (ProbeSink); see the
+// field.
 func (d *A2ADoor) SetProbe(probe ConversationProbe) {
 	d.probe = probe
 }
@@ -342,20 +349,9 @@ func (d *A2ADoor) Run(ctx context.Context, handler func(InboundMessage)) error {
 	}
 }
 
-// authorized is the inject door's check, verbatim in behaviour: constant
-// time on the credential, case-insensitive on the scheme, and a refusal that
-// says a token is required and nothing about what was presented.
+// authorized is the doors' shared bearer check (bearerAuthorized).
 func (d *A2ADoor) authorized(w http.ResponseWriter, r *http.Request) bool {
-	header := r.Header.Get(authorizationHeader)
-	if len(header) > len(bearerScheme) && strings.EqualFold(header[:len(bearerScheme)], bearerScheme) {
-		presented := strings.TrimSpace(header[len(bearerScheme):])
-		if subtle.ConstantTimeCompare([]byte(presented), []byte(d.token)) == 1 {
-			return true
-		}
-	}
-	w.Header().Set("WWW-Authenticate", "Bearer")
-	injectError(w, http.StatusUnauthorized, "the A2A door requires a bearer token")
-	return false
+	return bearerAuthorized(w, r, d.token, "the A2A door requires a bearer token")
 }
 
 // handleCard serves the agent card. Unauthenticated, deliberately: A2A
@@ -483,6 +479,11 @@ func callerOf(r *http.Request, metadata map[string]any) (string, *rpcError) {
 	}
 	if err := injectFieldWellFormed("caller", caller, a2aMaxCallerRunes); err != nil {
 		return "", &rpcError{Code: rpcInvalidParams, Message: err.Error()}
+	}
+	// No colon: the caller is a segment of the conversation key, and a
+	// colon in it would let two callers spell one key.
+	if strings.Contains(caller, ":") {
+		return "", &rpcError{Code: rpcInvalidParams, Message: "the caller must not contain a colon"}
 	}
 	return caller, nil
 }
@@ -638,7 +639,7 @@ func (d *A2ADoor) get(r *http.Request, req rpcRequest) rpcResponse {
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return rpcFail(req.ID, rpcInvalidParams, "params: "+err.Error(), nil)
 	}
-	caller, rerr := callerOf(r, nil)
+	caller, rerr := callerOf(r, params.Metadata)
 	if rerr != nil {
 		return rpcFail(req.ID, rerr.Code, rerr.Message, nil)
 	}
@@ -664,7 +665,7 @@ func (d *A2ADoor) cancel(r *http.Request, handler func(InboundMessage), req rpcR
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return rpcFail(req.ID, rpcInvalidParams, "params: "+err.Error(), nil)
 	}
-	caller, rerr := callerOf(r, nil)
+	caller, rerr := callerOf(r, params.Metadata)
 	if rerr != nil {
 		return rpcFail(req.ID, rerr.Code, rerr.Message, nil)
 	}
@@ -715,7 +716,8 @@ func (d *A2ADoor) claimTurn(ctx context.Context, key, caller, contextID string, 
 		if !conv.busy {
 			conv.busy = true
 			conv.pending = user
-			prior := a2aPrior{turns: conv.turns, drops: conv.drops, cancels: conv.cancels, tasks: len(conv.tasks), loose: len(conv.loose)}
+			conv.turnPosts = nil
+			prior := a2aPrior{turns: conv.turns, drops: conv.drops, cancels: conv.cancels, tasks: len(conv.tasks)}
 			d.mu.Unlock()
 			return prior, true
 		}
@@ -779,8 +781,8 @@ func (d *A2ADoor) awaitTurn(ctx context.Context, key string, prior a2aPrior, dea
 				return "", nil, &rpcError{Code: a2aErrAuthenticationFail,
 					Message: "the door's principal map does not carry this caller; nothing was started"}
 			}
-			if len(conv.loose) > prior.loose {
-				reply := d.messageObjectLocked(conv, conv.loose[prior.loose:])
+			if len(conv.turnPosts) > 0 {
+				reply := d.messageObjectLocked(conv, conv.turnPosts)
 				d.mu.Unlock()
 				return "", reply, nil
 			}
@@ -809,8 +811,8 @@ func (d *A2ADoor) awaitCancel(ctx context.Context, key string, prior a2aPrior, d
 		}
 		if conv.turns > prior.turns {
 			note := "the turn ended without a cancel reaching the bus"
-			if len(conv.loose) > prior.loose {
-				note += ": " + conv.loose[len(conv.loose)-1].text
+			if len(conv.turnPosts) > 0 {
+				note += ": " + conv.turnPosts[len(conv.turnPosts)-1].text
 			}
 			d.mu.Unlock()
 			return false, note
@@ -932,28 +934,30 @@ func (d *A2ADoor) mintMessageIDLocked() string {
 
 // Post records a message the gateway sent. Under an active task the first
 // post is the rolling line (startTask's placeholder) and the rest are the
-// task's messages; with no task active it is a loose reply on the
-// conversation.
+// task's messages. Every post also goes on the turn in flight, which is
+// what a turn that started no task answers with.
 func (d *A2ADoor) Post(conversation, text string) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	conv := d.conversationLocked(conversation)
 	id := d.mintMessageIDLocked()
 	text = truncateRunes(text, injectMaxEntryBytes)
+	post := a2aPost{id: id, text: text}
 	if task := conv.active; task != nil {
 		if task.lineID == "" {
 			task.lineID, task.line = id, text
 		} else {
-			task.posts = append(task.posts, a2aPost{id: id, text: text})
+			task.posts = append(task.posts, post)
 			if len(task.posts) > a2aMaxPostsPerTask {
 				task.posts = task.posts[1:]
 			}
 		}
 		task.updated = time.Now()
-	} else {
-		conv.loose = append(conv.loose, a2aPost{id: id, text: text})
-		if len(conv.loose) > a2aMaxLoosePosts {
-			conv.loose = conv.loose[1:]
+	}
+	if conv.busy {
+		conv.turnPosts = append(conv.turnPosts, post)
+		if len(conv.turnPosts) > a2aMaxTurnPosts {
+			conv.turnPosts = conv.turnPosts[1:]
 		}
 	}
 	d.wakeLocked()
@@ -1149,8 +1153,8 @@ func (d *A2ADoor) taskObjectLocked(task *a2aTask) a2aTaskObject {
 	}
 }
 
-// messageObjectLocked renders loose posts as one agent Message. Caller holds
-// d.mu.
+// messageObjectLocked renders a turn's posts as one agent Message. Caller
+// holds d.mu.
 func (d *A2ADoor) messageObjectLocked(conv *a2aConversation, posts []a2aPost) *a2aMessageObject {
 	texts := make([]string, 0, len(posts))
 	for _, p := range posts {
