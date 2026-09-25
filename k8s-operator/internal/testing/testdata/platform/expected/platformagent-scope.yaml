@@ -999,7 +999,7 @@ spec:
               memory: 1Gi
             requests:
               cpu: 500m
-              memory: 256Mi
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

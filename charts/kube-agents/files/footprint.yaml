@@ -56,7 +56,7 @@ operatorRendered:
   credentialProxy:
     requests:
       cpu: 500m
-      memory: 256Mi
+      memory: 512Mi
       ephemeral-storage: 2Gi
     limits:
       cpu: "1"
@@ -64,7 +64,7 @@ operatorRendered:
       ephemeral-storage: 2Gi
     cpuMillisRequest: 500
     cpuMillisLimit: 1000
-    memoryBytesRequest: 268435456
+    memoryBytesRequest: 536870912
     memoryBytesLimit: 1073741824
     ephemeralStorageBytesRequest: 2147483648
     ephemeralStorageBytesLimit: 2147483648

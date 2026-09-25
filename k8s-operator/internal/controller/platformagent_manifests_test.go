@@ -1364,12 +1364,14 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	// Pinned here as well as in the goldens: a golden regeneration blesses
 	// whatever the builder renders, so a request that drifted back down would
 	// otherwise pass every test. 500m is what lets a mint finish inside its
-	// five-second timeouts while an evicted pod's replacement warms up.
+	// five-second timeouts while an evicted pod's replacement warms up, and
+	// 512Mi is the memory Autopilot admits a 500m pod at, declared so the
+	// rendered request is the admitted one on both cluster modes.
 	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
 		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
 	}
-	if got := container.Resources.Requests.Memory().String(); got != "256Mi" {
-		t.Errorf("expected the proxy memory request left at 256Mi, got %s", got)
+	if got := container.Resources.Requests.Memory().String(); got != "512Mi" {
+		t.Errorf("expected a 512Mi memory request on the proxy container, got %s", got)
 	}
 	if got := container.Resources.Limits.Cpu().String(); got != "1" {
 		t.Errorf("expected the proxy CPU limit left at 1, got %s", got)

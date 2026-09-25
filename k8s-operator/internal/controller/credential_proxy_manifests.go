@@ -83,15 +83,18 @@ const (
 	// while the pod warms. On Standard the ceiling is the 1-CPU limit and the
 	// request is scheduling weight, which matters only on a contended node.
 	//
-	// Memory is lower than the sidecar's, which sized for the event watcher's
-	// informer caches. Nothing here holds cluster state; the memory goes on
-	// Envoy and one Python process per in-flight command. Autopilot enforces a
-	// CPU:memory ratio between 1:1 and 1:6.5 GiB per vCPU and raises the
-	// smaller request to meet it, so there this pod is admitted at 512Mi
-	// whatever this line says; that is accepted, as it is for LiteLLM in the
-	// chart's values, rather than raised for Standard, which does not need it.
+	// Memory is set by the CPU. Nothing here holds cluster state; the memory
+	// goes on Envoy and one Python process per in-flight command, and 256Mi
+	// covered that. Autopilot enforces a CPU:memory ratio between 1:1 and 1:6.5
+	// GiB per vCPU and raises the smaller request to meet it, so a 500m pod is
+	// admitted at 512Mi whatever this line says. The request is declared at
+	// that floor rather than left below it so the manifest the operator writes
+	// is the pod the cluster admits on both Standard and Autopilot: the chart's
+	// footprint file and its quota preflight sum this line, and a namespace
+	// quota sized to a 256Mi footprint would pass the preflight and then refuse
+	// the pod on Autopilot for the 256Mi the admission added.
 	credentialProxyCPURequest    = "500m"
-	credentialProxyMemoryRequest = "256Mi"
+	credentialProxyMemoryRequest = "512Mi"
 )
 
 // credentialProxyFederation returns the federation config when it is complete.
