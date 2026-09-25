@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
 
 ## Purpose
 
@@ -512,7 +512,8 @@ customer asks, with the mapping table as a hard prerequisite.
 
 The adapter interface is what makes the pick cheap: inbound message with verified sender,
 conversation and thread identity, roster read, post-to-conversation, `openDirect`. Five
-operations, normalized. If the Discord adapter leaks Discord-isms through that interface,
+operations, normalized. The console adapter is the third implementation and the smallest;
+see its own section. If the Discord adapter leaks Discord-isms through that interface,
 that's a bug in the interface, and better to learn it on the throwaway backend.
 
 ### The inject backend (added 9/17)
@@ -878,6 +879,153 @@ plus admin approval, so the fallback is refused too. The adapter therefore resol
 email to the immutable `users/{id}` it learned from that person's own event, which
 `findDirectMessage` does accept; a person who has never spoken cannot be opened. Ships
 as the primitive, unused, like the other backends.
+
+## The console adapter (added 9/23)
+
+The web console's chat door. Not a chat product's ingress: the browser is a bus client
+already (the `web` read surface), so the door is on the bus too, and the identity story is
+the one every other writer here has.
+
+**Transport.** Core NATS, no stream. The browser publishes a frame -
+`{"messageId","text","kind"}`, `kind` defaulting to `text` - to `chat.console.<token>.in`;
+the adapter posts the gateway's own notices back as `{"messageId","text","edit"}` on
+`chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus
+protocol, and the payload spec's agreement rules do not apply to it. The answers never
+travel here. They stream through TASKS, which the console page renders directly, so a lost
+`.out` frame across a reconnect costs a notice and never an answer. An `.in` frame published
+while no gateway subscription is live (the gateway restarting, or the NATS config not yet
+rolled) is dropped by core NATS without trace; the browser sees only a pending entry that
+never attaches. A receipt frame on `.out` is the natural follow-up for the page.
+
+**Conversation.** `console:<token>`, one dot-free DNS-1123 label per browser tab, kind `dm`.
+The gateway treats it like any DM: one session per conversation, spawned on the first turn,
+reaped at the idle TTL.
+
+**Identity.** The `console` NATS user is the only principal granted publish on
+`chat.console.*.in` (spec-nats-deployment.md, the console surface). So a frame there is from
+`console`, and the adapter reports that as the author; the gateway resolves it to the fixed
+principal `nats:console`, `verifiedBy: nats-grant`, with no mapping table - the mechanism is
+the connect-time grant, which is the same subject-derived identity `identity` was retired in
+favour of. That resolution is bound to the console conversation: the string `console`
+arriving on a Discord conversation is an unmapped id and drops. One shared principal is the
+posture until the account split gives each person a credential, at which point the entry
+becomes one inbound subject per principal and nothing else here changes.
+
+**Backend per message.** One gateway process runs its configured chat backend and the console
+together, through a mux that dispatches `post`/`edit`/`roster` on the conversation prefix.
+The console adapter stamps its own backend on every message it delivers, the way the inject
+door does, so `authority.requester.backend`, the drop notice and verification name the console
+rather than the configured backend. Where there is no message to ask (the relay holding a
+session record), the `console:` prefix answers the same question. `openDirect` takes a bare
+user id and goes to the configured backend. With no real backend, as on an inject-only eval
+install, the console is the only chat backend and runs without a mux.
+
+The inject door, when armed, sits beside the mux rather than inside it, for the reason in "A
+side door, not a fourth backend" above: the gateway finds the door's probe and observers by
+type assertion on the top of the adapter stack, and the mux implements none of them. The
+console runs whenever the gateway runs, so an inject-only gateway also exits when the console
+adapter does.
+
+**Bounds.** A frame's text is capped at 16 KiB; over it, the frame is refused with a notice
+naming the cap. Empty, malformed and mis-shaped frames drop with a log line each, as does a
+frame whose `kind` is anything but `text`. A NATS render that predates the console identity,
+or a NATS pod not yet rolled onto the new one, refuses the adapter's subscription
+asynchronously; the adapter logs that with the remedy rather than boot-failing,
+because the chat backend beside it is still good.
+
+## The A2A door (added 9/24)
+
+The gateway's ingress for an agent caller: an A2A client (Antigravity, an ADK agent, the MCP
+bridge that fronts Claude, `curl`) that speaks the A2A protocol over HTTP. A second side door
+beside the inject door, built on the same contract, and differing in what it speaks rather
+than in what it may do. This section is the door as `a2a/gateway/a2adoor.go` implements it.
+
+**A side door, again.** The inject door's reasoning holds unchanged. The door holds no bus
+credential, mints no id the bus sees and writes no `authority` block; a verified caller's
+message becomes an `InboundMessage` into `handleInbound`, and from there the turn is a chat
+turn - routed by the same matcher, subject to the same first-event grace, relayed back through
+the same `post`/`edit`. It sits beside the mux with the inject door, under the composite that
+forwards the gateway's probe and observers by conversation prefix, and it is not counted by the
+one-real-backend guard for the reason the inject door is not. Either door alone starts a
+gateway; with both doors and no real backend the default attribution is the inject door's, and
+every message through either stamps its own backend.
+
+**Wire.** JSON-RPC 2.0 over HTTP at `/a2a`, and the agent card at
+`/.well-known/agent-card.json`. Four methods:
+
+- `message/send` is a turn. The door answers with the A2A `Task` once the submission is on the
+  bus (`TaskObserver.TaskAccepted`, the inject door's rule: a caller is never handed an id whose
+  terminal cannot come), or with the gateway's reply as an A2A `Message` when the turn started
+  no task (a status answer, a steer, a refusal). `configuration.blocking: true` holds the call
+  until the task's terminal, bounded, which is the one-call `curl` demo. `message.taskId` names
+  a running task of the caller's own and lands the text on its conversation, where the gateway
+  treats it as a steer. `message.messageId` is the dedupe key: a retry after a dropped
+  connection is answered with the task the first attempt started, and starts nothing.
+- `tasks/get` returns the `Task` as the door holds it. Scoped to the caller: a task another
+  caller started is not found rather than forbidden, so the door confirms no id it will not
+  serve.
+- `tasks/cancel` is a cancel turn on the task's conversation - the same `kind: cancel` envelope
+  the inject door's cancel route and the chat path's `stop` publish - answered once the cancel is
+  on the bus (`TaskObserver.CancelPublished`) with the `Task` as it stands. The executor decides
+  when the task is canceled; the client polls `tasks/get` for that terminal as for any other.
+- `message/stream` is refused as unsupported and the card says `streaming: false`. It lands
+  next, as SSE frames from the same observer hooks.
+
+Only text parts are accepted. A data or file part has no home on a chat turn, so it is refused
+at the door in the protocol's own terms rather than dropped.
+
+**The Task object** is assembled from what the relay posted on the door's conversation, which
+is what a chat user would have read. The rolling progress line (`startTask`'s placeholder, which
+the relay edits) is `status.message`; the state is `submitted` from `TaskStarted`, `working` from
+the first edit, and the terminal state from `TaskTerminal`, whose reason - the executor's
+terminal status message, verbatim, which is `reason: <token>` on a failure - replaces the line
+on a terminal that carries one. Every other post under
+the task is an agent message in `history`, after the caller's own. On a completed terminal the
+last post before the terminal edit is the deliverable, and it is the task's one artifact, named
+`result` as the bus names it. `metadata.terminalSource` carries whose word the terminal is, for
+the reason the inject door's read route carries it. A2A clients read exactly `status`,
+`artifacts` and `history`, so nothing here is invented for them.
+
+**Conversation.** `a2a:<caller>:<contextId>`, kind `dm`. The caller is part of the key so two
+callers naming the same `contextId` do not share a conversation; a caller that sends none is
+minted one and reads it back on the `Task`. `Roster` is the caller alone, complete;
+`openDirect` returns the caller's last conversation, as on the inject door.
+
+**Identity, first version: the eval class.** The caller names itself - the `X-A2A-Caller` header,
+or `message.metadata.caller` for a client that cannot set headers - and is resolved through the
+door's **own** principal map at the prefixed key `a2a:<caller>`, whose value must be an eval
+identity. The three refusals are the inject door's, and for the same reason: the door takes its
+caller from the request, so the map is the only thing between a token holder and a principal of
+their choosing. An unmapped or unnamed caller is refused with a JSON-RPC error and starts nothing;
+nothing is defaulted. `verifiedBy` is `a2a-bearer`, its own value, so an external agent's
+submission and an eval harness's are distinguishable downstream even though both resolve into
+the eval namespace today.
+
+That is the demo answer and not the product answer. The developer class (an ID token for the
+person whose harness is calling, audience this install's door, principal the same email the
+Google Chat adapter carries) and the unattended class (an organisation's service identity,
+read-only against protected targets) arrive as verifiers beside this map, never as entries in
+it, and each gets its own `verifiedBy`. Validating a token at the door is not the per-user
+token brokerage the permission model declined: the door holds an audience and an allowlist,
+never a refresh token.
+
+**The card is the catalog.** One skill per destination this door routes to, which today is the
+gateway's default addressee. When profiles land the list is rendered from `DIRECTORY` and the
+caller's entitlements, per caller, and it is the same list the router's capability catalog is
+built from. The card is the one unauthenticated route, because discovery reads it to learn which
+security scheme to present; it discloses the endpoint URL, the scheme and the default
+destination's name, none of which a 401 hides.
+
+**Posture.** Every RPC request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
+`A2A_DOOR_LISTEN` is set, no unauthenticated mode); the caller map is its own file
+(`A2A_DOOR_PRINCIPAL_MAP`); the card advertises `A2A_DOOR_PUBLIC_URL`, which behind a
+port-forward or an ingress is not the listen address. The operator renders the door the way
+it renders the inject door, under its own operator-level flag (`A2A_AGENT_DOOR=true`, never a
+CRD field): a loopback bind on its own port, its own one-entry map admitting one caller, a
+token Secret minted once, a ClusterIP Service for the port-forward, and the gateway fence
+under the door's own name, so each door comes and goes with its own flag. The identity
+classes above are what will let it be rendered on an install a customer reaches; until then
+it is a dev and eval door like the other.
 
 ## What stage 2 builds from this doc
 

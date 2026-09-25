@@ -179,16 +179,18 @@ func TestStaticAndCalloutPrincipalsPartitionTheSet(t *testing.T) {
 // entry would hand it the agent container's grants as well, which is the union
 // A5 broke up; sys is a human; gateway could move today but its client program lands
 // separately from this render, so moving the identity first would refuse it at
-// connect on every install; and seed is applied rather than rendered, so
-// dropping its user would break an object already running on installs today. A
-// sixth name here means someone added a principal without asking whether it
-// could have an identity.
+// connect on every install; seed is applied rather than rendered, so
+// dropping its user would break an object already running on installs today;
+// and console is web's reason again -- a browser holds no ServiceAccount
+// token -- with its one write narrowed to a single subject rather than
+// widened into a second read credential. A seventh name here means someone
+// added a principal without asking whether it could have an identity.
 func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 	var got []string
 	for _, id := range staticIdentities(identityTestAgent()) {
 		got = append(got, id.user)
 	}
-	want := []string{"gateway", a2aBridgeUser, "seed", "web", "sys"}
+	want := []string{"gateway", a2aBridgeUser, "seed", "web", "console", "sys"}
 	if !slices.Equal(got, want) {
 		t.Errorf("static principals = %v, want %v.\nA new static principal needs a recorded reason it cannot present a ServiceAccount token, and a card that closes it if it can.", got, want)
 	}

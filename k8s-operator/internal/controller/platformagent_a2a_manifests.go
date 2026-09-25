@@ -250,6 +250,49 @@ const (
 	a2aInjectTokenEnvVar   = "A2A_INJECT_TOKEN" // #nosec G101 -- Environment variable name, not a credential
 	a2aInjectTokenNumBytes = 32
 
+	// a2aAgentDoorEnvVar arms the gateway's A2A door -- the ingress for an
+	// agent caller that speaks the A2A protocol (a2a/gateway/a2adoor.go) --
+	// and it is read from the CONTROLLER's environment for every reason
+	// a2aInjectBackendEnvVar is: the door resolves a caller-named identity
+	// through a door-scoped map into the eval namespace, and whether an
+	// install carries such a door is a property of who deployed the
+	// operator, not a field a cluster's owner edits. Anything but an
+	// explicit "true" is off. When the door grows identity classes a
+	// customer install can carry (token verification against an audience),
+	// the switch that renders THAT is a different decision from this one.
+	a2aAgentDoorEnvVar = "A2A_AGENT_DOOR"
+
+	// The door's listen address: the pod's loopback on its own port, beside
+	// the inject door's, so the two can be armed together. Reached the way
+	// the inject door is, by `kubectl port-forward` to the ClusterIP below;
+	// a real ingress is a later change and a decision of its own.
+	a2aDoorListenEnvVar = "A2A_DOOR_LISTEN"
+	a2aDoorListenHost   = "127.0.0.1"
+	a2aDoorPort         = 8098
+
+	// The one caller the door admits and the principal it stands for. The
+	// key carries the door's prefix and the value is an eval identity, and
+	// the gateway refuses anything else (resolveA2APrincipal in
+	// a2a/gateway/gchat.go), which is what keeps a door that takes its
+	// caller from a request unable to assert a principal a real backend's
+	// sender could hold. The name is what an MCP bridge or a curl demo
+	// presents in the caller header.
+	a2aDoorCaller          = "external-agent"
+	a2aDoorPrincipalPrefix = "a2a:"
+	a2aDoorPrincipal       = "eval:external-agent"
+
+	// The door's own map, mounted at its own path and named to the gateway
+	// by its own env: never the chat map, never the inject map.
+	a2aDoorPrincipalMapDir  = "/etc/a2a/a2a-door-principal-map"
+	a2aDoorPrincipalMapKey  = "principals"
+	a2aDoorPrincipalMapPath = a2aDoorPrincipalMapDir + "/" + a2aDoorPrincipalMapKey
+	a2aDoorPrincipalMapEnv  = "A2A_DOOR_PRINCIPAL_MAP"
+
+	// The door's bearer token, minted like the inject door's and for the
+	// same reason: it is the access control, not a layer over the fence.
+	a2aDoorTokenKey    = "token"          // #nosec G101 -- Secret key name, not a credential
+	a2aDoorTokenEnvVar = "A2A_DOOR_TOKEN" // #nosec G101 -- Environment variable name, not a credential
+
 	// a2aStrictEventsWriterEnvVar is read from the CONTROLLER's environment
 	// and rendered onto the gateway, the same override shape as the worker
 	// image above. It exists so that tightening the `…events` writer-class
@@ -308,6 +351,7 @@ const (
 	a2aBridgePasswordKey  = "bridge-password"  // #nosec G101 -- Secret key name, not a credential
 	a2aSeedPasswordKey    = "seed-password"    // #nosec G101 -- Secret key name, not a credential
 	a2aWebPasswordKey     = "web-password"     // #nosec G101 -- Secret key name, not a credential
+	a2aConsolePasswordKey = "console-password" // #nosec G101 -- Secret key name, not a credential
 	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
 
@@ -455,6 +499,12 @@ func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
 }
 
+// a2aAgentDoorEnabled reports whether the operator was deployed with the A2A
+// door flag, read the same way and failing shut the same way.
+func a2aAgentDoorEnabled() bool {
+	return os.Getenv(a2aAgentDoorEnvVar) == "true"
+}
+
 // a2aNATSName and a2aCredsSecretName are spelled in the API package, because
 // the validating webhook recognises the credentials Secret by name and must
 // agree with the render on what that name is.
@@ -476,6 +526,10 @@ func a2aNATSConfigSecretName(agent *agentv1alpha1.PlatformAgent) string {
 // together, and naming them apart would only make the teardown list harder to
 // read.
 func a2aInjectName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-inject" }
+
+// a2aDoorName is the same four for the A2A door. Its own name, not the inject
+// door's, so each door's objects come and go with its own flag.
+func a2aDoorName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-door" }
 
 // a2aCredsSecretName is the Secret holding the static users' passwords.
 func a2aCredsSecretName(agent *agentv1alpha1.PlatformAgent) string {
@@ -542,7 +596,7 @@ func randomA2APassword() (string, error) {
 // still has a credential.
 var a2aCredsKeys = []string{
 	a2aGatewayPasswordKey, a2aBridgePasswordKey, a2aSeedPasswordKey,
-	a2aWebPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
+	a2aWebPasswordKey, a2aConsolePasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
 }
 
 // a2aProvisionedStreams is every JetStream stream the provision Job creates, and
@@ -1198,13 +1252,14 @@ authorization {
     # task. Do not read this list as the session path.
     #
     # A name is here for one of three reasons, and each identity's own comment
-    # above says which. It can hold no projected token at all — the browser
-    # read user, the $SYS login held by a person, the seed tooling that is
-    # applied rather than run. Or it is a sidecar, which a ServiceAccount
-    # token cannot name apart from the container beside it — the bridge, whose
-    # own comment above says what a callout entry there would merge. Or it
-    # could move and has not: gateway, which is the remaining migration. The
-    # first two reasons are permanent; only the third is a migration.
+    # above says which. It can hold no projected token at all — the browser's
+    # two credentials, web and console, the $SYS login held by a person, the
+    # seed tooling that is applied rather than run. Or it is a sidecar, which
+    # a ServiceAccount token cannot name apart from the container beside it —
+    # the bridge, whose own comment above says what a callout entry there
+    # would merge. Or it could move and has not: gateway, which is the
+    # remaining migration. The first two reasons are permanent; only the
+    # third is a migration.
     auth_users: [ ` + renderA2AAuthUsers(agent) + ` ]
   }
 }
@@ -2352,6 +2407,103 @@ func randomA2AInjectToken() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
+// buildA2ADoorService names the A2A door for a port-forward, the way
+// buildA2AInjectService names the inject door: a ClusterIP that routes
+// nothing, because the door binds the pod's loopback.
+func buildA2ADoorService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
+	return &corev1.Service{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aDoorName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "door"),
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: map[string]string{"app": a2aGatewayName(agent)},
+			Ports: []corev1.ServicePort{{
+				Name:       "a2a",
+				Port:       a2aDoorPort,
+				TargetPort: intstr.FromInt32(a2aDoorPort),
+			}},
+		},
+	}
+}
+
+// buildA2ADoorPrincipalMap is the one-entry map that admits the door's one
+// caller, prefixed and eval-only for the reason buildA2AInjectPrincipalMap
+// gives.
+func buildA2ADoorPrincipalMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aDoorName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "door"),
+		},
+		Data: map[string]string{
+			a2aDoorPrincipalMapKey: fmt.Sprintf("%s%s %s\n",
+				a2aDoorPrincipalPrefix, a2aDoorCaller, a2aDoorPrincipal),
+		},
+	}
+}
+
+// ensureA2ADoorTokenSecret mints the A2A door's bearer token once and keeps
+// it, exactly as ensureA2AInjectTokenSecret does, under the door's own name.
+func (r *PlatformAgentReconciler) ensureA2ADoorTokenSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	name := types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}
+	existing := &corev1.Secret{}
+	err := r.a2aReader().Get(ctx, name, existing)
+	if err == nil {
+		if !metav1.IsControlledBy(existing, agent) {
+			return fmt.Errorf("refusing to adopt unowned Secret %s/%s as the A2A door's token; delete it, or give it a controller reference to this PlatformAgent", name.Namespace, name.Name)
+		}
+		if len(existing.Data[a2aDoorTokenKey]) > 0 {
+			return nil
+		}
+		token, err := randomA2AInjectToken()
+		if err != nil {
+			return err
+		}
+		if existing.Data == nil {
+			existing.Data = map[string][]byte{}
+		}
+		existing.Data[a2aDoorTokenKey] = []byte(token)
+		return r.Update(ctx, existing)
+	}
+	if !errors.IsNotFound(err) {
+		return err
+	}
+	token, err := randomA2AInjectToken()
+	if err != nil {
+		return err
+	}
+	secret := &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name.Name,
+			Namespace: name.Namespace,
+			Labels:    a2aLabels(agent, "door"),
+		},
+		Data: map[string][]byte{a2aDoorTokenKey: []byte(token)},
+	}
+	if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
+		return err
+	}
+	return r.Create(ctx, secret)
+}
+
+// buildA2ADoorNetworkPolicy is the A2A door's copy of the gateway fence: the
+// same pod selector and the same empty ingress, under the door's own name so
+// it comes and goes with the door's flag and never with the inject door's.
+// Two identical deny-all policies on one pod deny exactly what one does.
+func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+	np := buildA2AGatewayNetworkPolicy(agent)
+	np.Name = a2aDoorName(agent)
+	np.Labels = a2aLabels(agent, "door-netpol")
+	return np
+}
+
 // buildA2AGatewayNetworkPolicy fences ingress to the gateway pod while the
 // inject backend is armed.
 //
@@ -2443,6 +2595,28 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 				LocalObjectReference: corev1.LocalObjectReference{Name: a2aInjectName(agent)},
 			}},
 		}}
+	}
+	// The A2A door's additions, the same shape under its own flag. The two
+	// doors are independent: either, both or neither.
+	if a2aAgentDoorEnabled() {
+		injectEnv = append(injectEnv,
+			corev1.EnvVar{Name: a2aDoorListenEnvVar, Value: fmt.Sprintf("%s:%d", a2aDoorListenHost, a2aDoorPort)},
+			corev1.EnvVar{Name: a2aDoorPrincipalMapEnv, Value: a2aDoorPrincipalMapPath},
+			corev1.EnvVar{Name: a2aDoorTokenEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: a2aDoorName(agent)},
+				Key:                  a2aDoorTokenKey,
+			}}},
+		)
+		injectPorts = append(injectPorts, corev1.ContainerPort{Name: "a2a", ContainerPort: a2aDoorPort})
+		injectMounts = append(injectMounts, corev1.VolumeMount{
+			Name: "a2a-door-principal-map", MountPath: a2aDoorPrincipalMapDir, ReadOnly: true,
+		})
+		injectVolumes = append(injectVolumes, corev1.Volume{
+			Name: "a2a-door-principal-map",
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: a2aDoorName(agent)},
+			}},
+		})
 	}
 
 	return &appsv1.Deployment{
@@ -2652,6 +2826,9 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	// costs nothing, so the ordering hazard runs the safe way.
 	if a2aInjectBackendEnabled() {
 		fences = append(fences, buildA2AGatewayNetworkPolicy(agent))
+	}
+	if a2aAgentDoorEnabled() {
+		fences = append(fences, buildA2ADoorNetworkPolicy(agent))
 	}
 	for _, np := range fences {
 		if err := ctrl.SetControllerReference(agent, np, r.Scheme); err != nil {
@@ -2901,6 +3078,9 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	if err := r.applyA2AInjectBackend(ctx, agent); err != nil {
 		return state, err
 	}
+	if err := r.applyA2AAgentDoor(ctx, agent); err != nil {
+		return state, err
+	}
 
 	// The gateway is what dispatches: it spawns the session pods, and a
 	// session pod's bus credential is minted by the auth callout. So this is
@@ -2948,6 +3128,9 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
 			return state, err
 		}
+		if err := r.removeA2AAgentDoor(ctx, agent); err != nil {
+			return state, err
+		}
 		return state, nil
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
@@ -2965,6 +3148,9 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// the other order, not closed; closing it would mean holding the removal
 	// on the Deployment's rollout status.
 	if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
+		return state, err
+	}
+	if err := r.removeA2AAgentDoor(ctx, agent); err != nil {
 		return state, err
 	}
 
@@ -3054,6 +3240,58 @@ func (r *PlatformAgentReconciler) removeA2AInjectBackend(ctx context.Context, ag
 // caller's comment gives.
 func (r *PlatformAgentReconciler) a2aInjectObjects(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
 	name := a2aInjectName(agent)
+	meta := metav1.ObjectMeta{Name: name, Namespace: agent.Namespace}
+	return []a2aTeardownEntry{
+		{&corev1.Service{ObjectMeta: meta}, r.Client},
+		{&corev1.ConfigMap{ObjectMeta: meta}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: meta}, r.Client},
+		{&corev1.Secret{ObjectMeta: meta}, r.a2aReader()},
+	}
+}
+
+// applyA2AAgentDoor renders the A2A door's own objects under its flag, in the
+// inject door's order and for its reasons: the token ensured first, then the
+// map and the Service. The fence is reconcileA2ANetworkFences's.
+func (r *PlatformAgentReconciler) applyA2AAgentDoor(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if !a2aAgentDoorEnabled() {
+		return nil
+	}
+	if err := r.ensureA2ADoorTokenSecret(ctx, agent); err != nil {
+		return fmt.Errorf("failed to ensure the A2A door's token Secret: %w", err)
+	}
+	for _, obj := range []client.Object{
+		buildA2ADoorPrincipalMap(agent),
+		buildA2ADoorService(agent),
+	} {
+		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.applyManaged(ctx, agent, obj); err != nil {
+			return fmt.Errorf("failed to apply the A2A door's %T: %w", obj, err)
+		}
+	}
+	return nil
+}
+
+// removeA2AAgentDoor takes the A2A door away when its flag is not set. See
+// removeA2AInjectBackend for why the removal exists and why the Secret is
+// read uncached.
+func (r *PlatformAgentReconciler) removeA2AAgentDoor(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if a2aAgentDoorEnabled() {
+		return nil
+	}
+	for _, entry := range r.a2aDoorObjects(agent) {
+		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
+			return fmt.Errorf("failed to remove the A2A door's %T: %w", entry.obj, err)
+		}
+	}
+	return nil
+}
+
+// a2aDoorObjects names the A2A door's four objects, in the inject door's
+// order: the Secret last and through a2aReader.
+func (r *PlatformAgentReconciler) a2aDoorObjects(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
+	name := a2aDoorName(agent)
 	meta := metav1.ObjectMeta{Name: name, Namespace: agent.Namespace}
 	return []a2aTeardownEntry{
 		{&corev1.Service{ObjectMeta: meta}, r.Client},
@@ -3171,6 +3409,7 @@ type a2aTeardownEntry struct {
 // stale the next time the render grows a step.
 func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
 	injectMeta := metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	doorMeta := metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}
 	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The inject door's four, listed whatever the flag says: a flip to
@@ -3184,6 +3423,11 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		{&corev1.ConfigMap{ObjectMeta: injectMeta}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: injectMeta}, r.Client},
 		{&corev1.Secret{ObjectMeta: injectMeta}, r.a2aReader()},
+		// The A2A door's four, likewise.
+		{&corev1.Service{ObjectMeta: doorMeta}, r.Client},
+		{&corev1.ConfigMap{ObjectMeta: doorMeta}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: doorMeta}, r.Client},
+		{&corev1.Secret{ObjectMeta: doorMeta}, r.a2aReader()},
 		// The auth callout, before the bus it authorizes for. Its Deployment
 		// goes first so it stops answering while there is still a server to
 		// answer for; the keys Secret goes with it rather than surviving like

@@ -209,7 +209,11 @@ func (g *Gateway) applyArtifact(rec *SessionRecord, rs *relayState, taskID strin
 // whose word the terminal is, read off the subject it arrived on.
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
 	result := joinTextParts(rs.result)
-	if result == "" && s.Status.State == lib.StateCompleted {
+	// The console never posts the deliverable (see the StateCompleted arm), so
+	// replaying the stream to recover it would buy nothing. Checking here and
+	// not there is the difference between skipping the replay and paying for
+	// one whose result is then dropped.
+	if result == "" && s.Status.State == lib.StateCompleted && !isConsoleConversation(rec.Key) {
 		// Render state is cache; if a restart lost it, the stream still has
 		// everything. Replay against the addressee the task's own subjects
 		// carried - after a Delegate re-home, rec.Addressee is not it.
@@ -227,7 +231,17 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if result == "" {
 			result = "(completed with a non-text result; see the stream)"
 		}
-		g.post(rec.Key, result)
+		// The console renders answers straight off TASKS, so posting the
+		// deliverable here too would show it twice and put a burst of
+		// answer-sized frames on a subject documented to carry only notices
+		// (console.go and spec-chatops-gateway.md, "The console adapter").
+		// The other terminal arms below are notices, not answers, and go to
+		// every backend. Chat backends have no TASKS view, so for them this
+		// post IS the answer. The replay above is skipped for the same
+		// backends, so reaching here with an empty result costs nothing.
+		if !isConsoleConversation(rec.Key) {
+			g.post(rec.Key, result)
+		}
 	case lib.StateFailed:
 		reason := ""
 		if s.Status.Message != nil {
@@ -357,7 +371,9 @@ func terminalLine(state lib.TaskState, progress string) string {
 	}[state]
 	line := fmt.Sprintf("%s **%s**", icon, state)
 	// No tail on completed: the result is posted as its own message right
-	// before this edit, and the worker adapter's progress deviation (no
+	// before this edit on every backend that posts one at all (the console
+	// does not - it reads answers off TASKS), and the worker adapter's
+	// progress deviation (no
 	// explicit progress tool — assistant text becomes `progress`, the final
 	// text becomes `result`) makes the last narration routinely BE the
 	// result on a single-turn task, so keeping it rendered the answer
