@@ -1067,6 +1067,15 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # and the entrypoint's step 1.7; this is the belt for any database that stays
 # in WAL. Ordered before the two above only because it is independent of them.
 # See the module docstring in deploy/docker/patches/apply_state_db_synchronous_full.py.
+#
+# mcp_toolset_names rides the same COPY and RUN too, one statement in cli.py
+# that shares nothing with the three above: the CLI's pre-discovery toolset check
+# excludes configured MCP servers by their bare name while a profile lists
+# them by their registry alias (mcp-<server>), so every MCP toolset printed as
+# unknown on stdout ahead of the answer, which under `hermes chat -Q` is the
+# answer the Hermes bridge publishes (#2035). Upstream
+# NousResearch/hermes-agent#78102; this patch goes when a Hermes bump carries
+# the fix. See the module docstring in deploy/docker/patches/apply_mcp_toolset_names.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
      /opt/hermes/hermes_cli/
@@ -1076,11 +1085,14 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_rate_limit_retry_delay.py \
      deploy/docker/patches/apply_state_db_synchronous_full.py \
      deploy/docker/patches/verify_state_db_synchronous_full.py \
+     deploy/docker/patches/apply_mcp_toolset_names.py \
+     deploy/docker/patches/verify_mcp_toolset_names.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_synchronous_full.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_kanban_guardrail_exit.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_rate_limit_retry_delay.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_mcp_toolset_names.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
@@ -1088,9 +1100,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q "_kube_block_rate_limited(result)" /opt/hermes/cli.py && \
     grep -q "_kube_block_rate_limited_chat(turn.result)" /opt/hermes/hermes_cli/cli_chat_turn_mixin.py && \
     grep -q "_kube_retry_delay_from_error(api_error)" /opt/hermes/agent/turn_recovery.py && \
+    grep -q 'mcp_names |= {f"mcp-{_kube_mcp_name}" for _kube_mcp_name in mcp_names}' /opt/hermes/cli.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_mcp_toolset_names.py && \
     rm -rf /tmp/kanban-guardrail-exit
 
 # Perf: let a board mutation wake the kanban watchers instead of waiting out a
