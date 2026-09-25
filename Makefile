@@ -577,22 +577,21 @@ test-integration: ## Run just the integration seam tests; CI reaches them throug
 # error. This is the compiler for that layer.
 #
 # Not folded into docs-check: these files are runtime assets rather than
-# documents (the docs map does not inventory them), and the resolution rules are
-# not the same either -- a path here resolves against a profile home and the
-# /opt/defaults layer the entrypoint copies over it, not against the file that
-# cites them. CI runs it as its own job in validate.yml, alongside the other
-# repository-structure invariants.
+# documents, and the resolution rules are not the same either -- a path here
+# resolves against a profile home and the /opt/defaults layer the entrypoint
+# copies over it, not against the file that cites them. CI runs it as its own
+# job in validate.yml, alongside the other repository-structure invariants.
 prompt-check: ## Verify the agent's instructions cite skills and files that exist.
 	@python3 scripts/check_prompt_assets.py
 
 # Documentation that mirrors a machine-readable source is generated rather than
 # hand-kept: the cron jobs, the skill catalogue and the image inventory as
-# <!-- BEGIN GENERATED --> regions, plus docs/family-roster.txt written whole.
+# <!-- BEGIN GENERATED --> regions.
 docs-generate: ## Regenerate the generated doc regions and files from their sources.
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
-docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
+docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
 
 docs-check-generated:
 	@python3 scripts/generate_docs.py --check
@@ -603,8 +602,13 @@ docs-check-links:
 docs-check-terminology:
 	@./hack/check-docs-terminology.sh
 
+# Retired: the docs map no longer carries a per-document inventory for a
+# checker to police, and the property that inventory bought -- every document
+# is linked from somewhere -- runs under docs-check-links. The target stays,
+# and exits 0, because .github/workflows/docs-check.yml runs it by name; remove
+# the two together.
 docs-check-map:
-	@python3 scripts/check_docs_map.py
+	@echo "docs-check-map is retired; the linked-from-somewhere rule runs under docs-check-links."
 
 docs-check-audience: ## Fail when a published site page carries a maintainer identifier (shapes: scripts/docs_audience_denylist.txt).
 	@python3 scripts/check_docs_audience.py
