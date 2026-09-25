@@ -15,11 +15,13 @@ spec:
         # google_chat). Without mcp-router the gateway cannot hand an alert to a
         # specialist profile, and kanban is the second gate the dispatcher checks.
         #
-        # `mcp-<name>` maps to `mcp_servers.<name>`. Hermes logs a benign startup
-        # warning for these ("Unknown toolsets: mcp-platform_control, …", issue
-        # #38798): the startup check validates against the bare keys of `mcp_servers`
-        # and does not know the prefixed spelling yet. The tools load regardless, via
-        # the alias registered during discover_mcp_tools.
+        # `mcp-<name>` maps to `mcp_servers.<name>`. Upstream's startup check
+        # validates against the bare keys of `mcp_servers` and does not know the
+        # prefixed spelling (NousResearch/hermes-agent#78102), so a stock Hermes
+        # logs "Unknown toolsets: mcp-platform_control, …" on stdout; the image
+        # patches that check (deploy/docker/patches/apply_mcp_toolset_names.py) so
+        # it does not. The tools load either way, via the alias registered during
+        # discover_mcp_tools.
         #
         # Do not add `mcp-agent_common`: the `agent_common` server is no longer
         # declared for any profile (see the note above `mcp_servers` in
