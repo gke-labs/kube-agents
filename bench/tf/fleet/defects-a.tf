@@ -375,3 +375,427 @@ resource "kubernetes_pod_disruption_budget_v1" "inference_server" {
     }
   }
 }
+
+# ---------------------------------------------------------------------------
+# Defect (upgrades, API deprecation): a permanent caller of a deprecated API.
+#
+# Endpoints (core v1) has been deprecated since Kubernetes 1.33 and no release
+# through 1.37 removes it, so on every master this fleet will run, each write
+# to it is audit-stamped `k8s.io/deprecated=true` -- and never
+# `k8s.io/removed-release`, because core/v1 declares no removal. That is the
+# whole yield: an Admin Activity audit trail a case can read by principal
+# (system:serviceaccount:seeded-deprecation:legacy-endpoints-writer) plus
+# methodName (io.k8s.core.v1.endpoints.patch). Never by the label alone:
+# kube-system's endpoint-controller writes every Service's Endpoints and is
+# stamped the same way. No GKE Recommender DEPRECATION_* insight follows and
+# no auto-upgrade pause -- those exist for removed APIs only, and nothing
+# after 1.32 removes a served API version, which is why the fleet plants no
+# removed-API caller (README, accepted background).
+#
+# Mechanics: a CronJob (legacy-endpoints-writer) runs a short Python script
+# every ten minutes on a dedicated ServiceAccount under a namespaced Role. The
+# script reads /version first and refuses to write below 1.33 -- BROKEN, exit
+# 1, before any write -- so the fixture cannot quietly degrade into an ordinary
+# CronJob on an older master; otherwise it merge-patches an annotation onto
+# the hand-written Endpoints legacy-endpoints-lane, which sits on a headless,
+# selector-less Service so that the endpoints controller leaves it alone. The
+# first run is a standalone Job the apply waits on, so the trail exists on
+# apply day.
+#
+# Asserted by the deprecated-api-caller role in fixtures.json; no scenario
+# reads it yet. The role asserts a retained *failed* Job is absent (backoffLimit
+# 0 makes any failure the BROKEN exit) and deliberately not that a succeeded
+# one is present: successfulJobsHistoryLimit keeps three old successes, so a
+# succeeded assertion would never go red after the caller broke.
+resource "kubernetes_namespace_v1" "seeded_deprecation" {
+  metadata {
+    name   = "seeded-deprecation"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+# This namespace is outside default_deny's for_each on purpose: the writer is
+# the fleet's one workload that uses the network, and a deny-all would starve
+# it. Same shape otherwise -- both policy types, no ingress rule -- with one
+# egress allow: TCP 443 to the API server, both as the in-cluster Service IP
+# (the first address of the services range, what KUBERNETES_SERVICE_HOST
+# resolves to) and as the master endpoint, because a datapath that evaluates
+# policy after DNAT sees the second and one that evaluates before sees the
+# first. No DNS allow: the script dials the IP from the environment.
+resource "kubernetes_network_policy_v1" "deprecation_apiserver_egress_only" {
+  metadata {
+    name      = "apiserver-egress-only"
+    namespace = kubernetes_namespace_v1.seeded_deprecation.metadata[0].name
+  }
+
+  spec {
+    pod_selector {}
+    policy_types = ["Ingress", "Egress"]
+    egress {
+      ports {
+        port     = "443"
+        protocol = "TCP"
+      }
+      to {
+        ip_block {
+          cidr = "${cidrhost(google_container_cluster.seeded_a.services_ipv4_cidr, 1)}/32"
+        }
+      }
+      to {
+        ip_block {
+          cidr = "${google_container_cluster.seeded_a.endpoint}/32"
+        }
+      }
+    }
+  }
+}
+
+# Compliance SOP 2.7 flags the *default* ServiceAccount with its token
+# automounted; this is a dedicated account whose only grant is the Role below,
+# and the token is what the writer authenticates with, so it is mounted.
+resource "kubernetes_service_account_v1" "legacy_endpoints_writer" {
+  metadata {
+    name      = "legacy-endpoints-writer"
+    namespace = kubernetes_namespace_v1.seeded_deprecation.metadata[0].name
+  }
+  automount_service_account_token = true
+}
+
+# get to decide between patch and create, patch for the routine write, create
+# to re-seed the object if someone deleted it. Nothing else, and namespaced.
+resource "kubernetes_role_v1" "legacy_endpoints_writer" {
+  metadata {
+    name      = "legacy-endpoints-writer"
+    namespace = kubernetes_namespace_v1.seeded_deprecation.metadata[0].name
+  }
+  rule {
+    api_groups = [""]
+    resources  = ["endpoints"]
+    verbs      = ["get", "create", "patch"]
+  }
+}
+
+resource "kubernetes_role_binding_v1" "legacy_endpoints_writer" {
+  metadata {
+    name      = "legacy-endpoints-writer"
+    namespace = kubernetes_namespace_v1.seeded_deprecation.metadata[0].name
+  }
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "Role"
+    name      = kubernetes_role_v1.legacy_endpoints_writer.metadata[0].name
+  }
+  subject {
+    kind      = "ServiceAccount"
+    name      = kubernetes_service_account_v1.legacy_endpoints_writer.metadata[0].name
+    namespace = kubernetes_namespace_v1.seeded_deprecation.metadata[0].name
+  }
+}
+
+# Headless and selector-less: the endpoints controller manages Endpoints only
+# for Services with a selector, so the hand-written object below survives. An
+# Endpoints with no Service at all is an orphan a controller may garbage
+# collect, which is why the Service exists even though nothing dials it.
+resource "kubernetes_service_v1" "legacy_endpoints_lane" {
+  metadata {
+    name      = "legacy-endpoints-lane"
+    namespace = kubernetes_namespace_v1.seeded_deprecation.metadata[0].name
+  }
+  spec {
+    cluster_ip = "None"
+    port {
+      name     = "discard"
+      port     = 9
+      protocol = "TCP"
+    }
+  }
+}
+
+# The object the writer patches. 192.0.2.10 is TEST-NET-1: documentation
+# space that routes nowhere, which the Endpoints validation accepts and no
+# real backend will ever answer on. The role asserts this ip is still in the
+# subset. The writer's annotation is ignored so the reconcile does not undo
+# every run's stamp.
+resource "kubernetes_endpoints_v1" "legacy_endpoints_lane" {
+  metadata {
+    name      = "legacy-endpoints-lane"
+    namespace = kubernetes_namespace_v1.seeded_deprecation.metadata[0].name
+  }
+  subset {
+    address {
+      ip = "192.0.2.10"
+    }
+    port {
+      name     = "discard"
+      port     = 9
+      protocol = "TCP"
+    }
+  }
+  lifecycle {
+    ignore_changes = [metadata[0].annotations]
+  }
+  depends_on = [kubernetes_service_v1.legacy_endpoints_lane]
+}
+
+resource "kubernetes_config_map_v1" "legacy_endpoints_writer" {
+  metadata {
+    name      = "legacy-endpoints-writer"
+    namespace = kubernetes_namespace_v1.seeded_deprecation.metadata[0].name
+  }
+  data = {
+    "writer.py" = <<-PY
+      """One write to a deprecated API: merge-patch an annotation onto an Endpoints.
+
+      Refuses to write on a master below 1.33, where Endpoints is not yet
+      deprecated and the write would carry no k8s.io/deprecated audit label:
+      a run that wrote there would look healthy while yielding nothing.
+      """
+      import json
+      import os
+      import re
+      import ssl
+      import sys
+      import urllib.error
+      import urllib.request
+      from datetime import datetime, timezone
+
+      SERVICE_ACCOUNT_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+      TOKEN_PATH = SERVICE_ACCOUNT_DIR + "/token"
+      CA_PATH = SERVICE_ACCOUNT_DIR + "/ca.crt"
+      NAMESPACE_PATH = SERVICE_ACCOUNT_DIR + "/namespace"
+      ENDPOINTS_NAME = "legacy-endpoints-lane"
+      ANNOTATION = "seeded-last-run"
+      USER_AGENT = "legacy-endpoints-writer/1.0"
+      DEPRECATED_FROM_MINOR = 33
+      REQUEST_TIMEOUT_SECONDS = 20
+      JSON_TYPE = "application/json"
+      MERGE_PATCH_TYPE = "application/merge-patch+json"
+      HTTP_OK = 200
+      HTTP_CREATED = 201
+      HTTP_NOT_FOUND = 404
+      TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+      # The designed subset, re-seeded only when the object is gone. Keep it
+      # equal to kubernetes_endpoints_v1.legacy_endpoints_lane: the role
+      # asserts on the ip.
+      DESIGNED_SUBSET = {
+          "addresses": [{"ip": "192.0.2.10"}],
+          "ports": [{"name": "discard", "port": 9, "protocol": "TCP"}],
+      }
+
+
+      def main():
+          host = os.environ["KUBERNETES_SERVICE_HOST"]
+          port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+          base = "https://" + host + ":" + port
+          with open(TOKEN_PATH) as fh:
+              token = fh.read().strip()
+          with open(NAMESPACE_PATH) as fh:
+              namespace = fh.read().strip()
+          context = ssl.create_default_context(cafile=CA_PATH)
+
+          def call(method, path, body=None, content_type=None):
+              request = urllib.request.Request(base + path, data=body, method=method)
+              request.add_header("Authorization", "Bearer " + token)
+              request.add_header("User-Agent", USER_AGENT)
+              request.add_header("Accept", JSON_TYPE)
+              if content_type:
+                  request.add_header("Content-Type", content_type)
+              try:
+                  with urllib.request.urlopen(
+                      request, timeout=REQUEST_TIMEOUT_SECONDS, context=context
+                  ) as response:
+                      return response.status, json.loads(response.read() or b"{}")
+              except urllib.error.HTTPError as exc:
+                  return exc.code, {"message": exc.read().decode("utf-8", "replace")}
+
+          status, version = call("GET", "/version")
+          if status != HTTP_OK:
+              print("BROKEN: GET /version returned " + str(status) + "; no write made")
+              return 1
+          server = str(version.get("gitVersion", "unknown"))
+          minor = re.match(r"\d+", str(version.get("minor", "")))
+          if minor is None or int(minor.group(0)) < DEPRECATED_FROM_MINOR:
+              print(
+                  "BROKEN: server " + server + " is below 1." + str(DEPRECATED_FROM_MINOR)
+                  + ", where an Endpoints write carries no k8s.io/deprecated audit"
+                  " label; no write made"
+              )
+              return 1
+
+          collection = "/api/v1/namespaces/" + namespace + "/endpoints"
+          path = collection + "/" + ENDPOINTS_NAME
+          stamp = datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
+          status, _ = call("GET", path)
+          if status == HTTP_NOT_FOUND:
+              verb = "created"
+              body = {
+                  "apiVersion": "v1",
+                  "kind": "Endpoints",
+                  "metadata": {"name": ENDPOINTS_NAME, "annotations": {ANNOTATION: stamp}},
+                  "subsets": [DESIGNED_SUBSET],
+              }
+              status, doc = call("POST", collection, json.dumps(body).encode(), JSON_TYPE)
+          elif status == HTTP_OK:
+              verb = "patched"
+              body = {"metadata": {"annotations": {ANNOTATION: stamp}}}
+              status, doc = call("PATCH", path, json.dumps(body).encode(), MERGE_PATCH_TYPE)
+          else:
+              print("BROKEN: GET " + path + " returned " + str(status) + "; no write made")
+              return 1
+          if status not in (HTTP_OK, HTTP_CREATED):
+              print("BROKEN: write returned " + str(status) + ": " + str(doc.get("message", doc)))
+              return 1
+          print(
+              verb + " endpoints/" + ENDPOINTS_NAME + " in " + namespace + ": "
+              + ANNOTATION + "=" + stamp + " (server " + server + ")"
+          )
+          return 0
+
+
+      if __name__ == "__main__":
+          sys.exit(main())
+    PY
+  }
+}
+
+# The CronJob. Every ten minutes, one Job, never two at once; a Job that
+# misses its slot by more than five minutes is skipped rather than queued;
+# one attempt (backoffLimit 0, restartPolicy Never) so a failure is retained
+# as a failed Job, which is what the role's status.failed assertion reads.
+# The 900s TTL clears a transient failure in fifteen minutes; while the
+# caller is broken the next failure lands before the last one expires, so a
+# retained failure is always there to see. Hardening as on checkout-gateway,
+# except the token: this workload uses the API.
+resource "kubernetes_cron_job_v1" "legacy_endpoints_writer" {
+  metadata {
+    name      = "legacy-endpoints-writer"
+    namespace = kubernetes_namespace_v1.seeded_deprecation.metadata[0].name
+    labels    = { app = "legacy-endpoints-writer" }
+  }
+  spec {
+    schedule                      = "*/10 * * * *"
+    concurrency_policy            = "Forbid"
+    starting_deadline_seconds     = 300
+    successful_jobs_history_limit = 3
+    failed_jobs_history_limit     = 1
+    job_template {
+      metadata {
+        labels = { app = "legacy-endpoints-writer" }
+      }
+      spec {
+        backoff_limit              = 0
+        ttl_seconds_after_finished = "900"
+        # Keep this template byte-identical to the first-run Job's below.
+        template {
+          metadata {
+            labels = { app = "legacy-endpoints-writer" }
+          }
+          spec {
+            service_account_name            = kubernetes_service_account_v1.legacy_endpoints_writer.metadata[0].name
+            automount_service_account_token = true
+            restart_policy                  = "Never"
+            security_context {
+              run_as_non_root = true
+              run_as_user     = 65534
+              seccomp_profile {
+                type = "RuntimeDefault"
+              }
+            }
+            container {
+              name    = "writer"
+              image   = "docker.io/library/python:3.14-slim"
+              command = ["python3", "/app/writer.py"]
+              resources {
+                requests = { cpu = "20m", memory = "32Mi" }
+                limits   = { memory = "64Mi" }
+              }
+              volume_mount {
+                name       = "script"
+                mount_path = "/app"
+                read_only  = true
+              }
+            }
+            volume {
+              name = "script"
+              config_map {
+                name = kubernetes_config_map_v1.legacy_endpoints_writer.metadata[0].name
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  depends_on = [
+    kubernetes_role_binding_v1.legacy_endpoints_writer,
+    kubernetes_endpoints_v1.legacy_endpoints_lane,
+    kubernetes_network_policy_v1.deprecation_apiserver_egress_only,
+  ]
+}
+
+# The first run, so apply day already has an audit entry and the apply itself
+# proves the writer can reach and patch its object: wait_for_completion fails
+# the apply on a BROKEN exit. Same pod template as the CronJob's, but NO
+# ttl_seconds_after_finished, deliberately: the provider's Read has no TTL
+# handling and drops a Job it cannot find from state, so a TTL-expired
+# first-run Job would be re-created on every reconcile -- and a re-created
+# Job that failed would fail the apply. Without a TTL it stays, one Completed
+# pod of a few MiB, and every later apply is a no-op here.
+resource "kubernetes_job_v1" "legacy_endpoints_writer_first_run" {
+  metadata {
+    name      = "legacy-endpoints-writer-first-run"
+    namespace = kubernetes_namespace_v1.seeded_deprecation.metadata[0].name
+    labels    = { app = "legacy-endpoints-writer" }
+  }
+  spec {
+    backoff_limit = 0
+    template {
+      metadata {
+        labels = { app = "legacy-endpoints-writer" }
+      }
+      spec {
+        service_account_name            = kubernetes_service_account_v1.legacy_endpoints_writer.metadata[0].name
+        automount_service_account_token = true
+        restart_policy                  = "Never"
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "writer"
+          image   = "docker.io/library/python:3.14-slim"
+          command = ["python3", "/app/writer.py"]
+          resources {
+            requests = { cpu = "20m", memory = "32Mi" }
+            limits   = { memory = "64Mi" }
+          }
+          volume_mount {
+            name       = "script"
+            mount_path = "/app"
+            read_only  = true
+          }
+        }
+        volume {
+          name = "script"
+          config_map {
+            name = kubernetes_config_map_v1.legacy_endpoints_writer.metadata[0].name
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_completion = true
+  timeouts {
+    create = "5m"
+  }
+  depends_on = [
+    kubernetes_role_binding_v1.legacy_endpoints_writer,
+    kubernetes_endpoints_v1.legacy_endpoints_lane,
+    kubernetes_network_policy_v1.deprecation_apiserver_egress_only,
+  ]
+}
