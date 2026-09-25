@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a collection of agent configurations, personas, and skills designed to manage Kubernetes/GKE operations. It utilizes a Platform Agent to transition from reactive manual management to proactive, intent-driven operations.
+This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a collection of agent configurations, personas, and skills designed to manage Kubernetes/GKE operations.
 
 ## Repository Layout
 
@@ -245,10 +245,8 @@ Agents with a user in the loop follow this file.
   comment** (`uses: actions/checkout@3d3c42e… # v7.0.1`), and **guard automatically-triggered
   credentialed workflows against forks** with `if: github.repository == 'gke-labs/kube-agents'` on
   every job. A mutable tag lets a retagged release change what CI runs; an unguarded job fails on
-  every fork sync and mails the fork owner. No check in this repository blocks either one, and
-  both have exemptions — local reusable workflows need no pin, a `workflow_call`- or
-  `workflow_dispatch`-only workflow needs no guard, and `docs-deploy.yml` is unguarded on purpose
-  so a fork can publish its own Pages site. Open
+  every fork sync and mails the fork owner. No check in this repository blocks either one; the
+  exemptions are in the rule file. Open
   [`.agents/rules/github_actions.md`](.agents/rules/github_actions.md) whenever you touch a
   `uses:` line or a workflow trigger.
 - Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of
