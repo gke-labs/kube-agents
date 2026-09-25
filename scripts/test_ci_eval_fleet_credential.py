@@ -89,10 +89,25 @@ class DeployPreflightTest(unittest.TestCase):
         self.assertIn("reached-the-build", done.stdout)
 
     def test_the_deploy_and_the_eval_default_the_same_reader(self):
-        """One definition, `_fleet_default_reader`; both call sites use it."""
+        """One definition, `_fleet_reader_for_run`; both call sites use it,
+        and neither spells the account out."""
         for path in (DEPLOY, SCRIPT):
-            self.assertIn('_fleet_default_reader "${PROJECT_ID}"', path.read_text(encoding="utf-8"), path)
-        self.assertNotIn("seeded-fleet-reader@${PROJECT_ID}", SCRIPT.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            self.assertIn('_fleet_reader_for_run "${PROJECT_ID}"', text, path)
+            self.assertNotIn("seeded-fleet-reader@${PROJECT_ID}", text, path)
+
+    def test_the_developer_opt_in_leaves_the_reader_unset(self):
+        """`FLEET_ALLOW_RUNNER_CREDENTIAL=1` on a developer's own project must
+        reach the gate as no reader, or the gate cannot honour it."""
+        def reader(env: str) -> str:
+            done = subprocess.run(
+                ["bash", "-c", f'source "{RUNNER}"; {env} _fleet_reader_for_run p'],
+                capture_output=True, text=True, check=False,
+            )
+            return done.stdout
+        self.assertEqual("seeded-fleet-reader@p.iam.gserviceaccount.com", reader(""))
+        self.assertEqual("", reader("FLEET_ALLOW_RUNNER_CREDENTIAL=1"))
+        self.assertEqual("mine@p.iam.gserviceaccount.com", reader("FLEET_READONLY_SA=mine@p.iam.gserviceaccount.com FLEET_ALLOW_RUNNER_CREDENTIAL=1"))
 
 
 class FleetCredentialCallSiteTest(unittest.TestCase):

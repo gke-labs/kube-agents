@@ -331,6 +331,22 @@ _fleet_default_reader() {
   printf 'seeded-fleet-reader@%s.iam.gserviceaccount.com' "$1"
 }
 
+# What a CI script should export as FLEET_READONLY_SA for a run in $1: the
+# value already set wins; otherwise nothing when the caller opted into its own
+# credential (a developer running these scripts against a project of their
+# own, where roles/owner cannot impersonate the reader), else the default. An
+# empty result is what lets the gate honour the opt-in, since it consults
+# FLEET_ALLOW_RUNNER_CREDENTIAL only when no account is named.
+_fleet_reader_for_run() {
+  if [ -n "${FLEET_READONLY_SA:-}" ]; then
+    printf '%s' "$FLEET_READONLY_SA"
+  elif [ "${FLEET_ALLOW_RUNNER_CREDENTIAL:-}" = "1" ]; then
+    printf ''
+  else
+    _fleet_default_reader "$1"
+  fi
+}
+
 # An OAuth2 bearer token is a run of unreserved characters; anything else is
 # gcloud's stderr leaked into stdout.
 _fleet_bare_token() {
@@ -348,7 +364,7 @@ _fleet_require_readonly_credential() {
   local sa="$1" project="$2" errors token
   if [ -z "$sa" ]; then
     [ "${FLEET_ALLOW_RUNNER_CREDENTIAL:-}" = "1" ] && return 0
-    echo "ERROR: FLEET_READONLY_SA is unset; refusing to write kubeconfigs that carry the runner's own credential, which can WRITE to the shared fleet. Set FLEET_READONLY_SA=seeded-fleet-reader@${project}.iam.gserviceaccount.com, or FLEET_ALLOW_RUNNER_CREDENTIAL=1 on a fleet only you use." >&2
+    echo "ERROR: FLEET_READONLY_SA is unset; refusing to write kubeconfigs that carry the runner's own credential, which can WRITE to the shared fleet. Set FLEET_READONLY_SA=$(_fleet_default_reader "$project"), or FLEET_ALLOW_RUNNER_CREDENTIAL=1 on a fleet only you use." >&2
     return "$_FLEET_EXIT_READONLY_UNAVAILABLE"
   fi
   errors="$(mktemp)" || return 1

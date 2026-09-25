@@ -864,7 +864,7 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # bench/tf/fleet/README.md, "A read-only credential for evaluations".
 # shellcheck source=hack/fleet-kubeconfigs.sh
 source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
-export FLEET_READONLY_SA="${FLEET_READONLY_SA:-$(_fleet_default_reader "${PROJECT_ID}")}"
+export FLEET_READONLY_SA="$(_fleet_reader_for_run "${PROJECT_ID}")"
 
 profile_begin "fleet-kubeconfigs: seeded-fleet credentials"
 STEP_START=$SECONDS

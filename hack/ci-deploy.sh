@@ -75,15 +75,17 @@ ensure_helm
 # The gate hack/ci-eval-pr.sh applies before it writes the fleet kubeconfigs,
 # run here first: this script is the 20-30 minutes of build and deploy ahead
 # of it, and a project whose reader cannot be impersonated should fail in
-# seconds instead. Failing here also keeps the run inside the dashboard's
-# setup-death bound (a zero-task FAILURE under five minutes,
-# scripts/eval_dashboard/classify.py), so the health bot counts it as
-# infrastructure and points at the leased project rather than charging the
-# branch with a broken deploy. The presubmit always names the reader, so
-# FLEET_ALLOW_RUNNER_CREDENTIAL does not apply on this path.
+# seconds instead. Failing here usually also keeps the run inside the
+# dashboard's setup-death bound -- a zero-task FAILURE under five minutes of
+# whole job, scripts/eval_dashboard/classify.py -- so the health bot counts it
+# as infrastructure and points at the leased project; a run that waited longer
+# than that for its Boskos lease reads as a deploy break instead. A developer
+# running this against a project of their own sets
+# FLEET_ALLOW_RUNNER_CREDENTIAL=1, which leaves the reader unset here and lets
+# the gate pass on their own credential (roles/owner cannot impersonate it).
 # shellcheck source=hack/fleet-kubeconfigs.sh
 source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
-export FLEET_READONLY_SA="${FLEET_READONLY_SA:-$(_fleet_default_reader "${PROJECT_ID}")}"
+export FLEET_READONLY_SA="$(_fleet_reader_for_run "${PROJECT_ID}")"
 preflight_fleet_reader() {
   _fleet_require_readonly_credential "${FLEET_READONLY_SA}" "${PROJECT_ID}" || {
     echo "FATAL: the seeded fleet cannot be read as ${FLEET_READONLY_SA}; stopping before the build rather than grading the fleet with the runner's write credential. Re-apply bench/tf/fleet against ${PROJECT_ID}." >&2
