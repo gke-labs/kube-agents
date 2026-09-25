@@ -125,7 +125,15 @@ readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
 readonly REVALIDATION_INERT_PATHS='^((docs|\.github|examples)/|[^/]+\.md$|(LICENSE|OWNERS|OWNERS_ALIASES)$)'
 # Where the job history lives and how a human opens a build from the log.
 readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
-readonly REVALIDATION_JOB_NAME="pull-kube-agents-smoke-test"
+# The job whose history and status context step 0 reads: the running job's
+# own name, which Prow exports as JOB_NAME. Every presubmit that runs this
+# script has its own history path and its own status context, so keying the
+# reuse on a fixed name would let a second job (the next-mode lane runs this
+# same script under EVAL_MODE_NEXT=1) find the today job's green build at
+# the same head and run nothing. Outside Prow the default keeps the log
+# lines and the tests naming the job that exists.
+readonly REVALIDATION_DEFAULT_JOB_NAME="pull-kube-agents-smoke-test"
+readonly REVALIDATION_JOB_NAME="${JOB_NAME:-${REVALIDATION_DEFAULT_JOB_NAME}}"
 readonly REVALIDATION_SPYGLASS_PREFIX="https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
 # The started.json repos key naming this repository's clone record, and the
 # base ref assumed when the decoration did not export PULL_BASE_REF.

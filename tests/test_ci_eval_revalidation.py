@@ -229,6 +229,9 @@ class RevalidationTest(unittest.TestCase):
             "PULL_PULL_SHA": cur_head,
             "PULL_BASE_SHA": cur_base,
             "PULL_BASE_REF": "main",
+            # Unset in the pod that is not this job; a developer's shell may
+            # carry one, and the default is what these fixtures name.
+            "JOB_NAME": "",
             "GSUTIL_OBJECT_DIR": str(self.objects),
             "GSUTIL_CALL_LOG": str(self.call_log),
             "GITHUB_STATUS_DIR": str(self.statuses),
@@ -283,6 +286,40 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn(f"ls {prefix}/*/finished.json", calls)
         self.assertIn(f"cat {prefix}/200/finished.json", calls)
         self.assertIn(f"cat {prefix}/200/started.json", calls)
+
+    def test_the_history_read_is_keyed_on_the_running_jobs_name(self):
+        """A second presubmit running this script (the next-mode lane, under
+        EVAL_MODE_NEXT=1) has its own history path and its own status
+        context. Keyed on a fixed name it would find the today job's green
+        build at the same head and skip its own matrix; keyed on JOB_NAME it
+        reads only its own history, and the today job's status attests
+        nothing for it."""
+        other_job = f"{_JOB}-next"
+        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(
+            cur_head=self.c4, cur_base=self.c2, ls_file=ls, env_overrides={"JOB_NAME": other_job}
+        )
+        calls = self.call_log.read_text().splitlines()
+        own = f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{other_job}"
+        self.assertIn(f"ls {own}/*/finished.json", calls)
+        self.assertFalse(
+            [c for c in calls if f"/{_PR}/{_JOB}/" in c],
+            f"the today job's history was read under JOB_NAME={other_job}: {calls}",
+        )
+        # The stub listing is the today job's; its status event names the
+        # today context, so the other job's attestation must fail closed.
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn(f"GitHub holds no {other_job} success status", proc.stdout)
+
+    def test_job_name_unset_or_empty_reads_the_today_jobs_history(self):
+        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        for overrides in ({"JOB_NAME": ""}, None):
+            with self.subTest(overrides=overrides):
+                proc = self._run(
+                    cur_head=self.c4, cur_base=self.c2, ls_file=ls, env_overrides=overrides
+                )
+                self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+                self.assertIn(f"Attested by the Prow-posted {_JOB} success status", proc.stdout)
 
     def test_identical_shas_are_trivially_inert(self):
         """An empty delta means that side's tree is byte-identical to the one
