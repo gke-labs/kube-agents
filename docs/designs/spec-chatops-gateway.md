@@ -257,7 +257,10 @@ the stream already has everything - that's the whole point of the transcript of 
 The KV entry stays while active, holding the `contextId`. To bound bucket growth, an
 idle session whose pod has been reaped and whose last activity is older than `A2A_SESSION_TTL`
 (7 days by default, sitting well beyond the TASKS stream's 72-hour retention) has its
-KV session record pruned by the reaper. Reap never deletes a pod out from under a
+KV session record pruned by the reaper. Pruning removes the session record and any
+associated task routing even if an active task was left uncompleted (e.g. an executor that
+died without a terminal or an abandoned turn), since the retention horizon guarantees that
+stream retention and task deadlines have long elapsed. Reap never deletes a pod out from under a
 live task: an active task that has not detached (see Stop above) exempts the session
 from the idle TTL. The exemption is safe because the pod's end has owners. The session
 worker's adapter enforces a task deadline (30 minutes default, config-backed): at the

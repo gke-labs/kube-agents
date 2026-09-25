@@ -88,10 +88,10 @@ func TestSessionRecordRetainedBeforeSessionTTL(t *testing.T) {
 	}
 }
 
-// TestSessionRecordRetainedWhilePodOrTaskActive verifies Defect 1:
-// Even if last activity is old, a session with an active pod or active task
+// TestSessionRecordRetainedWhilePodActive verifies Defect 1:
+// Even if last activity is old, a session with an active pod
 // is not deleted out from under running work.
-func TestSessionRecordRetainedWhilePodOrTaskActive(t *testing.T) {
+func TestSessionRecordRetainedWhilePodActive(t *testing.T) {
 	r := startRig(t)
 	r.g.cfg.SessionTTL = 24 * time.Hour
 
@@ -107,28 +107,49 @@ func TestSessionRecordRetainedWhilePodOrTaskActive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Session with active task
-	convTask := "discord:g1/old-with-task"
-	recTask := &SessionRecord{
-		Key:          convTask,
-		ContextID:    "ctx-old-task",
-		ActiveTask:   &ActiveTask{TaskID: "task-live-1"},
-		LastActivity: time.Now().UTC().Add(-48 * time.Hour),
-	}
-	if err := r.g.reg.Put(context.Background(), recTask); err != nil {
-		t.Fatal(err)
-	}
-
 	r.g.reapOnce(context.Background())
 
 	gotPod, err := r.g.reg.Get(context.Background(), convPod)
 	if err != nil || gotPod == nil {
 		t.Fatalf("session with pod was deleted: %v", err)
 	}
+}
 
-	gotTask, err := r.g.reg.Get(context.Background(), convTask)
-	if err != nil || gotTask == nil {
-		t.Fatalf("session with task was deleted: %v", err)
+// TestSessionRecordPrunedWithStaleActiveTask verifies that a session whose pod
+// has been reaped (or never incarnated) but has a stale ActiveTask whose executor
+// died without a terminal or was abandoned is pruned once SessionTTL has elapsed.
+func TestSessionRecordPrunedWithStaleActiveTask(t *testing.T) {
+	r := startRig(t)
+	r.g.cfg.SessionTTL = 24 * time.Hour
+	ctx := context.Background()
+
+	convTask := "discord:g1/old-stale-task"
+	taskID := "task-stale-99"
+	recTask := &SessionRecord{
+		Key:          convTask,
+		ContextID:    "ctx-stale-task",
+		ActiveTask:   &ActiveTask{TaskID: taskID},
+		Tasks:        []TaskRef{{ID: taskID}},
+		LastActivity: time.Now().UTC().Add(-48 * time.Hour),
+	}
+	if err := r.g.reg.Put(ctx, recTask); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.g.reg.IndexTask(ctx, taskID, convTask); err != nil {
+		t.Fatal(err)
+	}
+
+	r.g.reapOnce(ctx)
+
+	gotTask, err := r.g.reg.Get(ctx, convTask)
+	if err == nil && gotTask != nil {
+		t.Fatalf("session with stale active task was retained: %+v", gotTask)
+	}
+
+	// Verify task routing was cleaned up
+	routedConv, err := r.g.reg.SessionForTask(ctx, taskID)
+	if err == nil && routedConv != "" {
+		t.Fatalf("stale task routing was retained for %s: %s", taskID, routedConv)
 	}
 }
 
@@ -265,7 +286,8 @@ func TestSessionLocksPrunedWhenIdle(t *testing.T) {
 }
 
 // TestIsMaxBytesDetection verifies Defect 5:
-// isMaxBytes distinguishes NATS JetStream bucket capacity limits.
+// isMaxBytes distinguishes NATS JetStream bucket capacity and storage exhaustion limits
+// without false positives from conversation keys (e.g. Discord snowflakes embedding digits).
 func TestIsMaxBytesDetection(t *testing.T) {
 	cases := []struct {
 		err  error
@@ -273,12 +295,18 @@ func TestIsMaxBytesDetection(t *testing.T) {
 	}{
 		{nil, false},
 		{errors.New("other network failure"), false},
+		// A snowflake or arbitrary digit sequence in the conversation key wrapping an unrelated error must NOT match:
+		{fmt.Errorf("session discord:100471234567890123/987654321: %w", errors.New("connection timeout")), false},
+		{fmt.Errorf("session discord:987654321/100471234567890123: %w", errors.New("auth refusal")), false},
 		{jetstream.ErrMaxBytesExceeded, true},
 		{fmt.Errorf("stream write: %w", jetstream.ErrMaxBytesExceeded), true},
 		{errors.New("nats: maximum bytes exceeded"), true},
 		{errors.New("nats: max bytes exceeded"), true},
-		{errors.New("10047: maximum bytes exceeded"), true},
-		{errors.New("nats: 10047 stream limit reached"), true},
+		// Typed jetstream.APIError with ErrorCode 10047 (JSStorageResourcesExceededErr):
+		{&jetstream.APIError{Code: 500, ErrorCode: jsErrCodeStorageResourcesExceeded, Description: "insufficient storage resources available"}, true},
+		{fmt.Errorf("session discord:123/456: %w", &jetstream.APIError{Code: 500, ErrorCode: jsErrCodeStorageResourcesExceeded, Description: "insufficient storage resources available"}), true},
+		// Typed jetstream.APIError with max bytes description:
+		{&jetstream.APIError{Code: 503, ErrorCode: 10077, Description: "maximum bytes exceeded"}, true},
 	}
 	for _, tc := range cases {
 		got := isMaxBytes(tc.err)

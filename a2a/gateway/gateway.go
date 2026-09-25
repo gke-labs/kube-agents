@@ -48,6 +48,15 @@ const (
 	correlationIDHexWidth = 12
 )
 
+// JetStream storage capacity error codes and patterns.
+const (
+	// jsErrCodeStorageResourcesExceeded is nats-server's JSStorageResourcesExceededErr (10047),
+	// returned when account or server storage resources are exhausted.
+	jsErrCodeStorageResourcesExceeded jetstream.ErrorCode = 10047
+	maxBytesErrPattern                                    = "max bytes"
+	maximumBytesErrPattern                                = "maximum bytes"
+)
+
 // gatewayParty is the gateway's own identity in from. Never the source of
 // authority: what makes a supervisor terminal the supervisor's is the subject
 // it is published on (`…supervisor`, which only the gateway's grant reaches),
@@ -1007,7 +1016,10 @@ func (g *Gateway) mintSession(ctx context.Context, msg InboundMessage) (*Session
 }
 
 // isMaxBytes reports whether err represents a NATS JetStream max_bytes limit
-// refusal (e.g. JSStreamMaxBytesErr, ErrMaxBytesExceeded).
+// or storage capacity refusal (e.g. JSStorageResourcesExceededErr, ErrMaxBytesExceeded,
+// or maximum bytes exceeded). It checks typed jetstream.APIError fields and the
+// innermost unwrapped root error to ensure conversation keys (which may embed arbitrary
+// digit sequences like Discord snowflakes) cannot trigger false positives.
 func isMaxBytes(err error) bool {
 	if err == nil {
 		return false
@@ -1015,8 +1027,26 @@ func isMaxBytes(err error) bool {
 	if errors.Is(err, jetstream.ErrMaxBytesExceeded) {
 		return true
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "max bytes") || strings.Contains(msg, "maximum bytes") || strings.Contains(msg, "10047")
+	var apiErr *jetstream.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.ErrorCode == jsErrCodeStorageResourcesExceeded {
+			return true
+		}
+		desc := strings.ToLower(apiErr.Description)
+		if strings.Contains(desc, maxBytesErrPattern) || strings.Contains(desc, maximumBytesErrPattern) {
+			return true
+		}
+	}
+	root := err
+	for {
+		if unwrapped := errors.Unwrap(root); unwrapped != nil {
+			root = unwrapped
+		} else {
+			break
+		}
+	}
+	msg := strings.ToLower(root.Error())
+	return strings.Contains(msg, maxBytesErrPattern) || strings.Contains(msg, maximumBytesErrPattern)
 }
 
 // startTask mints the identifiers, publishes the submission, and posts the
