@@ -1040,7 +1040,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
 
     # The runner's permission to borrow the seeded fleet's read-only account.
     # Without it hack/fleet-kubeconfigs.sh cannot mint a token for
-    # seeded-fleet-reader, writes nothing, and every presubmit that leases the
+    # seeded-fleet-reader, writes nothing, and every run that leases the
     # project stops at its fleet step. (Before it refused, it warned and read the
     # fleet on the runner's own roles/container.admin, unnoticed across the whole
     # pool: gke-labs/kube-agents#1051.) bench/tf/fleet now defaults the grant, so

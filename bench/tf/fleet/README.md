@@ -214,9 +214,10 @@ The chain, end to end:
 4. `kube_agents_bench.fleet.kubeconfig_for_role` turns the role into that path, and the
    verifier binds it to the check's `kubeconfig`.
 
-A role that will not resolve — the stack was never applied in the leased project, its
-apply stopped before planting that fixture, the runner never ran, or that cluster was
-unreachable — is `status: "error"` naming the role and the project. It never falls back
+A role that will not resolve — its apply stopped before planting that fixture, the runner
+never ran, or that cluster was unreachable — is `status: "error"` naming the role and the
+project. (A project the stack was never applied to has no reader account either, so a run
+stops at the credential gate before any check.) It never falls back
 to the ambient kubeconfig, which points at the agent's host cluster and carries no
 fixture; that fallback was activation blocker A5 in `bench/tasks/DRAFTS.md`. See
 [Addressing a seeded-fleet fixture by role](../../CUSTOM-TASKS.md#addressing-a-seeded-fleet-fixture-by-role)
@@ -277,8 +278,8 @@ ClusterRoleBindings or RoleBindings on these clusters naming any `*.gserviceacco
 subject; authorization comes entirely from the GKE IAM webhook, so there is nothing to
 narrow in-cluster either.
 
-The default landed after the pool was provisioned, so a project applied before it still
-lacks the binding — `scripts/verify_ci_pool_project.py` fails such a project, and
+The default landed after the pool was provisioned; a project applied before it and never
+re-applied lacks the binding — `scripts/verify_ci_pool_project.py` fails such a project, and
 re-applying this stack against it is the repair. Where the grant is in place the property
 is checkable rather than asserted:
 

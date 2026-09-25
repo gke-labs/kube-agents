@@ -477,7 +477,7 @@ write_fleet_kubeconfigs() {
   done <<<"$discovered"
 
   if [ "$labelled" -eq 0 ]; then
-    echo "WARNING: project ${project} carries no clusters labelled environment=seeded,managed-by=kube-agents-seeded-fleet. If the pool leased a project the fleet stack was never applied to, apply bench/tf/fleet/ there; until then every fleet check in this run reports status=error." >&2
+    echo "WARNING: project ${project} carries no clusters labelled environment=seeded,managed-by=kube-agents-seeded-fleet. Apply bench/tf/fleet/ there (an apply that made the reader account but no clusters reads like this); until then every fleet check in this run reports status=error." >&2
   elif [ "$found" -eq 0 ]; then
     # Clusters are there and labelled; not one of them resolved. Telling this
     # operator to apply the stack would send them to re-create what already
