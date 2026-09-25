@@ -817,7 +817,8 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # Clusters are found by label rather than by name, so this does not need to
 # know the leased project's cluster prefix or region.
 #
-# Non-fatal by design: an unreachable seeded cluster -- or a leased project the
+# Non-fatal by design, with one exception (the read-only credential, below):
+# an unreachable seeded cluster -- or a leased project the
 # fleet was never applied to -- leaves its roles' files absent, and
 # `fleet_resource_property` turns that into status=error naming the role and
 # the project: failing the checks that needed that cluster rather than the job,
@@ -837,11 +838,13 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # one namespace read per probe -- seconds, against a job measured in tens
 # of minutes.
 #
-# The `||` catches a REPOSITORY bug only: a missing or malformed
-# bench/tf/fleet/fixtures.json, or an unusable output directory. Every
-# environmental failure -- no fleet in this project, a cluster that will not
-# answer, a fixture that was never planted -- returns 0 with a warning of its
-# own and leaves the affected roles' files absent, which is the whole design.
+# The `||` catches two things. Exit 3 is the read-only credential unavailable
+# and ends the job (below). Any other non-zero is a REPOSITORY bug -- a missing
+# or malformed bench/tf/fleet/fixtures.json, an unusable output directory --
+# and warns. Every other environmental failure -- no fleet in this project, a
+# cluster that will not answer, a fixture that was never planted -- returns 0
+# with a warning of its own and leaves the affected roles' files absent, which
+# is the whole design.
 
 # The read-only identity the role kubeconfigs should carry. It cannot be a
 # static export in the Prow job the way EVAL_GITHUB_APP_ID is: the account is

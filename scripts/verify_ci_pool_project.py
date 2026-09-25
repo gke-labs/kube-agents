@@ -32,10 +32,13 @@ _UPSTREAM_SLUG = "gke-labs/kube-agents"
 _CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
 _CHART_VALUES = _ROOT / "charts" / "kube-agents" / "values.yaml"
 _FLEET_KUBECONFIGS = _ROOT / "hack" / "fleet-kubeconfigs.sh"
-# The read-only account bench/tf/fleet provisions. The runner refuses to write
-# kubeconfigs without one, so the fleet check names the project's unless the
-# operator set FLEET_READONLY_SA.
-FLEET_READER_SA_TEMPLATE = "seeded-fleet-reader@{project_id}.iam.gserviceaccount.com"
+# The runner refuses to write kubeconfigs on the caller's own credential unless
+# told to. The fleet check tells it: an operator, even a project owner, holds no
+# token-creator on the reader (roles/owner does not carry
+# iam.serviceAccounts.getAccessToken), and this one-off read of a project the
+# operator owns is not the shared-fleet hazard the refusal exists for. The
+# reader's bindings are checked in check_iam_and_service_accounts instead.
+FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV = "FLEET_ALLOW_RUNNER_CREDENTIAL"
 _FLEET_CATALOG = _ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 
 # The summary hack/fleet-kubeconfigs.sh prints to stderr on its way out. It is
@@ -237,8 +240,9 @@ CI_HEALTH_BOT_MEMBER = "serviceAccount:eval-dashboard-publisher@kube-agents-prow
 # What a runner loses without the token-creator grant; the bot's loss is
 # different and is spelled out in its own entry below.
 _RUNNER_WITHOUT_TOKEN_CREATOR = (
-    "every fleet check it runs in this project runs under its own read-write "
-    "credential. Re-apply bench/tf/fleet against {project_id}."
+    "every run it makes in this project stops at the fleet-credentials step: "
+    "hack/fleet-kubeconfigs.sh refuses to read the fleet on the runner's own "
+    "read-write credential. Re-apply bench/tf/fleet against {project_id}."
 )
 
 # Every member that must hold roles/iam.serviceAccountTokenCreator on the
@@ -1035,12 +1039,12 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
 
     # The runner's permission to borrow the seeded fleet's read-only account.
     # Without it hack/fleet-kubeconfigs.sh cannot mint a token for
-    # seeded-fleet-reader, so every role kubeconfig keeps the runner's own
-    # roles/container.admin credential on a fleet all open pull requests share --
-    # loud in the log, but the run still passes, which is why this went unnoticed
-    # across the whole pool (gke-labs/kube-agents#1051). bench/tf/fleet now
-    # defaults the grant, so a project failing here was last applied before that
-    # default landed and needs `tofu apply` against its seeded-fleet state.
+    # seeded-fleet-reader, writes nothing, and every presubmit that leases the
+    # project stops at its fleet step. (Before it refused, it warned and read the
+    # fleet on the runner's own roles/container.admin, unnoticed across the whole
+    # pool: gke-labs/kube-agents#1051.) bench/tf/fleet now defaults the grant, so
+    # a project failing here was last applied before that default landed and
+    # needs `tofu apply` against its seeded-fleet state.
     fleet_reader_email = f"seeded-fleet-reader@{project_id}.iam.gserviceaccount.com"
     rc, out, err = run_cmd([
         "gcloud", "iam", "service-accounts", "get-iam-policy",
@@ -1501,7 +1505,8 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
             FLEET_PROJECT_ID=project_id,
             BENCH_FLEET_KUBECONFIG_DIR=target,
         )
-        env.setdefault("FLEET_READONLY_SA", FLEET_READER_SA_TEMPLATE.format(project_id=project_id))
+        if not env.get("FLEET_READONLY_SA"):
+            env.setdefault(FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV, "1")
         rc, _, err = run_cmd(
             ["bash", str(_FLEET_KUBECONFIGS)], timeout=FLEET_TIMEOUT_SECONDS, env=env
         )

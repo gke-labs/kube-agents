@@ -75,9 +75,9 @@
 # Output: exports BENCH_FLEET_KUBECONFIG_DIR when sourced; prints it on stdout
 # when executed. Everything else this script says goes to stderr.
 #
-# Exit status: 0; 1 for bad inputs or a malformed catalog;
-# _FLEET_EXIT_READONLY_UNAVAILABLE when the read-only credential is unset or
-# cannot be minted -- nothing is written then.
+# Exit status: 0; 1 for bad inputs, a malformed catalog or a temp file that
+# could not be made; _FLEET_EXIT_READONLY_UNAVAILABLE (3) when the read-only
+# credential is unset or cannot be minted -- nothing is written then.
 # ==============================================================================
 
 _FLEET_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -265,15 +265,13 @@ _fleet_discover_clusters() {
 # that read these kubeconfigs start hours after this runs, so a baked token
 # would be expired for most of them; the file carries an exec entry pointing at
 # fleet-reader-credential.sh instead, which mints against the clock of the check
-# and caches between them. The mint below still happens, and is still what
-# decides whether the file is rewritten at all: it proves the caller can
-# actually impersonate $2 before the credential is committed to, so a project
-# missing the token-creator binding warns here and keeps its own credential
-# rather than producing a kubeconfig that fails later, one check at a time.
+# and caches between them. The mint below repeats the gate's check per file:
+# it proves the caller can impersonate $2 before the credential is committed
+# to, and on a failure the caller drops the file.
 #
 # The replacement file is composed from scratch and moved into place, so a
-# failure at any step leaves the gcloud-written credential intact rather than a
-# context wired to a user that does not exist. It is composed with a here-doc
+# failure at any step leaves the gcloud-written file whole for the caller to
+# remove, rather than a context wired to a user that does not exist. It is composed with a here-doc
 # rather than `kubectl config set-credentials --token=...` because that form
 # puts a live bearer token in argv, where `ps` and `set -x` can both read it.
 _fleet_use_readonly_token() {
@@ -351,8 +349,9 @@ _fleet_bare_token() {
 # Refuse to write kubeconfigs that would carry the caller's own credential.
 # The runner's identity holds container.admin on a fleet every open PR shares,
 # so a check made with it proves nothing; the old warn-and-fall-back ran
-# unread on two pool projects for a day. The mint is checked once, here: the
-# token-creator binding is per account, not per cluster.
+# unread on two pool projects for a day. One mint here settles the binding
+# (it is per account, not per cluster) before anything is written; the
+# per-file rewrite mints again to prove the credential it commits to.
 # FLEET_ALLOW_RUNNER_CREDENTIAL=1 opts out, for a fleet only you use.
 _fleet_require_readonly_credential() {
   local sa="$1" project="$2" errors token

@@ -3,6 +3,7 @@
 
 import base64
 import json
+import os
 import re
 import subprocess
 import time
@@ -376,7 +377,9 @@ class SeededFleetFixturesTest(unittest.TestCase):
 
     Two calls: `kubectl version` to establish the probes can run at all, then
     the script itself. The script exits 0 whether it wrote every role file or
-    none, so every assertion here is on the summary line it prints to stderr.
+    none -- except 3, when it refuses to read the fleet on a credential it was
+    not given -- so the assertions here are on the summary line it prints to
+    stderr, and on that one exit.
     """
 
     def _summary(self, written: int, unresolved: int = 0, unplanted: int = 0) -> str:
@@ -424,10 +427,6 @@ class SeededFleetFixturesTest(unittest.TestCase):
         env = run.call_args_list[1].kwargs["env"]
         self.assertEqual("kube-agents-evals-5", env["FLEET_PROJECT_ID"])
         self.assertTrue(env["BENCH_FLEET_KUBECONFIG_DIR"].startswith("/"))
-        # The runner refuses to run without a reader; the check names the
-        # project's own rather than inheriting whatever the operator's shell
-        # has, or nothing.
-        self.assertEqual("seeded-fleet-reader@kube-agents-evals-5.iam.gserviceaccount.com", env["FLEET_READONLY_SA"])
         # The state pass reads the directory the presence pass wrote, inside
         # the same temporary directory, and is told how long it may wait.
         state_cmd = run.call_args_list[2].args[0]
@@ -436,6 +435,40 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertEqual("kube-agents-evals-5", state_cmd[state_cmd.index("--project") + 1])
         self.assertEqual(str(checker.FLEET_STATE_WAIT_SECONDS), state_cmd[state_cmd.index("--wait") + 1])
         self.assertGreater(run.call_args_list[2].kwargs["timeout"], checker.FLEET_STATE_WAIT_SECONDS)
+
+    def test_the_fleet_check_runs_on_the_operators_own_credential(self):
+        # The runner refuses the caller's own credential unless told to; the
+        # check tells it, because an operator holds no token-creator on the
+        # reader and this is a one-off read of a project they own. The shell's
+        # own FLEET_READONLY_SA, when set, is respected instead.
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles())), (0, "", self._state(self._roles()))]
+            checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+            env = run.call_args_list[1].kwargs["env"]
+        self.assertEqual("1", env["FLEET_ALLOW_RUNNER_CREDENTIAL"])
+        self.assertNotIn("FLEET_READONLY_SA", env)
+        with mock.patch.dict(os.environ, {"FLEET_READONLY_SA": "reader@p.iam.gserviceaccount.com"}, clear=True), mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles())), (0, "", self._state(self._roles()))]
+            checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+            env = run.call_args_list[1].kwargs["env"]
+        self.assertEqual("reader@p.iam.gserviceaccount.com", env["FLEET_READONLY_SA"])
+        self.assertNotIn("FLEET_ALLOW_RUNNER_CREDENTIAL", env)
+
+    def test_a_reader_the_operator_cannot_mint_is_unverified_not_a_failure(self):
+        # The runner's exit 3 carries gcloud's own refusal, which the denial
+        # patterns read as an unperformed read: the project is not failed for
+        # what the operator could not see.
+        stderr = (
+            "ERROR: cannot mint a read-only token as seeded-fleet-reader@kube-agents-evals-5.iam.gserviceaccount.com: "
+            "ERROR: (gcloud.auth.print-access-token) PERMISSION_DENIED: Failed to impersonate. Nothing written."
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (3, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertTrue(any("exited 3 without reading the fleet" in w for w in result.warnings), result.warnings)
+        self.assertEqual(2, len(run.call_args_list), "no state pass runs on a fleet that was not read")
 
     def test_a_drifted_fixture_fails_and_names_the_role(self):
         # Presence passed -- payments-api's Deployment exists -- and the pod

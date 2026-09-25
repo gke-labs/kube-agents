@@ -52,10 +52,12 @@ Without `GCP_PROJECT_ID` the judge fails to construct (`No API key was provided`
 still needs the judge even though only the deterministic checks decide.
 
 A case that reads the seeded fleet needs it in your dev project: run
-[`hack/fleet-kubeconfigs.sh`](../../hack/fleet-kubeconfigs.sh) with
-`FLEET_READONLY_SA=seeded-fleet-reader@<project>.iam.gserviceaccount.com` (the fleet stack
-provisions it; on a fleet only you use, `FLEET_ALLOW_RUNNER_CREDENTIAL=1` runs it on your own
-credential instead) and export `BENCH_FLEET_KUBECONFIG_DIR` first. Without the fleet the case
+[`hack/fleet-kubeconfigs.sh`](../../hack/fleet-kubeconfigs.sh) and export
+`BENCH_FLEET_KUBECONFIG_DIR` first. The runner refuses to write kubeconfigs on your own
+credential unless told to: either set `FLEET_ALLOW_RUNNER_CREDENTIAL=1` (a fleet only you
+use), or apply the fleet stack with `user:<you>` added to `fleet_reader_token_creators` and
+set `FLEET_READONLY_SA=seeded-fleet-reader@<project>.iam.gserviceaccount.com` — the default
+grants token-creator to the CI identities only, and `roles/owner` does not include it. Without the fleet the case
 fails every time with the fleet phrases absent, which is broken, not red.
 
 It must fail, and fail for the reason your change addresses. Keep the failing entry from

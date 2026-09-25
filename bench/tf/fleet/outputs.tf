@@ -22,7 +22,7 @@ output "cluster_names" {
 }
 
 output "fleet_reader_service_account" {
-  description = "Read-only service account the evaluation checks read the fleet as. Export it as FLEET_READONLY_SA in the Prow job so hack/fleet-kubeconfigs.sh mints its token instead of using the runner's own credential."
+  description = "Read-only service account the evaluation checks read the fleet as. Export it as FLEET_READONLY_SA in the Prow job; hack/fleet-kubeconfigs.sh mints its token as this account and writes nothing without one."
   value       = google_service_account.fleet_reader.email
 }
 
