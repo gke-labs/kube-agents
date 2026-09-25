@@ -49,8 +49,11 @@ import (
 const (
 	// DefaultActivityListen is the loopback address the door binds. It is
 	// the host:port in the profile's hooks.overlay.yaml, and a test pins the
-	// two to each other.
-	DefaultActivityListen = "127.0.0.1:8643"
+	// two to each other. The pod's other listeners are hermes's API server
+	// on 8642 and the agent-api-auth container on 8643 (bound on every
+	// interface, so a loopback bind there fails too), the dashboard on 9119;
+	// 8651 is clear of all of them.
+	DefaultActivityListen = "127.0.0.1:8651"
 	// ActivityPath is the door's one route; hooks.overlay.yaml names it too.
 	ActivityPath = "/hermes/tool-events"
 	// ActivitySecretEnv is the variable hermes reads the signing key from

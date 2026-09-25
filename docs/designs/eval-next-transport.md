@@ -313,7 +313,7 @@ gate, an `authority` block that names a real principal, and the reply rendered i
 `resource_property` and `fleet_resource_property` read the cluster and never touched the
 transport. `tool_called` reads the trajectory, which on this path has tool-call data only when
 the executor publishes `activity` artifacts and the harness maps them in. Both executors
-now publish them: the worker adapter from the harness's `tool_use` blocks, the Hermes bridge
+publish them: the worker adapter from the harness's `tool_use` blocks, the Hermes bridge
 from hermes's outbound webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per
 invocation with the tool, its input, and the call's status, plus a `progress` heartbeat. The
 relay drops `activity` on purpose, so it reaches no conversation; the inject door's probe

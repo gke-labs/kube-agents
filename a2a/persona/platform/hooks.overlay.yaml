@@ -23,7 +23,7 @@
 hooks:
   outbound:
     - name: a2a-bridge-activity
-      url: http://127.0.0.1:8643/hermes/tool-events
+      url: http://127.0.0.1:8651/hermes/tool-events
       events: [pre_tool_call, post_tool_call]
       secret_env: A2A_ACTIVITY_SECRET
       timeout: 2

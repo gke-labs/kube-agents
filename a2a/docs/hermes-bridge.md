@@ -13,7 +13,7 @@ nothing answers on that subject yet - the worker adapter (W4) fast-follows, and 
 dispatcher is stage 3. The bridge is the stand-in executor: a small Go daemon on
 `a2a/lib` that consumes tasks addressed to `platform`, runs
 `hermes -p platform chat -Q -q <prompt>` per task, and publishes the lifecycle events with
-the output as the `result` artifact. It is scaffolding with a planned demolition date:
+the output as the `result` artifact and the persona's tool calls as `activity`. It is scaffolding with a planned demolition date:
 when the dispatcher and worker adapter land, the bridge retires. Nothing here is
 protocol - the wire contract is the payload spec's, unchanged.
 
@@ -220,7 +220,8 @@ its outbound webhooks: a `hooks.outbound` entry in the profile's config POSTs ev
 `pre_tool_call` and `post_tool_call` to a URL, fire-and-forget through a bounded queue,
 HMAC-SHA256 signed when the variable its `secret_env` names is set. The bridge listens
 for those on a loopback address in the pod (`BRIDGE_ACTIVITY_LISTEN`, default
-`127.0.0.1:8643`; `off` closes the door), and the platform profile carries the entry
+`127.0.0.1:8651`, clear of hermes's API server on 8642 and the agent-api-auth
+listener on 8643; `off` closes the door), and the platform profile carries the entry
 pointing at it — `a2a/persona/platform/hooks.overlay.yaml`, which the entrypoint merges
 into the profile only under `mode: next`, because in `mode: today` there is no sidecar and
 every tool call would otherwise try a dead port twice and log a warning.
@@ -228,7 +229,8 @@ every tool call would otherwise try a dead port twice and log a warning.
 Nothing in a delivery names the A2A task: hermes's own `task_id` is the kanban card or a
 fresh UUID, `cwd` and `profile` are shared by every process under the profile, and the URL
 does not expand environment variables. So the bridge gives each child a random key in its
-environment under `A2A_ACTIVITY_SECRET`, and a delivery belongs to whichever in-flight
+environment under `A2A_ACTIVITY_SECRET` (and the door's URL under `A2A_ACTIVITY_URL`, for
+the record; hermes reads the URL from its config), and a delivery belongs to whichever in-flight
 task's key verifies its signature — at most `BRIDGE_CONCURRENCY` keys to try. Unsigned or
 unmatched deliveries (kanban workers and cron ticks under the same profile) are answered
 204 and dropped, so they cost their sender nothing per call beyond one "deliveries will be
@@ -251,9 +253,9 @@ worker adapter's `{"tool","input"}` so one fold reads both executors:
 `status` is `completed` or `error` from the hook's own verdict. A call still open when the
 task finalizes — deadline, cancel, a crash mid-tool — is flushed as `interrupted` inside
 the finalize lock, ahead of the result and the terminal, so the trace is complete and
-nothing of it follows the final event. `input` is capped (2 KiB) and values under
-secret-looking keys (`token`, `secret`, `password`, `authorization`, `api_key`,
-`credential`) are replaced before publishing. Tool results are not published: no check
+nothing of it follows the final event. `input` is capped (2 KiB) and values under keys
+matching `token`, `secret`, `password`, `passwd`, `authorization`, `api_key`/`api-key` or
+`credential` are replaced before publishing. Tool results are not published: no check
 reads them and they are the riskiest payload in the pod. The stream keeps every activity
 part; the relay drops the artifact on purpose (debug and audit views never render to
 chat), and the inject door's probe is where a reader sees it.
