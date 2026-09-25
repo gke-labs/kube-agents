@@ -60,6 +60,13 @@ const (
 	defaultTaskDeadlineSeconds = 7200
 	defaultKillGraceSeconds    = 10
 	defaultKVBucket            = "runtime-state"
+	// defaultProgressIntervalSeconds is hermesbridge.DefaultProgressInterval
+	// in the environment's unit.
+	defaultProgressIntervalSeconds = 60
+	// activityListenOff is the value that closes the activity door. The
+	// Config zero value means "off" but an empty environment variable reads
+	// as unset, so the daemon needs a word for it.
+	activityListenOff = "off"
 )
 
 // errUsage is what realMain returns when NATS_URL is missing, so run can
@@ -104,7 +111,11 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		TaskDeadline: time.Duration(envInt(log, "BRIDGE_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds)) * time.Second,
 		KillGrace:    time.Duration(envInt(log, "BRIDGE_KILL_GRACE_SECONDS", defaultKillGraceSeconds)) * time.Second,
 		KVBucket:     envOr("BRIDGE_KV_BUCKET", defaultKVBucket),
-		Logger:       log,
+		// The activity door (a2a/hermes-bridge/activity.go): on by default at
+		// the address the platform profile's hooks.overlay.yaml names.
+		ActivityListen:   activityListen(envOr("BRIDGE_ACTIVITY_LISTEN", hermesbridge.DefaultActivityListen)),
+		ProgressInterval: time.Duration(envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)) * time.Second,
+		Logger:           log,
 	}
 	if bin := os.Getenv("HERMES_BIN"); bin != "" {
 		cfg.Command = []string{bin, "-p", cfg.Profile, "chat", "-Q", "-q"}
@@ -128,6 +139,14 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	}
 	log.Info("bridge shut down cleanly")
 	return nil
+}
+
+// activityListen maps the environment's spelling of "off" to the Config's.
+func activityListen(v string) string {
+	if v == activityListenOff {
+		return ""
+	}
+	return v
 }
 
 func envOr(key, def string) string {
