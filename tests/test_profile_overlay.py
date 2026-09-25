@@ -428,7 +428,7 @@ class A2AHooksFragmentTest(unittest.TestCase):
         self.run_step(with_fragment=True)
         merged = self.config()
         (hook,) = merged["hooks"]["outbound"]
-        self.assertEqual(hook["url"], "http://127.0.0.1:8643/hermes/tool-events")
+        self.assertEqual(hook["url"], "http://127.0.0.1:8651/hermes/tool-events")
         self.assertEqual(hook["secret_env"], "A2A_ACTIVITY_SECRET")
         self.assertEqual(hook["events"], ["pre_tool_call", "post_tool_call"])
         without = {k: v for k, v in merged.items() if k != "hooks"}

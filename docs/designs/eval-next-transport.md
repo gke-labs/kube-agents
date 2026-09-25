@@ -322,7 +322,7 @@ a trajectory item in the api path's shape, and writes one `a2a.activity` marker 
 was present at all; a probe without the key leaves the record with no marker and no calls. Which
 executor publishes `activity`, and whether the door carries it, is each component's own to state
 (the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the
-harness asks neither and grades on what the probe carried. Both executors now publish it: the
+harness asks neither and grades on what the probe carried. Both executors publish it: the
 worker adapter from the harness's `tool_use` blocks, the Hermes bridge from hermes's outbound
 webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool, its
 input, and the call's status, plus a `progress` heartbeat. `worker_commands` reads
