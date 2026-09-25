@@ -131,13 +131,13 @@ reduces to correctness. A task with no spec at all produces no correctness and i
 **The inject lane sets aside what its transport cannot show.** A record from the harness's inject
 transport carries the task's lifecycle envelope as its trajectory (`inject.task`, `inject.post`,
 `inject.edit`, `a2a.status-update`) and no tool call, and there are no card ids to read worker logs
-by, so every `tool_called` and `worker_commands` check is blind there: the first matrix run through
+by, so every `tool_called`, `worker_commands` and `worker_agents` check is blind there: the first matrix run through
 the door (#2007, 2026-09-25) collapsed `agent-kanban-smoke` 0 of 3 with a correct answer in every
 repetition. `classify_rep()` therefore re-reads such a record before the rungs. The
 condition is the record's, not the environment's: the trajectory carries the transport's task
 marker and nothing outside the envelope — `_inject_blind()` in `scoring.py`, whose literals
 `test_scoring.py` holds equal to the transport's. When it holds, every report entry the task
-declares whose check is made of `tool_called` or `worker_commands` leaves and nothing else
+declares whose check is made of `tool_called`, `worker_commands` or `worker_agents` leaves and nothing else
 (`CaseSpec.transport_blind_checks`, by entry name; a compound mixing in an applicable leaf is not
 in the set, because that leaf can fail on any transport and setting the entry aside would hide it)
 is set aside as `not_applicable`, whatever

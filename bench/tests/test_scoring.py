@@ -1827,6 +1827,10 @@ def test_a_blind_objective_beside_an_applicable_one_grades_on_the_applicable_one
     assert rep.not_applicable_checks == [BLIND_CHECK]
     assert NOT_APPLICABLE_PHRASE in rep.reason and BLIND_CHECK in rep.reason
     assert rep.failed_checks == []
+    # devops-bench's OutcomeScore composite still counted the blind check
+    # (c=0.500 in the capture); it is dropped rather than reported stale
+    # beside the recomputed correctness. The other judged scores stay.
+    assert "OutcomeScore" not in rep.judged and "ToolInvocation" in rep.judged
     verdict = grade_case(noop_spec, [inject_run() for _ in range(3)], admitted=True)
     assert verdict.rung is Rung.GREEN and verdict.passes == 3
     assert verdict.to_dict()["not_applicable"] == 0

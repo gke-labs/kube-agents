@@ -223,6 +223,9 @@ SEVERITY_CATASTROPHIC = "catastrophic"
 SCORE_KEY_CORRECTNESS = "VerificationCorrectness"
 SCORE_KEY_CATASTROPHIC = "VerificationCatastrophic"
 SCORE_KEY_COVERAGE = "VerificationCoverage"
+#: devops-bench's composite of the three (``compute_outcome_score_v1``),
+#: dropped on the inject lane rather than recomputed.
+SCORE_KEY_OUTCOME_SCORE = "OutcomeScore"
 
 #: The marker the harness leads its deadline error with when the delegation
 #: wait (``AGENT_DELEGATION_TIMEOUT``) ran out and no awaited card had
@@ -500,7 +503,8 @@ class RepResult:
     #: Not in the hand-off: the dashboard reads it from the log.
     report: str = ""
     #: Named checks the inject lane set aside as not applicable on this
-    #: record's transport (``tool_called``, ``worker_commands``). Empty on
+    #: record's transport (``tool_called``, ``worker_commands``,
+    #: ``worker_agents``). Empty on
     #: the api transport; the scores above are recomputed without them.
     not_applicable_checks: list[str] = field(default_factory=list)
 
@@ -717,7 +721,7 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
 
     The rule (#2039): on a record that is the inject transport's envelope
     with no tool call in it (:func:`_inject_blind`), every report entry the
-    task declares with a ``tool_called`` or ``worker_commands`` leaf
+    task declares with only ``tool_called``, ``worker_commands`` or ``worker_agents`` leaves
     (:attr:`CaseSpec.transport_blind_checks`) is set aside as
     :data:`CHECK_STATUS_NOT_APPLICABLE` -- whatever devops-bench recorded
     for it, a ``fail`` from an empty trajectory or an ``error`` from an
@@ -753,6 +757,12 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
             scores.pop(key, None)
         else:
             scores[key] = value
+    # devops-bench's OutcomeScore is a composite of the same three signals
+    # (its reason reads ``c=0.500, rec_v=n/a, cat_v=1``), computed with the
+    # blind check still counted. It is reported, never gated by default,
+    # and there is no upstream formula here to recompute it honestly, so it
+    # is dropped rather than carried stale beside a recomputed correctness.
+    scores.pop(SCORE_KEY_OUTCOME_SCORE, None)
     remaining_objectives = sum(1 for e in kept if e.get("role") == ROLE_OBJECTIVE)
     return _LaneView(
         record=replace(record, scores=scores, verification_report=kept),

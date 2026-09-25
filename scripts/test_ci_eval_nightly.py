@@ -319,7 +319,20 @@ class InjectLaneExclusionTest(unittest.TestCase):
         self.assertEqual(lines_tagged(result, "TASK"), [e for e in presubmit_entries() if e not in excluded])
         for name in eval_rosters.inject_lane_exclusions():
             self.assertIn(f"AGENT_TRANSPORT=inject: {name} leaves the matrix", result.stdout)
-        # The roster export is the file's, unchanged: an exclusion is not a demotion.
+        # The roster FILE is untouched (an exclusion is not a demotion), but
+        # the export leaves the dropped names out: a roster name the suite
+        # never grades would trip bench-gate's misspelled-roster banner on
+        # every run of the lane.
+        excluded_names = set(eval_rosters.inject_lane_exclusions())
+        self.assertTrue(excluded_names & set(eval_rosters.blocking_roster()), "the pinned exclusion is a roster case, so the export must differ from the file")
+        self.assertEqual(
+            lines_tagged(result, "ROSTER"),
+            [",".join(c for c in eval_rosters.blocking_roster() if c not in excluded_names)],
+        )
+
+    def test_the_api_lane_exports_the_whole_roster(self):
+        result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "api"})
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(eval_rosters.blocking_roster())])
 
     def test_the_nightly_tier_is_filtered_too(self):

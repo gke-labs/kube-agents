@@ -49,13 +49,15 @@ NOOP_DEPLOYER = "noop"
 
 # The check types that read the run's own tool calls or worker logs rather
 # than the answer or the cluster: ``tool_called`` reads the trajectory,
-# ``worker_commands`` the delegated cards' worker logs. On the inject
-# transport neither has a subject -- the record's trajectory is the task's
-# lifecycle envelope, and there are no card ids to read logs by -- so the
-# scorer reports such a check as not applicable there rather than failed
-# (``scoring.py``, the inject lane). Recorded per entry NAME, because the
-# report devops-bench writes carries the entry's name and not its check type.
-TRANSPORT_BLIND_CHECK_TYPES = frozenset({"tool_called", "worker_commands"})
+# ``worker_commands`` the delegated cards' worker logs, ``worker_agents`` the
+# ``agent`` tags the harness puts on the workers' trajectory entries. On the
+# inject transport none has a subject -- the record's trajectory is the
+# task's lifecycle envelope, and there are no card ids to read logs by -- so
+# the scorer reports such a check as not applicable there rather than failed
+# or errored (``scoring.py``, the inject lane). Recorded per entry NAME,
+# because the report devops-bench writes carries the entry's name and not
+# its check type.
+TRANSPORT_BLIND_CHECK_TYPES = frozenset({"tool_called", "worker_commands", "worker_agents"})
 
 # The keys a check subtree nests children under: compound nodes carry
 # ``checks``; a single wrapped child would be ``check``.

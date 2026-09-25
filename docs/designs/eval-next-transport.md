@@ -318,7 +318,7 @@ persona moves to the worker path. `worker_commands` reads the kanban worker logs
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
 signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
 as a failure meanwhile: on a record whose trajectory is this transport's envelope with no tool
-call in it, the scorer sets every `tool_called` and `worker_commands` entry aside as not
+call in it, the scorer sets every `tool_called`, `worker_commands` and `worker_agents` entry aside as not
 applicable and grades the checks that remain; a case with no other objective is not graded on
 the lane rather than collapsed, and the rule retires itself on the first record that carries a
 tool entry ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport

@@ -92,6 +92,8 @@ from kube_agents_bench.scoring import (
     DEFAULT_JUDGED_MARGIN,
     DEFAULT_JUDGED_METRICS,
     MISSING,
+    NOT_APPLICABLE_PHRASE,
+    REP_OUTCOME_NOT_APPLICABLE,
     SUITE_OUTCOME_GREEN,
     SUITE_OUTCOME_NOT_EVALUATED,
     SUITE_OUTCOME_RED,
@@ -755,6 +757,17 @@ def _record_for_case(
         return f"{case_id}: no version key on this run, so nothing to file it under"
 
     reps = [r for r in (case.get("reps") or []) if isinstance(r, dict)]
+    # A repetition the inject lane set aside (#2039) is not this store's
+    # evidence: the record is main's api-lane record, a line built from a
+    # transport that blinds one of the case's checks would not be comparable
+    # with it, and BaselineRecord has no column that could carry the
+    # outcome without dropping it. Skip the case, saying which outcome.
+    set_aside = sum(1 for r in reps if r.get("outcome") == REP_OUTCOME_NOT_APPLICABLE)
+    if set_aside:
+        return (
+            f"{case_id}: {set_aside} of {len(reps)} repetition(s) {NOT_APPLICABLE_PHRASE}; "
+            "not recorded, the store holds api-lane evidence only"
+        )
     scored = [r for r in reps if r.get("outcome") in ("pass", "fail")]
     if not scored:
         return (

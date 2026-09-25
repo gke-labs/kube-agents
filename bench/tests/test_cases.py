@@ -250,25 +250,37 @@ def test_an_unnamed_blind_entry_is_left_out(write_task):
 
 @pytest.mark.parametrize("path", sorted(TASKS.glob("*/task.yaml")), ids=lambda p: p.parent.name)
 def test_every_shipped_blind_check_is_named(path):
-    """Every shipped entry with a tool_called or worker_commands leaf carries
-    a name, so the lane can match it; a nameless one would grade as a
-    failure on the inject transport with no way to say why."""
+    """Every shipped entry with a transport-blind leaf carries a name, so
+    the lane can match it; a nameless one would grade as a failure on the
+    inject transport with no way to say why. And the loader's set is
+    exactly the entries whose leaves are ALL blind: a mixed compound is
+    declared here and, by design, left out there."""
     import json
+    import re
 
     import yaml
+    from kube_agents_bench.cases import TRANSPORT_BLIND_CHECK_TYPES
 
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+
     # Independently of the loader: an entry whose check subtree, serialised,
-    # names either type. Comments do not survive safe_load, so a task that
+    # names a blind type. Comments do not survive safe_load, so a task that
     # only talks about tool_called in prose declares nothing here.
+    def types_of(entry):
+        return set(re.findall(r'"type": "([a-z_]+)"', json.dumps(entry.get("check"))))
+
     declared = [
         e
         for e in doc.get("verification_spec") or []
-        if isinstance(e, dict)
-        and any(f'"type": "{t}"' in json.dumps(e.get("check")) for t in ("tool_called", "worker_commands"))
+        if isinstance(e, dict) and types_of(e) & TRANSPORT_BLIND_CHECK_TYPES
     ]
     if not declared:
         pytest.skip("no transport-blind check in this task")
     unnamed = [e for e in declared if e.get("name") is None]
     assert unnamed == [], f"{path}: transport-blind entries without a name"
-    assert load_case(path).transport_blind_checks == {str(e["name"]) for e in declared}
+    # Compound node types are not leaves; only leaf types decide.
+    compounds = {"sequence", "parallel", "all", "any", "none"}
+    all_blind = {
+        str(e["name"]) for e in declared if (types_of(e) - compounds) <= TRANSPORT_BLIND_CHECK_TYPES
+    }
+    assert load_case(path).transport_blind_checks == all_blind

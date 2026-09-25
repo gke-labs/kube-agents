@@ -244,7 +244,7 @@ nothing in the two roster files changes, and every case not named in the lane's 
 kept apart on purpose.
 
 A check the transport blinds is the scorer's business. The door's record carries no tool calls
-and no card ids, so `tool_called` and `worker_commands` see nothing there; `bench-gate` sets
+and no card ids, so `tool_called`, `worker_commands` and `worker_agents` see nothing there; `bench-gate` sets
 those entries aside as not applicable on that transport and grades the rest, and a case whose
 only objectives are of that kind is reported `NOT_GRADED_ON_TRANSPORT` rather than collapsed —
 evaluated, outside the pass rate, never weather

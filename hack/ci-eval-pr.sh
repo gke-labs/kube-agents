@@ -1581,13 +1581,16 @@ esac
 # missing file or an entry naming no case fails here rather than on the
 # lane that needs it; applied on the inject lane only, so the api lane's
 # matrix stays byte for byte the presubmit file. Not a demotion: the roster
-# files are untouched, and an excluded case still on the roster arms
-# nothing here, which is harmless -- bench-gate arms rung 4 per case it
-# grades. A check the transport blinds (tool_called, worker_commands) is the
-# scorer's to set aside, not this file's: docs/designs/eval-scorer.md, "The
-# inject lane".
+# files are untouched. The names dropped here are kept in
+# INJECT_LANE_DROPPED (empty on every other lane) so the BOOTSTRAP_ADMITTED
+# export below leaves them out too -- a roster name the suite never grades
+# would otherwise trip bench-gate's misspelled-roster banner on every run
+# of the lane. A check the transport blinds (tool_called, worker_commands,
+# worker_agents) is the scorer's to set aside, not this file's:
+# docs/designs/eval-scorer.md, "The inject lane".
 INJECT_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
 INJECT_LANE_EXCLUDED="$(roster_entries "${INJECT_LANE_EXCLUSIONS_FILE}")"
+INJECT_LANE_DROPPED=""
 while IFS= read -r NAME; do
   if [ -z "${NAME}" ]; then continue; fi
   if [ ! -f "${BENCH_DIR}/tasks/${NAME}/task.yaml" ]; then
@@ -1601,6 +1604,8 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_LANE_TRANSPORT}" ] && [ -n "${INJEC
     NAME="$(basename "$(dirname "${ENTRY}")")"
     if grep -qxF -- "${NAME}" <<< "${INJECT_LANE_EXCLUDED}"; then
       echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${NAME} leaves the matrix -- its premise needs the chat front door (${EVAL_INJECT_LANE_EXCLUSIONS_FILE})"
+      INJECT_LANE_DROPPED="${INJECT_LANE_DROPPED}${NAME}
+"
     else
       INJECT_LANE_KEPT+=("${ENTRY}")
     fi
@@ -1874,6 +1879,16 @@ while IFS= read -r NAME; do
   if ! grep -qxF -- "${NAME}" <<< "${PRESUBMIT_CASE_NAMES}"; then
     echo "ERROR: ${BLOCKING_ROSTER_FILE}: '${NAME}' is not a case in ${PRESUBMIT_CASES_FILE}; the blocking roster is a subset of the presubmit." >&2
     exit 1
+  fi
+  # A roster case the inject lane's exclusion step dropped from the matrix
+  # (INJECT_LANE_DROPPED, empty on every other lane) leaves the export too:
+  # it is still checked against the presubmit above, because the file is
+  # the api lane's roster and stays a subset of it, but a name that arms a
+  # case the suite never grades would trip bench-gate's "BOOTSTRAP_ADMITTED
+  # names no graded case" banner on every run of the lane, and that banner
+  # exists to catch a misspelled roster entry.
+  if [ -n "${INJECT_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${INJECT_LANE_DROPPED:-}"; then
+    continue
   fi
   BLOCKING_ROSTER_DEFAULT="${BLOCKING_ROSTER_DEFAULT:+${BLOCKING_ROSTER_DEFAULT},}${NAME}"
 done <<< "${BLOCKING_ROSTER_ENTRIES}"
@@ -2539,6 +2554,18 @@ announce_suite_verdict() {
       "${verdict_json}" "${EVAL_VERDICT_OUTCOME_NOT_EVALUATED}" 2>/dev/null; then
     not_evaluated="true"
   fi
+  # Two things write that outcome (bench/kube_agents_bench/scoring.py,
+  # grade_suite): weather that took an admitted case or every case, which
+  # lists the lost cases under `not_evaluated`, and an inject-lane run whose
+  # every case was set aside as not graded on its transport, which lists
+  # nothing there and the cases under `not_graded`. The final line says
+  # which, because the two ask for opposite actions: a rerun, or a roster.
+  local graded_nothing="false"
+  if [ "${not_evaluated}" = "true" ] && \
+    python3 -c 'import json, sys; v = json.load(open(sys.argv[1])); sys.exit(0 if not v.get("not_evaluated") and v.get("not_graded") else 1)' \
+      "${verdict_json}" 2>/dev/null; then
+    graded_nothing="true"
+  fi
   # The final line keeps the `PR Smoke Test Evaluation Failed` and
   # `(Total Duration: Ns)` anchors that scripts/eval_dashboard/collect.py
   # matches, so a not-evaluated run does not lose its final line on the
@@ -2546,6 +2573,10 @@ announce_suite_verdict() {
   if [ "${suite_status}" -eq 0 ]; then
     echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Succeeded (Total Duration: ${total_duration}s) ==="
     return 0
+  fi
+  if [ "${graded_nothing}" = "true" ]; then
+    echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- NOT EVALUATED: every case in the matrix was not graded on this transport (every objective check not applicable), so this run graded nothing and cannot certify green. Not a finding against the change and not an environment failure: the lane's roster is what to fix. See ${verdict_md} (Total Duration: ${total_duration}s)"
+    return "${EVAL_SUITE_NOT_EVALUATED_STATUS}"
   fi
   if [ "${not_evaluated}" = "true" ]; then
     echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- NOT EVALUATED: an admitted case (or every case) lost every repetition to infrastructure, so this run cannot certify green. Not a finding against the change: rerun when the environment is healthy rather than debugging it. See ${verdict_md} (Total Duration: ${total_duration}s)"
