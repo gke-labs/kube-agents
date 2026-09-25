@@ -163,7 +163,9 @@ SITE_CONVENTION_PAGES = frozenset({"404.md"})
 # links member by member: the agents' runtime material (personas, SOPs, skills
 # and their references, the onboarding templates) and the GitOps template's
 # per-directory documents. `*` stays inside one path segment; `**` crosses
-# segments. A new document in one of these directories needs no link; a new
+# segments; neither matches a segment that starts with a dot, so a nested
+# dot-directory (`examples/gitops-repo/.github/`) is content a family does not
+# cover. A new document in one of these directories needs no link; a new
 # family needs a line here, argued in the pull request.
 LINK_EXEMPT_FAMILY_GLOBS = (
     "agents/chat/defaults/onboarding/*.md",
@@ -174,6 +176,12 @@ LINK_EXEMPT_FAMILY_GLOBS = (
     "agents/platform/skills/*/references/*.md",
     "examples/gitops-repo/*/**",
 )
+
+# What the family globs' wildcards compile to. A segment is what sits between
+# slashes; `(?!\.)` at its start is the shell rule that a wildcard skips a
+# dot-entry.
+GLOB_STAR_RE = r"(?!\.)[^/]*"
+GLOB_DOUBLE_STAR_RE = r"(?:(?!\.)[^/]*/)*(?!\.)[^/]*"
 
 # Documents no reader reached when the rule arrived. Each stays here until it
 # is linked from the page that owns its topic or deleted; the check fails on
@@ -359,15 +367,20 @@ def check_code_file(path: Path, tracked: set[Path]) -> list[str]:
 
 
 def glob_to_regex(pattern: str) -> re.Pattern[str]:
-    """Translate a family glob to a regex: `**` crosses slashes, `*` does not."""
+    """Translate a family glob to a regex.
+
+    `**` crosses slashes and `*` does not; like a shell glob, neither matches
+    a segment that starts with a dot, so a wildcard never reaches into a
+    nested dot-directory.
+    """
     out: list[str] = []
     i = 0
     while i < len(pattern):
         if pattern.startswith("**", i):
-            out.append(".*")
+            out.append(GLOB_DOUBLE_STAR_RE)
             i += 2
         elif pattern[i] == "*":
-            out.append("[^/]*")
+            out.append(GLOB_STAR_RE)
             i += 1
         else:
             out.append(re.escape(pattern[i]))
@@ -415,7 +428,9 @@ def reached_by_shape(rel: str, site_directories: frozenset[str]) -> bool:
     ``rel`` is repository-relative with forward slashes. Root-level
     dot-directories are tooling, not documentation, and are out of scope by
     the same rule as before; a dot-directory nested inside a documented area
-    (``examples/gitops-repo/.github/``) is content and stays in scope.
+    (``examples/gitops-repo/.github/``) is content and stays in scope, which
+    ``glob_to_regex`` keeps true for the families: a wildcard does not match
+    a segment that starts with a dot.
     """
     if "/" not in rel or rel.startswith("."):
         return True
