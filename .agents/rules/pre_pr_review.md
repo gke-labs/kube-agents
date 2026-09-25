@@ -9,9 +9,9 @@ paths:
 
 [`AGENTS.md`](../../AGENTS.md) owns the three rules below — that adversarial self-review and live
 validation are required before opening a pull request, that each is recorded in the pull request
-body, and that a bug fix names what stops it recurring. This file holds the mechanics of carrying
-them out, and what the automated review shares with the first of them. Change those rules in
-`AGENTS.md`; change how they are done here.
+body, and that a bug fix must name what stops it recurring. This file holds the mechanics of
+carrying them out, and what the automated review shares with the first of them. Change those rules
+in `AGENTS.md`; change how they are done here.
 
 ## Adversarial self-review
 

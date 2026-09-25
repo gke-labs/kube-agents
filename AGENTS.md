@@ -253,7 +253,7 @@ Agents with a user in the loop follow this file.
   `uses:` line or a workflow trigger.
 - Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of
   detail. Do not use `--fill` with `gh pr create` as it bypasses the template.
-  A bug fix names what stops it recurring ([how](.agents/rules/pre_pr_review.md)).
+  A bug fix must name what stops it recurring ([how](.agents/rules/pre_pr_review.md)).
 - **AI Agent Attribution & Commit Authorship:**
   - Do not add AI agents as git commit co-authors or include `Co-Authored-By:` trailers in commit messages.
   - Note AI assistance in the PR description (e.g. `Generated with the help of <Agent/Model>.`).
