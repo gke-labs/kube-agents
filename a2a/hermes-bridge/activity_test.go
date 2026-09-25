@@ -1,7 +1,6 @@
 package hermesbridge
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -56,7 +55,8 @@ def call(tool, args, call_id, status="ok", error_type=None, ms=12):
 }
 
 // startBridgeCfg is startBridge with the caller's Config; the door is opened
-// on an ephemeral port unless the caller says otherwise.
+// on an ephemeral port unless the caller says otherwise. The lifecycle and
+// the consumer wait are startBridgeWith's.
 func startBridgeCfg(t *testing.T, url string, command []string, mutate func(*Config)) *Bridge {
 	t.Helper()
 	cfg := Config{
@@ -69,52 +69,7 @@ func startBridgeCfg(t *testing.T, url string, command []string, mutate func(*Con
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	b, err := New(ctx, cfg)
-	if err != nil {
-		cancel()
-		t.Fatalf("bridge new: %v", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- b.Run(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Logf("bridge exited: %v", err)
-			}
-		case <-time.After(10 * time.Second):
-			t.Error("bridge did not shut down")
-		}
-	})
-	waitFor(t, 10*time.Second, "bridge durable consumer", func() bool {
-		c, err := lib.Connect(testCtx(t), url, lib.WithName("probe"))
-		if err != nil {
-			return false
-		}
-		defer c.Close()
-		return true
-	})
-	// The consumer bind is what startBridge waits on; reuse its check.
-	startBridgeWaitConsumer(t, url)
-	return b
-}
-
-func startBridgeWaitConsumer(t *testing.T, url string) {
-	t.Helper()
-	waitFor(t, 10*time.Second, "bridge durable consumer", func() bool {
-		c, err := lib.Connect(testCtx(t), url, lib.WithName("probe-consumer"))
-		if err != nil {
-			return false
-		}
-		defer c.Close()
-		_, err = c.TasksGet(testCtx(t), "platform", "task-none-"+t.Name())
-		// TaskNotFound means the stream is readable; the consumer itself is
-		// bound before Run logs "consuming", which precedes the first task
-		// by the submit's own round trip in every test here.
-		return isTaskNotFound(err) || err == nil
-	})
+	return startBridgeWith(t, cfg)
 }
 
 func activityEntries(t *testing.T, task *lib.Task) []ActivityEntry {
@@ -506,5 +461,37 @@ func TestRedactInput_ValuesUnderInnocentKeys(t *testing.T) {
 	}
 	if !strings.Contains(out, "kubectl get pods -n kube-system") {
 		t.Fatalf("innocent value was damaged: %s", out)
+	}
+}
+
+// Past the budget, calls are counted, not published, and one marker at the
+// terminal says how many; the lifecycle events keep their room on the subject.
+func TestActivity_CallsPastTheBudgetBecomeOneMarker(t *testing.T) {
+	prev := activityEntryBudget
+	activityEntryBudget = 3
+	t.Cleanup(func() { activityEntryBudget = prev })
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+for i in range(5):
+    call("kubectl", {"n": i}, "c%d" % i)
+print("done")
+`), nil)
+	c := gatewayClient(t, url)
+	submit(t, c, "task-budget", "loop")
+	task := waitTerminal(t, c, "task-budget")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s", task.State)
+	}
+	entries := activityEntries(t, task)
+	if len(entries) != 4 {
+		t.Fatalf("entries = %d, want 3 calls + 1 marker: %+v", len(entries), entries)
+	}
+	marker := entries[3]
+	if marker.Tool != activityTruncatedTool || marker.Status != ActivityStatusTruncated || marker.Dropped != 2 {
+		t.Fatalf("marker = %+v, want %s/%s dropped=2", marker, activityTruncatedTool, ActivityStatusTruncated)
+	}
+	trail := eventTrail(t, replayEvents(t, url, "task-budget"))
+	if trail[len(trail)-1] != "completed/final" || trail[len(trail)-2] != "result" || trail[len(trail)-3] != "activity" {
+		t.Fatalf("marker not ahead of the result: %v", trail)
 	}
 }

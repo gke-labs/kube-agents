@@ -145,6 +145,21 @@ func (rec *SessionRecord) AddresseeFor(taskID string) string {
 	return rec.Addressee
 }
 
+// taskRef finds a task in the record's history, active or released. It is
+// the ownership check for a read by task id: a miss is a miss, never a
+// fallback to the record's current addressee.
+func (rec *SessionRecord) taskRef(taskID string) (TaskRef, bool) {
+	if taskID == "" {
+		return TaskRef{}, false
+	}
+	for _, ref := range rec.Tasks {
+		if ref.ID == taskID {
+			return ref, true
+		}
+	}
+	return TaskRef{}, false
+}
+
 const taskHistoryCap = 50
 
 // Registry is the KV-backed session registry. A gateway restart rediscovers

@@ -813,7 +813,10 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 // is the same read the active one is. Active and the fields beside it
 // describe the record's active task only when it is the task being read; a
 // named task the record no longer holds reports Active false with zero
-// SubmittedAt and Age, and its stream. A conversation with no record has
+// SubmittedAt and Age, and its stream. A task the record never held, active
+// or in its history, is not read at all: the door's token admits its holder
+// to conversations, not to every task on a shared addressee, and an id that
+// is not the record's is never formatted into a subject. A conversation with no record has
 // had no turn, so no task of it was ever published: the empty state, not a
 // read against the configured default addressee, which may be the
 // RouteSession sentinel -- a route, never a subject.
@@ -838,20 +841,36 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		taskID = active.TaskID
 	}
 	state.TaskID = taskID
-	if active != nil && active.TaskID == taskID {
+	// A named task is read only when this conversation owns it: the active
+	// task, or one in the record's own history. The door's token admits a
+	// caller to conversations under its prefix, not to every task on the
+	// addressee, and AddresseeFor's fallback for an unknown id is the
+	// record's addressee - on a fixed-addressee install the same `platform`
+	// every conversation shares - so an unowned id must never reach the
+	// bus. It also keeps the query string off the subject builder: an id
+	// that is not in the record is never formatted into a NATS subject, so
+	// a wildcard is a miss, not a replay of the whole addressee. A task
+	// older than the history cap reads as unknown, which is the price.
+	var addressee string
+	switch {
+	case active != nil && active.TaskID == taskID:
 		state.Active = true
 		state.SubmittedAt = active.SubmittedAt
 		state.Detached = active.Detached
 		if !active.SubmittedAt.IsZero() {
 			state.Age = time.Since(active.SubmittedAt)
 		}
+		// Against the addressee the task's own subjects carried: after a
+		// Delegate re-home rec.Addressee is not it (the relay's terminal
+		// replay makes the same choice).
+		addressee = rec.AddresseeFor(taskID)
+	default:
+		ref, owned := rec.taskRef(taskID)
+		if !owned {
+			return state, nil
+		}
+		addressee = ref.Addressee
 	}
-	// Against the addressee the task's own subjects carried: after a
-	// Delegate re-home rec.Addressee is not it (the relay's terminal replay
-	// makes the same choice). A task the history no longer lists (older
-	// than taskHistoryCap turns) reads against the record's current
-	// addressee, which is AddresseeFor's documented fallback.
-	addressee := rec.AddresseeFor(taskID)
 	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, taskID)
 	switch {
 	case terr == nil:

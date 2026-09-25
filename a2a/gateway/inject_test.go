@@ -3575,3 +3575,39 @@ func TestInjectReadRouteCapsTheTraceAndSaysSo(t *testing.T) {
 		t.Fatalf("activityDropped = %s, want %d", got, extra)
 	}
 }
+
+// TestInjectReadRouteRefusesAnotherConversationsTaskID: the door's token
+// admits a caller to conversations under its prefix, not to every task on
+// the addressee. A task id minted for one conversation, read through
+// another, is a miss -- no trace, no result, no error naming it -- and a
+// wildcard is a miss the same way, never a replay of the whole addressee.
+func TestInjectReadRouteRefusesAnotherConversationsTaskID(t *testing.T) {
+	r := startInjectRig(t)
+	theirs := r.inject(t, "case-theirs", injectTestAuthor, "their prompt")
+	theirOrigin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, theirOrigin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(context.Background(), lib.Artifact{ArtifactID: lib.ArtifactActivity, Name: lib.ArtifactActivity,
+		Parts: []lib.Part{{Kind: "data", Data: json.RawMessage(`{"tool":"secret-ish"}`)}}}); err != nil {
+		t.Fatal(err)
+	}
+	mine := r.inject(t, "case-mine", injectTestAuthor, "my prompt")
+	for _, foreign := range []string{theirs.TaskID, "*", "task-nobody"} {
+		raw := r.probeRaw(t, mine.Conversation, foreign)
+		if _, ok := raw["activity"]; ok {
+			t.Fatalf("task %q read through another conversation: %s", foreign, raw)
+		}
+		if _, ok := raw["result"]; ok {
+			t.Fatalf("task %q's result read through another conversation: %s", foreign, raw)
+		}
+		if e, ok := raw["error"]; ok {
+			t.Fatalf("task %q produced an error naming something: %s", foreign, e)
+		}
+	}
+	// The owner still reads it.
+	if raw := r.probeRaw(t, theirs.Conversation, theirs.TaskID); string(raw["activity"]) == "" {
+		t.Fatalf("the owning conversation lost its own trace: %s", raw)
+	}
+}

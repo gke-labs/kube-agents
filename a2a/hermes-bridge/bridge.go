@@ -145,7 +145,7 @@ type taskRun struct {
 	deadlineHit atomic.Bool
 
 	// act is the task's side of the activity door (activity.go): its
-	// signing key, the calls seen, the publisher's queue. Stored before
+	// signing key, the calls seen, the heartbeat's lifecycle. Stored before
 	// the subprocess starts, so no delivery can precede it, and atomic
 	// because the door reads it under b.mu while the worker writes it
 	// under mu - the two locks never nest, on purpose.
