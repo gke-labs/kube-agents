@@ -54,4 +54,4 @@ Both LiteLLM examples and `vllm-gemma` speak OpenAI-compatible Completions. You 
 ## Where to go next
 
 - [Inference gateway](/kube-agents/concepts/inference-gateway/) — decision framework for picking a provider.
-- [Deploy → Kustomize](/kube-agents/deploy/kustomize/) — what the Kustomize surface looks like.
+- [Deploy → Network policies and Service](/kube-agents/deploy/kustomize/) — what the operator renders around the agent Pod.

@@ -5307,8 +5307,9 @@ func peersNotAlreadyPresent(present, candidates []networkingv1.NetworkPolicyPeer
 	return kept
 }
 
-// buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
-// Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
+// buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent:
+// the gateway policy, the one policy an install places on the agent Pod. No static
+// copy of it ships anywhere in the repository.
 //
 // otlpDisabled carries the same meaning as renderOptions.otlpDisabled: discovery found no
 // collector, so there is no export to allow and the collector egress rule is left out.
@@ -5389,7 +5390,7 @@ func clusterDNSPeers(dnsIPs []string) []networkingv1.NetworkPolicyPeer {
 	// it under, so a grep for that constant finds both places the resolver is
 	// permitted. The grant is IPv4-only on purpose: fd20:ce::254 is documented as
 	// a metadata endpoint rather than as a resolver, and no static copy in
-	// charts/ or deploy/kustomize names it in a DNS rule, so it stays out until a
+	// charts/ names it in a DNS rule, so it stays out until a
 	// dual-stack Cloud DNS cluster is observed naming it in a Pod's resolv.conf.
 	peers = append(peers, formatCIDRPeers([]string{metadataResolverCIDR}, true)...)
 
