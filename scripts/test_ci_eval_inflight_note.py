@@ -6,7 +6,8 @@ removes it. A repetition whose worker died between the two leaves the note,
 and the next repetition of the case (and, on a stream two cases share, the
 sibling case's first) starts inside those two hours and is refused.
 `hack/ci-eval-pr.sh` therefore releases that unit's stream's note before each
-audit unit, from the same place the ledger reset runs. What has to hold,
+audit unit, from the same place the ledger reset runs, just before it. What
+has to hold,
 checked against the shell that ships (lifted out of the script) with
 `kubectl` and `timeout` stubbed:
 
@@ -24,7 +25,9 @@ checked against the shell that ships (lifted out of the script) with
   - a release that cannot run says why and the unit goes on: no context, a
     context that is another project's, no kubectl, an exec that fails or
     times out;
-  - it sits with the ledger reset: after it, before devops-bench, inside the
+  - it sits with the ledger reset: before it, so a `finish` the grace waits
+    for lands in the ledger the reset then retires rather than opening a
+    fresh one the next `start` would carry; before devops-bench, inside the
     task and stream locks, gated on the case writing a ledger.
 """
 
@@ -57,6 +60,7 @@ CONSTANT_LINES = [
     r"^readonly EVAL_SANDBOX_EXEC_TIMEOUT=.*$",
     r"^readonly EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=.*$",
     r"^readonly EVAL_INFLIGHT_GRACE_SECONDS=.*$",
+    r"^readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=.*$",
 ]
 
 
@@ -80,6 +84,10 @@ def grace_seconds() -> int:
 
 def round_trip_seconds() -> int:
     return int(lifted_line(CONSTANT_LINES[3]).split("=", 1)[1])
+
+
+def poll_step_seconds() -> int:
+    return int(lifted_line(CONSTANT_LINES[5]).split("=", 1)[1])
 
 
 def pod_snippet() -> str:
@@ -188,9 +196,9 @@ class ReleaseStepTest(unittest.TestCase):
             argv[:12],
             ["--context", CONTEXT, "-n", NAMESPACE, "exec", POD, "-c", "shell", "--request-timeout=30s", "--", "sh", "-c"],
         )
-        # The path and the grace are the shell's positionals, never part of
-        # the -c script.
-        self.assertEqual(argv[13:], ["sh", NOTE, str(grace_seconds())])
+        # The path, the grace and the poll step are the shell's positionals,
+        # never part of the -c script.
+        self.assertEqual(argv[13:], ["sh", NOTE, str(grace_seconds()), str(poll_step_seconds())])
         self.assertIn('"$1"', argv[12])
         self.assertNotIn("compliance-audit", argv[12])
         self.assertNotIn(".lock", " ".join(argv))
@@ -220,13 +228,18 @@ class ReleaseStepTest(unittest.TestCase):
         # The snippet as shipped, run by a local sh against real files: with
         # no grace a note is removed at once; with a grace, a note its own run
         # releases in time is left to it; one that outlives the grace goes.
-        # The lock beside the note is never touched.
+        # The lock beside the note is never touched. The poll step is the
+        # named constant, handed in as the third positional.
         snippet = pod_snippet()
+        self.assertIn('sleep "$3"; n=$((n + $3))', snippet)
+        self.assertEqual(poll_step_seconds(), 5)
         lock = self.dir / "inflight_compliance-audit.json.lock"
         lock.touch()
 
         def run(note, grace):
-            return subprocess.run(["sh", "-c", snippet, "sh", str(note), str(grace)], capture_output=True, text=True, check=False)
+            return subprocess.run(
+                ["sh", "-c", snippet, "sh", str(note), str(grace), str(poll_step_seconds())], capture_output=True, text=True, check=False
+            )
 
         note = self.dir / "inflight_compliance-audit.json"
         note.write_text('{"audit": "compliance-audit"}')
@@ -298,7 +311,7 @@ class ReleaseStepTest(unittest.TestCase):
         for audit_id in ["compliance-audit", "fleet-consistency-drift", "security-patch-orchestrator", "ai-security-audit"]:
             with self.subTest(audit_id=audit_id):
                 self.run_step(audit_id=audit_id)
-                self.assertEqual(self.argv()[-2], f"/opt/data/scratch/inflight_{audit_id}.json")
+                self.assertEqual(self.argv()[-3], f"/opt/data/scratch/inflight_{audit_id}.json")
 
     def test_no_kubectl_on_path_skips_out_loud(self):
         result = self.run_step(kubectl=False)
@@ -352,16 +365,21 @@ class NamesTest(unittest.TestCase):
 class CallSiteTest(unittest.TestCase):
     """Where the release sits in run_one_unit, by its text."""
 
-    def test_the_release_follows_the_ledger_reset_inside_the_locks_before_devops_bench(self):
+    def test_the_release_precedes_the_ledger_reset_inside_the_locks_before_devops_bench(self):
+        # Release first: the grace may wait for a live worker's `finish`, and
+        # that finish must land in the still-open ledger the reset then
+        # retires. After the reset it would find no open ledger, open a fresh
+        # one carrying the worker's findings, and this unit's `start` would
+        # carry them into the repetition.
         unit = lifted("run_one_unit")
         stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"')
         reset = unit.index('reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"')
         release = unit.index('release_inflight_note "${name} rep ${rep}" "${audit_id}"')
         launch = unit.index("uv run devops-bench")
         stream_release = unit.index('lock_release "${STATE_DIR}/lock-stream-${audit_id}"', launch)
-        self.assertLess(stream_lock, reset)
-        self.assertLess(reset, release)
-        self.assertLess(release, launch)
+        self.assertLess(stream_lock, release)
+        self.assertLess(release, reset)
+        self.assertLess(reset, launch)
         self.assertLess(launch, stream_release)
         # Both inside the one block gated on the case writing a ledger.
         block = re.search(r'  if \[ -n "\$\{audit_id\}" \]; then\n(.*?)\n  fi\n', unit, re.DOTALL).group(1)

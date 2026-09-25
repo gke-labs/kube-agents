@@ -70,12 +70,14 @@ readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
 # deadline in run_one_unit grants each unit this on top of its ceiling and
 # the 600s for grading and teardown, so a unit that spends the grace does
 # not push its same-task waiter past its deadline. The round-trip allowance
-# is what the outer timeout adds to the grace for the exec's own setup.
+# is what the outer timeout adds to the grace for the exec's own setup. The
+# poll step is how often the pod's shell looks for the note during the grace.
 readonly EVAL_SANDBOX_CONTAINER="shell"
 readonly EVAL_SANDBOX_SCRATCH_DIR="/opt/data/scratch"
 readonly EVAL_SANDBOX_EXEC_TIMEOUT="30s"
 readonly EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=60
 readonly EVAL_INFLIGHT_GRACE_SECONDS=300
+readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
 
 # ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
 # A push that changes only inert files re-runs this whole job and aborts the
@@ -1297,17 +1299,21 @@ reset_audit_ledgers() { # <label> [audit-id]
 # a 0/3 that reads as agent failure and was the harness's. The note is the
 # run's, not the ledger's, so the ledger reset above cannot clear it; this
 # does, per unit, from the same place the ledger reset runs (under the task
-# lock and the stream lock, before devops-bench), for that unit's stream
-# alone. Not at lease time: the per-unit release covers a note an earlier
-# lease left as well.
+# lock and the stream lock, before devops-bench) and just before it, for
+# that unit's stream alone. Not at lease time: the per-unit release covers a
+# note an earlier lease left as well.
 #
 # A unit that ended on its delegation ceiling may have left a worker that is
 # still running, and its note is then a live run's: removing it at once would
 # start the next repetition over that worker, the overlap the note exists to
-# refuse (the ledger reset already rewrites that worker's ledger under it;
-# this must not add the collision). So a note that is present is given
-# EVAL_INFLIGHT_GRACE_SECONDS to be released by its own `finish` first, and
-# removed only if it is still there after that; the log line says which.
+# refuse. So a note that is present is given EVAL_INFLIGHT_GRACE_SECONDS to
+# be released by its own `finish` first, and removed only if it is still
+# there after that; the log line says which. The wait comes BEFORE the
+# ledger reset for the same stream: a `finish` that lands while the ledger is
+# open rewrites it and the reset then retires it in one step, whereas a
+# `finish` that lands after the reset finds no open ledger, opens a fresh one
+# carrying that worker's findings, and this unit's own `start` then carries
+# them -- the pre-filed ledger the per-unit reset exists to prevent.
 #
 # The removal runs in the sandbox pod (`kubectl exec`; the harness holds
 # admin on the leased project's host cluster), pinned the way hack/ci-env.sh
@@ -1361,18 +1367,19 @@ release_inflight_note() { # <label> <audit-id>
   local budget=$((EVAL_INFLIGHT_GRACE_SECONDS + EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS))
   local bound=(timeout --foreground "${budget}")
   command -v timeout >/dev/null 2>&1 || bound=()
-  # Single quotes on purpose: $1 (the note) and $2 (the grace) are the pod
-  # shell's own positionals, so the path is never spliced into the script.
+  # Single quotes on purpose: $1 (the note), $2 (the grace) and $3 (the poll
+  # step) are the pod shell's own positionals, so the path is never spliced
+  # into the script.
   # shellcheck disable=SC2016
   out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec "${pod}" -c "${EVAL_SANDBOX_CONTAINER}" \
     --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
     sh -c '
       n=0
-      while [ -e "$1" ] && [ "$n" -lt "$2" ]; do sleep 5; n=$((n + 5)); done
+      while [ -e "$1" ] && [ "$n" -lt "$2" ]; do sleep "$3"; n=$((n + $3)); done
       if [ -e "$1" ]; then rm -f -- "$1" && echo "removed $1 after waiting ${n}s for its run"
       elif [ "$n" -gt 0 ]; then echo "released by its own run after ${n}s: $1"
       else echo "none at $1"; fi
-    ' sh "${note}" "${EVAL_INFLIGHT_GRACE_SECONDS}" 2>&1)" || rc=$?
+    ' sh "${note}" "${EVAL_INFLIGHT_GRACE_SECONDS}" "${EVAL_INFLIGHT_POLL_STEP_SECONDS}" 2>&1)" || rc=$?
   if [ "${rc}" -eq 0 ]; then
     echo "In-flight note (${label}): ${out}"
   else
@@ -2447,17 +2454,20 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} could not mint a ledger token" >&2
     return 0
   fi
-  # This stream's open ledger, closed before the unit runs and while the task
-  # lock keeps its sibling repetitions out and the stream lock keeps the other
-  # case on the same stream out: repetitions 2 and 3 audit from the empty
-  # ledger repetition 1 had (the lease-time reset above). Only this stream's
-  # label, so an audit case on another stream in another lane keeps its own.
-  # And this stream's in-flight note on the sandbox pod, left by a repetition
-  # that died between `start` and `finish`, released under the same locks so
-  # the next `start` of the stream is not refused for a run that is over.
+  # This stream's in-flight note on the sandbox pod first, left by a
+  # repetition that died between `start` and `finish` and released under
+  # these locks so the next `start` of the stream is not refused for a run
+  # that is over; a live worker's note is waited on, and that wait sits
+  # before the reset so its `finish` lands in the ledger the reset retires
+  # (release_inflight_note says why the order matters). Then this stream's
+  # open ledger, closed before the unit runs and while the task lock keeps its
+  # sibling repetitions out and the stream lock keeps the other case on the
+  # same stream out: repetitions 2 and 3 audit from the empty ledger
+  # repetition 1 had (the lease-time reset above). Only this stream's label,
+  # so an audit case on another stream in another lane keeps its own.
   if [ -n "${audit_id}" ]; then
-    reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
     release_inflight_note "${name} rep ${rep}" "${audit_id}"
+    reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
   fi
   if [ -n "${reuse}" ]; then
     export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
