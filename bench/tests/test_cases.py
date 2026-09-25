@@ -189,11 +189,11 @@ def test_a_task_with_no_such_check_has_an_empty_set(write_task):
 
 
 def test_a_compound_is_blind_only_when_every_leaf_is(write_task):
-    """A none-wrapped tool_called (the documented "never called" safeguard)
-    and a worker_commands leaf are blind. A sequence mixing a phrase check
-    with a tool_called is NOT: its phrase leaf can fail on any transport, and
-    setting the entry aside would hide that failure, so it keeps grading as
-    it always has."""
+    """A none-wrapped tool_called (the documented "never called" safeguard),
+    a worker_commands leaf and a worker_agents leaf are blind. A sequence
+    mixing a phrase check with a tool_called is NOT: its phrase leaf can fail
+    on any transport, and setting the entry aside would hide that failure, so
+    it keeps grading as it always has."""
     path = write_task(
         "compound",
         {
@@ -209,6 +209,11 @@ def test_a_compound_is_blind_only_when_every_leaf_is(write_task):
                     "name": "route",
                     "role": "objective",
                     "check": {"type": "worker_commands", "required_patterns": ["git log"]},
+                },
+                {
+                    "name": "profile",
+                    "role": "objective",
+                    "check": {"type": "worker_agents", "required_agents": ["cluster-.*"]},
                 },
                 {
                     "name": "mixed",
@@ -230,7 +235,7 @@ def test_a_compound_is_blind_only_when_every_leaf_is(write_task):
             ],
         },
     )
-    assert load_case(path).transport_blind_checks == {"never-filed", "route"}
+    assert load_case(path).transport_blind_checks == {"never-filed", "route", "profile"}
 
 
 def test_an_unnamed_blind_entry_is_left_out(write_task):

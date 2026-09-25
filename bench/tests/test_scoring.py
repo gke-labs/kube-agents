@@ -2189,12 +2189,16 @@ def test_a_case_whose_blind_objectives_all_errored_is_not_graded_not_blocked(wri
                     {
                         "name": "the-worker-took-the-git-route",
                         "role": "objective",
-                        "check": {"type": "worker_commands", "required_patterns": ["git log"]},
+                        "check": {"type": "worker_agents", "required_agents": ["cluster-.*"]},
                     }
                 ],
             },
         )
     )
+    # The third blind type, exercised through the scorer and not only the
+    # loader: a regression that drops worker_agents from the set turns this
+    # into a rung-2 block.
+    assert spec.transport_blind_checks == {"the-worker-took-the-git-route"}
 
     def errored_route_check_only(rec):
         rec["verification_report"] = [
