@@ -236,8 +236,8 @@ bounded by access control + read-only, not eliminated per request.
 **Routing does not grant authority.** The ChatOps gateway ([05](05-system-architecture.md) C15) may
 route a message to any tier — by slash command, `@<tier>-<scope>` handle, or NL inference
 ([02](02-agent-personas.md) §2.4) — but _reaching_ an agent is gated by that agent's own
-`AllowedUsers` allowlist, checked **before** dispatch. The NL router is model output and is therefore
-**never** an authorization signal (§1); worst-case a mis-route lands on an agent the human is already
+`AllowedUsers` allowlist, checked **before** dispatch. NL resolution is model output (the conversation's
+session agent's, never a model in the gateway) and is therefore **never** an authorization signal (§1); worst-case a mis-route lands on an agent the human is already
 allowlisted for, still bounded by that agent's read-only, tier-scoped ceiling. So routing changes
 _which_ trusted-human entrypoint a message reaches, never _what_ authority it carries. (The gateway is
 v1-compatible: it enforces the existing trusted-human allowlist and adds no per-request

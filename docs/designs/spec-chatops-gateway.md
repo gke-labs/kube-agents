@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription); nor yet the pieces "Sessions by default" names as transition work: the `/session` opt-in, the session's child-task grants, the `chat` profile's skills, and the default flip
 
 ## Purpose
 
@@ -23,7 +23,8 @@ The declarative subagent framework (its own doc) owns profile-addressed delegati
 the dispatcher, Jobs, `AgentProfile`s. This doc stops at the session boundary, with one
 amendment (8/31): the Delegate flow below hands a single task to a fresh
 gateway-spawned session worker, which stays inside the session model - the worker is an
-incarnation of the conversation's own session, not a profile executor.
+incarnation of the conversation's own session, not a profile executor - and a second
+(9/25): "Sessions by default" below, where the session itself delegates.
 
 ## The gateway holds no model
 
@@ -220,6 +221,62 @@ Two rules keep the conversation's route coherent:
   detached is not closed, so the deletion rule in Session lifecycle applies and that
   task's terminal is published first. The state is that rule's to name, not this
   section's. With that done, the delete is what reap or sweep would have done anyway.
+
+## Sessions by default (added 9/25)
+
+The routing judgment lives in the session, not the gateway. "The gateway holds no model"
+above says where the demo gateway's judgment went: into the session pods. For a while the
+plan carried one narrow exception, a model call the gateway itself would make to pick a
+destination for free text. That exception is withdrawn (2026-09-25). A model in the routing
+path does not scale well and produces results a user cannot predict, and the gateway is the
+one component every human message passes through. The gateway stays deterministic code.
+
+What does the free-text work instead is the conversation's own session: a pod per
+conversation (thread or DM), as "What a session is" defines it, running the session worker
+(the `chat` profile on the worker image) with skills, built as part of this, that let it know
+the system - discover agents, clusters and topics; answer from standing state; delegate to the
+platform agent or to a profile and receive what comes back. The gateway relays into the chat as it does for
+any task; the session posts nothing itself. It is the same machinery as the session route
+and the Delegate flow above, made the default rather than an affordance. To its user a
+session-routed conversation is a persistent agent session tied to the chat, as durable as
+the conversation and resumed by a fresh incarnation when one is reaped.
+
+The resolution order does not change ([architecture 02](../architecture/02-agent-personas.md),
+"Chat entrypoints"): a slash command first, an explicit handle second, and the session for free
+text on a thread nothing has bound. Thread affinity stands as the
+architecture docs state it: a thread a slash command or a handle routed to an agent keeps
+its unaddressed follow-ups on that agent until re-addressed, and inside a session, affinity
+to whatever the session last delegated to is the session's own to keep. The gateway spends
+no inference in any of the three. The third hands the turn to the session, and the session's
+judgment, like all model output, is never an authorization signal: the gateway's own sender
+verification runs before dispatch exactly as before, and the `authority` block is stamped at
+ingress as before (advisory today; see "Requester identity on the bus").
+
+Delegation on a human's behalf keeps the human's bound. When the session delegates, the
+child task carries the requester the turn came in with, and the target's allowlist is
+enforced on that requester where the child is minted, before it runs - so a session cannot
+reach an agent for a person who could not have addressed that agent directly, and the
+worst-case bound the architecture docs state for a mis-route (an agent the human is already
+allowed to reach) holds for a delegation too. The audit record for a session-routed turn
+names the mode and the session at the gateway; the target of any delegation is on the child
+task's envelope.
+
+Transition. `platform` remains the default addressee until the session can hand platform
+topics on to the platform agent without the user noticing. The route is a deploy-time
+setting today (`A2A_DEFAULT_ADDRESSEE`), and the Delegate flow covers one task; a
+per-conversation opt-in - a `/session` command, deterministic, resolved with the other
+slash commands and naming a route rather than a handle - is not implemented and lands
+with the transition. The default flips when the delegation primitive lands: a session pod
+submitting a child task on the bus to a named addressee and consuming that task's events,
+two grants a session does not hold today (its only subscribe grant is its inbox, and it
+publishes only on its own task), scoped and audited, with the requester rule above. Working
+state richer than the transcript primer rehydrate builds today - what the session has
+discovered and decided, keyed by `contextId` - is part of the same work, so a resumed
+conversation is a resumed agent. A warm pool of ready pods is deferred; the cold start is
+paid.
+
+What this costs is pods: one per live conversation, bounded by the session cap and the
+idle TTL. That is the figure to measure before the default flips.
 
 ## Session lifecycle
 
@@ -526,7 +583,7 @@ entirely - a path identical under both modes, so a run through it says nothing a
 **Why it is a backend rather than a bus client.** The harness could publish a submission
 straight to `a2a.tasks.platform.{taskId}.in`, and that proves the bus, the callout, the streams
 and the executor. It leaves out the gateway: its routing, its session registry, the relay back,
-and whatever the router becomes in round 3. It also needs a bus identity, and the only static
+and the session agent's routing once conversations are session-routed by default. It also needs a bus identity, and the only static
 user whose grants fit a requester is the gateway's own - handing a second process the one
 credential that may publish on `.in`. Going through the gateway instead means the gateway keeps
 that credential, mints the ids and the `authority` block itself, and the harness needs neither a
@@ -888,7 +945,9 @@ as the primitive, unused, like the other backends.
 - Roster tracking and the `openDirect` primitive.
 
 Not in stage 2: the classifier, the LCD permissions tool, the slack adapter, `grants`,
-and anything that makes `authority` decision-grade. (The gchat adapter was on this
+anything that makes `authority` decision-grade, and the transition work "Sessions by
+default" names (the `/session` opt-in, the session's child-task grants, the `chat`
+profile's skills, the warm pool). (The gchat adapter was on this
 list until 9/5; it now has its own section above.)
 
 ## Inherited from the kanban retirement (added 8/24)
