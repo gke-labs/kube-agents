@@ -246,30 +246,9 @@ func (c *Client) TasksGetAttributed(ctx context.Context, addressee, taskID strin
 }
 
 func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task, string, error) {
-	_, js := c.conn()
-	subjects := TaskReplaySubjects(addressee, taskID)
-	stream, err := js.Stream(ctx, TasksStream)
+	events, eventSubjects, found, err := c.replay(ctx, TaskReplaySubjects(addressee, taskID), taskID)
 	if err != nil {
-		return nil, "", fmt.Errorf("stream %s: %w", TasksStream, err)
-	}
-	// Snapshot the replay horizon first: fold what the stream holds now, and
-	// terminate deterministically even while the task is still emitting.
-	// GetLastMsgForSubject is single-subject, so the horizon is the later of
-	// the two, and a task exists if either subject holds a message.
-	var last uint64
-	found := false
-	for _, subject := range subjects {
-		msg, err := stream.GetLastMsgForSubject(ctx, subject)
-		if err != nil {
-			if errors.Is(err, jetstream.ErrMsgNotFound) {
-				continue
-			}
-			return nil, "", fmt.Errorf("replay horizon for %s: %w", taskID, err)
-		}
-		found = true
-		if msg.Sequence > last {
-			last = msg.Sequence
-		}
+		return nil, "", err
 	}
 	if !found {
 		// No events in the retention window: the A2A answer is
@@ -277,39 +256,115 @@ func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task,
 		// one.
 		return nil, "", &A2AError{Code: CodeTaskNotFound, Message: fmt.Sprintf("task %q has no events in the retention window", taskID)}
 	}
+	task, err := FoldTask(taskID, events)
+	if err != nil {
+		return nil, "", err
+	}
+	terminalSubject := ""
+	if task.Final {
+		terminalSubject = finalSubject(events, eventSubjects)
+	}
+	if task.PostFinalDropped > 0 {
+		c.protocolViolations.Add(int64(task.PostFinalDropped))
+		c.log.Warn("a2a events after final dropped from fold",
+			"task", taskID, "dropped", task.PostFinalDropped)
+	}
+	if task.SubmittedMissing {
+		// Not a protocol violation and not counted as one — see the
+		// field. The line is the whole point of the field: without it a
+		// replay whose head was evicted is a short history that reads
+		// like a complete one.
+		opensAt := "<no status event>"
+		if len(task.StatusHistory) > 0 {
+			opensAt = string(task.StatusHistory[0])
+		}
+		c.log.Warn("a2a task replayed without its submitted event",
+			"task", taskID, "events", len(events), "opensAt", opensAt)
+	}
+	return task, terminalSubject, nil
+}
+
+// TaskInReplay replays a task's `…in` subject in stream order — the
+// submission, any follow-ups, any cancel — and returns the envelopes. It is
+// the one-subject form of the read TasksGet does on the event subjects:
+// the same snapshotted horizon, the same ephemeral ordered consumer, the
+// same screen on parse and subject agreement. An executor that has taken a
+// task off the durable uses it to look ahead for a `cancel` the durable has
+// not delivered yet, before it spends anything on the task.
+//
+// A subject holding nothing in the retention window is an empty slice and no
+// error, not TaskNotFound: a task with no events is a task nobody can answer
+// for, but a submission subject with nothing on it answers the question this
+// read is asked (is there a cancel here?) with "no".
+func (c *Client) TaskInReplay(ctx context.Context, addressee, taskID string) ([]*Envelope, error) {
+	events, _, _, err := c.replay(ctx, []string{TaskInSubject(addressee, taskID)}, taskID)
+	return events, err
+}
+
+// replay reads subjects from sequence 1 up to a horizon snapshotted at the
+// call, on an ephemeral ordered consumer, and returns the envelopes with the
+// subject each arrived on, in step. found is false when no subject holds a
+// message in the retention window; the caller decides what that means. The
+// subjects share the TASKS stream sequence, so the ordered consumer supplies
+// their total order and the caller needs no merge.
+func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (events []*Envelope, eventSubjects []string, found bool, err error) {
+	_, js := c.conn()
+	stream, err := js.Stream(ctx, TasksStream)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("stream %s: %w", TasksStream, err)
+	}
+	// Snapshot the replay horizon first: fold what the stream holds now, and
+	// terminate deterministically even while the task is still emitting.
+	// GetLastMsgForSubject is single-subject, so the horizon is the latest
+	// across the subjects, and a task exists if any subject holds a message.
+	var last uint64
+	for _, subject := range subjects {
+		msg, err := stream.GetLastMsgForSubject(ctx, subject)
+		if err != nil {
+			if errors.Is(err, jetstream.ErrMsgNotFound) {
+				continue
+			}
+			return nil, nil, false, fmt.Errorf("replay horizon for %s: %w", taskID, err)
+		}
+		found = true
+		if msg.Sequence > last {
+			last = msg.Sequence
+		}
+	}
+	if !found {
+		return nil, nil, false, nil
+	}
 	cons, err := js.OrderedConsumer(ctx, TasksStream, jetstream.OrderedConsumerConfig{
 		FilterSubjects:    subjects,
 		DeliverPolicy:     jetstream.DeliverAllPolicy,
 		InactiveThreshold: EphemeralConsumerInactiveThreshold,
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("ordered consumer for %s: %w", taskID, err)
+		return nil, nil, false, fmt.Errorf("ordered consumer for %s: %w", taskID, err)
 	}
 	it, err := cons.Messages()
 	if err != nil {
-		return nil, "", fmt.Errorf("replay messages for %s: %w", taskID, err)
+		return nil, nil, false, fmt.Errorf("replay messages for %s: %w", taskID, err)
 	}
 	defer it.Stop()
 	// it.Next does not observe ctx on its own; stopping the iterator is what
 	// unblocks it, so a canceled context cannot hang the replay.
 	stopWatch := context.AfterFunc(ctx, it.Stop)
 	defer stopWatch()
-	var events []*Envelope
-	// One subject per folded event, in step with events: FoldTask sees only
+	// One subject per envelope, in step with events: FoldTask sees only
 	// envelopes, and the subject of the terminal is what tells an executor's
 	// word from the supervisor's after the fold.
-	var eventSubjects []string
 	for {
 		msg, err := it.Next()
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, "", fmt.Errorf("replay for %s: %w", taskID, ctx.Err())
+				return nil, nil, false, fmt.Errorf("replay for %s: %w", taskID, ctx.Err())
 			}
-			return nil, "", fmt.Errorf("replay next for %s: %w", taskID, err)
+			return nil, nil, false, fmt.Errorf("replay next for %s: %w", taskID, err)
 		}
 		meta, err := msg.Metadata()
 		if err != nil {
-			return nil, "", fmt.Errorf("replay metadata for %s: %w", taskID, err)
+			return nil, nil, false, fmt.Errorf("replay metadata for %s: %w", taskID, err)
 		}
 		subject := msg.Subject()
 		env, err := ParseEnvelope(msg.Data())
@@ -346,32 +401,7 @@ func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task,
 			break
 		}
 	}
-	task, err := FoldTask(taskID, events)
-	if err != nil {
-		return nil, "", err
-	}
-	terminalSubject := ""
-	if task.Final {
-		terminalSubject = finalSubject(events, eventSubjects)
-	}
-	if task.PostFinalDropped > 0 {
-		c.protocolViolations.Add(int64(task.PostFinalDropped))
-		c.log.Warn("a2a events after final dropped from fold",
-			"task", taskID, "dropped", task.PostFinalDropped)
-	}
-	if task.SubmittedMissing {
-		// Not a protocol violation and not counted as one — see the
-		// field. The line is the whole point of the field: without it a
-		// replay whose head was evicted is a short history that reads
-		// like a complete one.
-		opensAt := "<no status event>"
-		if len(task.StatusHistory) > 0 {
-			opensAt = string(task.StatusHistory[0])
-		}
-		c.log.Warn("a2a task replayed without its submitted event",
-			"task", taskID, "events", len(events), "opensAt", opensAt)
-	}
-	return task, terminalSubject, nil
+	return events, eventSubjects, true, nil
 }
 
 // finalSubject is the subject of the event that made the fold final: the

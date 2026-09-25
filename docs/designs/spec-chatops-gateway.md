@@ -634,11 +634,12 @@ not be silent about it.
   took the cancel turn itself runs the never-started heal first, which releases the record
   while the submission is still on the in subject, and the bridge's durable consumer delivers
   from the start of the stream, so a bridge that binds later within retention would run the
-  stale prompt. On today's bridge the cancel does not prevent that spawn: the consumer delivers
-  serially, an idle worker spawns the stale prompt before the cancel is dispatched, and the
-  cancel kills it inside the kill grace with a `canceled-by-request` terminal;
-  `canceled-before-start` is what a task still queued behind the cap gets. A pre-spawn look-ahead
-  for a trailing cancel is bridge work, not the door's.
+  stale prompt. The bridge honours that cancel before it spawns: its worker replays the task's
+  `in` subject and answers a cancel it finds there with `canceled-before-start` and no spawn,
+  the terminal a task still queued behind the cap gets too; a cancel that lands after that read
+  kills the run inside the kill grace with a `canceled-by-request` terminal. That look-ahead is
+  the bridge's work, not the door's
+  ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Lifecycle, steering, cancel").
 
 All five adapter operations are implemented rather than a subset the session manager has to
 special-case. The session key is `inject:<key>`, `Kind` is `dm`, `Roster` is the requester alone

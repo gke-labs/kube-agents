@@ -91,13 +91,14 @@ is granted.
 
 Note which delete is in that list and which is not: `$JS.API.CONSUMER.DELETE` is granted
 for `KV_runtime-state`, for the watcher, and withheld for TASKS. The bridge calls
-`lib.TasksGet` on every task it dispatches, and a call that finds events creates an ordered
+`lib.TasksGet` on every task it dispatches and `lib.TaskInReplay` on every task a worker is
+about to spawn (the cancel look-ahead below), and a call that finds messages creates an ordered
 consumer on TASKS; nothing deletes it. It is reaped by the five-second inactive threshold
-`TasksGet` sets on it, which is why the replay costs a consumer slot for the calls of the last
+both reads set on it, which is why the replay costs a consumer slot for the calls of the last
 five seconds rather than for the last five minutes of them (gke-labs/kube-agents#1739) without
 the bridge needing a destructive verb on TASKS. The slot outlives the call it served: the
 threshold runs from the call returning, not from it starting. A call on a task the retention window no longer holds
-creates no consumer at all -- the horizon read returns `TaskNotFound` before the consumer is
+creates no consumer at all -- the horizon read finds nothing before the consumer is
 created. Either way the call emits no refused publish of its own. One does arrive if the
 ordered consumer resets mid-replay -- a bus reconnect is enough -- because nats.go deletes
 the consumer it replaces: that publish on `$JS.API.CONSUMER.DELETE.TASKS.<name>` is refused,
@@ -200,10 +201,49 @@ is available.
 Honest, never silent. This does not change task state (payload spec assertion 12).
 
 **Cancel:** SIGTERM to the subprocess's process group, SIGKILL after a grace period,
-then terminal `canceled`. A task racing to completion may land `completed` first - both
-orders are legal and the terminal event wins. A per-task deadline (default 7200s,
-matching the profile's `activeDeadlineSeconds`) takes the same kill path and lands
-`failed`.
+then terminal `canceled` (`reason: canceled-by-request`). A task racing to completion may
+land `completed` first - both orders are legal and the terminal event wins. A per-task
+deadline (default 7200s, matching the profile's `activeDeadlineSeconds`) takes the same
+kill path and lands `failed`.
+
+A cancel for a task still queued finalizes it `canceled` with `reason: canceled-before-start`
+and nothing is spawned, and the worker looks for one itself before it spawns. The durable
+delivers serially and acks after the handler, so a cancel already on the task's `…in`
+subject when the bridge binds - the eval harness abandoning a submission nobody took, or any
+cancel inside the stream's retention window - is dispatched only after the submission's
+accept returns, and by then an idle worker, which a freshly bound bridge has, holds the run.
+Between dequeue and spawn the worker therefore replays the task's `…in` subject
+(`lib.TaskInReplay`, the one-subject form of the read `tasks/get` does on the event
+subjects) and, on a `cancel` newer than the submission it holds, finalizes
+`canceled-before-start` and spawns nothing. `working` is published only after that read, so
+a cancelled run never shows it. It is a read, not a consume: the durable still delivers the
+cancel to the handler afterwards, and it does nothing - the run is normally gone from the
+bridge's table by then, so the cancel takes the orphan path, finds the terminal on the stream
+and is acked with a warning like any other in-traffic for a finished task; in the window
+before finalize drops the run it finds it final and returns, finalize being idempotent. A read
+that fails, a bus error or its 10s bound, is logged and the run spawns
+anyway; the cancel still arrives on the durable and kills it, the bound the bridge always
+had, where a read failure that dropped the task would leave it open with no terminal event.
+
+## Sizing against the eval harness
+
+This section is the canonical statement of the sizing; the eval transport design
+([`eval-next-transport.md`](../../docs/designs/eval-next-transport.md), stage 1) summarises it.
+An eval install that declares the bridge sidecar runs it against the presubmit's fan-out, and
+two numbers bound what it can take. `BRIDGE_CONCURRENCY` (default 2, the cap above) is the worker
+count: a task past it is accepted and `submitted` and then queued with no subprocess until a
+worker frees, and the harness classifies a repetition that reaches its budget still
+`submitted` as infrastructure rather than a graded case - it cancels the task and the bridge
+answers `canceled-before-start`. The presubmit fans units out at `EVAL_TASK_PARALLELISM`,
+default 4, the nightly at 6, so the sidecar declares `BRIDGE_CONCURRENCY` at or above that
+value; at the defaults two of every four concurrent units wait for as long as the two ahead of
+them run. The queue behind the workers is fixed at `taskQueueCapacity`, 1024 in `bridge.go`,
+and a submission past it is finalized `failed` with `reason: bridge-queue-overflow`, also
+infrastructure in the harness's classification. Size the parallelism against both: concurrency
+at or above the parallelism, and the number of submissions a run can have outstanding at once,
+the units in flight plus anything abandoned and not yet cancelled, well under the queue
+capacity. Nothing in this repository declares that sidecar yet; the declaration that will carry
+the value is the CI flag's stage-1 work in the design above.
 
 ## Supervision
 

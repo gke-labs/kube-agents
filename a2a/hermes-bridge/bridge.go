@@ -40,8 +40,14 @@ const (
 	finalizePublishTimeout = 20 * time.Second
 	// registryClearTimeout bounds the KV delete after a terminal publish.
 	registryClearTimeout = 10 * time.Second
+	// lookAheadTimeout bounds the worker's pre-spawn read of the task's in
+	// subject. A read that outlives it is a read failure, and a read failure
+	// spawns: the bound keeps a slow bus from parking a worker slot, it never
+	// drops the task.
+	lookAheadTimeout = 10 * time.Second
 
-	shutdownReason = "reason: bridge-shutdown - the bridge was terminated while this task was in flight"
+	shutdownReason            = "reason: bridge-shutdown - the bridge was terminated while this task was in flight"
+	canceledBeforeStartReason = "reason: canceled-before-start"
 )
 
 // Config wires one bridge. Zero values get playground defaults in Run.
@@ -148,6 +154,11 @@ type Bridge struct {
 	// closing marks shutdown, so a worker whose subprocess died to the
 	// shutdown SIGKILL reports bridge-shutdown, not a bogus exit code.
 	closing atomic.Bool
+
+	// lookAhead is the worker's pre-spawn read for a trailing cancel,
+	// cancelInStream by default; a field so a test can stall it or make it
+	// fail without a bus that misbehaves on cue.
+	lookAhead func(ctx context.Context, run *taskRun) (bool, error)
 }
 
 // New connects and sweeps but does not consume yet; Run does.
@@ -163,6 +174,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		tasks: make(map[string]*taskRun),
 		queue: make(chan *taskRun, taskQueueCapacity),
 	}
+	b.lookAhead = b.cancelInStream
 	var err error
 	b.c, err = lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName(b.from.Session),
@@ -347,7 +359,7 @@ func (b *Bridge) handleCancel(ctx context.Context, env *lib.Envelope) {
 	run.mu.Unlock()
 	if pending {
 		// Not yet spawned: terminal now; the worker skips done runs.
-		b.finalize(run, lib.StateCanceled, "reason: canceled-before-start", nil)
+		b.finalize(run, lib.StateCanceled, canceledBeforeStartReason, nil)
 	}
 	// For a running task the runner publishes terminal canceled on exit.
 }
@@ -406,6 +418,32 @@ func (b *Bridge) worker(ctx context.Context) {
 			return
 		case run = <-b.queue:
 		}
+		if !run.pending() {
+			continue
+		}
+		// The look-ahead runs with the task still pending, so a cancel the
+		// durable delivers meanwhile takes handleCancel's queued path as
+		// before, and the re-check below sees its finalize.
+		canceled, err := b.lookAhead(ctx, run)
+		switch {
+		case ctx.Err() != nil:
+			// Shutdown reached the worker mid-read. Leave the run pending
+			// for shutdownTasks, whose terminal names the real cause; a
+			// spawn now would fail its working publish on the dead context
+			// and report bus-publish-failed instead.
+			return
+		case err != nil:
+			// A read failure spawns. The cancel, if there is one, still
+			// arrives on the durable and kills the run - today's bound -
+			// where a failure that dropped the task would leave it open
+			// with no terminal event.
+			b.cfg.Logger.Warn("cancel look-ahead failed; spawning anyway",
+				"task", run.origin.TaskID, "err", err)
+		case canceled:
+			b.cfg.Logger.Info("cancel already on the stream; not spawning", "task", run.origin.TaskID)
+			b.finalize(run, lib.StateCanceled, canceledBeforeStartReason, nil)
+			continue
+		}
 		run.mu.Lock()
 		if run.state != statePending {
 			run.mu.Unlock()
@@ -415,6 +453,52 @@ func (b *Bridge) worker(ctx context.Context) {
 		run.mu.Unlock()
 		b.runTask(ctx, run)
 	}
+}
+
+// pending reports whether the run is still queued: neither spawned nor
+// finalized.
+func (r *taskRun) pending() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.state == statePending
+}
+
+// cancelInStream is the worker's look-ahead: has a cancel for this task
+// already landed on its in subject, behind the submission the durable just
+// delivered? The durable delivers serially and acks after the handler, so a
+// cancel published before this bridge bound - the eval harness's abandonment
+// of a submission nobody took, or any cancel inside the retention window - is
+// dispatched only after accept returns, by which time an idle worker has the
+// run. Reading the subject closes that gap. It is a read, not a consume: the
+// durable still delivers the cancel to handle afterwards, where it finds a
+// finalized run and does nothing.
+//
+// Newer than the submission means after it in stream order. The submission
+// is normally in the replay, since the durable delivered it moments ago;
+// when it is not - the per-subject cap evicted it - everything left is
+// newer, and a cancel among it counts. Nothing here filters on `to`: the
+// replay already drops an envelope whose `to` disagrees with the subject's
+// addressee, the same screen the durable applies before handle sees one.
+func (b *Bridge) cancelInStream(ctx context.Context, run *taskRun) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, lookAheadTimeout)
+	defer cancel()
+	envs, err := b.c.TaskInReplay(ctx, b.cfg.Profile, run.origin.TaskID)
+	if err != nil {
+		return false, err
+	}
+	from := 0
+	for i, env := range envs {
+		if env.EnvelopeID == run.origin.EnvelopeID {
+			from = i + 1
+			break
+		}
+	}
+	for _, env := range envs[from:] {
+		if env.Kind == lib.KindCancel {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
