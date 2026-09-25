@@ -32,6 +32,7 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
@@ -777,7 +778,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// predicate's false negatives, a terminated pod still counted and an
 	// informer copy older than the pass's own apply, clear on a Deployment
 	// event the requeue does not need to wait for.
-	if a2aNext && (!a2aState.done || a2aState.gatewayHeld) {
+	// gatewayDark shares it too: the discord-bot Secret is not watched, so
+	// its creation is invisible without a requeue, and the pass that renders
+	// the gateway once it exists has to be a pass that happens.
+	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayDark) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -2534,12 +2538,18 @@ type splitWorkloadStatus struct {
 // rather than reporting a readiness it could not check. NotFound is not an error here: it
 // is the ordinary state between applying the objects and the API server serving them back,
 // and it reads as not-ready, which is what it is.
-func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]splitWorkloadStatus, error) {
+// The second result is non-empty when a next install's A2A gateway is
+// withheld for want of a chat backend (a2aGatewayBackend): the remedy text
+// the status writer publishes as the A2AGateway condition. A withheld gateway
+// is left out of the list rather than counted as not ready, because it is
+// absent on purpose and Ready would otherwise never be true on such an
+// install (#1660, option 1).
+func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]splitWorkloadStatus, string, error) {
 	shell := &appsv1.StatefulSet{}
 	shellName := shellSandboxName(agent)
 	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: shellName}, shell); err != nil {
 		if !errors.IsNotFound(err) {
-			return nil, fmt.Errorf("failed to get shell sandbox StatefulSet for status update: %w", err)
+			return nil, "", fmt.Errorf("failed to get shell sandbox StatefulSet for status update: %w", err)
 		}
 		shell.Status.ReadyReplicas = 0
 	}
@@ -2548,7 +2558,7 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 	brokerName := credentialBrokerName(agent)
 	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: brokerName}, broker); err != nil {
 		if !errors.IsNotFound(err) {
-			return nil, fmt.Errorf("failed to get credential broker Deployment for status update: %w", err)
+			return nil, "", fmt.Errorf("failed to get credential broker Deployment for status update: %w", err)
 		}
 		broker.Status.ReadyReplicas = 0
 	}
@@ -2572,21 +2582,94 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 	// whatever creates the Deployment. On version skew the A2A objects are frozen
 	// rather than reconciled, and that CR is already Degraded for the skew itself --
 	// a second reason to hold Ready there would report the freeze as a fault.
+	gatewayDark := ""
 	if a2aStackRendering(agent) {
+		// The rest of the stack the mode renders counts too (#1701): a next
+		// install whose NATS is not up, whose callout serves nothing, or
+		// whose bus was never provisioned cannot serve an A2A request either,
+		// and until these were counted the CR read Ready over every one of
+		// those states (quota refusals, image pulls, a Job burning its
+		// backoff). The Job is read through a2aReader like every other Job
+		// read here; it is ready when its Complete condition is true, and a
+		// Failed one is already A2AProvisionFailed before this runs.
+		nats := &appsv1.StatefulSet{}
+		natsName := a2aNATSName(agent)
+		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: natsName}, nats); err != nil {
+			if !errors.IsNotFound(err) {
+				return nil, "", fmt.Errorf("failed to get A2A NATS StatefulSet for status update: %w", err)
+			}
+			nats.Status.ReadyReplicas = 0
+		}
+		callout := &appsv1.Deployment{}
+		calloutName := a2aCalloutName(agent)
+		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: calloutName}, callout); err != nil {
+			if !errors.IsNotFound(err) {
+				return nil, "", fmt.Errorf("failed to get A2A auth callout Deployment for status update: %w", err)
+			}
+			callout.Status.ReadyReplicas = 0
+		}
+		// The Job counts until the bus has been provisioned once. After that a
+		// Job that is absent or running again is the TTL re-run (the finished
+		// Job is removed a day after completion and create-if-absent builds
+		// it again; a2aProvisionJobName's comment) or a digest change, both
+		// of which re-run an idempotent script against a bus that is already
+		// there, and neither should flip a Ready install to Provisioning for
+		// the minute it takes. "Provisioned once" is read off this CR's own
+		// Ready condition: True with reason Reconciled is a pass that counted
+		// the Job complete. A Failed Job is A2AProvisionFailed's, before this
+		// runs.
+		jobName := buildA2AProvisionJob(agent).Name
+		job := &batchv1.Job{}
+		var provisioned int32
+		if ready := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); ready != nil &&
+			ready.Status == metav1.ConditionTrue && ready.Reason == "Reconciled" {
+			provisioned = 1
+		}
+		if err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: jobName}, job); err != nil {
+			if !errors.IsNotFound(err) {
+				return nil, "", fmt.Errorf("failed to get A2A provision Job for status update: %w", err)
+			}
+		} else {
+			for _, c := range job.Status.Conditions {
+				if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
+					provisioned = 1
+				}
+			}
+		}
+		workloads = append(workloads,
+			splitWorkloadStatus{name: natsName, kind: "StatefulSet", ready: nats.Status.ReadyReplicas},
+			splitWorkloadStatus{name: calloutName, kind: "Deployment", ready: callout.Status.ReadyReplicas},
+			splitWorkloadStatus{name: jobName, kind: "Job", ready: provisioned},
+		)
+
 		gateway := &appsv1.Deployment{}
 		gatewayName := a2aGatewayName(agent)
 		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: gatewayName}, gateway); err != nil {
 			if !errors.IsNotFound(err) {
-				return nil, fmt.Errorf("failed to get A2A gateway Deployment for status update: %w", err)
+				return nil, "", fmt.Errorf("failed to get A2A gateway Deployment for status update: %w", err)
 			}
-			gateway.Status.ReadyReplicas = 0
+			// Absent. Withheld on purpose when the install configures no
+			// chat backend, in which case it is not a workload to wait on
+			// but a condition to publish; otherwise the callout gate is
+			// holding it, and it counts as not ready.
+			configured, why, berr := r.a2aGatewayBackend(ctx, agent)
+			if berr != nil {
+				return nil, "", fmt.Errorf("failed to read the A2A gateway's backend for status update: %w", berr)
+			}
+			if !configured {
+				gatewayDark = why
+			} else {
+				gateway.Status.ReadyReplicas = 0
+				workloads = append(workloads, splitWorkloadStatus{name: gatewayName, kind: "Deployment", ready: 0})
+			}
+		} else {
+			workloads = append(workloads, splitWorkloadStatus{
+				name: gatewayName, kind: "Deployment", ready: gateway.Status.ReadyReplicas,
+			})
 		}
-		workloads = append(workloads, splitWorkloadStatus{
-			name: gatewayName, kind: "Deployment", ready: gateway.Status.ReadyReplicas,
-		})
 	}
 
-	return workloads, nil
+	return workloads, gatewayDark, nil
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
@@ -2672,7 +2755,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// The workloads the gateway's own readiness does not cover. Read before the phase
 	// is decided, because Ready is a claim about every one of them and not about the
 	// gateway alone.
-	splitWorkloads, errSplit := r.readSplitWorkloads(ctx, agent)
+	splitWorkloads, a2aGatewayDark, errSplit := r.readSplitWorkloads(ctx, agent)
 	if errSplit != nil {
 		return "", errSplit
 	}
@@ -2695,7 +2778,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		condReason = "Reconciled"
 		condMsg = "Gateway, shell sandbox and credential broker are all ready"
 		if a2aStackRendering(agent) {
-			condMsg = "Gateway, shell sandbox, credential broker and A2A gateway are all ready"
+			condMsg = "Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready"
+			if a2aGatewayDark != "" {
+				condMsg = "Gateway, shell sandbox, credential broker, NATS, auth callout and bus provisioning are all ready; " +
+					"the A2A gateway is not rendered (no chat backend, see the A2AGateway condition)"
+			}
 		}
 	case errWorkload == nil:
 		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent); reasonOverride != "Provisioning" {
@@ -2779,6 +2866,17 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	hostPathDroppedMsg := hostPathDroppedMessage(agent, workloadRollIncomplete)
 	hostPathDroppedUnchanged := hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
 
+	// The withheld-gateway condition, same class as EventWatcher and for the
+	// same reason it needs its own term: the flip from dark to rendered can
+	// leave the Ready phase and message exactly as they were (another
+	// workload holding Provisioning both times), and without a term here the
+	// early return below would keep a NoChatBackend condition on a CR whose
+	// gateway is running.
+	existingA2AGatewayCond := meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType)
+	a2aGatewayUnchanged := (a2aGatewayDark == "" && existingA2AGatewayCond == nil) ||
+		(a2aGatewayDark != "" && existingA2AGatewayCond != nil && existingA2AGatewayCond.Status == metav1.ConditionFalse &&
+			existingA2AGatewayCond.Reason == a2aGatewayDarkReason && existingA2AGatewayCond.Message == a2aGatewayDark)
+
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
 	// A Degraded/RBACIncomplete condition is reportRBACSkew's, and this function
@@ -2812,6 +2910,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
 		hostPathDroppedUnchanged &&
+		a2aGatewayUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
 		return newPhase, nil
@@ -2878,6 +2977,23 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
+
+	// The withheld-gateway condition, on the EventWatcher pattern: written
+	// while the state holds, removed the pass it stops holding. Not Degraded:
+	// the install configured no chat backend and the rest of the stack is up;
+	// the message says what would render the gateway.
+	if a2aGatewayDark == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aGatewayConditionType)
+	} else {
+		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+			Type:               a2aGatewayConditionType,
+			Status:             metav1.ConditionFalse,
+			Reason:             a2aGatewayDarkReason,
+			Message:            a2aGatewayDark,
+			ObservedGeneration: agent.Generation,
+			LastTransitionTime: now,
+		})
+	}
 
 	return newPhase, r.Status().Update(ctx, agent)
 }

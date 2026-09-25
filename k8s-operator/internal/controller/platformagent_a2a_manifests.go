@@ -2499,8 +2499,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// reference is optional so the pod schedules
 							// before it.
 							{Name: "DISCORD_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{Name: "discord-bot"},
-								Key:                  "token",
+								LocalObjectReference: corev1.LocalObjectReference{Name: a2aDiscordBotSecretName},
+								Key:                  a2aDiscordBotTokenKey,
 								Optional:             ptr.To(true),
 							}}},
 							// Rendered explicitly even when the CR is silent:
@@ -2602,6 +2602,69 @@ type a2aProvisionState struct {
 	// written on the way OUT of the previous one, and nothing else is
 	// guaranteed to wake the reconcile that finally sees it.
 	gatewayHeld bool
+	// gatewayDark reports that the gateway Deployment was withheld because
+	// the install configures no chat backend for it: no discord-bot Secret
+	// and no door armed (a2aGatewayBackend). gatewayDarkReason is the
+	// remedy, for the condition the status writer publishes. A gateway that
+	// already exists is never withheld on this account; see the call site.
+	gatewayDark       bool
+	gatewayDarkReason string
+}
+
+// a2aDiscordBotSecretName is the hand-made Secret carrying the Discord bot
+// token, the one chat backend the gateway can be given today without a door.
+const (
+	a2aDiscordBotSecretName = "discord-bot"
+	a2aDiscordBotTokenKey   = "token" // #nosec G101 -- Secret key name, not a credential
+)
+
+// The condition the status writer publishes while a next install's gateway
+// is withheld for want of a backend (#1660, option 1). Informational rather
+// than Degraded: the install did nothing wrong, it configured no chat
+// backend, and the rest of the stack is up. The message names what would
+// render it.
+const (
+	a2aGatewayConditionType = "A2AGateway"
+	a2aGatewayDarkReason    = "NoChatBackend"
+)
+
+// a2aGatewayBackend reports whether the install gives the gateway a chat
+// backend to start on, and if not, what would. The gateway binary refuses to
+// start without one (a2a/gateway/config.go, "no chat backend"), so rendering
+// its Deployment without one is a crash loop by construction; the render
+// asks first. The answers, in the order the gateway itself accepts them:
+// the inject door armed on the operator (the eval install's case, #1660's
+// decision that the door alone is an ingress); the discord-bot Secret
+// present in the namespace. The Google Chat relay joins here when the
+// operator renders it (#1705), and the A2A door when its render lands.
+//
+// The Secret is read through a2aReader, uncached, for the reason every other
+// Secret read here is (see removeA2AInjectBackend): the operator ships
+// secrets with get only, and a cached Get would start a cluster-wide
+// informer whose LIST is forbidden.
+func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, string, error) {
+	if a2aInjectBackendEnabled() {
+		return true, "", nil
+	}
+	secret := &corev1.Secret{}
+	err := r.a2aReader().Get(ctx, types.NamespacedName{Name: a2aDiscordBotSecretName, Namespace: agent.Namespace}, secret)
+	switch {
+	case err == nil && len(secret.Data[a2aDiscordBotTokenKey]) > 0:
+		return true, "", nil
+	case err == nil:
+		// The Secret is there and the key the gateway reads is not: the env
+		// reference is optional, so a rendered gateway would start with no
+		// token and exit on "no chat backend", which is the crash loop this
+		// check exists to prevent. Withheld, with the key named.
+		return false, fmt.Sprintf("the %s Secret in %s carries no %q key, so the A2A gateway has no chat backend and its "+
+			"Deployment is not rendered: put the Discord bot token under that key; an eval install arms the inject door "+
+			"(%s=true on the operator) instead", a2aDiscordBotSecretName, agent.Namespace, a2aDiscordBotTokenKey, a2aInjectBackendEnvVar), nil
+	case !errors.IsNotFound(err):
+		return false, "", err
+	}
+	return false, fmt.Sprintf("no chat backend is configured for the A2A gateway, so its Deployment is not rendered: "+
+		"create the %s Secret (key %s) in %s; an eval install arms the inject door (%s=true on the operator) instead",
+		a2aDiscordBotSecretName, a2aDiscordBotTokenKey, agent.Namespace, a2aInjectBackendEnvVar), nil
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -2949,6 +3012,33 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	dep := buildA2AGatewayDeployment(agent)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
+	}
+	// Before the callout gate: a gateway with no chat backend to start on
+	// is a crash loop, so its first creation is withheld and the CR says
+	// why (#1660, option 1). Creation only, the same rule as the callout
+	// gate below and for the same reason: a gateway that exists is
+	// reconciled whatever happened to its backend, because deleting it
+	// would hand every session pod that hangs off its UID to the garbage
+	// collector. An operator who removes the discord-bot Secret from under
+	// a running gateway gets the crash loop that has always followed that,
+	// visible on the pod; an operator who never created one gets no
+	// Deployment and a condition instead.
+	if configured, why, err := r.a2aGatewayBackend(ctx, agent); err != nil {
+		return state, err
+	} else if !configured {
+		err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{})
+		if errors.IsNotFound(err) {
+			state.gatewayDark = true
+			state.gatewayDarkReason = why
+			logf.FromContext(ctx).Info("withholding the A2A gateway: no chat backend is configured", "deployment", dep.Name)
+			if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
+				return state, err
+			}
+			return state, nil
+		}
+		if err != nil {
+			return state, err
+		}
 	}
 	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep, calloutGeneration); err != nil {
 		return state, err

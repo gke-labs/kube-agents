@@ -40,7 +40,7 @@ The controller reconciles a `PlatformAgent` into:
 - `PersistentVolumeClaim`s for the agent's data and system metadata.
 - `ConfigMap`s for the pod: config overlays merged into each Hermes profile's `config.yaml` at startup (including the whole rendered config for the default, Planning Agent, profile — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)), a `SETTINGS.md` (GKE scope) mounted into `/opt/data/`, the [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope) declaration as `scope.json` mounted at `/etc/kube-agents/`, and a Fluent Bit config for the logging sidecar. Each profile's base config is baked into the image and scaffolded at startup.
 - Optional integrations wired through the CR `spec.integration` block: Google Chat (Pub/Sub topic/subscription), Slack (bot/app token secret refs), and GitHub (GitOps repo, with the GitHub Token Minter endpoint injected as an env var).
-- Under the unsupported `spec.mode: next` dev toggle, additionally the A2A playground stack (NATS, bus provisioning, the auth callout, the A2A gateway) — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
+- Under the unsupported `spec.mode: next` dev toggle, additionally the A2A playground stack (NATS, bus provisioning, the auth callout and, once a chat backend is configured, the A2A gateway) — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
 
 ## Custom resource shape
 
