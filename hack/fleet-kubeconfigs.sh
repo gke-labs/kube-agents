@@ -35,10 +35,10 @@
 # "-<slot>" segment, so the prefix and the location stay the Terraform's
 # business.
 #
-# A cluster that cannot be reached -- including a leased project where the
-# stack was never applied at all, which is a live possibility while the pool is
-# being filled out -- leaves its roles' files ABSENT rather than stale or
-# wrong, and this script still exits 0. That is deliberate: the verifier turns a
+# A cluster that cannot be reached leaves its roles' files ABSENT rather than
+# stale or wrong, and this script still exits 0. (A leased project where the
+# stack was never applied has no reader account either, so it stops at the
+# credential gate below instead.) That is deliberate: the verifier turns a
 # missing file into `status: "error"` naming the role AND the project, which
 # fails exactly the checks that needed that cluster instead of the whole job,
 # and it never falls back to the ambient kubeconfig -- falling back is the bug

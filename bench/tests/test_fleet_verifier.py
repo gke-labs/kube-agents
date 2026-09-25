@@ -1560,7 +1560,8 @@ def test_a_token_that_is_not_a_token_leaves_the_original_credential_alone(
     )
     assert done.returncode != 0
     assert "not a bare access token" in done.stderr
-    # Not a broken file: the caller warns and keeps its own credential.
+    # Not a broken file: the function leaves gcloud's own whole, and the
+    # caller removes it rather than keep a file on the runner's credential.
     assert "gke-gcloud-auth-plugin" in target.read_text()
 
 
