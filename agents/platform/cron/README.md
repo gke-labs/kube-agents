@@ -361,7 +361,11 @@ rule outlives the memory of why:
   repository. A run that died without `finish` costs the
   stream at most the ticks inside those two hours. For the operator only:
   when you know from outside the run that it is over (its card is closed, its
-  pod is gone), deleting that note releases the stream at once. The CLI has no
+  pod is gone), deleting that note releases the stream at once. The `.lock`
+  file beside the note is created once, mode 0644 whatever the creating
+  shell's umask, and never removed; a `START REFUSED` that says the guard
+  could not be taken names the error, and a lock that uid 1000 cannot open
+  is the first thing to check. The CLI has no
   override flag on purpose; the one it had was taken by refused workers over
   their own live runs (#1876), and a worker's shell is the same shell you
   would use, so the release lives here and not where a worker reads.

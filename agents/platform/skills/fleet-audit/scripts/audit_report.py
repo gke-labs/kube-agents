@@ -1569,8 +1569,17 @@ def claim_in_flight(audit_id: str) -> None:
         # hand-run `start` over `kubectl exec` lands as root; the tick and
         # every session run as uid 1000) must still open for everyone after.
         # O_RDWR made such a lock refuse the stream for good, before the TTL
-        # was ever read.
-        lock = os.open(f"{path}.lock", os.O_RDONLY | os.O_CREAT, 0o644)
+        # was ever read. The mode is a request the creating process's umask
+        # narrows: under 077 or 027 (hardened operator shells) that root-run
+        # `start` left a 0600 root:root lock that no uid-1000 `start` could
+        # open, and unlike the note the lock has no TTL and nothing removes
+        # it. The umask is cleared for this one call so the lock is 0644
+        # whoever creates it.
+        mask = os.umask(0)
+        try:
+            lock = os.open(f"{path}.lock", os.O_RDONLY | os.O_CREAT, 0o644)
+        finally:
+            os.umask(mask)
     except OSError as exc:
         raise StartRefused(
             f"could not take the in-flight guard for {audit_id} "

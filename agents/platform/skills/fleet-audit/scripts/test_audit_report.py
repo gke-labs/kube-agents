@@ -17,6 +17,7 @@ import io
 import json
 import fcntl
 import os
+import stat
 import re
 import shutil
 import subprocess
@@ -4198,6 +4199,30 @@ class TestStart(HarnessTestCase):
         self.assertEqual(seen, [os.O_RDONLY])
         self.assertNotIn("START REFUSED", self.err)
         self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+        # And the guard still holds behind that lock.
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+
+    def test_a_lock_created_under_a_restrictive_umask_still_opens_for_everyone(self):
+        # 0o644 is what `start` asks for; the kernel narrows it by the
+        # creator's umask. A root hand-run `start` under umask 077 (a common
+        # hardened shell profile) left a 0600 root:root lock, and since the
+        # lock has no TTL and is never removed, every later uid-1000 `start`
+        # of the stream failed the open for good. The umask is cleared for
+        # the create, and put back.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        lock = Path(f"{note}.lock")
+        self.assertFalse(lock.exists())
+        previous = os.umask(0o077)
+        self.addCleanup(os.umask, previous)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertNotIn("START REFUSED", self.err)
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o644)
+        # The process's own umask is restored after the create.
+        restored = os.umask(0o077)
+        self.assertEqual(restored, 0o077)
         # And the guard still holds behind that lock.
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
         self.assertIn("START REFUSED:", self.err)
