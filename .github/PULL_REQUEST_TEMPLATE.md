@@ -31,19 +31,19 @@ file matters.
 ## Bug Fix: Preventing Recurrence
 
 <!--
-Required when this PR fixes a bug, which includes every `fix:` title. Otherwise write
-"Not a bug fix."
+Required when this PR fixes a bug: any `fix` type, with or without a scope. Otherwise
+write "Not a bug fix."
 
 - Why it shipped: the test, check, or review step that should have caught the bug, and
   why it did not.
 - What catches it now: the test, eval case, or check that fails if the bug comes back,
-  and that you saw it fail without the fix. An eval case already named under Live
-  validation can be cited by name rather than repeated.
+  and that you saw fail without the fix. An existing case counts; name it.
 - Where else it lives: other places the same mistake could be, and whether you checked
-  them or the new guard covers them.
+  them or the guard covers them.
 
-If nothing automated can catch it, say why and what stands in for it. "Added a test"
-without naming the test is not an answer.
+If nothing automated can catch it, say why and what stands in for it.
+
+Full contract: .agents/rules/pre_pr_review.md.
 -->
 
 -

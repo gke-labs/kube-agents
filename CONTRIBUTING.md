@@ -38,7 +38,8 @@ human contributors and AI coding agents:
   each one exists for, how to poll for and answer the `kube-agents-bot` review, and how to
   resolve its threads.
 - [`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md) is the mechanics of the
-  self-review and live-validation sections the pull request template asks for.
+  self-review, live-validation, and bug-fix recurrence sections the pull request template asks
+  for.
 - [`docs/testing-map.md`](docs/testing-map.md) says where a new test goes and what runs it.
 - [`docs/designs/live-test-lease.md`](docs/designs/live-test-lease.md) is the lease to take before
   mutating an installation your team shares.

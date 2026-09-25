@@ -218,13 +218,15 @@ cite the rule when it applies. Judge by whether a change serves the stated inten
 it is — a big diff that does one thing is in scope, and a three-line change that does a second
 thing is not.
 
-Read the pull request's **Self-Review** and **Testing** sections when there is a body. `AGENTS.md`
-is canonical for what each owes a reviewer — "What any reviewer reads first" for the Self-Review,
-and the live-validation bullet under Pull Request Hygiene with `.agents/rules/pre_pr_review.md` for
-Testing; what this angle adds is that they are claims the tree can check: every path, script, or
-command the Testing section credits must exist and do what it is credited with, and a guard or test
-the description says covers a case must reach that case. A claim the diff does not support is the
-finding that page describes. One exception: on a preflight re-run of your own branch the Self-Review
+Read the pull request's **Self-Review** and **Testing** sections when there is a body, and on a
+`fix`-type pull request its **Bug Fix: Preventing Recurrence** section. `AGENTS.md` is canonical
+for what the first two owe a reviewer — "What any reviewer reads first" for the Self-Review, and
+the live-validation bullet under Pull Request Hygiene with `.agents/rules/pre_pr_review.md` for
+Testing — and `pre_pr_review.md` alone for the third. What this angle adds is that they are claims
+the tree can check: every path, script, or command the Testing section credits must exist and do
+what it is credited with, and a guard or test the description says covers a case must reach that
+case. A claim the diff does not support is the finding that page describes, and so is a recurrence
+section left empty or answered "Not a bug fix" on a `fix`. One exception: on a preflight re-run of your own branch the Self-Review
 is the previous round's dispositions, and `review-preflight` §7 says a fresh pass is not handed
 those — read it on a reviewer's or a bot's pass, withhold it on a re-run of your own.
 
@@ -232,12 +234,6 @@ Then check that the intent is actually tested: for each behaviour the change cla
 that would fail if that behaviour regressed. Where there is none, the candidate is the untested
 behaviour, not the absent test — say which regression would ship silently. Bug fixes without a
 regression test, and new error paths nothing exercises, are the usual cases.
-
-On a bug fix, hold the body's **Bug Fix: Preventing Recurrence** section to the same standard: the
-test, case, or check it names must exist in the tree, reach the path the bug took, and fail with
-the fix reverted. A `fix:` pull request whose section is missing, empty, or answered "Not a bug
-fix" is a finding, and so is one that names a guard the diff does not add or that could not have
-caught the bug.
 
 **Do not treat green test suites as proof of correctness**: a passing suite proves only that the
 paths it exercises work on the fixtures it supplies. For every validation check, gate, and error

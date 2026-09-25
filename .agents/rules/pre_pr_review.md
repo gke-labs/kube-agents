@@ -7,10 +7,11 @@ paths:
 
 # Pre-PR review mechanics
 
-[`AGENTS.md`](../../AGENTS.md) owns both rules below — that adversarial self-review and live
-validation are required before opening a pull request, and that each is recorded in the pull
+[`AGENTS.md`](../../AGENTS.md) owns the first two rules below — that adversarial self-review and
+live validation are required before opening a pull request, and that each is recorded in the pull
 request body. This file holds the mechanics of carrying them out, and what the automated review
-shares with the first of them. Change the rule in `AGENTS.md`; change how it is done here.
+shares with the first of them. Change those rules in `AGENTS.md`; change how they are done here.
+The third, preventing recurrence on a bug fix, is stated only here.
 
 ## Adversarial self-review
 
@@ -98,3 +99,26 @@ in `AGENTS.md` under Pull Request Hygiene.
 - **If the change cannot reach a running installation** — docs-only, a CI workflow, a code path
   that needs infrastructure you do not have — write "Not live-tested" and say why. An empty
   section is not an answer.
+
+## Preventing recurrence on a bug fix
+
+A pull request that fixes a bug — any `fix` type, with or without a scope — fills in the
+template's **Bug Fix: Preventing Recurrence** section. Any other pull request writes "Not a bug
+fix." there. The section answers three questions:
+
+- **Why it shipped.** The test, check, or review step that should have caught the bug, and why it
+  did not.
+- **What catches it now.** The test, eval case, or check that fails if the bug comes back, and
+  that you saw fail without the fix. It need not be new: an existing eval case run red against
+  `main`, or an `expected_fail` case this change flips
+  ([`eval_driven_development.md`](eval_driven_development.md), "When the fix is not yours"),
+  counts. A case already named under **Live validation** is cited by name, not repeated. "Added a
+  test" without naming it is not an answer.
+- **Where else it lives.** Other places the same mistake could be, and whether you checked them or
+  the guard covers them.
+
+When nothing automated can catch the bug, say why and what stands in for it.
+
+A reviewer, the automated one included, holds the section to the tree: the guard it names exists
+at the head, reaches the path the bug took, and fails with the fix reverted. A `fix` whose section
+is empty or answered "Not a bug fix" is a finding.

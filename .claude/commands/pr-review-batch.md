@@ -149,7 +149,7 @@ own merge rules, however clean the latest review reads.
 ### Signal 2 — the author reviewed and tested it themselves
 
 Read the body. Two of its sections are what AGENTS.md's "Pull Request Hygiene" requires before a
-pull request is opened at all:
+pull request is opened at all, and a `fix`-type pull request owes a third:
 
 - **`## Self-Review`** — the disposition list from the author's own pre-PR passes, merged:
   `review-adversarial` and `review-docs-drift`, both on every change. What they looked for, what
@@ -158,6 +158,8 @@ pull request is opened at all:
   the only one that says somebody already read this diff hostilely.
 - **`### Live validation`** (and the `## Testing` section around it) — that the change was actually
   exercised. `Not live-tested` with a stated reason is a filled section.
+- **`## Bug Fix: Preventing Recurrence`**, on a `fix` only — the guard that now fails if the bug
+  returns, per `.agents/rules/pre_pr_review.md`. "Not a bug fix" on a `fix` is unfilled.
 
 Judge them by reading, not by measuring. A section holding only the template's HTML comment,
 whitespace, or a bare `-` is unfilled — but so is a paragraph that says "reviewed it, looks fine",
