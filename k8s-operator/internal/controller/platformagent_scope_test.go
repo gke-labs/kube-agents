@@ -105,6 +105,25 @@ func TestRenderScopeJSONIsSortedAndDeterministic(t *testing.T) {
 	}
 }
 
+func TestRenderScopeJSONRendersContainersSorted(t *testing.T) {
+	// Folders and organisations are rendered under their own keys, sorted, and an
+	// absent list renders as [] so the reader never sees null.
+	scope := &agentv1alpha1.ScopeSpec{Folders: []string{"987654321098", "123456789012"}, Organizations: []string{"926317919369"}}
+	got := renderScopeJSON(scopeTestAgent(scope))
+	for _, want := range []string{
+		"\"folders\": [\n    \"123456789012\",\n    \"987654321098\"\n  ]",
+		"\"organizations\": [\n    \"926317919369\"\n  ]",
+		"\"projects\": []",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("render lacks %q:\n%s", want, got)
+		}
+	}
+	if none := renderScopeJSON(scopeTestAgent(&agentv1alpha1.ScopeSpec{})); !strings.Contains(none, "\"folders\": []") || !strings.Contains(none, "\"organizations\": []") {
+		t.Errorf("an empty block must render empty container lists, got:\n%s", none)
+	}
+}
+
 func TestRenderScopeJSONExcludeOnlyIsRendered(t *testing.T) {
 	// An install migrating only its exclusions still needs them applied.
 	scope := &agentv1alpha1.ScopeSpec{Exclude: &agentv1alpha1.ScopeExcludeSpec{

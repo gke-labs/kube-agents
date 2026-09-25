@@ -363,6 +363,8 @@ data:
     {
       "present": false,
       "projects": [],
+      "folders": [],
+      "organizations": [],
       "exclude": {
         "projects": [],
         "clusters": []

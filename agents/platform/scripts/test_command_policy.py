@@ -707,6 +707,33 @@ class GcloudReadOnlyTest(unittest.TestCase):
         # Test individual listed commands from GCLOUD_READ_COMMANDS.
         self.assertTrue(evaluate(["gcloud", "config", "list"]).allowed)
 
+    def test_asset_search_is_allowed_with_its_selectors_and_asset_writes_are_refused(self):
+        # The Cluster Agent reconcile resolves a folder or organisation in spec.scope with
+        # exactly this call (docs/designs/multi-project-scope.md §4); both selector flags take
+        # a value, so an unlisted flag would hide the command path and refuse it silently.
+        allowed = ["gcloud", "asset", "search-all-resources", "--scope=folders/123456789012",
+                   "--asset-types=container.googleapis.com/Cluster", "--format=json"]
+        self.assertTrue(evaluate(allowed).allowed)
+        spaced = ["gcloud", "asset", "search-all-resources", "--scope", "organizations/111111111111",
+                  "--asset-types", "container.googleapis.com/Cluster"]
+        self.assertTrue(evaluate(spaced).allowed)
+        # The verb is admitted for the one asset type the reconcile reads: no type, another
+        # type, or a list of types is refused by its own rule, so the sandbox cannot enumerate
+        # the rest of a container's asset index through it.
+        for argv in (["gcloud", "asset", "search-all-resources", "--scope=organizations/111111111111"],
+                     ["gcloud", "asset", "search-all-resources", "--scope=folders/1", "--asset-types=iam.googleapis.com/ServiceAccountKey"],
+                     ["gcloud", "asset", "search-all-resources", "--scope=folders/1",
+                      "--asset-types=container.googleapis.com/Cluster,compute.googleapis.com/Instance"]):
+            decision = evaluate(argv)
+            self.assertFalse(decision.allowed, argv)
+            self.assertEqual("gcp.asset-type-required", decision.rule_id, argv)
+        for argv in (["gcloud", "asset", "export", "--content-type=resource", "--output-path=gs://b/x"],
+                     ["gcloud", "asset", "feeds", "create", "f", "--project=p", "--pubsub-topic=t"],
+                     ["gcloud", "asset", "saved-queries", "delete", "q"]):
+            # Refused, by whichever rule fires first: the verb check, the file-write refusal
+            # on `export --output-path`, or the unknown-flag refusal on `feeds create`.
+            self.assertFalse(evaluate(argv).allowed, argv)
+
     def test_config_set_is_refused(self):
         # `config set` is not in GCLOUD_READ_COMMANDS, so it should be refused.
         decision = evaluate(["gcloud", "config", "set", "core.project", "my-proj"])

@@ -965,6 +965,16 @@ func (in *ScopeSpec) DeepCopyInto(out *ScopeSpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.Folders != nil {
+		in, out := &in.Folders, &out.Folders
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
+	if in.Organizations != nil {
+		in, out := &in.Organizations, &out.Organizations
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Exclude != nil {
 		in, out := &in.Exclude, &out.Exclude
 		*out = new(ScopeExcludeSpec)

@@ -245,6 +245,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "pull_request_opened": (),
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns"),
+    "worker_agents": ("required_agents",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

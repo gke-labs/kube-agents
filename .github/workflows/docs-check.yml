@@ -3,6 +3,8 @@ name: Documentation Checks
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  merge_group:
+    branches: [main]
   push:
     branches: [main]
 

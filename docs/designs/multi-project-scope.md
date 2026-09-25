@@ -1,6 +1,6 @@
 # An Opt-In Multi-Project Scope for the Platform Agent
 
-> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 1's IAM bindings, installer path, the chart's rendering of `spec.scope` and the `platform_mcp_server.py` change, and steps 2 to 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
+> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Steps 1 and 2's IAM bindings and installer paths, step 1's chart rendering of `spec.scope` and `platform_mcp_server.py` change, and steps 3 to 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
 > architecture documents define it as one agent per project. This document proposes replacing that
 > single project with a declared scope, and gives the order the change has to land in. Each section
 > says what is true on `main` now and what the design changes.
@@ -107,7 +107,7 @@ spec:
       - payments-staging
     folders: # Resource Manager folder IDs (numeric), resolved to every project beneath them
       - "123456789012"
-    organizations: # organisation IDs (numeric)
+    organizations: # organisation IDs (numeric); see §9 before using this
       - "987654321098"
     exclude:
       projects: # IDs or shell-style globs; dropped after resolution, even if a folder above contains them
@@ -152,7 +152,7 @@ Rules:
   `MaxItems=100` on the CRD, so an oversized declaration is refused at admission. That cap outlives the pool's move to per-project accounts (§6) for a reason of its own: a hand-written list past a hundred entries is the shape containers exist for, and the cap is where the CRD says so; an estate with more than a hundred explicit projects declares folders rather than raising anything. The reconcile lists at most a cap's worth of projects of the resolved set, the management project included, because one folder can resolve to any number. On `main` the cap is the fixed constant `RESOLVED_SET_CAP`, 100; making it a declared value, `spec.scope.maxProjects` with 100 as its default and the listing budget (§4) scaling with it rather than staying fixed, is the follow-up §10 step 2 names. The default sits below the estate that asked for this design, about 200 projects with one cluster each grouped by folder (#1354), and that install declares its folders and a higher cap rather than splitting in two; an estate that wanted two hundred explicit projects is refused at admission and declares folders instead; what bounds an install above the default is the pod, not the reconcile (§11). The set is
   filled in a fixed order so the cap binds the same way on every run: the management project, then
   explicit projects sorted by ID, then the phase 3 selectors' projects sorted by ID, then
-  containers sorted by ID; a container that does not fit is skipped and the next one is still tried,
+  containers sorted by ID; a container that does not fit is skipped and the next one is still tried (its members are carried `over-cap` and count against a later container only when that container would list them),
   and the members of a frozen container carry the container's outcome for the run (§4), never the `ok` they may have read last hour. An explicit project beyond the cap (100 by default) stays in the set and reads
   `over-cap` as its project outcome (§4: profiles kept, CREATE skipped); a container whose members would cross the cap reads `over-cap` as its container outcome: its members are carried forward reading `over-cap` and get no CREATE, as under §4's freeze, but because the lookup itself succeeded and the run
   holds the full member list, `over-cap` does not hold back §7's prune the way a failed lookup
@@ -198,7 +198,7 @@ schedule and the operator deliberately holds no GCP credential.
 gcloud asset search-all-resources \
   --scope=folders/123456789012 \
   --asset-types=container.googleapis.com/Cluster \
-  --format='value(name,location)'
+  --format='json(name,location)'
 ```
 
 One call returns every cluster under the container, including in projects created since the last
@@ -230,11 +230,8 @@ the fallback for an installation whose policy forbids the Asset API, filed and b
 installation appears rather than ahead of one; the snapshot's `resolver` field (§5) exists so the
 two can be told apart.
 
-The discovery verb is absent from the broker's read allowlist. `GCLOUD_READ_COMMANDS` in
-`command_policy.py` admits `container clusters list` and `projects list` but no `asset`
-command. This is the class of gap #1126 describes: a discovery read the leaf reads depend on,
-refused fail-closed with no signal. Adding `("asset", "search-all-resources")` is part of phase 2, with the resolver that needs it,
-and so is adding `--scope` and `--asset-types` to `_GCLOUD_FLAGS_WITH_VALUE`: the broker refuses a
+The discovery verb was absent from the broker's read allowlist until phase 2: `GCLOUD_READ_COMMANDS` in `command_policy.py` admitted `container clusters list` and `projects list` but no `asset` command. This is the class of gap #1126 describes: a discovery read the leaf reads depend on,
+refused fail-closed with no signal. Phase 2 added `("asset", "search-all-resources")` with the resolver that needs it, and `--scope` and `--asset-types` to `_GCLOUD_FLAGS_WITH_VALUE`: the broker refuses a
 flag it does not know the arity of before it matches the command path, so a verb whose flags are
 not listed is admitted and unreachable at once, which the set's own comment records as having
 happened to `logging read`.
@@ -317,7 +314,7 @@ profiles, on the data PVC, in a snapshot the reconcile run rewrites every hour:
 the only value phase 1 writes, `asset-inventory` once a folder or organisation is, and a fallback resolver,
 if one is ever built, names itself here. It says nothing about the other selectors: each project's
 `via` carries its source, and the phase 3 selectors record theirs there (§10). The management project's `via` is `["management"]`; an explicit project's is `["explicit"]`;
-a project a container produced names the container. `containers` lists every selector the run resolved at runtime, with its outcome and member count: the declared folders and organisations, and in phase 3 each `sharedVpcHosts/<host>` and `metricsScopes/<scope>` entry under its `via` name, so that a failed lookup of any of them is visible where the freeze rule (§4) and §7's second condition read it. `ignoredExcludes` lists every `exclude.projects` entry that matched the management project and was not applied (§3), with the project and the pattern, so an
+a project a container produced names the container. `containers` lists every selector the run resolved at runtime, with its outcome and member count: the declared folders and organisations, and in phase 3 each `sharedVpcHosts/<host>` and `metricsScopes/<scope>` entry under its `via` name, so that a failed lookup of any of them is visible where the freeze rule (§4) and §7's second condition read it. `ignoredExcludes` records the first `exclude.projects` entry that matched the management project and was not applied (§3), with the project and the pattern, so an
 exclusion the run declined to honour is visible in the snapshot rather than only in a log line.
 `profiles` maps every profile on the volume to its project as the run read it, or as the last run
 that could read it did: a profile whose `cluster_identity` cannot be read this run is attributed
@@ -397,8 +394,8 @@ Prerequisites the design has to state and the installer has to preflight:
 - The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or `resourcemanager.organizations.setIamPolicy` for an organisation; with the pool armed it also lists the container's projects at plan time, which needs `cloudasset.googleapis.com` searchable and `roles/cloudasset.viewer` on the container for that identity too. Today it needs only
   project-level IAM admin. The installer's preflight reports which containers it cannot bind rather
   than failing on the first.
-- A project in scope with `container.googleapis.com` disabled resolves to zero clusters (§4's
-  `api-disabled`); Terraform must not enable the API in other people's projects.
+- A project in scope with `container.googleapis.com` disabled reads `api-disabled` (§4: its
+  profiles kept, CREATE skipped); Terraform must not enable the API in other people's projects.
 - When a folder or organisation is declared, the identity running Terraform can enable
   `cloudasset.googleapis.com` in the host project, checked before the apply that then binds the
   agent's `roles/cloudasset.viewer` on each container. The preflight names an organisation policy
@@ -431,7 +428,7 @@ has three conditions, all required: the project is absent from this run's resolv
 because no selector produced it or because an `exclude.projects` entry removed it -- a project in
 the set is present in the snapshot with whatever outcome it read, `ok` or not, and is never pruned
 by this rule; every selector the run resolves at runtime, the declared containers and the phase 3 shared-VPC-host and metrics-scope lookups alike, resolved this run, `ok` or `over-cap` (§4), no project of any kind came back `unreachable`, the management project itself resolved and listed its own clusters, and the declaration file was read, so that the absence is the declaration speaking and not a failed lookup; and the project was present in the previous snapshot's `projects` array, as `in-scope` or
-`retiring`, so that removal is a transition the scope made and not a state it merely finds. A CR that carries no `scope` block at all declares nothing: the run lists the management project alone, keeps the last recorded declaration's exclusions, carries its projects forward as in scope, and marks nothing newly `retiring`; a project an earlier present block already marked `retiring`, or a management project whose identity changed, is still pruned on a clean no-block run, because that mark came from a real declaration. A block goes missing on its own when a CR write passes an older operator's webhook; dropping projects is done by emptying `projects` inside a present block. The rule therefore binds the renderer: once an install carries a scope value, the chart's `PlatformAgent` template emits `spec.scope` as a present block, empty lists included, rather than dropping the group the way its other optional groups are dropped when every value is empty, so that removing the last project from the tfvars and running `upgrade.sh` reads as the declaration that drops it and not as no declaration. The absent marker exists for CR writes the chart did not make. The prune takes two clean runs: the first clean run that finds a project absent writes it to the snapshot as `retiring`, and the next clean run that still finds it absent deletes its profiles, so a declaration edit has one clean run to be reverted before anything is removed. A run that is not clean neither marks nor counts: a project newly absent on it is carried forward as `in-scope` with no `via`, and one already `retiring` stays so. A management project that changes identity (`RECONCILE_PROJECT` re-pointed, or the metadata server naming another project) is marked `retiring` on the run the change is seen, once the new project has listed its own clusters, unless the declaration names the old one and no `exclude.projects` entry matches it; an answer from the gcloud config fallback that disagrees with the previous snapshot is treated as unresolved, not as a change. The third condition is what
+`retiring`, so that removal is a transition the scope made and not a state it merely finds. A CR that carries no `scope` block at all declares nothing: the run lists the management project alone, keeps the last recorded declaration's exclusions, carries its projects forward as in scope, and marks nothing newly `retiring`; a project an earlier present block already marked `retiring`, or a management project whose identity changed, is still pruned on a clean no-block run, because that mark came from a real declaration. A block goes missing on its own when a CR write passes an older operator's webhook; dropping projects is done by emptying `projects` inside a present block. The rule therefore binds the renderer: once an install carries a scope value, the chart's `PlatformAgent` template emits `spec.scope` as a present block, empty lists included, rather than dropping the group the way its other optional groups are dropped when every value is empty, so that removing the last project from the tfvars and running `upgrade.sh` reads as the declaration that drops it and not as no declaration. The absent marker exists for CR writes the chart did not make. The prune takes two clean runs: the first clean run that finds a project absent writes it to the snapshot as `retiring`, and the next clean run that still finds it absent deletes its profiles, so a declaration edit has one clean run to be reverted before anything is removed. A run that is not clean neither marks nor counts: a project newly absent on it is carried forward as `in-scope` with the `via` it had, so a later freeze still finds the member, and one already `retiring` stays so. A management project that changes identity (`RECONCILE_PROJECT` re-pointed, or the metadata server naming another project) is marked `retiring` on the run the change is seen, once the new project has listed its own clusters, unless the declaration names the old one and no `exclude.projects` entry matches it; an answer from the gcloud config fallback that disagrees with the previous snapshot is treated as unresolved, not as a change. The third condition is what
 protects profiles the scope never produced. The `manage-cluster` skill onboards a cluster with an
 explicit `--project` today, and those profiles exist on installs that will upgrade into phase 1
 with an empty scope; without it, the first tick would delete every one of them, which is the
@@ -453,9 +450,9 @@ the CR, retires it sooner, on the ordinary two runs. PRUNE's per-profile `descri
 meanwhile returns a 403, because the folder binding no longer covers it, which `_cluster_exists`
 classifies as unknown and keeps. Moved to a different declared folder: no change, because resolution
 is by project; the `via` field records the new path and any placement clears the stamp, including a
-placement during the lag by the folder the project left. Dropped from `projects` in the same edit that
+placement during the lag by the folder the project left. Dropped from `projects`, or from a folder the same edit removes, in the edit that
 declares the folder it moved into, a project is held the same day, since the index may not place it yet
-and its previous route names no container to keep it by.
+and its previous route names no declared container to keep it by.
 
 **Never on ambiguity.** The rule at `cluster_agent_reconcile.py:11-15` holds: auth, network, quota,
 and unclassified errors leave profiles untouched.
@@ -464,7 +461,7 @@ and unclassified errors leave profiles untouched.
 
 Discovery and IAM are the mechanism; these are the places that will read wrong once the mechanism
 works. Each is listed with whether it blocks the first phase or follows it: `1` is phase 1 of §10,
-`2` means after it, and `docs` means the documents step; the column is not §10's step numbering.
+`2` means after it, `docs` means the documents step, and `done` means `main` already carries the change; the column is not §10's step numbering.
 
 | Where                                                                                                                                                                            | What it assumes                                                                                                                                                                        | Phase |
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
@@ -508,8 +505,7 @@ read. The
 agent's service account carries `roles/container.viewer`, which "lets an identity read Kubernetes
 objects in every cluster in the project" (`kube-agents-iam/main.tf:30-31`); bound on a folder it
 reads every cluster in every project beneath, and the `asset search-all-resources` allowlist entry
-lets the agent, not only the reconcile job, read the metadata of every resource type in the
-container's asset index, since the allowlist matches the verb and not its arguments. Both are
+lets the agent, not only the reconcile job, search the container's asset index for GKE clusters, since the allowlist admits the verb for that one asset type at any scope, declared or not. Both are
 reads, and both are wider than today. That is the argument for landing the scoped service
 account pool's authority (`scoped_pool.tf`, currently granting nothing) before offering
 `organizations` in a release: a per-project credential (§6) bounds what a compromised sandbox reads to

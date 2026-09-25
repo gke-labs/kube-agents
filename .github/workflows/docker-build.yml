@@ -14,6 +14,8 @@ name: Docker Build
 on:
   pull_request:
     branches: [main]
+  merge_group:
+    branches: [main]
   push:
     branches: [main]
 
@@ -66,11 +68,13 @@ jobs:
       # context and shares no stage with this chain, so a cache would have to be its
       # own, and at ~7s of the job it is not worth one.
       #
-      # Read on the pull request, build fresh and write on the push to main. The two
-      # events want opposite things and the split is the point.
+      # Read on the pull request and on a merge-queue run, build fresh and write on
+      # the push to main. The two sides want opposite things and the split is the
+      # point.
       #
-      # A pull request wants speed, and a slightly stale base is fine there because
-      # nothing it builds ships. The push to main must not read the cache: this
+      # A pull request, and a merge-queue run, want speed, and a slightly stale base
+      # is fine there because nothing either builds ships. The push to main must
+      # not read the cache: this
       # workflow's header says the layer budget and the entrypoint gate are checked
       # only here, and the image they check has to be the one that ships. What ships
       # is built by docker-publish-ghcr.yml, which carries no cache at all. The
@@ -110,7 +114,7 @@ jobs:
           push: false
           load: true
           tags: platform-agent:latest
-          cache-from: ${{ github.event_name == 'pull_request' && 'type=gha,scope=platform-agent' || '' }}
+          cache-from: ${{ contains(fromJSON('["pull_request", "merge_group"]'), github.event_name) && 'type=gha,scope=platform-agent' || '' }}
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=platform-agent' || '' }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}

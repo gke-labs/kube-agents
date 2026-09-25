@@ -434,13 +434,11 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 # instructions: a skill that starts calling a shared script the sandbox does not
 # have fails that test rather than failing in a pod.
 #
-# Deliberately absent, and stubbed below instead: three scripts an agent is told to
-# run that cannot run here. cluster_agent_profile.py and cluster_agent_reconcile.py
-# shell out to `hermes profile create` and write /opt/data/profiles on the agent
-# pod's PVC — cluster_agent_profile.py:325 says so of itself — and
-# kanban_notify_propagate.py opens the kanban SQLite database in the agent pod's
-# Hermes home. Leaving the paths empty reads as a broken image; the stub says what
-# is actually true and exits non-zero.
+# Deliberately absent, and stubbed below instead: two scripts that cannot run here.
+# cluster_agent_profile.py and cluster_agent_reconcile.py shell out to
+# `hermes profile create` and write /opt/data/profiles on the agent pod's PVC —
+# cluster_agent_profile.py:325 says so of itself. Leaving the paths empty reads as
+# a broken image; the stub says what is actually true and exits non-zero.
 COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/repo_ref.py \
      agents/platform/scripts/forge.py \
@@ -456,7 +454,6 @@ COPY agents/platform/scripts/sandbox_exec.py \
      /opt/defaults/scripts/
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_profile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_reconcile.py
-COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/kanban_notify_propagate.py
 
 # Three things, in one layer.
 #

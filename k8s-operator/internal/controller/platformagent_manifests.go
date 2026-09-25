@@ -260,9 +260,11 @@ type scopeDeclaration struct {
 	// and retires nothing, because the ordinary way a block goes missing is a write
 	// through an older operator's webhook, not an operator dropping every project. An
 	// empty `projects` list in a present block is the declaration that drops projects.
-	Present  bool                    `json:"present"`
-	Projects []string                `json:"projects"`
-	Exclude  scopeExcludeDeclaration `json:"exclude"`
+	Present       bool                    `json:"present"`
+	Projects      []string                `json:"projects"`
+	Folders       []string                `json:"folders"`
+	Organizations []string                `json:"organizations"`
+	Exclude       scopeExcludeDeclaration `json:"exclude"`
 }
 
 type scopeExcludeDeclaration struct {
@@ -284,8 +286,10 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 		scope = &agentv1alpha1.ScopeSpec{}
 	}
 	decl := scopeDeclaration{
-		Present:  agent.Spec.Scope != nil,
-		Projects: append([]string{}, scope.Projects...),
+		Present:       agent.Spec.Scope != nil,
+		Projects:      append([]string{}, scope.Projects...),
+		Folders:       append([]string{}, scope.Folders...),
+		Organizations: append([]string{}, scope.Organizations...),
 		Exclude: scopeExcludeDeclaration{
 			Projects: []string{},
 			Clusters: []agentv1alpha1.ScopeClusterRef{},
@@ -296,6 +300,8 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 		decl.Exclude.Clusters = append(decl.Exclude.Clusters, scope.Exclude.Clusters...)
 	}
 	sort.Strings(decl.Projects)
+	sort.Strings(decl.Folders)
+	sort.Strings(decl.Organizations)
 	sort.Strings(decl.Exclude.Projects)
 	sort.Slice(decl.Exclude.Clusters, func(i, j int) bool {
 		a, b := decl.Exclude.Clusters[i], decl.Exclude.Clusters[j]

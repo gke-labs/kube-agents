@@ -41,9 +41,8 @@ the 2026-08-07 live run (12:58):
 
 Result: the synthesizer's answer sat undelivered for 91.3s until the user
 asked after it — ``gateway.log`` shows zero Slack sends between 12:59:02 and
-13:02:15. The manual remedy,
-``agents/platform/scripts/kanban_notify_propagate.py``, relies on the worker
-remembering to run it; it didn't.
+13:02:15. The manual remedy, a propagate script the worker had to remember
+to run, did not get run; it has since been deleted.
 
 The fix
 -------
@@ -56,11 +55,10 @@ So the user's thread follows the work wherever a worker fans it out, one hop
 at a time: coordinator → sleep tasks → synthesizer, each inheriting from the
 card that created it.
 
-Same contract as the manual script it automates: the copied column set is
-``platform, chat_id, thread_id, user_id, notifier_profile`` (also exactly
-what upstream ``_inherit_notify_subs`` copies), ``INSERT OR IGNORE`` on the
-subscription primary key makes it idempotent — the script remains in place
-as a manual/back-fill tool and double-writes are harmless — and
+The copied column set is ``platform, chat_id, thread_id, user_id,
+notifier_profile`` (exactly what upstream ``_inherit_notify_subs`` copies),
+``INSERT OR IGNORE`` on the subscription primary key makes it idempotent —
+so a card upstream already subscribed takes no double write — and
 ``created_at`` is re-stamped.
 
 The cursor starts caught up
@@ -105,8 +103,7 @@ logger = logging.getLogger(__name__)
 
 #: The subscription columns copied parent -> child. ``task_id`` is rewritten,
 #: ``created_at`` re-stamped, ``last_event_id`` seeded at the child's own
-#: head. Matches both the manual propagate script and upstream
-#: ``_inherit_notify_subs`` so a schema drift shows up here as a clear error
+#: head. Matches upstream ``_inherit_notify_subs`` so a schema drift shows up here as a clear error
 #: instead of a silently wrong copy.
 COPY_COLUMNS = ("platform", "chat_id", "thread_id", "user_id", "notifier_profile")
 

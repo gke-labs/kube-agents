@@ -119,6 +119,14 @@ MAX_CARDS = 32
 MAX_CALLS = 2000
 MAX_RESULT_CHARS = 2000
 MAX_ARGS_CHARS = 2000
+# What ``gaps`` reports for a read the pod clipped, by the cap that fired: past
+# ``MAX_CARDS`` later cards were never read, and past ``MAX_CALLS`` the walk
+# goes on but later workers' calls are dropped. Either way a profile that
+# worked only the unread part is absent from the capture without having been
+# absent from the run.
+TRUNCATED_GAP = "the read stopped at %d cards; later cards were not read" % MAX_CARDS
+CALL_CAP_GAP = "the read stopped at %d tool calls; later calls were not read" % MAX_CALLS
+CLIP_GAPS = {"cards": TRUNCATED_GAP, "calls": CALL_CAP_GAP}
 
 # Runs inside the agent container under hermes' own interpreter. Plain
 # ``python3`` and ``sqlite3``, plus the redactor loaded from the image: nothing
@@ -141,7 +149,24 @@ roots = [a for a in sys.argv[8:] if a]
 # Seconds a read waits on a locked store before reporting the card unread. A
 # hermes writer holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
-out = {"cards": [], "calls": [], "errors": [], "truncated": False}
+out = {"cards": [], "calls": [], "errors": [], "unread": [], "truncated": False, "clipped": []}
+
+
+# Which cap stopped the read; ``truncated`` alone cannot say.
+def stopped_at(cap):
+    out["truncated"] = True
+    if cap not in out["clipped"]:
+        out["clipped"].append(cap)
+
+
+# A note that also means something the run did was not read. Every other
+# entry in ``errors`` -- a withheld redactor, orphan tool results, the store
+# of a name no run was dispatched to -- leaves the capture's worker tags
+# whole, so only these can hide a profile that did work.
+def unread(problem):
+    out["errors"].append(problem)
+    out["unread"].append(problem)
+
 JSON_PREFIX = "\x00json:"
 PROMPT = "work kanban task "
 # The redactor's own marker, so a reader grepping artifacts finds one marker.
@@ -378,7 +403,7 @@ def read_session(conn, card, profile, sid):
                     continue
                 fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
                 if len(out["calls"]) >= MAX_CALLS:
-                    out["truncated"] = True
+                    stopped_at("calls")
                     return count
                 arguments = fn.get("arguments")
                 entry = {
@@ -433,13 +458,17 @@ def sessions_for(card, assignee, runs):
         sid = md.get("worker_session_id") if isinstance(md, dict) else None
         if isinstance(sid, str) and sid and sid not in [f[0] for f in found]:
             found.append((sid, run["profile"] or assignee, "run_metadata"))
-    profiles = list(dict.fromkeys([r["profile"] or assignee for r in runs] + [assignee]))
+    dispatched = [r["profile"] or assignee for r in runs]
+    profiles = list(dict.fromkeys(dispatched + [assignee]))
     for profile in profiles:
         if not profile:
             continue
         path = state_db(profile)
         if not os.path.exists(path):
-            out["errors"].append("no session store for profile %s" % profile)
+            # A name no run was dispatched to has no store because nothing
+            # ran as it: the observation, not a hole in it.
+            note = unread if profile in dispatched else out["errors"].append
+            note("no session store for profile %s" % profile)
             continue
         try:
             conn = ro(path)
@@ -450,7 +479,7 @@ def sessions_for(card, assignee, runs):
             ).fetchall()
             conn.close()
         except sqlite3.Error as exc:
-            out["errors"].append("session store for %s: %s" % (profile, exc))
+            unread("session store for %s: %s" % (profile, exc))
             continue
         # LIKE's trailing wildcard would also take a card whose id merely
         # starts with this one; the id has to end where the prompt's does.
@@ -465,7 +494,7 @@ def sessions_for(card, assignee, runs):
 try:
     kb = ro(ROOT + "/kanban.db")
 except sqlite3.Error as exc:
-    out["errors"].append("kanban board: %s" % exc)
+    unread("kanban board: %s" % exc)
     kb = None
 
 cards = {}
@@ -475,14 +504,14 @@ while kb is not None and queue:
     if tid in cards:
         continue
     if len(cards) >= MAX_CARDS:
-        out["truncated"] = True
+        stopped_at("cards")
         break
     try:
         row = kb.execute(
             "SELECT id, assignee, status FROM tasks WHERE id = ?", (tid,)
         ).fetchone()
         if row is None:
-            out["errors"].append("card %s is not on the board" % tid)
+            unread("card %s is not on the board" % tid)
             cards[tid] = None
             continue
         runs = kb.execute(
@@ -508,7 +537,7 @@ while kb is not None and queue:
             )
         ]
     except sqlite3.Error as exc:
-        out["errors"].append("card %s: %s" % (tid, exc))
+        unread("card %s: %s" % (tid, exc))
         cards[tid] = None
         continue
     card = {
@@ -527,13 +556,13 @@ while kb is not None and queue:
             calls = read_session(conn, tid, profile, sid)
             conn.close()
         except sqlite3.Error as exc:
-            out["errors"].append("session %s of %s: %s" % (sid, profile, exc))
+            unread("session %s of %s: %s" % (sid, profile, exc))
             continue
         card["sessions"].append(
             {"id": sid, "agent": profile, "match": match, "calls": calls}
         )
     if not card["sessions"] and runs:
-        out["errors"].append("no session found for card %s" % tid)
+        unread("no session found for card %s" % tid)
 
 out["cards"] = [c for c in cards.values() if c is not None]
 for entry in out["calls"]:
@@ -561,6 +590,25 @@ class WorkerCapture:
 
     entries: list[dict[str, Any]] = field(default_factory=list)
     summary: dict[str, Any] = field(default_factory=dict)
+
+
+def gaps(summary: dict[str, Any] | None) -> list[str] | None:
+    """What a capture could not read, from its ``summary``.
+
+    ``None`` when the read did not run at all; otherwise every read the pod
+    could not make (``unread``: a store, card or session it could not open,
+    a dispatched card with no session), plus the ``CLIP_GAPS`` entry for
+    each cap that clipped the read. The rest of ``errors`` is not a gap: a withheld
+    redactor or an orphan result leaves the worker tags whole, and a name
+    no run was dispatched to has no store because nothing ran as it. An
+    empty list means the capture is complete, so a profile missing from it
+    did not work the run.
+    """
+    if summary is None:
+        return None
+    problems = [str(e) for e in summary.get("unread") or []]
+    problems += [CLIP_GAPS[c] for c in summary.get("clipped") or [] if c in CLIP_GAPS]
+    return problems
 
 
 def _entry(call: dict[str, Any]) -> dict[str, Any]:
@@ -651,7 +699,9 @@ def capture(
     summary = {
         "cards": payload.get("cards") or [],
         "errors": [str(e) for e in payload.get("errors") or []],
+        "unread": [str(e) for e in payload.get("unread") or []],
         "truncated": bool(payload.get("truncated")),
+        "clipped": [str(c) for c in payload.get("clipped") or []],
         "calls": len(entries),
     }
     for problem in summary["errors"]:

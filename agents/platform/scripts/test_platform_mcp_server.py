@@ -841,9 +841,12 @@ class TestSessionKvHeaders(unittest.TestCase):
         env = config["mcp_servers"]["platform_control"]["env"]
         self.assertEqual(env.get("SESSION_KV_API_KEY"), "${SESSION_KV_API_KEY}")
 
-    def test_config_yaml_passes_platform_agent_home_into_this_subprocess(self):
-        """Hermes hands a stdio MCP server only the keys named in `env`, so
-        PLATFORM_AGENT_HOME is empty in profile-scoped homes unless config.yaml lists it."""
+    def test_config_yaml_passes_the_agent_home_into_this_subprocess(self):
+        """The roster tools read the Cluster Agent profiles under
+        PLATFORM_AGENT_HOME. Undeclared, Hermes strips it and the server falls
+        back to the default home, finding no profile on an install whose
+        agentHome is elsewhere. test_mcp_env_contract.py reads the
+        `get(...) or default` form as a probe and does not catch it."""
         import yaml
 
         config_path = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -1317,68 +1320,126 @@ class TestFindingsTransport(unittest.TestCase):
         self.assertNotIn("content-type", sent["headers"])
 
 
-class TestClusterProfileTools(unittest.TestCase):
-    @patch("cluster_agent_profile.list_ready_profiles")
-    def test_list_cluster_profiles_calls_list_ready_profiles(self, mock_list):
-        mock_list.return_value = ["cluster-a", "cluster-b"]
-        result = platform_mcp_server.list_cluster_profiles()
-        mock_list.assert_called_once_with()
-        self.assertEqual(result, "cluster-a\ncluster-b")
+class TestClusterAgentRoster(unittest.TestCase):
+    """The assignee lookup the sandbox cannot do: it reads the agent pod's profiles tree."""
 
-    def test_list_cluster_profiles_unmocked_with_profile_hermes_home(self):
-        tmp = Path(tempfile.mkdtemp(prefix="mcp-profiles-test-"))
-        try:
-            profiles_dir = tmp / "profiles"
-            profiles_dir.mkdir()
-            platform_home = profiles_dir / "platform"
-            platform_home.mkdir()
-            cluster_dir = profiles_dir / "cluster-prod"
-            cluster_dir.mkdir()
-            (cluster_dir / "USER.md").write_text("- project: p\n- cluster: c\n", encoding="utf-8")
-            (cluster_dir / "config.yaml").write_text(
-                "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n", encoding="utf-8"
-            )
-            (cluster_dir / "kubeconfig.yaml").write_text("apiVersion: v1\n", encoding="utf-8")
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.profiles = Path(self.tmp.name) / "profiles"
+        env = patch.dict(os.environ, {"PLATFORM_AGENT_HOME": self.tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
 
-            import cluster_agent_profile as cap
+    def _profile(self, name, identity=None):
+        home = self.profiles / name
+        home.mkdir(parents=True)
+        (home / "profile.yaml").write_text("")
+        (home / "USER.md").write_text("")
+        if identity:
+            (home / "config.yaml").write_text(json.dumps({"cluster_identity": identity}))
+        return home
 
-            # 1. HERMES_HOME points to profile home while PLATFORM_AGENT_HOME is unset
-            env_without_platform = {k: v for k, v in os.environ.items() if k != "PLATFORM_AGENT_HOME"}
-            env_without_platform["HERMES_HOME"] = str(platform_home)
-            with patch.dict(os.environ, env_without_platform, clear=True), \
-                 patch.object(cap, "PROFILES_BASE", cap._resolve_profiles_base()):
-                result = platform_mcp_server.list_cluster_profiles()
-                self.assertEqual(result, "cluster-prod")
+    def test_resolve_reports_an_existing_profile(self):
+        self._profile("cluster-proj-seeded-a-us-central1")
+        got = json.loads(platform_mcp_server.get_cluster_profile_name("proj", "seeded-a", "us-central1"))
+        self.assertEqual({"name": "cluster-proj-seeded-a-us-central1", "exists": True}, got)
 
-            # 2. PLATFORM_AGENT_HOME is explicitly set to the data root
-            env_with_platform = {k: v for k, v in os.environ.items()}
-            env_with_platform["HERMES_HOME"] = "/arbitrary/unused"
-            env_with_platform["PLATFORM_AGENT_HOME"] = str(tmp)
-            with patch.dict(os.environ, env_with_platform, clear=True), \
-                 patch.object(cap, "PROFILES_BASE", cap._resolve_profiles_base()):
-                result = platform_mcp_server.list_cluster_profiles()
-                self.assertEqual(result, "cluster-prod")
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+    def test_resolve_reports_a_missing_profile(self):
+        got = json.loads(platform_mcp_server.get_cluster_profile_name("proj", "seeded-z", "us-central1"))
+        self.assertEqual({"name": "cluster-proj-seeded-z-us-central1", "exists": False}, got)
 
-    @patch("cluster_agent_profile.profile_name")
-    def test_get_cluster_profile_name_calls_profile_name(self, mock_pname):
-        mock_pname.return_value = "cluster-myproj-myclust-us-central1"
-        result = platform_mcp_server.get_cluster_profile_name("myproj", "myclust", "us-central1")
-        mock_pname.assert_called_once_with("myproj", "myclust", "us-central1")
-        self.assertEqual(result, "cluster-myproj-myclust-us-central1")
+    def test_resolve_reads_the_data_root_not_the_profile_home(self):
+        # A platform worker's HERMES_HOME is <root>/profiles/platform; the roster is
+        # a level up from it, under PLATFORM_AGENT_HOME.
+        self._profile("cluster-proj-seeded-a-us-central1")
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.profiles / "platform")}):
+            got = json.loads(platform_mcp_server.get_cluster_profile_name("proj", "seeded-a", "us-central1"))
+        self.assertTrue(got["exists"])
 
-    @patch("cluster_agent_profile.list_ready_profiles")
-    def test_list_cluster_profiles_handles_exception(self, mock_list):
-        mock_list.side_effect = RuntimeError("disk failure")
-        result = platform_mcp_server.list_cluster_profiles()
-        self.assertEqual(result, "ERROR: Failed to list cluster profiles: disk failure")
+    def test_list_carries_identity_and_skips_reserved_profiles(self):
+        identity = {"project": "proj", "cluster": "seeded-a", "location": "us-central1"}
+        self._profile("cluster-proj-seeded-a-us-central1", identity)
+        self._profile("cluster-unstamped")
+        self._profile("platform")
+        self._profile("default")
+        got = json.loads(platform_mcp_server.list_cluster_profiles())
+        self.assertEqual(
+            [
+                {"name": "cluster-proj-seeded-a-us-central1", **identity},
+                {"name": "cluster-unstamped"},
+            ],
+            got,
+        )
 
-    @patch("cluster_agent_profile.profile_name")
-    def test_get_cluster_profile_name_handles_exception(self, mock_pname):
-        mock_pname.side_effect = RuntimeError("lookup failure")
-        result = platform_mcp_server.get_cluster_profile_name("myproj", "myclust", "us-central1")
-        self.assertEqual(result, "ERROR: Failed to derive cluster profile name: lookup failure")
+    def test_resolve_rejects_a_profile_pinned_to_another_cluster(self):
+        # acme-prod/east-a and acme-prod-east/a sanitize to the same name; the profile
+        # under it works the cluster its identity names, not the one asked about.
+        self._profile(
+            "cluster-acme-prod-east-a-us-central1",
+            {"project": "acme-prod", "cluster": "east-a", "location": "us-central1"},
+        )
+        mine = json.loads(platform_mcp_server.get_cluster_profile_name("acme-prod", "east-a", "us-central1"))
+        other = json.loads(platform_mcp_server.get_cluster_profile_name("acme-prod-east", "a", "us-central1"))
+        self.assertTrue(mine["exists"])
+        self.assertEqual(mine["name"], other["name"])
+        self.assertFalse(other["exists"])
+
+    def test_resolve_matches_identity_case_insensitively(self):
+        self._profile(
+            "cluster-acme-prod-east-a-us-central1",
+            {"project": "acme-prod", "cluster": "east-a", "location": "us-central1"},
+        )
+        got = json.loads(platform_mcp_server.get_cluster_profile_name("Acme-Prod", "east-a", "US-CENTRAL1"))
+        self.assertEqual({"name": "cluster-acme-prod-east-a-us-central1", "exists": True}, got)
+
+    def test_an_unfinished_scaffold_is_not_ready(self):
+        # create_profile registers and stamps the profile before it fetches the
+        # credential and writes USER.md; a scaffold that stopped there blocks its worker.
+        identity = {"project": "proj", "cluster": "seeded-a", "location": "us-central1"}
+        (self._profile("cluster-proj-seeded-a-us-central1", identity) / "USER.md").unlink()
+        got = json.loads(platform_mcp_server.get_cluster_profile_name("proj", "seeded-a", "us-central1"))
+        self.assertFalse(got["exists"])
+        self.assertEqual([], json.loads(platform_mcp_server.list_cluster_profiles()))
+
+    def test_a_config_that_is_not_a_mapping_does_not_lose_the_roster(self):
+        self._profile("cluster-good", {"project": "p", "cluster": "c", "location": "l"})
+        (self._profile("cluster-list") / "config.yaml").write_text("- x\n")
+        got = json.loads(platform_mcp_server.list_cluster_profiles())
+        self.assertEqual(["cluster-good", "cluster-list"], [e["name"] for e in got])
+
+    def test_an_unregistered_directory_is_not_a_profile(self):
+        # The kubelet can leave a plugin mount point under profiles/ that Hermes
+        # never registered; a card assigned to it would never be dispatched.
+        (self.profiles / "cluster-proj-seeded-a-us-central1" / "plugins").mkdir(parents=True)
+        got = json.loads(platform_mcp_server.get_cluster_profile_name("proj", "seeded-a", "us-central1"))
+        self.assertFalse(got["exists"])
+        self.assertEqual([], json.loads(platform_mcp_server.list_cluster_profiles()))
+
+    def test_resolve_requires_the_project(self):
+        self.assertTrue(
+            platform_mcp_server.get_cluster_profile_name("", "seeded-a", "us-central1").startswith("ERROR")
+        )
+
+    def test_one_unreadable_profile_does_not_lose_the_roster(self):
+        self._profile("cluster-proj-seeded-a-us-central1")
+        self._profile("cluster-proj-seeded-b-us-central1")
+        real = platform_mcp_server.read_cluster_identity
+
+        def flaky(home):
+            if home.name.endswith("seeded-a-us-central1"):
+                raise PermissionError("denied")
+            return real(home)
+
+        with patch.object(platform_mcp_server, "read_cluster_identity", flaky):
+            got = json.loads(platform_mcp_server.list_cluster_profiles())
+        self.assertEqual(
+            ["cluster-proj-seeded-a-us-central1", "cluster-proj-seeded-b-us-central1"],
+            [p["name"] for p in got],
+        )
+
+    def test_list_is_empty_without_a_profiles_tree(self):
+        self.assertEqual([], json.loads(platform_mcp_server.list_cluster_profiles()))
 
 
 if __name__ == '__main__':

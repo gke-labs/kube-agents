@@ -3,6 +3,8 @@ name: Python Unit Tests
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  merge_group:
+    branches: [main]
   push:
     branches: [main]
 
@@ -47,7 +49,8 @@ jobs:
   # blocking rules (diff-coverage floor, no-test detector, total ratchet) turn
   # on in stages once a baseline of merged-PR data exists, with thresholds set
   # from the observed distribution rather than this file. The job runs on
-  # pushes to main too -- measurement only, no diff, no comment; those runs are
+  # pushes to main and merge-queue runs too -- measurement only, no diff, no
+  # comment; the push runs are
   # what give the total ratchet a per-commit baseline measured in CI rather
   # than on a laptop.
   #
@@ -189,8 +192,9 @@ jobs:
       # cannot). The PR number rides inside the artifact because the
       # workflow_run event on the poster's side does not reliably carry it
       # for fork PRs; the poster validates it before use rather than
-      # trusting it. Skipped on the measurement-only pushes to main: there
-      # is no PR to hand off to, and the poster ignores runs without one.
+      # trusting it. Skipped on the measurement-only pushes to main and on
+      # merge-queue runs: neither has a PR to hand off to, and the poster
+      # ignores runs without one.
       - name: Write the comment hand-off data
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         continue-on-error: true

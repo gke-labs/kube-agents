@@ -332,6 +332,8 @@ def test_a_result_whose_id_matches_no_call_is_an_orphan(data_root: Path) -> None
     cluster = [c for c in payload["calls"] if c["task"] == CHILD]
     assert [c["result"] for c in cluster] == [None]
     assert any("1 tool result(s) matched no call" in e for e in payload["errors"])
+    # The call itself was read and tagged, so the note is not a read gap.
+    assert payload["unread"] == []
 
 
 def test_another_cards_session_in_the_same_store_is_not_read(data_root: Path) -> None:
@@ -373,18 +375,38 @@ def test_a_missing_session_store_is_reported_not_fatal(data_root: Path) -> None:
     assert any("cluster-abc" in e for e in payload["errors"])
     assert any(f"no session found for card {CHILD}" == e for e in payload["errors"])
     assert {c["agent"] for c in payload["calls"]} == {"platform"}
+    # A run was dispatched to cluster-abc, so its missing store hides work.
+    assert payload["unread"] == [e for e in payload["errors"] if "cluster-abc" in e or CHILD in e]
+    assert "no session store for profile cluster-abc" in payload["unread"]
+    assert f"no session found for card {CHILD}" in payload["unread"]
+
+
+def test_a_card_for_a_name_no_run_was_dispatched_to_is_not_a_read_gap(data_root: Path) -> None:
+    """A composed assignee that is not a profile never runs: that is the observation."""
+    with sqlite3.connect(data_root / "kanban.db") as conn:
+        conn.execute("UPDATE tasks SET assignee = 'cluster-made-up' WHERE id = ?", (CHILD,))
+        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (CHILD,))
+
+    payload = _payload(_run_script(data_root, [FRONT]))
+
+    assert "no session store for profile cluster-made-up" in payload["errors"]
+    assert payload["unread"] == []
+    captured = worker_trajectory.capture(lambda s, t: _run_script(data_root, [FRONT]), [FRONT], 5.0)
+    assert worker_trajectory.gaps(captured.summary) == []
 
 
 def test_a_card_not_on_the_board_is_reported(data_root: Path) -> None:
     payload = _payload(_run_script(data_root, ["t_missing"]))
     assert payload["cards"] == []
     assert payload["errors"] == ["card t_missing is not on the board"]
+    assert payload["unread"] == payload["errors"]
 
 
 def test_a_missing_board_still_answers_with_the_sentinel(tmp_path: Path) -> None:
     payload = _payload(_run_script(tmp_path, [FRONT]))
     assert payload["cards"] == [] and payload["calls"] == []
     assert payload["errors"] and payload["errors"][0].startswith("kanban board:")
+    assert payload["unread"] == payload["errors"]
 
 
 def test_long_results_are_clipped_in_the_pod(data_root: Path) -> None:
@@ -399,12 +421,19 @@ def test_the_call_cap_stops_the_read_and_says_so(data_root: Path) -> None:
     payload = _payload(_run_script(data_root, [FRONT], max_calls=2))
     assert [c["name"] for c in payload["calls"]] == ["terminal", "kanban_create"]
     assert payload["truncated"] is True
+    assert payload["clipped"] == ["calls"]
+
+
+def test_a_call_cap_clip_is_not_reported_as_the_card_cap(data_root: Path) -> None:
+    captured = worker_trajectory.capture(lambda s, t: _run_script(data_root, [FRONT], max_calls=2), [FRONT], 5.0)
+    assert worker_trajectory.gaps(captured.summary) == [worker_trajectory.CALL_CAP_GAP]
 
 
 def test_the_card_cap_stops_the_walk_and_says_so(data_root: Path) -> None:
     payload = _payload(_run_script(data_root, [FRONT], max_cards=1))
     assert [c["task"] for c in payload["cards"]] == [FRONT]
     assert payload["truncated"] is True
+    assert payload["clipped"] == ["cards"]
     assert CHILD not in {c["task"] for c in payload["calls"]}
 
 
@@ -724,6 +753,7 @@ def test_a_pod_without_the_redactor_withholds_content_and_says_so(data_root: Pat
     reply = _run_script(data_root, [FRONT], redactor=data_root / "no-such-redactor.py")
     payload = _payload(reply)
     assert any(e.startswith("redactor ") and "withheld" in e for e in payload["errors"])
+    assert payload["unread"] == []
     assert TOKEN not in reply
     captured = worker_trajectory.capture(lambda s, t: reply, [FRONT], 5.0)
     assert [e["name"] for e in captured.entries] == ["terminal", "kanban_create", "kubectl_get"]
@@ -773,6 +803,26 @@ def test_settle_records_none_when_the_read_did_not_run(no_cluster_exec: list[str
     assert result.metadata["worker_trajectory"] is None
     assert result.trajectory == []
     assert any(worker_trajectory.CAPTURE_PRESENT in s for s in no_cluster_exec)
+
+
+def test_gaps_is_none_when_the_read_did_not_run() -> None:
+    assert worker_trajectory.gaps(None) is None
+
+
+def test_gaps_lists_unread_reads_and_the_card_cap() -> None:
+    gap = "no session store for profile cluster-x"
+    summary = {"cards": [], "errors": [gap], "unread": [gap], "truncated": True, "clipped": ["cards"], "calls": 0}
+    assert worker_trajectory.gaps(summary) == [gap, worker_trajectory.TRUNCATED_GAP]
+
+
+def test_gaps_leaves_out_notes_that_hide_no_worker() -> None:
+    notes = ["redactor x: missing; results and arguments withheld", "no session store for profile cluster-y"]
+    summary = {"cards": [], "errors": notes, "unread": [], "truncated": False, "calls": 2}
+    assert worker_trajectory.gaps(summary) == []
+
+
+def test_gaps_is_empty_for_a_complete_read() -> None:
+    assert worker_trajectory.gaps({"cards": [], "errors": [], "unread": [], "truncated": False, "calls": 3}) == []
 
 
 # ---------------------------------------------------------- tool_called stays

@@ -1677,14 +1677,14 @@ qualifying question is the one the cron section below already asks — does it n
 agent-pod-only resources: the `hermes` binary, the profiles tree, the session or kanban
 databases, Hermes' own Python namespace.
 
-Three scripts an agent is told to run fail it: `cluster_agent_profile.py`,
-`cluster_agent_reconcile.py` and `kanban_notify_propagate.py`. Each gets a stub at its
-path in the sandbox that prints why it cannot run there and exits non-zero. Leaving the
+Two scripts fail an agent that runs them from the shell: `cluster_agent_profile.py` and
+`cluster_agent_reconcile.py`. Each gets a stub at its path in the sandbox that prints why it cannot run there and exits non-zero. Leaving the
 path empty was the other option and reads worse — the model gets `No such file or
 directory`, concludes the image is broken, and spends a turn proving it. The fuller
 answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
-pod; `platform_mcp_server.py` now exposes `list_cluster_profiles` and
-`get_cluster_profile_name` for read-only cluster discovery.
+pod. `platform_mcp_server.py` carries the two reads, `list_cluster_profiles` and
+`get_cluster_profile_name`, which is how the agent finds a kanban assignee; creating and
+deleting a profile still has no tool.
 
 None of this is held together by review.
 [`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)
@@ -2014,11 +2014,11 @@ was the alternative: it would put the tools next to the binaries and make the
 `_run_env()` leak harmless, since the sandbox environment holds nothing worth taking. It
 was rejected on cost. It needs a bearer token in a mounted Secret, a Service, a readiness
 probe and a supervised server process — a second mechanism running parallel to an SSH
-helper the three scripts need anyway — and it needs the file split, because
+helper the two profile scripts need anyway — and it needs the file split, because
 `send_notification` reads `SESSION_KV_API_KEY` and the module is also the parent process
 of the Session KV server, so moving it wholesale would put the incident's exact target
 inside the sandbox. The dedicated principal, meanwhile, is not a cost the HTTP design
-avoids: the three scripts need it either way. Once it exists, the MCP server using the
+avoids: the two profile scripts need it either way. Once it exists, the MCP server using the
 same helper is nearly free.
 
 It also degrades better. Hermes recovers a dropped MCP transport with five retries at
@@ -2052,19 +2052,22 @@ are not re-walked.
 it read-only (`mode=ro`) for its invariant and blocked-card queries and shells out to
 `hermes kanban diagnostics --json` for the rule engine; its docstring records that a
 read-write open of `/opt/data/kanban.db` from an agent shell is what the persona forbids.
-[`kanban_notify_propagate.py`](../../agents/platform/scripts/kanban_notify_propagate.py)
-does open it, `sqlite3.connect` at line 63 — and the Platform Agent's `SOUL.md` (§0, the
-sub-card paragraph under _Show your progress_; §6's fan-out bullet repeats it) tells the
-agent to run it from the shell. That is coherent today, where §0's ban on touching the
-board is a ban on ad-hoc edits and the script is a sanctioned writer, but it does not
-survive the move.
+`kanban_notify_propagate.py`, since deleted, did open it read-write — and the Platform
+Agent's `SOUL.md` (§0, the sub-card paragraph under _Show your progress_; §6's fan-out
+bullet repeated it) told the agent to run it from the shell. That was coherent before the split, where §0's ban on
+touching the board is a ban on ad-hoc edits and the script was a sanctioned writer, but
+it did not survive the move.
 
 Mounting `kanban.db` into the sandbox is ruled out. It would hand the shell exactly the
 write path that the rule exists to close, after a worker used that path on 2026-08-07
 to mark three cards `done` with an invented result. Under the split,
 `kanban_board_health.py` stays agent-side and stops being a problem;
 `kanban_notify_propagate.py` needs to become something the agent calls rather than
-something it runs.
+something it runs. It turned out to need neither: `kanban_create` copies the creating
+worker's subscription onto the child (upstream `create_task`, and the
+`kanban_auto_subscribe` image patch), so the instructions to run it were removed and
+the script deleted. An operator back-fills a card with no subscription with the built-in
+`hermes kanban notify-subscribe`, run in the agent pod.
 
 **Executing `hermes`.** Exactly one capability is invoked from sandbox-side prose:
 `hermes cron run <job-id>`, at `agents/platform/AGENTS.md:32` and
@@ -2785,7 +2788,7 @@ anyway is in [The Session KV store](#the-session-kv-store).
   standing there or the tools fail one step later than they do now.
 - **The cluster-agent kubeconfig has nowhere to go yet, and onboarding now fails
   earlier than that.** `cluster_agent_profile.py` writes a profile home on the agent
-  pod's PVC and shells out to `hermes`, so it is one of the three scripts the sandbox
+  pod's PVC and shells out to `hermes`, so it is one of the two scripts the sandbox
   stubs rather than bakes. The four skills that tell the model to run it by its runtime
   path therefore stop at the stub's message instead of reaching the kubeconfig problem
   at all. Both want the same fix — per-profile directories on the sandbox side, and an

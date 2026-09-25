@@ -36,6 +36,8 @@ except Exception:  # pragma: no cover - requirements-test always carries mcp
 
 EXPECTED_TOOLS = {
     "verify_gke_cluster",
+    "list_cluster_profiles",
+    "get_cluster_profile_name",
     "list_cc_healthchecks",
     "get_cc_operator_status",
     "get_cc_pod_diagnostics",
@@ -50,8 +52,6 @@ EXPECTED_TOOLS = {
     "mark_finding_surfaced",
     "record_finding_verification",
     "findings_publication",
-    "list_cluster_profiles",
-    "get_cluster_profile_name",
 }
 
 
