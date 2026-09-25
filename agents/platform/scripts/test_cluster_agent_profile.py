@@ -761,10 +761,9 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         # Must instruct polling to settlement and waiting before completing
         self.assertIn("settlement", self.content.lower())
         self.assertIn("sleep 60", self.content)
-        # Must bound the polling loop and handle ready cards
-        self.assertIn("5 polling rounds", self.content)
-        self.assertIn("do not time out queued cards in `ready`", self.content)
-        self.assertIn("timed out", self.content)
+        # Must handle ready cards without false timeouts
+        self.assertIn("Do NOT classify cards in `ready` as timed out", self.content)
+        self.assertIn("never complete while probe cards remain queued in `ready`", self.content)
         # Must acknowledge configurable concurrency (spec.harness.tuning.maxInProgress) rather than assuming a static cap
         self.assertIn("spec.harness.tuning.maxInProgress", self.content)
         # Must define that blocked or failed probes do not count as a match
