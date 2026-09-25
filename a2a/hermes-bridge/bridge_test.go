@@ -101,6 +101,14 @@ func startBridge(t *testing.T, url string, command []string) {
 
 func startBridgeN(t *testing.T, url string, command []string, concurrency int) {
 	t.Helper()
+	startBridgeWith(t, url, command, concurrency, nil)
+}
+
+// startBridgeWith is startBridgeN with a hook that sees the bridge between
+// New and Run, for a test that swaps the look-ahead seam, and returns the
+// bridge's shutdown for a test that ends it early.
+func startBridgeWith(t *testing.T, url string, command []string, concurrency int, mutate func(*Bridge)) context.CancelFunc {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	b, err := New(ctx, Config{
 		NATSURL:      url,
@@ -112,6 +120,9 @@ func startBridgeN(t *testing.T, url string, command []string, concurrency int) {
 	if err != nil {
 		cancel()
 		t.Fatalf("bridge new: %v", err)
+	}
+	if mutate != nil {
+		mutate(b)
 	}
 	done := make(chan error, 1)
 	go func() { done <- b.Run(ctx) }()
@@ -141,6 +152,7 @@ func startBridgeN(t *testing.T, url string, command []string, concurrency int) {
 		_, err = js.Consumer(ctx, lib.TasksStream, "bridge-platform")
 		return err == nil
 	})
+	return cancel
 }
 
 func gatewayClient(t *testing.T, url string) *lib.Client {
@@ -438,6 +450,405 @@ func processAlive(pidStr string) bool {
 		return false
 	}
 	return syscall.Kill(pid, 0) == nil
+}
+
+// publishCancel puts a cancel for origin on its in subject, addressed to the
+// platform profile the way the gateway addresses one.
+func publishCancel(t *testing.T, c *lib.Client, origin *lib.Envelope) *lib.Envelope {
+	t.Helper()
+	cancelEnv, err := lib.NewCancelEnvelope(gatewayParty, origin.TaskID, origin.ContextID, origin.CorrelationID,
+		lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", origin.TaskID), cancelEnv); err != nil {
+		t.Fatal(err)
+	}
+	return cancelEnv
+}
+
+// terminalReason is the text of the fold's final status message.
+func terminalReason(t *testing.T, task *lib.Task) string {
+	t.Helper()
+	if task.FinalMessage == nil || len(task.FinalMessage.Parts) == 0 {
+		t.Fatalf("terminal %s carries no reason", task.State)
+	}
+	return task.FinalMessage.Parts[0].Text
+}
+
+// bridgeDurableInfo reads the bridge's durable consumer.
+func bridgeDurableInfo(t *testing.T, url string) *jetstream.ConsumerInfo {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cons, err := js.Consumer(testCtx(t), lib.TasksStream, "bridge-platform")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := cons.Info(testCtx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info
+}
+
+// ---- the pre-spawn look-ahead ------------------------------------------------
+
+// A cancel already on the task's in subject when the bridge binds - the
+// eval harness abandoning a submission nobody took, or any cancel inside the
+// retention window - is honoured without a spawn: the worker's look-ahead
+// finds it behind the submission, the run ends canceled-before-start, no
+// working is ever published, and the durable's later delivery of the same
+// cancel to handle is a no-op (a read, not a consume).
+//
+// The durable's delivery of that cancel is held until the terminal has been
+// read. Its queued path in handleCancel writes the same record when it
+// reaches the run before the worker's read returns, and on an embedded
+// server it usually does; with the delivery held, the terminal can only be
+// the worker's, and the look-ahead's own answer is asserted too. A look-ahead
+// that read the subject and answered "no", or a worker that spawned
+// regardless of the answer, fails here instead of passing on the durable's
+// timing.
+func TestLookAhead_CancelOnStreamBeforeBindNeverSpawns(t *testing.T) {
+	_, url := startServer(t)
+	c := gatewayClient(t, url)
+	marker := filepath.Join(t.TempDir(), "spawned")
+
+	origin := submit(t, c, "task-stale", "the stale prompt")
+	publishCancel(t, c, origin)
+
+	type answer struct {
+		canceled bool
+		err      error
+		pending  bool // the run's state as the read returned
+	}
+	answers := make(chan answer, 1)
+	release := make(chan struct{})
+	var released atomic.Bool
+	releaseCancel := func() {
+		if released.CompareAndSwap(false, true) {
+			close(release)
+		}
+	}
+	t.Cleanup(releaseCancel)
+	startBridgeWith(t, url, script(t, fmt.Sprintf(`touch %s
+echo never`, marker)), 0, func(b *Bridge) {
+		realLookAhead, realDeliver := b.lookAhead, b.deliver
+		b.lookAhead = func(ctx context.Context, run *taskRun) (bool, error) {
+			canceled, err := realLookAhead(ctx, run)
+			answers <- answer{canceled: canceled, err: err, pending: run.pending()}
+			return canceled, err
+		}
+		b.deliver = func(ctx context.Context, env *lib.Envelope) {
+			if env.Kind == lib.KindCancel {
+				<-release
+			}
+			realDeliver(ctx, env)
+		}
+	})
+
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCanceled {
+		t.Fatalf("state = %s, want canceled", task.State)
+	}
+	if reason := terminalReason(t, task); !strings.Contains(reason, "canceled-before-start") {
+		t.Fatalf("reason = %q, want canceled-before-start", reason)
+	}
+	for _, s := range task.StatusHistory {
+		if s == lib.StateWorking {
+			t.Fatalf("history %v shows working for a run that was cancelled before it started", task.StatusHistory)
+		}
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the stub ran: the stale prompt was spawned despite the cancel on the stream")
+	}
+
+	// The terminal landed with the durable's cancel still held, so the
+	// worker wrote it, and it did so on the read's answer: the real replay
+	// of the in subject said "cancel" while the run was still pending.
+	var got answer
+	select {
+	case got = <-answers:
+	default:
+		t.Fatal("terminal written before the look-ahead returned: some path other than the worker's finalized the run")
+	}
+	if got.err != nil || !got.canceled {
+		t.Fatalf("look-ahead answered (canceled=%v, err=%v), want (true, nil)", got.canceled, got.err)
+	}
+	if !got.pending {
+		t.Fatal("the run was already finalized when the look-ahead answered, so the worker's branch was not what ended it")
+	}
+
+	// Now let the durable deliver the cancel: it is read and acked, and
+	// handle does nothing with it - no event after the terminal.
+	releaseCancel()
+	waitFor(t, 10*time.Second, "durable to consume the trailing cancel", func() bool {
+		info := bridgeDurableInfo(t, url)
+		return info.NumPending == 0 && info.NumAckPending == 0 && info.Delivered.Consumer >= 2
+	})
+	time.Sleep(500 * time.Millisecond)
+	after := fold(t, c, origin.TaskID)
+	if after.PostFinalDropped != 0 {
+		t.Fatalf("assertion 10: %d events after final - the durable's cancel was not a no-op", after.PostFinalDropped)
+	}
+	if n := len(replayEvents(t, url, origin.TaskID)); n != 2 {
+		t.Fatalf("events = %d, want exactly submitted and the terminal", n)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the stub ran after the terminal")
+	}
+}
+
+// No cancel on the stream: the run spawns as before, and working is
+// published only once the look-ahead has answered - while the read is
+// outstanding the task still reads submitted.
+func TestLookAhead_AbsentCancelSpawnsAndWorkingFollowsTheRead(t *testing.T) {
+	_, url := startServer(t)
+	c := gatewayClient(t, url)
+	gate := make(chan struct{})
+	var real func(context.Context, *taskRun) (bool, error)
+	startBridgeWith(t, url, script(t, `echo "answer for $1"`), 0, func(b *Bridge) {
+		real = b.lookAhead
+		b.lookAhead = func(ctx context.Context, run *taskRun) (bool, error) {
+			<-gate
+			return real(ctx, run)
+		}
+	})
+
+	origin := submit(t, c, "task-clean", "a live prompt")
+	waitFor(t, 10*time.Second, "submitted", func() bool {
+		task, err := c.TasksGet(testCtx(t), "platform", origin.TaskID)
+		return err == nil && task.State == lib.StateSubmitted
+	})
+	// The look-ahead is held; nothing past submitted may appear.
+	time.Sleep(1 * time.Second)
+	if task := fold(t, c, origin.TaskID); task.State != lib.StateSubmitted {
+		t.Fatalf("state = %s while the look-ahead is outstanding, want submitted", task.State)
+	}
+	close(gate)
+
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+	want := []lib.TaskState{lib.StateSubmitted, lib.StateWorking, lib.StateCompleted}
+	if fmt.Sprint(task.StatusHistory) != fmt.Sprint(want) {
+		t.Fatalf("history = %v, want %v", task.StatusHistory, want)
+	}
+}
+
+// A look-ahead that fails is logged and the run spawns: a read failure must
+// not become a dropped task.
+func TestLookAhead_ReadFailureSpawns(t *testing.T) {
+	_, url := startServer(t)
+	c := gatewayClient(t, url)
+	startBridgeWith(t, url, script(t, `echo "ran despite the failed read"`), 0, func(b *Bridge) {
+		b.lookAhead = func(context.Context, *taskRun) (bool, error) {
+			return false, fmt.Errorf("injected: the in subject could not be read")
+		}
+	})
+
+	origin := submit(t, c, "task-blindspawn", "spawn me")
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+	result := task.Artifact(lib.ArtifactResult)
+	if result == nil || !strings.Contains(result.Parts[0].Text, "ran despite the failed read") {
+		t.Fatal("the run did not spawn after the failed look-ahead")
+	}
+}
+
+// Shutdown arriving while a worker is inside its look-ahead is not a read
+// failure to spawn past: the run stays pending for shutdownTasks, whose
+// terminal names bridge-shutdown, and the stub never runs.
+func TestLookAhead_ShutdownMidReadLeavesTheRunToShutdownTasks(t *testing.T) {
+	_, url := startServer(t)
+	c := gatewayClient(t, url)
+	marker := filepath.Join(t.TempDir(), "spawned")
+	gate := make(chan struct{})
+	var real func(context.Context, *taskRun) (bool, error)
+	shutdown := startBridgeWith(t, url, script(t, fmt.Sprintf(`touch %s
+echo never`, marker)), 0, func(b *Bridge) {
+		real = b.lookAhead
+		b.lookAhead = func(ctx context.Context, run *taskRun) (bool, error) {
+			<-gate
+			return real(ctx, run)
+		}
+	})
+
+	origin := submit(t, c, "task-shutdown-midread", "a prompt")
+	waitFor(t, 10*time.Second, "submitted", func() bool {
+		task, err := c.TasksGet(testCtx(t), "platform", origin.TaskID)
+		return err == nil && task.State == lib.StateSubmitted
+	})
+	shutdown()
+	close(gate)
+
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateFailed {
+		t.Fatalf("state = %s, want failed", task.State)
+	}
+	if reason := terminalReason(t, task); !strings.Contains(reason, "bridge-shutdown") {
+		t.Fatalf("reason = %q, want bridge-shutdown", reason)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the stub ran after shutdown")
+	}
+}
+
+// cancelInStream's rule: a cancel counts when it is on the task's in
+// subject after the submission; a cancel before the submission, or a
+// follow-up, does not; an empty subject is "no" rather than an error.
+func TestCancelInStream_Cases(t *testing.T) {
+	_, url := startServer(t)
+	c := gatewayClient(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	b, err := New(ctx, Config{NATSURL: url, Command: []string{"true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cancel(); b.close() })
+
+	runFor := func(origin *lib.Envelope) *taskRun {
+		x, err := b.c.NewTaskExecution(origin, b.from, "platform")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &taskRun{origin: origin, exec: x}
+	}
+	unpublished := func(taskID string) *lib.Envelope {
+		env, err := lib.NewMessageEnvelope(gatewayParty, taskID, "ctx-"+taskID, "corr-"+taskID,
+			messagePayload(t, taskID, "ctx-"+taskID, "never sent"), lib.WithTo(lib.Party{Session: "platform"}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return env
+	}
+
+	cases := []struct {
+		name string
+		run  func() *taskRun
+		want bool
+	}{
+		{"submission alone", func() *taskRun {
+			return runFor(submit(t, c, "la-alone", "p"))
+		}, false},
+		{"cancel after the submission", func() *taskRun {
+			o := submit(t, c, "la-after", "p")
+			publishCancel(t, c, o)
+			return runFor(o)
+		}, true},
+		{"cancel before the submission is not newer", func() *taskRun {
+			o := unpublished("la-before")
+			publishCancel(t, c, o)
+			if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", o.TaskID), o); err != nil {
+				t.Fatal(err)
+			}
+			return runFor(o)
+		}, false},
+		{"follow-up after the submission is not a cancel", func() *taskRun {
+			o := submit(t, c, "la-steer", "p")
+			steer, err := lib.NewFollowUpEnvelope(o, gatewayParty,
+				messagePayload(t, o.TaskID, o.ContextID, "more"), lib.WithTo(lib.Party{Session: "platform"}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", o.TaskID), steer); err != nil {
+				t.Fatal(err)
+			}
+			return runFor(o)
+		}, false},
+		{"nothing on the subject", func() *taskRun {
+			return runFor(unpublished("la-empty"))
+		}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := b.cancelInStream(ctx, tc.run())
+			if err != nil {
+				t.Fatalf("cancelInStream: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("cancelInStream = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// finalize writes exactly one terminal however many callers reach it, and
+// handleCancel on an already-final run does nothing - whether the run is
+// still in the bridge's table (the window before finalize removes it) or
+// already gone (the orphan path, which finds the terminal on the stream).
+func TestFinalize_IdempotentAndCancelAfterFinalIsANoOp(t *testing.T) {
+	_, url := startServer(t)
+	c := gatewayClient(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	b, err := New(ctx, Config{NATSURL: url, Command: []string{"true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cancel(); b.close() })
+
+	origin := submit(t, c, "task-final-twice", "p")
+	x, err := b.c.NewTaskExecution(origin, b.from, "platform")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := x.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	run := &taskRun{origin: origin, exec: x}
+	b.mu.Lock()
+	b.tasks[origin.TaskID] = run
+	b.mu.Unlock()
+
+	b.finalize(run, lib.StateCanceled, canceledBeforeStartReason, nil)
+	b.finalize(run, lib.StateFailed, "reason: a second finalizer", nil)
+	run.mu.Lock()
+	state := run.state
+	run.mu.Unlock()
+	if state != stateDone {
+		t.Fatalf("state = %v, want done", state)
+	}
+
+	cancelEnv, err := lib.NewCancelEnvelope(gatewayParty, origin.TaskID, origin.ContextID, origin.CorrelationID,
+		lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Still in the table, already final.
+	b.mu.Lock()
+	b.tasks[origin.TaskID] = run
+	b.mu.Unlock()
+	b.handleCancel(ctx, cancelEnv)
+	// Gone from the table: the orphan path.
+	b.mu.Lock()
+	delete(b.tasks, origin.TaskID)
+	b.mu.Unlock()
+	b.handleCancel(ctx, cancelEnv)
+
+	events := replayEvents(t, url, origin.TaskID)
+	finals := 0
+	for _, env := range events {
+		if _, final := statusState(t, env); final {
+			finals++
+		}
+	}
+	if finals != 1 || len(events) != 2 {
+		t.Fatalf("events = %d with %d finals, want submitted plus exactly one terminal", len(events), finals)
+	}
+	task := fold(t, c, origin.TaskID)
+	if task.State != lib.StateCanceled || task.PostFinalDropped != 0 {
+		t.Fatalf("state = %s, post-final drops = %d; want canceled and 0", task.State, task.PostFinalDropped)
+	}
 }
 
 // A nonzero hermes exit is terminal failed carrying the evidence.

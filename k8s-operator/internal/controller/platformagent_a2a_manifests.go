@@ -391,7 +391,10 @@ const (
 	// seconds after it returns. That makes the missing term a call RATE over
 	// a rolling five-second window rather than a concurrency, and the callers
 	// are not just the web rail: the gateway's sweep, reap and relay paths
-	// replay too. The window was five minutes -- nats.go's default, left in
+	// replay too, and the bridge replays twice per task -- TasksGet when it
+	// dispatches and lib.TaskInReplay (the same replay, on the task's in
+	// subject, same threshold) before it spawns. The window was five
+	// minutes -- nats.go's default, left in
 	// place -- until TasksGet set the threshold, so the rate this constant
 	// absorbs is 60x lower than the number was sized against. gke-labs#1739
 	// owns the term and the number; this constant deliberately does not move
@@ -676,7 +679,7 @@ func a2aSeedJetStreamGrants() []string {
 // does emit here without a grant. The only emitter is the ordered consumer's
 // reset path, which fires DeleteConsumer for the consumer it is replacing in
 // a goroutine and ignores the result; the ephemeral it could not delete is
-// reaped by the inactive threshold lib.TasksGet sets on it,
+// reaped by the inactive threshold lib.TasksGet and lib.TaskInReplay set on it,
 // lib.EphemeralConsumerInactiveThreshold (five seconds -- nats.go's own
 // ordered default is five MINUTES, which is what the replay carried before
 // gke-labs/kube-agents#1739). TasksGet does not delete its own replay

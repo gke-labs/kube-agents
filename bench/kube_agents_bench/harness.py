@@ -1927,7 +1927,7 @@ class KubeAgentsHarness(AgentHarness):
             if task.cancel_sent:
                 bounded = (
                     "; a cancel naming the task was published so a bridge that binds later "
-                    "kills the stale prompt rather than running it to completion"
+                    "refuses the stale prompt before spawning it (canceled-before-start)"
                 )
             elif stop_pending:
                 bounded = "; a stop was already pending on the record"
