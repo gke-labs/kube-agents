@@ -694,6 +694,18 @@ class ListReadyProfilesTest(unittest.TestCase):
             {"project": "p", "cluster": "c", "location": "l"},
         )
 
+        # 7. Non-UTF-8 bytes (UnicodeDecodeError)
+        p_bin = self.tmp / "p_bin"
+        p_bin.mkdir()
+        (p_bin / "config.yaml").write_bytes(b"\xff\xfe")
+        self.assertIsNone(cap.read_cluster_identity(p_bin))
+
+        # 8. Directory config.yaml (IsADirectoryError / OSError)
+        p_dir = self.tmp / "p_dir"
+        p_dir.mkdir()
+        (p_dir / "config.yaml").mkdir()
+        self.assertIsNone(cap.read_cluster_identity(p_dir))
+
 
 
 class SandboxStubTest(unittest.TestCase):

@@ -25,9 +25,8 @@ from cluster_agent_profile import (
     profile_name,
     read_cluster_identity,
 )
-from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS
 from gke_endpoint import dns_endpoint_args
-from profile_scaffold import is_scaffolded, profiles_base
+from profile_scaffold import profiles_base
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
