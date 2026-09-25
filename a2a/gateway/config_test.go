@@ -34,6 +34,9 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_GCHAT_ALLOWED_USERS", "")
 	t.Setenv("A2A_GCHAT_ALLOW_ALL_USERS", "")
 	t.Setenv("A2A_CHAT_DISPLAY_MODE", "")
+	t.Setenv("A2A_INJECT_LISTEN", "")
+	t.Setenv("A2A_INJECT_TOKEN", "")
+	t.Setenv("A2A_INJECT_PRINCIPAL_MAP", "")
 }
 
 // TestFromEnvSaltPrecedence: the salt is SESSION_KV_SALT, the one the
@@ -379,16 +382,172 @@ func TestFromEnvGchatBackendSelection(t *testing.T) {
 	}
 }
 
-// TestFromEnvOneBackendPerProcess: two backends on one relay durable split
-// event deliveries, and no backend is a misconfiguration, not a default.
+// TestFromEnvInjectDoorArmsOnItsOwn: the door alone is enough for the gateway
+// to start, which is what makes it the answer for an eval install (#1660) --
+// a gateway with no ingress at all crash-loops, so a `mode: next` install
+// never reads Ready and nothing can gate a rollout on it.
+func TestFromEnvInjectDoorArmsOnItsOwn(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("A2A_INJECT_LISTEN", " :8099 ")
+	t.Setenv("A2A_INJECT_TOKEN", " s3cret ")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.InjectArmed() {
+		t.Fatal("the door is not armed")
+	}
+	// No REAL backend, and Backend() says so rather than naming the door:
+	// which backend a gateway has and whether its door is open are two
+	// questions, and collapsing them is what made the door exclusive.
+	if cfg.Backend() != "" {
+		t.Fatalf("Backend() = %q, want empty: the door is not a backend", cfg.Backend())
+	}
+	// Trimmed, because a value that is nothing but whitespace must read as
+	// unset rather than as a door armed on an address net.Listen refuses.
+	if cfg.InjectListen != ":8099" || cfg.InjectToken != "s3cret" {
+		t.Fatalf("listen = %q token = %q, want both trimmed", cfg.InjectListen, cfg.InjectToken)
+	}
+	// Its own map, and never the chat backends'. An entry written for a
+	// Discord sender must be unreachable from a door that takes its author
+	// from a request body.
+	if cfg.InjectPrincipalMapPath != defaultInjectPrincipalMapPath {
+		t.Fatalf("InjectPrincipalMapPath = %q, want %q", cfg.InjectPrincipalMapPath, defaultInjectPrincipalMapPath)
+	}
+	if cfg.InjectPrincipalMapPath == cfg.PrincipalMapPath {
+		t.Fatal("the door reads the chat backends' principal map")
+	}
+
+	t.Setenv("A2A_INJECT_LISTEN", "   ")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("a whitespace-only A2A_INJECT_LISTEN with no other ingress must refuse, not arm a door")
+	}
+}
+
+// TestFromEnvRefusesADoorWithNoToken: there is no unauthenticated mode. The
+// fence in front of the door does not govern the port-forward its caller
+// uses, so a door without a token would widen who can drive the platform
+// persona from the holders of the agent's API key to anyone with
+// pods/portforward in the namespace.
+func TestFromEnvRefusesADoorWithNoToken(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("A2A_INJECT_LISTEN", ":8099")
+	t.Setenv("A2A_INJECT_TOKEN", "")
+	_, err := FromEnv()
+	if err == nil {
+		t.Fatal("the door armed with no bearer token")
+	}
+	if !strings.Contains(err.Error(), "A2A_INJECT_TOKEN") {
+		t.Fatalf("the refusal does not name the variable to set: %v", err)
+	}
+	// Whitespace is not a token either.
+	t.Setenv("A2A_INJECT_TOKEN", "   ")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("whitespace passed as a bearer token")
+	}
+}
+
+// TestFromEnvTheDoorSitsBesideARealBackend is the decision this guard
+// encodes (bnaylor, 2026-09-17): the door is a side door, not a backend.
+//
+// The guard exists so that a two-backend misconfiguration cannot leave one
+// backend silently unconsumed -- two processes on one Chat relay durable
+// split its deliveries. A local HTTP door consumes nothing and competes for
+// nothing, so counting it would buy no safety and would cost stage 2 the
+// thing it needs: the eval door and the Chat relay on one install, so the
+// two transports can be compared against it.
+func TestFromEnvTheDoorSitsBesideARealBackend(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		env     map[string]string
+		backend string
+	}{
+		{"beside discord", map[string]string{"DISCORD_TOKEN": "x"}, discordBackend},
+		{"beside the chat relay", map[string]string{
+			"DISCORD_TOKEN": "", "A2A_GCHAT_RELAY_URL": "http://relay.ns.svc:8081",
+		}, gchatBackend},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setBaseEnv(t)
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			t.Setenv("A2A_INJECT_LISTEN", ":8099")
+			t.Setenv("A2A_INJECT_TOKEN", "s3cret")
+			cfg, err := FromEnv()
+			if err != nil {
+				t.Fatalf("the door beside one real backend must be accepted: %v", err)
+			}
+			if cfg.Backend() != tc.backend {
+				t.Fatalf("Backend() = %q, want %q: the door must not displace the real backend",
+					cfg.Backend(), tc.backend)
+			}
+			if !cfg.InjectArmed() {
+				t.Fatal("the door is not armed beside the backend")
+			}
+		})
+	}
+}
+
+// TestFromEnvOneBackendPerProcess: two REAL backends on one relay durable
+// split event deliveries, and no ingress at all is a misconfiguration, not a
+// default. The check counts rather than enumerating pairs, so a fourth
+// backend cannot be armed alongside one nobody thought of. The inject door is
+// not in the count -- TestFromEnvTheDoorSitsBesideARealBackend is that half.
 func TestFromEnvOneBackendPerProcess(t *testing.T) {
 	setBaseEnv(t)
-	t.Setenv("A2A_GCHAT_RELAY_URL", "http://relay.ns.svc:8081")
-	if _, err := FromEnv(); err == nil {
-		t.Fatal("DISCORD_TOKEN and A2A_GCHAT_RELAY_URL together must refuse")
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+	}{
+		{"discord and gchat", map[string]string{
+			"DISCORD_TOKEN": "x", "A2A_GCHAT_RELAY_URL": "http://relay.ns.svc:8081",
+		}},
+		{"discord and gchat with the door open too", map[string]string{
+			"DISCORD_TOKEN": "x", "A2A_GCHAT_RELAY_URL": "http://relay.ns.svc:8081",
+			"A2A_INJECT_LISTEN": ":8099", "A2A_INJECT_TOKEN": "s3cret",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("DISCORD_TOKEN", "")
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			_, err := FromEnv()
+			if err == nil {
+				t.Fatal("two chat backends in one process must refuse")
+			}
+			// The message has to name what is armed, or an operator reading
+			// it cannot tell which variable to unset. The door is not one of
+			// them: naming it would send the reader to unset the one thing
+			// that is allowed to be there.
+			for key := range tc.env {
+				if strings.HasPrefix(key, "A2A_INJECT_") {
+					// Not in the list of what is armed. The message may go on
+					// to say the door is allowed there -- that is the point
+					// it should make -- but the list an operator reads to
+					// decide what to unset must hold the two backends alone.
+					armed, _, _ := strings.Cut(err.Error(), ")")
+					if strings.Contains(armed, key) {
+						t.Errorf("the refusal lists %s among what is armed, and it is not one of the "+
+							"two backends: %v", key, err)
+					}
+					continue
+				}
+				if !strings.Contains(err.Error(), key) {
+					t.Errorf("the refusal does not name %s: %v", key, err)
+				}
+			}
+		})
 	}
+
+	setBaseEnv(t)
 	t.Setenv("DISCORD_TOKEN", "")
 	t.Setenv("A2A_GCHAT_RELAY_URL", "")
+	t.Setenv("A2A_INJECT_LISTEN", "")
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("no backend at all must refuse")
 	}

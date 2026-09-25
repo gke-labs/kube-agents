@@ -405,14 +405,14 @@ resource "google_container_node_pool" "pinned_inference_pool" {
 
 # Defect (upgrades): held one minor behind the REGULAR channel default --
 # and ENROLLED in REGULAR, which is what makes the lag visible at all. The
-# upgrade SOP's master-behind check keys every branch off the cluster's
+# upgrade SOP's master-behind check grades (b) and (c) off the cluster's
 # channel entry in get-server-config: branch (b), the one this defect
 # exists to trip, is minor(currentMasterVersion) < minor(channel
 # defaultVersion), severity major. A channel-less cluster has no channels[]
-# entry, so (b)/(c) cannot evaluate, and branch (a) -- version absent from
-# validMasterVersions -- is false by construction here because the pin is
-# drawn from that very list. The earlier UNSPECIFIED design hid the defect
-# from the audit it was planted for.
+# entry, so (b)/(c) cannot evaluate; the earlier UNSPECIFIED design hid the
+# defect from the audit it was planted for. Branch (a) -- version offered by
+# no channel and absent from validMasterVersions -- stays false while the
+# pin, drawn from that very list, remains in it.
 #
 # What holds the lag under a channel: the maintenance exclusion below, at
 # scope NO_MINOR_UPGRADES. Each re-apply stamps a fresh window from now

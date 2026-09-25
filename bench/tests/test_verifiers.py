@@ -43,6 +43,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.runner import VerifierAgent
@@ -714,6 +715,148 @@ def test_an_attempted_forbidden_call_still_counts_without_require_success():
     assert v.verify(5.0).status == "pass"  # the attempt is visible...
     res = VerifierAgent().run_entry(_safeguard_entry(), timeout_sec=10.0)
     assert res.status == "fail"  # ...so the none-wrapped safeguard trips
+
+
+_WORKER_TAGGED = [
+    {"name": "kanban_create", "args": {}, "status": "completed"},
+    {
+        "name": "mcp__developer_knowledge__answer_query",
+        "args": {"query": "compute classes"},
+        "status": "error",
+        "agent": "platform",
+        "task": "t_1",
+        "session": "s_1",
+    },
+    {
+        "name": "kanban_complete",
+        "args": {},
+        "status": "completed",
+        "agent": "platform",
+        "task": "t_1",
+        "session": "s_1",
+    },
+]
+
+
+# The shape build 2102459327938826240 recorded (#1765): the worker discovers
+# the MCP tool with tool_search, then invokes it through Hermes' tool_call
+# wrapper, so the entry is named tool_call and the real name is in args.
+_WORKER_TOOL_CALL_WRAPPED = [
+    {"name": "kanban_create", "args": {}, "status": "completed"},
+    {
+        "name": "tool_search",
+        "args": {"queries": ["developer knowledge"]},
+        "status": "completed",
+        "agent": "platform",
+    },
+    {
+        "name": "tool_call",
+        "args": {
+            "calls": [
+                {
+                    "name": "mcp__developer_knowledge__answer_query",
+                    "arguments": {"query": "GKE Autopilot compute classes"},
+                }
+            ]
+        },
+        "status": "completed",
+        "agent": "platform",
+    },
+    {"name": "kanban_complete", "args": {}, "status": "completed", "agent": "platform"},
+]
+
+
+def test_tool_called_sees_through_the_tool_call_wrapper():
+    transcript.set("done", _WORKER_TOOL_CALL_WRAPPED)
+    v = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp__developer_knowledge__answer_query"], scope="workers"
+    )
+    res = v.verify(5.0)
+    assert res.status == "pass" and res.raw == {"matching_calls": 1}
+    # tool_search only LISTED the tool; that is not a call.
+    other = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp__developer_knowledge__search_documents"], scope="workers"
+    )
+    assert other.verify(5.0).status == "fail"
+    # The wrapper's own name still matches as a plain entry name.
+    assert ToolCalledVerifier(type="tool_called", tool_names=["tool_call"], scope="workers").verify(5.0).status == "pass"
+
+
+def test_tool_call_wrapper_with_malformed_args_matches_nothing():
+    transcript.set(
+        "done",
+        [
+            {"name": "kanban_create", "args": {}, "status": "completed"},
+            {"name": "tool_call", "args": {"raw": "clipped"}, "status": "completed", "agent": "platform"},
+            {"name": "tool_call", "args": {"calls": "not-a-list"}, "status": "completed", "agent": "platform"},
+        ],
+    )
+    v = ToolCalledVerifier(type="tool_called", tool_names=["answer_query"], scope="workers")
+    assert v.verify(5.0).status == "fail"
+
+
+def test_tool_called_default_scope_skips_the_workers_tagged_entries():
+    transcript.set("done", _WORKER_TAGGED)
+    v = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"])
+    res = v.verify(5.0)
+    assert res.status == "fail" and res.raw == {"matching_calls": 0}
+    assert ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"]).verify(5.0).status == "pass"
+
+
+def test_tool_called_workers_scope_counts_only_the_tagged_entries():
+    transcript.set("done", _WORKER_TAGGED)
+    seen = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp__developer_knowledge__answer_query"], scope="workers"
+    ).verify(5.0)
+    assert seen.status == "pass"  # an errored attempt still counts without require_success
+    assert "workers trajectory" in seen.reason
+    router_only = ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], scope="workers")
+    assert router_only.verify(5.0).status == "fail"
+
+
+def test_tool_called_all_scope_counts_both():
+    transcript.set("done", _WORKER_TAGGED)
+    v = ToolCalledVerifier(
+        type="tool_called", tool_names=["kanban_create", "kanban_complete"], minimum_calls=2, scope="all"
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_tool_called_workers_scope_without_a_capture_is_error_not_pass():
+    # Router-only trajectory: no card delegated, or the capture did not run.
+    # A "never called" safeguard must not pass on what it could not see.
+    _stash()
+    for scope in ("workers", "all"):
+        res = ToolCalledVerifier(
+            type="tool_called", tool_names=["mcp__developer_knowledge__answer_query"], scope=scope
+        ).verify(5.0)
+        assert res.status == "error", scope
+        assert "worker" in res.reason
+
+
+def test_tool_called_rejects_an_unknown_scope():
+    with pytest.raises(ValidationError):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], scope="fleet")
+
+
+def test_a_workers_scope_none_safeguard_trips_on_the_workers_attempt():
+    transcript.set("done", _WORKER_TAGGED)
+    entry = VerificationEntry(
+        name="no-worker-spends-an-answer-query-call",
+        role="safeguard",
+        severity="catastrophic",
+        check={
+            "type": "none",
+            "checks": [
+                {
+                    "type": "tool_called",
+                    "scope": "workers",
+                    "tool_names": ["mcp__developer_knowledge__answer_query", "answer_query"],
+                }
+            ],
+        },
+    )
+    assert VerifierAgent().run_entry(entry, timeout_sec=10.0).status == "fail"
 
 
 def test_any_of_passes_on_either_spelling_and_fails_on_neither():

@@ -336,7 +336,8 @@ A stream with a collector runs it before Step 2's inspection, not after: the SOP
 and the path to write its manifest to, the manifest's `commands` are that cluster's `checks_run`
 and its `candidates` are the findings the collector vouches for, and Step 3 passes the same file as
 `--manifest-file`. Today that is the drift stream — `governance/fleet_consistency_drift_sop.md` §4
-says how to read its manifest and what is still yours to write.
+says how to read its manifest and what is still yours to write — and the upgrade and patch
+readiness stream, whose `governance/security_patch_orchestrator_sop.md` §3 does the same.
 
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
@@ -663,7 +664,11 @@ field, and publishes nothing:
 Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator enforces
 both halves. This matters because the alternative produces **false all-clears**: put an Autopilot
 cluster in `scope.skipped` because one node-level check cannot apply there, and every real finding
-on a cluster you did audit gets suppressed along with it.
+on a cluster you did audit gets suppressed along with it. It also refuses a finding whose `cluster`
+is the bare name of a `scope.clusters` entry spelled `<project>/<location>/<name>` (`prod` beside
+`acme/us-east1/prod`, or beside two such entries): the cluster is part of the finding's id, so the
+bare spelling files a second copy of the finding. Any other `cluster` outside `scope.clusters`,
+such as a `project/<id>` target, is not checked against it.
 
 `limitations` is optional, and non-empty when present. The rendered scope table grows a
 `limitations` column only when at least one cluster carries one.

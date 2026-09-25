@@ -60,19 +60,22 @@
 # the infra lock with the two incumbents) and consistency-no-environment-label
 # (#1818, ~28min at its measured 381s/385s/880s -- a full fleet audit, and the
 # spread is the audit band's, not this case's, so it takes the 900s hint the
-# band uses rather than its mean). Forty-two cases, ~921-941min serial.
-# 2026-09-22 moved incident-triage-oom-event-probe from this file to the
-# presubmit one (#1023): the nightly runs both files, so it still runs the
-# same forty-two cases at the same price. The
+# band uses rather than its mean). 2026-09-22 moved
+# incident-triage-oom-event-probe from this file to the presubmit one (#1023):
+# the nightly runs both files, so it still runs it at the same price.
+# 2026-09-23 added upgrades-master-behind-offered-elsewhere (~45min at the 900s
+# band; its runs measured 327s-1191s, the audit band's spread again) and
+# gitops-drift-out-of-band-triage (#1827, ~45min at its 900s hint).
+# Forty-four cases, ~1011-1031min serial. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
 # at its default 3 (#1491). At the ~1.15x the presubmit realised on
 # whole-job wall clock at parallelism 4 under daytime quota contention that
-# would be ~800-820min, over the deadline; 480m holds only if the nightly,
+# would be ~879-897min, over the deadline; 480m holds only if the nightly,
 # alone on the model quota at that hour and two lanes wider, realises ~1.9x
 # or better. Night one (2026-09-16, build 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
-# so the three additions are priced inside its headroom. The first nights after this change measure it:
+# so the five additions are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
 # order. A deadline kill is survivable by design -- the cost-hinted queue
@@ -143,7 +146,11 @@
 # its citation check was widened) and moved here on 2026-09-09: knowledge
 # grounding is a cross-cutting persona behavior, not one of the core
 # journeys the presubmit gate exists for, so it earns its record in the full
-# catalog instead. Priced at 600s in unit_cost_hint.
+# catalog instead. Priced at 600s in unit_cost_hint. #1765 gave it two
+# measured presubmit builds (2102459327938826240, 2102768495748976640) for
+# its new answer_query safeguard through a temporary seat reverted before
+# merge, the incident-triage-oom-event-probe shape; the seat's record is in
+# that pull request and the case's header.
 ./tasks/knowledge-grounding-sources-probe/task.yaml
 
 # The silence case for the gke-stall-detection skill (#1342), in the
@@ -243,6 +250,13 @@
 # because those runs showed they could not hold. What the nightly adds is a
 # record built without anyone watching, on an install nobody prepared for it.
 ./tasks/gitops-drift-out-of-band-triage/task.yaml
+
+# The patch stream's second full audit, nightly from the start (2026-09-23):
+# the same shape and 900s band as upgrade-readiness-lagging-cluster, grading
+# §3.1's severity on the version-laggard cluster, whose version has left its
+# channel's roster but is still served at its location. The collector
+# (`patch_readiness.py`) computes the route check.
+./tasks/upgrades-master-behind-offered-elsewhere/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was

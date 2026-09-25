@@ -1186,6 +1186,71 @@ class TestValidation(unittest.TestCase):
         with self.assertRaisesRegex(audit_report.ValidationError, "findings:"):
             audit_report.validate_findings(doc, AUDIT)
 
+    def test_a_project_target_outside_scope_is_accepted(self):
+        # The cost SOP files an unattributable disk under `project/<id>`,
+        # which no scope entry ever spells.
+        doc = make_doc(findings=[make_finding(cluster="project/acme-prod")])
+        audit_report.validate_findings(doc, AUDIT)
+
+    def test_bare_name_of_a_qualified_scope_entry_is_rejected_with_the_entry(self):
+        # A collector's qualified scope beside its `Cluster/<bare>` objects:
+        # stripping the prefix off `object` gives the bare name, whose id no
+        # collector-held candidate shares, so every finding reported twice.
+        qualified = "acme-prod/us-east1/prod-us-east"
+        doc = make_doc(
+            clusters=[{"name": qualified, "location": "us-east1", "project": "acme-prod"}],
+            findings=[make_finding(cluster="prod-us-east")],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn(repr(qualified), str(exc.exception))
+
+    def test_a_bare_name_matches_its_entry_as_the_id_would(self):
+        qualified = "acme-prod/us-east1/prod-us-east"
+        doc = make_doc(
+            clusters=[{"name": qualified, "location": "us-east1", "project": "acme-prod"}],
+            findings=[make_finding(cluster="Prod-US-East")],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn(repr(qualified), str(exc.exception))
+
+    def test_a_bare_name_two_qualified_entries_share_is_rejected_naming_both(self):
+        # Two regions' `prod`: which one is not the validator's guess, but
+        # either way the bare spelling is a second id for the finding.
+        doc = make_doc(
+            clusters=[
+                {"name": "acme-prod/us-east1/prod", "location": "us-east1", "project": "acme-prod"},
+                {"name": "acme-dr/us-west1/prod", "location": "us-west1", "project": "acme-dr"},
+            ],
+            findings=[make_finding(cluster="prod")],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("'acme-dr/us-west1/prod' and 'acme-prod/us-east1/prod'", str(exc.exception))
+
+    def test_a_qualified_entry_whose_fields_are_respelled_still_arms_the_guard(self):
+        # The manifest cross-check reads `name` alone, so the entry stands for
+        # the cluster whatever its `project` and `location` fields say.
+        for location, project in (("US-EAST1", "acme-prod"), ("us-east1", "acme")):
+            with self.subTest(location=location, project=project):
+                qualified = "acme-prod/us-east1-b/prod"
+                doc = make_doc(
+                    clusters=[{"name": qualified, "location": location, "project": project}],
+                    findings=[make_finding(cluster="prod")],
+                )
+                with self.assertRaises(audit_report.ValidationError) as exc:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertIn(repr(qualified), str(exc.exception))
+
+    def test_a_bare_project_id_beside_a_project_target_is_accepted(self):
+        # `project/<id>` is not a qualified cluster, so its tail is no cluster name.
+        doc = make_doc(
+            clusters=[{"name": "project/acme-prod", "location": "global", "project": "acme-prod"}],
+            findings=[make_finding(cluster="acme-prod")],
+        )
+        audit_report.validate_findings(doc, AUDIT)
+
     def test_skipped_entry_needs_a_reason(self):
         doc = make_doc(skipped=[{"cluster": "dr-west"}])
         with self.assertRaises(audit_report.ValidationError) as exc:
@@ -2662,12 +2727,11 @@ class TestAuditCatalogue(unittest.TestCase):
                 "hostpath-mount",
                 "legacy-metadata",
             ],
-            "security-patch-orchestrator": [
-                "pool-skew",
-                "no-autoupgrade",
-                "no-autorepair",
-                "stale-image-type",
-            ],
+            # security-patch-orchestrator is absent on purpose: its collector
+            # runs all four node-pool checks on Autopilot rather than declaring
+            # them inapplicable, and test_patch_readiness.py's
+            # `test_autopilot_runs_all_four_and_declares_nothing_inapplicable`
+            # guards that in code.
             "stockout-prevention": [
                 "single-zone-nodepool",
             ],
@@ -3676,6 +3740,15 @@ class TestResolvedBecauseValidation(unittest.TestCase):
             "resolved_because[0].cluster",
             "not in scope.clusters",
         )
+
+    def test_the_bare_name_of_a_qualified_entry_names_the_entry(self):
+        qualified = "acme-prod/us-east1/prod-us-east"
+        doc = make_doc(
+            findings=[],
+            clusters=[{"name": qualified, "location": "us-east1", "project": "acme-prod"}],
+        )
+        doc["resolved_because"] = [resolved_entry()]
+        self.rejects(doc, "resolved_because[0].cluster", f"Did you mean {qualified!r}")
 
     def test_a_short_reason_is_rejected(self):
         self.rejects(
@@ -16145,6 +16218,142 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("STILL FLAGGED:", self.err)
         self.assertNotIn("UNACCOUNTED:", self.err)
 
+    def test_a_clean_run_across_the_qualifying_rename_is_held_not_closed(self):
+        """The previous ledger named clusters bare, under the scheme before the
+        collector qualified them. Its rows re-spell through the Scope table, so
+        a clean document over a candidate the collector still emits is held;
+        matched on the bare spelling, nothing was held and the ledger closed."""
+        previous_body = published_body(make_doc(), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
+        )
+        self.replay_ledger(previous_body)
+        qualified = ("acme-prod/us-east1/prod-us-east", "acme-stage/europe-west1/stage-eu")
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {"name": qualified[0], "location": "us-east1", "project": "acme-prod"},
+                {"name": qualified[1], "location": "europe-west1", "project": "acme-stage"},
+            ],
+        )
+        manifest = _full_manifest(
+            names=qualified,
+            candidates=[self.netpol_candidate(cluster=qualified[0])],
+            command=self.NETPOL_COMMAND,
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(payload["unaccounted"], [derived_id(cluster=qualified[0])])
+        # Without a manifest the unaccounted-findings rule holds it the same way.
+        self.replay_ledger(previous_body)
+        rc = self.run_finish(doc)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.stdout_json()["unaccounted"], [derived_id(cluster=qualified[0])])
+
+    def test_a_cluster_past_the_scope_table_is_qualified_from_this_run(self):
+        """`_render_scope` stops at `MAX_SCOPE_ROWS`, so on a larger fleet the
+        previous body has `Where:` lines naming clusters with no Scope row.
+        This run's own clusters qualify those, and the clean run is held."""
+        previous_body = published_body(make_doc(), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
+        )
+        previous_body = re.sub(r"(?m)^\| `prod-us-east` \|.*\n", "", previous_body)
+        self.assertNotIn("prod-us-east", audit_report._scope_qualified_names(previous_body))
+        self.replay_ledger(previous_body)
+        qualified = ("acme-prod/us-east1/prod-us-east", "acme-stage/europe-west1/stage-eu")
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {"name": qualified[0], "location": "us-east1", "project": "acme-prod"},
+                {"name": qualified[1], "location": "europe-west1", "project": "acme-stage"},
+            ],
+        )
+        manifest = _full_manifest(
+            names=qualified,
+            candidates=[self.netpol_candidate(cluster=qualified[0])],
+            command=self.NETPOL_COMMAND,
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["unaccounted"], [derived_id(cluster=qualified[0])])
+        self.replay_ledger(previous_body)
+        rc = self.run_finish(doc)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.stdout_json()["unaccounted"], [derived_id(cluster=qualified[0])])
+
+    def test_the_manifest_path_holds_a_finding_past_the_scope_table(self):
+        """`collector_held_entries` carries the held entry itself; the finish
+        payload above would read `HELD` from the unaccounted rule alone. A name
+        two manifest clusters could own is spelled as the one the collector
+        flags, and held on the first by id when it flags both: holding neither
+        closed the ledger over a finding the collector still reported."""
+        previous_body = published_body(make_doc(), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
+        )
+        previous_body = re.sub(r"(?m)^\| `prod-us-east` \|.*\n", "", previous_body)
+        qualified = ("acme-prod/us-east1/prod-us-east", "acme-stage/europe-west1/stage-eu")
+        held = audit_report.collector_held_entries(
+            _full_manifest(names=qualified, candidates=[self.netpol_candidate(cluster=qualified[0])]),
+            make_doc(findings=[]),
+            exclude=set(),
+            previous_body=previous_body,
+        )
+        self.assertEqual([entry["id"] for entry in held], [derived_id(cluster=qualified[0])])
+        ambiguous = (qualified[0], "acme-stage/us-east1/prod-us-east")
+        for flagged in ((qualified[0],), (ambiguous[1],), ambiguous):
+            with self.subTest(flagged=flagged):
+                held = audit_report.collector_held_entries(
+                    _full_manifest(
+                        names=ambiguous,
+                        candidates=[self.netpol_candidate(cluster=name) for name in flagged],
+                    ),
+                    make_doc(findings=[]),
+                    exclude=set(),
+                    previous_body=previous_body,
+                )
+                self.assertEqual(
+                    [entry["id"] for entry in held],
+                    [min(derived_id(cluster=name) for name in flagged)],
+                )
+
+    def test_this_runs_clusters_qualify_only_names_the_table_does_not_list(self):
+        body = (
+            "| `web` | us-east1 | `acme-prod` | 10/10 |\n"
+            "| `web` | europe-west1 | `acme-prod` | 10/10 |\n"
+        )
+        clusters = [
+            "acme-prod/us-east1/web",
+            "acme-prod/us-east1/api",
+            "acme-prod/us-east1/db",
+            "acme-stage/us-east1/db",
+            "unqualified",
+        ]
+        self.assertEqual(
+            audit_report._scope_qualified_names(body, clusters), {"api": "acme-prod/us-east1/api"}
+        )
+
+    def test_a_name_audited_at_two_locations_is_not_qualified(self):
+        body = (
+            "| `web` | us-east1 | `acme-prod` | 10/10 |\n"
+            "| `web` | europe-west1 | `acme-prod` | 10/10 |\n"
+            "| `api` | us-east1 | `acme-prod` | 10/10 |\n"
+            "| `acme-prod/us-east1/db` | us-east1 | `acme-prod` | 10/10 |\n"
+        )
+        self.assertEqual(
+            audit_report._scope_qualified_names(body), {"api": "acme-prod/us-east1/api"}
+        )
+
     def test_a_clean_run_the_collector_agrees_with_closes(self):
         doc = self.clean_over_previous_ledger()
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(_full_manifest())])
@@ -16327,10 +16536,11 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     a renderer that reorders a section -- each fails here, naming the byte.
 
     One deviation is deliberate and is recorded in the transcripts rather than
-    excused: `ID_SCHEME` went from 2 to 3 because the drift collector now
-    qualifies cluster names, and the stamp is global, so every stream's bodies
-    carry the new number. That is the whole of the change here -- five lines,
-    one per body -- and this class is what proves it.
+    excused: `ID_SCHEME` went from 2 to 3 when the drift collector began
+    qualifying cluster names, and from 3 to 4 when the patch-readiness
+    collector did the same, and the stamp is global, so every stream's bodies
+    carry the current number. That is the whole of the change here -- five
+    lines, one per body -- and this class is what proves it.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,

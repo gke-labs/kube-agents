@@ -101,6 +101,25 @@ class SpecToolRegistryTest(unittest.TestCase):
         "kanban_heartbeat",
     }
 
+    # Tools behind a remote MCP proxy (`/opt/mcp-remote/dist/proxy.js <url>`),
+    # as (server alias, tool): nothing in this repository can enumerate them,
+    # so a spec may name one only through this list, registered under both
+    # separator spellings like the local servers. Evidence of each lives in
+    # the personas or the skill references that tell the agent about the
+    # tool (test_the_remote_allowlist_still_has_evidence_in_the_agent_text);
+    # a name added here needs the same, and its alias must still be a
+    # remote-proxy server in some agent config.
+    REMOTE_MCP_TOOLS = {
+        # #1765: the 50-a-day Developer Knowledge method the personas forbid
+        # and knowledge-grounding-sources-probe's safeguard names.
+        ("developer_knowledge", "answer_query"),
+    }
+    REMOTE_TOOL_EVIDENCE = (
+        "agents/platform/SOUL.md",
+        "agents/cluster/SOUL.md",
+        "agents/platform/skills/gke-basics/references/mcp-usage.md",
+    )
+
     def _mcp_server_aliases(self):
         """Alias → the local server script it launches, from every agent config.
 
@@ -124,6 +143,30 @@ class SpecToolRegistryTest(unittest.TestCase):
                     if arg.endswith(".py"):
                         aliases[alias] = Path(arg).name
         return aliases
+
+    def _remote_mcp_aliases(self):
+        """Aliases whose server is the remote proxy, from every agent config."""
+        yaml = _yaml()
+        aliases = set()
+        configs = list((REPO_ROOT / "agents").glob("*/config.yaml"))
+        configs.append(REPO_ROOT / "deploy" / "shared" / "defaults" / "config.yaml")
+        for config_path in configs:
+            if not config_path.exists():
+                continue
+            document = yaml.safe_load(config_path.read_text()) or {}
+            for alias, spec in (document.get("mcp_servers") or {}).items():
+                args = (spec or {}).get("args") or []
+                if any(str(arg).endswith("proxy.js") for arg in args):
+                    aliases.add(alias)
+        return aliases
+
+    def _remote_mcp_tools(self):
+        """REMOTE_MCP_TOOLS in the two namespaced spellings a trajectory carries."""
+        names = set()
+        for alias, tool in self.REMOTE_MCP_TOOLS:
+            names.add(f"mcp_{alias}_{tool}")
+            names.add(f"mcp__{alias}__{tool}")
+        return names
 
     def _registered_mcp_tools(self):
         """The tool names a trajectory can actually carry, not the bare ones.
@@ -200,7 +243,7 @@ class SpecToolRegistryTest(unittest.TestCase):
         return wanted
 
     def test_every_spec_tool_name_resolves_to_a_registry(self):
-        registry = self._registered_mcp_tools() | self.HERMES_BUILTIN_TOOLS
+        registry = self._registered_mcp_tools() | self._remote_mcp_tools() | self.HERMES_BUILTIN_TOOLS
         unresolved = [
             f"{path.parent.name}: {name}"
             for path, name in self._spec_tool_names()
@@ -224,6 +267,25 @@ class SpecToolRegistryTest(unittest.TestCase):
                 name in corpus or f"'{root}'" in corpus or f'"{root}"' in corpus,
                 f"{name} is allowlisted as a hermes builtin but the image "
                 "patches carry no evidence of it — stale allowlist entry",
+            )
+
+
+    def test_the_remote_allowlist_still_has_evidence_in_the_agent_text(self):
+        remote = self._remote_mcp_aliases()
+        corpus = "\n".join(
+            (REPO_ROOT / rel).read_text(errors="replace") for rel in self.REMOTE_TOOL_EVIDENCE
+        )
+        for alias, tool in sorted(self.REMOTE_MCP_TOOLS):
+            self.assertIn(
+                alias,
+                remote,
+                f"{alias} is allowlisted as a remote MCP server but no agent config "
+                "launches it through the remote proxy — stale allowlist entry",
+            )
+            self.assertTrue(
+                f"{alias}__{tool}" in corpus or f"`{tool}`" in corpus,
+                f"{alias}/{tool} is allowlisted as a remote MCP tool but the personas "
+                "and skill references carry no evidence of it — stale allowlist entry",
             )
 
 

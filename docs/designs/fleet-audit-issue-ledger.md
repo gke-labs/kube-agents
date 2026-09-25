@@ -710,20 +710,24 @@ read on the days it matters.
 #### "Did not run" and "cannot run" are different claims
 
 `checks_run` collapsed them, and the collapse had a cost that only shows on a real fleet. Four of
-this stream's ten upgrade checks read a node pool, and an Autopilot cluster has none to read. The
+this stream's ten upgrade checks read a node pool, and an Autopilot cluster was taken to have none
+to read. The
 SOP's answer was a `limitations` note — which is a coverage gap, so those clusters rendered `6/10 ⚠`
 on every run, forever. `partial` was therefore `true` on every run, forever, and everything keyed to
 `partial` followed: `resolved` pinned at `0`, the ledger unable to close, no stale remediation PR
 ever retired. On the fleet this was found on, two of three clusters are Autopilot. The audit was
 permanently unable to report good news about the majority of the fleet it audits, and the flag that
 was supposed to mean "I could not look here" had come to mean "there is nothing here to look at" —
-which is the opposite claim, published in the same column.
+which is the opposite claim, published in the same column. (The Autopilot premise was later found
+false — `clusters list` returns Autopilot node pools with every field those checks read, and the
+stream now runs all ten there — but the failure holds for any shape that genuinely rules a check
+out, such as the workload shapes Autopilot admission rejects in the compliance stream.)
 
 So `scope.clusters[]` gains an optional `checks_not_applicable`: a list of `{check, reason}` using
 the same slugs as `checks_run`. Those checks leave the denominator rather than counting as missing,
-so `6/10 ⚠` becomes `6/6 (4 n/a)`. `coverage_gaps` computes `applicable = roster - not_applicable`
-and reports a shortfall against that, which is what lets a fully-covered Autopilot fleet close its
-ledger.
+so `6/10 ⚠` became `6/6 (4 n/a)`. `coverage_gaps` computes `applicable = roster - not_applicable`
+and reports a shortfall against that, which is what lets a fully-covered fleet close its ledger when
+its shape rules checks out.
 
 The `reason` is required and must be at least sixteen characters. That is a deliberately crude
 proxy: it cannot tell a real reason from a padded one, but it does stop `"N/A"`, `"n/a"`, and

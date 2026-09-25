@@ -38,7 +38,7 @@ Each audit reads its SOP, executes read-only checks against the fleet, writes a 
 | ----------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------ |
 | `compliance-audit`            | `compliance_audit_sop.md`            | Security and RBAC posture across the fleet                                                       |
 | `obtainability-audit`         | `obtainability_audit_sop.md`         | Workload reliability: requests, PDBs, HPAs, probes, scheduling rigidity                          |
-| `security-patch-orchestrator` | `security_patch_orchestrator_sop.md` | Version currency and upgrade-policy hygiene against the cluster's channel                        |
+| `security-patch-orchestrator` | `security_patch_orchestrator_sop.md` | Version currency and upgrade-policy hygiene against what GKE offers at the cluster's location    |
 | `fleet-wide-cost-analysis`    | `fleet_wide_cost_analysis_sop.md`    | Observable waste, in resource units — no billing export required                                 |
 | `fleet-consistency-drift`     | `fleet_consistency_drift_sop.md`     | Clusters diverging from a baseline derived from the fleet itself                                 |
 | `ai-security-audit`           | `ai_security_audit_sop.md`           | AI inference and training workloads: exposure, model provenance, weights                         |
