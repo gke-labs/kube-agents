@@ -19,6 +19,32 @@ from tests.testing.common import get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
+_GKE_DNS_ENDPOINT = _REPO_ROOT / "scripts" / "installer" / "gke_dns_endpoint.sh"
+
+# The two ERR-trap tests below are real only on a bash that runs an inherited
+# ERR trap inside a `$(...)` whose failure the caller handles: bash 3.2 does,
+# bash 4.4 and 5.x do not (measured), so on the latter they pass with or
+# without the guard. They skip there rather than read as coverage; the
+# source-shape test in ToleratedProbesClearErrTrapTest is the regression
+# guard on every bash.
+# The trap writes to stderr: the substitution's stdout is the value being
+# captured, so a trap that echoed there would be swallowed with it.
+_INHERITED_TRAP_PROBE = (
+    "set -E; trap 'echo FIRED >&2' ERR; "
+    "probe() { if ! x=$(false); then :; fi; }; probe"
+)
+
+
+def _bash_runs_inherited_err_trap_in_substitution():
+    proc = subprocess.run(["bash", "-c", _INHERITED_TRAP_PROBE], capture_output=True, text=True)
+    return "FIRED" in proc.stderr
+
+
+_SKIP_UNLESS_TRAP_FIRES = (
+    "this bash does not run an inherited ERR trap inside a $(...) the caller "
+    "handles, so the guard cannot be seen missing here; "
+    "ToleratedProbesClearErrTrapTest pins it by shape"
+)
 
 # installer_common.sh's contract: the caller defines the print helpers.
 _PRINT_STUBS = """
@@ -262,6 +288,25 @@ class InstallerCommonTest(unittest.TestCase):
             gcloud_exit=1,
         )
         self.assertIn("done", proc.stdout, proc.stderr)
+        self.assertNotIn("ERR_TRAP_FIRED", proc.stderr)
+
+    def test_missing_deployment_does_not_fire_err_trap(self):
+        # running_image_tag's kubectl probe: no Deployment to read (a first
+        # install, or a context that cannot reach the cluster) is an empty
+        # answer the caller handles, not an abort. Same mechanism as above:
+        # inside the $(...) the probe is a bare failing command, so without
+        # `trap - ERR` in the substitution bash 3.2 fires the inherited trap
+        # there (#1798). The default kubectl stub exits 1.
+        if not _bash_runs_inherited_err_trap_in_substitution():
+            self.skipTest(_SKIP_UNLESS_TRAP_FIRES)
+        script = (
+            "set -E\n"
+            "trap 'echo \"ERR_TRAP_FIRED\" >&2' ERR\n"
+            'tag="$(running_image_tag kubeagents-system)"\n'
+            'echo "tag=[$tag] done"\n'
+        )
+        proc = self._run(script)
+        self.assertIn("tag=[] done", proc.stdout, proc.stderr)
         self.assertNotIn("ERR_TRAP_FIRED", proc.stderr)
 
     # ── tf_state_manages_resource: whose release is this? ────────────────────
@@ -1666,6 +1711,31 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("Rolling back", proc.stderr)
 
+    def test_missing_release_does_not_fire_err_trap(self):
+        # A first install onto an existing cluster: `helm status` exits 1
+        # because no release exists, helm_release_status answers empty and the
+        # caller carries on. Under the front doors' `set -E` the $(...) around
+        # the probe inherits their ERR trap, and on bash 3.2 (macOS's default)
+        # the trap fires inside the subshell unless `trap - ERR` clears it
+        # there: an abort banner and a FAILED report from a successful run
+        # (#1798).
+        if not _bash_runs_inherited_err_trap_in_substitution():
+            self.skipTest(_SKIP_UNLESS_TRAP_FIRES)
+        helm_script = (
+            '#!/usr/bin/env bash\n'
+            'echo "Error: release: not found" >&2\n'
+            'exit 1\n'
+        )
+        script = (
+            "set -E\n"
+            "trap 'echo \"ERR_TRAP_FIRED\" >&2' ERR\n"
+            'status="$(helm_release_status kube-agents kubeagents-system)"\n'
+            'echo "status=[$status] done"\n'
+        )
+        proc = self._run_helm_test(script, helm_script)
+        self.assertIn("status=[] done", proc.stdout, proc.stderr)
+        self.assertNotIn("ERR_TRAP_FIRED", proc.stderr)
+
     # ── clear_failed_initial_helm_release: the retry after a first apply died ─
 
     # The state coordinates the function reads through tf_state_read; the
@@ -2075,6 +2145,39 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "")
 
 
+class ToleratedProbesClearErrTrapTest(unittest.TestCase):
+    """The library's tolerated probes clear the inherited ERR trap inside their $(...).
+
+    The front doors' own handlers exit a subshell silently, so a probe there
+    needs no guard; this library cannot know its caller's trap, so its probes
+    guard themselves. The behavioural tests above cannot see the guard missing
+    on the bash CI runs, so this pins the shape: each probe whose non-zero exit
+    the caller handles begins its substitution with `trap - ERR;`. Dropping the
+    prefix at any of them brings back the bash 3.2 abort banner and FAILED
+    report under a caller whose trap is not subshell-aware (#1798), and this is
+    the test that goes red for it.
+    """
+
+    # (file, guarded substring, how many times it appears). The unguarded form
+    # is the same text without the prefix, and must not appear at all.
+    GUARDED_PROBES = (
+        (_INSTALLER_COMMON, 'response=$(trap - ERR; curl ', 1),
+        (_INSTALLER_COMMON, 'image="$(trap - ERR; kubectl get deployment ', 1),
+        (_INSTALLER_COMMON, 'status_json="$(trap - ERR; helm status ', 1),
+        (_INSTALLER_COMMON, 'history_json="$(trap - ERR; helm history ', 2),
+        (_INSTALLER_COMMON, 'last_good_rev="$(trap - ERR; printf ', 1),
+        (_GKE_DNS_ENDPOINT, 'described=$(trap - ERR; gcloud container clusters describe ', 1),
+    )
+
+    def test_each_tolerated_probe_clears_the_trap_inside_its_substitution(self):
+        sources = {}
+        for path, guarded, count in self.GUARDED_PROBES:
+            source = sources.setdefault(path, path.read_text())
+            unguarded = guarded.replace("trap - ERR; ", "")
+            with self.subTest(file=path.name, probe=unguarded.strip()):
+                self.assertEqual(source.count(guarded), count, f"{path.name}: {guarded!r}")
+                self.assertNotIn(unguarded, source, f"{path.name}: a probe lost its `trap - ERR`")
+
+
 if __name__ == "__main__":
     unittest.main()
-

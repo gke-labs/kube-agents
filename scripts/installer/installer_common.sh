@@ -670,7 +670,7 @@ github_account_type() {
   # Status is appended on its own line so a transport failure (curl non-zero)
   # stays distinguishable from an HTTP error (curl zero, status in the body).
   local response status body
-  if ! response=$(curl -sS --max-time 10 -H "Accept: application/vnd.github+json" \
+  if ! response=$(trap - ERR; curl -sS --max-time 10 -H "Accept: application/vnd.github+json" \
       -w '\n%{http_code}' "https://api.github.com/users/${name}" 2>/dev/null); then
     echo "unknown"
     return 0
@@ -1073,7 +1073,7 @@ if isinstance(value, str) and value:
 running_image_tag() {
   local namespace="${1:-$DEFAULT_NAMESPACE}" image=""
   command -v kubectl >/dev/null 2>&1 || return 0
-  if ! image="$(kubectl get deployment "${PLATFORM_AGENT_DEPLOYMENT}" -n "${namespace}" \
+  if ! image="$(trap - ERR; kubectl get deployment "${PLATFORM_AGENT_DEPLOYMENT}" -n "${namespace}" \
     -o jsonpath='{.spec.template.spec.containers[?(@.name=="platform-agent")].image}' 2>/dev/null)"; then
     return 0
   fi
@@ -1095,7 +1095,16 @@ helm_release_status() {
   command -v helm >/dev/null 2>&1 || return 0
 
   local status_json
-  if ! status_json="$(helm status "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
+  # `trap - ERR` inside the substitution: the front doors run `set -E`, so
+  # this subshell inherits their ERR trap, and in here `helm status` is a
+  # bare failing command the outer `if !` cannot shield. On bash 3.2 (macOS's
+  # default) the trap fires in the subshell: abort banner, FAILED report,
+  # then the caller carries on. A missing release is the ordinary
+  # first-install answer, not an abort. The front doors' own handlers exit
+  # a subshell silently, so a probe there needs no guard; this library
+  # cannot know its caller's trap, so its tolerated probes guard themselves.
+  # scripts/installer/README.md states the rule.
+  if ! status_json="$(trap - ERR; helm status "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
     return 0
   fi
 
@@ -1279,7 +1288,7 @@ ensure_clean_helm_release() {
       fi
 
       local history_json
-      if ! history_json="$(helm history "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
+      if ! history_json="$(trap - ERR; helm history "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
         if type print_error >/dev/null 2>&1; then
           print_error "Failed to retrieve Helm history for release '${release_name}' in namespace '${namespace}'."
         else
@@ -1290,7 +1299,7 @@ ensure_clean_helm_release() {
 
       local last_good_rev=""
       if command -v jq >/dev/null 2>&1; then
-        last_good_rev="$(printf '%s' "${history_json}" | jq -r '[.[] | select(.status == "deployed" or .status == "superseded") | .revision] | max // empty' 2>/dev/null)" || last_good_rev=""
+        last_good_rev="$(trap - ERR; printf '%s' "${history_json}" | jq -r '[.[] | select(.status == "deployed" or .status == "superseded") | .revision] | max // empty' 2>/dev/null)" || last_good_rev=""
       fi
 
       if [ -n "${last_good_rev}" ]; then
@@ -1399,7 +1408,7 @@ clear_failed_initial_helm_release() {
   fi
 
   local history_json
-  if ! history_json="$(helm history "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
+  if ! history_json="$(trap - ERR; helm history "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
     print_warning "Helm release '${release_name}' in namespace '${namespace}' is '${release_status}' and its history could not be read; leaving it. If the apply stops on 'cannot re-use a name that is still in use', inspect it with: helm history ${release_name} -n ${namespace}"
     return 0
   fi

@@ -128,8 +128,9 @@ verification_spec:
       # The planted defect: payments-api crashloops OOMKilled.
       required_phrases: ["payments-api", "OOMKilled"]
   # Cluster-state safeguard: "the fleet came out the way it went in."
-  # tool_called cannot see worker mutations (the trajectory carries only the
-  # delegating turn's calls), so read-only is asserted against the cluster
+  # tool_called cannot see worker mutations (it counts only the delegating
+  # turn's calls; the workers' entries in the trajectory are tagged and
+  # skipped), so read-only is asserted against the cluster
   # itself: the planted defect object must survive the audit untouched.
   # Addressed by fixture ROLE, so the check reads the cluster that carries the
   # crashloop in whichever eval project this run leased -- see

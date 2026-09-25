@@ -136,6 +136,27 @@ GKE_BASICS_NEW_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
      gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION" --project="$PROJECT" --quiet
      ```"""
 
+# gke-manifest-generation's grounding step upstream prefers Developer Knowledge's `answer_query`,
+# whose default quota is 50 requests per day per project (developers.google.com/knowledge/quota),
+# shared by every agent in an install; once spent, every lookup 429s for the rest of the day.
+# `search_documents` reads the same corpus at 100 requests per minute, so the skill starts there
+# and never calls `answer_query` (#1765). `get_document` is also not the tool's name.
+GKE_MANIFEST_GENERATION_OLD_DEVELOPER_KNOWLEDGE_SNIPPET = """        -   **`answer_query`**: Use this to ask direct questions (e.g., *"How to
+            configure GCS Fuse CSI driver in GKE"*). This is the preferred tool
+            for general queries.
+        -   **`search_documents`**: Use this to search for relevant GKE guides
+            or examples when you don't have a specific question.
+        -   **`get_document`**: Use this to fetch full document contents when
+            you have a specific document ID."""
+
+GKE_MANIFEST_GENERATION_NEW_DEVELOPER_KNOWLEDGE_SNIPPET = """        -   **`search_documents`**: Start every lookup here (e.g., *"configure
+            GCS Fuse CSI driver in GKE"*). It takes only `query`.
+        -   **`get_documents`**: Use this to fetch full document contents when
+            a returned chunk needs its surrounding page.
+        -   Do not call **`answer_query`**: its quota is 50 requests per day per
+            project, shared by every agent in the install, and it reads the
+            same corpus as `search_documents`. Never retry its `429`."""
+
 # In-place content substitutions applied to freshly-synced skills to correct upstream defects
 # where an appended footer is insufficient (e.g. multi-step remediation commands), to route to a
 # skill only this repository has from a passage upstream cannot know about, or to drop a name this
@@ -160,6 +181,10 @@ SKILL_SUBSTITUTIONS = {
         (
             GKE_MANIFEST_GENERATION_OLD_OUTPUT_PATH_SNIPPET,
             GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET,
+        ),
+        (
+            GKE_MANIFEST_GENERATION_OLD_DEVELOPER_KNOWLEDGE_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_DEVELOPER_KNOWLEDGE_SNIPPET,
         ),
     ],
     "gke-basics": [

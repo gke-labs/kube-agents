@@ -52,7 +52,7 @@
 # with exit code 137. Isolation class: read-only. Eligible tier: presubmit.
 #
 # The safeguard is a cluster-state check rather than a tool check for the
-# documented reason: tool_called carries only the delegating turn's calls, so
+# documented reason: tool_called counts only the delegating turn's calls, so
 # a mutation made by a Cluster Agent worker would be invisible to it.
 #
 # Not asserted, deliberately: that no query left the agent's own cluster.

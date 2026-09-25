@@ -47,6 +47,8 @@ from kube_agents_bench.scoring import (
     DEFAULT_JUDGED_MARGIN,
     DELEGATION_CEILING_MARKER,
     INFRA_FAILURE_MARKER,
+    A2A_STATE_WORKING,
+    A2A_STATUS_EVENT,
     MISSING,
     SUITE_OUTCOME_GREEN,
     SUITE_OUTCOME_NOT_EVALUATED,
@@ -417,6 +419,95 @@ def test_rung_3_each_liveness_signal_alone_blocks(noop_spec, make_run, mutation,
     assert verdict.rung is Rung.NOT_A_REAL_RUN
     assert verdict.blocking is True
     assert needle in verdict.reason
+
+
+def status_event(state, final):
+    """One lifecycle entry as the inject transport writes it."""
+    return {
+        "name": A2A_STATUS_EVENT,
+        "args": {"state": state, "final": final},
+        "result": None,
+        "status": "completed",
+    }
+
+
+def give_it_an_a2a_terminal(rec):
+    """Null token buckets plus an executor's lifecycle ending in a final event.
+
+    What an inject-transport run legitimately looks like: the gateway reports
+    no usage, so every bucket is None, and the evidence that a run happened is
+    the executor's final status event in the trajectory.
+    """
+    rec["tokens"] = {k: None for k in rec["tokens"]}
+    rec["trajectory"] = [
+        status_event("submitted", False),
+        status_event("working", False),
+        status_event("completed", True),
+    ]
+
+
+def test_rung_3_accepts_null_tokens_when_a_task_terminated(noop_spec, make_run):
+    """The one record that legitimately has no token accounting.
+
+    The A2A gateway reports no usage, so an inject-transport run's buckets are
+    all null -- which rung 3 reads as "no agent ran" everywhere else, and
+    would red every case run through the customer's front door.
+    """
+    verdict = grade_case(noop_spec, [make_run(mutate=give_it_an_a2a_terminal)], admitted=False)
+    assert verdict.rung is not Rung.NOT_A_REAL_RUN, verdict.reason
+
+
+def test_rung_3_still_blocks_null_tokens_with_no_terminal(noop_spec, make_run):
+    """The exemption is narrow on purpose.
+
+    A skeleton record has null buckets too. What distinguishes the inject run
+    is the final event, and a trajectory without one has to keep failing -- or
+    the exemption becomes a way for any empty record to pass.
+    """
+
+    def null_tokens_only(rec):
+        rec["tokens"] = {k: None for k in rec["tokens"]}
+
+    verdict = grade_case(noop_spec, [make_run(mutate=null_tokens_only)], admitted=False)
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert "tokens.total is null" in verdict.reason
+
+
+def test_rung_3_still_blocks_null_tokens_with_only_a_submitted_event(noop_spec, make_run):
+    """A task can be queued (submitted) and never run. That entry alone is
+    not run evidence."""
+
+    def queued_only(rec):
+        rec["tokens"] = {k: None for k in rec["tokens"]}
+        rec["trajectory"] = [status_event("submitted", False)]
+
+    verdict = grade_case(noop_spec, [make_run(mutate=queued_only)], admitted=False)
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert "tokens.total is null" in verdict.reason
+
+
+def test_rung_3_accepts_a_working_event_without_a_terminal(noop_spec, make_run):
+    """A graded timeout: the executor spawned the persona (working), the
+    harness cancelled the task at its budget, and no final event was
+    confirmed. That is a run, and it has to reach the judge rather than be
+    classified as one that never happened."""
+
+    def cancelled_at_the_budget(rec):
+        rec["tokens"] = {k: None for k in rec["tokens"]}
+        rec["trajectory"] = [status_event("submitted", False), status_event("working", False)]
+
+    verdict = grade_case(noop_spec, [make_run(mutate=cancelled_at_the_budget)], admitted=False)
+    assert verdict.rung is not Rung.NOT_A_REAL_RUN, verdict.reason
+
+
+def test_the_scorer_and_the_inject_transport_agree_on_the_status_entry():
+    """The scorer duplicates the transport's literal rather than importing it,
+    for the reason the marker above is duplicated. Duplicated literals drift;
+    this is what stops it silently."""
+    from kube_agents_bench import inject_transport
+
+    assert A2A_STATUS_EVENT == inject_transport.EVENT_ENTRY_STATUS
+    assert A2A_STATE_WORKING == inject_transport.STATE_WORKING
 
 
 def test_rung_3_ignores_an_empty_output(noop_spec, make_run):

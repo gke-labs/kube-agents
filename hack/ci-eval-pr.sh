@@ -1172,10 +1172,10 @@ ledger_reset_token() { # <owner/repo>
 }
 
 # The audit id a case grades its ledger under: the `audit:` key of its
-# ledger_issue_contains checks in task.yaml (each of the eight audit cases
-# carries one; two consistency cases share fleet-consistency-drift, and the
-# reset is per stream, so both retire that one ledger). Empty for a case that
-# writes no ledger.
+# ledger_issue_contains checks in task.yaml (each of the nine audit cases
+# carries one; two consistency cases share fleet-consistency-drift and two
+# patch cases share security-patch-orchestrator, and the reset is per stream,
+# so each pair retires one ledger). Empty for a case that writes no ledger.
 ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
   local file="$1"
   case "${file}" in /*) ;; *) file="${BENCH_DIR}/${file}" ;; esac
@@ -1928,6 +1928,7 @@ unit_cost_hint() {
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     consistency-no-environment-label) echo 900 ;;
+    upgrades-master-behind-offered-elsewhere) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # Nightly-only since 2026-09-22 (#1023; held out on #1171 and #1189),
     # presubmit before that. The canary measured 1002s median, 2074s p90,
@@ -1969,7 +1970,7 @@ unit_cost_hint() {
 # The harness's delegation ceiling for one unit, in seconds: how long
 # devops-bench keeps polling the Platform Agent for a delegated worker before
 # it grades whatever the parent has said so far. Every unit inherits the
-# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the seven
+# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the eight
 # full-audit units -- SOP dispatch, a delegated worker sweeping the fleet,
 # a ledger write, one closing line -- get 3000s.
 #
@@ -2004,6 +2005,7 @@ unit_delegation_timeout() {
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label) echo 3000 ;;
+    upgrades-master-behind-offered-elsewhere) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
 }
@@ -2099,7 +2101,7 @@ lock_acquire() { # <dir> [deadline-seconds]
 lock_release() { rmdir "$1" 2>/dev/null || true; }
 
 # How many cases in this run write the given stream's ledger: 1 for an
-# empty id or a case alone on its stream, 2 for the two consistency cases.
+# empty id or a case alone on its stream, 2 for a stream two cases share.
 # A loop over TASKS rather than a map, since bash 3.2 (what `bash -n` runs
 # under on a contributor's Mac) has no associative arrays and TASKS is short.
 stream_case_count() { # <audit-id>
@@ -2222,6 +2224,12 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # listener under every sibling mid-conversation. On its own port, each
   # unit owns its own tunnel and keeps the harness's stale-tunnel recycling.
   export AGENT_LOCAL_PORT=$((28642 + seq))
+  # Which case and which repetition this unit is, for any transport that can
+  # carry an id into the agent's own records. The inject transport sends the
+  # pair as the backend message id, which the gateway's ingress log joins to
+  # the correlationId -- so the audit chain runs from this run directory to
+  # every hop the task took, with nothing else added.
+  export EVAL_CASE_ID="${name}" EVAL_REPETITION="${rep}"
   # The stream this case writes its ledger under, empty for a case that
   # writes none, and the deadline for the locks below. The task lock is held
   # for the holder's whole unit, so the wait must outlast one: the unit's
@@ -2248,8 +2256,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   fi
   # A ledger-writing unit also holds the stream lock from here until its
   # state files are written, released with the task lock below: two cases on
-  # one stream (the two consistency cases) must not reset and rewrite each
-  # other's ledger mid-run. The same scaled
+  # one stream (the consistency pair, the patch pair) must not reset and
+  # rewrite each other's ledger mid-run. The same scaled
   # deadline: a waiter here outlasts the other cases' units on the stream.
   if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}" "${lock_deadline}"; then
     [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"

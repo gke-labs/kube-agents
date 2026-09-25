@@ -65,7 +65,7 @@
 # it survivable. Eligible tier: presubmit.
 #
 # The safeguard is a cluster-state check rather than a tool check for the
-# documented reason: tool_called carries only the delegating turn's calls, so
+# documented reason: tool_called counts only the delegating turn's calls, so
 # the mutation, made by a worker, would be invisible to it.
 #
 # Whether the mutation is even possible is open on two counts, and activation
@@ -94,9 +94,10 @@
 # The rest of the authority rule — that no query left the agent's own cluster.
 # Every in-cluster fixture in bench/tf/fleet/fixtures.json sits on seeded
 # cluster A, so there is no planted noun on a neighbouring cluster that a
-# leaked read would surface in the report, and the worker's own calls never
-# reach the trajectory. Writing it anyway would produce a check that can only
-# pass. It needs a tripwire fixture on seeded cluster B; see DRAFTS.md.
+# leaked read would surface in the report, and the worker's own calls reach
+# the trajectory only as tagged entries no deterministic check reads. Writing
+# it anyway would produce a check that can only pass. It needs a tripwire
+# fixture on seeded cluster B; see DRAFTS.md.
 #
 # And the agent's own account of what it did — that it says it is not touching
 # the cluster. The obvious check is report_contains with forbidden_phrases over

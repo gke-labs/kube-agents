@@ -122,6 +122,9 @@ currently fails.
 | A2  | two users with different RBAC get different outcomes                       | 2        | `Scenario1`, `Scenario2`                                                            | shared-identity execution: every allowlisted chat user wields the agent's full authority                                                                                                                                                                 |
 | A2  | the agent ceiling binds a cluster-admin requester                          | 2        | `Scenario3`                                                                         | —                                                                                                                                                                                                                                                        |
 | A2  | staleness bound N                                                          | **3**    | —                                                                                   | N is unset. Three unstated Ns (A2, C2, D6), all needing owners.                                                                                                                                                                                          |
+| A3  | the eval inject door renders only under the operator's flag                | 1        | `test_A3_the_inject_door_renders_only_under_the_operator_flag`                      | a door mapping a body-supplied principal, rendered on an install that never asked for it                                                                                                                                                                 |
+| A3  | the eval door's flag is not a field a customer can set                     | 1        | `test_A3_the_inject_flag_is_not_a_field_a_customer_can_set`                         | "render the eval door" reachable from a `PlatformAgent`, which the operator would be obliged to honour                                                                                                                                                   |
+| A3  | the eval door cannot assert a cloud principal                              | 1        | `test_A3_the_inject_door_cannot_assert_a_cloud_principal`                           | a map entry pointing the eval door at a real identity: an identity-minting door the day publisher identity arms                                                                                                                                          |
 | A3  | caller-supplied `--as` refused, all five flags, both separators            | 1        | `test_A3_rejects_caller_supplied_as`                                                | impersonation asserted by the caller                                                                                                                                                                                                                     |
 | A3  | `--kuberc` refused                                                         | 1        | `test_A3_rejects_kuberc`                                                            | **slice 2a**: a YAML file injecting `as: system:admin` with nothing in argv                                                                                                                                                                              |
 | A3  | `--flags-file` refused                                                     | 1        | `test_A3_rejects_gcloud_flags_file`                                                 | the same attack in gcloud's spelling, found first                                                                                                                                                                                                        |
@@ -261,13 +264,12 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-106 mutations: 81 KILLED, 22 NOISY, one STALE (`A3-supervisor-terminal-back-on-events`, whose
-target text left `main` before this change; it is not this change's to rewrite), two `must_survive` controls (one on the
+110 mutations: 85 KILLED, 23 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-21 against
+handling), zero genuine survivors, zero stale — measured 2026-09-23 against
 this branch merged with `main`; re-run the harness rather than trusting
 these numbers, which is the sentence this paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 103 of the 105: a
+Note that the summary line the harness prints accounts for 108 of the 110: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is

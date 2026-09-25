@@ -1,9 +1,10 @@
 # Fleet Audit — The Collector Manifest
 
-> **STATUS — design of record; the `finish` side is implemented, one collector ships.**
+> **STATUS — design of record; the `finish` side is implemented, two collectors ship.**
 > `audit_report.py finish` accepts a manifest through `--manifest-file` and applies every rule in
 > §3. `agents/platform/skills/fleet-audit/scripts/fleet_drift.py` emits one for the
-> `fleet-consistency-drift` stream, whose SOP runs it and passes the flag; every other stream
+> `fleet-consistency-drift` stream and `patch_readiness.py` one for `security-patch-orchestrator`;
+> each stream's SOP runs its collector and passes the flag, and every other stream
 > publishes on the document's own attestation, exactly as it did before the flag existed.
 
 **Scope:** the machine boundary between a per-stream collector script and the fleet-audit harness.
@@ -43,19 +44,22 @@ status surface and the collectors' own bookkeeping, and `finish` ignores them to
       "name": "prod-usc1",
       "project": "acme-prod",
       "location": "us-central1",
-      "autopilot": false,
+      "autopilot": true,
       "outcome": "collected",
       "commands": [
         {
-          "check": "privileged-container",
-          "command": "KUBECONFIG=… kubectl get deploy,sts,ds,cronjob,pod -A -o json",
+          "check": "cluster-admin-binding",
+          "command": "KUBECONFIG=… kubectl get clusterrolebindings -o json",
           "rc": 0,
           "duration_s": 8.2,
           "output_sha256": "…"
         }
       ],
       "checks_not_applicable": [
-        { "check": "no-autorepair", "reason": "Autopilot manages node pools" }
+        {
+          "check": "hostpath-mount",
+          "reason": "Autopilot rejects hostPath volumes at admission"
+        }
       ],
       "candidates": [
         {
@@ -82,18 +86,18 @@ status surface and the collectors' own bookkeeping, and `finish` ignores them to
 }
 ```
 
-| Key                                        | Read by `finish` | Meaning                                                                                                                                                                                                                                                                                                                                                                        |
-| ------------------------------------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `clusters[]`                               | **read**         | One entry per target the collector enumerated. The `name` is what `scope.clusters[].name` will say — a cluster name, `project/<id>`, or `<project>/<region>/<subnet>`.                                                                                                                                                                                                         |
-| `clusters[].outcome`                       | **read**         | `collected` means the collector read the target and vouches for `commands`. `unreachable` and `gate-failed` mean it did not, and `error` says why; the document accounts for such a target or is refused. `out-of-scope` means the target is not this audit's: it is not cross-checked, the document need not list it, and it contributes no gap (logged once at INFO).        |
-| `clusters[].commands[]`                    | **read**         | One record per check per target: the check slug, the literal command, its exit code. `rc == 0` is what makes a check "run" for the rules below. `duration_s` and `output_sha256` are carried, not read.                                                                                                                                                                        |
-| `clusters[].checks_not_applicable[]`       | **read**         | Checks the collector itself dispositioned as having nothing to run against on this target. The collector is the authority on applicability; §3.1 holds the document to it in both directions.                                                                                                                                                                                  |
-| `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is carried, not read: the model re-judges it against fleet context.                                                  |
-| `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                               |
-| `finished_at`                              | **read**         | When the collector stopped. Compared against the `started_at` the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted. |
-| `version`, `checks_revision`, `started_at` | carried          | Shape version, digest of the check logic, and the collector's own start. Reserved for a run-over-run comparison and the timing view that a later change adds; `finish` does not read them today.                                                                                                                                                                               |
-| `clusters[].autopilot`, `.project`, …      | carried          | Fleet facts the collector resolved during enumeration, for the SOP to copy rather than re-derive. `clusters[].limitations` is here too: the collector's own sentence saying what it read but did not compare on that target, which the SOP copies into the document where it becomes a coverage gap.                                                                           |
-| `error` (top level)                        | carried          | Set only on a run that produced no cluster entry at all — enumeration itself failed, or every target in scope failed its read. The collector exits non-zero with it, and the SOPs answer it by not calling `finish`, so in practice `finish` never sees a manifest carrying it.                                                                                                |
+| Key                                        | Read by `finish` | Meaning                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------------------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `clusters[]`                               | **read**         | One entry per target the collector enumerated. The `name` is what `scope.clusters[].name` will say — a cluster name, `project/<id>`, or `<project>/<region>/<subnet>`.                                                                                                                                                                                                               |
+| `clusters[].outcome`                       | **read**         | `collected` means the collector read the target and vouches for `commands`. `unreachable` and `gate-failed` mean it did not, and `error` says why; the document accounts for such a target or is refused. `out-of-scope` means the target is not this audit's: it is not cross-checked, the document need not list it, and it contributes no gap (logged once at INFO).              |
+| `clusters[].commands[]`                    | **read**         | One record per check per target: the check slug, the literal command, its exit code. `rc == 0` is what makes a check "run" for the rules below. `duration_s` and `output_sha256` are carried, not read.                                                                                                                                                                              |
+| `clusters[].checks_not_applicable[]`       | **read**         | Checks the collector itself dispositioned as having nothing to run against on this target. The collector is the authority on applicability; §3.1 holds the document to it in both directions.                                                                                                                                                                                        |
+| `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is carried, not read by `finish`: the stream's SOP says whether the model copies it or re-judges it against fleet context. |
+| `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                                     |
+| `finished_at`                              | **read**         | When the collector stopped. Compared against the `started_at` the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted.       |
+| `version`, `checks_revision`, `started_at` | carried          | Shape version, digest of the check logic, and the collector's own start. Reserved for a run-over-run comparison and the timing view that a later change adds; `finish` does not read them today.                                                                                                                                                                                     |
+| `clusters[].autopilot`, `.project`, …      | carried          | Fleet facts the collector resolved during enumeration, for the SOP to copy rather than re-derive. `clusters[].limitations` is here too: the collector's own sentence saying what it read but did not compare on that target, which the SOP copies into the document where it becomes a coverage gap.                                                                                 |
+| `error` (top level)                        | carried          | Set only on a run that produced no cluster entry at all — enumeration itself failed, or every target in scope failed its read. The collector exits non-zero with it, and the SOPs answer it by not calling `finish`, so in practice `finish` never sees a manifest carrying it.                                                                                                      |
 
 Rules for a collector: every enumerated target appears with an `outcome`; a gate failure (zero-byte
 or truncated read) is `outcome: "gate-failed"`, never a shorter candidate list; a candidate is
@@ -109,7 +113,7 @@ narrowed reads as a complete one and lets `finish` resolve every finding outside
 within the manifest and stable between runs, so a collector sweeping clusters names each one
 `<project>/<location>/<name>` — a GKE name is unique only inside one project and location, and a
 name qualified only where it collides today moves when the rest of the fleet changes, which is a
-finding announced resolved and refiled as new. The drift collector does this, and the SOP carries
+finding announced resolved and refiled as new. The drift and patch collectors do this, and their SOPs carry
 the qualified form into `scope.clusters[].name`, which is the key §3.1 matches on. The qualification stops at the
 target name: a candidate's `object` names the bare resource, because the identity tuple
 already carries the qualified cluster and `_shorten_id` spends a duplicate on the segment it
@@ -319,7 +323,12 @@ An identity-scheme bump re-spells every id, so the previous marker's ids would m
 previous body stamped with another scheme, every id the marker names that has a rendered row —
 a finding's or a held row's — is re-derived from that row's `Where:` line and the check in its id,
 and that re-derived set stands in for the raw marker on the manifest path and for the held list
-on the manifest-less one. Only held ids with no row — the note and fourth tiers write none — are
+on the manifest-less one. A bump that qualified a stream's cluster names leaves `Where:` lines
+naming the bare cluster, so on the manifest path a row is also spelled with each name that could
+qualify it — from the previous body's Scope table, or, for a cluster past its `MAX_SCOPE_ROWS`
+rows, from this run's manifest clusters — and the spelling the collector flags is used when it does
+not flag the bare one. A name two clusters share takes the one the collector flags, and the first by
+id when it flags both: either keeps the ledger open over a finding the collector reports. Only held ids with no row — the note and fourth tiers write none — are
 the residual: they leave the ledger unheld with the bump run's rewrite, and the run logs a warning
 naming their count. That residual is the cost of a
 bump, which is rare and operator-initiated.
