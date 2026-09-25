@@ -552,9 +552,18 @@ class ResolveProfilesBaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="test-prof-") as tmpdir:
             profile_home = Path(tmpdir) / "profiles" / "platform"
             (profile_home / "profiles").mkdir(parents=True)
+            (profile_home / "profile.yaml").touch()
             with mock.patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}, clear=True):
                 self.assertEqual(cap._resolve_data_root(), Path(tmpdir))
                 self.assertEqual(cap._resolve_profiles_base(), Path(tmpdir) / "profiles")
+
+    def test_resolves_when_data_root_ends_with_reserved_or_cluster_name_and_has_profiles_dir(self):
+        with tempfile.TemporaryDirectory(prefix="test-data-root-") as tmpdir:
+            data_root = Path(tmpdir) / "profiles" / "default"
+            (data_root / "profiles").mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"HERMES_HOME": str(data_root)}, clear=True):
+                self.assertEqual(cap._resolve_data_root(), data_root)
+                self.assertEqual(cap._resolve_profiles_base(), data_root / "profiles")
 
 
 class ListProfilesTest(unittest.TestCase):
