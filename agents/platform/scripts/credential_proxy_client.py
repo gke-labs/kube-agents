@@ -9,7 +9,9 @@ import http.client
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,6 +48,56 @@ MAX_KUBECONFIG_BYTES = 1 << 20
 # module both import; `credential_proxy` re-exports it. `ApiSession` below is
 # the client; `api_policy.API_READ_ROUTES` on the broker is what it may reach.
 API_RELAY_PREFIX = "/v1/gcp/"
+
+# Where a `get-credentials` that named no destination leaves its file:
+# `$HERMES_HOME/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
+# the convention agents/platform/AGENTS.md ("Cluster Credentials") teaches and
+# `platform_mcp_server._thread_kubeconfig_path` owns. The default home is the
+# one that convention spells as `${HERMES_HOME:-/opt/data}`.
+DEFAULT_HERMES_HOME = "/opt/data"
+KUBECONFIG_DIR_NAME = ".kubeconfigs"
+PER_TARGET_KUBECONFIG_NAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
+
+# A shell's context pin: which cluster the last context-less `get-credentials`
+# in this command line fetched, so a context-less `kubectl` later in the same
+# line reaches it -- `get-credentials seeded-a && kubectl get ...`, the shape
+# #1968's workers ran. Kept under the kubeconfig directory because
+# sandbox_mirror already excludes that from the profile mirror, and holding a
+# context name and nothing else.
+#
+# Keyed on the nearest shell above the `get-credentials` -- stepping over a
+# `timeout`, `xargs` or helper -- by its pid and its
+# start time from /proc, so a recycled pid is a different key. Hermes runs
+# every terminal command in a fresh `bash -c`, so the pin lasts exactly one
+# command line: the next command, a resumed card and another worker all have a
+# different shell and see none of it. A backgrounded `( ... ) &` subshell of
+# two or more commands is a shell of its own and pins alone; bash execs a
+# one-command `( get-credentials x ) &`, so that fetch pins the line's shell,
+# the same as without the parentheses.
+SHELL_CONTEXT_DIR_NAME = "shells"
+SHELL_CONTEXT_SUFFIX = ".context"
+# A GKE context name is under 200 characters; anything longer is not one.
+MAX_SHELL_CONTEXT_BYTES = 512
+PROC_ROOT = Path("/proc")
+# /proc/<pid>/stat fields, counted from the one after the `)` that closes the
+# command name (which may itself hold spaces and parentheses): the parent pid
+# is field 4 and the start time field 22, so 1 and 19 here.
+_STAT_PPID_INDEX = 1
+_STAT_STARTTIME_INDEX = 19
+# How far up a kubectl looks for a pin. `$(kubectl ...)`, a pipeline, a loop
+# or `timeout`/`xargs` puts one or two processes between the shell and
+# kubectl; this is a bound on a walk, not a depth anything reaches.
+MAX_SHELL_ANCESTORS = 16
+# The process names a pin may be keyed on: the shells a command line runs in.
+# Only these are keys: the walk steps over any other process without keying it.
+SHELL_COMMAND_NAMES = frozenset({"bash", "sh", "dash", "zsh", "ksh", "mksh", "ash"})
+_SHELL_CONTEXT_FILE = re.compile(r"^([0-9]+)-([0-9]+)\.context\Z")
+
+# kubectl stops reading its own flags here; what follows belongs to the
+# command `kubectl exec` or `kubectl debug` runs.
+END_OF_FLAGS = "--"
+CONTEXT_FLAG = "--context"
+KUBECONFIG_FLAG = "--kubeconfig"
 
 
 class BrokerConnection(http.client.HTTPConnection):
@@ -302,15 +354,319 @@ def resolve_kubeconfig_flags(argv: list[str]) -> list[str]:
     in kubectl's own precedence, so it has to be translated here for the same
     reason the environment is: the path names a file only this pod has. The
     broker resolves whichever it receives through the same regeneration.
+    Stops at `--`, as `kubectl_context_flag` does: a `--kubeconfig` after it
+    belongs to the command `kubectl exec` runs, names no file of this pod's,
+    and is passed through untouched.
     """
     rewritten = list(argv)
     for index, argument in enumerate(rewritten):
-        if argument == "--kubeconfig" and index + 1 < len(rewritten):
+        if argument == END_OF_FLAGS:
+            break
+        if argument == KUBECONFIG_FLAG and index + 1 < len(rewritten):
             rewritten[index + 1] = kubeconfig_context(rewritten[index + 1])
-        elif argument.startswith("--kubeconfig="):
+        elif argument.startswith(f"{KUBECONFIG_FLAG}="):
             _, _, value = argument.partition("=")
-            rewritten[index] = f"--kubeconfig={kubeconfig_context(value)}"
+            rewritten[index] = f"{KUBECONFIG_FLAG}={kubeconfig_context(value)}"
     return rewritten
+
+
+def names_kubeconfig_flag(argv: list[str]) -> bool:
+    """Whether argv carries a `--kubeconfig` of its own, in either spelling."""
+    for argument in argv:
+        if argument == END_OF_FLAGS:
+            return False
+        if argument == KUBECONFIG_FLAG or argument.startswith(f"{KUBECONFIG_FLAG}="):
+            return True
+    return False
+
+
+def kubectl_context_flag(argv: list[str]) -> str | None:
+    """The `--context` a kubectl argv names, the last one winning as in kubectl.
+
+    Stops at `--`: after it the words are the remote command's, and a
+    `kubectl exec pod -- tool --context x` names no context of kubectl's.
+    """
+    context: str | None = None
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == END_OF_FLAGS:
+            break
+        if argument == CONTEXT_FLAG and index + 1 < len(argv):
+            context = argv[index + 1]
+            index += 2
+            continue
+        if argument.startswith(f"{CONTEXT_FLAG}="):
+            context = argument.partition("=")[2]
+        index += 1
+    return context
+
+
+def kubeconfig_dir() -> Path:
+    """`$HERMES_HOME/.kubeconfigs`, read at call time so the session decides."""
+    home = os.environ.get("HERMES_HOME", "").strip() or DEFAULT_HERMES_HOME
+    return Path(home) / KUBECONFIG_DIR_NAME
+
+
+def per_target_kubeconfig_path(target: ClusterTarget) -> Path:
+    """The per-target file AGENTS.md tells the agent to export.
+
+    Built from a `ClusterTarget`, so every component has already passed
+    `parse_gke_context` and none can steer the path.
+    """
+    return kubeconfig_dir() / PER_TARGET_KUBECONFIG_NAME.format(
+        project=target.project, cluster=target.cluster, location=target.location
+    )
+
+
+def _process_stat(pid: int) -> tuple[int, str, str] | None:
+    """`(parent pid, start time, command name)` for `pid`, or None once it has exited."""
+    try:
+        raw = (PROC_ROOT / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    close = raw.rfind(")")
+    comm = raw[raw.find("(") + 1 : close]
+    fields = raw[close + 1 :].split()
+    try:
+        return int(fields[_STAT_PPID_INDEX]), fields[_STAT_STARTTIME_INDEX], comm
+    except (IndexError, ValueError):
+        return None
+
+
+def _shell_keys() -> list[str]:
+    """`<pid>-<start time>` for the shells this process runs under, nearest first.
+
+    The walk starts at the parent and steps over anything that is not a shell
+    -- `timeout`, `xargs`, a helper script -- without keying it, so recording
+    and reading agree: a `timeout 60 gcloud ... get-credentials` records under
+    the line's shell, replacing whatever an earlier fetch in the line recorded,
+    and a `timeout 30 kubectl` under that shell reads it.
+
+    Only shells are keys. sshd, which outlives every command line on a Hermes
+    ControlMaster connection, is never one, so a pin file named for it is never
+    read, and a default cannot outlast the line the way #1799's did. The cost:
+    a helper that bash exec'd as the last command of a bare `bash -c` keeps the
+    shell's pid but not its name, so a kubectl it starts reads the host. The
+    Hermes command wrapper runs the command inside an `eval` that is not its
+    last line, so bash does not exec it there.
+    """
+    keys: list[str] = []
+    pid = os.getppid()
+    for _ in range(MAX_SHELL_ANCESTORS):
+        if pid <= 1:
+            break
+        stat = _process_stat(pid)
+        if stat is None:
+            break
+        if stat[2] in SHELL_COMMAND_NAMES:
+            keys.append(f"{pid}-{stat[1]}")
+        pid = stat[0]
+    return keys
+
+
+def _own_key() -> str | None:
+    """This process's own key, which is its shell's when the shell exec'd it.
+
+    bash replaces itself with the last command of a `-c` string, an `eval` or a
+    subshell instead of forking it, so in `get-credentials x ; kubectl ...` the
+    kubectl *is* the shell that ran the get-credentials: same pid, same start
+    time, and a parent above the command line.
+    """
+    pid = os.getpid()
+    stat = _process_stat(pid)
+    return f"{pid}-{stat[1]}" if stat is not None else None
+
+
+def _shell_context_dir() -> Path:
+    return kubeconfig_dir() / SHELL_CONTEXT_DIR_NAME
+
+
+def _prune_shell_contexts(directory: Path, keep: str) -> None:
+    """Remove the pins of shells that have exited, except `keep`. Best-effort.
+
+    A pin is only ever read by its own shell's descendants, so once that shell
+    is gone the file is dead weight; clearing it here, on the next write, keeps
+    the directory to roughly the shells alive at once without a sweep.
+    """
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        match = _SHELL_CONTEXT_FILE.fullmatch(entry.name)
+        if match is None or entry.name == keep:
+            continue
+        stat = _process_stat(int(match.group(1)))
+        if stat is not None and stat[1] == match.group(2):
+            continue
+        try:
+            entry.unlink()
+        except OSError:
+            pass
+
+
+def _replace_file(path: Path, text: str) -> None:
+    """Write `text` to `path` so a concurrent reader sees the old file or the new.
+
+    A plain truncate-and-write leaves a window where the file is empty: a
+    kubectl reading the shell's pin in it falls back to the host with exit 0, and
+    one exporting the per-target kubeconfig, or a Cluster Agent's pinned
+    `--kubeconfig`/`KUBECONFIG` destination, fails as unreadable. Both are the
+    failures this module exists to prevent, so the file is staged beside its
+    destination and renamed over it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, staged = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.replace(staged, path)
+    except BaseException:
+        Path(staged).unlink(missing_ok=True)
+        raise
+
+
+def record_shell_context(context: str) -> bool:
+    """Make `context` this command line's default for a kubectl naming no cluster.
+
+    What gcloud does on a workstation -- the cluster you just fetched is
+    current -- for the rest of the shell that fetched it and nothing else, so
+    it never becomes the pod's default: the drift #1799 reported, which #1852
+    closed by pinning the broker to the host cluster. The next command line, a
+    resumed card or a multi-command parallel subshell has another shell, and a
+    context-less kubectl there reads the host cluster exactly as #1852 left it.
+
+    Returns whether the pin was recorded. Failing to record it costs the
+    convenience, not the command, so it is reported and not raised.
+    """
+    keys = _shell_keys()
+    if not keys:
+        return False
+    directory = _shell_context_dir()
+    path = directory / f"{keys[0]}{SHELL_CONTEXT_SUFFIX}"
+    try:
+        _replace_file(path, context)
+    except OSError as exc:
+        print(f"credential proxy: could not record the shell's context in {path}: {exc}", file=sys.stderr)
+        # An earlier fetch's pin in this shell would otherwise stay in force
+        # while the caller says the line reads the host.
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    _prune_shell_contexts(directory, keep=path.name)
+    return True
+
+
+def shell_context() -> str | None:
+    """The context the nearest enclosing shell's context-less get-credentials fetched.
+
+    The file is the agent's to write, so what it holds is caller input like any
+    other: it crosses only as a name, and only a name `parse_gke_context`
+    accepts. Naming a cluster is what `KUBECONFIG` already lets a caller do.
+
+    Only a pin this uid wrote counts. The hermes principal runs with
+    HERMES_HOME=/opt/data, a directory the sandboxed agent owns; a pin the
+    agent planted there under a hermes shell's key would otherwise steer a
+    trusted kubectl. The open refuses a symlink and the file must be a regular
+    file with one link, owned by this uid, which a file the agent made is not.
+    """
+    directory = _shell_context_dir()
+    own = _own_key()
+    uid = os.geteuid()
+    for key in ([own] if own else []) + _shell_keys():
+        try:
+            # O_NONBLOCK: a FIFO planted under the name would otherwise hold
+            # open() until a writer appears, before fstat can refuse it.
+            fd = os.open(
+                directory / f"{key}{SHELL_CONTEXT_SUFFIX}",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            )
+        except OSError:
+            continue
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1:
+                return None
+            raw = stream.read(MAX_SHELL_CONTEXT_BYTES + 1)
+        if len(raw) > MAX_SHELL_CONTEXT_BYTES:
+            return None
+        context = raw.decode("utf-8", errors="replace").strip()
+        return context if parse_gke_context(context) is not None else None
+    return None
+
+
+def implicit_kubectl_context(argv: list[str]) -> str:
+    """The cluster a kubectl that names no kubeconfig should reach, or "".
+
+    Only reached when neither `--kubeconfig` nor `KUBECONFIG` is set: those
+    pin a cluster already and keep precedence, so a Cluster Agent's pinned
+    file is never overridden from here.
+
+    `--context` first. The broker runs a context-less request against the host
+    cluster's file, which holds the host context alone, so a `--context` naming
+    any other cluster used to end in "context was not found". Sending the name
+    instead has the broker generate that cluster's file, whose one context is
+    the one the flag names. A `--context` that is not a GKE name is left to
+    kubectl, as before.
+
+    Then the shell's pin, when there is no `--context` at all. Empty otherwise,
+    which is the broker's host default.
+    """
+    flag = kubectl_context_flag(argv)
+    if flag is not None:
+        return flag if parse_gke_context(flag) is not None else ""
+    return shell_context() or ""
+
+
+def land_implicit_kubeconfig(generated: str) -> None:
+    """File a context-less get-credentials' kubeconfig, and say how to use it.
+
+    gcloud on a workstation would have written the default kubeconfig and made
+    the fetched cluster current. Here that default is the broker's, pinned to
+    the host cluster (#1852), so without this the file vanished into the
+    broker's pod and the agent's next bare `kubectl` read the host -- exit 0,
+    an empty answer, and a fixture reported absent that was there.
+
+    The context comes from what the broker returned, not from argv: gcloud
+    resolves an omitted `--project` or a `--zone`/`--region` spelling itself,
+    and the file is the only place the answer is written down.
+
+    Never changes the exit code. gcloud succeeded, and `--context` reaches the
+    cluster whether or not the file could be written here.
+    """
+    context = read_current_context(generated)
+    target = parse_gke_context(context) if context else None
+    if target is None:
+        return
+    path = per_target_kubeconfig_path(target)
+    written = True
+    try:
+        _replace_file(path, generated)
+    except OSError as exc:
+        written = False
+        print(f"credential proxy: could not write {path}: {exc}", file=sys.stderr)
+    pinned = record_shell_context(target.context_name)
+    lines = ["credential proxy: no --kubeconfig or KUBECONFIG was given."]
+    if written:
+        lines.append(f"  Credentials for {target.context_name} are in {path}.")
+    if pinned:
+        lines.append(
+            "  For the rest of this command line, a kubectl that names no cluster"
+            f" reads {target.context_name}. Later commands read the host cluster;"
+            f" to reach {target.context_name} from them:"
+        )
+    else:
+        lines.append(
+            "  A kubectl that names no cluster still reads the host cluster."
+            f" To reach {target.context_name}:"
+        )
+    if written:
+        lines.append(f"    export KUBECONFIG={path}")
+    lines.append(f"    kubectl --context={target.context_name} ...")
+    print("\n".join(lines), file=sys.stderr)
 
 
 def is_get_credentials(argv: list[str]) -> bool:
@@ -377,16 +733,26 @@ def execute(
     # resolved to a context name here rather than forwarded as a path.
     # Whitespace is stripped because profile .env files routinely carry a
     # trailing newline.
+    #
+    # With neither set, a get-credentials still asks for its file back and a
+    # kubectl may still name a cluster: see `land_implicit_kubeconfig` and
+    # `implicit_kubectl_context` for why, and for what keeps #1852's host
+    # default for everything that names nothing.
     destination: Path | None = None
+    implicit_destination = False
     try:
         context = ""
         if is_get_credentials(argv):
             argv, destination = get_credentials_destination(argv)
+            implicit_destination = destination is None
         elif argv and argv[0] in KUBECONFIG_AWARE:
+            flag_pinned = names_kubeconfig_flag(argv)
             argv = resolve_kubeconfig_flags(argv)
             kubeconfig = os.environ.get("KUBECONFIG", "").strip()
             if kubeconfig:
                 context = kubeconfig_context(kubeconfig)
+            elif argv[0] == "kubectl" and not flag_pinned:
+                context = implicit_kubectl_context(argv)
     except KubeconfigUnreadable as exc:
         print(f"credential proxy: {exc}", file=sys.stderr)
         return 1
@@ -397,7 +763,7 @@ def execute(
     }
     if context:
         request_payload["kubeconfigContext"] = context
-    if destination is not None:
+    if destination is not None or implicit_destination:
         request_payload["wantsKubeconfig"] = True
     if stdin is not None:
         request_payload["stdin"] = stdin
@@ -453,6 +819,8 @@ def execute(
     if payload.get("truncated"):
         print("credential proxy output truncated", file=sys.stderr)
     generated = payload.get("kubeconfig")
+    if implicit_destination and generated:
+        land_implicit_kubeconfig(generated)
     if destination is not None and generated:
         # gcloud's own output, written where gcloud would have written it had it
         # run here. The agent never runs a command against this file — a later
@@ -460,8 +828,7 @@ def execute(
         # so this is the visible pin `cluster_agent_profile.py` records and the
         # Cluster Agent preflight stats, and nothing more.
         try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(generated, encoding="utf-8")
+            _replace_file(destination, generated)
         except OSError as exc:
             print(f"credential proxy: could not write {destination}: {exc}", file=sys.stderr)
             return 1

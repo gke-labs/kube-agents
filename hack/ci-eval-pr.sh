@@ -1963,6 +1963,10 @@ unit_cost_hint() {
     # the tofu cases; the hint stays at the presubmit measurement until the
     # presubmit record says otherwise.
     incident-triage-oom-event-probe) echo 700 ;;
+    # Nightly-only since #1840. Median of four clean dev-install repetitions
+    # (710/710/735/1325s, 2026-09-23): the platform worker fans out to every
+    # Cluster Agent profile in the fleet before the payments-api one reports.
+    cluster-agent-delegation-profile-lookup) echo 720 ;;
     *) echo 200 ;;
   esac
 }

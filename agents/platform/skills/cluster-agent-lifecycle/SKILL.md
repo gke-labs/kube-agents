@@ -7,7 +7,7 @@ description: Create, delegate to, and tear down per-cluster Cluster Agent Hermes
 
 As the Platform Agent you own the lifecycle of **Cluster Agents**. A Cluster Agent is a Hermes _profile_ — an isolated agent instance with its own persona (`SOUL.md`), scoped toolset, and home directory — that you create dynamically **inside your own pod**, one per managed GKE cluster. It handles read-only runtime operations and deep workload diagnostics on that single cluster, and returns its findings to you.
 
-You never debug tenant workloads directly. You delegate that to the cluster's Cluster Agent and act on what it returns.
+You never debug tenant workloads directly while the cluster has a Cluster Agent. You delegate that to it and act on what it returns.
 
 The engine for all of this is the helper script `scripts/cluster_agent_profile.py` (resolved at `/opt/data/scripts/cluster_agent_profile.py` at runtime).
 
@@ -28,12 +28,9 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
 **Personas never pass context directly.** Delegation runs on the shared **kanban board**: you create a card assigned to the cluster's profile; the gateway's kanban dispatcher **auto-spawns** the Cluster Agent to work it; it reports a structured result on the card. You do **not** invoke the agent yourself.
 
-1. **Resolve the cluster's profile name** (the kanban `assignee`):
-
-   ```bash
-   python3 /opt/data/scripts/cluster_agent_profile.py name \
-     --project "<project>" --cluster "<cluster>" --location "<location>"
-   ```
+1. **Resolve the cluster's profile name** (the kanban `assignee`) with the `get_cluster_profile_name(project, cluster, location)` tool. It returns `name` and `exists`; `list_cluster_profiles()` returns every profile with its project, cluster and location, for when you still have to find the cluster. Both run in the agent pod — do not look the name up with `cluster_agent_profile.py name`, which is a stub in your shell, and do not block on it.
+   - Assign only to a profile that `exists`. A card for a name that is not a profile is never dispatched.
+   - If it does not exist, the cluster has no usable Cluster Agent: none yet (the hourly reconcile job below creates one for every cluster in scope), a scaffold that never finished, or a profile under that name pinned to a different cluster. Investigate it yourself and say in your `result` that it had no Cluster Agent.
 
 2. **Create the card** with the request in the body:
 
@@ -47,7 +44,7 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
    The dispatcher spawns the Cluster Agent (`hermes -p <profile> chat -q "work kanban task <id>"`) automatically; it reads the card, does read-only diagnostics, and calls `kanban_complete(result=<the RCA>, summary=<one-line status>, metadata={...})`.
 
-3. **Read the result** — you are auto-subscribed, so the completion (or a `needs_input` block) is pushed into your chat. You can also inspect it: `kanban_show(<id>)`. The RCA is in the card's `result` — the field the gateway posts verbatim, and the only one the requester receives — with any proposed patch in `metadata`; neither is ever in the worker's chat reply, which is a bare acknowledgement by design.
+3. **Read the result** — the card carries the requester's chat subscription, so the completion (or a `needs_input` block) is posted into their thread. You can also inspect it: `kanban_show(<id>)`. The RCA is in the card's `result` — the field the gateway posts verbatim, and the only one the requester receives — with any proposed patch in `metadata`; neither is ever in the worker's chat reply, which is a bare acknowledgement by design.
 
 **Multi-cluster (fan-out):** create one card per cluster **with no `parents`**, in one burst, so they run in parallel. `parents` means "runs after", so a per-cluster card that lists your own running card as a parent can never be claimed — see `SOUL.md` §0. Then **keep your own card open**: poll each per-cluster card with `kanban_show(<id>)` (`sleep 60` between rounds), and once all of them are settled, synthesize their `result`/`metadata` into your own `kanban_complete(result=...)`. Completing your card is the delivery, so never complete it on a dispatch receipt — the image refuses a `kanban_complete` while your fanned-out cards are unfinished (#1010). See the **`workload-rebalancing`** skill for the validation-then-declare pattern.
 
@@ -130,8 +127,4 @@ net, not the primary path.
 
 ## Listing profiles
 
-```bash
-python3 /opt/data/scripts/cluster_agent_profile.py list
-```
-
-Lists the currently provisioned Cluster Agent profiles (one per managed cluster).
+Call `list_cluster_profiles()`. It lists the currently provisioned Cluster Agent profiles (one per managed cluster) with the cluster each is pinned to.

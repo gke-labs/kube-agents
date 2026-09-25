@@ -50,6 +50,18 @@ import (
 var manifestsLog = logf.Log.WithName("platformagent-manifests")
 
 const (
+	// kindLocation is the spec.harness.location a kind install sets (with
+	// "kind" for projectId and clusterName as well). No GKE location looks like
+	// this. It means: there is no GKE cluster to fetch credentials for, use the
+	// cluster the pod runs in.
+	kindLocation = "kind"
+	// inClusterContextName is the kubectl context the credential proxy and the
+	// agent use on kind.
+	inClusterContextName = "in-cluster"
+	// inClusterAPIServer is the in-cluster API server address; its certificate
+	// carries this name, so no IP has to be read at render time.
+	inClusterAPIServer = "https://kubernetes.default.svc"
+
 	defaultPlatformAgentSecrets = "platform-agent-secrets"
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
@@ -2442,7 +2454,17 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		})
 	}
 
-	if agent.Spec.Harness != nil {
+	if agent.Spec.Harness != nil && harnessOnKind(agent.Spec.Harness) {
+		// The context the credential proxy's bootstrap writes on kind.
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "KUBE_CONTEXT_NAME",
+			Value: inClusterContextName,
+		})
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "KUBE_DEFAULT_NAMESPACE",
+			Value: agent.Namespace,
+		})
+	} else if agent.Spec.Harness != nil {
 		if agent.Spec.Harness.ProjectID != "" {
 			envVars = append(envVars, corev1.EnvVar{
 				Name:  "GKE_PROJECT_ID",
@@ -3620,6 +3642,12 @@ func sessionKVSaltSecretRef(agent *agentv1alpha1.PlatformAgent) *corev1.SecretKe
 	return defaultSecretRef(nil, defaultPlatformAgentSecrets, "SESSION_KV_SALT")
 }
 
+// harnessOnKind reports whether the harness describes a kind install rather
+// than a GKE cluster; see kindLocation.
+func harnessOnKind(harness *agentv1alpha1.HarnessSpec) bool {
+	return harness != nil && harness.Location == kindLocation
+}
+
 func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
@@ -3720,7 +3748,19 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"},
 	)
-	if harness := agent.Spec.Harness; harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
+	if harness := agent.Spec.Harness; harnessOnKind(harness) {
+		// kind: the proxy serves the cluster it runs in. Write its kubeconfig from the pod's service account mount --
+		// `tokenFile` rather than `--token`, since the kubelet rotates the
+		// projected token. Paths are literal because the bootstrap shell only
+		// receives GKE_* and KUBE_* variables (credential_proxy.py, bootstrap).
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "KUBE_CONTEXT_NAME", Value: inClusterContextName}, corev1.EnvVar{Name: "KUBE_DEFAULT_NAMESPACE", Value: agent.Namespace},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", Value: fmt.Sprintf(`kubectl config set-cluster "$KUBE_CONTEXT_NAME" --server=%q --certificate-authority=%q >/dev/null &&
+kubectl config set "users.${KUBE_CONTEXT_NAME}.tokenFile" %q >/dev/null &&
+kubectl config set-context "$KUBE_CONTEXT_NAME" --cluster="$KUBE_CONTEXT_NAME" --user="$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null &&
+kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null`, inClusterAPIServer, kubeAPIAccessMountPath+"/ca.crt", kubeAPIAccessMountPath+"/token")},
+		)
+	} else if harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "GKE_PROJECT_ID", Value: harness.ProjectID}, corev1.EnvVar{Name: "GKE_CLUSTER_NAME", Value: harness.ClusterName}, corev1.EnvVar{Name: "GKE_LOCATION", Value: harness.Location},
 			corev1.EnvVar{Name: "KUBE_CONTEXT_NAME", Value: fmt.Sprintf("gke_%s_%s_%s", harness.ProjectID, harness.Location, harness.ClusterName)}, corev1.EnvVar{Name: "KUBE_DEFAULT_NAMESPACE", Value: agent.Namespace},
