@@ -213,9 +213,480 @@ class TestGetCredentialsWritesTheFileOnThisSide(SubmittedPayloadTestCase):
         self.run_it(self.ARGV, {"KUBECONFIG": str(self.destination)})
         self.assertEqual(self.destination.read_text(encoding="utf-8"), self.GENERATED)
 
-    def test_no_destination_asks_for_nothing_back(self):
-        captured = self.send(self.ARGV, {"KUBECONFIG": ""})
-        self.assertNotIn("wantsKubeconfig", captured["payload"])
+    def test_a_refetch_replaces_the_pin_and_leaves_nothing_staged(self):
+        # The Cluster Agent's pin is read by every kubectl of that profile, so
+        # it is staged and renamed like the implicit file, never truncated.
+        self.destination.parent.mkdir(parents=True)
+        self.destination.write_text("stale", encoding="utf-8")
+        with patch.object(
+            credential_proxy_client, "_replace_file", wraps=credential_proxy_client._replace_file
+        ) as writer:
+            captured = self.run_it(self.ARGV, {"KUBECONFIG": str(self.destination)})
+        self.assertEqual(0, captured["exit_code"])
+        writer.assert_called_once_with(self.destination, self.GENERATED)
+        self.assertEqual(self.destination.read_text(encoding="utf-8"), self.GENERATED)
+        self.assertEqual([self.destination], list(self.destination.parent.iterdir()))
+
+    def test_an_unwritable_destination_fails_the_command(self):
+        # Unlike the implicit file, the caller named this path, so not landing
+        # it is a failure -- and that still holds with the staged writer.
+        blocker = self.directory / "not-a-directory"
+        blocker.write_text("", encoding="utf-8")
+        captured = self.run_it(self.ARGV, {"KUBECONFIG": str(blocker / "kubeconfig.yaml")})
+        self.assertEqual(1, captured["exit_code"])
+
+    def test_no_destination_still_asks_for_the_file_back(self):
+        # Before #1968 nothing came back, and the context-less kubectl that
+        # followed read the host cluster (#1852's default) and reported a
+        # seeded fixture absent.
+        home = self.directory / "home"
+        captured = self.run_it(self.ARGV, {"KUBECONFIG": "", "HERMES_HOME": str(home)})
+        self.assertTrue(captured["payload"]["wantsKubeconfig"])
+
+
+# A second GKE cluster, standing in for a seeded fleet member.
+SEEDED_CONTEXT = "gke_acme-evals_us-central1-a_seeded-a"
+SEEDED_KUBECONFIG = f"apiVersion: v1\nkind: Config\ncurrent-context: {SEEDED_CONTEXT}\n"
+CARD = "t_0123abcd"
+
+
+class ContextLessTestCase(SubmittedPayloadTestCase):
+    """A shell with no KUBECONFIG, as the platform profile's is (#1968)."""
+
+    GET_CREDENTIALS = [
+        "gcloud", "container", "clusters", "get-credentials", "seeded-a",
+        "--location", "us-central1-a",
+    ]
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.expected_file = (
+            self.home / ".kubeconfigs" / "kubeconfig_acme-evals_seeded-a_us-central1-a.yaml"
+        )
+
+    def environ(self, **extra):
+        base = {"KUBECONFIG": "", "HERMES_HOME": str(self.home)}
+        base.update(extra)
+        return base
+
+    @staticmethod
+    def in_shell(*keys):
+        """Run as though this process's ancestors were `keys`, nearest first.
+
+        Each key is `<pid>-<start time>`; an empty list is a process with no
+        shell to pin to.
+        """
+        return patch.object(credential_proxy_client, "_shell_keys", return_value=list(keys))
+
+    def fetch(self, environ):
+        """Run get-credentials and return (captured, stderr text)."""
+        stderr = io.StringIO()
+        captured = {}
+
+        def fake_open(request, *args, **kwargs):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            body = {"exitCode": 0, "kubeconfig": SEEDED_KUBECONFIG}
+            return RecordingResponse(json.dumps(body).encode("utf-8"))
+
+        with patch.dict("os.environ", environ, clear=False):
+            with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+                with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+                    captured["exit_code"] = credential_proxy_client.execute(
+                        self.LOCAL_ENDPOINT, list(self.GET_CREDENTIALS)
+                    )
+        return captured, stderr.getvalue()
+
+
+class TestAContextLessGetCredentialsLandsAFile(ContextLessTestCase):
+    """The minimal half: the file lands where AGENTS.md says, and the shell is told."""
+
+    def test_the_file_lands_at_the_per_target_path(self):
+        captured, _ = self.fetch(self.environ())
+        self.assertEqual(0, captured["exit_code"])
+        self.assertEqual(SEEDED_KUBECONFIG, self.expected_file.read_text(encoding="utf-8"))
+
+    def test_the_path_matches_the_mcp_servers_convention(self):
+        # _thread_kubeconfig_path owns the name; the two must not drift.
+        target = credential_proxy_client.parse_gke_context(SEEDED_CONTEXT)
+        with patch.dict("os.environ", {"HERMES_HOME": str(self.home)}, clear=False):
+            path = credential_proxy_client.per_target_kubeconfig_path(target)
+        self.assertEqual(self.expected_file, path)
+
+    def test_with_no_shell_it_says_the_host_is_still_the_default_and_how_to_move(self):
+        with self.in_shell():
+            _, stderr = self.fetch(self.environ())
+        self.assertIn("still reads the host cluster", stderr)
+        self.assertIn(f"export KUBECONFIG={self.expected_file}", stderr)
+        self.assertIn(f"kubectl --context={SEEDED_CONTEXT}", stderr)
+
+    def test_in_a_shell_it_says_how_long_the_default_lasts_and_how_to_move(self):
+        with self.in_shell("100-5"):
+            _, stderr = self.fetch(self.environ())
+        self.assertIn(f"For the rest of this command line, a kubectl that names no cluster reads {SEEDED_CONTEXT}", stderr)
+        self.assertIn("Later commands read the host cluster", stderr)
+        self.assertIn(f"export KUBECONFIG={self.expected_file}", stderr)
+        self.assertIn(f"kubectl --context={SEEDED_CONTEXT}", stderr)
+
+    def test_the_exported_file_then_reaches_the_cluster(self):
+        # The instruction it prints has to work: the file resolves through the
+        # existing KUBECONFIG path to the fetched cluster's name.
+        self.fetch(self.environ())
+        payload = self.submit(
+            ["kubectl", "get", "clusterrolebinding"],
+            self.environ(KUBECONFIG=str(self.expected_file)),
+        )
+        self.assertEqual(SEEDED_CONTEXT, payload["kubeconfigContext"])
+
+    def test_an_unwritable_home_does_not_fail_the_command(self):
+        # gcloud succeeded, and --context still reaches the cluster.
+        blocker = self.home / "not-a-directory"
+        blocker.write_text("", encoding="utf-8")
+        captured, stderr = self.fetch(self.environ(HERMES_HOME=str(blocker)))
+        self.assertEqual(0, captured["exit_code"])
+        self.assertIn("could not write", stderr)
+        self.assertIn(f"kubectl --context={SEEDED_CONTEXT}", stderr)
+        self.assertNotIn("export KUBECONFIG", stderr)
+
+    def test_an_explicit_destination_is_unchanged(self):
+        destination = self.home / "mine.yaml"
+        self.fetch(self.environ(KUBECONFIG=str(destination)))
+        self.assertTrue(destination.is_file())
+        self.assertFalse(self.expected_file.exists())
+
+    def test_a_second_fetch_replaces_the_file_and_leaves_nothing_staged(self):
+        # Staged beside the destination and renamed over it, so a reader never
+        # sees it half-written, and no staging file is left behind.
+        self.expected_file.parent.mkdir(parents=True)
+        self.expected_file.write_text("stale", encoding="utf-8")
+        self.fetch(self.environ())
+        self.assertEqual(SEEDED_KUBECONFIG, self.expected_file.read_text(encoding="utf-8"))
+        files = [p for p in self.expected_file.parent.iterdir() if p.is_file()]
+        self.assertEqual([self.expected_file], files)
+
+
+class TestKubectlContextFlagNamesTheCluster(ContextLessTestCase):
+    """`--context` used to end in "context was not found" (#1968, step 37)."""
+
+    def test_a_gke_context_flag_is_forwarded_as_the_cluster_name(self):
+        for argv in (
+            ["kubectl", "get", "crb", "--context", SEEDED_CONTEXT],
+            ["kubectl", f"--context={SEEDED_CONTEXT}", "get", "crb"],
+        ):
+            with self.subTest(argv=argv):
+                payload = self.submit(argv, self.environ())
+                self.assertEqual(SEEDED_CONTEXT, payload["kubeconfigContext"])
+                # The flag itself stays: the generated file's one context is it.
+                self.assertIn(SEEDED_CONTEXT, " ".join(payload["argv"]))
+
+    def test_a_non_gke_context_is_left_to_kubectl(self):
+        payload = self.submit(["kubectl", "--context", "minikube", "get", "pods"], self.environ())
+        self.assertNotIn("kubeconfigContext", payload)
+
+    def test_words_after_the_separator_are_not_kubectls(self):
+        argv = ["kubectl", "exec", "pod/x", "--", "tool", "--context", SEEDED_CONTEXT]
+        payload = self.submit(argv, self.environ())
+        self.assertNotIn("kubeconfigContext", payload)
+
+    def test_kubeconfig_keeps_precedence(self):
+        # A Cluster Agent's pin is never overridden from here.
+        pinned = write_kubeconfig(self.home)
+        payload = self.submit(
+            ["kubectl", "--context", SEEDED_CONTEXT, "get", "pods"],
+            self.environ(KUBECONFIG=str(pinned)),
+        )
+        self.assertEqual(GKE_CONTEXT, payload["kubeconfigContext"])
+
+    def test_gcloud_is_not_given_a_context(self):
+        payload = self.submit(
+            ["gcloud", "container", "clusters", "list", "--context", SEEDED_CONTEXT],
+            self.environ(),
+        )
+        self.assertNotIn("kubeconfigContext", payload)
+
+
+class TestAShellFollowsItsOwnGetCredentials(ContextLessTestCase):
+    """gcloud's "just fetched is current", for the rest of one command line only."""
+
+    KUBECTL = ["kubectl", "get", "clusterrolebinding", "debug-binding"]
+
+    def fetch_as(self, cluster, *keys):
+        """A context-less get-credentials for `cluster`, run from `keys`."""
+        context = f"gke_acme-evals_us-central1-a_{cluster}"
+        kubeconfig = f"apiVersion: v1\nkind: Config\ncurrent-context: {context}\n"
+        stderr = io.StringIO()
+
+        def fake_open(request, *args, **kwargs):
+            body = {"exitCode": 0, "kubeconfig": kubeconfig}
+            return RecordingResponse(json.dumps(body).encode("utf-8"))
+
+        argv = ["gcloud", "container", "clusters", "get-credentials", cluster,
+                "--location", "us-central1-a"]
+        # The keys are made up, so none is a live process and pruning would
+        # remove the other fakes' pins; TestShellAncestry covers pruning.
+        with self.in_shell(*keys), patch.dict("os.environ", self.environ(), clear=False), \
+             patch.object(credential_proxy_client, "_prune_shell_contexts"):
+            with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+                with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+                    credential_proxy_client.execute(self.LOCAL_ENDPOINT, argv)
+        return context
+
+    def kubectl_as(self, *keys, argv=None, **extra):
+        with self.in_shell(*keys):
+            return self.submit(argv or list(self.KUBECTL), self.environ(**extra))
+
+    def test_the_same_line_kubectl_reaches_the_fetched_cluster(self):
+        # `get-credentials seeded-a && kubectl get crb debug-binding`, the
+        # exact shape every #1838 rep ran: both are children of one shell.
+        self.fetch_as("seeded-a", "100-5")
+        payload = self.kubectl_as("100-5")
+        self.assertEqual(SEEDED_CONTEXT, payload["kubeconfigContext"])
+
+    def test_it_works_in_process_too(self):
+        # The real ancestry, not a patched one: a fetch and a kubectl from this
+        # process share a parent, as two commands of one line do.
+        if not credential_proxy_client._shell_keys():
+            self.skipTest("this test process was not started from a shell")
+        self.fetch(self.environ())
+        payload = self.submit(list(self.KUBECTL), self.environ())
+        self.assertEqual(SEEDED_CONTEXT, payload["kubeconfigContext"])
+
+    def test_the_next_command_line_reads_the_host(self):
+        # A new `bash -c` per command: a later turn, a resumed card, another
+        # worker. #1799: the default must not drift beyond the fetching line.
+        self.fetch_as("seeded-a", "100-5")
+        self.assertNotIn("kubeconfigContext", self.kubectl_as("101-9"))
+
+    def test_a_recycled_pid_is_not_the_same_shell(self):
+        self.fetch_as("seeded-a", "100-5")
+        self.assertNotIn("kubeconfigContext", self.kubectl_as("100-6"))
+
+    def test_a_kubectl_nested_below_the_shell_still_finds_it(self):
+        # `$(kubectl ...)`, a pipeline stage or a subshell puts a process
+        # between the fetching shell and kubectl.
+        self.fetch_as("seeded-a", "100-5")
+        payload = self.kubectl_as("300-7", "100-5")
+        self.assertEqual(SEEDED_CONTEXT, payload["kubeconfigContext"])
+
+    def test_parallel_subshells_each_keep_their_own(self):
+        # `(get-credentials a && kubectl) & (get-credentials b && kubectl) &`:
+        # each fetch pins its own subshell, so neither moves the other's.
+        a = self.fetch_as("seeded-a", "201-1", "100-5")
+        b = self.fetch_as("seeded-b", "202-1", "100-5")
+        self.assertEqual(a, self.kubectl_as("201-1", "100-5")["kubeconfigContext"])
+        self.assertEqual(b, self.kubectl_as("202-1", "100-5")["kubeconfigContext"])
+        # And the parent shell, which fetched nothing, still reads the host.
+        self.assertNotIn("kubeconfigContext", self.kubectl_as("100-5"))
+
+    def test_the_nearest_pin_wins(self):
+        outer = self.fetch_as("seeded-a", "100-5")
+        inner = self.fetch_as("seeded-b", "201-1", "100-5")
+        self.assertEqual(inner, self.kubectl_as("201-1", "100-5")["kubeconfigContext"])
+        self.assertEqual(outer, self.kubectl_as("100-5")["kubeconfigContext"])
+
+    def test_a_second_fetch_in_the_same_line_moves_it(self):
+        self.fetch_as("seeded-a", "100-5")
+        b = self.fetch_as("seeded-b", "100-5")
+        self.assertEqual(b, self.kubectl_as("100-5")["kubeconfigContext"])
+
+    def test_no_shell_means_no_pin_is_written(self):
+        self.fetch_as("seeded-a")
+        self.assertFalse((self.home / ".kubeconfigs" / "shells").exists())
+
+    def test_an_explicit_context_beats_the_pin(self):
+        self.fetch_as("seeded-a", "100-5")
+        payload = self.kubectl_as("100-5", argv=["kubectl", "--context", GKE_CONTEXT, "get", "pods"])
+        self.assertEqual(GKE_CONTEXT, payload["kubeconfigContext"])
+
+    def test_kubeconfig_beats_the_pin(self):
+        self.fetch_as("seeded-a", "100-5")
+        pinned = write_kubeconfig(self.home)
+        payload = self.kubectl_as("100-5", KUBECONFIG=str(pinned))
+        self.assertEqual(GKE_CONTEXT, payload["kubeconfigContext"])
+
+    def test_a_kubeconfig_after_the_separator_is_the_remote_commands(self):
+        # `kubectl exec pod -- tool --kubeconfig f` names no kubeconfig of
+        # kubectl's: it neither unpins the shell nor is read from this pod.
+        self.fetch_as("seeded-a", "100-5")
+        remote = "/nowhere/remote.yaml"
+        with self.in_shell("100-5"):
+            captured = self.send(
+                ["kubectl", "exec", "pod/x", "--", "tool", "--kubeconfig", remote],
+                self.environ(),
+            )
+        self.assertEqual(0, captured["exit_code"])
+        self.assertEqual(SEEDED_CONTEXT, captured["payload"]["kubeconfigContext"])
+        self.assertEqual(remote, captured["payload"]["argv"][-1])
+
+    def test_an_explicit_destination_records_no_pin(self):
+        # gcloud leaves the default kubeconfig alone when told to write
+        # elsewhere, and so does this.
+        destination = self.home / "mine.yaml"
+        with self.in_shell("100-5"):
+            self.fetch(self.environ(KUBECONFIG=str(destination)))
+        self.assertNotIn("kubeconfigContext", self.kubectl_as("100-5"))
+
+    def test_a_pin_that_is_not_a_gke_name_is_ignored(self):
+        # The file is the agent's to write; it only ever crosses as a name the
+        # grammar accepts.
+        shells = self.home / ".kubeconfigs" / "shells"
+        shells.mkdir(parents=True)
+        for content in ("minikube", "gke_../x_y_z", SEEDED_CONTEXT + "x" * 600):
+            with self.subTest(content=content[:20]):
+                (shells / "100-5.context").write_text(content, encoding="utf-8")
+                self.assertNotIn("kubeconfigContext", self.kubectl_as("100-5"))
+
+
+class TestShellAncestry(unittest.TestCase):
+    """Reading /proc: the key, the walk, and pruning pins of exited shells."""
+
+    def setUp(self):
+        self.proc = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.proc, ignore_errors=True)
+        patcher = patch.object(credential_proxy_client, "PROC_ROOT", self.proc)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def process(self, pid, ppid, start, comm="bash"):
+        # Fields 3..22 of /proc/<pid>/stat: state, ppid, then 17 others, then
+        # the start time; the values between do not matter here.
+        fields = ["S", str(ppid)] + ["0"] * 17 + [str(start), "0"]
+        (self.proc / str(pid)).mkdir()
+        (self.proc / str(pid) / "stat").write_text(f"{pid} ({comm}) {' '.join(fields)}\n")
+
+    def test_the_walk_is_nearest_first_and_stops_at_init(self):
+        self.process(300, 200, 33)
+        self.process(200, 100, 22)
+        self.process(100, 1, 11)
+        with patch.object(credential_proxy_client.os, "getppid", return_value=300):
+            keys = credential_proxy_client._shell_keys()
+        self.assertEqual(["300-33", "200-22", "100-11"], keys)
+
+    def test_a_command_name_with_spaces_and_parentheses_is_parsed(self):
+        self.process(300, 1, 44, comm="odd) (name x")
+        self.assertEqual((1, "44", "odd) (name x"), credential_proxy_client._process_stat(300))
+
+    def test_the_walk_keys_shells_and_steps_over_everything_else(self):
+        # `get-credentials x && timeout 30 kubectl ...`: kubectl's parent is
+        # timeout, and the line's shell is above it; sshd is never a key.
+        self.process(300, 200, 33, comm="timeout")
+        self.process(200, 100, 22)
+        self.process(100, 1, 11, comm="sshd")
+        with patch.object(credential_proxy_client.os, "getppid", return_value=300):
+            self.assertEqual(["200-22"], credential_proxy_client._shell_keys())
+        with patch.object(credential_proxy_client.os, "getppid", return_value=100):
+            self.assertEqual([], credential_proxy_client._shell_keys())
+
+    def test_a_pin_named_for_a_process_that_is_not_a_shell_is_not_read(self):
+        # sshd outlives every command line on a ControlMaster connection; a
+        # file keyed on it must not become every later command's default.
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        shells = home / ".kubeconfigs" / "shells"
+        shells.mkdir(parents=True)
+        (shells / "100-11.context").write_text(SEEDED_CONTEXT)
+        self.process(300, 200, 33, comm="kubectl")
+        self.process(200, 100, 22)
+        self.process(100, 1, 11, comm="sshd")
+        with patch.dict("os.environ", {"HERMES_HOME": str(home)}, clear=False), \
+             patch.object(credential_proxy_client.os, "getpid", return_value=300), \
+             patch.object(credential_proxy_client.os, "getppid", return_value=200):
+            self.assertIsNone(credential_proxy_client.shell_context())
+
+    def _pinned_shell(self):
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        shells = home / ".kubeconfigs" / "shells"
+        shells.mkdir(parents=True)
+        self.process(300, 200, 33, comm="kubectl")
+        self.process(200, 1, 22)
+        env = patch.dict("os.environ", {"HERMES_HOME": str(home)}, clear=False)
+        pid = patch.object(credential_proxy_client.os, "getpid", return_value=300)
+        ppid = patch.object(credential_proxy_client.os, "getppid", return_value=200)
+        return shells / "200-22.context", env, pid, ppid
+
+    def test_a_pin_another_uid_owns_is_not_read(self):
+        # hermes runs with HERMES_HOME=/opt/data, which the agent owns: a pin
+        # the agent planted under a hermes shell's key must not steer it.
+        path, env, pid, ppid = self._pinned_shell()
+        path.write_text(SEEDED_CONTEXT)
+        with env, pid, ppid:
+            self.assertEqual(SEEDED_CONTEXT, credential_proxy_client.shell_context())
+            with patch.object(credential_proxy_client.os, "geteuid", return_value=os.geteuid() + 1):
+                self.assertIsNone(credential_proxy_client.shell_context())
+
+    def test_a_symlinked_or_hard_linked_pin_is_not_read(self):
+        path, env, pid, ppid = self._pinned_shell()
+        target = path.parent / "elsewhere"
+        target.write_text(SEEDED_CONTEXT)
+        path.symlink_to(target)
+        with env, pid, ppid:
+            self.assertIsNone(credential_proxy_client.shell_context())
+            path.unlink()
+            os.link(target, path)
+            self.assertIsNone(credential_proxy_client.shell_context())
+            path.unlink()
+            path.write_text(SEEDED_CONTEXT)
+            self.assertEqual(SEEDED_CONTEXT, credential_proxy_client.shell_context())
+
+    def test_a_fifo_pin_is_refused_without_blocking(self):
+        import threading
+
+        path, env, pid, ppid = self._pinned_shell()
+        os.mkfifo(path)
+        result = []
+        with env, pid, ppid:
+            reader = threading.Thread(
+                target=lambda: result.append(credential_proxy_client.shell_context()), daemon=True
+            )
+            reader.start()
+            reader.join(timeout=5)
+        self.assertFalse(reader.is_alive(), "shell_context() blocked opening a FIFO")
+        self.assertEqual([None], result)
+
+    def test_an_execd_kubectl_reads_its_own_key_first(self):
+        # `get-credentials x ; kubectl` -- bash execs the last command, so the
+        # kubectl is the process the pin was recorded under.
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / ".kubeconfigs" / "shells").mkdir(parents=True)
+        (home / ".kubeconfigs" / "shells" / "300-33.context").write_text(SEEDED_CONTEXT)
+        self.process(300, 200, 33, comm="python3")
+        self.process(200, 1, 22, comm="sshd")
+        with patch.dict("os.environ", {"HERMES_HOME": str(home)}, clear=False), \
+             patch.object(credential_proxy_client.os, "getpid", return_value=300), \
+             patch.object(credential_proxy_client.os, "getppid", return_value=200):
+            self.assertEqual(SEEDED_CONTEXT, credential_proxy_client.shell_context())
+
+    def test_an_exited_process_has_no_key(self):
+        self.assertIsNone(credential_proxy_client._process_stat(999))
+        with patch.object(credential_proxy_client.os, "getppid", return_value=999):
+            self.assertEqual([], credential_proxy_client._shell_keys())
+
+    def test_the_walk_is_bounded(self):
+        # A cycle cannot happen in a real process table; the bound holds anyway.
+        self.process(300, 300, 1)
+        with patch.object(credential_proxy_client.os, "getppid", return_value=300):
+            keys = credential_proxy_client._shell_keys()
+        self.assertEqual(credential_proxy_client.MAX_SHELL_ANCESTORS, len(keys))
+
+    def test_recording_prunes_the_pins_of_exited_shells(self):
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        shells = home / ".kubeconfigs" / "shells"
+        shells.mkdir(parents=True)
+        self.process(300, 1, 33)  # this command's shell
+        self.process(400, 1, 44)  # another live shell
+        self.process(500, 1, 56)  # pid 500 was recycled since its pin
+        for name in ("400-44.context", "500-55.context", "600-66.context", "notes.txt"):
+            (shells / name).write_text(SEEDED_CONTEXT, encoding="utf-8")
+        with patch.dict("os.environ", {"HERMES_HOME": str(home)}, clear=False), \
+             patch.object(credential_proxy_client.os, "getppid", return_value=300):
+            self.assertTrue(credential_proxy_client.record_shell_context(SEEDED_CONTEXT))
+        self.assertEqual(
+            ["300-33.context", "400-44.context", "notes.txt"],
+            sorted(p.name for p in shells.iterdir()),
+        )
 
 
 class TestContextGrammar(unittest.TestCase):
@@ -892,6 +1363,186 @@ class ApiSessionTest(unittest.TestCase):
         )
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertEqual("http://b/v1/gcp/h/p", completed.stdout.strip())
+
+
+@unittest.skipUnless(Path("/proc/self/stat").exists() and shutil.which("bash"), "needs /proc and bash")
+class TestRealShellCommandLines(unittest.TestCase):
+    """The shell pin through real processes, not a patched ancestry.
+
+    Each case is one `bash -c` command line, as Hermes sends every terminal
+    command, running the shim as `gcloud` and `kubectl` through symlinks the
+    way the sandbox image installs it, against a broker on loopback. The
+    broker answers a get-credentials with a kubeconfig for the cluster named,
+    and a kubectl with `<last argument> -> <kubeconfigContext or HOST>`, so
+    stdout says which cluster each kubectl would have reached.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+        import threading
+
+        cls.requests = []
+
+        class Broker(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                cls.requests.append(payload)
+                argv = payload["argv"]
+                if "get-credentials" in argv:
+                    cluster = argv[argv.index("get-credentials") + 1]
+                    context = f"gke_acme-evals_us-central1-a_{cluster}"
+                    body = {"exitCode": 0, "kubeconfig":
+                            f"apiVersion: v1\nkind: Config\ncurrent-context: {context}\n"}
+                else:
+                    reached = payload.get("kubeconfigContext", "HOST")
+                    body = {"exitCode": 0, "stdout": f"{argv[-1]} -> {reached}\n"}
+                data = json.dumps(body).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Broker)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        shim = bin_dir / "credential-proxy-exec"
+        shutil.copy(credential_proxy_client.__file__, shim)
+        shim.chmod(0o755)
+        for name in ("kubectl", "gcloud"):
+            (bin_dir / name).symlink_to(shim)
+        self.home = self.root / "home"
+        self.env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "HERMES_HOME": str(self.home),
+            "CREDENTIAL_PROXY_URL": f"http://127.0.0.1:{self.server.server_address[1]}",
+        }
+
+    def line(self, script):
+        """Run one command line; return the kubectl answers, in order."""
+        script = script.replace("FETCH", "gcloud container clusters get-credentials")
+        completed = subprocess.run(
+            ["bash", "-c", script], env=self.env, capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        return completed.stdout.split("\n")[:-1]
+
+    A = "gke_acme-evals_us-central1-a_seeded-a"
+    B = "gke_acme-evals_us-central1-a_seeded-b"
+
+    def test_and_chained_kubectl_reaches_the_fetched_cluster(self):
+        self.assertEqual([f"m -> {self.A}"], self.line("FETCH seeded-a && kubectl get pods m"))
+
+    def test_semicolon_and_newline_forms_too(self):
+        self.assertEqual([f"m -> {self.A}"], self.line("FETCH seeded-a ; kubectl get pods m"))
+        self.assertEqual([f"m -> {self.A}"], self.line("FETCH seeded-a\nkubectl get pods m"))
+
+    def test_hermes_eval_wrapper(self):
+        # base.py runs the model's text through `eval` inside the same shell.
+        self.assertEqual(
+            [f"m -> {self.A}"],
+            self.line("builtin cd -- /tmp || exit 126\neval 'FETCH seeded-a && kubectl get pods m'"
+                      .replace("FETCH", "gcloud container clusters get-credentials")),
+        )
+
+    def test_command_substitution_pipeline_and_loop(self):
+        out = self.line(
+            'FETCH seeded-a && echo "$(kubectl get pods s)" && kubectl get pods p | cat'
+            " && for i in 1 2; do kubectl get pods l$i; done"
+        )
+        self.assertEqual([f"s -> {self.A}", f"p -> {self.A}", f"l1 -> {self.A}", f"l2 -> {self.A}"], out)
+
+    def test_the_next_command_line_reads_the_host(self):
+        self.line("FETCH seeded-a && kubectl get pods m")
+        self.assertEqual(["n -> HOST"], self.line("kubectl get pods n"))
+
+    def test_before_the_fetch_the_line_reads_the_host(self):
+        self.assertEqual(
+            ["before -> HOST", f"after -> {self.A}"],
+            self.line("kubectl get pods before; FETCH seeded-a && kubectl get pods after"),
+        )
+
+    def test_parallel_subshells_do_not_race(self):
+        # Interleaved on purpose: b's fetch lands between a's fetch and a's
+        # kubectl, which is the order a shared pin gets wrong.
+        for _ in range(3):
+            out = self.line(
+                "(FETCH seeded-a && sleep 0.6 && kubectl get pods a) &"
+                " (sleep 0.2 && FETCH seeded-b && kubectl get pods b) & wait"
+            )
+            self.assertEqual(sorted([f"a -> {self.A}", f"b -> {self.B}"]), sorted(out))
+
+    def test_a_subshells_fetch_does_not_leak_to_its_parent(self):
+        self.assertEqual(["m -> HOST"], self.line("(FETCH seeded-a && true) ; kubectl get pods m"))
+
+    def test_a_one_command_subshell_is_the_parent_fetching(self):
+        # bash execs a subshell's only command, so gcloud runs as the parent
+        # shell's child: the same process tree as `FETCH seeded-a ; kubectl`.
+        self.assertEqual([f"m -> {self.A}"], self.line("(FETCH seeded-a) ; kubectl get pods m"))
+        # Backgrounded too: a one-command `( ... ) &` pins the line's shell.
+        self.assertEqual([f"m -> {self.A}"], self.line("(FETCH seeded-a) & wait; kubectl get pods m"))
+
+    def test_a_kubectl_under_a_process_that_is_not_a_shell(self):
+        helper = "python3 -c 'import subprocess; subprocess.run([\"kubectl\", \"get\", \"pods\", \"p\"])'"
+        out = self.line(
+            "FETCH seeded-a && timeout 30 kubectl get pods t"
+            f" && echo x | xargs kubectl get pods && {helper}; true"
+        )
+        self.assertEqual([f"t -> {self.A}", f"x -> {self.A}", f"p -> {self.A}"], out)
+
+    def test_a_helper_bash_execs_last_reads_the_host(self):
+        # The one shape the shell-only keys give up: bash execs a bare -c
+        # string's last command, so the helper holds the shell's pid under
+        # another name. Hermes' wrapper runs the command inside a non-final
+        # eval, where bash does not exec it.
+        helper = self.root / "helper.py"
+        helper.write_text('import subprocess\nsubprocess.run(["kubectl", "get", "pods", "p"])\n')
+        self.assertEqual(["p -> HOST"], self.line(f"FETCH seeded-a && python3 {helper}"))
+        self.assertEqual(
+            [f"p -> {self.A}"],
+            self.line(f"eval 'FETCH seeded-a && python3 {helper}'\n__ec=$?"),
+        )
+
+    def test_a_fetch_under_a_process_that_is_not_a_shell_pins_the_line(self):
+        self.assertEqual(
+            [f"m -> {self.A}"], self.line("timeout 60 FETCH seeded-a && kubectl get pods m")
+        )
+
+    def test_a_wrapped_fetch_replaces_the_lines_earlier_pin(self):
+        out = self.line(
+            "FETCH seeded-a && kubectl get pods x"
+            " && timeout 60 FETCH seeded-b && kubectl get pods y"
+        )
+        self.assertEqual([f"x -> {self.A}", f"y -> {self.B}"], out)
+
+    def test_a_subshell_inherits_its_parents_pin(self):
+        self.assertEqual([f"m -> {self.A}"], self.line("FETCH seeded-a && (kubectl get pods m)"))
+
+    def test_an_explicit_context_still_wins(self):
+        self.assertEqual(
+            [f"m -> {self.B}"],
+            self.line(f"FETCH seeded-a && kubectl --context {self.B} get pods m"),
+        )
+
+    def test_exited_shells_leave_at_most_the_last_pin(self):
+        for _ in range(4):
+            self.line("FETCH seeded-a && kubectl get pods m")
+        shells = self.home / ".kubeconfigs" / "shells"
+        self.assertLessEqual(len(list(shells.iterdir())), 1)
 
 
 if __name__ == "__main__":

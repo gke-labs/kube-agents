@@ -30,15 +30,16 @@ The contributor workflow is written once, next to the code it governs, and the s
 human contributors and AI coding agents:
 
 - [`AGENTS.md`](AGENTS.md) states the rules: branch from a freshly fetched `main`, check whether
-  someone is already doing the work, Conventional Commits, the pull request template, the two
-  pre-PR review passes, live validation against a real install, and the automated review every
-  pull request receives.
+  someone is already doing the work, Conventional Commits, the pull request template, a bug fix's
+  recurrence guard, the two pre-PR review passes, live validation against a real install, and the
+  automated review every pull request receives.
 - [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md) has the commands behind them:
   the duplicate-work scan, the branch-drift check, the local validation checks and the constraint
   each one exists for, how to poll for and answer the `kube-agents-bot` review, and how to
   resolve its threads.
 - [`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md) is the mechanics of the
-  self-review and live-validation sections the pull request template asks for.
+  self-review, live-validation, and bug-fix recurrence sections the pull request template asks
+  for.
 - [`docs/testing-map.md`](docs/testing-map.md) says where a new test goes and what runs it.
 - [`docs/designs/live-test-lease.md`](docs/designs/live-test-lease.md) is the lease to take before
   mutating an installation your team shares.

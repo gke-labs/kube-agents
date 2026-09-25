@@ -113,9 +113,16 @@ class PatchOnImport:
         module_names = self._module_names
 
         def exec_and_patch(module):
-            exec_module(module)
-            for module_name in module_names:
-                _install(module_name)
+            try:
+                exec_module(module)
+                for module_name in module_names:
+                    _install(module_name)
+            except BaseException:
+                # A failed load leaves nothing in ``sys.modules``, so the next
+                # import of the trigger executes a fresh registry. Re-arm for
+                # it; staying latched would let that one load unpatched.
+                self._fired = False
+                raise
 
         spec.loader.exec_module = exec_and_patch
         return spec

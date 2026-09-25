@@ -1049,6 +1049,62 @@ def _purge_card_state(task_ids: list[str], timeout: float) -> None:
     _agent_shell(script, timeout)
 
 
+def _worker_token_buckets(
+    by_agent: dict[str, dict[str, int]], unbilled: list[dict[str, str]]
+) -> dict[str, Any] | None:
+    """The workers' counts in the record's buckets, per profile and summed.
+
+    ``by_agent`` and ``unbilled`` are :class:`worker_trajectory.WorkerCapture`'s
+    ``tokens`` and ``unbilled``: hermes' column names per profile, and the
+    sessions that reported no counts. Each profile gets the same buckets the
+    front door's row is read into, with ``total`` summed per
+    :data:`_TOTAL_BUCKETS` (reasoning reported, not added twice), and the
+    profiles add up under the top-level keys; ``unbilled`` rides along so a
+    partial sum says so in the record. ``None`` when no session reported
+    counts, which is not the same as a run whose workers cost nothing.
+    """
+    if not by_agent:
+        return None
+    workers: dict[str, Any] = {bucket: 0 for bucket, _ in _SESSION_TOKEN_KEYS}
+    workers["total"] = 0
+    workers["by_agent"] = {}
+    for agent, columns in by_agent.items():
+        counts = {bucket: int(columns.get(key) or 0) for bucket, key in _SESSION_TOKEN_KEYS}
+        counts["total"] = sum(counts[bucket] for bucket in _TOTAL_BUCKETS)
+        workers["by_agent"][agent] = counts
+        for bucket, value in counts.items():
+            workers[bucket] += value
+    workers["unbilled"] = list(unbilled)
+    return workers
+
+
+def _fold_worker_tokens(tokens: dict[str, Any]) -> None:
+    """Add the workers' spend into the run's buckets, keeping the router's apart.
+
+    Runs after the front door's session row has replaced the summed envelopes
+    (:func:`_canonical_session_tokens`), because that replacement is
+    wholesale: folded any earlier, the workers would be overwritten with the
+    row. The router's own numbers move under ``front_door`` first, so the
+    record keeps both halves and the top level is the run. A run that
+    delegated nothing has no ``workers`` key and is left alone, and so is one
+    whose workers could not be billed (``workers`` is ``None``): its top level
+    stays the router's. Which of the two it was is on the in-process
+    ``metadata["worker_trajectory"]`` -- ``None`` when the pod read never ran,
+    a summary whose ``errors`` name the unbilled sessions when it did.
+    """
+    workers = tokens.get("workers")
+    if not isinstance(workers, dict):
+        return
+    buckets = [bucket for bucket, _ in _SESSION_TOKEN_KEYS] + ["total"]
+    tokens["front_door"] = {bucket: tokens.get(bucket) for bucket in buckets}
+    for bucket in buckets:
+        extra = workers.get(bucket)
+        if not isinstance(extra, int) or isinstance(extra, bool):
+            continue
+        current = tokens.get(bucket)
+        tokens[bucket] = extra if current is None else current + extra
+
+
 def _sum_tokens(base: dict[str, Any], extra: dict[str, Any]) -> None:
     """Add ``extra``'s token buckets into ``base`` in place.
 
@@ -1514,6 +1570,8 @@ class KubeAgentsHarness(AgentHarness):
                 headers,
                 min(timeout, _SESSION_LOOKUP_TIMEOUT),
             )
+        # And only then the workers', which the row must not overwrite.
+        _fold_worker_tokens(result.tokens)
         return result
 
     def _execute_inject(self, prompt: str) -> AgentResult:
@@ -2300,6 +2358,12 @@ class KubeAgentsHarness(AgentHarness):
         ``worker_commands`` draws between an empty capture and no capture. It
         stays on the in-process result: devops-bench writes ``trajectory`` to
         the record and drops ``metadata``.
+
+        The workers' token counts land under ``tokens["workers"]`` in the
+        record's buckets, per profile and summed, or ``None`` when no session
+        could be billed. They are added into the run's top-level buckets later,
+        in :meth:`_execute`, after the front door's session row is read
+        (:func:`_fold_worker_tokens` says why the order matters).
         """
         _append_delivered(result, observed, awaited)
         _append_artifacts(result, awaited, _EXEC_TIMEOUT)
@@ -2310,9 +2374,15 @@ class KubeAgentsHarness(AgentHarness):
         captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
         if captured is None:
             result.metadata["worker_trajectory"] = None
+            # A run that filed no card settles too (nothing to wait for), and
+            # has no workers to bill: leave the key out. ``None`` is for a run
+            # that did delegate and whose pod could not be read.
+            if awaited:
+                result.tokens["workers"] = None
         else:
             result.trajectory.extend(captured.entries)
             result.metadata["worker_trajectory"] = captured.summary
+            result.tokens["workers"] = _worker_token_buckets(captured.tokens, captured.unbilled)
         _purge_card_state(awaited, _EXEC_TIMEOUT)
 
     @staticmethod

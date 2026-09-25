@@ -51,6 +51,18 @@ and statuses still come back. The tags are also how ``tool_called`` keeps its
 default router-only contract: ``scope: router`` skips every entry carrying
 ``agent`` and ``scope: workers`` counts only those.
 
+The same read collects each worker session's token counts (#1870). A session's
+usage is aggregated on its ``sessions`` row in the same five columns the
+harness reads for the front door's session (``input_tokens``,
+``cache_read_tokens``, ``cache_write_tokens``, ``reasoning_tokens``,
+``output_tokens``); a hermes that keeps usage per model in
+``session_model_usage`` is summed from there when the row is empty or missing. The
+counts come back per session in hermes' column names, are summed per profile
+in :attr:`WorkerCapture.tokens`, and the harness maps them into its buckets
+and adds them to the run's totals once the front door's own row is in
+(``harness._fold_worker_tokens``) -- a delegated run's ``tokens.total`` was
+the router's spend alone before this, the smallest part of the run.
+
 Two readers change with this. The record's ``trajectory`` is what devops-bench
 hands its judged metrics as the execution trace, so the judge now sees the
 worker's steps beside the router's ``kanban_create`` -- which is what the
@@ -173,6 +185,15 @@ PROMPT = "work kanban task "
 REDACTED = "[REDACTED_SECRET]"
 WITHHELD = "[WITHHELD: redactor unavailable in the pod]"
 TOOL_ERROR_PREFIX = "Error executing tool"
+# hermes' usage columns, on the ``sessions`` row as aggregates and, in a
+# hermes that attributes usage per model, on ``session_model_usage`` rows.
+TOKEN_COLUMNS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
 
 # What AuditRedactor leaves behind in the text a worker reads. In a Secret
 # payload: the continuation lines of a block scalar under data:/stringData:
@@ -366,6 +387,38 @@ def like_escape(value):
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def session_tokens(conn, profile, sid):
+    # The session row first: it is what /api/sessions/<id> serves for the front
+    # door, so the workers are counted by the same rule. A row whose counts are
+    # all zero on a store that also keeps per-model usage is summed from that
+    # table instead. A session that reaches here made model calls (it has
+    # assistant rows), so all zeros after both reads is "not tracked", never
+    # "free": it is reported and stays out of the record rather than in it as
+    # zero, the same as a store with neither table.
+    counts = None
+    if has_table(conn, "sessions"):
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+        if set(TOKEN_COLUMNS) <= cols:
+            row = conn.execute(
+                "SELECT %s FROM sessions WHERE id = ?" % ", ".join(TOKEN_COLUMNS), (sid,)
+            ).fetchone()
+            if row is not None:
+                counts = {c: int(row[c] or 0) for c in TOKEN_COLUMNS}
+    if (counts is None or not any(counts.values())) and has_table(conn, "session_model_usage"):
+        row = conn.execute(
+            "SELECT %s FROM session_model_usage WHERE session_id = ?"
+            % ", ".join("COALESCE(SUM(%s), 0)" % c for c in TOKEN_COLUMNS),
+            (sid,),
+        ).fetchone()
+        if row is not None and any(row):
+            counts = {c: int(row[i] or 0) for i, c in enumerate(TOKEN_COLUMNS)}
+    if counts is not None and not any(counts.values()):
+        counts = None
+    if counts is None:
+        out["errors"].append("session %s of %s: no token counts in the store" % (sid, profile))
+    return counts
+
+
 def has_table(conn, name):
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
@@ -554,12 +607,19 @@ while kb is not None and queue:
         try:
             conn = ro(state_db(profile))
             calls = read_session(conn, tid, profile, sid)
-            conn.close()
         except sqlite3.Error as exc:
             unread("session %s of %s: %s" % (sid, profile, exc))
             continue
+        # The calls are already in out["calls"]; a usage read that fails must
+        # not cost the session its place in the map, only its counts.
+        try:
+            tokens = session_tokens(conn, profile, sid)
+        except sqlite3.Error as exc:
+            out["errors"].append("session %s of %s: token counts: %s" % (sid, profile, exc))
+            tokens = None
+        conn.close()
         card["sessions"].append(
-            {"id": sid, "agent": profile, "match": match, "calls": calls}
+            {"id": sid, "agent": profile, "match": match, "calls": calls, "tokens": tokens}
         )
     if not card["sessions"] and runs:
         unread("no session found for card %s" % tid)
@@ -586,10 +646,21 @@ class WorkerCapture:
             Kept on the ``AgentResult``'s ``metadata["worker_trajectory"]``
             for the harness log and the tests; devops-bench does not write
             ``metadata`` to the record, so it is not in ``results.json``.
+        tokens: Each profile's token counts summed over the sessions it
+            worked in, keyed by profile and then by hermes' column name
+            (:data:`TOKEN_COLUMNS` in the pod). A session whose store had no
+            counts is absent from the sums and named in ``summary["errors"]``.
+            The harness maps these into its buckets and adds them to the run's
+            totals (``harness._fold_worker_tokens``).
+        unbilled: The sessions that reported no counts, as ``agent`` /
+            ``task`` / ``session``, so a record whose sums are partial says
+            so on disk (``summary`` does not reach ``results.json``).
     """
 
     entries: list[dict[str, Any]] = field(default_factory=list)
     summary: dict[str, Any] = field(default_factory=dict)
+    tokens: dict[str, dict[str, int]] = field(default_factory=dict)
+    unbilled: list[dict[str, str]] = field(default_factory=list)
 
 
 def gaps(summary: dict[str, Any] | None) -> list[str] | None:
@@ -706,4 +777,40 @@ def capture(
     }
     for problem in summary["errors"]:
         _log.warning("worker trajectory: %s", problem)
-    return WorkerCapture(entries=entries, summary=summary)
+    by_agent, unbilled = _tokens_by_agent(summary["cards"])
+    return WorkerCapture(entries=entries, summary=summary, tokens=by_agent, unbilled=unbilled)
+
+
+def _tokens_by_agent(
+    cards: list[Any],
+) -> tuple[dict[str, dict[str, int]], list[dict[str, str]]]:
+    """Sum each session's counts into its profile's, in hermes' column names.
+
+    A retried card ran in several sessions and a profile works several cards
+    in one run; both add up here. A session that reported no counts (``None``,
+    named in the pod's errors) contributes nothing rather than zero, and is
+    returned in the second element so the record can say the sums are partial.
+    """
+    by_agent: dict[str, dict[str, int]] = {}
+    unbilled: list[dict[str, str]] = []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        for session in card.get("sessions") or []:
+            if not isinstance(session, dict):
+                continue
+            agent = str(session.get("agent") or "")
+            if not isinstance(session.get("tokens"), dict):
+                unbilled.append(
+                    {
+                        "agent": agent,
+                        "task": str(card.get("task") or ""),
+                        "session": str(session.get("id") or ""),
+                    }
+                )
+                continue
+            counts = by_agent.setdefault(agent, {})
+            for column, value in session["tokens"].items():
+                if isinstance(value, int) and not isinstance(value, bool):
+                    counts[column] = counts.get(column, 0) + value
+    return by_agent, unbilled
