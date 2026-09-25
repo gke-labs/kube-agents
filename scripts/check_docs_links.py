@@ -44,7 +44,10 @@ Scope is deliberately narrow and offline:
   fetched or validated), however the link is written -- a Markdown link, a
   reference-style definition, an autolink, or an HTML or JSX ``href``
   attribute, which is how the site's hub pages link their sections
-  (``<LinkCard href=...>``). A document linked only from documents no reader
+  (``<LinkCard href=...>``). A link inside a fenced block, an inline code
+  span, an HTML comment or an MDX comment is a specimen or a leftover, not
+  a link: it reaches nothing and is not reported as broken either. A
+  document linked only from documents no reader
   reaches is as unreachable as one linked from nowhere, and is reported the
   same way. The documents that were unreachable when the rule arrived are
   named in ``UNLINKED_ALLOWLIST``; the list only shrinks -- an entry that
@@ -131,6 +134,16 @@ FENCE_RE = re.compile(r"^\s*(```|~~~)")
 # LINK_RE, which is the safe direction to be wrong in, and line numbers in the
 # report keep meaning what they say.
 INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)")
+
+# HTML and MDX comments, for the same reason again: a link an author commented
+# out instead of deleting renders nowhere, so it reaches no document -- the
+# rule the sidebar read applies to a JavaScript comment, one file over -- and
+# it is not a broken link either. A comment may span lines; the lines inside
+# one are dropped and the report's line numbers keep meaning what they say.
+# Removed after fences and inline code, because several design documents
+# quote the opener in a span (`<!--`) to explain a marker, and read raw it
+# would open a comment that swallows the rest of the document.
+COMMENT_DELIMITERS = (("<!--", "-->"), ("{/*", "*/}"))
 
 # A design or architecture document named from code. The match ends at `.md`,
 # so a trailing `)`, `.`, `,`, `:12`, `#anchor`, a closing backtick or a
@@ -302,6 +315,33 @@ def strip_code_fences(text: str) -> list[tuple[int, str]]:
     return kept
 
 
+def strip_comments(lines: Iterator[tuple[int, str]]) -> Iterator[tuple[int, str]]:
+    """The lines with every HTML and MDX comment removed, across line breaks."""
+    closer: str | None = None
+    for lineno, line in lines:
+        kept: list[str] = []
+        rest = line
+        while True:
+            if closer is not None:
+                end = rest.find(closer)
+                if end < 0:
+                    rest = ""
+                    break
+                rest = rest[end + len(closer) :]
+                closer = None
+            starts = [(rest.find(opener), opener, close) for opener, close in COMMENT_DELIMITERS]
+            starts = [found for found in starts if found[0] >= 0]
+            if not starts:
+                kept.append(rest)
+                break
+            start, opener, closer = min(starts)
+            # A space, as for an inline span: what stood either side of the
+            # comment must not be glued into a link that was never written.
+            kept.append(rest[:start] + " ")
+            rest = rest[start + len(opener) :]
+        yield lineno, "".join(kept)
+
+
 def line_links(line: str) -> Iterator[str]:
     """Every link target written on one line, in each form a document links another."""
     yield from LINK_RE.findall(line)
@@ -315,10 +355,10 @@ def line_links(line: str) -> Iterator[str]:
 
 def markdown_links(path: Path) -> Iterator[tuple[int, str]]:
     """Yield (line number, link target) for every navigable link in a document."""
-    for lineno, line in strip_code_fences(path.read_text(encoding="utf-8")):
-        # A space, not "", so stripping a span cannot glue a stray `[text]`
-        # onto a following `(target)` and invent a link that was never written.
-        line = INLINE_CODE_RE.sub(" ", line)
+    # A space, not "", so stripping a span cannot glue a stray `[text]`
+    # onto a following `(target)` and invent a link that was never written.
+    lines = ((n, INLINE_CODE_RE.sub(" ", line)) for n, line in strip_code_fences(path.read_text(encoding="utf-8")))
+    for lineno, line in strip_comments(lines):
         for raw in line_links(line):
             target = raw.strip()
             if target:
