@@ -512,3 +512,19 @@ class ProfileNameValidationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnionFallbackTest(unittest.TestCase):
+    """_union's fallback for unhashable items must not itself raise: a mapping with a
+    key JSON cannot sort or serialise (PyYAML reads a bare `on:` as a bool) is kept
+    rather than failing the whole profile's merge."""
+
+    def test_a_mapping_with_a_non_string_key_merges_without_raising(self):
+        theirs = {True: "bool key", "name": "odd-hook", "url": "https://x"}
+        merged = po.merge({"hooks": {"outbound": [theirs]}}, {"hooks": {"outbound": [{"name": "a2a-bridge-activity"}]}})
+        self.assertEqual([h.get("name") for h in merged["hooks"]["outbound"]], ["odd-hook", "a2a-bridge-activity"])
+
+    def test_duplicate_mappings_still_collapse(self):
+        a = {"name": "x", "events": ["a"]}
+        merged = po.merge({"hooks": {"outbound": [dict(a)]}}, {"hooks": {"outbound": [dict(a)]}})
+        self.assertEqual(len(merged["hooks"]["outbound"]), 1)

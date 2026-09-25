@@ -147,7 +147,13 @@ def _union(base, overlay):
             key = ("h", item)
             hash(key)
         except TypeError:
-            key = ("j", json.dumps(item, sort_keys=True, default=str))
+            try:
+                key = ("j", json.dumps(item, sort_keys=True, default=str))
+            except TypeError:
+                # A mapping whose keys will not sort or serialise (a bare
+                # `on:` read as a bool beside a string key): keep it rather
+                # than fail the merge, at the cost of not deduplicating it.
+                key = ("r", repr(item))
         if key in seen:
             continue
         seen.add(key)

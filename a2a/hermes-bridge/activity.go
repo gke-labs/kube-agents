@@ -123,9 +123,12 @@ const (
 // records. redactedKeyPattern names input keys whose values never go on the
 // bus. redactedValuePatterns catch the credential shapes a value can carry
 // under an innocent key - a terminal command is one string under "command" -
-// and are best-effort by nature: a bearer token, Google OAuth access token,
-// Google API key, GitHub token, or a "key=value" pair whose key looks like
-// a secret. Anything else the model pastes into a command line ships.
+// and are best-effort by nature: a bearer or basic authorization value,
+// a Google OAuth access token, a Google API key, a GitHub token, a
+// user:password given to curl's -u, or a key that looks like a secret
+// followed by its value - with or without the quotes and spaces a JSON body
+// or a header puts around the separator. Anything else the model pastes
+// into a command line ships.
 // activityEntryBudget bounds the activity parts one task publishes. The
 // trace rides the task's own events subject, which the TASKS stream caps at
 // 4096 messages per subject with discard-old, so a run that published a part
@@ -142,7 +145,9 @@ var (
 		regexp.MustCompile(`ya29\.[A-Za-z0-9._-]{20,}`),
 		regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),
 		regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
-		regexp.MustCompile(`(?i)(token|secret|password|passwd|api[_-]?key|credential)s?[=:]\s*\S+`),
+		regexp.MustCompile(`(?i)basic\s+[A-Za-z0-9+/=]{8,}`),
+		regexp.MustCompile(`(?i)(?:^|\s)(?:-u|--user)[\s=]+\S+:\S+`),
+		regexp.MustCompile(`(?i)(token|secret|password|passwd|api[_-]?key|credential)s?["']?\s*[=:]\s*["']?[^"'\s,}]+`),
 	}
 )
 
@@ -403,8 +408,14 @@ func redactInput(raw json.RawMessage) json.RawMessage {
 	if trimmed == "" || trimmed == "null" {
 		return nil
 	}
+	// UseNumber: a number decoded into float64 and written back loses the
+	// low digits of a 64-bit id, and the worker adapter publishes the same
+	// argument verbatim; json.Number falls through redactValue and marshals
+	// as its literal.
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
 	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
+	if err := dec.Decode(&v); err != nil {
 		return json.RawMessage(`{"unparseable":true}`)
 	}
 	out, err := json.Marshal(redactValue(v))
