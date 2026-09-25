@@ -862,8 +862,11 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # the grant is `fleet_reader_token_creators`, and
 # `scripts/verify_ci_pool_project.py` fails a project missing it. See
 # bench/tf/fleet/README.md, "A read-only credential for evaluations".
+# FLEET_ALLOW_RUNNER_CREDENTIAL=1 is a developer's opt-in for a fleet only they
+# use, and a Prow job refuses it: set there it would restore the fallback.
 # shellcheck source=hack/fleet-kubeconfigs.sh
 source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
+_fleet_refuse_opt_in_under_prow || exit 1
 export FLEET_READONLY_SA="$(_fleet_reader_for_run "${PROJECT_ID}")"
 
 profile_begin "fleet-kubeconfigs: seeded-fleet credentials"

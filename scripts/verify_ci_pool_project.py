@@ -1490,8 +1490,9 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
             "Not checked",
             warnings=[
                 "kubectl is not on PATH, so the planted fixtures were not checked. "
-                f"Install it and re-run, or run FLEET_PROJECT_ID={project_id} "
-                "hack/fleet-kubeconfigs.sh by hand and read its summary line."
+                f"Install it and re-run, or run {FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV}=1 "
+                f"FLEET_PROJECT_ID={project_id} hack/fleet-kubeconfigs.sh by hand and "
+                "read its summary line."
             ],
         )
 

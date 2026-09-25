@@ -70,14 +70,16 @@
 #   FLEET_READONLY_SA         service account to mint a read-only token for
 #   FLEET_ALLOW_RUNNER_CREDENTIAL  1 to run without FLEET_READONLY_SA on a
 #                             fleet only you use (the files then carry your
-#                             own credential; the script says so)
+#                             own credential; the script says so). The CI
+#                             scripts refuse it in a Prow job.
 #
 # Output: exports BENCH_FLEET_KUBECONFIG_DIR when sourced; prints it on stdout
 # when executed. Everything else this script says goes to stderr.
 #
 # Exit status: 0; 1 for bad inputs, a malformed catalog or a temp file that
 # could not be made; _FLEET_EXIT_READONLY_UNAVAILABLE (3) when the read-only
-# credential is unset or cannot be minted -- nothing is written then.
+# credential is unset or cannot be minted -- the output directory is removed
+# and nothing is written then.
 # ==============================================================================
 
 _FLEET_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -347,6 +349,18 @@ _fleet_reader_for_run() {
   fi
 }
 
+# The opt-in is for a developer's own fleet. In a Prow job -- JOB_NAME or
+# PULL_NUMBER set, the signal hack/ci-deploy.sh derives IS_PROW_RUN from -- it
+# would quietly restore, for every leased run, the write-credential fallback
+# the gate replaces, so the CI scripts refuse it before choosing a reader.
+_fleet_refuse_opt_in_under_prow() {
+  if { [ -n "${JOB_NAME:-}" ] || [ -n "${PULL_NUMBER:-}" ]; } && [ "${FLEET_ALLOW_RUNNER_CREDENTIAL:-}" = "1" ]; then
+    echo "ERROR: FLEET_ALLOW_RUNNER_CREDENTIAL=1 is set in a Prow job. The opt-in is for a developer's own fleet; a leased run reads the shared fleet as its reader or not at all. Remove it from the job's environment." >&2
+    return 1
+  fi
+  return 0
+}
+
 # An OAuth2 bearer token is a run of unreserved characters; anything else is
 # gcloud's stderr leaked into stdout.
 _fleet_bare_token() {
@@ -423,8 +437,11 @@ write_fleet_kubeconfigs() {
     echo "ERROR: ${dir} exists and was not written by this script; refusing to remove it" >&2
     return 1
   fi
-  _fleet_require_readonly_credential "$sa" "$project" || return $?
   rm -rf "$dir"
+  # After the rm: a refused run must not leave a previous run's files --
+  # credentials for a previous project -- where a caller that still exports
+  # BENCH_FLEET_KUBECONFIG_DIR would read them.
+  _fleet_require_readonly_credential "$sa" "$project" || return $?
   (umask 077 && mkdir -p "$dir/clusters") || return 1
   : >"${dir}/${_FLEET_MARKER}"
   # So a check that cannot resolve its role can name the project it was looking

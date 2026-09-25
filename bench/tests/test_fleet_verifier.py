@@ -1650,7 +1650,13 @@ def test_a_read_only_service_account_reaches_every_role_file(shell, tmp_path):
 def test_a_reader_that_cannot_be_minted_stops_the_runner_before_any_file(shell, tmp_path):
     """The warn-and-fall-back this replaces ran unread on two pool projects for
     a day: a check made with the runner's write credential proves nothing, so
-    the run stops instead, with nothing written."""
+    the run stops instead, with nothing written -- and nothing left. A previous
+    run's files are credentials for a previous project, and a caller that still
+    exports BENCH_FLEET_KUBECONFIG_DIR would otherwise read them."""
+    stale = tmp_path / "out"
+    stale.mkdir()
+    (stale / ".kube-agents-fleet-kubeconfigs").touch()
+    (stale / "crashloop-workload.kubeconfig").write_text("a previous project's credential\n")
     out = _provision(
         shell,
         tmp_path,
@@ -1659,7 +1665,7 @@ def test_a_reader_that_cannot_be_minted_stops_the_runner_before_any_file(shell, 
     )
     done = _provision.last
     assert done.returncode == 3, done.stderr
-    assert not out.exists()
+    assert out == stale and not out.exists()
     assert "seeded-fleet-reader@p" in done.stderr
     assert "PERMISSION_DENIED" in done.stderr
     assert "roles/iam.serviceAccountTokenCreator" in done.stderr

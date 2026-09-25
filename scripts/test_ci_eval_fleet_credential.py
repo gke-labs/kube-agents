@@ -29,6 +29,17 @@ def call_site() -> str:
     return match.group(0)
 
 
+def run_bash(script: str, **env: str) -> subprocess.CompletedProcess:
+    """Run under an explicit environment: the developer's shell may export the
+    very variables under test (the opt-in, the reader, Prow's JOB_NAME), and
+    the lifted code must see only what the case sets."""
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True, text=True, check=False,
+        env={"PATH": os.environ["PATH"], **env},
+    )
+
+
 def run_call_site(runner_exit: int) -> subprocess.CompletedProcess:
     script = "\n".join(
         [
@@ -41,11 +52,12 @@ def run_call_site(runner_exit: int) -> subprocess.CompletedProcess:
             "echo reached-the-next-step",
         ]
     )
-    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+    return run_bash(script)
 
 
 DEPLOY = REPO_ROOT / "hack" / "ci-deploy.sh"
 PREFLIGHT = "preflight_fleet_reader"
+PROW_REFUSAL = "_fleet_refuse_opt_in_under_prow || exit 1"
 
 
 def preflight_body() -> str:
@@ -56,13 +68,14 @@ def preflight_body() -> str:
     return match.group(0)
 
 
-def run_preflight(gate_exit: int, prow: bool = True) -> subprocess.CompletedProcess:
+def run_preflight(gate_exit: int | None, prow: bool = True, **env: str) -> subprocess.CompletedProcess:
+    """`gate_exit` stubs the credential gate; None runs the real one, which
+    passes without a mint only on the opt-in."""
     script = "\n".join(
         [
             "set -euo pipefail",
             f'source "{RUNNER}"',
-            f"_fleet_require_readonly_credential() {{ return {gate_exit}; }}",
-            "FLEET_READONLY_SA=reader@p.iam.gserviceaccount.com",
+            "" if gate_exit is None else f"_fleet_require_readonly_credential() {{ return {gate_exit}; }}",
             "PROJECT_ID=p",
             f"IS_PROW_RUN={'true' if prow else 'false'}",
             preflight_body(),
@@ -70,7 +83,7 @@ def run_preflight(gate_exit: int, prow: bool = True) -> subprocess.CompletedProc
             "echo reached-the-build",
         ]
     )
-    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+    return run_bash(script, **env)
 
 
 class DeployPreflightTest(unittest.TestCase):
@@ -82,7 +95,7 @@ class DeployPreflightTest(unittest.TestCase):
         done = run_preflight(3)
         self.assertEqual(1, done.returncode, done.stderr)
         self.assertIn("FATAL", done.stderr)
-        self.assertIn("reader@p.iam.gserviceaccount.com", done.stderr)
+        self.assertIn("seeded-fleet-reader@p.iam.gserviceaccount.com", done.stderr)
         self.assertIn("Re-apply bench/tf/fleet against p", done.stderr)
         self.assertNotIn("reached-the-build", done.stdout)
 
@@ -98,6 +111,20 @@ class DeployPreflightTest(unittest.TestCase):
         self.assertNotIn("Re-apply", done.stderr)
         self.assertNotIn("reached-the-build", done.stdout)
 
+    def test_a_laptop_that_opted_in_passes_on_its_own_credential(self):
+        done = run_preflight(None, prow=False, FLEET_ALLOW_RUNNER_CREDENTIAL="1")
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertIn("reached-the-build", done.stdout)
+
+    def test_a_prow_job_refuses_the_opt_in(self):
+        """Set in a job's environment, the opt-in would restore the fallback
+        this gate replaces for every leased run; the deploy stops before it
+        chooses a reader, whatever the gate would have said."""
+        done = run_preflight(0, JOB_NAME="pull-kube-agents-smoke-test", FLEET_ALLOW_RUNNER_CREDENTIAL="1")
+        self.assertEqual(1, done.returncode, done.stderr)
+        self.assertIn("FLEET_ALLOW_RUNNER_CREDENTIAL=1 is set in a Prow job", done.stderr)
+        self.assertNotIn("reached-the-build", done.stdout)
+
     def test_a_mintable_reader_lets_the_deploy_continue(self):
         done = run_preflight(0)
         self.assertEqual(0, done.returncode, done.stderr)
@@ -105,27 +132,31 @@ class DeployPreflightTest(unittest.TestCase):
 
     def test_the_deploy_and_the_eval_default_the_same_reader(self):
         """One definition, `_fleet_reader_for_run`; both call sites use it,
-        and neither spells the account out."""
+        neither spells the account out, and both refuse the opt-in under Prow
+        before choosing a reader."""
         for path in (DEPLOY, SCRIPT):
             text = path.read_text(encoding="utf-8")
             self.assertIn('_fleet_reader_for_run "${PROJECT_ID}"', text, path)
             self.assertNotIn("seeded-fleet-reader@${PROJECT_ID}", text, path)
+            self.assertLess(text.index(PROW_REFUSAL), text.index('_fleet_reader_for_run "${PROJECT_ID}"'), path)
 
     def test_the_developer_opt_in_leaves_the_reader_unset(self):
         """`FLEET_ALLOW_RUNNER_CREDENTIAL=1` on a developer's own project must
         reach the gate as no reader, or the gate cannot honour it."""
         def reader(**env: str) -> str:
-            # An explicit environment: the developer's shell may export the
-            # very variables under test, and the helper must not see them.
-            done = subprocess.run(
-                ["bash", "-c", f'source "{RUNNER}"; _fleet_reader_for_run p'],
-                capture_output=True, text=True, check=False,
-                env={"PATH": os.environ["PATH"], **env},
-            )
-            return done.stdout
+            return run_bash(f'source "{RUNNER}"; _fleet_reader_for_run p', **env).stdout
         self.assertEqual("seeded-fleet-reader@p.iam.gserviceaccount.com", reader())
         self.assertEqual("", reader(FLEET_ALLOW_RUNNER_CREDENTIAL="1"))
         self.assertEqual("mine@p.iam.gserviceaccount.com", reader(FLEET_READONLY_SA="mine@p.iam.gserviceaccount.com", FLEET_ALLOW_RUNNER_CREDENTIAL="1"))
+
+    def test_the_prow_refusal_fires_only_on_a_job_with_the_opt_in(self):
+        def refusal(**env: str) -> int:
+            return run_bash(f'source "{RUNNER}"; _fleet_refuse_opt_in_under_prow', **env).returncode
+        self.assertEqual(0, refusal())
+        self.assertEqual(0, refusal(FLEET_ALLOW_RUNNER_CREDENTIAL="1"))
+        self.assertEqual(0, refusal(JOB_NAME="periodic-kube-agents-nightly"))
+        self.assertEqual(1, refusal(JOB_NAME="periodic-kube-agents-nightly", FLEET_ALLOW_RUNNER_CREDENTIAL="1"))
+        self.assertEqual(1, refusal(PULL_NUMBER="2005", FLEET_ALLOW_RUNNER_CREDENTIAL="1"))
 
 
 class FleetCredentialCallSiteTest(unittest.TestCase):
