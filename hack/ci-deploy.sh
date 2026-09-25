@@ -110,8 +110,8 @@ readonly A2A_INJECT_BACKEND_ON="true"
 readonly A2A_NATS_SERVICE_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-nats"
 readonly A2A_NATS_CLIENT_PORT=4222
 # The URL the operator renders into the agent container for the same bus:
-# service, namespace, port (a2aNATSURL and the NATS_URL env in
-# platformagent_manifests.go). The namespace is known only once ci-env.sh is
+# service, namespace, port (the NATS_URL env in platformagent_manifests.go;
+# a2aNATSClientURL is the operator's own spelling for the gateway). The namespace is known only once ci-env.sh is
 # sourced, so this is a printf format, filled in step 6b.
 readonly A2A_NATS_URL_FORMAT='nats://%s.%s.svc:%d'
 readonly A2A_CREDS_SECRET_NAME="${A2A_NATS_SERVICE_NAME}-creds"
@@ -122,7 +122,7 @@ readonly A2A_BRIDGE_PASSWORD_KEY="bridge-password"
 # (deploy/shared/docker-entrypoint.sh, step 1.5; buildBaseContainers sets it
 # on the dashboard container the same way), and the projected bus token
 # volume the webhook reserves for the agent container, which the sidecar's
-# mounts must not name (a2aBusTokenVolume; reservedVolumeNames in the API).
+# mounts must not name (a2aBusTokenVolume; ReservedVolumeNames in the API).
 readonly BRIDGE_SIDECAR_NAME="hermes-bridge"
 readonly BRIDGE_NATS_URL_ENV_VAR="NATS_URL"
 readonly BRIDGE_NATS_USER_ENV_VAR="NATS_USER"
@@ -999,18 +999,21 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     dump_mode_next_state
     exit 1
   fi
-  echo "✓ inject door rendered (${A2A_INJECT_NAME} Service and token Secret) $((INJECT_GATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+  echo "✓ inject door rendered (${A2A_INJECT_NAME} Service, and token Secret with key ${A2A_INJECT_TOKEN_KEY} for the eval) $((INJECT_GATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
 
   # The bridge sidecar. Its concurrency is the matrix's fan-out, read from the
   # same job environment hack/ci-eval-pr.sh reads it from (the constants block
   # says how it is sized); refused outright rather than passed through when it
   # is not a count the bridge can honour.
-  # Digits only, before the numeric compare: bash's `test` skips surrounding
-  # whitespace and the bridge's strconv.Atoi does not, so " 4" would pass
-  # here and start the bridge at its default of 2 with a warning nobody reads.
+  # Digits only, and at most four of them, before the numeric compare: bash's
+  # `test` skips surrounding whitespace and the bridge's strconv.Atoi does
+  # not, so " 4" would pass here and start the bridge at its default of 2
+  # with a warning nobody reads; and `test` cannot parse a digit string past
+  # int64 at all, which would let it through the same way. Five digits or
+  # more can never be within the queue's capacity, whatever they are.
   MODE_NEXT_BRIDGE_CONCURRENCY="${EVAL_TASK_PARALLELISM:-${EVAL_TASK_PARALLELISM_DEFAULT}}"
   case "${MODE_NEXT_BRIDGE_CONCURRENCY}" in
-  '' | *[!0-9]*) MODE_NEXT_BRIDGE_CONCURRENCY_OK="false" ;;
+  '' | *[!0-9]* | ?????*) MODE_NEXT_BRIDGE_CONCURRENCY_OK="false" ;;
   *) MODE_NEXT_BRIDGE_CONCURRENCY_OK="true" ;;
   esac
   if [ "${MODE_NEXT_BRIDGE_CONCURRENCY_OK}" != "true" ] || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -lt 1 ] || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -gt "${BRIDGE_QUEUE_CAPACITY}" ]; then

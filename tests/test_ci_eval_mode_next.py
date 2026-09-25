@@ -153,16 +153,15 @@ class FlagSetIsInjectTest(unittest.TestCase):
             f"get secret platform-agent-a2a-inject -n {_NAMESPACE} -o jsonpath={{.data.token}}",
         )
 
-    def test_every_unit_gets_its_own_inject_tunnel(self) -> None:
+    def test_the_inject_tunnels_base_is_the_harnesss_variable_and_clear_of_the_api_range(self) -> None:
         """The harness owns one port-forward per process and tears it down at
         exit, which is why run_one_unit gives each unit its own agent-API port;
         the inject door reads a different variable, so it needs the same
-        treatment or every unit rides the first one's listener."""
-        script = text(_CI_EVAL)
-        unit = script[script.index("run_one_unit() {") :]
-        unit = unit[: unit.index("\n}\n")]
-        self.assertIn("export AGENT_LOCAL_PORT=$((28642 + seq))", unit)
-        self.assertIn("export AGENT_INJECT_LOCAL_PORT=$((EVAL_INJECT_LOCAL_PORT_BASE + seq))", unit)
+        treatment or every unit rides the first one's listener. That the unit
+        exports it, per unit, is run rather than read in
+        scripts/test_ci_eval_fanout.py (the fan-out's own suite, which runs
+        run_one_unit); what is pinned here is the name the harness reads and
+        the base the export is built from."""
         harness = text(_HARNESS)
         self.assertIn('"AGENT_INJECT_LOCAL_PORT"', harness)
         base = int(constants()["EVAL_INJECT_LOCAL_PORT_BASE"])
@@ -174,8 +173,11 @@ class FlagSetIsInjectTest(unittest.TestCase):
     def test_a_missing_token_secret_stops_the_run_before_the_matrix(self) -> None:
         result = run_section("1", secret_missing=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("platform-agent-a2a-inject", result.stderr)
-        self.assertIn("EVAL_MODE_NEXT=1", result.stderr)
+        # The script's own line, not the stub's echo of the kubectl call.
+        errors = [line for line in result.stderr.splitlines() if line.startswith("ERROR:")]
+        self.assertEqual(len(errors), 1, result.stderr)
+        self.assertIn("platform-agent-a2a-inject", errors[0])
+        self.assertIn("EVAL_MODE_NEXT=1", errors[0])
         self.assertNotIn("TRANSPORT=", result.stdout)
 
     def test_the_secret_and_transport_names_are_the_operators_and_the_harnesss(self) -> None:

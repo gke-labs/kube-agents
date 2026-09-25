@@ -14,8 +14,8 @@ build and push those four in order with the bridge FROM this build's platform
 image, the three guards (release-candidate path, Prow run with no pull request,
 the concurrency's grammar) run against the values they refuse and admit, the
 sidecar patch rendered from a fixture Deployment carries what the bridge doc
-lists and what the agent container had, and the two refusals (release-candidate
-path, Prow run with no pull request) sit where the script says they are.
+lists and what the agent container had, and the release-candidate refusal sits
+at the top of the branch the script says it guards.
 
 The names the flag path hands the operator, or reads back from what it
 renders, are copied from the operator's Go source, the bridge's, and the eval
@@ -372,10 +372,9 @@ class FlagSetIsNextTest(unittest.TestCase):
                 "--set-string",
                 f"operator.extraEnv[{index}].value={_AR_REPO}/{image}:{_TAG}",
             ]
-        # The inject door is armed the same way, and the operator opens it only
-        # on the exact word its reader compares against.
+        # The inject door is armed the same way; that the operator opens it only
+        # on the exact word "true" is the conformance suite's pin (test_A_authority).
         inject_env_var = go_constant(_A2A_MANIFESTS, "a2aInjectBackendEnvVar")
-        self.assertRegex(text(_A2A_MANIFESTS), rf'os\.Getenv\({re.escape("a2aInjectBackendEnvVar")}\) == "true"')
         expected += [
             "--set-string",
             f"operator.extraEnv[3].name={inject_env_var}",
@@ -499,7 +498,9 @@ class FlagSetIsNextTest(unittest.TestCase):
         # Unset and empty both mean the default, as `${VAR:-default}` reads them
         # in hack/ci-eval-pr.sh too; everything else is the string, verbatim.
         admitted = {"1": "1", "4": "4", "6": "6", "1024": "1024", None: "4", "": "4"}
-        refused = (" 4", "4 ", "0", "-1", "1025", "four", "4.0", "+4")
+        # The last two are the width boundary: `test` cannot parse a digit
+        # string past int64 and would let it through as neither -lt nor -gt.
+        refused = (" 4", "4 ", "0", "-1", "1025", "four", "4.0", "+4", "10240", "99999999999999999999")
         for value, expected in admitted.items():
             with self.subTest(EVAL_TASK_PARALLELISM=value):
                 env = "" if value is None else f'export EVAL_TASK_PARALLELISM="{value}"\n'
