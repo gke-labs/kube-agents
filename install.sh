@@ -14,6 +14,10 @@
 
 set -Eeuo pipefail
 
+# This script's own name, for the abort banner when it runs piped through
+# stdin (curl | bash): bash then has no file to name its frames after.
+INSTALL_SCRIPT_NAME="install.sh"
+
 # ─── Install sources ──────────────────────────────────────────────────────────
 # Where the sources come from when this script runs alone (curl | bash) and
 # where it puts them. upgrade.sh and uninstall.sh carry the same URL for the
@@ -112,7 +116,30 @@ on_error() {
   local exit_code="$1"
   local line_no="$2"
   local bash_cmd="$3"
-  echo -e "\n\033[91m\033[1m✗ Error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
+  # An inherited firing inside a subshell: `set -E` hands this trap to every
+  # `$(...)`, and a probe whose miss the caller handles (`if !`, `||`) still
+  # fires it there on bash 3.2 (macOS's /bin/bash) before the caller is
+  # consulted. The parent decides: it prints the banner and writes the report
+  # itself when the failure reaches it, and nothing when it is handled. Exit,
+  # not return: command substitution does not inherit errexit, so a returning
+  # handler would let a multi-step probe run on past its failure. Process
+  # substitution (`< <(...)`) keeps the counter at 0 on bash 3.2 and clears
+  # the trap inline instead.
+  if [ "${BASH_SUBSHELL:-0}" -gt 0 ]; then
+    exit "$exit_code"
+  fi
+  # The frame that ran the failing command: a sourced library's file and the
+  # function it was in, or this script and `main` at top level. $LINENO alone
+  # counts from the top of whichever file the command sat in, so a bare line
+  # number sent the reader to that line of install.sh instead. Piped through
+  # stdin, bash labels this script's frames `main` or not at all, and $0 is
+  # `bash`; both read as the script by name.
+  local source_file="${BASH_SOURCE[1]:-}"
+  case "$source_file" in
+    ""|main) source_file="$INSTALL_SCRIPT_NAME" ;;
+  esac
+  local func_name="${FUNCNAME[1]:-main}"
+  echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
   write_json_report "FAILED" "${line_no}" "${bash_cmd}" 2>/dev/null || true
   # A half-written install.env must not be left where the next run would load
   # it. The real file is only ever moved into place complete.
@@ -1886,6 +1913,12 @@ wait_for_rollout() {
   local deployment="$1"
   local namespace="$2"
   local timeout_secs="$3"
+  local context="${4:-}"
+
+  local ctx_flag=()
+  if [ -n "$context" ]; then
+    ctx_flag=(--context "$context")
+  fi
 
   local started=$SECONDS
   local log_file=""
@@ -1893,7 +1926,7 @@ wait_for_rollout() {
 
   local rc=0
   run_with_spinner "$deployment" "$log_file" \
-    kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s" || rc=$?
+    kubectl rollout status "deployment/${deployment}" -n "$namespace" "${ctx_flag[@]}" --timeout="${timeout_secs}s" || rc=$?
 
   # Published for the caller's failure message. How long the wait actually ran is
   # the diagnostic: a ProgressDeadlineExceeded that comes back in seconds is a
@@ -1926,9 +1959,15 @@ wait_for_deployment_object() {
   local deployment="$1"
   local namespace="$2"
   local timeout_secs="$3"
+  local context="${4:-}"
+
+  local ctx_flag=()
+  if [ -n "$context" ]; then
+    ctx_flag=(--context "$context")
+  fi
 
   local deadline=$((SECONDS + timeout_secs))
-  while ! kubectl get deployment "$deployment" -n "$namespace" >/dev/null 2>&1; do
+  while ! kubectl get deployment "$deployment" -n "$namespace" "${ctx_flag[@]}" >/dev/null 2>&1; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       return 1
     fi
@@ -4197,6 +4236,54 @@ main() {
       google_chat_home_channel "$google_chat_home_channel"
   }
 
+  # Both chat platforms are opt-in and default off, so this is the common
+  # install, and the terminal is the only way to reach the agent. Printed again
+  # at the end of main(), beside the Google Chat and Slack instructions.
+  #
+  # project_id, region and cluster_name are all set by earlier steps, and
+  # NAMESPACE is exported before the menu runs.
+  _prompt_no_chat_enabled() {
+    print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
+
+    # gcloud rejects --dns-endpoint on clusters without an external DNS
+    # endpoint, so print the resolved flag rather than a literal one. Resolved
+    # up here because it can warn on stderr, which would otherwise split the
+    # block below.
+    #
+    # This is step 6 of the interview and the apply that creates the cluster is
+    # step 12, so on a fresh install -- and on every --dry-run and
+    # --generate-only run -- there is nothing to describe yet. That is not a
+    # failure: the helper leaves GKE_DNS_ENDPOINT_FLAG empty and the command
+    # below prints without --dns-endpoint, which is the only command there is
+    # anything to print before the cluster exists. The copy in the completion
+    # banner runs after the apply and resolves the real flag.
+    #
+    # What keeps that miss silent is `trap - ERR` inside the helper's own
+    # describe, not the guard here: bash 3.2 runs the inherited ERR trap in the
+    # substitution's subshell, which nothing on this line can reach. The guard
+    # covers the other half -- a non-zero return from the helper -- and matches
+    # the two get-credentials sites further down. The reset keeps the variable
+    # defined whatever the helper does.
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
+
+    echo ""
+    echo -e "${C_CYAN}${C_BOLD}--- [Talking to the Agent from a Terminal] ---${C_RESET}"
+    echo -e "With no chat platform, the terminal is the way in. Point kubectl at the cluster,"
+    echo -e "then open a Hermes session in the agent container:"
+    echo ""
+    # The `:+` keeps the empty flag from leaving a trailing space.
+    echo -e "  ${C_BOLD}gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}${GKE_DNS_ENDPOINT_FLAG:+ ${GKE_DNS_ENDPOINT_FLAG}}${C_RESET}"
+    echo -e "  ${C_BOLD}kubectl exec -it deploy/${PLATFORM_AGENT_DEPLOYMENT} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} -c ${PLATFORM_AGENT_CONTAINER} -- hermes -p ${PLATFORM_AGENT_HERMES_PROFILE}${C_RESET}"
+    echo ""
+    # The pod runs three containers and hosts more than one Hermes profile, so
+    # a command missing -c or -p lands somewhere by accident.
+    echo -e "  ${C_CYAN}-p ${PLATFORM_AGENT_HERMES_PROFILE} reaches the Platform Agent directly, bypassing the Planning${C_RESET}"
+    echo -e "  ${C_CYAN}Agent front door where a chat message would have landed.${C_RESET}"
+    echo ""
+    echo -e "  To add a chat platform later, re-run ${C_BOLD}./install.sh --enable-google-chat${C_RESET} or ${C_BOLD}./install.sh --enable-slack${C_RESET}."
+  }
+
   case "$chat_choice" in
     1)
       google_chat_enabled="true"
@@ -4213,7 +4300,7 @@ main() {
       _prompt_slack_settings
       ;;
     4)
-      print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
+      _prompt_no_chat_enabled
       ;;
   esac
 
@@ -5142,13 +5229,22 @@ main() {
   # shellcheck disable=SC2086
   gcloud container clusters get-credentials "$cluster_name" --location "$region" \
     --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null
-  if ! kubectl get ns "$namespace" >/dev/null 2>&1; then
+  local expected_ctx
+  expected_ctx="$(gke_context_name)"
+  local current_ctx
+  current_ctx="$(kubectl config current-context 2>/dev/null || true)"
+  if [ "$current_ctx" != "$expected_ctx" ]; then
+    print_error "kubectl current-context ('${current_ctx}') does not match expected cluster context '${expected_ctx}'."
+    print_info "Failed to switch kubectl context to '${expected_ctx}'. Refusing to run health checks on the wrong cluster."
+    exit 1
+  fi
+  if ! kubectl get ns "$namespace" --context "$expected_ctx" >/dev/null 2>&1; then
     print_error "Namespace '${namespace}' was not created. Installation is incomplete."
     exit 1
   fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do
-    if ! wait_for_deployment_object "$deployment" "$namespace" "$DEPLOYMENT_APPEAR_TIMEOUT_SECS"; then
+    if ! wait_for_deployment_object "$deployment" "$namespace" "$DEPLOYMENT_APPEAR_TIMEOUT_SECS" "$expected_ctx"; then
       print_error "Expected deployment '$deployment' was not created within ${DEPLOYMENT_APPEAR_TIMEOUT_SECS}s."
       # platform-agent-gateway is the agent, and the sandbox is the one thing
       # that stops the operator writing it while leaving everything else
@@ -5156,7 +5252,7 @@ main() {
       # CR rather than in any of the logs an operator would reach for first.
       if [ "$deployment" = "$PLATFORM_AGENT_DEPLOYMENT" ] && [ "$enable_gvisor" = "true" ]; then
         print_info "The agent asks for the ${C_BOLD}gvisor${C_RESET} RuntimeClass; the operator will not create its Deployment until that RuntimeClass exists."
-        print_info "Read the reason with: ${C_BOLD}kubectl get platformagent -n ${namespace} -o jsonpath='{.items[*].status.conditions}'${C_RESET}"
+        print_info "Read the reason with: ${C_BOLD}kubectl get platformagent -n ${namespace} --context ${expected_ctx} -o jsonpath='{.items[*].status.conditions}'${C_RESET}"
         print_info "Re-run with ${C_BOLD}--enable-gvisor=false${C_RESET} to run the agent on the standard container runtime instead."
       fi
       exit 1
@@ -5165,7 +5261,7 @@ main() {
     # so a couple of minutes is normal. Running past the budget means "still
     # coming up", not "broken": say so and keep the summary below, which carries
     # the chat links and port-forward command.
-    if ! wait_for_rollout "$deployment" "$namespace" "$ROLLOUT_TIMEOUT_SECS"; then
+    if ! wait_for_rollout "$deployment" "$namespace" "$ROLLOUT_TIMEOUT_SECS" "$expected_ctx"; then
       slow_rollouts+=("$deployment")
       print_warning "$deployment did not report ready (after ${ROLLOUT_ELAPSED_SECS}s)."
     fi
@@ -5224,6 +5320,12 @@ main() {
   if [ "${slack_enabled:-false}" = "true" ]; then
     echo ""
     IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
+  fi
+  # Repeated here, where the two printers above give their instructions. Arm 4
+  # prints it as well, for the runs that never reach the end of main().
+  if [ "$chat_choice" = "4" ]; then
+    echo ""
+    _prompt_no_chat_enabled
   fi
 }
 

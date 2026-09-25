@@ -18,7 +18,7 @@ untested. This suite reads the output side instead:
                                                emit (golden_test.go keeps these
                                                equal to the operator's output)
 
-The golden half reaches only what the golden cases render. All six set
+The golden half reaches only what the golden cases render. All seven set
 `spec.mode: default`, so the `mode: next` stack is in none of them: the A2A
 gateway's strategy is asserted by `TestBuildA2AGatewayIdentityAndOwnerWiring`
 in `k8s-operator/internal/controller/`, and the A2A auth callout (two replicas,
@@ -77,8 +77,8 @@ _HELM_SET_VALUES = (
 # offenders", so the count is asserted, and a new chart Deployment fails here
 # until its author looks at its strategy and bumps the number.
 _EXPECTED_RENDERED_DEPLOYMENTS = 4
-# Six golden cases, each emitting an agent gateway and a credential proxy.
-_EXPECTED_GOLDEN_DEPLOYMENTS = 12
+# Seven golden cases, each emitting an agent gateway and a credential proxy.
+_EXPECTED_GOLDEN_DEPLOYMENTS = 14
 
 # Single-replica workloads that deliberately keep `maxUnavailable: 0` and so
 # stall under a zero-headroom quota. The reasons are the ones

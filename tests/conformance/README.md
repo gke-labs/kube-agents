@@ -105,8 +105,7 @@ workflow, run under `make test-python` in
 **KV** marks a known violation: the test exists, asserts the invariant, and
 currently fails.
 
-> **The cited documents are not in this repository.**
-> `04_major_requirements.md`, `slice-2a/`, `slice-2b/findings.md`,
+> **The cited documents are not in this repository.** > `04_major_requirements.md`, `slice-2a/`, `slice-2b/findings.md`,
 > `overnight-b/findings.md` and `round_2/` live in a separate working
 > repository that is not published, so those citations do not resolve for a
 > reader here. The table below is the vendored summary: it states each
@@ -123,6 +122,9 @@ currently fails.
 | A2  | two users with different RBAC get different outcomes                       | 2        | `Scenario1`, `Scenario2`                                                            | shared-identity execution: every allowlisted chat user wields the agent's full authority                                                                                                                                                                 |
 | A2  | the agent ceiling binds a cluster-admin requester                          | 2        | `Scenario3`                                                                         | —                                                                                                                                                                                                                                                        |
 | A2  | staleness bound N                                                          | **3**    | —                                                                                   | N is unset. Three unstated Ns (A2, C2, D6), all needing owners.                                                                                                                                                                                          |
+| A3  | the eval inject door renders only under the operator's flag                | 1        | `test_A3_the_inject_door_renders_only_under_the_operator_flag`                      | a door mapping a body-supplied principal, rendered on an install that never asked for it                                                                                                                                                                 |
+| A3  | the eval door's flag is not a field a customer can set                     | 1        | `test_A3_the_inject_flag_is_not_a_field_a_customer_can_set`                         | "render the eval door" reachable from a `PlatformAgent`, which the operator would be obliged to honour                                                                                                                                                   |
+| A3  | the eval door cannot assert a cloud principal                              | 1        | `test_A3_the_inject_door_cannot_assert_a_cloud_principal`                           | a map entry pointing the eval door at a real identity: an identity-minting door the day publisher identity arms                                                                                                                                          |
 | A3  | caller-supplied `--as` refused, all five flags, both separators            | 1        | `test_A3_rejects_caller_supplied_as`                                                | impersonation asserted by the caller                                                                                                                                                                                                                     |
 | A3  | `--kuberc` refused                                                         | 1        | `test_A3_rejects_kuberc`                                                            | **slice 2a**: a YAML file injecting `as: system:admin` with nothing in argv                                                                                                                                                                              |
 | A3  | `--flags-file` refused                                                     | 1        | `test_A3_rejects_gcloud_flags_file`                                                 | the same attack in gcloud's spelling, found first                                                                                                                                                                                                        |
@@ -192,6 +194,7 @@ currently fails.
 | C3  | untrusted content cannot derive an approval tier                           | **3**    | —                                                                                   | needs the provenance labelling D3 also needs. The fleet-drift attack (an attacker shifting a derived baseline until production reads as drift) is the case to write first.                                                                               |
 | C4  | every third-party action is pinned to a commit                             | 1        | `test_C4_every_third_party_action_is_pinned_to_a_commit`                            | a retagged release silently changing what CI runs                                                                                                                                                                                                        |
 | C4  | the agent base image is pinned by digest                                   | 1        | `test_C4_the_agent_base_image_is_pinned_by_digest`                                  | — (the one reference this repo gets right)                                                                                                                                                                                                               |
+| C4  | every hermes plugin install is pinned to a commit                          | 1        | `test_C4_every_hermes_plugin_install_is_pinned_to_a_commit`                         | an upstream default branch shipping a plugin manifest the pinned installer cannot read, breaking every image build                                                                                                                                       |
 | C4  | upstream skills are pinned and verified                                    | 1 **KV** | `test_C4_upstream_skills_are_pinned_and_verified`                                   | whatever is at upstream HEAD becoming agent instructions, landing in a preflight hook before the model wakes                                                                                                                                             |
 | C4  | every shipped image is pinned by digest                                    | 1 **KV** | `test_C4_every_shipped_image_is_pinned_by_digest`                                   | `DefaultPlatformAgentVersion = "latest"`                                                                                                                                                                                                                 |
 | C5  | no minted role grants a write verb                                         | 1        | `test_C5_no_minted_role_grants_a_write_verb`                                        | the blueprints operator minting ClusterRoleBindings from a namespaced CRD with no ceiling                                                                                                                                                                |
@@ -261,12 +264,12 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-105 mutations: 80 KILLED, 23 NOISY, two `must_survive` controls (one on the
+110 mutations: 85 KILLED, 23 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-21 against
+handling), zero genuine survivors, zero stale — measured 2026-09-23 against
 this branch merged with `main`; re-run the harness rather than trusting
 these numbers, which is the sentence this paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 103 of the 105: a
+Note that the summary line the harness prints accounts for 108 of the 110: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is

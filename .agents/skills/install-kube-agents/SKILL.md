@@ -1,6 +1,6 @@
 ---
 name: install-kube-agents
-description: Provision and install the Kubernetes Agentic Harness (kube-agents) onto a GKE cluster non-interactively or interactively.
+description: Install, set up, or deploy kube-agents (the Kubernetes Agentic Harness) and its Platform Agent onto a GKE cluster in a GCP project, interactively or non-interactively. Use when asked to install, bootstrap, or onboard kube-agents, or to plan one with a dry run.
 ---
 
 # `install-kube-agents` Skill
@@ -200,6 +200,31 @@ not enabled anything yet.
 `absent-accepted` (installed without enforcement, under `--accept-no-network-policy`); the last is
 also stamped onto the `PlatformAgent` as `kubeagents.x-k8s.io/network-policy-enforcement`, so it
 outlives the report. Relay it to the operator in either of the last two cases.
+
+## Handing over a chat-less install
+
+Chat is opt-in and both platforms default off, and a non-interactive run with no
+`--enable-google-chat` or `--enable-slack` selects "None" — so the common agent-driven install
+has no chat and the operator has no way to reach the agent unless you give them one. The
+installer prints it at the chat-configuration step and again when it finishes, under
+`--- [Talking to the Agent from a Terminal] ---`, with the cluster, region, project and namespace
+already substituted. Relay those two commands verbatim:
+
+```bash
+gcloud container clusters get-credentials <CLUSTER_NAME> --location <REGION> --project <PROJECT_ID> --dns-endpoint
+kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes -p platform
+```
+
+- Take `--dns-endpoint` from what the installer printed rather than adding it: `gcloud` rejects it
+  on a cluster publishing no externally reachable DNS endpoint, and the installer omits it there.
+- `-p platform` reaches the Platform Agent. A bare `hermes` reaches the Planning Agent front door,
+  which is where a chat message would have landed.
+- `kubectl port-forward` is not an alternative: the agent is sandboxed under gVisor by default and
+  the forward cannot see into the sandbox. `kubectl exec` enters it.
+- Say what the operator does not get until they enable a platform: scheduled reports and
+  alert-driven triage are delivered to chat only, and the first-run inventory report waits on a
+  human connecting over chat — read it with
+  `kubectl exec deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- cat /opt/data/INVENTORY.md`.
 
 ## GitOps Repository & GitHub Token Minter Configuration
 

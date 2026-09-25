@@ -52,6 +52,8 @@ from kube_agents_bench.baselines import (
     AdmissionBar,
     BaselineRecord,
     BaselineStore,
+    CaseOutOfScope,
+    StoreUnreachable,
     VersionKey,
     Versions,
     append_record,
@@ -851,3 +853,79 @@ def test_in_roster_mode_the_list_decides_and_the_record_is_only_said(tmp_path):
     )
     assert bare.reason == "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
     assert bare.record == "none"
+
+
+# --------------------------------------------------------------------------
+# a scoped read
+# --------------------------------------------------------------------------
+
+
+def test_a_scoped_load_holds_only_the_cases_it_was_given(tmp_path):
+    write_store(tmp_path, "planted-pdb", [record()])
+    write_store(tmp_path, "other-case", [record()])
+
+    store = BaselineStore.load(tmp_path, only=["planted-pdb"])
+    assert store.record_for("planted-pdb", KEY).passes == 19
+    assert store.scope == frozenset({"planted-pdb"})
+
+    # ...and an unscoped load still answers for both.
+    whole = BaselineStore.load(tmp_path)
+    assert whole.scope is None
+    assert whole.record_for("other-case", KEY).passes == 19
+
+
+def test_a_case_outside_the_scope_raises_rather_than_reading_as_unscreened(tmp_path):
+    """The failure the scope exists to make loud.
+
+    Every lookup answers "nothing here, so never screened" for a case it holds
+    no records for. That is correct for a whole-store read and a silent
+    de-admission for a scoped one. Each public entry point is checked, because
+    a guard is only worth having if it cannot be walked around.
+    """
+    write_store(tmp_path, "planted-pdb", [record()])
+    store = BaselineStore.load(tmp_path, only=["planted-pdb"])
+
+    bar = AdmissionBar()
+    for call in (
+        lambda: store.record_for("other-case", KEY),
+        lambda: store.history_for("other-case"),
+        lambda: store.evidence_for("other-case", KEY),
+        lambda: store.record_verdict("other-case", KEY, bar=bar),
+        lambda: store.admission("other-case", KEY, bar=bar),
+        lambda: store.is_admitted("other-case", KEY, bar=bar),
+    ):
+        with pytest.raises(CaseOutOfScope, match="outside this store's read scope"):
+            call()
+
+
+def test_the_scope_guard_is_not_a_corrupt_store_and_not_an_outage():
+    """``gate._load_store`` catches ValueError and StoreUnreachable and carries
+    on -- fatally for the first, degraded for the second. A caller bug is
+    neither, or it would be absorbed into a verdict instead of raising."""
+    assert not issubclass(CaseOutOfScope, (ValueError, StoreUnreachable))
+    with pytest.raises(CaseOutOfScope):
+        BaselineStore({}, scope=["planted-pdb"]).history_for("other-case")
+
+
+def test_a_scoped_store_answers_the_same_as_a_whole_one_in_scope(tmp_path):
+    """Scoping changes what is read, never what the store says about a case.
+
+    Worth pinning because a scoped read that fetched nothing would be fast and
+    green, so speed cannot tell a working one from a broken one.
+    """
+    lines = [
+        record(runs=3, passes=3, recorded_at=f"2026-08-{day:02d}T00:00:00Z")
+        for day in range(1, 8)
+    ]
+    write_store(tmp_path, "planted-pdb", lines)
+    write_store(tmp_path, "other-case", [record()])
+
+    bar = AdmissionBar()
+    scoped = BaselineStore.load(tmp_path, only=["planted-pdb"])
+    whole = BaselineStore.load(tmp_path)
+    assert scoped.evidence_for("planted-pdb", KEY) == whole.evidence_for(
+        "planted-pdb", KEY
+    )
+    assert scoped.admission("planted-pdb", KEY, bar=bar) == whole.admission(
+        "planted-pdb", KEY, bar=bar
+    )

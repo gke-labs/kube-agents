@@ -27,9 +27,18 @@ lease those projects. So:
     and no OPEN issue labelled `presubmit-gate` already names every drifted role
     -> create one addressed to the fleet owner, and say "Tracking #NNN"
 
+The fourth shape (#1894): runs Prow killed at the job deadline with no
+verdict, 3+ on 2+ pull requests in 2 hours, so nothing is graded and nobody
+can pass. So:
+
+    the condition becomes `deadline_kill`
+    and no OPEN issue labelled `presubmit-gate` has "deadline" and "smoke" in its TITLE
+    -> create one for whoever owns the gate, and say "Tracking #NNN"
+
 The dedupe is against people: a human who filed first, with the case names
-(or the node names, or the role names) in the title or body, wins and the bot
-adopts their issue. A recovery gets one comment ("Healthy again after Xh; bot will not
+(or the node names, or the role names) in the title or body -- or, for the
+deadline kills, those two words in the title -- wins and the bot adopts
+their issue. A recovery gets one comment ("Healthy again after Xh; bot will not
 close it"). The bot never closes an issue -- a green gate is not proof the
 fixture is fixed, only that three runs passed, and the node events are still
 worth reading after the pool has healed itself.
@@ -54,6 +63,21 @@ COMMENTS_PATH = "issues/{number}/comments"
 # (health.py owns the vocabulary).
 CONDITION_LOST_PODS = "lost_pods"
 CONDITION_FIXTURE_DRIFT = "fixture_drift"
+CONDITION_DEADLINE_KILL = "deadline_kill"
+# The presubmit job's timeout in minutes (health.py PROW_JOB_TIMEOUT owns it).
+DEADLINE_MINUTES = 360
+# health.py RECOVERY_GREEN_RUNS, the bar the body quotes.
+RECOVERY_RUNS = 3
+# What an open issue's TITLE must carry to be adopted as the deadline-kill
+# tracker. Title only: every bot-filed body names the job and quotes the
+# evidence block, which mentions deadline kills whenever one sits in the
+# window, so a body match would adopt a shared-break issue.
+DEADLINE_KILL_NAMES = ("deadline", "smoke")
+# The other direction: the deadline body quotes only the deadline evidence
+# lines. health.py's evidence also carries per-case collapse lines whenever a
+# case clears the shared-break floors, and a body naming those cases would
+# be adopted as the tracker of a break that fires later.
+DEADLINE_EVIDENCE_PREFIX = "deadline kills:"
 # GitHub rejects a longer title; the node list is compacted, then dropped
 # for a count, to stay under it.
 TITLE_MAX_CHARS = 256
@@ -98,6 +122,26 @@ The Prow build cluster (`kube-agents-prow`) lost the node(s) below at {when}; {r
 Incident brief: {brief}
 
 Filed automatically by the smoke health bot; the cluster owner should check the node events and autorepair; the bot will not close it.
+"""
+DEADLINE_KILL_TITLE = "Smoke gate outage: {runs} runs on {prs} PRs killed at the {minutes}-minute deadline with no verdict since {since}"
+DEADLINE_KILL_BODY = """\
+The smoke gate (`{job}`) is in OUTAGE: since {since} ({since_iso}), {runs} runs on {prs} pull requests ran to Prow's {minutes}-minute deadline and were killed with no eval verdict. Nothing is being graded, so no pull request can pass, and a red on an open PR from this window is not that PR's code.
+
+**Window:** {window} ({window_iso}).
+**Affected PRs:** {pr_list}.
+**Evidence:**
+
+{evidence}
+
+**Advice for authors:** don't retest until the Chat space reports the gate healthy; a run started now ends the same way.
+
+The rest of the evidence (any case collapsing underneath the kills) is in the brief.
+
+**For whoever picks this up:** each killed run's `build-log.txt` shows how far its units got (on 2026-09-22 every unit reached the delegation ceiling, #1880); the gateway and dispatcher lines in the eval project's Cloud Logging say what the workers were doing. Recovery is reported after {recovery} runs with a verdict, green or red, on distinct PRs.
+
+Incident brief: {brief}
+
+Filed automatically by the smoke health bot; edit freely. Fix PRs: reference this issue.
 """
 FIXTURE_DRIFT_TITLE = "Seeded fleet drift: {roles} out of designed state on {projects} pool {noun} since {since}"
 PROJECT_NOUN = ("project", "projects")
@@ -217,6 +261,33 @@ def render_lost_pods_body(health: dict, when_text: str, window_text: str, brief_
     )
 
 
+def render_deadline_kill_title(health: dict, since_text: str) -> str:
+    incident = health.get("incident") or {}
+    return DEADLINE_KILL_TITLE.format(runs=incident.get("runs", 0), prs=len(incident.get("prs") or []), minutes=DEADLINE_MINUTES, since=since_text)
+
+
+def render_deadline_kill_body(health: dict, since_text: str, window_text: str, brief_link: str) -> str:
+    incident = health.get("incident") or {}
+    prs = incident.get("prs") or []
+    evidence = [f"- {line}" for line in health.get("evidence") or [] if str(line).startswith(DEADLINE_EVIDENCE_PREFIX)]
+    return DEADLINE_KILL_BODY.format(
+        job=JOB_NAME,
+        since=since_text,
+        # The same instant as `since_text`: the outage's first kill, not the
+        # tick that declared the state after the third.
+        since_iso=incident.get("first_kill") or incident.get("window_start") or health.get("since") or "?",
+        runs=incident.get("runs", 0),
+        prs=len(prs),
+        minutes=DEADLINE_MINUTES,
+        window=window_text,
+        window_iso=f"{incident.get('window_start') or '?'} – {incident.get('window_end') or '?'}",
+        pr_list=", ".join(f"#{pr}" for pr in prs) or "none recorded",
+        evidence="\n".join(evidence) or NO_EVIDENCE,
+        recovery=RECOVERY_RUNS,
+        brief=brief_link,
+    )
+
+
 def render_fixture_drift_title(health: dict, since_text: str) -> str:
     incident = health.get("incident") or {}
     roles = list(incident.get("roles") or [])
@@ -255,28 +326,32 @@ class Tracker:
     def __init__(self, gh):
         self.gh = gh
 
-    def existing(self, names: list[str]) -> dict | None:
+    def existing(self, names: list[str], title_only: bool = False) -> dict | None:
         """An open `presubmit-gate` issue whose title or body names every
         one of `names` (the failing cases, or the lost nodes) -- a human got
-        there first."""
+        there first. `title_only` for names too common in bot-filed bodies."""
         issues = self.gh.call("GET", self.gh.path(OPEN_ISSUES_PATH), paginate=True)
         for issue in issues or []:
             if not isinstance(issue, dict) or issue.get("pull_request"):
                 continue
-            if names_all(f"{issue.get('title', '')}\n{issue.get('body', '')}", names):
+            text = issue.get("title", "") if title_only else f"{issue.get('title', '')}\n{issue.get('body', '')}"
+            if names_all(text, names):
                 return as_issue(issue)
         return None
 
     def ensure(self, health: dict, now, since_text: str, brief_link: str, window_text: str | None = None) -> dict | None:
         """The issue to cite: a human's if one names these cases (or, for
-        lost pods, these nodes), else a new one. `since_text` is the
-        incident's start on the reader's clock; `window_text` the span of
-        the losses, for the lost-pod body."""
+        lost pods, these nodes; for deadline kills, the two title words),
+        else a new one. `since_text` is the incident's start on the reader's
+        clock; `window_text` the span of the losses or kills, for those two
+        bodies."""
         condition = health.get("condition")
         if condition == CONDITION_LOST_PODS:
             return self._ensure_lost_pods(health, since_text, window_text or since_text, brief_link)
         if condition == CONDITION_FIXTURE_DRIFT:
             return self._ensure_fixture_drift(health, since_text, brief_link)
+        if condition == CONDITION_DEADLINE_KILL:
+            return self._ensure_deadline_kill(health, since_text, window_text or since_text, brief_link)
         cases = list(health.get("failing_cases") or [])
         if not cases:
             return None
@@ -304,6 +379,21 @@ class Tracker:
         created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), payload), CONDITION_LOST_PODS)
         if created:
             log(f"tracking issue: filed #{created['number']} for the cluster owner")
+        return created
+
+    def _ensure_deadline_kill(self, health: dict, since_text: str, window_text: str, brief_link: str) -> dict | None:
+        found = self.existing(list(DEADLINE_KILL_NAMES), title_only=True)
+        if found:
+            log(f"tracking issue: adopting open #{found['number']} (its title names the deadline kills)")
+            return dict(found, condition=CONDITION_DEADLINE_KILL)
+        payload = {
+            "title": render_deadline_kill_title(health, since_text),
+            "body": render_deadline_kill_body(health, since_text, window_text, brief_link),
+            "labels": [LABEL],
+        }
+        created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), payload), CONDITION_DEADLINE_KILL)
+        if created:
+            log(f"tracking issue: filed #{created['number']} for the gate's deadline kills")
         return created
 
     def _ensure_fixture_drift(self, health: dict, since_text: str, brief_link: str) -> dict | None:

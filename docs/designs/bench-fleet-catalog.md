@@ -192,22 +192,23 @@ worth changing.
 
 The fleet's premise is that a correct audit returns the planted findings and the
 documented background ones, and nothing else — that is what lets a case assert an exact
-finding set rather than a substring. One fixture currently breaks it.
+finding set rather than a substring. One fixture used to break it, and the upgrade SOP's
+rule now keeps it intact.
 
-A comment in `bench/tf/fleet/main.tf` argues that branch (a) of upgrade SOP check 3.1,
-"the control plane runs a version the channel does not offer", is "false by construction
-here because the pin is drawn from that very list". It is drawn from the location-wide
-`valid_master_versions` instead, so `seeded-b` sits on `1.34.10-gke.1106000`, a RAPID
-version absent from REGULAR's `validVersions`, and branch (a) fires at critical alongside
-the intended branch (b). An audit that reports it is right; a case that asserts the
-documented finding set is wrong. The fleet README's background-findings table, which
-promises the planted finding "plus the rows below — nothing else", does not list it
-either.
+The pin in `bench/tf/fleet/main.tf` is drawn from the location-wide `valid_master_versions`
+rather than REGULAR's own list, so `seeded-b` can sit on a version absent from REGULAR's
+`validVersions` — for example `1.34.10-gke.1106000`, on RAPID's roster as measured 2026-09-23. The check once read
+that absence as branch (a) of upgrade SOP check 3.1 and graded the cluster critical. Branch
+(a) now fires only when a version is offered by no route at the location: not by the
+cluster's channel, not by any other channel, and not by `validMasterVersions`. The pin stays
+offered for as long as `validMasterVersions` or any channel's roster carries it, so branch
+(a) does not fire and `seeded-b` carries the intended branch (b) at major. If GKE drops the
+pinned version from all of them before the next reconcile re-draws it, branch (a) fires, and
+correctly.
 
-Until `main.tf` derives the pin from the REGULAR channel's `validVersions` rather than the
-location-wide list, treat the branch (a) critical on slot `b` as expected output. A case
-touching `version-laggard` asserts branch (b) specifically and must not assert that the
-critical count is one, or that branch (a) is absent.
+A case touching `version-laggard` may assert that branch (a) is absent, and
+`upgrades-master-behind-offered-elsewhere` does: slot `b` graded critical is the defect it
+catches.
 
 ## When a fixture goes away
 
@@ -270,8 +271,8 @@ also need a GitOps-repo write path — the six audit scenarios and both remediat
 contained by pinning it to a throwaway repository per eval project.
 
 Asserting read-only from inside a case is a state check against the fixture — "the
-planted defect survived the run" — and not `tool_called`, which sees only the delegating
-turn's calls and would be blind to a worker's mutation. On the standing fleet that check
+planted defect survived the run" — and not `tool_called`, which even under `scope: workers`
+sees the call a worker made and not what it changed. On the standing fleet that check
 is `fleet_resource_property`, which resolves the cluster from the fixture role; plain
 `resource_property` reads the ambient kubeconfig and suits only a case whose deployer
 built its own cluster, as `gpu-stress-test-diagnosis` does.

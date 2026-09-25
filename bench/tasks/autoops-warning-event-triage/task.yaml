@@ -273,8 +273,9 @@ verification_spec:
 
   # The domain's claim is that triage never writes to the cluster, and these
   # are what hold it. Asserted against cluster state rather than the tool
-  # trace, for two reasons that both apply here: the trajectory carries only
-  # the delegating turn's calls, so a worker's mutation is invisible to it, and
+  # trace, for two reasons that both apply here: tool_called counts only the
+  # delegating turn's calls (the workers' entries in the trajectory are tagged
+  # and skipped), so a worker's mutation is invisible to it, and
   # the deployed profile's mutating surface is not enumerable by tool name --
   # config.yaml grants mcp-gke, a Google-hosted server whose remote tools we
   # cannot list.

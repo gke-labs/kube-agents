@@ -202,7 +202,7 @@ At that point the allowlist covers DNS (selector peers, the resolved cluster DNS
 - DuckDuckGo web search, which `deploy/shared/defaults/config.yaml` turns on for every profile (`web.backend: ddgs`), and the `browser` toolset, which only the Chat Agent disables;
 - the `gke` and `developer_knowledge` MCP servers, which proxy `container.googleapis.com` and `developerknowledge.googleapis.com`;
 - `github.com` reached directly from the sandbox — not the `gh` and `git` wrappers, which go through the broker;
-- the metadata lookup in `cluster_agent_reconcile.py`, which is how that script finds its project id. It fails soft after a five-second timeout and falls back to `gcloud config get-value project`, a broker call that is on the allowlist, so the cost is the timeout on each tick. Setting `RECONCILE_PROJECT` skips it.
+- the metadata lookup in `cluster_agent_reconcile.py`, which is how that script finds the management project (`RECONCILE_PROJECT`, the old override, is pinned empty in the managed `.env`; a project other than the pod's belongs in `spec.scope.projects`). It fails soft after a five-second timeout and falls back to `gcloud config get-value project`, a broker call that is on the allowlist, so the cost is the timeout on each tick, provided the broker's configured project is the pod's own: a fallback answer that differs from the previous run's management project is treated as unresolved rather than as a changed management project.
 
 Credentialed `gcloud`, `kubectl`, `gh` and `git` would be unaffected either way: they are wrappers that call the broker, and the broker is on the list.
 

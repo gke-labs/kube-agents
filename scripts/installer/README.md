@@ -76,11 +76,13 @@ installer-driven one name the same objects.
 
 `installer_common.sh` does declare constants of its own, and the distinction is the
 point: the Helm release name, the LiteLLM, operator and agent Deployment names, the
+agent container and Hermes profile inside that Deployment's pod, the
 `platform-agent-secrets` Secret, and the sandbox StatefulSet, credential-proxy
 Deployment and authorized-keys Secret the operator derives from the agent's name are
 the chart's and the operator's fixed names, which no `install.env` key can change, so
 they are `readonly` constants there (`KUBE_AGENTS_HELM_RELEASE`,
-`KUBE_AGENTS_OPERATOR_DEPLOYMENT`, `PLATFORM_AGENT_DEPLOYMENT`, `PLATFORM_AGENT_SECRET`,
+`KUBE_AGENTS_OPERATOR_DEPLOYMENT`, `PLATFORM_AGENT_DEPLOYMENT`,
+`PLATFORM_AGENT_CONTAINER`, `PLATFORM_AGENT_HERMES_PROFILE`, `PLATFORM_AGENT_SECRET`,
 `LITELLM_DEPLOYMENT`, `PLATFORM_AGENT_SHELL_STATEFULSET`,
 `PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT`, `PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET`)
 rather than defaults an install could override. So are the Helm timeouts
@@ -243,7 +245,16 @@ dotenv and `vars.sh` was generated with `printf %q`.
 - **[installer_common.sh](installer_common.sh)**: the `install.env` loader, validators,
   GitHub org checks, and the `terraform.tfvars` generator (table above). Sources the
   defaults from [`install.defaults.env`](../../install.defaults.env) rather than
-  declaring any itself.
+  declaring any itself. The front doors run `set -E` with an ERR trap that every `$(...)`
+  inherits, and bash 3.2 (macOS's `/bin/bash`) runs that trap inside the subshell even
+  when the caller handles the failure. Each front door's `on_error` therefore exits a
+  subshell silently and leaves the banner and the report to the parent, which prints
+  them only when the failure reaches it; a probe in a front door needs no guard of its
+  own. This library cannot know its caller's trap, so its tolerated probes (a release,
+  deployment, ref or state object that is not there: `helm_release_status`,
+  `tf_state_read`) run `trap - ERR` inside their substitution as well. Process
+  substitution (`< <(...)`) leaves `BASH_SUBSHELL` at 0 on bash 3.2, so a tolerated read
+  through one clears the trap inline wherever it sits.
 - **[common.sh](common.sh)**: utilities the dev tooling and the Prow CI scripts
   (`hack/ci-deploy.sh`) use — colour output, `init_var`/`load_state`,
   registry and third-party-image resolution, cluster connection helpers. Sources

@@ -36,7 +36,7 @@
         "expr": "20 7 * * 1",
         "display": "20 7 * * 1"
       },
-      "prompt": "Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrator_sop.md' in your profile home — all 290 lines of it, before you run anything. Its ten checks are section 3, lines 119-223, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. This audit is read-only: never upgrade a cluster.",
+      "prompt": "Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrator_sop.md' in your profile home — all 289 lines of it, before you run anything. Its ten checks are section 3, lines 96-219, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 3 opens by running the collector (`skills/fleet-audit/scripts/patch_readiness.py`), redirecting its stdout to /opt/data/scratch/manifest_security-patch-orchestrator.json: run it before evaluating any check by hand, read the manifest the way section 3 says, and pass the same file to finish as --manifest-file. Then execute it exactly, using the fleet-audit skill to open and close the audit run. This audit is read-only: never upgrade a cluster.",
       "skills": ["fleet-audit"],
       "risk": "low",
       "enabled": true,
@@ -64,7 +64,7 @@
         "expr": "20 8 * * 1",
         "display": "20 8 * * 1"
       },
-      "prompt": "Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' in your profile home — all 271 lines of it, before you run anything. Its nineteen facets are section 4, lines 96-201, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. The baseline is derived from the live fleet itself — never from an external blueprint.",
+      "prompt": "Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' in your profile home — all 337 lines of it, before you run anything. Its twenty checks are section 4, lines 121-263, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 4 opens by running the collector (`skills/fleet-audit/scripts/fleet_drift.py`), redirecting its stdout to /opt/data/scratch/manifest_fleet-consistency-drift.json: run it before comparing any facet by hand, read the manifest the way section 4 says, and pass the same file to finish as --manifest-file. Then execute it exactly, using the fleet-audit skill to open and close the audit run. The baseline is derived from the live fleet itself — never from an external blueprint.",
       "skills": ["fleet-audit"],
       "risk": "low",
       "enabled": true,

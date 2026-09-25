@@ -58,6 +58,9 @@ AUDIT = "compliance-audit"
 # which a `declared` list validates. Every other stream rejects the list.
 DECLARING_AUDIT = "obtainability-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
+# How far the run-record stamp may sit from wall-clock and still be this run's.
+# Wide enough for a loaded CI worker, narrow enough that a hardcoded date fails.
+STAMP_TOLERANCE_SECONDS = 300
 
 # Which SOP owns each stream's check roster. Spelled out rather than derived
 # from the audit id so that renaming a file breaks this mapping loudly instead
@@ -616,6 +619,17 @@ class BaseTestCase(unittest.TestCase):
         target.write_text("# remediation\n", encoding="utf-8")
         return target
 
+    def record_without_stamp(self, audit):
+        """The run record, minus the wall-clock `start` stamped it with.
+
+        The stamp is what `load_manifest` compares a collector manifest
+        against, so it is asserted where that matters rather than here, where
+        a whole-dict comparison would only be asserting that the clock moved.
+        """
+        record = audit_report.read_run_record(audit)
+        self.assertTrue(record.pop(audit_report.RUN_RECORD_STARTED_KEY))
+        return record
+
     def record_run(self, repo="acme/fleet", context=(), audit=DECLARING_AUDIT):
         """Leave the run record `start` would have, under the scratch directory."""
         Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
@@ -1165,6 +1179,71 @@ class TestValidation(unittest.TestCase):
         doc["findings"] = {"nope": True}
         with self.assertRaisesRegex(audit_report.ValidationError, "findings:"):
             audit_report.validate_findings(doc, AUDIT)
+
+    def test_a_project_target_outside_scope_is_accepted(self):
+        # The cost SOP files an unattributable disk under `project/<id>`,
+        # which no scope entry ever spells.
+        doc = make_doc(findings=[make_finding(cluster="project/acme-prod")])
+        audit_report.validate_findings(doc, AUDIT)
+
+    def test_bare_name_of_a_qualified_scope_entry_is_rejected_with_the_entry(self):
+        # A collector's qualified scope beside its `Cluster/<bare>` objects:
+        # stripping the prefix off `object` gives the bare name, whose id no
+        # collector-held candidate shares, so every finding reported twice.
+        qualified = "acme-prod/us-east1/prod-us-east"
+        doc = make_doc(
+            clusters=[{"name": qualified, "location": "us-east1", "project": "acme-prod"}],
+            findings=[make_finding(cluster="prod-us-east")],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn(repr(qualified), str(exc.exception))
+
+    def test_a_bare_name_matches_its_entry_as_the_id_would(self):
+        qualified = "acme-prod/us-east1/prod-us-east"
+        doc = make_doc(
+            clusters=[{"name": qualified, "location": "us-east1", "project": "acme-prod"}],
+            findings=[make_finding(cluster="Prod-US-East")],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn(repr(qualified), str(exc.exception))
+
+    def test_a_bare_name_two_qualified_entries_share_is_rejected_naming_both(self):
+        # Two regions' `prod`: which one is not the validator's guess, but
+        # either way the bare spelling is a second id for the finding.
+        doc = make_doc(
+            clusters=[
+                {"name": "acme-prod/us-east1/prod", "location": "us-east1", "project": "acme-prod"},
+                {"name": "acme-dr/us-west1/prod", "location": "us-west1", "project": "acme-dr"},
+            ],
+            findings=[make_finding(cluster="prod")],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("'acme-dr/us-west1/prod' and 'acme-prod/us-east1/prod'", str(exc.exception))
+
+    def test_a_qualified_entry_whose_fields_are_respelled_still_arms_the_guard(self):
+        # The manifest cross-check reads `name` alone, so the entry stands for
+        # the cluster whatever its `project` and `location` fields say.
+        for location, project in (("US-EAST1", "acme-prod"), ("us-east1", "acme")):
+            with self.subTest(location=location, project=project):
+                qualified = "acme-prod/us-east1-b/prod"
+                doc = make_doc(
+                    clusters=[{"name": qualified, "location": location, "project": project}],
+                    findings=[make_finding(cluster="prod")],
+                )
+                with self.assertRaises(audit_report.ValidationError) as exc:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertIn(repr(qualified), str(exc.exception))
+
+    def test_a_bare_project_id_beside_a_project_target_is_accepted(self):
+        # `project/<id>` is not a qualified cluster, so its tail is no cluster name.
+        doc = make_doc(
+            clusters=[{"name": "project/acme-prod", "location": "global", "project": "acme-prod"}],
+            findings=[make_finding(cluster="acme-prod")],
+        )
+        audit_report.validate_findings(doc, AUDIT)
 
     def test_skipped_entry_needs_a_reason(self):
         doc = make_doc(skipped=[{"cluster": "dr-west"}])
@@ -2212,6 +2291,121 @@ class TestAuditCatalogue(unittest.TestCase):
                 if sop_dir.is_dir():
                     self.assertTrue((sop_dir / spec.sop).is_file())
 
+    def collector_streams(self):
+        """The audit ids whose SOP tells the worker to run a collector.
+
+        Keyed on the SOP's own "Run the collector" step rather than on a list
+        kept here, so a stream that gains a collector joins the two tests
+        below the moment its SOP says so, and a stream without one is held to
+        nothing about a script it does not have.
+        """
+        sop_dir = self.sop_dir()
+        return [
+            audit_id
+            for audit_id in sorted(audit_report.AUDITS)
+            if "Run the collector" in (sop_dir / SOP_FILENAMES[audit_id]).read_text(encoding="utf-8")
+        ]
+
+    def test_cron_prompts_name_the_real_collector_invocation(self):
+        """A prompt pointing at a renamed or moved collector script is worse
+        than one that says nothing about it.
+
+        The prompt's named collector must be the exact one the SOP's own
+        "Run the collector" instruction documents, re-derived from the SOP
+        file each run, so an SOP edited without also updating the prompt (or
+        vice versa) fails here rather than at 08:20 in production.
+        """
+        jobs = self.cron_jobs()
+        sop_dir = self.sop_dir()
+        streams = self.collector_streams()
+        self.assertTrue(streams, "no SOP runs a collector; this test guards nothing")
+        for audit_id in streams:
+            prompt = jobs[audit_id]["prompt"]
+            name = SOP_FILENAMES[audit_id]
+            sop_text = (sop_dir / name).read_text(encoding="utf-8")
+            with self.subTest(audit=audit_id):
+                idx = sop_text.index("Run the collector")
+                fence_marker = "```bash\n"
+                fence_start = sop_text.index(fence_marker, idx) + len(fence_marker)
+                fence_end = sop_text.index("\n```", fence_start)
+                invocation_line = sop_text[fence_start:fence_end].splitlines()[0].strip()
+                # The script, not the first word: the documented invocation
+                # names an interpreter first, and the prompt cites the
+                # collector rather than a runnable command line.
+                script_token = next(
+                    token for token in invocation_line.split() if token.endswith(".py")
+                ).lstrip("./")
+                self.assertIn(
+                    script_token,
+                    prompt,
+                    f"the {audit_id} prompt does not name {script_token}, the "
+                    f"collector {name} actually documents",
+                )
+
+    def test_every_collector_prompt_names_a_command_argparse_accepts(self):
+        """Naming the right script is not the same as naming a runnable command.
+
+        The test above checks the script token and stops there, so it would
+        pass a prompt whose literal command exits 2 on argparse before a
+        single check ran -- a missing required flag, say. A test that reads
+        the prompt cannot see that; only the real parser can.
+
+        So run each prompt's own argv through the real script. `gcloud` is
+        stubbed to a failing no-op, so nothing reaches the network and no
+        collector gets past enumeration -- which is the point, because
+        argparse rejects before that and everything else fails after it.
+        Exit 2 with `usage:` on stderr is argparse and nothing else; whatever
+        follows a stubbed `gcloud` is a pass.
+        """
+        jobs = self.cron_jobs()
+        profile = Path(__file__).resolve().parents[4] / "platform"
+        pattern = re.compile(r"`([^`]*scripts/[a-z_]+\.py[^`]*)`")
+
+        stub = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, stub, True)
+        gcloud = stub / "gcloud"
+        gcloud.write_text("#!/bin/sh\nexit 1\n")
+        gcloud.chmod(0o755)
+
+        env = dict(os.environ)
+        env["PATH"] = f"{stub}{os.pathsep}{env.get('PATH', '')}"
+
+        streams = self.collector_streams()
+        self.assertTrue(streams, "no SOP runs a collector; this test guards nothing")
+        exercised = set()
+        for audit_id in streams:
+            invocations = pattern.findall(jobs[audit_id]["prompt"])
+            self.assertTrue(
+                invocations,
+                f"the {audit_id} prompt names no collector command",
+            )
+            for invocation in invocations:
+                argv = invocation.split()
+                # The prompt may name an interpreter first; drop it and run the
+                # script under this suite's own Python.
+                argv = argv[1:] if argv[0].endswith("python3") else argv
+                script = profile / argv[0]
+                exercised.add(audit_id)
+                with self.subTest(audit=audit_id, command=invocation):
+                    self.assertTrue(script.is_file(), f"{script} does not exist")
+                    done = subprocess.run(
+                        [sys.executable, str(script), *argv[1:]],
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=120,
+                    )
+                    self.assertFalse(
+                        done.returncode == 2 and "usage:" in done.stderr,
+                        f"the {audit_id} prompt's command is rejected by its own "
+                        f"parser:\n  {invocation}\n{done.stderr.strip()[:400]}",
+                    )
+        # Every stream reached the parser, not one command per stream: the
+        # loop above runs each invocation a prompt names, and a prompt naming
+        # two is a longer run rather than a failure. A closing count of
+        # invocations said the opposite, and would have failed on the second.
+        self.assertEqual(exercised, set(streams))
+
     def test_cron_prompts_cite_the_real_sop_geography(self):
         """A stale line number is worse than no line number.
 
@@ -2475,12 +2669,11 @@ class TestAuditCatalogue(unittest.TestCase):
                 "hostpath-mount",
                 "legacy-metadata",
             ],
-            "security-patch-orchestrator": [
-                "pool-skew",
-                "no-autoupgrade",
-                "no-autorepair",
-                "stale-image-type",
-            ],
+            # security-patch-orchestrator is absent on purpose: its collector
+            # runs all four node-pool checks on Autopilot rather than declaring
+            # them inapplicable, and test_patch_readiness.py's
+            # `test_autopilot_runs_all_four_and_declares_nothing_inapplicable`
+            # guards that in code.
             "stockout-prevention": [
                 "single-zone-nodepool",
             ],
@@ -3489,6 +3682,15 @@ class TestResolvedBecauseValidation(unittest.TestCase):
             "resolved_because[0].cluster",
             "not in scope.clusters",
         )
+
+    def test_the_bare_name_of_a_qualified_entry_names_the_entry(self):
+        qualified = "acme-prod/us-east1/prod-us-east"
+        doc = make_doc(
+            findings=[],
+            clusters=[{"name": qualified, "location": "us-east1", "project": "acme-prod"}],
+        )
+        doc["resolved_because"] = [resolved_entry()]
+        self.rejects(doc, "resolved_because[0].cluster", f"Did you mean {qualified!r}")
 
     def test_a_short_reason_is_rejected(self):
         self.rejects(
@@ -4953,7 +5155,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         # nothing, so the harness's own search read neither repository and
         # the record says so: `TestDeclaredIntentDiscovery` is where it reads.
         self.assertEqual(
-            audit_report.read_run_record(DECLARING_AUDIT),
+            self.record_without_stamp(DECLARING_AUDIT),
             {
                 "repo": "acme/fleet",
                 "context_repos": ["acme/terraform-live", "acme/fleet"],
@@ -5142,7 +5344,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         self.record_run(context=("acme/old-context",))
         self.assertEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
         self.assertEqual(
-            audit_report.read_run_record(DECLARING_AUDIT),
+            self.record_without_stamp(DECLARING_AUDIT),
             {"repo": "acme/fleet", "context_repos": [], "searched": [], "sources": []},
         )
 
@@ -12360,10 +12562,35 @@ def _full_manifest(names=("prod-us-east", "stage-eu"), candidates=(), audit=AUDI
 
 
 class TestLoadManifest(BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        # The staleness guard reads the run record, so the scratch directory
+        # has to be this test's own rather than the pod path the module names.
+        self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+
     def write(self, text):
         path = self.tmp_path / "manifest.json"
         path.write_text(text, encoding="utf-8")
         return str(path)
+
+    def manifest_finished(self, when):
+        return self.write(json.dumps({"audit": AUDIT, "finished_at": when}))
+
+    def run_started(self, when):
+        """The record `start` wrote, back-dated to `when` (None writes no stamp)."""
+        record = {
+            "audit": AUDIT,
+            "repo": "acme/fleet",
+            "context_repos": [],
+            audit_report.RUN_RECORD_SEARCHED_KEY: [],
+            audit_report.RUN_RECORD_SOURCES_KEY: [],
+        }
+        if when is not None:
+            record[audit_report.RUN_RECORD_STARTED_KEY] = when
+        Path(audit_report.run_record_path_for(AUDIT)).write_text(
+            json.dumps(record), encoding="utf-8"
+        )
 
     def test_a_missing_file_is_a_validation_error(self):
         with self.assertRaises(audit_report.ValidationError) as ctx:
@@ -12386,6 +12613,86 @@ class TestLoadManifest(BaseTestCase):
 
     def test_an_empty_envelope_loads(self):
         self.assertEqual(audit_report.load_manifest(self.write("{}")), {})
+
+    def test_last_weeks_manifest_at_the_same_path_is_refused(self):
+        """The failure the guard exists for: the worker skipped the collector.
+
+        `--manifest-file` names a fixed path the SOP gives in prose, so `start`
+        cannot scrub it. Without this check the run cross-checks against a
+        collection of the fleet as it stood a week ago and publishes with the
+        manifest's authority behind it.
+        """
+        self.run_started("2026-09-18T06:00:00Z")
+        path = self.manifest_finished("2026-09-11T06:03:30Z")
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.load_manifest(path, AUDIT)
+        message = str(ctx.exception)
+        self.assertIn("2026-09-11T06:03:30Z", message)
+        self.assertIn("2026-09-18T06:00:00Z", message)
+        self.assertIn("--no-collector-manifest", message)
+
+    def test_this_runs_own_collection_loads(self):
+        self.run_started("2026-09-18T06:00:00Z")
+        path = self.manifest_finished("2026-09-18T06:03:30Z")
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["audit"], AUDIT)
+
+    def test_a_manifest_finishing_on_the_second_start_wrote_is_this_runs(self):
+        """The boundary is not a staleness signal: equal stamps are one run.
+
+        The collector cannot finish before it was launched, so a second-level
+        tie is clock granularity, and refusing it would fail a fast collector
+        on a coarse clock rather than catch a stale document.
+        """
+        self.run_started("2026-09-18T06:00:00Z")
+        path = self.manifest_finished("2026-09-18T06:00:00Z")
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["audit"], AUDIT)
+
+    def test_a_start_from_before_the_stamp_existed_lets_the_manifest_through(self):
+        """Back-compat, and `parse_gh_timestamp`'s rule about missing stamps.
+
+        A run whose `start` predates `RUN_RECORD_STARTED_KEY` cannot say when
+        it opened. That is unknown, never old: failing here would red every run
+        that straddles the upgrade, for no evidence about the manifest at all.
+        """
+        self.run_started(None)
+        path = self.manifest_finished("2020-01-01T00:00:00Z")
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["audit"], AUDIT)
+
+    def test_a_collector_that_stamps_nothing_is_not_called_stale(self):
+        self.run_started("2026-09-18T06:00:00Z")
+        path = self.write(json.dumps({"audit": AUDIT, "clusters": []}))
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["clusters"], [])
+
+    def test_an_unparseable_finished_at_is_not_called_stale(self):
+        self.run_started("2026-09-18T06:00:00Z")
+        path = self.manifest_finished("last Tuesday")
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["audit"], AUDIT)
+
+    def test_with_no_run_record_there_is_nothing_to_compare_against(self):
+        path = self.manifest_finished("2020-01-01T00:00:00Z")
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["audit"], AUDIT)
+
+    def test_without_an_audit_id_the_guard_does_not_run(self):
+        """`remediate --manifest-file` and the unit callers pass no audit id.
+
+        There is no run record to look up without one, so the manifest loads on
+        its envelope alone, exactly as it did before the guard.
+        """
+        self.run_started("2026-09-18T06:00:00Z")
+        path = self.write(json.dumps({"finished_at": "2020-01-01T00:00:00Z"}))
+        self.assertEqual(audit_report.load_manifest(path)["finished_at"], "2020-01-01T00:00:00Z")
+
+    def test_start_stamps_the_run_it_opened(self):
+        audit_report.write_run_record(AUDIT, "acme/fleet", [])
+        record = json.loads(
+            Path(audit_report.run_record_path_for(AUDIT)).read_text(encoding="utf-8")
+        )
+        stamped = audit_report.parse_gh_timestamp(record[audit_report.RUN_RECORD_STARTED_KEY])
+        self.assertIsNotNone(stamped)
+        self.assertLess(
+            abs((stamped - datetime.now(timezone.utc)).total_seconds()),
+            STAMP_TOLERANCE_SECONDS,
+        )
 
 
 class TestCrossCheckManifest(unittest.TestCase):
@@ -15743,6 +16050,142 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("STILL FLAGGED:", self.err)
         self.assertNotIn("UNACCOUNTED:", self.err)
 
+    def test_a_clean_run_across_the_qualifying_rename_is_held_not_closed(self):
+        """The previous ledger named clusters bare, under the scheme before the
+        collector qualified them. Its rows re-spell through the Scope table, so
+        a clean document over a candidate the collector still emits is held;
+        matched on the bare spelling, nothing was held and the ledger closed."""
+        previous_body = published_body(make_doc(), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
+        )
+        self.replay_ledger(previous_body)
+        qualified = ("acme-prod/us-east1/prod-us-east", "acme-stage/europe-west1/stage-eu")
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {"name": qualified[0], "location": "us-east1", "project": "acme-prod"},
+                {"name": qualified[1], "location": "europe-west1", "project": "acme-stage"},
+            ],
+        )
+        manifest = _full_manifest(
+            names=qualified,
+            candidates=[self.netpol_candidate(cluster=qualified[0])],
+            command=self.NETPOL_COMMAND,
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(payload["unaccounted"], [derived_id(cluster=qualified[0])])
+        # Without a manifest the unaccounted-findings rule holds it the same way.
+        self.replay_ledger(previous_body)
+        rc = self.run_finish(doc)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.stdout_json()["unaccounted"], [derived_id(cluster=qualified[0])])
+
+    def test_a_cluster_past_the_scope_table_is_qualified_from_this_run(self):
+        """`_render_scope` stops at `MAX_SCOPE_ROWS`, so on a larger fleet the
+        previous body has `Where:` lines naming clusters with no Scope row.
+        This run's own clusters qualify those, and the clean run is held."""
+        previous_body = published_body(make_doc(), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
+        )
+        previous_body = re.sub(r"(?m)^\| `prod-us-east` \|.*\n", "", previous_body)
+        self.assertNotIn("prod-us-east", audit_report._scope_qualified_names(previous_body))
+        self.replay_ledger(previous_body)
+        qualified = ("acme-prod/us-east1/prod-us-east", "acme-stage/europe-west1/stage-eu")
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {"name": qualified[0], "location": "us-east1", "project": "acme-prod"},
+                {"name": qualified[1], "location": "europe-west1", "project": "acme-stage"},
+            ],
+        )
+        manifest = _full_manifest(
+            names=qualified,
+            candidates=[self.netpol_candidate(cluster=qualified[0])],
+            command=self.NETPOL_COMMAND,
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["unaccounted"], [derived_id(cluster=qualified[0])])
+        self.replay_ledger(previous_body)
+        rc = self.run_finish(doc)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.stdout_json()["unaccounted"], [derived_id(cluster=qualified[0])])
+
+    def test_the_manifest_path_holds_a_finding_past_the_scope_table(self):
+        """`collector_held_entries` carries the held entry itself; the finish
+        payload above would read `HELD` from the unaccounted rule alone. A name
+        two manifest clusters could own is spelled as the one the collector
+        flags, and held on the first by id when it flags both: holding neither
+        closed the ledger over a finding the collector still reported."""
+        previous_body = published_body(make_doc(), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
+        )
+        previous_body = re.sub(r"(?m)^\| `prod-us-east` \|.*\n", "", previous_body)
+        qualified = ("acme-prod/us-east1/prod-us-east", "acme-stage/europe-west1/stage-eu")
+        held = audit_report.collector_held_entries(
+            _full_manifest(names=qualified, candidates=[self.netpol_candidate(cluster=qualified[0])]),
+            make_doc(findings=[]),
+            exclude=set(),
+            previous_body=previous_body,
+        )
+        self.assertEqual([entry["id"] for entry in held], [derived_id(cluster=qualified[0])])
+        ambiguous = (qualified[0], "acme-stage/us-east1/prod-us-east")
+        for flagged in ((qualified[0],), (ambiguous[1],), ambiguous):
+            with self.subTest(flagged=flagged):
+                held = audit_report.collector_held_entries(
+                    _full_manifest(
+                        names=ambiguous,
+                        candidates=[self.netpol_candidate(cluster=name) for name in flagged],
+                    ),
+                    make_doc(findings=[]),
+                    exclude=set(),
+                    previous_body=previous_body,
+                )
+                self.assertEqual(
+                    [entry["id"] for entry in held],
+                    [min(derived_id(cluster=name) for name in flagged)],
+                )
+
+    def test_this_runs_clusters_qualify_only_names_the_table_does_not_list(self):
+        body = (
+            "| `web` | us-east1 | `acme-prod` | 10/10 |\n"
+            "| `web` | europe-west1 | `acme-prod` | 10/10 |\n"
+        )
+        clusters = [
+            "acme-prod/us-east1/web",
+            "acme-prod/us-east1/api",
+            "acme-prod/us-east1/db",
+            "acme-stage/us-east1/db",
+            "unqualified",
+        ]
+        self.assertEqual(
+            audit_report._scope_qualified_names(body, clusters), {"api": "acme-prod/us-east1/api"}
+        )
+
+    def test_a_name_audited_at_two_locations_is_not_qualified(self):
+        body = (
+            "| `web` | us-east1 | `acme-prod` | 10/10 |\n"
+            "| `web` | europe-west1 | `acme-prod` | 10/10 |\n"
+            "| `api` | us-east1 | `acme-prod` | 10/10 |\n"
+            "| `acme-prod/us-east1/db` | us-east1 | `acme-prod` | 10/10 |\n"
+        )
+        self.assertEqual(
+            audit_report._scope_qualified_names(body), {"api": "acme-prod/us-east1/api"}
+        )
+
     def test_a_clean_run_the_collector_agrees_with_closes(self):
         doc = self.clean_over_previous_ledger()
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(_full_manifest())])
@@ -15923,6 +16366,13 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     captured from the harness *before* the contract was added. A key added
     unconditionally to the payload, a log line that now prints on every run,
     a renderer that reorders a section -- each fails here, naming the byte.
+
+    One deviation is deliberate and is recorded in the transcripts rather than
+    excused: `ID_SCHEME` went from 2 to 3 when the drift collector began
+    qualifying cluster names, and from 3 to 4 when the patch-readiness
+    collector did the same, and the stamp is global, so every stream's bodies
+    carry the current number. That is the whole of the change here -- five
+    lines, one per body -- and this class is what proves it.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,

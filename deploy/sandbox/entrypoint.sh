@@ -39,6 +39,7 @@ SANDBOX_HOME_ROOTS="${SANDBOX_HOME_ROOTS:-. profiles/platform}"
 # home root above, so a home that gains a database gains a tripwire with it.
 AGENT_POD_DATABASES="${AGENT_POD_DATABASES:-kanban.db state.db}"
 AGENT_POD_DATABASE_NOTE="NOT-THE-AGENT-POD-DATABASE.txt"
+SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION"
 
 # Every name under $DATA is owned by uid 1000 and survives a pod recycle, so any
 # path below it that this script hands to root may be a symlink the model planted
@@ -401,7 +402,7 @@ setenv_args="PATH=\"$SANDBOX_PATH\" HERMES_HOME=\"$DATA\" PLATFORM_AGENT_HOME=\"
 # every caller once it is off the agent's pod — which the sandbox being here
 # already means — so a session that has the URL and not this one reaches the
 # listener and is refused by it.
-for name in CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE; do
+for name in $SANDBOX_FORWARDED_ENV_NAMES; do
   value="${!name-}"
   if [ -z "$value" ]; then
     continue

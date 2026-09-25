@@ -8,8 +8,8 @@
 # domain is a targeted question about the planted defect, answered from
 # observed evidence and graded on the reply — the shape
 # cluster-agent-crashloop-debug proved at 142s. Full audit SOP fidelity lives
-# in the fleet-audits canary (compliance-rbac-overgrant, 606s measured) and in
-# the future nightly tier, where obtainability-planted-pdb is parked.
+# in the nightly tier: the fleet-audits canary (compliance-rbac-overgrant,
+# 606s measured; nightly since 2026-09-22) and obtainability-planted-pdb.
 # Expected cost bracket: ~150-350s (chat prompt, delegated worker, a handful
 # of cluster reads; no ledger write).
 #
@@ -81,8 +81,9 @@ verification_spec:
       required_phrases: ["checkout-gateway"]
       any_of_phrases: ["PodDisruptionBudget", "PDB"]
   # Cluster-state safeguard: "the fleet came out the way it went in."
-  # tool_called cannot see worker mutations (the trajectory carries only the
-  # delegating turn's calls), so read-only is asserted against the cluster
+  # tool_called cannot see worker mutations (it counts only the delegating
+  # turn's calls; the workers' entries in the trajectory are tagged and
+  # skipped), so read-only is asserted against the cluster
   # itself. Addressed by fixture ROLE, so the check reads the cluster that
   # carries the unbudgeted workload in whichever eval project this run leased
   # -- see bench/tf/fleet/fixtures.json and DRAFTS.md's A5 for why naming a

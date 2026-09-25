@@ -48,6 +48,25 @@ fails if the two drift apart. Do not restate a title anywhere else.
 
 ## Running a stream on demand
 
+An audit request arrives in one of two distinct forms, distinguished by the request itself:
+
+### 1. Asked to run an audit stream per its SOP: Run the audit directly
+
+When you are delegated a task or kanban card to execute an audit stream following its standard operating procedure (e.g. _"Run the security and RBAC posture audit, following the compliance-audit SOP"_ or a card naming the stream and SOP):
+
+- **You are the audit worker.** You have been given a dedicated worker session and turn budget for this specific audit stream.
+- **Execute the audit following its SOP (mapped in `AUDITS` at the top of `audit_report.py`, e.g. `governance/compliance_audit_sop.md` for `compliance-audit`) directly.** Use the two-command lifecycle below:
+  1. `./skills/fleet-audit/scripts/audit_report.py start --audit <stream> [--repo "<owner>/<repo>"]`
+  2. Enumerate clusters and run the checks per the SOP.
+  3. `./skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
+- **Do not reach for `hermes cron run` or say "queued for the next cron tick":** This request is an explicit on-demand audit execution, not a request to trigger the scheduled cron job. Execute the SOP directly and report the ledger issue URL in your result.
+- **Alignment with `AGENTS.md`:** `AGENTS.md` ("'Run the `<x>` cron job now' → trigger the schedule, do not re-enact it") addresses requests asking to trigger the background cron job or to run multiple/all audits in a single session. When delegated a task to execute a single audit stream per its SOP, you are the dedicated worker session for that stream; execute the audit directly.
+- **A card whose result is "queued for later" must NEVER be marked `done` (#1876):** If an audit cannot be run in this session due to missing credentials or infrastructure failure, call `kanban_block` (or ask for input); **never** call `kanban_complete` claiming `done` when zero findings or ledger were produced.
+
+### 2. Asked to run or trigger the scheduled cron job, or to run multiple/all audits
+
+When a request asks to trigger or run the scheduled cron job (e.g. _"Run the `compliance-audit` cron job now"_, _"Trigger the compliance-audit schedule"_), or asks to run multiple or all scheduled audits in one request (e.g. _"Run all scheduled audits"_):
+
 Each stream's cron job id **is** its audit id, so an operator asking for a run off-schedule is asking
 for one command per stream:
 
@@ -68,16 +87,14 @@ paragraph exists to prevent. Elsewhere it hands the run to the background delega
 returns a handle; that is closer to what you want, but `hermes cron run` is the one route that
 behaves identically on every runtime and always runs in a fresh process.
 
-**Your shell cannot reach that command, and there is no substitute yet.** It runs on the gateway pod,
+**Your shell cannot reach that command in the sandbox pod, and there is no substitute yet.** It runs on the gateway pod,
 where `hermes` and `/opt/data/profiles` are; your shell runs in the sandbox pod, which has neither, so
 `command not found` there is the split working as designed rather than a broken install. When you hit
 it, say the on-demand trigger is unavailable and that the stream will run on its 06:20 schedule. That
-does not license either fallback: not `cronjob(action='run')`, and not running the audit yourself —
-see the next paragraph. The gap is a deliberate deferral of the shell-sandbox design, not an
-oversight.
+does not license either fallback: not `cronjob(action='run')`, and not running the audit yourself inline.
 
-**Do not run the audit yourself in the session that received the request.** A triggered run gets its
-own process and its own turn budget. A session that improvises the audit instead has neither — and
+**Never do the audit in the session that received the request when asked to trigger the cron job or run all audits.** A triggered run gets its
+own process and its own turn budget. A session that improvises multiple audits instead has neither — and
 when the request is "run them all", it has one turn budget for work the schedule spreads across
 every stream and two days. That is not a hypothetical failure mode: on 2026-08-03 a single worker
 asked to run all five streams that existed then issued zero `kubectl` commands, hand-typed five
@@ -87,8 +104,8 @@ The scheduler holds a per-job lock for the length of a run, so a stream already 
 started a second time and cannot write its ledger issue twice. `cronjob(action='runs')` shows what
 is running and what each attempt did.
 
-**Each run reports on itself. Your own answer is a roll-up, not a copy.** Answer with one line per
-stream — the stream, and that it is queued for the next tick. The reports arrive through each run's
+**Each run reports on itself. Your own answer is a roll-up, not a copy.** When triggering cron jobs, answer with one line per
+stream — the stream, and that it is queued for the next tick (or that the on-demand trigger is unavailable). The reports arrive through each run's
 own `deliver` setting; repeating them here sends the same content twice.
 
 ## The two-command lifecycle
@@ -309,6 +326,13 @@ collector-manifest design says what the manifest holds): `--manifest-file` names
 collector wrote and `--no-collector-manifest` publishes without one, reporting the reason as a
 coverage gap. An SOP that mentions neither runs `finish` without them, exactly as before.
 
+A stream with a collector runs it before Step 2's inspection, not after: the SOP names the script
+and the path to write its manifest to, the manifest's `commands` are that cluster's `checks_run`
+and its `candidates` are the findings the collector vouches for, and Step 3 passes the same file as
+`--manifest-file`. Today that is the drift stream — `governance/fleet_consistency_drift_sop.md` §4
+says how to read its manifest and what is still yours to write — and the upgrade and patch
+readiness stream, whose `governance/security_patch_orchestrator_sop.md` §3 does the same.
+
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
@@ -346,7 +370,11 @@ the message names and re-run; never delete the finding that tripped it. What rea
 document failed a field rule, the file named by `--findings-file` is missing or is not valid JSON,
 `--audit` is not one of the registered ids above, the document contradicts the collector manifest
 named by `--manifest-file`, that manifest is missing or malformed, `--manifest-file` was given an
-empty path, or `--no-collector-manifest` was given a blank reason. Exit 1 is fatal and means
+empty path, or `--no-collector-manifest` was given a blank reason. A manifest that finished before
+this run's `start` opened reaches exit 2 too: the collector writes to a fixed path that is not
+scrubbed between runs, so a run whose collector never ran finds the previous one's manifest sitting
+there, and cross-checking against a week-old reading of the fleet is worse than cross-checking
+against nothing. Re-run the collector. Exit 1 is fatal and means
 something else broke.
 
 ### Partial coverage
@@ -630,7 +658,11 @@ field, and publishes nothing:
 Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator enforces
 both halves. This matters because the alternative produces **false all-clears**: put an Autopilot
 cluster in `scope.skipped` because one node-level check cannot apply there, and every real finding
-on a cluster you did audit gets suppressed along with it.
+on a cluster you did audit gets suppressed along with it. It also refuses a finding whose `cluster`
+is the bare name of a `scope.clusters` entry spelled `<project>/<location>/<name>` (`prod` beside
+`acme/us-east1/prod`, or beside two such entries): the cluster is part of the finding's id, so the
+bare spelling files a second copy of the finding. Any other `cluster` outside `scope.clusters`,
+such as a `project/<id>` target, is not checked against it.
 
 `limitations` is optional, and non-empty when present. The rendered scope table grows a
 `limitations` column only when at least one cluster carries one.
@@ -1128,8 +1160,8 @@ be a day stale until a run can read it; report the gap as you would any other pa
   protection above back off: the run stops being `partial`, the ledger closes, and a fleet nobody
   looked at publishes as clean. The commands are published verbatim, so a padded entry is not a
   private shortcut — it is a false statement in a public issue, with your run's name on it.
-- **Never run the audit inline when asked to run the cron job.** Dispatch it; see
-  [Running a stream on demand](#running-a-stream-on-demand).
+- **Never run the audit inline when asked to run or trigger the cron job, or when asked to run all audits.** Trigger the schedule or report that the trigger is unavailable; see
+  [Running a stream on demand](#running-a-stream-on-demand). When delegated a task to execute an audit stream per its SOP, run the audit directly using the two-command lifecycle.
 - **Never call `start`, `finish`, or `remediate` for a stream you dispatched.** The run owns its
   stream's lifecycle end to end and has already published by the time the call returns to you. A
   second `finish` reads a findings document the run's own `start` consumed, so it publishes whatever

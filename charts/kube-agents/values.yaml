@@ -20,6 +20,23 @@
 admissionPolicy:
   enabled: true
 
+# Preflight ResourceQuota validation at chart render time (#749).
+# When enabled and running against a live cluster (`helm install` or `helm upgrade`),
+# the chart queries namespace ResourceQuotas via `lookup`. If any un-scoped quota lacks
+# sufficient headroom for the combined footprint of the chart workloads and the
+# operator-rendered pods (gateway, shell sandbox, credential proxy), the render fails
+# fast with a diagnosis and patch command instead of stalling later during pod creation.
+#
+# With no cluster to query (`helm template` in CI) or no ResourceQuota in the namespace,
+# `lookup` returns nothing and the check passes.
+#
+# It needs `get`/`list` on `resourcequotas` in the release namespace, though. Helm's
+# `lookup` swallows a NotFound and nothing else, so a 403 aborts the render rather than
+# passing quietly; an identity without that permission installs with
+# `--set quotaPreflight.enabled=false`.
+quotaPreflight:
+  enabled: true
+
 global:
   # Registry prefix for the images built from this repo (operator, agent,
   # credential proxy). Empty leaves them on the public defaults below.
@@ -427,6 +444,8 @@ hindsight:
     # Recall is CPU-bound on the in-process cross-encoder reranker; see the
     # template before raising these — more CPU has been measured to buy
     # nothing on e2-standard-4, and a request of 4 CPUs never schedules there.
+    # Steady-state usage is ~9m against the 2-CPU request; right-sizing
+    # requests.cpu is tracked in #1637.
     resources:
       requests:
         cpu: "2"

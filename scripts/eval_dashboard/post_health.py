@@ -47,8 +47,10 @@ the cluster owner, unless an open `presubmit-gate` issue already names the
 lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
 designed state on two consecutive hourly scans or on three pool projects at
 once, #1550) files one for the fleet owner the same way, unless an open
-`presubmit-gate` issue already names the drifted roles. It never closes an
-issue. A GitHub failure is a warning: the message goes out with "no issue
+`presubmit-gate` issue already names the drifted roles. A new `deadline_kill`
+OUTAGE (runs killed at the job timeout with no verdict, #1894) files one for
+whoever owns the gate, unless an open `presubmit-gate` issue's title already
+names the deadline kills. It never closes an issue. A GitHub failure is a warning: the message goes out with "no issue
 yet" and the next change asks again.
 
 Delivery is the Google Chat REST API with the job's service account acting
@@ -86,11 +88,11 @@ try:
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, minutes_text, pool_span, wait_text
+    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_span, wait_text
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import gate_issue, ghcli, nightly
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, minutes_text, pool_span, wait_text
+    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_span, wait_text
 
 STATE_SCHEMA_VERSION = 1
 
@@ -110,6 +112,10 @@ OUTAGE = "OUTAGE"
 CONDITION_LOST_PODS = "lost_pods"
 CONDITION_SHARED_BREAK = "shared_break"
 CONDITION_FIXTURE_DRIFT = "fixture_drift"
+CONDITION_DELEGATION_CEILING = "delegation_ceiling"
+CONDITION_DEADLINE_KILL = "deadline_kill"
+# The presubmit job's timeout in minutes, as health.py owns it.
+DEADLINE_MINUTES = int(PROW_JOB_TIMEOUT.total_seconds() // 60)
 # health.json's summary of the hourly seeded-fleet scan (health.py,
 # fixture_state_block); absent before the scan has ever published.
 FIXTURE_STATE_KEY = "fixture_state"
@@ -598,6 +604,13 @@ def cause_sentence(health: dict) -> str:
         if incident.get("event"):
             return f"the build cluster lost {nodes_text(incident.get('nodes'))} at {when}; {runs} runs on {prs} PRs died mid-run."
         return f"{runs} runs on {prs} PRs died with their build node at {when}."
+    if condition == CONDITION_DEADLINE_KILL:
+        start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
+        window = clock_range(start, end) if start and end else f"since {since}"
+        return (
+            f"{incident.get('runs', 0)} runs on {prs} PRs were killed at the {DEADLINE_MINUTES}-minute deadline with no verdict {window};"
+            " nothing is being graded, so the gate cannot pass anyone."
+        )
     if condition == "shared_break":
         return (
             f"{describe_cases(health.get('failing_cases'))} fail on every PR since {since}"
@@ -611,6 +624,13 @@ def cause_sentence(health: dict) -> str:
         return f"{incident.get('runs', 0)} runs on {prs} PRs died during setup since {since}."
     if condition == CONDITION_FIXTURE_DRIFT:
         return fixture_drift_sentence(health, since)
+    if condition == CONDITION_DELEGATION_CEILING:
+        start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
+        window = clock_range(start, end) if start and end else f"since {since}"
+        return (
+            f"{incident.get('reps', 0)} repetitions on {prs} PRs ended with the worker still running {window};"
+            " nothing was graded and nothing counts against a case."
+        )
     return health.get("cause") or "no single cause"
 
 
@@ -625,6 +645,11 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
         end = parse_iso((health.get("incident") or {}).get("window_end"))
         when = f"after {clock(end + STORM_COOLDOWN)}" if end else "once the storm has passed"
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours went red, retest {when}."]
+    elif condition == CONDITION_DELEGATION_CEILING:
+        lines = [
+            f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Those runs read NOT EVALUATED, not red; retest once workers are"
+            " finishing again. The gateway log in a run's artifacts says whether the dispatcher stalled (#1879)."
+        ]
     elif condition == CONDITION_LOST_PODS:
         tag = issue_tag(issue)
         tracking = f" Tracking {tag}." if tag else ""
@@ -656,8 +681,10 @@ def figure(value) -> str:
 def slow_text(slow: dict) -> str:
     """The numbers behind a slow gate, in minutes, as one clause: "the last
     5 full runs took 152–213 min (median 183) against a 7-day typical of
-    151 min (p90 198); 2 reps lost to 429s"."""
-    lost = f"{slow['infra_reps']} reps lost to 429s" if slow.get("infra_reps") else "no reps lost"
+    151 min (p90 198); 2 reps lost to 429s or empty records"."""
+    # health.py's storm_reps: 429s and empty records alike (rep_kind), so the
+    # note names both rather than calling an empty record a 429.
+    lost = f"{slow['infra_reps']} reps lost to 429s or empty records" if slow.get("infra_reps") else "no reps lost"
     return (
         f"the last {slow.get('runs', 0)} full runs took {minutes_text(slow.get('min_s'))}–{minutes_text(slow.get('max_s'))} min"
         f" (median {minutes_text(slow.get('median_s'))}) against a {slow.get('baseline_days', DEFAULT_SLOW_BASELINE_DAYS)}-day typical"
@@ -867,6 +894,10 @@ def short_cause(prev: dict) -> str:
         return "the build cluster lost nodes"
     if condition == CONDITION_FIXTURE_DRIFT:
         return "seeded fixtures had drifted"
+    if condition == CONDITION_DELEGATION_CEILING:
+        return "workers were not finishing"
+    if condition == CONDITION_DEADLINE_KILL:
+        return "runs were being killed at the deadline"
     return prev.get("cause") or "unknown cause"
 
 
@@ -952,6 +983,15 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
         lines.append(f"⚪ No fresh data since {clock(parse_iso(health.get('generated_at')))} — these numbers stop there. Someone check the refresh job.")
     if health.get("slow"):
         lines.append(f"🐢 Slow since {clock(parse_iso(health['slow'].get('since')))}: {slow_text(health['slow'])}.")
+    ceiling = metrics.get("ceiling_reps") or 0
+    if ceiling:
+        # Apart from the headline's infra count on purpose: these repetitions
+        # were neither lost to 429s nor graded (#1874). Only on a day that
+        # had one; a zero line every morning would be read past.
+        lines.append(
+            f"⏳ {ceiling} repetitions ended at the delegation ceiling with the worker still running;"
+            " not counted as infra or against any case."
+        )
     if health.get("pool"):
         lines.append(pool_digest_line(health["pool"]))
     if data is not None:
@@ -1093,8 +1133,8 @@ def run(
     if tracker is not None and wants_issue:
         incident = health.get("incident") or {}
         since = parse_iso(health.get("since"))
-        if condition == CONDITION_LOST_PODS:
-            start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
+        if condition in (CONDITION_LOST_PODS, CONDITION_DEADLINE_KILL):
+            start, end = parse_iso(incident.get("first_kill") or incident.get("window_start")), parse_iso(incident.get("window_end"))
             issue = tracker.ensure(health, now, clock(start or since, weekday=True), incident_link(health), clock_range(start, end) if start and end else clock(since, weekday=True))
         else:
             issue = tracker.ensure(health, now, clock(since, weekday=True), incident_link(health))

@@ -27,7 +27,7 @@ Invoked by the `obtainability-audit` watchdog. The cron id predates the rename.
 
 ### `security_patch_orchestrator_sop.md`
 
-Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared against `gcloud container get-server-config` for each cluster's release channel, node skew against GKE's two-minor ceiling, fleet-wide minor spread, clusters on no release channel, `autoUpgrade`/`autoRepair` off, missing maintenance windows, upgrade-blocking maintenance exclusions, deprecated node image variants, and absent upgrade notifications.
+Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared against every version `gcloud container get-server-config` still offers at the cluster's location, and against its release channel's default, node skew against GKE's two-minor ceiling, fleet-wide minor spread, clusters on no release channel, `autoUpgrade`/`autoRepair` off, missing maintenance windows, upgrade-blocking maintenance exclusions, deprecated node image variants, and absent upgrade notifications.
 
 The SOP forbids the words "vulnerable", "unpatched", and "CVE" in its findings: there is no vulnerability feed in this environment, so every finding is version currency or upgrade-policy hygiene. Invoked by the `security-patch-orchestrator` watchdog.
 
@@ -39,7 +39,7 @@ Findings are reported in **resource units — GiB, vCPU, node and object counts 
 
 ### `fleet_consistency_drift_sop.md`
 
-Fleet consistency drift, weekly. For each configuration facet — release channel, Workload Identity, Shielded Nodes, logging and monitoring config, network policy, node auto-provisioning, Binary Authorization, required labels — it computes what the majority of _comparable_ clusters do and reports the outliers.
+Fleet consistency drift, weekly. For each configuration facet — release channel, Shielded Nodes, logging and monitoring config, network policy, node auto-provisioning, Binary Authorization, label keys — it computes what the majority of _comparable_ clusters do and reports the outliers, and it reports a cluster whose missing environment label keeps it out of every comparison.
 
 The baseline is derived from the live fleet and nowhere else. That is what makes this one runnable where the retired `blueprint_sync_sop.md` and `standardization_validator_sop.md` are not: it needs no master blueprint, no CMDB, and no standards document. Invoked by the `fleet-consistency-drift` watchdog.
 

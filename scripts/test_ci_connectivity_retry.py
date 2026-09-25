@@ -83,6 +83,23 @@ def dump_function() -> str:
     return match.group(0)
 
 
+def gateway_collector() -> str:
+    """collect_gateway_log() and the log-tail constants, lifted from ci-env.sh.
+
+    The dumper calls it for the running pod's log, so the dump under test
+    carries the real collector rather than a stub: its `|| true` guard is
+    one of the ones the survival test below is about. Every `*_LOG_*`
+    readonly comes along, since the dumper reads the litellm and envoy tail
+    sizes too and `set -u` would end the script at the first unbound one.
+    """
+    src = ENV_SCRIPT.read_text(encoding="utf-8")
+    constants = re.findall(r"^readonly [A-Z_]*_LOG_[A-Z_]+=.*$", src, re.MULTILINE)
+    match = re.search(r"^collect_gateway_log\(\) \{\n.*?^\}$", src, re.DOTALL | re.MULTILINE)
+    if match is None or not constants:  # pragma: no cover
+        raise AssertionError(f"collect_gateway_log() not found in {ENV_SCRIPT}")
+    return "\n".join([*constants, match.group(0)])
+
+
 def write_stub(directory: pathlib.Path, name: str, body: str) -> None:
     path = directory / name
     path.write_text(body, encoding="utf-8")
@@ -180,6 +197,7 @@ class FailureDumpArtifactsTest(unittest.TestCase):
             [
                 "set -euo pipefail",
                 "collect_bench_results() { :; }",
+                gateway_collector(),
                 dump_function(),
                 "false || dump_prow_artifacts_on_failure",
                 'echo "SURVIVED"',

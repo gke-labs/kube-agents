@@ -550,7 +550,7 @@ rc_tag_core() {
 # ─── Eval-candidate tags ──────────────────────────────────────────────────────
 # NOT WIRED YET. Nothing in this repository composes, pushes or reads an
 # evalcand_ tag: these helpers and poll_rc_eval_verdict.py beside them are the
-# pieces, and the pull request that changes nightly-pipeline.yml is what joins
+# pieces, and the pull request that changes staging-promotion-pipeline.yml is what joins
 # them up. Until it lands the nightly still pushes staging_ straight off a green
 # matrix, and the paragraph below describes where this is going rather than what
 # runs tonight. Everything downstream of that sentence is true of the helpers
@@ -756,7 +756,7 @@ get_existing_staging_tag() {
 # This does not expire with the restructure. Once the RC pipeline validates a
 # post-restructure commit, `get_latest_validated_rc_tag` stops returning an old
 # one and the default path never reaches this check again — but
-# nightly-pipeline.yml takes an `rc_tag` dispatch input whose description offers
+# staging-promotion-pipeline.yml takes an `rc_tag` dispatch input whose description offers
 # any validated candidate, and the tag graph keeps every candidate it ever
 # validated. Naming one by hand is a supported thing to do and stays wrong for
 # the same reason it is wrong today.

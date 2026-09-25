@@ -1,8 +1,10 @@
 # The eval transport under `spec.mode: next`
 
-> **STATUS — draft for review; nothing here is built.** The bench harness has one transport,
-> `hack/ci-deploy.sh` has no mode flag, the gateway has no inject adapter, and the presubmit
-> install runs `today`. The measurement that motivates the document is on
+> **STATUS — design of record; stage 1 partially built.** The gateway has the inject adapter and
+> the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator renders the door only
+> under its eval flag. Still unbuilt: the bridge image the eval install needs, `hack/ci-deploy.sh`
+> has no mode flag, the presubmit install runs `today`, and stage 2 (Chat ingress) is not started.
+> The measurement that motivates the document is on
 > gke-labs/kube-agents#1661; the presubmit run it cites is build `2100310325382352896`. The A2A
 > owner answered the first draft's questions on 2026-09-17 and reviewed the draft the same day;
 > the answers and the review's points are folded in below as decisions, dated where each lands.
@@ -45,14 +47,18 @@ endpoint from outside the cluster. It is also identical in both modes, because t
 renders the bus beside the agent and leaves the agent's HTTP server as it was.
 
 The reply it grades is the Responses payload. When the agent delegates by filing a kanban card,
-the harness re-prompts the same conversation every `AGENT_DELEGATION_POLL_INTERVAL` seconds (30
-by default) with an instruction to call `kanban_show` on the outstanding ids, until every card
-reads done, blocked or archived or `AGENT_DELEGATION_TIMEOUT` elapses (1800 s by default, 2700 s
-in the presubmit, 3000 s for its six full-audit units). The delivered card results are appended
-to the answer, and the worker's report and terminal commands are read back with `kubectl exec` from
+the harness reads the outstanding cards' statuses off the agent's kanban store with `kubectl exec`
+every `AGENT_DELEGATION_POLL_INTERVAL` seconds (30 by default), and re-prompts the same
+conversation with an instruction to call `kanban_show` only once a card reads done, archived,
+blocked, failed or cancelled (or when the store cannot be read or does not know a card), until
+every card has settled or
+`AGENT_DELEGATION_TIMEOUT` elapses (1800 s by default, 2700 s in the presubmit, 3000 s for its
+six full-audit units). The delivered card results are appended to the answer, and the worker's
+report and terminal commands are read back with `kubectl exec` from
 `/opt/data/kanban/attachments/<id>/` and `/opt/data/kanban/logs/<id>.log` in the agent pod, then
-deleted. A customer sees the card result relayed to their thread; they never see the files, and
-the poll turns are model calls the customer never made.
+deleted; a card still running when the wait ran out is archived first, which stops its worker. A
+customer sees the card result relayed to their thread; they never see the files, the
+store reads, or the collecting turn, which is a model call the customer never made.
 
 The consequence, measured: the presubmit matrix ran under `mode: next` with the A2A gateway in
 `ErrImagePull`, the auth callout in `ImagePullBackOff` and the provisioning Job in `Error`, and
@@ -71,9 +77,9 @@ streams and the executor, but it leaves out the gateway's routing, its session r
 relay back, and it hands a second process the one credential that may publish on `.in`. Stage 1
 is therefore the next-stack analogue of the door the harness uses today: an **inject adapter in
 the gateway**, a third backend beside Discord and Google Chat, HTTP on localhost or a ClusterIP
-Service, off by default, rendered by the operator only under the eval flag. Its design text goes
-in the gateway spec's "The test backend" section, which does not carry it yet; this document
-records what the harness does with it. The direct-bus transport survives as a diagnostic, below.
+Service, off by default, rendered by the operator only under the eval flag. Its design text is
+the gateway spec's "The inject backend" section; this document records what the harness does
+with it. The direct-bus transport survives as a diagnostic, below.
 
 Selected by `AGENT_TRANSPORT=inject`; unset, or `api`, is today's transport byte for byte, and
 the presubmit exports nothing new until it chooses to. The exchange:
@@ -145,14 +151,16 @@ the presubmit exports nothing new until it chooses to. The exchange:
    final status entry as liveness evidence in place of a token total; `working` counts because
    a graded timeout, canceled at the budget with the cancel unconfirmed, has no final entry and
    would otherwise block as not a real run, and a `submitted` entry alone still blocks. A task
-   nobody took reaches the scorer as infrastructure through the harness's marker, never as a
-   record the rung blocks. That
-   scorer rule lands with the diagnostic transport, and whichever of the two transports merges
-   first brings it.
+   nobody took, and one an executor took and never brought to `working` by the budget, reaches
+   the scorer as infrastructure through the harness's marker, never as a record the rung
+   blocks: the harness's deadline predicate (`Fold.started`) and the rung's are one rule,
+   `shows_a_run`, held together by a test. The inject transport brings the scorer rule; the
+   diagnostic transport reuses it.
 
-The adapter binds to localhost or a ClusterIP Service. A NetworkPolicy edge fences it from every
-in-cluster pod but the eval runner's path; it does not govern the port-forward the harness uses,
-which enters from the node, so the fence is not what keeps the door shut. What keeps it shut is a
+The adapter binds the gateway pod's loopback, with a ClusterIP Service that gives the harness's
+port-forward a name and routes nothing. A NetworkPolicy edge fences it from every in-cluster pod
+as a second control; neither governs the port-forward the harness uses, which the kubelet serves
+from inside the pod's network namespace, so they are not what keeps the door shut. What keeps it shut is a
 bearer token the operator renders into a Secret beside the adapter's env, under the eval flag
 only, which the harness reads the way the presubmit reads `API_SERVER_KEY` today. The door it
 replaces admits key holders, and this one admits the same population rather than everyone
@@ -232,7 +240,7 @@ that reads "status". The harness therefore sends no message at the deadline. It 
 conversation's state through the adapter's read route, a pure read that mutates nothing: the
 heal is a write under the per-conversation lock, and a route that performed it from outside
 `handleInbound` would be a second writer racing the next inbound message for the record. The
-harness classifies from one of six outcomes, by the state the route's fold returns: no active
+harness classifies from one of seven outcomes, by the state the route's fold returns: no active
 task and a terminal posted, the run finished as the deadline fired, so it is graded like any
 other; an active task with no executor event, nobody took it, infrastructure, whether or not the
 gateway has released the conversation yet; an active task at `submitted` and never `working`, an
@@ -245,8 +253,11 @@ cancel, because there is nothing left to cancel; the record then holds a finishe
 something releases it, which on a key never reused is nothing and costs nothing. The sixth is
 the state a failed publish leaves, no active task and no terminal, the fold none and the last
 posted message the failure edit; the harness ordinarily met that edit in step 3 long before
-the deadline, and at the deadline it grades the same, infrastructure, no cancel. In every other
-outcome that leaves an active task, the no-executor one included, the cancel then goes out for
+the deadline, and at the deadline it grades the same, infrastructure, no cancel. The seventh is
+an active task past `submitted` that never reached `working` (`input-required`,
+`auth-required`): an executor took it and parked it, infrastructure by the rule the scorer's
+liveness rung applies, so no fold the harness grades is a record the rung then refuses. In every
+other outcome that leaves an active task, the no-executor one included, the cancel then goes out for
 the task id the adapter answered with, whether or not the record still holds it. The
 classification comes from the read and never from
 the cancel's answer: a cancel sent to a task nobody consumed gets "cancel sent" back and no
@@ -429,10 +440,11 @@ project, because a Chat app configuration is per GCP project.
 
 ## Completion signals
 
-Today's wait costs one model turn per poll interval, notices completion only at a poll boundary,
-and slows down exactly when the agent is rate-limited, because the status question is itself a
-model call the agent has to answer. A delegated case that waits ten minutes spends about twenty
-turns asking.
+Today's wait costs one `kubectl exec` against the kanban store per poll interval and one model
+turn per card that settles (plus a turn whenever the store cannot be read or does not know a
+card), notices completion only at a poll boundary, and still needs that collecting turn, which
+slows down exactly when the agent is rate-limited. A delegated case that waits ten minutes spends
+about twenty store reads and one turn.
 
 On the bus a task has a lifecycle the requester can watch: `status-update` events, a `result`
 artifact, one terminal event with `final: true`, and `cancel` as a real envelope rather than a
@@ -455,11 +467,12 @@ ended and the card was filed, not that the work is done.
 
 Stage 1 handles that in three parts. The transport awaits the terminal of a named task id,
 "await the terminal of task X" rather than "await the task I submitted", for everything the
-executor does itself, which is most cases and removes the poll turns. For a terminal whose result
+executor does itself, which is most cases and removes the store reads and the collecting turn. For a terminal whose result
 names card ids, the case runner waits for the cards one hop further in, with the time cost above
 moved with it. Today's wait cannot be re-entered as it is: it is a method of the api transport
 that re-posts `/v1/responses`, takes card ids from `kanban_create` tool results and statuses from
-`kanban_show` payloads in the trajectory, and gives up after three turns that report nothing, and
+the kanban store or from `kanban_show` payloads in the trajectory, and gives up after three status
+turns that report nothing, and
 on this path the trajectory holds no tool calls, only the lifecycle entries of step 4. Stage 1
 writes the wait again for the inject path: card ids and statuses read from the `result` text, the
 status question sent as a new turn on the same conversation key with its own backend message

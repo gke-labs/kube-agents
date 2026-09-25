@@ -1,6 +1,6 @@
 ---
 name: uninstall-kube-agents
-description: Discovers and removes provisioned kube-agents GCP/GKE infrastructure.
+description: Uninstall kube-agents (the Kubernetes Agentic Harness) — discover and remove the GCP/GKE infrastructure an install provisioned. Use when asked to uninstall, remove, or tear down kube-agents from a project or cluster.
 ---
 
 # Uninstall Kubernetes Agentic Harness (kube-agents)
