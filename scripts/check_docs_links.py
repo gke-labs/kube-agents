@@ -29,18 +29,23 @@ Scope is deliberately narrow and offline:
   this script's own tests do; a literal in a tracked file is a citation
   like any other;
 * every tracked ``.md``/``.mdx`` outside a root-level dot-directory must be
-  reached by one of those: a relative link from another document, a
-  repository blob URL (the form the generated skill catalogue uses; the URL
-  itself is not fetched or validated), or a design-document citation from
-  code. Some documents are reached by shape rather than by a link, and those
-  are exempt: files at the repository root (the front door), any
-  ``README.md`` (its directory reaches it), the published site under
-  ``SITE_CONTENT_DIR`` (Starlight's sidebar reaches every page), and the
-  uniform families in ``LINK_EXEMPT_FAMILY_GLOBS``, which a reader reaches by
-  browsing the directory and which no page links one by one. The documents
-  that were unlinked when the rule arrived are named in
-  ``UNLINKED_ALLOWLIST``; the list only shrinks -- an entry that gains a link
-  or is deleted fails the check until it is dropped.
+  reachable from where a reader starts. The starting points are the documents
+  a reader reaches without a link: files at the repository root (the front
+  door), any ``README.md`` (its directory reaches it), the tooling under the
+  root dot-directories, the site pages Starlight's sidebar lists (read from
+  ``SITE_CONFIG``: every page under an ``autogenerate`` directory, every
+  ``link:`` entry, and the ``404`` page it serves by convention), the uniform
+  families in ``LINK_EXEMPT_FAMILY_GLOBS``, which a reader reaches by
+  browsing the directory and which no page links one by one, and every
+  design document a code file cites. From there, reach follows links: a
+  relative link, a site route (``/kube-agents/...``), or a repository blob
+  URL (the form the generated skill catalogue uses; the URL itself is not
+  fetched or validated). A document linked only from documents no reader
+  reaches is as unreachable as one linked from nowhere, and is reported the
+  same way. The documents that were unreachable when the rule arrived are
+  named in ``UNLINKED_ALLOWLIST``; the list only shrinks -- an entry that
+  becomes reachable, becomes exempt by shape, or is deleted fails the check
+  until it is dropped.
 
 Standard library only, so it runs in CI and in a bare clone.
 
@@ -125,36 +130,50 @@ CITATION_RE = re.compile(r"docs/(?:designs|architecture)/[A-Za-z0-9_./-]+?\.md(?
 # directory is browsed, and every other tool that shows a tree does the same.
 README_NAME = "README.md"
 
-# Every page under the site's content root is in Starlight's sidebar, which is
-# generated from the tree, so a page there is reached without anyone linking it.
+# The published site. Starlight's sidebar is what reaches a page there, and
+# the sidebar is hand-written in the site config: a group is either a list of
+# `link:` entries, one per page, or `autogenerate`d from a directory, which
+# lists every page under it. Both forms are read from the config, so a page
+# added to a hand-listed group without a sidebar entry is reported, not
+# exempted: it would publish with no navigation to it. The `404` page is
+# served by name and listed nowhere.
 SITE_CONTENT_DIR = "docs/site/src/content/docs/"
+SITE_CONFIG = "docs/site/astro.config.mjs"
+SITE_AUTOGENERATE_RE = re.compile(r"autogenerate:\s*\{\s*directory:\s*['\"]([^'\"]+)['\"]")
+SITE_SIDEBAR_LINK_RE = re.compile(r"\blink:\s*['\"](/[^'\"]*)['\"]")
+SITE_ROUTE_PREFIX = "/kube-agents/"  # the Astro `base`; a sidebar `link:` omits it
+SITE_PAGE_SUFFIXES = (".md", ".mdx")
+SITE_INDEX_STEM = "index"
+SITE_CONVENTION_PAGES = frozenset({"404.md"})
 
 # Uniform families a reader reaches by browsing the directory and that no page
 # links member by member: the agents' runtime material (personas, SOPs, skills
-# and their references, the onboarding templates), the forge fixture READMEs,
-# and the GitOps template's per-directory documents. `*` stays inside one path
-# segment; `**` crosses segments. A new document in one of these directories
-# needs no link; a new family needs a line here, argued in the pull request.
+# and their references, the onboarding templates) and the GitOps template's
+# per-directory documents. `*` stays inside one path segment; `**` crosses
+# segments. A new document in one of these directories needs no link; a new
+# family needs a line here, argued in the pull request.
 LINK_EXEMPT_FAMILY_GLOBS = (
     "agents/chat/defaults/onboarding/*.md",
     "agents/cluster/*.md",
     "agents/cluster/skills/*/SKILL.md",
     "agents/platform/governance/*.md",
-    "agents/platform/scripts/testdata/providers/*/README.md",
     "agents/platform/skills/*/SKILL.md",
     "agents/platform/skills/*/references/*.md",
     "examples/gitops-repo/*/**",
 )
 
-# Documents nothing linked when the rule arrived. Each stays here until it is
-# linked from the page that owns its topic or deleted; the check fails on an
-# entry that is either, so the list can only shrink. Do not add to it: a new
-# document is linked from where its readers start.
+# Documents no reader reached when the rule arrived. Each stays here until it
+# is linked from the page that owns its topic or deleted; the check fails on
+# an entry that is either, or that a shape now exempts, so the list can only
+# shrink. Do not add to it: a new document is linked from where its readers
+# start.
 UNLINKED_ALLOWLIST = frozenset(
     {
+        "a2a/docs/hermes-bridge.md",
         "a2a/persona/platform/skills/a2a-topics/SKILL.md",
         "agents/chat/AGENTS.md",
         "agents/platform/docs/autoops-architecture.md",
+        "docs/designs/capability-delivery-vehicle.md",
         "docs/designs/design_537148738.md",
         "docs/designs/e2e-testing-harness.md",
         "docs/designs/eval-next-transport.md",
@@ -171,8 +190,14 @@ UNLINKED_ALLOWLIST = frozenset(
 # deleted design document is reported here as a broken citation as well.
 SELF = Path(__file__).resolve()
 
-UNLINKED_MESSAGE = "linked from nowhere -- link it from the page that owns its topic"
-ALLOWLIST_LINKED_MESSAGE = "in UNLINKED_ALLOWLIST but is now linked -- drop the entry"
+# What a link target loses before it names a file: a `#fragment`, and the
+# `?plain=1` GitHub appends when a Markdown file's URL is copied from its
+# rendered view.
+LINK_SUFFIX_RE = re.compile(r"[#?].*\Z")
+
+UNLINKED_MESSAGE = "no reader reaches it -- link it from the page that owns its topic"
+ALLOWLIST_LINKED_MESSAGE = "in UNLINKED_ALLOWLIST but is now reachable -- drop the entry"
+ALLOWLIST_EXEMPT_MESSAGE = "in UNLINKED_ALLOWLIST but is now exempt by shape -- drop the entry"
 ALLOWLIST_UNTRACKED_MESSAGE = "in UNLINKED_ALLOWLIST but is not tracked -- drop the entry"
 
 
@@ -236,26 +261,51 @@ def markdown_links(path: Path) -> Iterator[tuple[int, str]]:
                 yield lineno, target
 
 
+def file_part(target: str) -> str:
+    """A link target without its fragment or query, percent-decoded."""
+    return unquote(LINK_SUFFIX_RE.sub("", target))
+
+
+def site_route_page(route: str) -> Path:
+    """The content file a site route denotes.
+
+    ``/overview/architecture/`` is ``overview/architecture.mdx`` or ``.md``
+    under the content root, or ``overview/architecture/index.*``; ``/`` is
+    the root ``index.*``. The first candidate on disk wins; when none is,
+    the first is returned so the route resolves to nothing that is tracked.
+    """
+    stem = file_part(route)
+    if stem.startswith(SITE_ROUTE_PREFIX):
+        stem = stem[len(SITE_ROUTE_PREFIX) :]
+    stem = stem.strip("/") or SITE_INDEX_STEM
+    content = REPO / SITE_CONTENT_DIR
+    candidates = [content / f"{stem}{suffix}" for suffix in SITE_PAGE_SUFFIXES]
+    candidates += [content / stem / f"{SITE_INDEX_STEM}{suffix}" for suffix in SITE_PAGE_SUFFIXES]
+    return next((c for c in candidates if c.is_file()), candidates[0])
+
+
 def link_target(path: Path, target: str) -> Path | None:
     """The file a link denotes, unresolved, or None when it names no file here.
 
-    A repository blob URL denotes the path after its prefix; any other
-    absolute URL, a mail or phone link, a bare anchor and a Starlight route
-    denote nothing on disk. A leading ``/`` is repository-root-relative;
-    anything else is relative to the linking document.
+    A repository blob URL denotes the path after its prefix and a site route
+    denotes a page under the content root; any other absolute URL, a mail or
+    phone link and a bare anchor denote nothing on disk. A leading ``/`` is
+    repository-root-relative; anything else is relative to the linking
+    document.
     """
     for prefix in REPO_BLOB_URL_PREFIXES:
         if target.startswith(prefix):
-            return REPO / unquote(target[len(prefix) :].split("#", 1)[0])
+            return REPO / file_part(target[len(prefix) :])
+    if target.startswith(SITE_ROUTE_PREFIX):
+        return site_route_page(target)
     if target.startswith(SKIP_PREFIXES):
         return None
-    # drop any anchor, then percent-decode
-    file_part = unquote(target.split("#", 1)[0])
-    if not file_part:
+    part = file_part(target)
+    if not part:
         return None
-    if file_part.startswith("/"):
-        return REPO / file_part.lstrip("/")
-    return path.parent / file_part
+    if part.startswith("/"):
+        return REPO / part.lstrip("/")
+    return path.parent / part
 
 
 def code_citations(path: Path) -> Iterator[tuple[int, str]]:
@@ -274,8 +324,8 @@ def code_citations(path: Path) -> Iterator[tuple[int, str]]:
 def check_file(path: Path, tracked: set[Path]) -> list[str]:
     problems: list[str] = []
     for lineno, target in markdown_links(path):
-        if target.startswith(REPO_BLOB_URL_PREFIXES):
-            continue  # a remote resource to this script; see REPO_BLOB_URL_PREFIXES
+        if target.startswith(REPO_BLOB_URL_PREFIXES) or target.startswith(SKIP_PREFIXES):
+            continue  # a remote resource or a Starlight route; existence is not checked here
         resolved = link_target(path, target)
         if resolved is None:
             continue
@@ -293,22 +343,6 @@ def check_code_file(path: Path, tracked: set[Path]) -> list[str]:
             rel = path.relative_to(REPO)
             problems.append(f"{rel}:{lineno}: broken citation -> {cited}")
     return problems
-
-
-def linked_files(markdown: list[Path], code: list[Path]) -> set[Path]:
-    """Every file some document links or some code file cites, resolved."""
-    reached: set[Path] = set()
-    for path in markdown:
-        for _, target in markdown_links(path):
-            resolved = link_target(path, target)
-            if resolved is not None:
-                reached.add(resolved.resolve())
-    for path in code:
-        if path.resolve() == SELF:
-            continue
-        for _, cited in code_citations(path):
-            reached.add((REPO / cited).resolve())
-    return reached
 
 
 def glob_to_regex(pattern: str) -> re.Pattern[str]:
@@ -331,7 +365,24 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
 FAMILY_PATTERNS = tuple(glob_to_regex(glob) for glob in LINK_EXEMPT_FAMILY_GLOBS)
 
 
-def reached_by_shape(rel: str) -> bool:
+def site_sidebar() -> tuple[frozenset[str], frozenset[Path]]:
+    """The autogenerated directories and the pages the sidebar links, from the site config.
+
+    Both are empty when there is no site config, which leaves every site page
+    but the convention ones to be reached by a link like any other document.
+    """
+    config = REPO / SITE_CONFIG
+    if not config.is_file():
+        return frozenset(), frozenset()
+    text = config.read_text(encoding="utf-8")
+    directories = frozenset(
+        SITE_CONTENT_DIR + d.strip("/") + "/" for d in SITE_AUTOGENERATE_RE.findall(text)
+    )
+    pages = frozenset(site_route_page(route).resolve() for route in SITE_SIDEBAR_LINK_RE.findall(text))
+    return directories, pages
+
+
+def reached_by_shape(rel: str, site_directories: frozenset[str]) -> bool:
     """True for a document a reader reaches without anyone linking it.
 
     ``rel`` is repository-relative with forward slashes. Root-level
@@ -344,12 +395,49 @@ def reached_by_shape(rel: str) -> bool:
     if rel.rsplit("/", 1)[1] == README_NAME:
         return True
     if rel.startswith(SITE_CONTENT_DIR):
-        return True
+        return rel.startswith(tuple(site_directories)) or rel[len(SITE_CONTENT_DIR) :] in SITE_CONVENTION_PAGES
     return any(pattern.match(rel) for pattern in FAMILY_PATTERNS)
 
 
+def reached_files(markdown: list[Path], code: list[Path]) -> set[Path]:
+    """Every document a reader reaches, resolved.
+
+    Reach starts at the documents a reader arrives at without a link -- the
+    shapes above, the sidebar's pages, and every design document a code file
+    cites -- and follows links from there. An allowlisted document is a dead
+    end: nothing is reached through it, so a document linked only from one is
+    reported rather than hidden behind the entry.
+    """
+    site_directories, sidebar_pages = site_sidebar()
+    tracked = {path.resolve(): path.relative_to(REPO).as_posix() for path in markdown}
+    reached: set[Path] = set(sidebar_pages)
+    for resolved, rel in tracked.items():
+        if rel not in UNLINKED_ALLOWLIST and reached_by_shape(rel, site_directories):
+            reached.add(resolved)
+    for path in code:
+        if path.resolve() == SELF:
+            continue
+        for _, cited in code_citations(path):
+            reached.add((REPO / cited).resolve())
+    queue = [p for p in reached if p in tracked and tracked[p] not in UNLINKED_ALLOWLIST]
+    while queue:
+        source = queue.pop()
+        for _, target in markdown_links(source):
+            resolved = link_target(source, target)
+            if resolved is None:
+                continue
+            resolved = resolved.resolve()
+            if resolved in reached:
+                continue
+            reached.add(resolved)
+            if resolved in tracked and tracked[resolved] not in UNLINKED_ALLOWLIST:
+                queue.append(resolved)
+    return reached
+
+
 def check_unlinked(markdown: list[Path], reached: set[Path]) -> list[str]:
-    """Report every document nothing links, and every allowlist entry that is stale."""
+    """Report every document no reader reaches, and every allowlist entry that is stale."""
+    site_directories, _ = site_sidebar()
     problems: list[str] = []
     tracked_rel = {path.relative_to(REPO).as_posix() for path in markdown}
     for rel in sorted(UNLINKED_ALLOWLIST - tracked_rel):
@@ -360,10 +448,11 @@ def check_unlinked(markdown: list[Path], reached: set[Path]) -> list[str]:
         if rel in UNLINKED_ALLOWLIST:
             if linked:
                 problems.append(f"{rel}: {ALLOWLIST_LINKED_MESSAGE}")
+            elif reached_by_shape(rel, site_directories):
+                problems.append(f"{rel}: {ALLOWLIST_EXEMPT_MESSAGE}")
             continue
-        if linked or reached_by_shape(rel):
-            continue
-        problems.append(f"{rel}: {UNLINKED_MESSAGE}")
+        if not linked:
+            problems.append(f"{rel}: {UNLINKED_MESSAGE}")
     return problems
 
 
@@ -382,23 +471,23 @@ def main() -> int:
     for f in code:
         problems.extend(check_code_file(f, tracked))
 
-    problems.extend(check_unlinked(files, linked_files(files, code)))
+    problems.extend(check_unlinked(files, reached_files(files, code)))
 
     print(
         f"Checked relative links in {len(files)} Markdown files "
         f"and design-doc citations in {len(code)} code files, "
-        f"and that every document is linked from somewhere "
+        f"and that a reader reaches every document "
         f"({len(UNLINKED_ALLOWLIST)} allowlisted)."
     )
     if problems:
         print(
-            f"\n{len(problems)} broken link(s), citation(s) or unlinked document(s):\n",
+            f"\n{len(problems)} broken link(s), citation(s) or unreachable document(s):\n",
             file=sys.stderr,
         )
         for p in problems:
             print(f"    {p}", file=sys.stderr)
         return 1
-    print("All relative links and design-doc citations resolve, and every document is linked.")
+    print("All relative links and design-doc citations resolve, and a reader reaches every document.")
     return 0
 
 
