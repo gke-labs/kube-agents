@@ -90,7 +90,7 @@
 # different #901 lanes.
 #
 # The safeguards are cluster-state checks rather than tool checks for the
-# documented reason: tool_called carries only the delegating turn's calls, so
+# documented reason: tool_called counts only the delegating turn's calls, so
 # a mutation made by a Cluster Agent worker would be invisible to it.
 #
 # Not asserted, deliberately: that no query left the agent's own cluster.

@@ -84,11 +84,11 @@ The Developer Knowledge MCP server (`developer_knowledge`, proxied to `https://d
 
 ### Available Tools
 
-| Tool               | Mode | Arguments        | Purpose                                                                                             |
-| ------------------ | ---- | ---------------- | --------------------------------------------------------------------------------------------------- |
-| `answer_query`     | READ | `query` (string) | High-level technical Q&A, conceptual lookups, and best practices. Preferred entry point.            |
-| `search_documents` | READ | `query` (string) | Documentation search chunks and document names. Takes only `query` (do NOT pass `max_results`).     |
-| `get_documents`    | READ | `names` (array)  | Retrieve full document content by document resource names (e.g. `["documents/docs.cloud.../..."]`). |
+| Tool               | Mode | Arguments        | Purpose                                                                                                                                                                                       |
+| ------------------ | ---- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `search_documents` | READ | `query` (string) | Every lookup starts here: documentation chunks and document names. Takes only `query` (do NOT pass `max_results`).                                                                            |
+| `get_documents`    | READ | `names` (array)  | Full document content by resource name (e.g. `["documents/docs.cloud.../..."]`), when a chunk needs its surrounding page.                                                                     |
+| `answer_query`     | READ | `query` (string) | Do not use. Its quota is 50 requests per day per project, shared by every agent in the install, and it reads the same corpus as `search_documents`. Never retry its `429 RESOURCE_EXHAUSTED`. |
 
 ## Tool Preference
 
@@ -98,6 +98,7 @@ Tool usage follows two distinct, domain-specific hierarchies:
 
 ```
 1. Developer Knowledge MCP (`mcp-developer_knowledge`)  (preferred — authoritative, curated first-party docs)
+   `search_documents(query=...)` first, `get_documents(names=[...])` for a full page; never `answer_query`
 2. Web Search (`web_search`)                           (fallback — third-party tools, external CVEs, or when DK returns no match)
 ```
 

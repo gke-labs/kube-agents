@@ -67,6 +67,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -232,8 +233,17 @@ def _record_decided(cases: list[dict[str, Any]]) -> bool:
     )
 
 
-def _load_store(location: str) -> tuple[BaselineStore | None, str | None, str | None]:
+def _load_store(
+    location: str, *, only: Collection[str]
+) -> tuple[BaselineStore | None, str | None, str | None]:
     """``(store, fatal_reason, degraded_reason)`` -- exactly one of the last two.
+
+    ``only`` is the cases this command will ask about, and it is required
+    rather than optional: on GCS the store costs one listing plus a read per
+    case, the gate loads it once per graded case, and no caller here has ever
+    wanted a case it did not name. The store remembers the scope and raises on
+    a lookup outside it, so narrowing it here cannot quietly turn a passing
+    case into an unscreened one.
 
     Three failure classes, deliberately not treated alike.
 
@@ -249,11 +259,13 @@ def _load_store(location: str) -> tuple[BaselineStore | None, str | None, str | 
     that is what this whole design exists to avoid.
     """
     try:
-        return BaselineStore.load(location), None, None
+        return BaselineStore.load(location, only=only), None, None
     except ValueError as exc:
         return None, str(exc), None
     except StoreUnreachable as exc:
-        return BaselineStore({}), None, f"{location} unreachable: {exc}"
+        # Scoped like the successful read, so an unreachable store answers
+        # "no evidence" for the cases in scope and still refuses the rest.
+        return BaselineStore({}, scope=only), None, f"{location} unreachable: {exc}"
 
 
 def _bootstrap_admitted() -> frozenset[str]:
@@ -348,7 +360,7 @@ def _cmd_case(args: argparse.Namespace) -> int:
         )
         break
 
-    store, fatal, degraded = _load_store(_store_location(args))
+    store, fatal, degraded = _load_store(_store_location(args), only={spec.case_id})
     if fatal or store is None:
         print(f"Task {spec.case_id} Result: [FAILED] {fatal}", file=sys.stderr)
         return 2
@@ -583,7 +595,11 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         print(f"::error::{cases}", file=sys.stderr)
         return 1
 
-    store, fatal, degraded = _load_store(_store_location(args))
+    # The graded cases and no others. `_baseline_rate` below walks this same
+    # list, so the scope and the questions are built from one source.
+    store, fatal, degraded = _load_store(
+        _store_location(args), only={str(c.get("case") or "") for c in cases}
+    )
     if fatal or store is None:
         print(f"::error::{fatal}", file=sys.stderr)
         return 1

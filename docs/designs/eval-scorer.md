@@ -85,8 +85,14 @@ checks are broken, which is the state it is most likely to be in.
 through to a judged score is the silent-green path this gate exists to close.
 
 **Rung 3's signals are what the fixtures proved are populated** — `status == "success"`, a
-non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. There is no `metadata` block on a
-devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake
+non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. One exception to the token signal:
+a record the harness's inject transport produced carries no usage at all (the gateway reports
+none), so its liveness signal is the executor's own events instead — a trajectory entry named
+`a2a.status-update` whose `args.final` is true (the task ended) or whose `args.state` is `working`
+(the executor spawned the persona; a task the harness cancelled at its budget has no final entry)
+stands in for a null total and nothing else; a null total with no such entry, or with only a
+`submitted` entry (queued, never run), still fails the rung, and so does a total of zero. The harness applies the same predicate before a record exists (`Fold.started` in `bench/kube_agents_bench/inject_transport.py` is `shows_a_run`, this rung's rule, and a test holds the two together): a task that reached neither `working` nor a terminal by its deadline, and a terminal the executor wrote for its own fault (the bridge's and the worker adapter's `reason:` tokens, or a `rejected` submission), are recorded as infrastructure, so those entries reaching the rung is the backstop. There is no `metadata`
+block on a devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake
 is why the fixtures are captured rather than hand-written. `output` is deliberately **not** a
 signal: a legitimately failing agent can return an empty report, and rung 3 must not double as a
 quality check. The token and latency floors are `> 0` rather than something realistic because five
@@ -556,6 +562,8 @@ The backend has been exercised end to end against a real bucket
 | An admitted case that fails every repetition reds the suite | rung 4 collapse, `suite` exits 1                                  |
 | A pull request cannot append                                | `refusing to record a baseline with PULL_NUMBER set`              |
 | A missing bucket degrades rather than reds                  | 404 → advisory, with the banner in the markdown verdict           |
+| A single-case scope lists that case's prefix alone          | the case's own objects, not the store's                           |
+| A case with no prefix yet is an empty read, not an outage   | `matched no objects`, the same text an empty root gives           |
 
 What no local run can reach is the nightly Prow job's own append. Its nights are the validation,
 read through the dashboard's Nightly report (`scripts/eval_dashboard/nightly.py`).
@@ -589,7 +597,7 @@ measured data. Config belongs where it gets reviewed.
 
 ### Reading is capped, and says so
 
-The reader lists the whole prefix once, groups the object names by case and then by key directory,
+The reader lists the prefix once, groups the object names by case and then by key directory,
 takes the newest `EVAL_BASELINE_MAX_OBJECTS` (default 200) **per case per key**, and concatenates
 what survives in one `cat` per case. Those per-case `cat`s run concurrently, at most
 `EVAL_BASELINE_CAT_WORKERS` (default 16) at a time: the cost of a read is one `gcloud` process
@@ -611,25 +619,37 @@ directory, so all of one key's records land in one directory and sort by stamp w
 directories.
 
 **The cap bounds the fetch, not the listing.** Listing is O(every object ever written under the
-prefix), because the reader cannot know which names are newest without seeing them. The key
-partition largely settles this on its own: a prefix stops growing when the key changes, and a
-long-lived key at one recorded batch a night is on the order of a few hundred objects a year. What
-remains unbounded is the _total_ across all historical keys, which grows only as fast as the
-software versions do. At today's scale — a handful of active cases, one batch per case per night —
-that is invisible. If it ever stops being invisible, the fix is to scope the listing to
-the key being read rather than the whole prefix, which the layout now makes a one-line change; see
-[Open items](#open-items).
+prefix being listed), because the reader cannot know which names are newest without seeing them.
+The key partition largely settles this on its own: a prefix stops growing when the key changes, and
+a long-lived key at one recorded batch a night is on the order of a few hundred objects a year.
+What remains unbounded is the _total_ across all historical keys, which grows only as fast as the
+software versions do. Scoping the read to one case, below, bounds it further: the prefix a
+single-case read lists is that case's own.
 
 Money is not the constraint at any of these scales. Standard storage bills actual bytes with no
 minimum object size, and both the listing and the per-object fetches are fractions of a cent per
-run. Wall clock was: the gate reads the whole store once per graded case, which is why the fetches
-are concurrent.
+run. Wall clock is, which is why the fetches are concurrent and the read is scoped.
 
 The key partition also retires a caveat this section used to carry. Under a flat layout and a
 per-case window, a version key that went A → B → A could push the revert's own evidence at key A
 out of the window, so a genuinely screened case would read as "no evidence" and be de-admitted.
 With one directory per key and a per-key cap, key B's volume cannot displace key A's records at
 all: the revert lands back in A's directory and finds its own history intact.
+
+### The read is scoped to the cases being graded
+
+`bench-gate case` runs once per task and `bench-gate suite` once at the end, so the store is read
+once per active case plus one. Each read asks about the cases it is grading — one for `case`, the
+graded set for `suite` — and never about the rest, so reading all of them was the same work
+repeated every time. `BaselineStore.load(only=…)` takes the cases the caller will ask about; a
+single-case read lists that case's own prefix rather than the whole store, and fetches that case's
+objects in one `cat`.
+
+The narrowing has a failure mode that speed cannot detect, because a read that fetches nothing is
+the fastest of all: a store missing a case answers "never screened", which de-admits a case that
+is in fact passing and reds nothing. So the scope is remembered on the store, and a lookup outside
+it raises `CaseOutOfScope` — deliberately neither the `ValueError` the gate treats as a corrupt
+store nor the `StoreUnreachable` it degrades on, both of which get absorbed into a verdict.
 
 ### When the store is unreachable
 
@@ -1381,11 +1401,10 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   Trend page can draw the spread across repetitions rather than the range of nightly means
   ([What a score is](#what-a-score-is)). Additive and optional; `bench-gate record` writes it,
   `_pool_judged()` ignores it.
-- The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
-  filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked
-  for and `bench-gate suite` reads many cases at potentially different keys. Scoping the listing to
-  the key means threading it through both, which the layout now makes worth doing but which buys
-  nothing at today's volumes; see
+- The GCS listing is scoped by case, not by key, and only when the scope is a single case.
+  `bench-gate suite` names several, so it lists the whole store and filters afterwards: one
+  listing is one `gcloud` process, and a listing per case would cost more than it saved. Both
+  limits are worth revisiting only if the store outgrows a listing; see
   [Reading is capped, and says so](#reading-is-capped-and-says-so).
 - The `bench/tf/fleet` drift-reconcile schedule — a drifted fixture silently changes what a
   baseline means.

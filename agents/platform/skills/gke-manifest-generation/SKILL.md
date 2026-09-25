@@ -219,13 +219,13 @@ hallucinations and optimize configurations:
     -   For GKE-specific features, API defaults, manifest examples, or security
         contexts, you **must** query Google's developer knowledge base to
         retrieve official GKE documentation:
-        -   **`answer_query`**: Use this to ask direct questions (e.g., *"How to
-            configure GCS Fuse CSI driver in GKE"*). This is the preferred tool
-            for general queries.
-        -   **`search_documents`**: Use this to search for relevant GKE guides
-            or examples when you don't have a specific question.
-        -   **`get_document`**: Use this to fetch full document contents when
-            you have a specific document ID.
+        -   **`search_documents`**: Start every lookup here (e.g., *"configure
+            GCS Fuse CSI driver in GKE"*). It takes only `query`.
+        -   **`get_documents`**: Use this to fetch full document contents when
+            a returned chunk needs its surrounding page.
+        -   Do not call **`answer_query`**: its quota is 50 requests per day per
+            project, shared by every agent in the install, and it reads the
+            same corpus as `search_documents`. Never retry its `429`.
 
 --------------------------------------------------------------------------------
 

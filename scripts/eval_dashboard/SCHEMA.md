@@ -111,7 +111,8 @@ the same layout and is collected from the moment it starts running.
   verdict: Prow's deadline (it delivers SIGTERM and records `FAILURE`, not
   `ABORTED`; build 2092688354838581248 below is one), a death before the
   cases, or step 0's revalidation (a `SUCCESS`). A record written before
-  the field existed has no key: unknown, which is not `null`.
+  the field existed has no key: unknown, which is not `null` — `health.py`
+  never counts it as a deadline kill.
 - `duration_s` — the `Total Duration` of the final
   `PR Smoke Test Evaluation Succeeded/Failed` line (eval loop only). A
   truncated log has no verdict line — and neither does a `SUCCESS` build that
@@ -399,7 +400,12 @@ what the renderer does with them.
   `result` stands in for one rep.
 - `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
   it; a night that is not a `SUCCESS` and carries `null` was ended before
-  its verdict and is reported as truncated. Absent means unknown.
+  its verdict and is reported as truncated. `health.py` reads a presubmit
+  `FAILURE` with `null` that ran to the job's deadline — and is neither a
+  lost pod nor a conflicted merge — as a deadline kill
+  (rule 3d), `classify.py` classes the run `deadline-kill`, and
+  `gate_comment.py` gives it the one-line deadline comment. Absent means
+  unknown: never a kill.
 - `runs[].log_url` — nightly runs only: Spyglass's page for the build
   directory the collector listed
   (`https://oss.gprow.dev/view/gs/<bucket>/logs/<job>/<build>`), so the
@@ -626,7 +632,12 @@ pending[], releases[], nightly{}, trend{}}`. `runs[]` is the **presubmit's** las
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
 `infra` = the gate's), `headline`, `lede`, `matches_incident`,
-`setup_death`, `storm_reps`, `ceiling_reps`, `do`, `cases[]` (`{case, outcome, cls,
+`setup_death`, `storm_reps`, `ceiling_reps`, `do`, the run-level `cls`
+(`setup` for a setup death or a lost pod, `deadline-kill`, `only-this-pr`
+for a conflicted merge, else `null` — a run whose classes are per case),
+`eval_verdict` (present only when the `data.json` record carries the key,
+so the Brief's recovery count out of a deadline-kill outage can tell a
+recorded `null` from a pre-field record), `cases[]` (`{case, outcome, cls,
 also_failing_prs, pass_rate_30d, reason, excerpt, rep_n, do, admitted, reps,
 nightly_failed_recent}`, `reps` being `{pass, fail, infra, ceiling}`) and
 `health_at` (the verdict in force when it
@@ -794,7 +805,7 @@ read is final.
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|delegation_ceiling`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
 `slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
@@ -807,7 +818,12 @@ a run-page banner of its own, and otherwise show the generic degraded
 headline. For `delegation_ceiling` (15+ repetitions across 3+ PRs in 2 hours
 ended at the harness's delegation wait with the worker still running, #1874)
 the `incident` also carries `reps`, and the pages give it the storm's 2-hour
-lead, a Brief headline and a run-page banner of its own. `issue` (`{number, url}`) may carry `condition`, the one it was
+lead, a Brief headline and a run-page banner of its own. `deadline_kill` (3+ runs on 2+ PRs in 2 hours that concluded `FAILURE`
+with `eval_verdict` `null` after running to the job's 360-minute deadline,
+#1894) is an OUTAGE with the storm's incident keys plus `first_kill` — the
+outage's first kill, kept across ticks while `window_start` slides with the
+rule's 2-hour window, for the surfaces that date the whole episode; the pages
+give it a Brief headline and a run-page banner of its own. `issue` (`{number, url}`) may carry `condition`, the one it was
 filed for. `fixture_drift` (the hourly seeded-fleet scan found a fixture
 role out of its designed state; docs/ci-health.md, "The seeded-fleet scan")
 carries `roles`, `projects` and `drift` in its `incident` and a
@@ -952,7 +968,9 @@ period; the `recorded` lines are restamped to this build. The
 suffix) to the runs that finished in [2026-09-01, 2026-09-09) — the last of
 them on 2026-09-08 — and the fields the health adjudicator reads (`build_id`,
 `pr`, `started`, `finished`, `result`, `duration_s`, `tier` when the run
-carries one, and per task `name`, `result`, `reps[].result` and the first
+carries one, the how-it-ended fields — `has_build_log`, the `pod_*` trio,
+`merge_conflict`, `eval_verdict` — when the source has them, and per task
+`name`, `result`, `reps[].result` and the first
 96 characters of `reps[].reason`);
 its `trimmed` key records the source and the cut. Six of its zero-task runs
 carry `result: "failure"` in lowercase, as Prow wrote them on 2026-09-05 —
@@ -974,7 +992,11 @@ asserts it reads as `lost_pods` and not as setup deaths.
 [2026-09-07 18:00Z, 2026-09-14 18:20Z) — the seven days the slow-gate rule's
 baseline needs, ending on the afternoon every run was green and three hours
 long (#1586); the test asserts the `slow` note from 18:00Z that day and none
-over the 09-12/13 weekend.
+over the 09-12/13 weekend. `testdata_health/deadline-kills-2026-09-22.json.gz`
+is the same cut for [2026-09-22 12:00Z, 2026-09-23 20:00Z) — 183 runs, 33 of
+them killed at the deadline with `eval_verdict: null` (#1880, #1894); the
+test asserts the `deadline_kill` OUTAGE from the third kill and a lull
+reading as recovering.
 
 `testdata_store/` holds four **real** objects from the evidence store's
 first recording night (2026-09-17, build 2100374258805903360, commit

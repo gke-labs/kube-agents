@@ -44,7 +44,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -80,6 +80,11 @@ _NO_TRANSCRIPT_REASON = (
     "no transcript stashed for this run: the harness did not complete an "
     "agent execution (kube_agents_bench.transcript is empty), so this check "
     "could not be evaluated"
+)
+_NO_WORKER_CALLS_REASON = (
+    "no delegated worker's tool calls are in the trajectory: either no card was "
+    "delegated or the worker-trajectory capture did not run, so a check scoped to "
+    "the workers cannot observe its subject"
 )
 
 # Emphasis and code markers, dropped before matching. The agent answers in
@@ -201,32 +206,70 @@ class ReportContainsVerifier(BaseVerifier):
         )
 
 
+# Hermes' MCP dispatch wrapper: a worker's trajectory entry named this carries
+# the tools it actually invoked under args["calls"][*]["name"].
+_TOOL_CALL_WRAPPER = "tool_call"
+
+
+def _wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
+    """Tool names a ``tool_call`` wrapper entry invoked; empty for any other."""
+    if entry.get("name") != _TOOL_CALL_WRAPPER:
+        return set()
+    args = entry.get("args")
+    calls = args.get("calls") if isinstance(args, dict) else None
+    if not isinstance(calls, list):
+        return set()
+    return {str(c.get("name")) for c in calls if isinstance(c, dict) and c.get("name")}
+
+
 @VERIFIERS.register("tool_called")
 class ToolCalledVerifier(BaseVerifier):
     """Count trajectory entries whose tool name is in ``tool_names``.
 
-    THE COUNT IS THE ROUTER'S, NOT THE FLEET'S. By this harness's
-    design, this verifier counts only the delegating turn's calls: poll-turn
-    calls are the harness's own bookkeeping and are kept out of the
-    trajectory (``_fold_status_turn``), and the delegated workers' calls,
-    which the harness appends after settlement tagged with the ``agent``
-    that made them (``worker_trajectory``), are skipped here so the count
-    keeps meaning what it always has. This verifier can therefore assert
-    what the ROUTER did (``kanban_create`` is the router's own call) and
-    nothing about what a worker did on a cluster — a mutation safeguard
-    built on it would be blind to the very calls it fears. Use a
-    cluster-state check (``resource_property``) for those.
+    ``scope`` says whose calls count. The trajectory holds two kinds of
+    entry: the delegating turn's own calls (poll-turn calls are the
+    harness's bookkeeping and are kept out, ``_fold_status_turn``), and the
+    delegated workers' calls, which the harness appends after settlement
+    tagged with the ``agent`` that made them (``worker_trajectory``).
+
+    - ``router`` (the default, and what every check written before the
+      workers' calls were recorded means): the delegating turn's calls only,
+      so ``kanban_create`` counts and the worker's ``kanban_complete`` does
+      not. A cluster-mutation safeguard in this scope is blind to the calls
+      it fears; use a cluster-state check (``resource_property``) for those.
+    - ``workers``: the tagged entries only -- what the platform worker and
+      any Cluster Agent called on the run's cards. This is the scope that
+      sees which MCP tool a worker reached for.
+    - ``all``: both.
+
+    ``workers`` and ``all`` fail closed on a trajectory that carries no
+    tagged entry: a worker that ran made at least one call (its
+    ``kanban_complete``), so no tagged entry means the capture did not run,
+    or the router never delegated, and either way the check cannot observe
+    its subject -- ``status="error"``, never a pass, the same rule
+    ``worker_commands`` applies to an absent capture.
 
     Passes when at least ``minimum_calls`` matching calls were made. Wrapped
     in a ``none`` compound, it is the safeguard shape "this tool was never
-    called", within the router-only limits above. Names match the harness's
-    canonical trajectory entries (``ToolCall.to_dict()["name"]``), e.g.
-    ``kanban_create``.
+    called", within the chosen scope. Names match the harness's canonical
+    trajectory entries (``ToolCall.to_dict()["name"]``), e.g.
+    ``kanban_create``; a worker's entries carry the name the profile's
+    session store recorded for the tool.
+
+    A worker reaches an MCP tool through Hermes' ``tool_call`` wrapper: the
+    entry is named ``tool_call`` and the tool actually invoked sits in its
+    arguments, ``{"calls": [{"name": "mcp__developer_knowledge__search_documents",
+    "arguments": {...}}]}`` (measured on build 2102459327938826240, #1765).
+    A name in ``tool_names`` therefore also matches a ``tool_call`` entry
+    whose ``calls`` list names it, else a worker's MCP calls would be
+    invisible to this check by name. One wrapper entry counts once however
+    many of its calls match; ``require_success`` reads the wrapper's status.
     """
 
     type: Literal["tool_called"]
     tool_names: list[str] = Field(min_length=1)
     minimum_calls: int = Field(default=1, ge=1)
+    scope: Literal["router", "workers", "all"] = "router"
     # Objectives set this: a call the harness marked status="error" produced
     # no effect (kanban_create that failed filed no card), so counting it
     # would pass a check whose subject never happened. Safeguards leave it
@@ -244,13 +287,23 @@ class ToolCalledVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=_NO_TRANSCRIPT_REASON,
             )
+        entries = [entry for entry in snap.trajectory if isinstance(entry, dict)]
+        if self.scope != "router" and not any(entry.get("agent") for entry in entries):
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_WORKER_CALLS_REASON,
+            )
+        if self.scope == "router":
+            entries = [entry for entry in entries if not entry.get("agent")]
+        elif self.scope == "workers":
+            entries = [entry for entry in entries if entry.get("agent")]
         wanted = set(self.tool_names)
         calls = [
             entry
-            for entry in snap.trajectory
-            if isinstance(entry, dict)
-            and not entry.get("agent")
-            and entry.get("name") in wanted
+            for entry in entries
+            if (entry.get("name") in wanted or _wrapped_tool_names(entry) & wanted)
             and not (self.require_success and entry.get("status") == "error")
         ]
         count = len(calls)
@@ -259,7 +312,7 @@ class ToolCalledVerifier(BaseVerifier):
             success=ok,
             elapsed_time=time.monotonic() - start,
             reason=(
-                f"{count} call(s) to {sorted(wanted)} in the trajectory"
+                f"{count} call(s) to {sorted(wanted)} in the {self.scope} trajectory"
                 f" (minimum {self.minimum_calls})"
             ),
             raw={"matching_calls": count},
@@ -292,6 +345,19 @@ LEDGER_AUDIT_IDS = frozenset(
 # Environment names carrying the read credential, in precedence order. See
 # LedgerIssueContainsVerifier's docstring for what it has to be.
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
+
+# The first line of the closing comment hack/ci_reset_audit_ledgers.py leaves
+# on a ledger it retires before a repetition (RESET_MARKER there;
+# scripts/test_ci_eval_ledger_reset.py pins the two literals equal). A closed
+# ledger a report still cites is read for it, so the harness's own close is
+# named as such rather than blamed on the run.
+LEDGER_RESET_MARKER = "<!-- kube-agents-eval-ledger-reset -->"
+# How far back from a ledger's closed_at that comment is asked for, and the
+# page it is asked for on. The reset posts the comment and closes seconds
+# later; an hour is generous and keeps the read to one page.
+_RESET_COMMENT_LOOKBACK = timedelta(hours=1)
+_GITHUB_PAGE_SIZE = 100
+_GITHUB_SINCE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 # github.com only, and issues only: `/pull/<n>` is a remediation pull request,
 # which every audit report also links and which is not the ledger.
@@ -349,6 +415,16 @@ _CLEAN_CLOSE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches when the worker queued the audit for a future cron schedule or reported
+# that the on-demand trigger was unavailable (#1876), instead of running the audit.
+_QUEUED_INSTEAD_OF_RUN_RE = re.compile(
+    r"\b(?:queued\s+(?:to\s+run|for\s+its\s+next|for\s+the\s+next|the\s+stream)|"
+    r"on-demand\s+trigger\s+is\s+unavailable|"
+    r"stream\s+will\s+run\s+on\s+its\s+\d{2}:\d{2}\s+schedule|"
+    r"will\s+run\s+on\s+its\s+next\s+cron\s+schedule)\b",
+    re.IGNORECASE,
+)
+
 _NO_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
     "is unset), so this check cannot tell this run's ledger from a previous "
@@ -398,9 +474,9 @@ _MAX_NAMED_COMMANDS = 5
 class WorkerCommandsVerifier(BaseVerifier):
     """Pattern checks against the terminal commands the delegated workers ran.
 
-    The one check that sees the ROUTE a worker took rather than the answer it
-    gave. ``tool_called`` cannot: it skips the worker entries the harness
-    appends to the trajectory, by design (see its docstring).
+    Sees the ROUTE a worker took rather than the answer it gave, through the
+    terminal commands it typed; ``tool_called`` under ``scope: workers`` is
+    the companion for the MCP tool calls it made (see its docstring).
     The harness reads each delegated card's worker log before purging it and
     stashes every ``💻 $`` line as a command (``transcript.worker_commands``);
     this verifier matches Python regular expressions against those strings,
@@ -670,6 +746,22 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     did exactly that and shared its reason with a delegation that never
     returned (#1683). Neither is a new pass or fail; both are the same fail
     with a reason a reader can act on.
+
+    THE HARNESS'S OWN CLOSE IS NAMED AS SUCH. ``hack/ci-eval-pr.sh`` retires
+    the stream's open ledger before every repetition
+    (``hack/ci_reset_audit_ledgers.py``), seconds before devops-bench starts
+    the run, so that ``closed_at`` falls inside the same window a false clean
+    would. A worker that cites the retired ledger instead of the fresh one it
+    should have opened did not close it: when a closed ledger carries a
+    ``LEDGER_RESET_MARKER`` comment posted within ``max_clock_skew_sec`` of
+    its ``closed_at``, the reason says the harness reset it before this run
+    started. Bound to the close on purpose: the reset comments first and
+    closes second, so a reset whose close failed leaves the marker on an OPEN
+    ledger, and a worker's genuine false clean on it later must not inherit
+    the harness's name from a comment that is minutes or hours older than the
+    close. Still a fail, since the run published nothing to the ledger it
+    named; only the sentence changes, whichever side of ``started_at`` the
+    close fell on.
     """
 
     type: Literal["ledger_issue_contains"]
@@ -698,6 +790,44 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     # same stream -- the six audit scenarios use six DIFFERENT streams, so
     # even back-to-back tasks in one presubmit never share a ledger.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    def _closed_by_the_reset(
+        self, api_url: str, closed_at: datetime, token: str, budget: float
+    ) -> bool | None:
+        """Whether the harness's reset marker was posted alongside this close.
+
+        ``True`` or ``False`` when the comments were read; ``None`` when they
+        could not be (a transport fault or a non-200), which the caller
+        reports instead of treating it as either answer. Only comments from
+        the hour before the close are asked for, and only a marker comment
+        created within ``max_clock_skew_sec`` of ``closed_at`` counts: the
+        reset posts its comment and closes seconds later, so a marker that is
+        older than that belongs to a reset whose close failed, not to this
+        close.
+        """
+        closed_at = closed_at.astimezone(timezone.utc)
+        since = (closed_at - _RESET_COMMENT_LOOKBACK).strftime(_GITHUB_SINCE_FORMAT)
+        try:
+            status_code, payload = _http_get_json(
+                f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={since}",
+                token,
+                budget,
+            )
+        except OSError:
+            return None
+        if status_code != 200 or not isinstance(payload, list):
+            return None
+        for comment in payload:
+            if not isinstance(comment, dict):
+                continue
+            if LEDGER_RESET_MARKER not in str(comment.get("body") or ""):
+                continue
+            created_at = _parse_github_time(comment.get("created_at"))
+            if created_at is None:
+                continue
+            if abs((closed_at - created_at).total_seconds()) <= self.max_clock_skew_sec:
+                return True
+        return False
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -734,6 +864,15 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             if key not in seen:
                 seen.append(key)
         if not seen:
+            queued = _QUEUED_INSTEAD_OF_RUN_RE.search(snap.final_message)
+            if queued:
+                return done(
+                    False,
+                    "the run's report names no github.com issue URL because the worker queued "
+                    f"the audit for later instead of running it ({queued.group(0).strip()!r}): "
+                    "when asked to run an audit following its SOP, the worker must execute "
+                    "the audit now via audit_report.py start/finish rather than deferring to cron (#1876)",
+                )
             clean = _CLEAN_CLOSE_RE.search(snap.final_message)
             if clean:
                 return done(
@@ -819,6 +958,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             matches.append(
                 {
                     "slug": f"{owner}/{repo}#{number}",
+                    "api_url": url,
                     "body": body,
                     "generated_at": footer[1],
                     # Read here, decided below: a closed issue is only telling
@@ -849,28 +989,56 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         age = (started - generated_at).total_seconds()
         if age > self.max_clock_skew_sec:
             closed_at: datetime | None = ledger["closed_at"]
-            closed_by_this_run = (
-                ledger["state"] == "closed"
-                and closed_at is not None
-                and (started - closed_at).total_seconds() <= self.max_clock_skew_sec
-            )
-            if closed_by_this_run:
-                assert closed_at is not None
-                return done(
-                    False,
-                    f"{ledger['slug']} was closed as "
-                    f"{ledger['state_reason'] or 'completed'} at "
-                    f"{closed_at.isoformat()}, during this run, with its body still "
-                    f"carrying the previous run's stamp ({generated_at.isoformat()}): "
-                    "the audit reported the stream clean and retired the ledger "
-                    "while this case expected a finding on it -- a false clean, not "
-                    "an absent report",
-                    raw={
-                        "generated_at": generated_at.isoformat(),
-                        "closed_at": closed_at.isoformat(),
-                        "state_reason": ledger["state_reason"],
-                    },
-                )
+            if ledger["state"] == "closed" and closed_at is not None:
+                state_reason = ledger["state_reason"] or "completed"
+                raw = {
+                    "generated_at": generated_at.isoformat(),
+                    "closed_at": closed_at.isoformat(),
+                    "state_reason": ledger["state_reason"],
+                }
+                # One more read, only for a closed ledger: was the close the
+                # harness's own reset? None means the comments could not be
+                # read, which is said rather than taken for either answer.
+                reset = self._closed_by_the_reset(ledger["api_url"], closed_at, token, budget)
+                raw["reset_by_harness"] = reset
+                if reset:
+                    # The per-unit reset runs before the harness's clock starts,
+                    # so "before" is the expected reading; a reset close after
+                    # it would be another lane's, and is said as what it is.
+                    when = (
+                        f"before this run started ({started.isoformat()})"
+                        if closed_at <= started
+                        else f"{(closed_at - started).total_seconds():.0f}s after this run "
+                        f"started ({started.isoformat()})"
+                    )
+                    return done(
+                        False,
+                        f"{ledger['slug']} was closed as {state_reason} at "
+                        f"{closed_at.isoformat()} by the eval harness's ledger reset, "
+                        f"{when}: the report cites the ledger the reset retired so a "
+                        "repetition would open a fresh one, and its body still carries "
+                        f"the previous run's stamp ({generated_at.isoformat()}), so this "
+                        "run published nothing to it -- a stale pointer to the harness's "
+                        "close, not a false clean",
+                        raw=raw,
+                    )
+                if (started - closed_at).total_seconds() <= self.max_clock_skew_sec:
+                    unread = (
+                        ""
+                        if reset is False
+                        else " (its comments could not be read, so the harness's own "
+                        "ledger reset is not ruled out)"
+                    )
+                    return done(
+                        False,
+                        f"{ledger['slug']} was closed as {state_reason} at "
+                        f"{closed_at.isoformat()}, during this run, with its body still "
+                        f"carrying the previous run's stamp ({generated_at.isoformat()}): "
+                        "the audit reported the stream clean and retired the ledger "
+                        "while this case expected a finding on it -- a false clean, not "
+                        f"an absent report{unread}",
+                        raw=raw,
+                    )
             return done(
                 False,
                 f"{ledger['slug']} was generated at {generated_at.isoformat()}, "

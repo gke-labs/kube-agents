@@ -11,6 +11,10 @@ import (
 )
 
 const (
+	// discordBackend names the backend in authority blocks and config, the
+	// way gchatBackend does for Google Chat.
+	discordBackend = "discord"
+
 	// threadAutoArchiveMinutes is Discord's 24h auto-archive tier; an
 	// archived thread reopens on the next message, so sessions survive it.
 	threadAutoArchiveMinutes = 1440

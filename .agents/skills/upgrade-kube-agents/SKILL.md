@@ -1,6 +1,6 @@
 ---
 name: upgrade-kube-agents
-description: Perform non-interactive or interactive Day-2 upgrades of the Kubernetes Agentic Harness and operator on GKE clusters.
+description: Upgrade kube-agents (the Kubernetes Agentic Harness) and its operator on a GKE cluster, interactively or non-interactively. Use when asked to upgrade, update, or apply a Day-2 change to an existing kube-agents install.
 ---
 
 # Upgrade Kubernetes Agentic Harness (kube-agents)
