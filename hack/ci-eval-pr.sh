@@ -1642,10 +1642,17 @@ esac
 INJECT_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
 INJECT_LANE_EXCLUDED="$(roster_entries "${INJECT_LANE_EXCLUSIONS_FILE}")"
 INJECT_LANE_DROPPED=""
+# Every entry must be a registered case id, spelled exactly as the matrix
+# spells it: the drop below is an exact match against the matrix's names,
+# so a variant a filesystem test would accept (`agent-kanban-smoke/`) would
+# pass here and match nothing there, leaving the case running on the lane
+# with nothing said. Registered means the presubmit or the nightly file --
+# a nightly-only case may be excluded from an inject nightly.
+REGISTERED_CASE_NAMES="$(printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | sed -e 's#^\./tasks/##' -e 's#/task\.yaml$##')"
 while IFS= read -r NAME; do
   if [ -z "${NAME}" ]; then continue; fi
-  if [ ! -f "${BENCH_DIR}/tasks/${NAME}/task.yaml" ]; then
-    echo "ERROR: ${INJECT_LANE_EXCLUSIONS_FILE}: '${NAME}' names no case under bench/tasks/; an exclusion that matches nothing would leave the case it meant running on the inject lane." >&2
+  if ! grep -qxF -- "${NAME}" <<< "${REGISTERED_CASE_NAMES}"; then
+    echo "ERROR: ${INJECT_LANE_EXCLUSIONS_FILE}: '${NAME}' is not a case id in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; an exclusion that matches nothing would leave the case it meant running on the inject lane." >&2
     exit 1
   fi
 done <<< "${INJECT_LANE_EXCLUDED}"

@@ -352,12 +352,29 @@ class InjectLaneExclusionTest(unittest.TestCase):
             return load_matrix_through_the_lane_step(env, hack_dir=hack)
 
     def test_an_entry_naming_no_case_stops_the_job_on_every_lane(self):
-        for env in ({}, {"AGENT_TRANSPORT": "inject"}):
+        # A typo, and the path variants a filesystem test would accept while
+        # the exact-match drop would not: each must stop the job, on both lanes.
+        for bad in ("agent-kanban-smok", "agent-kanban-smoke/", "./agent-kanban-smoke"):
+            for env in ({}, {"AGENT_TRANSPORT": "inject"}):
+                with self.subTest(entry=bad, env=env):
+                    result = self.scratch(lambda d, bad=bad: (d / "inject-lane-exclusions.txt").write_text(f"# #1: typo\n{bad}\n"), env)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("inject-lane-exclusions.txt", result.stderr)
+                    self.assertIn(bad, result.stderr)
+                    self.assertNotIn("TASK ", result.stdout, "the matrix must not be built past a bad entry")
+
+    def test_a_nightly_only_case_may_be_excluded(self):
+        # Registered means either file: an inject nightly may leave out a
+        # nightly-only case, and the presubmit lane must accept the entry too.
+        nightly_case = eval_rosters.nightly_cases()[0]
+        for env in ({}, {"AGENT_TRANSPORT": "inject"}, {"AGENT_TRANSPORT": "inject", "EVAL_TIER": "nightly"}):
             with self.subTest(env=env):
-                result = self.scratch(lambda d: (d / "inject-lane-exclusions.txt").write_text("# #1: typo\nagent-kanban-smok\n"), env)
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn("inject-lane-exclusions.txt", result.stderr)
-                self.assertIn("agent-kanban-smok", result.stderr)
+                result = self.scratch(
+                    lambda d: (d / "inject-lane-exclusions.txt").write_text(f"# #1: nightly-only\n{nightly_case}\n"), env
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if env.get("EVAL_TIER") == "nightly":
+                    self.assertNotIn(f"./tasks/{nightly_case}/task.yaml", lines_tagged(result, "TASK"))
 
     def test_a_missing_file_stops_the_job(self):
         result = self.scratch(lambda d: (d / "inject-lane-exclusions.txt").unlink(), {})
