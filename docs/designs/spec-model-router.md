@@ -20,22 +20,26 @@ namespace called johns-team". Left alone, it ends with users typing `/route` at 
 fleet, which is a regression from what the Hermes-based agent gives them today. The
 router exists so that natural language understood in context stays the interface.
 
-This departs from the end-state architecture's routing contract, which resolves a message
-slash command first, then `@handle`, then natural language as the fallback
+The end-state architecture resolves a message in a fixed order: a slash command first,
+then an `@handle`, then natural language
 ([`../architecture/02-agent-personas.md`](../architecture/02-agent-personas.md),
 [`../architecture/06-api-and-data-contracts.md`](../architecture/06-api-and-data-contracts.md)).
-Here natural language is primary and slash commands are a debug side door. The audit
-record that architecture asks for (which agent resolved, by what routing mode) is the
+That order stands. A slash command is a function call: deterministic code, resolved
+ahead of the router, never reaching the model. A handle is a name on the destination list
+and resolves deterministically whenever the gateway holds a map from handle to
+destination. Today it does not: no agent has a chat identity, and the destination list has
+two entries, so an `@handle` resolves through the router until profiles give agents
+handles and a deterministic map earns its keep. That is an implementation detail of the
+current version, not a change to the contract. Natural language is the catch-all layer,
+and in product terms it is the primary experience, because it is what people type. The
+audit record the architecture asks for, which agent resolved and by which mode, is the
 published decision below.
 
-That is the end state changing rather than a first version on the way to the older order,
-and both architecture documents carry a dated note saying so. `@handle` addressing - the
-architecture's mode 2, which this document otherwise never mentions - goes through the
-model rather than ahead of it. A handle is a name on the destination list, and a turn that
-spells one exactly is the easy case for a router that has to resolve the turns that do
-not. In the first version the list holds two entries and no handles exist, so the choice
-costs nothing; it is worth revisiting when profiles add entries and a second, deterministic
-dispatch path for an exact handle starts to earn its keep.
+What this specification does change is sequence and framing. The roadmap scheduled the
+deterministic modes first and natural-language routing later, as a fallback; this builds
+the router first, because natural language is the product, and lands slash dispatch beside
+the gateway's existing interceptors. The architecture documents carry dated notes saying
+exactly that and no more.
 
 Companion documents, and what each owns that this one uses: the payload spec owns the
 envelope, the task lifecycle, what each subject class admits, and the verified-identity
@@ -155,19 +159,29 @@ spec already has.
 
 ### What bypasses the model
 
-The gateway's deterministic interceptors stay ahead of the router
-([`spec-chatops-gateway.md`](spec-chatops-gateway.md), "The deterministic interceptors"):
-the stop words after normalisation (`stop`, `cancel`, `abort`) and the exact status
-phrase set. That is two of the three interceptors the gateway spec defines, and inside the
-status one the wide interrogative heuristic retires into the model, which is what it was
-approximating.
+Three things resolve ahead of the router and never reach it:
 
-The third interceptor, the `delegate:` prefix, retires as well, at build step 4 with the
-call. It is a hand-rolled choice between the two entries on the destination list, which is
-the router's whole job, so keeping it would mean two mechanisms deciding the same thing
-from the same text. The gateway spec's Delegate flow carries a dated line saying the
-prefix is what the gateway does until step 4 lands. The one thing a user must always be able to do when the model is slow or
-wrong is stop, and that path has no model in it.
+- **Slash commands.** A function call, not a prompt: `/status`, `/stop`, `/route
+<destination>`, forced disambiguation, and whatever else is added, parsed by
+  deterministic code, resolved before the router is consulted. They are always available,
+  they are the deterministic path for scripts and for debugging, and they are not the
+  taught interface. Natural language is what people type; commands are what you reach for
+  when determinism is the point.
+- **The gateway's existing interceptors** ([`spec-chatops-gateway.md`](spec-chatops-gateway.md),
+  "The deterministic interceptors"): the stop words after normalisation (`stop`, `cancel`,
+  `abort`) and the exact status phrase set. That is two of the three interceptors the
+  gateway spec defines, and inside the status one the wide interrogative heuristic retires
+  into the model, which is what it was approximating. The one thing a user must always be
+  able to do when the model is slow or wrong is stop, and that path has no model in it.
+- **An exact `@handle`, once a handle map exists.** Until profiles give agents handles
+  there is nothing deterministic to match against, and a handle spelled in a turn is the
+  easy case for the router.
+
+The third of the gateway's interceptors, the `delegate:` prefix, retires at build step 4
+with the call. It is a hand-rolled choice between the two entries on the destination
+list, which is the router's whole job, so keeping it would mean two mechanisms deciding
+the same thing from the same text. The gateway spec's Delegate flow carries a dated line
+saying the prefix is what the gateway does until step 4 lands.
 
 ### Invalid output and policy violations are different
 
@@ -489,10 +503,12 @@ change, designed when profiles land.
 
 ## Slash commands
 
-A debug side door and only that: `/route`, `/session`, forced disambiguation. They do
-not reach the model, they are not the taught interface, and nothing in the product's
-documentation teaches them. Natural language is the interface; commands are what you
-reach for when it fails.
+Deterministic, resolved first, never a model in the path; see "What bypasses the model".
+The first version ships the ones the gateway already needs a deterministic spelling for:
+`/status`, `/stop`, `/route <destination>`, and a forced-disambiguation form. They are
+documented as what they are, a function-call interface for scripts, debugging and the
+moments when a person wants certainty over understanding. The product's taught interface
+stays natural language.
 
 ## Build order
 

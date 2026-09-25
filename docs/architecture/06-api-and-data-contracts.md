@@ -224,14 +224,15 @@ above; the gateway normalizes them to a single dispatch path.
 **Resolution order:** (1) slash command → (2) explicit `@handle` → (3) NL inference (fallback; low
 confidence → clarify, not guess). Modes 1–2 spend no inference; mode 3 spends one router call.
 
-**Update 2026-09-24: the end-state resolution order is reversed.** The model router
-([`../designs/spec-model-router.md`](../designs/spec-model-router.md)) reads every turn,
-including one that spells a handle exactly, and slash commands become a debug side door
-that never reaches the model. This is a change to the target rather than a staging of the
-order above. The handle grammar and the derived map are unchanged; what changes is that
-resolving a handle is the router's job rather than a lookup ahead of it. Routing is still
-never an authz signal, and the allowlist check below still runs after resolution and
-before dispatch.
+**Update 2026-09-24: the resolution order stands; what changes is which layer is built
+first and how a handle resolves today.** The model router
+([`../designs/spec-model-router.md`](../designs/spec-model-router.md)) is the
+natural-language layer, built ahead of deterministic handle dispatch because natural
+language is the primary experience. Slash commands remain deterministic and never reach
+the model. A handle resolves through the router until a deterministic handle map exists,
+which needs agents to have handles, which needs profiles. The handle grammar and the
+derived map are unchanged. Routing is still never an authz signal, and the allowlist check
+below still runs after resolution and before dispatch.
 
 **Attribution (extends §8).** Every chat turn's audit record adds the **resolved agent** (`tier`,
 `scope`) and the **routing mode** (`slash` | `handle` | `inference`) alongside the requester +

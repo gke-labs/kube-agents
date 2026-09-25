@@ -126,14 +126,15 @@ acceptance criteria pass.
   `@cluster-<c>` handle routes to it **without** an inference call, and a message from a
   non-`allowedUsers` requester is **refused before dispatch**; RBAC granting an agent SA a write verb or a
   wrong-scope binding is **rejected at apply time by the `ValidatingAdmissionPolicy`**, even if merged.
-- **Update 2026-09-24: the ChatOps router items above and in Phase 3 are superseded**, deliverable
-  and acceptance criterion both. The model router
-  ([`../designs/spec-model-router.md`](../designs/spec-model-router.md)) reads every turn, including
-  one that spells a handle exactly, so "routes to it **without** an inference call" is not the
-  behaviour being built and "deterministic modes first, NL-inference mode later" is not the
-  sequence. What survives unchanged is the part these items share with the router's own rules: the
-  target CR's `allowedUsers` is enforced before dispatch, routing is never an authz signal, and
-  model output is never trusted for authorization. The router's build order is in its spec.
+- **Update 2026-09-24: the ChatOps router items above and in Phase 3 are re-sequenced, not
+  superseded.** The model router
+  ([`../designs/spec-model-router.md`](../designs/spec-model-router.md)) is built first, so
+  "deterministic modes first, NL-inference mode later" is no longer the order. Slash dispatch
+  is deterministic and lands beside the gateway's existing interceptors; handle dispatch
+  "without an inference call" is deferred until agents have handles, which profiles supply,
+  and a handle resolves through the router until then. What survives unchanged: the target
+  CR's `allowedUsers` is enforced before dispatch, routing is never an authz signal, and model
+  output is never trusted for authorization. The router's build order is in its spec.
 
 ### Phase 3 — Developer Team Agent + isolation proof
 
