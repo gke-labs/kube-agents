@@ -34,7 +34,8 @@ Scope is deliberately narrow and offline:
   door), any ``README.md`` (its directory reaches it), the tooling under the
   root dot-directories, the site pages Starlight's sidebar lists (read from
   ``SITE_CONFIG``: every page under an ``autogenerate`` directory, every
-  ``link:`` entry, and the ``404`` page it serves by convention), the uniform
+  page an entry names by ``link:``, ``slug:`` or the bare-string shorthand,
+  and the ``404`` page it serves by convention), the uniform
   families in ``LINK_EXEMPT_FAMILY_GLOBS``, which a reader reaches by
   browsing the directory and which no page links one by one, and every
   design document a code file cites. From there, reach follows links: a
@@ -132,29 +133,46 @@ README_NAME = "README.md"
 
 # The published site. Starlight's sidebar is what reaches a page there, and
 # the sidebar is hand-written in the site config: a group is either a list of
-# `link:` entries, one per page, or `autogenerate`d from a directory, which
-# lists every page under it. Both forms are read from the config, so a page
-# added to a hand-listed group without a sidebar entry is reported, not
-# exempted: it would publish with no navigation to it. The `404` page is
-# served by name and listed nowhere.
+# entries, one per page, or `autogenerate`d from a directory, which lists
+# every page under it. Both forms are read from the config, so a page added
+# to a hand-listed group without a sidebar entry is reported, not exempted:
+# it would publish with no navigation to it. The `404` page is served by name
+# and listed nowhere.
 SITE_CONTENT_DIR = "docs/site/src/content/docs/"
 SITE_CONFIG = "docs/site/astro.config.mjs"
 # The config is JavaScript, and an entry commented out is an entry gone: a
 # `// { label: ..., link: ... }` line or a `/* ... */` group is not
-# navigation, so comments are removed before the two patterns below run.
+# navigation, so comments are removed before the sidebar patterns run.
 # String literals are matched first and kept whole, so the `//` inside a
 # quoted URL is never read as a comment. A line comment leaves its newline;
 # a block comment becomes one space, so what it separated stays separate.
+JS_STRING_RE = r"""'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`"""
 JS_STRING_OR_COMMENT_RE = re.compile(
-    r"""(?P<string>'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`)"""
-    r"""|(?P<block>/\*.*?\*/)"""
-    r"""|(?P<line>//[^\n]*)""",
+    rf"""(?P<string>{JS_STRING_RE})|(?P<block>/\*.*?\*/)|(?P<line>//[^\n]*)""",
     re.DOTALL,
 )
 JS_BLOCK_COMMENT_REPLACEMENT = " "
-SITE_AUTOGENERATE_RE = re.compile(r"autogenerate:\s*\{\s*directory:\s*['\"]([^'\"]+)['\"]")
-SITE_SIDEBAR_LINK_RE = re.compile(r"\blink:\s*['\"](/[^'\"]*)['\"]")
+# The sidebar is the `sidebar: [...]` array, cut at its matching bracket so
+# that a bare string elsewhere in the config (`customCss`, a theme list) is
+# never read as an entry. Brackets inside string literals do not count.
+SITE_SIDEBAR_START_RE = re.compile(r"\bsidebar:\s*\[")
+SIDEBAR_TOKEN_RE = re.compile(rf"{JS_STRING_RE}|[\[\]]", re.DOTALL)
+SIDEBAR_OPEN, SIDEBAR_CLOSE = "[", "]"
+# Starlight's grammar for an entry that names a page, each read after comment
+# stripping: `link: '/route/'` (a site route; an `https://` link is not a
+# page), `slug: 'dir/page'` (the content slug), the bare-string shorthand for
+# a slug (an array element that is a string), and an `autogenerate` object
+# whose `directory` key sits anywhere inside it (`collapsed` may come first).
+# A value is quoted with any of JavaScript's three quote characters; a
+# template literal that interpolates names no page and is skipped.
+JS_QUOTED_VALUE_RE = r"""(?P<quote>['"`])(?P<value>[^'"`\n]*)(?P=quote)"""
+JS_INTERPOLATION = "${"
+SITE_AUTOGENERATE_RE = re.compile(rf"autogenerate:\s*\{{[^}}]*?\bdirectory:\s*{JS_QUOTED_VALUE_RE}")
+SITE_SIDEBAR_LINK_RE = re.compile(rf"\blink:\s*{JS_QUOTED_VALUE_RE}")
+SITE_SIDEBAR_SLUG_RE = re.compile(rf"\bslug:\s*{JS_QUOTED_VALUE_RE}")
+SITE_SIDEBAR_SHORTHAND_RE = re.compile(rf"(?<=[\[,])\s*{JS_QUOTED_VALUE_RE}\s*(?=[,\]])")
 SITE_ROUTE_PREFIX = "/kube-agents/"  # the Astro `base`; a sidebar `link:` omits it
+SITE_ROUTE_SEPARATOR = "/"  # a `link:` value starts with it; a slug is wrapped in it to make a route
 SITE_PAGE_SUFFIXES = (".md", ".mdx")
 SITE_INDEX_STEM = "index"
 SITE_CONVENTION_PAGES = frozenset({"404.md"})
@@ -404,21 +422,56 @@ def strip_js_comments(text: str) -> str:
     return JS_STRING_OR_COMMENT_RE.sub(keep_or_drop, text)
 
 
+def sidebar_array(text: str) -> str:
+    """The ``sidebar: [...]`` array in comment-stripped config text, or "" when there is none.
+
+    A sidebar assembled elsewhere and passed in by name is not an array here
+    and reads as empty, which reports every hand-listed page: the loud
+    direction, and the signal to teach this function the new shape.
+    """
+    start = SITE_SIDEBAR_START_RE.search(text)
+    if start is None:
+        return ""
+    opened = start.end() - 1
+    depth = 0
+    for token in SIDEBAR_TOKEN_RE.finditer(text, opened):
+        if token.group() == SIDEBAR_OPEN:
+            depth += 1
+        elif token.group() == SIDEBAR_CLOSE:
+            depth -= 1
+            if depth == 0:
+                return text[opened : token.end()]
+    return text[opened:]
+
+
+def sidebar_values(pattern: re.Pattern[str], text: str) -> Iterator[str]:
+    """The quoted values ``pattern`` finds in ``text``, skipping template literals that interpolate."""
+    for match in pattern.finditer(text):
+        value = match.group("value")
+        if JS_INTERPOLATION not in value:
+            yield value
+
+
 def site_sidebar() -> tuple[frozenset[str], frozenset[Path]]:
-    """The autogenerated directories and the pages the sidebar links, from the site config.
+    """The autogenerated directories and the pages the sidebar lists, from the site config.
 
     Both are empty when there is no site config, which leaves every site page
     but the convention ones to be reached by a link like any other document.
-    A commented-out entry or group is read as absent.
+    A commented-out entry or group is read as absent. A page is listed by a
+    ``link:`` route, a ``slug:``, or the bare-string shorthand for one.
     """
     config = REPO / SITE_CONFIG
     if not config.is_file():
         return frozenset(), frozenset()
-    text = strip_js_comments(config.read_text(encoding="utf-8"))
+    text = sidebar_array(strip_js_comments(config.read_text(encoding="utf-8")))
     directories = frozenset(
-        SITE_CONTENT_DIR + d.strip("/") + "/" for d in SITE_AUTOGENERATE_RE.findall(text)
+        SITE_CONTENT_DIR + d.strip(SITE_ROUTE_SEPARATOR) + SITE_ROUTE_SEPARATOR
+        for d in sidebar_values(SITE_AUTOGENERATE_RE, text)
     )
-    pages = frozenset(site_route_page(route).resolve() for route in SITE_SIDEBAR_LINK_RE.findall(text))
+    routes = [r for r in sidebar_values(SITE_SIDEBAR_LINK_RE, text) if r.startswith(SITE_ROUTE_SEPARATOR)]
+    for pattern in (SITE_SIDEBAR_SLUG_RE, SITE_SIDEBAR_SHORTHAND_RE):
+        routes += [SITE_ROUTE_SEPARATOR + slug + SITE_ROUTE_SEPARATOR for slug in sidebar_values(pattern, text)]
+    pages = frozenset(site_route_page(route).resolve() for route in routes)
     return directories, pages
 
 
