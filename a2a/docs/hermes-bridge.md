@@ -263,7 +263,11 @@ matching `token`, `secret`, `password`, `passwd`, `authorization`, `api_key`/`ap
 carry under an innocent key (a bearer token, a Google OAuth or API key, a GitHub token, a
 `key=value` pair whose key looks like a secret) — a terminal command is one string, so this
 is best-effort, and anything else the model pastes into a command line ships. Tool results are not published: no check
-reads them and they are the riskiest payload in the pod. The stream keeps every activity
+reads them and they are the riskiest payload in the pod. One task publishes at most 3000
+trace parts: the task's events subject is capped at 4096 messages, and a looping persona
+publishing without bound would evict its own `submitted` and `working`. Past the budget,
+calls are counted and one entry, `tool` `activity-budget` with `status` `truncated` and
+`dropped` saying how many, goes out at the terminal ahead of the result. The stream keeps every activity
 part; the relay drops the artifact on purpose (debug and audit views never render to
 chat), and the inject door's probe is where a reader sees it.
 

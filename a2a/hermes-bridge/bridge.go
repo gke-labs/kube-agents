@@ -561,10 +561,10 @@ func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultO
 		run.mu.Unlock()
 		return
 	}
-	// The trace first, while the state still admits it: queued calls and
-	// any call still open go out ahead of the result, inside this critical
-	// section, so the activity artifact is complete and nothing of it can
-	// follow the final event.
+	// The trace first, while the state still admits it: any call still
+	// open, and the budget marker if calls were cut, go out ahead of the
+	// result inside this critical section, so the activity artifact is
+	// complete and nothing of it can follow the final event.
 	b.drainActivity(run)
 	run.state = stateDone
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)

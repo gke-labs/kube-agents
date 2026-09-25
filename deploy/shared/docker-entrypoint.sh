@@ -21,6 +21,9 @@ umask 0002
 # come up; every other non-zero exit there is still fatal. Change both together.
 readonly SANDBOX_MIRROR_RETRY_RC=2
 readonly OTEL_FLAG_DISABLED="--disabled"
+# The bridge's webhook fragment, shipped beside the A2A skill tree; step 2.7
+# merges it into the platform profile only when step 2.6a-bis's probe says next.
+readonly A2A_HOOKS_OVERLAY="/opt/a2a-template/hooks.overlay.yaml"
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
@@ -1433,11 +1436,10 @@ A2A_PYEOF
 # on, so it is kept rather than recomputed: two probes would be two readers of
 # one decision, and a managed .env that changed between them would give the
 # skill and the hook different answers on the same boot. The fragment ships
-# in the same image layer as the skill tree (see the Dockerfile), so gating
-# the probe on the skills directory covers both. Empty means today, or
+# in the same image as the skill tree (a COPY beside it in the Dockerfile),
+# so gating the probe on the skills directory covers both. Empty means today, or
 # undecided — either way 2.7 leaves the hook out, which is the safe side.
 A2A_MODE_NEXT=""
-A2A_HOOKS_OVERLAY="/opt/a2a-template/hooks.overlay.yaml"
 if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
     # `|| rc=$?` keeps the non-zero answers out of set -e's reach — "today"
     # is a return value here, not a failure.

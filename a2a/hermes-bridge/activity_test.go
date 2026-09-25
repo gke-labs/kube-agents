@@ -452,15 +452,18 @@ func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
 }
 
 func TestRedactInput_ValuesUnderInnocentKeys(t *testing.T) {
-	in := `{"command": "curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' https://x; export GH=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345; gcloud --access-token=ya29.a0AfH6SMBxyzxyzxyzxyzxyzxyz ls", "plain": "kubectl get pods -n kube-system"}`
+	in := `{"command": "curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' -u admin:hunter2 -d '{\"password\":\"hunter3\", \"token\": \"hunter4\"}' -H 'Authorization: Basic dXNlcjpodW50ZXIy' https://x; export GH=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345; gcloud --access-token=ya29.a0AfH6SMBxyzxyzxyzxyzxyzxyz ls", "plain": "kubectl get pods -n kube-system", "id": 9007199254740993}`
 	out := string(redactInput(json.RawMessage(in)))
-	for _, leaked := range []string{"abcdefghijklmnopqrstuvwxyz0123", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "ya29.a0AfH6SMB"} {
+	for _, leaked := range []string{"abcdefghijklmnopqrstuvwxyz0123", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "ya29.a0AfH6SMB", "hunter2", "hunter3", "hunter4", "dXNlcjpodW50ZXIy"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
 	}
 	if !strings.Contains(out, "kubectl get pods -n kube-system") {
 		t.Fatalf("innocent value was damaged: %s", out)
+	}
+	if !strings.Contains(out, `"id":9007199254740993`) {
+		t.Fatalf("a 64-bit id lost digits through the scrub: %s", out)
 	}
 }
 
