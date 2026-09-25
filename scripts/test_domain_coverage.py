@@ -14,13 +14,12 @@ This test is what makes the rule a build failure:
 Delete allowlist entries as Phase 2 ACTIVATES scenarios. The shrinking
 allowlist is the tier-2 progress metric of the testing implementation plan.
 
-Covered means running on every pull request: a task counts toward its domain
-only when its spec is non-empty AND its path is an entry in
-hack/eval/presubmit-cases.txt, the file hack/ci-eval-pr.sh reads into TASKS.
-A case in hack/eval/nightly-cases.txt runs every night and blocks nothing on
-a pull request, so a domain whose only scenario is nightly-only is still
-uncovered here. Without this distinction the allowlist would have emptied the
-day the specs were written, ten scenarios before any of them ran.
+Covered means able to red every pull request: a task counts toward its domain
+only when its spec is non-empty AND its name is on hack/eval/blocking-roster.txt
+(a subset of the presubmit file by construction). A nightly case, or a
+presubmit seat held out of the roster, blocks nothing and leaves its domain
+uncovered. Without this distinction the allowlist would have emptied the day
+the specs were written, ten scenarios before any of them ran.
 """
 
 import pathlib
@@ -43,17 +42,25 @@ def load_domains():
     return data["domains"], set(data.get("allowlist") or [])
 
 
-def active_task_paths():
-    """Task paths the presubmit runs: the entries of hack/eval/presubmit-cases.txt."""
-    names = eval_rosters.presubmit_cases()
+def blocking_task_paths():
+    """Task paths that can red a pull request: the entries of hack/eval/blocking-roster.txt.
+
+    The roster is a subset of the presubmit file by construction (the script
+    refuses a roster name outside it; scripts/test_task_registration.py pins
+    it), so a roster case runs on every pull request AND blocks there. A
+    presubmit seat held out of the roster (HELD_OUT_IN_PRESUBMIT in
+    scripts/test_eval_rosters.py) runs without blocking and covers nothing
+    until its roster line lands.
+    """
+    names = eval_rosters.blocking_roster()
     if not names:
-        raise AssertionError(f"{eval_rosters.PRESUBMIT_CASES_FILE} parsed to no cases")
+        raise AssertionError(f"{eval_rosters.BLOCKING_ROSTER_FILE} parsed to no cases")
     return {f"bench/tasks/{name}/task.yaml" for name in names}
 
 
 def covered_domains():
-    """Domain slugs claimed by an ACTIVE task carrying a non-empty spec."""
-    active = active_task_paths()
+    """Domain slugs claimed by a BLOCKING task carrying a non-empty spec."""
+    active = blocking_task_paths()
     claimed = {}
     for task_file in sorted(REPO_ROOT.glob(TASKS_GLOB)):
         task = yaml.safe_load(task_file.read_text()) or {}

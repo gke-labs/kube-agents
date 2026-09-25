@@ -28,8 +28,9 @@ retired: a case path inside a roster-file comment is a finding.
 
 This lint and scripts/test_domain_coverage.py ratchet together. That one
 counts a domain covered only when a task carrying its slug and a non-empty
-verification_spec is in the PRESUBMIT file, so a nightly-only task never
-counts as coverage; this one guarantees every task is at least registered
+verification_spec is on the BLOCKING ROSTER, so neither a nightly-only task
+nor a held-out presubmit seat counts as coverage; this one guarantees every
+task is at least registered
 and internally valid.
 
 The files are read with the parse in scripts/eval_rosters.py, the Python copy

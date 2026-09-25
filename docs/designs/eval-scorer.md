@@ -74,7 +74,8 @@ an `issues: read` credential the Prow job supplied. That was rung 2 working, not
 mounts one now. The canary `compliance-rbac-overgrant` ran on every presubmit until 2026-09-22,
 when the presubmit became the blocking roster only (#1023) and the never-admitted canary joined the
 other audit scenarios in the nightly tier (`hack/eval/nightly-cases.txt`), where those had been kept
-out of the presubmit on cost. The
+out of the presubmit on cost, and since 2026-09-25 it runs on every presubmit again as a held-out seat
+(#2013), where rung 2 reaches it as before. The
 alternative — scoping 1–3 to admitted cases — means an unscreened case can never report that its
 checks are broken, which is the state it is most likely to be in.
 

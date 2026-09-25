@@ -78,8 +78,9 @@ request, with `owner:` set and a `docs/designs/domains.yaml` slug (or a reviewed
 "Registration"): it runs every night from the night it merges and builds its record; a
 presubmit seat is a later pull request that cites that record — one edit that moves the
 line to `hack/eval/presubmit-cases.txt` and adds the name to `hack/eval/blocking-roster.txt`
-(an `eval-crew` approval; since 2026-09-22 the presubmit runs the blocking roster only, and
-`scripts/test_eval_rosters.py` pins the two files as equal) — never the one that makes the
+(an `eval-crew` approval; since 2026-09-22 the presubmit runs the blocking roster only, plus
+the held-out seat a coverage tracker may take first, `presubmit-cases.txt`'s last section,
+which `scripts/test_eval_rosters.py` pins) — never the one that makes the
 case pass. A case whose fixture does not exist at all is a `FIXTURE_NOT_READY` entry in
 `scripts/validate_bench_cases.py` with its issue instead. A case already registered stays
 where it is. That seat is the admission, earned on the case's record

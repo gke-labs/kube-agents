@@ -1,11 +1,17 @@
-# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-09-22;
-# a presubmit entry from 2026-08-25 until then, and from 2026-08-26 THE
-# AUDIT-MACHINERY CANARY: the one full audit scenario the presubmit kept.
+# PRESUBMIT-ACTIVE, HELD OUT — an entry in hack/eval/presubmit-cases.txt
+# without a blocking-roster.txt line since 2026-09-25 (#2013 step 2), the
+# documented exception to the blocking-only rule: it runs on every pull
+# request, cannot red one on rungs 4 or 6, and reds one on rungs 1-3 like
+# every case. A presubmit entry from 2026-08-25 to 2026-09-22, nightly
+# 2026-09-22 to 2026-09-25, and from 2026-08-26 THE AUDIT-MACHINERY CANARY:
+# the one full audit scenario the presubmit kept.
 # Demoted from the blocking roster on 2026-09-02 (#1171) and, when the
 # presubmit became the blocking roster only (#1023), moved to the nightly
 # with the other held-out cases (413/677 graded presubmit repetitions
 # 2026-09-15 to 09-22), which put the fleet-audits domain back on the
-# docs/designs/domains.yaml allowlist (#1876). Re-admission bar: #1171's.
+# docs/designs/domains.yaml allowlist (#1876). Re-admission bar: #2013 step 3
+# (#1171 closed 2026-09-08): three clean days at >= 90 % of graded
+# repetitions, no all-reps collapse.
 # It exercises SOP dispatch, delegation to a worker, the GitHub token
 # minter, and the ledger write end to end, and it is the
 # scenario that proved that chain — measured 606s clean on 2026-08-26 (build
@@ -59,8 +65,8 @@
 # remediation pull requests and closes findings that stopped reproducing.
 # Presubmit-eligible because that write path is pinned per eval project to a
 # throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
-# blocker A1, now closed. Eligible tier: presubmit once re-admitted; active
-# there 2026-08-25 to 2026-09-22, nightly since.
+# blocker A1, now closed. Eligible tier: presubmit; active there 2026-08-25
+# to 2026-09-22, nightly 2026-09-22 to 2026-09-25, presubmit held out since.
 id: compliance-rbac-overgrant
 name: Security sweep finds the cluster-admin over-grant
 # The prompt no longer asks for a summary in the final answer: the SOP's

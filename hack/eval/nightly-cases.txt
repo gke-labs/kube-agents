@@ -9,19 +9,22 @@
 # identically in both. The script refuses to start on a line that names no
 # case directory or that is also in presubmit-cases.txt (it would run twice a
 # night). The registration lint (scripts/validate_bench_cases.py) reads this
-# file as well as the presubmit one; the domain-coverage lint deliberately
-# does not, so an entry here satisfies presubmit domain coverage not at all.
+# file as well as the presubmit one; the domain-coverage lint reads only
+# blocking-roster.txt, so neither an entry here nor a held-out presubmit
+# seat counts as coverage.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
 #
 # WHAT BELONGS HERE. Every registered case that is not on the blocking
 # roster and has a fixture. Since 2026-09-22 (#1023, the eval crew's call)
-# the presubmit runs the blocking roster and nothing else, so "not in the
-# presubmit" and "not admitted" are the same set and this file is where a
-# held-out case lives: the seven cases the presubmit had been running
-# without letting them block moved here that day, each with its hold-out
-# reason as the # line above it (the last section of this file). This is
+# the presubmit runs the blocking roster and nothing else, so this file is
+# where a held-out case lives unless a coverage tracker seats it held out in
+# the presubmit file instead (the exception section at the foot of
+# presubmit-cases.txt, #2013): the seven cases the presubmit had been
+# running without letting them block moved here that day, each with its
+# hold-out reason as the # line above it (the last section of this file;
+# six remain there). This is
 # the default home for a new case too (decided 2026-09-15 on #1546 and
 # #1564): it lands here, the nightly builds its record in the evidence
 # store -- one data point a night, three repetitions -- and a presubmit
@@ -90,6 +93,10 @@
 # thirty (90), +21 units: at their hints (178s, 200s x4, 700s x2) about
 # 120 serial minutes, at their measured presubmit medians (the canary's is
 # 1002s, p90 2074s, over 903 repetitions 2026-09-04 to 09-15) nearer 150.
+# 2026-09-25: the canary returned to the presubmit file held out (#2013), so
+# this file's share is thirty-three cases (99 units) of the forty-six-case,
+# 138-unit matrix the 2026-09-23 and 09-25 additions made it; the nightly runs
+# both files, so its matrix and its price do not change.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -343,8 +350,10 @@
 # ── Moved here 2026-09-22 from the presubmit file (#1023) ───────────────────
 # The seven cases the presubmit ran without letting them block, when the
 # eval crew decided the presubmit runs the blocking roster and nothing else.
-# None was admitted; each # line is the hold-out reason as it stood that day,
-# with the case's presubmit record from #1626's merge to the move (graded
+# Six remain here; compliance-rbac-overgrant went back to the presubmit file
+# held out on 2026-09-25 (#2013), the documented exception. None was
+# admitted; each # line is the hold-out reason as it stood that day, with
+# the case's presubmit record from #1626's merge to the move (graded
 # repetitions in the dashboard's data.json, 2026-09-15 to 09-22, 734 runs)
 # so the nightly record starts from a known point. The admission edit for any
 # of them moves its line back to presubmit-cases.txt and onto
@@ -378,18 +387,6 @@
 # item 2), and on #1780's own head it went 0/3 on a leftover. 434/681
 # (63.7%) in the window. Priced at 700s. Re-admission bar: #1189's.
 ./tasks/rca-remediation-pr/task.yaml
-
-# Demoted 2026-09-02 on #1171 (rung-4 collapses on unrelated pull requests;
-# the fleet-audit delegation chain going partial on "access limitations" and
-# some runs publishing no ledger at all). The audit-machinery canary, the one
-# full audit the presubmit kept from 2026-08-25, and the fleet-audits
-# domain's only presubmit case, so its move puts fleet-audits on the
-# docs/designs/domains.yaml allowlist (#1876) until an admitted case covers
-# the SOP machinery again. 413/677 (61.0%) in the window; 1002s median,
-# 2074s p90, over 903 repetitions 2026-09-04 to 09-15. Priced at 700s, with
-# the 3000s delegation ceiling the full audits get. Re-admission bar: #1171's
-# (delegation fixed and a clean 3-day graded record).
-./tasks/compliance-rbac-overgrant/task.yaml
 
 # Held out on #1010 (the delegation receipt graded as the answer -- fixed by
 # #1174 on 2026-09-03 for the capacity probe, but this case's record after

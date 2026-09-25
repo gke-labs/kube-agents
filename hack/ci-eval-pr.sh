@@ -1519,7 +1519,9 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # at EVAL_TASK_PARALLELISM=6 (#1491; oss-test-infra#2707, open, moves it to
 # 8), and that is the copy to keep current. Since 2026-09-22 (#1023) the
 # presubmit file is the blocking roster and nothing else, so this file is
-# also where every held-out case lives, with its hold-out reason.
+# where a held-out case lives, with its hold-out reason, unless a coverage
+# tracker seats it in the presubmit file held out (#2013; the presubmit
+# file's last section).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -1698,6 +1700,21 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # fifty-four units; the first runs of the twelve-case matrix measure the
 # new one, and until they have, this note is the projection rather than the
 # record. Still no Prow deadline change: the matrix shrank.
+#
+# 2026-09-25: the compliance canary is back in the presubmit file, held out
+# (#2013 step 2): THIRTEEN tasks, 39 units, against the same 360m deadline.
+# What arrived is three units at 1002s median / 2074s p90 (903 presubmit
+# repetitions, 2026-09-04 to 09-15), 3000s at the delegation ceiling,
+# serialized on their task lock: a ~50min chain at the median, ~104min at
+# p90, ~150min if every repetition runs to the ceiling. Against the
+# twelve-case fan-out that is +10-20min of wall clock in a typical run (the
+# chain hides inside the span; the cost is displaced lane time) and
+# +30-45min at p90, when the chain becomes the critical path. The
+# dispatcher-stall residual adds ~15-20min of wait per delegation and takes
+# a repetition to the ceiling only at p90. The record predates the
+# collector that moves check evaluation out of the worker; the first runs
+# of the thirteen-case matrix measure it, and until they have, this is the
+# projection. No Prow deadline change.
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
@@ -1930,12 +1947,18 @@ unit_cost_hint() {
     consistency-no-environment-label) echo 900 ;;
     upgrades-master-behind-offered-elsewhere) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
-    # Nightly-only since 2026-09-22 (#1023; held out on #1171 and #1189),
-    # presubmit before that. The canary measured 1002s median, 2074s p90,
-    # over 903 presubmit repetitions 2026-09-04 to 09-15; the hint stays at
-    # the 700 it carried as a presubmit case until the nightly record says
-    # otherwise.
-    compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
+    # Presubmit again since 2026-09-25, held out (#2013 step 2); nightly-only
+    # 2026-09-22 to then (#1023; held out on #1171, closed 2026-09-08, the
+    # bar now on #2013 step 3). The canary measured 1002s median, 2074s p90,
+    # over 903 presubmit repetitions 2026-09-04 to 09-15; priced at that
+    # median, the way capacity (540) and the incident probe (700) are, so it
+    # launches first in each repetition round. Its three repetitions
+    # serialize on the task lock, so ~50min at the median and ~104min at p90
+    # is the chain a presubmit carries for it.
+    compliance-rbac-overgrant) echo 1000 ;;
+    # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
+    # before that, priced at the 700 it carried there.
+    rca-remediation-pr) echo 700 ;;
     # Nightly-only. The 2026-09-22 promotion (#1023) was withdrawn before
     # merge: its record was graded by the check #1780 replaced. Measured
     # 980-1929s across build 2099539376672346112's three repetitions (267-559s

@@ -10,9 +10,11 @@
 #
 # A task claims a domain with a top-level `domain: <slug>` field in its
 # task.yaml. It counts as covering the domain only when it also carries a
-# non-empty verification_spec AND is an entry in hack/eval/presubmit-cases.txt.
-# Covered means running on every pull request: a nightly-only task leaves its
-# domain uncovered until its line moves to the presubmit file.
+# non-empty verification_spec AND is a name on hack/eval/blocking-roster.txt.
+# Covered means able to red every pull request: a nightly-only task, or a
+# presubmit seat held out of the roster (the exception section in
+# hack/eval/presubmit-cases.txt), leaves its domain uncovered until its
+# roster line lands.
 #
 # `allowlist` names the domains that are known-uncovered today. Delete entries
 # as Phase 2 ACTIVATES scenarios; the lint refuses both an uncovered domain that
@@ -31,8 +33,8 @@
 # by exactly one audit kept as a canary, under the `fleet-audits` domain,
 # until 2026-09-22, when the presubmit became the blocking roster only and
 # the never-admitted canary moved to the nightly with the other full audits
-# (hack/eval/nightly-cases.txt); only an entry in
-# hack/eval/presubmit-cases.txt counts as coverage.
+# (hack/eval/nightly-cases.txt), and back into the presubmit file, held out,
+# on 2026-09-25 (#2013); only a roster line counts as coverage.
 
 domains:
   - slug: chat-and-routing
@@ -89,19 +91,16 @@ domains:
 #
 # An entry goes back on here only alongside a scenario that stopped running.
 allowlist:
-  # fleet-audits, since 2026-09-22 (#1023): the presubmit runs the blocking
-  # roster only, and the domain's one presubmit case, the
+  # fleet-audits, since 2026-09-22 (#1023): the domain's one case, the
   # compliance-rbac-overgrant canary, was never admitted (demoted 2026-09-02
-  # on #1171), so it moved to hack/eval/nightly-cases.txt with the other
-  # full audits. The SOP machinery it exercised end to end -- dispatch,
-  # delegation, token minter, ledger write -- now runs on every pull request
-  # only as far as the reliability and security probes reach, and the
-  # on-demand path a human would use to run a stream is itself unreachable
-  # from the sandbox (#1876). Delete this entry when a fleet-audits case is
-  # admitted on its nightly record (#1171's bar for the canary, or
-  # ai-security-planted-model-audit's), or when the coverage contract
-  # formally recognizes the nightly tier (#1175). incident-triage sat here
-  # from 2026-09-03 to 2026-09-22 for the same shape of reason.
+  # on #1171) and moved to the nightly that day. Since 2026-09-25 it is seated
+  # held out in hack/eval/presubmit-cases.txt (#2013 step 2, the documented
+  # exception to the blocking-only rule): it runs on every pull request,
+  # cannot red one on a graded failure, and covers nothing here. Delete this
+  # entry in the pull request that adds its roster line (#2013 step 4, after
+  # three clean days), or when the coverage contract formally recognizes the
+  # nightly tier (#1175). incident-triage sat here from 2026-09-03 to
+  # 2026-09-22 for the same shape of reason.
   - fleet-audits
   # remediation, since 2026-09-22 (#1023): the same decision, and neither of
   # the domain's two writers holds a seat. rca-remediation-pr was demoted

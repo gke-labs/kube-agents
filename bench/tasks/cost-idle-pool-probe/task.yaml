@@ -15,7 +15,7 @@
 # age-gated version stays parked as fleet-cost-idle-pool for the nightly
 # tier once A3 passes; full audit SOP fidelity lives there and in the
 # fleet-audits canary (compliance-rbac-overgrant, 606s measured 2026-08-26;
-# nightly since 2026-09-22).
+# nightly 2026-09-22 to 2026-09-25, presubmit held out since (#2013)).
 # Expected cost bracket: ~150-350s.
 #
 # Planted defect required: a node pool named "idle-batch-pool" on the seeded

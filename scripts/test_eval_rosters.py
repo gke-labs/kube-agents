@@ -11,10 +11,13 @@ what blocks did not move that day; the admissions and promotions since are
 pinned beside them (ADMITTED_AFTER_THE_SPLIT, PROMOTED_AFTER_THE_SPLIT), and
 so is the 2026-09-22 decision that the presubmit runs the blocking roster
 only (HELD_OUT_TO_NIGHTLY: the seven held-out cases that left the presubmit
-file for the nightly one that day) -- and the nightly file holds the
+file for the nightly one that day) and the held-out seats a coverage tracker
+puts back in the presubmit file without a roster line (HELD_OUT_IN_PRESUBMIT,
+the documented exception, #2013) -- and the nightly file holds the
 script's nightly array plus the nine cases the TASKS array held commented
 out, which the same decision moved into the nightly (#1546, #1564), less
-the cases promoted out of it since, plus the seven. A later roster change
+the cases promoted out of it since, plus the seven, less any of them seated
+back. A later roster change
 edits the expected sets here in the same pull request; that is the point of
 pinning them, since the files are what the eval-crew rule in hack/OWNERS
 guards.
@@ -137,16 +140,31 @@ PROMOTED_AFTER_THE_SPLIT = [
 # (#1023), when the eval crew decided the presubmit runs the blocking roster
 # and nothing else: the seven cases the presubmit had run without letting
 # them block, in the presubmit file's reporting order, each with its hold-out
-# reason beside its nightly line. The presubmit file and the roster have held
-# the same cases since.
+# reason beside its nightly line. The presubmit file and the roster held the
+# same cases from then until the first held-out seat (HELD_OUT_IN_PRESUBMIT).
 HELD_OUT_TO_NIGHTLY = [
     "security-overgrant-remediation-proposal",  # #1066, never admitted
     "obtainability-pdb-semantics",  # #1049, never admitted
     "obtainability-fleet-exposure-sweep",  # #1049, never admitted
     "obtainability-healthy-namespace-silence",  # #1049, never admitted
     "rca-remediation-pr",  # demoted 2026-09-02, #1189
-    "compliance-rbac-overgrant",  # demoted 2026-09-02, #1171
+    "compliance-rbac-overgrant",  # demoted 2026-09-02, #1171; seated back in the presubmit 2026-09-25 (HELD_OUT_IN_PRESUBMIT)
     "cluster-agent-healthy-workload-no-finding",  # held out on #1010
+]
+
+# Seated in the presubmit file WITHOUT a roster line: the documented exception
+# to the 2026-09-22 rule, one case per coverage tracker, as (case, the
+# presubmit line it follows). A held-out seat runs on every pull request and
+# cannot red one on a graded failure -- rungs 4 and 6 are scoped to the
+# roster; rungs 1-3 still block for it as for every case -- and earns its
+# record at presubmit volume instead of one nightly a night. Each case here is
+# also in a nightly expectation above (its nightly line is what moved), and
+# the nightly still runs it through the presubmit file. The tracker's
+# roster-line step deletes the entry here and adds the name to
+# blocking-roster.txt. roster <= presubmit holds; presubmit == roster holds
+# less exactly this list.
+HELD_OUT_IN_PRESUBMIT = [
+    ("compliance-rbac-overgrant", "agent-kanban-smoke"),  # #2013 step 2, seated 2026-09-25; the roster line is step 4
 ]
 
 
@@ -207,14 +225,25 @@ class ParserTest(unittest.TestCase):
 class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted_less_the_held_out(self):
         expected = [c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT) if c not in HELD_OUT_TO_NIGHTLY]
-        self.assertEqual(eval_rosters.presubmit_cases(), expected)
+        self.assertEqual(eval_rosters.presubmit_cases(), with_insertions(expected, HELD_OUT_IN_PRESUBMIT))
 
-    def test_the_presubmit_runs_the_blocking_roster_and_nothing_else(self):
+    def test_the_presubmit_runs_the_blocking_roster_plus_the_held_out_seats_and_nothing_else(self):
         # Decided 2026-09-22 (#1023): a case that cannot red a pull request
-        # does not run on one. The script checks only that the roster is a
-        # subset of the presubmit; the equality is policy, pinned here.
-        self.assertEqual(eval_rosters.presubmit_cases(), eval_rosters.blocking_roster())
+        # does not run on one -- less the documented exception, one seat per
+        # coverage tracker (HELD_OUT_IN_PRESUBMIT), which runs without
+        # blocking until its roster line lands. The script checks only that
+        # the roster is a subset of the presubmit; the rest is policy, pinned here.
+        seated = {case for case, _ in HELD_OUT_IN_PRESUBMIT}
+        self.assertEqual([c for c in eval_rosters.presubmit_cases() if c not in seated], eval_rosters.blocking_roster())
+        for case in seated:
+            with self.subTest(case=case):
+                self.assertIn(case, eval_rosters.presubmit_cases())
+                self.assertNotIn(case, eval_rosters.blocking_roster())
+                self.assertNotIn(case, eval_rosters.nightly_cases())
+                self.assertIn(case, NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + HELD_OUT_TO_NIGHTLY, "a held-out seat's nightly line is what moved")
         for case in HELD_OUT_TO_NIGHTLY:
+            if case in seated:
+                continue
             with self.subTest(case=case):
                 self.assertNotIn(case, eval_rosters.presubmit_cases())
                 self.assertNotIn(case, eval_rosters.blocking_roster())
@@ -225,8 +254,13 @@ class SplitLostNothingTest(unittest.TestCase):
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases_less_the_promoted_plus_the_held_out(self):
         promoted = {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
-        expected = [c for c in NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY if c not in promoted]
-        self.assertEqual(eval_rosters.nightly_cases(), expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL)
+        seated = {case for case, _ in HELD_OUT_IN_PRESUBMIT}
+        expected = [
+            c
+            for c in NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL
+            if c not in promoted and c not in seated
+        ]
+        self.assertEqual(eval_rosters.nightly_cases(), expected)
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
         for case, _ in PROMOTED_AFTER_THE_SPLIT:

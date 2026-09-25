@@ -210,10 +210,11 @@ covers no row gets a reviewed `KNOWN_NO_DOMAIN` entry instead of an absent field
 `docs/designs/bench-case-format.md` is the contract, and this section is the how-to.
 The slugs live in `docs/designs/domains.yaml`, and
 `scripts/test_domain_coverage.py` counts a domain as covered only when a task carries its
-slug AND a non-empty `verification_spec` AND is an entry in
-`hack/eval/presubmit-cases.txt` — covered means running on every pull request, so a
-nightly-only task leaves its domain honestly uncovered until its line moves to the presubmit
-file, and that move forces the allowlist edit in `domains.yaml` in the same change. devops-bench
+slug AND a non-empty `verification_spec` AND is a name on
+`hack/eval/blocking-roster.txt` — covered means able to red every pull request, so neither a
+nightly-only task nor a presubmit seat held out of the roster counts, and the domain stays
+uncovered until the roster line lands; that edit forces the allowlist edit in `domains.yaml` in
+the same change. devops-bench
 ignores the extra key (`extra: "ignore"` on its task model), so the field is free to carry.
 
 Every task also carries a top-level `owner:` — a GitHub login without the at sign, or

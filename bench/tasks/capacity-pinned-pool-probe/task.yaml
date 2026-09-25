@@ -14,8 +14,9 @@
 # this domain is therefore a targeted question about the planted defect,
 # answered from observed evidence and graded on the reply. Full audit SOP
 # fidelity lives in the nightly tier: the fleet-audits canary
-# (compliance-rbac-overgrant, 606s measured 2026-08-26; nightly since
-# 2026-09-22) and stockout-pinned-pool. Cost: the ~150-350s bracket the probes
+# (compliance-rbac-overgrant, 606s measured 2026-08-26; nightly 2026-09-22
+# to 2026-09-25, presubmit held out since (#2013)) and stockout-pinned-pool.
+# Cost: the ~150-350s bracket the probes
 # were promised is not what this one costs. Measured over its 1155 presubmit
 # repetitions from 2026-09-04 to 2026-09-15 (after #1174): median 540s, p10
 # 248s, p90 1318s, the ~2960s maxima being AGENT_DELEGATION_TIMEOUT plus
