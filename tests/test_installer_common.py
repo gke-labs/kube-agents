@@ -10,6 +10,7 @@ import datetime
 import json
 import pathlib
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -153,6 +154,7 @@ class InstallerCommonTest(unittest.TestCase):
         kms_versions="",
         sa_describe_stub="exit 1",
         gcloud_stderr=None,
+        gcloud_extra_cases="",
         get_credentials_stub=None,
     ):
         """Source installer_common.sh with print stubs and run `script`.
@@ -161,6 +163,10 @@ class InstallerCommonTest(unittest.TestCase):
         `gcloud_exit` for `storage cat` calls on the state object;
         `clusters describe` runs `describe_stub` (default: exit 1, meaning
         the cluster does not exist).
+
+        `gcloud_extra_cases` is spliced in ahead of those arms, for a caller
+        that needs to answer a subcommand none of them match — `get-credentials`
+        and its `--help` probe, which fall through to the state read otherwise.
         """
         # A failing `storage cat` with no stderr of its own reads as "absent":
         # that is what every pre-existing caller meant by gcloud_exit=1, and
@@ -185,6 +191,7 @@ class InstallerCommonTest(unittest.TestCase):
             gcloud.write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
+                f"{gcloud_extra_cases}"
                 f"  *\"clusters describe\"*) {describe_stub} ;;\n"
                 f"{get_cred_case}"
                 f"  *\"keys versions list\"*) printf '%s' '{kms_versions}'; exit 0 ;;\n"
@@ -1120,6 +1127,74 @@ class InstallerCommonTest(unittest.TestCase):
             # SESSION_KV_* recover too: an adoption re-install must keep the
             # live salt or every chat identity re-pseudonymises.
             self.assertIn('session_kv_salt    = "recovered-key"', content)
+
+    # ── the adoption fetch: which control-plane endpoint it writes ───────────
+
+    def _run_adoption_fetch(self, dns_endpoint, allow_external, supports_flag=True):
+        """Drive write_tfvars_from_state down the adoption path.
+
+        Returns the recorded `gcloud container clusters get-credentials`
+        invocation. create_cluster is false only when the cluster is already
+        there, so the existence probe has to succeed; the helper's own describe
+        asks for the dnsEndpointConfig fields and is answered from the same arm.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            record = pathlib.Path(tmp) / "fetch.args"
+            describe_stub = (
+                'if [[ "$*" == *dnsEndpointConfig* ]]; then '
+                f"printf '{dns_endpoint}\\t{allow_external}\\n'; exit 0; fi\n"
+                'case "$*" in\n'
+                "  *currentMasterVersion*) printf '1.30.1-gke.100\\n' ;;\n"
+                "  *) printf 'True\\n' ;;\n"
+                "esac\n"
+                "exit 0"
+            )
+            # An older gcloud has no --dns-endpoint at all, and the helper is
+            # meant to notice that from the help text before offering the flag.
+            help_text = "--dns-endpoint" if supports_flag else "--internal-ip"
+            extra = (
+                f"  *\"get-credentials --help\"*) printf -- '{help_text}\\n'; exit 0 ;;\n"
+                f"  *get-credentials*) printf '%s\\n' \"$*\" >> '{record}'; exit 0 ;;\n"
+            )
+            with tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                    env={"API_SERVER_KEY": "k"},
+                    describe_stub=describe_stub,
+                    gcloud_extra_cases=extra,
+                )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            return record.read_text() if record.exists() else ""
+
+    def test_the_helper_is_in_scope_for_a_caller_that_sources_only_this_file(self):
+        # uninstall.sh sources installer_common.sh and nothing else, so the
+        # predicate has to come with the file. Left to the caller, the fetch
+        # below would be an undefined function and `set -e` would end the run.
+        proc = self._run('echo "kind=$(type -t gke_dns_endpoint_flag)"')
+        self.assertIn("kind=function", proc.stdout, proc.stderr)
+
+    def test_the_adoption_fetch_uses_the_dns_endpoint_when_one_accepts_traffic(self):
+        # The whole point of the call: on a cluster whose IP endpoint this host
+        # cannot route to, the IP kubeconfig makes every secret read below time
+        # out, and the generator cannot tell that from "nothing to recover" --
+        # so it mints a new SESSION_KV_SALT over the live one.
+        args = self._run_adoption_fetch("gke-abc.us-central1.gke.goog", "True")
+        self.assertIn("--dns-endpoint", args)
+
+    def test_the_adoption_fetch_leaves_an_ordinary_cluster_on_its_ip_endpoint(self):
+        # gcloud rejects the flag on a cluster with no externally reachable DNS
+        # endpoint, so passing it blind would break the clusters that work.
+        for dns_endpoint, allow_external, supports_flag, why in (
+            ("gke-abc.us-central1.gke.goog", "False", True, "external traffic is off"),
+            ("", "True", True, "no DNS endpoint is published"),
+            ("gke-abc.us-central1.gke.goog", "True", False, "this gcloud has no such flag"),
+        ):
+            with self.subTest(why=why):
+                args = self._run_adoption_fetch(dns_endpoint, allow_external, supports_flag)
+                self.assertNotIn("--dns-endpoint", args)
+                # Still fetched, just over the IP endpoint as before.
+                self.assertIn("get-credentials test-cluster", args)
 
     def test_tfvars_omits_credentials_when_persist_secrets_off(self):
         with tempfile.TemporaryDirectory() as out_dir:
@@ -2143,6 +2218,70 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
+
+
+class MissingEndpointHelperTest(unittest.TestCase):
+    """The fallback for a tree with no gke_dns_endpoint.sh beside this file.
+
+    Nothing else reaches it. Every other test here sources the checkout's own
+    installer_common.sh, where the helper is always its neighbour, so they all
+    take the branch that sources it for real. The arm below is the one an
+    incomplete checkout takes, and the two ways it can break are both silent
+    until then: a slip in its syntax stops the source at load time, and a stub
+    that does not define the function leaves every caller with an undefined
+    command.
+    """
+
+    def _source_without_helper(self, probe):
+        """Source a copy of installer_common.sh with no helper beside it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            installer_dir = root / "scripts" / "installer"
+            installer_dir.mkdir(parents=True)
+            copied = installer_dir / "installer_common.sh"
+            shutil.copy(_INSTALLER_COMMON, copied)
+            # Two levels up, where the file looks for them. The defaults are
+            # copied because their absence is a hard failure by design -- this
+            # test is about the helper's absence alone.
+            shutil.copy(_REPO_ROOT / "install.defaults.env", root / "install.defaults.env")
+            # gke_dns_endpoint.sh is deliberately NOT created beside the copy.
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            body = f'set -u\n{_PRINT_STUBS}\nsource "{copied}"\n{probe}'
+            return subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(root),
+            )
+
+    def test_a_tree_without_the_helper_still_defines_the_predicate(self):
+        # uninstall.sh calls this unconditionally. Were the stub missing or the
+        # arm broken, the call would be an undefined command and `set -e` would
+        # end a teardown over which endpoint to dial.
+        proc = self._source_without_helper('echo "kind=$(type -t gke_dns_endpoint_flag)"')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("kind=function", proc.stdout, proc.stderr)
+
+    def test_the_stub_leaves_the_flag_empty_so_the_fetch_is_unchanged(self):
+        # The empty flag is the command that ran before the helper existed, and
+        # it still reaches every cluster with a routable IP endpoint. A stub
+        # that left a stale value in place would splice it into get-credentials.
+        proc = self._source_without_helper(
+            'GKE_DNS_ENDPOINT_FLAG=--stale\n'
+            'gke_dns_endpoint_flag some-cluster us-central1 some-project\n'
+            'echo "flag=[${GKE_DNS_ENDPOINT_FLAG}]"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("flag=[]", proc.stdout, proc.stderr)
+
+    def test_it_says_so_rather_than_falling_back_in_silence(self):
+        # uninstall.sh and upgrade.sh are the front doors that reach this; the
+        # next thing their operator sees is an unrelated-looking missing key.
+        proc = self._source_without_helper("true")
+        self.assertIn("gke_dns_endpoint.sh", proc.stderr)
+        self.assertIn("IP endpoint", proc.stderr)
 
 
 class ToleratedProbesClearErrTrapTest(unittest.TestCase):

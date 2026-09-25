@@ -31,10 +31,6 @@
 # path nobody knows in advance.
 _installer_common_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
 INSTALL_DEFAULTS_FILE="${KUBE_AGENTS_INSTALL_DEFAULTS:-${_installer_common_dir}/../../install.defaults.env}"
-if [ -r "${_installer_common_dir}/gke_dns_endpoint.sh" ]; then
-  # shellcheck source=scripts/installer/gke_dns_endpoint.sh
-  . "${_installer_common_dir}/gke_dns_endpoint.sh"
-fi
 unset _installer_common_dir
 if [ -r "$INSTALL_DEFAULTS_FILE" ]; then
   # shellcheck source=/dev/null
@@ -47,6 +43,40 @@ else
   echo "  ℹ It ships with the repository. Re-clone, or point KUBE_AGENTS_INSTALL_DEFAULTS at a copy." >&2
   return 1 2>/dev/null || exit 1
 fi
+
+# ─── Control-plane endpoint selection ─────────────────────────────────────────
+# gke_dns_endpoint_flag, the one predicate deciding whether a cluster is reached
+# over its IP or its DNS control-plane endpoint. Sourced here rather than left
+# to the caller: common.sh and install.sh source the helper themselves, but
+# uninstall.sh sources only this file, and calling an undefined function under
+# `set -e` would end the run. Sourcing it twice is harmless — it defines a
+# function and initialises its memo, both at load time, before anything probes.
+#
+# Resolved relative to this file, like the defaults above and for the same
+# reason. Unlike upgrade.sh, which reads the helper out of a checkout because it
+# also runs piped from curl, this file is only ever sourced from one.
+#
+# A tree without the helper gets a stub rather than a refusal, which is the
+# answer the helper itself gives for a cluster it cannot describe: the empty
+# flag is the command that ran before the helper existed, and it still reaches
+# every cluster with a routable IP endpoint. The defaults above refuse because
+# they decide what gets installed; this only picks an endpoint to dial, and an
+# uninstall or upgrade is not worth stopping over it.
+#
+# uninstall.sh and upgrade.sh reach the stub: both source this file before
+# anything else loads the helper. install.sh does not — common.sh sources the
+# helper unguarded ahead of this file and would already have stopped on the
+# same missing file. It says so rather than falling back in silence, because
+# the next thing that caller sees is an unrelated-looking missing key.
+_gke_dns_endpoint_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gke_dns_endpoint.sh"
+if [ -r "$_gke_dns_endpoint_helper" ]; then
+  # shellcheck source=scripts/installer/gke_dns_endpoint.sh
+  . "$_gke_dns_endpoint_helper"
+else
+  echo "  ⚠ Cannot find ${_gke_dns_endpoint_helper}; reaching clusters over their IP endpoint." >&2
+  gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=""; }
+fi
+unset _gke_dns_endpoint_helper
 
 # Request timeout for kubectl probes against live clusters in the installer.
 readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
@@ -1558,13 +1588,19 @@ write_tfvars_from_state() {
   # live only in that cluster's Secret (a fresh clone has no install.env values),
   # and recovery is gated on the kubectl context actually being this cluster.
   if [ "$create_cluster" = "false" ] && command -v kubectl >/dev/null 2>&1; then
-    if type gke_dns_endpoint_flag >/dev/null 2>&1; then
-      GKE_DNS_ENDPOINT_FLAG=""
-      gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true
-    fi
+    # Through the helper, as the front doors' other credential fetches are.
+    # Without the flag a cluster whose IP endpoint this host cannot route to
+    # gets that IP written into the kubeconfig anyway, and the recovery loop
+    # below then reaches nothing. It cannot tell that from "no secret to
+    # recover" — both leave the keys empty — so the install would go on to
+    # generate a fresh SESSION_KV_SALT over the live one, re-anonymising every
+    # chat user, and report success.
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true
+    # Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
     # shellcheck disable=SC2086
     gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" \
-      --project "${PROJECT_ID}" ${GKE_DNS_ENDPOINT_FLAG:-} >/dev/null 2>&1 || true
+      --project "${PROJECT_ID}" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
   fi
 
   # install.env does not always carry the credentials: PERSIST_SECRETS_ON_DISK=false

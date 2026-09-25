@@ -19,9 +19,12 @@
 # most wrong, so this reads the cluster's configuration up front instead.
 #
 # This file is deliberately dependency-free -- no colours, no state file, no
-# print_* helpers -- because it is sourced by three shell libraries that do not
-# share anything else: scripts/installer/common.sh, hack/ci-env.sh, and
-# scripts/release/common.sh.
+# print_* helpers -- because it is sourced by callers that share nothing else
+# with each other: the installer libraries and front doors, CI, the release
+# scripts, and the Terraform composition's lifecycle.sh. Keep it that way, so
+# that taking the predicate never means taking anything along with it.
+# scripts/installer/README.md holds the roster; do not restate it here, where a
+# count goes stale the next time something sources this file.
 #
 # The Python equivalent, used by the agent at runtime, is
 # agents/platform/scripts/gke_endpoint.py. Keep the two predicates in step.
