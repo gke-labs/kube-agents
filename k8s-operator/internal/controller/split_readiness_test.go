@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -112,6 +113,27 @@ func a2aStackUp(agent *agentv1alpha1.PlatformAgent) []client.Object {
 	return []client.Object{discordBotSecret(agent), a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, true)}
 }
 
+// a2aStateFrom is the provision state reconcileA2A would have handed the status
+// writer this pass: the Job's digest name, and done when the Job in the fake
+// client reports Complete. The status writer no longer reads the Job itself.
+func a2aStateFrom(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent) a2aProvisionState {
+	t.Helper()
+	if !a2aStackRendering(agent) {
+		return a2aProvisionState{}
+	}
+	state := a2aProvisionState{jobName: buildA2AProvisionJob(agent).Name}
+	job := &batchv1.Job{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: state.jobName, Namespace: agent.Namespace}, job); err != nil {
+		return state
+	}
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
+			state.done = true
+		}
+	}
+	return state
+}
+
 func settleStatus(t *testing.T, agent *agentv1alpha1.PlatformAgent, objects ...client.Object) (string, string) {
 	t.Helper()
 	scheme := setupScheme()
@@ -124,7 +146,7 @@ func settleStatus(t *testing.T, agent *agentv1alpha1.PlatformAgent, objects ...c
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 
 	ctx := context.Background()
-	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent))
+	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, cl, agent))
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -225,7 +247,7 @@ func TestReadSplitWorkloadsReportsAnAbsentObjectAsNotReady(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build()
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 
-	workloads, _, err := r.readSplitWorkloads(context.Background(), agent)
+	workloads, _, err := r.readSplitWorkloads(context.Background(), agent, a2aProvisionState{})
 	if err != nil {
 		t.Fatalf("an absent workload is not a read failure: %v", err)
 	}
@@ -444,12 +466,134 @@ func TestReadyWaitsOnEveryWorkloadTheModeRenders(t *testing.T) {
 // re-run takes. A CR that has never been Ready still waits on it.
 func TestAProvisionedBusStaysReadyThroughTheJobReRun(t *testing.T) {
 	agent := splitReadinessNextAgent()
-	agent.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Reconciled", LastTransitionTime: metav1.Now()}}
+	agent.Status.Conditions = []metav1.Condition{{Type: busProvisionedConditionType, Status: metav1.ConditionTrue, Reason: busProvisionedReason, LastTransitionTime: metav1.Now()}}
 	objects := []client.Object{discordBotSecret(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1),
 		a2aGatewayWorkload(agent, 1), a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, false)}
 	phase, _ := settleStatus(t, agent, objects...)
 	if phase != "Ready" {
 		t.Errorf("got phase %q, want Ready: the bus was provisioned once and the Job is only re-running", phase)
+	}
+	if !busProvisioned(agent) {
+		t.Error("the re-run removed the provisioned-once record; the next pass would count the Job again")
+	}
+}
+
+// TestAReadyInheritedFromAnOlderOperatorDoesNotLatchTheJob: the latch is keyed
+// on a condition only this code writes. An install upgraded from an operator
+// that never counted the Job arrives with Ready=True/Reconciled and an
+// unprovisioned bus (#1701's state), and that Ready must not stand in for a
+// completion nobody saw.
+func TestAReadyInheritedFromAnOlderOperatorDoesNotLatchTheJob(t *testing.T) {
+	agent := splitReadinessNextAgent()
+	agent.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Reconciled",
+		Message: "Gateway, shell sandbox, credential broker and A2A gateway are all ready", LastTransitionTime: metav1.Now()}}
+	objects := []client.Object{discordBotSecret(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1),
+		a2aGatewayWorkload(agent, 1), a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, false)}
+	phase, msg := settleStatus(t, agent, objects...)
+	if phase != "Provisioning" {
+		t.Fatalf("got phase %q, want Provisioning: the inherited Ready says nothing about the bus and the Job is not complete", phase)
+	}
+	if !strings.Contains(msg, "Job "+buildA2AProvisionJob(agent).Name) {
+		t.Errorf("the message does not name the Job Ready waits on: %q", msg)
+	}
+	if busProvisioned(agent) {
+		t.Error("BusProvisioned was written without a completion")
+	}
+}
+
+// TestTheFirstCompletionRecordsBusProvisioned: the pass that sees the Job
+// complete is Ready and writes the record; the record then carries a later
+// pass whose Job is re-running.
+func TestTheFirstCompletionRecordsBusProvisioned(t *testing.T) {
+	agent := splitReadinessNextAgent()
+	objects := []client.Object{discordBotSecret(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1),
+		a2aGatewayWorkload(agent, 1), a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, true)}
+	phase, _ := settleStatus(t, agent, objects...)
+	if phase != "Ready" {
+		t.Fatalf("got phase %q, want Ready on the pass that sees the Job complete", phase)
+	}
+	cond := meta.FindStatusCondition(agent.Status.Conditions, busProvisionedConditionType)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != busProvisionedReason {
+		t.Fatalf("the completion was not recorded: %+v", cond)
+	}
+	if !strings.Contains(cond.Message, buildA2AProvisionJob(agent).Name) {
+		t.Errorf("the record does not name the Job that provisioned the bus: %q", cond.Message)
+	}
+
+	// The TTL removed the Job and create-if-absent built a new one that has
+	// not finished: still Ready, on the record alone.
+	rerun := splitReadinessNextAgent()
+	rerun.Status.Conditions = append([]metav1.Condition(nil), agent.Status.Conditions...)
+	objects = []client.Object{discordBotSecret(rerun), readyGateway(rerun), shellSandbox(rerun, 1), credentialBroker(rerun, 1),
+		a2aGatewayWorkload(rerun, 1), a2aNATS(rerun, 1), a2aCallout(rerun, 1), a2aProvisionJob(rerun, false)}
+	if phase, msg := settleStatus(t, rerun, objects...); phase != "Ready" {
+		t.Errorf("got phase %q (%q) on the re-run, want Ready", phase, msg)
+	}
+}
+
+// TestBusProvisionedIsPersistedWhenNothingElseChanged: the record has its
+// own term in the unchanged-status early return. Without one, a pass whose
+// phase, message and generation already match (a same-build restart on an
+// install whose record was lost, a Ready written by hand) would see the Job
+// complete and skip the write, and the next TTL re-run would count the Job
+// again.
+func TestBusProvisionedIsPersistedWhenNothingElseChanged(t *testing.T) {
+	agent := splitReadinessNextAgent()
+	agent.Generation = 3
+	agent.Status.Phase = "Ready"
+	agent.Status.ObservedGeneration = 3
+	agent.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Reconciled",
+		Message:            "Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready",
+		ObservedGeneration: 3, LastTransitionTime: metav1.Now()}}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, discordBotSecret(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1),
+			a2aGatewayWorkload(agent, 1), a2aNATS(agent, 1), a2aCallout(agent, 1), a2aProvisionJob(agent, true)).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+	ctx := context.Background()
+	// Settle the rest of the status the writer compares, then take the
+	// record away and persist that, so the record is the only thing the
+	// next pass finds different.
+	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, cl, agent)); err != nil {
+		t.Fatal(err)
+	}
+	meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
+	if err := cl.Status().Update(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	ready := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
+	if ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Fatalf("precondition: the settled CR is not Ready: %+v", ready)
+	}
+
+	phase, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, cl, agent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if phase != "Ready" {
+		t.Fatalf("got phase %q, want Ready", phase)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}, stored); err != nil {
+		t.Fatal(err)
+	}
+	if !busProvisioned(stored) {
+		t.Error("BusProvisioned was not persisted on a pass where nothing else about the status changed")
+	}
+}
+
+// TestBusProvisionedLeavesWithTheStack: a flip to today tears the bus down,
+// and the record goes with it rather than describing a bus that is gone.
+func TestBusProvisionedLeavesWithTheStack(t *testing.T) {
+	agent := splitReadinessAgent()
+	agent.Status.Conditions = []metav1.Condition{{Type: busProvisionedConditionType, Status: metav1.ConditionTrue, Reason: busProvisionedReason, LastTransitionTime: metav1.Now()}}
+	settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
+	if busProvisioned(agent) {
+		t.Error("a today install still carries BusProvisioned")
 	}
 }
 
@@ -469,7 +613,7 @@ func TestTheDarkGatewayConditionClearsEvenWhenTheReadyMessageDoesNot(t *testing.
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 	ctx := context.Background()
-	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent)); err != nil {
+	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, cl, agent)); err != nil {
 		t.Fatal(err)
 	}
 	if meta.FindStatusCondition(agent.Status.Conditions, a2aGatewayConditionType) == nil {
@@ -483,7 +627,7 @@ func TestTheDarkGatewayConditionClearsEvenWhenTheReadyMessageDoesNot(t *testing.
 	if err := cl.Create(ctx, a2aGatewayWorkload(agent, 1)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent)); err != nil {
+	if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aStateFrom(t, ctx, cl, agent)); err != nil {
 		t.Fatal(err)
 	}
 	persisted := &agentv1alpha1.PlatformAgent{}

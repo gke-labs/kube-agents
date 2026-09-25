@@ -741,8 +741,8 @@ rendered regardless, so any install with neither a Discord token nor a Chat rela
 gateway Deployment that crash-looped forever and nothing could rollout-gate on. The operator
 now asks first: a `mode: next` install with no chat backend - no `discord-bot` Secret in the
 namespace and no door armed - gets no gateway Deployment at all, its `Ready` counts the rest
-of the stack (NATS, the auth callout, the provisioning Job, the sandbox, the broker, today's
-gateway), and an `A2AGateway` condition (`status: False`, `Reason: NoChatBackend`) names what
+of the stack (NATS, the auth callout, the provisioning Job's first completion, the sandbox, the
+broker, today's gateway), and an `A2AGateway` condition (`status: False`, `Reason: NoChatBackend`) names what
 would render it. The rule is creation-only, like the callout ordering gate: a gateway that
 exists keeps reconciling whatever happened to its backend, because deleting it would take
 every session pod that hangs off its UID. An eval install with this door armed has an ingress

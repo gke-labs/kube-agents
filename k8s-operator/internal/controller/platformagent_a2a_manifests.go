@@ -2609,6 +2609,10 @@ type a2aProvisionState struct {
 	// already exists is never withheld on this account; see the call site.
 	gatewayDark       bool
 	gatewayDarkReason string
+	// jobName is the provisioning Job this pass rendered, by its digest
+	// name. The status writer names it when it is what Ready waits on,
+	// and carrying it saves re-rendering the JobSpec to hash it again.
+	jobName string
 }
 
 // a2aDiscordBotSecretName is the hand-made Secret carrying the Discord bot
@@ -2626,6 +2630,20 @@ const (
 const (
 	a2aGatewayConditionType = "A2AGateway"
 	a2aGatewayDarkReason    = "NoChatBackend"
+)
+
+// The condition that records the bus having been provisioned once: written
+// the first pass that sees the provisioning Job complete, kept through the
+// Job's later lives (the 24h TTL removes a finished Job and create-if-absent
+// runs it again; a digest change runs a new one), removed with the rest of
+// the stack when the mode flips to today. It is what lets Ready stop
+// counting the Job after the first completion. Only this code writes it, so
+// a Ready inherited from an operator that never counted the Job cannot seed
+// it: that operator is the one #1701 describes, and its Ready is exactly the
+// claim not to trust.
+const (
+	busProvisionedConditionType = "BusProvisioned"
+	busProvisionedReason        = "ProvisionJobComplete"
 )
 
 // a2aGatewayBackend reports whether the install gives the gateway a chat
@@ -2818,6 +2836,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// name and a fresh run. The superseded generation is swept below rather
 	// than left to its TTL, for the reason the sweep's own comment gives.
 	job := buildA2AProvisionJob(agent)
+	state.jobName = job.Name
 	if err := ctrl.SetControllerReference(agent, job, r.Scheme); err != nil {
 		return state, err
 	}
@@ -3023,11 +3042,24 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// a running gateway gets the crash loop that has always followed that,
 	// visible on the pod; an operator who never created one gets no
 	// Deployment and a condition instead.
-	if configured, why, err := r.a2aGatewayBackend(ctx, agent); err != nil {
-		return state, err
-	} else if !configured {
-		err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{})
-		if errors.IsNotFound(err) {
+	//
+	// Existence first, backend second, so the backend question (an uncached
+	// Secret read when no door is armed) is asked only on the pass that
+	// would create the gateway, and a running install pays nothing for it.
+	// Through the informer rather than a2aReader, unlike the callout gate
+	// below, because the stale directions cost differently here: a stale
+	// NotFound withholds an apply the gateway does not need for one pass,
+	// and a stale hit -- the Deployment deleted inside the informer's lag,
+	// with the Secret gone at the same moment -- falls through to the callout
+	// gate's live read and at worst re-creates the crash-looping gateway
+	// every install had before this gate. A live read would buy that corner
+	// with one API call per pass on every next install.
+	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{}); errors.IsNotFound(err) {
+		configured, why, berr := r.a2aGatewayBackend(ctx, agent)
+		if berr != nil {
+			return state, berr
+		}
+		if !configured {
 			state.gatewayDark = true
 			state.gatewayDarkReason = why
 			logf.FromContext(ctx).Info("withholding the A2A gateway: no chat backend is configured", "deployment", dep.Name)
@@ -3036,9 +3068,8 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 			}
 			return state, nil
 		}
-		if err != nil {
-			return state, err
-		}
+	} else if err != nil {
+		return state, err
 	}
 	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep, calloutGeneration); err != nil {
 		return state, err

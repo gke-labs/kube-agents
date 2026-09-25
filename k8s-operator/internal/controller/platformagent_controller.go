@@ -32,7 +32,6 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
@@ -753,7 +752,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf)
+	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf, a2aState)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -2544,7 +2543,7 @@ type splitWorkloadStatus struct {
 // is left out of the list rather than counted as not ready, because it is
 // absent on purpose and Ready would otherwise never be true on such an
 // install (#1660, option 1).
-func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]splitWorkloadStatus, string, error) {
+func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent *agentv1alpha1.PlatformAgent, a2a a2aProvisionState) ([]splitWorkloadStatus, string, error) {
 	shell := &appsv1.StatefulSet{}
 	shellName := shellSandboxName(agent)
 	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: shellName}, shell); err != nil {
@@ -2614,27 +2613,23 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 		// it again; a2aProvisionJobName's comment) or a digest change, both
 		// of which re-run an idempotent script against a bus that is already
 		// there, and neither should flip a Ready install to Provisioning for
-		// the minute it takes. "Provisioned once" is read off this CR's own
-		// Ready condition: True with reason Reconciled is a pass that counted
-		// the Job complete. A Failed Job is A2AProvisionFailed's, before this
-		// runs.
-		jobName := buildA2AProvisionJob(agent).Name
-		job := &batchv1.Job{}
-		var provisioned int32
-		if ready := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); ready != nil &&
-			ready.Status == metav1.ConditionTrue && ready.Reason == "Reconciled" {
-			provisioned = 1
+		// the minute it takes. "Provisioned once" is the BusProvisioned
+		// condition, which only a pass that saw the Job complete writes
+		// (updateStatusReady, below); this pass's own sighting counts too, so
+		// the first completion is Ready on the pass that sees it. Not the
+		// Ready condition: an install upgraded from an operator that never
+		// counted the Job carries a Ready=True that says nothing about the
+		// bus, and a latch seeded from it would never count the Job at all.
+		// The Job itself is not read again here; reconcileA2A read it this
+		// pass and a2a carries the answer. A Failed Job is
+		// A2AProvisionFailed's, before this runs.
+		jobName := a2a.jobName
+		if jobName == "" {
+			jobName = strings.TrimSuffix(agent.Name+a2aProvisionJobNameInfix, "-")
 		}
-		if err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: jobName}, job); err != nil {
-			if !errors.IsNotFound(err) {
-				return nil, "", fmt.Errorf("failed to get A2A provision Job for status update: %w", err)
-			}
-		} else {
-			for _, c := range job.Status.Conditions {
-				if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
-					provisioned = 1
-				}
-			}
+		var provisioned int32
+		if a2a.done || busProvisioned(agent) {
+			provisioned = 1
 		}
 		workloads = append(workloads,
 			splitWorkloadStatus{name: natsName, kind: "StatefulSet", ready: nats.Status.ReadyReplicas},
@@ -2659,7 +2654,6 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 			if !configured {
 				gatewayDark = why
 			} else {
-				gateway.Status.ReadyReplicas = 0
 				workloads = append(workloads, splitWorkloadStatus{name: gatewayName, kind: "Deployment", ready: 0})
 			}
 		} else {
@@ -2672,11 +2666,20 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 	return workloads, gatewayDark, nil
 }
 
+// busProvisioned reports whether this CR has recorded the bus provisioned
+// once (the BusProvisioned condition, True).
+func busProvisioned(agent *agentv1alpha1.PlatformAgent) bool {
+	return meta.IsStatusConditionTrue(agent.Status.Conditions, busProvisionedConditionType)
+}
+
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
 // the caller can decide whether the agent is still converging. otlpEndpoint, otlpSource,
 // and netpolProfile are the resolved telemetry and network policy wiring; they are reported
 // rather than derived because discovery is otherwise invisible to anyone reading the CR.
-func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string, netpolProfile netpolProfile) (string, error) {
+// a2a is what reconcileA2A found this pass (zero on a today install): whether the
+// provisioning Job is complete and what it is called, so the status write neither
+// re-reads the Job nor re-renders it to learn its name.
+func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string, netpolProfile netpolProfile, a2a a2aProvisionState) (string, error) {
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
@@ -2755,7 +2758,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// The workloads the gateway's own readiness does not cover. Read before the phase
 	// is decided, because Ready is a claim about every one of them and not about the
 	// gateway alone.
-	splitWorkloads, a2aGatewayDark, errSplit := r.readSplitWorkloads(ctx, agent)
+	splitWorkloads, a2aGatewayDark, errSplit := r.readSplitWorkloads(ctx, agent, a2a)
 	if errSplit != nil {
 		return "", errSplit
 	}
@@ -2877,6 +2880,15 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		(a2aGatewayDark != "" && existingA2AGatewayCond != nil && existingA2AGatewayCond.Status == metav1.ConditionFalse &&
 			existingA2AGatewayCond.Reason == a2aGatewayDarkReason && existingA2AGatewayCond.Message == a2aGatewayDark)
 
+	// The provisioned-once record. Sticky under next: wanted once this pass
+	// or an earlier one saw the Job complete, and its message keeps naming
+	// the Job that first did, so a re-run under a new digest is not a write.
+	// Absent under today, where the flip's teardown took the bus with it.
+	existingBusProvisionedCond := meta.FindStatusCondition(agent.Status.Conditions, busProvisionedConditionType)
+	wantBusProvisioned := a2aStackRendering(agent) && (a2a.done || busProvisioned(agent))
+	busProvisionedUnchanged := (wantBusProvisioned && existingBusProvisionedCond != nil && existingBusProvisionedCond.Status == metav1.ConditionTrue) ||
+		(!wantBusProvisioned && existingBusProvisionedCond == nil)
+
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
 	// A Degraded/RBACIncomplete condition is reportRBACSkew's, and this function
@@ -2911,6 +2923,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		eventWatcherUnchanged &&
 		hostPathDroppedUnchanged &&
 		a2aGatewayUnchanged &&
+		busProvisionedUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
 		return newPhase, nil
@@ -2990,6 +3003,21 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			Status:             metav1.ConditionFalse,
 			Reason:             a2aGatewayDarkReason,
 			Message:            a2aGatewayDark,
+			ObservedGeneration: agent.Generation,
+			LastTransitionTime: now,
+		})
+	}
+
+	switch {
+	case !wantBusProvisioned:
+		meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
+	case existingBusProvisionedCond == nil || existingBusProvisionedCond.Status != metav1.ConditionTrue:
+		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+			Type:   busProvisionedConditionType,
+			Status: metav1.ConditionTrue,
+			Reason: busProvisionedReason,
+			Message: fmt.Sprintf("provisioning Job %s completed; the Job's later re-runs (the 24h TTL, a digest change) do not hold Ready",
+				a2a.jobName),
 			ObservedGeneration: agent.Generation,
 			LastTransitionTime: now,
 		})

@@ -648,7 +648,7 @@ func TestACalloutCanServeANewGatewayFromOneReadyUpdatedReplica(t *testing.T) {
 
 // a2aGateTestReconcilerWithoutABackend is a2aGateTestReconciler minus the
 // discord-bot Secret it seeds, for the tests that are about its absence.
-func a2aGateTestReconcilerWithoutABackend(t *testing.T, agent *agentv1alpha1.PlatformAgent) (*PlatformAgentReconciler, client.Client) {
+func a2aGateTestReconcilerWithoutABackend(t *testing.T, agent *agentv1alpha1.PlatformAgent) (*PlatformAgentReconciler, client.Client, ctrl.Request) {
 	t.Helper()
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
@@ -657,13 +657,95 @@ func a2aGateTestReconcilerWithoutABackend(t *testing.T, agent *agentv1alpha1.Pla
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
-	return &PlatformAgentReconciler{Client: cl, Scheme: scheme}, cl
+	return &PlatformAgentReconciler{Client: cl, Scheme: scheme}, cl,
+		ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+}
+
+// TestADarkGatewayKeepsTheReconcileRequeuing: the discord-bot Secret is not
+// watched, so the pass that renders the gateway once a Secret appears has to
+// be a pass that happens. Measured on a provisioned bus with the callout
+// serving, for the reason TestAWithheldGatewayRendersOnceACalloutReplicaServes
+// gives: an unprovisioned bus or a held gateway requeues on its own account,
+// and the install where the dark term alone carries the requeue is the one
+// where everything else is done. The interval, not merely non-zero: the
+// telemetry re-probe requeues at 15 minutes, which is how long a new Secret
+// would wait with this term deleted.
+func TestADarkGatewayKeepsTheReconcileRequeuing(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+
+	// Settled first: a first pass over a fresh CR returns on its own
+	// bookkeeping (the finalizer write) before the requeue is decided, as
+	// the callout gate's test does.
+	var res ctrl.Result
+	for i := 0; i < 3; i++ {
+		var err error
+		if res, err = r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d with a dark gateway: %v", i+1, err)
+		}
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); !errors.IsNotFound(err) {
+		t.Fatalf("precondition: the gateway rendered without a backend (err=%v)", err)
+	}
+	if res.RequeueAfter != 30*time.Second {
+		t.Errorf("a dark gateway on a provisioned bus requeued after %s, want 30s; nothing watches the discord-bot Secret", res.RequeueAfter)
+	}
+}
+
+// TestARunningGatewayDoesNotReadTheSecret: the backend question costs an
+// uncached Secret read, and it is asked only on the pass that would create
+// the gateway. An install whose gateway exists pays nothing for the gate.
+func TestARunningGatewayDoesNotReadTheSecret(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	secretReads := 0
+	funcs := fakeServerSideApplyInterceptors()
+	funcs.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.Secret); ok && key.Name == a2aDiscordBotSecretName {
+			secretReads++
+		}
+		return c.Get(ctx, key, obj, opts...)
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, sandboxKeysSecret(agent), discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(funcs).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("precondition: the gateway renders with the Secret present: %v", err)
+	}
+	if secretReads == 0 {
+		t.Fatal("precondition: the creating pass never asked the backend question; the counter is not counting")
+	}
+
+	secretReads = 0
+	for i := 0; i < 3; i++ {
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatalf("reconcileA2A %d with the gateway running: %v", i+1, err)
+		}
+	}
+	if secretReads != 0 {
+		t.Errorf("a running gateway's reconcile read the discord-bot Secret %d times in three passes, want 0", secretReads)
+	}
 }
 
 func TestAGatewayIsNotRenderedWithoutAChatBackend(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := a2aTestAgent()
-	r, cl := a2aGateTestReconcilerWithoutABackend(t, agent)
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
 
@@ -689,7 +771,7 @@ func TestAGatewayIsNotRenderedWithoutAChatBackend(t *testing.T) {
 func TestTheDiscordSecretRendersTheGateway(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := a2aTestAgent()
-	r, cl := a2aGateTestReconcilerWithoutABackend(t, agent)
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	if state, err := r.reconcileA2A(ctx, agent); err != nil || !state.gatewayDark {
@@ -714,7 +796,7 @@ func TestTheDiscordSecretRendersTheGateway(t *testing.T) {
 func TestTheInjectDoorRendersTheGatewayWithoutASecret(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
 	agent := a2aTestAgent()
-	r, cl := a2aGateTestReconcilerWithoutABackend(t, agent)
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	state, err := r.reconcileA2A(ctx, agent)
@@ -768,7 +850,7 @@ func TestAnExistingGatewayKeepsReconcilingWithoutABackend(t *testing.T) {
 func TestADiscordSecretWithoutATokenIsNotABackend(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := a2aTestAgent()
-	r, cl := a2aGateTestReconcilerWithoutABackend(t, agent)
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	wrong := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: a2aDiscordBotSecretName, Namespace: agent.Namespace},
