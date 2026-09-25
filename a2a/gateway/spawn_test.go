@@ -189,6 +189,24 @@ func TestSpawnedSessionsCarryNoBusPasswordAndAPodBoundTokenInstead(t *testing.T)
 	}
 	c := pod.Spec.Containers[0]
 
+	// Requests and limits on the session container, both resources: a
+	// namespace ResourceQuota that requires limits refuses the pod at
+	// admission otherwise, and a refused session pod is a delegation that
+	// never starts.
+	for _, res := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		req, ok := c.Resources.Requests[res]
+		if !ok || req.IsZero() {
+			t.Errorf("session pod has no %s request", res)
+		}
+		lim, ok := c.Resources.Limits[res]
+		if !ok || lim.IsZero() {
+			t.Errorf("session pod has no %s limit; a limits-requiring quota refuses it", res)
+		}
+		if ok && req.Cmp(lim) > 0 {
+			t.Errorf("session pod %s request %s exceeds its limit %s", res, req.String(), lim.String())
+		}
+	}
+
 	// Nothing in the environment carries a credential, by value or by
 	// reference. Checked as "no env var reads a Secret" rather than as "no
 	// env var is named NATS_PASSWORD", because the hole is the delivery

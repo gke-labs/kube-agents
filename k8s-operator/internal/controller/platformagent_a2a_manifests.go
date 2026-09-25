@@ -135,7 +135,53 @@ const (
 	a2aProvisionImageEnvVar = "A2A_PROVISION_IMAGE"
 	// nats-box carries the nats CLI the provisioning script drives.
 	defaultA2AProvisionImage = "natsio/nats-box:0.14.5"
-	a2aGatewayImageEnvVar    = "A2A_GATEWAY_IMAGE"
+
+	// Requests and limits on the next-stack pods. A namespace whose
+	// ResourceQuota requires limits refuses a pod that omits them at
+	// admission, per container, and the refusal surfaces as a stack that
+	// never schedules while nothing in the render looks wrong (the sandbox's
+	// own resources block says the same). On a GKE Autopilot cluster a pod
+	// with no requests is also sized at the platform's per-pod default (0.5
+	// vCPU and 2GiB on the general-purpose class, observed on the dev
+	// install), which is more than any of these uses; and on an Autopilot
+	// cluster without Pod bursting the limit is rewritten to equal the
+	// request, so every request below is also a ceiling the pod can live
+	// under, which is why NATS asks for more than it uses idle.
+	//
+	// Sized from what the pods use on a dev install (NATS about 10Mi and a
+	// few millicores idle with the four streams provisioned; the gateway and
+	// the callout under 20Mi; the provisioning Job a short nats CLI run) with
+	// headroom for an eval run's traffic, not from a load measurement. NATS
+	// gets the most: JetStream keeps stream indexes in memory and the TASKS
+	// stream is sized at 20GiB on disk. Named constants so the next
+	// measurement changes one line.
+	a2aNATSCPURequest    = "250m"
+	a2aNATSMemoryRequest = "512Mi"
+	a2aNATSCPULimit      = "1"
+	a2aNATSMemoryLimit   = "1Gi"
+
+	a2aGatewayCPURequest    = "50m"
+	a2aGatewayMemoryRequest = "64Mi"
+	a2aGatewayCPULimit      = "500m"
+	a2aGatewayMemoryLimit   = "512Mi"
+
+	a2aProvisionCPURequest    = "50m"
+	a2aProvisionMemoryRequest = "64Mi"
+	a2aProvisionCPULimit      = "200m"
+	a2aProvisionMemoryLimit   = "256Mi"
+
+	// The callout already carried requests and a memory limit; the CPU
+	// limit is what a limits.cpu quota was still missing, and a refused
+	// callout is a provision Job that waits forever on it.
+	a2aCalloutCPULimit = "500m"
+
+	// a2aProvisionWaitContainerName is the Job's init container that waits
+	// for the auth callout; a2aCalloutWaitInterval is how often it retries
+	// (seconds) and a2aCalloutWaitProbeTimeout how long one probe may take.
+	a2aProvisionWaitContainerName = "wait-for-callout"
+	a2aCalloutWaitInterval        = "3"
+	a2aCalloutWaitProbeTimeout    = "3"
+	a2aGatewayImageEnvVar         = "A2A_GATEWAY_IMAGE"
 	// The stage 1 dev registry. A dev toggle's default may name a dev
 	// registry; graduation moves this to the release pipeline alongside the
 	// other first-party images.
@@ -1285,6 +1331,20 @@ func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secr
 // and leaks the PV on every CR deletion. One spelling, both sites.
 const a2aNATSDataClaim = "data"
 
+// a2aResources builds the requests-and-limits block from the constants above.
+func a2aResources(cpuRequest, memoryRequest, cpuLimit, memoryLimit string) corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpuRequest),
+			corev1.ResourceMemory: resource.MustParse(memoryRequest),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpuLimit),
+			corev1.ResourceMemory: resource.MustParse(memoryLimit),
+		},
+	}
+}
+
 func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string) *appsv1.StatefulSet {
 	name := a2aNATSName(agent)
 	labels := a2aLabels(agent, "nats")
@@ -1330,6 +1390,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 							{Name: a2aNATSDataClaim, MountPath: "/data"},
 						},
 						SecurityContext: hardenedSecurityContext(),
+						Resources:       a2aResources(a2aNATSCPURequest, a2aNATSMemoryRequest, a2aNATSCPULimit, a2aNATSMemoryLimit),
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("monitor")},
@@ -1993,11 +2054,43 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						Name:         "tmp",
 						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 					}},
+					// The callout is the Job's authentication path: the
+					// provision principal has no static password, so every
+					// connection it makes is decided by a callout replica
+					// serving the identity map. Nothing else orders the Job
+					// after the callout, and a Job that starts first fails
+					// on "authentication error" and spends its backoff on
+					// the ordering -- measured at nine attempts and nineteen
+					// minutes with no streams for that whole window. This
+					// init container makes the callout a hard dependency:
+					// the provision container does not start until the
+					// callout Service answers its readiness probe, which it
+					// does only while a replica is serving a map. A Job
+					// waiting here reads Init:0/1 on the pod rather than a
+					// climbing restart count, and `kubectl logs <pod> -c
+					// wait-for-callout` says what it is waiting for. (wget is
+					// busybox's, present in the nats-box image; checked with
+					// crane export, the way the WORKDIR note below was
+					// measured.)
+					InitContainers: []corev1.Container{{
+						Name:            a2aProvisionWaitContainerName,
+						Image:           a2aProvisionImage(),
+						Command:         []string{"sh", "-c", a2aWaitForCalloutScript(agent)},
+						SecurityContext: hardenedSecurityContext(),
+						Resources:       a2aResources(a2aProvisionCPURequest, a2aProvisionMemoryRequest, a2aProvisionCPULimit, a2aProvisionMemoryLimit),
+						// The same image runs as the same uid with the same
+						// WORKDIR problem the provision container documents
+						// below, so it gets the same writable cwd.
+						WorkingDir:   a2aProvisionWritablePath,
+						Env:          []corev1.EnvVar{{Name: "HOME", Value: a2aProvisionWritablePath}},
+						VolumeMounts: []corev1.VolumeMount{{Name: "tmp", MountPath: a2aProvisionWritablePath}},
+					}},
 					Containers: []corev1.Container{{
 						Name:            "provision",
 						Image:           a2aProvisionImage(),
 						Command:         []string{"sh", "-c", script},
 						SecurityContext: hardenedSecurityContext(),
+						Resources:       a2aResources(a2aProvisionCPURequest, a2aProvisionMemoryRequest, a2aProvisionCPULimit, a2aProvisionMemoryLimit),
 						// nats-box ships WORKDIR /root and declares no USER,
 						// so it expects to run as root (measured with
 						// `crane config` on 0.14.5). The pod above runs it as
@@ -2039,6 +2132,29 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 	}
 	job.Name = a2aProvisionJobName(agent, job.Spec)
 	return job
+}
+
+// a2aWaitForCalloutScript polls the callout Service's readiness endpoint
+// until it answers 2xx. The endpoint is the same one the callout's own
+// readiness probe reads (/readyz on a2aCalloutStatusPort), so "answers" means
+// what it means to the kubelet: a replica is serving the identity map. Busybox
+// wget, which the nats-box image carries; its own error line (a 503, a DNS
+// failure) is left on stderr so the reason is in the log beside the attempt
+// count. The loop is unbounded on purpose,
+// because a callout that never serves is a fault the callout's own condition
+// and events name, and a Job that gave up would only re-create itself under
+// its TTL and wait again.
+func a2aWaitForCalloutScript(agent *agentv1alpha1.PlatformAgent) string {
+	url := fmt.Sprintf("http://%s.%s.svc:%d/readyz", a2aCalloutName(agent), agent.Namespace, a2aCalloutStatusPort)
+	return fmt.Sprintf(`url=%q
+i=0
+until wget -q -T %s -O /dev/null "$url"; do
+  i=$((i+1))
+  echo "waiting for the auth callout to serve (attempt $i): $url"
+  sleep %s
+done
+echo "the auth callout is serving: $url"
+`, url, a2aCalloutWaitProbeTimeout, a2aCalloutWaitInterval)
 }
 
 // a2aProvisionJobName derives the provision Job's name from a digest of its
@@ -2488,6 +2604,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						// it wants a directory it can traverse, not one it can
 						// write.
 						WorkingDir: "/",
+						Resources:  a2aResources(a2aGatewayCPURequest, a2aGatewayMemoryRequest, a2aGatewayCPULimit, a2aGatewayMemoryLimit),
 						Env: append([]corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							{Name: "NATS_USER", Value: "gateway"},
