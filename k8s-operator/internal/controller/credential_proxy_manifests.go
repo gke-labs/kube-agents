@@ -69,13 +69,29 @@ const (
 	// every container start, so nothing is gained by letting it reach a disk.
 	credentialProxyWIFCredentialFile = "/var/run/credential-proxy/wif-credentials.json" // #nosec G101 -- File path, not a credential
 
-	// The CPU the broker container requests. Sized for a cold pod: after an
-	// eviction the replacement passes its readiness probe five seconds in, and
-	// the first mints then arrive while gcloud and the Minty client are still
-	// warming up, each under a five-second timeout. At 100m those calls timed
-	// out for minutes and one throttled pod kept timing out for over an hour;
-	// 500m lets a mint finish inside its timeout while the pod warms.
-	credentialProxyCPURequest = "500m"
+	// What the broker container requests.
+	//
+	// CPU is sized for a cold pod. After an eviction the replacement passes
+	// its readiness probe five seconds in, and the first mints then arrive
+	// while gcloud and the Minty client are still warming up, each bounded by
+	// GCLOUD_TIMEOUT_SECONDS and MINTY_REQUEST_TIMEOUT_SECONDS in
+	// agents/platform/scripts/github_token_refresh.py. Observed on Autopilot,
+	// the composition's default, where a pod without bursting has its CPU
+	// limit clamped to its request: at 100m the request was the ceiling, the
+	// calls timed out for minutes after a start and one throttled pod kept
+	// timing out for over an hour. 500m lets a mint finish inside its timeout
+	// while the pod warms. On Standard the ceiling is the 1-CPU limit and the
+	// request is scheduling weight, which matters only on a contended node.
+	//
+	// Memory is lower than the sidecar's, which sized for the event watcher's
+	// informer caches. Nothing here holds cluster state; the memory goes on
+	// Envoy and one Python process per in-flight command. Autopilot enforces a
+	// CPU:memory ratio between 1:1 and 1:6.5 GiB per vCPU and raises the
+	// smaller request to meet it, so there this pod is admitted at 512Mi
+	// whatever this line says; that is accepted, as it is for LiteLLM in the
+	// chart's values, rather than raised for Standard, which does not need it.
+	credentialProxyCPURequest    = "500m"
+	credentialProxyMemoryRequest = "256Mi"
 )
 
 // credentialProxyFederation returns the federation config when it is complete.
@@ -294,12 +310,10 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 			FailureThreshold:    3,
 		},
 		Resources: corev1.ResourceRequirements{
-			// Memory lower than the sidecar's, which sized for the event
-			// watcher's informer caches. Nothing here holds cluster state; the
-			// memory goes on Envoy and one Python process per in-flight
-			// command. CPU is sized for the warm-up after an eviction; see
-			// credentialProxyCPURequest.
-			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(credentialProxyCPURequest), corev1.ResourceMemory: resource.MustParse("256Mi")},
+			// Sized where the constants are declared: CPU for the warm-up
+			// after an eviction, memory for Envoy and one Python process per
+			// in-flight command.
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(credentialProxyCPURequest), corev1.ResourceMemory: resource.MustParse(credentialProxyMemoryRequest)},
 			Limits: corev1.ResourceList{
 				corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
 			},
