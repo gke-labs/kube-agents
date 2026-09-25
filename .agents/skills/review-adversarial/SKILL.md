@@ -222,7 +222,7 @@ Read the pull request's **Self-Review** and **Testing** sections when there is a
 `fix`-type pull request its **Bug Fix: Preventing Recurrence** section. `AGENTS.md` is canonical
 for what the first two owe a reviewer — "What any reviewer reads first" for the Self-Review, and
 the live-validation bullet under Pull Request Hygiene with `.agents/rules/pre_pr_review.md` for
-Testing — and `pre_pr_review.md` alone for the third. What this angle adds is that they are claims
+Testing — and `pre_pr_review.md` for the third. What this angle adds is that they are claims
 the tree can check: every path, script, or command the Testing section credits must exist and do
 what it is credited with, and a guard or test the description says covers a case must reach that
 case. A claim the diff does not support is the finding "What any reviewer reads first" describes,
