@@ -128,12 +128,18 @@ spec:
             # costs". Grouping only — same units, same scores.
             - name: HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING
               value: "true"
-          # Recall is CPU-bound on the in-process reranker. Do not raise these
-          # expecting a speedup — that experiment has been run (2/4 vs 500m/2
-          # left latency unchanged on e2-standard-4: hyperthreads share the
-          # vector units this saturates). The request also cannot match the
-          # limit: system daemonsets hold ~1250m of a node's 3920m allocatable,
-          # so a 4-CPU request would leave the pod Pending forever.
+          # The request covers steady state (the API idles near 9m, and the
+          # request is what the scheduler places and Autopilot bills); the
+          # limit is the ceiling recall may burst to on the in-process reranker.
+          # CPU above the request is best-effort, so on a node shared with
+          # other CPU-heavy tenants the request is the number to raise. Do not
+          # raise the limit expecting a speedup — that experiment has been run
+          # (2/4 vs 500m/2 left latency unchanged on e2-standard-4:
+          # hyperthreads share the vector units this saturates). The request
+          # also cannot match the limit: system daemonsets hold ~1250m of a
+          # node's 3920m allocatable, so a 4-CPU request would leave the pod
+          # Pending forever. k8s-operator/config/integrations/hindsight/api.yaml
+          # carries the canonical account.
           resources:
             {{- toYaml .Values.hindsight.api.resources | nindent 12 }}
           securityContext:

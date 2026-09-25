@@ -53,7 +53,6 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -2727,7 +2726,8 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// connection, so a bus standing up without it accepts only the static
 	// users and refuses everything else — and refuses it as an Authorization
 	// Violation, which reads exactly like a credential problem.
-	if err := r.reconcileA2ACallout(ctx, agent); err != nil {
+	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent)
+	if err != nil {
 		return state, err
 	}
 
@@ -2906,9 +2906,11 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// session pod's bus credential is minted by the auth callout. So this is
 	// where the deployment spec's ordering - "the operator sets
 	// BusCredentialsReady only after the callout reports serving, and nothing
-	// dispatches before that condition is true" - either holds or is a
-	// sentence. Until this gate, it was a sentence: the operator wrote the
-	// condition and nothing in the repository read it. This reads it.
+	// dispatches before that condition is true", as its rule sentence read
+	// until the 9/17 amendment restated it as one serving replica - either
+	// holds or is a sentence. Until this gate, it was a sentence: the operator
+	// wrote the condition and nothing in the repository read it. This reads
+	// the same Deployment the condition is written from.
 	//
 	// Creation only, and the distinction is the whole design. A callout that
 	// goes unready under a running install must not take the gateway with it:
@@ -2917,28 +2919,43 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// existing gateway is reconciled normally no matter what the condition
 	// says, and only the FIRST creation waits.
 	//
-	// It reads the published condition rather than recomputing readiness from
-	// the callout Deployment, so the gate and the signal an operator watches
-	// cannot disagree about what "ready" meant. The cost is that
+	// It used to read the published condition, so that the gate and the
+	// signal an operator watches could not disagree. They now can, on
+	// purpose, because they answer different questions. BusCredentialsReady
+	// asks "is the callout as a whole serving map V": every replica ready and
+	// on the current template, which is the right claim for the operator
+	// reading it and stays as strict as it is. The gate asks "can a new
+	// gateway safely connect right now", and the callout's replicas form a
+	// NATS queue group (a2a/authcallout/service.go, AuthQueueGroup), so ONE
+	// replica serving the current map already answers every authorization
+	// request a session pod will make. Importing the all-replicas rule here
+	// held a first gateway indefinitely on a callout whose second pod could
+	// not schedule -- a namespace quota with no headroom, node pressure, an
+	// image pull failing on one node -- on a bus that would have authenticated
+	// every one of its sessions.
+	//
+	// What makes the disagreement safe is the direction it can take.
+	// a2aCalloutCanServeANewGateway is a lower bound on the replicas that are
+	// both ready and on the current template, so it never reads true while
+	// the condition's False is describing a callout with no current-template
+	// pod serving; when the two differ, the condition is the stricter one,
+	// and a gateway let through has a serving replica to mint against. The
+	// gate reads the Deployment itself rather than the condition because
 	// syncBusCredentialsReady is deferred to the way out of Reconcile, so the
-	// value read here is one pass old, and the two directions differ.
-	// Stale-false costs only a delay: the gateway is held one more pass and
-	// gatewayHeld requeues. Stale-true is a wrong answer, and worth naming as
-	// one - a first creation goes through on a callout that was serving as
-	// recently as the previous pass and is not serving now. What bounds it is
-	// that one pass, the same window the condition's own doc comment already
-	// accepts ("a stale condition for a moment is cheaper than a refused
-	// connection").
+	// condition is one pass old both ways; the predicate is as current as the
+	// informer, and once the informer's copy is known to be the one this pass
+	// applied (calloutGeneration, below) its only error direction is a false
+	// negative that gatewayHeld's requeue clears.
 	dep := buildA2AGatewayDeployment(agent)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
 	}
-	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep); err != nil {
+	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep, calloutGeneration); err != nil {
 		return state, err
 	} else if hold {
 		state.gatewayHeld = true
-		logf.FromContext(ctx).Info("holding the A2A gateway until the auth callout serves",
-			"deployment", dep.Name, "condition", busCredentialsReadyCondition)
+		logf.FromContext(ctx).Info("holding the A2A gateway until one auth callout replica serves on the current spec",
+			"deployment", dep.Name, "callout", a2aCalloutName(agent))
 		// The flag-off removal below is ordered after the gateway apply so
 		// the fence outlives the listener. Held, there is no gateway pod
 		// at all (the hold is creation-only), so nothing is listening and
@@ -3078,13 +3095,86 @@ func (r *PlatformAgentReconciler) deleteOwnedA2AObject(ctx context.Context, agen
 	return client.IgnoreNotFound(r.Delete(ctx, obj))
 }
 
+// a2aCalloutCanServeANewGateway reports whether at least one replica of the
+// auth callout Deployment is both ready and on the current pod template, which
+// is what a gateway created now needs: one such replica answers every
+// authorization request through the queue group, against the map this render
+// produced.
+//
+// Deployment status does not count that intersection directly. ReadyReplicas
+// and UpdatedReplicas are independent, so "ReadyReplicas >= 1" cannot tell one
+// ready replica on the current template from two ready replicas on the previous
+// one -- and under MaxUnavailable 0 a roll wedged on a pod too old to parse the
+// rendered identity map sits at exactly Ready=2, Updated=1, Replicas=3, which
+// is the failure the map's schema annotation exists to catch. What status does
+// give is an inclusion-exclusion bound: every counted pod is in the ready set,
+// the updated set, or neither, so ready + updated - total is a lower bound on
+// |ready AND updated|. Testing that against one can never read true when no
+// current-template pod is serving. It admits the second replica Pending
+// (1 + 2 - 2 = 1) and rejects the wedged roll (2 + 1 - 3 = 0).
+//
+// The arithmetic holds for the object it is given; appliedGeneration says
+// whether that object is the right one. The caller reads dep from the informer
+// after applying the callout in the same pass, and the informer learns of the
+// apply by watch event, so the copy can still be the object BEFORE the write.
+// On a pass that changed the callout's pod template -- a bump of
+// a2aIdentityMapSchema, a new callout image, an operator upgrade -- that copy
+// carries the previous Generation with ObservedGeneration equal to it and every
+// replica ready and updated on the template the apply just replaced, so the
+// counts read serving and the ObservedGeneration guard cannot tell: both
+// numbers come from the same stale object. Requiring dep.Generation to have
+// reached the Generation the apply's response reported closes that, and a
+// caller with no apply in hand passes 0.
+//
+// The error directions are then both false negatives, each costing the held
+// pass and the requeue that gatewayHeld already pays: a terminated pod still
+// counted in Status.Replicas -- a reap window, where one ready updated replica
+// beside a dying one reads 1 + 1 - 2 = 0 -- and an informer that has not yet
+// delivered this pass's apply, which the watch event for that apply clears.
+// ObservedGeneration is required for the reason setBusCredentialsReady gives:
+// until the Deployment controller has seen the current spec, every count
+// describes the spec before it.
+func a2aCalloutCanServeANewGateway(dep *appsv1.Deployment, appliedGeneration int64) bool {
+	if dep.Generation < appliedGeneration {
+		return false
+	}
+	if dep.Status.ObservedGeneration < dep.Generation {
+		return false
+	}
+	return dep.Status.ReadyReplicas+dep.Status.UpdatedReplicas-dep.Status.Replicas >= 1
+}
+
 // a2aGatewayWaitsForCallout reports whether the gateway Deployment must be
 // withheld this pass. See the call site for why the gate is creation-only and
-// why it reads the condition rather than the Deployment.
-func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment) (bool, error) {
-	if meta.IsStatusConditionTrue(agent.Status.Conditions, busCredentialsReadyCondition) {
+// why it computes its own answer rather than reading BusCredentialsReady.
+// calloutGeneration is the callout Deployment's Generation as this pass's
+// apply of it returned.
+//
+// The callout is read from the informer, as syncBusCredentialsReady reads it,
+// not live: the steady state of every next install passes through here on
+// every pass, and a lower bound that lags the cache by a moment can only hold
+// the gateway one pass longer than the truth would -- with one exception,
+// which is why the apply's Generation comes along. A cached copy that predates
+// this pass's apply is not merely late, it describes the callout on the
+// template the apply replaced, and on that copy the counts can read serving
+// while no replica is on the current one. The predicate refuses a copy whose
+// Generation is below the applied one; in the steady state the two are equal
+// and the check costs nothing, and on the pass that changed the template it
+// holds the gateway until the informer has delivered the write, which the
+// watch event for that write triggers a pass for.
+func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment, calloutGeneration int64) (bool, error) {
+	callout := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}, callout)
+	if err == nil && a2aCalloutCanServeANewGateway(callout, calloutGeneration) {
 		return false, nil
 	}
+	if client.IgnoreNotFound(err) != nil {
+		return false, err
+	}
+	// A callout the cache does not hold yet, one it holds as of before this
+	// pass's apply, or one short of a serving replica, holds the gate the
+	// same way; all three are "not serving".
+	//
 	// Already there: reconcile it. A gateway that exists was let through by
 	// an earlier pass, and withholding its updates now would freeze its image
 	// and env at whatever a callout outage happened to interrupt.
@@ -3096,11 +3186,11 @@ func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context,
 	// decide whether the gate holds, and the two directions of cache
 	// staleness are not symmetric. A stale NotFound costs one more held pass
 	// and a requeue. A stale hit — an informer that has not yet seen it gone —
-	// answers "already there" and lets the Deployment be re-created while
-	// BusCredentialsReady is false, which is the single thing this gate
-	// exists to prevent. The cost is one API call, and only while the
-	// condition is false: the check above returns first in the steady state.
-	err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{})
+	// answers "already there" and lets the Deployment be re-created while no
+	// callout replica is serving, which is the single thing this gate exists
+	// to prevent. The cost is one API call, and only while the callout is
+	// short of serving: the check above returns first in the steady state.
+	err = r.a2aReader().Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{})
 	if err == nil {
 		return false, nil
 	}

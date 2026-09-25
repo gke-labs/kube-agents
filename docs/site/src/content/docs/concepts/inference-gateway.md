@@ -206,5 +206,5 @@ The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the 
 ## Where to go next
 
 - [Reference → Examples](/kube-agents/reference/examples/) — the inference example bundles walked through.
-- [Deploy → Kustomize](/kube-agents/deploy/kustomize/) — what the LiteLLM Deployment looks like on disk.
+- [Deploy → Network policies and Service](/kube-agents/deploy/kustomize/#kustomize-for-operator-integrations) — where the LiteLLM Deployment's dev copy lives on disk.
 - [Concepts → Observability](/kube-agents/concepts/observability/) — LLM telemetry export.

@@ -9954,7 +9954,8 @@ spec:
                     alone, keeps the last declaration's exclusions and retires nothing; an empty
                     projects list in a present block drops the projects an earlier block declared.
                     The management project is always in scope and cannot be excluded. The design is docs/designs/multi-project-scope.md;
-                    this is its phases 1 and 2: explicit projects, folders and organisations.
+                    this is its phases 1 to 3: explicit projects, folders and organisations, and the
+                    sharedVpcHosts and metricsScopes selectors, which resolve to explicit projects.
                   properties:
                     exclude:
                       description: |-
@@ -10025,6 +10026,30 @@ spec:
                       maxItems: 100
                       type: array
                       x-kubernetes-list-type: set
+                    metricsScopes:
+                      description: |-
+                        MetricsScopes lists Cloud Monitoring Metrics Scope scoping-project IDs; every
+                        monitored project of the scope contributes its GKE clusters, resolved on each
+                        run from the Monitoring API (gcloud beta monitoring metrics-scopes describe).
+                        The API names monitored projects by number, so each is mapped to its ID with
+                        gcloud projects describe, and a monitored project the agent cannot read is
+                        reported by number under the naming call's outcome (denied for a 403).
+                        Nothing is inherited through a Metrics Scope, so the agent's service account
+                        needs the read roles in each resolved project, granted by hand until the
+                        install's Terraform resolves the selectors at plan time (the design's §10
+                        step 3); the lookup itself needs to read the scope in the scoping project:
+                        roles/monitoring.metricsScopesViewer (resourcemanager.projects.get and
+                        resourcemanager.projects.list) is the narrowest role that grants it, and the
+                        read roles the scope binds carry both between them. The Monitoring API has to
+                        be enabled in the scoping project. A lookup that fails freezes the selector's
+                        previous members and holds the scope prune, and is reported in the
+                        snapshot's containers array under metricsScopes/<scope>.
+                      items:
+                        pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]$
+                        type: string
+                      maxItems: 100
+                      type: array
+                      x-kubernetes-list-type: set
                     organizations:
                       description: |-
                         Organizations lists GCP organisation IDs (numeric), resolved the way Folders
@@ -10043,6 +10068,28 @@ spec:
                         Terraform gains a scope input; a project it cannot list is reported with
                         the reason (denied, api-disabled, unreachable) and its existing profiles
                         are kept.
+                      items:
+                        pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]$
+                        type: string
+                      maxItems: 100
+                      type: array
+                      x-kubernetes-list-type: set
+                    sharedVpcHosts:
+                      description: |-
+                        SharedVpcHosts lists Shared VPC host project IDs; every service project
+                        attached to the host contributes its GKE clusters, resolved on each run from
+                        the Compute API (gcloud compute shared-vpc list-associated-resources). The
+                        host project itself is not included: name it in projects if its clusters are
+                        wanted. A project that is not a Shared VPC host resolves to no members: the
+                        API answers HTTP 400 for it, which the reconcile reads as an empty membership
+                        rather than a failed lookup, so a misdeclared host cannot hold the scope prune.
+                        Nothing is inherited through a Shared VPC, so the agent's service account
+                        needs the read roles in each resolved project, granted by hand until the
+                        install's Terraform resolves the selectors at plan time (the design's §10
+                        step 3), and compute.projects.get in the host project (roles/compute.viewer
+                        carries it). A lookup that fails freezes
+                        the selector's previous members and holds the scope prune, and is reported
+                        in the snapshot's containers array under sharedVpcHosts/<host>.
                       items:
                         pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]$
                         type: string
@@ -10319,11 +10366,9 @@ spec:
                         for egress by <name>-gateway-netpol, which the operator renders on every
                         reconcile whether this field is set or not — unless
                         spec.networkPolicy.enabled is false, which withholds the gateway policy.
-                        On a Helm install that makes this the Pod's only policy: the one shape
-                        where this field enforces for real on an enforcing CNI, denying
-                        everything off its list. A Kustomize install still carries the static
-                        platform-agent-core-egress set over the same Pod, so the union resumes
-                        there. Everywhere else, turning this on leaves the
+                        That makes this the Pod's only policy: the one shape where this field
+                        enforces for real on an enforcing CNI, denying everything off its list.
+                        Everywhere else, turning this on leaves the
                         Pod's permitted egress a strict superset of what it was. In the default
                         shape the only destination it adds is the credential broker on TCP 8765
                         — plus, when the agent is not exporting telemetry, the managed collector
@@ -10346,12 +10391,6 @@ spec:
                             FQDNNetworkPolicy annotation is set. So every HTTPS destination on
                             the public internet stays open, and with it the exfiltration half of
                             what this control is meant to be.
-
-                        A Kustomize install additionally applies platform-agent-core-egress
-                        (deploy/kustomize/platform/networkpolicy-core-egress.yaml), which selects
-                        the agent Pod by app.kubernetes.io/name and permits the same metadata
-                        path. A Helm install does not carry it, and it changes nothing either
-                        way: the gateway policy alone is enough to make the point above.
 
                         The overlap is deliberate rather than an oversight. Workload Identity
                         needs the metadata path, and <name>-gateway-netpol still permits it to

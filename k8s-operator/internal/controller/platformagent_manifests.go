@@ -272,11 +272,13 @@ type scopeDeclaration struct {
 	// and retires nothing, because the ordinary way a block goes missing is a write
 	// through an older operator's webhook, not an operator dropping every project. An
 	// empty `projects` list in a present block is the declaration that drops projects.
-	Present       bool                    `json:"present"`
-	Projects      []string                `json:"projects"`
-	Folders       []string                `json:"folders"`
-	Organizations []string                `json:"organizations"`
-	Exclude       scopeExcludeDeclaration `json:"exclude"`
+	Present        bool                    `json:"present"`
+	Projects       []string                `json:"projects"`
+	Folders        []string                `json:"folders"`
+	Organizations  []string                `json:"organizations"`
+	SharedVpcHosts []string                `json:"sharedVpcHosts"`
+	MetricsScopes  []string                `json:"metricsScopes"`
+	Exclude        scopeExcludeDeclaration `json:"exclude"`
 }
 
 type scopeExcludeDeclaration struct {
@@ -298,10 +300,12 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 		scope = &agentv1alpha1.ScopeSpec{}
 	}
 	decl := scopeDeclaration{
-		Present:       agent.Spec.Scope != nil,
-		Projects:      append([]string{}, scope.Projects...),
-		Folders:       append([]string{}, scope.Folders...),
-		Organizations: append([]string{}, scope.Organizations...),
+		Present:        agent.Spec.Scope != nil,
+		Projects:       append([]string{}, scope.Projects...),
+		Folders:        append([]string{}, scope.Folders...),
+		Organizations:  append([]string{}, scope.Organizations...),
+		SharedVpcHosts: append([]string{}, scope.SharedVpcHosts...),
+		MetricsScopes:  append([]string{}, scope.MetricsScopes...),
 		Exclude: scopeExcludeDeclaration{
 			Projects: []string{},
 			Clusters: []agentv1alpha1.ScopeClusterRef{},
@@ -314,6 +318,8 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 	sort.Strings(decl.Projects)
 	sort.Strings(decl.Folders)
 	sort.Strings(decl.Organizations)
+	sort.Strings(decl.SharedVpcHosts)
+	sort.Strings(decl.MetricsScopes)
 	sort.Strings(decl.Exclude.Projects)
 	sort.Slice(decl.Exclude.Clusters, func(i, j int) bool {
 		a, b := decl.Exclude.Clusters[i], decl.Exclude.Clusters[j]
@@ -327,9 +333,9 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 	})
 	out, err := json.MarshalIndent(decl, "", "  ")
 	if err != nil {
-		// Three string slices cannot fail to marshal; if they ever do, an empty
-		// scope is the safe render: the reconcile falls back to today's behaviour
-		// rather than acting on a partial declaration.
+		// String slices and a struct of them cannot fail to marshal; if they ever
+		// do, an empty scope is the safe render: the reconcile falls back to today's
+		// behaviour rather than acting on a partial declaration.
 		manifestsLog.Error(err, "rendering spec.scope failed; rendering no scope")
 		return ""
 	}
@@ -5307,8 +5313,9 @@ func peersNotAlreadyPresent(present, candidates []networkingv1.NetworkPolicyPeer
 	return kept
 }
 
-// buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
-// Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
+// buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent:
+// the gateway policy, the one policy an install places on the agent Pod. No static
+// copy of it ships anywhere in the repository.
 //
 // otlpDisabled carries the same meaning as renderOptions.otlpDisabled: discovery found no
 // collector, so there is no export to allow and the collector egress rule is left out.
@@ -5389,7 +5396,7 @@ func clusterDNSPeers(dnsIPs []string) []networkingv1.NetworkPolicyPeer {
 	// it under, so a grep for that constant finds both places the resolver is
 	// permitted. The grant is IPv4-only on purpose: fd20:ce::254 is documented as
 	// a metadata endpoint rather than as a resolver, and no static copy in
-	// charts/ or deploy/kustomize names it in a DNS rule, so it stays out until a
+	// charts/ names it in a DNS rule, so it stays out until a
 	// dual-stack Cloud DNS cluster is observed naming it in a Pod's resolv.conf.
 	peers = append(peers, formatCIDRPeers([]string{metadataResolverCIDR}, true)...)
 

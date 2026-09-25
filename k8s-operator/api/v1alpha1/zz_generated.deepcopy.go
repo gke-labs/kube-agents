@@ -975,6 +975,16 @@ func (in *ScopeSpec) DeepCopyInto(out *ScopeSpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.SharedVpcHosts != nil {
+		in, out := &in.SharedVpcHosts, &out.SharedVpcHosts
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
+	if in.MetricsScopes != nil {
+		in, out := &in.MetricsScopes, &out.MetricsScopes
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Exclude != nil {
 		in, out := &in.Exclude, &out.Exclude
 		*out = new(ScopeExcludeSpec)

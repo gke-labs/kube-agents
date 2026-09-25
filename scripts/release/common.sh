@@ -548,30 +548,26 @@ rc_tag_core() {
 }
 
 # ─── Eval-candidate tags ──────────────────────────────────────────────────────
-# NOT WIRED YET. Nothing in this repository composes, pushes or reads an
-# evalcand_ tag: these helpers and poll_rc_eval_verdict.py beside them are the
-# pieces, and the pull request that changes staging-promotion-pipeline.yml is what joins
-# them up. Until it lands the nightly still pushes staging_ straight off a green
-# matrix, and the paragraph below describes where this is going rather than what
-# runs tonight. Everything downstream of that sentence is true of the helpers
-# themselves and can be relied on now.
-#
-# The nightly pipeline will nominate a candidate for staging by tagging its
-# commit evalcand_<ts>_<sha>. That push is what fires post-kube-agents-eval-rc,
-# the release-candidate eval in GoogleCloudPlatform/oss-test-infra, and the
-# pipeline then waits for that job's verdict before pushing the staging_ tag
-# below.
+# The staging promotion pipeline nominates a candidate for staging by tagging
+# its commit evalcand_<ts>_<sha>. That push is what fires
+# post-kube-agents-eval-rc, the release-candidate eval in
+# GoogleCloudPlatform/oss-test-infra, and the pipeline then waits for that job's
+# verdict before pushing the staging_ tag below.
 #
 # WHY A SECOND TAG FAMILY AND NOT JUST staging_. The eval used to trigger on
 # staging_, which is also what staging-deploy.yml triggers on: both fired off one
 # push event, and the deploy — minutes — finished long before the eval — hours —
 # had a verdict, so the verdict could only ever describe a deploy that had
-# already happened. evalcand_ puts the eval between the two. Nothing else in this
-# repository reads the evalcand_ family, and that is deliberate: a candidate the
-# eval rejects leaves its evalcand_ tag behind, and every other tag reader here
-# is prefix-scoped to a family that is not this one, so the leftover drives
-# nothing. A rejected candidate leaving a staging_ tag behind would not be inert
-# — get_latest_staging_tag would offer it to a manual deploy dispatch.
+# already happened. evalcand_ puts the eval between the two.
+#
+# WHAT READS IT. resolve_promotion_candidate.sh, and only it: a commit already
+# carrying an evalcand_ tag has been answered about, so it skips. That makes the
+# leftover tag on a rejected candidate the thing that keeps it rejected, rather
+# than an inert marker — which is why drop_eval_candidate.sh exists for the runs
+# where no verdict arrived at all. Every other tag reader here is prefix-scoped
+# to a family that is not this one. A rejected candidate leaving a staging_ tag
+# behind would be worse than either: get_latest_staging_tag would offer it to a
+# manual deploy dispatch.
 export EVALCAND_TAG_PREFIX="evalcand_"
 
 # Derives the eval-candidate tag from a validated RC tag:
@@ -641,9 +637,9 @@ get_existing_evalcand_tag() {
 
 # ─── Staging promotion tags ───────────────────────────────────────────────────
 # The nightly pipeline promotes a candidate by tagging its commit
-# staging_<ts>_<sha>, which is what staging-deploy.yml triggers on. Today it
-# pushes this as soon as the E2E matrix passes; once the evalcand_ family above
-# is wired up it will push it only after the eval that tag fired returns green.
+# staging_<ts>_<sha>, which is what staging-deploy.yml triggers on. It pushes
+# this only after the eval fired by the evalcand_ tag above returns green; a red,
+# timed-out or never-started eval leaves staging on the build it is running.
 export STAGING_TAG_PREFIX="staging_"
 
 # Derives the staging promotion tag from a validated RC tag:
@@ -671,8 +667,8 @@ staging_tag_for_rc() {
 # workflows trigger on, and the difference is the whole defence. The prefix is a
 # trigger anyone can push by hand; a `staging_hotfix` typed at a terminal would
 # otherwise read back to the release gate as "the full nightly matrix passed on
-# this commit". The timestamp and short SHA in the right places are not produced
-# by accident.
+# this commit and the eval that followed it came back green". The timestamp and
+# short SHA in the right places are not produced by accident.
 #
 # It stops an accident, not an attacker. Nothing checks that the 7-hex field is
 # the short SHA of the commit the tag points at, or that the commit carries
@@ -698,7 +694,10 @@ get_latest_staging_tag() {
 }
 
 # Lists the shape-valid staging promotion tags pointing at a commit, one per
-# line. Empty output means this commit has not passed the nightly matrix.
+# line. Empty output means the commit has not been promoted, which since the
+# eval gate no longer implies it failed the nightly matrix: a candidate whose
+# matrix was green is unpromoted while its eval runs, and stays unpromoted if
+# that eval comes back red. `evalcand_tags_at_commit` is what tells those apart.
 staging_promotion_tags_at_commit() {
   local sha="${1:-}"
   local tags

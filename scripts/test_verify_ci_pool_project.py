@@ -3,6 +3,7 @@
 
 import base64
 import json
+import os
 import re
 import subprocess
 import time
@@ -376,7 +377,9 @@ class SeededFleetFixturesTest(unittest.TestCase):
 
     Two calls: `kubectl version` to establish the probes can run at all, then
     the script itself. The script exits 0 whether it wrote every role file or
-    none, so every assertion here is on the summary line it prints to stderr.
+    none -- except 3, when it refuses to read the fleet on a credential it was
+    not given -- so the assertions here are on the summary line it prints to
+    stderr, and on that one exit.
     """
 
     def _summary(self, written: int, unresolved: int = 0, unplanted: int = 0) -> str:
@@ -433,6 +436,69 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertEqual(str(checker.FLEET_STATE_WAIT_SECONDS), state_cmd[state_cmd.index("--wait") + 1])
         self.assertGreater(run.call_args_list[2].kwargs["timeout"], checker.FLEET_STATE_WAIT_SECONDS)
 
+    def test_the_fleet_check_runs_on_the_operators_own_credential(self):
+        # The runner refuses the caller's own credential unless told to; the
+        # check tells it, because an operator holds no token-creator on the
+        # reader and this is a one-off read of a project they own. The shell's
+        # own FLEET_READONLY_SA, when set, is respected instead.
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles())), (0, "", self._state(self._roles()))]
+            checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+            env = run.call_args_list[1].kwargs["env"]
+        self.assertEqual("1", env["FLEET_ALLOW_RUNNER_CREDENTIAL"])
+        self.assertNotIn("FLEET_READONLY_SA", env)
+        # Forced over whatever the shell exported: a blank or 0 left over
+        # from a runner session would otherwise fail a healthy project.
+        for exported in ("", "0"):
+            with mock.patch.dict(os.environ, {"FLEET_ALLOW_RUNNER_CREDENTIAL": exported}, clear=True), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles())), (0, "", self._state(self._roles()))]
+                checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+                self.assertEqual("1", run.call_args_list[1].kwargs["env"]["FLEET_ALLOW_RUNNER_CREDENTIAL"], repr(exported))
+        with mock.patch.dict(os.environ, {"FLEET_READONLY_SA": "reader@p.iam.gserviceaccount.com"}, clear=True), mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles())), (0, "", self._state(self._roles()))]
+            checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+            env = run.call_args_list[1].kwargs["env"]
+        self.assertEqual("reader@p.iam.gserviceaccount.com", env["FLEET_READONLY_SA"])
+        self.assertNotIn("FLEET_ALLOW_RUNNER_CREDENTIAL", env)
+
+    def test_a_reader_the_operator_cannot_mint_is_unverified_not_a_failure(self):
+        # The runner's exit 3 carries gcloud's own refusal, which the denial
+        # patterns read as an unperformed read: the project is not failed for
+        # what the operator could not see.
+        stderr = (
+            "ERROR: cannot mint a read-only token as seeded-fleet-reader@kube-agents-evals-5.iam.gserviceaccount.com: "
+            "ERROR: (gcloud.auth.print-access-token) PERMISSION_DENIED: Failed to impersonate. Nothing written."
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (3, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertTrue(any("exited 3 without reading the fleet" in w for w in result.warnings), result.warnings)
+        self.assertEqual(2, len(run.call_args_list), "no state pass runs on a fleet that was not read")
+
+    def test_every_shape_of_the_gates_refusal_is_unverified_not_a_failure(self):
+        # Exit 3 is the gate in every wording it has -- the bare-token line
+        # carries no gcloud stderr for the denial patterns to find -- and is
+        # about the credential the verifier ran with, never the project.
+        stderr = (
+            "ERROR: gcloud returned something other than a bare access token for "
+            "seeded-fleet-reader@kube-agents-evals-5.iam.gserviceaccount.com; nothing written."
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (checker.FLEET_EXIT_READONLY_UNAVAILABLE, "", stderr)]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result)
+        self.assertEqual("Not checked", result.message)
+        self.assertTrue(any("bare access token" in w for w in result.warnings), result.warnings)
+        # Any other non-zero exit with no known reason is still the project's.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (1, "", "ERROR: catalog is malformed")]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed, result)
+        with open(checker._FLEET_KUBECONFIGS, encoding="utf-8") as fh:
+            self.assertIn(f"_FLEET_EXIT_READONLY_UNAVAILABLE={checker.FLEET_EXIT_READONLY_UNAVAILABLE}", fh.read())
+
     def test_a_drifted_fixture_fails_and_names_the_role(self):
         # Presence passed -- payments-api's Deployment exists -- and the pod
         # has never restarted, so no OOMKilled evidence exists: the 2026-09-07
@@ -488,6 +554,22 @@ class SeededFleetFixturesTest(unittest.TestCase):
             result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
         self.assertFalse(result.passed)
         self.assertEqual(2, run.call_count)
+
+    def test_a_dropped_rewrite_is_unverified_not_an_incomplete_fleet(self):
+        # The runner now drops a slot's file when it cannot rewrite it to the
+        # reader's exec credential -- a local fault after the cluster was
+        # listed, reached and credentialed -- and every role on that slot
+        # counts as unresolved. That is unread, not a finding about the pool.
+        stderr = "\n".join([
+            "WARNING: seeded-a kubeconfig could not be rewritten to seeded-fleet-reader@kube-agents-evals-5.iam.gserviceaccount.com; "
+            "dropped. Every check naming a role on slot 'a' will report status=error.",
+            self._summary(self._roles() - 1, unresolved=1),
+        ])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr), (0, "", self._state(self._roles() - 1))]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result)
+        self.assertTrue(any("could not be rewritten" in w for w in result.warnings), result.warnings)
 
     def test_the_state_pass_is_skipped_when_no_role_was_published(self):
         stderr = "\n".join([
@@ -750,7 +832,7 @@ class SeededFleetFixturesTest(unittest.TestCase):
         wrong = checker._FLEET_LOOKED_AND_FOUND_WRONG.pattern.split("|")
         unreachable = checker._FLEET_UNREACHABLE.pattern.split("|")
         self.assertEqual(4, len(wrong))
-        self.assertEqual(2, len(unreachable))
+        self.assertEqual(3, len(unreachable))
         for phrase in [*wrong, *unreachable, checker._FLEET_COULD_NOT_LOOK.pattern]:
             with self.subTest(phrase=phrase):
                 self.assertRegex(text, phrase)

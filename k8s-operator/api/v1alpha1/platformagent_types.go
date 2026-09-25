@@ -46,12 +46,14 @@ type PlatformAgentSpec struct {
 	// alone, keeps the last declaration's exclusions and retires nothing; an empty
 	// projects list in a present block drops the projects an earlier block declared.
 	// The management project is always in scope and cannot be excluded. The design is docs/designs/multi-project-scope.md;
-	// this is its phases 1 and 2: explicit projects, folders and organisations.
+	// this is its phases 1 to 3: explicit projects, folders and organisations, and the
+	// sharedVpcHosts and metricsScopes selectors, which resolve to explicit projects.
 	// +optional
 	Scope *ScopeSpec `json:"scope,omitempty"`
 }
 
-// ScopeSpec is the opt-in set of projects, folders and organisations the Cluster Agent
+// ScopeSpec is the opt-in set of projects, folders and organisations, plus the Shared
+// VPC host and Metrics Scope selectors that resolve to projects, the Cluster Agent
 // reconcile manages.
 type ScopeSpec struct {
 	// Projects lists GCP project IDs whose GKE clusters get Cluster Agent
@@ -85,6 +87,48 @@ type ScopeSpec struct {
 	// +listType=set
 	// +optional
 	Organizations []string `json:"organizations,omitempty"`
+
+	// SharedVpcHosts lists Shared VPC host project IDs; every service project
+	// attached to the host contributes its GKE clusters, resolved on each run from
+	// the Compute API (gcloud compute shared-vpc list-associated-resources). The
+	// host project itself is not included: name it in projects if its clusters are
+	// wanted. A project that is not a Shared VPC host resolves to no members: the
+	// API answers HTTP 400 for it, which the reconcile reads as an empty membership
+	// rather than a failed lookup, so a misdeclared host cannot hold the scope prune.
+	// Nothing is inherited through a Shared VPC, so the agent's service account
+	// needs the read roles in each resolved project, granted by hand until the
+	// install's Terraform resolves the selectors at plan time (the design's §10
+	// step 3), and compute.projects.get in the host project (roles/compute.viewer
+	// carries it). A lookup that fails freezes
+	// the selector's previous members and holds the scope prune, and is reported
+	// in the snapshot's containers array under sharedVpcHosts/<host>.
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`
+	// +listType=set
+	// +optional
+	SharedVpcHosts []string `json:"sharedVpcHosts,omitempty"`
+
+	// MetricsScopes lists Cloud Monitoring Metrics Scope scoping-project IDs; every
+	// monitored project of the scope contributes its GKE clusters, resolved on each
+	// run from the Monitoring API (gcloud beta monitoring metrics-scopes describe).
+	// The API names monitored projects by number, so each is mapped to its ID with
+	// gcloud projects describe, and a monitored project the agent cannot read is
+	// reported by number under the naming call's outcome (denied for a 403).
+	// Nothing is inherited through a Metrics Scope, so the agent's service account
+	// needs the read roles in each resolved project, granted by hand until the
+	// install's Terraform resolves the selectors at plan time (the design's §10
+	// step 3); the lookup itself needs to read the scope in the scoping project:
+	// roles/monitoring.metricsScopesViewer (resourcemanager.projects.get and
+	// resourcemanager.projects.list) is the narrowest role that grants it, and the
+	// read roles the scope binds carry both between them. The Monitoring API has to
+	// be enabled in the scoping project. A lookup that fails freezes the selector's
+	// previous members and holds the scope prune, and is reported in the
+	// snapshot's containers array under metricsScopes/<scope>.
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`
+	// +listType=set
+	// +optional
+	MetricsScopes []string `json:"metricsScopes,omitempty"`
 
 	// Exclude subtracts projects and clusters after every selector has
 	// contributed.

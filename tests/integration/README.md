@@ -37,7 +37,11 @@ convenience, not the definition of what must pass.
 One file per seam, `test_seam_<name>.py`, stdlib unittest. `_seams.py` carries the
 shared fixtures: the real `session_kv_server` in a subprocess with a controlled
 environment, argv-recording fake executables for PATH, and a recording stub HTTP
-server for the one component a seam deliberately excludes.
+server for the one component a seam deliberately excludes. A fixture the unit tier
+needs too goes in `tests/testing/` instead and both tiers import it — as
+`test_seam_rc_eval_verdict.py` does with `rc_eval_driver.py`. Import the fixture,
+never the other tier's `TestCase`: subclassing one runs its whole suite a second
+time inside this one.
 
 Rules the existing files follow:
 

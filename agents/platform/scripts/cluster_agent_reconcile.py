@@ -8,7 +8,9 @@
 # the management cluster where kube-agents itself runs. The scope is the management project
 # alone unless the PlatformAgent declares `spec.scope` (docs/designs/multi-project-scope.md),
 # which the operator renders to the file KUBEAGENTS_SCOPE_FILE names: explicit projects,
-# folders and organisations (resolved through Cloud Asset Inventory) to add, project IDs or
+# folders and organisations (resolved through Cloud Asset Inventory), Shared VPC hosts and
+# Metrics Scopes (each resolved to the projects it reaches, which then list their own
+# clusters) to add, project IDs or
 # globs to drop, and single clusters (by project, location and name) to leave unmanaged. RECONCILE_EXCLUDE, a bare-name list matched across every project, keeps
 # working for one release alongside `exclude.clusters`. Per run this deterministic engine:
 #   • CREATE — scaffolds a profile for every cluster in scope that doesn't have one yet;
@@ -95,6 +97,38 @@ RESOLVER_EXPLICIT = "explicit"
 # Inventory, one call per container (design §4).
 RESOLVER_ASSET_INVENTORY = "asset-inventory"
 CONTAINER_KINDS = ("folders", "organizations")
+# The two phase 3 selectors (design §3, §10 step 3). Neither is a Resource Manager container:
+# each resolves at runtime to explicit projects, which then list their own clusters and take
+# the phase 1 path, and each is reported in the snapshot's `containers` array under its `via`
+# name so a lookup that fails freezes its previous members and holds the scope prune the way
+# a container's does (design §4, §7).
+SELECTOR_KIND_SHARED_VPC = "sharedVpcHosts"
+SELECTOR_KIND_METRICS_SCOPE = "metricsScopes"
+SELECTOR_KINDS = (SELECTOR_KIND_SHARED_VPC, SELECTOR_KIND_METRICS_SCOPE)
+# A selector value is a project ID, the CRD's pattern. The reconcile re-checks it because the
+# Shared VPC host is passed to gcloud as a bare positional, and a value that read as a flag
+# would be refused by the broker, or worse, honoured.
+_PROJECT_ID = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
+# Shared VPC: `compute shared-vpc list-associated-resources <host>` (the Compute API's
+# projects.getXpnResources) names each attached service project with its ID and a type.
+XPN_RESOURCES_FORMAT = "json(id,type)"
+XPN_RESOURCE_TYPE_PROJECT = "PROJECT"
+# What the Compute API answers (HTTP 400) for a project that is not a Shared VPC host. It has
+# no service projects, which is a fact about the estate and not a failed lookup: zero members,
+# `ok`. Reading it as a failure would hold the scope prune for the whole install, every tick,
+# over one misdeclared host.
+_NOT_XPN_HOST_MARKER = "is not a shared VPC host project"
+# Metrics Scope: `beta monitoring metrics-scopes describe locations/global/metricsScopes/<id>`
+# (the verb is on the beta track only, which the credential proxy's gcloud ships) lists the
+# monitored projects by project *number*, never by ID, so each is named with
+# `projects describe <number>`; a project the account cannot read cannot be named either.
+METRICS_SCOPE_NAME_PREFIX = "locations/global/metricsScopes/"
+METRICS_SCOPE_FORMAT = "json(name,monitoredProjects)"
+_MONITORED_PROJECT_NAME = re.compile(r"^locations/global/metricsScopes/[^/]+/projects/(?P<project>[^/]+)$")
+PROJECT_ID_FORMAT = "value(projectId)"
+# A snapshot row of a member the run named by number keeps the number, so the next run can
+# still name the project when the naming call is refused (no outcome is silent, design §4).
+NUMBER_KEY = "number"
 ASSET_TYPE_CLUSTER = "container.googleapis.com/Cluster"
 # The two fields the resolver reads, projected so a container of thousands of clusters
 # stays far below the credential proxy's output cap; full-fidelity JSON is ~1 KB a row.
@@ -258,9 +292,21 @@ def _bounded_map(lookup, keys: list[str], deadline: float, what: str) -> dict:
     return results
 
 
-def _search_containers(containers: list[str], deadline: float) -> dict[str, tuple[dict | None, str]]:
-    """Resolve every container within the run's listing budget; a pending one freezes (design §4)."""
-    return _bounded_map(_search_container, containers, deadline, "resolving")
+def _lookup_group(group: str, timeout: float = LIST_TIMEOUT_SECONDS):
+    """One runtime lookup by kind: a container through Asset Inventory, a selector through its API."""
+    kind = group.split("/")[0]
+    if kind in SELECTOR_KINDS:
+        return _resolve_selector(group, timeout=timeout)
+    return _search_container(group, timeout=timeout)
+
+
+def _resolve_groups(groups: list[str], deadline: float) -> dict[str, tuple]:
+    """Resolve every container and selector within the run's listing budget, in one pool.
+
+    A pending one freezes (design §4). Containers and selectors share the pool so a slow
+    folder search does not push the selectors past the budget or the other way round.
+    """
+    return _bounded_map(_lookup_group, groups, deadline, "resolving")
 
 
 def _list_projects(projects: list[str], deadline: float) -> dict[str, tuple[list | None, str]]:
@@ -312,11 +358,12 @@ def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
 
 
 def _empty_scope() -> dict:
-    return {"projects": [], "folders": [], "organizations": [], "exclude": {"projects": [], "clusters": []}}
+    return {"projects": [], "folders": [], "organizations": [], SELECTOR_KIND_SHARED_VPC: [],
+            SELECTOR_KIND_METRICS_SCOPE: [], "exclude": {"projects": [], "clusters": []}}
 
 
-def _load_scope() -> tuple[dict, bool, bool, bool]:
-    """The declaration the operator rendered: (scope, readable, present, containers_known).
+def _load_scope() -> tuple[dict, bool, bool, bool, bool]:
+    """The declaration the operator rendered: (scope, readable, present, containers_known, selectors_known).
 
     The operator renders the file on every install, so a missing, empty,
     unparseable or non-object file means the render did not reach this pod (a
@@ -332,14 +379,15 @@ def _load_scope() -> tuple[dict, bool, bool, bool]:
     under the last declaration's exclusions. `containers_known` says whether the
     render carries the `folders` and `organizations` keys at all: a render from an
     operator that predates them (a rollback) declares nothing about containers, so a
-    project reached through one is carried, not retired.
+    project reached through one is carried, not retired. `selectors_known` says the same
+    of the `sharedVpcHosts` and `metricsScopes` keys.
     """
     path = os.environ.get(SCOPE_FILE_ENV)
     if not path:
         # An agent image ahead of its operator: no variable, no render. CREATE under the last
         # declaration's exclusions, and no scope prune, because nothing declared anything.
         log(f"{SCOPE_FILE_ENV} is not set; using the management project alone and skipping the scope prune.")
-        return _empty_scope(), False, False, False
+        return _empty_scope(), False, False, False, False
     try:
         raw = Path(path).read_text(encoding="utf-8").strip()
         if not raw:
@@ -350,12 +398,13 @@ def _load_scope() -> tuple[dict, bool, bool, bool]:
     except Exception as e:  # noqa: BLE001 - unreadable declaration: fall back, loudly, and prune nothing by scope
         log(f"could not read the scope declaration at {path} ({e}); using the management project "
             "alone and skipping the scope prune this run.")
-        return _empty_scope(), False, False, False
+        return _empty_scope(), False, False, False, False
     containers_known = any(kind in parsed for kind in CONTAINER_KINDS)
+    selectors_known = any(kind in parsed for kind in SELECTOR_KINDS)
     if parsed.get(SCOPE_PRESENT_KEY) is not True:
         # No block on the CR (or a render that predates the marker): nothing declared.
-        return _empty_scope(), True, False, containers_known
-    return _normalize_scope(parsed), True, True, containers_known
+        return _empty_scope(), True, False, containers_known, selectors_known
+    return _normalize_scope(parsed), True, True, containers_known, selectors_known
 
 
 def _normalize_scope(parsed: dict) -> dict:
@@ -369,6 +418,13 @@ def _normalize_scope(parsed: dict) -> dict:
     scope["projects"] = strings(parsed.get("projects"))
     for kind in CONTAINER_KINDS:
         scope[kind] = [c for c in strings(parsed.get(kind)) if c.isdigit()]
+    for kind in SELECTOR_KINDS:
+        scope[kind] = []
+        for value in strings(parsed.get(kind)):
+            if _PROJECT_ID.match(value):
+                scope[kind].append(value)
+            else:
+                log(f"{kind} entry {value!r} is not a project ID; ignored (the CRD refuses it at admission).")
     exclude = parsed.get("exclude") if isinstance(parsed.get("exclude"), dict) else {}
     scope["exclude"]["projects"] = strings(exclude.get("projects"))
     clusters = exclude.get("clusters")
@@ -402,6 +458,19 @@ def _excluded_by(project: str, patterns: list[str]) -> str | None:
 def _container_ids(scope: dict) -> list[str]:
     """The declared containers as `folders/<id>` and `organizations/<id>`, sorted by ID."""
     return sorted(f"{kind}/{cid}" for kind in CONTAINER_KINDS for cid in set(scope.get(kind) or []))
+
+
+def _selector_ids(scope: dict) -> list[str]:
+    """The declared selectors as `sharedVpcHosts/<host>` and `metricsScopes/<scope>`, sorted by ID."""
+    return sorted(f"{kind}/{sid}" for kind in SELECTOR_KINDS for sid in set(scope.get(kind) or []))
+
+
+def _is_selector(via: str) -> bool:
+    return via.split("/")[0] in SELECTOR_KINDS
+
+
+def _is_container(via: str) -> bool:
+    return via.split("/")[0] in CONTAINER_KINDS
 
 
 def _parse_asset(asset: dict) -> tuple[str, str, str] | None:
@@ -467,6 +536,173 @@ def _search_container(container: str, timeout: float = LIST_TIMEOUT_SECONDS) -> 
     return members, OUTCOME_OK
 
 
+def _resolve_selector(selector: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[list[str] | None, str]:
+    """The projects a Shared VPC host or Metrics Scope reaches, as gcloud names them, and the outcome.
+
+    One call per selector, through the broker (design §10 step 3). A Shared VPC host's
+    service projects come back by ID; a Metrics Scope's monitored projects come back by
+    project number, which `_selector_members` names afterwards. (None, outcome) means the
+    selector could not be read: its previous members are then carried forward under that
+    outcome by the caller, and the scope prune stays off for the run, exactly as for a
+    container whose search failed.
+    """
+    kind, _, value = selector.partition("/")
+    if kind == SELECTOR_KIND_SHARED_VPC:
+        cmd = ["gcloud", "compute", "shared-vpc", "list-associated-resources", value,
+               f"--format={XPN_RESOURCES_FORMAT}"]
+    else:
+        cmd = ["gcloud", "beta", "monitoring", "metrics-scopes", "describe",
+               f"{METRICS_SCOPE_NAME_PREFIX}{value}", f"--format={METRICS_SCOPE_FORMAT}"]
+    try:
+        result = sandbox_exec.run(cmd, check=True, timeout=timeout)
+        parsed = json.loads(result.stdout or "null")
+        members = (_xpn_members(parsed) if kind == SELECTOR_KIND_SHARED_VPC
+                   else _monitored_members(parsed))
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr or ""
+        if kind == SELECTOR_KIND_SHARED_VPC and _NOT_XPN_HOST_MARKER in stderr:
+            log(f"{selector}: {value} is not a Shared VPC host project, so it has no service projects; "
+                "resolved to no members. Name the project in spec.scope.projects if its own clusters are wanted.")
+            return [], OUTCOME_OK
+        outcome = _classify_list_failure(stderr)
+        log(f"resolving {selector} failed ({outcome}; its previous members are carried forward, "
+            f"no CREATE under them): {stderr.strip()}")
+        return None, outcome
+    except subprocess.TimeoutExpired:
+        log(f"resolving {selector} timed out ({OUTCOME_UNREACHABLE}); its previous members are carried forward.")
+        return None, OUTCOME_UNREACHABLE
+    except Exception as e:  # noqa: BLE001 - a failed lookup is never a resolved-empty selector
+        log(f"resolving {selector} errored ({OUTCOME_UNREACHABLE}; its previous members are carried forward): {e}")
+        return None, OUTCOME_UNREACHABLE
+    return sorted(set(members)), OUTCOME_OK
+
+
+def _xpn_members(parsed) -> list[str]:
+    """Service project IDs from `list-associated-resources` output; raises on a shape this run cannot read."""
+    if not isinstance(parsed, list):
+        raise ValueError("list-associated-resources did not return a list")
+    members = []
+    for row in parsed:
+        # The API's other resource type is unspecified and names no project; a row with no
+        # readable id or type is a shape this run does not know, and reading it as "no
+        # project" would retire a member two runs later while the selector read `ok`.
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not isinstance(row.get("type"), str):
+            raise ValueError(f"a row has a shape this run cannot read: {str(row)[:LOG_ROW_PREVIEW_CHARS]!r}")
+        if row["type"] == XPN_RESOURCE_TYPE_PROJECT:
+            members.append(row["id"])
+    return members
+
+
+def _monitored_members(parsed) -> list[str]:
+    """Monitored project numbers (or IDs) from a `metrics-scopes describe`; raises on an unknown shape."""
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("monitoredProjects", []), list):
+        raise ValueError("metrics-scopes describe did not return a metrics scope")
+    members = []
+    for row in parsed.get("monitoredProjects", []):
+        match = _MONITORED_PROJECT_NAME.match(row.get("name", "")) if isinstance(row, dict) else None
+        if match is None:
+            raise ValueError(f"a monitored project has a shape this run cannot read: {str(row)[:LOG_ROW_PREVIEW_CHARS]!r}")
+        members.append(match.group("project"))
+    return members
+
+
+def _project_id_of(number: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[str | None, str]:
+    """The project ID behind a project number, through the broker, and the outcome.
+
+    `projects describe` needs `resourcemanager.projects.get`, which every read role the scope
+    binds carries, so under the default set a monitored project the account cannot name is one
+    it holds no role in: the same `denied` its listing would have read. An answer the scope
+    model cannot carry (a legacy domain-scoped `example.com:name` ID, with a `:` no exclusion,
+    profile name or declared value can carry) is returned as it came, with `denied`: the caller
+    reads it as a known identity the set cannot hold, a stable fact reported by number and
+    dropped by naming the number in `exclude.projects`, never `unreachable`, which would hold
+    the scope prune for the whole install on every tick. (None, outcome) is an identity the run
+    does not know at all.
+    """
+    cmd = ["gcloud", "projects", "describe", number, f"--format={PROJECT_ID_FORMAT}"]
+    try:
+        result = sandbox_exec.run(cmd, check=True, timeout=timeout)
+        project = (result.stdout or "").strip()
+        if not project:
+            raise ValueError("projects describe returned no project ID")
+        if not _PROJECT_ID.match(project):
+            log(f"naming project {number} returned {project!r}, a project ID the scope cannot carry "
+                f"(a legacy domain-scoped ID); reported by number as {OUTCOME_DENIED}, so the prune is not held. "
+                "Name the number in spec.scope.exclude.projects to drop it from the set.")
+            return project, OUTCOME_DENIED
+        return project, OUTCOME_OK
+    except subprocess.CalledProcessError as e:
+        outcome = _classify_list_failure(e.stderr or "")
+        log(f"naming project {number} failed ({outcome}): {(e.stderr or '').strip()}")
+        return None, outcome
+    except subprocess.TimeoutExpired:
+        log(f"naming project {number} timed out ({OUTCOME_UNREACHABLE}).")
+        return None, OUTCOME_UNREACHABLE
+    except Exception as e:  # noqa: BLE001 - an unnamed member is reported by number, never dropped
+        log(f"naming project {number} errored ({OUTCOME_UNREACHABLE}): {e}")
+        return None, OUTCOME_UNREACHABLE
+
+
+def _previous_numbers(previous: dict | None) -> dict[str, str]:
+    """project number -> ID, from every snapshot row a past run named by number.
+
+    A row written under the bare number (never named) is not a mapping and is left out, so
+    the log says "reported by number" for it rather than naming an ID that is the number.
+    """
+    return {p[NUMBER_KEY]: p["id"] for p in (previous or {}).get("projects", [])
+            if isinstance(p, dict) and isinstance(p.get(NUMBER_KEY), str) and isinstance(p.get("id"), str)
+            and p["id"] != p[NUMBER_KEY]}
+
+
+def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: dict | None,
+                      deadline: float) -> dict[str, tuple[dict[str, dict] | None, str]]:
+    """Name each selector's members: selector -> (members, outcome).
+
+    `members` maps a project ID to {"outcome", "number"}: outcome None for a project still to
+    be listed, or the outcome of the naming call for a monitored project whose number could
+    not be named this run. Such a member is reported under the ID the last snapshot recorded
+    for its number, and under the bare number when no run has named it yet (no outcome is
+    silent, design §4); either way it is not listed and nothing is created under it, unless a
+    declared container places it, which lists it as it lifts a frozen member. A member reported
+    by number whose identity no run knows is `unnamed`: the caller holds the scope prune for the
+    run, because that number could be any project, including one the same edit dropped from
+    `projects`, and a project pruned on that guess is the deletion this script never makes. A
+    number named to an ID the scope cannot carry is a known identity and holds nothing. None
+    members means the selector's own lookup failed.
+    """
+    numbers = sorted({m for members, _ in raw.values() if members for m in members if m.isdigit()})
+    named = _bounded_map(_project_id_of, numbers, deadline, "naming project") if numbers else {}
+    known = _previous_numbers(previous)
+    out: dict[str, tuple[dict[str, dict] | None, str]] = {}
+    for selector, (members, outcome) in raw.items():
+        if members is None:
+            out[selector] = (None, outcome)
+            continue
+        resolved: dict[str, dict] = {}
+        for member in members:
+            if not member.isdigit():
+                resolved.setdefault(member, {"outcome": None, NUMBER_KEY: None})
+                continue
+            project, naming = named.get(member, (None, OUTCOME_UNREACHABLE))
+            if project and naming == OUTCOME_OK:
+                resolved.setdefault(project, {"outcome": None, NUMBER_KEY: member})
+            elif project:
+                # Named, to an ID the set cannot carry: a known identity, reported by number.
+                resolved.setdefault(member, {"outcome": naming, NUMBER_KEY: member})
+            elif member in known:
+                log(f"{selector}: project {member} ({known[member]}) could not be named this run ({naming}); "
+                    "reported under the ID the last snapshot recorded, not listed.")
+                resolved.setdefault(known[member], {"outcome": naming, NUMBER_KEY: member})
+            else:
+                log(f"{selector}: project {member} could not be named ({naming}) and no run has named it; "
+                    "reported by number, not listed, and the scope prune is held this run: the number could "
+                    "be a project this declaration just dropped. Grant resourcemanager.projects.get there, "
+                    "or name the number in spec.scope.exclude.projects.")
+                resolved.setdefault(member, {"outcome": naming, NUMBER_KEY: member, "unnamed": True})
+        out[selector] = (resolved, outcome)
+    return out
+
+
 def _previous_outcome(previous: dict | None, project: str) -> str | None:
     """The outcome the last snapshot recorded for the project, if any."""
     for p in (previous or {}).get("projects", []):
@@ -487,17 +723,22 @@ def _previous_container_members(previous: dict | None, container: str) -> list[s
 
 def _resolve_projects(management: str | None, scope: dict,
                       searches: dict[str, tuple[dict | None, str]] | None = None,
-                      previous: dict | None = None) -> tuple[list[dict], list[dict], list[dict]]:
+                      previous: dict | None = None,
+                      selections: dict[str, tuple[dict | None, str]] | None = None) -> tuple[list[dict], list[dict], list[dict]]:
     """Turn the declaration into the ordered resolved set (design §3).
 
     Returns (entries, ignored_excludes, containers). Each entry is {id, via, outcome},
     where outcome is None for a project still to be listed, `ok` for a container member
-    whose clusters Asset Inventory already named (kept under `clusters`), a container's
-    own outcome for a member carried forward under the freeze rule, and `over-cap` for a
+    whose clusters Asset Inventory already named (kept under `clusters`), a container's or
+    selector's own outcome for a member carried forward under the freeze rule, the naming
+    call's outcome for a monitored project that could not be named, and `over-cap` for a
     project past RESOLVED_SET_CAP. The order is fixed so the cap binds the same way every
-    run: the management project, then explicit projects sorted by ID, then containers
-    sorted by ID (design §3). A glob that matches the management project is recorded and
-    not applied. `searches` holds each container's Asset Inventory result.
+    run: the management project, then explicit projects sorted by ID, then the selectors'
+    projects sorted by ID, then containers sorted by ID (design §3). A glob that matches the
+    management project is recorded and not applied. `searches` holds each container's Asset
+    Inventory result; `selections` each selector's named members (`_selector_members`). The
+    `containers` list carries one row per container and per selector, in that order, under
+    the id that is also the row's `via` name.
     """
     patterns = scope["exclude"]["projects"]
     entries: list[dict] = []
@@ -554,6 +795,88 @@ def _resolve_projects(management: str | None, scope: dict,
                 entry["indexed"] = True
 
     containers: list[dict] = []
+    # Selectors resolve to explicit projects (design §3): their members are merged, sorted by
+    # ID, and filled after the explicit projects, each listing its own clusters and reading
+    # over-cap on its own past the cap, the way an explicit project does. A selector's own
+    # row in `containers` records the lookup; a failed lookup carries its previous members
+    # frozen, after the live ones, so a project one selector froze and another named live is
+    # listed. A monitored project that could not be named (`outcome` set), and that no other
+    # selector named live, is in the set,
+    # reported, and not listed, unless a declared container places it below: nothing is
+    # created under a project the run cannot read.
+    selected: dict[str, dict] = {}
+    frozen_selected: list[tuple[str, str, str]] = []
+    for selector in _selector_ids(scope):
+        members, outcome = (selections or {}).get(selector, (None, OUTCOME_UNREACHABLE))
+        if members is None:
+            carried = _previous_container_members(previous, selector)
+            frozen_selected.extend((selector, project, outcome) for project in carried)
+            containers.append({"id": selector, "outcome": outcome, "projects": len(carried)})
+            continue
+        for project, info in members.items():
+            merged = selected.setdefault(project, {"via": [], "outcome": None, NUMBER_KEY: None, "live": False, "unnamed": False})
+            merged["via"].append(selector)
+            merged["unnamed"] = merged["unnamed"] or bool(info.get("unnamed"))
+            # A selector that named the project live (outcome None: still to be listed) wins
+            # over one whose naming call failed for it: that failure says the number could
+            # not be named this run, not that the project cannot be listed, and the live
+            # selector shows it can.
+            if info.get("outcome") is None:
+                merged["live"], merged["outcome"] = True, None
+            elif not merged["live"]:
+                merged["outcome"] = merged["outcome"] or info["outcome"]
+            merged[NUMBER_KEY] = merged[NUMBER_KEY] or info.get(NUMBER_KEY)
+        containers.append({"id": selector, "outcome": OUTCOME_OK, "projects": len(members)})
+    def keep_number(project: str, number: str | None) -> None:
+        # Every row a Metrics Scope named by number carries the number, whichever route
+        # listed the project: it is what lets a later run whose naming call is refused still
+        # report the project under its ID rather than retire it.
+        if not number:
+            return
+        for entry in entries:
+            if entry["id"] == project and not entry.get(NUMBER_KEY):
+                entry[NUMBER_KEY] = number
+
+    for project in sorted(selected):
+        info = selected[project]
+        if project in seen:
+            # Declared explicitly, or the management project, as well as reached through a
+            # selector: both vias, the listing it already has, and the number.
+            for via in info["via"]:
+                add_via(project, via)
+            keep_number(project, info[NUMBER_KEY])
+            continue
+        seen.add(project)
+        if _excluded_by(project, patterns):
+            continue
+        outcome = info["outcome"]
+        if outcome is None and listed_count() >= RESOLVED_SET_CAP:
+            outcome = OUTCOME_OVER_CAP
+            log(f"{project} (via {', '.join(sorted(info['via']))}) is past the resolved-set cap of {RESOLVED_SET_CAP}; over-cap, no CREATE.")
+        # A member whose naming call failed is carried under that outcome the way a frozen
+        # member is, and marked so: a container that places it live below lifts it into the
+        # listing, as it lifts a frozen one, rather than losing the folder's clusters to a
+        # naming call that was cut or refused.
+        entries.append({"id": project, "via": sorted(info["via"]), "outcome": outcome,
+                        **({"frozen": True} if info["outcome"] else {}),
+                        **({"unnamed": True} if info["unnamed"] and not info["live"] else {}),
+                        **({NUMBER_KEY: info[NUMBER_KEY]} if info[NUMBER_KEY] else {})})
+    for selector, project, outcome in sorted(frozen_selected):
+        if project in seen:
+            add_via(project, selector)
+            keep_number(project, _previous_number(previous, project))
+            continue
+        if _excluded_by(project, patterns):
+            continue
+        seen.add(project)
+        # Frozen (design §4): carried under the selector's outcome, so a failed lookup never
+        # reads as "no projects"; not placed by anything this run (`indexed` False keeps an
+        # index-lag stamp the row may carry from a container); the number it was named by
+        # last time rides along so a later run can still name it.
+        number = _previous_number(previous, project)
+        entries.append({"id": project, "via": [selector], "outcome": outcome, "frozen": True, "indexed": False,
+                        "uncounted": _previous_outcome(previous, project) == OUTCOME_OVER_CAP,
+                        **({NUMBER_KEY: number} if number else {})})
     for container in _container_ids(scope):
         members, outcome = (searches or {}).get(container, (None, OUTCOME_UNREACHABLE))
         if members is not None:
@@ -651,6 +974,14 @@ def _write_snapshot(snapshot: dict) -> None:
         log(f"could not write the scope snapshot at {path}: {e}")
 
 
+def _previous_number(previous: dict | None, project: str) -> str | None:
+    """The project number the last snapshot recorded for the project, if any."""
+    for p in (previous or {}).get("projects", []):
+        if isinstance(p, dict) and p.get("id") == project:
+            return p.get(NUMBER_KEY) if isinstance(p.get(NUMBER_KEY), str) else None
+    return None
+
+
 def _previous_via(previous: dict | None, project: str) -> list[str]:
     """The `via` the last snapshot recorded for a project, or [] when it had none."""
     for p in (previous or {}).get("projects", []):
@@ -670,7 +1001,9 @@ def _previous_container_ids(previous: dict | None) -> set[str]:
     """
     declaration = _previous_declaration(previous)
     known = set(_container_ids(declaration)) if declaration else set()
-    known.update(c["id"] for c in (previous or {}).get("containers", []) if isinstance(c, dict) and isinstance(c.get("id"), str))
+    # The array also carries the selectors' rows, which are not containers and have no index lag.
+    known.update(c["id"] for c in (previous or {}).get("containers", [])
+                 if isinstance(c, dict) and isinstance(c.get("id"), str) and _is_container(c["id"]))
     return known
 
 
@@ -894,7 +1227,7 @@ def reconcile(dry_run: bool = False) -> dict:
     management, management_authoritative = _project_source()
     _denied_this_run.clear()
     _api_disabled_this_run.clear()
-    scope, scope_readable, scope_present, containers_known = _load_scope()
+    scope, scope_readable, scope_present, containers_known, selectors_known = _load_scope()
     previous = _load_previous_snapshot()
     # An unreadable or absent declaration keeps the exclusions of the last one read. The
     # projects do not carry: nothing is listed or created outside the management project
@@ -935,15 +1268,18 @@ def reconcile(dry_run: bool = False) -> dict:
     carried_management = _previous_management(previous) if not management else None
     # One budget for the whole listing phase (LIST_BUDGET_SECONDS): the management project
     # lists first, at the start of it, so its listing, the one that decides whether the
-    # roster is reconciled, is never cut short by a slow container; then the containers,
-    # one Asset Inventory call each; then the explicit projects. Container members arrive
-    # with their clusters, so no per-project listing follows for them (design §4).
+    # roster is reconciled, is never cut short by a slow container; then the containers and
+    # selectors together, one call each, and the naming of the monitored projects a Metrics
+    # Scope returned by number; then the explicit and selector projects. Container members
+    # arrive with their clusters, so no per-project listing follows for them (design §4).
     listing_deadline = time.monotonic() + LIST_BUDGET_SECONDS
     listings: dict[str, tuple[list | None, str]] = {}
     if management:
         listings[management] = _list_project(management)
-    searches = _search_containers(_container_ids(scope), listing_deadline)
-    entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous)
+    groups = _resolve_groups(_container_ids(scope) + _selector_ids(scope), listing_deadline)
+    searches = {g: r for g, r in groups.items() if _is_container(g)}
+    selections = _selector_members({g: r for g, r in groups.items() if _is_selector(g)}, previous, listing_deadline)
+    entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous, selections)
     report["containers"] = [dict(c) for c in containers]
     if carried_management:
         for entry in entries:
@@ -995,8 +1331,10 @@ def reconcile(dry_run: bool = False) -> dict:
         # be scaffolded (registered with Hermes, stamped, pushed to the sandbox) and fail
         # only at get-credentials, every run. One describe per cluster before its create
         # answers cheaply: a NotFound skips the cluster the index still names, a 403 skips
-        # the project's remaining creates and reads it `denied` (design §4).
-        member_only = not ({VIA_MANAGEMENT, VIA_EXPLICIT} & set(entry["via"]))
+        # the project's remaining creates and reads it `denied` (design §4). A project
+        # listed by its own `clusters list` (management, explicit, or reached through a
+        # selector) has had that check, and `clusters` is set on exactly the index-listed rows.
+        member_only = "clusters" in entry
         for (proj, cluster, location) in sorted(listed):
             if (proj, cluster, location) in existing_keys:
                 continue
@@ -1103,12 +1441,19 @@ def reconcile(dry_run: bool = False) -> dict:
     elif management_changed:
         log(f"management project changed from {previous_management} to {management}, which did not "
             "list its clusters; the old project is carried forward and nothing is judged this run.")
+    # A Metrics Scope member the run could not name and no run has named is an identity the
+    # run does not know: the bare number could be the project this very declaration dropped
+    # from `projects` (the one-edit migration), and a project retired on that guess is the
+    # deletion this script never makes. It holds the scope prune the way a frozen container
+    # does, until the account can name it or the operator excludes the number.
+    unnamed = sorted(e["id"] for e in entries if e.get("unnamed"))
     lookups_clean = (management is not None and management_listed and scope_readable
-                     and not management_changed
+                     and not management_changed and not unnamed
                      and all(e["outcome"] != OUTCOME_UNREACHABLE for e in entries)
                      and all(c["outcome"] in (OUTCOME_OK, OUTCOME_OVER_CAP) for c in containers))
     if not lookups_clean and not management_changed:
         why = ("the management project did not list its own clusters" if management and not management_listed
+               else f"a Metrics Scope member could not be named and no run has named it ({', '.join(unnamed)})" if unnamed
                else "a lookup or the declaration could not be trusted")
         log(f"scope prune skipped this run: {why}.")
     declared_containers = set(_container_ids(scope))
@@ -1120,6 +1465,9 @@ def reconcile(dry_run: bool = False) -> dict:
 
     now = datetime.now(timezone.utc)
     absent_since: dict[str, str] = {}
+    # Why a project absent from the set is held rather than judged, when the reason is not
+    # the index's: reached through a selector the running render does not know.
+    held_reason: dict[str, str] = {}
 
     def index_dropped(project: str) -> bool:
         """A project reached only through containers that the index no longer places under one.
@@ -1150,12 +1498,20 @@ def reconcile(dry_run: bool = False) -> dict:
         if project in previously_retiring:
             return False
         via = _previous_via(previous, project)
-        container_vias = [v for v in via if v.split("/")[0] in CONTAINER_KINDS]
+        container_vias = [v for v in via if _is_container(v)]
         if VIA_MANAGEMENT in via:
             return False
         if _excluded_by(project, exclude_patterns):
             return False
         if not container_vias:
+            # A selector has no index and no lag: a member it no longer names is the
+            # declaration or the estate speaking, and retires under the ordinary rule. The
+            # one hold is a render that predates the selectors (a rollback), which declares
+            # nothing about them and keeps their members without a clock, as for containers.
+            if any(_is_selector(v) for v in via) and not selectors_known:
+                held_reason[project] = ("reached through a selector the running render does not know; kept" if scope_readable
+                                        else "not judged this run: the declaration could not be read; carried forward")
+                return True
             if not (containers_known and (newly_declared_containers or _previous_absent_since(previous, project))):
                 return False
         elif not containers_known:
@@ -1240,7 +1596,8 @@ def reconcile(dry_run: bool = False) -> dict:
                 # asset index this run: the index dropped it, not the declaration. Kept, listed,
                 # and back in scope the run the index places it again.
                 carried_in_scope.add(project)
-                reason = (f"not under any declared container in the asset index this run (a move, or the "
+                reason = (held_reason[project] if project in held_reason
+                          else f"not under any declared container in the asset index this run (a move, or the "
                           f"index behind); kept until {INDEX_LAG_GRACE_SECONDS // SECONDS_PER_HOUR}h after {absent_since.get(project, '')}"
                           if containers_known
                           else "reached through a container the running render does not know; kept" if scope_readable
@@ -1325,7 +1682,7 @@ def reconcile(dry_run: bool = False) -> dict:
     # an IAM deny on a member project blocks the inherited grant without hiding the
     # cluster from the asset index, and these calls are the only ones that see it.
     for entry in entries:
-        if entry["outcome"] != OUTCOME_OK or {VIA_MANAGEMENT, VIA_EXPLICIT} & set(entry["via"]):
+        if entry["outcome"] != OUTCOME_OK or "clusters" not in entry:
             continue
         for bucket, revised_to, why in ((_api_disabled_this_run, OUTCOME_API_DISABLED, "answered API disabled"),
                                         (_denied_this_run, OUTCOME_DENIED, "answered 403")):
@@ -1345,7 +1702,14 @@ def reconcile(dry_run: bool = False) -> dict:
         {"id": e["id"], "via": e["via"], "outcome": e["outcome"], "state": STATE_IN_SCOPE,
          "clusters": cluster_counts.get(e["id"]),
          **({ABSENT_SINCE_KEY: _previous_absent_since(previous, e["id"])}
-            if e.get("indexed") is False and _previous_absent_since(previous, e["id"]) else {})}
+            if e.get("indexed") is False and _previous_absent_since(previous, e["id"]) else {}),
+         # The number a Metrics Scope named the project by, this run or any earlier one, kept
+         # on every later row for the project whatever route built it (explicit, management, a
+         # container, a frozen carry), so a later run that cannot name the number (the grant
+         # revoked) still reports the project under its ID rather than retiring it. A number
+         # and an ID are immutable and unique per project, so a recorded pair never goes stale.
+         **({NUMBER_KEY: e.get(NUMBER_KEY) or _previous_number(previous, e["id"])}
+            if (e.get(NUMBER_KEY) or _previous_number(previous, e["id"])) else {})}
         for e in entries
     ] + [
         # Carried with the via it had, so a container frozen on a later run still finds the
@@ -1357,11 +1721,16 @@ def reconcile(dry_run: bool = False) -> dict:
         {"id": pid, "via": [v for v in _previous_via(previous, pid) if v != VIA_MANAGEMENT], "outcome": OUTCOME_UNREACHABLE,
          "state": STATE_IN_SCOPE, "clusters": remaining(pid),
          **({ABSENT_SINCE_KEY: absent_since.get(pid) or _previous_absent_since(previous, pid)}
-            if (pid in absent_since or _previous_absent_since(previous, pid)) else {})}
+            if (pid in absent_since or _previous_absent_since(previous, pid)) else {}),
+         **({NUMBER_KEY: _previous_number(previous, pid)} if _previous_number(previous, pid) else {})}
         for pid in sorted(carried_in_scope - resolved_ids)
     ] + [
+        # With the number it was named by, so a run that relinks it while the naming call is
+        # refused reports it under its ID, `denied` and in scope, rather than pruning it as a
+        # retiring project the run did not see.
         {"id": pid, "via": [], "outcome": OUTCOME_OK, "state": STATE_RETIRING,
-         "clusters": remaining(pid)}
+         "clusters": remaining(pid),
+         **({NUMBER_KEY: _previous_number(previous, pid)} if _previous_number(previous, pid) else {})}
         for pid in sorted(still_retiring - carried_in_scope)
     ], key=lambda p: p["id"])
     if not dry_run:
@@ -1410,16 +1779,16 @@ def _format_notification(report: dict) -> str:
             f"  ⚠️ {len(report['skipped_error'])} profile(s) could not be verified this run "
             f"(left untouched): {', '.join(f'`{n}`' for n in report['skipped_error'])}."
         )
-    # Containers first, one line each: a container that failed or read over-cap stands
+    # Containers and selectors first, one line each: one that failed or read over-cap stands
     # for every member it carried, which is what keeps the next line short. The two are
-    # said apart: a failed lookup points at IAM or the Asset API, an over-cap one (the
+    # said apart: a failed lookup points at IAM or the API, an over-cap one (the
     # lookup succeeded, the members would cross the cap) at the declaration.
     containers = sorted((report.get("containers") or []), key=lambda c: c["id"])
     failed_containers = [c for c in containers if c.get("outcome") not in (OUTCOME_OK, OUTCOME_OVER_CAP)]
     over_cap_containers = [c for c in containers if c.get("outcome") == OUTCOME_OVER_CAP]
     if failed_containers:
         lines.append(
-            f"  ⚠️ {len(failed_containers)} folder(s)/organisation(s) could not be resolved (members carried, profiles kept): "
+            f"  ⚠️ {len(failed_containers)} scope selector(s) (folder, organisation, Shared VPC host or Metrics Scope) could not be resolved (members carried, profiles kept): "
             + ", ".join(f"`{c['id']}` ({c['outcome']}, {c.get('projects', 0)} project(s))" for c in failed_containers) + "."
         )
     if over_cap_containers:

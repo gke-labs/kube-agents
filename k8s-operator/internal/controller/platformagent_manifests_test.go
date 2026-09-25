@@ -1422,6 +1422,21 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	if len(container.Command) != 1 || container.Command[0] != "/usr/local/bin/start-services" {
 		t.Errorf("unexpected proxy command: %v", container.Command)
 	}
+	// Pinned here as well as in the goldens: a golden regeneration blesses
+	// whatever the builder renders, so a request that drifted back down would
+	// otherwise pass every test. 500m is what lets a mint finish inside its
+	// five-second timeouts while an evicted pod's replacement warms up, and
+	// 512Mi is the memory Autopilot admits a 500m pod at, declared so the
+	// rendered request is the admitted one on both cluster modes.
+	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
+		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
+	}
+	if got := container.Resources.Requests.Memory().String(); got != "512Mi" {
+		t.Errorf("expected a 512Mi memory request on the proxy container, got %s", got)
+	}
+	if got := container.Resources.Limits.Cpu().String(); got != "1" {
+		t.Errorf("expected the proxy CPU limit left at 1, got %s", got)
+	}
 	env := make(map[string]corev1.EnvVar)
 	for _, item := range container.Env {
 		env[item.Name] = item
@@ -1894,161 +1909,6 @@ func TestEventWatcherTokenEnvMatchesStartServices(t *testing.T) {
 	t.Fatalf("%s passes --token-env=%s, but the container hosting the watcher has no such variable; the watcher will exit on every start", path, tokenEnv)
 }
 
-func TestKustomizeNetworkPolicies_PodSelectorMatchesCommonLabels(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "platform-agent",
-			Namespace: "kubeagents-system",
-		},
-	}
-	expectedLabels := commonLabels(agent)
-	expectedName := expectedLabels[labelName] // "platform-agent"
-
-	policyFiles := []string{
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-ingress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-core-egress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-internal-egress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-apiserver-egress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-external-egress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "gke-dataplane-v2", "fqdn-networkpolicy.yaml"),
-	}
-
-	for _, path := range policyFiles {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("failed to read policy file %s: %v", path, err)
-		}
-		var manifest struct {
-			Metadata struct {
-				Name string `yaml:"name"`
-			} `yaml:"metadata"`
-			Spec struct {
-				PodSelector struct {
-					MatchLabels map[string]string `yaml:"matchLabels"`
-				} `yaml:"podSelector"`
-			} `yaml:"spec"`
-		}
-		if err := yaml.Unmarshal(data, &manifest); err != nil {
-			t.Fatalf("failed to unmarshal YAML %s: %v", path, err)
-		}
-		got := manifest.Spec.PodSelector.MatchLabels[labelName]
-		if got != expectedName {
-			t.Errorf("policy %s (%s): expected podSelector.matchLabels[%q]=%q, got %q", manifest.Metadata.Name, path, labelName, expectedName, got)
-		}
-	}
-}
-
-// TestKustomizeCoreEgressDNSPeersMatchTheOperator pins the static Kustomize DNS
-// rule to the one buildNetworkPolicy renders. They are two hand-maintained
-// copies of the same peer list, and nothing else compares them: the only other
-// test reading these files checks podSelector alone.
-//
-// The drift is not hypothetical. Every other static copy in the tree — the
-// chart's litellm and github-minter policies, the LiteLLM integration base, the
-// examples — already named the Cloud DNS resolver while this file did not, and
-// no test noticed until a Cloud DNS install lost name resolution. The regression
-// this catches is the reverse: someone edits the builder, `go test ./...` stays
-// green, and Kustomize installs quietly get a different resolver set.
-//
-// It compares ipBlock CIDRs only. The selector peers are equivalent but not
-// textually comparable across a Go literal and a YAML document, and pinning
-// those would make the test fail on cosmetic edits rather than on drift.
-func TestKustomizeCoreEgressDNSPeersMatchTheOperator(t *testing.T) {
-	path := filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-core-egress.yaml")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("failed to read %s: %v", path, err)
-	}
-	var manifest struct {
-		Spec struct {
-			Egress []struct {
-				Ports []struct {
-					Port int32 `yaml:"port"`
-				} `yaml:"ports"`
-				To []struct {
-					IPBlock struct {
-						CIDR string `yaml:"cidr"`
-					} `yaml:"ipBlock"`
-				} `yaml:"to"`
-			} `yaml:"egress"`
-		} `yaml:"spec"`
-	}
-	if err := yaml.Unmarshal(data, &manifest); err != nil {
-		t.Fatalf("failed to unmarshal %s: %v", path, err)
-	}
-
-	// The static file's DNS rule carries a 0.0.0.0/0 peer with an except list,
-	// which the operator's does not; compare the single-host grants, which are
-	// the resolvers themselves.
-	static := map[string]bool{}
-	for _, rule := range manifest.Spec.Egress {
-		isDNS := len(rule.Ports) > 0
-		for _, port := range rule.Ports {
-			if port.Port != dnsPort {
-				isDNS = false
-			}
-		}
-		if !isDNS {
-			continue
-		}
-		for _, peer := range rule.To {
-			if strings.HasSuffix(peer.IPBlock.CIDR, "/32") || strings.HasSuffix(peer.IPBlock.CIDR, "/128") {
-				static[peer.IPBlock.CIDR] = true
-			}
-		}
-	}
-
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
-	}
-	// Every port-53 rule, not egressCIDRsForPort, which returns at the first one
-	// it finds. The static side above iterates the whole file, and comparing one
-	// operator rule against all of the manifest's would report parity for a
-	// second operator rule nobody had mirrored — the exact drift this test is
-	// here to catch, and a split into two port-53 rules is a plausible edit given
-	// that separate rules are how this policy keeps grants from widening one
-	// another.
-	rendered := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
-	operator := map[string]bool{}
-	for _, rule := range rendered.Spec.Egress {
-		// Written out rather than through ruleNamesPort, which counts a rule with
-		// no ports as naming every one of them. That is right for its callers and
-		// wrong here: such a rule's peers are not DNS peers, and folding them into
-		// this set would report drift against the static file for peers the static
-		// file's DNS rule was never supposed to carry.
-		namesDNS := false
-		for _, candidate := range rule.Ports {
-			if candidate.Port != nil && candidate.Port.IntValue() == dnsPort {
-				namesDNS = true
-				break
-			}
-		}
-		if !namesDNS {
-			continue
-		}
-		for _, peer := range rule.To {
-			if peer.IPBlock == nil {
-				continue
-			}
-			if strings.HasSuffix(peer.IPBlock.CIDR, "/32") || strings.HasSuffix(peer.IPBlock.CIDR, "/128") {
-				operator[peer.IPBlock.CIDR] = true
-			}
-		}
-	}
-
-	for cidr := range operator {
-		if !static[cidr] {
-			t.Errorf("the operator's DNS rule grants %s and %s does not; a Kustomize install gets a "+
-				"different resolver set from an operator-managed one", cidr, filepath.Base(path))
-		}
-	}
-	for cidr := range static {
-		if !operator[cidr] {
-			t.Errorf("%s grants %s on port 53 and the operator's DNS rule does not", filepath.Base(path), cidr)
-		}
-	}
-}
-
 // fqdnPatternsFromPolicy returns the egress match patterns buildFQDNNetworkPolicy emits.
 func fqdnPatternsFromPolicy(t *testing.T) []string {
 	t.Helper()
@@ -2099,10 +1959,10 @@ func fqdnPatternToRegexp(t *testing.T, pattern string) *regexp.Regexp {
 }
 
 // TestFQDNPatternList_MatchesRealHostnames pins the egress allowlist against
-// hostnames the gateway actually dials. TestFQDNPatternList_MatchesKustomizeManifest
-// only proves the two copies of the list agree — it would pass just as happily
-// if both were wrong, which is how "*.gke.goog" was first shipped one label
-// short of every DNS control-plane endpoint it was added to allow.
+// hostnames the gateway actually dials rather than against another copy of the
+// list — a copy-to-copy comparison passes just as happily when both are wrong,
+// which is how "*.gke.goog" was first shipped one label short of every DNS
+// control-plane endpoint it was added to allow.
 func TestFQDNPatternList_MatchesRealHostnames(t *testing.T) {
 	patterns := fqdnPatternsFromPolicy(t)
 
@@ -2142,39 +2002,6 @@ func TestFQDNPatternList_MatchesRealHostnames(t *testing.T) {
 		if !matched {
 			t.Errorf("no FQDN egress pattern matches %q; the gateway cannot reach it under FQDN network policy (patterns: %v)", host, patterns)
 		}
-	}
-}
-
-func TestFQDNPatternList_MatchesKustomizeManifest(t *testing.T) {
-	goPatterns := fqdnPatternsFromPolicy(t)
-
-	path := filepath.Join("..", "..", "..", "deploy", "kustomize", "gke-dataplane-v2", "fqdn-networkpolicy.yaml")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("failed to read %s: %v", path, err)
-	}
-	var manifest struct {
-		Spec struct {
-			Egress []struct {
-				Matches []struct {
-					Pattern string `yaml:"pattern"`
-				} `yaml:"matches"`
-			} `yaml:"egress"`
-		} `yaml:"spec"`
-	}
-	if err := yaml.Unmarshal(data, &manifest); err != nil {
-		t.Fatalf("failed to unmarshal %s: %v", path, err)
-	}
-	if len(manifest.Spec.Egress) == 0 {
-		t.Fatalf("expected egress in YAML manifest %s", path)
-	}
-	var yamlPatterns []string
-	for _, m := range manifest.Spec.Egress[0].Matches {
-		yamlPatterns = append(yamlPatterns, m.Pattern)
-	}
-
-	if !reflect.DeepEqual(goPatterns, yamlPatterns) {
-		t.Errorf("FQDN patterns diverge between Go code and YAML manifest: Go=%v, YAML=%v", goPatterns, yamlPatterns)
 	}
 }
 

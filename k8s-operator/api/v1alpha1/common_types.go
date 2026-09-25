@@ -1004,11 +1004,9 @@ type SecuritySpec struct {
 	// for egress by <name>-gateway-netpol, which the operator renders on every
 	// reconcile whether this field is set or not — unless
 	// spec.networkPolicy.enabled is false, which withholds the gateway policy.
-	// On a Helm install that makes this the Pod's only policy: the one shape
-	// where this field enforces for real on an enforcing CNI, denying
-	// everything off its list. A Kustomize install still carries the static
-	// platform-agent-core-egress set over the same Pod, so the union resumes
-	// there. Everywhere else, turning this on leaves the
+	// That makes this the Pod's only policy: the one shape where this field
+	// enforces for real on an enforcing CNI, denying everything off its list.
+	// Everywhere else, turning this on leaves the
 	// Pod's permitted egress a strict superset of what it was. In the default
 	// shape the only destination it adds is the credential broker on TCP 8765
 	// — plus, when the agent is not exporting telemetry, the managed collector
@@ -1031,12 +1029,6 @@ type SecuritySpec struct {
 	//     FQDNNetworkPolicy annotation is set. So every HTTPS destination on
 	//     the public internet stays open, and with it the exfiltration half of
 	//     what this control is meant to be.
-	//
-	// A Kustomize install additionally applies platform-agent-core-egress
-	// (deploy/kustomize/platform/networkpolicy-core-egress.yaml), which selects
-	// the agent Pod by app.kubernetes.io/name and permits the same metadata
-	// path. A Helm install does not carry it, and it changes nothing either
-	// way: the gateway policy alone is enough to make the point above.
 	//
 	// The overlap is deliberate rather than an oversight. Workload Identity
 	// needs the metadata path, and <name>-gateway-netpol still permits it to

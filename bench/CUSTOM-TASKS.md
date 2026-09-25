@@ -586,7 +586,8 @@ rather than resolved by listing order.
 **An unresolvable role is loud.** No `BENCH_FLEET_KUBECONFIG_DIR`, no file for the role, a role
 whose cluster the runner could not reach, or a fixture that was never planted, all produce
 `status: "error"` naming the role _and the project the runner looked in_ — the pool leases projects
-at random and a project the fleet stack was never applied to is a live possibility. It never falls
+at random. (A project the fleet stack was never applied to has no reader account, so the run stops
+at the credential gate before any check.) It never falls
 back to the ambient kubeconfig; that fallback is the defect this type exists to remove.
 
 **Fail versus error, which is the point of the type.** A safeguard that cannot tell "the agent

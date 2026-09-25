@@ -364,6 +364,13 @@ data:
       "organizations": [
         "111111111111"
       ],
+      "sharedVpcHosts": [
+        "vpc-host-dev",
+        "vpc-host-prod"
+      ],
+      "metricsScopes": [
+        "ops-metrics"
+      ],
       "exclude": {
         "projects": [
           "*-sandbox"
@@ -998,8 +1005,8 @@ spec:
               ephemeral-storage: 2Gi
               memory: 1Gi
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: 500m
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

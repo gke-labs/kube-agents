@@ -365,6 +365,8 @@ data:
       "projects": [],
       "folders": [],
       "organizations": [],
+      "sharedVpcHosts": [],
+      "metricsScopes": [],
       "exclude": {
         "projects": [],
         "clusters": []
@@ -991,8 +993,8 @@ spec:
               ephemeral-storage: 2Gi
               memory: 1Gi
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: 500m
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

@@ -943,7 +943,7 @@ function releasesHtml() {
   const body = releases.length
     ? `<table class="rel"><thead><tr><th>Candidate</th><th>Tier</th><th>Verdict</th><th>Admitted rate</th><th>Cases passed</th><th>Started</th><th>Eval took</th></tr></thead>` +
       `<tbody>${releases.map(releaseRow).join("")}</tbody></table>` +
-      `<p class="mut small">One row per <code>post-kube-agents-eval-rc</code> run: the full suite against a release candidate's own images. Advisory: this lane reports and does not gate, and the non-inferiority comparison stays advisory while the baseline store is maturing. The admitted rate covers only the cases admitted to the gate; cases passed counts every graded case in the run.</p>`
+      `<p class="mut small">One row per <code>post-kube-agents-eval-rc</code> run: the full suite against a release candidate's own images. The verdict gates the staging deploy — only GREEN promotes the candidate — while the non-inferiority comparison stays advisory as the baseline store matures. The admitted rate covers only the cases admitted to the gate; cases passed counts every graded case in the run.</p>`
     : `<p class="mut">No release-candidate eval run on record. When the next RC cuts, its run appears here: candidate, tier, verdict and the advisory non-inferiority number.</p>`;
   return `<div class="sec" id="releases"><h2>Release candidates</h2>${body}</div>`;
 }

@@ -137,7 +137,8 @@ LATEST_GA_TAG="$(get_latest_ga_tag)"
 # ── 1. Has anything passed the gate? ─────────────────────────────────────────
 #
 # The staging tag is the evidence, and it is the only evidence: it means the full
-# nightly matrix passed on this commit, where an rc_*_validated tag means only the
+# nightly matrix passed on this commit and the release-candidate eval it was then
+# nominated for came back green, where an rc_*_validated tag means only the
 # narrow three-hourly suite did. Requiring both would re-check a property the
 # first already guarantees — the nightly only ever promotes a candidate that
 # carries rc_*_validated — and would leave two gates to keep in step.

@@ -68,12 +68,14 @@
 # gitops-drift-out-of-band-triage (#1827, ~45min at its 900s hint).
 # Forty-four cases, ~1011-1031min serial. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
-# herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
-# at its default 3 (#1491). At the ~1.15x the presubmit realised on
-# whole-job wall clock at parallelism 4 under daytime quota contention that
-# would be ~879-897min, over the deadline; 480m holds only if the nightly,
-# alone on the model quota at that hour and two lanes wider, realises ~1.9x
-# or better. Night one (2026-09-16, build 2100374258805903360, #1491)
+# herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=8 (6 from #1491 until
+# oss-test-infra#2707, 2026-09-25; the arithmetic that follows was done at
+# six) and EVAL_REPETITIONS at its default 3. At the ~1.15x the presubmit
+# realised on whole-job wall clock at parallelism 4 under daytime quota
+# contention that would be ~879-897min, over the deadline; 480m holds only
+# if the nightly, alone on the model quota at that hour and two lanes
+# wider, realises ~1.9x or better. Night one (2026-09-16, build
+# 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
 # so the five additions are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
@@ -96,11 +98,11 @@
 # 5.4-5.8x over parallelism 6, so 5h39m on the lightest night and the Prow
 # deadline on the two heaviest (09-18 and 09-21, 8h00m, nothing recorded).
 # The worst measured night does not fit at parallelism 6 today, and this
-# edit adds nothing to it. oss-test-infra#2707 (open, approved 2026-09-22)
-# moves the periodic to EVAL_TASK_PARALLELISM=8, at which the worst night's
-# 2693 serial minutes project to ~5.6h of fan-out plus ~20 minutes of build
-# and deploy, inside 480m with about two hours to spare; until it merges a
-# heavy night is a truncated night, whichever file its cases are listed in.
+# edit adds nothing to it. oss-test-infra#2707 (merged 2026-09-25) moved the
+# periodic to EVAL_TASK_PARALLELISM=8, at which the worst night's 2693 serial
+# minutes project to ~5.6h of fan-out plus ~20 minutes of build and deploy,
+# inside 480m with about two hours to spare; the nights before it a heavy
+# night was a truncated night, whichever file its cases were listed in.
 # The seven now record one data point a night here where they recorded ten
 # to sixty a day in the presubmit; the admission edit for any of them cites
 # this record, so the record is thinner and the wait is longer by design.

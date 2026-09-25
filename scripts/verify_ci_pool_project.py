@@ -32,13 +32,25 @@ _UPSTREAM_SLUG = "gke-labs/kube-agents"
 _CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
 _CHART_VALUES = _ROOT / "charts" / "kube-agents" / "values.yaml"
 _FLEET_KUBECONFIGS = _ROOT / "hack" / "fleet-kubeconfigs.sh"
+# The runner refuses to write kubeconfigs on the caller's own credential unless
+# told to. The fleet check tells it: an operator, even a project owner, holds no
+# token-creator on the reader (roles/owner does not carry
+# iam.serviceAccounts.getAccessToken), and this one-off read of a project the
+# operator owns is not the shared-fleet hazard the refusal exists for. The
+# reader's bindings are checked in check_iam_and_service_accounts instead.
+FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV = "FLEET_ALLOW_RUNNER_CREDENTIAL"
+# The runner's `_FLEET_EXIT_READONLY_UNAVAILABLE`: its credential gate refused
+# this caller before reading anything, whatever the line says. That is about
+# the credential the verifier ran with, never about the project.
+FLEET_EXIT_READONLY_UNAVAILABLE = 3
 _FLEET_CATALOG = _ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 
 # The summary hack/fleet-kubeconfigs.sh prints to stderr on its way out. It is
 # the only place the counts appear, and the script exits 0 whether it wrote
 # every role file or none -- an absent kubeconfig becomes `status: error` on
 # the checks that needed it rather than killing the job, which is what that
-# script is for -- so the numbers are the whole signal.
+# script is for -- so the numbers are the whole signal. The one exception is
+# exit 3, a read-only credential it could not mint: nothing written, no line.
 _FLEET_SUMMARY = re.compile(
     r"Seeded-fleet kubeconfigs: (?P<written>\d+) role\(s\) written to \S+, "
     r"(?P<unresolved>\d+) on clusters that could not be resolved or reached, "
@@ -233,8 +245,9 @@ CI_HEALTH_BOT_MEMBER = "serviceAccount:eval-dashboard-publisher@kube-agents-prow
 # What a runner loses without the token-creator grant; the bot's loss is
 # different and is spelled out in its own entry below.
 _RUNNER_WITHOUT_TOKEN_CREATOR = (
-    "every fleet check it runs in this project runs under its own read-write "
-    "credential. Re-apply bench/tf/fleet against {project_id}."
+    "every run it makes in this project stops at the fleet-credentials step: "
+    "hack/fleet-kubeconfigs.sh refuses to read the fleet on the runner's own "
+    "read-write credential. Re-apply bench/tf/fleet against {project_id}."
 )
 
 # Every member that must hold roles/iam.serviceAccountTokenCreator on the
@@ -430,7 +443,9 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # The listing is not the only thing that can be refused. A cluster that the
 # listing returned and `get-credentials` would not open is unread for the same
 # reason and to the same effect, and so is one skipped because a temporary file
-# could not be created. Sources: hack/fleet-kubeconfigs.sh lines 394 and 386.
+# could not be created, or dropped because the file gcloud wrote could not be
+# rewritten to the reader's exec credential (a local fault, not a pool state).
+# Sources: the three per-cluster WARNING lines in hack/fleet-kubeconfigs.sh.
 #
 # One of these, or _FLEET_COULD_NOT_LOOK, must be present before an unresolved
 # role may be excused. Excusing on the *absence* of a "looked and found wrong"
@@ -440,7 +455,8 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # stays non-zero so :406 is silent, something else resolves so :411 is silent,
 # and its roles increment `unresolved` with nothing printed at all.
 _FLEET_UNREACHABLE = re.compile(
-    r"no credentials for seeded cluster|could not create a temporary file", re.I
+    r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to",
+    re.I,
 )
 
 
@@ -1031,12 +1047,12 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
 
     # The runner's permission to borrow the seeded fleet's read-only account.
     # Without it hack/fleet-kubeconfigs.sh cannot mint a token for
-    # seeded-fleet-reader, so every role kubeconfig keeps the runner's own
-    # roles/container.admin credential on a fleet all open pull requests share --
-    # loud in the log, but the run still passes, which is why this went unnoticed
-    # across the whole pool (gke-labs/kube-agents#1051). bench/tf/fleet now
-    # defaults the grant, so a project failing here was last applied before that
-    # default landed and needs `tofu apply` against its seeded-fleet state.
+    # seeded-fleet-reader, writes nothing, and every run that leases the
+    # project stops at its fleet step. (Before it refused, it warned and read the
+    # fleet on the runner's own roles/container.admin, unnoticed across the whole
+    # pool: gke-labs/kube-agents#1051.) bench/tf/fleet now defaults the grant, so
+    # a project failing here was last applied before that default landed and
+    # needs `tofu apply` against its seeded-fleet state.
     fleet_reader_email = f"seeded-fleet-reader@{project_id}.iam.gserviceaccount.com"
     rc, out, err = run_cmd([
         "gcloud", "iam", "service-accounts", "get-iam-policy",
@@ -1481,8 +1497,9 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
             "Not checked",
             warnings=[
                 "kubectl is not on PATH, so the planted fixtures were not checked. "
-                f"Install it and re-run, or run FLEET_PROJECT_ID={project_id} "
-                "hack/fleet-kubeconfigs.sh by hand and read its summary line."
+                f"Install it and re-run, or run {FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV}=1 "
+                f"FLEET_PROJECT_ID={project_id} hack/fleet-kubeconfigs.sh by hand and "
+                "read its summary line."
             ],
         )
 
@@ -1497,6 +1514,11 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
             FLEET_PROJECT_ID=project_id,
             BENCH_FLEET_KUBECONFIG_DIR=target,
         )
+        # Forced, not defaulted: this check has decided the operator's own
+        # credential is acceptable, and a shell that exports the opt-in blank
+        # or as 0 would otherwise turn a healthy project into exit 3.
+        if not env.get("FLEET_READONLY_SA"):
+            env[FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV] = "1"
         rc, _, err = run_cmd(
             ["bash", str(_FLEET_KUBECONFIGS)], timeout=FLEET_TIMEOUT_SECONDS, env=env
         )
@@ -1630,7 +1652,10 @@ def _fleet_presence_result(
     if not match:
         last = (err.strip().splitlines() or ["no output"])[-1]
         if rc != 0:
-            reason = _unread_reason(err)
+            # Exit 3 is the gate, before any read, in every shape it prints,
+            # and its one line is the reason whole; the other codes are unread
+            # only when stderr says why.
+            reason = last if rc == FLEET_EXIT_READONLY_UNAVAILABLE else _unread_reason(err)
             if reason:
                 return CheckResult(
                     name,
