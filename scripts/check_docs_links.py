@@ -41,7 +41,10 @@ Scope is deliberately narrow and offline:
   design document a code file cites. From there, reach follows links: a
   relative link, a site route (``/kube-agents/...``), or a repository blob
   URL (the form the generated skill catalogue uses; the URL itself is not
-  fetched or validated). A document linked only from documents no reader
+  fetched or validated), however the link is written -- a Markdown link, a
+  reference-style definition, an autolink, or an HTML or JSX ``href``
+  attribute, which is how the site's hub pages link their sections
+  (``<LinkCard href=...>``). A document linked only from documents no reader
   reaches is as unreachable as one linked from nowhere, and is reported the
   same way. The documents that were unreachable when the rule arrived are
   named in ``UNLINKED_ALLOWLIST``; the list only shrinks -- an entry that
@@ -79,6 +82,17 @@ VENDORED_DIR = "node_modules"
 
 # [text](target) but not ![image](target) handled separately; both are checked.
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(\s*([^)\s]+)(?:\s+\"[^\"]*\")?\s*\)")
+# The other ways a document links another, read for the same two rules. An
+# HTML or JSX `href` attribute: `<LinkCard href="/kube-agents/..."/>` is how
+# the site's hub pages link their sections, and `<a href>` reads the same; an
+# `href={expression}` names no file and is skipped. A reference-style
+# definition, `[label]: target`, alone on its line with at most a quoted title
+# after it, so a footnote (`[^1]: prose`) and a paragraph that happens to open
+# with a bracketed word are not read as one. An autolink, `<https://...>`,
+# which reaches a document only when it is a repository blob URL.
+HREF_RE = re.compile(r"""\bhref=(?P<quote>["'])(?P<target>[^\n]*?)(?P=quote)""")
+REFERENCE_DEFINITION_RE = re.compile(r"""^\s{0,3}\[(?!\^)[^\]]+\]:\s*<?(?P<target>[^\s<>]+)>?(?:\s+"[^"]*")?\s*\Z""")
+AUTOLINK_RE = re.compile(r"<(?P<target>https?://[^\s<>]+)>")
 
 SKIP_PREFIXES = (
     "http://",
@@ -288,13 +302,24 @@ def strip_code_fences(text: str) -> list[tuple[int, str]]:
     return kept
 
 
+def line_links(line: str) -> Iterator[str]:
+    """Every link target written on one line, in each form a document links another."""
+    yield from LINK_RE.findall(line)
+    for pattern in (HREF_RE, AUTOLINK_RE):
+        for match in pattern.finditer(line):
+            yield match.group("target")
+    definition = REFERENCE_DEFINITION_RE.match(line)
+    if definition:
+        yield definition.group("target")
+
+
 def markdown_links(path: Path) -> Iterator[tuple[int, str]]:
     """Yield (line number, link target) for every navigable link in a document."""
     for lineno, line in strip_code_fences(path.read_text(encoding="utf-8")):
         # A space, not "", so stripping a span cannot glue a stray `[text]`
         # onto a following `(target)` and invent a link that was never written.
         line = INLINE_CODE_RE.sub(" ", line)
-        for raw in LINK_RE.findall(line):
+        for raw in line_links(line):
             target = raw.strip()
             if target:
                 yield lineno, target

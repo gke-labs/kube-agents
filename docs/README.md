@@ -119,7 +119,9 @@ CI enforcement: `make docs-check` runs the same checks as
   onboarding templates and the GitOps template's per-directory documents —
   and every design document a code file cites. From there reach follows
   relative links, site routes and repository blob URLs (the generated skill
-  catalogue's form). A document linked only from documents no reader reaches
+  catalogue's form), written as a Markdown link, a reference-style definition,
+  an autolink or an `href` attribute (the site's hub pages link by
+  `<LinkCard href=...>`). A document linked only from documents no reader reaches
   is reported like one linked from nowhere. The documents that were
   unreachable when the rule arrived are named in the script's allowlist, which
   only shrinks: an entry that becomes reachable, becomes exempt by shape, or is
