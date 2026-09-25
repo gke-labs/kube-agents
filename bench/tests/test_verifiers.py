@@ -1431,16 +1431,56 @@ def test_a_report_that_answers_silent_gets_the_silent_reason(token, github):
         "`[SILENT]`",
         "  `[SILENT]`\n",
         "[**SILENT**]",
-        "[SILENT]\n\nLedger unchanged.",
+        "~~[SILENT]~~",
         "Result of delegated task t_4f81:\n[SILENT]",
         "<router closer>\n\nResult of delegated task t_abc:\n**[SILENT]**",
-        "### Status: [SILENT]",
+        "<router closer>\n\nResult of delegated task t_abc:\n`[SILENT]`",
+        "<router closer>\n\nResult of delegated task t_1:\nfoo\n\nResult of delegated task t_2:\n[SILENT]",
     ):
         _stash_report(final_message=variant)
         res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
         assert res.status == "fail" and not res.success
         assert "was [SILENT] with no issue URL" in res.reason
         assert "#1929" in res.reason
+        assert github.calls == []
+
+
+def test_a_report_quoting_or_mentioning_silent_in_prose_is_not_silence(token, github):
+    """Whole-message rule: mentioning [SILENT] in prose is not a silent report (#1929).
+
+    Matches the silence predicate in deploy/docker/plugins/chat/adapter.py: only a
+    report whose entire content (or whose delegated worker task result) is the
+    silence marker alone is graded as silence. Mentions in prose or alongside
+    other text do not get the #1929 silent reason.
+    """
+    for variant in (
+        "the ledger was unchanged; this was an on-demand run so I did not answer [SILENT]",
+        "<router closer>\n\nResult of delegated task t_abc:\nthe ledger was unchanged; this was an on-demand run so I did not answer [SILENT]",
+        "[SILENT]\nwas recorded at 06:00.",
+        "The 06:00 run recorded\n[SILENT]",
+        "[SILENT]\n\nLedger unchanged.",
+        "### Status: [SILENT]",
+    ):
+        _stash_report(final_message=variant)
+        res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+        assert res.status == "fail" and not res.success
+        assert "was [SILENT] with no issue URL" not in res.reason
+        assert "names no github.com issue URL" in res.reason
+        assert github.calls == []
+
+
+def test_a_queued_report_mentioning_silent_gets_the_queued_reason(token, github):
+    """A report that queues the audit but happens to mention [SILENT] gets the #1876 queued reason."""
+    for variant in (
+        "stream will run on its next cron schedule; previous tick answered [SILENT]",
+        "<router closer>\n\nResult of delegated task t_1:\nqueued to run for the next schedule [SILENT]",
+    ):
+        _stash_report(final_message=variant)
+        res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+        assert res.status == "fail" and not res.success
+        assert "was [SILENT] with no issue URL" not in res.reason
+        assert "queued the audit for later instead of running it" in res.reason
+        assert "#1876" in res.reason
         assert github.calls == []
 
 
