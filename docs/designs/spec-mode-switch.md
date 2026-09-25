@@ -144,7 +144,9 @@ should survive chart upgrades.
 ## One thing inside `next` has its own switch
 
 The A2A gateway's inject door (`spec-chatops-gateway.md`, "The test backend") renders only
-when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`. That is not a
+when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`, and its A2A
+door for agent callers (`spec-chatops-gateway.md`, "The A2A door") only under
+`A2A_AGENT_DOOR=true`, the same way. That is not a
 second mode mechanism and does not belong in the field this document defines. The door takes the
 principal it acts as out of a request body, so a CRD field would put "render the eval door" in
 the API a cluster's owner edits and the operator would be obliged to honour it. Whether an
