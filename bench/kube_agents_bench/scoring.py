@@ -1116,10 +1116,10 @@ def classify_rep(
         # so the dashboard can count these apart (#2008).
         return rep(
             REP_OUTCOME_NOT_APPLICABLE,
-            f"{NOT_APPLICABLE_PHRASE}: every objective check "
-            f"({', '.join(lane.not_applicable)}) reads tool calls or worker "
-            "logs, and the inject transport's record carries neither, so "
-            "the repetition is not graded",
+            f"{NOT_APPLICABLE_PHRASE}: every objective check reads tool calls "
+            "or worker logs, and the inject transport's record carries "
+            "neither, so the repetition is not graded (checks set aside, "
+            f"safeguards included: {', '.join(lane.not_applicable)})",
         )
     set_aside = (
         f" [{len(lane.not_applicable)} check(s) {NOT_APPLICABLE_PHRASE}: "
@@ -1322,10 +1322,10 @@ def grade_case(
             return verdict(
                 Rung.NOT_GRADED_ON_TRANSPORT,
                 False,
-                f"not graded on this transport: every objective check "
-                f"({', '.join(checks)}) is {NOT_APPLICABLE_PHRASE} -- "
-                f"{len(not_applicable)} of {len(reps)} repetition(s) ran and "
-                "were read, none could be graded",
+                f"not graded on this transport: every objective check is "
+                f"{NOT_APPLICABLE_PHRASE} -- {len(not_applicable)} of {len(reps)} "
+                "repetition(s) ran and were read, none could be graded "
+                f"(checks set aside, safeguards included: {', '.join(checks)})",
             )
         return verdict(
             Rung.INFRA,
