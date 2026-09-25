@@ -1,0 +1,45 @@
+# The Hermes bridge sidecar image: the platform-agent image plus the one static
+# hermes-bridge binary (a2a/docs/hermes-bridge.md, "Where it runs").
+#
+# CI-ONLY, and deliberately so. deploy/docker/cloudbuild-ci.yaml builds it in
+# its `a2a` step when hack/ci-deploy.sh runs under EVAL_MODE_NEXT=1, FROM the
+# platform-agent image the same build just produced, so the sidecar and the
+# agent container it shares a pod with are one build. It is not in images.json
+# (hack/check-image-inventory.sh says why) and not release surface: it joins at
+# stage-2 graduation or dies before it, whichever the dispatcher decides.
+#
+# PLATFORM_AGENT_IMAGE has no default on purpose. A registry default would let
+# a build quietly pair a bridge with some other run's agent image; with none,
+# `docker build` without the arg fails at the FROM line.
+#
+# Build from the a2a/ module root:
+#   docker build -f Dockerfile.hermes-bridge \
+#     --build-arg PLATFORM_AGENT_IMAGE=<registry>/platform-agent:<tag> \
+#     -t <registry>/hermes-bridge:<tag> .
+
+# The builder base comes from images.json, spelled the way a2a/Dockerfile.gateway
+# spells it so `make mirror-images` and the pinning there cover this build too.
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.27-alpine
+ARG PLATFORM_AGENT_IMAGE
+
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
+# Refuse to download a toolchain the pin above does not name: without this, a
+# substituted GOLANG_IMAGE older than a2a/go.mod's `go` directive silently
+# fetches a newer one instead of failing the build (#1138).
+ENV GOTOOLCHAIN=local
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/hermes-bridge ./cmd/hermes-bridge
+
+# Everything else -- the hermes CLI at /opt/hermes/.venv/bin, the agent
+# entrypoint, the runtime user -- is the platform-agent image's. The ENTRYPOINT
+# stays the agent entrypoint: with AGENT_SHARED_STATE_SETUP=skip on the sidecar
+# it runs upstream's container-local init, waits for the owner's config.yaml,
+# enters $HERMES_HOME and execs the bridge, exactly as it does for the dashboard
+# container (deploy/shared/docker-entrypoint.sh, step 1.5).
+FROM ${PLATFORM_AGENT_IMAGE}
+COPY --from=build /out/hermes-bridge /usr/local/bin/hermes-bridge
+CMD ["/usr/local/bin/hermes-bridge"]

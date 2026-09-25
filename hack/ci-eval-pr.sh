@@ -41,6 +41,18 @@ readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_SUITE_NOT_EVALUATED_STATUS=2
 readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 
+# EVAL_MODE_NEXT=1 is the flag hack/ci-deploy.sh flipped the install to
+# `spec.mode: next` under, in the same job environment. Under it the matrix
+# runs through the gateway's inject door (docs/designs/eval-next-transport.md,
+# stage 1): the harness's transport switch, and the door's bearer token read
+# from the Secret the operator renders beside the door -- <agent>-a2a-inject,
+# key `token` (a2aInjectName and a2aInjectTokenKey in the operator; the deploy
+# already waited for it). Unset, the matrix runs over the agent API exactly
+# as before; section 4 below is the only site that reads the flag.
+readonly EVAL_INJECT_TRANSPORT="inject"
+readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
+readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
+
 # ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
 # A push that changes only inert files re-runs this whole job and aborts the
 # run in flight -- #1127's comment-only push cost a 123-minute re-run. Prow's
@@ -1394,6 +1406,23 @@ export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down Gemini 3.1
 PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
 export PLATFORM_AGENT_TOKEN
+# Under EVAL_MODE_NEXT=1 the deploy flipped the install to next, armed the
+# inject door and declared the bridge; the matrix goes through the door. The
+# agent token above is still fetched: the transport switch changes how a
+# prompt reaches the agent, not what else the run reads from the install.
+# Everything about the door the harness needs beyond these two it derives
+# from AGENT_SERVICE_NAME and AGENT_NAMESPACE, exported above.
+if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+  EVAL_INJECT_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_INJECT_TOKEN_SECRET_SUFFIX}"
+  if ! AGENT_INJECT_TOKEN="$(kubectl get secret "${EVAL_INJECT_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_INJECT_TOKEN_SECRET_KEY}}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
+    echo "ERROR: EVAL_MODE_NEXT=1 but the inject door's token Secret ${EVAL_INJECT_TOKEN_SECRET} (key ${EVAL_INJECT_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}." >&2
+    echo "       The operator renders it only when deployed with the inject door armed, which hack/ci-deploy.sh does under the same flag." >&2
+    exit 1
+  fi
+  export AGENT_INJECT_TOKEN
+  export AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"
+  echo "EVAL_MODE_NEXT=1: running the matrix through the inject door (AGENT_TRANSPORT=${AGENT_TRANSPORT}, token from ${EVAL_INJECT_TOKEN_SECRET})"
+fi
 export JUDGE_API_KEY="${GEMINI_API_KEY}"
 export JUDGE_PROVIDER="google"
 # The judge is pinned INDEPENDENTLY of the agent, and the invariant is:
