@@ -318,6 +318,14 @@ dropped `flowcontrol.apiserver.k8s.io/v1beta3`.
 - Why it is on the list: Helm and Spinnaker on 1.25 in the
   [incidents](upgrade-readiness-checks.md#upgrades-that-went-wrong-in-public); the 1.32 removal is
   in GKE's [deprecation notes](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/apis-1-32).
+- Fixture: none in the seeded fleet, and none can be standing. No minor after 1.32 removes a served
+  API, and 1.31, the last minor that serves one, leaves GKE's Extended channel on 2026-10-22, so a
+  caller of a removed API cannot be planted for longer than that. Measured on a test cluster built
+  for it: a caller writing FlowSchemas through `flowcontrol/v1beta3` on 1.31 was audit-stamped
+  `k8s.io/removed-release=1.32` on every write, and failed with a 404 on discovery within a minute
+  of the control plane reaching 1.32 while the object it had written stayed readable through v1.
+  The permanent stand-in the fleet plants instead writes `Endpoints`, deprecated in 1.33: each
+  write is stamped `k8s.io/deprecated=true`, with no removal label and no Recommender insight.
 
 ### 8. A fail-closed webhook whose backend is not up
 
