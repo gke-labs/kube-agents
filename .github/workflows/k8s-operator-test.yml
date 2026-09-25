@@ -1,6 +1,6 @@
 name: Operator Tests
 
-# The two triggers filter in different places, and they have to.
+# The pull-request and push triggers filter in different places, and they have to.
 #
 # On a pull request the filtering is the `Detect changes` step below, because
 # `Run Controller Tests` is a required check: a workflow that `paths:` declines
@@ -21,8 +21,13 @@ name: Operator Tests
 # So the push trigger filters with `paths:` instead: a commit that touches
 # nothing here produces no run at all, and an absent run cannot lie. Keep this
 # list and the `operator:` filter below identical.
+#
+# A merge-queue run takes the pull request's shape, not the push's: the check
+# is required there too, so it has to start every time and filter in the step.
 on:
   pull_request:
+    branches: [main]
+  merge_group:
     branches: [main]
   push:
     branches: [main]

@@ -693,10 +693,12 @@ because the sandbox never had a handle on the document that is opened.
 
 The same substitution is applied to a `--kubeconfig` flag in the argument
 vector, which `kubectl` prefers over the environment; covering only the
-environment would leave the flag as an equivalent path. `get-credentials` is
-handled as the one command permitted to author a kubeconfig: it writes into the
-broker's own directory, the result is filed under the context it selects, and the
-context name is what the caller gets back. The visible pin
+environment would leave the flag as an equivalent path. Shim and broker scan
+only up to the `--` where kubectl's own flags end. `get-credentials` is
+handled as the one command permitted to author a kubeconfig: gcloud writes into
+the broker's own directory, the result is filed under the context it selects, and
+the context name is what the caller gets back; the shim files the returned copy
+on the sandbox side. The visible pin
 that profile scaffolding records and the Cluster Agent preflight inspects
 therefore still exists, without being what a later command opens.
 
@@ -725,14 +727,53 @@ Consequences:
   denial-of-service boundary rather than a performance choice.
 - `gcloud container clusters get-credentials` runs against an isolated scratch
   kubeconfig, and the result is filed under the context it names. It never writes
-  the broker's own base kubeconfig. That base file is where a `kubectl` naming no
-  kubeconfig resolves, and `bootstrap` sets its `current-context` — and its
+  the broker's own base kubeconfig. That base file is where a request naming no
+  cluster resolves, and `bootstrap` sets its `current-context` — and its
   default namespace — to the host cluster once at startup. Leaving it alone is
   what keeps a context-less `kubectl` on the host cluster instead of following
-  whichever cluster was fetched last. Selecting a different cluster is done by
-  pointing `KUBECONFIG` at a per-target file, which is the pin the broker reads;
-  a bare `--context` is passed through to `kubectl` and will not find a context
-  the file it was handed does not contain.
+  whichever cluster was fetched last, pod-wide. A caller names a different
+  cluster in one of three ways, all resolved by the sandbox's shim
+  (`credential_proxy_client.py`) to the context name the broker regenerates from:
+  `KUBECONFIG` or `--kubeconfig` pointing at a per-target file, which keep
+  precedence; a `--context` that is a GKE context name, forwarded as that name;
+  or, later in the same command line, nothing at all — a context-less `kubectl`
+  run after a `get-credentials` that was given no `KUBECONFIG` destination, as
+  in `get-credentials seeded-a && kubectl get pods`, reaches that cluster, as
+  `gcloud` would on a workstation. The pin is keyed on the nearest shell
+  process above the `get-credentials` (its pid and start time), and a `kubectl`
+  finds it by the same walk, after first checking its own pid for the case
+  where bash exec'd it in the shell's place: both step over `timeout`, `xargs`
+  or a helper script and key only processes whose `/proc` command name is a
+  shell. So a `timeout 60 gcloud …`
+  fetch pins the line and replaces an earlier fetch's pin in it. sshd, which
+  outlives every command line on the Hermes connection, is never keyed, so no
+  pin outlives the line. sshd is pid 1 in the sandbox and the walk stops
+  there, so no shell above it can be keyed either. A pin counts only when it is
+  a regular file, not a link or a FIFO, owned by the uid reading it, so the hermes
+  principal, whose `HERMES_HOME` is the agent-owned `/opt/data`, is not steered
+  or stalled by a file the agent planted. The pin lasts one command line and
+  never becomes the pod's default: the next command and a resumed card have a
+  different shell and read the host cluster. A backgrounded subshell of two or more
+  commands, `( get-credentials a && … ) &`, pins that subshell alone, so
+  parallel fetches written that way do not race; bash execs a one-command
+  `( get-credentials a ) &`, so that fetch pins the line's own shell, as it
+  would without the parentheses. Other parallel fetches in one line also share
+  the line's pin, last writer wins: bare
+  `get-credentials a & get-credentials b &`, `xargs -P`, and `#!/bin/bash`
+  helper scripts run by path, whose command
+  name is the script's rather than a shell's. Parallel work that needs
+  different clusters exports `KUBECONFIG` per target. A fetch inside a forked
+  stage of several commands, `{ get-credentials a; … } | tee log` or `$( … )`,
+  pins that stage, and a `kubectl` after it reads the host. Bash also execs the last command of a bare
+  `bash -c`, so a helper script run there holds the shell's pid under its own
+  name and a `kubectl` it starts reads the host; the Hermes command wrapper
+  runs the command inside an `eval` that is not its last line, so this does
+  not arise there. A
+  `get-credentials` given no `KUBECONFIG` destination also asks for its file
+  back and lands it at
+  `${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
+  and prints the `export KUBECONFIG=` and `--context` lines that reach that
+  cluster from later commands.
 - Proxied `kubectl` reads get `--request-timeout=30s` and a 60-second deadline,
   so an unreachable control plane fails in seconds rather than holding a broker
   worker for `kubectl`'s 300-second client default. Commands that are meant to

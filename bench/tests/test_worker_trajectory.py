@@ -51,19 +51,51 @@ _CHILDREN_DDL = (
     "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT,"
     " created_at INTEGER)"
 )
-# ``messages`` only: the read never opens hermes' ``sessions`` table.
+# ``messages`` for the calls and the usage columns of ``sessions`` for the
+# counts: the two tables the read opens, in hermes' shapes.
 _STORE_DDL = (
     "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT,"
     " content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL,"
     " active INTEGER DEFAULT 1)",
+    "CREATE TABLE sessions (id TEXT PRIMARY KEY, input_tokens INTEGER NOT NULL DEFAULT 0,"
+    " output_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0,"
+    " cache_write_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0)",
 )
+_USAGE_DDL = (
+    "CREATE TABLE session_model_usage (session_id TEXT, model TEXT, input_tokens INTEGER,"
+    " output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER,"
+    " reasoning_tokens INTEGER)"
+)
+# What each worker session billed, in hermes' column names.
+PLATFORM_TOKENS = {
+    "input_tokens": 1200,
+    "output_tokens": 300,
+    "cache_read_tokens": 5000,
+    "cache_write_tokens": 0,
+    "reasoning_tokens": 100,
+}
+CLUSTER_TOKENS = {
+    "input_tokens": 400,
+    "output_tokens": 50,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 64,
+    "reasoning_tokens": 0,
+}
+_SOME_TOKENS = {k: 1 for k in PLATFORM_TOKENS}
 
 
-def _store(path: Path, session: str, messages: list[tuple]) -> None:
+def _store(
+    path: Path, session: str, messages: list[tuple], tokens: dict[str, int] = _SOME_TOKENS
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
         for ddl in _STORE_DDL:
             conn.execute(ddl)
+        conn.execute(
+            "INSERT INTO sessions (id, input_tokens, output_tokens, cache_read_tokens,"
+            " cache_write_tokens, reasoning_tokens) VALUES (?, ?, ?, ?, ?, ?)",
+            (session, *(tokens[k] for k in PLATFORM_TOKENS)),
+        )
         for index, (role, content, tool_call_id, tool_calls, tool_name) in enumerate(messages):
             conn.execute(
                 "INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls,"
@@ -167,6 +199,7 @@ def data_root(tmp_path: Path) -> Path:
             ("tool", json.dumps({"ok": False, "error": "board is full"}), "call_2", None, None),
             ("assistant", "Done.", None, None, None),
         ],
+        tokens=PLATFORM_TOKENS,
     )
     # Another card's session in the same store: must not be read.
     with sqlite3.connect(tmp_path / "profiles" / "platform" / "state.db") as conn:
@@ -194,6 +227,7 @@ def data_root(tmp_path: Path) -> Path:
             ),
             ("tool", "pods: checkout CrashLoopBackOff", None, None, "kubectl_get"),
         ],
+        tokens=CLUSTER_TOKENS,
     )
     return tmp_path
 
@@ -332,6 +366,8 @@ def test_a_result_whose_id_matches_no_call_is_an_orphan(data_root: Path) -> None
     cluster = [c for c in payload["calls"] if c["task"] == CHILD]
     assert [c["result"] for c in cluster] == [None]
     assert any("1 tool result(s) matched no call" in e for e in payload["errors"])
+    # The call itself was read and tagged, so the note is not a read gap.
+    assert payload["unread"] == []
 
 
 def test_another_cards_session_in_the_same_store_is_not_read(data_root: Path) -> None:
@@ -373,18 +409,38 @@ def test_a_missing_session_store_is_reported_not_fatal(data_root: Path) -> None:
     assert any("cluster-abc" in e for e in payload["errors"])
     assert any(f"no session found for card {CHILD}" == e for e in payload["errors"])
     assert {c["agent"] for c in payload["calls"]} == {"platform"}
+    # A run was dispatched to cluster-abc, so its missing store hides work.
+    assert payload["unread"] == [e for e in payload["errors"] if "cluster-abc" in e or CHILD in e]
+    assert "no session store for profile cluster-abc" in payload["unread"]
+    assert f"no session found for card {CHILD}" in payload["unread"]
+
+
+def test_a_card_for_a_name_no_run_was_dispatched_to_is_not_a_read_gap(data_root: Path) -> None:
+    """A composed assignee that is not a profile never runs: that is the observation."""
+    with sqlite3.connect(data_root / "kanban.db") as conn:
+        conn.execute("UPDATE tasks SET assignee = 'cluster-made-up' WHERE id = ?", (CHILD,))
+        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (CHILD,))
+
+    payload = _payload(_run_script(data_root, [FRONT]))
+
+    assert "no session store for profile cluster-made-up" in payload["errors"]
+    assert payload["unread"] == []
+    captured = worker_trajectory.capture(lambda s, t: _run_script(data_root, [FRONT]), [FRONT], 5.0)
+    assert worker_trajectory.gaps(captured.summary) == []
 
 
 def test_a_card_not_on_the_board_is_reported(data_root: Path) -> None:
     payload = _payload(_run_script(data_root, ["t_missing"]))
     assert payload["cards"] == []
     assert payload["errors"] == ["card t_missing is not on the board"]
+    assert payload["unread"] == payload["errors"]
 
 
 def test_a_missing_board_still_answers_with_the_sentinel(tmp_path: Path) -> None:
     payload = _payload(_run_script(tmp_path, [FRONT]))
     assert payload["cards"] == [] and payload["calls"] == []
     assert payload["errors"] and payload["errors"][0].startswith("kanban board:")
+    assert payload["unread"] == payload["errors"]
 
 
 def test_long_results_are_clipped_in_the_pod(data_root: Path) -> None:
@@ -399,12 +455,19 @@ def test_the_call_cap_stops_the_read_and_says_so(data_root: Path) -> None:
     payload = _payload(_run_script(data_root, [FRONT], max_calls=2))
     assert [c["name"] for c in payload["calls"]] == ["terminal", "kanban_create"]
     assert payload["truncated"] is True
+    assert payload["clipped"] == ["calls"]
+
+
+def test_a_call_cap_clip_is_not_reported_as_the_card_cap(data_root: Path) -> None:
+    captured = worker_trajectory.capture(lambda s, t: _run_script(data_root, [FRONT], max_calls=2), [FRONT], 5.0)
+    assert worker_trajectory.gaps(captured.summary) == [worker_trajectory.CALL_CAP_GAP]
 
 
 def test_the_card_cap_stops_the_walk_and_says_so(data_root: Path) -> None:
     payload = _payload(_run_script(data_root, [FRONT], max_cards=1))
     assert [c["task"] for c in payload["cards"]] == [FRONT]
     assert payload["truncated"] is True
+    assert payload["clipped"] == ["cards"]
     assert CHILD not in {c["task"] for c in payload["calls"]}
 
 
@@ -724,12 +787,237 @@ def test_a_pod_without_the_redactor_withholds_content_and_says_so(data_root: Pat
     reply = _run_script(data_root, [FRONT], redactor=data_root / "no-such-redactor.py")
     payload = _payload(reply)
     assert any(e.startswith("redactor ") and "withheld" in e for e in payload["errors"])
+    assert payload["unread"] == []
     assert TOKEN not in reply
     captured = worker_trajectory.capture(lambda s, t: reply, [FRONT], 5.0)
     assert [e["name"] for e in captured.entries] == ["terminal", "kanban_create", "kubectl_get"]
     assert [e["status"] for e in captured.entries] == ["completed", "error", "completed"]
     assert all("WITHHELD" in e["result"] for e in captured.entries)
     assert all(e["args"] == {"raw": e["result"]} for e in captured.entries)
+
+
+# ------------------------------------------------------------ the tokens
+
+
+def test_each_session_reports_its_usage_row(data_root: Path) -> None:
+    payload = _payload(_run_script(data_root, [FRONT]))
+
+    cards = {c["task"]: c for c in payload["cards"]}
+    assert cards[FRONT]["sessions"][0]["tokens"] == PLATFORM_TOKENS
+    assert cards[CHILD]["sessions"][0]["tokens"] == CLUSTER_TOKENS
+    assert payload["errors"] == []
+
+
+def test_a_store_without_usage_columns_reports_it_and_keeps_the_calls(data_root: Path) -> None:
+    """An older hermes store: the calls are still the record, the spend is named missing."""
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute("DROP TABLE sessions")
+
+    payload = _payload(_run_script(data_root, [FRONT]))
+
+    cards = {c["task"]: c for c in payload["cards"]}
+    assert cards[FRONT]["sessions"][0]["tokens"] is None
+    assert cards[FRONT]["sessions"][0]["calls"] == 2
+    assert cards[CHILD]["sessions"][0]["tokens"] == CLUSTER_TOKENS
+    assert payload["errors"] == [
+        f"session {PLATFORM_SESSION} of platform: no token counts in the store"
+    ]
+
+
+def test_a_sessions_table_without_usage_columns_is_reported_too(data_root: Path) -> None:
+    """The table exists but predates the counts: same answer as no table."""
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute("DROP TABLE sessions")
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT)")
+        conn.execute("INSERT INTO sessions VALUES (?, 'work')", (PLATFORM_SESSION,))
+
+    payload = _payload(_run_script(data_root, [FRONT]))
+
+    cards = {c["task"]: c for c in payload["cards"]}
+    assert cards[FRONT]["sessions"][0]["tokens"] is None
+    assert cards[FRONT]["sessions"][0]["calls"] == 2
+    assert payload["errors"] == [
+        f"session {PLATFORM_SESSION} of platform: no token counts in the store"
+    ]
+
+
+def test_a_session_with_no_row_and_no_usage_rows_is_reported(data_root: Path) -> None:
+    """Messages without a sessions row: the calls are read, the spend is named missing."""
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute("DELETE FROM sessions WHERE id = ?", (PLATFORM_SESSION,))
+
+    payload = _payload(_run_script(data_root, [FRONT]))
+
+    cards = {c["task"]: c for c in payload["cards"]}
+    assert cards[FRONT]["sessions"][0]["tokens"] is None
+    assert cards[FRONT]["sessions"][0]["calls"] == 2
+    assert payload["errors"] == [
+        f"session {PLATFORM_SESSION} of platform: no token counts in the store"
+    ]
+
+
+def test_an_all_zero_row_with_nothing_to_fall_back_on_is_not_billed_as_free(
+    data_root: Path,
+) -> None:
+    """A session with assistant rows made model calls; zeros mean untracked, not zero."""
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute(
+            "UPDATE sessions SET input_tokens = 0, output_tokens = 0, cache_read_tokens = 0,"
+            " cache_write_tokens = 0, reasoning_tokens = 0 WHERE id = ?",
+            (PLATFORM_SESSION,),
+        )
+
+    payload = _payload(_run_script(data_root, [FRONT]))
+
+    cards = {c["task"]: c for c in payload["cards"]}
+    assert cards[FRONT]["sessions"][0]["tokens"] is None
+    assert payload["errors"] == [
+        f"session {PLATFORM_SESSION} of platform: no token counts in the store"
+    ]
+
+
+def test_a_failing_usage_read_costs_the_session_its_counts_not_its_place(
+    data_root: Path,
+) -> None:
+    """The calls were already read; a broken usage table must not drop the session."""
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute(
+            "UPDATE sessions SET input_tokens = 0, output_tokens = 0, cache_read_tokens = 0,"
+            " cache_write_tokens = 0, reasoning_tokens = 0 WHERE id = ?",
+            (PLATFORM_SESSION,),
+        )
+        # A per-model table missing one of the five columns: the fallback's
+        # SELECT raises rather than returning.
+        conn.execute("CREATE TABLE session_model_usage (session_id TEXT, input_tokens INTEGER)")
+
+    payload = _payload(_run_script(data_root, [FRONT]))
+
+    cards = {c["task"]: c for c in payload["cards"]}
+    session = cards[FRONT]["sessions"][0]
+    assert session["id"] == PLATFORM_SESSION
+    assert session["tokens"] is None
+    assert session["calls"] == 2
+    assert [c["name"] for c in payload["calls"] if c["task"] == FRONT] == [
+        "terminal",
+        "kanban_create",
+    ]
+    assert len(payload["errors"]) == 1
+    assert payload["errors"][0].startswith(
+        f"session {PLATFORM_SESSION} of platform: token counts: "
+    )
+
+
+def test_per_model_usage_is_summed_when_the_session_row_is_empty(data_root: Path) -> None:
+    """A hermes that attributes usage per model leaves the row at zero; the rows add up."""
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute(
+            "UPDATE sessions SET input_tokens = 0, output_tokens = 0, cache_read_tokens = 0,"
+            " cache_write_tokens = 0, reasoning_tokens = 0 WHERE id = ?",
+            (PLATFORM_SESSION,),
+        )
+        conn.execute(_USAGE_DDL)
+        conn.executemany(
+            "INSERT INTO session_model_usage VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (PLATFORM_SESSION, "model-a", 700, 200, 5000, 0, 100),
+                (PLATFORM_SESSION, "model-b", 500, 100, 0, 0, 0),
+                (OTHER_SESSION, "model-a", 9999, 9999, 9999, 9999, 9999),
+            ],
+        )
+
+    payload = _payload(_run_script(data_root, [FRONT]))
+
+    cards = {c["task"]: c for c in payload["cards"]}
+    assert cards[FRONT]["sessions"][0]["tokens"] == PLATFORM_TOKENS
+    assert payload["errors"] == []
+
+
+def test_capture_sums_the_counts_per_profile(data_root: Path) -> None:
+    captured = worker_trajectory.capture(lambda s, t: _run_script(data_root, [FRONT]), [FRONT], 5.0)
+
+    assert captured is not None
+    assert captured.tokens == {"platform": PLATFORM_TOKENS, "cluster-abc": CLUSTER_TOKENS}
+    assert captured.unbilled == []
+
+
+def test_a_profiles_sessions_add_up_and_an_unbilled_one_is_named_instead() -> None:
+    cards = [
+        {
+            "task": FRONT,
+            "sessions": [
+                {"agent": "platform", "tokens": {"input_tokens": 10, "output_tokens": 1}},
+                {"agent": "platform", "tokens": {"input_tokens": 5, "reasoning_tokens": 2}},
+            ],
+        },
+        {"task": CHILD, "sessions": [{"id": "s9", "agent": "cluster-abc", "tokens": None}]},
+    ]
+    assert worker_trajectory._tokens_by_agent(cards) == (
+        {"platform": {"input_tokens": 15, "output_tokens": 1, "reasoning_tokens": 2}},
+        [{"agent": "cluster-abc", "task": CHILD, "session": "s9"}],
+    )
+
+
+def test_settle_records_the_workers_tokens_in_the_records_buckets(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per profile and summed, in the front door's bucket names, reasoning out of the total."""
+    reply = _run_script(data_root, [FRONT])
+    monkeypatch.setattr(
+        harness,
+        "_agent_shell",
+        lambda script, timeout: reply if worker_trajectory.CAPTURE_PRESENT in script else "",
+    )
+    result = AgentResult(output="filed", trajectory=[])
+    result.metadata["final_message"] = "filed"
+
+    harness.KubeAgentsHarness._settle(result, [], [FRONT])
+
+    platform = {
+        "input": 1200,
+        "cached": 5000,
+        "cache_write": 0,
+        "reasoning": 100,
+        "output": 300,
+        "total": 6500,
+    }
+    cluster = {"input": 400, "cached": 0, "cache_write": 64, "reasoning": 0, "output": 50, "total": 514}
+    assert result.tokens["workers"] == {
+        "input": 1600,
+        "cached": 5000,
+        "cache_write": 64,
+        "reasoning": 100,
+        "output": 350,
+        "total": 7014,
+        "by_agent": {"platform": platform, "cluster-abc": cluster},
+        "unbilled": [],
+    }
+    # Not yet in the run's own buckets: that waits for the front door's row.
+    assert "input" not in result.tokens and "front_door" not in result.tokens
+
+
+def test_settle_names_the_sessions_a_partial_sum_is_missing(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One profile billed, the other's store had no counts: the sum says which."""
+    with sqlite3.connect(data_root / "profiles" / "cluster-abc" / "state.db") as conn:
+        conn.execute("DROP TABLE sessions")
+    reply = _run_script(data_root, [FRONT])
+    monkeypatch.setattr(
+        harness,
+        "_agent_shell",
+        lambda script, timeout: reply if worker_trajectory.CAPTURE_PRESENT in script else "",
+    )
+    result = AgentResult(output="filed", trajectory=[])
+    result.metadata["final_message"] = "filed"
+
+    harness.KubeAgentsHarness._settle(result, [], [FRONT])
+
+    workers = result.tokens["workers"]
+    assert workers["total"] == 6500
+    assert list(workers["by_agent"]) == ["platform"]
+    assert workers["unbilled"] == [
+        {"agent": "cluster-abc", "task": CHILD, "session": CLUSTER_SESSION}
+    ]
 
 
 def test_settle_appends_worker_calls_after_the_routers_and_before_the_purge(
@@ -771,8 +1059,40 @@ def test_settle_records_none_when_the_read_did_not_run(no_cluster_exec: list[str
     result.metadata["final_message"] = "filed"
     harness.KubeAgentsHarness._settle(result, [], [FRONT])
     assert result.metadata["worker_trajectory"] is None
+    assert result.tokens["workers"] is None
     assert result.trajectory == []
     assert any(worker_trajectory.CAPTURE_PRESENT in s for s in no_cluster_exec)
+
+
+def test_gaps_is_none_when_the_read_did_not_run() -> None:
+    assert worker_trajectory.gaps(None) is None
+
+
+def test_gaps_lists_unread_reads_and_the_card_cap() -> None:
+    gap = "no session store for profile cluster-x"
+    summary = {"cards": [], "errors": [gap], "unread": [gap], "truncated": True, "clipped": ["cards"], "calls": 0}
+    assert worker_trajectory.gaps(summary) == [gap, worker_trajectory.TRUNCATED_GAP]
+
+
+def test_gaps_leaves_out_notes_that_hide_no_worker() -> None:
+    notes = ["redactor x: missing; results and arguments withheld", "no session store for profile cluster-y"]
+    summary = {"cards": [], "errors": notes, "unread": [], "truncated": False, "calls": 2}
+    assert worker_trajectory.gaps(summary) == []
+
+
+def test_gaps_is_empty_for_a_complete_read() -> None:
+    assert worker_trajectory.gaps({"cards": [], "errors": [], "unread": [], "truncated": False, "calls": 3}) == []
+
+
+def test_settle_of_a_run_that_filed_no_card_bills_no_workers(no_cluster_exec: list[str]) -> None:
+    """Settling with nothing awaited is the undelegated path: no ``workers`` key at all."""
+    result = AgentResult(output="answered", trajectory=[])
+    result.metadata["final_message"] = "answered"
+    harness.KubeAgentsHarness._settle(result, [], [])
+    assert "workers" not in result.tokens
+    assert result.metadata["worker_trajectory"] is None
+    # Nothing to read, so the pod is not asked.
+    assert not any(worker_trajectory.CAPTURE_PRESENT in s for s in no_cluster_exec)
 
 
 # ---------------------------------------------------------- tool_called stays

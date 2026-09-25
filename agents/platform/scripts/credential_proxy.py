@@ -41,11 +41,14 @@ import scoped_sa_pool
 import vcs_broker
 
 # Re-exported, not re-implemented. The shim owns kubeconfig parsing because the
-# file is in its pod and not in this one; these three are the vocabulary both
-# sides share, and importing them keeps the context-name grammar in one place.
-# Nothing else in credential_proxy_client runs on import.
+# file is in its pod and not in this one; these are the vocabulary both sides
+# share, and importing them keeps the context-name grammar -- and where the
+# `--kubeconfig` scan stops -- in one place. Nothing else in
+# credential_proxy_client runs on import.
 from credential_proxy_client import (  # noqa: F401  (re-export)
     API_RELAY_PREFIX,
+    END_OF_FLAGS,
+    KUBECONFIG_FLAG,
     ClusterTarget,
     parse_gke_context,
     read_current_context,
@@ -4086,22 +4089,31 @@ class CommandExecutor:
         already put its cluster through pool selection, and selecting a *second*
         cluster for the same request is not a second control, it is a bug. The
         last flag wins, the way kubectl reads them.
+
+        Stops at `--`, where the shim's scan stops too. After it the words are
+        the command `kubectl exec` or `kubectl debug` runs in the pod, kubectl
+        does not read them as its own flags, and the shim forwarded any
+        `--kubeconfig` there as the path it was. Resolving that path here would
+        refuse the request as a non-GKE context name; the two sides have to
+        agree on where kubectl's flags end.
         """
         rewritten = list(command)
         resolved_path: Path | None = None
         index = 1
         while index < len(rewritten):
             argument = rewritten[index]
-            if argument == "--kubeconfig" and index + 1 < len(rewritten):
+            if argument == END_OF_FLAGS:
+                break
+            if argument == KUBECONFIG_FLAG and index + 1 < len(rewritten):
                 resolved_path = self._resolve_kubeconfig(rewritten[index + 1], scoped=scoped)
                 rewritten[index + 1] = str(resolved_path)
                 index += 2
                 continue
-            if argument.startswith("--kubeconfig="):
+            if argument.startswith(f"{KUBECONFIG_FLAG}="):
                 resolved_path = self._resolve_kubeconfig(
                     argument.split("=", 1)[1], scoped=scoped
                 )
-                rewritten[index] = f"--kubeconfig={resolved_path}"
+                rewritten[index] = f"{KUBECONFIG_FLAG}={resolved_path}"
             index += 1
         return rewritten, resolved_path
 

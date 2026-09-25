@@ -51,6 +51,7 @@ from devops_bench.verification.spec import VerificationEntry, parse_node
 
 from kube_agents_bench import transcript, verifiers
 from kube_agents_bench.verifiers import (
+    WorkerAgentsVerifier,
     WorkerCommandsVerifier,
     LedgerIssueContainsVerifier,
     PullRequestOpenedVerifier,
@@ -219,6 +220,77 @@ def test_worker_commands_rejects_a_pattern_that_does_not_compile():
 
 def test_worker_commands_is_registered_under_its_type():
     assert "worker_commands" in VERIFIERS
+
+
+# ------------------------------------------------------------ worker_agents
+
+
+def _stash_agents(agents: list[str]) -> None:
+    worker = [{"name": "terminal", "args": {}, "agent": a, "task": "t_1"} for a in agents]
+    transcript.set("ok", _TRAJECTORY + worker)
+
+
+def test_worker_agents_passes_when_a_cluster_profile_worked():
+    _stash_agents(["platform", "cluster-demo-seeded-a-us-central1-a"])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert res.success, res.reason
+
+
+def test_worker_agents_fails_when_only_the_platform_worker_ran():
+    _stash_agents(["platform"])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "['platform']" in res.reason
+
+
+def test_worker_agents_matches_the_whole_tag():
+    _stash_agents(["platform-cluster-x"])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert not res.success
+
+
+def test_worker_agents_missing_profile_with_capture_gaps_is_error_not_fail():
+    # The platform worker's store read, the Cluster Agent's did not: the
+    # absent profile is a read gap, not the agent taking the wrong route.
+    worker = [{"name": "terminal", "args": {}, "agent": "platform", "task": "t_1"}]
+    gap = "no session store for profile cluster-demo-seeded-a-us-central1-a"
+    transcript.set("ok", _TRAJECTORY + worker, worker_capture_gaps=[gap])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert res.status == "error"
+    assert not res.success
+    assert gap in res.reason
+
+
+def test_worker_agents_gaps_do_not_mask_a_match():
+    worker = [{"name": "terminal", "args": {}, "agent": "cluster-demo-seeded-a-us-central1-a", "task": "t_2"}]
+    transcript.set("ok", _TRAJECTORY + worker, worker_capture_gaps=["card t_9: locked"])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert res.success, res.reason
+
+
+def test_worker_agents_complete_capture_still_fails():
+    worker = [{"name": "terminal", "args": {}, "agent": "platform", "task": "t_1"}]
+    transcript.set("ok", _TRAJECTORY + worker, worker_capture_gaps=[])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+
+
+def test_worker_agents_router_only_is_error_not_fail():
+    transcript.set("ok", _TRAJECTORY)
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert res.status == "error"
+    assert not res.success
+
+
+def test_worker_agents_requires_a_pattern():
+    with pytest.raises(Exception):
+        WorkerAgentsVerifier(type="worker_agents", required_agents=[])
+
+
+def test_worker_agents_is_registered_under_its_type():
+    assert "worker_agents" in VERIFIERS
 
 
 # ------------------------------------------- report_contains: normalization

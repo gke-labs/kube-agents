@@ -1120,11 +1120,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # 12:58: coordinator t_b9659077 was subscribed, the 4 cards it created as a
 # WORKER were not, and the synthesizer's answer sat undelivered for 91.3s
 # (gateway.log: zero Slack sends 12:59:02-13:02:15) until the user asked. The
-# manual remedy (agents/platform/scripts/kanban_notify_propagate.py) relies on
-# the worker
-# remembering to run it; it didn't. Same column set and INSERT OR IGNORE
-# idempotency as that script, so keeping it around as a back-fill tool
-# double-writes harmlessly. verify_kanban_auto_subscribe.py replays the
+# manual remedy, a propagate script the worker had to remember to run, did not
+# get run; it has since been deleted. verify_kanban_auto_subscribe.py replays the
 # incident through the real patched create handler on a real board.
 # Since v2026.9.14 upstream's create_task inherits the creator card's
 # subscriptions inside the creation transaction itself, so that verifier passes

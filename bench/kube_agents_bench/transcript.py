@@ -103,6 +103,12 @@ class TranscriptSnapshot:
     # the run ended before settlement -- which ``worker_commands`` reports as
     # ``status="error"``; an empty list means workers ran and typed nothing.
     worker_commands: list[dict[str, str]] | None = None
+    # What the worker-trajectory read could not reach (``worker_trajectory.
+    # gaps``): a store it could not open for a profile a run was dispatched
+    # to, a dispatched card with no session, a fan-out clipped at the card cap. ``None`` when the read did not run;
+    # empty when it read everything. ``worker_agents`` reads it to tell a
+    # profile that never worked the run from one whose calls went unread.
+    worker_capture_gaps: list[str] | None = None
 
 
 _current: TranscriptSnapshot | None = None
@@ -116,6 +122,7 @@ def set(  # noqa: A001 - deliberate, matches get/clear
     final_message: str = "",
     started_at: float = 0.0,
     worker_commands: list[dict[str, str]] | None = None,
+    worker_capture_gaps: list[str] | None = None,
 ) -> None:
     """Stash the just-finished run's transcript for the verifiers.
 
@@ -133,6 +140,7 @@ def set(  # noqa: A001 - deliberate, matches get/clear
         final_message=final_message or output,
         started_at=started_at,
         worker_commands=None if worker_commands is None else list(worker_commands),
+        worker_capture_gaps=None if worker_capture_gaps is None else list(worker_capture_gaps),
     )
 
 

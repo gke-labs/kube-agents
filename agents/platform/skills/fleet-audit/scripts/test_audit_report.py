@@ -1889,6 +1889,7 @@ class TestAuditCatalogue(unittest.TestCase):
             {
                 "github-repo-watcher",
                 "eod-event-watcher-daily-report",
+                "stall-watch",
                 "kanban-workspace-gc",
                 "kanban-board-health",
                 "findings-morning-nudge",

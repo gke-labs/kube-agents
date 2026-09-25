@@ -357,6 +357,13 @@ data:
         "payments-prod",
         "payments-staging"
       ],
+      "folders": [
+        "123456789012",
+        "987654321098"
+      ],
+      "organizations": [
+        "111111111111"
+      ],
       "exclude": {
         "projects": [
           "*-sandbox"

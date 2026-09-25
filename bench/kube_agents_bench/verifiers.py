@@ -580,6 +580,88 @@ class WorkerCommandsVerifier(BaseVerifier):
         )
 
 
+_NO_WORKER_AGENTS_REASON = (
+    "no delegated worker's tool calls were captured for this run: either no card "
+    "was delegated, the run ended before the cards settled, or the worker "
+    "trajectory could not be read -- so this check could not be evaluated"
+)
+
+
+@VERIFIERS.register("worker_agents")
+class WorkerAgentsVerifier(BaseVerifier):
+    """Checks which profiles the delegated workers ran as.
+
+    The harness appends each delegated worker's tool calls to the trajectory
+    tagged with ``agent``, the profile that made the call
+    (:mod:`kube_agents_bench.worker_trajectory`). ``tool_called`` skips those
+    entries and ``worker_commands`` sees commands but not who ran them, so
+    neither can tell a card a Cluster Agent worked from one the Platform Agent
+    kept. This reads the tags and nothing else.
+
+    ``required_agents``: Python regular expressions, each of which must
+    ``re.fullmatch`` the ``agent`` tag of at least one worker entry.
+
+    Fails closed like its siblings: a run with no tagged entries is
+    ``status="error"``, not a fail -- the harness saw no worker at all. So is
+    a required profile missing from a capture that recorded gaps
+    (``worker_capture_gaps``): a store it could not open or a fan-out it
+    clipped may hold exactly the calls that would have matched, and grading
+    that as the agent taking the wrong route would be a guess.
+    """
+
+    type: Literal["worker_agents"]
+    required_agents: list[str] = Field(min_length=1)
+
+    @field_validator("required_agents")
+    @classmethod
+    def _patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            re.compile(pattern)
+        return patterns
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        agents = sorted({str(e["agent"]) for e in snap.trajectory if e.get("agent")})
+        if not agents:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_WORKER_AGENTS_REASON,
+            )
+        missing = [p for p in self.required_agents if not any(re.fullmatch(p, a) for a in agents)]
+        if missing and snap.worker_capture_gaps:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"no captured worker ran as a profile matching {missing} (workers seen: {agents}), "
+                    f"but the capture was incomplete, so this check could not be evaluated: "
+                    f"{'; '.join(snap.worker_capture_gaps)}"
+                ),
+            )
+        if missing:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=f"no delegated worker ran as a profile matching {missing}; workers ran as {agents}",
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"all {len(self.required_agents)} required profile pattern(s) matched; workers ran as {agents}",
+        )
+
+
 def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     """One GET against the GitHub REST API. The whole faked surface in tests.
 

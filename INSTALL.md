@@ -800,7 +800,17 @@ kubectl get platformagents -A
 
 ## Method 3: Local Development & Fast Iteration
 
-For developer testing on a workstation against a local cluster (e.g., Kind) or fast remote iteration against a GKE cluster:
+### kind
+
+`hack/kind-up.sh` builds the images from the checkout, creates a kind cluster, installs the chart
+with LiteLLM routed to the Gemini API (`GEMINI_API_KEY`), and prints the command that runs a bench
+case against it. It sets `harness.location: kind` on the `PlatformAgent`, which the operator reads
+as "no GKE cluster": the credential proxy uses the cluster it runs in and no `GKE_*` variables are
+set. Most of the evals depend on GKE or GCP and cannot run there. `--delete` removes the cluster.
+
+### The operator against a cluster you already have
+
+For fast iteration on the operator itself, against a GKE cluster or the kind cluster above:
 
 1. **Set your active Kubernetes context**:
    ```bash

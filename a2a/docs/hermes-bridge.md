@@ -58,11 +58,16 @@ gap - its `NATS_URL` and credentials arrive as sidecar env.
 Closing it breaks this deployment method, so it stays open as a stated trade while the
 bridge exists; the bridge's demolition removes the reason.
 
-One provenance note: no build config for the bridge image ships in this repository.
-The image is fork-built for the playground (`FROM` the platform-agent image plus the
-one static binary above) and is not in `images.json` or the release pipeline; it joins
-the release surface at stage-2 graduation or dies before it, whichever the dispatcher
-decides.
+One provenance note: the bridge image is CI-only. `a2a/Dockerfile.hermes-bridge` builds it
+(`FROM` the platform-agent image plus the one static binary above), and
+`deploy/docker/cloudbuild-ci.yaml` builds it in its `a2a-bridge` step when `hack/ci-deploy.sh`
+runs under `EVAL_MODE_NEXT=1`, `FROM` the platform-agent image that same build produced,
+by the tag it just pushed and never from a registry default, so the sidecar and the agent
+container it shares a pod with are one build; the deploy then declares it on the CR for
+the eval install (`docs/designs/eval-next-transport.md`, "The CI flag"). It is not in
+`images.json` (`hack/check-image-inventory.sh` states the exclusion) and not release
+surface; it joins the release surface at stage-2 graduation or dies before it, whichever
+the dispatcher decides.
 
 ## Bus user and grants
 

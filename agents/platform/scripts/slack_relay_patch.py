@@ -788,10 +788,10 @@ def install() -> None:
                 try:
                     patch_slack_entry(entry)
                 except Exception:
-                    # sitecustomize latches its trigger before calling
-                    # install(), and the gateway folds an exception from that
-                    # import into a debug line. Raising here would disable the
-                    # relay for the life of the process, and say nothing.
+                    # The gateway folds an exception from the trigger import
+                    # into a debug line and does not import it again. Raising
+                    # here would disable the relay for the life of the
+                    # process, and say nothing.
                     LOGGER.warning("Slack relay entry patch failed", exc_info=True)
             # Forward everything after ``entry`` blind rather than restating
             # today's signature. This wrapper sits on the class, so every

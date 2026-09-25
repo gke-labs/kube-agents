@@ -1145,6 +1145,67 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	}
 }
 
+func TestCredentialProxyBootstrapsInClusterOnKind(t *testing.T) {
+	// A kind install sets projectId, location and clusterName to "kind". The
+	// proxy must not reach for gcloud; it writes an in-cluster context from
+	// the pod's service account, and the agent is told the same context name.
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "kind", Location: "kind", ClusterName: "kind"},
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{Image: "example/platform-agent", Tag: ptr.To("v1")},
+				Security:   &agentv1alpha1.SecuritySpec{ServiceAccountName: "credential-sa"},
+			},
+		},
+	}
+
+	env := make(map[string]corev1.EnvVar)
+	for _, item := range buildCredentialProxyEnv(agent) {
+		env[item.Name] = item
+	}
+	if env["KUBE_CONTEXT_NAME"].Value != inClusterContextName {
+		t.Errorf("expected the in-cluster context, got %#v", env["KUBE_CONTEXT_NAME"])
+	}
+	if env["KUBE_DEFAULT_NAMESPACE"].Value != "test-ns" {
+		t.Errorf("expected the agent's namespace as default, got %#v", env["KUBE_DEFAULT_NAMESPACE"])
+	}
+	if _, set := env["GKE_PROJECT_ID"]; set {
+		t.Errorf("expected no GKE project on kind, got %#v", env["GKE_PROJECT_ID"])
+	}
+	bootstrap := env["CREDENTIAL_PROXY_BOOTSTRAP_COMMAND"].Value
+	for _, expected := range []string{
+		"kubectl config set-cluster", inClusterAPIServer, kubeAPIAccessMountPath + "/ca.crt",
+		".tokenFile", kubeAPIAccessMountPath + "/token", "kubectl config set-context", "kubectl config use-context",
+	} {
+		if !strings.Contains(bootstrap, expected) {
+			t.Errorf("expected in-cluster bootstrap to contain %q, got %q", expected, bootstrap)
+		}
+	}
+	if strings.Contains(bootstrap, "gcloud") {
+		t.Errorf("in-cluster bootstrap must not call gcloud, got %q", bootstrap)
+	}
+
+	pod := buildPodTemplateSpec(agent, "cfg", "fb", "settings", "policy", nil, renderOptions{})
+	agentEnv := map[string]string{}
+	for _, container := range pod.Spec.Containers {
+		if container.Name != "platform-agent" {
+			continue
+		}
+		for _, item := range container.Env {
+			agentEnv[item.Name] = item.Value
+		}
+	}
+	if agentEnv["KUBE_CONTEXT_NAME"] != inClusterContextName {
+		t.Errorf("expected the agent container to carry the in-cluster context, got %q", agentEnv["KUBE_CONTEXT_NAME"])
+	}
+	for _, name := range []string{"GKE_PROJECT_ID", "GKE_CLUSTER_NAME", "GKE_LOCATION", "GCP_PROJECT_ID"} {
+		if value, set := agentEnv[name]; set {
+			t.Errorf("expected no %s on kind, got %q", name, value)
+		}
+	}
+}
+
 func TestSafeSandboxEnvOverridesRejectsValueFrom(t *testing.T) {
 	custom := []corev1.EnvVar{
 		{Name: "OTEL_SERVICE_NAME", Value: "platform-agent"},

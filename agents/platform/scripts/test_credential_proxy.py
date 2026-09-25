@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest import mock
 
 import credential_proxy
+import credential_proxy_client
 import gke_endpoint
 import providers
 import vcs_broker
@@ -2308,6 +2309,44 @@ class CommandExecutorTest(unittest.TestCase):
             executor._reroute_kubeconfig_flags(
                 ["kubectl", "--kubeconfig=/etc/kubeconfig.yaml", "get", "pods"]
             )
+
+    def test_a_kubeconfig_after_the_separator_is_the_remote_commands(self):
+        # `kubectl exec pod -- tool --kubeconfig f`: kubectl stops reading its
+        # own flags at `--`, and so does the shim, which forwards `f` as the
+        # path it is. Resolving it here refused the whole request as a
+        # non-GKE context name.
+        executor = self.executor()
+        managed = self.seed_managed(executor)
+        for remote in ("--kubeconfig", "/remote/path.yaml"), ("--kubeconfig=/remote/path.yaml",):
+            with self.subTest(remote=remote):
+                argv = ["kubectl", "exec", "pod/x", "--", "tool", *remote]
+                rewritten, path = executor._reroute_kubeconfig_flags(argv)
+                self.assertEqual(argv, rewritten)
+                self.assertIsNone(path)
+
+                pinned = ["kubectl", f"--kubeconfig={self.CONTEXT}", *argv[1:]]
+                rewritten, path = executor._reroute_kubeconfig_flags(pinned)
+                self.assertEqual(
+                    ["kubectl", f"--kubeconfig={managed}", *argv[1:]], rewritten
+                )
+                self.assertEqual(managed, path)
+
+    def test_the_broker_accepts_every_argv_the_shim_rewrites(self):
+        # The contract, end to end: what `resolve_kubeconfig_flags` leaves in
+        # argv is what this side resolves. A shim test alone stubs the broker
+        # with a 200 and cannot see the two disagree about where flags end.
+        executor = self.executor()
+        managed = self.seed_managed(executor)
+        local = self.caller_kubeconfig(executor)
+        argv = [
+            "kubectl", "--kubeconfig", str(local), "exec", "pod/x",
+            "--", "tool", "--kubeconfig", "/remote/path.yaml",
+        ]
+        shimmed = credential_proxy_client.resolve_kubeconfig_flags(argv)
+        rewritten, path = executor._reroute_kubeconfig_flags(shimmed)
+        self.assertEqual(managed, path)
+        self.assertEqual(str(managed), rewritten[2])
+        self.assertEqual(argv[3:], rewritten[3:])
 
     def test_kubeconfig_surrounding_whitespace_is_ignored(self):
         # Profile .env files routinely carry a trailing newline, and the shim

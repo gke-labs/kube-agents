@@ -63,7 +63,7 @@ query($pr:Int!){repository(owner:"gke-labs",name:"kube-agents"){pullRequest(numb
    end)'
 
 # Signal 2: the PR description. Read it yourself — see below.
-gh pr view <N> --repo gke-labs/kube-agents --json body -q .body
+gh pr view <N> --repo gke-labs/kube-agents --json title,body -q '.title, .body'
 ```
 
 Use GraphQL for the reviews rather than `gh api repos/$REPO/pulls/<N>/reviews`: the REST endpoint
@@ -149,7 +149,7 @@ own merge rules, however clean the latest review reads.
 ### Signal 2 — the author reviewed and tested it themselves
 
 Read the body. Two of its sections are what AGENTS.md's "Pull Request Hygiene" requires before a
-pull request is opened at all:
+pull request is opened at all, and a `fix`-type pull request owes a third:
 
 - **`## Self-Review`** — the disposition list from the author's own pre-PR passes, merged:
   `review-adversarial` and `review-docs-drift`, both on every change. What they looked for, what
@@ -158,6 +158,9 @@ pull request is opened at all:
   the only one that says somebody already read this diff hostilely.
 - **`### Live validation`** (and the `## Testing` section around it) — that the change was actually
   exercised. `Not live-tested` with a stated reason is a filled section.
+- **`## Bug Fix: Preventing Recurrence`**, on a `fix` only (the title's Conventional Commit type)
+  — the guard that now fails if the bug returns, per `.agents/rules/pre_pr_review.md`. "Not a bug
+  fix" on a `fix` is unfilled.
 
 Judge them by reading, not by measuring. A section holding only the template's HTML comment,
 whitespace, or a bare `-` is unfilled — but so is a paragraph that says "reviewed it, looks fine",
@@ -166,7 +169,7 @@ Length settles neither question. Watch for the section heading appearing in pros
 body, which is why this is a read rather than a regex: a PR that discusses the `## Self-Review`
 section is not a PR that filled one in.
 
-When the section is missing or unanswered, Signal 2 fails — say so plainly, since that is the first
+When a section is missing or unanswered, Signal 2 fails — say so plainly, since that is the first
 thing the review would report anyway.
 
 Do not reach for the author's inline comments as a substitute. Authors here do not leave top-level
@@ -194,6 +197,7 @@ the evidence in front of me before you spend anything:
 - its commit versus the head, and what the commits in between are, if any;
 - what the Self-Review section says it looked for and found, in a line or two;
 - the Live-validation section in one line — what the author says they exercised;
+- on a `fix`, the guard the recurrence section names, in one line;
 - for `partial`, the single thing that is missing.
 
 Then offer three choices: **skip it**, **review only what landed since `<sha>`** — the bot review's

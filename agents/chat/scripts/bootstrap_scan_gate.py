@@ -118,7 +118,13 @@ RECONCILE_SCRIPT_NAME = "cluster_agent_reconcile.py"
 # projects the roster covers and which it could not list this run.
 SCOPE_SNAPSHOT_NAME = "fleet_scope.json"
 SCOPE_OUTCOME_OK = "ok"
+# The one non-ok container outcome whose lookup succeeded: its members would cross the
+# reconcile's listing cap, so they are carried unlisted. Named apart from a failed lookup.
+SCOPE_OUTCOME_OVER_CAP = "over-cap"
 SCOPE_OUTCOME_UNKNOWN = "unknown"
+# How many unlisted projects the sweep's task prompt names before it counts the rest; a
+# folder or organisation can carry thousands, and the prompt names the container instead.
+SCOPE_GAP_NAMED_LIMIT = 20
 
 # The reconcile that creates the Cluster Agents runs on its own cron at `11 * * * *`,
 # while this gate runs every minute. On a fresh install the gate therefore reaches the
@@ -205,38 +211,83 @@ def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-def _scope_has_other_projects(data_dir: Path) -> bool:
-    """Whether the last reconcile resolved more than one project.
+def _unresolved_containers(data_dir: Path) -> list[tuple[str, str, int]]:
+    """Folders and organisations the last reconcile could not resolve, as (id, outcome, projects)."""
+    try:
+        snapshot = json.loads((data_dir / SCOPE_SNAPSHOT_NAME).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - absent or unreadable: nothing to name
+        return []
+    containers = snapshot.get("containers") if isinstance(snapshot, dict) else None
+    out = []
+    for entry in containers if isinstance(containers, list) else []:
+        if isinstance(entry, dict) and entry.get("id") and entry.get("outcome") != SCOPE_OUTCOME_OK:
+            count = entry.get("projects") if isinstance(entry.get("projects"), int) else 0
+            out.append((str(entry["id"]), str(entry.get("outcome") or SCOPE_OUTCOME_UNKNOWN), count))
+    return sorted(out)
 
-    The task body speaks of "the project" on an install with no scope, exactly as it
-    did before scopes existed, and of "the projects in scope" only once the snapshot
-    names more than one, so a single-project install renders the same prompt as before.
+
+def _scope_has_other_projects(data_dir: Path) -> bool:
+    """Whether the last reconcile's scope reaches beyond one project.
+
+    True when the snapshot names more than one project, or any declared folder or
+    organisation. The task body speaks of "the project" on an install with no scope,
+    exactly as it did before scopes existed, and of "the projects in scope" only then,
+    so a single-project install renders the same prompt as before.
     """
     try:
         snapshot = json.loads((data_dir / SCOPE_SNAPSHOT_NAME).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - absent or unreadable: one project, as before
         return False
     projects = snapshot.get("projects") if isinstance(snapshot, dict) else None
+    containers = snapshot.get("containers") if isinstance(snapshot, dict) else None
+    if isinstance(containers, list) and any(isinstance(c, dict) and c.get("id") for c in containers):
+        return True
     return isinstance(projects, list) and len([p for p in projects if isinstance(p, dict) and p.get("id")]) > 1
 
 
 def _scope_gap_paragraph(data_dir: Path) -> str:
-    """The sweep's note on projects the reconcile could not list, on a scoped install.
+    """The sweep's note on projects and containers the reconcile could not resolve.
 
-    Rendered only when the snapshot names more than one project: an install with no
-    scope renders the prompt it rendered before scopes existed, whatever its one
-    project's outcome, and that prompt already tells the worker what to do when the
-    project cannot be listed.
+    Rendered when a declared folder or organisation could not be resolved, or when the
+    snapshot names more than one project (or any container) and one project was not listed. An install with
+    no scope renders the prompt it rendered before scopes existed, whatever its one
+    project's outcome: that prompt already tells the worker what to do when the project
+    cannot be listed.
     """
-    if not _scope_has_other_projects(data_dir):
-        return ""
+    containers = _unresolved_containers(data_dir)
     unlisted = _unlisted_projects(data_dir)
-    if not unlisted:
+    # A container the reconcile could not resolve is a gap on its own, even when it
+    # carried no project rows (a first run, or a container the snapshot never reached).
+    if not containers and not (unlisted and _scope_has_other_projects(data_dir)):
         return ""
-    named = ", ".join(f"`{project}` ({outcome})" for project, outcome in unlisted)
+    container_note = ""
+    failed = [c for c in containers if c[1] != SCOPE_OUTCOME_OVER_CAP]
+    over_cap = [c for c in containers if c[1] == SCOPE_OUTCOME_OVER_CAP]
+    if failed:
+        container_note += (
+            "The last reconcile could not resolve "
+            + ", ".join(f"`{cid}` ({outcome}, {count} project(s) carried)" for cid, outcome, count in failed)
+            + ", so every project beneath it is unlisted and the container is what to name. "
+        )
+    if over_cap:
+        container_note += (
+            "It resolved "
+            + ", ".join(f"`{cid}` ({count} project(s))" for cid, _outcome, count in over_cap)
+            + " past its listing cap, so those members are carried `over-cap` and unlisted; name the "
+            "container as over the cap, which the declaration fixes (narrower excludes or sub-folders), "
+            "not as unreadable. "
+        )
+    if unlisted:
+        named = ", ".join(f"`{project}` ({outcome})" for project, outcome in unlisted[:SCOPE_GAP_NAMED_LIMIT])
+        rest = len(unlisted) - SCOPE_GAP_NAMED_LIMIT
+        if rest > 0:
+            named += f", and {rest} more (the full list is in `fleet_scope.json`)"
+        project_note = f"The last reconcile did not list these projects: {named}. "
+    else:
+        project_note = "Every project it did resolve was listed. "
     return (
         "**Some projects in scope have no Cluster Agents for a reason the roster cannot show.** "
-        f"The last reconcile did not list these projects: {named}. The roster holds only the "
+        f"{container_note}{project_note}The roster holds only the "
         "clusters of theirs that already had a profile, and you cannot list them yourself. A "
         "project marked `over-cap` is reachable but past the reconcile's listing cap, and the "
         "others the last run could not list. Name each one at the top of the report as not fully "

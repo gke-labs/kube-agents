@@ -427,6 +427,12 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # below, so the manifest comes back on stdout.
         ("container", "ai", "profiles", "manifests", "create"),
         ("container", "ai", "profiles", "models", "list"),
+        # Cloud Asset Inventory search: how the Cluster Agent reconcile resolves a
+        # folder or organisation in spec.scope to the GKE clusters beneath it, one
+        # call per container (docs/designs/multi-project-scope.md §4). A pure read
+        # of the asset index; `asset export`, `feeds` and `saved-queries` writes
+        # stay refused, and the tests hold that door.
+        ("asset", "search-all-resources"),
         ("container", "clusters", "describe"),
         ("container", "clusters", "list"),
         # Writes a kubeconfig in the sidecar and nothing in the cloud. It is
@@ -464,6 +470,10 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         "--billing-project", "--sort-by", "--limit", "--trace-token",
         "--flatten", "--access-token-file", "-z", "--page-size", "--freshness",
         "--cluster", "--model",
+        # `asset search-all-resources` selectors: the reconcile passes both, and
+        # a verb whose flags are not listed is admitted and unreachable at once
+        # (see the `logging read` note below).
+        "--scope", "--asset-types",
         # `logging read` selectors. The command was allowlisted without them,
         # which refused every spelling the repo actually ships: both
         # log-autoscaler-events.sh scripts pass `--order=asc`, and the two
@@ -512,6 +522,14 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
 # a caller nothing it cannot get by redirecting stdout in its own shell. This
 # is the gcloud half of the rule _KUBECTL_FILE_WRITE_FLAGS states for kubectl.
 _GCLOUD_FILE_WRITE_FLAGS = frozenset({"--output-path", "--log-http-log-file"})
+
+# `asset search-all-resources` is admitted for one asset type: the reconcile reads GKE
+# clusters and nothing else, and the verb without the constraint would let any argv
+# behind the broker enumerate every resource type in a container's asset index across
+# every project the operator granted `roles/cloudasset.viewer` on.
+_ASSET_SEARCH_VERB = ("asset", "search-all-resources")
+_ASSET_SEARCH_TYPE_FLAG = "--asset-types"
+_ASSET_SEARCH_REQUIRED_TYPE = "container.googleapis.com/Cluster"
 
 # gcloud boolean global flags that do not consume the following argument.
 # These are enumerated from gcloud help and are boolean **at the global parser
@@ -655,6 +673,17 @@ def _gcloud_writes_a_file(argv: list[str]) -> str | None:
         if name in _GCLOUD_FILE_WRITE_FLAGS:
             return name
     return None
+
+
+def _asset_search_type(argv: list[str]) -> str | None:
+    """The value of --asset-types in either spelling, or None when absent or repeated with two values."""
+    values: list[str] = []
+    for i, token in enumerate(argv):
+        if token.startswith(_ASSET_SEARCH_TYPE_FLAG + "="):
+            values.append(token.split("=", 1)[1])
+        elif token == _ASSET_SEARCH_TYPE_FLAG and i + 1 < len(argv):
+            values.append(argv[i + 1])
+    return values[0] if len(values) == 1 else None
 
 
 def _gcloud_words_and_flag(argv: list[str]) -> tuple[list[str] | None, str | None]:
@@ -1168,6 +1197,19 @@ def evaluate(argv: list[str]) -> Decision:
         # track otherwise stands where the surface should be.
         if _gcloud_asks_for_help(argv) and _gcloud_surface(words) not in _NO_HELP_ESCAPE_SURFACES:
             return _ALLOWED
+
+        if tuple(words[:2]) == _ASSET_SEARCH_VERB and _asset_search_type(argv) != _ASSET_SEARCH_REQUIRED_TYPE:
+            return Decision(
+                allowed=False,
+                rule_id="gcp.asset-type-required",
+                message=(
+                    "asset search-all-resources is allowed for one asset type only: pass "
+                    f"{_ASSET_SEARCH_TYPE_FLAG}={_ASSET_SEARCH_REQUIRED_TYPE}. The Cluster Agent "
+                    "reconcile reads GKE clusters through it; every other type in the asset "
+                    "index stays closed to the sandbox."
+                ),
+                offending_flag=_ASSET_SEARCH_TYPE_FLAG,
+            )
 
         if not _gcloud_is_read_only(words):
             return Decision(

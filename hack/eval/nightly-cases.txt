@@ -104,6 +104,12 @@
 # The seven now record one data point a night here where they recorded ten
 # to sixty a day in the presubmit; the admission edit for any of them cites
 # this record, so the record is thinner and the wait is longer by design.
+#
+# 2026-09-23 adds cluster-agent-delegation-profile-lookup (#1840): one case,
+# three units, ~36 serial minutes at its 720s hint (four clean dev-install
+# repetitions measured 710-1325s). With the 2026-09-23 additions above it
+# grows the matrix to forty-five cases and 135 units, ~1047-1067 serial
+# minutes, on nights the 2026-09-22 paragraph already says can truncate.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -251,6 +257,13 @@
 # record built without anyone watching, on an install nobody prepared for it.
 ./tasks/gitops-drift-out-of-band-triage/task.yaml
 
+# Not yet observed in CI (`validated: false`). Delegation's route rather
+# than its answer: the crashloop-debug prompt and fixture, graded on a
+# Cluster Agent profile doing the delegated work (worker_agents) and on the
+# platform worker not running cluster_agent_profile.py, which the shell
+# sandbox stubs, or the deleted kanban_notify_propagate.py.
+./tasks/cluster-agent-delegation-profile-lookup/task.yaml
+
 # The patch stream's second full audit, nightly from the start (2026-09-23):
 # the same shape and 900s band as upgrade-readiness-lagging-cluster, grading
 # §3.1's severity on the version-laggard cluster, whose version has left its
@@ -387,3 +400,6 @@
 # repetition, the 200s default. Enters when a re-derived record clears the
 # bar in docs/eval-gate-roster.md.
 ./tasks/cluster-agent-healthy-workload-no-finding/task.yaml
+
+# A simple case that can run on kind.
+./tasks/chat-routing-own-cluster-namespaces/task.yaml
