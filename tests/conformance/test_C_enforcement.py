@@ -26,6 +26,25 @@ from . import _harness as h
 from ._harness import command_policy
 
 
+def _go_code(source: str, name: str) -> str:
+    """`h.go_function_body` narrowed to the function's own code.
+
+    The harness helper runs from the `func` keyword to the NEXT one, so what
+    it returns carries the next function's doc comment as well as every
+    inline comment in the body. Either can satisfy an `assertIn` with an
+    explanation where the test meant to find code -- and in the operator's
+    identities file the function after `agentIdentity` is `bridgeIdentity`,
+    whose doc comment discusses exactly the fields the assertions below look
+    for. Trim at the column-zero closing brace, then drop `//` lines, the
+    same way test_A_authority.py does at its jetstream-grant call site.
+    """
+    body = h.go_function_body(source, name)
+    end = body.find("\n}\n")
+    if end != -1:
+        body = body[: end + 3]
+    return re.sub(r"//[^\n]*", "", body)
+
+
 class C1IsolationIsStructural(unittest.TestCase):
     """C1: no security property rests on the model choosing not to."""
 
@@ -770,6 +789,399 @@ class C1IsolationIsStructural(unittest.TestCase):
             with self.subTest(content=content[:40]):
                 self.assertEqual(redactor.redact_text(content), content)
 
+    # The env var the operator renders into the agent container to name the bus
+    # principal it authenticated that container as. This is the literal both
+    # sides must agree on, and each module holds its own copy because neither
+    # can import the other. The operator carries a third copy, as a
+    # SensitiveEnvVars key in api/v1alpha1 -- that one is the CR reservation
+    # rather than the render, and TestPluginCannotOverrideBusEnv pins it to the
+    # same controller constant this test reads.
+    BUS_USER_ENV = "A2A_BUS_USER"
+
+    def test_C1_the_agent_containers_bus_identity_env_is_spelled_the_same_in_both_modules(
+        self,
+    ) -> None:
+        """A contract across a module boundary neither side can import.
+
+        The agent container authenticates to the bus by projected token, with
+        no password. The token says which ServiceAccount; it does not say which
+        of that account's grants to pin an inbox prefix from, so the operator
+        also renders the principal's NAME into the container's env and the
+        `a2a` CLI reads it back. Two Go modules, no shared package: the
+        operator cannot import `a2a/lib` and `a2a/lib` cannot import the
+        operator, so each holds its own string literal.
+
+        Why this is a security assertion and not tidiness. A callout principal's
+        grants carry its own inbox subject (`_INBOX.agent.>`), and a NATS client
+        that does not pin a matching prefix subscribes to a random inbox its
+        grants refuse. Pinning it is what the CLI needs the principal's name
+        for, and the env var is the only place the name arrives.
+
+        What a drift actually produces. `busUser()` reads this name and falls
+        back to `NATS_USER`, which the operator no longer renders into this
+        container, so a disagreement leaves the CLI with no identity at all:
+        `connect` refuses before dialling, with `no bus identity: set
+        A2A_BUS_USER or NATS_USER`. Loud rather than silent, and every `a2a`
+        invocation in the agent container fails the same way.
+
+        Read as source rather than executed because the two literals are in
+        different modules and no test binary links both.
+        """
+        operator = h.text("a2a_identities")
+        library = h.text("a2a_bus_credentials")
+        cli = h.text("a2a_cli_main")
+
+        operator_env = re.findall(r'a2aBusUserEnv\s*=\s*"([^"]+)"', operator)
+        library_env = re.findall(r'EnvBusUser\s*=\s*"([^"]+)"', library)
+
+        # Anti-vacuity, both halves. A regex that stops matching returns [] and
+        # every comparison below would hold over nothing.
+        self.assertEqual(
+            len(operator_env),
+            1,
+            "a2aBusUserEnv is not a single string constant in the operator's "
+            "identities file; this test compared nothing",
+        )
+        self.assertEqual(
+            len(library_env),
+            1,
+            "EnvBusUser is not a single string constant in a2a/lib/credentials.go; "
+            "this test compared nothing",
+        )
+
+        self.assertEqual(
+            operator_env[0],
+            library_env[0],
+            "the operator renders %r and the a2a client reads %r: the agent "
+            "container gets a bus identity under a name nothing looks up, so "
+            "every `a2a` invocation there refuses to connect with `no bus "
+            "identity`"
+            % (operator_env[0], library_env[0]),
+        )
+        self.assertEqual(
+            operator_env[0],
+            self.BUS_USER_ENV,
+            "the bus identity env var was renamed; every install's agent "
+            "container keeps the old name until its operator is upgraded, so "
+            "this is a breaking change rather than a rename",
+        )
+
+        # And the client half actually consults it. Agreeing literals prove
+        # nothing if the CLI reads the environment by some other name.
+        self.assertIn(
+            "lib.EnvBusUser",
+            h.go_function_body(cli, "busUser"),
+            "the a2a CLI's busUser() no longer reads lib.EnvBusUser, so the "
+            "name the operator renders is not the name the client resolves",
+        )
+
+    def test_C1_the_bus_token_path_and_audience_agree_across_the_module_boundary(
+        self,
+    ) -> None:
+        """The other cross-module literal the same change created.
+
+        The operator projects the token at a path it spells itself and the
+        client reads a path it spells itself, in modules neither can import.
+        Nothing is rendered to connect them: the operator does NOT set
+        A2A_BUS_TOKEN_FILE, so the client's default path IS the contract.
+
+        A drift here fails worse than a missing file, which is why it is a
+        security assertion. `os.Stat` on the wrong path misses, and
+        `a2a/cmd/a2a/main.go`'s connect() then falls through to
+        `WithUserPassword(user, os.Getenv("NATS_PASSWORD"))` -- and under this
+        change no password is rendered into that container, so the CLI offers
+        the empty string. The callout refuses, and the whole topic blackboard
+        stops working on an install whose Go test suites are green, because no
+        test binary links both modules.
+
+        The audience is the same contract one field over and a sharper one: it
+        is what stops the bus accepting any readable ServiceAccount token in the
+        cluster as proof of this pod's identity. The client demands nothing --
+        it presents whatever file it read. What demands the audience is the
+        callout, whose TokenReview names it explicitly (`NewTokenValidator`), so
+        a kubelet minting anything else produces a refused connect rather than a
+        silent downgrade. The operator spells it in `api/v1alpha1`, a package
+        over from the projection, because the validating webhook reads the
+        same value to refuse a user volume that projects it; the controller
+        constant the render uses is a reference to that one. The two literals
+        are held apart by the same module boundary as the path above, so they
+        are checked together.
+        """
+        operator = h.text("operator_a2a_callout")
+        api = h.text("operator_bus_api")
+        library = h.text("a2a_bus_credentials")
+
+        def one(pattern: str, text: str, what: str) -> str:
+            found = re.findall(pattern, text)
+            self.assertEqual(
+                len(found),
+                1,
+                "%s is not a single string constant (%d matches); this test "
+                "compared nothing" % (what, len(found)),
+            )
+            return found[0]
+
+        mount = one(r'a2aBusTokenPath\s*=\s*"([^"]+)"', operator, "a2aBusTokenPath")
+        filename = one(r'a2aBusTokenFile\s*=\s*"([^"]+)"', operator, "a2aBusTokenFile")
+        reader = one(r'BusTokenPath\s*=\s*"([^"]+)"', library, "lib.BusTokenPath")
+
+        self.assertEqual(
+            mount.rstrip("/") + "/" + filename,
+            reader,
+            "the operator projects the bus token at %s/%s and the client reads "
+            "%s: the client finds no token, falls back to a password the "
+            "operator no longer renders, and every bus call from the agent "
+            "container is refused" % (mount, filename, reader),
+        )
+
+        # The operator's half of the audience is declared in the API package
+        # rather than beside the projection, because the validating webhook
+        # reads it too. So it is extracted from there -- and the controller's
+        # constant is held to being a reference to it rather than a second
+        # spelling, which is what keeps the literal read here the one the
+        # kubelet actually mints under. Comparing the controller constant to
+        # the API constant instead would be the same value twice.
+        rendered_audience = one(
+            r'A2ABusTokenAudience\s*=\s*"([^"]+)"', api, "A2ABusTokenAudience"
+        )
+        controller_audience = one(
+            r"a2aBusTokenAudience\s*=\s*(\S+)", operator, "the controller's audience"
+        )
+        self.assertEqual(
+            controller_audience,
+            "agentv1alpha1.A2ABusTokenAudience",
+            "the controller spells the bus token audience %s rather than "
+            "taking it from the API package, so the literal this test "
+            "compared is not the one the projection mints under"
+            % controller_audience,
+        )
+        demanded_audience = one(
+            r'BusTokenAudience\s*=\s*"([^"]+)"', library, "lib.BusTokenAudience"
+        )
+        self.assertEqual(
+            rendered_audience,
+            demanded_audience,
+            "the kubelet mints the bus token for audience %r and the client "
+            "half of the contract names %r" % (rendered_audience, demanded_audience),
+        )
+
+        # The projection actually uses both, rather than agreeing with the
+        # client about two constants it does not render.
+        source = h.go_function_body(operator, "a2aBusTokenVolumeSource")
+        for name in ("a2aBusTokenAudience", "a2aBusTokenFile"):
+            self.assertIn(
+                name,
+                source,
+                "a2aBusTokenVolumeSource does not use %s, so the constant this "
+                "test compared is not the one the pod gets" % name,
+            )
+
+        # And the reading half consults the constant rather than a literal of
+        # its own: agreeing constants prove nothing if connect() stats some
+        # other path and falls through to the password branch.
+        self.assertIn(
+            "lib.BusTokenPath",
+            _go_code(h.text("a2a_cli_main"), "connect"),
+            "the a2a CLI's connect() no longer reaches for lib.BusTokenPath, so "
+            "the path this test held to the operator's projection is not the "
+            "path the client reads",
+        )
+
+    # The third cross-module literal, and the only one the operator names in
+    # order NOT to render it. This is what both sides must agree on for the
+    # reservation to reserve anything. Same third copy as BUS_USER_ENV above --
+    # a SensitiveEnvVars key, pinned to the controller constant by
+    # TestPluginCannotOverrideBusEnv rather than by this suite.
+    BUS_TOKEN_FILE_ENV = "A2A_BUS_TOKEN_FILE"
+
+    def test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules(
+        self,
+    ) -> None:
+        """The contract the two tests above leave open, and the odd one out.
+
+        A2A_BUS_TOKEN_FILE is not rendered by the operator and never has been:
+        the client falls back to lib.BusTokenPath, which is where the kubelet
+        projects the token, and the test above is what holds that path to the
+        operator's. What the operator does with this name instead is REFUSE
+        it -- SensitiveEnvVars for a spec.deployment.env entry, and
+        buildPodTemplateSpec's own drop for an AgentPlugin's spec.env, which
+        is one layer further out than the webhook looks.
+
+        So the failure a drift produces here is not a client that cannot
+        connect. It is a reservation over a name nothing reads: the operator
+        goes on refusing A2A_BUS_TOKEN_FILE while the client consults
+        A2A_BUS_TOKEN_PATH, and an AgentPlugin -- model-authored content
+        reaches the container this variable belongs to -- sets the name that
+        is actually read. a2a/cmd/a2a/main.go's connect() prefers an
+        explicitly set value over the projection with NO fallback, so the
+        container then presents whatever file the plugin named. The blast
+        radius is denial rather than escalation, because every other token in
+        reach is minted for somebody else's audience and the bus refuses it at
+        connect -- but a control that can be silently pointed at the wrong
+        name is not a control, and the reason it is a security assertion is
+        that nothing fails: the operator's own tests stay green on both sides
+        of the drift, because no test binary links both modules.
+
+        Read as source for the same reason its two siblings are. The Go
+        constant in the operator is the one the comparison is about, so the
+        drop site is checked for the constant rather than for the literal:
+        a2aBusTokenFileEnv is what this test pinned, and a hand-spelled
+        "A2A_BUS_TOKEN_FILE" beside it would be a second spelling this test
+        does not police.
+        """
+        operator = h.text("a2a_identities")
+        library = h.text("a2a_bus_credentials")
+        cli = h.text("a2a_cli_main")
+
+        operator_env = re.findall(r'a2aBusTokenFileEnv\s*=\s*"([^"]+)"', operator)
+        library_env = re.findall(r'EnvBusTokenFile\s*=\s*"([^"]+)"', library)
+
+        # Anti-vacuity, both halves: a regex that stops matching returns [],
+        # and every comparison below would hold over nothing.
+        self.assertEqual(
+            len(operator_env),
+            1,
+            "a2aBusTokenFileEnv is not a single string constant in the "
+            "operator's identities file; this test compared nothing",
+        )
+        self.assertEqual(
+            len(library_env),
+            1,
+            "EnvBusTokenFile is not a single string constant in "
+            "a2a/lib/credentials.go; this test compared nothing",
+        )
+
+        self.assertEqual(
+            operator_env[0],
+            library_env[0],
+            "the operator reserves %r and the a2a client reads %r: the "
+            "reservation covers a name nothing consults, and an AgentPlugin's "
+            "spec.env -- the only CR-authored env that reaches this container, "
+            "since safeSandboxEnvOverrides allowlists spec.deployment.env away "
+            "-- can set the one that decides which file this container presents "
+            "as its bearer token" % (operator_env[0], library_env[0]),
+        )
+        self.assertEqual(
+            operator_env[0],
+            self.BUS_TOKEN_FILE_ENV,
+            "the bus token-file env var was renamed; every install keeps the "
+            "old name reserved until its operator is upgraded, and the new "
+            "one is unreserved on the installs that matter",
+        )
+
+        # The client half actually consults it, by the constant rather than by
+        # a literal of its own. Agreeing constants prove nothing if connect()
+        # reads the environment by some other name.
+        self.assertIn(
+            "lib.EnvBusTokenFile",
+            h.go_function_body(cli, "connect"),
+            "the a2a CLI's connect() no longer reads lib.EnvBusTokenFile, so "
+            "the name the operator reserves is not the name the client "
+            "resolves its bearer token from",
+        )
+
+        # And the operator half reserves it by that constant. The plugin-env
+        # drop is the layer the webhook does not reach, so it is the one worth
+        # pinning to the identifier this test compared.
+        self.assertIn(
+            "a2aBusTokenFileEnv",
+            _go_code(h.text("manifests_go"), "buildPodTemplateSpec"),
+            "buildPodTemplateSpec no longer drops a plugin-supplied "
+            "a2aBusTokenFileEnv by that constant; the name this test compared "
+            "across the module boundary is not the name the operator refuses",
+        )
+
+    def test_C1_the_agent_principal_carries_no_static_bus_password(self) -> None:
+        """The other half of the same change, and what it was for.
+
+        `worker` was one password shared by the agent container and the Hermes
+        bridge sidecar beside it, so either workload could do the other's job:
+        the CLI's blackboard reads and the bridge's task-plane execution were
+        one grant set. Retiring it split the credential in two, and the agent
+        half became a callout principal with no password at all.
+
+        A regression here is not subtle to describe and is easy to make: the
+        operator appends bus env after the plugin merge, and restoring a
+        `NATS_PASSWORD` SecretKeyRef beside the token would put a static
+        credential back on the container that runs model-authored prompts --
+        and back into `/proc/<pid>/environ` reach of every other container in
+        the pod, which is what the operator's shared-process-namespace test
+        argues about.
+
+        What this reads is the identity list, not a rendered container: no
+        principal the agent's ServiceAccount resolves to carries a Secret key,
+        so there is no password for the operator to render. The container's own
+        env is asserted one module over, by
+        `TestPluginCannotOverrideBusEnv`, which pins `NATS_PASSWORD` absent
+        from the agent container under `mode: next`.
+        """
+        operator = h.text("a2a_identities")
+
+        self.assertIn(
+            "a2aBridgeUser",
+            operator,
+            "the bridge principal is gone from the operator's identities file; "
+            "this test's premise about a two-way split no longer holds",
+        )
+        # Two spellings, in the two files that can carry them. The identity
+        # list never held the literal -- it named the key through
+        # `a2aWorkerPasswordKey`, and the constant is declared one file over,
+        # so asserting the string's absence from this text guarded nothing a
+        # regression would touch.
+        self.assertNotIn(
+            "a2aWorkerPasswordKey",
+            operator,
+            "the retired worker credential's Secret key is named again in the "
+            "operator's identity list",
+        )
+        self.assertNotIn(
+            '"worker-password"',
+            h.text("a2a_jetstream_grants"),
+            "the retired worker credential's Secret key is declared again in "
+            "the operator's A2A manifests; a2aCredsKeys would mint a password "
+            "that nothing authenticates with",
+        )
+
+        # The split's shape, read off the two constructors. A callout principal
+        # is keyed on a ServiceAccount and holds no Secret key; a static one is
+        # the reverse. An identity that grew the other field is a principal
+        # authenticated two ways, which is the thing `auth_users` and the
+        # callout must never both answer for.
+        agent = _go_code(operator, "agentIdentity")
+        bridge = _go_code(operator, "bridgeIdentity")
+        self.assertTrue(
+            agent.strip() and bridge.strip(),
+            "agentIdentity or bridgeIdentity is gone from the operator's "
+            "identities file; this test read empty bodies and asserted nothing",
+        )
+        self.assertIn(
+            "serviceAccount:",
+            agent,
+            "the agent principal names no ServiceAccount, so the callout "
+            "cannot key on it and the agent container has no way to "
+            "authenticate by token",
+        )
+        self.assertNotIn(
+            "credsKey:",
+            agent,
+            "the agent principal carries a Secret key, so the operator mints a "
+            "static password for a principal the callout also answers for",
+        )
+        self.assertIn(
+            "credsKey:",
+            bridge,
+            "the bridge principal carries no Secret key; the sidecar has no "
+            "credential to present and cannot use a token, because it shares "
+            "the agent pod's ServiceAccount",
+        )
+        self.assertNotIn(
+            "serviceAccount:",
+            bridge,
+            "the bridge principal is keyed on a ServiceAccount -- the one it "
+            "shares with the agent container, so both would resolve to one map "
+            "entry holding the union of their grants, which is `worker` rebuilt",
+        )
+
 
 class C2FailClosed(unittest.TestCase):
     """C2: anything the policy layer cannot parse, resolve or verify is refused."""
@@ -1087,6 +1499,10 @@ class C3UntrustedByDefault(unittest.TestCase):
         self.assertLessEqual(len(sanitize("A" * 4096)), 64)
 
 
+# A Dockerfile `RUN` wrapped over several lines is one command; join it
+# before reading, or a flag on the second line is invisible.
+_CONTINUATION_RE = re.compile(r"\\\s*\n\s*")
+
 class C4ProvenanceOfExecutableContent(unittest.TestCase):
     """C4: skills, plugins, actions and images are pinned, signed and owned."""
 
@@ -1147,6 +1563,39 @@ class C4ProvenanceOfExecutableContent(unittest.TestCase):
         """
         self.assertRegex(h.text("tags_env"), r"HERMES_AGENT_TAG=\S+@sha256:[0-9a-f]{64}")
         self.assertIn("${HERMES_AGENT_TAG}", h.text("dockerfile"))
+
+    def test_C4_every_hermes_plugin_install_is_pinned_to_a_commit(self) -> None:
+        """A plugin installed from a third-party default branch is unpinned
+        upstream content executed inside the agent process.
+
+        `hermes plugins install <spec>` with no `--ref` resolves against
+        whatever that repository's default branch holds at build time, so the
+        image changes without a commit here and the build can break on a
+        morning nobody touched it. Asserted so that dropping the ref back to a
+        floating branch is a red test rather than a diff nobody reads.
+
+        Deliberately tolerant about spelling: the ref may sit before or after
+        the plugin spec, may be `--ref X` or `--ref=X`, and may be a variable
+        so long as an `ARG` in the same file binds it to a full SHA. What it
+        will not accept is a branch, a tag, or nothing -- the three things
+        that leave the build reading a moving target.
+        """
+        dockerfile = _CONTINUATION_RE.sub(" ", h.text("dockerfile"))
+        args = dict(re.findall(r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)=(\S+)", dockerfile, re.M))
+        installs = re.findall(r"hermes\s+plugins\s+install\s+(.*?)(?:&&|;|$)", dockerfile, re.M)
+        self.assertTrue(installs, "no `hermes plugins install` found; this test is vacuous")
+        for command in installs:
+            ref = re.search(r"--ref[=\s]+(\S+)", command)
+            self.assertIsNotNone(ref, f"`hermes plugins install{command}` carries no --ref")
+            value = ref.group(1).strip("\"'")
+            var = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", value)
+            if var:
+                value = args.get(var.group(1), "").strip("\"'")
+            self.assertRegex(
+                value,
+                r"(?i)^[0-9a-f]{40}$",
+                f"`hermes plugins install{command}` is not pinned to a full commit SHA",
+            )
 
     def test_C4_precondition_the_chart_still_names_images(self) -> None:
         self.assertIn("repository:", h.text("chart_values"))

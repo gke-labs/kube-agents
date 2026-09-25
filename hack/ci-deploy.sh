@@ -577,11 +577,13 @@ fi
 # which is `gvisor`. Step 7 reaches the agent over `kubectl port-forward`, and
 # that does not work against a sandboxed pod -- the forward is set up in the
 # host-side CNI netns while the listener lives in the sandbox's own network
-# stack, so the connection is refused (scripts/exec_tunnel.py is canonical on
-# this). On a pool cluster with no `gvisor` RuntimeClass the pod would not
-# schedule at all. Either way this job wants the standard runtime; what the
-# sandbox does to the agent is the release pipeline's to exercise, not a smoke
-# test's.
+# stack, so the connection is refused
+# (docs/site/src/content/docs/operator/platformagent-crd.md is canonical on
+# this; scripts/exec_tunnel.py is the relay that reaches one instead, as
+# tests/e2e does). On a pool cluster with no `gvisor` RuntimeClass the pod
+# would not schedule at all. Either way this job wants the standard runtime;
+# what the sandbox does to the agent is the release pipeline's to exercise,
+# not a smoke test's.
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying the kube-agents chart ==="
 

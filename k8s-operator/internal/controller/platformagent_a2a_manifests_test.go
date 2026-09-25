@@ -29,7 +29,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -59,7 +61,7 @@ func a2aTestCreds() *corev1.Secret {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: "test-ns"},
 		Data: map[string][]byte{
 			"gateway-password": []byte("pw-gateway"),
-			"worker-password":  []byte("pw-worker"),
+			"bridge-password":  []byte("pw-bridge"),
 			"seed-password":    []byte("pw-seed"),
 			"web-password":     []byte("pw-web"),
 			"sys-password":     []byte("pw-sys"),
@@ -107,7 +109,7 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 	// The static principals, with their inbox prefixes and their generated
 	// passwords. Per-user inbox prefixes are what stop the connect-time
 	// property leaking through the reply path.
-	for _, user := range []string{"worker", "web", "gateway"} {
+	for _, user := range []string{a2aBridgeUser, "web", "gateway"} {
 		if !strings.Contains(conf, "user: "+user) {
 			t.Errorf("nats.conf missing static user %q", user)
 		}
@@ -115,7 +117,7 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 			t.Errorf("nats.conf missing the _INBOX prefix for %q", user)
 		}
 	}
-	for _, pw := range []string{"pw-worker", "pw-web", "pw-gateway"} {
+	for _, pw := range []string{"pw-bridge", "pw-web", "pw-gateway"} {
 		if !strings.Contains(conf, pw) {
 			t.Errorf("nats.conf does not carry the generated password %q", pw)
 		}
@@ -210,7 +212,7 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 // TestSystemUsersAckGrantsAreScopedPerStream pins each user's ack surface
 // exactly. An ack subject names a stream and a CONSUMER, never the caller,
 // so an unscoped $JS.ACK.> lets its holder publish +TERM onto another
-// principal's in-flight delivery and destroy it. gateway and worker ack only
+// principal's in-flight delivery and destroy it. gateway and bridge ack only
 // the TASKS deliveries they consume with explicit ack; seed and web create
 // no acking consumer and hold no ack grant at all. Within the shared TASKS
 // stream the grant cannot distinguish consumers (NATS wildcards match whole
@@ -219,14 +221,16 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 	agent := a2aTestAgent()
 
-	// Asserted against the principal list, which spans both renders: the
-	// gateway is now issued by the callout and the worker still comes from
-	// nats.conf, and an unscoped ack grant is exactly as dangerous in either.
+	// Asserted against the principal list, which spans both renders: gateway
+	// and bridge are static entries in nats.conf, while the agent and session
+	// principals are served by the callout. The agent's grants are listed
+	// here; the session's are derived at mint time. An unscoped ack grant is
+	// exactly as dangerous in any of them.
 	want := map[string][]string{
-		"gateway":   {"$JS.ACK.TASKS.>"},
-		"worker":    {"$JS.ACK.TASKS.>"},
-		"agent":     nil,
-		"provision": nil,
+		"gateway":       {"$JS.ACK.TASKS.>"},
+		a2aBridgeUser:   {"$JS.ACK.TASKS.>"},
+		a2aAgentBusUser: nil,
+		"provision":     nil,
 		// The session's grants are derived, so it holds no listed grant of
 		// any kind, ack included. What it actually gets at mint time is
 		// also ack-free: its three consumers are ack-none pulls, and an ack
@@ -380,7 +384,7 @@ func TestReconcileA2AGatedByMode(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats-creds", Namespace: "test-ns"}, creds); err != nil {
 		t.Fatalf("creds Secret not rendered under next: %v", err)
 	}
-	for _, key := range []string{"gateway-password", "worker-password", "seed-password"} {
+	for _, key := range []string{"gateway-password", a2aBridgePasswordKey, "seed-password"} {
 		if len(creds.Data[key]) < 24 {
 			t.Errorf("creds key %q missing or too short", key)
 		}
@@ -391,6 +395,9 @@ func TestReconcileA2AGatedByMode(t *testing.T) {
 	if err := cl.List(ctx, jobs); err != nil || len(jobs.Items) == 0 {
 		t.Errorf("provision Job not rendered under next (err=%v, n=%d)", err, len(jobs.Items))
 	}
+	// The gateway waits on BusCredentialsReady (see the gate tests); under
+	// next with a serving callout it renders like the rest.
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
 	dep := &appsv1.Deployment{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-gateway", Namespace: "test-ns"}, dep); err != nil {
 		t.Errorf("A2A gateway Deployment not rendered under next: %v", err)
@@ -459,6 +466,7 @@ func TestUnrecognizedModePreservesRunningNextStack(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
 	sts := &appsv1.StatefulSet{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats", Namespace: "test-ns"}, sts); err != nil {
 		t.Fatalf("next stack did not render: %v", err)
@@ -508,7 +516,7 @@ func TestEnsureA2ACredsSecretRepairsMissingKeys(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: "test-ns"},
 		Data: map[string][]byte{
 			"gateway-password": []byte(intact),
-			"worker-password":  []byte(injected),
+			"bridge-password":  []byte(injected),
 		},
 	}
 
@@ -522,7 +530,7 @@ func TestEnsureA2ACredsSecretRepairsMissingKeys(t *testing.T) {
 	if string(got.Data["gateway-password"]) != intact {
 		t.Error("an intact key was re-rolled")
 	}
-	if string(got.Data["worker-password"]) == injected {
+	if string(got.Data[a2aBridgePasswordKey]) == injected {
 		t.Error("a malformed key survived repair; its value reaches nats.conf inside quotes")
 	}
 	for _, key := range a2aCredsKeys {
@@ -866,7 +874,7 @@ func TestSubjectMatches(t *testing.T) {
 // Asked by SUBJECT MATCHING, not by substring: measured on a live dev bus,
 // a seed user holding `a2a.>` as a convenience covered the probe subject
 // without ever naming it. Nothing here holds such a wildcard today — the
-// worker's topic grants name the exact provisioned list — and this test is
+// agent's topic grants name the exact provisioned list — and this test is
 // what keeps that true: re-widening any publish grant to `a2a.topics.>`
 // fails here rather than silently making the probe writable.
 func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
@@ -1559,26 +1567,40 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 // unexercised -- nothing seeded a Job condition -- so dropping the JobFailed case
 // or inverting the ConditionTrue guard left a stream-less bus reporting Ready
 // with the suite green.
+//
+// The two failed cases split on the condition's reason, which is what decides
+// whether the message carries the consumer remedy. Only the deterministic
+// refusal exits 2, only exit 2 matches the podFailurePolicy, and only a Job the
+// policy failed carries PodFailurePolicy; a transient failure that spends the
+// backoffLimit arrives as BackoffLimitExceeded and must get no stream edit
+// prescribed for it.
 func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		cond       *batchv1.JobCondition
 		wantDone   bool
 		wantFailed bool
+		wantRemedy bool
 	}{
-		{"pending", nil, false, false},
-		{"complete", &batchv1.JobCondition{
+		{name: "pending"},
+		{name: "complete", cond: &batchv1.JobCondition{
 			Type: batchv1.JobComplete, Status: corev1.ConditionTrue,
-		}, true, false},
-		{"failed", &batchv1.JobCondition{
+		}, wantDone: true},
+		{name: "failed-backoff-limit", cond: &batchv1.JobCondition{
 			Type: batchv1.JobFailed, Status: corev1.ConditionTrue,
-			Reason: "BackoffLimitExceeded", Message: "Job has reached the specified backoff limit",
-		}, false, true},
+			Reason:  batchv1.JobReasonBackoffLimitExceeded,
+			Message: "Job has reached the specified backoff limit",
+		}, wantFailed: true},
+		{name: "failed-pod-failure-policy", cond: &batchv1.JobCondition{
+			Type: batchv1.JobFailed, Status: corev1.ConditionTrue,
+			Reason:  batchv1.JobReasonPodFailurePolicy,
+			Message: "Container provision for pod test/x failed with exit code 2 matching FailJob rule at index 0",
+		}, wantFailed: true, wantRemedy: true},
 		// A condition present but False is not the event: the scan must skip it
 		// rather than read the type alone.
-		{"failed-but-false", &batchv1.JobCondition{
+		{name: "failed-but-false", cond: &batchv1.JobCondition{
 			Type: batchv1.JobFailed, Status: corev1.ConditionFalse,
-		}, false, false},
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := setupScheme()
@@ -1610,12 +1632,153 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				if !strings.Contains(state.message, job.Name) {
 					t.Errorf("message does not name the Job to inspect: %q", state.message)
 				}
-				if !strings.Contains(state.message, "BackoffLimitExceeded") {
-					t.Errorf("message drops the condition reason: %q", state.message)
+				if !strings.Contains(state.message, tc.cond.Reason) {
+					t.Errorf("message drops the condition reason %q: %q", tc.cond.Reason, state.message)
+				}
+				// The message is the only thing a refusal puts in
+				// `kubectl describe`, and the script's closing block
+				// refuses installs whose bus is complete. So whatever
+				// the cause, it must not promise an empty bus and must
+				// not offer a Job delete as the remedy.
+				for _, untrue := range []string{"the bus has no streams", "deleting the Job retries"} {
+					if strings.Contains(state.message, untrue) {
+						t.Errorf("message claims %q, which is false of a closing-block refusal — that bus is fully provisioned and one limit short: %q", untrue, state.message)
+					}
+				}
+			}
+			if tc.wantFailed && !tc.wantRemedy {
+				// A reason that is not PodFailurePolicy is not the
+				// exit-2 refusal, so prescribing the consumer remedy
+				// for it is a wrong answer that costs something. The
+				// cause may be a NATS outage, and both ways out of
+				// the refusal give something up: one lowers the
+				// concurrency the install advertises, the other
+				// deletes a stream holding task history. `nats stream
+				// edit` is in the list because the remedy naming it
+				// was wrong for a second reason and could come back
+				// as a well-meaning revert. The gateway restart is
+				// there for the same reason as the other two: it is
+				// the last step of the recreate, and prescribing it
+				// against a NATS outage tells an operator to bounce
+				// the one component whose durable is fine.
+				for _, unwanted := range []string{"delete the TASKS stream", "lower maxSessions", "nats stream edit", "kubectl rollout restart"} {
+					if strings.Contains(state.message, unwanted) {
+						t.Errorf("a %s failure names %q, which only the exit-2 refusal needs: %q", tc.cond.Reason, unwanted, state.message)
+					}
+				}
+			}
+			if tc.wantRemedy {
+				// Both ways out, and the second half that makes
+				// either of them land. Neither one changes anything
+				// the operator can see on its own: reconcileA2A reads
+				// the Job's condition, and a Failed Job stays Failed.
+				// So the message has to say what re-runs the script -
+				// or an operator lowers maxSessions, watches the CR
+				// stay Degraded, and concludes the change was wrong.
+				//
+				// And the recreate's last step, which is the one
+				// an operator cannot infer: deleting a stream
+				// deletes every consumer on it, and the gateway's
+				// event relay and the Hermes bridge hold durables
+				// there that their client does not re-create --
+				// lib.Client.SubscribeDurable consumes with no
+				// jetstream.ConsumeErrHandler, so the deleted
+				// consumer ends the subscription silently. The
+				// remedy without the restart produces a gateway
+				// that spawns session pods and relays no events
+				// while this very condition has gone back to
+				// Ready, which is a worse place than the refusal.
+				//
+				// The restart is asserted as the whole command,
+				// down to the workload it names. A restart of the
+				// wrong Deployment is worse than none: the callout
+				// and the agent workload both exist and both
+				// restart cleanly, so an operator who is sent to
+				// one of those watches the command succeed, sees
+				// the relay still dead, and has no reason to
+				// suspect the instruction. Only the A2A gateway
+				// holds the relay durable.
+				for _, want := range []string{
+					"maxSessions",
+					"delete the TASKS stream",
+					"Delete the Job to re-run it now",
+					fmt.Sprintf("kubectl rollout restart deployment/%s -n %s", a2aGatewayName(agent), agent.Namespace),
+				} {
+					if !strings.Contains(state.message, want) {
+						t.Errorf("message does not name %q, so the only remedy for a consumer refusal is in a pod log: %q", want, state.message)
+					}
+				}
+				// The half that needs none of the above. Lowering
+				// maxSessions moves required_consumers in the
+				// render, and the Job's name digests the render,
+				// so a new Job appears and runs on its own. The
+				// message used to tell the operator that neither
+				// way out cleared itself, which sent the one who
+				// took the cheap branch looking for something to
+				// delete.
+				if strings.Contains(state.message, "Neither way out clears this on its own") {
+					t.Errorf("message claims neither remedy clears itself, which is false of the maxSessions edit -- it re-renders the Job: %q", state.message)
+				}
+				// And it must not go back to naming the stream edit
+				// it used to name. nats-server refuses a
+				// max_consumers change on a stream that exists -
+				// "stream configuration update can not change
+				// MaxConsumers", in every release this operator's
+				// pinned nats:2.10 bus can be - so that remedy sent
+				// operators to a command that could only fail. The
+				// flag and not the command: the script's
+				// max_msgs_per_subject report names a `nats stream
+				// edit` that IS legal.
+				if strings.Contains(state.message, "--max-consumers=") {
+					t.Errorf("message prescribes a --max-consumers= edit, which nats-server refuses on a stream that exists: %q", state.message)
+				}
+				// The number it does name is the width a fresh render
+				// creates, not the raw budget. This agent takes the
+				// default maxSessions, so its budget (46) sits below
+				// the floor its TASKS renders at (64), and the
+				// refusal is reached as readily by an operator
+				// upgrade whose stream is already at that floor. A
+				// recreate at the budget would hand that operator a
+				// NARROWER stream than the one they deleted, which is
+				// the downward derivation the render refuses to make.
+				width := remedyRecreateWidth(t, state.message)
+				if width < a2aTasksMaxConsumersFloor {
+					t.Errorf("remedy recreates TASKS at %d, below the shipped floor %d: run against a default install's stream, that TIGHTENS it: %q",
+						width, a2aTasksMaxConsumersFloor, state.message)
+				}
+				if width < a2aTasksConsumerBudget(agent) {
+					t.Errorf("remedy recreates TASKS at %d but the budget is %d, so the stream it describes does not clear the script's own gate: %q",
+						width, a2aTasksConsumerBudget(agent), state.message)
 				}
 			}
 		})
 	}
+}
+
+// remedyRecreateWidth reads the number out of the status message's "delete the
+// TASKS stream and let provisioning recreate it at N" remedy. It fails rather
+// than returning a zero value: a parse that quietly answered 0 would make every
+// floor assertion above pass on a message that had stopped naming a number.
+func remedyRecreateWidth(t *testing.T, message string) int {
+	t.Helper()
+	const marker = "recreate it at "
+	i := strings.Index(message, marker)
+	if i < 0 {
+		t.Fatalf("no %q in the status message, so its recreate remedy names no width: %q", marker, message)
+	}
+	rest := message[i+len(marker):]
+	end := strings.IndexFunc(rest, func(r rune) bool { return r < '0' || r > '9' })
+	if end == 0 {
+		t.Fatalf("%q in the status message is not followed by a number: %q", marker, message)
+	}
+	if end > 0 {
+		rest = rest[:end]
+	}
+	n, err := strconv.Atoi(rest)
+	if err != nil {
+		t.Fatalf("parsing the remedy's recreate width from %q: %v", message, err)
+	}
+	return n
 }
 
 // TestCleanupA2AResumesAfterAMidPassError is the safety proof for cleanupA2A's
@@ -1653,8 +1816,33 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 
+	// The gateway is the first object cleanupA2A deletes, so it is the object
+	// this test's early-exit argument turns on -- and reconcileA2A withholds
+	// its creation until BusCredentialsReady is True. Driving reconcileA2A
+	// directly never publishes that condition, so without this the gateway is
+	// never created and the "it is gone after cleanup" row below asserts the
+	// absence of an object the render never made.
+	busCredentialsAreReady(agent)
+	// The teardown list carries the inject door's four objects, which render
+	// only under the operator's flag; set it, so the precondition below
+	// covers them rather than failing on objects the render was told not to
+	// make.
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+
 	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatalf("render: %v", err)
+	}
+
+	// The render has to have produced what the cleanup is asked to remove.
+	// Checked for the whole teardown list, not the gateway alone: every row of
+	// the IsNotFound table below is satisfied by an object that was never
+	// created, so this is what makes that table a proof rather than a
+	// restatement of what the render skipped.
+	for _, entry := range r.a2aNamespacedTeardown(agent) {
+		if err := entry.reader.Get(ctx, client.ObjectKeyFromObject(entry.obj), entry.obj); err != nil {
+			t.Fatalf("%T %s was not rendered, so cleanup deleting it proves nothing: %v",
+				entry.obj, entry.obj.GetName(), err)
+		}
 	}
 
 	// Pass one dies on the Role. The gateway Deployment (deleted first) is
@@ -1885,10 +2073,15 @@ func TestBuildNetworkPolicyBusEgressGatedOnMode(t *testing.T) {
 	}
 }
 
-// The agent container gets NATS_URL / NATS_USER / NATS_PASSWORD under next —
-// from the same creds Secret the gateway reads, as the worker user, never on
-// the PVC or in a profile .env (a second place to rotate and a first place to
-// leak). Today's render has none of the three.
+// The agent container gets NATS_URL and A2A_BUS_USER under next, and its bus
+// credential as a projected ServiceAccount token — never a password, never on
+// the PVC, and never in a profile .env (a second place to rotate and a first
+// place to leak). Today's render has none of it.
+//
+// The negative half is the part A5 added and the part worth keeping: NATS_USER
+// and NATS_PASSWORD must be absent under next as well as under today. A change
+// that put the token in and left the password behind would pass every positive
+// assertion here while the shared credential was still mounted.
 func TestBuildPodTemplateSpecBusEnvGatedOnMode(t *testing.T) {
 	agentEnv := func(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		pt := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{})
@@ -1913,39 +2106,82 @@ func TestBuildPodTemplateSpecBusEnvGatedOnMode(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 	}
 	todayEnv := agentEnv(today)
-	for _, name := range []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD"} {
+	for _, name := range []string{"NATS_URL", a2aBusUserEnv, "NATS_USER", "NATS_PASSWORD"} {
 		if v := find(todayEnv, name); v != nil {
 			t.Errorf("mode absent rendered %s onto the agent container", name)
 		}
+	}
+	if podVolume(buildPodTemplateSpec(today, "", "", "", "", nil, renderOptions{}), a2aBusTokenVolume) != nil {
+		t.Error("mode absent projected a bus token onto the agent pod")
 	}
 
 	nextEnv := agentEnv(a2aTestAgent())
 	if v := find(nextEnv, "NATS_URL"); v == nil || v.Value != "nats://test-agent-a2a-nats.test-ns.svc:4222" {
 		t.Errorf("NATS_URL = %+v, want the rendered NATS Service address", v)
 	}
-	if v := find(nextEnv, "NATS_USER"); v == nil || v.Value != "worker" {
-		t.Errorf("NATS_USER = %+v, want the worker user", v)
+	if v := find(nextEnv, a2aBusUserEnv); v == nil || v.Value != a2aAgentBusUser {
+		t.Errorf("%s = %+v, want %q — the principal whose _INBOX prefix the client has to pin", a2aBusUserEnv, v, a2aAgentBusUser)
 	}
-	v := find(nextEnv, "NATS_PASSWORD")
-	if v == nil || v.ValueFrom == nil || v.ValueFrom.SecretKeyRef == nil {
-		t.Fatalf("NATS_PASSWORD = %+v, want a SecretKeyRef — the literal must never render into the pod spec", v)
+	for _, name := range []string{"NATS_USER", "NATS_PASSWORD"} {
+		if v := find(nextEnv, name); v != nil {
+			t.Errorf("%s = %+v under next; A5 moved this container onto a projected token and the "+
+				"static credential must not render alongside it", name, v)
+		}
 	}
-	if v.ValueFrom.SecretKeyRef.Name != "test-agent-a2a-nats-creds" || v.ValueFrom.SecretKeyRef.Key != "worker-password" {
-		t.Errorf("NATS_PASSWORD reads %s/%s, want test-agent-a2a-nats-creds/worker-password",
-			v.ValueFrom.SecretKeyRef.Name, v.ValueFrom.SecretKeyRef.Key)
+
+	// The credential itself: a projected token volume on the pod, mounted
+	// read-only into the agent container and audience-bound to the bus.
+	next := buildPodTemplateSpec(a2aTestAgent(), "", "", "", "", nil, renderOptions{})
+	vol := podVolume(next, a2aBusTokenVolume)
+	if vol == nil {
+		t.Fatalf("no %s volume on the agent pod; the container has a bus address and no credential", a2aBusTokenVolume)
 	}
-	if v.ValueFrom.SecretKeyRef.Optional == nil || !*v.ValueFrom.SecretKeyRef.Optional {
-		t.Error("NATS_PASSWORD's SecretKeyRef is not Optional; a skewed install whose creds Secret " +
-			"never existed would roll (strategy Recreate) into CreateContainerConfigError — an outage " +
-			"bought by the helper that exists to prevent one")
+	if vol.Projected == nil || len(vol.Projected.Sources) != 1 || vol.Projected.Sources[0].ServiceAccountToken == nil {
+		t.Fatalf("%s is not a single projected ServiceAccount token: %+v", a2aBusTokenVolume, vol)
+	}
+	if aud := vol.Projected.Sources[0].ServiceAccountToken.Audience; aud != a2aBusTokenAudience {
+		t.Errorf("bus token audience = %q, want %q; a default-audience token would be every readable "+
+			"token in the cluster", aud, a2aBusTokenAudience)
+	}
+
+	var mounts []corev1.VolumeMount
+	for _, c := range next.Spec.Containers {
+		if c.Name == "platform-agent" {
+			mounts = c.VolumeMounts
+		}
+	}
+	var mounted *corev1.VolumeMount
+	for i := range mounts {
+		if mounts[i].Name == a2aBusTokenVolume {
+			mounted = &mounts[i]
+		}
+	}
+	if mounted == nil {
+		t.Fatalf("the bus token is projected onto the pod but not mounted into platform-agent")
+	}
+	if mounted.MountPath != a2aBusTokenPath || !mounted.ReadOnly {
+		t.Errorf("bus token mount = %+v, want %s read-only", mounted, a2aBusTokenPath)
 	}
 }
 
-// Adversarial-review finding, reproduced before fixing: NATS_PASSWORD arrives
-// by SecretKeyRef, so the credential is in the container whatever the address
-// says — a plugin that could set NATS_URL would have the client hand the
-// worker password to an address of its choosing, in the CONNECT frame, in the
-// clear, out through the 443-to-anywhere egress rule. And the operator cannot
+// podVolume returns the named volume from a pod template, or nil.
+func podVolume(pt corev1.PodTemplateSpec, name string) *corev1.Volume {
+	for i := range pt.Spec.Volumes {
+		if pt.Spec.Volumes[i].Name == name {
+			return &pt.Spec.Volumes[i]
+		}
+	}
+	return nil
+}
+
+// Adversarial-review finding, reproduced before fixing, and it outlived the
+// credential it was found against: the container holds a bus credential
+// whatever the address says, so a plugin that could set NATS_URL would have the
+// client hand it to a server of the plugin's choosing, in the CONNECT frame, in
+// the clear, out through the 443-to-anywhere egress rule. That was the worker
+// password; since A5 it is a projected token, which is audience-bound and so
+// does not authenticate anywhere else — but it still names this ServiceAccount
+// to whoever catches it, and A2A_BUS_USER joined the list on top. And the operator cannot
 // simply append its own values over a plugin's: an appended name does not
 // shadow a same-named plugin entry, it duplicates it, and server-side apply
 // refuses a duplicate env key — which would wedge every reconcile of the CR.
@@ -1957,6 +2193,8 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 		Spec: agentv1alpha1.AgentPluginSpec{
 			Env: []corev1.EnvVar{
 				{Name: "NATS_URL", Value: "nats://attacker.example:443"},
+				{Name: a2aBusUserEnv, Value: "gateway"},
+				{Name: a2aBusTokenFileEnv, Value: "/opt/data/attacker/token"},
 				{Name: "NATS_USER", Value: "gateway"},
 				{Name: "NATS_PASSWORD", Value: "hunter2"},
 				{Name: "PLUGIN_OWN_KEY", Value: "kept"},
@@ -1980,26 +2218,43 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	// Exactly one entry per bus name: a duplicate would not be "last value
 	// wins" at the kubelet — server-side apply refuses the whole Deployment,
 	// wedging reconcile with no Degraded status to say why.
-	for _, name := range []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD"} {
+	for _, name := range []string{"NATS_URL", a2aBusUserEnv} {
 		if counts[name] != 1 {
 			t.Errorf("%s appears %d times in the agent env; a duplicate key is refused by "+
 				"server-side apply and freezes the reconcile", name, counts[name])
 		}
 	}
+	// The three the operator never renders into this container. Dropped rather
+	// than overwritten, so the assertion is absence. A surviving plugin
+	// NATS_PASSWORD is not a static login as this principal: nats.conf lists no
+	// `agent` in auth_users, so the connect reaches the callout, which reads
+	// ConnectOptions.Password as a bearer token and TokenReviews it. It is
+	// still what the CLI offers when no token is on disk, so what it buys is a
+	// refused connect rather than a second way in. NATS_USER is the identity
+	// the CLI reads when A2A_BUS_USER is absent, so a plugin that set both
+	// would choose the principal. And a surviving A2A_BUS_TOKEN_FILE would be
+	// the file the CLI presents as a token instead of the projected one, which
+	// it prefers unconditionally and with no fallback.
+	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv} {
+		if counts[name] != 0 {
+			t.Errorf("a plugin's %s survived into the agent env under next", name)
+		}
+	}
 	if got := values["NATS_URL"].Value; got != "nats://test-agent-a2a-nats.test-ns.svc:4222" {
 		t.Errorf("a plugin redirected the bus: NATS_URL = %q", got)
 	}
-	if got := values["NATS_USER"].Value; got != "worker" {
-		t.Errorf("a plugin changed the bus identity: NATS_USER = %q", got)
-	}
-	if values["NATS_PASSWORD"].ValueFrom == nil || values["NATS_PASSWORD"].ValueFrom.SecretKeyRef == nil {
-		t.Error("a plugin replaced NATS_PASSWORD's SecretKeyRef with a literal")
+	if got := values[a2aBusUserEnv].Value; got != a2aAgentBusUser {
+		t.Errorf("a plugin changed the bus identity: %s = %q", a2aBusUserEnv, got)
 	}
 	if counts["PLUGIN_OWN_KEY"] != 1 || values["PLUGIN_OWN_KEY"].Value != "kept" {
 		t.Error("the bus-name reservation dropped a plugin variable it has no claim on")
 	}
-	if _, sensitive := agentv1alpha1.SensitiveEnvVars["NATS_PASSWORD"]; !sensitive {
-		t.Error("NATS_PASSWORD is not in SensitiveEnvVars; the CR's own env could name it")
+	for _, name := range []string{"NATS_URL", a2aBusUserEnv, a2aBusTokenFileEnv, "NATS_USER", "NATS_PASSWORD"} {
+		if _, sensitive := agentv1alpha1.SensitiveEnvVars[name]; !sensitive {
+			t.Errorf("%s is not in SensitiveEnvVars; the drop above covers plugin env only, and membership "+
+				"is what keeps the name out of the sidecar containers, which take spec.deployment.env "+
+				"through mergeCredentialProxyEnv rather than through safeSandboxEnvOverrides' allowlist", name)
+		}
 	}
 
 	// Under today the reservation is off and the plugin's variables pass
@@ -2059,10 +2314,19 @@ func TestSkewPreservesTheAgentBusSurface(t *testing.T) {
 			names[e.Name] = true
 		}
 	}
-	for _, want := range []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD"} {
+	for _, want := range []string{"NATS_URL", a2aBusUserEnv} {
 		if !names[want] {
 			t.Errorf("skew removed %s while the bus keeps running", want)
 		}
+	}
+	// And the credential with them. A projected token is strictly better here
+	// than the SecretKeyRef it replaced: the old one needed Optional so a
+	// today-lineage install that hit skew would not roll into
+	// CreateContainerConfigError against a Secret that had never existed,
+	// while the kubelet mints this from the pod's own ServiceAccount, which
+	// exists on every lineage.
+	if podVolume(pt, a2aBusTokenVolume) == nil {
+		t.Error("skew removed the bus token while the bus keeps running; the container would dial with no credential")
 	}
 
 	// The managed .env still reports today — the agent-side gate is
@@ -2073,18 +2337,23 @@ func TestSkewPreservesTheAgentBusSurface(t *testing.T) {
 	}
 }
 
-// TestNoWorkerCanPublishToTheDirectory pins the identity plane against its least
-// trusted principal.
+// TestNoAgentSidePrincipalCanPublishToTheDirectory pins the identity plane
+// against its least trusted principals.
 //
 // a2a.agents.{profile} is last-value, so a single publish REPLACES a profile's
 // card and an agent-closed tombstone retires it. The payload spec assigns that to
 // the profile's owner explicitly -- "not by workers" -- and nothing in the tree
 // publishes a card at all today, so the grant this removes had no caller.
 //
-// Asserted against the worker's publish list specifically rather than the whole
-// config: the gateway keeps SUBSCRIBE on the same subjects, which is the read
-// discovery needs, and a test that just greps the file for "a2a.agents" would
-// fail on that legitimate line.
+// Both halves of the A5 split are asked, and the agent is the one that matters:
+// it is the container running model output, and its three topic grants are the
+// literal list a consolidating wildcard would replace. The bridge is asked too
+// because it is the principal that was holding those grants until A5.
+//
+// Asserted against those publish lists specifically rather than against the
+// whole config: the gateway keeps SUBSCRIBE on the same subjects, which is the
+// read discovery needs, and a test that just greps for "a2a.agents" would fail
+// on that legitimate line.
 // a2aGrantSubjects returns the subjects in one user's publish or subscribe
 // allow-list, parsed the way the server reads them.
 //
@@ -2129,22 +2398,40 @@ func a2aGrantSubjects(t *testing.T, conf, user, section string) []string {
 	return subjects
 }
 
-func TestNoWorkerCanPublishToTheDirectory(t *testing.T) {
+func TestNoAgentSidePrincipalCanPublishToTheDirectory(t *testing.T) {
 	// Third argument is this branch's: the callout's NKey seeds. #1313 wrote
 	// this test against the two-argument signature on main.
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	agent := a2aTestAgent()
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	doc, err := renderA2AAuthMap(agent)
+	if err != nil {
+		t.Fatalf("rendering the auth map: %v", err)
+	}
 
 	// Asked as the server would ask it, not as a substring scan would. A grant
 	// need not spell the subject to authorize it: "a2a.*.*" covers
 	// a2a.agents.platform and contains no "a2a.agents" to grep for, and
-	// consolidating the worker's three exact topic grants into one wildcard is
+	// consolidating the agent's three exact topic grants into one wildcard is
 	// the plausible way that arrives.
 	const card = "a2a.agents.platform"
-	for _, grant := range a2aGrantSubjects(t, conf, "worker", "publish") {
-		if subjectMatches(grant, card) {
-			t.Errorf("worker can publish %s via grant %q; one publish replaces a profile's "+
-				"card, and the payload spec assigns cards to the profile owner, not workers",
-				card, grant)
+	publishLists := map[string][]string{
+		a2aBridgeUser: a2aGrantSubjects(t, conf, a2aBridgeUser, "publish"),
+	}
+	for _, id := range doc.Identities {
+		if id.User == a2aAgentBusUser {
+			publishLists[a2aAgentBusUser] = id.Grants.Publish
+		}
+	}
+	if publishLists[a2aAgentBusUser] == nil {
+		t.Fatalf("no %q principal in the rendered map", a2aAgentBusUser)
+	}
+	for who, grants := range publishLists {
+		for _, grant := range grants {
+			if subjectMatches(grant, card) {
+				t.Errorf("%s can publish %s via grant %q; one publish replaces a profile's "+
+					"card, and the payload spec assigns cards to the profile owner, not workers",
+					who, card, grant)
+			}
 		}
 	}
 
@@ -2285,6 +2572,10 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
+	// The A2A gateway is withheld until BusCredentialsReady is True, and it is
+	// one of the objects this test has to look at. Report the callout serving
+	// so the walk below has a gateway to walk.
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
 
 	stored := &corev1.Secret{}
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(creds), stored); err != nil {
@@ -2337,6 +2628,7 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 		&rbacv1.RoleBindingList{},
 	}
 	walked := 0
+	seen := map[string]bool{}
 	for _, list := range lists {
 		if err := cl.List(ctx, list); err != nil {
 			t.Fatalf("listing %T: %v", list, err)
@@ -2352,6 +2644,7 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 			}
 			walked++
 			kind := fmt.Sprintf("%T %s", obj, obj.GetName())
+			seen[kind] = true
 			check(t, kind, "name", obj.GetName())
 			for key, value := range obj.GetLabels() {
 				check(t, kind, "label "+key, value)
@@ -2383,6 +2676,22 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 	}
 	if walked == 0 {
 		t.Fatal("walked no rendered objects; the check is inert")
+	}
+	// Named, not counted. A non-zero walk says the lists found something; it
+	// does not say they found the objects whose metadata the passwords could
+	// reach. Two must be there or this proves nothing about them: the NATS
+	// StatefulSet, which carries the nats.conf digest on its pod template and
+	// is the exact regression above, and the A2A gateway Deployment, which the
+	// creation gate withholds until BusCredentialsReady is True -- so a test
+	// that does not open the gate walks a namespace with no gateway in it and
+	// reports green on coverage it never had.
+	for _, want := range []string{
+		"*v1.StatefulSet test-agent-a2a-nats",
+		"*v1.Deployment test-agent-a2a-gateway",
+	} {
+		if !seen[want] {
+			t.Errorf("the walk never saw %s, so nothing here checked its metadata; walked %d objects", want, walked)
+		}
 	}
 }
 
@@ -2732,17 +3041,17 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	}
 }
 
-// TestWorkerHoldsNoWholesaleJetStreamAPI is the shape check for the worker's
-// JetStream API grant; the refusal proof is TestWorkerJetStreamGrantOnARealServer,
+// TestBridgeHoldsNoWholesaleJetStreamAPI is the shape check for the bridge's
+// JetStream API grant; the refusal proof is TestBridgeJetStreamGrantOnARealServer,
 // which asks a server. This one keeps the wildcard from coming back by
-// accident, and asks three questions, none by substring -- the web user's test
+// accident, and asks four questions, none by substring -- the web user's test
 // above records why: `$JS.API.STREAM.>` contains none of the words a blocklist
 // would think to name.
 //
-//  1. The publish allow-list is pinned exactly: the task-events subject, the
-//     three topic subjects, heartbeats, the runtime-state bucket, the grants
-//     a2aWorkerJetStreamGrants renders, the TASKS ack, flow control, and the
-//     worker's own inbox. Any other entry, in any spelling, is a diff.
+//  1. The publish allow-list is pinned exactly: the task-events subject for the
+//     one addressee this principal executes for, the runtime-state bucket, the
+//     grants a2aBridgeJetStreamGrants renders, the TASKS ack, flow control, and
+//     the bridge's own inbox. Any other entry, in any spelling, is a diff.
 //  2. Every destructive or out-of-scope route -- a concrete subject per verb,
 //     on every provisioned stream, not one sample per verb -- is run through
 //     subjectMatches against every rendered entry. That is the question the
@@ -2752,29 +3061,36 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 //  4. The subscribe list is pinned exactly too: a subscribe grant is delivery
 //     interest for a push consumer's deliver_subject, so widening it is a
 //     review conversation for the same reason widening publish is.
-func TestWorkerHoldsNoWholesaleJetStreamAPI(t *testing.T) {
+//
+// The blackboard streams are on the forbidden side here, and that is the half
+// of A5 this test carries. `worker` held INFO and DIRECT.GET on TOPICS-STATE
+// and TOPICS-JOURNAL and publish on three topic subjects, because the `a2a`
+// CLI shared its credential. The CLI is the `agent` principal now
+// (TestAgentHoldsOnlyTheBlackboard), and a change that gave either of them the
+// other's list would put `worker` back under a new name.
+func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
-	got := a2aGrantSubjects(t, conf, "worker", "publish")
+	got := a2aGrantSubjects(t, conf, a2aBridgeUser, "publish")
 
-	if sub, want := a2aGrantSubjects(t, conf, "worker", "subscribe"), []string{"a2a.tasks.>", "a2a.topics.>", "$KV.runtime-state.>", "_INBOX.worker.>"}; !reflect.DeepEqual(sub, want) {
-		t.Errorf("worker subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
+	if sub, want := a2aGrantSubjects(t, conf, a2aBridgeUser, "subscribe"), []string{
+		"a2a.tasks." + a2aBridgeAddressee + ".*.in",
+		"$KV.runtime-state.>",
+		"_INBOX." + a2aBridgeUser + ".>",
+	}; !reflect.DeepEqual(sub, want) {
+		t.Errorf("bridge subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
 	}
 
 	want := []string{
-		"a2a.tasks.*.*.events",
-		"a2a.topics.agent.platform.upgrade-readiness",
-		"a2a.topics.shared.blueprint",
-		"a2a.topics.shared.annotations",
-		"agents.hb.>",
+		"a2a.tasks." + a2aBridgeAddressee + ".*.events",
 		"$KV.runtime-state.>",
 	}
-	want = append(want, a2aWorkerJetStreamGrants()...)
-	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.worker.>")
+	want = append(want, a2aBridgeJetStreamGrants()...)
+	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX."+a2aBridgeUser+".>")
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("worker publish allow-list changed.\n got: %q\nwant: %q", got, want)
+		t.Errorf("bridge publish allow-list changed.\n got: %q\nwant: %q", got, want)
 	}
 
-	// Verbs no worker path uses, against every stream the provision script
+	// Verbs no bridge path uses, against every stream the provision script
 	// creates. A named grant only widens the stream it names, so a verb
 	// sampled on TASKS says nothing about the same verb on DIRECTORY.
 	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap"}
@@ -2797,10 +3113,11 @@ func TestWorkerHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		}
 		forbidden = append(forbidden, "$JS.API.CONSUMER.INFO."+s+".x")
 	}
-	// Streams the worker has no business on at all: not a read, not a
+	// Streams the bridge has no business on at all: not a read, not a
 	// consumer, not a direct get. The directory is the identity plane; the
-	// session registry is the gateway's; cap is the capability envelope's.
-	for _, s := range []string{"DIRECTORY", "KV_session-state", "KV_cap"} {
+	// session registry is the gateway's; cap is the capability envelope's;
+	// and the two topic streams are the agent's since A5.
+	for _, s := range []string{"DIRECTORY", "KV_session-state", "KV_cap", "TOPICS-STATE", "TOPICS-JOURNAL"} {
 		forbidden = append(forbidden,
 			"$JS.API.STREAM.INFO."+s,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
@@ -2814,64 +3131,176 @@ func TestWorkerHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	}
 	forbidden = append(forbidden,
 		// The gateway's relay durable: CREATE and MSG.NEXT on a shared stream
-		// are conceded, DELETE is not (see a2aWorkerJetStreamGrants).
+		// are conceded, DELETE is not (see a2aBridgeJetStreamGrants).
 		"$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
 		// The registry is put, listed and deleted, never read by key.
 		"$JS.API.DIRECT.GET.KV_runtime-state.$KV.runtime-state.k",
-		// Topic streams are read by direct get, never consumed.
-		"$JS.API.CONSUMER.CREATE.TOPICS-STATE.x",
-		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.x",
-		"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.x",
-		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.x",
+		// The blackboard by direct get, which is the read `worker` had.
+		"$JS.API.DIRECT.GET.TOPICS-STATE.a2a.topics.shared.blueprint",
+		"$JS.API.DIRECT.GET.TOPICS-JOURNAL.a2a.topics.shared.annotations",
 		// Account discovery and enumeration.
 		"$JS.API.INFO",
 		"$JS.API.STREAM.NAMES",
 		"$JS.API.STREAM.LIST",
-		// A stream nobody provisions, for the verbs the worker does hold.
+		// A stream nobody provisions, for the verbs the bridge does hold.
 		"$JS.API.STREAM.INFO.NOT-PROVISIONED",
 		"$JS.API.CONSUMER.CREATE.NOT-PROVISIONED.x",
 		"$JS.API.DIRECT.GET.NOT-PROVISIONED.x",
 	)
+	// Core subjects, not JetStream API: the blackboard writes and every other
+	// addressee's task plane. The publish DeepEqual above would catch a new
+	// literal entry, but not a widening of one that is already there --
+	// a2a.tasks.*.*.events, which is what `worker` held, passes a DeepEqual
+	// written against itself.
+	forbidden = append(forbidden,
+		"a2a.topics.shared.blueprint",
+		"a2a.topics.shared.annotations",
+		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.tasks.session-abc123.t1.events",
+		"a2a.tasks.session-abc123.t1.in",
+		"a2a.tasks."+a2aBridgeAddressee+".t1.in",
+	)
 	for _, subject := range forbidden {
 		for _, grant := range got {
 			if subjectMatches(grant, subject) {
-				t.Errorf("worker grant %q permits %q; nothing on the worker path uses it", grant, subject)
+				t.Errorf("bridge grant %q permits %q; nothing on the bridge path uses it", grant, subject)
 			}
 		}
 	}
 
 	// The other direction, and the one a forbidden list cannot cover: an
-	// entry added inside a2aWorkerJetStreamGrants is invisible to the
+	// entry added inside a2aBridgeJetStreamGrants is invisible to the
 	// DeepEqual above. Anything outside these shapes has to be argued for in
 	// that function's comment rather than added quietly.
 	allowedShapes := map[string]bool{}
-	for _, s := range []string{"TASKS", "KV_runtime-state", "TOPICS-STATE", "TOPICS-JOURNAL"} {
-		allowedShapes["$JS.API.STREAM.INFO."+s] = true
-	}
-	for _, s := range []string{"TASKS", "TOPICS-STATE", "TOPICS-JOURNAL"} {
-		allowedShapes["$JS.API.DIRECT.GET."+s+".>"] = true
-	}
 	for _, s := range []string{"TASKS", "KV_runtime-state"} {
+		allowedShapes["$JS.API.STREAM.INFO."+s] = true
 		allowedShapes["$JS.API.CONSUMER.CREATE."+s+".>"] = true
 	}
+	allowedShapes["$JS.API.DIRECT.GET.TASKS.>"] = true
 	allowedShapes["$JS.API.CONSUMER.MSG.NEXT.TASKS.*"] = true
 	allowedShapes["$JS.API.CONSUMER.DELETE.KV_runtime-state.*"] = true
-	for _, grant := range a2aWorkerJetStreamGrants() {
+	for _, grant := range a2aBridgeJetStreamGrants() {
 		if !allowedShapes[grant] {
-			t.Errorf("worker holds JetStream API grant %q, which is outside the shapes a2aWorkerJetStreamGrants argues for", grant)
+			t.Errorf("bridge holds JetStream API grant %q, which is outside the shapes a2aBridgeJetStreamGrants argues for", grant)
 		}
 	}
 }
 
-// TestWorkerGrantNamesStreamsTheProvisionScriptCreates pins the pair. The
-// worker's grants render from the stream-name constants; the provision script
-// spells each name itself, because every create line carries its own subjects,
-// retention and caps. Rename a stream on one side only and the worker holds
-// grants on a name that does not exist -- an authorization failure at runtime
-// with a green suite -- so the script's create lines are held to the constants
-// here. Anchored to the create itself, not the bare name, for the reason
-// #1306's pairing test records: the script's prose mentions every name too.
-func TestWorkerGrantNamesStreamsTheProvisionScriptCreates(t *testing.T) {
+// TestAgentHoldsOnlyTheBlackboard is the other half of the A5 split, and it
+// reads the auth map rather than nats.conf: `agent` is callout-authenticated,
+// so its grants are rendered as JSON for the callout to serve and never appear
+// in a user block.
+//
+// What it pins is a negative that the bridge's test cannot state. The agent
+// container is the widest-reach workload in the namespace -- it runs model
+// output against a writable PVC -- and the reason A5 exists is that it used to
+// hold a task-plane executor credential in order to run `a2a topics read`. So:
+// no publish and no subscribe on a2a.tasks anything, no JetStream consumer verb
+// of any kind (a consumer's target stream and deliver subject are body fields,
+// which is how a CONSUMER.CREATE grant becomes a read of a stream the subject
+// list withholds), and no reach into the buckets.
+func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
+	doc, err := renderA2AAuthMap(a2aTestAgent())
+	if err != nil {
+		t.Fatalf("rendering the auth map: %v", err)
+	}
+	var agent *a2aAuthMapIdentity
+	for i := range doc.Identities {
+		if doc.Identities[i].User == a2aAgentBusUser {
+			agent = &doc.Identities[i]
+		}
+	}
+	if agent == nil {
+		t.Fatalf("no %q principal in the rendered map; the agent container has no identity to present", a2aAgentBusUser)
+	}
+
+	wantPublish := []string{
+		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.shared.blueprint",
+		"a2a.topics.shared.annotations",
+	}
+	wantPublish = append(wantPublish, a2aAgentJetStreamGrants()...)
+	wantPublish = append(wantPublish, "_INBOX."+a2aAgentBusUser+".>")
+	if !reflect.DeepEqual(agent.Grants.Publish, wantPublish) {
+		t.Errorf("agent publish allow-list changed.\n got: %q\nwant: %q", agent.Grants.Publish, wantPublish)
+	}
+	if want := []string{"a2a.topics.>", "_INBOX." + a2aAgentBusUser + ".>"}; !reflect.DeepEqual(agent.Grants.Subscribe, want) {
+		t.Errorf("agent subscribe allow-list changed.\n got: %q\nwant: %q", agent.Grants.Subscribe, want)
+	}
+
+	// The task plane, both directions and both spellings -- the bridge's own
+	// addressee and a session pod's -- plus every consumer verb on every
+	// stream, the other principals' buckets, and enumeration.
+	var forbidden []string
+	for _, addressee := range []string{a2aBridgeAddressee, "session-abc123"} {
+		forbidden = append(forbidden,
+			"a2a.tasks."+addressee+".t1.in",
+			"a2a.tasks."+addressee+".t1.events",
+			"$JS.ACK.TASKS.1.2.3",
+		)
+	}
+	for _, s := range []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap"} {
+		forbidden = append(forbidden,
+			"$JS.API.CONSUMER.CREATE."+s+".x",
+			"$JS.API.CONSUMER.DURABLE.CREATE."+s+".x",
+			"$JS.API.CONSUMER.MSG.NEXT."+s+".x",
+			"$JS.API.CONSUMER.DELETE."+s+".x",
+			"$JS.API.CONSUMER.INFO."+s+".x",
+			"$JS.API.STREAM.PURGE."+s,
+			"$JS.API.STREAM.UPDATE."+s,
+			"$JS.API.STREAM.DELETE."+s,
+			"$JS.API.STREAM.MSG.GET."+s,
+		)
+	}
+	forbidden = append(forbidden,
+		"$KV.runtime-state.bridge.platform.t1",
+		"$KV.session-state.k",
+		"$KV.cap.root.t1",
+		"$JS.API.STREAM.INFO.TASKS",
+		"$JS.API.DIRECT.GET.TASKS.a2a.tasks.platform.t1.events",
+		"$JS.API.INFO",
+		"$JS.API.STREAM.NAMES",
+		"$JS.API.STREAM.LIST",
+	)
+	for _, subject := range forbidden {
+		for _, grant := range append(slices.Clone(agent.Grants.Publish), agent.Grants.Subscribe...) {
+			if subjectMatches(grant, subject) {
+				t.Errorf("agent grant %q permits %q; the platform agent container holds the blackboard and nothing else", grant, subject)
+			}
+		}
+	}
+
+	// And the bound on the grant function itself, for the same reason the
+	// bridge's test bounds its own: a DeepEqual built from the function
+	// cannot see an entry added inside it.
+	allowedShapes := map[string]bool{}
+	for _, s := range []string{a2aTopicsStateStream, a2aTopicsJournalStream} {
+		allowedShapes["$JS.API.STREAM.INFO."+s] = true
+		allowedShapes["$JS.API.DIRECT.GET."+s+".>"] = true
+	}
+	for _, grant := range a2aAgentJetStreamGrants() {
+		if !allowedShapes[grant] {
+			t.Errorf("agent holds JetStream API grant %q, which is outside the shapes a2aAgentJetStreamGrants argues for", grant)
+		}
+	}
+}
+
+// TestBusGrantsNameStreamsTheProvisionScriptCreates pins the pair. The bridge's
+// and the agent's grants render from the stream-name constants; the provision
+// script spells each name itself, because every create line carries its own
+// subjects, retention and caps. Rename a stream on one side only and a
+// principal holds grants on a name that does not exist -- an authorization
+// failure at runtime with a green suite -- so the script's create lines are
+// held to the constants here. Anchored to the create itself, not the bare name,
+// for the reason #1306's pairing test records: the script's prose mentions
+// every name too.
+//
+// Both grant functions, in one test, because the pairing is a property of the
+// script rather than of either caller: A5 split one list into two, and a test
+// that walked only the list it was written for would stop covering the other
+// the day someone added a stream to it.
+func TestBusGrantsNameStreamsTheProvisionScriptCreates(t *testing.T) {
 	script := a2aProvisionScript(a2aTestAgent())
 	for _, create := range []string{
 		"stream add " + a2aTasksStream + " ",
@@ -2880,21 +3309,255 @@ func TestWorkerGrantNamesStreamsTheProvisionScriptCreates(t *testing.T) {
 		"kv add " + a2aRuntimeStateBucket + " ",
 	} {
 		if !strings.Contains(script, create) {
-			t.Errorf("the provision script has no %q; the worker's grant names a stream nothing creates", strings.TrimSpace(create))
+			t.Errorf("the provision script has no %q; a bus grant names a stream nothing creates", strings.TrimSpace(create))
 		}
 	}
 	// Every grant names one of those constants, so the check above covers
 	// the whole list rather than the four names this test happens to know.
 	known := []string{a2aTasksStream, a2aTopicsStateStream, a2aTopicsJournalStream, a2aKVStreamPrefix + a2aRuntimeStateBucket}
-	for _, grant := range a2aWorkerJetStreamGrants() {
-		if !slices.ContainsFunc(known, func(name string) bool { return strings.Contains(grant, "."+name) }) {
-			t.Errorf("worker grant %q names a stream outside the constants the provision script is held to", grant)
+	for who, grants := range map[string][]string{
+		a2aBridgeUser:   a2aBridgeJetStreamGrants(),
+		a2aAgentBusUser: a2aAgentJetStreamGrants(),
+	} {
+		for _, grant := range grants {
+			if !slices.ContainsFunc(known, func(name string) bool { return strings.Contains(grant, "."+name) }) {
+				t.Errorf("%s grant %q names a stream outside the constants the provision script is held to", who, grant)
+			}
 		}
 	}
 	// And the direct-get route the grants assume: every stream add says so.
 	for _, line := range strings.Split(script, "\n") {
 		if strings.Contains(line, "stream add ") && !strings.Contains(line, "--allow-direct") {
-			t.Errorf("provision line %q does not set --allow-direct; the worker's grant is written for DIRECT.GET, not STREAM.MSG.GET", strings.TrimSpace(line))
+			t.Errorf("provision line %q does not set --allow-direct; the bus grants are written for DIRECT.GET, not STREAM.MSG.GET", strings.TrimSpace(line))
+		}
+	}
+}
+
+// TestGatewayHoldsNoWholesaleJetStreamAPI is the shape check for the gateway's
+// JetStream API grant; the refusal proof is
+// TestGatewayJetStreamGrantOnARealServer, which asks a server. It is the last
+// of these, and it asks what the seed and bridge ones ask, in the same four
+// parts: the publish allow-list pinned exactly, every destructive and
+// out-of-scope route run through subjectMatches against every rendered entry,
+// a structural bound on the grant function's own output, and the subscribe
+// list pinned exactly.
+//
+// The route that motivated #1666 is one row of part 2:
+// $JS.API.STREAM.DELETE.TASKS, which the wildcard permitted and which was
+// measured deleting the stream on a live install.
+func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	got := a2aGrantSubjects(t, conf, "gateway", "publish")
+
+	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
+		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
+		"agents.hb.>", "$KV.session-state.>", "_INBOX.gateway.>",
+	}; !reflect.DeepEqual(sub, want) {
+		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
+	}
+
+	want := []string{
+		"a2a.tasks.*.*.in",
+		"a2a.tasks.*.*.supervisor",
+		"$KV.session-state.>",
+	}
+	want = append(want, a2aGatewayJetStreamGrants()...)
+	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("gateway publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+
+	// Verbs no gateway path uses, against every stream the provision script
+	// creates. A named grant only widens the stream it names, so a verb
+	// sampled on TASKS says nothing about the same verb on DIRECTORY.
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap"}
+	forbiddenVerbs := []string{
+		"$JS.API.STREAM.CREATE.",
+		"$JS.API.STREAM.UPDATE.",
+		"$JS.API.STREAM.DELETE.",
+		"$JS.API.STREAM.PURGE.",
+		"$JS.API.STREAM.MSG.DELETE.",
+		"$JS.API.STREAM.MSG.GET.",
+		"$JS.API.STREAM.RESTORE.",
+		"$JS.API.STREAM.SNAPSHOT.",
+		"$JS.API.CONSUMER.NAMES.",
+		"$JS.API.CONSUMER.LIST.",
+	}
+	var forbidden []string
+	for _, s := range provisioned {
+		for _, verb := range forbiddenVerbs {
+			forbidden = append(forbidden, verb+s)
+		}
+		// Nothing on the gateway path binds a consumer by name, on any
+		// stream (a2aGatewayJetStreamGrants says what withholding this
+		// costs).
+		forbidden = append(forbidden, "$JS.API.CONSUMER.INFO."+s+".x")
+	}
+	// Streams the gateway has no business on at all: not a read, not a
+	// consumer, not a direct get. The directory is the identity plane and
+	// the gateway reads it by subscribing to the cards; the topic streams
+	// are the blackboard, which nothing in a2a/gateway touches; the other
+	// two buckets are the bridge's and the capability envelope's.
+	for _, s := range []string{"DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
+		forbidden = append(forbidden,
+			"$JS.API.STREAM.INFO."+s,
+			"$JS.API.CONSUMER.CREATE."+s+".x",
+			"$JS.API.CONSUMER.CREATE."+s+".x.a2a.agents.platform",
+			"$JS.API.CONSUMER.DURABLE.CREATE."+s+".x",
+			"$JS.API.CONSUMER.MSG.NEXT."+s+".x",
+			"$JS.API.CONSUMER.DELETE."+s+".x",
+			"$JS.API.DIRECT.GET."+s+".a2a.agents.platform",
+			"$JS.API.DIRECT.GET."+s,
+		)
+	}
+	forbidden = append(forbidden,
+		// A session pod's three consumers, and the bridge's durable: the
+		// gateway may create consumers on TASKS, and create-as-update
+		// reaches them (a2aGatewayJetStreamGrants records that residue),
+		// but deleting one by name is a route this grant does not carry.
+		"$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+		"$JS.API.CONSUMER.DELETE.TASKS.bridge-platform",
+		"$JS.API.CONSUMER.DELETE.TASKS.x",
+		// Account discovery and enumeration.
+		"$JS.API.INFO",
+		"$JS.API.STREAM.NAMES",
+		"$JS.API.STREAM.LIST",
+		// A stream nobody provisions, for the verbs the gateway does hold.
+		"$JS.API.STREAM.INFO.NOT-PROVISIONED",
+		"$JS.API.CONSUMER.CREATE.NOT-PROVISIONED.x",
+		"$JS.API.DIRECT.GET.NOT-PROVISIONED.x",
+	)
+	for _, subject := range forbidden {
+		for _, grant := range got {
+			if subjectMatches(grant, subject) {
+				t.Errorf("gateway grant %q permits %q; nothing on the gateway path uses it", grant, subject)
+			}
+		}
+	}
+
+	// The other direction, and the one a forbidden list cannot cover: an
+	// entry added inside a2aGatewayJetStreamGrants is invisible to the
+	// DeepEqual above, since want is built from that same function.
+	// Anything outside these shapes has to be argued for in that function's
+	// comment rather than added quietly.
+	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
+	allowedShapes := map[string]bool{
+		"$JS.API.STREAM.INFO." + a2aTasksStream:              true,
+		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>":   true,
+		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*": true,
+		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>":        true,
+		"$JS.API.STREAM.INFO." + kvSessionState:              true,
+		"$JS.API.DIRECT.GET." + kvSessionState + ".>":        true,
+		"$JS.API.CONSUMER.CREATE." + kvSessionState + ".>":   true,
+		"$JS.API.CONSUMER.DELETE." + kvSessionState + ".*":   true,
+	}
+	for _, grant := range a2aGatewayJetStreamGrants() {
+		if !allowedShapes[grant] {
+			t.Errorf("gateway holds JetStream API grant %q, which is outside the shapes a2aGatewayJetStreamGrants argues for", grant)
+		}
+	}
+}
+
+// TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit is the other half
+// of the shape check, and the half a forbidden list cannot supply: every
+// $JS.API subject the gateway's own code paths put on the wire has to be
+// INSIDE the grant. A narrowing that misses one is not a green suite and a
+// broken install -- it is a call that never gets a reply, because a refused
+// request is not an error nats.go reports to the caller, so the gateway waits
+// out its context instead. That is #1306's STREAM.NAMES lesson, and it is why
+// this table is written from the call sites rather than from the grant.
+//
+// Each row is a real subject, spelled as nats.go v1.53.1 formats it for that
+// call, with the caller named. The server test runs the calls themselves;
+// this one is the cheap version that fails in milliseconds and says which
+// caller lost its route.
+func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
+
+	// The generated tokens nats.go supplies: an ordered consumer's name is
+	// nuid-derived with a serial suffix, and a KV watcher's is a hash.
+	const (
+		orderedConsumerName = "GxQ1Vk8yPqR3Sn7TmW2bLc_1"
+		kvWatcherName       = "7yLm2Qr9"
+		sessionKey          = "sessions.discord_live_thread-2f9a1c3d"
+	)
+	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
+	eventsSubject := "a2a.tasks.platform.task-0001.events"
+
+	for _, tc := range []struct{ caller, subject string }{
+		// lib.TasksGet, the tasks/get replay behind every status answer,
+		// the reap scan and the spawn watchdog.
+		{"lib.TasksGet js.Stream", "$JS.API.STREAM.INFO." + a2aTasksStream},
+		{"lib.TasksGet GetLastMsgForSubject (events)", "$JS.API.DIRECT.GET." + a2aTasksStream + "." + eventsSubject},
+		{"lib.TasksGet GetLastMsgForSubject (supervisor)", "$JS.API.DIRECT.GET." + a2aTasksStream + ".a2a.tasks.platform.task-0001.supervisor"},
+		{"lib.TasksGet OrderedConsumer", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + "." + orderedConsumerName},
+		{"lib.TasksGet ordered Next", "$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + "." + orderedConsumerName},
+		// gateway.Run's event relay: two filter subjects, so nats.go puts
+		// the filter in the body and the subject ends at the durable name.
+		{"lib.SubscribeDurable relay create", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".gateway-relay"},
+		{"relay Consume pull", "$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".gateway-relay"},
+		// The same durable rebound with ONE filter subject, which is the
+		// shape every install already has on disk and the shape a rebind
+		// goes through: nats.go appends the filter to the API subject.
+		{"lib.SubscribeDurable single-filter rebind", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".gateway-relay." + eventsSubject},
+		// gateway.Registry, over the session-state bucket.
+		{"Registry js.KeyValue", "$JS.API.STREAM.INFO." + kvSessionState},
+		{"Registry Get / SessionForTask (kv.Get)", "$JS.API.DIRECT.GET." + kvSessionState + ".$KV." + a2aSessionStateBucket + "." + sessionKey},
+		{"Registry Sessions (ListKeysFiltered watcher)", "$JS.API.CONSUMER.CREATE." + kvSessionState + "." + kvWatcherName + ".$KV." + a2aSessionStateBucket + ".sessions.>"},
+		{"Registry Sessions watcher Stop (Unsubscribe)", "$JS.API.CONSUMER.DELETE." + kvSessionState + "." + kvWatcherName},
+		// The ack the relay's explicit-ack durable publishes, granted
+		// beside the API list rather than in it.
+		{"relay msg.Ack", "$JS.ACK." + a2aTasksStream + ".gateway-relay.1.1.1.1.1"},
+	} {
+		var covered bool
+		for _, g := range grants {
+			if subjectMatches(g, tc.subject) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			t.Errorf("no gateway grant covers %q (%s); that call gets no reply and the caller waits out its context",
+				tc.subject, tc.caller)
+		}
+	}
+}
+
+// TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo pins the pair the
+// gateway identity's comment names. The registry's writes are publishes on
+// $KV.<bucket>.>, spelled as a literal in gatewayIdentity; its reads are
+// JetStream API calls on stream KV_<bucket>, built from a2aSessionStateBucket
+// inside a2aGatewayJetStreamGrants. Two spellings of one bucket: change one
+// and the gateway can write the registry and not read it, which is an
+// authorization failure at runtime with nothing failing here to say so.
+//
+// Also held to the provision script, for the same reason the bridge's streams
+// are: a grant naming a bucket nothing creates is a call that times out on a
+// real install and nowhere else.
+func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
+
+	dataPlane := "$KV." + a2aSessionStateBucket + ".>"
+	if !slices.Contains(grants, dataPlane) {
+		t.Errorf("the gateway's publish list has no %q; its JetStream grants name bucket %q, so the two no longer describe one bucket",
+			dataPlane, a2aSessionStateBucket)
+	}
+	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
+	if !slices.Contains(grants, "$JS.API.STREAM.INFO."+kvSessionState) {
+		t.Errorf("the gateway holds no STREAM.INFO on %s; js.KeyValue binds a bucket by reading its stream, so the registry cannot open", kvSessionState)
+	}
+	if script := a2aProvisionScript(a2aTestAgent()); !strings.Contains(script, "kv add "+a2aSessionStateBucket+" ") {
+		t.Errorf("the provision script has no %q; the gateway's grant names a bucket nothing creates", "kv add "+a2aSessionStateBucket)
+	}
+	// Every JetStream grant names TASKS or that bucket's stream, so the two
+	// checks above cover the whole list rather than the entries this test
+	// happens to spell.
+	known := []string{a2aTasksStream, kvSessionState}
+	for _, grant := range a2aGatewayJetStreamGrants() {
+		if !slices.ContainsFunc(known, func(name string) bool { return strings.Contains(grant, "."+name) }) {
+			t.Errorf("gateway grant %q names a stream outside %v, which is what this pair is held to", grant, known)
 		}
 	}
 }
@@ -3093,9 +3756,13 @@ type a2aGrantRow struct {
 	// accountLevel is the $JS.API discovery the principal may make with no
 	// stream in the subject.
 	accountLevel []string
-	// wholesale records a principal that still holds $JS.API.>; narrowing
-	// it is a behaviour change with its own real-server test, not this
-	// table's to make.
+	// wholesale records a principal that holds $JS.API.>. No row sets it
+	// any more -- seed came off the wildcard in #1306, worker in #1393 and
+	// gateway in #1666 -- and the field stays because the alternative to a
+	// flag is silence: with it, a principal that takes the wildcard back
+	// has to say so on its own row in this table, and the diff is one word
+	// a reviewer can see. Narrowing one is a behaviour change with its own
+	// real-server test, not this table's to make.
 	wholesale bool
 }
 
@@ -3338,15 +4005,23 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{
-				a2aTasksStream: {"ACK"},
-				kvSessionState: {"KV"},
+				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
+				kvSessionState: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 			},
-			wholesale: true,
 		},
-		"worker": {
+		a2aBridgeUser: {
 			streams: map[string][]string{
-				a2aTasksStream:         {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET", "ACK"},
-				kvRuntimeState:         {"KV", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				a2aTasksStream: {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET", "ACK"},
+				kvRuntimeState: {"KV", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+			},
+		},
+		// The other half of what `worker` held. Two streams, two read verbs,
+		// no consumer verb anywhere and nothing on the task plane -- and it is
+		// a callout row, so the whole list is served from the identity map
+		// rather than from a user block in nats.conf.
+		a2aAgentBusUser: {
+			callout: true,
+			streams: map[string][]string{
 				a2aTopicsStateStream:   {"STREAM.INFO", "DIRECT.GET"},
 				a2aTopicsJournalStream: {"STREAM.INFO", "DIRECT.GET"},
 			},
@@ -3629,5 +4304,835 @@ func TestCheckA2AUserGrants(t *testing.T) {
 				t.Errorf("checker did not refuse with %q; recorded %q", c.wantErr, r.errors)
 			}
 		})
+	}
+}
+
+// ---- the inject backend (#1704) ------------------------------------------
+//
+// The gateway's inject door is an HTTP door into handleInbound, for the eval
+// harness. Everything below is about the properties that keep it from being a
+// hole: it is rendered only when the operator itself was deployed with the
+// flag, every request to it carries a bearer token this operator mints, the
+// only identity it admits is an eval one, and while it is rendered the
+// gateway pod is fenced against every pod on the network.
+
+// a2aInjectAgentState reconciles a next-mode agent twice (finalizer pass,
+// then the real one), reports the auth callout serving and reconciles past
+// the gateway gate, and hands back the client, so each inject test states
+// only what it is asserting. The gate matters here: the door's env rides on
+// the gateway Deployment, and the flag-off removal is ordered after its
+// apply, so a test that never let the gateway through would assert against
+// a Deployment the render withheld.
+func a2aInjectAgentState(t *testing.T) (client.Client, *agentv1alpha1.PlatformAgent, *PlatformAgentReconciler, ctrl.Request) {
+	t.Helper()
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i+1, err)
+		}
+	}
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
+	return cl, agent, r, req
+}
+
+// a2aGatewayEnv reads the rendered gateway container's environment by name.
+func a2aGatewayEnv(t *testing.T, cl client.Client, agent *agentv1alpha1.PlatformAgent) map[string]corev1.EnvVar {
+	t.Helper()
+	dep := &appsv1.Deployment{}
+	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(context.Background(), key, dep); err != nil {
+		t.Fatalf("gateway Deployment: %v", err)
+	}
+	env := map[string]corev1.EnvVar{}
+	for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+		env[e.Name] = e
+	}
+	return env
+}
+
+// TestA2AInjectBackendIsOffWithoutTheFlag is the property the whole design
+// rests on: an ordinary next install renders no inject door at all. Not a
+// closed one, not one behind a fence -- none, so there is nothing to
+// misconfigure and nothing to find.
+func TestA2AInjectBackendIsOffWithoutTheFlag(t *testing.T) {
+	// Pinned off rather than inherited, so a shell that exports the flag does
+	// not turn this test into its opposite.
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+
+	// The render, first: nothing in the pod spec even mentions it.
+	dep := buildA2AGatewayDeployment(agent)
+	container := dep.Spec.Template.Spec.Containers[0]
+	for _, e := range container.Env {
+		if e.Name == a2aInjectListenEnvVar {
+			t.Errorf("%s is rendered without the flag", a2aInjectListenEnvVar)
+		}
+		if e.Name == "A2A_PRINCIPAL_MAP" {
+			t.Errorf("A2A_PRINCIPAL_MAP is repointed without the flag: %+v", e)
+		}
+	}
+	if len(container.Ports) != 0 {
+		t.Errorf("the gateway publishes %d container ports without the flag", len(container.Ports))
+	}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if strings.Contains(v.Name, "inject") {
+			t.Errorf("an inject volume is mounted without the flag: %s", v.Name)
+		}
+	}
+
+	// And the cluster: no Service to reach, no map to be admitted by.
+	cl, agent, _, _ := a2aInjectAgentState(t)
+	ctx := context.Background()
+	name := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	for _, obj := range a2aInjectRenderedKinds() {
+		if err := cl.Get(ctx, name, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s exists without the flag (err=%v)", obj, name.Name, err)
+		}
+	}
+}
+
+// TestA2AInjectBackendRendersUnderTheFlag: with the operator deployed with
+// the flag, the gateway gets a listener, a map that admits exactly the eval
+// author, and a ClusterIP to reach it on.
+func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, _, _ := a2aInjectAgentState(t)
+	ctx := context.Background()
+
+	env := a2aGatewayEnv(t, cl, agent)
+	// Loopback, not every interface: the port-forward the eval runner uses
+	// is served from inside the pod's network namespace, and a bind on every
+	// interface would hand the pod network a listener the fence alone
+	// withholds.
+	listen := env[a2aInjectListenEnvVar]
+	if listen.Value != fmt.Sprintf("%s:%d", a2aInjectListenHost, a2aInjectPort) {
+		t.Errorf("%s = %q, want the pod's loopback on the inject port", a2aInjectListenEnvVar, listen.Value)
+	}
+	if strings.HasPrefix(listen.Value, ":") {
+		t.Errorf("%s = %q binds every interface", a2aInjectListenEnvVar, listen.Value)
+	}
+	// The map the gateway reads has to be the one the operator rendered; the
+	// default path is the hand-made Discord map, which carries no eval
+	// author, and a gateway reading it drops every injected message at
+	// verification with nothing in the render looking wrong.
+	if got := env[a2aInjectPrincipalMapEnv].Value; got != a2aInjectPrincipalMapPath {
+		t.Errorf("%s = %q, want the operator's own map at %q",
+			a2aInjectPrincipalMapEnv, got, a2aInjectPrincipalMapPath)
+	}
+	// Beside the chat map rather than over it. The door may be armed next to
+	// a real backend now, and repointing the one variable would take that
+	// backend's identities away with it.
+	if got := env["A2A_PRINCIPAL_MAP"].Value; got == a2aInjectPrincipalMapPath {
+		t.Error("the door repointed A2A_PRINCIPAL_MAP, which is the chat backends' map")
+	}
+	// The token, from the Secret this operator mints, and NOT optional: a
+	// missing Secret must crash-loop the pod rather than leave the gateway
+	// to arm a door with no token -- which it would refuse to do anyway.
+	tokenRef := env[a2aInjectTokenEnvVar].ValueFrom
+	if tokenRef == nil || tokenRef.SecretKeyRef == nil {
+		t.Fatalf("%s is not read from a Secret: %+v", a2aInjectTokenEnvVar, env[a2aInjectTokenEnvVar])
+	}
+	if tokenRef.SecretKeyRef.Name != a2aInjectName(agent) || tokenRef.SecretKeyRef.Key != a2aInjectTokenKey {
+		t.Errorf("the token comes from %s/%s, want %s/%s", tokenRef.SecretKeyRef.Name,
+			tokenRef.SecretKeyRef.Key, a2aInjectName(agent), a2aInjectTokenKey)
+	}
+	if tokenRef.SecretKeyRef.Optional != nil && *tokenRef.SecretKeyRef.Optional {
+		t.Error("the token reference is optional, so a pod could start with an empty token")
+	}
+	if env[a2aInjectTokenEnvVar].Value != "" {
+		t.Error("the token is rendered as a literal env value rather than a Secret reference")
+	}
+
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, dep); err != nil {
+		t.Fatal(err)
+	}
+	container := dep.Spec.Template.Spec.Containers[0]
+	var mounted bool
+	for _, m := range container.VolumeMounts {
+		if m.MountPath == a2aInjectPrincipalMapDir {
+			mounted = true
+			if !m.ReadOnly {
+				t.Error("the inject principal map is mounted writable")
+			}
+		}
+	}
+	if !mounted {
+		t.Errorf("no volume is mounted at %s, so the gateway would read an empty map", a2aInjectPrincipalMapDir)
+	}
+	// The other map stays mounted, at its own path: two ConfigMaps cannot
+	// share one, and the chat backends still read the default.
+	var stillHasDefault bool
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == "principal-map" {
+			stillHasDefault = true
+		}
+	}
+	if !stillHasDefault {
+		t.Error("the flag removed the default principal-map volume; it is shared with the chat backends")
+	}
+
+	cm := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}, cm); err != nil {
+		t.Fatalf("inject principal map: %v", err)
+	}
+	// One line, "inject:<author> eval:<...>". Both halves are load-bearing:
+	// the gateway looks up the prefixed key in this map alone, and refuses
+	// any value outside the eval namespace -- which is what keeps a door
+	// taking its author from a request body unable to assert a principal a
+	// real backend's sender could hold.
+	fixture := cm.Data[a2aInjectPrincipalMapKey]
+	lines := strings.Fields(strings.TrimSpace(fixture))
+	if len(cm.Data) != 1 || len(lines) != 2 {
+		t.Fatalf("the map is %q under %d keys, want one prefixed entry", fixture, len(cm.Data))
+	}
+	if lines[0] != a2aInjectPrincipalPrefix+a2aInjectAuthor {
+		t.Errorf("the map's key is %q, want it qualified with %q", lines[0], a2aInjectPrincipalPrefix)
+	}
+	if !strings.HasPrefix(lines[1], "eval:") {
+		t.Errorf("the map admits %q, which is not an eval identity; a synthetic door must be "+
+			"structurally incapable of asserting a cloud principal", lines[1])
+	}
+
+	secret := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}, secret); err != nil {
+		t.Fatalf("the door's bearer token Secret was not rendered: %v", err)
+	}
+	// Hex, two characters a byte: the length says the whole of the random
+	// material reached the Secret.
+	if len(secret.Data[a2aInjectTokenKey]) != 2*a2aInjectTokenNumBytes {
+		t.Errorf("the token is %d hex characters, want %d (%d random bytes); it is the door's whole access control",
+			len(secret.Data[a2aInjectTokenKey]), 2*a2aInjectTokenNumBytes, a2aInjectTokenNumBytes)
+	}
+
+	svc := &corev1.Service{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}, svc); err != nil {
+		t.Fatalf("inject Service: %v", err)
+	}
+	// ClusterIP keeps the door inside the cluster: a LoadBalancer or a
+	// NodePort would publish a task-submission endpoint off-cluster with the
+	// bearer token as its only guard.
+	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
+		t.Errorf("inject Service type = %q, want ClusterIP", svc.Spec.Type)
+	}
+	if svc.Spec.Selector["app"] != a2aGatewayName(agent) {
+		t.Errorf("inject Service selects %v, want the gateway pod", svc.Spec.Selector)
+	}
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != a2aInjectPort {
+		t.Errorf("inject Service ports = %+v, want just the inject port", svc.Spec.Ports)
+	}
+	// The listener and the Service must agree, or a port-forward reaches a
+	// closed port and reads as a broken gateway.
+	if !strings.HasSuffix(listen.Value, fmt.Sprintf(":%d", svc.Spec.Ports[0].Port)) {
+		t.Errorf("the gateway listens on %q and the Service publishes %d", listen.Value, svc.Spec.Ports[0].Port)
+	}
+}
+
+// TestA2AInjectFenceDeniesEveryPod: the fence is what keeps every other pod
+// off the door's port, so a leaked token alone reaches nothing; it has to
+// select the gateway pod and admit nobody. An ingress rule appearing here later is a
+// decision someone has to make deliberately.
+func TestA2AInjectFenceDeniesEveryPod(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, _, _ := a2aInjectAgentState(t)
+
+	np := &networkingv1.NetworkPolicy{}
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(context.Background(), key, np); err != nil {
+		t.Fatalf("the gateway fence was not rendered with the inject backend: %v", err)
+	}
+	if np.Spec.PodSelector.MatchLabels["app"] != a2aGatewayName(agent) {
+		t.Errorf("the fence selects %v, want the gateway pod", np.Spec.PodSelector.MatchLabels)
+	}
+	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeIngress {
+		t.Errorf("policyTypes = %v, want Ingress alone -- Egress here would cut the gateway off the bus",
+			np.Spec.PolicyTypes)
+	}
+	if len(np.Spec.Ingress) != 0 {
+		t.Errorf("the fence admits %d ingress rules; the inject port must be reachable from no pod, "+
+			"only through the node path a port-forward uses", len(np.Spec.Ingress))
+	}
+}
+
+// TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff: unsetting the operator's
+// flag has to take the door with it. Left behind, a Service and a map would
+// sit on an install that is supposed to look like it never had one -- and the
+// next operator roll that re-reads the flag would find them already there.
+func TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
+		t.Fatalf("the Service was not rendered, so this test proves nothing: %v", err)
+	}
+
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flag went off: %v", err)
+	}
+	for _, obj := range a2aInjectRenderedKinds() {
+		if err := cl.Get(ctx, key, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s survived the flag going off (err=%v)", obj, key.Name, err)
+		}
+	}
+	if env := a2aGatewayEnv(t, cl, agent); env[a2aInjectListenEnvVar].Value != "" {
+		t.Errorf("the gateway still listens on %q after the flag went off", env[a2aInjectListenEnvVar].Value)
+	}
+}
+
+// TestA2AInjectFlagOffRemovalReadsTheSecretUncached: the flag-off path reads
+// four objects before deleting them, and the fourth is a Secret. The operator
+// ships secrets with get only, so a cached Get of one starts an informer
+// whose LIST is forbidden and blocks the single reconcile worker for good --
+// the fake client cannot show that hang (its cache is the store), so this
+// test fails the cached path outright and passes only if the Secret is read
+// through the reader the other A2A Secrets use.
+func TestA2AInjectFlagOffRemovalReadsTheSecretUncached(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	// The "cache": the same store, refusing a Secret read once armed. Armed
+	// only for the flag-off reconcile, so the setup reconciles that mint the
+	// Secret through the reader are not what is under test.
+	var strict atomic.Bool
+	cached := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Secret); ok && strict.Load() {
+				return fmt.Errorf("cached Get of Secret %s: on the shipped RBAC this starts an informer whose LIST is forbidden, and the reconcile worker blocks in WaitForCacheSync", key)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	r := &PlatformAgentReconciler{Client: cached, APIReader: base, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d with the flag on: %v", i+1, err)
+		}
+	}
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := base.Get(ctx, key, &corev1.Secret{}); err != nil {
+		t.Fatalf("the token Secret was not minted, so this test proves nothing: %v", err)
+	}
+
+	strict.Store(true)
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flag went off read a Secret through the cache: %v", err)
+	}
+	if err := base.Get(ctx, key, &corev1.Secret{}); !errors.IsNotFound(err) {
+		t.Fatalf("the token Secret survived the flag going off (err=%v)", err)
+	}
+}
+
+// TestA2AInjectBackendGoesAwayOnAFlipToToday: the darkness property. A today
+// install must carry no A2A object, and the inject backend's four are
+// exactly the kind that get forgotten -- they are rendered by a branch the
+// teardown path never consults.
+func TestA2AInjectBackendGoesAwayOnAFlipToToday(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
+		t.Fatalf("the Service was not rendered, so this test proves nothing: %v", err)
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatal(err)
+	}
+	fresh.Spec.Mode = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flip to today: %v", err)
+	}
+	for _, obj := range a2aInjectRenderedKinds() {
+		if err := cl.Get(ctx, key, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s survived the flip to today (err=%v)", obj, key.Name, err)
+		}
+	}
+}
+
+// a2aInjectRenderedKinds is every kind the door renders, for the tests that
+// assert it is entirely gone. A list rather than three literals: the Secret
+// was the fourth, and the next one must not be missed the same way.
+func a2aInjectRenderedKinds() []client.Object {
+	return []client.Object{
+		&corev1.Service{},
+		&corev1.ConfigMap{},
+		&networkingv1.NetworkPolicy{},
+		&corev1.Secret{},
+	}
+}
+
+// TestA2AInjectTokenIsMintedOnceAndKept: the token is a live credential a
+// caller holds for the length of an eval run. Re-rolling it on a reconcile --
+// which happens every few seconds -- would 401 a run mid-flight, and the
+// failure would read as a broken gateway rather than as a rotated secret.
+func TestA2AInjectTokenIsMintedOnceAndKept(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+
+	first := &corev1.Secret{}
+	if err := cl.Get(ctx, key, first); err != nil {
+		t.Fatalf("the token Secret was not rendered: %v", err)
+	}
+	minted := string(first.Data[a2aInjectTokenKey])
+	if minted == "" {
+		t.Fatal("the token is empty, so the gateway would refuse to arm the door")
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i, err)
+		}
+	}
+	again := &corev1.Secret{}
+	if err := cl.Get(ctx, key, again); err != nil {
+		t.Fatal(err)
+	}
+	if string(again.Data[a2aInjectTokenKey]) != minted {
+		t.Error("the token changed across reconciles; every caller holding it is now refused")
+	}
+}
+
+// TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret: a Secret under the
+// rendered name that this agent did not create is not the door's key. The
+// token is the door's only access control, so adopting one would arm the door
+// with a credential its planter holds; and the flag-off removal refuses to
+// delete an unowned object, so a render built on it would wedge every later
+// reconcile. The reconcile fails before the Service is rendered, and the
+// planted Secret is left exactly as it was.
+func TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	planted := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace},
+		Data:       map[string][]byte{a2aInjectTokenKey: []byte("planted-token")},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, planted).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+
+	var err error
+	for i := 0; i < 2 && err == nil; i++ {
+		_, err = r.Reconcile(ctx, req)
+	}
+	if err == nil || !strings.Contains(err.Error(), "unowned") {
+		t.Fatalf("Reconcile with a planted token Secret: err = %v, want a refusal naming the unowned Secret", err)
+	}
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	after := &corev1.Secret{}
+	if err := cl.Get(ctx, key, after); err != nil {
+		t.Fatal(err)
+	}
+	if string(after.Data[a2aInjectTokenKey]) != "planted-token" || metav1.IsControlledBy(after, agent) {
+		t.Errorf("the planted Secret was changed or adopted: %+v", after.ObjectMeta.OwnerReferences)
+	}
+	if err := cl.Get(ctx, key, &corev1.Service{}); !errors.IsNotFound(err) {
+		t.Errorf("the inject Service was rendered on top of the refused token (err=%v)", err)
+	}
+}
+
+// TestA2AInjectTokenIsRepairedIfEmptied: an empty key renders an empty env,
+// and the gateway refuses to arm the door without a token -- so the pod would
+// crash-loop with nothing in the object set looking wrong. Emptied is the
+// shape a hand-edit or a half-written Secret takes.
+func TestA2AInjectTokenIsRepairedIfEmptied(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+
+	secret := &corev1.Secret{}
+	if err := cl.Get(ctx, key, secret); err != nil {
+		t.Fatal(err)
+	}
+	secret.Data[a2aInjectTokenKey] = []byte("")
+	if err := cl.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the token was emptied: %v", err)
+	}
+	repaired := &corev1.Secret{}
+	if err := cl.Get(ctx, key, repaired); err != nil {
+		t.Fatal(err)
+	}
+	if len(repaired.Data[a2aInjectTokenKey]) == 0 {
+		t.Error("an emptied token was left empty, so the door can never arm")
+	}
+}
+
+// TestA2AInjectTokenIsNotRenderedWithoutTheFlag: the darkness property
+// applied to the credential. A Secret is the one object here whose presence
+// on an install that never asked for the door would be more than residue.
+func TestA2AInjectTokenIsNotRenderedWithoutTheFlag(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	cl, agent, _, _ := a2aInjectAgentState(t)
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(context.Background(), key, &corev1.Secret{}); !errors.IsNotFound(err) {
+		t.Errorf("a bearer token Secret exists without the flag (err=%v)", err)
+	}
+}
+
+// The split A5 made is enforced by the pod spec, and spec.deployment is
+// user-authored: sidecars, init containers and their volumes are copied
+// verbatim into the render. So the one thing that keeps the projected bus token
+// in the platform-agent container is that nothing else mounts it by that name,
+// and until
+// this test nothing made that true — a2aBusTokenVolume is a public string in
+// the rendered Deployment, the volume is in the pod under `next`, and the
+// bridge image is built FROM the platform-agent image so it ships the client
+// that would read it. A sidecar holding this token AND bridge-password holds
+// the union of the two grant sets, which is `worker` rebuilt.
+//
+// Absence, per container, plus the volume-name shadow: two volumes with one
+// name is a Deployment server-side apply refuses, so that arm is a wedge guard
+// as well.
+//
+// Scope, so the name is not read as more than it pins: this is the NAME-based
+// reservation. A user volume projecting the a2a-bus audience under some other
+// name defeats the reservation and leaves this test passing, which is what the
+// ByName is doing in the name. The source check is
+// TestUserAuthoredVolumesCannotCarryTheBusCredentialBySource, its sibling in
+// platformagent_a2a_bus_source_test.go.
+func TestUserAuthoredContainersCannotMountTheBusTokenByName(t *testing.T) {
+	grab := func(agent *agentv1alpha1.PlatformAgent) corev1.PodSpec {
+		t.Helper()
+		return buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec
+	}
+	mount := corev1.VolumeMount{Name: a2aBusTokenVolume, MountPath: "/var/run/secrets/a2a-bus", ReadOnly: true}
+
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Sidecars: []corev1.Container{{
+			Name: "hermes-bridge", Image: "bridge:dev",
+			VolumeMounts: []corev1.VolumeMount{{Name: "agent-data", MountPath: "/opt/data"}, mount},
+		}},
+		InitContainers: []corev1.Container{{
+			Name: "peek", Image: "busybox", VolumeMounts: []corev1.VolumeMount{mount},
+		}},
+		SidecarVolumes: []corev1.Volume{{
+			Name: a2aBusTokenVolume, VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: "attacker"},
+			},
+		}},
+	}
+	spec := grab(agent)
+
+	// Precondition: the surface is up and the real volume is in the pod, so an
+	// absent mount below means the strip ran rather than the feature being off.
+	var projected int
+	for _, v := range spec.Volumes {
+		if v.Name != a2aBusTokenVolume {
+			continue
+		}
+		projected++
+		if v.Projected == nil {
+			t.Errorf("the pod's %s volume is %+v, not the operator's projection; a user-supplied "+
+				"volume shadowed it", a2aBusTokenVolume, v)
+		}
+	}
+	if projected != 1 {
+		t.Fatalf("the pod carries %d volumes named %s, want exactly 1 (the operator's projection); "+
+			"a duplicate name is refused by server-side apply and wedges every reconcile", projected, a2aBusTokenVolume)
+	}
+
+	holders := map[string]bool{}
+	for _, c := range slices.Concat(spec.Containers, spec.InitContainers) {
+		for _, m := range c.VolumeMounts {
+			if m.Name == a2aBusTokenVolume {
+				holders[c.Name] = true
+			}
+		}
+	}
+	if !holders["platform-agent"] {
+		t.Error("the platform-agent container lost its bus token mount; the strip is too wide and the CLI " +
+			"will fall through to a password that is no longer rendered")
+	}
+	delete(holders, "platform-agent")
+	if len(holders) != 0 {
+		t.Errorf("containers other than platform-agent mount %s: %v -- one of them plus bridge-password "+
+			"is the retired `worker` credential rebuilt", a2aBusTokenVolume, slices.Sorted(maps.Keys(holders)))
+	}
+
+	// The sidecar keeps everything it is entitled to.
+	for _, c := range spec.Containers {
+		if c.Name != "hermes-bridge" {
+			continue
+		}
+		if len(c.VolumeMounts) != 1 || c.VolumeMounts[0].Name != "agent-data" {
+			t.Errorf("the strip took a mount it has no claim on: %+v", c.VolumeMounts)
+		}
+	}
+
+	// The webhook says why; this render is what holds when the webhook is
+	// unreachable (chart default failurePolicy: Ignore).
+	if _, reserved := agentv1alpha1.ReservedVolumeNames[a2aBusTokenVolume]; !reserved {
+		t.Errorf("%s is not in ReservedVolumeNames, so the webhook admits a sidecar that mounts it and "+
+			"the author gets a silent strip instead of a field.Forbidden", a2aBusTokenVolume)
+	}
+
+	// Under today there is no such volume and the CR's containers are its
+	// author's business.
+	today := a2aTestAgent()
+	today.Spec.Mode = ptr.To("today")
+	today.Spec.Deployment = agent.Spec.Deployment.DeepCopy()
+	var sidecarMounts int
+	for _, c := range grab(today).Containers {
+		if c.Name != "hermes-bridge" {
+			continue
+		}
+		sidecarMounts = len(c.VolumeMounts)
+	}
+	if sidecarMounts != 2 {
+		t.Errorf("a today install's sidecar has %d mounts, want 2; the strip is not gated on the surface, "+
+			"which is one more way to tell the next stack exists", sidecarMounts)
+	}
+}
+
+// The fifth field, and the one the test above does not reach.
+//
+// spec.deployment.extraVolumeMounts names no container, which is why it did
+// not read like a surface the reservation had to cover -- but
+// buildBaseContainers appends it verbatim to the platform-agent container AND
+// to platform-agent-dashboard (its own comment there says "extraVolumeMounts
+// reaches both containers"). So the one CR field that mentions no container at
+// all is the one that puts the projected bus token into a SECOND container,
+// and the author never wrote a sidecar. The dashboard runs the same image as
+// the agent, so it already ships the `a2a` client that would read the file:
+// one entry, and the pod has two workloads on the bus wearing the `agent`
+// identity, which is the split A5 made undone by four lines of YAML.
+//
+// Measured on the rendered pod rather than on the presence of a guard. A test
+// that asserted "extraVolumeMounts is in ReservedVolumeNames' docstring" would
+// pass against the hole this closes.
+func TestTheDashboardNeverReceivesTheBusToken(t *testing.T) {
+	const ordinary = "my-scratch"
+	dep := func() *agentv1alpha1.DeploymentSpec {
+		return &agentv1alpha1.DeploymentSpec{
+			ExtraVolumeMounts: []corev1.VolumeMount{
+				{Name: ordinary, MountPath: "/scratch"},
+				{Name: a2aBusTokenVolume, MountPath: "/var/run/secrets/stolen"},
+			},
+		}
+	}
+
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = dep()
+	spec := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec
+
+	// Precondition. Without the projection in the pod an absent mount below
+	// says only that the feature is off, and every assertion here is vacuous.
+	if podVolume(corev1.PodTemplateSpec{Spec: spec}, a2aBusTokenVolume) == nil {
+		t.Fatalf("the pod carries no %s volume, so this test proves nothing about who mounts it",
+			a2aBusTokenVolume)
+	}
+	var dashboard bool
+	for _, c := range spec.Containers {
+		if c.Name == "platform-agent-dashboard" {
+			dashboard = true
+		}
+	}
+	if !dashboard {
+		t.Fatal("the render produced no platform-agent-dashboard container; the container this test " +
+			"is about is not in the pod, so its absence from the holder set below means nothing")
+	}
+
+	holders := map[string][]string{}
+	for _, c := range slices.Concat(spec.Containers, spec.InitContainers) {
+		for _, m := range c.VolumeMounts {
+			if m.Name == a2aBusTokenVolume {
+				holders[c.Name] = append(holders[c.Name], m.MountPath)
+			}
+		}
+	}
+	// The agent keeps exactly the operator's mount at the operator's path. The
+	// CR's own entry is stripped there too: a second mount of the same volume
+	// at a path of the author's choosing is not an escalation inside the one
+	// container entitled to the token, but it is the CR deciding where a
+	// credential appears, and a2aBusTokenPath is the path a2a/lib reads.
+	if got := holders["platform-agent"]; len(got) != 1 || got[0] != a2aBusTokenPath {
+		t.Errorf("the platform-agent container mounts %s at %v, want exactly [%s]: the operator's mount "+
+			"and nothing the CR added", a2aBusTokenVolume, got, a2aBusTokenPath)
+	}
+	delete(holders, "platform-agent")
+	if len(holders) != 0 {
+		t.Errorf("containers other than platform-agent mount %s: %v. spec.deployment.extraVolumeMounts "+
+			"reaches platform-agent-dashboard as well as the agent, so this entry is a second workload "+
+			"wearing the agent's bus identity -- the retired `worker` credential rebuilt from a CR field "+
+			"that names no container", a2aBusTokenVolume, holders)
+	}
+
+	// Not too wide: an ordinary extraVolumeMount still reaches both.
+	for _, c := range spec.Containers {
+		if c.Name != "platform-agent" && c.Name != "platform-agent-dashboard" {
+			continue
+		}
+		if !slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool { return m.Name == ordinary }) {
+			t.Errorf("the %s container lost its %s mount; the strip is taking mounts it has no claim on",
+				c.Name, ordinary)
+		}
+	}
+
+	// Gated on the surface, like every other strip: a today install has no such
+	// volume and the CR's mount list is its author's business.
+	today := a2aTestAgent()
+	today.Spec.Mode = ptr.To("today")
+	today.Spec.Deployment = dep()
+	var kept int
+	for _, c := range buildPodTemplateSpec(today, "", "", "", "", nil, renderOptions{}).Spec.Containers {
+		for _, m := range c.VolumeMounts {
+			if m.Name == a2aBusTokenVolume {
+				kept++
+			}
+		}
+	}
+	if kept == 0 {
+		t.Error("a today install lost the CR's extraVolumeMounts entry too; the strip is not gated on " +
+			"the surface, which is one more way to tell the next stack exists")
+	}
+}
+
+// The fourth field, and the one neither test above reaches.
+//
+// spec.deployment.sidecarVolumes and spec.deployment.extraVolumes are two
+// separate slices that land in the same pod-level volume list, and the render
+// strips each with its own call —
+// TestUserAuthoredContainersCannotMountTheBusTokenByName puts its shadow in
+// sidecarVolumes only. Measured before this test was written: deleting
+// `extraVolumes = a2aStripBusTokenVolume(extraVolumes)` from
+// buildPodTemplateSpec left the whole operator suite green, so the reservation
+// row that claims a render strip for ExtraVolumes
+// (TestEveryUserAuthoredMountSurfaceIsReserved) was claiming coverage that did
+// not exist. That is the same defect class A5 shipped to close, one field over.
+//
+// Why extraVolumes is its own surface and not a rewording of sidecarVolumes:
+// it needs no container. A CR that declares no sidecar and no init container
+// at all can still add a volume named a2a-bus-token, so the author never
+// writes anything that looks like it is reaching for the agent's identity.
+// The entry is appended AFTER the operator's projection, and both halves of
+// a2aStripBusTokenVolume's argument apply to it — a Secret or hostPath under
+// that name is a credential of the author's choosing presented as the pod's,
+// and two volumes with one name is a Deployment server-side apply refuses,
+// which wedges every reconcile of the CR with nothing in status to say which
+// field did it.
+//
+// The webhook refuses the entry and says why, which is the half that gives the
+// author a field.Forbidden; this render is the half that holds when the
+// webhook is unreachable, which the chart's default failurePolicy: Ignore
+// makes the ordinary case rather than the exotic one.
+func TestAnExtraVolumesEntryCannotShadowTheBusToken(t *testing.T) {
+	const ordinary = "my-scratch"
+	dep := func() *agentv1alpha1.DeploymentSpec {
+		return &agentv1alpha1.DeploymentSpec{
+			// No sidecars, no initContainers, no sidecarVolumes: the only
+			// strip that can produce the pod asserted below is the
+			// extraVolumes one, so this test goes red for that call alone.
+			ExtraVolumes: []corev1.Volume{
+				{Name: ordinary, VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				}},
+				{Name: a2aBusTokenVolume, VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: "attacker"},
+				}},
+			},
+		}
+	}
+
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = dep()
+	pod := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{})
+
+	// Precondition. If the surface were off there would be no projection to
+	// shadow, and every assertion below would hold over a pod this test is
+	// not about.
+	if !a2aAgentSurface(agent) {
+		t.Fatal("the a2a agent surface is off for this fixture, so the pod carries no bus token and " +
+			"nothing here measures a shadow of it")
+	}
+
+	var named []corev1.Volume
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == a2aBusTokenVolume {
+			named = append(named, v)
+		}
+	}
+	if len(named) != 1 {
+		t.Fatalf("the pod carries %d volumes named %s, want exactly 1: the CR's extraVolumes entry "+
+			"survived the strip. Two volumes with one name is refused by server-side apply, so the "+
+			"Deployment never applies and every reconcile of this CR wedges", len(named), a2aBusTokenVolume)
+	}
+	// And the one that survived is the operator's, not the author's. A strip
+	// that removed the projection and kept the Secret would leave the count at
+	// 1 and hand the agent container a credential the CR chose.
+	if !reflect.DeepEqual(named[0], a2aBusTokenVolumeSource()) {
+		t.Errorf("the pod's %s volume is %+v, not the operator's projection; the CR's entry is what the "+
+			"platform-agent container would mount at %s, which is the file a2a/lib reads",
+			a2aBusTokenVolume, named[0], a2aBusTokenPath)
+	}
+
+	// The agent keeps its mount: the strip is on the volume list, and taking
+	// the projection away would leave the container mounting a name no volume
+	// answers to.
+	var mounted bool
+	for _, c := range pod.Spec.Containers {
+		if c.Name != "platform-agent" {
+			continue
+		}
+		mounted = slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
+			return m.Name == a2aBusTokenVolume
+		})
+	}
+	if !mounted {
+		t.Error("the platform-agent container no longer mounts the bus token; the strip is too wide and " +
+			"the CLI falls through to a password that is no longer rendered")
+	}
+
+	// Not too wide: an ordinary extraVolumes entry is still the author's.
+	if podVolume(pod, ordinary) == nil {
+		t.Errorf("the pod lost its %s volume; the strip is taking entries it has no claim on", ordinary)
+	}
+
+	// Gated on the surface, like every other strip: a today install has no
+	// projected bus token, and a volume the next stack has never heard of is
+	// the CR author's business.
+	today := a2aTestAgent()
+	today.Spec.Mode = ptr.To("today")
+	today.Spec.Deployment = dep()
+	if podVolume(buildPodTemplateSpec(today, "", "", "", "", nil, renderOptions{}), a2aBusTokenVolume) == nil {
+		t.Error("a today install lost the CR's extraVolumes entry too; the strip is not gated on the " +
+			"surface, which is one more way to tell the next stack exists")
 	}
 }

@@ -5,12 +5,13 @@ output "cluster_name" {
 
 output "cluster_endpoint" {
   description = "Endpoint of the GKE cluster"
-  value = one(concat(
-    google_container_cluster.autopilot[*].endpoint,
-    google_container_cluster.standard[*].endpoint,
-    data.google_container_cluster.existing[*].endpoint,
-  ))
-  sensitive = true
+  value       = local.cluster_endpoint
+  sensitive   = true
+}
+
+output "cluster_endpoint_is_dns" {
+  description = "Whether cluster_endpoint is the DNS-based control plane endpoint (gke-<hash>.<region>.gke.goog) rather than an IP address. True means Google Front End terminates the connection with a publicly signed certificate, so a client dialling it must verify against the system trust store and must NOT be given cluster_ca_certificate, which signs only the IP endpoints."
+  value       = local.cluster_endpoint_is_dns
 }
 
 output "cluster_location" {
@@ -39,4 +40,9 @@ output "workload_identity_pool" {
     google_container_cluster.standard[*].workload_identity_config[0].workload_pool,
     data.google_container_cluster.existing[*].workload_identity_config[0].workload_pool,
   )), "")
+}
+
+output "network_policy_enforced" {
+  description = "Whether the cluster enforces NetworkPolicy (Dataplane V2 or the legacy Calico addon). Always true for a cluster this module creates; false only for an adopted cluster admitted by accept_no_network_policy, where every NetworkPolicy kube-agents installs is inert."
+  value       = local.network_policy_enforced
 }

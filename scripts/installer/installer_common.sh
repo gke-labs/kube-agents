@@ -31,6 +31,10 @@
 # path nobody knows in advance.
 _installer_common_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
 INSTALL_DEFAULTS_FILE="${KUBE_AGENTS_INSTALL_DEFAULTS:-${_installer_common_dir}/../../install.defaults.env}"
+if [ -r "${_installer_common_dir}/gke_dns_endpoint.sh" ]; then
+  # shellcheck source=scripts/installer/gke_dns_endpoint.sh
+  . "${_installer_common_dir}/gke_dns_endpoint.sh"
+fi
 unset _installer_common_dir
 if [ -r "$INSTALL_DEFAULTS_FILE" ]; then
   # shellcheck source=/dev/null
@@ -43,6 +47,9 @@ else
   echo "  ℹ It ships with the repository. Re-clone, or point KUBE_AGENTS_INSTALL_DEFAULTS at a copy." >&2
   return 1 2>/dev/null || exit 1
 fi
+
+# Request timeout for kubectl probes against live clusters in the installer.
+readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
 
 # ─── Helm Release Management Defaults ─────────────────────────────────────────
 # Operation timeout for an in-flight Helm install/upgrade across deploy workflows (10m).
@@ -62,6 +69,15 @@ readonly KUBE_AGENTS_HELM_RELEASE="kube-agents"
 # shellcheck disable=SC2034  # read by install.sh and upgrade.sh
 readonly KUBE_AGENTS_OPERATOR_DEPLOYMENT="kube-agents-controller-manager"
 readonly PLATFORM_AGENT_DEPLOYMENT="platform-agent-gateway"
+# The Hermes container in that Deployment's pod. The pod runs three and sets no
+# default-container annotation, so `kubectl exec` without -c lands on whichever
+# is first.
+# shellcheck disable=SC2034  # read by install.sh
+readonly PLATFORM_AGENT_CONTAINER="platform-agent"
+# The Hermes profile the Platform Agent answers on. A bare `hermes` reaches the
+# `default` profile instead -- the Planning Agent front door.
+# shellcheck disable=SC2034  # read by install.sh
+readonly PLATFORM_AGENT_HERMES_PROFILE="platform"
 readonly PLATFORM_AGENT_SECRET="platform-agent-secrets"
 # The chart's LiteLLM Deployment, and the objects the operator composes from
 # the PlatformAgent's name (platform-agent, which the composition leaves at
@@ -180,6 +196,13 @@ is_valid_model_provider() {
   [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai)$ ]]
 }
 
+# MODEL_MAX_TOKENS: a whole number of output tokens, 0 meaning none. Digits
+# only, so a sign, a decimal point or a unit suffix is refused before it
+# reaches terraform.tfvars as a bare word HCL cannot parse.
+is_non_negative_integer() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
 # read-only in every one of them; see the site's reference/security-and-iam.
 is_valid_permission_set() {
@@ -266,7 +289,7 @@ warn_on_overreaching_custom_roles() {
 # (us-central1-a). Autopilot clusters are regional, so this is what decides
 # whether the default shape is creatable at a given location. One home for the
 # pattern: install.sh both demotes the default and validates an explicit
-# --cluster-mode against it, and the two must agree.
+# --gke-cluster-mode against it, and the two must agree.
 location_is_region() {
   [[ "${1:-}" =~ ^[a-z]+-[a-z]+[0-9]+$ ]]
 }
@@ -647,7 +670,7 @@ github_account_type() {
   # Status is appended on its own line so a transport failure (curl non-zero)
   # stays distinguishable from an HTTP error (curl zero, status in the body).
   local response status body
-  if ! response=$(curl -sS --max-time 10 -H "Accept: application/vnd.github+json" \
+  if ! response=$(trap - ERR; curl -sS --max-time 10 -H "Accept: application/vnd.github+json" \
       -w '\n%{http_code}' "https://api.github.com/users/${name}" 2>/dev/null); then
     echo "unknown"
     return 0
@@ -1050,7 +1073,7 @@ if isinstance(value, str) and value:
 running_image_tag() {
   local namespace="${1:-$DEFAULT_NAMESPACE}" image=""
   command -v kubectl >/dev/null 2>&1 || return 0
-  if ! image="$(kubectl get deployment "${PLATFORM_AGENT_DEPLOYMENT}" -n "${namespace}" \
+  if ! image="$(trap - ERR; kubectl get deployment "${PLATFORM_AGENT_DEPLOYMENT}" -n "${namespace}" \
     -o jsonpath='{.spec.template.spec.containers[?(@.name=="platform-agent")].image}' 2>/dev/null)"; then
     return 0
   fi
@@ -1072,7 +1095,16 @@ helm_release_status() {
   command -v helm >/dev/null 2>&1 || return 0
 
   local status_json
-  if ! status_json="$(helm status "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
+  # `trap - ERR` inside the substitution: the front doors run `set -E`, so
+  # this subshell inherits their ERR trap, and in here `helm status` is a
+  # bare failing command the outer `if !` cannot shield. On bash 3.2 (macOS's
+  # default) the trap fires in the subshell: abort banner, FAILED report,
+  # then the caller carries on. A missing release is the ordinary
+  # first-install answer, not an abort. The front doors' own handlers exit
+  # a subshell silently, so a probe there needs no guard; this library
+  # cannot know its caller's trap, so its tolerated probes guard themselves.
+  # scripts/installer/README.md states the rule.
+  if ! status_json="$(trap - ERR; helm status "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
     return 0
   fi
 
@@ -1256,7 +1288,7 @@ ensure_clean_helm_release() {
       fi
 
       local history_json
-      if ! history_json="$(helm history "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
+      if ! history_json="$(trap - ERR; helm history "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
         if type print_error >/dev/null 2>&1; then
           print_error "Failed to retrieve Helm history for release '${release_name}' in namespace '${namespace}'."
         else
@@ -1267,7 +1299,7 @@ ensure_clean_helm_release() {
 
       local last_good_rev=""
       if command -v jq >/dev/null 2>&1; then
-        last_good_rev="$(printf '%s' "${history_json}" | jq -r '[.[] | select(.status == "deployed" or .status == "superseded") | .revision] | max // empty' 2>/dev/null)" || last_good_rev=""
+        last_good_rev="$(trap - ERR; printf '%s' "${history_json}" | jq -r '[.[] | select(.status == "deployed" or .status == "superseded") | .revision] | max // empty' 2>/dev/null)" || last_good_rev=""
       fi
 
       if [ -n "${last_good_rev}" ]; then
@@ -1376,7 +1408,7 @@ clear_failed_initial_helm_release() {
   fi
 
   local history_json
-  if ! history_json="$(helm history "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
+  if ! history_json="$(trap - ERR; helm history "${release_name}" -n "${namespace}" -o json 2>/dev/null)"; then
     print_warning "Helm release '${release_name}' in namespace '${namespace}' is '${release_status}' and its history could not be read; leaving it. If the apply stops on 'cannot re-use a name that is still in use', inspect it with: helm history ${release_name} -n ${namespace}"
     return 0
   fi
@@ -1443,7 +1475,7 @@ write_tfvars_from_state() {
   # deletion-protection apply and upgrade's full apply both became cluster
   # replacements.
   #
-  # CLUSTER_MODE (install.sh --cluster-mode, recorded in install.env) therefore
+  # CLUSTER_MODE (install.sh --gke-cluster-mode, recorded in install.env) therefore
   # decides ONE case: the fresh create, where the probe found no cluster and
   # the interview is the only information there is. Every branch on which a
   # cluster exists assigns cluster_mode from the probe, so a stale or
@@ -1526,8 +1558,13 @@ write_tfvars_from_state() {
   # live only in that cluster's Secret (a fresh clone has no install.env values),
   # and recovery is gated on the kubectl context actually being this cluster.
   if [ "$create_cluster" = "false" ] && command -v kubectl >/dev/null 2>&1; then
+    if type gke_dns_endpoint_flag >/dev/null 2>&1; then
+      GKE_DNS_ENDPOINT_FLAG=""
+      gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true
+    fi
+    # shellcheck disable=SC2086
     gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" \
-      --project "${PROJECT_ID}" >/dev/null 2>&1 || true
+      --project "${PROJECT_ID}" ${GKE_DNS_ENDPOINT_FLAG:-} >/dev/null 2>&1 || true
   fi
 
   # install.env does not always carry the credentials: PERSIST_SECRETS_ON_DISK=false
@@ -1558,7 +1595,8 @@ write_tfvars_from_state() {
       # just destroyed black-holes TCP instead of refusing, and eight keys
       # times a hung connect stalls the install for minutes.
       secret_val="$({ kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
-        --request-timeout=10s \
+        --context "$expected_ctx" \
+        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
         -o jsonpath="{.data.${secret_key}}" 2>/dev/null || true; } | base64 --decode 2>/dev/null || true)"
       if [ -n "$secret_val" ]; then
         export "${secret_key}=${secret_val}"
@@ -1608,7 +1646,13 @@ write_tfvars_from_state() {
     print_info "SKIP_CERT_MANAGER=true: the composition will not install cert-manager. The operator webhooks need one serving before the apply."
   elif [ "$create_cluster" = "false" ] && command -v kubectl >/dev/null 2>&1; then
     # Credentials were fetched above, on the same adoption branch.
-    if kubectl get deployment cert-manager -n cert-manager >/dev/null 2>&1; then
+    # Check that current-context actually points to this cluster; a stale context
+    # must not probe another cluster and wrongly disable cert-manager on this one.
+    local cert_expected_ctx
+    cert_expected_ctx="$(gke_context_name)"
+    if [ "$(kubectl config current-context 2>/dev/null || true)" = "$cert_expected_ctx" ] &&
+      kubectl get deployment cert-manager -n cert-manager --context "$cert_expected_ctx" \
+        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" >/dev/null 2>&1; then
       # The Deployment alone cannot say whose it is. On a retry after an
       # apply that died past the cert-manager release, and on every
       # upgrade.sh regeneration of an existing-cluster install, the
@@ -1670,7 +1714,7 @@ write_tfvars_from_state() {
   # pool AND the RuntimeClass on the pod; Autopilot ships the gvisor
   # RuntimeClass natively and has no pool to manage, so asking the gke-cluster
   # module for one there fails the plan. Deriving both from the probed
-  # cluster_mode keeps --gvisor=true meaning the same thing on either shape.
+  # cluster_mode keeps --enable-gvisor=true meaning the same thing on either shape.
   #
   # The fallback stays false even though a fresh install now defaults to the
   # sandbox. install.sh owns that default and exports ENABLE_GVISOR before
@@ -1697,7 +1741,7 @@ write_tfvars_from_state() {
       # release channel's current version, which has been past the floor since
       # 2023. There is nothing to describe yet, so checking would only produce
       # the "could not read the version" warning below on every fresh
-      # --cluster-mode=autopilot --gvisor=true install.
+      # --gke-cluster-mode=autopilot --enable-gvisor=true install.
       print_info "Creating Autopilot cluster '${CLUSTER_NAME}': using its built-in gvisor RuntimeClass, with no sandbox node pool to provision."
     else
       # Autopilot's gvisor RuntimeClass arrived in a specific GKE version, and
@@ -1725,12 +1769,23 @@ write_tfvars_from_state() {
         print_warning "Could not read the GKE version of Autopilot cluster '${CLUSTER_NAME}'; proceeding as though it supports GKE Sandbox. Below ${GVISOR_AUTOPILOT_MIN_VERSION} the agent Deployment is never created and this run fails at its final check."
       elif ! gke_version_at_least "$master_version" "$GVISOR_AUTOPILOT_MIN_VERSION"; then
         print_error "Autopilot cluster '${CLUSTER_NAME}' runs GKE ${master_version}, and its gvisor RuntimeClass needs ${GVISOR_AUTOPILOT_MIN_VERSION} or later."
-        print_info "Upgrade the cluster, or run the agent on the standard runtime: install.sh takes --gvisor=false, and upgrade.sh reads the choice from ENABLE_GVISOR in install.env. Continuing would apply every GCP and Helm resource and then fail on a missing agent Deployment."
+        print_info "Upgrade the cluster, or run the agent on the standard runtime: install.sh takes --enable-gvisor=false, and upgrade.sh reads the choice from ENABLE_GVISOR in install.env. Continuing would apply every GCP and Helm resource and then fail on a missing agent Deployment."
         print_info "Tearing down instead? uninstall.sh forces ENABLE_GVISOR=false and is never blocked by this check; if you reach it from some other caller, export ENABLE_GVISOR=false first."
         return 1
       fi
       print_info "Cluster '${CLUSTER_NAME}' is Autopilot: using its built-in gvisor RuntimeClass, with no sandbox node pool to provision."
     fi
+  fi
+
+  # Empty takes the default, 0, and both render nothing in the chart. Checked
+  # here as well as in install.sh's interview because upgrade.sh and
+  # uninstall.sh regenerate from install.env without it, and a bare word in
+  # HCL would otherwise fail at terraform's parser with a message naming
+  # neither the key nor the file to fix.
+  local model_max_tokens="${MODEL_MAX_TOKENS:-$DEFAULT_MODEL_MAX_TOKENS}"
+  if ! is_non_negative_integer "$model_max_tokens"; then
+    print_error "MODEL_MAX_TOKENS='${model_max_tokens}' is not a whole number of tokens. Set a non-negative integer, or leave it empty, in install.env."
+    return 1
   fi
 
   local old_umask
@@ -1761,9 +1816,12 @@ write_tfvars_from_state() {
     echo ""
     echo "# The DNS endpoint is open and deletion protection is off. cluster_mode is"
     echo "# the live cluster's own shape whenever there is one to probe, and the"
-    echo "# --cluster-mode the install asked for only on a create."
+    echo "# --gke-cluster-mode the install asked for only on a create."
     echo "cluster_mode               = $(hcl_str "${cluster_mode}")"
     echo "create_cluster             = ${create_cluster}"
+    echo "# An adoption that chose to install without NetworkPolicy enforcement."
+    echo "# Inert on a created cluster and on one that already enforces."
+    echo "accept_no_network_policy   = $(hcl_bool "${ACCEPT_NO_NETWORK_POLICY:-false}")"
     echo "allow_external_dns_traffic = true"
     echo "deletion_protection        = false"
     echo "enable_gvisor_node_pool    = ${gvisor_node_pool}"
@@ -1777,6 +1835,7 @@ write_tfvars_from_state() {
     echo ""
     echo "model_provider     = $(hcl_str "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}")"
     echo "model_default_name = $(hcl_str "${MODEL_DEFAULT_NAME:-}")"
+    echo "model_max_tokens   = ${model_max_tokens}"
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"

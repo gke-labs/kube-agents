@@ -34,7 +34,12 @@ _LEADING_MENTION_RE = re.compile(r"^<@[UWB][A-Z0-9]+>\s*")
 
 def _subcommand_map() -> Dict[str, str]:
     """Bare subcommand name -> real gateway command (``sethome`` -> ``/sethome``)."""
-    from hermes_cli.commands import slack_subcommand_map
+    # Hermes moved this helper to hermes_cli.commands_platforms in v2026.9.x and
+    # keeps the old path only as a warning compat shim scheduled for removal.
+    try:
+        from hermes_cli.commands_platforms import slack_subcommand_map
+    except ImportError:  # a base older than the move
+        from hermes_cli.commands import slack_subcommand_map
 
     mapping = dict(slack_subcommand_map())
     # The Slack adapter adds this alias after building the map; mirror it so the

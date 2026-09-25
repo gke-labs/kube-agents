@@ -72,6 +72,28 @@ func provision(t *testing.T, url string) {
 	}
 }
 
+// deleteTasksStream takes the task stream away, which is how a test makes the
+// gateway's submission publish fail for real rather than through a fake. The
+// session-state bucket stays, so everything up to the publish still works:
+// the session is minted, the task is announced and the placeholder posted.
+func deleteTasksStream(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := js.DeleteStream(ctx, lib.TasksStream); err != nil {
+		t.Fatalf("delete TASKS: %v", err)
+	}
+}
+
 type fakePost struct {
 	Conversation string
 	MessageID    string
@@ -91,16 +113,30 @@ type fakeAdapter struct {
 	// failEdits makes the next N Edit calls fail (and go unrecorded), for
 	// pinning what the relay does when a Chat edit does not land.
 	failEdits int
+	// stopped is closed when Run returns, so a test can assert that a
+	// backend was actually told to stop rather than left running.
+	stopped  chan struct{}
+	stopOnce sync.Once
+	// stopDelay is how long Run takes to return once told to stop, for
+	// pinning that a caller waits for it rather than exiting on its own.
+	stopDelay time.Duration
 }
 
 func newFakeAdapter() *fakeAdapter {
-	return &fakeAdapter{inbox: make(chan InboundMessage, 16), roster: []string{"1001"}, complete: true}
+	return &fakeAdapter{
+		inbox:    make(chan InboundMessage, 16),
+		roster:   []string{"1001"},
+		complete: true,
+		stopped:  make(chan struct{}),
+	}
 }
 
 func (a *fakeAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	defer a.stopOnce.Do(func() { close(a.stopped) })
 	for {
 		select {
 		case <-ctx.Done():
+			time.Sleep(a.stopDelay)
 			return nil
 		case msg := <-a.inbox:
 			handler(msg)
@@ -877,17 +913,18 @@ type fakeSpawner struct {
 }
 
 type fakeSpawn struct {
-	Session string
-	TaskID  string
+	Session   string
+	TaskID    string
+	OriginSeq uint64
 }
 
-func (s *fakeSpawner) Spawn(_ context.Context, rec *SessionRecord, taskID, _ string) (string, error) {
+func (s *fakeSpawner) Spawn(_ context.Context, rec *SessionRecord, taskID, _ string, originSeq uint64) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.spawnErr != nil {
 		return "", s.spawnErr
 	}
-	s.spawns = append(s.spawns, fakeSpawn{Session: rec.BusSession, TaskID: taskID})
+	s.spawns = append(s.spawns, fakeSpawn{Session: rec.BusSession, TaskID: taskID, OriginSeq: originSeq})
 	return rec.BusSession, nil
 }
 

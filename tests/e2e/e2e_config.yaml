@@ -18,8 +18,8 @@ defaults:
   # and e2e-manual-runner.yml both export the suite they picked — so this is the
   # local-developer default and conftest's fixture fallback. `gchat` because it is
   # the only suite with an unbroken record of passing on a real cluster; it needs
-  # the E2E_CHAT_* credentials, and failing on a missing credential is a clearer
-  # answer than a suite that half-runs.
+  # CHAT_SPACE_ID (the E2E_CHAT_* credentials are the read fallback), and failing
+  # on a missing space id is a clearer answer than a suite that half-runs.
   default_suite: "gchat"
 
 # A suite is a named list of test files plus the env vars those files need. It is
@@ -111,7 +111,7 @@ suites:
   # 6. Full Nightly E2E Matrix Environment
   # ----------------------------------------------------------------------------
   # Every nightly test file in one unit, for a hand-dispatched "run the lot".
-  # nightly-pipeline.yml does NOT run it as a single suite: it gates the staging
+  # staging-promotion-pipeline.yml does NOT run it as a single suite: it gates the staging
   # promotion on `rc` — the subset with a green run on a real cluster behind it —
   # and runs `gchat`, `agent-plugin` and `stockout-full` alongside as optional
   # coverage. Those three cover the files this suite adds on top of `rc`, so the

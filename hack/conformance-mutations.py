@@ -48,7 +48,7 @@ class Mutation:
 
     id: str
     path: str
-    #: (old, new) applied with str.replace, or a callable taking/returning text.
+    #: (old, new), applied as a single str.replace of the first occurrence.
     edit: tuple[str, str]
     #: Substring matching the test name that must go red.
     kills: str
@@ -121,7 +121,11 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-kubectl-kuberc-env",
         "agents/platform/scripts/credential_proxy.py",
-        ('"KUBECTL_KUBERC": "false"', '"KUBECTL_KUBERC_UNUSED": "false"'),
+        # Indented to pin the sandbox environment the test reads. The
+        # unindented spelling occurs first, in `_GIT_PROBE_ENVIRONMENT`,
+        # and a one-shot replace aimed there proves nothing.
+        ('            "KUBECTL_KUBERC": "false",',
+         '            "KUBECTL_KUBERC_UNUSED": "false",'),
         "test_A3_default_path_kuberc_is_disabled",
         "rename the env var while 'tidying', leaving the default-path kuberc "
         "feature on and the protection resting on mount geometry alone",
@@ -404,6 +408,25 @@ Mutation(
         "the new rules too -- arbitrary code execution with a writable token",
     ),
     Mutation(
+        # The same attack as the row above, spelled so a case-sensitive filter
+        # never sees it: GitHub resolves `uses:` case-insensitively, so this
+        # runs the identical action. The test walked straight past it and
+        # reported OK until the filter was lowercased. Pins the action SHA
+        # because the flip and the ref are not contiguous otherwise -- a pin
+        # bump reports STALE here, and the fix is to paste the new SHA in.
+        "B4-pull-request-target-checkout-case",
+        ".github/workflows/risk_classify.yml",
+        ("        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+         "        with:\n"
+         "          ref: ${{ github.event.repository.default_branch }}",
+         "        uses: Actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+         "        with:\n"
+         "          ref: ${{ github.event.Pull_Request.HEAD.sha }}"),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "capitalise both the action name and the expression context while "
+        "repointing the ref, which is the shape a case-flip evasion takes",
+    ),
+    Mutation(
         "B6-codeowners-bot",
         "examples/gitops-repo/CODEOWNERS.example",
         ("@your-org/security", "@kube-agents-bot[bot]"),
@@ -486,7 +509,9 @@ Mutation(
     Mutation(
         "C1-git-ext-transport",
         "agents/platform/scripts/credential_proxy.py",
-        ('"GIT_ALLOW_PROTOCOL": "https",', '"GIT_ALLOW_PROTOCOL": "https:ext",'),
+        # Indented for the same reason as A3-kubectl-kuberc-env above.
+        ('            "GIT_ALLOW_PROTOCOL": "https",',
+         '            "GIT_ALLOW_PROTOCOL": "https:ext",'),
         "test_C1_git_in_the_broker_cannot_execute_arbitrary_code",
         "re-admit the ext:: transport, which is the whole of the RCE: "
         "`git clone \'ext::sh -c <cmd>\'` runs <cmd> in the credential holder. "
@@ -510,8 +535,8 @@ Mutation(
     Mutation(
         "C1-executable-allowlist",
         "agents/platform/scripts/credential_proxy.py",
-        ('ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")',
-         'ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git", "sh")'),
+        ('return ("gcloud", "kubectl", "git", *providers.Registry().executables)',
+         'return ("gcloud", "kubectl", "git", "sh", *providers.Registry().executables)'),
         "test_C1_the_executor_refuses_an_executable_it_does_not_ship",
         "add sh to the allowlist, giving a compound command somewhere to land",
     ),
@@ -654,9 +679,19 @@ Mutation(
     Mutation(
         "C4-base-image-digest",
         "tags.env",
-        ("@sha256:3811ed13da874fba2ac99b6d492db9a203d34cb6dccf90d886948c00d0ccec09", ""),
+        ("@sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294", ""),
         "test_C4_the_agent_base_image_is_pinned_by_digest",
         "drop the digest and keep the tag, which reads as equivalent",
+    ),
+    Mutation(
+        "C4-hermes-plugin-ref",
+        "deploy/docker/Dockerfile",
+        (' --ref "${HERMES_OTEL_REF}"', ""),
+        "test_C4_every_hermes_plugin_install_is_pinned_to_a_commit",
+        "drop the ref and install the plugin from whatever the upstream "
+        "default branch holds, which is how the build broke in the first place; "
+        "the SHA itself lives in an ARG, so the ref token is what a careless "
+        "edit removes",
     ),
     Mutation(
         "C5-minted-write-verb",
@@ -953,8 +988,8 @@ Mutation(
     Mutation(
         "D15-executor-absolute-path",
         "agents/platform/scripts/credential_proxy.py",
-        ('ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")',
-         'ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git", "/usr/bin/kubectl")'),
+        ('return ("gcloud", "kubectl", "git", *providers.Registry().executables)',
+         'return ("gcloud", "kubectl", "git", "/usr/bin/kubectl", *providers.Registry().executables)'),
         "test_D15_the_two_layers_agree_on_the_governed_tool",
         "pin kubectl to an absolute path so PATH cannot be shadowed -- a "
         "hardening on its face, and a spelling _GOVERNED_TOOLS matches exactly "
@@ -1033,6 +1068,60 @@ Mutation(
         "entering it costs an argument",
     ),
     Mutation(
+        "A3-inject-door-always-rendered",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("\tif a2aInjectBackendEnabled() {\n\t\tinjectEnv = []corev1.EnvVar{",
+         "\tif true {\n\t\tinjectEnv = []corev1.EnvVar{"),
+        "test_A3_the_inject_door_renders_only_under_the_operator_flag",
+        "render the eval door's env, port and principal-map mount on every "
+        "mode: next gateway rather than only under the operator's flag. The "
+        "door has no customer-facing purpose and maps a principal out of a "
+        "request body, so an install that never asked for it must not carry "
+        "it. The operator's own flag-off render test "
+        "(TestA2AInjectBackendIsOffWithoutTheFlag) would catch it too, but it "
+        "is a Go test this harness does not run; the conformance test is the "
+        "one that has to notice, from the source, that the render consults "
+        "the flag",
+    ),
+    Mutation(
+        "A3-inject-flag-fails-open",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ('\treturn os.Getenv(a2aInjectBackendEnvVar) == "true"',
+         "\treturn os.Getenv(a2aInjectBackendEnvVar) != \"\""),
+        "test_A3_the_inject_flag_is_not_a_field_a_customer_can_set",
+        "make the eval flag true for any non-empty value. A typo, a stray "
+        "\"false\" or a templating artifact would then render a door that "
+        "maps a body-supplied principal, on an install that never asked for "
+        "one, instead of leaving it shut, which is the direction a flag "
+        "guarding this must never relax in",
+    ),
+    Mutation(
+        "A3-inject-principal-unchecked",
+        "a2a/gateway/gchat.go",
+        ("\tif !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {",
+         "\tif false {"),
+        "test_A3_the_inject_door_cannot_assert_a_cloud_principal",
+        "let the eval door's principal map resolve to any principal at all. "
+        "The door takes its author from a request body, so the map is the "
+        "only thing between a token holder and a principal of their "
+        "choosing; without this refusal an entry naming a cloud identity "
+        "would be honoured, which is an identity-minting door the day "
+        "publisher identity arms",
+    ),
+    Mutation(
+        "A3-inject-principal-defaulted",
+        "a2a/gateway/gchat.go",
+        ('\t\t\t"author", authorID, "wantPrefix", injectEvalPrincipalPrefix)\n\t\treturn ""\n\t}',
+         '\t\t\t"author", authorID, "wantPrefix", injectEvalPrincipalPrefix)\n'
+         "\t\tprincipal = injectEvalPrincipalPrefix + principal\n\t}"),
+        "test_A3_the_inject_door_cannot_assert_a_cloud_principal",
+        "keep the refusal's condition and log line but repair the value into "
+        "the eval namespace instead of dropping it. The check still runs, the "
+        "error is still logged, and a map entry naming a cloud identity is "
+        "still honoured -- so an assertion that only looks for the condition "
+        "passes on a resolver that defaults",
+    ),
+    Mutation(
         "C1-session-fence-selector-drift",
         "a2a/gateway/spawn.go",
         ('\tsessionRole = "a2a-session"', '\tsessionRole = "a2a-worker"'),
@@ -1102,8 +1191,8 @@ Mutation(
     Mutation(
         "A3-supervisor-terminal-back-on-events",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ('\t\t\t"a2a.tasks.*.*.in",\n\t\t\t"a2a.tasks.*.*.supervisor",',
-         '\t\t\t"a2a.tasks.*.*.in",\n\t\t\t"a2a.tasks.*.*.events",'),
+        ('\t\t"a2a.tasks.*.*.in",\n\t\t"a2a.tasks.*.*.supervisor",',
+         '\t\t"a2a.tasks.*.*.in",\n\t\t"a2a.tasks.*.*.events",'),
         "test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject",
         "move the gateway's supervisor publish back onto the executors' events "
         "subject -- the pre-split render, and the change a rollback of the "
@@ -1113,12 +1202,14 @@ Mutation(
     Mutation(
         "A3-second-supervisor-writer",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ('\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.topics.agent.platform.upgrade-readiness",',
-         '\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.tasks.*.*.supervisor",\n\t\t"a2a.topics.agent.platform.upgrade-readiness",'),
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.tasks.*.*.supervisor",\n\t\t"$KV.runtime-state.>",'),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
-        "grant the static worker publish on the supervisor subject, the shape "
-        "a bridge-side janitor written against the shared credential would "
-        "take. The subject then no longer says who wrote there",
+        "grant the static bridge publish on the supervisor subject, the shape "
+        "a bridge-side janitor would take -- finalising a task it executed "
+        "reads like the executor's own business. The subject then no longer "
+        "says who wrote there. Retargeted from `worker` when A5 retired that "
+        "user; the static credential it names is the half the bridge inherited",
     ),
     Mutation(
         "A3-session-writes-its-own-supervisor-subject",
@@ -1140,6 +1231,135 @@ Mutation(
         "widen the session's task-plane grant toward the per-task wildcard the "
         "cards sketched, which puts the executor in its own in-subject writer "
         "set: it can steer and cancel itself as if from the user",
+    ),
+    Mutation(
+        "A3-bridge-events-grant-rewildcarded",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('"a2a.tasks." + a2aBridgeAddressee + ".*.events",',
+         '"a2a.tasks.*.*.events",'),
+        "test_A3_the_events_subject_has_no_rendered_writer",
+        "put the addressee wildcard back on the bridge's events grant, which "
+        "is what `worker` held and the one edit that reopens the violation A5 "
+        "closed. It reads as a generalisation -- one bridge build serving any "
+        "addressee -- and it costs every chat session's `…events` its writer "
+        "set, so a forged terminal from the shared credential is "
+        "indistinguishable from the executor's on replay",
+    ),
+    Mutation(
+        "C1-bus-user-env-renamed-on-one-side",
+        "a2a/lib/credentials.go",
+        ('EnvBusUser = "A2A_BUS_USER"', 'EnvBusUser = "A2A_BUS_PRINCIPAL"'),
+        "test_C1_the_agent_containers_bus_identity_env_is_spelled_the_same_in_both_modules",
+        "rename the bus identity env var in a2a/lib without touching the "
+        "operator that renders it -- the shape a rename takes when the two "
+        "literals live in modules that cannot import each other. Both modules "
+        "build and both Go suites stay green, because no test binary links "
+        "them. What breaks is every `a2a` invocation in the agent container: "
+        "busUser() reads the new name, finds nothing, falls back to NATS_USER "
+        "which A5 stopped rendering, and connect() refuses with `no bus "
+        "identity` before it dials. Loud where it runs and invisible where it "
+        "is reviewed, and the half a reviewer has to think to check is the "
+        "operator's render rather than this file",
+    ),
+    Mutation(
+        "C1-bus-token-path-moved-on-the-operator-side",
+        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
+        ('a2aBusTokenPath      = "/var/run/secrets/a2a-bus"',
+         'a2aBusTokenPath      = "/var/run/secrets/kubeagents/a2a-bus"'),
+        "test_C1_the_bus_token_path_and_audience_agree_across_the_module_boundary",
+        "tidy the projected token under a vendor-prefixed directory, touching "
+        "only the module that renders the mount. The client half of the "
+        "contract lives in a2a/lib and is not rebuilt by this edit, so it keeps "
+        "os.Stat-ing the old path, finds nothing, and falls back to a password "
+        "this change stopped rendering -- an agent container that offers the "
+        "empty string to the callout and loses the bus entirely, with both Go "
+        "suites green because no test binary links both modules",
+    ),
+    Mutation(
+        "C1-bus-token-file-env-renamed-on-the-client-side",
+        "a2a/lib/credentials.go",
+        ('EnvBusTokenFile = "A2A_BUS_TOKEN_FILE"',
+         'EnvBusTokenFile = "A2A_BUS_TOKEN_PATH"'),
+        "test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules",
+        "tidy the client's override variable to match BusTokenPath beside it, "
+        "in the module that reads it. Nothing in a2a notices, because a2a is "
+        "the only module that consumes this name -- and the operator, which "
+        "does not consume it but RESERVES it, is not rebuilt by this edit. It "
+        "goes on refusing A2A_BUS_TOKEN_FILE in spec.deployment.env and in an "
+        "AgentPlugin's spec.env, and A2A_BUS_TOKEN_PATH is reserved nowhere: "
+        "a plugin sets it, connect() prefers it over the projection with no "
+        "fallback, and the agent container presents a file the plugin chose",
+    ),
+    Mutation(
+        "C1-bus-token-file-reservation-spelled-by-hand",
+        "k8s-operator/internal/controller/platformagent_manifests.go",
+        ('\t\t\t\t\te.Name == a2aBusTokenFileEnv ||',
+         '\t\t\t\t\te.Name == "A2A_BUS_TOKEN_FILE" ||'),
+        "test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules",
+        "inline the constant at the plugin-env drop, which changes no "
+        "behaviour today and is the shape a reviewer waves through. It costs "
+        "the cross-module comparison its subject: a2aBusTokenFileEnv is what "
+        "the conformance suite pins against a2a/lib, and after this edit the "
+        "name the operator actually refuses is a literal no test reads. The "
+        "next rename moves the constant and leaves the drop behind",
+    ),
+    Mutation(
+        "C1-agent-principal-gets-a-static-password",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\tuser:           a2aAgentBusUser,',
+         '\t\tuser:           a2aAgentBusUser,\n\t\tcredsKey:       a2aBridgePasswordKey,'),
+        "test_C1_the_agent_principal_carries_no_static_bus_password",
+        "give the agent's callout principal a Secret key as well, so the same "
+        "name is answered for by both the callout and nats.conf's auth_users "
+        "exemption and a client is authenticated by whichever path it happened "
+        "to take. This is how the retired `worker` credential comes back: one "
+        "field, added by someone wiring up a local test that could not present "
+        "a token",
+    ),
+    Mutation(
+        "C1-bridge-principal-keyed-on-a-service-account",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\tuser:     a2aBridgeUser,',
+         '\t\tuser:     a2aBridgeUser,\n'
+         '\t\tserviceAccount: a2aServiceAccountName(ns, agentServiceAccountName(agent)),'),
+        "test_C1_the_agent_principal_carries_no_static_bus_password",
+        "move the bridge sidecar onto the callout, which reads as tightening "
+        "and is the exact opposite. A sidecar shares its pod's ServiceAccount, "
+        "so the bridge's entry and the agent's would key on one username and "
+        "each workload would hold the union of the two grant sets -- the task "
+        "plane and the blackboard in one credential, which is `worker` rebuilt "
+        "by the mechanism meant to retire it",
+    ),
+    Mutation(
+        # The guard this branch adds, mutated the way it would really fail:
+        # not by deleting the guard, but by the glob going wrong underneath
+        # it. Breaking the pattern empties the set, which before the guard
+        # left B2's absence assertion -- and B4's checkout filter -- green
+        # over nothing at all.
+        "B-workflow-glob-emptied",
+        "tests/conformance/test_B_write_path.py",
+        ('.glob("*.y*ml")', '.glob("*.y*ml.disabled")'),
+        "test_B2_no_workflow_approves_or_merges_a_pull_request",
+        "point the workflow glob at nothing, which turns every assertion "
+        "over the set vacuously green",
+    ),
+    Mutation(
+        # The other way the set empties: not the glob, but the parse. Every
+        # workflow here spells the trigger block `on:`, which YAML 1.1 reads
+        # as the boolean True, so the key a trigger filter asks for only
+        # exists because `_workflow_documents` puts it there. Aimed at the
+        # normalisation rather than at a filter because it is the one line
+        # whose removal empties every trigger-filtered subset in this file at
+        # once, which is what the preconditions on those subsets exist for.
+        "B-workflow-on-normalisation-dropped",
+        "tests/conformance/test_B_write_path.py",
+        ('        if True in document:  # `on:` is the YAML 1.1 boolean `y`/`yes`/`on`\n'
+         '            document["on"] = document.pop(True)\n', ""),
+        "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
+        "drop the YAML 1.1 `on:` -> True normalisation, the way a tidy-up "
+        "deletes a workaround whose comment reads as trivia -- every trigger "
+        "filter in this file then selects nothing, and the tests that walk "
+        "those subsets pass over the empty set",
     ),
     Mutation(
         "harness-fixture-emptied",

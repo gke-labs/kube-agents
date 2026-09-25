@@ -326,6 +326,120 @@ source "{_COMMON_SH}"
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertEqual(proc.stdout.strip(), "")
 
+    def test_evalcand_tag_for_rc(self):
+        cases = [
+            ("rc_2608241820_b35543c_validated", "evalcand_2608241820_b35543c"),
+            ("rc_2608241820_b35543c", "evalcand_2608241820_b35543c"),
+        ]
+        for rc_tag, expected in cases:
+            with self.subTest(rc_tag=rc_tag):
+                proc = self._run_common_func(f'evalcand_tag_for_rc "{rc_tag}"')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), expected)
+
+    def test_evalcand_tag_for_rc_refuses_anything_outside_the_rc_family(self):
+        """The output fires a job that takes a project out of a shared pool."""
+        for bad in ("", "0.2.0", "evalcand_2608241820_b35543c", "rc_", "not-a-tag"):
+            with self.subTest(bad=bad):
+                proc = self._run_common_func(f'evalcand_tag_for_rc "{bad}"')
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout.strip(), "")
+
+    def test_the_two_tag_families_share_a_core(self):
+        """The invariant the whole gate rests on.
+
+        An evalcand_ tag has to read back to the staging_ tag it becomes without
+        a lookup, because the eval verdict is recorded against one and the
+        promotion is pushed as the other. rc_tag_core is what makes that
+        structural rather than two functions happening to agree.
+        """
+        rc_tag = "rc_2608241820_b35543c_validated"
+        evalcand = self._run_common_func(f'evalcand_tag_for_rc "{rc_tag}"').stdout.strip()
+        staging = self._run_common_func(f'staging_tag_for_rc "{rc_tag}"').stdout.strip()
+        self.assertEqual(
+            evalcand.removeprefix("evalcand_"),
+            staging.removeprefix("staging_"),
+        )
+
+    def test_the_evalcand_shape_matches_what_evalcand_tag_for_rc_composes(self):
+        """EVALCAND_TAG_SHAPE_REGEX is mirrored by the `branches` regex on
+        post-kube-agents-eval-rc in GoogleCloudPlatform/oss-test-infra. If the
+        shape and the composer drift apart here, the pipeline pushes a tag no
+        eval fires on and every candidate times out unpromoted."""
+        proc = self._run_common_func(
+            'tag="$(evalcand_tag_for_rc "rc_2608241820_b35543c_validated")";'
+            ' grep -qE "${EVALCAND_TAG_SHAPE_REGEX}" <<<"${tag}"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_get_existing_evalcand_tag(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            head = git("rev-parse", "HEAD").stdout.strip()
+
+            proc = self._run_common_func(f'get_existing_evalcand_tag "{head}"', cwd=repo_dir)
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), "")
+
+            # A hand-pushed prefix tag is not a nomination. This is what
+            # resolve_promotion_candidate.sh reads to decide whether a candidate
+            # has already been measured, so a match here skips the eval and the
+            # candidate never reaches staging at all.
+            git("tag", "-a", "evalcand_hotfix", head, "-m", "Hand-made")
+            proc = self._run_common_func(f'get_existing_evalcand_tag "{head}"', cwd=repo_dir)
+            self.assertEqual(proc.stdout.strip(), "")
+
+            git("tag", "-a", "evalcand_2608241820_b35543c", head, "-m", "Nominated")
+            proc = self._run_common_func(f'get_existing_evalcand_tag "{head}"', cwd=repo_dir)
+            self.assertEqual(proc.stdout.strip(), "evalcand_2608241820_b35543c")
+
+            # And not for a different commit.
+            (pathlib.Path(repo_dir) / "second.txt").write_text("second\n")
+            git("add", "second.txt")
+            git("commit", "-m", "chore: second commit")
+            other = git("rev-parse", "HEAD").stdout.strip()
+            proc = self._run_common_func(f'get_existing_evalcand_tag "{other}"', cwd=repo_dir)
+            self.assertEqual(proc.stdout.strip(), "")
+        finally:
+            temp_dir.cleanup()
+
+    def test_a_staging_tag_is_not_an_evalcand_tag_and_the_reverse(self):
+        """The families must not answer for each other.
+
+        They share a core by design, so a lookup matching on the core rather
+        than the prefix would read a rejected candidate's leftover evalcand_ tag
+        as a promotion -- or a promotion as a nomination, which would stop the
+        eval ever running again on a commit that reached staging.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            head = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", "evalcand_2608241820_b35543c", head, "-m", "Nominated")
+
+            proc = self._run_common_func(f'get_existing_staging_tag "{head}"', cwd=repo_dir)
+            self.assertEqual(proc.stdout.strip(), "")
+
+            git("tag", "-a", "staging_2608241820_b35543c", head, "-m", "Promoted")
+            proc = self._run_common_func(f'get_existing_staging_tag "{head}"', cwd=repo_dir)
+            self.assertEqual(proc.stdout.strip(), "staging_2608241820_b35543c")
+            proc = self._run_common_func(f'get_existing_evalcand_tag "{head}"', cwd=repo_dir)
+            self.assertEqual(proc.stdout.strip(), "evalcand_2608241820_b35543c")
+
+            # The reverse, on its own commit. Asserting it above the two tags
+            # this commit now carries would prove nothing: the evalcand_ lookup
+            # would find its own tag whether or not it also matched the
+            # staging_ one, which is the direction that stops the eval ever
+            # running again on a commit that reached staging.
+            (pathlib.Path(repo_dir) / "promoted.txt").write_text("promoted\n")
+            git("add", "promoted.txt")
+            git("commit", "-m", "chore: a commit that reached staging")
+            promoted = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", "staging_2608241821_c46654d", promoted, "-m", "Promoted")
+            proc = self._run_common_func(f'get_existing_evalcand_tag "{promoted}"', cwd=repo_dir)
+            self.assertEqual(proc.stdout.strip(), "")
+        finally:
+            temp_dir.cleanup()
+
     def test_get_existing_staging_tag(self):
         temp_dir, repo_dir, git = create_mock_git_repo()
         try:

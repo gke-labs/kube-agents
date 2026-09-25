@@ -444,19 +444,40 @@ ConfigMap changed, the checksum did not, the Deployment did not roll. The
 gateway mounts this with subPath, and a subPath ConfigMap mount never receives
 in-place updates, so the running pod would have kept the old file indefinitely.
 
-Takes a dict of provider, model, callbacks.
+Takes a dict of provider, model, callbacks, and maxTokens (optional; 0 or
+absent renders no max_tokens).
 */}}
 {{- define "kube-agents.litellmConfig" -}}
+{{- /*
+  max_tokens on every alias when .maxTokens is above zero, and no key at all
+  otherwise, so the default render stays byte-identical to the kustomize base
+  (k8s-operator/config/integrations/litellm/base/config.yaml), which carries
+  no such key on purpose. One value for all three aliases: they are one
+  upstream model, and the budget is the backend's property, not the alias's.
+  LiteLLM's router spreads litellm_params underneath the request's own
+  arguments, so this is what a request that names no max_tokens gets, not a
+  ceiling on one that does; values.yaml says what that means for the agent.
+*/}}
+{{- $maxTokens := int (.maxTokens | default 0) -}}
 model_list:
   - model_name: model-default
     litellm_params:
       model: {{ printf "%s/%s" .provider .model }}
+      {{- if gt $maxTokens 0 }}
+      max_tokens: {{ $maxTokens }}
+      {{- end }}
   - model_name: hermes-agent
     litellm_params:
       model: {{ printf "%s/%s" .provider .model }}
+      {{- if gt $maxTokens 0 }}
+      max_tokens: {{ $maxTokens }}
+      {{- end }}
   - model_name: {{ .model }}
     litellm_params:
       model: {{ printf "%s/%s" .provider .model }}
+      {{- if gt $maxTokens 0 }}
+      max_tokens: {{ $maxTokens }}
+      {{- end }}
 litellm_settings:
   callbacks: {{ .callbacks }}
 {{- /*
@@ -486,6 +507,67 @@ selectors are immutable once the Deployment exists.
 {{- define "kube-agents.operatorSelectorLabels" -}}
 app.kubernetes.io/name: {{ .Chart.Name }}-operator
 app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+topologySpreadConstraints for a multi-replica workload this chart owns.
+
+Renders nothing below two replicas, so the operator gets the field only if
+someone raises operator.replicaCount. A constraint over a single pod is
+satisfied by construction, and printing it would leave a reader working out that
+it means nothing. Hindsight has no call site at all for the same reason taken
+further: both its workloads carry a literal `replicas: 1` with no value behind
+it, so a call there could never render and would read as coverage it does not
+have.
+
+The chart shipped PDBs and a default replicaCount of 2 for litellm and
+github-token-minter without this, and the Workload Reliability Audit in this
+repository found both on 2026-09-06: "replicas=2, no topologySpreadConstraints
+or podAntiAffinity". The PDB does not cover the gap it names. maxUnavailable: 1
+stalls a *drain* that would take both replicas, but a node that fails takes
+whatever is on it, and nothing was keeping the two pods apart.
+
+ScheduleAnyway, not DoNotSchedule — obtainability_audit_sop.md 3.8 calls that
+mandatory, and the reason is the shape of the clusters this chart installs into.
+A pool that cannot satisfy maxSkew: 1 leaves the second replica Pending
+indefinitely, which is worse than the co-location this exists to avoid.
+
+kubernetes.io/hostname and not the zone key, for the same section's reason: the
+loss this guards against is a node going away under a drain or a repair, and a
+zonal cluster has one zone to spread across.
+
+The selector is the workload's own and is passed in rather than derived, as
+already-rendered YAML rather than a dict so the operator can hand over
+`kube-agents.operatorSelectorLabels` verbatim instead of a second copy of it. A
+labelSelector that does not match the pods the constraint is attached to counts
+some other population and skews against it; these selectors are also immutable
+once the Deployment exists, so the caller is the only thing that knows the right
+answer. Keep each call in step with its Deployment's spec.selector, the way
+pdb.yaml's selectors already have to be.
+
+matchLabelKeys scopes the skew to one ReplicaSet. Without it the constraint
+counts old and new pods together during a rollout, and with maxSurge: 1,
+maxUnavailable: 1 and two nodes holding one replica each, the surge pod lands
+beside an old one, the controller prefers to delete the old pod that shares a
+node, and the second new pod then sees a tie and can land on the same node —
+both live replicas on one node until the next rollout, which the constraint
+exists to prevent. Every image pin, config checksum or resource change is a
+rollout, so this is ordinary use. pod-template-hash is the label the
+Deployment controller stamps per revision; the field is on by default from
+Kubernetes 1.27, inside the chart's 1.29 floor.
+*/}}
+{{- define "kube-agents.topologySpreadConstraints" -}}
+{{- if and .enabled (gt (int .replicas) 1) -}}
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    matchLabelKeys:
+      - pod-template-hash
+    labelSelector:
+      matchLabels:
+        {{- .selectorLabels | nindent 8 }}
+{{- end }}
 {{- end }}
 
 {{/*
@@ -571,4 +653,708 @@ Takes a dict: {rollingUpdate, defaultSurge, defaultUnavailable, scope}.
 {{- end -}}
 maxSurge: {{ $surge }}
 maxUnavailable: {{ $unavail }}
+{{- end }}
+
+{{/*
+Resource parsing helpers for quota preflight (#749).
+Converts Kubernetes quantities to canonical integer units:
+- CPU: millicores (e.g. "500m" -> 500, "1" -> 1000, "1.5" -> 1500, "1500u" -> 2)
+- Memory / Storage: bytes (e.g. "128Mi" -> 134217728, "2Gi" -> 2147483648)
+
+Both fail the render on a quantity they cannot parse rather than returning a number.
+An earlier version fell through to `int64`, which yields 0 for anything it does not
+understand: a `1Pi` quota then read as `hard 0` and the release was refused with a
+message describing a cluster that does not exist. A quantity this cannot read is a bug
+in this helper, and saying so is the only honest outcome.
+
+Every conversion to an integer goes through kube-agents.clampInt64 rather than `int64`,
+because the millicore and byte forms of a large quantity overflow where the quantity
+itself does not. `1E` CPU is 10^21 millicores and `8Ei` is 2^63 bytes, both past
+math.MaxInt64, and Go's float-to-int conversion wraps them to -9223372036854775808:
+`hard` then read as negative, fell short of every requirement it dwarfs, and the render
+was refused with a patch asking for a negative quota. Saturating keeps the comparison
+honest — a quota that large cannot constrain this release either way.
+*/}}
+{{- /* Float to int64, saturating rather than wrapping. 2^63 is the first float64 above
+       math.MaxInt64, which is not itself representable as a float64 — comparing against
+       a rounded MaxInt64 would let the wrapping value through. */ -}}
+{{- define "kube-agents.clampInt64" -}}
+{{- $v := float64 . -}}
+{{- if ge $v 9223372036854775808.0 -}}
+9223372036854775807
+{{- else -}}
+{{- $v | int64 -}}
+{{- end -}}
+{{- end }}
+
+{{- define "kube-agents.parseCpuMillis" -}}
+{{- $raw := trim (toString .) -}}
+{{- $numeric := "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$" -}}
+{{- $decimalCores := dict "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
+{{- if or (eq $raw "") (eq $raw "<nil>") -}}
+0
+{{- else if hasSuffix "m" $raw -}}
+{{- $n := trimSuffix "m" $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- include "kube-agents.clampInt64" (ceil (float64 $n)) -}}
+{{- else if hasSuffix "u" $raw -}}
+{{- $n := trimSuffix "u" $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000.0)) -}}
+{{- else if hasSuffix "n" $raw -}}
+{{- $n := trimSuffix "n" $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000000.0)) -}}
+{{- else -}}
+{{- $out := "" -}}
+{{- range $unit, $mult := $decimalCores -}}
+{{- if and (eq $out "") (hasSuffix $unit $raw) -}}
+{{- $n := trimSuffix $unit $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- $out = include "kube-agents.clampInt64" (mulf (mulf (float64 $n) $mult) 1000.0) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $out "" -}}
+{{- if not (regexMatch $numeric $raw) -}}
+{{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- $out = include "kube-agents.clampInt64" (mulf (float64 $raw) 1000.0) -}}
+{{- end -}}
+{{- $out -}}
+{{- end -}}
+{{- end }}
+
+{{- define "kube-agents.parseBytes" -}}
+{{- $raw := trim (toString .) -}}
+{{- $numeric := "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$" -}}
+{{- $binary := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 -}}
+{{- $decimal := dict "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
+{{- if or (eq $raw "") (eq $raw "<nil>") -}}
+0
+{{- else if hasSuffix "m" $raw -}}
+{{- $n := trimSuffix "m" $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000.0)) -}}
+{{- else -}}
+{{- $out := "" -}}
+{{- range $unit, $mult := $binary -}}
+{{- if and (eq $out "") (hasSuffix $unit $raw) -}}
+{{- $n := trimSuffix $unit $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- $out = include "kube-agents.clampInt64" (mulf (float64 $n) $mult) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $out "" -}}
+{{- range $unit, $mult := $decimal -}}
+{{- if and (eq $out "") (hasSuffix $unit $raw) -}}
+{{- $n := trimSuffix $unit $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- $out = include "kube-agents.clampInt64" (mulf (float64 $n) $mult) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $out "" -}}
+{{- if not (regexMatch $numeric $raw) -}}
+{{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- $out = include "kube-agents.clampInt64" (float64 $raw) -}}
+{{- end -}}
+{{- $out -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Count quotas (`pods`, `persistentvolumeclaims`) go through the same parser.
+
+They are not plain integers on the wire. The API server round-trips every quota value
+through resource.Quantity and writes back the canonical form, so a namespace created
+with `pods: 1000` is read back as `pods: "1k"`. Sprig's `int64` is `cast.ToInt64`, which
+answers 0 for a string it cannot parse rather than failing — so an earlier version read
+that quota as `hard 0`, refused the release for a shortfall that did not exist, and
+printed a patch lowering the namespace to 7 pods for whoever followed the instructions.
+parseBytes already reads the decimal-SI suffixes this needs, and fails loudly on the rest.
+*/}}
+{{- define "kube-agents.parseCount" -}}
+{{- include "kube-agents.parseBytes" . -}}
+{{- end }}
+
+{{/*
+Format helpers for friendly error display and patch generation:
+- CPU: converts millicores to e.g. "10000m" (or "10" if exact integer cores)
+- Memory / Storage: converts bytes to Mi / Gi
+scripts/generate_chart_footprint.py has the same two functions, so the numbers the
+preflight prints and the numbers in footprint.yaml are written the same way.
+*/}}
+{{- define "kube-agents.formatCpu" -}}
+{{- $m := int64 . -}}
+{{- if and (gt $m 0) (eq (mod $m 1000) 0) -}}
+{{- printf "%d" (div $m 1000) -}}
+{{- else -}}
+{{- printf "%dm" $m -}}
+{{- end -}}
+{{- end }}
+
+{{- define "kube-agents.formatBytes" -}}
+{{- $b := int64 . -}}
+{{- if and (gt $b 0) (eq (mod $b 1073741824) 0) -}}
+{{- printf "%dGi" (div $b 1073741824) -}}
+{{- else if and (gt $b 0) (eq (mod $b 1048576) 0) -}}
+{{- printf "%dMi" (div $b 1048576) -}}
+{{- else -}}
+{{- printf "%d" $b -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Two more byte formatters, for the quota diagnosis rather than for footprint.yaml.
+
+formatBytes above only names a unit when the value divides exactly, and falls back to a
+bare byte count otherwise. That is right for footprint.yaml, whose numbers are always
+Mi-aligned, and wrong in the failure message: a namespace whose quota is written in
+decimal SI (`requests.memory: 10G`) turns every figure into an eleven-digit byte count,
+which is the opposite of the legible diagnosis this check exists to give.
+
+Rounding in a patch value is not free, so the direction is chosen per use:
+
+- formatBytesCeil rounds UP to whole Mi, and sizes the remediation patch. Rounding down
+  would print a patch that is short of what the release needs, which is worse than an
+  ugly number: the operator runs it and the install still fails.
+- formatBytesApprox rounds toward zero and marks the result `~`, and is display-only.
+  Nothing is computed from it, and the `~` keeps it from being read as exact.
+*/}}
+{{- define "kube-agents.formatBytesCeil" -}}
+{{- $b := int64 . -}}
+{{- if and (gt $b 0) (eq (mod $b 1048576) 0) -}}
+{{- include "kube-agents.formatBytes" $b -}}
+{{- else if le $b 0 -}}
+{{- printf "%d" $b -}}
+{{- else -}}
+{{- printf "%dMi" (div (add $b 1048575) 1048576) -}}
+{{- end -}}
+{{- end }}
+
+{{- define "kube-agents.formatBytesApprox" -}}
+{{- $b := int64 . -}}
+{{- if and (gt $b 0) (eq (mod $b 1048576) 0) -}}
+{{- include "kube-agents.formatBytes" $b -}}
+{{- else if eq $b 0 -}}
+0
+{{- else -}}
+{{- printf "~%dMi" (div $b 1048576) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Reads one resources block — requests and limits, CPU, memory and ephemeral-storage — from a
+values subtree, and returns the parsed quantities as JSON.
+
+Every field is optional at every level. values.schema.json declares each `resources` as a
+bare object with no `required` keyword, so `--set litellm.resources.limits=null` — the
+documented Helm way to drop a key, and the obvious edit for someone who does not want
+limits charged against a quota — is valid input. Reaching through it with
+`.Values.litellm.resources.limits.cpu` aborted the whole render with `nil pointer
+evaluating interface {}.cpu`, and only in a namespace that has a ResourceQuota, which is
+the one population this check exists for.
+
+When requests are omitted but limits are specified, Kubernetes defaults the request to
+match the limit at admission time, which is reflected here. When a quantity is omitted
+from both requests and limits, it contributes zero to the sum (though note that if a
+ResourceQuota constrains that resource, Kubernetes quota admission requires containers
+to declare it unless defaulted by a LimitRange).
+
+"Omitted" is decided by kube-agents.declaredQuantity rather than by Sprig's `default`,
+for the same reason kube-agents.replicaCount exists: `default` calls 0 empty, and each
+`resources` block is an open object in values.schema.json, so `requests: {cpu: 0}` is
+valid input that arrives as a numeric zero. Chained through `default` it read as absent
+and was charged the limit instead — a workload asking for nothing was summed as the
+largest thing it could ever use.
+*/}}
+{{- define "kube-agents.declaredQuantity" -}}
+{{- $v := .value -}}
+{{- if or (kindIs "invalid" $v) (eq (toString $v) "") -}}
+{{- toString .fallback -}}
+{{- else -}}
+{{- toString $v -}}
+{{- end -}}
+{{- end }}
+
+{{- define "kube-agents.workloadResources" -}}
+{{- $res := (. | default dict).resources | default dict -}}
+{{- $req := (index $res "requests") | default dict -}}
+{{- $lim := (index $res "limits") | default dict -}}
+{{- $cpuLim := include "kube-agents.declaredQuantity" (dict "value" (index $lim "cpu") "fallback" "0") -}}
+{{- $memLim := include "kube-agents.declaredQuantity" (dict "value" (index $lim "memory") "fallback" "0") -}}
+{{- $ephLim := include "kube-agents.declaredQuantity" (dict "value" (index $lim "ephemeral-storage") "fallback" "0") -}}
+{{- $cpuReq := include "kube-agents.declaredQuantity" (dict "value" (index $req "cpu") "fallback" $cpuLim) -}}
+{{- $memReq := include "kube-agents.declaredQuantity" (dict "value" (index $req "memory") "fallback" $memLim) -}}
+{{- $ephReq := include "kube-agents.declaredQuantity" (dict "value" (index $req "ephemeral-storage") "fallback" $ephLim) -}}
+{{- dict
+      "cpuRequest" (include "kube-agents.parseCpuMillis" $cpuReq | int64)
+      "cpuLimit" (include "kube-agents.parseCpuMillis" $cpuLim | int64)
+      "memoryRequest" (include "kube-agents.parseBytes" $memReq | int64)
+      "memoryLimit" (include "kube-agents.parseBytes" $memLim | int64)
+      "ephemeralRequest" (include "kube-agents.parseBytes" $ephReq | int64)
+      "ephemeralLimit" (include "kube-agents.parseBytes" $ephLim | int64)
+   | toJson -}}
+{{- end }}
+
+{{/*
+Replica count, where an explicit 0 means 0.
+
+`replicas | default 1` reads a falsy 0 as absent and charges a full replica for a workload
+scaled to zero. AvailabilitySpec.Replicas is +kubebuilder:validation:Minimum=0
+(k8s-operator/api/v1alpha1/common_types.go), so 0 is a value a user can legitimately set,
+and the chart's own replicaCount keys take one too. Only an absent value defaults to 1.
+*/}}
+{{- define "kube-agents.replicaCount" -}}
+{{- if kindIs "invalid" . -}}
+1
+{{- else -}}
+{{- int64 . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Preflight validation against namespace ResourceQuotas (#749).
+
+Split into three templates so the parts that need no cluster can be tested without one:
+
+- kube-agents.quotaRequirements — totals what the release needs, as JSON. Pure function of
+  the values and footprint.yaml.
+- kube-agents.quotaCheckItems — compares those totals against a list of ResourceQuota
+  objects and fails the render on a shortfall. Takes the list as an argument.
+- kube-agents.quotaPreflight — the entry point: looks the quotas up, then calls the two above.
+
+Only the last one touches the cluster, so tests/test_quota_preflight.py can drive the other
+two with synthetic quotas and assert the arithmetic and the pass/fail decision offline.
+
+Fails the render if:
+- hard < required (the quota cannot fit the release even if empty)
+- OR (hard - used) < required AND .Release.IsInstall (on a fresh install, remaining headroom
+  is insufficient). Install-only on purpose: on upgrade the release's own pods are already
+  counted in `used`, so subtracting them again would refuse every upgrade of a release that
+  exactly fits its quota. The cost of that exemption is that `used` on upgrade also holds
+  any neighbouring workload's usage, which this cannot tell apart from the release's own —
+  so in a namespace shared with other workloads an upgrade is checked against `hard` alone.
+
+Quota keys understood: CPU, memory and ephemeral-storage (requests and limits), pods,
+persistentvolumeclaims and requests.storage. Keys outside that set (services, secrets, other
+count/<resource>) are not modelled, and are skipped rather than guessed at.
+
+Inert when lookup returns empty — `helm template` without a cluster, or a namespace with no
+ResourceQuota at all.
+
+It is NOT inert when the installing identity cannot read ResourceQuotas. Helm's `lookup`
+swallows a NotFound and returns nothing; every other API error, a 403 on
+`list resourcequotas` among them, comes back as a template error and aborts the render. So
+the check needs `get`/`list` on `resourcequotas` in the release namespace, and an identity
+without it installs with `--set quotaPreflight.enabled=false`. Nothing here can soften that:
+a Go template cannot catch the error `lookup` raises.
+*/}}
+{{- define "kube-agents.quotaRequirements" -}}
+{{- $footprint := .Files.Get "files/footprint.yaml" | fromYaml -}}
+{{- /* The footprint is the only source for the operator-rendered pods, which are most of
+       the release. If it is missing or unparseable every one of them silently counts as
+       zero and the preflight waves through a quota that cannot fit the release — the exact
+       failure it exists to prevent, now with a green light in front of it. */ -}}
+{{- if not (index $footprint "operatorRendered") -}}
+  {{- fail "quota preflight: footprint.yaml is missing or unreadable in the chart, so the operator-rendered pods cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+{{- end -}}
+{{- $op := (index $footprint "operatorRendered") | default dict -}}
+
+{{- $reqPods := 0 -}}
+{{- $reqCpu := 0 -}}
+{{- $limCpu := 0 -}}
+{{- $reqMem := 0 -}}
+{{- $limMem := 0 -}}
+{{- $reqEph := 0 -}}
+{{- $limEph := 0 -}}
+{{- $reqPvc := 0 -}}
+{{- $reqStorage := 0 -}}
+
+{{- /* Largest single pod among the workloads that roll with a surge Pod. Used only to size
+       the remediation patch, never the pass/fail threshold: a quota raised to exactly
+       used+required fits the release at rest and then stalls its first rollout, which is the
+       failure values.yaml warns about under hindsight.api.rollingUpdate. Rollouts are
+       per-workload, so room for one surge Pod at a time is enough. */ -}}
+{{- $surgeCpuReq := 0 -}}
+{{- $surgeCpuLim := 0 -}}
+{{- $surgeMemReq := 0 -}}
+{{- $surgeMemLim := 0 -}}
+{{- $surgeEphReq := 0 -}}
+{{- $surgeEphLim := 0 -}}
+
+{{- /* The chart's own workloads, as (resources subtree, pod count, rolls-with-a-surge-Pod).
+       One list and one loop rather than a block each: the four blocks this replaced were
+       identical but for the values path, which is how the dashboard came to be read from
+       the wrong key and how a new workload comes to be missed. `hindsight.postgresql` is a
+       StatefulSet, so it contributes no surge Pod. The pre-delete cleanup hook is a batch
+       Job that runs at uninstall while the release still stands, so it needs headroom but
+       no surge. */ -}}
+{{- $chartWorkloads := list -}}
+{{- if .Values.operator.enabled -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.operator "pods" (include "kube-agents.replicaCount" .Values.operator.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if .Values.litellm.enabled -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.litellm "pods" (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if include "kube-agents.hindsightEnabled" . -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.hindsight.api "pods" 1 "surges" true) -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.hindsight.postgresql "pods" 1 "surges" false) -}}
+{{- end -}}
+{{- if .Values.githubMinter.enabled -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
+  {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall
+         while every release pod still exists, so quota admission needs headroom for it. */ -}}
+  {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi") "limits" (dict "cpu" "200m" "memory" "128Mi")) -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" $cleanupRes "pods" 1 "surges" false) -}}
+{{- end -}}
+
+{{- range $workload := $chartWorkloads -}}
+  {{- $res := include "kube-agents.workloadResources" $workload.values | fromJson -}}
+  {{- $replicas := $workload.pods | int64 -}}
+  {{- $reqPods = add $reqPods $replicas -}}
+  {{- $reqCpu = add $reqCpu (mul $res.cpuRequest $replicas) -}}
+  {{- $limCpu = add $limCpu (mul $res.cpuLimit $replicas) -}}
+  {{- $reqMem = add $reqMem (mul $res.memoryRequest $replicas) -}}
+  {{- $limMem = add $limMem (mul $res.memoryLimit $replicas) -}}
+  {{- $reqEph = add $reqEph (mul $res.ephemeralRequest $replicas) -}}
+  {{- $limEph = add $limEph (mul $res.ephemeralLimit $replicas) -}}
+  {{- /* A workload scaled to zero has no pod to surge from, so it sizes no patch. */ -}}
+  {{- if and $workload.surges (gt $replicas (int64 0)) -}}
+    {{- $surgeCpuReq = max $surgeCpuReq $res.cpuRequest -}}
+    {{- $surgeCpuLim = max $surgeCpuLim $res.cpuLimit -}}
+    {{- $surgeMemReq = max $surgeMemReq $res.memoryRequest -}}
+    {{- $surgeMemLim = max $surgeMemLim $res.memoryLimit -}}
+    {{- $surgeEphReq = max $surgeEphReq $res.ephemeralRequest -}}
+    {{- $surgeEphLim = max $surgeEphLim $res.ephemeralLimit -}}
+  {{- end -}}
+{{- end -}}
+
+{{- /* Hindsight's PostgreSQL claim, from the same key templates/hindsight.yaml renders the
+       volumeClaimTemplate request from. */ -}}
+{{- if include "kube-agents.hindsightEnabled" . -}}
+  {{- $pgStorage := .Values.hindsight.postgresql.storage -}}
+  {{- /* values.schema.json closes hindsight.postgresql to image, resources and storage, but
+         `additionalProperties: false` rejects extra keys rather than requiring the ones
+         listed, and the schema has no `required` anywhere. So `storage: null` is valid
+         input that parses as 0 and under-counts requests.storage by the whole claim,
+         passing a quota that cannot hold it. The StatefulSet would render an empty request
+         from the same key, so failing here is the honest answer. */ -}}
+  {{- if or (kindIs "invalid" $pgStorage) (eq (toString $pgStorage) "") -}}
+    {{- fail "quota preflight: hindsight.postgresql.storage is empty, so the PostgreSQL claim cannot be sized. Set it to the size the StatefulSet should request, or set quotaPreflight.enabled=false to skip the check." -}}
+  {{- end -}}
+  {{- $reqPvc = add $reqPvc 1 -}}
+  {{- $reqStorage = add $reqStorage (include "kube-agents.parseBytes" $pgStorage | int64) -}}
+{{- end -}}
+
+{{- /* Operator-rendered workloads (footprint.yaml) */ -}}
+{{- if .Values.platformAgent.enabled -}}
+  {{- /* The agent pod is the one operator-rendered workload that scales: the gateway
+         Deployment takes spec.replicas from availability.replicas, while the shell
+         StatefulSet and the credential proxy stay at 1 (see the platformagent-ha golden,
+         where the gateway goes to 3 and the other two do not). The footprint records one
+         pod's worth, so it is multiplied here — without this an HA install passes the
+         check and then leaves its extra replicas Pending, which is the failure this
+         whole template exists to prevent. An absent value means the operator's own
+         default of 1; an explicit 0 means 0, and the CRD allows it. */ -}}
+  {{- $agentReplicas := include "kube-agents.replicaCount" (((.Values.platformAgent.deployment | default dict).availability | default dict).replicas) | int64 -}}
+  {{- $base := (index $op "agentPod" "base") | default dict -}}
+  {{- $podReqCpu := $base.cpuMillisRequest | default 0 | int64 -}}
+  {{- $podLimCpu := $base.cpuMillisLimit | default 0 | int64 -}}
+  {{- $podReqMem := $base.memoryBytesRequest | default 0 | int64 -}}
+  {{- $podLimMem := $base.memoryBytesLimit | default 0 | int64 -}}
+  {{- $podReqEph := $base.ephemeralStorageBytesRequest | default 0 | int64 -}}
+  {{- $podLimEph := $base.ephemeralStorageBytesLimit | default 0 | int64 -}}
+
+  {{- /* The dashboard is another container in the agent pod rather than a pod of its own,
+         so it scales with the same replica count and adds no pod. Its flag is
+         harness.hermes.dashboardEnabled; reading it one level up at harness.dashboardEnabled
+         matches nothing, leaves this branch dead, and counts the dashboard even when it is
+         switched off. `null` there means "no opinion", so the CRD default (true) applies. */ -}}
+  {{- $hermes := (index (.Values.platformAgent.harness | default dict) "hermes") | default dict -}}
+  {{- $dashEnabled := true -}}
+  {{- if kindIs "bool" (index $hermes "dashboardEnabled") -}}
+    {{- $dashEnabled = index $hermes "dashboardEnabled" -}}
+  {{- end -}}
+  {{- if $dashEnabled -}}
+    {{- $dash := (index $op "agentPod" "dashboard") | default dict -}}
+    {{- $podReqCpu = add $podReqCpu ($dash.cpuMillisRequest | default 0 | int64) -}}
+    {{- $podLimCpu = add $podLimCpu ($dash.cpuMillisLimit | default 0 | int64) -}}
+    {{- $podReqMem = add $podReqMem ($dash.memoryBytesRequest | default 0 | int64) -}}
+    {{- $podLimMem = add $podLimMem ($dash.memoryBytesLimit | default 0 | int64) -}}
+    {{- $podReqEph = add $podReqEph ($dash.ephemeralStorageBytesRequest | default 0 | int64) -}}
+    {{- $podLimEph = add $podLimEph ($dash.ephemeralStorageBytesLimit | default 0 | int64) -}}
+  {{- end -}}
+
+  {{- $reqPods = add $reqPods (mul ($base.pods | default 1 | int64) $agentReplicas) -}}
+  {{- $reqCpu = add $reqCpu (mul $podReqCpu $agentReplicas) -}}
+  {{- $limCpu = add $limCpu (mul $podLimCpu $agentReplicas) -}}
+  {{- $reqMem = add $reqMem (mul $podReqMem $agentReplicas) -}}
+  {{- $limMem = add $limMem (mul $podLimMem $agentReplicas) -}}
+  {{- $reqEph = add $reqEph (mul $podReqEph $agentReplicas) -}}
+  {{- $limEph = add $limEph (mul $podLimEph $agentReplicas) -}}
+  {{- /* Only an HA gateway surges. The operator gives the gateway Deployment a
+         RollingUpdate strategy only when availability.replicas is above 1 and renders
+         `strategy: Recreate` otherwise (resolveDeploymentReplicasAndStrategy in
+         k8s-operator/internal/controller/manifest_helpers.go; the default-CR golden
+         platformagent.yaml shows Recreate, the platformagent-ha one RollingUpdate). A
+         Recreate rollout deletes the old Pod before creating the new one, so it needs no
+         extra room. Counting the agent pod here at one replica made it win the max on
+         every default install — it is the largest workload in the release — and the
+         printed patch then asked for an agent pod's worth of CPU, memory and ephemeral
+         storage that the release can never consume. */ -}}
+  {{- if gt $agentReplicas (int64 1) -}}
+    {{- $surgeCpuReq = max $surgeCpuReq $podReqCpu -}}
+    {{- $surgeCpuLim = max $surgeCpuLim $podLimCpu -}}
+    {{- $surgeMemReq = max $surgeMemReq $podReqMem -}}
+    {{- $surgeMemLim = max $surgeMemLim $podLimMem -}}
+    {{- $surgeEphReq = max $surgeEphReq $podReqEph -}}
+    {{- $surgeEphLim = max $surgeEphLim $podLimEph -}}
+  {{- end -}}
+
+  {{- /* Workloads rendered by the operator outside the agent pod (e.g. shellSandbox,
+         credentialProxy, and any future workload added to operatorRendered). Iterating
+         generic keys here ensures that any workload summed into extract_footprint is
+         automatically counted by the preflight without requiring manual template edits.
+         agentPod and storage are handled separately above and below. */ -}}
+  {{- range $key, $workload := $op -}}
+    {{- if and (ne $key "agentPod") (ne $key "storage") -}}
+      {{- $reqPods = add $reqPods (include "kube-agents.replicaCount" $workload.pods | int64) -}}
+      {{- $reqCpu = add $reqCpu ($workload.cpuMillisRequest | default 0 | int64) -}}
+      {{- $limCpu = add $limCpu ($workload.cpuMillisLimit | default 0 | int64) -}}
+      {{- $reqMem = add $reqMem ($workload.memoryBytesRequest | default 0 | int64) -}}
+      {{- $limMem = add $limMem ($workload.memoryBytesLimit | default 0 | int64) -}}
+      {{- $reqEph = add $reqEph ($workload.ephemeralStorageBytesRequest | default 0 | int64) -}}
+      {{- $limEph = add $limEph ($workload.ephemeralStorageBytesLimit | default 0 | int64) -}}
+    {{- end -}}
+  {{- end -}}
+
+  {{- /* Claims are release-scoped rather than per-replica, so they are not multiplied. */ -}}
+  {{- $storage := (index $op "storage") | default dict -}}
+  {{- $reqPvc = add $reqPvc ($storage.persistentVolumeClaims | default 0 | int64) -}}
+  {{- $reqStorage = add $reqStorage ($storage.storageBytesRequest | default 0 | int64) -}}
+{{- end -}}
+
+{{- dict
+      "pods" $reqPods
+      "requestsCpu" $reqCpu "limitsCpu" $limCpu
+      "requestsMemory" $reqMem "limitsMemory" $limMem
+      "requestsEphemeral" $reqEph "limitsEphemeral" $limEph
+      "persistentVolumeClaims" $reqPvc "requestsStorage" $reqStorage
+      "surgeRequestsCpu" $surgeCpuReq "surgeLimitsCpu" $surgeCpuLim
+      "surgeRequestsMemory" $surgeMemReq "surgeLimitsMemory" $surgeMemLim
+      "surgeRequestsEphemeral" $surgeEphReq "surgeLimitsEphemeral" $surgeEphLim
+   | toJson -}}
+{{- end }}
+
+{{- define "kube-agents.quotaCheckItems" -}}
+{{- $ctx := .ctx -}}
+{{- $r := .required -}}
+{{- /* Every deficient quota, not the first one. `fail` inside the loop reported one quota
+       per render, so a namespace with two of them was a patch-and-retry cycle — and the
+       whole value of this check is telling the operator what to fix in one pass. */ -}}
+{{- $quotaReports := list -}}
+{{- range $quota := .items -}}
+  {{- $spec := index $quota "spec" | default dict -}}
+  {{- $scopes := index $spec "scopes" -}}
+  {{- $scopeSelector := index $spec "scopeSelector" -}}
+  {{- if or $scopes $scopeSelector -}}
+    {{- /* Scoped quota: it applies to a subset of pods this template cannot identify, so
+           comparing the whole release against it would be wrong in both directions. */ -}}
+  {{- else -}}
+    {{- $hard := index $spec "hard" | default dict -}}
+    {{- $status := index $quota "status" | default dict -}}
+    {{- $used := index $status "used" | default dict -}}
+    {{- $shortfalls := list -}}
+    {{- $patchEntries := list -}}
+    {{- $constrainsEphemeral := false -}}
+
+    {{- range $key, $hardRaw := $hard -}}
+      {{- if or (eq $key "limits.ephemeral-storage") (eq $key "requests.ephemeral-storage") (eq $key "ephemeral-storage") -}}
+        {{- $constrainsEphemeral = true -}}
+      {{- end -}}
+      {{- $req := 0 -}}
+      {{- /* Named $surgeRoom rather than the fencepost name used by
+             kube-agents.rollingUpdateFenceposts: tests/test_deployments_rollout_quota.py
+             scans this whole file for an unguarded reassignment of that name, which would be
+             a rollingUpdate fencepost pinned for every install. This is a different quantity
+             — the headroom the remediation patch leaves — and sharing the name would make
+             that check unreadable. */ -}}
+      {{- $surgeRoom := 0 -}}
+      {{- $isCpu := false -}}
+      {{- $isBytes := false -}}
+      {{- $isCount := false -}}
+      {{- /* Claim-shaped keys. A PersistentVolumeClaim outlives the release that created it:
+             the shell StatefulSet sets persistentVolumeClaimRetentionPolicy Retain/Retain, so
+             `helm uninstall` leaves its claims behind and they appear in `used` on the next
+             install — claims this release will reuse by name rather than create again.
+             Charging them twice refused a reinstall into a namespace sized exactly for the
+             release, and the patch it printed asked for 50% more claims than the release
+             will ever hold. `hard` still has to fit the release, which is the comparison
+             that catches a quota genuinely too small. */ -}}
+      {{- $isClaimShaped := false -}}
+
+      {{- if eq $key "limits.cpu" -}}
+        {{- $req = int64 $r.limitsCpu -}}
+        {{- $surgeRoom = int64 $r.surgeLimitsCpu -}}
+        {{- $isCpu = true -}}
+      {{- else if or (eq $key "requests.cpu") (eq $key "cpu") -}}
+        {{- $req = int64 $r.requestsCpu -}}
+        {{- $surgeRoom = int64 $r.surgeRequestsCpu -}}
+        {{- $isCpu = true -}}
+      {{- else if eq $key "limits.memory" -}}
+        {{- $req = int64 $r.limitsMemory -}}
+        {{- $surgeRoom = int64 $r.surgeLimitsMemory -}}
+        {{- $isBytes = true -}}
+      {{- else if or (eq $key "requests.memory") (eq $key "memory") -}}
+        {{- $req = int64 $r.requestsMemory -}}
+        {{- $surgeRoom = int64 $r.surgeRequestsMemory -}}
+        {{- $isBytes = true -}}
+      {{- else if eq $key "limits.ephemeral-storage" -}}
+        {{- $req = int64 $r.limitsEphemeral -}}
+        {{- /* A surge Pod brings its ephemeral storage with it, same as its CPU and memory. */ -}}
+        {{- $surgeRoom = int64 $r.surgeLimitsEphemeral -}}
+        {{- $isBytes = true -}}
+      {{- else if or (eq $key "requests.ephemeral-storage") (eq $key "ephemeral-storage") -}}
+        {{- $req = int64 $r.requestsEphemeral -}}
+        {{- $surgeRoom = int64 $r.surgeRequestsEphemeral -}}
+        {{- $isBytes = true -}}
+      {{- else if or (eq $key "requests.storage") (eq $key "storage") -}}
+        {{- $req = int64 $r.requestsStorage -}}
+        {{- /* No surge room: a surge Pod mounts the existing claim rather than creating one. */ -}}
+        {{- $isBytes = true -}}
+        {{- $isClaimShaped = true -}}
+      {{- else if or (eq $key "pods") (eq $key "count/pods") -}}
+        {{- $req = int64 $r.pods -}}
+        {{- /* One surge Pod, for the same reason as the CPU and memory surge. */ -}}
+        {{- $surgeRoom = 1 -}}
+        {{- $isCount = true -}}
+      {{- else if or (eq $key "persistentvolumeclaims") (eq $key "count/persistentvolumeclaims") -}}
+        {{- $req = int64 $r.persistentVolumeClaims -}}
+        {{- $isCount = true -}}
+        {{- $isClaimShaped = true -}}
+      {{- end -}}
+
+      {{- if or $isCpu $isBytes $isCount -}}
+        {{- $hardVal := 0 -}}
+        {{- $usedVal := 0 -}}
+        {{- if $isCpu -}}
+          {{- $hardVal = include "kube-agents.parseCpuMillis" $hardRaw | int64 -}}
+          {{- $usedVal = include "kube-agents.parseCpuMillis" (index $used $key | default "0") | int64 -}}
+        {{- else if $isBytes -}}
+          {{- $hardVal = include "kube-agents.parseBytes" $hardRaw | int64 -}}
+          {{- $usedVal = include "kube-agents.parseBytes" (index $used $key | default "0") | int64 -}}
+        {{- else if $isCount -}}
+          {{- $hardVal = include "kube-agents.parseCount" $hardRaw | int64 -}}
+          {{- $usedVal = include "kube-agents.parseCount" (index $used $key | default "0") | int64 -}}
+        {{- end -}}
+
+        {{- $availVal := sub $hardVal $usedVal -}}
+        {{- $failed := false -}}
+        {{- $reason := "" -}}
+
+        {{- if lt $hardVal $req -}}
+          {{- $failed = true -}}
+          {{- $reason = "quota hard capacity is less than required" -}}
+        {{- else if and $ctx.Release.IsInstall (not $isClaimShaped) (lt $availVal $req) -}}
+          {{- $failed = true -}}
+          {{- $reason = "available headroom (hard - used) is less than required for fresh install" -}}
+        {{- end -}}
+
+        {{- if $failed -}}
+          {{- $patchTarget := 0 -}}
+          {{- if and $ctx.Release.IsInstall (not $isClaimShaped) -}}
+            {{- /* used + required + one surge Pod. Exactly used+required fits the release at
+                   rest and then stalls its first rolling update. */ -}}
+            {{- $patchTarget = add $usedVal $req $surgeRoom -}}
+          {{- else -}}
+            {{- /* On upgrade — and for claim-shaped keys on install, where retained PVCs from a
+                   previous install may already sit in `used` — adding `used` asks for the
+                   release twice: a release needing 6 pods with 4 running was told to patch to
+                   11 where 7 does, and a 22Gi claim requirement with 22Gi retained asked for
+                   44Gi. What a neighbouring workload holds is in `used` too and cannot be told
+                   apart from the release's own, so this is the release's need plus a surge Pod
+                   — right in a namespace the release has to itself, and short by the neighbours'
+                   share in one it does not. */ -}}
+            {{- $patchTarget = add $req $surgeRoom -}}
+          {{- end -}}
+          {{- $reqFormatted := "" -}}
+          {{- $hardFormatted := "" -}}
+          {{- $availFormatted := "" -}}
+          {{- $patchVal := "" -}}
+          {{- if $isCpu -}}
+            {{- $reqFormatted = include "kube-agents.formatCpu" $req -}}
+            {{- $hardFormatted = include "kube-agents.formatCpu" $hardVal -}}
+            {{- $availFormatted = include "kube-agents.formatCpu" $availVal -}}
+            {{- $patchVal = include "kube-agents.formatCpu" $patchTarget -}}
+          {{- else if $isBytes -}}
+            {{- $reqFormatted = include "kube-agents.formatBytesApprox" $req -}}
+            {{- /* The quota's own spelling, not a re-rendering of it: `hard 10G` is what
+                   `kubectl describe resourcequota` shows, so echoing it verbatim is both
+                   shorter and easier to match up than any unit this could pick. */ -}}
+            {{- $hardFormatted = toString $hardRaw -}}
+            {{- $availFormatted = include "kube-agents.formatBytesApprox" $availVal -}}
+            {{- $patchVal = include "kube-agents.formatBytesCeil" $patchTarget -}}
+          {{- else -}}
+            {{- $reqFormatted = printf "%d" $req -}}
+            {{- $hardFormatted = printf "%d" $hardVal -}}
+            {{- $availFormatted = printf "%d" $availVal -}}
+            {{- $patchVal = printf "%d" $patchTarget -}}
+          {{- end -}}
+
+          {{- $line := printf "  - %s: required %s, hard %s, available %s (%s)" $key $reqFormatted $hardFormatted $availFormatted $reason -}}
+          {{- $shortfalls = append $shortfalls $line -}}
+          {{- $patchEntries = append $patchEntries (printf "%q:%q" $key $patchVal) -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+
+    {{- if gt (len $shortfalls) 0 -}}
+      {{- $qName := (index (index $quota "metadata" | default dict) "name") | default "resourcequota" -}}
+      {{- $patchBody := printf "{\"spec\":{\"hard\":{%s}}}" (join "," $patchEntries) -}}
+      {{- $patchCmd := printf "kubectl patch resourcequota %s -n %s --type=strategic --patch '%s'" $qName $ctx.Release.Namespace $patchBody -}}
+      {{- $ephNote := "" -}}
+      {{- if $constrainsEphemeral -}}
+        {{- $ephNote = printf "\n(a quota constraining ephemeral storage additionally requires a LimitRange in namespace %q providing default requests and limits, because chart workloads and operator containers omit them; without one, pod creation fails with 'must specify requests.ephemeral-storage')" $ctx.Release.Namespace -}}
+      {{- end -}}
+      {{- $report := printf "ResourceQuota %q in namespace %q has insufficient capacity for release %q:\n%s\n\nRemediation: increase the quota with:\n  %s\n(those values leave room for one rollout surge Pod, except for claim counts and storage, which a surge Pod does not add to)%s" $qName $ctx.Release.Namespace $ctx.Release.Name (join "\n" $shortfalls) $patchCmd $ephNote -}}
+      {{- $quotaReports = append $quotaReports $report -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- if gt (len $quotaReports) 0 -}}
+  {{- fail (printf "%s\n\nor bypass this check with --set quotaPreflight.enabled=false" (join "\n\n" $quotaReports)) -}}
+{{- end -}}
+{{- end }}
+
+{{- define "kube-agents.quotaPreflight" -}}
+{{- if .Values.quotaPreflight.enabled -}}
+{{- $rawQuotas := lookup "v1" "ResourceQuota" .Release.Namespace "" -}}
+{{- $quotas := $rawQuotas | default dict -}}
+{{- $items := list -}}
+{{- if kindIs "map" $quotas -}}
+  {{- $items = index $quotas "items" | default list -}}
+{{- end -}}
+{{- if gt (len $items) 0 -}}
+  {{- $required := include "kube-agents.quotaRequirements" . | fromJson -}}
+  {{- include "kube-agents.quotaCheckItems" (dict "ctx" . "items" $items "required" $required) -}}
+{{- end -}}
+{{- end -}}
 {{- end }}

@@ -100,6 +100,7 @@ DEFAULT_MAX_MATCH_CHARS = 400
 # imported: this is the enforcement point, and a control that depends on a skill
 # module being importable is a control that disappears when the skill moves.
 PROTECTED_BRANCHES = frozenset({"main", "master", "production"})
+PROTECTED_BRANCH_PREFIXES = ("run/",)
 
 # The complete set of git subcommands this module ever issues. Not a policy
 # knob and not derived from any request — a literal, so that "what git can the
@@ -481,7 +482,7 @@ def check_expected_sha(value: object, field: str) -> str:
     return sha
 
 
-def check_branch(name: object) -> str:
+def check_branch(name: object, base_branch: str = "") -> str:
     """A branch name the broker is willing to *author*.
 
     `check_branch_name` first, then the protected set, so a suggestion can never
@@ -491,9 +492,32 @@ def check_branch(name: object) -> str:
     from would make the feature useless, and reading is not authoring.
     """
     branch = check_branch_name(name)
-    if branch.casefold() in PROTECTED_BRANCHES:
+    protected = set(PROTECTED_BRANCHES)
+    override = (
+        base_branch.strip()
+        or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    )
+    if override:
+        norm_override = override.strip()
+        if norm_override.startswith("refs/heads/"):
+            norm_override = norm_override[len("refs/heads/"):]
+        elif norm_override.startswith("heads/"):
+            norm_override = norm_override[len("heads/"):]
+        protected.add(norm_override.casefold())
+
+    norm_branch = branch.strip()
+    if norm_branch.startswith("refs/heads/"):
+        norm_branch = norm_branch[len("refs/heads/"):]
+    elif norm_branch.startswith("heads/"):
+        norm_branch = norm_branch[len("heads/"):]
+
+    if (
+        norm_branch.casefold() in protected
+        or any(norm_branch.casefold().startswith(p) for p in PROTECTED_BRANCH_PREFIXES)
+    ):
         raise ContentWorkspaceError(
-            f"'{branch}' is a rollout branch; suggestions are proposed on their "
+            f"'{branch}' is a rollout, base, or run branch; suggestions are proposed on their "
             "own branch and merged by a human"
         )
     return branch
@@ -541,11 +565,23 @@ class Workspace:
     # the pull request's branch rather than on the base, and a caller that
     # assumed the base would silently rewrite the reviewed work.
     started_from: str = ""
+    default_branch: str = ""
     shallow: bool = False
     metadata: dict = field(default_factory=dict)
+    # What this workspace's clone presented to the remote, kept so the fetch in
+    # `commit` presents the same thing. None when the clone carried nothing of
+    # its own -- a managed repository on the ambient credential, or a public
+    # one on none -- and never anything a response reports.
+    credential: object | None = None
 
 
 GitRunner = Callable[..., object]
+# Answers "what credential does the broker's own clone of this repository
+# present": the forge's read-only one for a context repository, none otherwise.
+# Injected rather than imported so this module keeps knowing nothing about
+# repository registration, which is the property `require_managed_workspace`
+# in the broker relies on.
+CredentialFor = Callable[[str], object]
 
 
 class ContentWorkspaceStore:
@@ -568,6 +604,8 @@ class ContentWorkspaceStore:
         tree_root: str | Path,
         agent_workspace_root: str | Path,
         runner: GitRunner,
+        base_branch: str = "",
+        credential_for: CredentialFor | None = None,
     ) -> None:
         # Resolved, because `assert_disjoint_roots` resolves both sides and
         # `_redact` matches this value against paths git prints -- which git
@@ -590,6 +628,12 @@ class ContentWorkspaceStore:
             # the `git_hooks_dir` chmod in the executor already warns.
             LOGGER.warning("could not restrict the content workspace root %s", self.tree_root)
         self._runner = runner
+        self.base_branch = (
+            base_branch.strip()
+            or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+            or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+        )
+        self._credential_for = credential_for
         self._workspaces: dict[str, Workspace] = {}
         # One lock, held across the whole of every public verb.
         #
@@ -672,13 +716,28 @@ class ContentWorkspaceStore:
         rendered = _ABSOLUTE_PATH_RE.sub("<path>", rendered)
         return rendered[:500]
 
-    def _git(self, workspace_or_dir, argv: list[str], *, check: bool = True):
+    def _git(
+        self,
+        workspace_or_dir,
+        argv: list[str],
+        *,
+        check: bool = True,
+        config: tuple[tuple[str, str], ...] = (),
+    ):
         cwd = (
             workspace_or_dir.tree
             if isinstance(workspace_or_dir, Workspace)
             else Path(workspace_or_dir)
         )
-        result = self._runner(["git", *argv], cwd=cwd)
+        # `config` is handed on only when there is something in it. The two
+        # verbs that talk to the remote are the only ones that ever have any,
+        # and a runner that takes `(argv, cwd)` -- every recorded one in the
+        # tests, and the executor before it learned the argument -- keeps
+        # working for the rest.
+        if config:
+            result = self._runner(["git", *argv], cwd=cwd, config=config)
+        else:
+            result = self._runner(["git", *argv], cwd=cwd)
         exit_code = getattr(result, "exit_code", 1)
         if check and exit_code != 0:
             raise GitFailed(
@@ -690,6 +749,39 @@ class ContentWorkspaceStore:
     @staticmethod
     def _out(result) -> str:
         return (getattr(result, "stdout", "") or "").strip()
+
+    def _credential(self, repo: str) -> object | None:
+        """The credential this repository's clone presents, or None.
+
+        Asked once per `open`, before the clone. Whatever it answers is made
+        current here too, so the caller holds an object whose `git_config` is
+        ready to hand to git.
+        """
+        if self._credential_for is None:
+            return None
+        credential = self._credential_for(repo)
+        if credential is None:
+            return None
+        credential.ensure(repo)
+        return credential
+
+    @staticmethod
+    def _remote_config(workspace: Workspace) -> tuple[tuple[str, str], ...]:
+        """The git config a fetch of this workspace carries.
+
+        Made current again first rather than replayed from the clone: the
+        clone-time token may have expired over the workspace's lifetime, and a
+        fresh mint is what a fetch on a live token needs. The layer keeps the
+        ambient helper cleared either way, so a repository that was context at
+        `open` and is managed by `commit` is refused a fresh read token and the
+        fetch runs with no credential at all, never on the write token this
+        handle was opened without; reopening the repository is what presents
+        the credential its new role earns.
+        """
+        if workspace.credential is None:
+            return ()
+        workspace.credential.ensure(workspace.repo)
+        return tuple(workspace.credential.git_config(workspace.repo))
 
     # -- lifecycle -------------------------------------------------------
 
@@ -747,6 +839,13 @@ class ContentWorkspaceStore:
             tree = self.tree_root / handle
             tree.mkdir(parents=True, exist_ok=False)
             url = f"https://github.com/{repo}.git"
+            # Which credential, if any, this clone presents is decided by the
+            # broker from the repository's registered role: a read-only token
+            # for a context repository, nothing added for anything else. It is
+            # applied to this clone and to the fetch in `commit`, and to no
+            # other git this store runs -- everything else is local.
+            credential = self._credential(repo)
+            remote_config = tuple(credential.git_config(repo)) if credential else ()
             # The URL is composed here from a validated `owner/name`, never taken
             # from the caller: a caller-supplied URL is `url.<host>.insteadOf` by
             # another route, and the whole point of this module is that the agent
@@ -764,7 +863,7 @@ class ContentWorkspaceStore:
                     if base is not None:
                         argv += ["--branch", base]
                 argv += [url, str(tree / "repo")]
-                self._git(tree, argv)
+                self._git(tree, argv, config=remote_config)
                 # Measured after the clone, and the tree goes if it is over.
                 # A repository the broker cannot afford to hold is not one it
                 # should hold *badly*, half-cloned and still on the disk.
@@ -781,8 +880,10 @@ class ContentWorkspaceStore:
                     base="",
                     base_sha="",
                     shallow=depth is not None,
+                    credential=credential,
                 )
-                workspace.base = base or self._default_branch(workspace)
+                workspace.default_branch = self._default_branch(workspace)
+                workspace.base = base or workspace.default_branch
                 workspace.base_sha = self._sha(workspace, f"origin/{workspace.base}")
                 workspace.started_from = f"origin/{workspace.base}"
                 # Only when the caller named one, and only when it is really
@@ -1101,7 +1202,41 @@ class ContentWorkspaceStore:
                     "this workspace was opened shallow, which makes it "
                     "read-only; reopen it without a depth to author a change"
                 )
-            branch = check_branch(branch)
+            branch = check_branch(branch, base_branch=self.base_branch)
+            norm_branch = branch.strip()
+            if norm_branch.startswith("refs/heads/"):
+                norm_branch = norm_branch[len("refs/heads/"):]
+            elif norm_branch.startswith("heads/"):
+                norm_branch = norm_branch[len("heads/"):]
+
+            norm_base = (workspace.base or "").strip()
+            if norm_base.startswith("refs/heads/"):
+                norm_base = norm_base[len("refs/heads/"):]
+            elif norm_base.startswith("heads/"):
+                norm_base = norm_base[len("heads/"):]
+
+            norm_default = (getattr(workspace, "default_branch", "") or "").strip()
+            if norm_default.startswith("refs/heads/"):
+                norm_default = norm_default[len("refs/heads/"):]
+            elif norm_default.startswith("heads/"):
+                norm_default = norm_default[len("heads/"):]
+
+            norm_configured = self.base_branch.strip()
+            if norm_configured.startswith("refs/heads/"):
+                norm_configured = norm_configured[len("refs/heads/"):]
+            elif norm_configured.startswith("heads/"):
+                norm_configured = norm_configured[len("heads/"):]
+
+            if (
+                (norm_base and norm_branch.casefold() == norm_base.casefold())
+                or (norm_default and norm_branch.casefold() == norm_default.casefold())
+                or (norm_configured and norm_branch.casefold() == norm_configured.casefold())
+                or any(norm_branch.casefold().startswith(p) for p in PROTECTED_BRANCH_PREFIXES)
+            ):
+                raise ContentWorkspaceError(
+                    f"'{branch}' is the workspace base, remote default, or run branch; suggestions are proposed on their "
+                    "own branch and merged by a human"
+                )
             self._git(workspace, ["check-ref-format", "--branch", branch])
             if not isinstance(message, str) or not message.strip():
                 raise ContentWorkspaceError("message must be a non-empty string")
@@ -1115,7 +1250,11 @@ class ContentWorkspaceStore:
                 )
             changes = list(changes)
 
-            self._git(workspace, ["fetch", "--quiet", "--prune", "origin"])
+            self._git(
+                workspace,
+                ["fetch", "--quiet", "--prune", "origin"],
+                config=self._remote_config(workspace),
+            )
             current_base_sha = self._sha(workspace, f"origin/{workspace.base}")
             if expected_base_sha and expected_base_sha != current_base_sha:
                 self._raise_if_moved_under_us(
@@ -1262,7 +1401,41 @@ class ContentWorkspaceStore:
         """
         with self._lock:
             workspace = self.get(handle)
-            branch = check_branch(branch)
+            branch = check_branch(branch, base_branch=self.base_branch)
+            norm_branch = branch.strip()
+            if norm_branch.startswith("refs/heads/"):
+                norm_branch = norm_branch[len("refs/heads/"):]
+            elif norm_branch.startswith("heads/"):
+                norm_branch = norm_branch[len("heads/"):]
+
+            norm_base = (workspace.base or "").strip()
+            if norm_base.startswith("refs/heads/"):
+                norm_base = norm_base[len("refs/heads/"):]
+            elif norm_base.startswith("heads/"):
+                norm_base = norm_base[len("heads/"):]
+
+            norm_default = (getattr(workspace, "default_branch", "") or "").strip()
+            if norm_default.startswith("refs/heads/"):
+                norm_default = norm_default[len("refs/heads/"):]
+            elif norm_default.startswith("heads/"):
+                norm_default = norm_default[len("heads/"):]
+
+            norm_configured = self.base_branch.strip()
+            if norm_configured.startswith("refs/heads/"):
+                norm_configured = norm_configured[len("refs/heads/"):]
+            elif norm_configured.startswith("heads/"):
+                norm_configured = norm_configured[len("heads/"):]
+
+            if (
+                (norm_base and norm_branch.casefold() == norm_base.casefold())
+                or (norm_default and norm_branch.casefold() == norm_default.casefold())
+                or (norm_configured and norm_branch.casefold() == norm_configured.casefold())
+                or any(norm_branch.casefold().startswith(p) for p in PROTECTED_BRANCH_PREFIXES)
+            ):
+                raise ContentWorkspaceError(
+                    f"'{branch}' is the workspace base, remote default, or run branch; suggestions are proposed on their "
+                    "own branch and merged by a human"
+                )
             if workspace.branch != branch:
                 raise ContentWorkspaceError(
                     f"nothing has been committed on '{branch}' in this workspace"

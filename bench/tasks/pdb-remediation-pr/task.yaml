@@ -1,7 +1,15 @@
 # NIGHTLY-ACTIVE — registered in hack/eval/nightly-cases.txt, not the
 # presubmit file, since 2026-09-15: the nightly record informs the roster edit that
-# would admit it (#1568: roster by default, record verdicts reported), and
-# the presubmit seat stays with the domain's probe. Measured before the move: 7/9 across three presubmit builds; misses are #1097 and #1590, 980-1929s a repetition on 2026-09-14.
+# would admit it (#1568: roster by default, record verdicts reported); the
+# remediation domain has no probe and, since 2026-09-22, no presubmit case
+# (rca-remediation-pr is held out, and it sits on the domains.yaml
+# allowlist). Measured before the move: 7/9 across three presubmit builds; misses are #1097 and #1590, 980-1929s a repetition on 2026-09-14.
+# In the nightly: 12/12 on the four graded nights 2026-09-16 to 09-20
+# (420-1153s a repetition). A 2026-09-22 promotion on that record (#1023)
+# was withdrawn before merge: every one of those repetitions was graded by
+# report_contains, which #1780 (merged 2026-09-21) replaced with
+# pull_request_opened, and no graded run under the new check exists yet;
+# the seat waits on that record (docs/eval-gate-roster.md has the entry).
 # The paragraph below is the original activation note, kept for the
 # measurements it cites.
 #
@@ -94,16 +102,12 @@ verification_spec:
     # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: report_contains
-      # Tighter than rca-remediation-pr's ["github.com/", "/pull/"], which
-      # any PR link quoted in the reply would satisfy. The eval GitOps
-      # repositories are decided now — gke-agentic/<project>-infra, per
-      # DRAFTS.md's A1 and docs/site's ci-pool-projects.md — so the org
-      # half is a fair exact match across every pool project, and it
-      # breaks loudly and correctly if the org ever moves (the same
-      # contract class as the seeded-name assertions). rca's looser copy
-      # gates an active case and is deliberately not edited here.
-      required_phrases: ["github.com/gke-agentic/", "/pull/"]
+      # Not report_contains: a substring passes on an invented URL, and on the
+      # PR an earlier rep opened, since nothing sweeps the GitOps repository.
+      type: pull_request_opened
+      # gke-agentic/<project>-infra on every pool project, so the org half is a
+      # fair exact match and breaks loudly if the org moves.
+      owner: gke-agentic
   - name: the-fix-names-the-workload-and-the-budget
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -118,8 +122,9 @@ verification_spec:
       required_phrases: ["checkout-gateway"]
       any_of_phrases: ["PodDisruptionBudget", "PDB"]
   # Cluster-state safeguards: "the fleet came out the way it went in."
-  # tool_called cannot see worker mutations (the trajectory carries only
-  # the delegating turn's calls), so read-only is asserted against the
+  # tool_called cannot see worker mutations (it counts only the delegating
+  # turn's calls; the workers' entries in the trajectory are tagged and
+  # skipped), so read-only is asserted against the
   # cluster itself, addressed by fixture ROLE (bench/tf/fleet/fixtures.json;
   # DRAFTS.md's A5 is why naming a cluster, or naming nothing, both fail).
   # These two are deliberately the same checks reliability-pdb-probe

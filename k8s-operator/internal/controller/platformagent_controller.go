@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -53,6 +54,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -62,6 +64,29 @@ const (
 	minIPv4CIDRPrefix      = 12
 	minIPv6CIDRPrefix      = 48
 	maxCIDRsPerAnnotation  = 50
+
+	// The two keys of the <agent>-gitops-state ConfigMap the minter policy is
+	// synced from: managed_repos renders write policies, context_repos read-only
+	// ones. gitops_workspace.py names the same two keys on the agent side.
+	gitopsStateManagedReposKey = "managed_repos"
+	gitopsStateContextReposKey = "context_repos"
+	// minterConfigMapName is the minty rule ConfigMap the chart and the kustomize
+	// template render; minterBaseTemplateKey is the policy every rendered key is
+	// derived from.
+	minterConfigMapName   = "github-token-minter-config"
+	minterBaseTemplateKey = "default.yaml"
+	// minterPolicyKeySuffix turns a bare repository name into its policy key. A
+	// repository whose key would be minterBaseTemplateKey is skipped: rendering
+	// it would overwrite the template every other policy is derived from.
+	minterPolicyKeySuffix = ".yaml"
+	// minterReadScope is the scope a context repository's policy carries and
+	// nothing else: contents: read, as the chart's default.yaml declares it. A
+	// default.yaml without it predates the read grant and renders no context
+	// policies. minterScopeField and minterRepositoriesField are the minty v2
+	// rule fields the read-only rendering rewrites.
+	minterReadScope         = "platform-agent-read-scope"
+	minterScopeField        = "scope"
+	minterRepositoriesField = "repositories"
 
 	// metadataLinkLocalIP is the address a workload dials for GCP metadata and Workload
 	// Identity tokens. It is only ever the pre-DNAT destination.
@@ -126,6 +151,87 @@ const (
 		"The k8s-event-watcher is not started, so no cluster warning reaches the agent and no autonomous triage " +
 		"session is created from one; the pod stays Ready regardless. Nothing restores this automatically — set " +
 		"spec.harness.eventWatcher.enabled=true (or remove the field) to start watching again."
+
+	// The condition reporting that the render left a hostPath volume out of
+	// the agent Pod. Written only while the spec carries one, on the
+	// EventWatcher pattern above, and not a Degraded state: the Pod runs, the
+	// author's other volumes are in it, and the CR says what was left out and
+	// why. See hostPathVolumes for the drop itself.
+	//
+	// Both status writers carry it, updateStatusReady and
+	// updateStatusDegraded, because the strip happens at render and the render
+	// is above both of them: three refusals park the CR on Degraded after the
+	// Pod has already been written (ModeNotRecognized, A2AProvisionFailed,
+	// ShellSandboxKeysMissing), and ShellSandboxKeysMissing is where a bare
+	// `helm install` sits indefinitely -- the chart renders the sandbox's
+	// authorized-keys Secret only when a public key is supplied. That is the
+	// same chart-default install the webhook is off on, so the one park most
+	// likely to hold a dropped hostPath was the one saying nothing about it.
+	//
+	// The Degraded writer carries it on those three only. The other four
+	// refusals return before the render (ForbiddenVolumeMount,
+	// ShellSandboxCannotBeDisabled, RuntimeClassNotFound,
+	// EgressAllowlistRefused), so the Pod left running on such a pass is
+	// whatever the previous pass rendered -- and on an operator rolled out
+	// over a CR whose Deployment a pre-fix render gave real hostPath mounts,
+	// writing the condition there would report the mounts gone while they are
+	// still in the Pod, on every requeue tick for as long as the refusal
+	// stands. A condition asserting a security property must not be able to
+	// say True where the property does not hold. See workloadRenderState.
+	hostPathDroppedConditionType = "VolumesDropped"
+	hostPathDroppedReason        = "HostPathVolumeDropped"
+	// hostPathDroppedEntryFormat renders one dropped entry as the author would
+	// find it in the spec: field, index, name, and the host path it asked for.
+	hostPathDroppedEntryFormat = "%s[%d] %q (hostPath %s)"
+	// hostPathDroppedMessageFormat takes the joined entries and then the
+	// rollout clause below, which is "" on most passes. It says what is left
+	// out, that the mounts go with it, what keeping them would have cost, why
+	// admission did not stop it, and how to clear the condition, because
+	// `kubectl describe` is where the author of a CR the webhook never saw
+	// finds out.
+	//
+	// It speaks about the Pod template the operator renders, not about the Pod
+	// that is running, because the template is the whole of what this
+	// controller observes. reconcileWorkload server-side-applies it and
+	// returns once the API server has accepted it; nothing waits on the
+	// rollout. With spec.deployment.availability.replicas > 1 the strategy is
+	// RollingUpdate at maxUnavailable 1, so Pods from the revision before it --
+	// on an operator rolled out over a CR a pre-fix render gave real hostPath
+	// mounts, Pods that really do mount them -- keep running until the roll
+	// finishes, and indefinitely if it stalls. "Left out of the agent Pod"
+	// asserted a property of those Pods too, and Ready does not offset it:
+	// updateStatusReady decides the phase from ReadyReplicas, which counts
+	// ready Pods across every ReplicaSet the Deployment owns.
+	hostPathDroppedMessageFormat = "hostPath volumes are forbidden and are left out of the Pod template the operator " +
+		"renders, along with every volumeMount naming them: %s. Keeping them would give the agent container, which is " +
+		"where model output runs, access to the node's filesystem at those paths.%s The admission webhook refuses " +
+		"these when it runs, and this CR was admitted without it (the Helm chart ships operator.webhooks.enabled=false, " +
+		"and one enabled through the chart fails open at its default failurePolicy: Ignore). Remove the entries from " +
+		"the spec to clear this condition."
+	// hostPathDroppedRollingClause fills the second slot on a pass that can see
+	// the roll of that template is not finished. A separate sentence rather
+	// than a hedge on the first one, so the reader who does not get it reads an
+	// unqualified statement, and leading with a space because the slot sits
+	// directly after a full stop.
+	hostPathDroppedRollingClause = " That template is still rolling out, so Pods from an earlier revision may still be " +
+		"running with these volumes mounted."
+	hostPathDroppedEntrySeparator = ", "
+	// hostPathDroppedEntryBudget bounds the joined entries, and
+	// hostPathDroppedOverflowFormat counts whatever did not fit. Volume names
+	// and host paths are the author's, and neither the CRD nor this controller
+	// bounds their length or their number, while the CRD schema caps a
+	// condition message at 32768 characters -- so an unbounded list is one
+	// spec away from failing the whole status write, Ready and the phase and
+	// every other condition with it, on every pass, for as long as the entries
+	// stay in the spec. The budget is far under the cap because the message is
+	// read in `kubectl describe`, where the first few entries are what anyone
+	// acts on.
+	hostPathDroppedEntryBudget    = 4096
+	hostPathDroppedOverflowFormat = ", and %d more"
+	// hostPathDroppedEntryEllipsis marks a single entry cut to fit the budget,
+	// which takes one name or one path longer than the whole list is allowed
+	// to be.
+	hostPathDroppedEntryEllipsis = "..."
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
@@ -440,7 +546,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if msg := validateExtraVolumeMounts(instance); msg != "" {
 		log.Info(msg)
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reasonForbiddenVolumeMount, msg); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reasonForbiddenVolumeMount, msg, workloadNotRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		if guardrailErr != nil {
@@ -459,7 +565,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if reason, msg := validateShellSandbox(instance); reason != "" {
 		log.Info(msg)
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, workloadNotRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		if guardrailErr != nil {
@@ -478,7 +584,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
 			log.Info(msg)
 			guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg); statusErr != nil {
+			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg, workloadNotRendered); statusErr != nil {
 				return ctrl.Result{}, statusErr
 			}
 			if guardrailErr != nil {
@@ -538,7 +644,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// before returning any guardrail error so neither the agent gateway policy
 		// nor the litellm policy is stranded when reconciliation pauses at Degraded.
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, workloadNotRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		if guardrailErr != nil {
@@ -615,13 +721,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// on this object's watches.
 	if modeErr != nil {
 		msg := modeErr.Error() + " (version skew); rendering today's stack until the operator is upgraded or spec.mode is corrected"
-		if statusErr := r.updateStatusDegraded(ctx, instance, "ModeNotRecognized", msg); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, "ModeNotRecognized", msg, workloadRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 	if a2aState.failed {
-		if statusErr := r.updateStatusDegraded(ctx, instance, "A2AProvisionFailed", a2aState.message); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, "A2AProvisionFailed", a2aState.message, workloadRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -640,7 +746,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Secret write in the namespace.
 	if reason, msg := r.checkShellSandboxKeys(ctx, instance); reason != "" {
 		log.Info(msg)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, workloadRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -661,7 +767,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// A2A provisioning still running — Jobs are not watched (see a2aReader),
 	// so completion, failure, and the TTL removing a finished Job are all
 	// invisible without a requeue.
-	if a2aNext && !a2aState.done {
+	//
+	// gatewayHeld shares the requeue rather than getting its own: the gateway
+	// is waiting on BusCredentialsReady, which this reconcile writes on its
+	// way out, so the pass that finally sees it true has to be a pass that
+	// happens. The callout Deployment is owned and its readiness does trigger
+	// one, but a gate that only converges because something else is watched
+	// is a gate with a hidden dependency.
+	if a2aNext && (!a2aState.done || a2aState.gatewayHeld) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -983,7 +1096,7 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			if err := r.Create(ctx, cm); err != nil {
 				return err
 			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, cm.Data["managed_repos"])
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, cm.Data[gitopsStateManagedReposKey], cm.Data[gitopsStateContextReposKey])
 		}
 		return err
 	}
@@ -1000,17 +1113,17 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			if err := r.Update(ctx, found); err != nil {
 				return err
 			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, cmRepo)
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, cmRepo, found.Data[gitopsStateContextReposKey])
 		}
 		specEntries, err := parseManagedRepoEntries(cmRepo)
 		if err != nil {
 			logger.Error(err, "skipping gitops state reconcile due to unparseable spec repository JSON")
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 		}
 		existingEntries, err := parseManagedRepoEntries(existing)
 		if err != nil {
 			logger.Error(err, "skipping gitops state reconcile due to unparseable existing managed_repos in ConfigMap", "configMap", found.Name)
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 		}
 		updated := false
 		for _, se := range specEntries {
@@ -1033,11 +1146,11 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			if err := r.Update(ctx, found); err != nil {
 				return err
 			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 		}
 	}
 
-	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 }
 
 func parseManagedKeysAnnotation(ann string) map[string]struct{} {
@@ -1092,22 +1205,128 @@ func renderRepoPolicy(baseTemplate string, repos []string) string {
 	})
 }
 
+// renderReadOnlyPolicy renders the policy a context repository gets: baseTemplate
+// with its scope map reduced to minterReadScope alone and that scope's
+// repositories replaced by repos. Everything else at the top level (version,
+// rule) is carried over as parsed.
+//
+// Parsed rather than edited by regex like renderRepoPolicy, because dropping
+// the write scope is a structural edit: a text substitution that removes one
+// mapping from a block it did not author is how a policy ends up carrying a
+// scope nobody meant it to. sigs.k8s.io/yaml marshals through JSON, so keys come
+// out sorted and the rendering is stable across reconciles.
+//
+// The second return is false when baseTemplate does not parse or carries no
+// minterReadScope; the caller then renders no context policies rather than
+// inventing a scope the minter was never told about.
+func renderReadOnlyPolicy(baseTemplate string, repos []string) (string, bool) {
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal([]byte(baseTemplate), &doc); err != nil || doc == nil {
+		return "", false
+	}
+	scopes, ok := doc[minterScopeField].(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	readScope, ok := scopes[minterReadScope].(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	repoList := make([]interface{}, 0, len(repos))
+	for _, repo := range repos {
+		repoList = append(repoList, repo)
+	}
+	readScope[minterRepositoriesField] = repoList
+	doc[minterScopeField] = map[string]interface{}{minterReadScope: readScope}
+	rendered, err := yaml.Marshal(doc)
+	if err != nil {
+		return "", false
+	}
+	return string(rendered), true
+}
+
+// minterBareRepos returns the bare repository names in reposStr (a managed_repos
+// or context_repos JSON list) that belong to primaryOrg, deduplicated and
+// sorted. An empty primaryOrg accepts every organisation, as the managed sync
+// always has. listName is for the log lines only. A list that is not JSON is
+// an error, never an empty result: the caller skips the whole sync on it,
+// because an empty result would read as "no repositories" and prune every
+// policy the operator tracks.
+func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) ([]string, error) {
+	reposStr = strings.TrimSpace(reposStr)
+	if reposStr == "" {
+		return nil, nil
+	}
+	repos, err := parseManagedRepos(reposStr)
+	if err != nil {
+		return nil, fmt.Errorf("unparseable %s in ConfigMap: %w", listName, err)
+	}
+	seen := make(map[string]struct{}, len(repos))
+	var bare []string
+	for _, fullRepo := range repos {
+		fullRepo = strings.TrimSpace(fullRepo)
+		if fullRepo == "" {
+			continue
+		}
+		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
+		if err != nil {
+			logger.V(1).Info("skipping invalid repo in minter policy sync", "list", listName, "repo", fullRepo, "error", err)
+			continue
+		}
+		parts := strings.SplitN(slug, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		repoOrg, bareRepo := parts[0], parts[1]
+		if primaryOrg != "" && !strings.EqualFold(repoOrg, primaryOrg) {
+			logger.Info("skipping cross-org repository in minter policy sync; minter is scoped to primary org",
+				"list", listName, "repo", fullRepo, "repoOrg", repoOrg, "primaryOrg", primaryOrg)
+			continue
+		}
+		if bareRepo+minterPolicyKeySuffix == minterBaseTemplateKey {
+			// The base template is never claimed: a policy rendered under its
+			// key becomes the template the next reconcile derives every policy
+			// from, and a read-only rendering there strips the write scope from
+			// every managed repository.
+			logger.Info("skipping repository whose minter policy key would be the base template",
+				"list", listName, "repo", fullRepo, "key", minterBaseTemplateKey)
+			continue
+		}
+		if _, exists := seen[bareRepo]; exists {
+			continue
+		}
+		seen[bareRepo] = struct{}{}
+		bare = append(bare, bareRepo)
+	}
+	sort.Strings(bare)
+	return bare, nil
+}
+
 // syncGithubTokenMinterConfigMap ensures that for every repository in managed_repos that belongs
 // to the primary GitHub organization (spec.integration.github.org), a corresponding <repo>.yaml
-// entry exists in github-token-minter-config ConfigMap.
+// entry exists in github-token-minter-config ConfigMap, and that every same-organization
+// repository in context_repos has a <repo>.yaml carrying the read-only scope alone.
 // Repositories belonging to a different organization are skipped because the minter instance is
 // bound to the primary organization directory (/etc/minty/<primary-org>/).
 //
+// A managed repository's policy is default.yaml with the repository list replaced by every
+// same-org managed repository (renderRepoPolicy). A context repository's policy is default.yaml
+// reduced to minterReadScope, listing every same-org context repository (renderReadOnlyPolicy):
+// the broker mints from it for its own clone and nothing else, so a private context repository
+// is readable without a write token ever covering it. A repository in both lists is managed and
+// keeps the write rendering. A default.yaml without the read scope renders no context policies.
+//
 // Key ownership contract:
-// The operator owns every <repo>.yaml key for an active managed repository (including adopting
-// pre-rendered chart or template keys). Hand-editing <repo>.yaml keys for active managed repositories
-// is unsupported: custom edits will be overwritten with policy rendered from default.yaml on reconcile,
-// and the key will be pruned when the repository is unregistered. Keys for repositories not present in
-// managed_repos (and default.yaml itself) are never claimed or pruned.
-func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr string) error {
+// The operator owns every <repo>.yaml key for an active managed or context repository (including
+// adopting pre-rendered chart or template keys). Hand-editing <repo>.yaml keys for active
+// repositories is unsupported: custom edits will be overwritten with policy rendered from
+// default.yaml on reconcile, and the key will be pruned when the repository is unregistered from
+// both lists. Keys for repositories present in neither list (and default.yaml itself) are never
+// claimed or pruned.
+func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr, contextReposStr string) error {
 	logger := logf.FromContext(ctx)
 	minterCM := &corev1.ConfigMap{}
-	err := r.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: agent.Namespace}, minterCM)
+	err := r.Get(ctx, client.ObjectKey{Name: minterConfigMapName, Namespace: agent.Namespace}, minterCM)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil
@@ -1119,12 +1338,13 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		return nil
 	}
 
-	baseTemplate, ok := minterCM.Data["default.yaml"]
+	baseTemplate, ok := minterCM.Data[minterBaseTemplateKey]
 	if !ok || strings.TrimSpace(baseTemplate) == "" {
 		return nil
 	}
 
 	managedReposStr = strings.TrimSpace(managedReposStr)
+	contextReposStr = strings.TrimSpace(contextReposStr)
 
 	// Read operator-managed keys from annotation
 	existingAnn := ""
@@ -1133,8 +1353,8 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 	}
 	operatorManagedKeys := parseManagedKeysAnnotation(existingAnn)
 
-	// If managed_repos is empty and no keys are tracked as operator-managed, no-op to avoid touching unmanaged keys.
-	if managedReposStr == "" && len(operatorManagedKeys) == 0 {
+	// If both lists are empty and no keys are tracked as operator-managed, no-op to avoid touching unmanaged keys.
+	if managedReposStr == "" && contextReposStr == "" && len(operatorManagedKeys) == 0 {
 		return nil
 	}
 
@@ -1152,48 +1372,56 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		}
 	}
 
-	repos, err := parseManagedRepos(managedReposStr)
+	// Both lists are parsed before anything is computed from either: an
+	// unparseable one skips the sync and leaves the ConfigMap as it is, as the
+	// managed-only sync always did. Treating it as empty would prune every
+	// tracked policy and break every write until the JSON was repaired.
+	allBareRepos, err := minterBareRepos(logger, managedReposStr, primaryOrg, gitopsStateManagedReposKey)
 	if err != nil {
-		logger.Error(err, "skipping minter policy sync due to unparseable managed_repos in ConfigMap")
+		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateManagedReposKey)
 		return nil
 	}
-	var allBareRepos []string
-	activeKeys := make(map[string]string, len(repos))
-	for _, fullRepo := range repos {
-		fullRepo = strings.TrimSpace(fullRepo)
-		if fullRepo == "" {
-			continue
+	contextCandidates, err := minterBareRepos(logger, contextReposStr, primaryOrg, gitopsStateContextReposKey)
+	if err != nil {
+		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateContextReposKey)
+		return nil
+	}
+	// Managed wins: a repository registered in both lists is written to, so its
+	// policy is the write one, and it is left out of the read-only list too.
+	var contextBareRepos []string
+	for _, bareRepo := range contextCandidates {
+		if !slices.Contains(allBareRepos, bareRepo) {
+			contextBareRepos = append(contextBareRepos, bareRepo)
 		}
-		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
-		if err != nil {
-			logger.V(1).Info("skipping invalid repo in managed_repos for minter policy sync", "repo", fullRepo, "error", err)
-			continue
-		}
-		parts := strings.SplitN(slug, "/", 2)
-		if len(parts) == 2 {
-			repoOrg := parts[0]
-			bareRepo := parts[1]
-			if primaryOrg != "" && !strings.EqualFold(repoOrg, primaryOrg) {
-				logger.Info("skipping cross-org repository in minter policy sync; minter is scoped to primary org",
-					"repo", fullRepo, "repoOrg", repoOrg, "primaryOrg", primaryOrg)
-				continue
-			}
-			if _, exists := activeKeys[bareRepo+".yaml"]; !exists {
-				activeKeys[bareRepo+".yaml"] = bareRepo
-				allBareRepos = append(allBareRepos, bareRepo)
+	}
+
+	// key -> the content it must hold. No capacity hint: both lengths come from
+	// ConfigMap JSON, and CodeQL (go/allocation-size-overflow) flags their sum
+	// as an allocation size that untrusted input could overflow.
+	expected := make(map[string]string)
+	writeContent := renderRepoPolicy(baseTemplate, allBareRepos)
+	for _, bareRepo := range allBareRepos {
+		expected[bareRepo+minterPolicyKeySuffix] = writeContent
+	}
+	if len(contextBareRepos) > 0 {
+		readContent, ok := renderReadOnlyPolicy(baseTemplate, contextBareRepos)
+		if !ok {
+			logger.Info("skipping context_repos in minter policy sync; default.yaml has no read-only scope",
+				"scope", minterReadScope, "repos", contextBareRepos)
+		} else {
+			for _, bareRepo := range contextBareRepos {
+				expected[bareRepo+minterPolicyKeySuffix] = readContent
 			}
 		}
 	}
-	sort.Strings(allBareRepos)
 
 	updated := false
 
-	// Ensure all active managed repositories have policy entries containing all same-org managed repositories.
-	// The operator claims and owns every <repo>.yaml key for an active managed repository: if unmanaged (!managed),
-	// it adopts the key and overwrites it with rendered policy derived from default.yaml. Hand-editing <repo>.yaml
-	// for an active managed repository is unsupported; when the repository is later unregistered, the key is pruned.
-	expectedContent := renderRepoPolicy(baseTemplate, allBareRepos)
-	for key := range activeKeys {
+	// Ensure every active repository has its policy entry. The operator claims and owns every
+	// <repo>.yaml key for an active repository: if unmanaged (!managed), it adopts the key and
+	// overwrites it with rendered policy derived from default.yaml. Hand-editing <repo>.yaml for an
+	// active repository is unsupported; when the repository is later unregistered, the key is pruned.
+	for key, expectedContent := range expected {
 		currentVal, exists := minterCM.Data[key]
 		_, managed := operatorManagedKeys[key]
 		if !exists || !managed || currentVal != expectedContent {
@@ -1205,10 +1433,10 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 
 	// Prune policy entries ONLY for repositories that were previously managed by the operator but are no longer active
 	for key := range operatorManagedKeys {
-		if key == "default.yaml" {
+		if key == minterBaseTemplateKey {
 			continue
 		}
-		if _, active := activeKeys[key]; !active {
+		if _, active := expected[key]; !active {
 			delete(minterCM.Data, key)
 			delete(operatorManagedKeys, key)
 			updated = true
@@ -2276,8 +2504,9 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	return nil
 }
 
-// splitWorkloadStatus is one of the two workloads the credential-broker split made
-// mandatory alongside the gateway, read back so Ready can depend on it.
+// splitWorkloadStatus is one workload the gateway's readiness does not cover,
+// read back so Ready can depend on it: the two the credential-broker split made
+// mandatory, and on a next install the A2A gateway as well.
 type splitWorkloadStatus struct {
 	// name is the object's name, and what the Provisioning message reports.
 	name string
@@ -2288,9 +2517,10 @@ type splitWorkloadStatus struct {
 }
 
 // readSplitWorkloads reads the shell sandbox StatefulSet and the credential broker
+// Deployment, and on an install that renders the A2A stack, the A2A gateway
 // Deployment.
 //
-// Ready has to depend on both. Before the split the credential runtime was a native
+// Ready has to depend on all of them. Before the split the credential runtime was a native
 // sidecar of the gateway pod, so a broker that could not start held the gateway out of
 // readiness and the existing pod scan reported why. Splitting it into its own pod took
 // that away: the gateway now becomes Ready on its own while the model cannot run a single
@@ -2320,10 +2550,38 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 		broker.Status.ReadyReplicas = 0
 	}
 
-	return []splitWorkloadStatus{
+	workloads := []splitWorkloadStatus{
 		{name: shellName, kind: "StatefulSet", ready: shell.Status.ReadyReplicas},
 		{name: brokerName, kind: "Deployment", ready: broker.Status.ReadyReplicas},
-	}, nil
+	}
+
+	// The A2A gateway stands in the same relation to Ready as those two: a next
+	// install without one cannot serve an A2A request at all, and nothing about the
+	// agent gateway's own readiness says so. It is also the one workload here that
+	// the operator withholds ON PURPOSE -- a2aGatewayWaitsForCallout holds the first
+	// creation while the auth callout is short of serving -- and until that hold is
+	// counted, the CR reports Ready: True beside a BusCredentialsReady of False and
+	// the two contradict each other. The hold stays; it stops being silent.
+	//
+	// a2aStackRendering, not a2aAgentSurface: this has to be the same predicate as
+	// whatever creates the Deployment. On version skew the A2A objects are frozen
+	// rather than reconciled, and that CR is already Degraded for the skew itself --
+	// a second reason to hold Ready there would report the freeze as a fault.
+	if a2aStackRendering(agent) {
+		gateway := &appsv1.Deployment{}
+		gatewayName := a2aGatewayName(agent)
+		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: gatewayName}, gateway); err != nil {
+			if !errors.IsNotFound(err) {
+				return nil, fmt.Errorf("failed to get A2A gateway Deployment for status update: %w", err)
+			}
+			gateway.Status.ReadyReplicas = 0
+		}
+		workloads = append(workloads, splitWorkloadStatus{
+			name: gatewayName, kind: "Deployment", ready: gateway.Status.ReadyReplicas,
+		})
+	}
+
+	return workloads, nil
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
@@ -2335,6 +2593,26 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
 
+	// Whether the gateway workload may still be running Pods from a revision
+	// older than the template reconcileWorkload just applied. It qualifies the
+	// VolumesDropped message below, which otherwise asserts a security
+	// property of Pods the apply has not reached yet. Read off the object this
+	// function already fetches, so it costs no extra API call.
+	//
+	// Two terms, because neither is sound alone. UpdatedReplicas < Replicas is
+	// the direct reading -- Replicas counts every non-terminated Pod the
+	// selector matches, UpdatedReplicas only those from the current revision --
+	// but both are as of Status.ObservedGeneration, so immediately after an
+	// apply they describe the previous template and can read equal while every
+	// Pod is old. ObservedGeneration < Generation catches exactly that window.
+	//
+	// It over-reports on a workload that has only just been created: no Pods
+	// exist, the status is zeroes, and the generation term holds until the
+	// workload controller writes back. That is the safe direction, because the
+	// clause weakens the condition's claim -- a spurious one under-claims the
+	// drop rather than over-claiming it -- and it clears on the next pass.
+	workloadRollIncomplete := rolloutNotKnownIncomplete
+
 	if useStatefulSet(agent) {
 		sts := &appsv1.StatefulSet{}
 		errWorkload = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, sts)
@@ -2344,6 +2622,10 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		if errWorkload == nil {
 			newDeploymentStatusName = sts.Name
 			newDeploymentStatusReadyReplicas = sts.Status.ReadyReplicas
+			// The ordered roll has the same window: replicas > 1 over RWO
+			// storage takes this path, and the StatefulSet controller replaces
+			// Pods one at a time.
+			workloadRollIncomplete = statefulSetRollIncomplete(sts)
 		}
 	} else {
 		dep := &appsv1.Deployment{}
@@ -2354,6 +2636,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		if errWorkload == nil {
 			newDeploymentStatusName = dep.Name
 			newDeploymentStatusReadyReplicas = dep.Status.ReadyReplicas
+			workloadRollIncomplete = deploymentRollIncomplete(dep)
 		}
 	}
 
@@ -2381,8 +2664,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		newAddress = fmt.Sprintf("%s.%s.svc.cluster.local", svc.Name, svc.Namespace)
 	}
 
-	// The two workloads the split made mandatory. Read before the phase is decided,
-	// because Ready is a claim about all three and not about the gateway alone.
+	// The workloads the gateway's own readiness does not cover. Read before the phase
+	// is decided, because Ready is a claim about every one of them and not about the
+	// gateway alone.
 	splitWorkloads, errSplit := r.readSplitWorkloads(ctx, agent)
 	if errSplit != nil {
 		return "", errSplit
@@ -2405,6 +2689,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		condStatus = metav1.ConditionTrue
 		condReason = "Reconciled"
 		condMsg = "Gateway, shell sandbox and credential broker are all ready"
+		if a2aStackRendering(agent) {
+			condMsg = "Gateway, shell sandbox, credential broker and A2A gateway are all ready"
+		}
 	case errWorkload == nil:
 		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent); reasonOverride != "Provisioning" {
 			newPhase = phaseOverride
@@ -2477,6 +2764,16 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		(!eventWatcherOn && existingWatcherCond != nil && existingWatcherCond.Status == metav1.ConditionFalse &&
 			existingWatcherCond.Reason == eventWatcherDisabledReason && existingWatcherCond.Message == eventWatcherDisabledMessage)
 
+	// A hostPath volume the render left out of the Pod template, reported
+	// while the spec still carries one and absent otherwise. Message is
+	// compared for the same reason EventWatcher's is: it names the entries,
+	// and an edit that swaps one hostPath for another has to change what the
+	// CR says. workloadRollIncomplete rides in the same string, so the
+	// comparison covers it without a term of its own -- a roll finishing is
+	// one status write, not a write per pass (#1392).
+	hostPathDroppedMsg := hostPathDroppedMessage(agent, workloadRollIncomplete)
+	hostPathDroppedUnchanged := hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
+
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
 	// A Degraded/RBACIncomplete condition is reportRBACSkew's, and this function
@@ -2509,6 +2806,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		networkPolicyStatusUnchanged(agent.Status.NetworkPolicy, netpolProfile) &&
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
+		hostPathDroppedUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
 		return newPhase, nil
@@ -2574,7 +2872,173 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		})
 	}
 
+	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
+
 	return newPhase, r.Status().Update(ctx, agent)
+}
+
+// hostPathDroppedConditionCurrent reports whether the VolumesDropped condition
+// on the CR already says msg, where "" means the condition is to be absent.
+// Both status writers gate their write on this -- the Degraded one only on the
+// passes that rendered, which are the only ones it may write the condition on
+// at all -- because a condition rewritten on every pass re-enqueues the CR
+// through the unfiltered watch (see updateStatusDegraded for what that costs).
+func hostPathDroppedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, hostPathDroppedConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == hostPathDroppedReason && existing.Message == msg
+}
+
+// setHostPathDroppedCondition writes the VolumesDropped condition, or removes
+// it when msg is "" because the spec carries no hostPath any more. The caller
+// does the API write.
+func setHostPathDroppedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, hostPathDroppedConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               hostPathDroppedConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             hostPathDroppedReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
+// oldPodsPossible says whether Pods from a revision older than the template
+// this pass rendered may still be running, and is the argument
+// hostPathDroppedMessage takes to decide whether the message carries
+// hostPathDroppedRollingClause. Named rather than a bare bool because it is
+// not a property of the CR the callers are holding: it is read off the
+// workload, and a caller that cannot see the workload has to say so rather
+// than say no.
+type oldPodsPossible bool
+
+const (
+	// rolloutIncomplete is the workload not having finished rolling the
+	// applied template out, and also the workload not being readable at all
+	// -- see gatewayRollIncomplete for why those share an answer.
+	rolloutIncomplete oldPodsPossible = true
+	// rolloutNotKnownIncomplete is the workload's own status saying the roll
+	// is done, which is as far as the operator can see.
+	rolloutNotKnownIncomplete oldPodsPossible = false
+)
+
+// deploymentRollIncomplete and statefulSetRollIncomplete are the two-term roll
+// test, in one place because both status writers ask it. updateStatusReady
+// carries the argument for the two terms; neither is sound alone.
+func deploymentRollIncomplete(dep *appsv1.Deployment) oldPodsPossible {
+	return oldPodsPossible(dep.Status.ObservedGeneration < dep.Generation ||
+		dep.Status.UpdatedReplicas < dep.Status.Replicas)
+}
+
+func statefulSetRollIncomplete(sts *appsv1.StatefulSet) oldPodsPossible {
+	return oldPodsPossible(sts.Status.ObservedGeneration < sts.Generation ||
+		sts.Status.UpdatedReplicas < sts.Status.Replicas)
+}
+
+// gatewayRollIncomplete answers the same question for a caller that is not
+// already holding the gateway workload, by reading it back.
+//
+// The read does not reach the API server. SetupWithManager Owns both the
+// Deployment and the StatefulSet, so the manager's cache already watches them
+// and r.Get is served from that informer's store; r.APIReader is the uncached
+// reader and this is deliberately not it. That is why the Degraded path can
+// afford to qualify its wording on a parked CR, which an earlier round of this
+// change assumed it could not.
+//
+// A workload it cannot read counts as still rolling. NotFound is not sorted
+// out from a real read error, because the safe answer is the same for both and
+// it is the same direction the two terms already err in on a workload that has
+// only just been created: the clause weakens the condition's claim, so a
+// spurious one under-reports a drop that did happen rather than asserting one
+// that did not.
+func (r *PlatformAgentReconciler) gatewayRollIncomplete(ctx context.Context, agent *agentv1alpha1.PlatformAgent) oldPodsPossible {
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}
+	if useStatefulSet(agent) {
+		sts := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, key, sts); err != nil {
+			return rolloutIncomplete
+		}
+		return statefulSetRollIncomplete(sts)
+	}
+	dep := &appsv1.Deployment{}
+	if err := r.Get(ctx, key, dep); err != nil {
+		return rolloutIncomplete
+	}
+	return deploymentRollIncomplete(dep)
+}
+
+// hostPathDroppedMessage is the VolumesDropped condition's message for the
+// hostPath entries the render left out of the Pod template, or "" when the
+// spec carries none and the condition is to be absent.
+func hostPathDroppedMessage(agent *agentv1alpha1.PlatformAgent, oldPods oldPodsPossible) string {
+	dropped := hostPathVolumes(agent)
+	if len(dropped) == 0 {
+		return ""
+	}
+	entries := make([]string, 0, len(dropped))
+	for _, d := range dropped {
+		entries = append(entries, fmt.Sprintf(hostPathDroppedEntryFormat, d.field, d.index, d.name, d.path))
+	}
+	rolling := ""
+	if oldPods {
+		rolling = hostPathDroppedRollingClause
+	}
+	return fmt.Sprintf(hostPathDroppedMessageFormat, hostPathDroppedEntryList(entries), rolling)
+}
+
+// hostPathDroppedEntryList joins as many entries as fit in
+// hostPathDroppedEntryBudget and counts the rest, so that the message stays
+// under the 32768 characters the CRD schema allows a condition message
+// whatever the spec asks for. See hostPathDroppedEntryBudget for why an
+// unbounded list is not an option: the status write that carries it is the
+// whole status write.
+func hostPathDroppedEntryList(entries []string) string {
+	var b strings.Builder
+	listed := 0
+	for _, entry := range entries {
+		want := len(entry)
+		if listed > 0 {
+			want += len(hostPathDroppedEntrySeparator)
+		}
+		if b.Len()+want > hostPathDroppedEntryBudget {
+			break
+		}
+		if listed > 0 {
+			b.WriteString(hostPathDroppedEntrySeparator)
+		}
+		b.WriteString(entry)
+		listed++
+	}
+	if listed == 0 {
+		// A single entry over the whole budget, which takes one author-chosen
+		// name or path longer than the message may be. Say as much of it as
+		// fits: a cut name is still something to search the spec for, and a
+		// message naming nothing at all is not.
+		b.WriteString(truncateToValidUTF8(entries[0], hostPathDroppedEntryBudget-len(hostPathDroppedEntryEllipsis)))
+		b.WriteString(hostPathDroppedEntryEllipsis)
+		listed = 1
+	}
+	if rest := len(entries) - listed; rest > 0 {
+		fmt.Fprintf(&b, hostPathDroppedOverflowFormat, rest)
+	}
+	return b.String()
+}
+
+// truncateToValidUTF8 cuts s to at most max bytes, dropping any rune the cut
+// lands in the middle of. The API server stores strings as UTF-8, so a message
+// ending in half a rune is a write that either fails or is silently rewritten.
+func truncateToValidUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[:max], "")
 }
 
 func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, profile netpolProfile) bool {
@@ -2609,18 +3073,40 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	reason = "Provisioning"
 	message = "Waiting for deployment replicas to be ready"
 
-	// All three pods, gateway first so an install with a fault in more than one of
-	// them reports the same sentence it always has. The other two are here because
-	// the faults this function names are exactly the ones the split introduced a
-	// new way to hit: a runtimeClassName the cluster has no node pool for, and a
-	// sandbox or broker image tag nothing published. Neither is visible from the
-	// gateway's own pod any more.
-	pods := make([]corev1.Pod, 0)
-	for _, selector := range []map[string]string{
+	// Every pod Ready is a claim about, gateway first so an install with a fault in
+	// more than one of them reports the same sentence it always has. The middle two
+	// are here because the faults this function names are exactly the ones the split
+	// introduced a new way to hit: a runtimeClassName the cluster has no node pool
+	// for, and a sandbox or broker image tag nothing published. Neither is visible
+	// from the gateway's own pod any more.
+	selectors := []map[string]string{
 		{"app": agent.Name + "-gateway"},
 		shellSandboxSelector(agent),
 		{"app": credentialProxyName(agent)},
-	} {
+	}
+
+	// Appended last, for that same reason, one release later: readSplitWorkloads
+	// made the A2A gateway gate Ready, and a workload that gates Ready and is never
+	// scanned leaves an operator with nothing to act on. Unscanned, a gateway pod in
+	// ImagePullBackOff or CrashLoopBackOff reads as "Waiting for Deployment
+	// <agent>-a2a-gateway to become ready" indefinitely -- which is also what the
+	// deliberate callout hold says, and what a slow scheduler says, so the phase
+	// distinguishes none of the three. Scanned, the container fault names itself.
+	//
+	// Last rather than first: the ordering above is load-bearing, and an install
+	// faulting in more than one workload has to keep reporting the sentence it
+	// always did.
+	//
+	// a2aStackRendering, the same predicate readSplitWorkloads gates on and the same
+	// one that renders the Deployment: a today install has no such pod, and a skewed
+	// one has its A2A objects frozen and is already Degraded/ModeNotRecognized for
+	// the skew itself -- a second reason there would report the freeze as a fault.
+	if a2aStackRendering(agent) {
+		selectors = append(selectors, map[string]string{"app": a2aGatewayName(agent)})
+	}
+
+	pods := make([]corev1.Pod, 0)
+	for _, selector := range selectors {
 		podList := &corev1.PodList{}
 		if err := r.List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
 			continue
@@ -2786,6 +3272,24 @@ func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
 	return names
 }
 
+// workloadRenderState says whether the reconcile pass parking the agent on
+// Degraded reached the render, and is the argument updateStatusDegraded takes
+// to decide whether it may touch the VolumesDropped condition. Named rather
+// than a bare bool because the answer is not obvious from the call site: the
+// refusals read top to bottom and only their position in Reconcile says which
+// side of reconcileWorkload they are on.
+type workloadRenderState bool
+
+const (
+	// workloadRendered is the three refusals below the render:
+	// ModeNotRecognized, A2AProvisionFailed, ShellSandboxKeysMissing.
+	workloadRendered workloadRenderState = true
+	// workloadNotRendered is the four above it, which return with the workload
+	// untouched: ForbiddenVolumeMount, ShellSandboxCannotBeDisabled,
+	// RuntimeClassNotFound, EgressAllowlistRefused.
+	workloadNotRendered workloadRenderState = false
+)
+
 // updateStatusDegraded parks the agent on a refusal: phase Degraded, and a
 // Ready=False condition carrying the reason and message. It writes only when
 // something it is about to write differs from what the status already holds.
@@ -2810,13 +3314,58 @@ func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
 // The generation witness is the condition's observedGeneration rather than the
 // top-level field, for the reason updateStatusReady gives: a CRD that predates
 // status.observedGeneration prunes the top-level copy on every write.
-func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string) error {
+//
+// rendered says whether the caller got as far as reconcileWorkload, and gates
+// the VolumesDropped condition alone -- everything else here is written either
+// way. See workloadRenderState.
+func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState) error {
+	// VolumesDropped rides along on a pass that rendered, because the strip it
+	// reports happens at render and three of the refusals that land here
+	// render first (see the condition's own comment). It is in the comparison
+	// as well as the write: without that, a CR parked on one of those refusals
+	// with an unchanged Ready would leave the condition unwritten forever.
+	//
+	// A pre-render refusal neither writes it nor clears it. Not writes,
+	// because the Pod still running is the previous pass's and the strip may
+	// never have reached it; not clears, because a condition already on the CR
+	// was written by a pass that did render, and that render is still what the
+	// running Pod is -- so it is left exactly as it stands, stale wording and
+	// all, until a pass renders again and refreshes or removes it. That errs
+	// towards over-reporting a drop that has happened, never towards claiming
+	// one that has not. It drops out of the comparison on those passes for the
+	// same reason: a term no write can satisfy would make every requeue tick a
+	// status write (#1392).
+	hostPathDroppedMsg := ""
+	hostPathDroppedUnchanged := true
+	if rendered {
+		// Qualified the same way updateStatusReady qualifies it. That function
+		// reads the roll off the gateway workload it fetches anyway; this one
+		// is handed the CR and the refusal and nothing else, so it reads the
+		// workload back through gatewayRollIncomplete, which is a cache hit
+		// and not an API request. A CR parked on one of these three refusals
+		// has exactly the same window as one reading Ready -- the render
+		// applied a template and the apply returns before the Pods carrying
+		// the hostPath are gone -- so saying it more strongly here would be
+		// the one wording that can claim a security property the cluster does
+		// not have.
+		//
+		// Only asked when there is something to report. On the CRs that never
+		// carried a hostPath, which is nearly all of them, a parked pass does
+		// no workload read at all.
+		oldPods := rolloutNotKnownIncomplete
+		if len(hostPathVolumes(agent)) > 0 {
+			oldPods = r.gatewayRollIncomplete(ctx, agent)
+		}
+		hostPathDroppedMsg = hostPathDroppedMessage(agent, oldPods)
+		hostPathDroppedUnchanged = hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
+	}
 	if existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); existing != nil &&
 		agent.Status.Phase == "Degraded" &&
 		existing.Status == metav1.ConditionFalse &&
 		existing.Reason == reason &&
 		existing.Message == message &&
-		existing.ObservedGeneration == agent.Generation {
+		existing.ObservedGeneration == agent.Generation &&
+		hostPathDroppedUnchanged {
 		return nil
 	}
 
@@ -2834,6 +3383,9 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		LastTransitionTime: now,
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)
+	if rendered {
+		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
+	}
 	return r.Status().Update(ctx, agent)
 }
 

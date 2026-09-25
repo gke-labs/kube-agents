@@ -211,6 +211,7 @@ module "gke_cluster" {
   cluster_name               = var.cluster_name
   cluster_mode               = var.cluster_mode
   create_cluster             = var.create_cluster
+  accept_no_network_policy   = var.accept_no_network_policy
   location                   = var.location
   deletion_protection        = var.deletion_protection
   release_channel            = var.release_channel
@@ -543,6 +544,7 @@ resource "helm_release" "kube_agents" {
       {
         modelProvider    = var.model_provider
         modelDefaultName = var.model_default_name
+        maxTokens        = var.model_max_tokens
       },
       local.use_vertex ? {
         vertex = {
@@ -556,6 +558,14 @@ resource "helm_release" "kube_agents" {
       } : {}
     )
     platformAgent = {
+      # The durable record of an adoption that accepted a cluster with no
+      # NetworkPolicy enforcement. Derived from what the module read, not from
+      # the variable that admitted it: a cluster that later gains Dataplane V2
+      # drops the annotation on the next apply, and one that never lacked
+      # enforcement never carries it, whatever accept_no_network_policy says.
+      annotations = module.gke_cluster.network_policy_enforced ? {} : {
+        "kubeagents.x-k8s.io/network-policy-enforcement" = "absent-accepted"
+      }
       harness = {
         clusterName = module.gke_cluster.cluster_name
         location    = module.gke_cluster.cluster_location
@@ -650,7 +660,7 @@ resource "helm_release" "kube_agents" {
         org     = local.github_org
         repo    = local.github_repo_name
         appId   = var.github_app_id
-        # The minty rule's only gate on platform-agent-scope is assertion.email
+        # The minty rule's only gate on either scope is assertion.email
         # against this value; left unset the chart falls back to the fixed
         # kubeagents-platform-gsa name, so an install that overrides
         # agent_service_account_id would annotate one GSA and allowlist another.

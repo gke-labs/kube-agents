@@ -94,6 +94,76 @@ It sits here rather than on the Chat Agent's roster because that roster delivers
 `local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
 under this roster `HERMES_HOME` is `profiles/platform`, which holds no board.
 
+## `feedback-prompt` asks once, a week after it first runs
+
+The one entry here whose product is a question to the operator rather than a
+report on the fleet. Every feedback channel kube-agents has is
+reporter-initiated: the tracker, the public form behind the short link, and the
+agent handing out both when asked. `feedback_prompt.py` is the one place the
+product asks, and it does so once per install: a fixed message in the home
+chat channel carrying the form's short link, the form's disclosure that a
+submission becomes a public issue, and a line saying a reply in the thread
+reaches the agent. `deliver: "chat"` is what makes that last line true; the
+Chat Agent posts the message and owns the thread.
+
+It is a daily cron entry that fires once, not a Hermes one-shot, and the
+reason is this roster's merge. A shipped entry cannot carry an absolute
+`run_at`, and a completed one-shot is pruned from the store after seven days,
+at which point `merge_cron_store` sees an id the volume lacks and re-adds it,
+re-arming the prompt. So the once-only state lives outside the store, in two
+marker files in the profile home (`HERMES_HOME` under this roster is
+`profiles/platform`): `.feedback_prompt_armed`, created with `O_EXCL` on the
+first tick and holding the anchor time, and `.feedback_prompt_sent`, claimed
+with `O_EXCL` before anything reaches stdout, the same claim
+`bootstrap_delivery.py` makes and for the same reason, holding the time of the
+claim. Both sit on the data volume, which survives
+restarts and image rolls and dies only with an uninstall, so an upgrade is not
+a new install.
+
+Printing is not delivering: the relay runs after the script, and a claim taken
+on a day the relay, the Session KV server or the chat platform was down, or on
+an install that had bound no chat platform yet, spends the one message on
+nothing. The script does not read the scheduler's record of that delivery
+(`last_delivery_error` on its entry in this profile's `cron/jobs.json`, the
+field `chat_delivery_watch.py` grades) to post again, because the record
+cannot tell a post that landed from one that did not: a `hermes send` that
+posts, exits 0 and prints no readable message id is recorded as `composed but
+not delivered`, the same words as a send that failed, and so is a relay that
+raises or times out after the post has gone out. A retry on that record posts
+the request twice, and a message in a channel cannot be taken back. So the
+job fails in the direction of at most once: a post the scheduler recorded as
+undelivered is a lost request, which `chat-delivery-watch` counts like any
+other failed delivery, and which an operator sends again by removing
+`.feedback_prompt_sent` from the profile home, after which the next tick
+claims afresh. One Chat Agent composition is all the job ever costs, on the
+one tick that prints. The clock starts at the first
+tick, not at any record of when the install finished: nothing in the operator
+status carries a ready-since time, and the Chat Agent's onboarding markers
+live in a different home. An install that predates the entry therefore gets
+the message a week after the upgrade that brings it.
+
+Every other tick prints nothing and relays nothing, so once the message has
+landed the job costs one silent subprocess a day, like `github-repo-watcher`'s idle
+ticks. Two environment variables, set per install through the CR's
+`spec.deployment.env` and passed to the agent container by the operator's
+allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENABLED`
+(default `true`; `false` neither arms nor claims, so an install that turns it
+on later still gets exactly one) and `FEEDBACK_PROMPT_DELAY` (default `7d`;
+`<n>d`, `<n>h` or `<n>m`). A delay that does not parse is a failed run, exit 1
+with the reason on stderr, which the scheduler reports in chat like any other
+script failure until the value is fixed; it does not fall back, because the
+scheduler keeps a zero-exit script's stderr nowhere and a silent fallback
+would leave no trace but the message arriving a week early. The schedule is
+daily, so whatever the delay, the message lands on the first 13:00 UTC tick
+at or after it; a delay of a day or more is compared with ten minutes of
+slack, because the tick's own time drifts by seconds from one day to the next
+and a strict week would otherwise land on day eight. The form URL is a
+constant, never a knob: the short link is the only address the maintainers
+publish. `enabled: false` on the entry stays the fleet-wide switch, and
+retiring it follows the two-step path below like any other id; deleting the
+entry outright would leave the volume's copy firing against a script the next
+image no longer ships.
+
 ## Never put an id on both rosters
 
 Do not add any id here to `agents/chat/defaults/cron/jobs.json` as well. Two
@@ -104,7 +174,7 @@ concurrently with itself, writing its ledger issue twice. The per-job lock
 ## `deliver` is `"local"` on exactly one job
 
 Every enabled job here sets `deliver` to `"chat"` or `"all"`, the two audible
-values, with one exception below. `cron/scheduler.py::_resolve_delivery_targets`
+values, with one exception below. `cron/scheduler_delivery.py::_resolve_delivery_targets`
 returns an **empty target list** for `"local"` — the outcome is written to
 `last_output` and delivered nowhere. A watchdog whose run failed would then be
 indistinguishable from a quiet fleet. Both audible values carry a failure: the
@@ -125,6 +195,12 @@ under "Detecting a broken leg".
 `test_every_watchdog_declares_all_delivery` in
 `../skills/fleet-audit/scripts/test_audit_report.py` enforces this, and carries
 the exemption by name, pinned to a `no_agent` entry whose script exists.
+
+A misspelled `deliver` part next to one that resolves is dropped by the scheduler
+with the run still recording `ok`. `check_cron_delivery` in
+`scripts/check_prompt_assets.py` (`make prompt-check`) refuses a value outside the
+`CRON_DELIVER_VALUES` set in that file, bare or as a `platform:chat_id` prefix, so
+the typo fails the pull request instead.
 
 ## `deliver: "chat"` — reporting through the Chat Agent
 

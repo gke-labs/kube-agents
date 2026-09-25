@@ -121,6 +121,31 @@ const (
 	// error strings gVisor never raises, so the operator, which knows the runtime
 	// for certain, pins the mode instead.
 	sqliteJournalModeDelete = "delete"
+
+	// agentAPIAuthCPULimit and agentAPIAuthMemoryLimit size the agent-api-auth native sidecar's
+	// resource limits. The CPU limit is 1, down from 2 (#749).
+	//
+	// The 22m measured across 19 watched Cluster Agent profiles is the container's total,
+	// so one core is roughly 45x the observed use rather than a budget for the watcher alone.
+	//
+	// GOMAXPROCS has been cgroup-aware since Go 1.25 and k8s-operator builds with 1.27
+	// (k8s-operator/go.mod), so dropping this limit from 2 to 1 sets the
+	// k8s-event-watcher's GOMAXPROCS to 1. Go rounds up, so choosing 1 rather than 500m
+	// keeps GOMAXPROCS=1 while preserving a full core of burst.
+	//
+	// Memory limit must stay at 2Gi: the event watcher reads this limit via Downward API
+	// (EVENT_WATCHER_MEMORY_LIMIT_BYTES) to set GOMEMLIMIT to half of it.
+	agentAPIAuthCPULimit              = "1"
+	agentAPIAuthMemoryLimit           = "2Gi"
+	agentAPIAuthEphemeralStorageLimit = "2Gi"
+	agentAPIAuthCPURequest            = "150m"
+	agentAPIAuthMemoryRequest         = "384Mi"
+
+	// hostPathExtraVolumesField and hostPathSidecarVolumesField are the two CR
+	// lists a user-authored volume arrives on, spelled the way the
+	// VolumesDropped condition names them. See hostPathVolumes.
+	hostPathExtraVolumesField   = "spec.deployment.extraVolumes"
+	hostPathSidecarVolumesField = "spec.deployment.sidecarVolumes"
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -225,6 +250,74 @@ const credentialProxyPolicyJSON = `{
   ]
 }`
 
+// scopeDeclaration is the on-disk shape of spec.scope, the file
+// cluster_agent_reconcile.py reads. Field order is the JSON order; every list is
+// sorted before rendering so an unchanged CR renders byte-identical bytes and the
+// config hash does not move.
+type scopeDeclaration struct {
+	// Present says whether the CR carries a scope block at all. The reconcile reads a
+	// block that is absent as "nothing declared": it lists the management project alone
+	// and retires nothing, because the ordinary way a block goes missing is a write
+	// through an older operator's webhook, not an operator dropping every project. An
+	// empty `projects` list in a present block is the declaration that drops projects.
+	Present  bool                    `json:"present"`
+	Projects []string                `json:"projects"`
+	Exclude  scopeExcludeDeclaration `json:"exclude"`
+}
+
+type scopeExcludeDeclaration struct {
+	Projects []string                        `json:"projects"`
+	Clusters []agentv1alpha1.ScopeClusterRef `json:"clusters"`
+}
+
+// renderScopeJSON renders spec.scope for the pod. It is rendered on every install,
+// an empty declaration when the CR has no scope, so that the reconcile can tell
+// "the operator declared nothing" from "the declaration never reached this pod":
+// the second is what a rollback to an operator without the field looks like, and
+// the reconcile must not prune on it (docs/designs/multi-project-scope.md §7). The
+// `present` flag tells a CR with no block (false) from one whose block is present
+// but empty (true): an empty block and a block whose every list is empty render the
+// same bytes, and a missing block renders differently by that one field.
+func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
+	scope := agent.Spec.Scope
+	if scope == nil {
+		scope = &agentv1alpha1.ScopeSpec{}
+	}
+	decl := scopeDeclaration{
+		Present:  agent.Spec.Scope != nil,
+		Projects: append([]string{}, scope.Projects...),
+		Exclude: scopeExcludeDeclaration{
+			Projects: []string{},
+			Clusters: []agentv1alpha1.ScopeClusterRef{},
+		},
+	}
+	if scope.Exclude != nil {
+		decl.Exclude.Projects = append(decl.Exclude.Projects, scope.Exclude.Projects...)
+		decl.Exclude.Clusters = append(decl.Exclude.Clusters, scope.Exclude.Clusters...)
+	}
+	sort.Strings(decl.Projects)
+	sort.Strings(decl.Exclude.Projects)
+	sort.Slice(decl.Exclude.Clusters, func(i, j int) bool {
+		a, b := decl.Exclude.Clusters[i], decl.Exclude.Clusters[j]
+		if a.ProjectID != b.ProjectID {
+			return a.ProjectID < b.ProjectID
+		}
+		if a.Location != b.Location {
+			return a.Location < b.Location
+		}
+		return a.ClusterName < b.ClusterName
+	})
+	out, err := json.MarshalIndent(decl, "", "  ")
+	if err != nil {
+		// Three string slices cannot fail to marshal; if they ever do, an empty
+		// scope is the safe render: the reconcile falls back to today's behaviour
+		// rather than acting on a partial declaration.
+		manifestsLog.Error(err, "rendering spec.scope failed; rendering no scope")
+		return ""
+	}
+	return string(out) + "\n"
+}
+
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
@@ -273,6 +366,7 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 		managedEnvKey:     renderManagedEnv(agent),
 		"leader_elect.py": leaderElectScript,
 	}
+	data[scopeConfigKey] = renderScopeJSON(agent)
 
 	untargeted, targeted := partitionPluginsByProfile(filterValidAgentPlugins(agentPlugins))
 
@@ -377,7 +471,7 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// UNCONDITIONAL, and one of the three pins here that are not about chat. Every chat key
+	// UNCONDITIONAL, and one of the five pins here that are not about chat. Every chat key
 	// below exists because the agent could otherwise write a competing value into the PVC
 	// .env; this one exists because something already does, on every boot, without being
 	// asked.
@@ -426,6 +520,23 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// from the container env: one delivery path means one answer
 	// (docs/designs/spec-mode-switch.md).
 	add(kubeagentsModeEnvKey, string(renderMode(agent, "settings")))
+
+	// The scope path, pinned for the same reason as HERMES_HOME_MODE: the container env
+	// is the layer a line in the PVC .env outranks, and the reconcile is a cron script
+	// that inherits the gateway's environment after that file is applied. Without the
+	// pin, one `KUBEAGENTS_SCOPE_FILE=/opt/data/scope.json` line written by the agent
+	// would hand it a declaration it authored; with it, save_env_value refuses the key
+	// and the ConfigMap stays the only answer to "what is declared".
+	add(scopeFileEnvKey, scopeDir+"/"+scopeFileName)
+
+	// RECONCILE_PROJECT, pinned empty. The reconcile reads it as the management project
+	// ahead of the metadata server, and since the scope prune exists a management
+	// identity that changes retires the old project's profiles. Unpinned, one line in
+	// the PVC .env would re-point it, and two clean runs later every profile of the
+	// real management project would be gone. Nothing in the operator or the chart sets
+	// it, so pinning it empty costs no install anything; the script treats an empty
+	// value as unset and asks the metadata server.
+	add(reconcileProjectEnvKey, "")
 
 	integration := agent.Spec.Integration
 	if integration == nil {
@@ -664,6 +775,29 @@ const (
 	// managedVolumeName projects the two keys above into managedScopeDir under the names
 	// Hermes expects (config.yaml and .env).
 	managedVolumeName = "platform-agent-managed-vol"
+
+	// scopeConfigKey holds the rendered spec.scope in the config ConfigMap, on every install:
+	// an empty declaration when the CR has no scope, so the reconcile can tell a declared
+	// nothing from a render that never arrived. It rides in this ConfigMap so a scope edit
+	// moves the config hash and rolls the pod (docs/designs/multi-project-scope.md §5).
+	scopeConfigKey = "scope.json"
+
+	// scopeVolumeName projects scopeConfigKey into scopeDir for the agent container. The
+	// volume is marked optional so a ConfigMap written by an older operator, which has no
+	// such key, still mounts (as an empty directory) instead of holding the pod in
+	// ContainerCreating during a roll; the reader treats the missing file as "no render",
+	// not as an empty scope. It is not under managedScopeDir on purpose: /etc/hermes is
+	// Hermes' administrator policy directory and holds exactly what managed_scope.py reads.
+	scopeVolumeName = "platform-agent-scope-vol"
+	scopeDir        = "/etc/kube-agents"
+	scopeFileName   = "scope.json"
+
+	// scopeFileEnvKey tells cluster_agent_reconcile.py where the declaration is. One
+	// reader, by design; a second code site naming this key is a review comment.
+	scopeFileEnvKey = "KUBEAGENTS_SCOPE_FILE"
+	// reconcileProjectEnvKey is the reconcile's management-project override, pinned
+	// empty in the managed .env (see renderManagedEnv) so the agent cannot write it.
+	reconcileProjectEnvKey = "RECONCILE_PROJECT"
 
 	// gitopsStateVolumeName projects the GitOps state ConfigMap as a mounted directory
 	// volume into the agent container so skills can read managed repositories directly from disk.
@@ -942,7 +1076,10 @@ var frontDoorPlugins = []string{
 // block to the platform profile; nothing renders them for the default profile, whose
 // copy is the image's. TestFrontDoorKanbanMatchesChatConfig fails the build when the two
 // drift, and the note beside each key in that file is the reasoning for its value.
-const kanbanDispatchIntervalSeconds = 5
+const (
+	kanbanDispatchIntervalSeconds     = 5
+	kanbanDispatchStaleTimeoutSeconds = 1800
+)
 
 var kanbanWakeOnEvents = []string{"gave_up", "crashed", "timed_out", "blocked"}
 
@@ -976,11 +1113,12 @@ func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
 // quietly having no effect at all.
 func frontDoorKanban(agent *agentv1alpha1.PlatformAgent) map[string]any {
 	return map[string]any{
-		"dispatch_in_gateway":       true,
-		"auto_subscribe_on_create":  true,
-		"dispatch_interval_seconds": kanbanDispatchIntervalSeconds,
-		"wake_on_events":            slices.Clone(kanbanWakeOnEvents),
-		"max_in_progress":           resolveKanbanMaxInProgress(agent),
+		"dispatch_in_gateway":            true,
+		"auto_subscribe_on_create":       true,
+		"dispatch_interval_seconds":      kanbanDispatchIntervalSeconds,
+		"dispatch_stale_timeout_seconds": kanbanDispatchStaleTimeoutSeconds,
+		"wake_on_events":                 slices.Clone(kanbanWakeOnEvents),
+		"max_in_progress":                resolveKanbanMaxInProgress(agent),
 	}
 }
 
@@ -1952,6 +2090,162 @@ func lastWinsEnv(env []corev1.EnvVar) []corev1.EnvVar {
 	return out
 }
 
+// droppedHostPathVolume is one user-authored volume the render left out of the
+// Pod because its source is a hostPath: the CR list it sits on, its index
+// there, its name, and the host path it asked for, which is what the
+// VolumesDropped condition has to say for the author to find the entry.
+type droppedHostPathVolume struct {
+	field string
+	index int
+	name  string
+	path  string
+}
+
+// hostPathVolumes lists the entries on spec.deployment.extraVolumes and
+// spec.deployment.sidecarVolumes whose source is a hostPath, in spec order.
+//
+// The admission webhook refuses these with a field error that tells the author
+// why, and on an install where it runs this returns nothing. It does not run on
+// a Helm install at the chart's defaults (operator.webhooks.enabled is false),
+// and when the chart does register it, failurePolicy: Ignore admits the CR
+// with validation skipped for as long as the webhook Pod is unreachable. The
+// controller used to copy both lists into the Pod verbatim, so on either
+// install a hostPath reached the agent Pod, which is the widest-reach workload
+// in the namespace and where model output executes (#1671).
+//
+// This is the layer that holds when admission did not run. The render leaves
+// the volume out of the Pod, and every volumeMount naming it out of the
+// containers the CR authored, because a mount naming a volume the Pod does not
+// declare is a Deployment the API server rejects, which wedges every reconcile
+// with nothing in status to say why. The drop is reported rather than parked
+// on: a pass that rendered writes the VolumesDropped condition while the spec
+// carries a hostPath and removes it once the entry is gone, so the agent keeps
+// running and the CR says what it is running without. Both status writers do
+// that, not only updateStatusReady, because three of the refusals that park the
+// CR on Degraded sit below the render and would otherwise drop the condition
+// off a CR whose template really is missing these volumes. The refusals above
+// the render neither write it nor clear it: that pass rendered nothing, so it
+// knows nothing about the template the workload is carrying, and the condition
+// the last rendering pass left is still the better answer (see
+// hostPathDroppedConditionType).
+func hostPathVolumes(agent *agentv1alpha1.PlatformAgent) []droppedHostPathVolume {
+	if agent.Spec.Deployment == nil {
+		return nil
+	}
+	var dropped []droppedHostPathVolume
+	collect := func(field string, volumes []corev1.Volume) {
+		for i, vol := range volumes {
+			if vol.HostPath == nil {
+				continue
+			}
+			dropped = append(dropped, droppedHostPathVolume{field: field, index: i, name: vol.Name, path: vol.HostPath.Path})
+		}
+	}
+	collect(hostPathExtraVolumesField, agent.Spec.Deployment.ExtraVolumes)
+	collect(hostPathSidecarVolumesField, agent.Spec.Deployment.SidecarVolumes)
+	return dropped
+}
+
+// hostPathVolumeNames is the set of volume names hostPathVolumes would drop,
+// which is what the mount filters key on. Empty when nothing is dropped, and
+// every filter below returns its input unchanged in that case, so a CR with no
+// hostPath renders the same bytes it always did.
+func hostPathVolumeNames(agent *agentv1alpha1.PlatformAgent) map[string]bool {
+	dropped := hostPathVolumes(agent)
+	if len(dropped) == 0 {
+		return nil
+	}
+	names := make(map[string]bool, len(dropped))
+	for _, d := range dropped {
+		names[d.name] = true
+	}
+	return names
+}
+
+// stripMatching returns s without the elements drop reports true for, and
+// returns s itself when drop matches none of them.
+//
+// One helper rather than a filter loop per reservation. buildPodTemplateSpec
+// now applies two of them to the same four user-authored lists -- the hostPath
+// source strip below and the bus-token name strip from gke-labs#1653 -- and
+// gke-labs#1667 adds a third; written out longhand they were the same fourteen
+// lines with the predicate swapped, and the interesting part of each is the
+// predicate and the comment above it.
+//
+// Not slices.DeleteFunc, which compacts in place. Every caller here is
+// filtering a list that came off the manager's cached copy of the CR, so
+// rewriting the backing array would edit the informer's object underneath
+// every other reader of it. Returning the input unchanged when there is
+// nothing to drop is what keeps a clean CR rendering the same bytes it always
+// did, and keeps the cost of a reservation nobody tripped at one scan.
+func stripMatching[E any](s []E, drop func(E) bool) []E {
+	if !slices.ContainsFunc(s, drop) {
+		return s
+	}
+	keep := make([]E, 0, len(s))
+	for _, e := range s {
+		if drop(e) {
+			continue
+		}
+		keep = append(keep, e)
+	}
+	return keep
+}
+
+// stripContainerMountsMatching applies stripMatching to the volumeMounts of
+// every container in the list. A container whose mounts change is copied
+// rather than edited in place, for stripMatching's reason -- these containers
+// are the CR's own, off the cache -- and the input slice is returned as-is
+// when no container is affected.
+func stripContainerMountsMatching(containers []corev1.Container, drop func(corev1.VolumeMount) bool) []corev1.Container {
+	var out []corev1.Container
+	for i, c := range containers {
+		kept := stripMatching(c.VolumeMounts, drop)
+		if len(kept) == len(c.VolumeMounts) {
+			if out != nil {
+				out = append(out, c)
+			}
+			continue
+		}
+		if out == nil {
+			out = make([]corev1.Container, 0, len(containers))
+			out = append(out, containers[:i]...)
+		}
+		c.VolumeMounts = kept
+		out = append(out, c)
+	}
+	if out == nil {
+		return containers
+	}
+	return out
+}
+
+// stripHostPathVolumes returns volumes without the entries whose source is a
+// hostPath. This is the source-type predicate: unlike the bus-token strip next
+// to it, it matches on what the volume is and not on what it is called, so a
+// CR cannot dodge it by renaming the entry.
+func stripHostPathVolumes(volumes []corev1.Volume) []corev1.Volume {
+	return stripMatching(volumes, func(v corev1.Volume) bool { return v.HostPath != nil })
+}
+
+// stripVolumeMountsNamed returns mounts without the entries naming a volume in
+// dropped. Name-matched rather than source-matched because a mount names a
+// volume and carries no source of its own; dropped comes from
+// hostPathVolumeNames, which resolved the sources.
+func stripVolumeMountsNamed(mounts []corev1.VolumeMount, dropped map[string]bool) []corev1.VolumeMount {
+	return stripMatching(mounts, func(m corev1.VolumeMount) bool { return dropped[m.Name] })
+}
+
+// stripContainerMountsNamed is stripVolumeMountsNamed over a list of
+// containers. An empty dropped set needs no guard here: no mount matches, so
+// stripContainerMountsMatching hands back the CR's own container slice, which
+// is what a clean CR rendering unchanged depends on. An earlier version of
+// this carried a len check and a comment crediting it with that, which the
+// callee does anyway.
+func stripContainerMountsNamed(containers []corev1.Container, dropped map[string]bool) []corev1.Container {
+	return stripContainerMountsMatching(containers, func(m corev1.VolumeMount) bool { return dropped[m.Name] })
+}
+
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
 func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) corev1.PodTemplateSpec {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
@@ -1970,12 +2264,53 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	var sidecarVolumes []corev1.Volume
 	var extraVolumes []corev1.Volume
 	var podAnnotations map[string]string
+	// A hostPath entry on either volume list stays out of the Pod, and so does
+	// every mount naming it on the containers the CR authored. Computed once
+	// here and handed to buildBaseContainers below, which applies the same
+	// filter to the agent container's extraVolumeMounts. Empty on a CR with no
+	// spec.deployment, which is the same answer the scan would give. See
+	// hostPathVolumes for why the webhook's refusal is not enough on its own,
+	// and why the mounts have to go with the volume.
+	droppedVolumes := hostPathVolumeNames(agent)
 	if agent.Spec.Deployment != nil {
-		initContainers = agent.Spec.Deployment.InitContainers
-		sidecars = agent.Spec.Deployment.Sidecars
-		sidecarVolumes = agent.Spec.Deployment.SidecarVolumes
-		extraVolumes = agent.Spec.Deployment.ExtraVolumes
+		initContainers = stripContainerMountsNamed(agent.Spec.Deployment.InitContainers, droppedVolumes)
+		sidecars = stripContainerMountsNamed(agent.Spec.Deployment.Sidecars, droppedVolumes)
+		sidecarVolumes = stripHostPathVolumes(agent.Spec.Deployment.SidecarVolumes)
+		extraVolumes = stripHostPathVolumes(agent.Spec.Deployment.ExtraVolumes)
 		podAnnotations = agent.Spec.Deployment.PodAnnotations
+	}
+	// The four slices above are still the CR's own, filtered for hostPath and
+	// nothing else: no operator-owned container or volume has joined them yet,
+	// which is what the strip below depends on. Under `next` the pod carries a
+	// projected bus token that belongs to the platform-agent container alone.
+	// Take the mount away from anything else that names it, before the
+	// operator's own containers join the slices -- see
+	// a2aStripBusTokenMounts for what a sidecar holding it would be. Gated on
+	// the surface for the same reason the plugin env drop is: on a today
+	// install there is no such volume, and dropping a name only the next stack
+	// cares about would be one more way to tell the feature exists.
+	//
+	// Two halves. The name half takes the reserved volume name. The source
+	// half takes any user volume that would deliver the same credential under
+	// another name -- a serviceAccountToken projection for the bus audience,
+	// or any of the Secrets the bus renders credentials into -- and every
+	// mount naming it, because a mount
+	// with no volume is a Deployment the API server refuses. Neither half is a
+	// boundary against a hostile sidecar: KSA tokens are pod-scoped and the
+	// callout cannot tell which container presented one. Both are a guard
+	// against a misconfiguration by the CR's author, and are worth having on
+	// those terms -- see a2aBusCredentialVolumeNames.
+	if a2aAgentSurface(agent) {
+		initContainers = a2aStripBusTokenMounts(initContainers)
+		sidecars = a2aStripBusTokenMounts(sidecars)
+		sidecarVolumes = a2aStripBusTokenVolume(sidecarVolumes)
+		extraVolumes = a2aStripBusTokenVolume(extraVolumes)
+
+		droppedSources := a2aBusCredentialVolumeNames(agent)
+		initContainers = stripContainerMountsNamed(initContainers, droppedSources)
+		sidecars = stripContainerMountsNamed(sidecars, droppedSources)
+		sidecarVolumes = a2aStripBusCredentialSources(sidecarVolumes, agent.Name)
+		extraVolumes = a2aStripBusCredentialSources(extraVolumes, agent.Name)
 	}
 
 	homeDir := "/opt/data"
@@ -2069,10 +2404,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// Neither grants access to any cloud API, any repository, or anything
 	// outside the pod, which is the property the isolation boundary protects.
 	//
-	// The third is NATS_PASSWORD, appended further down under mode: next, and
-	// it is the one that does not have that property: it authenticates to the
-	// A2A bus over the cluster network. Do not reason about what this Pod
-	// holds from this block alone.
+	// There is no third any more. NATS_PASSWORD used to be appended further
+	// down under mode: next, and it was the one that did not have that
+	// property: it authenticated to the A2A bus over the cluster network. A5
+	// moved this container onto a projected token, so the bus credential is no
+	// longer an environment variable at all -- it is the file at
+	// a2aBusTokenPath, and the reasons it is not in reach of a plugin are the
+	// mount, not this list. Do not reason about what this Pod holds from this
+	// block alone.
 	// See docs/credential-isolation-design.md.
 	envVars = append(envVars,
 		corev1.EnvVar{
@@ -2284,10 +2623,29 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// surface rather than unconditional so a today install's plugin env is
 		// untouched — dropping a name only the next stack cares about would be
 		// one more way to tell the feature exists.
+		//
+		// NATS_USER and NATS_PASSWORD are not appended any more — A5 moved this
+		// container onto a projected token — so the duplicate-key argument does
+		// not reach them and a different one does: the `a2a` CLI falls back to
+		// user/password when no bus token is readable, so a plugin that set
+		// them would be choosing the identity this container connects as. The
+		// CR's own spec.deployment.env never reaches this container to begin
+		// with — safeSandboxEnvOverrides copies a fixed allowlist and no bus
+		// name is on it — and their SensitiveEnvVars entries are what turn an
+		// attempt into a webhook rejection rather than a silent no-op. This
+		// drop is the same refusal one layer further out, at the env source
+		// with no allowlist in front of it and no webhook looking at it.
+		//
+		// A2A_BUS_TOKEN_FILE is dropped for the stronger version of that: the
+		// operator never renders it, the client prefers it over the projected
+		// path with no fallback, and a plugin that set it would choose which
+		// file this container presents as its bearer token.
 		if a2aAgentSurface(agent) {
 			kept := extEnvs[:0]
 			for _, e := range extEnvs {
-				if e.Name == "NATS_URL" || e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
+				if e.Name == "NATS_URL" || e.Name == a2aBusUserEnv ||
+					e.Name == a2aBusTokenFileEnv ||
+					e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
 					continue
 				}
 				kept = append(kept, e)
@@ -2316,6 +2674,16 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "HERMES_MANAGED_DIR",
 		Value: managedScopeDir,
 	})
+	// Always set, scope or not: the file is always rendered, and a fixed path keeps "what
+	// is declared" a question about the ConfigMap alone. Also pinned in the managed .env
+	// (renderManagedEnv), which is the layer that makes the container env's answer stick.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  scopeFileEnvKey,
+		Value: scopeDir + "/" + scopeFileName,
+	})
+	// The managed .env pins RECONCILE_PROJECT empty (renderManagedEnv says why), and the
+	// two renders must agree, so the container env carries the same empty value.
+	envVars = append(envVars, corev1.EnvVar{Name: reconcileProjectEnvKey, Value: ""})
 	// The other half of the umask note at the top of this file. That umask governs what
 	// the entrypoints create; this governs what Hermes then re-tightens. Hermes chmods
 	// HERMES_HOME and ten named subdirectories to 0700 on every process start, and a cron
@@ -2398,34 +2766,43 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 		Value: credentialProxyTokenMountPath + "/token",
 	})
-	// The A2A bus, under `next` only: address and credentials for the worker
-	// user, whose grants fit an agent-side reader — subscribe on a2a.topics.>,
-	// publish on the provisioned topics. From the same Secret the A2A gateway
-	// reads, and container env only: a copy in a profile .env on the PVC would
-	// be a second place to rotate and a first place to leak. A bridge sidecar
-	// declared in spec.deployment.sidecars shares the pod and declares the
-	// same three against the same Secret, so this is one Secret seam, not two.
+	// The A2A bus, under `next` only: the address, and the name this container
+	// authenticates as. There is no password here since A5. The credential is
+	// the projected ServiceAccount token mounted below, the callout resolves it
+	// against the cluster, and the grants it gets back are agentIdentity's —
+	// the blackboard and nothing else. What this replaced was NATS_USER=worker
+	// and a worker-password SecretKeyRef: a static credential, shared with the
+	// bridge sidecar, carrying publish on every addressee's task events.
 	//
-	// APPENDED AFTER THE PLUGIN MERGE, and this one is not about pins but about
-	// a credential. NATS_PASSWORD is injected by SecretKeyRef, so the value
-	// lands in the container whatever the address says; if a plugin could set
-	// NATS_URL, the client would hand the worker password to an address of the
-	// plugin's choosing, in the CONNECT frame, in plaintext — and egress rule 7
-	// permits 443 to the internet whenever FQDN policy is off, so it leaves the
-	// cluster. It cannot: the three names are dropped from plugin env above
-	// while the surface is up, and they are in SensitiveEnvVars so the CR's
-	// own spec.deployment.env cannot reach them either. Found by adversarial
-	// review before this shipped.
+	// A2A_BUS_USER is not decoration and not a second copy of a secret. A
+	// callout principal's grants carry its own inbox prefix (_INBOX.agent.>),
+	// and a client that does not pin a matching prefix authenticates fine and
+	// then hangs on every JetStream reply — the failure shape W6 found twice.
+	// The operator renders the name and the client reads it back, so the two
+	// cannot drift; the provision Job does the same thing with a literal in its
+	// script.
 	//
-	// The SecretKeyRef is Optional, and that is what keeps the skew branch of
-	// a2aAgentSurface inert rather than fatal: on a today-lineage install that
-	// hit skew the creds Secret has never existed, and a required ref there
-	// would roll the pod (strategy Recreate) into CreateContainerConfigError —
-	// a full agent outage bought by a helper that exists to prevent one. With
-	// Optional the kubelet omits the variable when the Secret is absent and
-	// injects it when a frozen next stack's Secret exists, which is the freeze
-	// the helper promises. Under plain next the Secret is reconciled into
-	// existence before anything dials, so Optional costs nothing there.
+	// APPENDED AFTER THE PLUGIN MERGE, and the reason survives the move off a
+	// password. A plugin that could set NATS_URL would point this container's
+	// bus client at an address of its choosing, and egress rule 7 permits 443
+	// to the internet whenever FQDN policy is off. A bearer token in a CONNECT
+	// frame to an attacker's server is the same exfiltration the password was;
+	// it is audience-bound, so it does not authenticate anywhere else, but it
+	// still names this ServiceAccount to whoever catches it. So the names stay
+	// dropped from plugin env above while the surface is up. The CR's own
+	// spec.deployment.env is a different layer: safeSandboxEnvOverrides is an
+	// allowlist and no bus name is on it, so a CR entry cannot reach this
+	// container at all — the SensitiveEnvVars membership is what turns the
+	// attempt into a webhook rejection instead of a silent no-op.
+	//
+	// Nothing here is Optional any more and nothing needs to be, which is the
+	// one thing the token makes simpler: the skew branch of a2aAgentSurface
+	// used to need Optional on the SecretKeyRef so a today-lineage install that
+	// hit skew would not roll the pod into CreateContainerConfigError against a
+	// Secret that had never existed. A projected token volume has no such
+	// failure — the kubelet mints it from the pod's own ServiceAccount, which
+	// exists on every lineage — so the freeze the helper promises costs two
+	// inert env vars and a mount.
 	if a2aAgentSurface(agent) {
 		envVars = append(envVars,
 			corev1.EnvVar{
@@ -2433,16 +2810,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
 			},
 			corev1.EnvVar{
-				Name:  "NATS_USER",
-				Value: "worker",
-			},
-			corev1.EnvVar{
-				Name: "NATS_PASSWORD",
-				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
-					Key:                  "worker-password",
-					Optional:             ptr.To(true),
-				}},
+				Name:  a2aBusUserEnv,
+				Value: a2aAgentBusUser,
 			},
 		)
 	}
@@ -2488,7 +2857,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		runtimeClassName = agent.Spec.Deployment.Availability.RuntimeClassName
 	}
 
-	containers := buildBaseContainers(agent, image, envVars, agentPlugins, opts.imageVolumeSupported)
+	containers := buildBaseContainers(agent, image, envVars, agentPlugins, opts.imageVolumeSupported, droppedVolumes)
 
 	// The API authenticator is a NATIVE SIDECAR -- an init container carrying
 	// restartPolicy: Always -- and not an ordinary container.
@@ -2544,6 +2913,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	mountIntoContainer(containers, "platform-agent", corev1.VolumeMount{
 		Name: agentCredentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true,
 	})
+	// The bus credential, under `next` only. Into the agent container alone and
+	// never into a sidecar: the pod's ServiceAccount is what the callout
+	// resolves, so a sidecar holding this token would be a second workload
+	// wearing the agent's identity, and the split A5 made would be undone by a
+	// volumeMount. The bridge sidecar authenticates with its own password for
+	// exactly that reason — see bridgeIdentity.
+	if a2aAgentSurface(agent) {
+		mountIntoContainer(containers, "platform-agent", a2aBusTokenVolumeMount())
+	}
 
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -2589,6 +2967,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// watcher here, and so does the token the agent presents across the network.
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
+	if a2aAgentSurface(agent) {
+		volumes = append(volumes, a2aBusTokenVolumeSource())
+	}
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
 	}
@@ -2625,15 +3006,22 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		},
 		Spec: corev1.PodSpec{
 			// No ShareProcessNamespace, and under mode: next the field is
-			// load-bearing rather than a default. The agent container carries
-			// the A2A bus credential there (NATS_PASSWORD, by SecretKeyRef
-			// above), and a Pod that shares its process namespace hands every
-			// container's /proc/<pid>/environ — that value included — to every
-			// other container in it, spec.deployment.sidecars entries among
-			// them. Under mode: today the credential is absent and only the
-			// weaker reason applies: the next container added here should not
-			// inherit a shared namespace by default. Do not set this field on
-			// the strength of that weaker reason alone.
+			// load-bearing rather than a default. The agent container holds
+			// the A2A bus credential — since A5 not as NATS_PASSWORD in its
+			// env but as the projected token file at a2aBusTokenPath — and a
+			// Pod that shares its process namespace hands every container's
+			// /proc/<pid> to every other container in it,
+			// spec.deployment.sidecars entries among them. That reaches the
+			// file as well as the environment: /proc/<pid>/environ for an env
+			// var, /proc/<pid>/root for anything the process has mounted, and
+			// every container in this Pod runs as the same UID (see
+			// RunAsUser below), so the DAC check that would otherwise stop it
+			// passes. Moving the credential out of `env` narrowed which CR
+			// fields can reach it; it did not weaken this. Under mode: today
+			// the credential is absent and only the weaker reason applies:
+			// the next container added here should not inherit a shared
+			// namespace by default. Do not set this field on the strength of
+			// that weaker reason alone.
 			// See docs/security-requirements.md.
 			RuntimeClassName: runtimeClassName,
 			InitContainers:   initContainers,
@@ -2764,6 +3152,15 @@ func buildDefaultVolumeMounts(homeDir string) []corev1.VolumeMount {
 			// directory a CR edit re-pins live, without a restart.
 			Name:      managedVolumeName,
 			MountPath: managedScopeDir,
+			ReadOnly:  true,
+		},
+		{
+			// The scope declaration, read by cluster_agent_reconcile.py through
+			// scopeFileEnvKey. A directory mount for the same reason as the managed scope:
+			// a CR edit reaches the file without a restart, and the pod rolls anyway
+			// because the key lives in the hashed ConfigMap.
+			Name:      scopeVolumeName,
+			MountPath: scopeDir,
 			ReadOnly:  true,
 		},
 		{
@@ -3136,9 +3533,16 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		Resources: corev1.ResourceRequirements{
 			// Memory request covers the watcher's informer and dedup caches, which
 			// scale with the number of watched clusters.
-			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("150m"), corev1.ResourceMemory: resource.MustParse("384Mi")},
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
+				corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
+			},
+			// Why these values are what they are: see the agentAPIAuth* constant
+			// declarations at the top of this file.
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+				corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
+				corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
+				corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
 			},
 		},
 		VolumeMounts: []corev1.VolumeMount{
@@ -3506,11 +3910,29 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// Any value parses: `excluded_namespaces` comma-splits the string and
 	// matches the parts literally, so an arbitrary one names namespaces that do
 	// not exist and excludes nothing. There is no validation to fail.
+	//
+	// FEEDBACK_PROMPT_ENABLED and FEEDBACK_PROMPT_DELAY are the feedback
+	// prompt's two per-install settings (`feedback_prompt.py`, a `no_agent`
+	// cron script). The first turns one fixed chat message off, the second
+	// moves when it is sent; neither names a path, a URL, a credential or an
+	// image, and a value that does not parse fails the run (exit 1, the reason
+	// on stderr, reported in chat like any other script failure) before the
+	// script arms or prints, so an arbitrary value reaches nothing but that
+	// one message and its own failure report.
 	allowed := map[string]struct{}{
-		"ALERT_DAILY_LIMIT_CRITICAL":  {},
+		"ALERT_DAILY_LIMIT_CRITICAL": {},
+		// Not a severity, unlike its three neighbours: the drift detector's
+		// records display as Warning and bill a bucket of their own, so
+		// `alert_quota` is keyed on "GitOpsDrift" and this is the variable that
+		// tunes it (DRIFT_QUOTA_KEY in session_kv_server.py). It earns the same
+		// place here for the same reason the others do — it bounds a count of
+		// chat messages and reaches nothing else.
+		"ALERT_DAILY_LIMIT_DRIFT":     {},
 		"ALERT_DAILY_LIMIT_INFO":      {},
 		"ALERT_DAILY_LIMIT_WARNING":   {},
 		"EOD_EXCLUDE_NAMESPACES":      {},
+		"FEEDBACK_PROMPT_DELAY":       {},
+		"FEEDBACK_PROMPT_ENABLED":     {},
 		envHermesOtelEnabled:          {},
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},
@@ -3708,7 +4130,10 @@ func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
 }
 
 // buildBaseContainers generates the base containers for PlatformAgent.
-func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) []corev1.Container {
+// droppedVolumes is the set of hostPath volume names the render is leaving out
+// of the Pod, from the caller, which needs it for the CR's own containers
+// anyway; see hostPathVolumeNames.
+func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool, droppedVolumes map[string]bool) []corev1.Container {
 	homeDir := defaultAgentHome
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
 		homeDir = agent.Spec.Harness.Hermes.AgentHome
@@ -3721,8 +4146,28 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		if agent.Spec.Deployment.ImagePullPolicy != nil {
 			pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
 		}
-		extraVolumeMounts = agent.Spec.Deployment.ExtraVolumeMounts
+		// Filtered before dropTmpScratchIfClaimed reads the list, so a hostPath
+		// mount at /tmp that the render is about to drop does not also take
+		// the tmp-scratch emptyDir with it.
+		extraVolumeMounts = stripVolumeMountsNamed(agent.Spec.Deployment.ExtraVolumeMounts, droppedVolumes)
 		storages = agent.Spec.Deployment.Storages
+	}
+	// The fifth user-authored mount surface, and the one the A5 reservation
+	// missed. buildPodTemplateSpec strips the bus token out of sidecars,
+	// initContainers, sidecarVolumes and extraVolumes; this list is read here
+	// instead of there, and it is appended verbatim BOTH to the platform-agent
+	// container below and to platform-agent-dashboard further down. A CR that
+	// names the projected bus token here therefore puts the agent's own bus
+	// identity into a second container -- see a2aStripBusTokenVolumeMounts.
+	// Gated on the surface for the same reason the strips up there are: on a
+	// today install there is no such volume, and dropping a name only the next
+	// stack cares about would be one more way to tell the feature exists.
+	// The source half of the same reservation takes the mounts of any user
+	// volume buildPodTemplateSpec dropped for what it projects or which
+	// Secret it names; see a2aBusCredentialVolumeNames.
+	if a2aAgentSurface(agent) {
+		extraVolumeMounts = a2aStripBusTokenVolumeMounts(extraVolumeMounts)
+		extraVolumeMounts = stripVolumeMountsNamed(extraVolumeMounts, a2aBusCredentialVolumeNames(agent))
 	}
 
 	resources := resolveResources(agent.Spec.Deployment)
@@ -3988,6 +4433,10 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				},
 			},
 			Env: dashboardEnvVars,
+			// Limits remain 1 CPU / 2Gi pending live working-set measurement (#1635):
+			// lowering limits.memory without measurement risks OOMKilling the container,
+			// and Pod readiness is the AND of every container, so an OOM-looping dashboard
+			// withdraws the agent API on :8642 and drives the CR to Ready=False.
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("256m"),
@@ -4157,6 +4606,24 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 						{Key: managedConfigKey, Path: "config.yaml"},
 						{Key: managedEnvKey, Path: ".env"},
 					},
+					DefaultMode: ptr.To(int32(0444)),
+				},
+			},
+		},
+		{
+			// The scope declaration (scopeConfigKey), optional so that a ConfigMap
+			// written by an operator predating the key mounts an empty directory instead
+			// of holding the pod in ContainerCreating during a roll.
+			Name: scopeVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: agent.Name + "-config",
+					},
+					Items: []corev1.KeyToPath{
+						{Key: scopeConfigKey, Path: scopeFileName},
+					},
+					Optional:    ptr.To(true),
 					DefaultMode: ptr.To(int32(0444)),
 				},
 			},

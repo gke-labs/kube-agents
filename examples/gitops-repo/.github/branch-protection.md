@@ -11,7 +11,7 @@ acceptance (A3) is satisfied end to end.
   [`CODEOWNERS.example`](../CODEOWNERS.example) (a template with `@your-org/*` placeholders; copy it to
   `CODEOWNERS` and substitute real teams when forking this repo — GitHub only activates a file named
   `CODEOWNERS`). Guarded globs: `**/provisioning/**`, `**/agents/**`, `**/namespaces/**`,
-  `**/policy/**`, and agent config / `SOUL.md`.
+  `**/policy/**`, `knowledge/**`, `.kube-agents/**`, and agent config / `SOUL.md`.
 - **Require status checks to pass** — the actuation pipeline's validation and the **security review
   gate** (`review-gate.yml`, added Phase 5): any unmitigated high/critical finding blocks merge.
 - **Dismiss stale approvals on new commits**; **require branches up to date**; **no bypass** for the

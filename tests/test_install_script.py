@@ -1,22 +1,28 @@
 """Unit tests for install.sh validation and execution routines.
 
 Tests pure numeric SemVer (X.Y.Z) references, 40-character commit SHAs,
-piped stdin (curl | bash) execution, local script path resolution, and the
-NetworkPolicy enablement sequence install.sh runs against adopted clusters.
+piped stdin (curl | bash) execution, local script path resolution, the
+NetworkPolicy enablement sequence install.sh runs against adopted clusters,
+and that the helpers driving install.sh here detach from the controlling
+terminal, so a prompt auto-selects its default instead of blocking the suite.
 """
 
+import json
 import os
 import pathlib
 import pty
 import re
+import shlex
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from tests.testing.common import (
     INSTALLER_HELP_BANNER,
@@ -34,12 +40,50 @@ from tests.testing.release import (
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALL_SH = _REPO_ROOT / "install.sh"
+_PRINT_NO_CHAT_SH = _REPO_ROOT / "scripts" / "installer" / "print_instructions_no_chat.sh"
+# The other two front doors, for the assertion that all three handlers share
+# the subshell rule.
+_FRONT_DOORS = (_INSTALL_SH, _REPO_ROOT / "upgrade.sh", _REPO_ROOT / "uninstall.sh")
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
 
 # install.sh sources the shared helpers from the acquired workspace partway
 # through main(), so a validator that leans on one is unreachable from a bare
 # KUBE_AGENTS_SOURCE_ONLY source. Prepend this to reach it.
 _SOURCE_INSTALLER_COMMON = f'source "{_INSTALLER_COMMON}"; '
+
+# Bound on a sourced install.sh function run through _run_installer_bash.
+# Each is a stub-backed call that takes a few seconds at most (the slowest
+# measured, a run_menu_system save, takes about two), so a run that reaches
+# this is stuck -- on a prompt, if the terminal detach ever slips -- and the
+# bound turns that into a failure with output, not a hang.
+_INSTALLER_RUN_TIMEOUT_SECONDS = 60
+
+
+def _run_installer_bash(body, env, cwd=_REPO_ROOT):
+    """Run a bash body that sources install.sh, detached from any terminal.
+
+    install.sh's prompts read /dev/tty whenever has_controlling_tty finds one,
+    and /dev/tty resolves through the controlling terminal rather than stdin,
+    so a child that only had stdin redirected still blocks a developer's run
+    on the first prompt it reaches, forever, with the prompt captured and
+    nothing on screen. start_new_session puts the child in a session with no
+    controlling terminal, the branch CI's terminal-less runners already take,
+    so every prompt auto-selects its default; stdin is closed for the same
+    reason, and the timeout bounds whatever is left. The helpers whose runs
+    the hang was traced to go through here, and
+    InstallerHelpersDetachFromTheTerminalTest pins both that set and the
+    detach itself; a new helper for a function that prompts belongs here too.
+    """
+    return subprocess.run(
+        ["bash", "-c", body],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+        env=env,
+        cwd=str(cwd),
+    )
 
 
 class InstallScriptValidationTest(unittest.TestCase):
@@ -69,13 +113,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
         overrides.update(env or {})
         full_env = get_isolated_test_env(overrides=overrides, bin_dir=bin_dir)
-        return subprocess.run(
-            ["bash", "-c", setup],
-            capture_output=True,
-            text=True,
-            env=full_env,
-            cwd=str(cwd or _REPO_ROOT),
-        )
+        return _run_installer_bash(setup, full_env, cwd=cwd or _REPO_ROOT)
 
     def test_validate_immutable_ref_accepts_valid_refs(self):
         for ref in VALID_IMMUTABLE_REFS:
@@ -665,14 +703,14 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             )
 
     def test_parse_args_cluster_mode(self):
-        """Verifies parse_args captures --cluster-mode."""
-        cmd = 'parse_args --cluster-mode=autopilot; echo "MODE=$PARAM_CLUSTER_MODE"'
+        """Verifies parse_args captures --gke-cluster-mode."""
+        cmd = 'parse_args --gke-cluster-mode=autopilot; echo "MODE=$PARAM_CLUSTER_MODE"'
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("MODE=autopilot", proc.stdout)
 
     def test_cluster_mode_defaults_to_unset(self):
-        """An unpassed --cluster-mode leaves the interview free to ask."""
+        """An unpassed --gke-cluster-mode leaves the interview free to ask."""
         proc = self._run_install_func('echo "MODE=[$PARAM_CLUSTER_MODE]"')
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("MODE=[]", proc.stdout)
@@ -732,7 +770,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
 
     def test_resolve_creatable_cluster_mode_steps_aside_for_a_zone(self):
         """A defaulted Autopilot demotes rather than writing a config Terraform
-        rejects. Reachable non-interactively via --cluster-name, where nothing
+        rejects. Reachable non-interactively via --gke-cluster-name, where nothing
         else checks the mode/location pair."""
         proc = self._run_install_func(
             f'{_SOURCE_INSTALLER_COMMON}resolve_creatable_cluster_mode "" us-central1-a'
@@ -895,6 +933,47 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("MANAGE=false", proc.stdout)
+
+    def test_parse_args_model_max_tokens_is_read(self):
+        cmd = 'parse_args --model-max-tokens=4096; echo "MAX=$PARAM_MODEL_MAX_TOKENS"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MAX=4096", proc.stdout)
+
+    def test_model_max_tokens_defaults_to_unset(self):
+        cmd = 'echo "MAX=[$PARAM_MODEL_MAX_TOKENS]"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MAX=[]", proc.stdout)
+
+    def test_validate_model_max_tokens_accepts_whole_numbers_and_empty(self):
+        for value in ("4096", "0", ""):
+            with self.subTest(value=value):
+                proc = self._run_install_func(
+                    _SOURCE_INSTALLER_COMMON
+                    + f"parse_args --model-max-tokens={value}; validate_model_max_tokens"
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+
+    def test_validate_model_max_tokens_rejects_anything_else(self):
+        # The same helper the tfvars generator applies, so the interview and
+        # upgrade.sh cannot disagree on what a valid value is.
+        for value in ("4k", "-1", "4096.5", "+1"):
+            with self.subTest(value=value):
+                proc = self._run_install_func(
+                    _SOURCE_INSTALLER_COMMON
+                    + f"parse_args --model-max-tokens={value}; validate_model_max_tokens"
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(
+                    "--model-max-tokens must be a whole number of tokens",
+                    proc.stderr + proc.stdout,
+                )
+        # install.env's recorded value is checked too, not only the flag.
+        proc = self._run_install_func(
+            _SOURCE_INSTALLER_COMMON + 'MODEL_MAX_TOKENS="4k"; validate_model_max_tokens'
+        )
+        self.assertNotEqual(proc.returncode, 0)
 
     def test_parse_args_vertex_location_overrides_the_default(self):
         """An explicit --vertex-location still wins over DEFAULT_VERTEX_LOCATION."""
@@ -1140,6 +1219,56 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         proc2 = self._run_install_func(cmd2)
         self.assertEqual(proc2.returncode, 0, proc2.stderr)
         self.assertIn("NP=false", proc2.stdout)
+
+    def test_parse_args_accept_no_network_policy(self):
+        cmd = 'parse_args --accept-no-network-policy; echo "A=$PARAM_ACCEPT_NO_NETWORK_POLICY"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("A=true", proc.stdout)
+
+        cmd2 = 'parse_args --accept-no-network-policy=false; echo "A=$PARAM_ACCEPT_NO_NETWORK_POLICY"'
+        proc2 = self._run_install_func(cmd2)
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertIn("A=false", proc2.stdout)
+
+    def test_validate_existing_cluster_opt_in_flags_rejects_both_network_policy_answers(self):
+        # Enable Calico and record that it was not enabled: two answers to one
+        # question, refused before the cluster is read.
+        cmd = 'parse_args --enable-network-policy --accept-no-network-policy; validate_existing_cluster_opt_in_flags'
+        proc = self._run_install_func(cmd)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("two answers to one question", proc.stderr + proc.stdout)
+
+        cmd2 = 'parse_args --accept-no-network-policy=maybe; validate_existing_cluster_opt_in_flags'
+        proc2 = self._run_install_func(cmd2)
+        self.assertNotEqual(proc2.returncode, 0)
+        self.assertIn("--accept-no-network-policy must be either true or false.", proc2.stderr + proc2.stdout)
+
+        cmd3 = 'parse_args --accept-no-network-policy --enable-network-policy=false; validate_existing_cluster_opt_in_flags'
+        proc3 = self._run_install_func(cmd3)
+        self.assertEqual(proc3.returncode, 0, proc3.stderr + proc3.stdout)
+
+    def test_a_flag_overrides_the_recorded_network_policy_answer_for_one_run(self):
+        # The "confine it later" path: an install that recorded
+        # ACCEPT_NO_NETWORK_POLICY=true re-run with --enable-network-policy
+        # passed one flag and is not told it passed two.
+        cmd = 'parse_args --enable-network-policy; validate_existing_cluster_opt_in_flags; echo "E=$PARAM_ENABLE_NETWORK_POLICY A=$PARAM_ACCEPT_NO_NETWORK_POLICY"'
+        proc = self._run_install_func(cmd, env={"ACCEPT_NO_NETWORK_POLICY": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("E=true A=false", proc.stdout)
+        self.assertIn("overrides the ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout)
+
+        cmd = 'parse_args --accept-no-network-policy; validate_existing_cluster_opt_in_flags; echo "E=$PARAM_ENABLE_NETWORK_POLICY A=$PARAM_ACCEPT_NO_NETWORK_POLICY"'
+        proc = self._run_install_func(cmd, env={"ENABLE_NETWORK_POLICY": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("E=false A=true", proc.stdout)
+
+        # Both recorded, neither passed: nothing to prefer, so it is refused and
+        # the message names the file as a source.
+        cmd = 'validate_existing_cluster_opt_in_flags'
+        proc = self._run_install_func(cmd, env={"ENABLE_NETWORK_POLICY": "true", "ACCEPT_NO_NETWORK_POLICY": "true"})
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("install.env", proc.stderr + proc.stdout)
 
     def test_validate_existing_cluster_opt_in_flags_rejects_typos(self):
         cmd = 'parse_args --enable-network-policy=ture; validate_existing_cluster_opt_in_flags'
@@ -1600,13 +1729,16 @@ run_menu_system "."
         self.assertIn("GVISOR=true", proc.stdout)
 
     def test_parse_args_keeps_an_empty_gvisor_value_empty(self):
-        """`--gvisor=` must reach main's validator rather than read as a default.
+        """`--enable-gvisor=` must reach main's validator rather than read as a default.
 
         main uses ${PARAM_ENABLE_GVISOR-true} for exactly this: parse_args
         leaves the empty string in place, the `:-` form would silently
         substitute it back to the default, and the validator rejects it.
+
+        flag_bool_value has to preserve this too: the bare `--enable-gvisor`
+        form yields true, and only the `=` form with nothing after it is empty.
         """
-        cmd = 'parse_args --gvisor=; echo "GVISOR=[$PARAM_ENABLE_GVISOR]"'
+        cmd = 'parse_args --enable-gvisor=; echo "GVISOR=[$PARAM_ENABLE_GVISOR]"'
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("GVISOR=[]", proc.stdout)
@@ -1616,7 +1748,7 @@ run_menu_system "."
 
         main lists the incoming value as option 1 and treats option 2 as "the
         other one", so that answering the prompt with nothing confirms what
-        `--gvisor` asked for and the `(Default)` label matches what that
+        `--enable-gvisor` asked for and the `(Default)` label matches what that
         produces. It holds only while prompt_menu resolves an unanswered
         prompt to option 1; if that moves, the prompt starts inverting the
         caller's choice in silence.
@@ -1695,6 +1827,78 @@ run_menu_system "."
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("RC=1", proc.stdout)
 
+    def test_wait_for_deployment_object_passes_context(self):
+        """Context argument must be forwarded as --context to kubectl."""
+        stub = 'case "$*" in *"--context my-ctx"*) exit 0 ;; *) exit 1 ;; esac'
+        proc = self._run_with_kubectl_stub(
+            'rc=0; wait_for_deployment_object dep ns 0 my-ctx || rc=$?; echo "RC=$rc"',
+            stub,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+
+    def test_wait_for_rollout_passes_context(self):
+        """Context argument must be forwarded as --context to kubectl rollout."""
+        stub = 'case "$*" in *"--context my-ctx"*) exit 0 ;; *) exit 1 ;; esac'
+        proc = self._run_with_kubectl_stub(
+            'rc=0; wait_for_rollout dep ns 0 my-ctx || rc=$?; echo "RC=$rc"',
+            stub,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+
+    # main() is not callable from here -- reaching step 13 means provisioning a
+    # cluster -- so its context gate is lifted out of the source and run in a
+    # function of its own. The anchors are checked in _context_gate_body, so a
+    # rewrite of the step fails loudly rather than leaving the two tests below
+    # asserting against an empty string.
+    _CONTEXT_GATE_START = '  local expected_ctx\n  expected_ctx="$(gke_context_name)"'
+    _CONTEXT_GATE_END = "    exit 1\n  fi\n"
+
+    def _context_gate_body(self):
+        source = _INSTALL_SH.read_text()
+        start = source.index(self._CONTEXT_GATE_START)
+        end = source.index(self._CONTEXT_GATE_END, start) + len(self._CONTEXT_GATE_END)
+        gate = source[start:end]
+        self.assertIn("kubectl config current-context", gate)
+        return (
+            _SOURCE_INSTALLER_COMMON
+            + '\nPROJECT_ID="a-project"; REGION="a-region"; CLUSTER_NAME="a-cluster"\n'
+            + "context_gate() {\n"
+            + gate
+            + "}\n"
+        )
+
+    def test_the_health_check_refuses_a_kubectl_pointed_elsewhere(self):
+        """Step 13 reads whatever context is current, so a get-credentials that
+        did not take must end the run rather than grade another cluster."""
+        proc = self._run_with_kubectl_stub(
+            self._context_gate_body() + 'context_gate; echo "REACHED_HEALTH_CHECKS"',
+            'echo "gke_another-project_another-region_another-cluster"',
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("REACHED_HEALTH_CHECKS", proc.stdout)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("gke_another-project_another-region_another-cluster", combined)
+        self.assertIn("gke_a-project_a-region_a-cluster", combined)
+
+    def test_the_health_check_continues_on_the_expected_context(self):
+        """The other half: the gate has to let the matching context through."""
+        proc = self._run_with_kubectl_stub(
+            self._context_gate_body() + 'context_gate; echo "REACHED_HEALTH_CHECKS"',
+            'echo "gke_a-project_a-region_a-cluster"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("REACHED_HEALTH_CHECKS", proc.stdout)
+
+    def test_step_13_namespace_check_passes_context(self):
+        """Step 13's namespace check must forward --context to avoid querying ambient context."""
+        source = _INSTALL_SH.read_text()
+        start = source.index(self._CONTEXT_GATE_START)
+        end = source.index("wait_for_deployment_object", start)
+        body = source[start:end]
+        self.assertIn('kubectl get ns "$namespace" --context "$expected_ctx"', body)
+
     def test_print_generate_only_handoff_renders_required_commands(self):
         """Verifies print_generate_only_handoff prints all out-of-Terraform and lifecycle commands."""
         cmd = f"""
@@ -1748,6 +1952,27 @@ cat /tmp/kube-agents-install-report.json
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn('"status": "GENERATE_ONLY_SUCCESS"', proc.stdout)
         self.assertIn('"generate_only": true', proc.stdout)
+
+    def test_write_json_report_records_network_policy_enforcement(self):
+        """The choice to install without enforcement outlives the terminal (#1682)."""
+        cmd = """
+PARAM_DRY_RUN="false"
+PARAM_GENERATE_ONLY="false"
+PARAM_NON_INTERACTIVE="true"
+INSTALL_ENV_FILE="/tmp/install.env"
+NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
+write_json_report "SUCCESS" >/dev/null
+cat /tmp/kube-agents-install-report.json
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('"network_policy_enforcement": "absent-accepted"', proc.stdout)
+
+        # Before a run has decided, the field is present and empty rather than
+        # restating a default the run never applied.
+        proc = self._run_install_func(cmd.replace('NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"\n', ""))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('"network_policy_enforcement": ""', proc.stdout)
 
 
 class InstallEnvInputTest(unittest.TestCase):
@@ -1806,7 +2031,7 @@ class InstallEnvInputTest(unittest.TestCase):
     def test_a_flag_beats_the_file(self):
         """Order of authority: flag, then file, then default."""
         proc = self._source_with_env_file(
-            'parse_args --project-id=from-the-flag; echo "P=$PARAM_PROJECT_ID"',
+            'parse_args --gcp-project-id=from-the-flag; echo "P=$PARAM_PROJECT_ID"',
             contents="PROJECT_ID=from-the-file\n",
         )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
@@ -2002,7 +2227,7 @@ class NonInteractiveRerunInheritanceTest(unittest.TestCase):
 
         proc = self._params(
             "ALLOWED_USERS=from-the-file@example.com",
-            'parse_args --allowed-users=from-the-flag@example.com; '
+            'parse_args --google-chat-allowed-users=from-the-flag@example.com; '
             'echo "U=$PARAM_ALLOWED_USERS"',
         )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
@@ -2120,6 +2345,16 @@ class NonInteractiveRerunInheritanceTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertIn("N=true", proc.stdout)
 
+    def test_accept_no_network_policy_inherits_from_install_env(self):
+        # A standing decision about the cluster: a re-run that omits the flag
+        # must not turn the accepted install back into a refusal.
+        proc = self._params(
+            "ACCEPT_NO_NETWORK_POLICY=true\n",
+            'echo "A=$PARAM_ACCEPT_NO_NETWORK_POLICY"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("A=true", proc.stdout)
+
 
 class SecretManagerAutoDiscoveryQuietTest(unittest.TestCase):
     """Verifies gcloud secrets versions access passes --quiet to avoid hangs."""
@@ -2145,12 +2380,13 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
     `clusters update` calls is the behaviour under test.
     """
 
-    def _run(self, datapath="", legacy_np="", opt_in=True, status="RUNNING"):
+    def _run(self, datapath="", legacy_np="", opt_in=True, status="RUNNING", accept=False, preset=""):
         """Run the function against a stub gcloud that records every call.
 
         Returns (CompletedProcess, [argv-strings in call order]). The stub
         answers `clusters describe` on the --format it is given: an empty
-        string stands for a field gcloud did not print.
+        string stands for a field gcloud did not print. `accept` stands for
+        --accept-no-network-policy, the answer that leaves the cluster alone.
         """
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -2168,21 +2404,25 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
                 "exit 0\n"
             )
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("")
             opt_in_line = (
                 'PARAM_ENABLE_NETWORK_POLICY="true"\n' if opt_in else ""
             )
+            if accept:
+                opt_in_line += 'PARAM_ACCEPT_NO_NETWORK_POLICY="true"\n'
+            if preset:
+                opt_in_line += f'NETWORK_POLICY_ENFORCEMENT="{preset}"\n'
             body = (
                 f'source "{_INSTALLER_COMMON}"\n'
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 f"{opt_in_line}"
                 "ensure_existing_cluster_network_policy proj cluster region\n"
+                'echo "RECORDED=$NETWORK_POLICY_ENFORCEMENT"\n'
             )
-            proc = subprocess.run(
-                ["bash", "-c", body],
-                capture_output=True,
-                text=True,
-                env=get_isolated_test_env(bin_dir=str(bin_dir)),
-                cwd=str(_REPO_ROOT),
+            proc = _run_installer_bash(
+                body,
+                get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)),
             )
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
@@ -2211,6 +2451,36 @@ class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
         self.assertEqual(self._updates(calls), [])
         self.assertIn("Explicit opt-in was not provided", proc.stderr + proc.stdout)
+        # The refusal names both ways forward; naming only the mutating one is
+        # how an agent came to read it as the instruction (#1682).
+        self.assertIn("--accept-no-network-policy", proc.stderr + proc.stdout)
+
+    def test_accepted_absence_leaves_the_cluster_alone_and_is_recorded(self):
+        # The third branch: no clusters update at all, exit 0, the decision
+        # recorded where write_json_report reads it, and one line saying it is
+        # proceeding as accepted -- the consequences were stated at the
+        # preflight, which is the only way a run reaches this step accepted.
+        proc, calls = self._run(opt_in=False, accept=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(self._updates(calls), [])
+        out = proc.stderr + proc.stdout
+        self.assertIn("WITHOUT NetworkPolicy enforcement, as accepted above", out)
+        self.assertNotIn("enforced by nothing", out)
+        self.assertIn("RECORDED=absent-accepted", proc.stdout)
+
+    def test_enforcement_the_install_enabled_is_recorded(self):
+        proc, _ = self._run(opt_in=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RECORDED=enabled-by-install", proc.stdout)
+
+    def test_accepting_on_a_cluster_that_enforces_changes_nothing(self):
+        # accept is inert where there is nothing to accept: Dataplane V2 is
+        # recorded as enforced, and no warning about a lost sandbox is printed.
+        proc, calls = self._run(datapath="ADVANCED_DATAPATH", opt_in=False, accept=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._updates(calls), [])
+        self.assertIn("RECORDED=enforced", proc.stdout)
+        self.assertNotIn("WITHOUT NetworkPolicy enforcement", proc.stderr + proc.stdout)
 
     def test_addon_state_is_not_probed(self):
         # Skipping the addon call when it is already on would be free, but
@@ -2277,13 +2547,7 @@ class EnsureExistingClusterWorkloadIdentityTest(unittest.TestCase):
                 f"{opt_in_line}"
                 "ensure_existing_cluster_workload_identity proj cluster region\n"
             )
-            proc = subprocess.run(
-                ["bash", "-c", body],
-                capture_output=True,
-                text=True,
-                env=get_isolated_test_env(bin_dir=str(bin_dir)),
-                cwd=str(_REPO_ROOT),
-            )
+            proc = _run_installer_bash(body, get_isolated_test_env(bin_dir=str(bin_dir)))
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
 
@@ -2773,7 +3037,9 @@ class CheckExistingClusterNodePoolsPreflightTest(unittest.TestCase):
 class CheckExistingClusterNetworkPolicyPreflightTest(unittest.TestCase):
     """check_existing_cluster_network_policy_preflight tests."""
 
-    def _run(self, dp="", legacy_np="", opt_in="", status="RUNNING"):
+    def _run(self, dp="", legacy_np="", opt_in="", status="RUNNING", accept="", install_env=None):
+        """`install_env`, when given, is the contents of a pre-existing install.env
+        the run points INSTALL_ENV_FILE at; None means no file."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
@@ -2788,19 +3054,28 @@ class CheckExistingClusterNetworkPolicyPreflightTest(unittest.TestCase):
                 "exit 0\n"
             )
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("")
             opt_in_line = f'PARAM_ENABLE_NETWORK_POLICY="{opt_in}"\n' if opt_in else ""
+            if accept:
+                opt_in_line += f'PARAM_ACCEPT_NO_NETWORK_POLICY="{accept}"\n'
+            if install_env is not None:
+                existing = pathlib.Path(tmp) / "existing.env"
+                existing.write_text(install_env)
+                opt_in_line += f'INSTALL_ENV_FILE="{existing}"\n'
             body = (
                 f'source "{_INSTALLER_COMMON}"\n'
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 'TFVARS_CREATE_CLUSTER="false"\n'
                 f"{opt_in_line}"
                 "check_existing_cluster_network_policy_preflight p c r\n"
+                'echo "RECORDED=$NETWORK_POLICY_ENFORCEMENT"\n'
             )
             return subprocess.run(
                 ["bash", "-c", body],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)),
                 cwd=str(_REPO_ROOT),
             )
 
@@ -2808,10 +3083,53 @@ class CheckExistingClusterNetworkPolicyPreflightTest(unittest.TestCase):
         proc = self._run(dp="", legacy_np="False", opt_in="false")
         self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
         self.assertIn("enforces no NetworkPolicy", proc.stderr + proc.stdout)
+        # Both answers are named, and the cost of each; an agent reading this
+        # refusal is not handed one flag to pass.
+        self.assertIn("--enable-network-policy", proc.stderr + proc.stdout)
+        self.assertIn("--accept-no-network-policy", proc.stderr + proc.stdout)
+        self.assertIn("may recreate node pools", proc.stderr + proc.stdout)
+        self.assertIn("unconfined", proc.stderr + proc.stdout)
 
     def test_passes_when_opt_in_provided(self):
         proc = self._run(dp="", legacy_np="False", opt_in="true")
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+
+    def test_passes_unchanged_when_absence_is_accepted(self):
+        # The acceptance criterion of #1682: an agent-driven install onto a
+        # cluster with no enforcement completes without modifying it, and not
+        # silently -- the consequences are printed and the choice recorded.
+        proc = self._run(dp="", legacy_np="False", opt_in="false", accept="true")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        out = proc.stderr + proc.stdout
+        self.assertNotIn("REFUSED", out)
+        self.assertIn("WITHOUT NetworkPolicy enforcement", out)
+        self.assertIn("The cluster is not modified", out)
+        self.assertIn("RECORDED=absent-accepted", proc.stdout)
+
+    def test_the_preflight_repeats_the_unrecorded_key_note(self):
+        # The settle step and the preflight each describe the cluster once. If
+        # the first failed and this one succeeds, install.env was just written
+        # without the key; the preflight asks the note again so the run says so.
+        proc = self._run(dp="", legacy_np="False", accept="true", install_env="PROJECT_ID=p\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("Add ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout)
+
+        proc = self._run(dp="", legacy_np="False", accept="true", install_env="ACCEPT_NO_NETWORK_POLICY=true\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertNotIn("Add ACCEPT_NO_NETWORK_POLICY", proc.stderr + proc.stdout)
+
+    def test_acceptance_is_inert_where_enforcement_exists(self):
+        proc = self._run(dp="ADVANCED_DATAPATH", legacy_np="False", accept="true")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("RECORDED=enforced", proc.stdout)
+        self.assertNotIn("WITHOUT NetworkPolicy enforcement", proc.stderr + proc.stdout)
+
+    def test_unreadable_cluster_is_refused_even_when_accepting(self):
+        # Accepting the absence of enforcement is not accepting an unknown
+        # cluster state; that refusal stands.
+        proc = self._run(status="", accept="true")
+        self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
+        self.assertIn("Could not query NetworkPolicy configuration", proc.stderr + proc.stdout)
 
     def test_passes_when_dataplane_v2(self):
         proc = self._run(dp="ADVANCED_DATAPATH", legacy_np="False", opt_in="false")
@@ -2881,6 +3199,333 @@ class GenerateOnlyCrossesTheExistingClusterConsentGatesTest(unittest.TestCase):
         self.assertLess(prompt, mode_branch, "the prompt must precede the generate-only handoff")
 
 
+class InteractiveNetworkPolicyPromptTest(unittest.TestCase):
+    """prompt_existing_cluster_opt_ins on the path an interactive adoption takes.
+
+    This is the prompt a real run reaches: main() calls it before the summary,
+    against a Standard cluster with neither Dataplane V2 nor Calico, with no
+    flag and no install.env answer. The three answers each have to land in
+    the two PARAM_ variables the rest of the run reads.
+    """
+
+    def _run(self, answer, dp="", legacy_np="False", autopilot="False", preset=""):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f"  *autopilot.enabled*) printf '{autopilot}\\n' ;;\n"
+                "  *node-pools*list*) printf 'default-pool,GKE_METADATA\\n' ;;\n"
+                f"  *datapathProvider,networkPolicy.enabled*) printf 'RUNNING,{dp},{legacy_np}\\n' ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("")
+            body = (
+                f'source "{_INSTALLER_COMMON}"\n'
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'PARAM_NON_INTERACTIVE="false"\n'
+                'PARAM_DRY_RUN="false"\n'
+                f"{preset}"
+                "has_controlling_tty() { return 0; }\n"
+                f'prompt_read() {{ echo "PROMPTED: $1"; printf -v "$2" "%s" "{answer}"; }}\n'
+                "prompt_existing_cluster_opt_ins proj cluster region; echo \"rc=$?\"\n"
+                'echo "E=${PARAM_ENABLE_NETWORK_POLICY:-unset} A=${PARAM_ACCEPT_NO_NETWORK_POLICY:-unset}"\n'
+            )
+            return subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(
+                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)
+                ),
+                cwd=str(_REPO_ROOT),
+            )
+
+    def test_accept_sets_the_accept_answer(self):
+        proc = self._run("a")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("PROMPTED: Choose (e/a/N)", proc.stdout)
+        self.assertIn("E=false A=true", proc.stdout)
+
+    def test_enable_sets_the_enable_answer(self):
+        proc = self._run("e")
+        self.assertIn("E=true A=false", proc.stdout, proc.stderr)
+
+    def test_the_default_answers_neither(self):
+        proc = self._run("")
+        self.assertIn("PROMPTED", proc.stdout, proc.stderr)
+        self.assertIn("E=false A=false", proc.stdout)
+
+    def test_a_recorded_answer_is_not_asked_again(self):
+        proc = self._run("a", preset='PARAM_ACCEPT_NO_NETWORK_POLICY="true"\n')
+        self.assertNotIn("PROMPTED", proc.stdout, proc.stderr)
+        self.assertIn("E=unset A=true", proc.stdout)
+
+    def test_an_enforcing_cluster_is_not_asked(self):
+        for dp, legacy_np in (("ADVANCED_DATAPATH", "False"), ("", "True")):
+            proc = self._run("a", dp=dp, legacy_np=legacy_np)
+            self.assertNotIn("PROMPTED", proc.stdout, (dp, legacy_np, proc.stderr))
+            self.assertIn("E=unset A=unset", proc.stdout)
+
+
+class SettleNetworkPolicyAcceptanceTest(unittest.TestCase):
+    """settle_network_policy_acceptance: the answer reaches the tfvars and the decision.
+
+    Runs between the prompt and the install.env bootstrap. An accept answered
+    at the prompt has to regenerate terraform.tfvars, since the generator ran
+    before the prompt and the module's postcondition reads the variable; and
+    what install.env then records is the decision from the probe, so a flag
+    against an enforcing cluster records nothing and an unreadable cluster
+    decides nothing.
+    """
+
+    def _run(self, param="", env_accept="", dp="", legacy_np="False", status="RUNNING"):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f"  *datapathProvider,networkPolicy.enabled*) printf '{status},{dp},{legacy_np}\\n' ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("")
+            preset = f'PARAM_ACCEPT_NO_NETWORK_POLICY="{param}"\n' if param else ""
+            preset += f"export ACCEPT_NO_NETWORK_POLICY={env_accept}\n" if env_accept else ""
+            body = (
+                f'source "{_INSTALLER_COMMON}"\n'
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                # The generator has run by then and found the cluster outside state.
+                'TFVARS_CREATE_CLUSTER="false"\n'
+                f"{preset}"
+                'write_tfvars_from_state() { echo "REGENERATED $1 $2 accept=$ACCEPT_NO_NETWORK_POLICY key=${KUBE_AGENTS_GENERATE_API_SERVER_KEY:-}"; }\n'
+                "settle_network_policy_acceptance proj cluster region /tmp/t.tfvars 0.5.0; echo \"rc=$?\"\n"
+                'echo "DECISION=${NETWORK_POLICY_ENFORCEMENT:-none} ENV=${ACCEPT_NO_NETWORK_POLICY:-unset}"\n'
+            )
+            return subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(
+                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)
+                ),
+                cwd=str(_REPO_ROOT),
+            )
+
+    def test_an_answer_at_the_prompt_regenerates_and_records(self):
+        proc = self._run(param="true")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("REGENERATED /tmp/t.tfvars 0.5.0 accept=true key=true", proc.stdout)
+        self.assertIn("DECISION=absent-accepted ENV=true", proc.stdout)
+
+    def test_a_flag_already_in_the_environment_does_not_regenerate(self):
+        # The first generator pass already saw it.
+        proc = self._run(param="true", env_accept="true")
+        self.assertNotIn("REGENERATED", proc.stdout, proc.stderr)
+        self.assertIn("DECISION=absent-accepted", proc.stdout)
+
+    def test_no_answer_touches_nothing(self):
+        proc = self._run()
+        self.assertNotIn("REGENERATED", proc.stdout, proc.stderr)
+        self.assertIn("DECISION=none ENV=unset", proc.stdout)
+
+    def test_the_flag_against_an_enforcing_cluster_decides_nothing(self):
+        for dp, legacy_np in (("ADVANCED_DATAPATH", "False"), ("", "True")):
+            proc = self._run(param="true", dp=dp, legacy_np=legacy_np)
+            self.assertIn("DECISION=none", proc.stdout, (dp, legacy_np, proc.stderr))
+
+    def test_an_unreadable_cluster_decides_nothing(self):
+        # The preflight refuses it a few steps on; recording an acceptance
+        # for a cluster nobody read would be a waiver with no decision behind it.
+        proc = self._run(param="true", status="")
+        self.assertIn("DECISION=none", proc.stdout, proc.stderr)
+
+
+class AcceptedAbsenceOutlivesTheRunTest(unittest.TestCase):
+    """An accepted install without NetworkPolicy enforcement has to survive the run (#1682).
+
+    Three things carry it. install.env, or upgrade.sh's generator emits
+    accept_no_network_policy = false and the module refuses the plan the install
+    already passed; terraform.tfvars, which the module's postcondition reads and
+    which was generated before the interactive prompt could answer; and the
+    PlatformAgent annotation the composition stamps. These read main()'s control
+    flow, which the KUBE_AGENTS_SOURCE_ONLY harness cannot drive.
+    """
+
+    _OPT_IN_PROMPT_CALL = 'prompt_existing_cluster_opt_ins "$project_id" "$cluster_name" "$region"'
+    _BOOTSTRAP_CALL = 'bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"'
+    _SETTLE_CALL = 'settle_network_policy_acceptance "$project_id" "$cluster_name" "$region" "$tfvars_file" "$image_tag"'
+
+    def test_the_answer_is_settled_between_the_prompt_and_the_bootstrap(self):
+        """settle_network_policy_acceptance (behaviour: SettleNetworkPolicyAcceptanceTest)
+        has to run after the prompt that can produce the answer and before the
+        bootstrap that records it."""
+        text = _INSTALL_SH.read_text()
+        settle = text.index(self._SETTLE_CALL)
+        self.assertLess(text.index(self._OPT_IN_PROMPT_CALL), settle)
+        self.assertLess(settle, text.index(self._BOOTSTRAP_CALL))
+
+    def _note(self, env_contents, decision, func="note_unrecorded_network_policy_acceptance"):
+        """Run one of the install.env notes against a file with the given contents.
+
+        `decision` is the value NETWORK_POLICY_ENFORCEMENT holds by then: the
+        notes key off what the run decided, not off the flag, so that a flag
+        passed against a cluster that already enforces records nothing.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text(env_contents)
+            body = (
+                f'source "{_INSTALLER_COMMON}"\n'
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                f'NETWORK_POLICY_ENFORCEMENT="{decision}"\n'
+                f'{func} "{env_file}"\n'
+            )
+            # PARAM_NON_INTERACTIVE and no TTY: the agent-driven shape, which
+            # is where the interview-answer warning deliberately stays silent.
+            return subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file)}),
+                cwd=str(_REPO_ROOT),
+            )
+
+    def test_an_unrecorded_acceptance_is_reported_without_a_tty(self):
+        """A pre-existing install.env without the key gets the warning, not silence."""
+        proc = self._note("PROJECT_ID=p\n", "absent-accepted")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("Add ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout)
+
+    def test_an_acceptance_the_file_records_as_false_is_reported(self):
+        proc = self._note("PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=false\n", "absent-accepted")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("Add ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout)
+
+    def test_a_recorded_acceptance_is_not_nagged(self):
+        proc = self._note("PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=true\n", "absent-accepted")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertNotIn("Add ACCEPT_NO_NETWORK_POLICY", proc.stderr + proc.stdout)
+
+    def test_a_flag_against_an_enforcing_cluster_records_nothing(self):
+        # The decision, not the flag: enforced means nothing was accepted, so
+        # the file is not asked to carry a standing waiver of the module's check.
+        for decision in ("enforced", "enabled-by-install", ""):
+            proc = self._note("PROJECT_ID=p\n", decision)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertNotIn("ACCEPT_NO_NETWORK_POLICY", proc.stderr + proc.stdout, decision)
+
+    def test_a_stale_recorded_acceptance_is_reported_once_the_cluster_enforces(self):
+        # The converse note, so the key retires: confined later, the file still
+        # says accepted, and every later upgrade would waive the postcondition.
+        for decision in ("enforced", "enabled-by-install"):
+            proc = self._note(
+                "PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=true\n", decision,
+                func="note_stale_network_policy_acceptance",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("records ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout, decision)
+            self.assertIn("Remove that line", proc.stderr + proc.stdout, decision)
+
+    def test_the_stale_note_stays_quiet_while_the_acceptance_holds(self):
+        for contents, decision in (
+            ("PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=true\n", "absent-accepted"),
+            ("PROJECT_ID=p\n", "enforced"),
+            ("PROJECT_ID=p\nACCEPT_NO_NETWORK_POLICY=false\n", "enforced"),
+        ):
+            proc = self._note(contents, decision, func="note_stale_network_policy_acceptance")
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertNotIn("Remove that line", proc.stderr + proc.stdout, (contents, decision))
+
+    def test_the_stale_note_runs_after_the_preflight_and_after_calico_goes_on(self):
+        text = _INSTALL_SH.read_text()
+        first = text.index('note_stale_network_policy_acceptance "$INSTALL_ENV_FILE"')
+        second = text.index('note_stale_network_policy_acceptance "$INSTALL_ENV_FILE"', first + 1)
+        self.assertLess(text.index('check_existing_cluster_network_policy_preflight "$project_id"'), first)
+        self.assertLess(text.index('ensure_existing_cluster_network_policy "$project_id"'), second)
+
+    def test_install_env_bootstrap_records_the_decision_not_the_flag(self):
+        """A fresh install.env carries the key only when enforcement was absent and accepted."""
+        for decision, expected in (("absent-accepted", True), ("enforced", False), ("", False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                dest = pathlib.Path(tmp) / "install.env"
+                body = (
+                    f'source "{_INSTALLER_COMMON}"\n'
+                    f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                    'PARAM_DRY_RUN="false"\n'
+                    "export ACCEPT_NO_NETWORK_POLICY=true\n"
+                    f'NETWORK_POLICY_ENFORCEMENT="{decision}"\n'
+                    f'bootstrap_install_env_file "{dest}" 0.5.0\n'
+                )
+                empty = pathlib.Path(tmp) / "loaded.env"
+                empty.write_text("")
+                proc = subprocess.run(
+                    ["bash", "-c", body],
+                    capture_output=True,
+                    text=True,
+                    env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty)}),
+                    cwd=str(_REPO_ROOT),
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertTrue(dest.exists(), proc.stderr + proc.stdout)
+                self.assertEqual(
+                    "ACCEPT_NO_NETWORK_POLICY=true" in dest.read_text(), expected, (decision, dest.read_text())
+                )
+
+
+    def test_the_note_runs_when_install_env_already_exists(self):
+        """Behaviour: bootstrap against a file that exists calls the note and writes nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "install.env"
+            dest.write_text("PROJECT_ID=p\n")
+            empty = pathlib.Path(tmp) / "loaded.env"
+            empty.write_text("")
+            body = (
+                f'source "{_INSTALLER_COMMON}"\n'
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                'PARAM_DRY_RUN="false"\n'
+                'NETWORK_POLICY_ENFORCEMENT="absent-accepted"\n'
+                f'bootstrap_install_env_file "{dest}" 0.5.0\n'
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty)}),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("Add ACCEPT_NO_NETWORK_POLICY=true", proc.stderr + proc.stdout)
+            self.assertEqual(dest.read_text(), "PROJECT_ID=p\n")
+
+    def test_an_unset_answer_is_not_exported_as_false(self):
+        """An exported "false" is an answer to the prompt gates, which read
+        ${PARAM_...:-${ACCEPT_NO_NETWORK_POLICY:-}}: unconditional export silenced
+        the interactive three-way prompt on every run without the flag."""
+        text = _INSTALL_SH.read_text()
+        self.assertNotIn('export ACCEPT_NO_NETWORK_POLICY="${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}"', text)
+        self.assertIn(
+            'if [ -n "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" ]; then\n'
+            '    export ACCEPT_NO_NETWORK_POLICY="$PARAM_ACCEPT_NO_NETWORK_POLICY"',
+            text,
+        )
+
+    def test_the_composition_stamps_the_annotation_from_what_the_module_read(self):
+        main_tf = (_REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf").read_text()
+        self.assertIn('"kubeagents.x-k8s.io/network-policy-enforcement" = "absent-accepted"', main_tf)
+        self.assertIn("module.gke_cluster.network_policy_enforced ? {}", main_tf)
+        self.assertRegex(main_tf, r"accept_no_network_policy\s+= var\.accept_no_network_policy")
+
+
 class SummarizeExistingClusterMutationsTest(unittest.TestCase):
     """summarize_existing_cluster_mutations outputs expected lines for adoption."""
 
@@ -2893,6 +3538,7 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
         dp="ADVANCED_DATAPATH",
         legacy_np="False",
         status="RUNNING",
+        accept="",
     ):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -2912,16 +3558,20 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
                 "exit 0\n"
             )
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("")
+            accept_line = f'PARAM_ACCEPT_NO_NETWORK_POLICY="{accept}"\n' if accept else ""
             body = (
                 f'source "{_INSTALLER_COMMON}"\n'
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                f"{accept_line}"
                 "summarize_existing_cluster_mutations p c r true\n"
             )
             return subprocess.run(
                 ["bash", "-c", body],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)),
                 cwd=str(_REPO_ROOT),
             )
 
@@ -2939,6 +3589,14 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("NetworkPolicy Enforcement: Refused", proc.stdout)
         self.assertIn("install will abort", proc.stdout)
+        self.assertIn("--accept-no-network-policy", proc.stdout)
+
+    def test_summary_reflects_accepted_absence(self):
+        proc = self._run(dp="", legacy_np="False", accept="true")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("NetworkPolicy Enforcement: Absent, accepted", proc.stdout)
+        self.assertIn("cluster unchanged", proc.stdout)
+        self.assertNotIn("install will abort", proc.stdout)
 
     def test_summary_reflects_refused_node_pool_migration_when_missing(self):
         proc = self._run(node_pools="default-pool,GCE_METADATA")
@@ -3188,7 +3846,7 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
             )
 
     def test_a_zonal_region_is_reduced_to_the_kms_region(self):
-        """KMS locations are regional. The caller passes install.sh's --region,
+        """KMS locations are regional. The caller passes install.sh's --gcp-region,
         which may be a zone."""
         _, calls = self._run()
         creates = [c for c in calls if "kms keys create" in c]
@@ -3581,7 +4239,7 @@ class TheMinterCliSourceIsSpelledOnceTest(unittest.TestCase):
 
 
 class ShellNamespaceNeverReachesTheGeneratorTest(unittest.TestCase):
-    """NAMESPACE is a name kubectl tooling exports; only install.env may set it."""
+    """NAMESPACE is a name kubectl tooling exports; only install.env or flags may set it."""
 
     def _namespace_after_load(self, contents):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3591,6 +4249,7 @@ class ShellNamespaceNeverReachesTheGeneratorTest(unittest.TestCase):
             proc = subprocess.run(
                 ["bash", "-c",
                  f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                 'apply_agent_namespace_override\n'
                  'echo "NS=${NAMESPACE:-unset}"'],
                 capture_output=True, text=True,
                 env=get_isolated_test_env(overrides={
@@ -3670,6 +4329,123 @@ class BootstrapRecordsIdentityKeysOnlyWhenSetTest(unittest.TestCase):
         seen by the same anchored pattern, so their silence means absence."""
         out = self._bootstrap({"GKE_DB_KMS_KEY": "key-two"})
         self.assertRegex(out, re.compile(r"^GKE_DB_KMS_KEY=key-two$", re.MULTILINE))
+
+
+class ModelMaxTokensPersistsThroughInstallEnvTest(unittest.TestCase):
+    """The flag on the first run, the file on every later one.
+
+    main() exports MODEL_MAX_TOKENS from the flag (or the loaded file),
+    bootstrap_install_env_file records the export in a fresh install.env, and
+    the next run seeds PARAM_MODEL_MAX_TOKENS from the file at source time.
+    Dropping the write_env_var line, the ${MODEL_MAX_TOKENS:-} seed or the
+    export leaves the flag and validator tests green while --model-max-tokens
+    renders model_max_tokens = 0 on the next upgrade, so this walks the file
+    the first run writes into a second run.
+    """
+
+    _RECORDED_VALUE = "4096"
+
+    def _bootstrap_with_export(self, tmp, export_line):
+        dest = pathlib.Path(tmp) / "new.install.env"
+        loaded = pathlib.Path(tmp) / "loaded.install.env"
+        loaded.write_text("")
+        loaded.chmod(0o600)
+        proc = subprocess.run(
+            ["bash", "-c",
+             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+             'source scripts/installer/installer_common.sh\n'
+             'resolve_shared_defaults\n'
+             'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n'
+             f'{export_line}\n'
+             f'bootstrap_install_env_file "{dest}" some-tag >/dev/null'],
+            capture_output=True, text=True,
+            env=self._env({
+                "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
+            }),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertTrue(dest.exists(), proc.stderr + proc.stdout)
+        return dest
+
+    def _read_back(self, env_file, body):
+        proc = subprocess.run(
+            ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{body}\n'],
+            capture_output=True, text=True,
+            env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(env_file)}),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        return proc.stdout
+
+    @staticmethod
+    def _env(overrides):
+        # A developer's own exported value must not stand in for the file.
+        env = get_isolated_test_env(overrides=overrides)
+        env.pop("MODEL_MAX_TOKENS", None)
+        env.update(overrides)
+        return env
+
+    def test_the_first_run_records_the_export_and_the_next_run_reads_it_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(
+                tmp, f'export MODEL_MAX_TOKENS="{self._RECORDED_VALUE}"'
+            )
+            self.assertIn(f"MODEL_MAX_TOKENS={self._RECORDED_VALUE}\n", dest.read_text())
+            # The parameter block, and the exported environment the tfvars
+            # generator reads (set -a around the load is what carries it).
+            out = self._read_back(
+                dest,
+                'echo "PARAM=[$PARAM_MODEL_MAX_TOKENS]"; '
+                "bash -c 'echo \"EXPORTED=[$MODEL_MAX_TOKENS]\"'",
+            )
+            self.assertIn(f"PARAM=[{self._RECORDED_VALUE}]", out)
+            self.assertIn(f"EXPORTED=[{self._RECORDED_VALUE}]", out)
+
+    def test_an_unset_value_is_recorded_empty_and_reads_back_empty(self):
+        """Empty is what the generator turns into DEFAULT_MODEL_MAX_TOKENS, and
+        the quoted empty string is the spelling the drift check knows."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, 'export MODEL_MAX_TOKENS=""')
+            self.assertIn("MODEL_MAX_TOKENS=''\n", dest.read_text())
+            out = self._read_back(dest, 'echo "PARAM=[$PARAM_MODEL_MAX_TOKENS]"')
+            self.assertIn("PARAM=[]", out)
+
+    def test_a_flag_on_a_later_run_beats_the_recorded_value(self):
+        """Order of authority: flag, then file. 0 is non-empty to ${:-}, so a
+        flag of 0 switches the budget off against a file that records one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(
+                tmp, f'export MODEL_MAX_TOKENS="{self._RECORDED_VALUE}"'
+            )
+            out = self._read_back(
+                dest, 'parse_args --model-max-tokens=0; echo "PARAM=[$PARAM_MODEL_MAX_TOKENS]"'
+            )
+            self.assertIn("PARAM=[0]", out)
+
+    def test_main_validates_then_exports_before_the_generator_and_the_bootstrap(self):
+        """The KUBE_AGENTS_SOURCE_ONLY harness cannot drive main(), so the wiring
+        between parse_args and the export block is pinned by text: the value
+        main() exports is the flag-or-file one the validator checked, and the
+        export comes before the two readers, write_tfvars_from_state and
+        bootstrap_install_env_file."""
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        seed_line = 'local model_max_tokens="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"'
+        validate_line = "validate_model_max_tokens || exit 1"
+        export_line = 'export MODEL_MAX_TOKENS="$model_max_tokens"'
+        for line in (seed_line, validate_line, export_line):
+            self.assertIn(line, text[main_start:], f"main() no longer carries: {line}")
+        seed = text.index(seed_line, main_start)
+        validated = text.index(validate_line, main_start)
+        exported = text.index(export_line, main_start)
+        generator = text.index('write_tfvars_from_state "$tfvars_file" "$image_tag"', exported)
+        bootstrap = text.index('bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"', exported)
+        self.assertLess(seed, validated)
+        self.assertLess(validated, exported)
+        self.assertLess(exported, generator)
+        self.assertLess(exported, bootstrap)
 
 
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
@@ -3948,8 +4724,8 @@ class ChatBooleansAreReadThroughIsTruthyTest(unittest.TestCase):
     literal. `GOOGLE_CHAT_ENABLED=True` therefore dropped `chat_choice` to 4 and
     planned the Pub/Sub topic away on the next `-y` run, while `upgrade.sh` read
     the same file as enabled — two front doors disagreeing about one file. The
-    sibling booleans fail loudly on their `^(true|false)$` validators instead;
-    only these two were silent.
+    `^(true|false)$` validators run in `parse_args`, on what a caller typed on
+    the command line, so a spelling seeded from `install.env` never reaches one.
     """
 
     def _chat_choice(self, contents):
@@ -3981,9 +4757,9 @@ class ChatBooleansAreReadThroughIsTruthyTest(unittest.TestCase):
         and it is invisible to the behavioural cases below on a `true` file."""
         block = self._SOURCE_BLOCK()
         self.assertNotIn('"$PARAM_ENABLE_GOOGLE_CHAT" = "true"', block)
-        self.assertNotIn('"${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" = "true"', block)
+        self.assertNotIn('"${PARAM_ENABLE_SLACK:-$DEFAULT_SLACK_ENABLED}" = "true"', block)
         self.assertIn('is_truthy "$PARAM_ENABLE_GOOGLE_CHAT"', block)
-        self.assertIn('is_truthy "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"', block)
+        self.assertIn('is_truthy "${PARAM_ENABLE_SLACK:-$DEFAULT_SLACK_ENABLED}"', block)
 
     def _SOURCE_BLOCK(self):
         source = _INSTALL_SH.read_text()
@@ -4200,6 +4976,21 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
 
     def test_an_unchanged_memory_answer_says_nothing(self):
         proc = self._warn("MEMORY=file\n", {"PARAM_MEMORY": "file"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("does not record", proc.stdout + proc.stderr)
+
+    def test_a_changed_max_tokens_answer_is_named(self):
+        """A --model-max-tokens flag on a run against a file that records a
+        different value: the file still says the old budget, and the next
+        upgrade.sh would render it."""
+        proc = self._warn("MODEL_MAX_TOKENS=4096\n", {"MODEL_MAX_TOKENS": "8192"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("does not record", combined)
+        self.assertIn("MODEL_MAX_TOKENS=8192", combined)
+
+    def test_an_unchanged_max_tokens_answer_says_nothing(self):
+        proc = self._warn("MODEL_MAX_TOKENS=4096\n", {"MODEL_MAX_TOKENS": "4096"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("does not record", proc.stdout + proc.stderr)
 
@@ -4535,7 +5326,10 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         proc = self._run_func(f'run_lifecycle_apply "{repo_dir}" "{log_file}"')
 
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("Error encountered at line", proc.stderr)
+        # on_error names the frame that called it: install.sh itself, in the
+        # dispatcher, since the failure is reported from there.
+        self.assertIn(f"Error encountered at {_INSTALL_SH}:", proc.stderr)
+        self.assertIn(" in handle_pipeline_status (exit code 1): ", proc.stderr)
         self.assertIn("./lifecycle.sh apply -auto-approve -input=false", proc.stderr)
         self.assertNotIn('tee "$log_file"', proc.stderr)
         self.assertNotIn("tee ", proc.stderr)
@@ -4554,6 +5348,129 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertEqual(proc.returncode, 0, f"Stderr: {proc.stderr}")
         self.assertTrue(log_file.exists())
         self.assertIn("Apply complete", log_file.read_text())
+
+    def test_a_failure_inside_a_sourced_library_names_its_file_and_function(self):
+        """The abort banner points at the frame that failed.
+
+        $LINENO counts from the top of whichever file the failing command sat
+        in. Printed alone, a failure inside a sourced helper read as a line of
+        install.sh, where that line is unrelated code (#1798). The banner now
+        carries the file and the function; the JSON report is unchanged and
+        still records the status alone.
+        """
+        lib = self._tmp_path / "helper_lib.sh"
+        lib.write_text("library_probe() {\n  false\n}\n")
+        # Same file the other write_json_report tests read, removed first so
+        # the assertions below read this run's report and not the one the
+        # previous test left behind.
+        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
+        report_file.unlink(missing_ok=True)
+        proc = self._run_func(f'source "{lib}"\nlibrary_probe\necho "NOT_REACHED"')
+
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("NOT_REACHED", proc.stdout)
+        self.assertIn(f"Error encountered at {lib}:", proc.stderr)
+        self.assertIn(" in library_probe (exit code 1): false", proc.stderr)
+        # The report the handler wrote on the way out.
+        self.assertTrue(report_file.exists(), proc.stderr)
+        report = json.loads(report_file.read_text())
+        self.assertEqual(report["status"], "FAILED")
+        for absent in ("message", "line", "line_no", "command", "function", "source_file"):
+            self.assertNotIn(absent, report)
+        for value in report.values():
+            self.assertNotIn("library_probe", str(value))
+            self.assertNotIn("Error encountered", str(value))
+
+    def test_a_failure_in_a_piped_script_names_install_sh_not_bash(self):
+        """The curl | bash entry has no file for bash to name a frame after.
+
+        Read from stdin, BASH_SOURCE for this script's own frames is `main` on
+        a modern bash and unset on bash 3.2, and $0 is `bash`. The banner
+        names the script instead, so the line number has a file to belong to.
+        """
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "piped_step() {\n  false\n}\n"
+            "piped_step\n"
+        )
+        proc = subprocess.run(
+            ["bash"],
+            input=script,
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+            ),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("Error encountered at install.sh:", proc.stderr)
+        self.assertIn(" in piped_step (exit code 1): false", proc.stderr)
+        self.assertNotIn(" at bash:", proc.stderr)
+        self.assertNotIn(" at main:", proc.stderr)
+
+    def test_a_handled_miss_inside_a_substitution_prints_no_banner_and_no_report(self):
+        """A probe whose miss the caller handles is not an abort.
+
+        `set -E` hands the ERR trap to the `$(...)`, and bash 3.2 fires it
+        there before the caller's `if !` is consulted (#1798). The handler
+        exits the subshell silently and leaves the verdict to the parent, which
+        handles the miss: no banner, no report. bash 4.4 and 5.x never fire the
+        inherited trap in this shape, so there this asserts the contract
+        without exercising the check; the unhandled case below does.
+        """
+        # Same file the other write_json_report tests read.
+        report = pathlib.Path("/tmp/kube-agents-install-report.json")
+        report.unlink(missing_ok=True)
+        proc = self._run_func(
+            "probe() { false; }\n"
+            'step() { if ! x="$(probe)"; then echo "handled"; fi; }\n'
+            "step\n"
+            'echo "done"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("handled", proc.stdout)
+        self.assertIn("done", proc.stdout)
+        self.assertNotIn("Error encountered", proc.stderr)
+        self.assertFalse(report.exists())
+
+    def test_an_unhandled_failure_inside_a_substitution_prints_one_banner_from_the_parent(self):
+        """A real failure inside a `$(...)` is reported once, by the parent.
+
+        Every bash fires the inherited trap inside an unhandled substitution.
+        The subshell's handler exits at the failing command rather than
+        printing: command substitution does not inherit errexit, so a handler
+        that merely returned would let the probe run on past its failure and
+        hand the caller a clean exit. The parent's trap then fires at the
+        assignment and prints the one banner.
+        """
+        # Same file the other write_json_report tests read, removed first so
+        # the report assertion reads this run's and not the previous test's.
+        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
+        report_file.unlink(missing_ok=True)
+        proc = self._run_func(
+            'probe() { false; echo "NOT_REACHED_IN_PROBE"; }\n'
+            'x="$(probe)"\n'
+            'echo "NOT_REACHED x=[$x]"'
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("NOT_REACHED", proc.stdout)
+        self.assertEqual(proc.stderr.count("Error encountered"), 1, proc.stderr)
+        self.assertIn(' in main (exit code 1): x="$(probe)"', proc.stderr)
+        self.assertTrue(report_file.exists(), proc.stderr)
+        report = json.loads(report_file.read_text())
+        self.assertEqual(report["status"], "FAILED")
+
+    def test_each_front_door_handler_exits_a_subshell_silently(self):
+        """The three handlers share the rule, and apply it before they print."""
+        check = 'if [ "${BASH_SUBSHELL:-0}" -gt 0 ]; then\n    exit "$exit_code"\n  fi'
+        for path in _FRONT_DOORS:
+            with self.subTest(file=path.name):
+                source = path.read_text()
+                handler = source[source.index("\non_error() {") :]
+                handler = handler[: handler.index("\n}\n")]
+                self.assertIn(check, handler)
+                self.assertLess(handler.index(check), handler.index("echo -e"))
 
     def test_pipeline_status_handles_empty_array_safely_under_set_u(self):
         source = _INSTALL_SH.read_text()
@@ -4872,42 +5789,22 @@ echo "DERIVED_SUB=$chat_sub_name"
         self.assertIn("DERIVED_SUB=legacy-managed-sub", proc.stdout)
 
 
-@unittest.skipUnless(hasattr(pty, "fork"), "run_with_spinner's terminal branch needs a pty")
-class SpinnerTerminalBranchTest(unittest.TestCase):
-    """run_with_spinner on a real terminal, the branch no piped test reaches.
+class PtyChildTestMixin:
+    """Shared plumbing for a test that forks a child under a controlling terminal.
 
-    Every other test in this file runs under a subprocess pipe, so `[ ! -t 1 ]`
-    diverts it to the fallback and the spinner loop, the cursor calls, the
-    background job and the interrupt traps never execute at all. On a terminal
-    -- where an operator actually meets them -- they all do, so these drive one.
+    The parent drains the pty for the child's life (a child that writes more
+    than the pty buffers blocks otherwise), kills the child's whole group and
+    reaps it on cleanup, and reads the child's outcome from a file it writes,
+    since the pty carries the child's screen, not its result.
     """
 
     _READY_TIMEOUT_SECS = 30
     _POLL_INTERVAL_SECS = 0.1
 
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self._tmp_path = pathlib.Path(tmp.name)
-
-    def _spawn_on_pty(self, script):
-        """Run script under bash with a controlling terminal. Returns its pid."""
-        env = get_isolated_test_env(
-            overrides={"KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json")}
-        )
-        pid, fd = pty.fork()
-        if pid == 0:
-            try:
-                os.chdir(str(_REPO_ROOT))
-                os.execvpe("bash", ["bash", "-c", script], env)
-            finally:  # pragma: no cover - only on execvpe failure
-                os._exit(127)
-        # The spinner redraws continuously, so the pty buffer fills and the child
-        # blocks on write unless someone is reading. Drain it for the run's life.
+    def _watch_pty_child(self, pid, fd):
         drain = threading.Thread(target=self._drain, args=(fd,), daemon=True)
         drain.start()
         self.addCleanup(self._cleanup_pty, pid, fd)
-        return pid
 
     @staticmethod
     def _drain(fd):
@@ -4941,6 +5838,39 @@ class SpinnerTerminalBranchTest(unittest.TestCase):
                 return path.read_text().strip()
             time.sleep(self._POLL_INTERVAL_SECS)
         self.fail(f"timed out after {self._READY_TIMEOUT_SECS}s waiting for {what} at {path}")
+
+
+@unittest.skipUnless(hasattr(pty, "fork"), "run_with_spinner's terminal branch needs a pty")
+class SpinnerTerminalBranchTest(PtyChildTestMixin, unittest.TestCase):
+    """run_with_spinner on a real terminal, the branch no piped test reaches.
+
+    Every other test in this file runs under a subprocess pipe, so `[ ! -t 1 ]`
+    diverts it to the fallback and the spinner loop, the cursor calls, the
+    background job and the interrupt traps never execute at all. On a terminal
+    -- where an operator actually meets them -- they all do, so these drive one.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._tmp_path = pathlib.Path(tmp.name)
+
+    def _spawn_on_pty(self, script):
+        """Run script under bash with a controlling terminal. Returns its pid."""
+        env = get_isolated_test_env(
+            overrides={"KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json")}
+        )
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.chdir(str(_REPO_ROOT))
+                os.execvpe("bash", ["bash", "-c", script], env)
+            finally:  # pragma: no cover - only on execvpe failure
+                os._exit(127)
+        # The spinner redraws continuously, so the pty buffer fills and the child
+        # blocks on write unless someone is reading.
+        self._watch_pty_child(pid, fd)
+        return pid
 
     def test_the_spinner_loop_keeps_errexit_out_of_its_interruptible_commands(self):
         """The loop's forked children must not be able to fire the ERR trap.
@@ -4994,6 +5924,1107 @@ echo "$rc" > "{rc_file}"
         self._spawn_on_pty(script)
         self.assertEqual("42", self._await_file(rc_file, "the wrapped command's exit status"))
         self.assertIn("the wrapped output", log_file.read_text())
+
+
+class DomainScopedFlagsTest(unittest.TestCase):
+    """The CLI surface issue #1540 defines.
+
+    Three things are asserted here and nowhere else: that the legacy spellings
+    are GONE rather than quietly still accepted, that every `--enable-*` toggle
+    means the same thing bare as it does with `=true`, and that the flags which
+    had no CLI at all before this reach the variables the install actually
+    reads.
+    """
+
+    def _parse(self, args, body, contents="", env=None):
+        """parse_args the given args, then run `body`, with an install.env.
+
+        installer_common.sh is sourced too, in the order main() does it:
+        source_provisioning_helpers runs at step 2, so every function reached
+        below has is_truthy and the DEFAULT_* set by the time it runs.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text(contents)
+            script = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+                f"parse_args {args}\n{body}\n"
+            )
+            overrides = {"KUBE_AGENTS_INSTALL_ENV": str(env_file)}
+            overrides.update(env or {})
+            return subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(overrides=overrides),
+                cwd=str(_REPO_ROOT),
+            )
+
+    # Every flag the issue removes, with no alias fallback. A rename that left
+    # the old spelling working would pass every other test in this file.
+    LEGACY_FLAGS = [
+        "--project-id=p",
+        "--region=r",
+        "--cluster-name=c",
+        "--cluster-mode=autopilot",
+        "--gvisor=false",
+        "--allowed-users=a@example.com",
+        "--enable-web-ui",
+        "--enable-web-ui=true",
+        "--enable-webui",
+        "--enable-webui=true",
+        "--webui",
+        "--webui=true",
+    ]
+
+    def test_every_legacy_flag_is_rejected(self):
+        for flag in self.LEGACY_FLAGS:
+            with self.subTest(flag=flag):
+                proc = self._parse(flag, 'echo "REACHED"')
+                self.assertNotIn("REACHED", proc.stdout)
+                self.assertIn("Unknown parameter", proc.stdout + proc.stderr)
+
+    # flag -> (PARAM variable, value to pass)
+    RENAMED_FLAGS = {
+        "--gcp-project-id": ("PARAM_PROJECT_ID", "my-project"),
+        "--gcp-region": ("PARAM_REGION", "europe-west1"),
+        "--gke-cluster-name": ("PARAM_CLUSTER_NAME", "my-cluster"),
+        "--gke-cluster-mode": ("PARAM_CLUSTER_MODE", "standard"),
+        "--agent-namespace": ("PARAM_AGENT_NAMESPACE", "my-namespace"),
+        "--google-chat-allowed-users": ("PARAM_ALLOWED_USERS", "a@example.com"),
+        "--slack-bot-token": ("PARAM_SLACK_BOT_TOKEN", "xoxb-1"),
+        "--slack-app-token": ("PARAM_SLACK_APP_TOKEN", "xapp-1"),
+        "--slack-allowed-users": ("PARAM_SLACK_ALLOWED_USERS", "U123,U456"),
+        "--slack-home-channel": ("PARAM_SLACK_HOME_CHANNEL", "C01234567"),
+        "--slack-home-channel-name": ("PARAM_SLACK_HOME_CHANNEL_NAME", "#gke-alerts"),
+    }
+
+    def test_each_value_flag_reaches_its_variable(self):
+        for flag, (var, value) in self.RENAMED_FLAGS.items():
+            with self.subTest(flag=flag):
+                proc = self._parse(f"{flag}={shlex.quote(value)}", f'echo "V=${var}"')
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertIn(f"V={value}", proc.stdout)
+
+    TOGGLES = {
+        "--enable-gvisor": "PARAM_ENABLE_GVISOR",
+        "--enable-hermes-dashboard": "PARAM_ENABLE_WEBUI",
+        "--enable-gke-backup-plan": "PARAM_ENABLE_GKE_BACKUP_PLAN",
+        "--enable-pubsub-platform": "PARAM_ENABLE_PUBSUB_PLATFORM",
+        "--enable-stockout-investigator": "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
+        "--enable-google-chat": "PARAM_ENABLE_GOOGLE_CHAT",
+        "--enable-slack": "PARAM_ENABLE_SLACK",
+    }
+
+    def test_bare_and_explicit_boolean_forms_agree(self):
+        """`--flag` and `--flag=true` are the same answer, for every toggle.
+
+        The old parser was inconsistent about this -- `--enable-gvisor` took only the
+        `=` form, `--enable-google-chat` only the bare one -- so an automated
+        caller had to know which was which per flag.
+        """
+        for flag, var in self.TOGGLES.items():
+            with self.subTest(flag=flag):
+                bare = self._parse(flag, f'echo "V=${var}"')
+                self.assertEqual(bare.returncode, 0, bare.stderr + bare.stdout)
+                self.assertIn("V=true", bare.stdout)
+
+                explicit = self._parse(f"{flag}=true", f'echo "V=${var}"')
+                self.assertEqual(explicit.returncode, 0, explicit.stderr + explicit.stdout)
+                self.assertIn("V=true", explicit.stdout)
+
+                off = self._parse(f"{flag}=false", f'echo "V=${var}"')
+                self.assertEqual(off.returncode, 0, off.stderr + off.stdout)
+                self.assertIn("V=false", off.stdout)
+
+    def test_a_flag_still_beats_install_env_for_the_new_names(self):
+        """The precedence install.defaults.env documents, on the renamed flags.
+
+        parse_args runs after install.env is sourced, which is what makes this
+        true; a seed added in the wrong place would silently invert it.
+        """
+        proc = self._parse(
+            "--gcp-project-id=from-the-flag",
+            'echo "P=$PARAM_PROJECT_ID"',
+            contents="PROJECT_ID=from-the-file\n",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("P=from-the-flag", proc.stdout)
+
+    def test_slack_settings_inherit_from_install_env(self):
+        """A re-run that repeats no --slack-* flag keeps the recorded settings.
+
+        Same contract the Google Chat seeds have: losing SLACK_ALLOWED_USERS on
+        a silent re-run would widen the allowlist to the whole workspace rather
+        than merely dropping a setting.
+        """
+        proc = self._parse(
+            "--enable-slack",
+            'echo "T=$PARAM_SLACK_BOT_TOKEN U=$PARAM_SLACK_ALLOWED_USERS"',
+            contents="SLACK_BOT_TOKEN=xoxb-from-the-file\nSLACK_ALLOWED_USERS=U999\n",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("T=xoxb-from-the-file U=U999", proc.stdout)
+
+    def test_agent_namespace_survives_the_unset_namespace_guard(self):
+        """--agent-namespace must reach NAMESPACE despite bootstrap_install_env.
+
+        That function unsets NAMESPACE before reading install.env, so an
+        inherited kubectl variable cannot redirect an install -- which is what
+        the seeded NAMESPACE below stands in for. A flag is a deliberate act and
+        has to get through anyway.
+
+        Calls install.sh's own apply_agent_namespace_override rather than a copy
+        of its body: a test that re-implements the export passes just as well
+        once the export is deleted from the script, while --agent-namespace
+        silently stops reaching write_tfvars_from_state.
+        """
+        proc = self._parse(
+            "--agent-namespace=chosen-ns",
+            'apply_agent_namespace_override; echo "N=$NAMESPACE"',
+            env={"NAMESPACE": "inherited-from-kubectl"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("N=chosen-ns", proc.stdout)
+
+    def test_the_ambient_namespace_alone_still_does_not_get_through(self):
+        """The other half of the same guard: no flag, no override.
+
+        A function that exported $NAMESPACE rather than PARAM_AGENT_NAMESPACE
+        would pass the test above and undo the guard entirely.
+        """
+        proc = self._parse(
+            "--gcp-project-id=p",
+            'apply_agent_namespace_override; echo "N=[${NAMESPACE:-}]"',
+            env={"NAMESPACE": "inherited-from-kubectl"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("N=[]", proc.stdout)
+
+    def test_agent_namespace_seeds_from_install_env(self):
+        """install.env key NAMESPACE seeds PARAM_AGENT_NAMESPACE and reaches NAMESPACE."""
+        proc = self._parse(
+            "--gcp-project-id=p",
+            'apply_agent_namespace_override; echo "N=[${NAMESPACE:-}]"',
+            contents="NAMESPACE=recorded-ns\n",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("N=[recorded-ns]", proc.stdout)
+
+
+    def test_both_entry_paths_apply_the_namespace_override(self):
+        """main() and the control panel each have to apply it after their unset.
+
+        The behavioural test above can only prove the function does what it
+        says; it cannot notice the call going missing. main() applies it once
+        parse_args has run, and run_menu_system applies it again because
+        load_install_env unsets NAMESPACE a second time on its way in -- a menu
+        that lost the flag would open on the default namespace and write tfvars
+        for that one.
+        """
+        text = _INSTALL_SH.read_text()
+        main_at = text.index("\nmain() {")
+        self.assertIn(
+            'parse_args "$@"\n  apply_agent_namespace_override',
+            text[main_at:],
+            "main() must apply the override immediately after parse_args",
+        )
+        menu = text[text.index("run_menu_system() {") : main_at]
+        load_at = menu.find('load_install_env "$INSTALL_ENV_FILE"')
+        reapply_at = menu.find("apply_agent_namespace_override")
+        self.assertNotEqual(load_at, -1, "the menu's install.env reload is missing")
+        self.assertNotEqual(
+            reapply_at, -1, "run_menu_system never re-applies --agent-namespace"
+        )
+        self.assertLess(load_at, reapply_at)
+
+    def test_a_namespace_the_flag_chose_is_recorded_for_the_next_run(self):
+        """Otherwise the flag applies to exactly one run and says nothing.
+
+        install.env is the only thing a later install.sh, upgrade.sh or --menu
+        run reads. Without the key they resolve ${NAMESPACE:-$DEFAULT_NAMESPACE}
+        back to kubeagents-system, render tfvars for it, look for the recovered
+        Secret there, and are refused by lifecycle.sh's guard_release_namespace.
+
+        $NAMESPACE on its own must still not be recorded: it is a variable
+        kubectl tooling exports, and freezing a stray value would move the
+        release on the next apply.
+        """
+        for args, expected in (("--agent-namespace=chosen-ns", True), ("", False)):
+            with self.subTest(args=args):
+                with tempfile.TemporaryDirectory() as tmp:
+                    destination = pathlib.Path(tmp) / "written.env"
+                    proc = self._parse(
+                        args,
+                        f'bootstrap_install_env_file "{destination}" v1.2.3',
+                        env={"NAMESPACE": "inherited-from-kubectl"},
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    written = destination.read_text()
+                    if expected:
+                        self.assertIn("NAMESPACE=chosen-ns", written)
+                    else:
+                        self.assertNotIn("\nNAMESPACE=", written)
+                        self.assertNotIn("inherited-from-kubectl", written)
+
+    def test_the_flag_says_so_when_it_cannot_be_recorded(self):
+        """An install.env that already exists is never rewritten.
+
+        That is the file's contract, so the second install passing the flag by
+        hand is the one case nothing can record for the operator. Silence there
+        is the trap the test above describes, arriving one run later.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--agent-namespace=chosen-ns",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("chosen-ns", combined)
+            self.assertIn(
+                "repeat --agent-namespace on every later install.sh, upgrade.sh and --menu run",
+                combined,
+            )
+            self.assertEqual(
+                destination.read_text(),
+                "PROJECT_ID=p\n",
+                "an install.env that already exists must be left alone",
+            )
+
+    def test_the_backup_plan_flag_says_so_when_it_beats_a_recorded_value(self):
+        """Reversing this one destroys a BackupPlan rather than moving a release.
+
+        The recorded value is what a later run re-reads, so a re-run that omits
+        the flag plans the BackupPlan's destruction — and once a backup has been
+        taken the API refuses that destroy, leaving a half-applied install.
+        Nothing else says so: bootstrap_install_env_file will not rewrite an
+        existing file, the menu has no entry for the key, and
+        warn_unrecorded_interview_answers deliberately excludes it because it
+        has no interview question.
+
+        The recorded value is named, not merely contradicted: "applies to this
+        run only" against a file the operator believes says true is a warning
+        they will read as spurious.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_GKE_BACKUP_PLAN=false\n")
+            proc = self._parse(
+                "--enable-gke-backup-plan",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("ENABLE_GKE_BACKUP_PLAN=false", combined)
+            self.assertIn("BackupPlan", combined)
+            self.assertIn(
+                "repeat --enable-gke-backup-plan on every later install.sh run",
+                combined,
+            )
+            self.assertNotIn("upgrade.sh", combined)
+            self.assertNotIn("--menu", combined)
+
+    def test_the_backup_plan_warning_fires_non_interactively(self):
+        """-y is the route these flags were added for, not an exemption.
+
+        warn_unrecorded_interview_answers returns early on -y, because its
+        answers came from flags and the file and there is no third source to
+        surprise anyone. Here the flag IS the surprise, so a copy of that early
+        return would silence the warning on every run that can hit the trap.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "-y --enable-gke-backup-plan",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("records no ENABLE_GKE_BACKUP_PLAN", combined)
+
+    def test_a_flag_that_agrees_with_the_recorded_value_is_not_warned_about(self):
+        """Nothing is overridden, so there is nothing to lose by omitting it.
+
+        A warning here would fire on every re-run of a correctly recorded
+        install, which is the way a real warning gets ignored.
+
+        The non-canonical spellings are the case that matters. A flag's value is
+        always `true` or `false`; install.env is hand-written, and CI's
+        render_install_env.sh copies the GitHub variable in verbatim while
+        provision_environment.sh canonicalises the same variable onto the flag.
+        So an environment typed `True` disagrees on spelling and agrees on
+        meaning, and comparing the two as strings warned about a destroyed
+        BackupPlan on every rebuild.
+        """
+        for key, flag in (
+            ("ENABLE_GKE_BACKUP_PLAN=true", "--enable-gke-backup-plan=true"),
+            ("ENABLE_GKE_BACKUP_PLAN=True", "--enable-gke-backup-plan=true"),
+            ("ENABLE_GKE_BACKUP_PLAN=yes", "--enable-gke-backup-plan"),
+            ("ENABLE_GKE_BACKUP_PLAN=1", "--enable-gke-backup-plan=true"),
+            ("ENABLE_GKE_BACKUP_PLAN=on", "--enable-gke-backup-plan=true"),
+            ("ENABLE_GKE_BACKUP_PLAN=off", "--enable-gke-backup-plan=false"),
+            ("ENABLE_GKE_BACKUP_PLAN=no", "--enable-gke-backup-plan=false"),
+            ("NAMESPACE=chosen-ns", "--agent-namespace=chosen-ns"),
+        ):
+            with self.subTest(key=key, flag=flag):
+                with tempfile.TemporaryDirectory() as tmp:
+                    destination = pathlib.Path(tmp) / "existing.env"
+                    destination.write_text(f"{key}\n")
+                    proc = self._parse(
+                        flag,
+                        f'bootstrap_install_env_file "{destination}" v1.2.3',
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    self.assertNotIn(
+                        "applies to this run only", proc.stdout + proc.stderr
+                    )
+
+    def test_a_non_canonical_recorded_value_still_warns_when_it_disagrees(self):
+        """Comparing by meaning must not turn the warning off altogether.
+
+        Both directions, because they are different branches of the comparison
+        and each is a reversal: a recorded `no` against the bare flag, and a
+        recorded `True` against `=false`, which is the run that turns a backup
+        plan off for itself and leaves the file saying otherwise.
+        """
+        for recorded, flag in (
+            ("no", "--enable-gke-backup-plan"),
+            ("True", "--enable-gke-backup-plan=false"),
+        ):
+            with self.subTest(recorded=recorded, flag=flag):
+                with tempfile.TemporaryDirectory() as tmp:
+                    destination = pathlib.Path(tmp) / "existing.env"
+                    destination.write_text(f"ENABLE_GKE_BACKUP_PLAN={recorded}\n")
+                    proc = self._parse(
+                        flag,
+                        f'bootstrap_install_env_file "{destination}" v1.2.3',
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    combined = proc.stdout + proc.stderr
+                    self.assertIn("applies to this run only", combined)
+                    # The operator's own spelling, not a canonicalised one: they
+                    # have to find the line in the file.
+                    self.assertIn(f"ENABLE_GKE_BACKUP_PLAN={recorded}", combined)
+
+    def test_a_recorded_spelling_warns_about_nothing_when_no_flag_was_passed(self):
+        """The case that reaches this function without anyone typing a flag.
+
+        `PARAM_ENABLE_GKE_BACKUP_PLAN` is seeded from the loaded
+        `ENABLE_GKE_BACKUP_PLAN`, so on a re-run that says nothing about the
+        backup plan the "flag value" this function is handed is the file's own
+        spelling. Canonicalising one side and not the other therefore reported
+        the file as disagreeing with itself, and printed the BackupPlan's
+        destruction as the consequence of a flag nobody passed.
+
+        The file loaded and the file written to are the same one here, as they
+        are in the real call: `bootstrap_install_env_file "$INSTALL_ENV_FILE"`.
+        """
+        for recorded in ("true", "false", "True", "yes", "1", "on", "off", "no"):
+            with self.subTest(recorded=recorded):
+                proc = self._parse(
+                    "",
+                    'bootstrap_install_env_file "$KUBE_AGENTS_INSTALL_ENV" v1.2.3',
+                    contents=f"ENABLE_GKE_BACKUP_PLAN={recorded}\n",
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertNotIn(
+                    "applies to this run only", proc.stdout + proc.stderr
+                )
+
+    def test_the_namespace_flag_is_compared_literally(self):
+        """NAMESPACE is a string, and `true`/`false` are legal namespace names.
+
+        Routing it through is_truthy as well would read a recorded `yes` and a
+        flagged `true` as agreement and skip a warning about a release moving.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("NAMESPACE=yes\n")
+            proc = self._parse(
+                "--agent-namespace=true",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("NAMESPACE=yes", combined)
+
+    def test_empty_gvisor_value_is_not_read_back_as_true(self):
+        """`--enable-gvisor=` stays empty so the validator can reject it.
+
+        flag_bool_value returns true only for the BARE form. Collapsing the two
+        would send the empty string back as the default and lose the rejection.
+        """
+        proc = self._parse("--enable-gvisor=", 'echo "G=[$PARAM_ENABLE_GVISOR]"')
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("G=[]", proc.stdout)
+
+    def test_flag_bool_value_handles_a_value_containing_equals(self):
+        """Only the FIRST `=` separates the flag from its value."""
+        proc = self._parse(
+            "--slack-home-channel-name=a=b",
+            'echo "V=$PARAM_SLACK_HOME_CHANNEL_NAME"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("V=a=b", proc.stdout)
+
+    def test_several_slack_bot_tokens_reach_the_variable_unsplit(self):
+        """One token per workspace, comma-separated, is a supported shape.
+
+        SlackRelay splits SLACK_BOT_TOKEN on commas and keys a client per
+        team_id, which is how one install serves several Slack workspaces. The
+        flag is the only new way in, and it must hand the value over whole:
+        splitting, trimming to the first token, or rejecting the comma as a
+        malformed secret would each remove multi-workspace support while every
+        other test stayed green.
+        """
+        tokens = "xoxb-workspace-one,xoxb-workspace-two"
+        proc = self._parse(
+            f"--slack-bot-token={tokens}",
+            'echo "T=[$PARAM_SLACK_BOT_TOKEN]"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn(f"T=[{tokens}]", proc.stdout)
+
+    def test_the_help_text_says_the_bot_token_flag_takes_several(self):
+        """A capability nobody can find from `--help` is one nobody uses.
+
+        Asserted because the singular wording it replaces was accurate about
+        the common case and wrong about the feature, which is exactly the kind
+        of line that gets "tidied" back.
+        """
+        proc = subprocess.run(
+            ["bash", str(_INSTALL_SH), "--help"],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(),
+            cwd=str(_REPO_ROOT),
+        )
+        help_text = proc.stdout + proc.stderr
+        self.assertIn("--slack-bot-token=TOKENS", help_text)
+        self.assertRegex(help_text, r"Comma-separated Slack bot tokens")
+
+
+class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):
+    """--enable-slack with nobody to ask for the tokens is refused.
+
+    The socket-mode relay cannot connect without both, and the failure would
+    otherwise appear as a CrashLoopBackOff long after a successful-looking
+    apply.
+
+    One guard does this, require_slack_tokens_after_recovery, and it runs after
+    write_tfvars_from_state -- the only thing that can still supply the tokens
+    -- and before the apply. It is a function, so these exercise it; the two
+    ordering tests read the file, because reaching that point in main() needs a
+    cluster.
+    """
+
+    _REFUSAL = "--enable-slack needs a bot token and an app token"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._install_env = pathlib.Path(tmp.name) / "install.env"
+        self._install_env.write_text("")
+
+    def _run_deferred_check(self, bot="", app="", enabled="true", before=""):
+        """Execute require_slack_tokens_after_recovery on a given recovery.
+
+        The variables are assigned after the source rather than exported into
+        the environment, because install.sh seeds its own copies at file scope
+        and would overwrite them.
+        """
+        script = (
+            f'source "{_INSTALLER_COMMON}"\n'
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            f"SLACK_ENABLED={shlex.quote(enabled)}\n"
+            f"SLACK_BOT_TOKEN={shlex.quote(bot)}\n"
+            f"SLACK_APP_TOKEN={shlex.quote(app)}\n"
+            'PARAM_NON_INTERACTIVE="true"\n'
+            f"{before}\n"
+            "require_slack_tokens_after_recovery\n"
+            'echo "REACHED_THE_APPLY"\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._install_env)}
+            ),
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_the_deferred_check_refuses_when_the_recovery_found_nothing(self):
+        """The run this guard exists for: both tokens still missing after it."""
+        proc = self._run_deferred_check()
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("REACHED_THE_APPLY", proc.stdout)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("--slack-bot-token (SLACK_BOT_TOKEN)", combined)
+        self.assertIn("--slack-app-token (SLACK_APP_TOKEN)", combined)
+
+    def test_the_deferred_check_refuses_on_one_token_and_names_only_it(self):
+        """Half a recovery is still a relay that cannot open a socket."""
+        proc = self._run_deferred_check(bot="xoxb-recovered")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("--slack-app-token (SLACK_APP_TOKEN)", combined)
+        self.assertNotIn("--slack-bot-token (SLACK_BOT_TOKEN)", combined)
+
+    def test_a_recovery_that_found_both_tokens_proceeds(self):
+        """The unattended PERSIST_SECRETS_ON_DISK=false re-run this unblocks."""
+        proc = self._run_deferred_check(bot="xoxb-recovered", app="xapp-recovered")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("REACHED_THE_APPLY", proc.stdout)
+
+    def test_an_install_without_slack_is_never_asked_for_tokens(self):
+        proc = self._run_deferred_check(enabled="false")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("REACHED_THE_APPLY", proc.stdout)
+
+    def test_the_deferred_check_reads_the_recovered_tokens_not_the_flags(self):
+        """PARAM_SLACK_* is what the operator passed; SLACK_* is what exists.
+
+        write_tfvars_from_state exports the tokens it recovered from the live
+        Secret under the unprefixed names, and this check runs on those. Reading
+        PARAM_SLACK_* instead would let a run whose recovery found nothing reach
+        the apply and CrashLoop, which is the whole failure the guard prevents.
+        """
+        proc = self._run_deferred_check(
+            before='PARAM_SLACK_BOT_TOKEN="xoxb-1"; PARAM_SLACK_APP_TOKEN="xapp-1"'
+        )
+        self.assertNotEqual(
+            proc.returncode,
+            0,
+            "the flag variables must not stand in for a recovery that failed",
+        )
+        self.assertNotIn("REACHED_THE_APPLY", proc.stdout)
+
+    def test_the_guard_names_both_tokens(self):
+        text = _INSTALL_SH.read_text()
+        self.assertIn("--slack-bot-token (SLACK_BOT_TOKEN)", text)
+        self.assertIn("--slack-app-token (SLACK_APP_TOKEN)", text)
+
+    def test_an_interactive_run_without_tokens_is_still_refused_after_recovery(self):
+        """Even with a TTY, missing tokens after recovery cannot reach apply.
+
+        The interview prompts for the tokens, but an empty response against an
+        empty default leaves them empty; if the live Secret recovery also finds
+        nothing, proceeding would CrashLoop the relay.
+        """
+        proc = self._run_deferred_check(
+            before='PARAM_NON_INTERACTIVE="false"; has_controlling_tty() { return 0; }'
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("REACHED_THE_APPLY", proc.stdout)
+        self.assertIn(self._REFUSAL, proc.stdout + proc.stderr)
+
+    def test_nothing_refuses_slack_before_the_recovery_has_run(self):
+        """There is one guard, and it is the one that runs after the recovery.
+
+        A second, earlier copy is the tempting change -- refusing in the chat
+        step that asks for Slack reads as failing faster. It is not: the
+        Secret-recovery loop inside write_tfvars_from_state can still supply
+        both tokens off the live Secret, and it is gated on kubectl's context,
+        not on PERSIST_SECRETS_ON_DISK. An earlier copy keyed on that setting
+        therefore refuses the fresh-clone adoption the loop exists to serve,
+        and buys nothing, because the surviving guard already lands before
+        anything is provisioned.
+
+        Counting the refusal is what catches the copy coming back; asserting
+        the surviving one is present would not.
+        """
+        text = _INSTALL_SH.read_text()
+        self.assertEqual(
+            text.count(self._REFUSAL),
+            1,
+            "the Slack refusal must exist exactly once, in "
+            "require_slack_tokens_after_recovery",
+        )
+        refusal_at = text.find(self._REFUSAL)
+        function_at = text.find("require_slack_tokens_after_recovery() {")
+        self.assertNotEqual(function_at, -1)
+        self.assertLess(function_at, refusal_at, "the refusal moved out of the guard")
+
+    def test_the_deferred_check_runs_after_the_recovery_and_before_the_apply(self):
+        """The guard's position: after the recovery that answers it, before the apply."""
+        text = _INSTALL_SH.read_text()
+        write_at = text.find('write_tfvars_from_state "$tfvars_file"')
+        deferred_at = text.find("\n  require_slack_tokens_after_recovery")
+        apply_at = text.find("run_lifecycle_apply \"$repo_dir\" \"$provisioning_log\"")
+        self.assertNotEqual(deferred_at, -1, "the deferred Slack check is missing")
+        self.assertNotEqual(apply_at, -1)
+        self.assertLess(write_at, deferred_at)
+        self.assertLess(deferred_at, apply_at)
+
+
+class ToggleValuesAreValidatedTest(unittest.TestCase):
+    """Every --enable-* toggle rejects a value that is not a boolean.
+
+    flag_bool_value extracts what a toggle carries without checking it, and
+    every read of the result goes through is_truthy, where anything that is not
+    "true" is false. Unchecked, `--enable-slack=ture` provisions an install with
+    Slack off and says nothing until the integration is missed.
+    """
+
+    def _validate(self, flag, value):
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            f'validate_bool_flag_value "{flag}" "{value}"\n'
+            'echo "PASSED"\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(),
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_a_typo_is_rejected_and_names_the_flag(self):
+        proc = self._validate("--enable-slack", "ture")
+        self.assertNotIn("PASSED", proc.stdout)
+        self.assertIn(
+            "--enable-slack must be either true or false",
+            proc.stdout + proc.stderr,
+        )
+
+    def test_booleans_pass(self):
+        for value in ("true", "false"):
+            with self.subTest(value=value):
+                proc = self._validate("--enable-slack", value)
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertIn("PASSED", proc.stdout)
+
+    def test_an_empty_value_is_refused_and_suggests_the_three_spellings(self):
+        """`--enable-slack=` is not "nobody chose"; nobody chose is no flag.
+
+        Only the `=` form reaches here empty — the bare flag yields "true" — so
+        the empty string is always something a caller typed, and taking it as
+        "leave the setting alone" is what made it dangerous.
+        """
+        proc = self._validate("--enable-slack", "")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("PASSED", proc.stdout)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("empty value", combined)
+        self.assertIn("--enable-slack=true", combined)
+        self.assertIn("--enable-slack=false", combined)
+
+    # Every toggle validate_bool_flag_value judges at parse time.
+    # --enable-gvisor is absent: it has a validator of its own further down in
+    # main(), reached because resolve_shared_defaults applies its default with
+    # ${VAR-...} and so leaves an empty assignment empty.
+    # --enable-hermes-dashboard is here as well as in main() because its default
+    # is applied with ${VAR:-...}, which reads the empty assignment as "unset".
+    PARSE_TIME_CHECKED_TOGGLES = [
+        "--enable-google-chat",
+        "--enable-slack",
+        "--enable-gke-backup-plan",
+        "--enable-pubsub-platform",
+        "--enable-stockout-investigator",
+        "--enable-hermes-dashboard",
+    ]
+
+    def _parse_args(self, *args, **env_overrides):
+        """Run parse_args with these arguments, under these environment keys."""
+        quoted = " ".join(shlex.quote(a) for a in args)
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            f"parse_args {quoted}\n"
+            'echo "PASSED"\n'
+        )
+        env = get_isolated_test_env()
+        env.update(env_overrides)
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_every_toggle_rejects_a_typo_at_parse_time(self):
+        """A toggle nothing checks is a toggle that fails silently.
+
+        The check lives in parse_args rather than main() because that is the
+        last point the value is known to have come from the command line.
+        """
+        for flag in self.PARSE_TIME_CHECKED_TOGGLES:
+            with self.subTest(flag=flag):
+                proc = self._parse_args(f"{flag}=ture")
+                self.assertNotIn("PASSED", proc.stdout)
+                self.assertIn(
+                    f"{flag} must be either true or false",
+                    proc.stdout + proc.stderr,
+                )
+
+    # The environment key each toggle is seeded from, before parse_args runs.
+    SEEDED_TOGGLE_ENV_KEYS = {
+        "--enable-google-chat": "GOOGLE_CHAT_ENABLED",
+        "--enable-slack": "SLACK_ENABLED",
+        "--enable-gke-backup-plan": "ENABLE_GKE_BACKUP_PLAN",
+        "--enable-pubsub-platform": "ENABLE_PUBSUB_PLATFORM",
+        "--enable-stockout-investigator": "ENABLE_STOCKOUT_INVESTIGATOR",
+    }
+
+    def test_a_spelling_seeded_from_install_env_is_never_judged(self):
+        """`install.env` is hand-written, and is_truthy takes True/yes/y/1/on.
+
+        Every PARAM_* these flags write is also seeded from the loaded
+        configuration before parse_args runs. Judging the seeded value with
+        ^(true|false)$ would abort a re-run over a spelling the rest of the
+        pipeline honours, naming a flag the operator never passed — and CI
+        exports three of these keys from GitHub vars.
+        """
+        for flag, key in self.SEEDED_TOGGLE_ENV_KEYS.items():
+            for value in ("True", "yes", "on", "1"):
+                with self.subTest(flag=flag, value=value):
+                    proc = self._parse_args(**{key: value})
+                    self.assertIn(
+                        "PASSED",
+                        proc.stdout,
+                        f"{key}={value} was rejected: {proc.stdout + proc.stderr}",
+                    )
+
+    def test_every_toggle_refuses_an_empty_value_against_a_seed(self):
+        """`--enable-slack=` with SLACK_ENABLED=true recorded is the bad case.
+
+        The seed is set here deliberately: waving the empty string through as
+        "nobody chose" is only tempting while the run has nothing to lose, and
+        this is the run that has something to lose. A wrapper expanding an
+        unset variable produces exactly this, so the flag arrives without
+        anyone having chosen to turn the integration off.
+        """
+        for flag, key in self.SEEDED_TOGGLE_ENV_KEYS.items():
+            with self.subTest(flag=flag):
+                proc = self._parse_args(f"{flag}=", **{key: "true"})
+                self.assertNotIn("PASSED", proc.stdout)
+                self.assertIn(
+                    f"{flag}= was given an empty value",
+                    proc.stdout + proc.stderr,
+                )
+
+    def test_an_empty_toggle_resolves_to_the_default_not_the_recorded_value(self):
+        """Why the refusal above is a refusal and not a shrug.
+
+        PARAM_ENABLE_SLACK is seeded from SLACK_ENABLED so a re-run that says
+        nothing about Slack keeps the relay. The read is
+        `${PARAM_ENABLE_SLACK:-$DEFAULT_SLACK_ENABLED}`, and `:-` treats empty
+        as unset — so an empty assignment does not restate the recorded value,
+        it falls through to the default. Were the validator to accept it, the
+        run would disable a working relay and say nothing.
+        """
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            'echo "SEEDED=${PARAM_ENABLE_SLACK:-$DEFAULT_SLACK_ENABLED}"\n'
+            'PARAM_ENABLE_SLACK=""\n'
+            'echo "EMPTIED=${PARAM_ENABLE_SLACK:-$DEFAULT_SLACK_ENABLED}"\n'
+        )
+        env = get_isolated_test_env()
+        env["SLACK_ENABLED"] = "true"
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("SEEDED=true", proc.stdout)
+        self.assertIn("EMPTIED=false", proc.stdout)
+
+    def test_an_empty_hermes_dashboard_value_is_refused_against_a_seed(self):
+        """The dashboard toggle reaches the same trap by the same route.
+
+        It is not in SEEDED_TOGGLE_ENV_KEYS because main() does judge its seeded
+        value with ^(true|false)$, so the claim that test makes does not hold
+        for it. What does hold is the half that bites: PARAM_ENABLE_WEBUI is
+        seeded from HERMES_DASHBOARD_ENABLED and resolved with `:-`, so an empty
+        assignment fell through to DEFAULT_ENABLE_WEBUI and main() saw a
+        well-formed "false" -- a running dashboard taken down by a wrapper
+        expanding an unset variable.
+        """
+        proc = self._parse_args(
+            "--enable-hermes-dashboard=", HERMES_DASHBOARD_ENABLED="true"
+        )
+        self.assertNotIn("PASSED", proc.stdout)
+        self.assertIn(
+            "--enable-hermes-dashboard= was given an empty value",
+            proc.stdout + proc.stderr,
+        )
+
+    def test_an_empty_hermes_dashboard_value_would_resolve_to_the_default(self):
+        """Why the refusal above is a refusal and not a shrug.
+
+        `:-` here, `-` for --enable-gvisor: the gvisor toggle keeps an empty
+        assignment empty so main()'s validator rejects it, and the dashboard's
+        does not. Driven through resolve_shared_defaults rather than by
+        restating the expansion, which would assert a fact about bash and stay
+        green whatever install.sh does with it.
+        """
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+            'PARAM_ENABLE_WEBUI=""\n'
+            "resolve_shared_defaults\n"
+            'echo "RESOLVED=[$PARAM_ENABLE_WEBUI]"\n'
+        )
+        env = get_isolated_test_env()
+        env["HERMES_DASHBOARD_ENABLED"] = "true"
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        # Not "[]": the empty assignment reaches main() as a well-formed
+        # "false", which is what makes it silent.
+        self.assertIn("RESOLVED=[false]", proc.stdout)
+class InstallerHelpersDetachFromTheTerminalTest(PtyChildTestMixin, unittest.TestCase):
+    """The helpers that run install.sh functions must not hand them a terminal.
+
+    _run_installer_bash's docstring says why: a prompt reads /dev/tty whenever
+    has_controlling_tty finds one, so an attached child hangs a developer's run
+    while CI, whose runners have no terminal, stays green. Two halves pin it.
+    The runner is proved under pty.fork, which gives this process the terminal
+    a developer's shell has: the predicate run bare must see it, or the check
+    proves nothing, and run through the runner it must not. Then each helper
+    the hang was traced to is shown to call that runner, so dropping the
+    detach from one of them fails here, in CI, at once.
+    """
+
+    # The pty child runs two bounded bash calls; waiting longer than both lets
+    # the child's TimeoutExpired, which names the command and carries its
+    # output, reach the report instead of a bare "timed out" from the parent.
+    _CHILD_OVERHEAD_SECS = 10
+    _READY_TIMEOUT_SECS = 2 * _INSTALLER_RUN_TIMEOUT_SECONDS + _CHILD_OVERHEAD_SECS
+    _PROBE = "has_controlling_tty && echo TTY=yes || echo TTY=no"
+
+    def test_the_runner_hides_the_controlling_terminal(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        result_path = pathlib.Path(tmp.name) / "result.json"
+        pid, fd = pty.fork()
+        if pid == 0:  # pragma: no cover - runs in the forked child
+            self._probe_in_child(result_path)
+        self._watch_pty_child(pid, fd)
+        result = json.loads(self._await_file(result_path, "the pty child's result"))
+        self.assertNotIn("error", result, result.get("error"))
+        self.assertEqual(
+            "TTY=yes",
+            result["bare"],
+            f"the forked test process has no controlling terminal, so nothing is checked: {result}",
+        )
+        self.assertEqual(
+            "TTY=no",
+            result["runner"],
+            f"_run_installer_bash handed install.sh the controlling terminal: {result}",
+        )
+
+    def test_every_helper_that_can_prompt_uses_the_runner(self):
+        """The three helpers the terminal hang was traced to; the set the fix covers."""
+        validation = InstallScriptValidationTest()
+        validation.setUp()
+        self.addCleanup(validation.doCleanups)
+        helpers = {
+            "InstallScriptValidationTest._run_install_func": lambda: validation._run_install_func("true"),
+            "EnsureExistingClusterNetworkPolicyTest._run": lambda: EnsureExistingClusterNetworkPolicyTest()._run(),
+            "EnsureExistingClusterWorkloadIdentityTest._run": lambda: EnsureExistingClusterWorkloadIdentityTest()._run(),
+        }
+        for name, call in helpers.items():
+            with self.subTest(helper=name):
+                with mock.patch.object(sys.modules[__name__], "_run_installer_bash") as runner:
+                    call()
+                self.assertEqual(runner.call_count, 1, f"{name} did not go through _run_installer_bash")
+                body = runner.call_args.args[0]
+                self.assertIn(f'source "{_INSTALL_SH}"', body, f"{name} handed the runner a body that does not source install.sh")
+
+    @classmethod
+    def _probe_in_child(cls, result_path):
+        """In the pty child: run the probe bare, then through the runner; record both; exit."""
+        result = {}
+        try:
+            os.chdir(str(_REPO_ROOT))
+            with tempfile.TemporaryDirectory() as tmp:
+                empty_env = pathlib.Path(tmp) / "install.env"
+                empty_env.write_text("")
+                env = get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)})
+                body = f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{cls._PROBE}'
+                bare = subprocess.run(
+                    ["bash", "-c", body],
+                    capture_output=True,
+                    text=True,
+                    timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+                    env=env,
+                    cwd=str(_REPO_ROOT),
+                )
+                runner = _run_installer_bash(body, env)
+            result = {
+                "bare": bare.stdout.strip(),
+                "runner": runner.stdout.strip(),
+                "runner_stderr": runner.stderr,
+            }
+        except BaseException as exc:  # the parent reports it
+            result = {"error": repr(exc)}
+        finally:
+            try:
+                # Written whole then renamed, so the parent's poll never reads a
+                # half-written file.
+                staging = result_path.with_suffix(".partial")
+                staging.write_text(json.dumps(result))
+                os.replace(staging, result_path)
+            finally:
+                os._exit(0)
+
+
+class NoChatTerminalAccessTest(unittest.TestCase):
+    """The installer names a way in when no chat platform is chosen.
+
+    Both chat platforms default off, so this is the common install, and nothing
+    else in a run tells the operator how to reach the agent.
+
+    These read install.sh rather than running it: the code is inside main(),
+    which the KUBE_AGENTS_SOURCE_ONLY harness cannot drive.
+    """
+
+    _FUNCTION = "  _prompt_no_chat_enabled() {"
+    _SIBLINGS = ("  _prompt_google_chat_settings() {", "  _prompt_slack_settings() {")
+    _HEADING = "--- [Talking to the Agent from a Terminal] ---"
+    _GET_CREDENTIALS = "gcloud container clusters get-credentials ${cluster_name}"
+    _EXEC = "kubectl exec -it deploy/${PLATFORM_AGENT_DEPLOYMENT}"
+    _FLAG_RESOLUTION = 'gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id"'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = _INSTALL_SH.read_text()
+
+    def test_the_none_arm_delegates_to_the_function(self):
+        """Arm 4 handles the no-chat case, and delegates rather than inlining."""
+        self.assertIn(self._FUNCTION, self.source)
+        self.assertRegex(self.source, r"\n    4\)\n      _prompt_no_chat_enabled\n      ;;")
+
+    def test_the_completion_banner_prints_it_too(self):
+        """Chat and Slack instruct at the end of the run, and so does this.
+
+        By then the chat step is a Terraform plan away. Arm 4 alone would leave
+        the feature looking present while nobody sees it, so the second call is
+        pinned separately from the first.
+        """
+        banner = self.source.index("print_instructions_slack.sh")
+        self.assertLess(
+            banner,
+            self.source.rindex("_prompt_no_chat_enabled"),
+            "the no-chat block must also print beside the two chat printers",
+        )
+        self.assertIn('if [ "$chat_choice" = "4" ]; then', self.source)
+
+    def test_it_is_defined_beside_the_arms_it_is_a_sibling_of(self):
+        for sibling in self._SIBLINGS:
+            self.assertIn(sibling, self.source)
+        self.assertLess(
+            max(self.source.index(s) for s in self._SIBLINGS),
+            self.source.index(self._FUNCTION),
+            "the four chat outcomes are read together, so keep their handlers together",
+        )
+
+    def test_nothing_reconstructs_the_no_chat_case_from_the_toggles(self):
+        """The case statement decided it; a second derivation could disagree.
+
+        Re-testing the toggles later has to be revisited for every platform
+        added, and when it is not, an install with working chat is told it has
+        none.
+        """
+        self.assertNotIn("any_chat_enabled", self.source)
+
+    def test_it_prints_both_commands(self):
+        body = self._function_body()
+        self.assertIn(self._HEADING, body)
+        self.assertIn(self._GET_CREDENTIALS, body)
+        self.assertIn(self._EXEC, body)
+
+    def test_the_exec_names_the_container_and_the_profile(self):
+        # Without -c, kubectl picks the first of the pod's three containers.
+        # Without -p, the session is the Planning Agent, not the Platform Agent.
+        body = self._function_body()
+        self.assertIn("-c ${PLATFORM_AGENT_CONTAINER}", body)
+        self.assertIn("hermes -p ${PLATFORM_AGENT_HERMES_PROFILE}", body)
+
+    def test_the_namespace_is_the_one_the_install_uses(self):
+        # A literal kubeagents-system would print a command that fails on the
+        # installs that passed --agent-namespace.
+        self.assertIn(
+            "-n ${NAMESPACE:-$DEFAULT_NAMESPACE}",
+            self._function_body(),
+        )
+
+    def test_the_dns_endpoint_flag_is_the_resolved_one(self):
+        # gcloud rejects --dns-endpoint on clusters without an external DNS
+        # endpoint, so the printed flag has to be the resolved one -- which
+        # means gke_dns_endpoint_flag has to run first.
+        body = self._function_body()
+        printed = body.index(self._GET_CREDENTIALS)
+        self.assertIn("${GKE_DNS_ENDPOINT_FLAG:+ ${GKE_DNS_ENDPOINT_FLAG}}", body)
+        self.assertLess(
+            body.index(self._FLAG_RESOLUTION),
+            printed,
+            "the command reads GKE_DNS_ENDPOINT_FLAG, so it must be resolved above it",
+        )
+        self.assertNotIn(
+            " --dns-endpoint",
+            body[printed : printed + 400],
+            "the printed flag must be the resolved one",
+        )
+
+    def test_it_says_how_to_add_a_chat_platform_later(self):
+        body = self._function_body()
+        self.assertIn("--enable-google-chat", body)
+        self.assertIn("--enable-slack", body)
+
+    def _function_body(self):
+        """The function's text alone.
+
+        Some of these strings also appear in the completion banner, so matching
+        against the whole file would pass on a body that had lost the line.
+        """
+        start = self.source.index(self._FUNCTION)
+        return self.source[start : self.source.index("\n  }\n", start)]
+
+
+class BannerColourVariablesAreDefinedTest(unittest.TestCase):
+    """Every C_* install.sh interpolates is one install.sh itself defines.
+
+    install.sh does not source scripts/installer/common.sh, which declares a
+    wider palette (C_WHITE among it). Under `set -Eeuo pipefail` naming one of
+    those is not a cosmetic slip: the unset variable aborts the run at the line
+    that reads it, and most of this palette is used in the completion banner --
+    so the failure lands after a successful apply, on the last thing an
+    operator sees.
+    """
+
+    def test_no_undefined_colour_is_interpolated(self):
+        source = _INSTALL_SH.read_text()
+        used = set(re.findall(r"\$\{(C_[A-Z_]+)\}", source))
+        used |= set(re.findall(r"\$(C_[A-Z_]+)\b", source))
+        defined = set(re.findall(r"\b(C_[A-Z_]+)=", source))
+        self.assertEqual(
+            sorted(used - defined),
+            [],
+            "install.sh interpolates colour variables it does not define; "
+            "they come from scripts/installer/common.sh, which it does not source",
+        )
+
 
 
 if __name__ == "__main__":

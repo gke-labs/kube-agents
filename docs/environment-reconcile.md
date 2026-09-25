@@ -53,7 +53,7 @@ are clean.
 
 Long-lived environments are reconciled and deployed atomically using `./upgrade.sh --upgrade-mode=full`:
 
-- **staging** is deployed by `Staging: Deploy` (`staging-deploy.yml`), which triggers when the nightly pipeline pushes a `staging_*` tag after its full E2E test matrix passes on a fresh nightly cluster. The workflow reconciles the Terraform composition, Helm release, and container images together atomically from that validated candidate commit.
+- **staging** is deployed by `Staging: Deploy` (`staging-deploy.yml`), which triggers when the staging promotion pipeline pushes a `staging_*` tag after its full E2E test matrix passes on a fresh nightly cluster. The workflow reconciles the Terraform composition, Helm release, and container images together atomically from that validated candidate commit.
 - **autopush** is deployed by `Autopush: Deploy` (`autopush-deploy.yml`), which triggers whenever candidate container images are successfully published to GHCR from `main`.
 
 A deploy takes the live-test lease before it applies anything (see
@@ -146,11 +146,32 @@ above its teardown. `rc` and `nightly` are exempt by design — they are
 destroyed and rebuilt every run and no real user reaches them, so an
 unconditional check would fail the RC pipeline rather than protect anything.
 
+`SLACK_ENABLED` needs both `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` beside it.
+`install.sh` refuses the combination itself, but only after the Secret-recovery
+step that can still read them off a live install — which a rebuild has already
+destroyed by then, so `provision_environment.sh` makes the same check above its
+teardown. A token that goes missing on an environment that had one is usually
+the `secrets: inherit` gap
+[`scripts/release/README.md`](../scripts/release/README.md) describes for
+`GH_APP_ID`, which drops every secret the same way.
+
+`ENABLE_GKE_BACKUP_PLAN`, `ENABLE_GVISOR`, and `HERMES_DASHBOARD_ENABLED` are checked
+there too, for spelling rather than presence. All three reach `install.sh` as
+`--enable-*` flags, whose validator takes `true` or `false` and nothing else, while
+the same values travelling through `install.env` reach `is_truthy`, which also takes
+`True`/`yes`/`y`/`1`/`on`. `provision_environment.sh` folds the second list into
+the first, so an environment that deployed on `True` keeps deploying; a spelling
+neither list recognises is refused before the teardown rather than by
+`install.sh` after it. A variable holding nothing but a space or a tab is
+refused the same way rather than read as `false`: unset means "say nothing about
+this setting", and guessing `false` from whitespace would rebuild the
+environment with the feature off and nothing in the log saying so.
+
 Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `GOOGLE_CHAT_MODE`, `GOOGLE_CHAT_HOME_CHANNEL`,
 `CHAT_TOPIC_NAME`, `CHAT_SUB_NAME`, `SLACK_ENABLED`, `SLACK_HOME_CHANNEL`,
 `SLACK_HOME_CHANNEL_NAME`, `PLATFORM_AGENT_CUSTOM_ROLES`,
-`HERMES_DASHBOARD_ENABLED`, `REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`,
+`REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`,
 `KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`. Secrets: `GH_APP_ID`,
 `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`,
 `SLACK_APP_TOKEN`.

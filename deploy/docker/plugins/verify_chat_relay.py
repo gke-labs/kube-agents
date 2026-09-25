@@ -2,9 +2,26 @@
 """Build-time proof that ``deliver: "chat"`` reaches the Chat Agent relay.
 
 Run from ``/opt/hermes`` with the plugin already installed under
-``plugins/platforms/chat/``. Drives the REAL ``cron/scheduler.py::_deliver_result``
-against a loopback stand-in for the Session KV server and asserts on what
-crossed the wire.
+``plugins/platforms/chat/``. Drives the REAL ``_deliver_result`` against a
+loopback stand-in for the Session KV server and asserts on what crossed the
+wire.
+
+Where the upstream symbols live
+-------------------------------
+
+Upstream split ``cron/scheduler.py`` in September 2026 (commit ``5a8fbbf16c``,
+"split scheduler.py into delivery/script/prompt/preflight modules", then
+``a9b0dd6742`` dropped the re-exports). The delivery path -- ``_deliver_result``,
+``_resolve_delivery_targets``, ``_expand_routing_tokens``,
+``_is_known_delivery_platform`` and ``_plugin_cron_env_var`` -- is
+``cron/scheduler_delivery.py``; ``SILENT_MARKER`` and
+``_is_cron_silence_response`` stayed in ``cron/scheduler.py``; the ``cronjob``
+tool's ``_local_delivery_notice`` is ``tools/cronjob_job_args.py``. Import from
+the module that defines a name, not from one that happens to re-export it
+today: ``cron/scheduler.py`` still imports ``_deliver_result`` and
+``_resolve_delivery_targets`` for its own use (two of the five names it takes
+from ``scheduler_delivery``; the other three above it never touches), and the
+earlier base failed here with ``ImportError`` the day it stopped.
 
 Why this exists
 ---------------
@@ -117,8 +134,8 @@ def main() -> None:
     # build cwd gets to register it and make this pass for the wrong reason.
     os.environ.pop("HERMES_ENABLE_PROJECT_PLUGINS", None)
 
-    from cron.scheduler import _deliver_result, _is_known_delivery_platform
-    from cron.scheduler import _resolve_delivery_targets, _expand_routing_tokens
+    from cron.scheduler_delivery import _deliver_result, _is_known_delivery_platform
+    from cron.scheduler_delivery import _resolve_delivery_targets, _expand_routing_tokens
 
     # 0. A cron child inherits the relay's credential.
     #
@@ -133,7 +150,16 @@ def main() -> None:
     #    set, because the set is one of several ways a name can be dropped.
     from tools.environments.local import build_subprocess_env
 
-    for name in ("SESSION_KV_API_KEY", "CRON_REPORT_RELAY_URL"):
+    #    The two feedback-prompt knobs take the same route: rendered by the
+    #    operator's allowlist, then through this scrub to `feedback_prompt.py`.
+    #    Scrubbed, `FEEDBACK_PROMPT_ENABLED=false` on the CR would still render
+    #    and the prompt would post on an install that turned it off.
+    for name in (
+        "SESSION_KV_API_KEY",
+        "CRON_REPORT_RELAY_URL",
+        "FEEDBACK_PROMPT_ENABLED",
+        "FEEDBACK_PROMPT_DELAY",
+    ):
         child_env = build_subprocess_env(base={**os.environ, name: "sentinel"})
         check(
             child_env.get(name) == "sentinel",
@@ -196,7 +222,7 @@ def main() -> None:
         # 5. `cronjob(action='create')` does not warn that a relayed job is
         #    local-only. It decides by calling _resolve_delivery_targets, so
         #    the answer follows the switch — see check 8 for the other branch.
-        from tools.cronjob_tools import _local_delivery_notice
+        from tools.cronjob_job_args import _local_delivery_notice
 
         check(
             _local_delivery_notice(job("chat"), "chat") is None,

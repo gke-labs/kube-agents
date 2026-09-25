@@ -22,8 +22,10 @@ INSTALL.md "Method 3" is the local-iteration path). `hack/ci-deploy.sh` itself i
 secrets. For cases that read the seeded fleet, whether through `fixtures:` or by naming
 `seeded-a`/`-b`/`-c` directly, the fleet must be applied to the dev project once
 ([`bench/tf/fleet/README.md`](../../bench/tf/fleet/README.md)). Every contributor, human or
-agent, is expected to have one. There is no path around the loop: a pull request that changes
-agent behaviour without eval evidence is not ready for review.
+agent, is expected to have one. A stock install sandboxes the agent, which the harness's
+`kubectl port-forward` cannot reach; [`bench/README.md`](../../bench/README.md#sandboxed-installs)
+has the ways round that. There is no path around the loop: a pull request that changes agent
+behaviour without eval evidence is not ready for review.
 
 ## The loop
 
@@ -74,14 +76,16 @@ request, with `owner:` set and a `docs/designs/domains.yaml` slug (or a reviewed
 `KNOWN_NO_DOMAIN` entry). The nightly is where a new case lands
 ([`docs/designs/bench-case-format.md`](../../docs/designs/bench-case-format.md),
 "Registration"): it runs every night from the night it merges and builds its record; a
-presubmit seat (`hack/eval/presubmit-cases.txt`, an `eval-crew` approval) is a later pull
-request that cites that record, never the one that makes the case pass. A case whose
-fixture does not exist at all is a `FIXTURE_NOT_READY` entry in
+presubmit seat is a later pull request that cites that record — one edit that moves the
+line to `hack/eval/presubmit-cases.txt` and adds the name to `hack/eval/blocking-roster.txt`
+(an `eval-crew` approval; since 2026-09-22 the presubmit runs the blocking roster only, and
+`scripts/test_eval_rosters.py` pins the two files as equal) — never the one that makes the
+case pass. A case whose fixture does not exist at all is a `FIXTURE_NOT_READY` entry in
 `scripts/validate_bench_cases.py` with its issue instead. A case already registered stays
-where it is. Admission to the blocking roster (`hack/eval/blocking-roster.txt`) is earned on
-the case's record afterwards ([`docs/eval-gate-roster.md`](../../docs/eval-gate-roster.md),
+where it is. That seat is the admission, earned on the case's record
+([`docs/eval-gate-roster.md`](../../docs/eval-gate-roster.md),
 [`bench/baselines/README.md`](../../bench/baselines/README.md)); never add a new case to
-it in the pull request that makes it pass.
+the roster in the pull request that makes it pass.
 
 ## When the fix is not yours
 

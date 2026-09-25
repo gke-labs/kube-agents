@@ -71,8 +71,9 @@ every pull request in the repo until it is fixed. §4.2 confirms this is live ra
 hypothetical — it is what kept the audit scenarios commented out in `TASKS` in
 `hack/ci-eval-pr.sh`, since their `ledger_issue_contains` checks returned `status: "error"` without
 an `issues: read` credential the Prow job supplied. That was rung 2 working, not misfiring; the job
-mounts one now. The canary `compliance-rbac-overgrant` runs on every presubmit, and the other audit
-scenarios run in the nightly tier only (`hack/eval/nightly-cases.txt`), kept
+mounts one now. The canary `compliance-rbac-overgrant` ran on every presubmit until 2026-09-22,
+when the presubmit became the blocking roster only (#1023) and the never-admitted canary joined the
+other audit scenarios in the nightly tier (`hack/eval/nightly-cases.txt`), where those had been kept
 out of the presubmit on cost. The
 alternative — scoping 1–3 to admitted cases — means an unscreened case can never report that its
 checks are broken, which is the state it is most likely to be in.
@@ -84,8 +85,14 @@ checks are broken, which is the state it is most likely to be in.
 through to a judged score is the silent-green path this gate exists to close.
 
 **Rung 3's signals are what the fixtures proved are populated** — `status == "success"`, a
-non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. There is no `metadata` block on a
-devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake
+non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. One exception to the token signal:
+a record the harness's inject transport produced carries no usage at all (the gateway reports
+none), so its liveness signal is the executor's own events instead — a trajectory entry named
+`a2a.status-update` whose `args.final` is true (the task ended) or whose `args.state` is `working`
+(the executor spawned the persona; a task the harness cancelled at its budget has no final entry)
+stands in for a null total and nothing else; a null total with no such entry, or with only a
+`submitted` entry (queued, never run), still fails the rung, and so does a total of zero. The harness applies the same predicate before a record exists (`Fold.started` in `bench/kube_agents_bench/inject_transport.py` is `shows_a_run`, this rung's rule, and a test holds the two together): a task that reached neither `working` nor a terminal by its deadline, and a terminal the executor wrote for its own fault (the bridge's and the worker adapter's `reason:` tokens, or a `rejected` submission), are recorded as infrastructure, so those entries reaching the rung is the backstop. There is no `metadata`
+block on a devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake
 is why the fixtures are captured rather than hand-written. `output` is deliberately **not** a
 signal: a legitimately failing agent can return an empty report, and rung 3 must not double as a
 quality check. The token and latency floors are `> 0` rather than something realistic because five
@@ -97,10 +104,18 @@ exactly 0 is the never-ran signature — no tool ran and no model call was bille
 `classify_rep()` classifies that repetition as `infra`, whatever produced the record (#1184). The
 `KUBE_AGENTS_INFRA_FAILURE` marker covers the producers the harness can name (#1095's terminal
 429s, #1137's unestablishable tunnels); this covers the ones it cannot, such as a transport
-failure that comes back as an empty success with no error string. The check sits after rung 1 —
+failure that comes back as an empty success with no error string. A second marker,
+`KUBE_AGENTS_DELEGATION_CEILING`, names the harness's own delegation wait running out
+(`AGENT_DELEGATION_TIMEOUT`) with the delegated card still running and nothing delivered: the
+record is scored, but what was scored is the acknowledgement the front door gives by design when
+it delegates, so `classify_rep()` classifies the repetition `infra` under a reason that leads
+with the marker. The dashboard reads that lead to count these apart from quota-storm repetitions
+(`scripts/eval_dashboard/SCHEMA.md`). A ceiling hit after a partial delivery carries no marker
+and grades on what arrived. Both the ceiling check and the never-ran signature sit after rung 1 —
 the catastrophic score grades the cluster rather than the record, so a tripped safeguard is
-positive evidence something acted and keeps blocking — and applies only to a record that carries
-a scores map; a scoreless one still blocks at rung 2. The near-misses still block at rung 3:
+positive evidence something acted and keeps blocking, whether the worker was still running at the
+deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
+one still blocks at rung 2. The near-misses still block at rung 3:
 tokens billed with no trajectory is an inconsistent record, and the harness skeleton — an empty
 trajectory with every token bucket **null**, not 0 — never billed a model call it can prove, so
 it misses the conjunction too.
@@ -132,9 +147,20 @@ environment. Unarmed,
 which is the default, a rate below the margin over a full sample is written into the verdict as a
 note rather than a reason: the flat margin has not been measured against how much an unchanged
 pull request moves the aggregate on `main`, and arming it is a decision for after the store holds
-enough nights to say. Two job-level rules sit alongside it: any blocking case reds the job, and _all_ cases
-failing on infrastructure reds it too — individually that is weather, but all at once means the
-eval infrastructure is down and a green would be a lie about coverage.
+enough nights to say. Two job-level rules sit alongside it. Any blocking case reds the job
+(`suite` exits 1). And green has a coverage floor: an admitted case with no scored repetition —
+every one excluded as infrastructure — makes the run **not evaluated**: `suite` exits 2, the code `case` already uses for
+"could not grade", and writes `outcome: not_evaluated` with the case ids under `not_evaluated`; the
+markdown carries a banner saying rerun when the environment is healthy rather than debug the
+change, and `hack/ci-eval-pr.sh` passes the status through (confirming it against the JSON first,
+since argparse exits 2 too) so the release-candidate lane reports NOT RUN rather than RED. Weather
+that takes one repetition leaves the case scored and trips nothing; only a case lost whole does,
+and only an admitted one. _All_ cases failing on infrastructure is the same floor at its limit and
+reports the same outcome — individually that is weather, but all at once means the eval
+infrastructure is down and a green would be a lie about coverage. A blocking case outranks the
+weather: the outcome is red, with the lost cases still listed among the reasons. `green` stays in
+the JSON, derived from `outcome`, so a reader that only knows the boolean sees not-evaluated as
+not green.
 
 **Why the aggregate has a sample floor and the per-case rungs do not.** A flat margin is a
 suite-scale rule, and at small `n` it measures luck. Against a baseline screened at the 19/20
@@ -154,6 +180,56 @@ times to produce one.
 Every threshold above is a named constant read from the environment. All of them are starting
 points, to be tuned by running the suite against `main` and setting the bars above the observed
 movement.
+
+## What a score is
+
+Two numbers come out of a case, and they are not the same kind of number. This section is the one
+place that says which is which; the dashboard's Trend page (`scripts/eval_dashboard/trend.py`,
+`docs/ci-health.md`) and the record format below follow it.
+
+**The deterministic pass rate is the gate's number.** A repetition passes or fails on the
+deterministic checks alone (rungs 1–4), and a case's rate is `passes / runs` over the repetitions
+that were scored: `blocked` and `infra` repetitions are counted in the record and kept out of the
+rate. Admission reads that rate over a window — the newest whole records at the current version key
+pooled until they hold `EVAL_ADMISSION_MIN_RUNS` runs (20; seven nightlies at three repetitions
+give 21) — against `EVAL_ADMISSION_RATE` (0.95), and the presubmit's aggregate rule compares the
+same kind of rate against `main`'s. Nothing judged enters it.
+
+**Judged quality is advisory.** `OutcomeValidity` and the other GEval metrics never fail a
+repetition on their own; rung 6 reads the mean of one metric against `main`'s pooled mean with a
+margin sized to the judge's own measured noise ([Why the margin is 0.5](#why-the-margin-is-05)), and
+that is the only place a judged score touches a verdict. Everywhere it is shown it is shown **with
+its spread across repetitions, never as a single point**: three repetitions of one unchanged task
+scored 0.9, 1.0 and 0.2, so a lone mean of three is a number with a standard error near 0.25 and
+must not read as the truth about the case.
+
+What the store can support today, and what it cannot, follows from the record: a `judged` block
+carries a `mean` and its `n` per metric and not the repetitions' own values. So:
+
+- A night's mean is drawn with its `n`, and a case with one night at a key is drawn as one marked
+  point that says so, with no line and no band.
+- The spread the Trend page draws for a case is the **range of its nightly means** over the
+  trailing seven nights at the same key; for a domain it is the `n`-weighted mean across its cases
+  with the range of their means. Both are honest about what they are and neither is the
+  per-repetition spread.
+- The per-repetition spread needs an addition to the record: the repetitions' values (or their
+  standard deviation) per metric, written by `bench-gate record` beside `mean` and `n`. It is
+  additive and optional, so old lines stay readable; it is listed under [Open items](#open-items).
+
+**Only the nightly's lines feed the trend.** The store holds what ran on `main` — only the nightly
+appends to it, a pull request's run is graded against it and never writes — so a trend read from
+the store is nightly-only by construction. The presubmit's judged scores stay on the run page: they
+are per pull request, mix in broken branches, and are not evidence about `main`.
+
+**Retention covers a quarter, and more.** Nothing in the bucket is ever deleted (no lifecycle rule,
+no `storage.objects.delete` on either identity); what is bounded is the read. The reader takes the
+newest `EVAL_BASELINE_MAX_OBJECTS` (200) objects **per case per key**
+([Reading is capped, and says so](#reading-is-capped-and-says-so)), and the nightly writes one
+object per case per night, so the cap holds about 200 nights at one key — six and a half months —
+against the 91 a quarter needs. The Trend page draws a 90-day window, reads two weeks further back
+so the first drawn night's admission window pools the nights before it as the gate does, applies the
+same cap and says which cases it trimmed, if it ever does; a version-key change starts a new
+directory and does not consume the old one's budget.
 
 ## What is stored
 
@@ -334,6 +410,11 @@ job and withhold it from the other, so the split was unimplementable until the n
 dedicated account. That is not a reviewer's preference; it is what the guard is made of — which is
 why creating `eval-baseline-recorder` is step 2 of [Provisioning it](#provisioning-it) rather than a
 follow-up, and why the change that armed the store named it on the periodic in the same diff.
+Different accounts in `kube-agents-prow`, the same twelve roles in every pool project: the nightly
+runs the same `hack/ci-eval-pr.sh` against a leased project, so
+[`docs/ci-pool-projects.md`](../ci-pool-projects.md) section 3 grants and verifies its account
+beside the presubmit's, after the second nightly died at `get-credentials` on a project that
+granted only the presubmit's ([#1491](https://github.com/gke-labs/kube-agents/issues/1491)).
 
 **Who can grant this.** `kube-agents-prow` has a single `roles/owner`, who is also one of its two
 `storage.admin` holders, so the bucket, the service account and all three grants are one person's
@@ -481,6 +562,8 @@ The backend has been exercised end to end against a real bucket
 | An admitted case that fails every repetition reds the suite | rung 4 collapse, `suite` exits 1                                  |
 | A pull request cannot append                                | `refusing to record a baseline with PULL_NUMBER set`              |
 | A missing bucket degrades rather than reds                  | 404 → advisory, with the banner in the markdown verdict           |
+| A single-case scope lists that case's prefix alone          | the case's own objects, not the store's                           |
+| A case with no prefix yet is an empty read, not an outage   | `matched no objects`, the same text an empty root gives           |
 
 What no local run can reach is the nightly Prow job's own append. Its nights are the validation,
 read through the dashboard's Nightly report (`scripts/eval_dashboard/nightly.py`).
@@ -514,9 +597,12 @@ measured data. Config belongs where it gets reviewed.
 
 ### Reading is capped, and says so
 
-The reader lists the whole prefix once, groups the object names by case and then by key directory,
+The reader lists the prefix once, groups the object names by case and then by key directory,
 takes the newest `EVAL_BASELINE_MAX_OBJECTS` (default 200) **per case per key**, and concatenates
-what survives in one `cat`. 200 objects is roughly 600 runs, two orders of magnitude past the 20
+what survives in one `cat` per case. Those per-case `cat`s run concurrently, at most
+`EVAL_BASELINE_CAT_WORKERS` (default 16) at a time: the cost of a read is one `gcloud` process
+startup per case and almost nothing else, so serially it grew with the matrix. 200 objects is
+roughly 600 runs, two orders of magnitude past the 20
 the admission bar wants, so the cap never binds in practice — but it bounds a read that would
 otherwise grow without limit as one key accumulates years of history, and when it does bind the
 gate says which case was capped and by how much. A cap that is silent reads as "I considered
@@ -533,24 +619,37 @@ directory, so all of one key's records land in one directory and sort by stamp w
 directories.
 
 **The cap bounds the fetch, not the listing.** Listing is O(every object ever written under the
-prefix), because the reader cannot know which names are newest without seeing them. The key
-partition largely settles this on its own: a prefix stops growing when the key changes, and a
-long-lived key at one recorded batch a night is on the order of a few hundred objects a year. What
-remains unbounded is the _total_ across all historical keys, which grows only as fast as the
-software versions do. At today's scale — a handful of active cases, one batch per case per night —
-that is invisible. If it ever stops being invisible, the fix is to scope the listing to
-the key being read rather than the whole prefix, which the layout now makes a one-line change; see
-[Open items](#open-items).
+prefix being listed), because the reader cannot know which names are newest without seeing them.
+The key partition largely settles this on its own: a prefix stops growing when the key changes, and
+a long-lived key at one recorded batch a night is on the order of a few hundred objects a year.
+What remains unbounded is the _total_ across all historical keys, which grows only as fast as the
+software versions do. Scoping the read to one case, below, bounds it further: the prefix a
+single-case read lists is that case's own.
 
-Costs are not the constraint at any of these scales. Standard storage bills actual bytes with no
+Money is not the constraint at any of these scales. Standard storage bills actual bytes with no
 minimum object size, and both the listing and the per-object fetches are fractions of a cent per
-run.
+run. Wall clock is, which is why the fetches are concurrent and the read is scoped.
 
 The key partition also retires a caveat this section used to carry. Under a flat layout and a
 per-case window, a version key that went A → B → A could push the revert's own evidence at key A
 out of the window, so a genuinely screened case would read as "no evidence" and be de-admitted.
 With one directory per key and a per-key cap, key B's volume cannot displace key A's records at
 all: the revert lands back in A's directory and finds its own history intact.
+
+### The read is scoped to the cases being graded
+
+`bench-gate case` runs once per task and `bench-gate suite` once at the end, so the store is read
+once per active case plus one. Each read asks about the cases it is grading — one for `case`, the
+graded set for `suite` — and never about the rest, so reading all of them was the same work
+repeated every time. `BaselineStore.load(only=…)` takes the cases the caller will ask about; a
+single-case read lists that case's own prefix rather than the whole store, and fetches that case's
+objects in one `cat`.
+
+The narrowing has a failure mode that speed cannot detect, because a read that fetches nothing is
+the fastest of all: a store missing a case answers "never screened", which de-admits a case that
+is in fact passing and reds nothing. So the scope is remembered on the store, and a lookup outside
+it raises `CaseOutOfScope` — deliberately neither the `ValueError` the gate treats as a corrupt
+store nor the `StoreUnreachable` it degrades on, both of which get absorbed into a verdict.
 
 ### When the store is unreachable
 
@@ -824,6 +923,21 @@ re-applies its OpenTofu GPU stack on **every** repetition, so the cost per repet
 of agent time the fixtures show. Confirm all three on the first three nights' measured wall clock and
 record the result on #1491; the dashboard's Nightly report carries each night's wall clock and
 whether the deadline cut it short.
+
+**A night the deadline cuts still records what it finished.** The nights of 2026-09-18 and
+2026-09-21 (builds 2101099042170736640 and 2102186223282950144) had finished 105 and 122 units when
+SIGTERM arrived and left nothing: the per-case grading, the `record` call and the verdict table were
+all downstream of the fan-out's `wait`, and the grading pass alone took 37 minutes on a full night.
+Since 2026-09-22 `hack/ci-eval-pr.sh` grades and records each case inside the fan-out, by the unit
+that finishes its last repetition (`finish_case`), so a finished case's `Task` block, its
+`case-<name>.json` and its baseline line exist before the deadline can arrive; a case with a
+repetition still running, or one that gave up on its lock, is not recorded until the loop after the
+fan-out, as before. `bench-gate record --recorded-manifest` (the `baseline-recorded.jsonl` artifact)
+keeps that pass from appending a case twice, and the EXIT trap's `report_partial_verdict` tables the
+graded cases into `eval-verdict.md` under a PARTIAL banner and prints a cut-off line that is
+deliberately not a verdict line, so the Nightly report counts the cases and still calls the night
+truncated. The presubmit grades per case too and gets the same table on a deadline kill; its store
+stays read-only, as `PULL_NUMBER` and the viewer-only identity already guarantee.
 
 Whether the shared `prowjob-default-sa` or a dedicated identity should hold the bucket grants is
 not an open question: it has to be a dedicated one, or the read/write split cannot be expressed at
@@ -1283,11 +1397,14 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   wall clock and record the result on
   [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491).
 - A lint that a behaviour change bumped `fleet` or `verifiers`.
-- The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
-  filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked
-  for and `bench-gate suite` reads many cases at potentially different keys. Scoping the listing to
-  the key means threading it through both, which the layout now makes worth doing but which buys
-  nothing at today's volumes; see
+- The per-repetition judged values (or a standard deviation) in the record's `judged` block, so the
+  Trend page can draw the spread across repetitions rather than the range of nightly means
+  ([What a score is](#what-a-score-is)). Additive and optional; `bench-gate record` writes it,
+  `_pool_judged()` ignores it.
+- The GCS listing is scoped by case, not by key, and only when the scope is a single case.
+  `bench-gate suite` names several, so it lists the whole store and filters afterwards: one
+  listing is one `gcloud` process, and a listing per case would cost more than it saved. Both
+  limits are worth revisiting only if the store outgrows a listing; see
   [Reading is capped, and says so](#reading-is-capped-and-says-so).
 - The `bench/tf/fleet` drift-reconcile schedule — a drifted fixture silently changes what a
   baseline means.

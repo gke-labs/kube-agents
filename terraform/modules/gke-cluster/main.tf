@@ -268,13 +268,29 @@ data "google_container_cluster" "existing" {
     # Dataplane V2 nor the legacy Calico addon — GKE Standard's default —
     # and the isolation the security reference documents would be absent
     # while the install reports success. install.sh enables the legacy addon
-    # on adopted clusters (ensure_existing_cluster_network_policy); a bare
-    # Terraform run refuses instead.
+    # on adopted clusters (ensure_existing_cluster_network_policy) when
+    # authorized; a bare Terraform run refuses instead. The refusal is the
+    # default, not the only answer: accept_no_network_policy installs anyway,
+    # on record — the composition stamps the choice onto the PlatformAgent
+    # from the network_policy_enforced output — because the alternative for
+    # an operator who will not have their node pools recreated is a fork
+    # between abort and a control-plane update they did not want.
     postcondition {
-      condition     = try(self.datapath_provider, "") == "ADVANCED_DATAPATH" || try(self.network_policy[0].enabled, false) == true
-      error_message = "Cluster '${var.cluster_name}' enforces no NetworkPolicy (neither Dataplane V2 nor the legacy addon), so every NetworkPolicy kube-agents installs would be inert. Run these two commands in this order, then re-run: gcloud container clusters update ${var.cluster_name} --location ${var.location} --project ${var.project_id} --update-addons=NetworkPolicy=ENABLED, then gcloud container clusters update ${var.cluster_name} --location ${var.location} --project ${var.project_id} --enable-network-policy. GKE rejects the second until the addon is on, and gcloud rejects both flags in one invocation."
+      condition     = var.accept_no_network_policy || try(self.datapath_provider, "") == "ADVANCED_DATAPATH" || try(self.network_policy[0].enabled, false) == true
+      error_message = "Cluster '${var.cluster_name}' enforces no NetworkPolicy (neither Dataplane V2 nor the legacy addon), so every NetworkPolicy kube-agents installs would be inert. Either enable enforcement — gcloud container clusters update ${var.cluster_name} --location ${var.location} --project ${var.project_id} --update-addons=NetworkPolicy=ENABLED, then gcloud container clusters update ${var.cluster_name} --location ${var.location} --project ${var.project_id} --enable-network-policy (GKE rejects the second until the addon is on, gcloud rejects both flags in one invocation, and the second may recreate node pools) — or set accept_no_network_policy = true to install without it, leaving the cluster as it is and the agent sandbox unconfined on the network."
     }
   }
+}
+
+locals {
+  # Whether the cluster the composition installs onto enforces NetworkPolicy.
+  # A cluster this module creates always does (Dataplane V2); an adopted one
+  # is whatever the data source read. False only when the postcondition above
+  # was passed by accept_no_network_policy.
+  network_policy_enforced = var.create_cluster ? true : (
+    try(data.google_container_cluster.existing[0].datapath_provider, "") == "ADVANCED_DATAPATH"
+    || try(data.google_container_cluster.existing[0].network_policy[0].enabled, false) == true
+  )
 }
 
 # A dedicated GKE Sandbox (gVisor) node pool. Standard only: Autopilot ships
@@ -324,4 +340,32 @@ locals {
     google_container_cluster.standard[*].name,
     data.google_container_cluster.existing[*].name,
   ))
+
+  cluster_endpoint = one(concat(
+    google_container_cluster.autopilot[*].endpoint,
+    google_container_cluster.standard[*].endpoint,
+    data.google_container_cluster.existing[*].endpoint,
+  ))
+
+  # Which of the control plane's two endpoints `endpoint` gave us, and so which
+  # certificate a client dialling it will be offered.
+  #
+  # The provider documents `endpoint` as the master's IP address, and on any
+  # cluster with IP access enabled it is. On a cluster with IP access disabled
+  # GKE puts the DNS-based endpoint's hostname in the same field -- nothing here
+  # asks for it -- and that endpoint is terminated at Google Front End with a
+  # certificate from a publicly trusted CA, while the IP endpoints get one
+  # signed by the cluster root CA that cluster_ca_certificate returns. A
+  # consumer pairing the two therefore has to know which it received, and the
+  # suffix is the only thing in the value that says so.
+  #
+  # Derived from the endpoint rather than from ip_endpoints_config because it is
+  # the endpoint that will actually be dialled: whatever the cluster's
+  # configuration says, the certificate offered is the one belonging to the host
+  # in this value.
+  cluster_endpoint_is_dns = endswith(local.cluster_endpoint, local.gke_dns_endpoint_suffix)
+
+  # The domain GKE's DNS-based control plane endpoints live under, as
+  # gke-<hash>.<region>.gke.goog.
+  gke_dns_endpoint_suffix = ".gke.goog"
 }

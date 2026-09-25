@@ -47,7 +47,9 @@ install without the interview.
   checkout with Workload Identity annotations and the credentials Secret
   composed from your variables. `model_provider` selects which provider
   LiteLLM routes `model-default` to (set the matching `*_api_key` variable);
-  `model_default_name` overrides the per-provider default model.
+  `model_default_name` overrides the per-provider default model;
+  `model_max_tokens` (default `0`, meaning none) sets the output-token budget
+  the gateway asks for on a request that names none.
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.
@@ -100,7 +102,13 @@ install without the interview.
   either present (`enable_cert_manager = false`) or absent. The module refuses the
   plan on two of these, the Workload Identity pool and NetworkPolicy enforcement,
   and checks none of the others; `install.sh` changes an adopted cluster to meet
-  those two instead, and this composition on its own never does.
+  those two instead, and this composition on its own never does. The NetworkPolicy
+  refusal alone can be waived: `accept_no_network_policy = true` installs onto a
+  cluster that enforces none, leaves it as it is, and stamps the
+  `kubeagents.x-k8s.io/network-policy-enforcement: absent-accepted` annotation onto
+  the `PlatformAgent` so the choice is readable later. Every NetworkPolicy the
+  install ships is then inert, including the ones that confine the agent's shell
+  sandbox.
 - Application Default Credentials for the Google, Kubernetes, and Helm
   providers:
 

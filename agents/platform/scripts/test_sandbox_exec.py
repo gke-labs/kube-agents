@@ -180,8 +180,9 @@ class ClientEnvironmentTestCase(unittest.TestCase):
     def test_pod_secrets_are_not_offered_to_the_ssh_client(self):
         """`_run_env()` would have passed these; this helper must not.
 
-        The sandbox declines them today (PermitUserEnvironment no, AcceptEnv
-        LANG LC_*), but that is the remote end's choice, not this end's.
+        The sandbox declines them today (PermitUserEnvironment no; AcceptEnv
+        LANG LC_*, plus HERMES_PROFILE_HOME for the `agent` account this helper
+        never connects as), but that is the remote end's choice, not this end's.
         """
         with patch.dict(os.environ, {"API_SERVER_KEY": "sentinel",
                                      "SESSION_KV_API_KEY": "sentinel",

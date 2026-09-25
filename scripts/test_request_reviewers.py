@@ -16,11 +16,16 @@ week) or requested on every completed check, which is what this change exists
 to stop.
 """
 
+import contextlib
+import io
+import os
 import random
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
@@ -35,7 +40,7 @@ CONFIG = {
     "reviewers": {
         "defaults": ["repository-owners"],
         "groups": {
-            "repository-owners": ["bradhoekstra", "jayantid", "toshiowang", "dshnayder"],
+            "repository-owners": ["bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor"],
             "eval-crew": ["jayantid", "lapis2002"],
         },
     },
@@ -55,7 +60,40 @@ CONFIG = {
 
 OWNERS = CONFIG["reviewers"]["groups"]["repository-owners"]
 EVAL_CREW = CONFIG["reviewers"]["groups"]["eval-crew"]
-LIVE_CONFIG = _HERE.parent / rr.DEFAULT_CONFIG_PATH
+REPO_ROOT = _HERE.parent
+LIVE_CONFIG = REPO_ROOT / rr.DEFAULT_CONFIG_PATH
+
+# The OWNERS approvers the verdict check is handed in these tests, plus one
+# login outside them. The set mirrors the `repository-owners` group. What the
+# fixtures below depend on is two memberships rather than the exact names:
+# `jayantid` is inside it, so an `APPROVED` review from him reads as an
+# approval, and `NON_APPROVER` is outside it, so the same review from him
+# does not.
+APPROVERS = {"bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor"}
+NON_APPROVER = "kyber775"
+
+# The root OWNERS, OWNERS_ALIASES and hack/OWNERS as they stand, for the walk
+# tests that need a tree they can also mutate.
+OWNERS_TREE = {
+    "OWNERS": "approvers:\n- AntonTyb\n- bradhoekstra\n- jayantid\n",
+    "OWNERS_ALIASES": "aliases:\n  eval-crew:\n    - jayantid\n    - lapis2002\n",
+    "hack/OWNERS": (
+        "filters:\n"
+        "  'eval/(presubmit-cases|blocking-roster)\\.txt$':\n"
+        "    approvers:\n"
+        "    - eval-crew\n"
+        "options:\n"
+        "  no_parent_owners: true\n"
+    ),
+}
+ROOT_APPROVERS = {"antontyb", "bradhoekstra", "jayantid"}
+
+
+def write_tree(root, files):
+    for relative, content in files.items():
+        path = Path(root) / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
 
 
 def pull_request(**overrides):
@@ -87,32 +125,50 @@ def check_run(conclusion="success", **overrides):
     return base
 
 
-def review(login, state="COMMENTED", user_type="User"):
-    return {"user": {"login": login, "type": user_type}, "state": state}
+def review(login, state="COMMENTED", user_type="User", submitted_at=None):
+    filed = {"user": {"login": login, "type": user_type}, "state": state}
+    if submitted_at is not None:
+        filed["submitted_at"] = submitted_at
+    return filed
 
 
 class FakeAPI:
-    """Just enough of `GitHubAPI` for the two functions that call it."""
+    """Just enough of `GitHubAPI` for the functions that call it, `main` included."""
 
-    def __init__(self, pulls=(), commits=None, check_runs=None):
+    def __init__(self, pulls=(), commits=None, check_runs=None, reviews=None, files=None):
         self.repo = "gke-labs/kube-agents"
         self.pulls = list(pulls)
         self.commits = commits or {}
         self.check_runs = check_runs or {}
+        self.reviews = reviews or {}
+        self.files = files or {}
+        self.posts = []
 
     def get_all(self, path):
         if path.endswith("/pulls?state=open"):
             return self.pulls
-        matched = re.search(r"/pulls/(\d+)/commits$", path)
+        matched = re.search(r"/pulls/(\d+)/(commits|reviews|files)$", path)
         if matched:
-            return [{"sha": sha} for sha in self.commits.get(int(matched.group(1)), [])]
+            number, kind = int(matched.group(1)), matched.group(2)
+            if kind == "commits":
+                return [{"sha": sha} for sha in self.commits.get(number, [])]
+            if kind == "reviews":
+                return self.reviews.get(number, [])
+            return [{"filename": name} for name in self.files.get(number, [])]
         raise AssertionError(f"unexpected list call: {path}")
 
     def get(self, path):
         matched = re.search(r"/commits/([0-9a-f]+)/check-runs$", path)
         if matched:
             return {"check_runs": self.check_runs.get(matched.group(1), [])}
+        matched = re.search(r"/pulls/(\d+)$", path)
+        if matched:
+            return next(pull for pull in self.pulls if pull["number"] == int(matched.group(1)))
         raise AssertionError(f"unexpected call: {path}")
+
+    def post(self, path, payload=None):
+        self.posts.append((path, payload))
+        return {}
 
 
 class GlobTest(unittest.TestCase):
@@ -277,7 +333,9 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_fewer_candidates_than_requested_is_not_an_error(self):
-        config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=5))
+        # One more than the group holds, so the request stays short of the
+        # candidates however many names the group grows to.
+        config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=len(OWNERS) + 1))
         picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0))
         self.assertCountEqual(picked, OWNERS)
 
@@ -287,46 +345,150 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(teams, ["sre"])
 
 
+class OwnersTest(unittest.TestCase):
+    """`applicable_approvers` -- Prow's approver walk over the OWNERS files."""
+
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.addCleanup(self.root.cleanup)
+        write_tree(self.root.name, OWNERS_TREE)
+
+    def approvers(self, *changed):
+        return rr.applicable_approvers(list(changed), self.root.name)
+
+    def test_a_root_file_gets_the_root_approvers_lower_cased(self):
+        # GitHub logins are case-insensitive and OWNERS spells `AntonTyb` in
+        # mixed case; the reviews API may spell it either way.
+        self.assertEqual(self.approvers("README.md"), ROOT_APPROVERS)
+
+    def test_a_nested_file_walks_up_to_the_root(self):
+        self.assertEqual(self.approvers("k8s-operator/internal/controller/pa.go"), ROOT_APPROVERS)
+
+    def test_a_filtered_path_under_no_parent_owners_gets_only_the_filter(self):
+        # hack/OWNERS: only eval-crew can /approve the presubmit rosters, and a
+        # root approver does not count (#1546).
+        for path in ("hack/eval/presubmit-cases.txt", "hack/eval/blocking-roster.txt"):
+            with self.subTest(path=path):
+                self.assertEqual(self.approvers(path), {"jayantid", "lapis2002"})
+
+    def test_an_unfiltered_path_under_no_parent_owners_falls_through_to_the_root(self):
+        # The same file's comment: everything else under hack/ matches no
+        # filter and falls through, so no_parent_owners only bites on a match.
+        for path in ("hack/eval/nightly-cases.txt", "hack/ci-eval-pr.sh"):
+            with self.subTest(path=path):
+                self.assertEqual(self.approvers(path), ROOT_APPROVERS)
+
+    def test_a_mixed_change_is_the_union(self):
+        self.assertEqual(
+            self.approvers("README.md", "hack/eval/presubmit-cases.txt"),
+            ROOT_APPROVERS | {"lapis2002"},
+        )
+
+    def test_a_plain_approvers_list_in_a_subdirectory_adds_to_the_root(self):
+        write_tree(self.root.name, {"docs/OWNERS": "approvers:\n- writer\n"})
+        self.assertEqual(self.approvers("docs/README.md"), ROOT_APPROVERS | {"writer"})
+        self.assertEqual(self.approvers("README.md"), ROOT_APPROVERS)
+
+    def test_no_parent_owners_stops_on_approvers_collected_below_it_too(self):
+        # Prow's `entriesForFile` breaks on "any approver collected so far",
+        # not "matched at this level". With an OWNERS file under hack/eval/,
+        # a file there arrives at hack/ already holding an approver, so
+        # hack/'s no_parent_owners stops the walk whether or not its filter
+        # matched -- and the root approvers never enter the set.
+        write_tree(self.root.name, {"hack/eval/OWNERS": "approvers:\n- sub\n"})
+        self.assertEqual(self.approvers("hack/eval/nightly-cases.txt"), {"sub"})
+        self.assertEqual(self.approvers("hack/eval/presubmit-cases.txt"), {"sub", "jayantid", "lapis2002"})
+        self.assertEqual(self.approvers("hack/ci-eval-pr.sh"), ROOT_APPROVERS)
+
+    def test_top_level_approvers_beside_filters_are_ignored_as_prow_does(self):
+        # Prow reads a file with `filters:` as a filtered file and drops a
+        # top-level `approvers:` next to them.
+        write_tree(
+            self.root.name,
+            {"hack/OWNERS": "approvers:\n- stray\n" + OWNERS_TREE["hack/OWNERS"]},
+        )
+        self.assertEqual(self.approvers("hack/eval/presubmit-cases.txt"), {"jayantid", "lapis2002"})
+        self.assertEqual(self.approvers("hack/ci-eval-pr.sh"), ROOT_APPROVERS)
+
+    def test_no_changed_files_means_no_approvers(self):
+        self.assertEqual(self.approvers(), set())
+
+    def test_a_missing_owners_tree_means_no_approvers(self):
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertEqual(rr.applicable_approvers(["README.md"], empty), set())
+
+    def test_the_live_tree_agrees_with_the_bots_config(self):
+        # The same property docs/pull-request-workflow.md states of the config:
+        # everyone the bot can assign is an approver for what it assigns them.
+        # If this fails, one of OWNERS, OWNERS_ALIASES, hack/OWNERS or the
+        # config moved and the other did not.
+        root_approvers = rr.applicable_approvers(["README.md"], REPO_ROOT)
+        self.assertTrue(set(OWNERS) <= root_approvers, root_approvers)
+        self.assertEqual(rr.applicable_approvers(["hack/eval/presubmit-cases.txt"], REPO_ROOT), set(EVAL_CREW))
+        self.assertNotIn(NON_APPROVER, root_approvers)
+
+
 class SkipReasonTest(unittest.TestCase):
-    """`skip_reason` -- the pull request states that get no reviewer."""
+    """`skip_reason` -- the pull request states that get no reviewer, override or not."""
 
     def test_an_open_untouched_pull_request_is_not_skipped(self):
-        self.assertIsNone(rr.skip_reason(pull_request(), [], CONFIG))
+        self.assertIsNone(rr.skip_reason(pull_request(), CONFIG))
 
     def test_a_closed_pull_request_is_skipped(self):
-        self.assertIn("not open", rr.skip_reason(pull_request(state="closed"), [], CONFIG))
+        self.assertIn("not open", rr.skip_reason(pull_request(state="closed"), CONFIG))
 
     def test_a_draft_is_skipped(self):
-        self.assertIn("draft", rr.skip_reason(pull_request(draft=True), [], CONFIG))
+        self.assertIn("draft", rr.skip_reason(pull_request(draft=True), CONFIG))
 
     def test_a_draft_is_not_skipped_when_ignore_draft_is_off(self):
         config = dict(CONFIG, options=dict(CONFIG["options"], ignore_draft=False))
-        self.assertIsNone(rr.skip_reason(pull_request(draft=True), [], config))
+        self.assertIsNone(rr.skip_reason(pull_request(draft=True), config))
 
     def test_an_ignored_keyword_in_the_title_is_skipped(self):
-        skipped = rr.skip_reason(pull_request(title="DO NOT REVIEW: wip"), [], CONFIG)
+        skipped = rr.skip_reason(pull_request(title="DO NOT REVIEW: wip"), CONFIG)
         self.assertIn("DO NOT REVIEW", skipped)
 
     def test_an_existing_request_is_not_duplicated(self):
         # The workflow fires on every completed AI Review check, so a pull
         # request already handed to a human must not be handed over again.
-        skipped = rr.skip_reason(
-            pull_request(requested_reviewers=[{"login": "jayantid"}]), [], CONFIG
-        )
+        skipped = rr.skip_reason(pull_request(requested_reviewers=[{"login": "jayantid"}]), CONFIG)
         self.assertIn("jayantid", skipped)
 
     def test_an_existing_team_request_is_not_duplicated(self):
-        skipped = rr.skip_reason(pull_request(requested_teams=[{"slug": "sre"}]), [], CONFIG)
+        skipped = rr.skip_reason(pull_request(requested_teams=[{"slug": "sre"}]), CONFIG)
         self.assertIn("team:sre", skipped)
 
-    def test_a_human_verdict_already_submitted_is_skipped(self):
+
+class AlreadyReviewedTest(unittest.TestCase):
+    """`already_reviewed_reason` -- whose verdict makes a request redundant."""
+
+    def reason(self, reviews, approvers=APPROVERS):
+        return rr.already_reviewed_reason(pull_request(), reviews, approvers)
+
+    def test_an_approvers_verdict_is_skipped(self):
         for state in ("APPROVED", "CHANGES_REQUESTED"):
-            reviews = [review("bnaylor", state)]
-            self.assertIn("bnaylor", rr.skip_reason(pull_request(), reviews, CONFIG), state)
+            reviews = [review("jayantid", state)]
+            self.assertIn("jayantid", self.reason(reviews), state)
+
+    def test_a_non_approvers_approval_does_not_count(self):
+        # The defect behind #1653, #1672 and #1545: an approval from someone
+        # outside OWNERS cannot produce the `approved` label, so the pull
+        # request sat with nobody asked and no way to merge.
+        self.assertIsNone(self.reason([review(NON_APPROVER, "APPROVED")]))
+
+    def test_a_non_approvers_changes_requested_still_counts(self):
+        # Decided, not inherited: whoever asked for changes is owed a reply,
+        # and asking a fresh reviewer over an open objection is noise.
+        self.assertIn(NON_APPROVER, self.reason([review(NON_APPROVER, "CHANGES_REQUESTED")]))
+
+    def test_approver_logins_match_case_insensitively(self):
+        self.assertIsNotNone(self.reason([review("JayantiD", "APPROVED")]))
+        self.assertIsNotNone(self.reason([review("jayantid", "APPROVED")], approvers={"JayantiD"}))
 
     def test_the_bots_own_review_does_not_count_as_human_coverage(self):
         reviews = [review("kube-agents-bot[bot]", user_type="Bot")]
-        self.assertIsNone(rr.skip_reason(pull_request(), reviews, CONFIG))
+        self.assertIsNone(self.reason(reviews))
+        self.assertIsNone(self.reason([review("kube-agents-bot[bot]", "APPROVED", user_type="Bot")]))
 
     def test_the_authors_replies_to_the_bot_do_not_block_their_own_reviewer(self):
         # Answering a review thread files a `COMMENTED` review under the
@@ -334,16 +496,136 @@ class SkipReasonTest(unittest.TestCase):
         # before running `/review`. Counting those would starve exactly the pull
         # requests that follow the process.
         reviews = [review("kube-agents-bot[bot]", user_type="Bot"), review("author")]
-        self.assertIsNone(rr.skip_reason(pull_request(), reviews, CONFIG))
+        self.assertIsNone(self.reason(reviews))
 
     def test_a_drive_by_comment_from_a_colleague_does_not_block_it_either(self):
-        self.assertIsNone(rr.skip_reason(pull_request(), [review("bnaylor")], CONFIG))
+        self.assertIsNone(self.reason([review("jayantid")]))
 
     def test_a_verdict_from_the_author_is_still_the_author(self):
         # GitHub will not let you approve your own pull request, but a
         # `CHANGES_REQUESTED` on your own is possible and is not coverage.
-        reviews = [review("author", "CHANGES_REQUESTED")]
-        self.assertIsNone(rr.skip_reason(pull_request(), reviews, CONFIG))
+        self.assertIsNone(self.reason([review("author", "CHANGES_REQUESTED")]))
+        self.assertIsNone(self.reason([review("author", "CHANGES_REQUESTED")], approvers={"author"}))
+
+    def test_the_live_fixture_shape_is_not_skipped(self):
+        # #1545 on 2026-09-17: one bot COMMENTED, one APPROVED from a colleague
+        # outside OWNERS, nobody requested. main said "already reviewed it".
+        reviews = [review("kube-agents-bot[bot]", user_type="Bot"), review(NON_APPROVER, "APPROVED")]
+        self.assertIsNone(self.reason(reviews))
+
+    def test_with_no_approvers_only_an_objection_counts(self):
+        self.assertIsNone(self.reason([review("jayantid", "APPROVED")], approvers=set()))
+        self.assertIsNotNone(self.reason([review("jayantid", "CHANGES_REQUESTED")], approvers=set()))
+
+    def test_a_withdrawn_objection_no_longer_counts(self):
+        # The reviews list keeps every review ever filed. A non-approver who
+        # asked for changes and then approved has said their piece; only the
+        # latest verdict is theirs, and that one cannot produce `approved`.
+        reviews = [review(NON_APPROVER, "CHANGES_REQUESTED"), review(NON_APPROVER, "APPROVED")]
+        self.assertIsNone(self.reason(reviews))
+        # The same sequence from an approver is an approval that counts.
+        reviews = [review("jayantid", "CHANGES_REQUESTED"), review("jayantid", "APPROVED")]
+        self.assertIn("jayantid", self.reason(reviews))
+
+    def test_an_objection_after_an_approval_counts(self):
+        reviews = [review(NON_APPROVER, "APPROVED"), review(NON_APPROVER, "CHANGES_REQUESTED")]
+        self.assertIn(NON_APPROVER, self.reason(reviews))
+
+    def test_a_later_comment_does_not_clear_an_objection(self):
+        # GitHub's own rule: only a new verdict or a dismissal moves the state.
+        reviews = [review(NON_APPROVER, "CHANGES_REQUESTED"), review(NON_APPROVER)]
+        self.assertIn(NON_APPROVER, self.reason(reviews))
+
+    def test_verdicts_are_ordered_by_submission_time_not_list_order(self):
+        reviews = [
+            review(NON_APPROVER, "APPROVED", submitted_at="2026-09-17T12:00:00Z"),
+            review(NON_APPROVER, "CHANGES_REQUESTED", submitted_at="2026-09-17T10:00:00Z"),
+        ]
+        self.assertIsNone(self.reason(reviews))
+
+    def test_a_dismissed_review_does_not_count(self):
+        self.assertIsNone(self.reason([review("jayantid", "DISMISSED"), review(NON_APPROVER, "DISMISSED")]))
+
+
+class MainTest(unittest.TestCase):
+    """`main` -- the check-run path and the `/request-review` override end to end."""
+
+    COMMENT_ID = 5719654130
+    REQUESTED = "/repos/gke-labs/kube-agents/pulls/1/requested_reviewers"
+    REACTIONS = f"/repos/gke-labs/kube-agents/issues/comments/{COMMENT_ID}/reactions"
+
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.addCleanup(self.root.cleanup)
+        write_tree(self.root.name, OWNERS_TREE)
+        self.summary = Path(self.root.name) / "summary.md"
+        env = {"GITHUB_TOKEN": "t", rr.STEP_SUMMARY_ENV: str(self.summary)}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_main(self, pull, reviews, *extra):
+        self.api = FakeAPI(pulls=[pull], reviews={1: reviews}, files={1: ["README.md"]})
+        argv = ["--pr", "1", "--config", str(LIVE_CONFIG), "--owners-root", self.root.name, "--seed", "0", *extra]
+        self.stdout, self.stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(rr, "GitHubAPI", return_value=self.api):
+            with contextlib.redirect_stdout(self.stdout), contextlib.redirect_stderr(self.stderr):
+                self.code = rr.main(argv)
+        return [path for path, _ in self.api.posts]
+
+    def reaction(self):
+        return [payload["content"] for path, payload in self.api.posts if path == self.REACTIONS]
+
+    def test_a_non_approvers_approval_no_longer_blocks_the_check_run_path(self):
+        posts = self.run_main(pull_request(), [review(NON_APPROVER, "APPROVED")])
+        self.assertEqual(posts, [self.REQUESTED])
+        self.assertEqual(self.code, 0)
+
+    def test_an_approvers_approval_still_blocks_the_check_run_path(self):
+        posts = self.run_main(pull_request(), [review("jayantid", "APPROVED")])
+        self.assertEqual(posts, [])
+        self.assertIn("jayantid already reviewed it", self.stderr.getvalue())
+        # The quiet path: no annotation, no summary line, exit 0.
+        self.assertNotIn(rr.WORKFLOW_WARNING_PREFIX, self.stdout.getvalue())
+        self.assertFalse(self.summary.exists())
+        self.assertEqual(self.code, 0)
+
+    def test_the_override_bypasses_the_verdict_and_acknowledges(self):
+        posts = self.run_main(pull_request(), [review("jayantid", "APPROVED")], "--react-to", str(self.COMMENT_ID))
+        self.assertEqual(posts, [self.REQUESTED, self.REACTIONS])
+        self.assertEqual(self.reaction(), [rr.REACTION_ACKNOWLEDGED])
+        self.assertEqual(self.code, 0)
+
+    def test_the_override_does_not_re_ask_when_someone_is_already_requested(self):
+        pull = pull_request(requested_reviewers=[{"login": "jayantid"}])
+        posts = self.run_main(pull, [], "--react-to", str(self.COMMENT_ID))
+        self.assertEqual(posts, [self.REACTIONS])
+        self.assertEqual(self.reaction(), [rr.REACTION_DECLINED])
+        self.assertEqual(self.code, 0)
+
+    def test_a_declined_override_is_written_where_the_person_can_see_it(self):
+        pull = pull_request(requested_reviewers=[{"login": "jayantid"}])
+        self.run_main(pull, [], "--react-to", str(self.COMMENT_ID))
+        message = "Not requesting a reviewer: review is already requested from jayantid"
+        self.assertIn(f"{rr.WORKFLOW_WARNING_PREFIX}{message}", self.stdout.getvalue())
+        self.assertEqual(self.summary.read_text(encoding="utf-8"), f"{message}\n")
+        self.assertIn(message, self.stderr.getvalue())
+
+    def test_a_declined_override_on_a_draft_reacts_too(self):
+        posts = self.run_main(pull_request(draft=True), [], "--react-to", str(self.COMMENT_ID))
+        self.assertEqual(posts, [self.REACTIONS])
+        self.assertEqual(self.reaction(), [rr.REACTION_DECLINED])
+
+    def test_dry_run_posts_nothing_on_either_outcome(self):
+        pull = pull_request(requested_reviewers=[{"login": "jayantid"}])
+        self.assertEqual(self.run_main(pull, [], "--react-to", str(self.COMMENT_ID), "--dry-run"), [])
+        self.assertIn(f"would react {rr.REACTION_DECLINED}", self.stderr.getvalue())
+        self.assertEqual(self.run_main(pull_request(), [], "--react-to", str(self.COMMENT_ID), "--dry-run"), [])
+        self.assertIn(f"would react {rr.REACTION_ACKNOWLEDGED}", self.stderr.getvalue())
+
+    def test_the_check_run_path_never_reacts(self):
+        posts = self.run_main(pull_request(requested_reviewers=[{"login": "jayantid"}]), [])
+        self.assertEqual(posts, [])
 
 
 class AiReviewGateTest(unittest.TestCase):

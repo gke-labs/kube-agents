@@ -27,6 +27,7 @@ their own copies:
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
 | `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `litellm.yaml` mirrors them     |
+| `DEFAULT_MODEL_MAX_TOKENS`                                                | Output tokens the gateway asks for on a request that names none (`0`: no `max_tokens`) |
 | `DEFAULT_GEMINI_API_KEY_SECRET_NAME`                                      | Secret Manager secret a Gemini key is read from when none is given (`gemini-api-key`)  |
 | `DEFAULT_NAMESPACE`                                                       | Kubernetes namespace of the release (`kubeagents-system`)                              |
 | `DEFAULT_PLATFORM_AGENT_GSA_NAME`                                         | The agent's GCP service account id (`kubeagents-platform-gsa`); one name per project   |
@@ -75,11 +76,13 @@ installer-driven one name the same objects.
 
 `installer_common.sh` does declare constants of its own, and the distinction is the
 point: the Helm release name, the LiteLLM, operator and agent Deployment names, the
+agent container and Hermes profile inside that Deployment's pod, the
 `platform-agent-secrets` Secret, and the sandbox StatefulSet, credential-proxy
 Deployment and authorized-keys Secret the operator derives from the agent's name are
 the chart's and the operator's fixed names, which no `install.env` key can change, so
 they are `readonly` constants there (`KUBE_AGENTS_HELM_RELEASE`,
-`KUBE_AGENTS_OPERATOR_DEPLOYMENT`, `PLATFORM_AGENT_DEPLOYMENT`, `PLATFORM_AGENT_SECRET`,
+`KUBE_AGENTS_OPERATOR_DEPLOYMENT`, `PLATFORM_AGENT_DEPLOYMENT`,
+`PLATFORM_AGENT_CONTAINER`, `PLATFORM_AGENT_HERMES_PROFILE`, `PLATFORM_AGENT_SECRET`,
 `LITELLM_DEPLOYMENT`, `PLATFORM_AGENT_SHELL_STATEFULSET`,
 `PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT`, `PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET`)
 rather than defaults an install could override. So are the Helm timeouts
@@ -104,9 +107,10 @@ reach `write_tfvars_from_state` and the `TF_VAR_*` handoff, both of which read t
 environment. Order of authority is **flag, then file, then an exported variable, then
 the defaults above** — `set -a` sourcing means a key the file carries overwrites an
 export of the same name, so a flag is what overrides a recorded value for one run.
-One key is file-only: the front doors clear a shell-exported `NAMESPACE` before reading
-the file, because kubectl tooling exports that name and the value now reaches the Helm
-release's namespace. The dev tooling's `load_state` clears it the same way.
+One key ignores the environment: the front doors clear a shell-exported `NAMESPACE`
+before reading the file, because kubectl tooling exports that name and the value now
+reaches the Helm release's namespace. The file and `--agent-namespace` are the two
+routes in. The dev tooling's `load_state` clears it the same way.
 `KUBE_AGENTS_INSTALL_ENV` points at a different path, which is how CI renders one from
 its own variables rather than keeping install state on an ephemeral runner.
 
@@ -203,8 +207,12 @@ requires Workload Identity (`GKE_METADATA`).
 
 `ENABLE_NETWORK_POLICY=true` (or `--enable-network-policy`) authorizes enabling the legacy Calico
 NetworkPolicy addon and enforcement on pre-existing GKE Standard clusters lacking Dataplane V2.
-Enabling Calico may recreate nodes and restart workloads. Without opt-in, the install aborts before
-making any cluster changes because kube-agents requires NetworkPolicy enforcement.
+Enabling Calico may recreate nodes and restart workloads. `ACCEPT_NO_NETWORK_POLICY=true` (or
+`--accept-no-network-policy`) is the other answer: install without enforcement and leave the cluster
+as it is. The generator emits it as `accept_no_network_policy` in `terraform.tfvars`, which is what
+gets the plan past the gke-cluster module's postcondition, so the key has to stay in `install.env`
+for `upgrade.sh` and the Day-2 menu to regenerate an applicable file. Without either, the install
+aborts before making any cluster changes.
 
 `ALLOW_UNENCRYPTED_SECRETS=true` skips the out-of-band Cloud KMS CMEK database encryption on
 pre-existing clusters (testing environments only).
@@ -237,7 +245,16 @@ dotenv and `vars.sh` was generated with `printf %q`.
 - **[installer_common.sh](installer_common.sh)**: the `install.env` loader, validators,
   GitHub org checks, and the `terraform.tfvars` generator (table above). Sources the
   defaults from [`install.defaults.env`](../../install.defaults.env) rather than
-  declaring any itself.
+  declaring any itself. The front doors run `set -E` with an ERR trap that every `$(...)`
+  inherits, and bash 3.2 (macOS's `/bin/bash`) runs that trap inside the subshell even
+  when the caller handles the failure. Each front door's `on_error` therefore exits a
+  subshell silently and leaves the banner and the report to the parent, which prints
+  them only when the failure reaches it; a probe in a front door needs no guard of its
+  own. This library cannot know its caller's trap, so its tolerated probes (a release,
+  deployment, ref or state object that is not there: `helm_release_status`,
+  `tf_state_read`) run `trap - ERR` inside their substitution as well. Process
+  substitution (`< <(...)`) leaves `BASH_SUBSHELL` at 0 on bash 3.2, so a tolerated read
+  through one clears the trap inline wherever it sits.
 - **[common.sh](common.sh)**: utilities the dev tooling and the Prow CI scripts
   (`hack/ci-deploy.sh`) use — colour output, `init_var`/`load_state`,
   registry and third-party-image resolution, cluster connection helpers. Sources

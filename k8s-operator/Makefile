@@ -60,8 +60,38 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet setup-envtest test-python ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+test: manifests generate fmt vet test-python ## Run tests.
+# KUBEBUILDER_ASSETS comes from envtest-path, which installs the binaries if
+# they are absent, so every envtest-asset fetch in this file goes through the
+# retrying macro and this target needs no setup-envtest prerequisite of its
+# own. Dropping it costs the "Setting up envtest binaries..." line and saves a
+# second `use`. (go-install-tool's `go install` of setup-envtest itself is a
+# separate fetch and still has no retry; the module cache usually serves it.)
+#
+# Resolved on a line of its own and then checked, not written as a prefix
+# assignment on the `go test` line: a command substitution in a prefix
+# assignment has its exit status discarded, exactly as the $(shell ...) this
+# replaced did, so a fetch that exhausted its retries would leave
+# KUBEBUILDER_ASSETS empty, skip every envtest-backed test, and still report
+# success. The root Makefile's coverage target resolves it the same way, though
+# it settles for a non-empty check.
+#
+# --no-print-directory because -s suppresses only the directory banners that
+# -C turns on implicitly, not an explicit -w inherited through MAKEFLAGS, and
+# those go to stdout. The check is for the kube-apiserver rather than for a
+# non-empty string for the same reason -- a2a-test.yml makes the same check on
+# the same value -- since a banner-wrapped path is not empty, just wrong.
+#
+# `make -n test` runs this recipe rather than printing it: make executes any
+# recipe line holding $(MAKE) even under -n, so $assets ends up holding the
+# sub-make's printed recipe. The kube-apiserver check then rejects it, which
+# is why `make -n test` errors out instead of reaching `go test`.
+	assets="$$($(MAKE) -s --no-print-directory envtest-path)"; \
+	if [ ! -x "$$assets/kube-apiserver" ]; then \
+		echo "Error: envtest-path gave '$$assets', which holds no kube-apiserver." >&2; \
+		exit 1; \
+	fi; \
+	KUBEBUILDER_ASSETS="$$assets" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 .PHONY: test-python
 # Discovery, not a hand-maintained list. The list version was stale: it named
@@ -264,6 +294,16 @@ ENVTEST_VERSION ?= release-0.24
 # ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.36)
 ENVTEST_K8S_VERSION ?= 1.36.0
 
+# The envtest binaries come from GitHub's release-asset CDN, which has bad
+# seconds: two unrelated jobs on #1562 each died on a 504 from it, four minutes
+# apart, neither of them related to the change under test (#1603). Each was a
+# single failed transfer rather than one long outage, which is what a retry
+# absorbs. Four attempts with a doubling delay (5s, 10s, 20s) spends at most 35
+# seconds on that before giving up, so an asset that is genuinely unreachable
+# does not hold a runner.
+ENVTEST_DOWNLOAD_ATTEMPTS ?= 4
+ENVTEST_RETRY_DELAY_SECONDS ?= 5
+
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
@@ -274,17 +314,18 @@ controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessar
 $(CONTROLLER_GEN): $(LOCALBIN)
 	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen,$(CONTROLLER_TOOLS_VERSION))
 
+.PHONY: envtest-k8s-version
+envtest-k8s-version: ## Print the Kubernetes version the envtest binaries are pinned to.
+	@echo "$(ENVTEST_K8S_VERSION)"
+
 .PHONY: envtest-path
 envtest-path: envtest ## Print the KUBEBUILDER_ASSETS path (installs the binaries if absent).
-	@$(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path
+	$(call envtest-use)
 
 .PHONY: setup-envtest
 setup-envtest: envtest ## Download the binaries required for ENVTEST in the local bin directory.
 	@echo "Setting up envtest binaries for Kubernetes version $(ENVTEST_K8S_VERSION)..."
-	@$(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path || { \
-		echo "Error: Failed to set up envtest binaries for version $(ENVTEST_K8S_VERSION)."; \
-		exit 1; \
-	}
+	$(call envtest-use)
 
 .PHONY: envtest
 envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
@@ -305,6 +346,42 @@ GOBIN="$(LOCALBIN)" go install $${package} ;\
 mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
 } ;\
 ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"
+endef
+
+# envtest-use runs `setup-envtest use` and retries a failed fetch, because the
+# unretried version turned a 504 from GitHub's release-asset CDN into a red
+# check on pull requests whose diff held no Go at all (#1603).
+#
+# Everything except the assets path goes to stderr. .github/workflows/a2a-test.yml
+# captures `make -s envtest-path` into a variable and then checks that what it
+# captured holds a kube-apiserver, so a retry notice on stdout would break that
+# caller rather than inform it.
+#
+# The two tunables are checked before the loop reads them. An empty one gets
+# past `?=` -- an exported empty variable, or `make ... ENVTEST_DOWNLOAD_ATTEMPTS=`
+# -- and `[ "$$attempt" -ge "" ]` then errors, which `if` reads as false: the
+# ceiling never fires and the loop retries forever.
+define envtest-use
+@attempts="$(ENVTEST_DOWNLOAD_ATTEMPTS)"; \
+delay="$(ENVTEST_RETRY_DELAY_SECONDS)"; \
+if ! [ "$$attempts" -ge 1 ] 2>/dev/null || ! [ "$$delay" -ge 0 ] 2>/dev/null; then \
+echo "Error: ENVTEST_DOWNLOAD_ATTEMPTS must be a whole number of at least 1 and ENVTEST_RETRY_DELAY_SECONDS one of at least 0; got '$$attempts' and '$$delay'." >&2; \
+exit 1; \
+fi; \
+attempt=1; \
+while :; do \
+if $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path; then \
+exit 0; \
+fi; \
+if [ "$$attempt" -ge "$$attempts" ]; then \
+echo "Error: Failed to set up envtest binaries for version $(ENVTEST_K8S_VERSION) after $$attempts attempts." >&2; \
+exit 1; \
+fi; \
+echo "envtest download attempt $$attempt of $$attempts failed; retrying in $${delay}s" >&2; \
+sleep "$$delay"; \
+attempt=$$((attempt + 1)); \
+delay=$$((delay * 2)); \
+done
 endef
 
 ##@ Setup & Cleanup

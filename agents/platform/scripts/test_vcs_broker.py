@@ -827,6 +827,88 @@ class RepositoryVerbTest(unittest.TestCase):
         self.assertEqual(self.remote_tip("main"), answer["revision"])
         self.assertEqual(list(self.scratch.iterdir()), [])
 
+    def test_publish_refuses_the_configured_base_branch(self):
+        # Run branches (run/**) are protected from direct publication unconditionally (#1498),
+        # as are configured base branches (CREDENTIAL_PROXY_BASE_BRANCH or GITOPS_BASE_BRANCH).
+        git(self.seed, "checkout", "--quiet", "-b", "run/test-cluster/fix-task")
+        git(self.seed, "push", "--quiet", "origin", "run/test-cluster/fix-task")
+        git(self.seed, "checkout", "--quiet", "main")
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "run/test-cluster/fix-task")
+        self.commit_in(work, "README.md", "direct to run branch\n", "bypass")
+        # Refused unconditionally without any env override
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "run/test-cluster/fix-task",
+                    "target": "main",
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "run/test-cluster/fix-task", answer["revision"]),
+                }
+            )
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+
+        broker_with_env = vcs_broker.VcsBroker(
+            self.scratch, git_runner=self.broker._git_runner, base_branch="custom-broker-base"
+        )
+        broker_with_env.registry.hosts["local.test"] = self.forge
+        self.assertEqual(broker_with_env.base_branch, "custom-broker-base")
+        git(work, "checkout", "--quiet", "-b", "custom-broker-base")
+        self.commit_in(work, "README.md", "direct to custom base\n", "bypass-custom")
+        with self.assertRaises(WorkspaceError) as caught:
+            broker_with_env.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "custom-broker-base",
+                    "target": "main",
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "custom-broker-base", answer["revision"]),
+                }
+            )
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+
+        # Refusal via environment variable override (including refs/heads/ prefix normalization)
+        git(work, "checkout", "--quiet", "-b", "env-broker-base")
+        self.commit_in(work, "README.md", "direct to env base\n", "bypass-env")
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "refs/heads/env-broker-base"}):
+            self.assertEqual(self.broker.base_branch, "")
+            with self.assertRaises(WorkspaceError) as caught:
+                self.broker.publish(
+                    {
+                        "repository": "local.test/acme/infra",
+                        "branch": "env-broker-base",
+                        "target": "main",
+                        "baseRevision": answer["revision"],
+                        "bundleBase64": self.bundle_of(work, "env-broker-base", answer["revision"]),
+                    }
+                )
+            self.assertEqual(caught.exception.status, 409)
+            self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+
+    def test_publish_refuses_hardcoded_protected_branches_and_ref_prefixes(self):
+        # VcsBroker.publish refuses main, master, production and refs/heads/ prefixes (#1498, Thread 12)
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "feature")
+        self.commit_in(work, "README.md", "direct to protected\n", "bypass")
+        bundle_b64 = self.bundle_of(work, "feature", answer["revision"])
+        for branch_name in ("master", "production", "refs/heads/main", "refs/heads/master"):
+            with self.subTest(branch=branch_name):
+                with self.assertRaises(WorkspaceError) as caught:
+                    self.broker.publish(
+                        {
+                            "repository": "local.test/acme/infra",
+                            "branch": branch_name,
+                            "target": "main",
+                            "baseRevision": answer["revision"],
+                            "bundleBase64": bundle_b64,
+                        }
+                    )
+                self.assertEqual(caught.exception.status, 409)
+                self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+
     def test_publish_refuses_the_branch_the_client_says_it_cloned(self):
         # A non-default branch cloned and published under another target is
         # what the default-branch check cannot see; the client names the

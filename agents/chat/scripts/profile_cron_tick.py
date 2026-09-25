@@ -216,7 +216,7 @@ def _rotate(log_path: Path) -> None:
 
 # Home-target routing keys, per platform: (chat id, thread id).
 #
-# ``deliver=all`` resolves through ``cron/scheduler.py``'s
+# ``deliver=all`` resolves through ``cron/scheduler_delivery.py``'s
 # ``_get_home_target_chat_id``, which reads ``os.getenv`` and nothing else — it
 # never consults ``config.yaml``. So the child needs these in its environment
 # or it has nowhere to post.

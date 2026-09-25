@@ -31,7 +31,7 @@ variable "cluster_prefix" {
 }
 
 variable "fleet_reader_token_creators" {
-  description = "IAM members that may mint an access token as the seeded-fleet reader service account, in `serviceAccount:...`/`user:...`/`group:...` form. Two callers need it: the eval project's Prow runner identity, because hack/fleet-kubeconfigs.sh calls `gcloud auth print-access-token --impersonate-service-account` as that identity and without an entry here falls back to its own cluster-admin credential (loudly); and the CI health bot (eval-dashboard-publisher@kube-agents-prow), whose hourly fixture-state scan (.github/workflows/ci-health.yml, docs/ci-health.md) runs every gcloud and kubectl read as the reader and holds no grant of its own on the project, so a project without its entry scans as 'not checked'. Defaults to both -- the same two accounts in every pool project. Override it when applying this stack outside the CI pool."
+  description = "IAM members that may mint an access token as the seeded-fleet reader service account, in `serviceAccount:...`/`user:...`/`group:...` form. Three callers need it. Two are the identities that run hack/ci-eval-pr.sh in a leased pool project, the presubmit's Prow runner and the nightly periodic's recorder: hack/fleet-kubeconfigs.sh calls `gcloud auth print-access-token --impersonate-service-account` as whichever is running, so without its entry here that runner cannot assume the read-only account and falls back to its own cluster-admin credential (loudly). The third is the CI health bot (eval-dashboard-publisher@kube-agents-prow), whose hourly fixture-state scan (.github/workflows/ci-health.yml, docs/ci-health.md) runs every gcloud and kubectl read as the reader and holds no grant of its own on the project, so a project without its entry scans as 'not checked'. Defaults to all three -- the same three accounts in every pool project, kept equal to FLEET_READER_TOKEN_CREATORS in scripts/verify_ci_pool_project.py by its tests. Override it when applying this stack outside the CI pool."
   type        = list(string)
 
   # Defaulted here rather than passed with -var, because the resource is keyed
@@ -40,6 +40,7 @@ variable "fleet_reader_token_creators" {
   # Observed as `1 to destroy` on kube-agents-evals-16 (gke-labs/kube-agents#1051).
   default = [
     "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com",
+    "serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com",
     "serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com",
   ]
 

@@ -9,9 +9,9 @@
 # the endpoint rather than the scenario. Its shape budgets at 600-1300s, so
 # presubmit coverage of this domain is a targeted question about the planted
 # defect, answered from observed evidence and graded on the reply. Full
-# audit SOP fidelity lives in the fleet-audits canary
-# (compliance-rbac-overgrant, 606s measured 2026-08-26) and in the future
-# nightly tier, where upgrade-readiness-lagging-cluster is parked.
+# audit SOP fidelity lives in the nightly tier: the fleet-audits canary
+# (compliance-rbac-overgrant, 606s measured 2026-08-26; nightly since
+# 2026-09-22) and upgrade-readiness-lagging-cluster.
 # Expected cost bracket: ~150-350s.
 #
 # Planted defect required: the seeded fleet's slot-b cluster held one minor

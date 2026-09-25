@@ -38,12 +38,31 @@ variable "create_cluster" {
     through a data source and creates no cluster or KMS resources. The
     existing cluster must already have Workload Identity enabled and enforce
     NetworkPolicy (Dataplane V2 or the legacy Calico addon); two postconditions
-    refuse the plan otherwise. Enabling CMEK database encryption on it stays a
+    refuse the plan otherwise, the second unless accept_no_network_policy is
+    set. Enabling CMEK database encryption on it stays a
     `gcloud container clusters update --database-encryption-key` step outside
     Terraform — a data source cannot mutate the cluster.
   EOT
   type        = bool
   default     = true
+}
+
+variable "accept_no_network_policy" {
+  description = <<-EOT
+    Install onto an existing cluster (create_cluster = false) that enforces no
+    NetworkPolicy — neither Dataplane V2 nor the legacy Calico addon — instead
+    of refusing the plan. The cluster is not modified. Every NetworkPolicy
+    kube-agents installs is then accepted by the API server and enforced by
+    nothing: the agent pod's ingress and egress confinement, the shell
+    sandbox's deny-all policy, and the LiteLLM, GitHub minter and Hindsight
+    policies. What is lost is the confinement of
+    kube-agents' own workloads, not of yours. The composition records the
+    choice on the PlatformAgent as the
+    kubeagents.x-k8s.io/network-policy-enforcement annotation. No effect on a
+    cluster the module creates (Dataplane V2) or one that already enforces.
+  EOT
+  type        = bool
+  default     = false
 }
 
 variable "location" {

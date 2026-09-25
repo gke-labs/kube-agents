@@ -71,10 +71,11 @@ not:
   the marker through the fallback, so under ``dispatch_in_gateway`` an unrelated
   worker running concurrently with somebody else's dispatch answered
   ``current_cron_job() == '<their job>'``.
-* **It was inherited by spawned workers.** ``hermes_cli/kanban_db.py``'s spawn
-  copies ``os.environ`` and scrubs only the ``HERMES_KANBAN_*`` keys
-  ``gateway/session_context.py`` lists. This marker is not among them, so a
-  worker spawned during a run carried it for life.
+* **It was inherited by spawned workers.** ``_default_spawn`` in
+  ``hermes_cli/kanban_db_dispatch.py`` copies ``os.environ`` and scrubs only
+  the ``HERMES_KANBAN_*`` keys ``gateway/session_context.py`` lists. This
+  marker is not among them, so a worker spawned during a run carried it for
+  life.
 
 A ContextVar has none of those failure modes and needs no save/restore: it is
 scoped to the thread ``run_job`` submitted the run on, ``copy_context()`` carries

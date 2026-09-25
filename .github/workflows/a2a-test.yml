@@ -74,6 +74,38 @@ jobs:
           cache: true
           cache-dependency-path: "a2a/go.sum"
 
+      # This job fetches the same envtest binaries as the operator's, through
+      # envtest-path, and on the same unretried path that failed a pull request
+      # containing no Go (#1603). Same key as k8s-operator-test.yml, so the two
+      # jobs share one entry -- across runs, not within one: both start
+      # concurrently on a pull request touching k8s-operator/Makefile, and on a
+      # run where the entry does not yet exist both miss and both fetch. The
+      # version is read from the Makefile that declares it rather than copied.
+      - name: Resolve the pinned envtest Kubernetes version
+        if: steps.filter.outputs.a2a == 'true'
+        id: envtest
+        # Assigned before it is written, so a failing make fails this step
+        # rather than writing an empty value into the key, and
+        # --no-print-directory so an inherited -w cannot make it a multi-line
+        # one. See the twin step in k8s-operator-test.yml.
+        run: |
+          version="$(make -C k8s-operator -s --no-print-directory envtest-k8s-version)"
+          if [ -z "$version" ]; then
+            echo "::error::envtest-k8s-version printed nothing; the cache key would carry no version."
+            exit 1
+          fi
+          echo "k8s-version=$version" >> "$GITHUB_OUTPUT"
+
+      # Restore everywhere, save only on main -- k8s-operator-test.yml's restore
+      # step carries the budget reasoning for both.
+      - name: Restore cached envtest binaries
+        if: steps.filter.outputs.a2a == 'true'
+        id: envtest-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: k8s-operator/bin/k8s
+          key: envtest-${{ runner.os }}-${{ steps.envtest.outputs.k8s-version }}
+
       # The provision Job hands the nats CLI a ServiceAccount token in the
       # password field, and whether that works is a fact about the CLI rather
       # than about our client library - so the test that covers the one product
@@ -116,3 +148,15 @@ jobs:
           cd a2a
           go vet ./...
           KUBEBUILDER_ASSETS="$ASSETS" NATS_CLI="$NATS_CLI" PATH="$GO_BIN_DIR:$PATH" go test -race ./...
+
+      # The one writer; see the twin step in k8s-operator-test.yml.
+      - name: Save envtest binaries to the cache
+        if: >-
+          steps.filter.outputs.a2a == 'true'
+          && github.event_name == 'push'
+          && github.ref == 'refs/heads/main'
+          && steps.envtest-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: k8s-operator/bin/k8s
+          key: envtest-${{ runner.os }}-${{ steps.envtest.outputs.k8s-version }}

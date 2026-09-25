@@ -32,9 +32,31 @@ baseline it is judged against and may never move it.
 EXIT CODES. ``case`` exits 0 whenever it produced a verdict, including a
 blocking one: the loop must keep going so the summary covers every task, and
 the blocking flag rides in the JSON. It exits 2 when it could not grade at all
-(an unreadable task file, a bad flag). ``suite`` exits 0 green, 1 red.
+(an unreadable task file, a bad flag). ``suite`` exits 0 green, 1 red, and 2
+when the run could not be evaluated: an admitted case lost every repetition
+to infrastructure, or every case did, so the run cannot certify green and
+has no finding against the change either. That is the same code ``case``
+uses for "could not grade", and for the same reason -- could not check is
+not a pass -- and it is distinct from 1 so the shell, the artifact and the
+dashboards can say "rerun when the environment is healthy" instead of
+"debug the change". ``suite`` also exits 1 on what it cannot read -- a case
+result the loop never wrote, a store that will not parse -- because those
+are the job's failures, not the environment's, and must not read as weather.
 ``record`` exits 0 unless it was asked to write somewhere it cannot — it is
 bookkeeping, and bookkeeping must never be the reason a merge to main reds.
+
+ONE RUN, SEVERAL CALLS. Since the shell grades each case inside its fan-out,
+the moment the case's last repetition finishes, ``record`` is called once per
+case during the run and once more after it for whatever the fan-out left. The
+``--recorded-manifest`` file is what keeps that idempotent: every append is
+noted there as (case, version key), and a later call that names the same pair
+skips it and says so, so a case recorded in a lane is never appended again by
+the pass after the fan-out. ``--lines-out`` appends for the same reason. And a
+run the Prow deadline ends before its suite step gets a table anyway: the
+shell's EXIT trap runs ``suite --partial NOTE`` over the cases graded by then,
+which banners the markdown and marks the JSON ``partial: true`` so nothing
+downstream reads it as the run's verdict: hack/ci-eval-rc.sh's driver does
+not let a partial JSON turn an exit 2 into NOT RUN.
 """
 
 from __future__ import annotations
@@ -45,6 +67,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -69,6 +92,9 @@ from kube_agents_bench.scoring import (
     DEFAULT_JUDGED_MARGIN,
     DEFAULT_JUDGED_METRICS,
     MISSING,
+    SUITE_OUTCOME_GREEN,
+    SUITE_OUTCOME_NOT_EVALUATED,
+    SUITE_OUTCOME_RED,
     Rung,
     grade_case,
     grade_suite,
@@ -78,6 +104,19 @@ from kube_agents_bench.scoring import (
 __all__ = ["main"]
 
 _DEFAULT_BASELINE_DIR = "baselines"
+
+#: What ``suite`` exits when the run could not be evaluated (see the module
+#: docstring's EXIT CODES): the code ``case`` uses for "could not grade",
+#: and what ``hack/ci-eval-pr.sh`` branches on before it announces the
+#: verdict. 0 green and 1 red are the literals they have always been.
+SUITE_EXIT_NOT_EVALUATED = 2
+
+#: The verdict headline per outcome, the first thing the markdown says.
+SUITE_HEADLINES = {
+    SUITE_OUTCOME_GREEN: "GREEN",
+    SUITE_OUTCOME_RED: "RED",
+    SUITE_OUTCOME_NOT_EVALUATED: "NOT EVALUATED",
+}
 
 #: Set to one of these (case-insensitive) and the suite aggregate may red the
 #: job. Unset, the aggregate rule still runs and is still reported -- it just
@@ -194,8 +233,17 @@ def _record_decided(cases: list[dict[str, Any]]) -> bool:
     )
 
 
-def _load_store(location: str) -> tuple[BaselineStore | None, str | None, str | None]:
+def _load_store(
+    location: str, *, only: Collection[str]
+) -> tuple[BaselineStore | None, str | None, str | None]:
     """``(store, fatal_reason, degraded_reason)`` -- exactly one of the last two.
+
+    ``only`` is the cases this command will ask about, and it is required
+    rather than optional: on GCS the store costs one listing plus a read per
+    case, the gate loads it once per graded case, and no caller here has ever
+    wanted a case it did not name. The store remembers the scope and raises on
+    a lookup outside it, so narrowing it here cannot quietly turn a passing
+    case into an unscreened one.
 
     Three failure classes, deliberately not treated alike.
 
@@ -211,11 +259,13 @@ def _load_store(location: str) -> tuple[BaselineStore | None, str | None, str | 
     that is what this whole design exists to avoid.
     """
     try:
-        return BaselineStore.load(location), None, None
+        return BaselineStore.load(location, only=only), None, None
     except ValueError as exc:
         return None, str(exc), None
     except StoreUnreachable as exc:
-        return BaselineStore({}), None, f"{location} unreachable: {exc}"
+        # Scoped like the successful read, so an unreachable store answers
+        # "no evidence" for the cases in scope and still refuses the rest.
+        return BaselineStore({}, scope=only), None, f"{location} unreachable: {exc}"
 
 
 def _bootstrap_admitted() -> frozenset[str]:
@@ -310,7 +360,7 @@ def _cmd_case(args: argparse.Namespace) -> int:
         )
         break
 
-    store, fatal, degraded = _load_store(_store_location(args))
+    store, fatal, degraded = _load_store(_store_location(args), only={spec.case_id})
     if fatal or store is None:
         print(f"Task {spec.case_id} Result: [FAILED] {fatal}", file=sys.stderr)
         return 2
@@ -425,12 +475,26 @@ def _record_says(case: dict[str, Any]) -> str:
 def _markdown(
     verdict: Any, cases: list[dict[str, Any]], *, admission_column: bool = False
 ) -> str:
+    not_evaluated = verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED
     lines = [
         "## Evaluation verdict",
         "",
-        f"**{'GREEN' if verdict.green else 'RED'}**",
+        f"**{SUITE_HEADLINES[verdict.outcome]}**",
         "",
     ]
+    if not_evaluated:
+        # The banner says what to do, because the headline alone invites the
+        # wrong action: a pull request author who sees a red job debugs the
+        # change, and there is nothing in this run about the change to debug.
+        named = ", ".join(f"`{case_id}`" for case_id in verdict.not_evaluated)
+        lines += [
+            "> **NOT EVALUATED — rerun when the environment is healthy.** "
+            f"{named}: every repetition was excluded as infrastructure, so this "
+            "run evaluated nothing about the case and cannot certify green. "
+            "This is not a finding against the change under test: do not debug "
+            "the change for it; rerun once the eval environment is healthy.",
+            "",
+        ]
     if verdict.pass_rate is not None:
         rate = f"{verdict.pass_rate:.1%}"
         if verdict.baseline_rate is not None:
@@ -441,7 +505,8 @@ def _markdown(
     for note in getattr(verdict, "notes", None) or []:
         lines += [f"_{note}_", ""]
     if verdict.reasons:
-        lines += ["### Why it is red", ""]
+        heading = "Why it cannot report green" if not_evaluated else "Why it is red"
+        lines += [f"### {heading}", ""]
         lines += [f"- {r}" for r in verdict.reasons]
         lines += [""]
     extra_header = f" {ADMISSION_COLUMN} | {RECORD_COLUMN} |" if admission_column else ""
@@ -530,7 +595,11 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         print(f"::error::{cases}", file=sys.stderr)
         return 1
 
-    store, fatal, degraded = _load_store(_store_location(args))
+    # The graded cases and no others. `_baseline_rate` below walks this same
+    # list, so the scope and the questions are built from one source.
+    store, fatal, degraded = _load_store(
+        _store_location(args), only={str(c.get("case") or "") for c in cases}
+    )
     if fatal or store is None:
         print(f"::error::{fatal}", file=sys.stderr)
         return 1
@@ -579,6 +648,17 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     # silently loosens the gate, and the one thing that must not happen is a
     # green nobody knows was measured against nothing.
     banners = []
+    if args.partial:
+        # First, above every other banner: a table the shell's EXIT trap
+        # wrote for a run that never reached its own suite step is not that
+        # run's verdict, whatever the headline below it says about the cases
+        # it does cover.
+        banners.append(
+            "> **PARTIAL — not this run's verdict.** "
+            f"{args.partial}. Only the cases graded before the run ended are "
+            "in the table below; the headline and the aggregate cover those "
+            "cases alone, and this table gates nothing."
+        )
     if unknown:
         print(
             f"WARNING: BOOTSTRAP_ADMITTED names no graded case: {unknown}",
@@ -614,10 +694,16 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text, encoding="utf-8")
     if args.json_out:
+        doc = verdict.to_dict()
+        if args.partial:
+            doc["partial"] = True
+            doc["partial_note"] = args.partial
         out = Path(args.json_out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(verdict.to_dict(), indent=2) + "\n", encoding="utf-8")
+        out.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
 
+    if verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED:
+        return SUITE_EXIT_NOT_EVALUATED
     return 0 if verdict.green else 1
 
 
@@ -661,6 +747,51 @@ def _record_for_case(
     )
 
 
+def _manifest_key(case_id: str, key: dict[str, Any] | None) -> tuple[str, str]:
+    """What one manifest line identifies: the case and its version key, the
+    key in a canonical spelling so two dicts that mean the same key compare
+    equal whatever order they were written in."""
+    return case_id, json.dumps(key or {}, sort_keys=True)
+
+
+def _read_manifest(path: Path) -> dict[tuple[str, str], str]:
+    """(case, key) -> where it was written, for everything this run has
+    recorded so far. Absent means nothing yet. A line that will not parse is
+    skipped rather than fatal: the manifest is a memo the writer keeps for
+    itself, and a half-written last line (a kill mid-append) must cost at
+    most one duplicate, never the whole record step."""
+    seen: dict[tuple[str, str], str] = {}
+    if not path.is_file():
+        return seen
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or not entry.get("case"):
+            continue
+        key = entry.get("key") if isinstance(entry.get("key"), dict) else None
+        seen[_manifest_key(str(entry["case"]), key)] = str(entry.get("written_to") or "")
+    return seen
+
+
+def _note_in_manifest(path: Path, case_id: str, record: BaselineRecord, written_to: str) -> None:
+    """One line, appended and flushed right after the store append it
+    describes, so a later call in the same run sees it even if this process
+    is killed a moment later."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "case": case_id,
+        "recorded_at": record.recorded_at,
+        "key": record.key.to_dict(),
+        "written_to": written_to,
+    }
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
 def _cmd_record(args: argparse.Namespace) -> int:
     """Append this run's evidence to the baseline store. Main only.
 
@@ -702,6 +833,11 @@ def _cmd_record(args: argparse.Namespace) -> int:
     recorded_at = args.recorded_at or utc_now()
     commit = args.commit or None
     written: list[str] = []
+    # What this run already appended, when the shell records case by case
+    # (module docstring, "one run, several calls"). Without the flag every
+    # call is the only call, as before.
+    manifest = Path(args.recorded_manifest) if args.recorded_manifest else None
+    already = _read_manifest(manifest) if manifest else {}
 
     for case in cases:
         outcome = _record_for_case(case, commit=commit, recorded_at=recorded_at)
@@ -709,11 +845,21 @@ def _cmd_record(args: argparse.Namespace) -> int:
             print(f"  skipped {outcome}")
             continue
         case_id, record = outcome
+        ident = _manifest_key(case_id, record.key.to_dict())
+        if ident in already:
+            print(
+                f"  already recorded {case_id} this run -> {already[ident] or 'the store'}; "
+                "not appended again"
+            )
+            continue
         try:
             path, line = append_record(_store_location(args), case_id, record)
         except (OSError, StoreUnreachable) as exc:
             print(f"::error::cannot append to the baseline store: {exc}", file=sys.stderr)
             return 2
+        if manifest is not None:
+            _note_in_manifest(manifest, case_id, record, path)
+            already[ident] = path
         written.append(line)
         print(
             f"  recorded {case_id}: {record.passes}/{record.runs} -> {path}"
@@ -729,10 +875,13 @@ def _cmd_record(args: argparse.Namespace) -> int:
         # The store lives in git and this job cannot push, so the appended file
         # dies with the workspace; the artefact is how the evidence survives
         # long enough for someone to land it. Automating that push is its own
-        # change, with its own credential argument.
+        # change, with its own credential argument. Appended, not rewritten:
+        # a run that records case by case calls this once per case, and the
+        # artefact is the whole run's lines.
         out = Path(args.lines_out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text("".join(f"{line}\n" for line in written), encoding="utf-8")
+        with out.open("a", encoding="utf-8") as fh:
+            fh.write("".join(f"{line}\n" for line in written))
 
     return 0
 
@@ -835,6 +984,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             "below this it is reported but advisory (default: %(default)s)"
         ),
     )
+    suite.add_argument(
+        "--partial",
+        default=None,
+        metavar="NOTE",
+        help=(
+            "this is not the run's verdict: banner the markdown with NOTE and "
+            "mark the JSON partial; for a run the deadline ended before its "
+            "suite step"
+        ),
+    )
     suite.set_defaults(func=_cmd_suite)
 
     record = sub.add_parser(
@@ -873,7 +1032,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     record.add_argument(
         "--lines-out",
         default=None,
-        help="also write the appended lines here, for collection as an artefact",
+        help="also append the appended lines here, for collection as an artefact",
+    )
+    record.add_argument(
+        "--recorded-manifest",
+        default=None,
+        metavar="JSONL",
+        help=(
+            "what this run has recorded so far, one line per case and version "
+            "key; a case already in it is skipped, and every append is added to it"
+        ),
     )
     record.add_argument(
         "--force",

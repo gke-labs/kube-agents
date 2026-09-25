@@ -53,7 +53,7 @@ When running the official release installer (`<RELEASE_VERSION>/install.sh`) or 
 - **`gcloud` Authentication**: Checks login state and launches auth flows if needed.
 - **GCP Project & Region Selection**: Auto-detects the active project and prompts for confirmation; you can type a project ID that the discovered list does not show.
 - **Install Sources**: Puts the Terraform configuration and chart on disk (this checkout, or a clone at the requested revision) and verifies they match the image ref _before_ the interview starts. A clone an earlier one-liner left at `$HOME/kube-agents` is moved to the requested release when it is clean (detached at the tag; a branch it was on stays where it was, and untracked files such as `install.env` are kept), and left alone when it has uncommitted changes, where verification then stops the run.
-- **GKE Cluster Setup**: Provisions an Autopilot or Standard cluster (`--cluster-mode`, Autopilot by default) or connects to an existing one. Autopilot is regional, so a zonal `--region` with no explicit `--cluster-mode` builds Standard instead of failing; asking for `--cluster-mode=autopilot` at a zone is still an error.
+- **GKE Cluster Setup**: Provisions an Autopilot or Standard cluster (`--gke-cluster-mode`, Autopilot by default) or connects to an existing one. Autopilot is regional, so a zonal `--gcp-region` with no explicit `--gke-cluster-mode` builds Standard instead of failing; asking for `--gke-cluster-mode=autopilot` at a zone is still an error.
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
 - **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials, or selects Vertex AI (no key — Workload Identity).
 - **Long-Term Memory**: Asks whether the agents should remember anything between conversations, and if so which store (`--memory=file|hindsight|off`, default `file`). The default is **on**, and it is the store this repository shipped before the searchable one existed, so an upgrade that says nothing about memory keeps what it already has: per-user Markdown inside the pod (`multiuser_memory`), no extra services, suited to **small or personal** deployments — but the whole store is loaded into the model's context every turn, so it stops scaling past a few pages. Pick `hindsight` for **enterprise** deployments — ranked recall that stays affordable as the store grows, at the cost of an API server and a Postgres database in the cluster; it selects the `kube_agents_memory` provider. Pick `off` to retain nothing and run no database. The measurements behind that split, and how to change it later, are in [`docs/designs/memory.md`](docs/designs/memory.md).
@@ -64,11 +64,13 @@ The installer's engine is [Method 1](#method-1-the-install-engine--terraform--he
 the canonical description of what gets created. When adopting a **pre-existing** cluster, four mutations
 are checked out-of-band by `install.sh` before the apply: CMEK database encryption (a control-plane
 update), Workload Identity pool enablement, node-pool migration to `GKE_METADATA` (recreates nodes;
-requires `--migrate-node-pools` or `MIGRATE_NODE_POOLS=true`), and legacy Calico NetworkPolicy
-enforcement (may recreate nodes; requires `--enable-network-policy` or `ENABLE_NETWORK_POLICY=true`);
-see the site's
+requires `--migrate-node-pools` or `MIGRATE_NODE_POOLS=true`), and NetworkPolicy enforcement, where
+the cluster's owner chooses between enabling the legacy Calico addon (`--enable-network-policy` or
+`ENABLE_NETWORK_POLICY=true`; may recreate nodes) and installing without enforcement
+(`--accept-no-network-policy` or `ACCEPT_NO_NETWORK_POLICY=true`; the cluster is left as it is and the
+choice is recorded); see the site's
 [cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements).
-On Standard clusters, Terraform also adds a `gvisor-pool` node pool unless `--gvisor=false`.
+On Standard clusters, Terraform also adds a `gvisor-pool` node pool unless `--enable-gvisor=false`.
 Outside cluster adoption, two tasks stay outside Terraform: setting the managed-OTel collection scope
 on freshly created clusters (no Terraform field exists) and the GitHub App private-key import into KMS
 (the PEM must not enter Terraform state). The installer sources
@@ -88,7 +90,7 @@ Three behaviours worth knowing before the first run:
   unsandboxed pod shares the node kernel with everything else on the node. Autopilot, the shape a
   fresh install creates, ships the RuntimeClass and needs no node pool, from GKE `1.27.4-gke.800`
   on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
-  node pool of one `e2-standard-4` per zone. Pass `--gvisor=false` to run on the standard
+  node pool of one `e2-standard-4` per zone. Pass `--enable-gvisor=false` to run on the standard
   container runtime.
 
 ### Generate-Only Mode (Recommended for Existing Infrastructure)
@@ -98,9 +100,9 @@ When deploying `kube-agents` onto **pre-existing infrastructure** (an existing G
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --generate-only \
-  --project-id="my-gcp-project" \
-  --cluster-name="existing-cluster-name" \
-  --region="us-central1"
+  --gcp-project-id="my-gcp-project" \
+  --gke-cluster-name="existing-cluster-name" \
+  --gcp-region="us-central1"
 ```
 
 #### Why `--generate-only` on Existing Infrastructure:
@@ -111,7 +113,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 #### What `--generate-only` Does:
 
 1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent) and `terraform/examples/full-install/terraform.tfvars`.
-2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools` or `--enable-network-policy` is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
+2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
    - **Terraform Apply execution** with remote state management via `lifecycle.sh`:
@@ -131,9 +133,9 @@ For headless environments, automated CI scripts, and AI Agent harnesses where no
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --non-interactive \
-  --project-id="my-gcp-project" \
-  --cluster-name="platform-agent-host" \
-  --region="us-central1" \
+  --gcp-project-id="my-gcp-project" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
   --model-provider="gemini" \
   --permission-set="read-only"
 ```
@@ -143,9 +145,9 @@ When enabling GitOps pull-request automation, also provide the GitOps repository
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --non-interactive \
-  --project-id="YOUR_GCP_PROJECT_ID" \
-  --cluster-name="platform-agent-host" \
-  --region="us-central1" \
+  --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
   --model-provider="gemini" \
   --permission-set="read-only" \
   --gitops-org="YOUR_GITHUB_ORG" \
@@ -165,7 +167,7 @@ Default Credentials are available:
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --dry-run \
   --non-interactive \
-  --project-id="my-gcp-project"
+  --gcp-project-id="my-gcp-project"
 ```
 
 _Guidance for AI Agents:_ For production deployments, deploy or test from an official release using the release installer (`<RELEASE_VERSION>/install.sh`), the published release tarball (`kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), e.g. `0.4.0`), or `git clone --branch <RELEASE_VERSION>` if a Git checkout is specifically needed. Do not deploy from a `main` checkout: manifests and CRD schemas on `main` diverge from released versions, and `verify_local_source_ref` blocks mismatched revisions.
@@ -197,12 +199,13 @@ Before beginning installation, ensure your environment meets the requirements fo
 | **`kubectl`**                   | `1.28+`                                         | `kubectl version --client`         | Communicates with your target Kubernetes or GKE cluster.                                                                                                                                                               | **All Methods**                                  |
 | **Terraform**                   | `~> 1.5`                                        | `terraform version`                | The install and lifecycle engine. `install.sh` offers to install it when missing.                                                                                                                                      | **Methods 0 & 1**                                |
 | **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path and standalone chart install; the engine itself uses the Terraform Helm provider.                                                                                                             | **Methods 0, 1, & 2**                            |
-| **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`.                                                                                                                                    | **All Methods**                                  |
+| **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`, and by `upgrade.sh` to read the release's values and confirm the images it re-tagged.                                              | **All Methods**                                  |
 | **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation.                                                                                                                                                      | **Methods 0 & 1**                                |
 | **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                                              | **All Methods**                                  |
 | **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`                  | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                                                                                                                     | **All Methods**                                  |
 | **`gcloud beta` component**     | Standard                                        | `gcloud beta --help`               | Required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`).                             | **Optional (CMEK / Backup Plan lifecycle)**      |
 | **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`               | Template substitution in development Kustomize deployment targets (`make -C k8s-operator deploy-*`).                                                                                                                   | **Method 2 only**                                |
+| **OpenSSH (`ssh-keygen`)**      | Standard                                        | `ssh -V`                           | Mints the shell sandbox SSH keypair in Method 2 Step 2 and in `upgrade.sh`'s backfill; `install.sh` and the Terraform composition mint it without it (`tls_private_key`).                                              | **Method 2 and `upgrade.sh`**                    |
 | **Go**                          | `1.27+`; `1.21+` for the PEM import             | `go version`                       | Required for bootstrapping development tooling (`controller-gen`, `kustomize`), running tests, building operator binaries, or importing a GitHub App private key (`.pem`) into Cloud KMS via `install.sh` / Minty CLI. | **Methods 2 & 3, or Method 0/1 with PEM import** |
 | **Docker / Podman**             | `20.10+`                                        | `docker --version`                 | Required when building operator or agent container images locally (`make docker-build`, `make dev-rebuild-agent`).                                                                                                     | **Methods 2 & 3 only**                           |
 
@@ -312,7 +315,7 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
     --dry-run \
     --non-interactive \
-    --project-id="my-gcp-project"
+    --gcp-project-id="my-gcp-project"
   # or, hand-driven from repo, plain:  terraform plan
   ```
 
@@ -324,7 +327,8 @@ The automated installer includes local state hardening and Cloud KMS (CMEK) etcd
 - **GKE Database Encryption (CMEK)**: GKE etcd database encryption is configured automatically using Cloud KMS (`kms_keyring_name` / `kms_key_name`, default `platform-agent-keyring` / `k8s-secret-encryption-key`; `GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY` in `install.env` set both). On a **pre-existing** cluster Terraform cannot enable it, so `install.sh` enables Cloud KMS encryption on the control plane as a `gcloud` pre-step before the apply (a permanent, non-revertible cluster update), reading the same two keys.
 - **`ALLOW_UNENCRYPTED_SECRETS`**: Set `ALLOW_UNENCRYPTED_SECRETS=true` before running `install.sh` against an existing unencrypted cluster to skip that CMEK pre-step (testing environments only).
 - **`MIGRATE_NODE_POOLS`**: kube-agents requires Workload Identity (`GKE_METADATA`) to authenticate agent and operator pods. On existing clusters, migrating legacy node pools to `GKE_METADATA` can recreate nodes and restart workloads. Pass `--migrate-node-pools` / `MIGRATE_NODE_POOLS=true` to authorize migration; without opt-in, `install.sh` aborts before making any cluster changes (`REFUSED_MISSING_NODE_POOL_MIGRATION`).
-- **`ENABLE_NETWORK_POLICY`**: kube-agents requires NetworkPolicy enforcement for agent sandbox isolation. On an existing GKE Standard cluster lacking Dataplane V2 and Calico, enabling Calico can recreate nodes and restart workloads. Pass `--enable-network-policy` / `ENABLE_NETWORK_POLICY=true` to authorize enablement; without opt-in, `install.sh` aborts before making any cluster changes (`REFUSED_MISSING_NETWORK_POLICY`).
+- **`ENABLE_NETWORK_POLICY`**: kube-agents ships NetworkPolicies that isolate the agent's execution sandbox, and they enforce only on Dataplane V2 or with the legacy Calico addon. On an existing GKE Standard cluster with neither, `--enable-network-policy` / `ENABLE_NETWORK_POLICY=true` authorizes enabling Calico, which can recreate nodes and restart workloads. This is one of two answers; without either, `install.sh` aborts before making any cluster changes (`REFUSED_MISSING_NETWORK_POLICY`).
+- **`ACCEPT_NO_NETWORK_POLICY`**: the other answer. `--accept-no-network-policy` / `ACCEPT_NO_NETWORK_POLICY=true` installs onto such a cluster without modifying it. Every NetworkPolicy the install ships is then inert, the agent sandbox's included; the choice is recorded in the install report (`network_policy_enforcement`) and on the `PlatformAgent` (`kubeagents.x-k8s.io/network-policy-enforcement`). Record the key in `install.env`, or the next `upgrade.sh` is refused for the enforcement this install accepted; remove it once the cluster enforces, or every later apply waives that check. The site's [Installing without NetworkPolicy enforcement](docs/site/src/content/docs/install/prerequisites.md#installing-without-networkpolicy-enforcement) says exactly what stops being enforced. Mutually exclusive with `ENABLE_NETWORK_POLICY`.
 - **`PERSIST_SECRETS_ON_DISK`**: By default (`PERSIST_SECRETS_ON_DISK=true`), credentials (API keys, Slack tokens) are saved to `install.env`. Set `PERSIST_SECRETS_ON_DISK=false` to keep them out of every file the installer writes; they travel to Terraform as `TF_VAR_*` and later runs recover them from the live `platform-agent-secrets` Secret.
 
 #### Private container registry
@@ -430,6 +434,33 @@ If you enabled Google Chat or Slack during the install, perform the following re
   ./scripts/installer/print_instructions_slack.sh
   ```
 
+#### Step 6: Talk to the Agent With No Chat Platform
+
+Both chat integrations are opt-in and off by default, so an install that enabled neither reaches
+the agent over `kubectl exec`. `install.sh` prints these two commands when you choose "None" at the
+chat prompt and again when it finishes, with the cluster, region, project and namespace already
+filled in:
+
+```bash
+gcloud container clusters get-credentials <CLUSTER_NAME> --location <REGION> --project <PROJECT_ID> --dns-endpoint
+kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- hermes -p platform
+```
+
+- `--dns-endpoint` applies only to a cluster that publishes an externally reachable DNS endpoint;
+  `gcloud` rejects the flag on one that does not, so drop it there. The installer decides per
+  cluster ([`scripts/installer/gke_dns_endpoint.sh`](scripts/installer/gke_dns_endpoint.sh)).
+- `-c platform-agent` selects the Hermes container; the gateway pod runs three, so omitting it
+  works but makes `kubectl` warn about which one it picked.
+- `-p platform` reaches the Platform Agent directly. A bare `hermes` reaches the Planning Agent
+  front door, which is where a chat message would have landed. See the site's
+  [ChatOps](docs/site/src/content/docs/concepts/chatops.md) for the difference and for what a
+  chat-less install does not exercise.
+- `kubectl port-forward` is not an alternative here: the agent runs sandboxed under gVisor by
+  default and the forward cannot see into the sandbox. `kubectl exec` enters it.
+
+To add a chat platform later, re-run the installer with `--enable-google-chat` or `--enable-slack`
+and follow Step 5.
+
 ---
 
 ## The Shell Sandbox
@@ -439,7 +470,8 @@ credentials and is reached over SSH. It is not optional and there is nothing to 
 operator refuses `shellSandbox.enabled: false` with `Degraded`/`ShellSandboxCannotBeDisabled`, and
 the chart fails the render rather than installing something that would sit `Degraded`. The SSH
 keypair it needs is minted for you by `install.sh`, by the Terraform composition, and by
-`upgrade.sh` on an install that predates it, so there is no key ceremony.
+`upgrade.sh` on an install that predates it, so there is no key ceremony; on Method 2 you mint it
+yourself in [Step 2](#step-2-create-api-key--access-secrets).
 
 The one thing left to choose is the container runtime. `gvisor` puts a user-space kernel under the
 sandbox pod and needs a GKE Sandbox node pool; on Standard clusters `enable_gvisor_node_pool = true`
@@ -522,6 +554,9 @@ Create the `kubeagents-system` namespace and add your model provider credentials
 ```bash
 kubectl create namespace kubeagents-system --dry-run=client -o yaml | kubectl apply -f -
 
+KEY_DIR="$(mktemp -d)"
+ssh-keygen -q -t ed25519 -N '' -C kube-agents-shell-sandbox -f "$KEY_DIR/id_ed25519"
+
 kubectl create secret generic platform-agent-secrets \
   --namespace kubeagents-system \
   --from-literal=GEMINI_API_KEY="your-gemini-api-key" \
@@ -529,10 +564,29 @@ kubectl create secret generic platform-agent-secrets \
   --from-literal=ANTHROPIC_API_KEY="your-anthropic-api-key" \
   --from-literal=OPENAI_API_KEY="your-openai-api-key" \
   --from-literal=SESSION_KV_API_KEY="$(openssl rand -hex 32)" \
-  --from-literal=SESSION_KV_SALT="$(openssl rand -hex 32)"
+  --from-literal=SESSION_KV_SALT="$(openssl rand -hex 32)" \
+  --from-file=SANDBOX_SSH_PRIVATE_KEY="$KEY_DIR/id_ed25519" \
+  --from-file=SANDBOX_SSH_PUBLIC_KEY="$KEY_DIR/id_ed25519.pub" &&
+  kubectl create secret generic platform-agent-shell-authorized-keys \
+    --namespace kubeagents-system \
+    --from-file=authorized_keys="$KEY_DIR/id_ed25519.pub" --dry-run=client -o yaml | kubectl apply -f -
+
+rm -rf "$KEY_DIR"
 ```
 
-The last two are generated, not chosen: `SESSION_KV_API_KEY` is the bearer token
+The SSH pair is how the agent reaches [the shell sandbox](#the-shell-sandbox); `--from-file`
+reads the private key whole, so its newlines need no quoting. The public half goes into a second
+Secret because the sandbox mounts its `authorized_keys` from there and must not mount
+`platform-agent-secrets`, which holds every model API key. The Helm chart renders
+`platform-agent-shell-authorized-keys` from the pair; nothing on this path does, so create it here.
+The name derives from the `PlatformAgent`'s `metadata.name`, which Step 6 sets to `platform-agent`.
+The two creates are chained so an `AlreadyExists` on `platform-agent-secrets` stops the block before
+the authorized-keys Secret is written; that error means the install predates this step, and the
+upgrade note further down this section is the path for it, not a re-run. The authorized-keys create
+goes through `kubectl apply`, so a re-run after deleting `platform-agent-secrets` leaves
+`authorized_keys` matching the pair just minted rather than an earlier one.
+
+The Session KV values are generated, not chosen: `SESSION_KV_API_KEY` is the bearer token
 for the pod-local Session KV server, and `SESSION_KV_SALT` is the HMAC salt that
 pseudonymises chat identities before they are written to disk, and, when the
 chart's `litellm.redaction` is on, also keys the `[ip:…]` and `[<rule>:…]`
@@ -549,8 +603,8 @@ and a CR whose `.status` says nothing. The Session KV server also answers `503`
 to every request (losing chat-thread resolution and incident lookup), and
 identity pseudonyms stop being stable across pod restarts. If you are upgrading
 an installation that predates these keys, `upgrade.sh` adds them to the existing
-Secret before it rolls the agent; a Helm or Terraform install supplies them
-itself. To add them by hand:
+Secret on a Helm or Terraform install before it rolls the agent; on this path,
+add them by hand:
 
 ```bash
 kubectl patch secret platform-agent-secrets -n kubeagents-system --type=merge \
@@ -561,6 +615,60 @@ kubectl rollout restart deployment/platform-agent-gateway -n kubeagents-system
 The restart buys promptness, not correctness: the operator notices the changed
 Secret within fifteen minutes and rolls the gateway itself. See
 [Rotating a Secret rolls the pod](docs/site/src/content/docs/operator/platformagent-crd.md#rotating-a-secret-rolls-the-pod).
+
+A Method 2 install made before Step 2 minted the shell sandbox keypair (any install whose
+`platform-agent-secrets` has no `SANDBOX_SSH_PUBLIC_KEY`) lacks it, and `upgrade.sh` does not run
+on this path. The symptom is `<name>-shell-0` stuck in `ContainerCreating` with a `FailedMount` on
+`<name>-shell-authorized-keys`, where `<name>` is the PlatformAgent's `metadata.name`
+(`platformagent` if you applied the sample unmodified, `platform-agent` if you followed the current
+Step 6), and the `PlatformAgent` `Degraded` with reason `ShellSandboxKeysMissing`. This block
+generates the pair and adds both Secrets only when either half is absent; a complete pair already
+present is left alone, because replacing a key the sandbox trusts locks the agent out of its shell.
+
+```bash
+AGENT_NAME="$(kubectl get platformagents -n kubeagents-system -o jsonpath='{.items[0].metadata.name}')"
+if [ -z "$AGENT_NAME" ]; then
+  echo "no PlatformAgent found in kubeagents-system" >&2
+elif [ -z "$(kubectl get secret platform-agent-secrets -n kubeagents-system -o jsonpath='{.data.SANDBOX_SSH_PRIVATE_KEY}')" ] ||
+  [ -z "$(kubectl get secret platform-agent-secrets -n kubeagents-system -o jsonpath='{.data.SANDBOX_SSH_PUBLIC_KEY}')" ]; then
+  KEY_DIR="$(mktemp -d)"
+  ssh-keygen -q -t ed25519 -N '' -C kube-agents-shell-sandbox -f "$KEY_DIR/id_ed25519" &&
+    kubectl patch secret platform-agent-secrets -n kubeagents-system --type=merge \
+      -p "{\"data\":{\"SANDBOX_SSH_PRIVATE_KEY\":\"$(base64 < "$KEY_DIR/id_ed25519" | tr -d '\n')\",\"SANDBOX_SSH_PUBLIC_KEY\":\"$(base64 < "$KEY_DIR/id_ed25519.pub" | tr -d '\n')\"}}" &&
+    kubectl create secret generic "${AGENT_NAME}-shell-authorized-keys" \
+      --namespace kubeagents-system \
+      --from-file=authorized_keys="$KEY_DIR/id_ed25519.pub" --dry-run=client -o yaml | kubectl apply -f -
+  rm -rf "$KEY_DIR"
+fi
+```
+
+This patches `data` with base64 rather than `stringData` with the raw key because the private key
+has newlines and the patch is interpolated into JSON; `tr -d '\n'` because macOS `base64` has no
+`-w0`. The steps are chained so a failed patch does not go on to create the authorized-keys Secret,
+which would clear `ShellSandboxKeysMissing` while the gateway still has no private key. If
+`platform-agent-secrets` holds the pair but `<name>-shell-authorized-keys` is missing, or both
+halves are present yet the agent's commands fail with `Permission denied (publickey)` (the
+authorized-keys Secret kept a public key from an earlier pair, which the operator's existence check
+cannot see), this creates or replaces it from the stored public half and runs nothing on an empty
+value; then restart as below:
+
+```bash
+AGENT_NAME="$(kubectl get platformagents -n kubeagents-system -o jsonpath='{.items[0].metadata.name}')" && [ -n "$AGENT_NAME" ] &&
+  SANDBOX_PUB="$(kubectl get secret platform-agent-secrets -n kubeagents-system -o jsonpath='{.data.SANDBOX_SSH_PUBLIC_KEY}' | base64 --decode)" && [ -n "$SANDBOX_PUB" ] &&
+  printf '%s\n' "$SANDBOX_PUB" | kubectl create secret generic "${AGENT_NAME}-shell-authorized-keys" -n kubeagents-system --from-file=authorized_keys=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Then restart the gateway and the shell StatefulSet. For this key the restart is required, not a
+convenience: the operator does not roll the gateway for a mounted Secret, and the `sandbox-ssh-key`
+init container copies the private key out of it only at pod start. A shell pod still in
+`ContainerCreating` needs no restart: the kubelet mounts the new Secret on its next retry and the
+pod starts. The StatefulSet restart is for a sandbox that was already running, which otherwise
+keeps the `authorized_keys` it installed at start.
+
+```bash
+AGENT_NAME="$(kubectl get platformagents -n kubeagents-system -o jsonpath='{.items[0].metadata.name}')" && [ -n "$AGENT_NAME" ] &&
+  kubectl rollout restart deployment/"${AGENT_NAME}-gateway" statefulset/"${AGENT_NAME}-shell" -n kubeagents-system
+```
 
 Vertex AI needs no entry here: `MODEL_PROVIDER=vertex` authenticates with Workload Identity
 (see [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#vertex-ai-and-model-garden)).
@@ -670,10 +778,21 @@ make deploy-github
 
 ### Step 6: Apply Custom Resources
 
-Submit a sample `PlatformAgent` Custom Resource to activate cluster governance (run inside `k8s-operator/`):
+Submit a sample `PlatformAgent` Custom Resource to activate cluster governance (run inside `k8s-operator/`).
+The `sed` renames the CR from `platformagent` to `platform-agent`, because the operator derives
+`platform-agent-gateway`, `platform-agent-shell-0` and `platform-agent-shell-authorized-keys` from
+the CR name and those are the names this guide uses, and drops the sample's
+`spec.harness.hermes.apiServerSecretRef`, which names a Secret that does not exist. With the field
+absent the operator uses `platform-agent-secrets` / `API_SERVER_KEY` as an optional reference, so
+the gateway starts even before that entry exists. This step is for a first install. On an existing
+install keep the CR you have: the webhook admits one per cluster ("only one PlatformAgent is
+allowed per cluster"), so re-applying under a new name is refused, and the upgrade note in Step 2
+derives its names from whichever CR exists.
 
 ```bash
-kubectl apply -f examples/platformagent.yaml
+sed -e 's/^  name: platformagent$/  name: platform-agent/' \
+    -e '/^      apiServerSecretRef:$/,/^        key: "api-key"$/d' \
+    examples/platformagent.yaml | kubectl apply -f -
 kubectl get platformagents -A
 ```
 
@@ -712,9 +831,9 @@ To remove the resources created for one configured `kube-agents` installation:
 
 ```bash
 ./uninstall.sh --non-interactive \
-  --project-id="<PROJECT_ID>" \
-  --cluster-name="<CLUSTER_NAME>" \
-  --region="<REGION>"
+  --gcp-project-id="<PROJECT_ID>" \
+  --gke-cluster-name="<CLUSTER_NAME>" \
+  --gcp-region="<REGION>"
 ```
 
 ### Automated Cloud Teardown

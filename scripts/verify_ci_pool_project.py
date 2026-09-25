@@ -112,16 +112,23 @@ MINTER_KSA = "kubeagents-system/kubeagents-github-minter"
 # is what makes it a usable identity probe rather than just a reachability test.
 GITHUB_APP_URL = "https://api.github.com/app"
 
-# The read-only App the EVAL RUNNER grades ledger issues with, which is not the
-# minter App above. hack/ci-eval-pr.sh mints an installation token from it into
-# BENCH_GITHUB_TOKEN before each devops-bench invocation; a test pins these two
-# to that script, so changing the App there cannot leave this check attesting a
-# credential CI no longer uses.
+# The App the EVAL RUNNER grades ledger issues with (a mint pinned to reads; its
+# installation also holds issues: write, for hack/ci-eval-pr.sh's ledger reset),
+# which is not the minter App above. hack/ci-eval-pr.sh mints an installation
+# token from it into BENCH_GITHUB_TOKEN before each devops-bench invocation; a
+# test pins these two to that script, so changing the App there cannot leave
+# this check attesting a credential CI no longer uses.
 LEDGER_APP_ID = 4739812
 LEDGER_INSTALLATION_ID = 157029058
 GITHUB_INSTALLATION_TOKEN_URL = (
     "https://api.github.com/app/installations/{installation}/access_tokens"
 )
+# What this script's probe mint asks for: the same three reads the eval's
+# grading mint pins (LEDGER_GRADING_MINT_BODY in hack/ci-eval-pr.sh; a test
+# holds the two equal). An omitted body would mint the installation's whole
+# grant, which since 2026-09-22 includes issues: write on every pool repository
+# for the ledger reset; a read probe has no business holding that.
+LEDGER_READ_PERMISSIONS = {"issues": "read", "pull_requests": "read", "metadata": "read"}
 
 # Its private key, read from the cluster rather than the operator's disk: a
 # local copy answers a question nobody asked. `build-kube-agents` is the Prow
@@ -196,17 +203,55 @@ AR_PULLER_ROLES = AR_WRITER_ROLES | {"roles/artifactregistry.reader"}
 # `Required "container.clusters.get" permission(s)`.
 PROW_RUNNER_MEMBER = "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 
-# The second identity that borrows seeded-fleet-reader: the CI health bot's
-# hourly seeded-fleet scan (.github/workflows/ci-health.yml, docs/ci-health.md
-# "The seeded-fleet scan") runs as eval-dashboard-publisher@kube-agents-prow and
-# impersonates the reader in every pool project. Without the grant the scan
-# reports the project as "not checked" and fixture drift there goes unseen.
+# The nightly periodic (ci-kube-agents-eval-nightly) runs the same
+# hack/ci-eval-pr.sh against a leased project as its own identity, kept apart
+# from the presubmit's so the baseline store can grant it a write the presubmit
+# never holds (docs/designs/eval-scorer.md). Apart in kube-agents-prow, equal in
+# the pool: on 2026-09-16 the second nightly leased kube-agents-evals-10 and
+# died at get-credentials on the same `container.clusters.get` denial as #966,
+# holding no role there at all (gke-labs/kube-agents#1491).
+NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
+
+# Every identity that leases a pool project and runs hack/ci-eval-pr.sh in it,
+# as (label, the job it runs, member). Each must hold PROW_RUNNER_ROLES on the
+# project and roles/iam.serviceAccountTokenCreator on the fleet reader, and a
+# missing grant is reported under its label. Kept equal to the grant loop in
+# scripts/provision_ci_pool_project.sh by scripts/test_verify_ci_pool_project.py.
+RUNNERS = (
+    ("The Prow runner", "a presubmit", PROW_RUNNER_MEMBER),
+    ("The nightly runner", "the nightly periodic", NIGHTLY_RUNNER_MEMBER),
+)
+
+# The one borrower of seeded-fleet-reader that leases no project: the CI health
+# bot's hourly seeded-fleet scan (.github/workflows/ci-health.yml,
+# docs/ci-health.md "The seeded-fleet scan") runs as
+# eval-dashboard-publisher@kube-agents-prow and impersonates the reader in every
+# pool project, holding nothing else there. Without the grant the scan reports
+# the project as "not checked" and fixture drift there goes unseen.
 CI_HEALTH_BOT_MEMBER = "serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com"
 
+# What a runner loses without the token-creator grant; the bot's loss is
+# different and is spelled out in its own entry below.
+_RUNNER_WITHOUT_TOKEN_CREATOR = (
+    "every fleet check it runs in this project runs under its own read-write "
+    "credential. Re-apply bench/tf/fleet against {project_id}."
+)
+
 # Every member that must hold roles/iam.serviceAccountTokenCreator on the
-# fleet reader. Kept equal to bench/tf/fleet's `fleet_reader_token_creators`
-# default by scripts/test_verify_ci_pool_project.py.
-FLEET_READER_TOKEN_CREATORS = (PROW_RUNNER_MEMBER, CI_HEALTH_BOT_MEMBER)
+# fleet reader, as (label, member, what a missing grant costs and how to repair
+# it): the two runners, then the CI health bot. Kept equal to bench/tf/fleet's
+# `fleet_reader_token_creators` default by scripts/test_verify_ci_pool_project.py.
+FLEET_READER_TOKEN_CREATORS = tuple(
+    (label, member, _RUNNER_WITHOUT_TOKEN_CREATOR) for label, _, member in RUNNERS
+) + (
+    (
+        "The CI health bot",
+        CI_HEALTH_BOT_MEMBER,
+        "its hourly seeded-fleet scan reports {project_id} as not checked and fixture "
+        "drift there goes unseen. Re-apply bench/tf/fleet against {project_id}, or run "
+        "the grant in docs/ci-health.md (The seeded-fleet scan).",
+    ),
+)
 
 # The set kube-agents-evals holds, matched literally rather than by permission.
 # Not minimal -- container.admin subsumes container.developer, viewer subsumes
@@ -747,7 +792,7 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, the Prow runner's and platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
+    """Verify Workload Identity, both runners' and the platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
     details = []
     warnings: List[str] = []
     passed = True
@@ -838,7 +883,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         if not _record_unreadable(
             err,
             f"Failed reading the IAM policy for {project_id}: {err.strip()[:160]}",
-            f"Could not read the project IAM policy on {project_id}, so the Prow runner's twelve roles, "
+            f"Could not read the project IAM policy on {project_id}, so both runners' twelve roles, "
             "the platform agent GSA's read-only set and any public binding were not checked",
             details,
             warnings,
@@ -850,7 +895,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             policy = _load_json(out)
             platform_member = PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             litellm_member = LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
-            prow_held = set()
+            runner_held = {member: set() for _, _, member in RUNNERS}
             platform_held = set()
             litellm_held = set()
             public_held = set()
@@ -870,22 +915,24 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                 # gap to close before one does rather than a live hole.
                 if b.get("condition"):
                     continue
-                if PROW_RUNNER_MEMBER in members:
-                    prow_held.add(b.get("role"))
+                for _, _, member in RUNNERS:
+                    if member in members:
+                        runner_held[member].add(b.get("role"))
                 if platform_member in members:
                     platform_held.add(b.get("role"))
                 if litellm_member in members:
                     litellm_held.add(b.get("role"))
 
-            missing = PROW_RUNNER_ROLES - prow_held
-            if missing:
-                passed = False
-                details.append(
-                    f"The Prow runner ({PROW_RUNNER_MEMBER.split(':', 1)[1]}) is missing "
-                    f"{len(missing)} role(s) on {project_id}: {', '.join(sorted(missing))}. "
-                    "A presubmit authenticates as this account after leasing the project, so it "
-                    "will fail on the first gcloud call rather than at registration"
-                )
+            for label, job, member in RUNNERS:
+                missing = PROW_RUNNER_ROLES - runner_held[member]
+                if missing:
+                    passed = False
+                    details.append(
+                        f"{label} ({member.split(':', 1)[1]}) is missing "
+                        f"{len(missing)} role(s) on {project_id}: {', '.join(sorted(missing))}. "
+                        f"{job[0].upper()}{job[1:]} authenticates as this account after leasing the "
+                        "project, so it will fail on the first gcloud call rather than at registration"
+                    )
 
             platform_missing = PLATFORM_GSA_ROLES - platform_held
             platform_extra = platform_held - PLATFORM_GSA_ROLES
@@ -1016,23 +1063,14 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             for b in policy.get("bindings", []):
                 if b.get("role") == "roles/iam.serviceAccountTokenCreator":
                     token_creators.update(b.get("members", []))
-            if PROW_RUNNER_MEMBER not in token_creators:
-                passed = False
-                details.append(
-                    f"The Prow runner ({PROW_RUNNER_MEMBER.split(':', 1)[1]}) is missing "
-                    f"roles/iam.serviceAccountTokenCreator on {fleet_reader_email}, so every "
-                    f"fleet check in this project runs under the runner's own read-write "
-                    f"credential. Re-apply bench/tf/fleet against {project_id}."
-                )
-            if CI_HEALTH_BOT_MEMBER not in token_creators:
-                passed = False
-                details.append(
-                    f"The CI health bot ({CI_HEALTH_BOT_MEMBER.split(':', 1)[1]}) is missing "
-                    f"roles/iam.serviceAccountTokenCreator on {fleet_reader_email}, so its hourly "
-                    f"seeded-fleet scan reports {project_id} as not checked and fixture drift "
-                    f"there goes unseen. Re-apply bench/tf/fleet against {project_id}, or run "
-                    f"the grant in docs/ci-health.md (The seeded-fleet scan)."
-                )
+            for label, member, consequence in FLEET_READER_TOKEN_CREATORS:
+                if member not in token_creators:
+                    passed = False
+                    details.append(
+                        f"{label} ({member.split(':', 1)[1]}) is missing "
+                        f"roles/iam.serviceAccountTokenCreator on {fleet_reader_email}, so "
+                        + consequence.format(project_id=project_id)
+                    )
         except Exception as exc:
             passed = False
             details.append(f"Failed parsing policy for {fleet_reader_email}: {exc}")
@@ -1041,7 +1079,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     partial = _partial_summary(
         [
             ("the Workload Identity binding", wi_checked),
-            ("the Prow runner and platform GSA project roles", roles_checked),
+            ("the runners' and platform GSA project roles", roles_checked),
             ("the cross-project AR reader grants", prow_checked),
             ("the fleet reader's token-creator binding", fleet_reader_checked),
         ]
@@ -1052,7 +1090,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         message = partial
     else:
         message = (
-            "Workload Identity, Prow runner and platform GSA project roles, "
+            "Workload Identity, both runners' and platform GSA project roles, "
             "cross-project AR reader grants, and the fleet reader's token-creator "
             "binding verified"
         )
@@ -1923,8 +1961,10 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
         headers={
             "Authorization": f"Bearer {jwt}",
             "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
             "User-Agent": "kube-agents-verify-ci-pool-project",
         },
+        data=json.dumps({"permissions": LEDGER_READ_PERMISSIONS}).encode(),
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -1939,6 +1979,18 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
             return None, "failed", (
                 f"App {LEDGER_APP_ID} has no installation {LEDGER_INSTALLATION_ID} (404). It was "
                 "uninstalled from gke-agentic, or the id moved; ledger grading is broken pool-wide"
+            )
+        if exc.code == 422:
+            # The body asked for a permission the installation does not hold.
+            # hack/ci-eval-pr.sh's preflight mint sends the same body and exits
+            # on this answer, so every run on every pool project would stop.
+            wanted = ", ".join(f"{k}: {v}" for k, v in LEDGER_READ_PERMISSIONS.items())
+            return None, "failed", (
+                f"GitHub refused to mint {wanted} for App {LEDGER_APP_ID}'s installation "
+                f"{LEDGER_INSTALLATION_ID} (422): the installation no longer holds one of them. "
+                "hack/ci-eval-pr.sh's preflight mint asks for exactly these and stops the run on "
+                "this answer, so ledger grading is broken pool-wide until an organisation owner "
+                "restores the permission (or accepts a pending permission change) on the installation"
             )
         return None, "unverified", (
             f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of minting a token"
@@ -1978,8 +2030,10 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
     a run publish its ledger issue. This is the read half, and it is a different
     App with a different key. `ledger_issue_contains`
     (bench/kube_agents_bench/verifiers.py) reads the published issue back from
-    the Prow runner, needing `issues: read` and nothing else. Nothing in the
-    project implies it, and nothing else here looks at it.
+    the Prow runner, needing `issues: read`; `pull_request_opened` reads a
+    remediation pull request the same way, needing `pull_requests: read`. This
+    check covers the issues half. Nothing in the project implies it, and
+    nothing else here looks at it.
 
     kube-agents-evals-6 is why this exists. It passed every other check, was
     registered, and redded the first pull request that leased it: the agent filed
@@ -2026,9 +2080,10 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
             response.read()
     except urllib.error.HTTPError as exc:
         # A 403 is two different answers. Rate limiting is a limit of the moment
-        # and leaves the question open; anything else is the token reaching the
-        # repository without `issues: read`, which is a real failure and the one
-        # a blanket "403 is unverified" would hide.
+        # and leaves the question open; anything else is a token that was just
+        # minted WITH `issues: read` being refused the repository anyway (a
+        # suspended installation, an organisation access setting), which is a
+        # real failure and the one a blanket "403 is unverified" would hide.
         if exc.code == 403 and (exc.headers or {}).get("x-ratelimit-remaining") == "0":
             return CheckResult(
                 name,
@@ -2042,8 +2097,10 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
         if exc.code == 403:
             return CheckResult(name, False, "Ledger issues not readable", details=[
                 f"App {LEDGER_APP_ID} reaches {repo_slug} but is refused its issues "
-                f"(403 {exc.reason}). Its installation needs `issues: read`, which is a pool-wide "
-                f"permission rather than anything about {project_id}; accept it and re-run"
+                f"(403 {exc.reason}). The token was just minted with `issues: read`, so this is "
+                "not a missing permission: the installation is suspended, or an organisation "
+                "IP allow list or SAML setting blocks App tokens from here. Pool-wide rather than "
+                f"anything about {project_id}; clear it and re-run"
             ])
         if exc.code == 404:
             return CheckResult(name, False, "Ledger issues not readable", details=[

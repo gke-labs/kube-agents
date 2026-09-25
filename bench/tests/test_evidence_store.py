@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -49,6 +51,7 @@ from kube_agents_bench.evidence_store import (
     StoreUnreachable,
     is_gcs,
     open_backend,
+    scope_of,
 )
 
 
@@ -61,6 +64,9 @@ class FakeGcloud:
 
     def __init__(self, objects: dict[str, str] | None = None):
         self.objects = dict(objects or {})
+        # Cats run on a pool, so the order of `cat` entries here is whichever
+        # worker arrived first. Filter this per case; do not read it as a
+        # sequence across cases.
         self.calls: list[list[str]] = []
         self.fail: str | None = None
 
@@ -371,6 +377,165 @@ def test_the_case_is_the_first_segment_whatever_the_depth(gcloud):
     assert [s.case_id for s in GcsBackend("gs://b/e").sources()] == ["case-a", "case-b"]
 
 
+def test_cases_keep_their_order_when_their_reads_finish_out_of_order(
+    gcloud, monkeypatch
+):
+    """Cases are read concurrently, and the result is still ordered by case id.
+
+    The order is load-bearing twice over: ``_parse_source`` reports a bad line
+    by its position within a case, and a reader that shuffled cases would make
+    the gate's output depend on which ``gcloud`` returned first.
+    """
+    for name in ("case-a", "case-b", "case-c", "case-d"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    inner = evidence_store.subprocess.run
+
+    def slow_on_the_first_case(argv, **kwargs):
+        # case-a is submitted first and returns last, so completion order and
+        # submission order disagree for certain rather than by luck.
+        if argv[2] == "cat" and "case-a" in argv[3]:
+            time.sleep(0.05)
+        return inner(argv, **kwargs)
+
+    monkeypatch.setattr(evidence_store.subprocess, "run", slow_on_the_first_case)
+
+    sources = GcsBackend("gs://b/e").sources()
+    assert [s.case_id for s in sources] == ["case-a", "case-b", "case-c", "case-d"]
+    # Each case got its own text, not a neighbour's.
+    for source in sources:
+        assert json.loads(source.text)["case"] == source.case_id
+
+
+def test_a_cat_that_fails_inside_a_worker_is_still_unreachable(gcloud, monkeypatch):
+    """The exception has to cross the thread boundary as itself.
+
+    ``gate._load_store`` catches :class:`StoreUnreachable` and degrades the gate
+    to advisory; any other type crashes ``bench-gate case`` with exit 2 and
+    stops the job. A pool sits between those two now, so what this pins is the
+    type that arrives, not merely that something was raised.
+
+    The outage tests above all fail every verb, so they stop at the ``ls`` in
+    ``_list()`` and never build the pool. This one lets ``ls`` through.
+    """
+    for name in ("case-a", "case-b", "case-c"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    inner = evidence_store.subprocess.run
+
+    def only_cat_fails(argv, **kwargs):
+        if argv[2] == "cat":
+            return subprocess.CompletedProcess(argv, 1, "", "ERROR: 403 forbidden")
+        return inner(argv, **kwargs)
+
+    monkeypatch.setattr(evidence_store.subprocess, "run", only_cat_fails)
+
+    with pytest.raises(StoreUnreachable, match="403"):
+        GcsBackend("gs://b/e").sources()
+
+
+def test_a_failing_read_waits_for_the_ones_still_in_flight(gcloud, monkeypatch):
+    """Raising must not leave workers behind it still running.
+
+    Abandoning them does not save the time: Python joins the pool's threads at
+    interpreter exit, so ``bench-gate case`` returns, prints its degraded
+    banner, grades the case -- and then hangs for up to ``timeout`` seconds
+    with nothing left to report. The gate runs once per task, so that is paid
+    per task. Joining here moves the same wait to where the caller can see it.
+
+    The test above fails every ``cat`` at once, so nothing is ever in flight
+    to abandon. This one fails only the first.
+    """
+    for name in ("case-a", "case-b", "case-c"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    done: list[str] = []
+    running = threading.Semaphore(0)
+    inner = evidence_store.subprocess.run
+
+    def the_first_cat_fails_and_the_rest_linger(argv, **kwargs):
+        if argv[2] != "cat":
+            return inner(argv, **kwargs)
+        if "case-a" in argv[3]:  # submitted first, so it is what raises
+            # Not until the other two are inside their read. A read still
+            # queued gets cancelled on the way out, and cancelled is not
+            # abandoned -- it is only a started one that can be left running.
+            assert running.acquire(timeout=10)
+            assert running.acquire(timeout=10)
+            return subprocess.CompletedProcess(argv, 1, "", "ERROR: 403 forbidden")
+        running.release()
+        time.sleep(0.05)
+        done.append(argv[3])
+        return inner(argv, **kwargs)
+
+    monkeypatch.setattr(
+        evidence_store.subprocess, "run", the_first_cat_fails_and_the_rest_linger
+    )
+
+    with pytest.raises(StoreUnreachable, match="403"):
+        GcsBackend("gs://b/e", cat_workers=4).sources()
+
+    assert len(done) == 2, "the slow reads were abandoned, not joined"
+
+
+def test_one_worker_reads_the_same_thing_as_many(gcloud):
+    """The concurrency is a speed-up, not a behaviour change."""
+    for name in ("case-a", "case-b", "case-c"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    serial = GcsBackend("gs://b/e", cat_workers=1).sources()
+    parallel = GcsBackend("gs://b/e", cat_workers=8).sources()
+    assert serial == parallel
+    # A junk worker count bounds a read; it must not be why a run cannot be
+    # graded, so it falls back rather than raising out of ThreadPoolExecutor.
+    assert GcsBackend("gs://b/e", cat_workers=0).sources() == serial
+
+
+def test_the_per_case_reads_are_in_flight_at_the_same_time(gcloud, monkeypatch):
+    """The overlap itself, which is the only reason any of this is here.
+
+    Pinned with a barrier rather than a stopwatch, so it asserts concurrency
+    and not the speed of the machine. A serial read never reaches the fourth
+    party, the barrier breaks, and the test fails -- which is what the other
+    tests here miss: every one of them passes against the old serial read.
+    """
+    for name in ("case-a", "case-b", "case-c", "case-d"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    barrier = threading.Barrier(4)
+    inner = evidence_store.subprocess.run
+
+    def wait_for_the_others(argv, **kwargs):
+        if argv[2] == "cat":
+            barrier.wait(timeout=10)
+        return inner(argv, **kwargs)
+
+    monkeypatch.setattr(evidence_store.subprocess, "run", wait_for_the_others)
+
+    sources = GcsBackend("gs://b/e", cat_workers=4).sources()
+    assert [s.case_id for s in sources] == ["case-a", "case-b", "case-c", "case-d"]
+
+
+def test_the_worker_count_is_an_env_knob_that_cannot_break_a_read(monkeypatch):
+    """An operator can turn the fan-out down without a code change.
+
+    It exists because sixteen concurrent ``gcloud`` processes are the one part
+    of this that a small pod might not have the memory for, and a code change
+    is a poor mitigation for an outage. Junk falls back, like its sibling.
+    """
+    monkeypatch.setenv("EVAL_BASELINE_CAT_WORKERS", "2")
+    assert open_backend("gs://b/e").cat_workers == 2
+
+    for junk in ("", "lots", "0", "-4"):
+        monkeypatch.setenv("EVAL_BASELINE_CAT_WORKERS", junk)
+        assert open_backend("gs://b/e").cat_workers == evidence_store.DEFAULT_CAT_WORKERS
+
+
 def test_a_flat_object_still_reads(gcloud):
     """The layout gained depth while the store was empty, so nothing needs
     migrating -- but a reader that could only handle one shape would make the
@@ -420,3 +585,133 @@ def test_an_uncapped_multi_key_case_reports_no_truncation(gcloud):
     (source,) = backend.sources()
     assert backend.truncated == {}
     assert len(source.text.strip().splitlines()) == 2
+
+
+# --------------------------------------------------------------------------
+# scoping the read
+# --------------------------------------------------------------------------
+
+
+def test_a_bare_string_is_one_case_not_its_letters():
+    """The one way an ``only`` argument fails without saying anything.
+
+    Iterating ``"case-a"`` yields single characters, every one of them a case
+    id that matches nothing, so the read comes back empty and the gate reports
+    a screened case as never screened.
+    """
+    assert scope_of("case-a") == frozenset({"case-a"})
+    assert scope_of(["case-a", "case-b"]) == frozenset({"case-a", "case-b"})
+    assert scope_of(None) is None
+
+
+def test_local_reads_only_the_cases_asked_for(tmp_path):
+    backend = LocalBackend(tmp_path)
+    for name in ("case-a", "case-b", "case-c"):
+        backend.append(name, line(name))
+    assert [s.case_id for s in backend.sources(["case-a", "case-c"])] == [
+        "case-a",
+        "case-c",
+    ]
+    assert [s.case_id for s in backend.sources()] == ["case-a", "case-b", "case-c"]
+
+
+def test_local_still_refuses_a_stray_json_outside_the_scope(tmp_path):
+    """The format check is about the store, not about this read's cases.
+
+    A scoped read that skipped it would let a half-migrated store go unnoticed
+    for as long as nobody asked for the case that was left behind.
+    """
+    LocalBackend(tmp_path).append("case-a", line("case-a"))
+    (tmp_path / "case-b.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="rename it to case-b.jsonl"):
+        LocalBackend(tmp_path).sources(["case-a"])
+
+
+def test_one_case_is_listed_at_its_own_prefix(gcloud):
+    """The saving, and the whole reason for the argument.
+
+    Listing ``<prefix>/**`` walks every case in the store, and the gate does it
+    once per graded case. A single-case read asks the server for one case.
+    """
+    for name in ("case-a", "case-b", "case-c"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    (source,) = GcsBackend("gs://b/e").sources(["case-b"])
+    assert source.case_id == "case-b"
+
+    (listed,) = [c for c in gcloud.calls if c[2] == "ls"]
+    assert listed[3] == "gs://b/e/case-b/**"
+    # One `cat`, over case-b's objects alone.
+    cats = [c for c in gcloud.calls if c[2] == "cat"]
+    assert len(cats) == 1
+    assert all("case-b" in u for u in cats[0][3:])
+
+
+def test_a_case_with_no_objects_of_its_own_is_an_empty_store_not_an_outage(gcloud):
+    """The scoped read hits "matched no objects" as a matter of routine.
+
+    Every case the nightly has not reached yet has no prefix at all, so the
+    exit code that means "empty" must not be read as the bucket being gone --
+    that would degrade the gate on an ordinary new case.
+    """
+    url, text = nested("case-a", KEY_DIR, 1)
+    gcloud.objects[url] = text
+    assert GcsBackend("gs://b/e").sources(["case-zzz"]) == []
+
+
+def test_several_cases_are_filtered_from_one_listing(gcloud):
+    """A wider scope lists once and drops the rest.
+
+    One `ls` of everything is one process; one `ls` per case would cost more
+    than the filtering saves, and the `cat` fan-out is where the saving is.
+    """
+    for name in ("case-a", "case-b", "case-c", "case-d"):
+        url, text = nested(name, KEY_DIR, 1)
+        gcloud.objects[url] = text
+
+    sources = GcsBackend("gs://b/e").sources({"case-a", "case-c"})
+    assert [s.case_id for s in sources] == ["case-a", "case-c"]
+
+    (listed,) = [c for c in gcloud.calls if c[2] == "ls"]
+    assert listed[3] == "gs://b/e/**"
+    assert len([c for c in gcloud.calls if c[2] == "cat"]) == 2
+
+
+def test_an_empty_scope_reads_nothing_at_all(gcloud):
+    """Not even the listing. `bench-gate suite` with no case results lands here.
+
+    An empty scope is not `None`: it asks about no cases, so every object a
+    listing returned would be filtered straight back out again.
+    """
+    url, text = nested("case-a", KEY_DIR, 1)
+    gcloud.objects[url] = text
+
+    assert GcsBackend("gs://b/e").sources(set()) == []
+    assert gcloud.calls == []
+
+
+def test_a_scoped_read_returns_the_same_bytes_as_a_whole_one(gcloud):
+    """Scoping changes what is read, never what a case's read says.
+
+    The failure this guards is the quiet one: a scoped read is fast whether or
+    not it is correct, so speed cannot tell the two apart.
+    """
+    for name in ("case-a", "case-b"):
+        for day in (1, 2, 3):
+            url, text = nested(name, KEY_DIR, day, passes=day)
+            gcloud.objects[url] = text
+
+    whole = {s.case_id: s for s in GcsBackend("gs://b/e").sources()}
+    (scoped,) = GcsBackend("gs://b/e").sources(["case-a"])
+    assert scoped == whole["case-a"]
+
+
+def test_truncation_is_reported_for_a_scoped_case(gcloud):
+    for day in range(1, 6):
+        url, text = nested("case-a", KEY_DIR, day)
+        gcloud.objects[url] = text
+
+    backend = GcsBackend("gs://b/e", max_objects=2)
+    backend.sources(["case-a"])
+    assert backend.truncated == {"case-a": 3}

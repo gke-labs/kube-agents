@@ -13,6 +13,10 @@
 
 set -Eeuo pipefail
 
+# This script's own name, for the abort banner when it runs piped through
+# stdin (curl | bash): bash then has no file to name its frames after.
+UNINSTALL_SCRIPT_NAME="uninstall.sh"
+
 # ANSI Color Tokens
 C_CYAN="\033[1;36m"
 C_GREEN="\033[1;32m"
@@ -64,7 +68,30 @@ on_error() {
   if [ "$exit_code" = "$EXIT_NOTHING_TO_TEAR_DOWN" ]; then
     exit_code=1
   fi
-  echo -e "\n\033[91m\033[1m✗ Teardown error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
+  # An inherited firing inside a subshell: `set -E` hands this trap to every
+  # `$(...)`, and a probe whose miss the caller handles (`if !`, `||`) still
+  # fires it there on bash 3.2 (macOS's /bin/bash) before the caller is
+  # consulted. The parent decides: it prints the banner and writes the report
+  # itself when the failure reaches it, and nothing when it is handled. Exit,
+  # not return: command substitution does not inherit errexit, so a returning
+  # handler would let a multi-step probe run on past its failure. Process
+  # substitution (`< <(...)`) keeps the counter at 0 on bash 3.2 and clears
+  # the trap inline instead.
+  if [ "${BASH_SUBSHELL:-0}" -gt 0 ]; then
+    exit "$exit_code"
+  fi
+  # The frame that ran the failing command: a sourced library's file and the
+  # function it was in, or this script and `main` at top level. $LINENO alone
+  # counts from the top of whichever file the command sat in, so a bare line
+  # number sent the reader to that line of uninstall.sh instead. Piped through
+  # stdin, bash labels this script's frames `main` or not at all, and $0 is
+  # `bash`; both read as the script by name.
+  local source_file="${BASH_SOURCE[1]:-}"
+  case "$source_file" in
+    ""|main) source_file="$UNINSTALL_SCRIPT_NAME" ;;
+  esac
+  local func_name="${FUNCNAME[1]:-main}"
+  echo -e "\n\033[91m\033[1m✗ Teardown error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
   write_report "FAILED" "true" "${line_no}" "${bash_cmd}" 2>/dev/null || true
   # A tfvars the generator was midway through writing is mode 600, carries
   # every secret this run was given, and is named one character from the file
@@ -86,6 +113,10 @@ PARAM_DRY_RUN="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
+# Empty means "whatever the loaded configuration says". The teardown
+# regenerates terraform.tfvars before destroying and namespace is one of its
+# keys, so this is not cosmetic: it names the release being torn down.
+PARAM_AGENT_NAMESPACE=""
 PARAM_SOURCE_REF=""
 TEMP_REPO_DIR=""
 
@@ -150,9 +181,11 @@ Usage: ./uninstall.sh [OPTIONS]
 Options:
   -y, --yes, --non-interactive  Automated execution mode (no interactive confirmation prompt)
   --dry-run                     Preview uninstall plan without deleting resources
-  --project-id ID               GCP Target Project ID
-  --cluster-name NAME           GKE Target Cluster Name (default: platform-agent-host)
-  --region REGION               GKE GCP Region
+  --gcp-project-id ID           GCP Target Project ID
+  --gke-cluster-name NAME       GKE Target Cluster Name (default: platform-agent-host)
+  --gcp-region REGION           GKE GCP Region
+  --agent-namespace NS          Kubernetes namespace the release lives in
+                                (default: the install's own, else kubeagents-system)
   --source-ref REF              Tag or commit SHA of the release that made the install; that
                                 release's own uninstall.sh is fetched and run in place of this one
   --help, -h, -?                Show this help message
@@ -162,7 +195,7 @@ Examples:
   ./uninstall.sh
 
   # Automated teardown for a known project and cluster
-  ./uninstall.sh --non-interactive --project-id="my-gcp-project" --cluster-name="platform-agent-host"
+  ./uninstall.sh --non-interactive --gcp-project-id="my-gcp-project" --gke-cluster-name="platform-agent-host"
 
 Exit codes:
   0  Teardown completed (or --dry-run finished, or you declined the
@@ -185,12 +218,14 @@ parse_args() {
       -y|--yes|--non-interactive) PARAM_NON_INTERACTIVE="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --uninstall|--delete) shift ;;
-      --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
-      --project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
-      --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
-      --cluster-name) PARAM_CLUSTER_NAME="$2"; shift 2 ;;
-      --region=*) PARAM_REGION="${1#*=}"; shift ;;
-      --region) PARAM_REGION="$2"; shift 2 ;;
+      --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
+      --gcp-project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
+      --gke-cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
+      --gke-cluster-name) PARAM_CLUSTER_NAME="$2"; shift 2 ;;
+      --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
+      --gcp-region) PARAM_REGION="$2"; shift 2 ;;
+      --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
+      --agent-namespace) PARAM_AGENT_NAMESPACE="$2"; shift 2 ;;
       --source-ref=*) PARAM_SOURCE_REF="${1#*=}"; shift ;;
       --source-ref) PARAM_SOURCE_REF="$2"; shift 2 ;;
       --help|-h|-\?|help) show_help ;;
@@ -310,6 +345,24 @@ main() {
       print_error "'${PARAM_SOURCE_REF}' carries no uninstall.sh; tear the install down with that release's documented procedure."
       exit 1
     fi
+    # FLAG DIALECT, chosen from the script we are about to exec rather than
+    # assumed. --source-ref reaches in both directions: releases cut before the
+    # domain-scoped rename parse --project-id/--cluster-name/--region and reject
+    # the new spellings, and releases cut from this commit on do the exact
+    # opposite. Hard-coding either one makes the hand-over fail with "Unknown
+    # parameter" against half the refs the flag exists for, and that failure
+    # exits 2 -- not the 3 an automated caller reads as "nothing to tear down".
+    #
+    # Grepping the cloned script is the only signal available here: the ref is a
+    # tag or a SHA, so there is no version to compare against.
+    local flag_project_id="--project-id"
+    local flag_cluster_name="--cluster-name"
+    local flag_region="--region"
+    if grep -q -- '--gcp-project-id' "${repo_dir}/uninstall.sh"; then
+      flag_project_id="--gcp-project-id"
+      flag_cluster_name="--gke-cluster-name"
+      flag_region="--gcp-region"
+    fi
     local dispatch_args=()
     if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
       dispatch_args+=(--non-interactive)
@@ -318,13 +371,18 @@ main() {
       dispatch_args+=(--dry-run)
     fi
     if [ -n "$PARAM_PROJECT_ID" ]; then
-      dispatch_args+=(--project-id="$PARAM_PROJECT_ID")
+      dispatch_args+=("${flag_project_id}=$PARAM_PROJECT_ID")
     fi
     if [ -n "$PARAM_CLUSTER_NAME" ]; then
-      dispatch_args+=(--cluster-name="$PARAM_CLUSTER_NAME")
+      dispatch_args+=("${flag_cluster_name}=$PARAM_CLUSTER_NAME")
     fi
     if [ -n "$PARAM_REGION" ]; then
-      dispatch_args+=(--region="$PARAM_REGION")
+      dispatch_args+=("${flag_region}=$PARAM_REGION")
+    fi
+    # Only to a release that parses it. Older ones do not, and passing it there
+    # is the same "Unknown parameter" exit the dialect choice above avoids.
+    if [ -n "$PARAM_AGENT_NAMESPACE" ] && grep -q -- '--agent-namespace' "${repo_dir}/uninstall.sh"; then
+      dispatch_args+=(--agent-namespace="$PARAM_AGENT_NAMESPACE")
     fi
     print_info "Handing over to the '${PARAM_SOURCE_REF}' release's own uninstall.sh..."
     TEMP_REPO_DIR=""
@@ -352,7 +410,7 @@ main() {
   source "${repo_dir}/scripts/installer/installer_common.sh"
   # Legacy state first, then install.env over the top of it, so the
   # hand-authored input wins. Both are optional here: unlike upgrade.sh, a
-  # teardown can proceed on --project-id/--cluster-name/--region alone.
+  # teardown can proceed on --gcp-project-id/--gke-cluster-name/--gcp-region alone.
   if [ -f "${repo_dir}/k8s-operator/scripts/vars.sh" ]; then
     # shellcheck disable=SC1091
     if ! source "${repo_dir}/k8s-operator/scripts/vars.sh"; then
@@ -382,7 +440,7 @@ main() {
     target_project="$(gcloud config get-value project 2>/dev/null || true)"
   fi
   if [ -z "$target_project" ]; then
-    print_error "A GCP project is required. Pass --project-id or configure one with gcloud."
+    print_error "A GCP project is required. Pass --gcp-project-id or configure one with gcloud."
     exit 1
   fi
 
@@ -400,6 +458,11 @@ main() {
   export PROJECT_ID="$target_project"
   export CLUSTER_NAME="$target_cluster"
   export REGION="$target_region"
+  # write_tfvars_from_state writes `namespace` from this, so --agent-namespace
+  # has to win over the loaded configuration here the way the three above do.
+  if [ -n "$PARAM_AGENT_NAMESPACE" ]; then
+    export NAMESPACE="$PARAM_AGENT_NAMESPACE"
+  fi
   export NO_CONFIRM="1"
 
   # The engine is `lifecycle.sh destroy` against the install's Terraform state

@@ -613,6 +613,12 @@ func TestBuildDeployment(t *testing.T) {
 		if !watcherToken {
 			t.Errorf("expected the default-audience token mounted where InClusterConfig reads it, got %#v", authC.VolumeMounts)
 		}
+		if authC.Resources.Requests.Cpu().String() != "150m" || authC.Resources.Requests.Memory().String() != "384Mi" {
+			t.Errorf("expected CPU 150m and Mem 384Mi requests on auth sidecar container, got %v", authC.Resources.Requests)
+		}
+		if authC.Resources.Limits.Cpu().String() != "1" || authC.Resources.Limits.Memory().String() != "2Gi" || authC.Resources.Limits.StorageEphemeral().String() != "2Gi" {
+			t.Errorf("expected CPU 1, Mem 2Gi, and Eph 2Gi limits on auth sidecar container, got %v", authC.Resources.Limits)
+		}
 
 		sidecarC := containerByName(t, dep.Spec.Template.Spec.Containers, "my-sidecar")
 		if sidecarC.Image != "sidecar-image:latest" {
@@ -1193,9 +1199,11 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// so an operator has to be able to tune or disable them on the CR. Without
 	// these names on the allowlist the documented override silently does
 	// nothing and the only way to change a limit is a new image. One name per
-	// severity the server caps, Info included.
+	// bucket the server caps: the three severities, Info included, and the
+	// drift detector's own bucket, which is not a severity.
 	custom := []corev1.EnvVar{
 		{Name: "ALERT_DAILY_LIMIT_CRITICAL", Value: "25"},
+		{Name: "ALERT_DAILY_LIMIT_DRIFT", Value: "50"},
 		{Name: "ALERT_DAILY_LIMIT_INFO", Value: "3"},
 		{Name: "ALERT_DAILY_LIMIT_WARNING", Value: "0"},
 		{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
@@ -1219,6 +1227,15 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 
 	if values["ALERT_DAILY_LIMIT_CRITICAL"] != "25" {
 		t.Errorf("expected the critical ceiling to be overridable, got %q", values["ALERT_DAILY_LIMIT_CRITICAL"])
+	}
+	// Drift bills a bucket of its own rather than the Warning one it displays
+	// as, so its ceiling is a fourth variable and has to be overridable by the
+	// same route. Off the allowlist, one multi-object `kubectl apply` spends
+	// the default of 5 and every later drift record that day is lost for good
+	// — the detector cannot re-offer one — with no way to raise the cap short
+	// of a new image.
+	if values["ALERT_DAILY_LIMIT_DRIFT"] != "50" {
+		t.Errorf("expected the drift ceiling to be overridable, got %q", values["ALERT_DAILY_LIMIT_DRIFT"])
 	}
 	// Info is capped too — nothing on the watcher path filters on Event.Type,
 	// so Normal-type events with an allowlisted reason arrive as Info.
@@ -1271,6 +1288,47 @@ func TestSafeSandboxEnvOverridesPassesEodRecapFilters(t *testing.T) {
 	// row would make one cluster's noise read as another's.
 	if _, ok := values["GKE_CLUSTER_NAME"]; ok {
 		t.Errorf("GKE_CLUSTER_NAME must stay operator-owned, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesFeedbackPromptKnobs(t *testing.T) {
+	// The feedback prompt's whole per-install surface: `feedback_prompt.py`
+	// reads both from the environment on every tick and there is no config
+	// file behind them. Off the allowlist, the documented override renders on
+	// the CR, validates, and never reaches the script, and an install that
+	// wants the prompt off has no supported way to get it.
+	custom := []corev1.EnvVar{
+		{Name: "FEEDBACK_PROMPT_ENABLED", Value: "false"},
+		{Name: "FEEDBACK_PROMPT_DELAY", Value: "14d"},
+		{Name: "HERMES_HOME", Value: "/tmp/elsewhere"},
+		{
+			Name: "FEEDBACK_PROMPT_ENABLED",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	values := map[string]string{}
+	for _, e := range got {
+		if e.ValueFrom != nil {
+			t.Errorf("ValueFrom must never survive the allowlist, got %#v", e)
+		}
+		values[e.Name] = e.Value
+	}
+
+	if values["FEEDBACK_PROMPT_ENABLED"] != "false" {
+		t.Errorf("expected the feedback prompt to be switchable off, got %q", values["FEEDBACK_PROMPT_ENABLED"])
+	}
+	if values["FEEDBACK_PROMPT_DELAY"] != "14d" {
+		t.Errorf("expected the feedback prompt's delay to be overridable, got %q", values["FEEDBACK_PROMPT_DELAY"])
+	}
+	// The script anchors its markers under HERMES_HOME; letting the CR move
+	// it would re-arm the prompt on a volume that has already sent it.
+	if _, ok := values["HERMES_HOME"]; ok {
+		t.Errorf("HERMES_HOME must stay operator-owned, got %#v", got)
 	}
 }
 
@@ -1513,13 +1571,16 @@ func TestBuildPodTemplateSpecHoldsNoCredentialRuntime(t *testing.T) {
 // already asserts it, and a second copy would only look like coverage.
 //
 // mode: next is the shape the field is actually load-bearing on, and it had no
-// case here until the bus surface landed: that render puts NATS_PASSWORD on the
-// agent container by SecretKeyRef, so sharing the namespace publishes the bus
-// credential through /proc/<pid>/environ to every other container in the Pod,
-// spec.deployment.sidecars entries included. The case carries a non-vacuity
-// check for exactly that reason -- an assertion that the process namespace is
-// unshared on a Pod that turns out to hold no credential proves nothing, so the
-// subtest fails if the credential it is guarding is not there.
+// case here until the bus surface landed: that render puts a bus credential on
+// the agent container alone, and a shared process namespace hands it to every
+// other container in the Pod, spec.deployment.sidecars entries included. The
+// reach survived the move off a password -- a projected token is a file rather
+// than an environment variable, but /proc/<pid>/root walks into the mount
+// namespace of any process the sharing makes visible, at matched UIDs, so the
+// token path is readable exactly where /proc/<pid>/environ used to be. The case
+// carries a non-vacuity check for that reason -- an assertion that the process
+// namespace is unshared on a Pod that turns out to hold no credential proves
+// nothing, so the subtest fails if the credential it is guarding is not there.
 func TestTheProcessNamespaceIsUnsharedOnEverySpecShape(t *testing.T) {
 	stock := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
@@ -1528,7 +1589,7 @@ func TestTheProcessNamespaceIsUnsharedOnEverySpecShape(t *testing.T) {
 	for _, testCase := range []struct {
 		name string
 		// credentialed marks the shapes whose agent container carries the A2A
-		// bus password; on those the subtest first proves the credential is
+		// bus credential; on those the subtest first proves the credential is
 		// present, so the assertion below cannot pass by its absence.
 		credentialed bool
 		agent        *agentv1alpha1.PlatformAgent
@@ -1552,11 +1613,16 @@ func TestTheProcessNamespaceIsUnsharedOnEverySpecShape(t *testing.T) {
 }
 
 // assertAgentContainerHoldsBusCredential fails unless the platform-agent
-// container carries NATS_PASSWORD as a SecretKeyRef. It is the non-vacuity
-// guard for the credentialed rows above: were the bus surface to stop
-// rendering, or move to another container, those rows would keep passing while
-// asserting nothing, and the comment in buildPodTemplateSpec that tells the
-// next author why ShareProcessNamespace stays unset would lose its test.
+// container mounts the projected bus token. It is the non-vacuity guard for
+// the credentialed rows above: were the bus surface to stop rendering, or move
+// to another container, those rows would keep passing while asserting nothing,
+// and the comment in buildPodTemplateSpec that tells the next author why
+// ShareProcessNamespace stays unset would lose its test.
+//
+// It also refuses a password, which is the guard the worker retirement needs
+// here specifically: NATS_PASSWORD coming back on this container would restore
+// the /proc/<pid>/environ reach this test exists to argue about, and a check
+// written only against the token would not notice.
 func assertAgentContainerHoldsBusCredential(t *testing.T, spec corev1.PodSpec) {
 	t.Helper()
 	for _, container := range spec.Containers {
@@ -1564,16 +1630,30 @@ func assertAgentContainerHoldsBusCredential(t *testing.T, spec corev1.PodSpec) {
 			continue
 		}
 		for _, env := range container.Env {
-			if env.Name != "NATS_PASSWORD" {
+			if env.Name == "NATS_PASSWORD" || env.Name == "NATS_USER" {
+				t.Fatalf("%s is back on the platform-agent container (%+v); the agent authenticates by projected token", env.Name, env)
+			}
+		}
+		mounted := false
+		for _, mount := range container.VolumeMounts {
+			if mount.Name == a2aBusTokenVolume {
+				mounted = true
+			}
+		}
+		if !mounted {
+			t.Fatalf("no %s mount on the platform-agent container: this shape holds no bus credential, "+
+				"so the shared-process-namespace assertion beside this one would pass vacuously", a2aBusTokenVolume)
+		}
+		for i := range spec.Volumes {
+			if spec.Volumes[i].Name != a2aBusTokenVolume {
 				continue
 			}
-			if env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil {
-				t.Fatalf("NATS_PASSWORD is not a SecretKeyRef (%+v); the literal must never render into the pod spec", env)
+			if spec.Volumes[i].Projected == nil {
+				t.Fatalf("%s is not a projected volume (%+v); the token must never render as a Secret the Pod can reread", a2aBusTokenVolume, spec.Volumes[i])
 			}
 			return
 		}
-		t.Fatal("no NATS_PASSWORD on the platform-agent container: this shape holds no bus credential, " +
-			"so the shared-process-namespace assertion beside this one would pass vacuously")
+		t.Fatalf("the platform-agent container mounts %s and the Pod has no such volume", a2aBusTokenVolume)
 	}
 	t.Fatal("no platform-agent container in the pod template")
 }
@@ -3285,12 +3365,15 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// three unconditional pins, none of which is about chat: the loopback bearer (see
-	// the next test), the PVC's directory mode, and the mode switch.
+	// five unconditional pins, none of which is about chat: the loopback bearer (see
+	// the next test), the PVC's directory mode, the mode switch, the scope path, and
+	// the empty management-project override.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
 		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
-		kubeagentsModeEnvKey + "=today\n"
+		kubeagentsModeEnvKey + "=today\n" +
+		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
+		reconcileProjectEnvKey + "=\n"
 	if bare != want {
 		t.Errorf("renderManagedEnv with no integration = %q, want %q", bare, want)
 	}
@@ -5835,6 +5918,13 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 	if !reflect.DeepEqual(got, image.Kanban) {
 		t.Errorf("the front door's kanban block differs from the one the chat profile gets "+
 			"from %s:\n  overlay: %v\n  image:   %v", path, got, image.Kanban)
+	}
+
+	// Issue #1880: bound kanban stale running timeout to 30m (1800s) to prevent
+	// wedged workers from occupying dispatch slots until the 4h upstream default.
+	if got["dispatch_stale_timeout_seconds"] != 1800 {
+		t.Errorf("dispatch_stale_timeout_seconds = %v, want 1800 to bound kanban worker reclaim to 30m (#1880)",
+			got["dispatch_stale_timeout_seconds"])
 	}
 
 	// The CR field is the reason equality with the image is not enough on its own: it is

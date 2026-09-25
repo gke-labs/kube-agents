@@ -7,8 +7,8 @@ whose CLI body is verbatim ``tick(verbose=True)``. Everything Hermes attaches to
 the ticker's lifetime -- the in-flight job set, the startup recovery sweep, the
 assumption that a tick is a short scheduling pass inside a long-lived process --
 is therefore either absent or wrong on that profile. This module and the
-fourteen anchored edits in ``apply_cron_tick_lock_scope.py`` supply what is
-missing.
+twelve anchored edits in ``apply_cron_tick_lock_scope.py`` supply what is
+missing (v2026.9.14 absorbed the sweep half; see the last section).
 
 Head-of-line blocking: the tick lock covered execution
 ------------------------------------------------------
@@ -87,10 +87,10 @@ The caller owns its claim
 the caller later releases by job id. That is not a style preference; releasing
 by id was a leak.
 
-``tick`` claims on the ticker thread and releases in ``_run_and_release``'s
-``finally``, which runs on a ``ThreadPoolExecutor`` worker -- and, crucially,
-OUTSIDE the ``contextvars.copy_context()`` that ``ctx.run(_process_job, j)``
-enters. A registry keyed by lock path has to recompute that path to release,
+``tick`` (through ``_submit_with_guard``, module-level since v2026.9.14)
+claims on the ticker thread and releases in ``_run_and_release``'s ``finally``,
+which runs on a ``ThreadPoolExecutor`` worker -- and, crucially, OUTSIDE the
+``contextvars.copy_context()`` that ``ctx.run(process_job, j)`` enters. A registry keyed by lock path has to recompute that path to release,
 and the path comes from ``_get_lock_paths`` -> ``get_hermes_home()``, whose
 override is a ``ContextVar`` in ``hermes_constants``. A worker thread starts
 with an empty context, so the recomputed path is the *process* ``HERMES_HOME``,
@@ -142,13 +142,17 @@ synchronously and hand the run to a daemon worker -- and released in a
 only one of them, so guarding the run rather than the entry point is what keeps
 the other three covered.
 
-Guarding there puts the flock AFTER ``claim_job_for_fire``, and that costs one
-thing: the CAS has already advanced ``next_run_at``, so a refusal skips a
-scheduled occurrence of a job this call never ran. It is a deliberate trade, and
-the same one upstream makes two lines above for its own
-``try_register_running_job`` guard. A skipped occurrence of a job that is
-*already executing* is a far smaller harm than the two overlapping runs sharing
-one output file that this patch exists to stop.
+Guarding there puts the flock AFTER ``claim_job_for_fire``. Since v2026.9.11
+every claim on this path is a ``manual`` one (``cron/jobs.py``,
+``claim_job_for_fire(manual=True)``): it stamps ``fire_claim`` and, for a
+recurring job, rewrites ``next_run_at`` to ``compute_next_run(schedule, now)``
+-- the same slot for a cron expression, now plus one period for an interval --
+but stamps no occurrence identity, so no execution row can make the scheduler
+treat the pending slot as already done. A refusal therefore costs the
+requested run itself, not a scheduled occurrence: the same trade upstream
+makes two lines above for its own ``try_register_running_job`` guard, and a
+far smaller harm than the two overlapping runs sharing one output file that
+this patch exists to stop.
 
 A refused dispatch returns immediately rather than waiting for the lock. The
 caller is an agent blocked inside a tool call, the run it would wait for can
@@ -157,11 +161,11 @@ of a job that has just finished. The refusal is returned as ``claimed: True``
 with an ``error``, which ``cronjob``'s ``run`` branch surfaces to the model as
 ``execution_error``. ``claimed: False`` would read better -- nothing ran, and
 ``result["executed"]`` consequently says ``True`` when it should not -- but it
-would also be a lie about the CAS, which did succeed and did advance
-``next_run_at``. That branch skips ``_notify_provider_jobs_changed_safe()`` on
-an unclaimed result, so reporting the refusal as unclaimed would leave an
-external provider's one-shot un-reconciled against an occurrence this call has
-already consumed.
+would also be a lie about the CAS, which did succeed: the fire claim is
+stamped and ``next_run_at`` rewritten. That branch skips
+``_notify_provider_jobs_changed_safe()`` on an unclaimed result, so reporting
+the refusal as unclaimed would leave an external provider unreconciled against
+the claim and the ``next_run_at`` this call has already written.
 
 A spawned tick is a scheduler restart
 -------------------------------------
@@ -183,12 +187,19 @@ one of them was reapable and none had been reaped. A run that dies leaves no
 failure anywhere: ``cron runs`` shows it as still in flight, ``cron_health``
 projects a run that is not running, and the row is immortal.
 
-The fix is one line in ``hermes_cli/cron.py::cron_tick``, which is that
-profile's entire scheduler lifecycle: sweep first, then tick. It cannot reap a
-live run -- ``_owner_is_live`` checks both the pid and its start time, so a
-still-running sibling tick or a live gateway is skipped -- and a sweep that
-raises is logged and stepped over, because nothing about bookkeeping may stop a
-tick from dispatching.
+The fix used to be one line in ``hermes_cli/cron.py::cron_tick``, which is
+that profile's entire scheduler lifecycle: sweep first, then tick. Upstream
+closed the same gap in the run-up to v2026.9.14 (#86721): ``tick`` now calls
+``_maybe_reap_dead_owners``, which runs the sweep behind a 300s throttle held
+in a module global -- unset in every freshly spawned process, so a spawned tick
+sweeps every time -- and ``_try_dispatch_background_run`` reaps before every
+manual dispatch. The applier's edit is therefore retired; what stays is the
+guarantee, which ``verify_cron_tick_lock_scope.py`` pins on upstream's code:
+the reap precedes dispatch, cannot touch a live run (``_owner_is_live`` checks
+both the pid and its start time, so a still-running sibling tick or a live
+gateway is skipped), is wrapped in a ``try`` because nothing about bookkeeping
+may stop a tick from dispatching, and a real stuck row is reaped by a real
+spawned ``cron_tick``.
 
 Testing
 -------

@@ -234,6 +234,65 @@ bash -c "exit 3"
         self.assertIn("Teardown error encountered", proc.stderr)
         self.assertIn("exit code 1", proc.stderr)
 
+    def test_a_child_exiting_3_inside_a_substitution_is_reported_once_as_1(self):
+        # The subshell's handler normalises the code and exits silently; the
+        # parent's then fires at the assignment with 1 and prints the one
+        # banner (#1798). The echo after the failing child proves the subshell
+        # stopped there: command substitution does not inherit errexit.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UNINSTALL_SH}"
+x="$(bash -c "exit 3"; echo "NOT_REACHED_IN_PROBE")"
+echo "NOT_REACHED x=[$x]"
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("NOT_REACHED", proc.stdout)
+        self.assertEqual(proc.stderr.count("Teardown error encountered"), 1, proc.stderr)
+        # A `bash -c` body has no file for bash to name its frames after, so
+        # the banner falls back to the script's name; the assignment in the
+        # parent is the command it names.
+        self.assertIn(" at uninstall.sh:", proc.stderr)
+        self.assertIn(' in main (exit code 1): x="$(', proc.stderr)
+        self.assertNotIn("exit code 3", proc.stderr)
+
+    def test_a_failure_inside_a_sourced_helper_names_its_file_and_function(self):
+        # $LINENO counts from the top of whichever file the failing command
+        # sat in, so a bare line number sent the reader to an unrelated line
+        # of uninstall.sh (#1798). The banner names the helper and the
+        # function it failed in.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            lib = pathlib.Path(tmp) / "helper_lib.sh"
+            lib.write_text("helper_probe() {\n  false\n}\n")
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UNINSTALL_SH}"
+source "{lib}"
+helper_probe
+echo "NOT_REACHED"
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertNotIn("NOT_REACHED", proc.stdout)
+            self.assertEqual(proc.stderr.count("Teardown error encountered"), 1, proc.stderr)
+            self.assertIn(f"Teardown error encountered at {lib}:", proc.stderr)
+            self.assertIn(" in helper_probe (exit code 1): false", proc.stderr)
+
     def _scratch_repo(self, tmp):
         """A minimal kube-agents tree for whole-script runs.
 
@@ -266,7 +325,7 @@ bash -c "exit 3"
         root = self._scratch_repo(tmp)
         return subprocess.run(
             ["bash", str(root / "uninstall.sh"), "--non-interactive", "-y",
-             "--project-id=p1", "--cluster-name=c1", "--region=r1"],
+             "--gcp-project-id=p1", "--gke-cluster-name=c1", "--gcp-region=r1"],
             capture_output=True,
             text=True,
             env=get_isolated_test_env(
@@ -318,13 +377,17 @@ bash -c "exit 3"
 
 
 class SourceRefDispatchTest(unittest.TestCase):
-    def _run(self, ref_carries_uninstall, args):
+    def _run(self, ref_carries_uninstall, args, ref_speaks_domain_scoped=False):
         """Run the real uninstall.sh with a stub git on PATH.
 
         The stub's `clone` creates the target directory and, when
         `ref_carries_uninstall`, drops an uninstall.sh into it that records
         its argv to DISPATCH_LOG — standing in for the pinned release's own
         uninstaller. fetch/checkout are no-ops.
+
+        `ref_speaks_domain_scoped` makes that stand-in advertise the
+        domain-scoped flag names, which is how the hand-over tells which
+        dialect the release it is about to exec parses.
         """
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -339,6 +402,9 @@ class SourceRefDispatchTest(unittest.TestCase):
                 f'  if [ "{str(ref_carries_uninstall).lower()}" = "true" ]; then\n'
                 "    {\n"
                 "      echo '#!/usr/bin/env bash'\n"
+                f'      if [ "{str(ref_speaks_domain_scoped).lower()}" = "true" ]; then\n'
+                "        echo '# parses --gcp-project-id --gke-cluster-name --gcp-region --agent-namespace'\n"
+                "      fi\n"
                 "      echo 'printf \"%s\\n\" \"$@\" > \"$DISPATCH_LOG\"'\n"
                 '    } > "$dest/uninstall.sh"\n'
                 "  fi\n"
@@ -366,13 +432,19 @@ class SourceRefDispatchTest(unittest.TestCase):
             args=[
                 "--source-ref=v0.9.0",
                 "--non-interactive",
-                "--project-id=p1",
-                "--cluster-name=c1",
-                "--region=r1",
+                "--gcp-project-id=p1",
+                "--gke-cluster-name=c1",
+                "--gcp-region=r1",
             ],
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIsNotNone(log, proc.stdout + proc.stderr)
+        # LEGACY spellings coming out, domain-scoped ones going in, and the
+        # asymmetry is the assertion. What is dispatched is not this script's
+        # flag set but the v0.9.0 uninstall.sh's, which has never heard of
+        # --gcp-project-id and would exit 2 on it. --source-ref exists for
+        # precisely those pre-Terraform releases, so translating the flags here
+        # would break the one path it is for.
         self.assertEqual(
             log.split(),
             [
@@ -382,6 +454,54 @@ class SourceRefDispatchTest(unittest.TestCase):
                 "--region=r1",
             ],
         )
+
+    def test_a_release_that_speaks_the_new_dialect_is_handed_the_new_flags(self):
+        """--source-ref reaches forwards as well as back.
+
+        Every release cut from the domain-scoped rename on rejects
+        --project-id with "Unknown parameter" and exits 2, which an automated
+        caller reads as a hard failure rather than the 3 that means "nothing to
+        tear down". Translating unconditionally would break the hand-over for
+        exactly those refs, so the dialect is read off the cloned script.
+        """
+        proc, log = self._run(
+            ref_carries_uninstall=True,
+            ref_speaks_domain_scoped=True,
+            args=[
+                "--source-ref=v9.9.9",
+                "--non-interactive",
+                "--gcp-project-id=p1",
+                "--gke-cluster-name=c1",
+                "--gcp-region=r1",
+                "--agent-namespace=ns1",
+            ],
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(log, proc.stdout + proc.stderr)
+        self.assertEqual(
+            log.split(),
+            [
+                "--non-interactive",
+                "--gcp-project-id=p1",
+                "--gke-cluster-name=c1",
+                "--gcp-region=r1",
+                "--agent-namespace=ns1",
+            ],
+        )
+
+    def test_a_legacy_release_is_not_handed_agent_namespace(self):
+        """No release in the legacy dialect parses it, so passing it exits 2."""
+        _proc, log = self._run(
+            ref_carries_uninstall=True,
+            args=[
+                "--source-ref=v0.9.0",
+                "--non-interactive",
+                "--gcp-project-id=p1",
+                "--agent-namespace=ns1",
+            ],
+        )
+        self.assertIsNotNone(log)
+        self.assertNotIn("--agent-namespace=ns1", log.split())
 
     def test_source_ref_without_an_uninstaller_refuses(self):
         # Driving a ref that carries no uninstall.sh with this script's own

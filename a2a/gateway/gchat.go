@@ -111,17 +111,30 @@ const (
 // verifiedByFor names the mechanism that checked the requester at ingress
 // for one backend (authority.requester.verifiedBy).
 func verifiedByFor(backend string) string {
-	if backend == gchatBackend {
+	switch backend {
+	case gchatBackend:
 		return gchatVerifiedBy
+	case injectBackend:
+		// Its own value, not "principal-map" and deliberately nothing a real
+		// backend stamps. The map is what resolves the author here too, but
+		// what checked the caller is the door's bearer token -- so a reader
+		// of an authority block downstream can tell an eval submission from
+		// a Chat message verified by the IAM-locked topic, which is the
+		// whole point of recording the mechanism rather than the table.
+		return injectVerifiedBy
 	}
 	return "principal-map"
 }
 
 // unverifiedRemedyFor names what an admin edits to admit a sender — the
-// allowlist on gchat, the mapping table everywhere else.
+// allowlist on gchat, the door's own map on inject, the mapping table
+// everywhere else.
 func unverifiedRemedyFor(backend string) string {
-	if backend == gchatBackend {
+	switch backend {
+	case gchatBackend:
 		return "the allowed users list"
+	case injectBackend:
+		return "the inject door's principal map"
 	}
 	return "the principal map"
 }
@@ -756,9 +769,12 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 // identity mechanism. On gchat the Google-asserted email IS the principal —
 // resolution is the identity function gated by the allowlist (the mapping
 // table other backends need is exactly what this backend exists to not
-// have). Everything else goes through the principal map. Empty means drop.
-func (g *Gateway) resolvePrincipal(authorID string) string {
-	if g.backend != gchatBackend {
+// have). Everything else goes through a principal map. Empty means drop.
+func (g *Gateway) resolvePrincipal(backend, authorID string) string {
+	if backend == injectBackend {
+		return g.resolveInjectPrincipal(authorID)
+	}
+	if backend != gchatBackend {
 		return g.pm.Resolve(authorID)
 	}
 	if g.gchatAllowAll || g.gchatAllowed[strings.ToLower(authorID)] {
@@ -770,6 +786,41 @@ func (g *Gateway) resolvePrincipal(authorID string) string {
 		return authorID
 	}
 	return ""
+}
+
+// resolveInjectPrincipal resolves an author the side door delivered, and it
+// is where the door is made structurally incapable of asserting a principal
+// a real backend's sender could hold. Two rules, both refusals.
+//
+// The lookup is prefixed: the key is "inject:<author>", in the door's own
+// map. So an entry admitting a Discord snowflake or a Google-asserted email
+// cannot be reached from here even if someone writes one, and an author id
+// that collides with a real backend's resolves to nothing.
+//
+// And the value must be an eval identity. The door takes its author from a
+// request body, so the map is the only thing standing between a bearer-token
+// holder and a principal of their choosing; a map entry pointing at a cloud
+// identity would hand them one, today advisory and the day publisher identity
+// arms, real. An entry that does not conform is refused here rather than
+// honoured, which makes a mistake in the map a lockout instead of a
+// privilege.
+//
+// Empty means drop, exactly as an unmapped Discord sender drops: logged,
+// noticed once, no task. Nothing is defaulted.
+func (g *Gateway) resolveInjectPrincipal(authorID string) string {
+	if g.injectPM == nil {
+		return ""
+	}
+	principal := g.injectPM.Resolve(injectPrincipalPrefix + authorID)
+	if principal == "" {
+		return ""
+	}
+	if !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {
+		g.log.Error("the inject door's principal map maps an author to a principal that is not an eval identity; refusing it",
+			"author", authorID, "wantPrefix", injectEvalPrincipalPrefix)
+		return ""
+	}
+	return principal
 }
 
 // gchatConversationID mints the session key for one inbound message. space is

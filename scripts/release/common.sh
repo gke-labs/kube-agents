@@ -515,9 +515,135 @@ is_rc_candidate_commit_already_validated() {
   [ -n "${validated_tags}" ]
 }
 
+# ─── Promotion tag cores ──────────────────────────────────────────────────────
+# Two tag families are derived from a validated RC tag — evalcand_ below and
+# staging_ after it — and the design rests on them sharing a core. A reader who
+# sees evalcand_2608241820_b35543c has to be able to name the staging_ tag it
+# becomes without a lookup, and resolve_promotion_candidate.sh composes both from
+# the same rc_ tag and expects them to agree. One extractor rather than two is
+# what makes that structural instead of a convention two functions happen to
+# follow.
+#
+# `family` names what the caller is composing, and appears only in the refusal.
+rc_tag_core() {
+  local rc_tag="${1:-}"
+  local family="${2:-promotion}"
+  if [ -z "${rc_tag}" ]; then
+    echo "❌ ERROR: an RC tag is required to derive a ${family} tag." >&2
+    return 1
+  fi
+
+  # The _validated suffix is dropped: it records that the RC gate passed, not
+  # that anything downstream of it did.
+  local core="${rc_tag%_validated}"
+  case "${core}" in
+    rc_?*) core="${core#rc_}" ;;
+    *)
+      echo "❌ ERROR: '${rc_tag}' is not an rc_* candidate tag; refusing to derive a ${family} tag from it." >&2
+      return 1
+      ;;
+  esac
+
+  printf '%s\n' "${core}"
+}
+
+# ─── Eval-candidate tags ──────────────────────────────────────────────────────
+# NOT WIRED YET. Nothing in this repository composes, pushes or reads an
+# evalcand_ tag: these helpers and poll_rc_eval_verdict.py beside them are the
+# pieces, and the pull request that changes staging-promotion-pipeline.yml is what joins
+# them up. Until it lands the nightly still pushes staging_ straight off a green
+# matrix, and the paragraph below describes where this is going rather than what
+# runs tonight. Everything downstream of that sentence is true of the helpers
+# themselves and can be relied on now.
+#
+# The nightly pipeline will nominate a candidate for staging by tagging its
+# commit evalcand_<ts>_<sha>. That push is what fires post-kube-agents-eval-rc,
+# the release-candidate eval in GoogleCloudPlatform/oss-test-infra, and the
+# pipeline then waits for that job's verdict before pushing the staging_ tag
+# below.
+#
+# WHY A SECOND TAG FAMILY AND NOT JUST staging_. The eval used to trigger on
+# staging_, which is also what staging-deploy.yml triggers on: both fired off one
+# push event, and the deploy — minutes — finished long before the eval — hours —
+# had a verdict, so the verdict could only ever describe a deploy that had
+# already happened. evalcand_ puts the eval between the two. Nothing else in this
+# repository reads the evalcand_ family, and that is deliberate: a candidate the
+# eval rejects leaves its evalcand_ tag behind, and every other tag reader here
+# is prefix-scoped to a family that is not this one, so the leftover drives
+# nothing. A rejected candidate leaving a staging_ tag behind would not be inert
+# — get_latest_staging_tag would offer it to a manual deploy dispatch.
+export EVALCAND_TAG_PREFIX="evalcand_"
+
+# Derives the eval-candidate tag from a validated RC tag:
+#   rc_2608241820_b35543c_validated  ->  evalcand_2608241820_b35543c
+evalcand_tag_for_rc() {
+  local core
+  core="$(rc_tag_core "${1:-}" "eval-candidate")" || return 1
+  printf '%s\n' "${EVALCAND_TAG_PREFIX}${core}"
+}
+
+# The shape an eval-candidate tag must have, mirrored by the `branches` regex on
+# post-kube-agents-eval-rc in GoogleCloudPlatform/oss-test-infra. Change one and
+# the other stops matching: the pipeline pushes a tag no eval fires on, waits out
+# its poll deadline, and promotes nothing.
+#
+# Shape and not the bare prefix, for the reason STAGING_TAG_SHAPE_REGEX gives
+# below — a prefix is a trigger anyone can push by hand, and here the cost of an
+# `evalcand_hotfix` typed at a terminal is a project taken out of a pool shared
+# with the merge-blocking presubmit for hours.
+export EVALCAND_TAG_SHAPE_REGEX='^evalcand_[0-9]{10}_[0-9a-f]{7}$'
+
+# Lists the shape-valid eval-candidate tags pointing at a commit, one per line.
+# Empty output means this commit has never been nominated.
+evalcand_tags_at_commit() {
+  local sha="${1:-}"
+  local tags
+  tags="$(git tag --points-at "${sha}" "${EVALCAND_TAG_PREFIX}*" 2>/dev/null || true)"
+  grep -E "${EVALCAND_TAG_SHAPE_REGEX}" <<<"${tags}" || true
+}
+
+# Finds an existing eval-candidate tag on a commit SHA, if any. Empty output
+# means the commit has not been nominated yet.
+#
+# This is what resolve_promotion_candidate.sh will read to set `skip_promotion`,
+# a job get_existing_staging_tag does today. The move is the point of the split:
+# the staging_ tag will appear only on a green verdict, so keying the skip on it
+# would re-nominate every candidate the eval had already rejected, once per
+# nightly, each attempt costing hours of a leased project to reach the same
+# answer. The evalcand_ tag records that the candidate was measured, which is the
+# question being asked.
+#
+# "Measured" and not "attempted", which is a distinction the tag alone cannot
+# carry and the pipeline supplies: a nomination whose eval never returned a
+# verdict has its tag deleted again, so the commit is eligible tomorrow. Read
+# this function as answering "has this candidate been answered about", because
+# by the time anything calls it that is what the tag's presence means.
+#
+# A missed lookup is therefore not free, but it is self-correcting. It leads to a
+# redundant nomination, `ensure_git_tag` no-ops because the tag already points at
+# the same commit, nothing is pushed, no eval fires, and the poll reports
+# never_ran at its 45-minute clock — unsettled, so the tag is dropped and the
+# next nightly nominates cleanly. The cost is one night, not a stranded
+# candidate, which is why erring towards not-yet-nominated remains the safe
+# direction here even though the no-op is the failure rather than the harmless
+# case.
+get_existing_evalcand_tag() {
+  local sha="$1"
+  local tags
+  tags="$(evalcand_tags_at_commit "${sha}")"
+  # First line by parameter expansion rather than `head -n 1`, for the reason
+  # get_latest_staging_tag gives below: under `set -o pipefail` head closing the
+  # pipe early makes the producer exit 141, and the `|| echo ""` that usually
+  # sits beside it would read that as "not nominated".
+  [ -n "${tags}" ] && printf '%s\n' "${tags%%$'\n'*}"
+  return 0
+}
+
 # ─── Staging promotion tags ───────────────────────────────────────────────────
-# The nightly pipeline promotes a validated RC candidate by tagging its commit
-# staging_<ts>_<sha>, which is what staging-redeploy-*.yml triggers on.
+# The nightly pipeline promotes a candidate by tagging its commit
+# staging_<ts>_<sha>, which is what staging-deploy.yml triggers on. Today it
+# pushes this as soon as the E2E matrix passes; once the evalcand_ family above
+# is wired up it will push it only after the eval that tag fired returns green.
 export STAGING_TAG_PREFIX="staging_"
 
 # Derives the staging promotion tag from a validated RC tag:
@@ -525,29 +651,15 @@ export STAGING_TAG_PREFIX="staging_"
 #
 # The timestamp stays first after the prefix so `git tag -l --sort=-v:refname
 # 'staging_*'` orders by time, and the transform is mechanical in both
-# directions, so a staging tag reads back to its candidate without a lookup. The
-# _validated suffix is dropped: it records that the RC gate passed, not that the
-# promotion did.
+# directions, so a staging tag reads back to its candidate — and to the
+# evalcand_ tag it shares a core with — without a lookup.
 #
 # Refuses anything outside the rc_ family rather than composing staging_<junk>,
 # because the result is a live deploy trigger.
 staging_tag_for_rc() {
-  local rc_tag="${1:-}"
-  if [ -z "${rc_tag}" ]; then
-    echo "❌ ERROR: an RC tag is required for staging_tag_for_rc." >&2
-    return 1
-  fi
-
-  local core="${rc_tag%_validated}"
-  case "${core}" in
-    rc_?*) core="${core#rc_}" ;;
-    *)
-      echo "❌ ERROR: '${rc_tag}' is not an rc_* candidate tag; refusing to derive a staging tag from it." >&2
-      return 1
-      ;;
-  esac
-
-  echo "${STAGING_TAG_PREFIX}${core}"
+  local core
+  core="$(rc_tag_core "${1:-}" "staging")" || return 1
+  printf '%s\n' "${STAGING_TAG_PREFIX}${core}"
 }
 
 # The shape a staging tag must have to count as release evidence:
@@ -599,8 +711,9 @@ staging_promotion_tags_at_commit() {
 #
 # Shape-matched, like the two above, and it has to be. This is what
 # resolve_promotion_candidate.sh reads to set `skip_promotion`, so a prefix match
-# here means a hand-pushed `staging_hotfix` — which staging-redeploy-*.yml
-# legitimately triggers on — tells the nightly the commit is already promoted. It
+# here means a hand-pushed `staging_hotfix` — which staging-deploy.yml
+# legitimately triggers on, its `tags:` pattern being `staging_*` — tells the
+# nightly the commit is already promoted. It
 # then never pushes the real staging_<ts>_<sha> tag, and the release gate, which
 # does match on shape, reads that same commit as unreleasable. The candidate goes
 # quietly unshippable, and the two lookups have to agree for it not to.
@@ -643,7 +756,7 @@ get_existing_staging_tag() {
 # This does not expire with the restructure. Once the RC pipeline validates a
 # post-restructure commit, `get_latest_validated_rc_tag` stops returning an old
 # one and the default path never reaches this check again — but
-# nightly-pipeline.yml takes an `rc_tag` dispatch input whose description offers
+# staging-promotion-pipeline.yml takes an `rc_tag` dispatch input whose description offers
 # any validated candidate, and the tag graph keeps every candidate it ever
 # validated. Naming one by hand is a supported thing to do and stays wrong for
 # the same reason it is wrong today.

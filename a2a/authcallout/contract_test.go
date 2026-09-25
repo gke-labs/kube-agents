@@ -48,12 +48,18 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 	// particular list that means a workload either lost its grants or
 	// silently gained some.
 	//
-	// Two names: the provisioning Job, and now the session pod, which is the
-	// second workload the operator renders an a2a-bus token for. The platform
-	// agent pod is still not here: its only bus client is the Hermes bridge
-	// sidecar, which authenticates as static `worker`, so a principal keyed on
-	// the agent ServiceAccount would be a grant nothing can present.
-	want := map[string]bool{"provision": true, "session": true}
+	// Three names: the provisioning Job, the session pod, and the platform
+	// agent container, which arrived when the static `worker` credential was
+	// retired.
+	//
+	// The Hermes bridge sidecar is deliberately NOT here and cannot be. The
+	// callout keys on the username TokenReview returns, which names a
+	// ServiceAccount; the sidecar shares the agent pod's ServiceAccount, so a
+	// token would resolve it to the `agent` entry below and hand each of them
+	// the union of the two grant sets — `worker` reborn under a new name. The
+	// bridge stays a static principal for that reason, and the static-residue
+	// check below is what holds it there.
+	want := map[string]bool{"provision": true, "session": true, "agent": true}
 	for _, id := range m.Identities {
 		if !want[id.User] {
 			t.Errorf("the operator renders a principal this package did not expect: %q", id.User)
@@ -74,7 +80,7 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 	// presents a token for it.
 	for _, id := range m.Identities {
 		switch id.User {
-		case "gateway", "worker", "seed", "web", "sys":
+		case "gateway", "bridge", "seed", "web", "sys":
 			t.Errorf("%q is a static principal and must not appear in the callout's map", id.User)
 		}
 	}

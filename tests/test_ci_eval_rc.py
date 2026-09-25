@@ -91,6 +91,7 @@ class RcEvalDriverTestCase(unittest.TestCase):
         deploy_supports_rc: bool = True,
         eval_supports_tier: bool = True,
         eval_exit_code: int = 0,
+        eval_body: str = "",
         deploy_exit_code: int = 0,
         truncate_driver_from_deploy: bool = False,
     ) -> tuple[pathlib.Path, str]:
@@ -167,7 +168,9 @@ class RcEvalDriverTestCase(unittest.TestCase):
         # candidate's ci-eval-pr.sh, so the stub for a candidate that predates
         # the tier must not mention it anywhere — including in its trace lines.
         if eval_supports_tier:
-            eval_stub = _stub(self.trace, "eval", exit_code=eval_exit_code)
+            eval_stub = _stub(
+                self.trace, "eval", body=eval_body, exit_code=eval_exit_code
+            )
         else:
             eval_stub = textwrap.dedent(
                 f"""\
@@ -431,6 +434,112 @@ class RcEvalDriverTestCase(unittest.TestCase):
         summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
         self.assertIn("| Verdict | RED |", summary)
         self.assertIn("does not hold a release", summary)
+
+    def test_a_not_evaluated_eval_is_not_run_rather_than_red(self):
+        """ci-eval-pr.sh exits 2 when `bench-gate suite` could not evaluate the
+        run (an admitted case lost every repetition to infrastructure), and
+        bench-gate has written `outcome: not_evaluated` beside the markdown.
+        That formed no judgement on the candidate, so it is the failed
+        deploy's NOT RUN and not a RED somebody then investigates; the status
+        itself still survives, as every other one does.
+        """
+        root, _ = self.build_repo(
+            eval_exit_code=2,
+            eval_body='printf \'{"outcome": "not_evaluated"}\' > "${ARTIFACTS}/eval-verdict.json"',
+        )
+        result = self.run_driver(root)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(self.steps(), ["resolve", "deploy", "eval"])
+        self.assertIn("NOT RUN", result.stdout)
+        self.assertNotIn("RED", result.stdout)
+        self.assertIn("could not certify a verdict", result.stdout)
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Verdict | NOT RUN |", summary)
+        self.assertIn("Nothing here is a judgement on the candidate", summary)
+
+    def test_an_exit_2_the_verdict_json_does_not_confirm_is_red(self):
+        """The status is not the proof. `bench-gate case` exits 2 when it could
+        not grade at all (a store that will not load, a bad VERSIONS.json), and
+        ci-eval-pr.sh dies with that status; for a candidate cut before the
+        not-evaluated verdict existed it is the only meaning 2 has. Calling
+        that NOT RUN would tell the reader to rerun when the weather clears,
+        for as long as the store stays broken. Without the JSON's word, RED.
+        """
+        root, _ = self.build_repo(eval_exit_code=2)
+        result = self.run_driver(root)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("RED", result.stdout)
+        self.assertNotIn("NOT RUN", result.stdout)
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Verdict | RED |", summary)
+        # The summary keys its "not measured" paragraph on the verdict, not on
+        # the status: a RED row followed by "rerun when the environment is
+        # healthy" would tell the reader the opposite of the row.
+        self.assertNotIn("could not certify", summary)
+        self.assertNotIn("rerun when the environment is healthy", summary)
+
+    def test_an_exit_2_whose_verdict_json_says_red_is_red(self):
+        root, _ = self.build_repo(
+            eval_exit_code=2,
+            eval_body='printf \'{"outcome": "red"}\' > "${ARTIFACTS}/eval-verdict.json"',
+        )
+        result = self.run_driver(root)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Verdict | RED |", summary)
+        self.assertNotIn("could not certify", summary)
+        self.assertNotIn("rerun when the environment is healthy", summary)
+
+    def test_an_exit_2_whose_verdict_json_is_the_traps_partial_table_is_red(self):
+        """ci-eval-pr.sh's EXIT trap tables the cases graded so far when the
+        run ends after its fan-out began and before its own suite step, in
+        the same two files `bench-gate suite` would have written, with
+        `partial: true` in the JSON. A `bench-gate case` that could not grade
+        in the loop after the fan-out lands there with status 2, and the
+        subset's `outcome` can read `not_evaluated` when one graded case lost
+        every repetition to infrastructure. That is not the run's word for
+        it: the run died on a grading error, and before the trap existed it
+        left no JSON at all and was RED. It stays RED, and the summary says
+        the verdict step was not reached rather than pointing at the table
+        as the run's per-case detail.
+        """
+        root, _ = self.build_repo(
+            eval_exit_code=2,
+            eval_body=(
+                'printf \'{"outcome": "not_evaluated", "partial": true}\' > "${ARTIFACTS}/eval-verdict.json"; '
+                'printf \'# PARTIAL\\n\' > "${ARTIFACTS}/eval-verdict.md"'
+            ),
+        )
+        result = self.run_driver(root)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("RED", result.stdout)
+        self.assertNotIn("NOT RUN", result.stdout)
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Verdict | RED |", summary)
+        self.assertNotIn("could not certify", summary)
+        self.assertNotIn("rerun when the environment is healthy", summary)
+        self.assertIn("did not reach its verdict step", summary)
+        self.assertIn("under\na PARTIAL banner", summary)
+        self.assertNotIn("Per-case detail is in", summary)
+
+    def test_a_deadline_kill_with_a_partial_table_says_the_verdict_step_was_not_reached(self):
+        """The same table after Prow's deadline (143): RED as before, and the
+        summary must not present the trap's partial table as the run's
+        per-case detail beside that RED.
+        """
+        root, _ = self.build_repo(
+            eval_exit_code=143,
+            eval_body=(
+                'printf \'{"outcome": "green", "partial": true}\' > "${ARTIFACTS}/eval-verdict.json"; '
+                'printf \'# PARTIAL\\n\' > "${ARTIFACTS}/eval-verdict.md"'
+            ),
+        )
+        result = self.run_driver(root)
+        self.assertEqual(result.returncode, 143, result.stdout)
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Verdict | RED |", summary)
+        self.assertIn("did not reach its verdict step", summary)
+        self.assertNotIn("Per-case detail is in", summary)
 
     def test_writes_the_target_and_summary_artifacts(self):
         root, candidate = self.build_repo()

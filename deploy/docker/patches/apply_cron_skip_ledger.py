@@ -9,9 +9,15 @@ rather than shipping a half-patched image.
 
 **Must run after ``apply_cron_tick_lock_scope.py``.** Two of the anchors here
 are text that patch inserts — the cross-process ``_job_locks.claim`` guard in
-``tick``, and its counterpart in ``_run_claimed_job`` — so applying this one
-first would fail on a missing anchor rather than silently mis-apply, but the
-ordering is still load-bearing and the Dockerfile records it.
+``_submit_with_guard``, and its counterpart in ``_run_claimed_job`` — so
+applying this one first would fail on a missing anchor rather than silently
+mis-apply, but the ordering is still load-bearing and the Dockerfile records it.
+
+Anchors are derived against v2026.9.14, which lifted the dispatch guard out of
+``tick`` into a module-level ``_submit_with_guard`` (and the fire-claim re-take
+into ``_process_due_job``), moved the missed-window catch-up into
+``cron.jobs._fast_forward_missed_recurring`` over a ``_DueJob`` record, and gave
+the executions table two handoff columns and a third index.
 
 Why each edit is needed is documented in the module docstring of
 ``deploy/docker/patches/cron_skip_ledger.py``. Usage::
@@ -37,6 +43,7 @@ DRIFT_NOTE = (
 # --- cron/executions.py: a fifth terminal status, and per-job retention -----
 
 EXEC_CONSTANTS = '''MAX_TERMINAL_EXECUTIONS = 1000
+HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 '''
 
@@ -53,6 +60,7 @@ from tools.cron_skip_ledger import (  # noqa: E402
     normalize_reason as _normalize_skip_reason,
     prune_terminal_executions as _prune_terminal_executions,
 )
+HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 
 '''
 
@@ -66,21 +74,24 @@ EXEC_CREATE_TABLE = '''    conn.execute(
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
                ('claimed','running','completed','failed','unknown')),
+             handoff_pending INTEGER NOT NULL DEFAULT 0,
+             handoff_started_at REAL,
              claimed_at TEXT NOT NULL,
              started_at TEXT,
              finished_at TEXT,
              error TEXT
            )"""
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
+    add_column_if_missing(
 '''
 
 # The CREATE TABLE gains 'skipped' and skip_reason so a fresh ledger is born
-# migrated. ensure_schema() then sits between the table and the indexes on
-# purpose: it only fires on a ledger that predates this patch, and its rebuild
-# drops the indexes along with the old table, so the CREATE INDEX statements
-# below must run after it.
+# migrated. ensure_schema() then sits between the table and everything that
+# follows it on purpose: it only fires on a ledger that predates this patch,
+# and its rebuild drops the indexes along with the old table, so the CREATE
+# INDEX statements further down must run after it. v2026.9.14's
+# add_column_if_missing calls (the handoff columns) come after it too, so a
+# legacy ledger is rebuilt from the DDL it actually has and then widened.
 EXEC_CREATE_TABLE_PATCHED = '''    conn.execute(
         """CREATE TABLE IF NOT EXISTS executions (
              id TEXT PRIMARY KEY,
@@ -91,6 +102,8 @@ EXEC_CREATE_TABLE_PATCHED = '''    conn.execute(
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
                ('claimed','running','completed','failed','unknown','skipped')),
+             handoff_pending INTEGER NOT NULL DEFAULT 0,
+             handoff_started_at REAL,
              claimed_at TEXT NOT NULL,
              started_at TEXT,
              finished_at TEXT,
@@ -104,19 +117,17 @@ EXEC_CREATE_TABLE_PATCHED = '''    conn.execute(
     # indexes below because its rebuild drops them with the old table. See
     # tools/cron_skip_ledger.py.
     _ensure_skip_schema(conn)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
+    add_column_if_missing(
 '''
 
 EXEC_PRUNE = '''def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
-             ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
+             ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
-        (limit,),
+        (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
     )
 '''
 
@@ -169,10 +180,7 @@ EXEC_NEW_FUNCTIONS_PATCHED = '''def record_skipped_execution(
              _process_start_time(pid), now, now, text, code),
         )
         _prune_unlocked(conn)
-        row = conn.execute(
-            "SELECT * FROM executions WHERE id=?", (execution_id,)
-        ).fetchone()
-    record = _record(row)
+        record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record
 
@@ -202,9 +210,7 @@ def skip_execution(
         if cur.rowcount != 1:
             return None
         _prune_unlocked(conn)
-        record = _record(conn.execute(
-            "SELECT * FROM executions WHERE id=?", (execution_id,)
-        ).fetchone())
+        record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record
 
@@ -214,17 +220,17 @@ def skip_execution(
 # --- cron/scheduler.py: record the six ways a due occurrence is dropped -----
 
 SCHED_IMPORT = (
-    "from cron.executions import create_execution, finish_execution, "
-    "mark_execution_running"
+    "from cron.executions import (\n"
+    "    _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,\n"
+    "    get_execution, mark_execution_handoff_pending, mark_execution_running,\n"
+    "    recover_interrupted_executions)\n"
 )
 
 SCHED_IMPORT_PATCHED = (
     "from cron.executions import (\n"
-    "    create_execution,\n"
-    "    finish_execution,\n"
-    "    mark_execution_running,\n"
-    "    skip_execution,\n"
-    ")\n"
+    "    _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,\n"
+    "    get_execution, mark_execution_handoff_pending, mark_execution_running,\n"
+    "    recover_interrupted_executions, skip_execution)\n"
     "\n"
     "# kube-agents patch: a due occurrence that never ran used to leave nothing\n"
     "# behind but a log line. See tools/cron_skip_ledger.py.\n"
@@ -241,42 +247,36 @@ SCHED_IMPORT_PATCHED = (
 
 # advance_next_runs() has already moved next_run_at for the whole due set by
 # the time any of the three guards below runs, so each one drops the
-# occurrence permanently rather than deferring it.
+# occurrence permanently rather than deferring it. All three live in
+# _submit_with_guard, module-level since v2026.9.14.
 #
-# The trailing _clear_run_claim_best_effort() arrived in v2026.8.19. It is in
-# the anchor because the anchor is verbatim source, not because it separates
-# anything: the near-identical guard on the submit-failure path logs the same
-# two lines, and what keeps this anchor off it is that one's deeper
-# indentation and its `isinstance(submit_err, RuntimeError) and` condition.
-SCHED_SHUTDOWN_GUARD = '''            if _interpreter_shutting_down():
-                logger.warning(
-                    "Job '%s' not dispatched — interpreter is shutting down",
-                    job.get("name", job_id),
-                )
-                _clear_run_claim_best_effort()
-                return None
+# _not_dispatched_shutdown() is a local helper that logs the warning; the
+# submit-failure path calls it too, but from an `else:`-less `if` that is not
+# followed by _clear_run_claim_best_effort(), which is what keeps this anchor
+# off it.
+SCHED_SHUTDOWN_GUARD = '''    if _interpreter_shutting_down():
+        _not_dispatched_shutdown()
+        _clear_run_claim_best_effort()
+        return None
 '''
 
-SCHED_SHUTDOWN_GUARD_PATCHED = '''            if _interpreter_shutting_down():
-                logger.warning(
-                    "Job '%s' not dispatched — interpreter is shutting down",
-                    job.get("name", job_id),
-                )
-                _clear_run_claim_best_effort()
-                # kube-agents patch: next_run_at was advanced for this whole
-                # due set before dispatch, so the occurrence is gone, not
-                # deferred. See tools/cron_skip_ledger.py.
-                record_skip(
-                    job_id,
-                    source="builtin",
-                    reason=SKIP_INTERPRETER_SHUTDOWN,
-                    detail=(
-                        "Interpreter began finalizing before this occurrence "
-                        "could be dispatched; the job was not run and its "
-                        "schedule had already advanced."
-                    ),
-                )
-                return None
+SCHED_SHUTDOWN_GUARD_PATCHED = '''    if _interpreter_shutting_down():
+        _not_dispatched_shutdown()
+        _clear_run_claim_best_effort()
+        # kube-agents patch: next_run_at was advanced for this whole
+        # due set before dispatch, so the occurrence is gone, not
+        # deferred. See tools/cron_skip_ledger.py.
+        record_skip(
+            job_id,
+            source="builtin",
+            reason=SKIP_INTERPRETER_SHUTDOWN,
+            detail=(
+                "Interpreter began finalizing before this occurrence "
+                "could be dispatched; the job was not run and its "
+                "schedule had already advanced."
+            ),
+        )
+        return None
 '''
 
 # The ledger write has to stay OUT of the _running_lock critical section. That
@@ -287,72 +287,70 @@ SCHED_SHUTDOWN_GUARD_PATCHED = '''            if _interpreter_shutting_down():
 # which has returned by the time control reaches the line below, so the write is
 # outside it for free. Keep the constraint in mind if upstream ever inlines the
 # guard again.
-SCHED_RUNNING_GUARD = '''            if not try_register_running_job(job_id):
-                logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                return None
+SCHED_RUNNING_GUARD = '''    if not try_register_running_job(job_id):
+        logger.info("Job '%s' already running — skipping", job_label)
+        return None
 '''
 
-SCHED_RUNNING_GUARD_PATCHED = '''            if not try_register_running_job(job_id):
-                logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                # kube-agents patch: written outside the running-set lock on
-                # purpose — every dispatching thread in this tick takes that
-                # lock, and a ledger write behind a 5s busy timeout inside it
-                # would serialise the whole dispatch pass. Safe here because
-                # try_register_running_job() has already released it. See
-                # tools/cron_skip_ledger.py.
-                record_skip(
-                    job_id,
-                    source="builtin",
-                    reason=SKIP_ALREADY_RUNNING,
-                    detail=(
-                        "A previous run of this job was still in flight in "
-                        "this process when the occurrence came due; the "
-                        "occurrence was dropped, not queued."
-                    ),
-                )
-                return None
+SCHED_RUNNING_GUARD_PATCHED = '''    if not try_register_running_job(job_id):
+        logger.info("Job '%s' already running — skipping", job_label)
+        # kube-agents patch: written outside the running-set lock on
+        # purpose — every dispatching thread in this tick takes that
+        # lock, and a ledger write behind a 5s busy timeout inside it
+        # would serialise the whole dispatch pass. Safe here because
+        # try_register_running_job() has already released it. See
+        # tools/cron_skip_ledger.py.
+        record_skip(
+            job_id,
+            source="builtin",
+            reason=SKIP_ALREADY_RUNNING,
+            detail=(
+                "A previous run of this job was still in flight in "
+                "this process when the occurrence came due; the "
+                "occurrence was dropped, not queued."
+            ),
+        )
+        return None
 '''
 
 # Inserted by apply_cron_tick_lock_scope.py — this applier must run after it.
-SCHED_JOB_LOCK_GUARD = '''            _job_lock = _job_locks.claim(job_id)
-            if _job_lock is None:
-                logger.info(
-                    "Job '%s' already running in another process — skipping",
-                    job.get("name", job_id),
-                )
-                release_running_job(job_id)
-                return None
+SCHED_JOB_LOCK_GUARD = '''    _job_lock = _job_locks.claim(job_id)
+    if _job_lock is None:
+        logger.info(
+            "Job '%s' already running in another process — skipping",
+            job_label,
+        )
+        release_running_job(job_id)
+        return None
 '''
 
-SCHED_JOB_LOCK_GUARD_PATCHED = '''            _job_lock = _job_locks.claim(job_id)
-            if _job_lock is None:
-                logger.info(
-                    "Job '%s' already running in another process — skipping",
-                    job.get("name", job_id),
-                )
-                release_running_job(job_id)
-                # kube-agents patch: distinct from SKIP_ALREADY_RUNNING because
-                # the remedy is distinct — that one says the job outruns its
-                # own period, this one says two tickers are racing for the same
-                # profile. See tools/cron_skip_ledger.py.
-                record_skip(
-                    job_id,
-                    source="builtin",
-                    reason=SKIP_ALREADY_RUNNING_ELSEWHERE,
-                    detail=(
-                        "Another process held this job's run lock when the "
-                        "occurrence came due; the occurrence was dropped, not "
-                        "queued."
-                    ),
-                )
-                return None
+SCHED_JOB_LOCK_GUARD_PATCHED = '''    _job_lock = _job_locks.claim(job_id)
+    if _job_lock is None:
+        logger.info(
+            "Job '%s' already running in another process — skipping",
+            job_label,
+        )
+        release_running_job(job_id)
+        # kube-agents patch: distinct from SKIP_ALREADY_RUNNING because
+        # the remedy is distinct — that one says the job outruns its
+        # own period, this one says two tickers are racing for the same
+        # profile. See tools/cron_skip_ledger.py.
+        record_skip(
+            job_id,
+            source="builtin",
+            reason=SKIP_ALREADY_RUNNING_ELSEWHERE,
+            detail=(
+                "Another process held this job's run lock when the "
+                "occurrence came due; the occurrence was dropped, not "
+                "queued."
+            ),
+        )
+        return None
 '''
 
 SCHED_DISPATCH_CLAIM = '''            finish_execution(
-                execution_id,
-                success=False,
-                error="Dispatch claim rejected; execution was not started.",
-            )
+                execution_id, success=False,
+                error="Dispatch claim rejected; execution was not started.")
             return True  # not an error — already handled/removed
 '''
 
@@ -375,118 +373,111 @@ SCHED_DISPATCH_CLAIM_PATCHED = '''            # kube-agents patch: a one-shot th
 # message text is unique in the file. The write goes after the log call, so
 # ``release_running_job`` and the flock release have both already run — the
 # ordering every other guard keeps, and the one check_shape asserts.
-SCHED_CREATE_EXECUTION_ERR = '''                logger.exception(
-                    "Job '%s' not dispatched: execution creation failed: %s",
-                    job.get("name", job_id),
-                    execution_err,
-                )
-                return None
+SCHED_CREATE_EXECUTION_ERR = '''        logger.exception(
+            "Job '%s' not dispatched: execution creation failed: %s", job_label, execution_err)
+        return None
 '''
 
-SCHED_CREATE_EXECUTION_ERR_PATCHED = '''                logger.exception(
-                    "Job '%s' not dispatched: execution creation failed: %s",
-                    job.get("name", job_id),
-                    execution_err,
-                )
-                # kube-agents patch: next_run_at was advanced for this whole
-                # due set before dispatch, so the occurrence is gone, and the
-                # stack trace above is rotated out of the pod in hours. Written
-                # after the running slot and the flock are released, like every
-                # other guard. A failure of the ledger itself cannot be recorded
-                # this way — record_skip writes to the same file and swallows.
-                # See tools/cron_skip_ledger.py.
-                record_skip(
-                    job_id,
-                    source="builtin",
-                    reason=SKIP_CREATE_EXECUTION_FAILED,
-                    detail=(
-                        "Execution record could not be created before "
-                        f"dispatch ({type(execution_err).__name__}: "
-                        f"{execution_err}); the job was not run and its "
-                        "schedule had already advanced."
-                    ),
-                )
-                return None
+SCHED_CREATE_EXECUTION_ERR_PATCHED = '''        logger.exception(
+            "Job '%s' not dispatched: execution creation failed: %s", job_label, execution_err)
+        # kube-agents patch: next_run_at was advanced for this whole
+        # due set before dispatch, so the occurrence is gone, and the
+        # stack trace above is rotated out of the pod in hours. Written
+        # after the running slot and the flock are released, like every
+        # other guard. A failure of the ledger itself cannot be recorded
+        # this way — record_skip writes to the same file and swallows.
+        # See tools/cron_skip_ledger.py.
+        record_skip(
+            job_id,
+            source="builtin",
+            reason=SKIP_CREATE_EXECUTION_FAILED,
+            detail=(
+                "Execution record could not be created before "
+                f"dispatch ({type(execution_err).__name__}: "
+                f"{execution_err}); the job was not run and its "
+                "schedule had already advanced."
+            ),
+        )
+        return None
 '''
 
-# ``_process_job``, the body ``_run_and_release`` runs on the worker. It
-# re-takes the fire claim at execution time (v2026.8.19) and, when that CAS
-# loses, upstream closes the claimed row as failed. The row is still
-# ``claimed`` here — nothing has marked it running — so ``skip_execution``
-# closes it in place; the ``return True`` that tells the tick the occurrence
-# was handled is unchanged.
-SCHED_FIRE_CLAIM_LOST = '''                finish_execution(
-                    job["execution_id"],
-                    success=False,
-                    error="Fire claim lost; execution was not started.",
-                )
-                return True
+# ``_process_due_job`` (module-level since v2026.9.14; ``tick``'s
+# ``_process_job`` closure delegates to it), the body ``_run_and_release`` runs
+# on the worker. It re-takes the fire claim at execution time (v2026.8.19) and,
+# when that CAS loses, upstream closes the claimed row as failed. The row is
+# still ``claimed`` here — nothing has marked it running — so
+# ``skip_execution`` closes it in place; the ``return True`` that tells the
+# tick the occurrence was handled is unchanged.
+SCHED_FIRE_CLAIM_LOST = '''    if not claimed:
+        finish_execution(
+            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
+        return True
 '''
 
-SCHED_FIRE_CLAIM_LOST_PATCHED = '''                # kube-agents patch: the re-taken fire claim was refused and
-                # this worker stood down without running. Usually another
-                # owner holds a fresh claim — at-most-once working, not a
-                # failure — but claim_job_for_fire also returns False for a
-                # job no longer runnable and for a fire fence that timed out
-                # or could not be opened, and this call site cannot tell them
-                # apart. Closed as failed it inflated the failure rate
-                # cron_health derives from this ledger; closed as skipped the
-                # count of the code is the signal, and upstream's fence log
-                # lines name the infrastructure causes. See
-                # tools/cron_skip_ledger.py.
-                skip_execution(
-                    job["execution_id"],
-                    reason=SKIP_FIRE_CLAIM_LOST,
-                    detail=(
-                        "Fire claim was not obtained at execution time; the "
-                        "execution was not started. Another owner holds a "
-                        "fresh claim, the job is no longer runnable, or the "
-                        "fire fence timed out or could not be opened; the "
-                        "scheduler log names which."
-                    ),
-                )
-                return True
+SCHED_FIRE_CLAIM_LOST_PATCHED = '''    if not claimed:
+        # kube-agents patch: the re-taken fire claim was refused and
+        # this worker stood down without running. Usually another
+        # owner holds a fresh claim — at-most-once working, not a
+        # failure — but claim_job_for_fire also returns False for a
+        # job no longer runnable, for an occurrence the ledger already
+        # shows completed, and for a fire fence that timed out or could
+        # not be opened, and this call site cannot tell them apart.
+        # Closed as failed it inflated the failure rate cron_health
+        # derives from this ledger; closed as skipped the count of the
+        # code is the signal, and upstream's fence log lines name the
+        # infrastructure causes. See tools/cron_skip_ledger.py.
+        skip_execution(
+            job["execution_id"],
+            reason=SKIP_FIRE_CLAIM_LOST,
+            detail=(
+                "Fire claim was not obtained at execution time; the "
+                "execution was not started. Another owner holds a "
+                "fresh claim, the ledger already records this occurrence "
+                "as completed, the job is no longer runnable, or the "
+                "fire fence timed out or could not be opened; the "
+                "scheduler log names which."
+            ),
+        )
+        return True
 '''
 
 # --- cron/jobs.py: the outage that hides itself -----------------------------
 
-JOBS_CATCH_UP = '''                        record_catch_up_occurrence()
-                        # Fall through to due.append(job) — execute once now
+# v2026.9.14 moved the catch-up decision out of get_due_jobs' loop into
+# _fast_forward_missed_recurring(d, grace) over a _DueJob record: the job, its
+# schedule, the stale instant and the scan's ``now`` are attributes of ``d``,
+# and ``return False`` is the "fire once now" fall-through the comment used to
+# mark.
+JOBS_CATCH_UP = '''    record_catch_up_occurrence()
+    return False
 '''
 
-JOBS_CATCH_UP_PATCHED = '''                        record_catch_up_occurrence()
-                        # kube-agents patch: record_catch_up_occurrence() bumps
-                        # one profile-wide integer in a file — no job id, no
-                        # window, no count — so a gateway outage long enough to
-                        # blow the grace window leaves a daily watchdog looking
-                        # as though it ran on schedule. One ledger row per gap,
-                        # not per lost occurrence: a three-hour outage of a
-                        # minute-ly job would otherwise write 180 rows and evict
-                        # the history somebody is reading. The catch-up fire
-                        # itself is recorded separately by the ticker.
-                        # See tools/cron_skip_ledger.py.
-                        try:
-                            from tools.cron_skip_ledger import (
-                                SKIP_MISSED_WINDOW,
-                                missed_window_detail,
-                                record_skip,
-                            )
+JOBS_CATCH_UP_PATCHED = '''    record_catch_up_occurrence()
+    # kube-agents patch: record_catch_up_occurrence() bumps one profile-wide
+    # integer in a file — no job id, no window, no count — so a gateway outage
+    # long enough to blow the grace window leaves a daily watchdog looking as
+    # though it ran on schedule. One ledger row per gap, not per lost
+    # occurrence: a three-hour outage of a minute-ly job would otherwise write
+    # 180 rows and evict the history somebody is reading. The catch-up fire
+    # itself is recorded separately by the ticker.
+    # See tools/cron_skip_ledger.py.
+    try:
+        from tools.cron_skip_ledger import (
+            SKIP_MISSED_WINDOW,
+            missed_window_detail,
+            record_skip,
+        )
 
-                            record_skip(
-                                job["id"],
-                                source="builtin",
-                                reason=SKIP_MISSED_WINDOW,
-                                detail=missed_window_detail(
-                                    schedule, next_run_dt, now, grace
-                                ),
-                            )
-                        except Exception:
-                            logger.debug(
-                                "could not record missed window for job %s",
-                                job.get("id"),
-                                exc_info=True,
-                            )
-                        # Fall through to due.append(job) — execute once now
+        record_skip(
+            d.job["id"],
+            source="builtin",
+            reason=SKIP_MISSED_WINDOW,
+            detail=missed_window_detail(d.schedule, d.next_run_dt, d.scan.now, grace),
+        )
+    except Exception:
+        logger.debug(
+            "could not record missed window for job %s", d.job.get("id"), exc_info=True)
+    return False
 '''
 
 # --- agent/monitoring/cron_health.py: do not launder a skip into "unknown" --
@@ -512,11 +503,7 @@ HEALTH_IMPORT_PATCHED = (
     "from tools.cron_skip_ledger import normalize_reason as _normalize_skip_reason"
 )
 
-HEALTH_ERROR_CLASS = '''        error_class=(
-            classify_cron_error(record.get("error"))
-            if status in {"failed", "unknown"}
-            else None
-        ),
+HEALTH_ERROR_CLASS = '''        error_class=classify_cron_error(record.get("error")) if status in {"failed", "unknown"} else None,
 '''
 
 HEALTH_ERROR_CLASS_PATCHED = '''        error_class=(
@@ -531,31 +518,35 @@ HEALTH_ERROR_CLASS_PATCHED = '''        error_class=(
         ),
 '''
 
-HEALTH_FLUSH = '''        if event.status in {"completed", "failed", "unknown"}:
-            target.flush(timeout=1.0)
-'''
+# v2026.9.14 named the terminal set emit_execution_state flushes on; the
+# flush itself is unchanged, so the set is what gains the fifth status.
+HEALTH_FLUSH = '''_TERMINAL_STATUSES = {"completed", "failed", "unknown"}'''
 
-HEALTH_FLUSH_PATCHED = '''        # kube-agents patch: 'skipped' is terminal, so it crosses the queue
-        # barrier synchronously like the other terminal states — a skip
-        # recorded moments before the gateway exits is exactly the one worth
-        # keeping. See tools/cron_skip_ledger.py.
-        if event.status in {"completed", "failed", "unknown", "skipped"}:
-            target.flush(timeout=1.0)
-'''
+HEALTH_FLUSH_PATCHED = (
+    "# kube-agents patch: 'skipped' is terminal, so it crosses the queue\n"
+    "# barrier synchronously like the other terminal states — a skip\n"
+    "# recorded moments before the gateway exits is exactly the one worth\n"
+    "# keeping. See tools/cron_skip_ledger.py.\n"
+    '_TERMINAL_STATUSES = {"completed", "failed", "unknown", "skipped"}'
+)
 
 # --- tools/cronjob_tools.py: the dispatch path loses occurrences too --------
 #
 # Both refusals in ``_run_claimed_job`` sit after ``claim_job_for_fire`` has
-# advanced ``next_run_at``, so each one drops a scheduled occurrence for a run
-# that never happened — the same shape as the two guards in ``tick`` above, and
-# recorded with the same two reasons.
+# run, so each one refuses a run that was asked for — the same shape as the two
+# guards in ``_submit_with_guard`` above, and recorded with the same two
+# reasons.
 #
 # This became true at v2026.8.13. Before it, upstream had no in-flight dedupe
 # here, and the kube-agents flock was taken *before* the CAS precisely so that a
 # refusal cost nothing. The split into ``_run_claimed_job`` gave the run half
-# four call sites, so the flock had to follow the run; the occurrence loss is
-# the price, and ``tools/cron_skip_ledger.py`` exists to stop that price being
-# paid silently.
+# four call sites, so the flock had to follow the run. Since v2026.9.11 the
+# claim on this path is a ``manual`` one: it stamps the fire claim and
+# re-anchors a recurring job's next_run_at from now, but no occurrence
+# identity, so the refusal does not mark the pending slot done; what is lost
+# is the requested run, and on the background path its error goes to a daemon
+# worker nobody reads. ``tools/cron_skip_ledger.py`` exists to stop that loss
+# being silent.
 #
 # ``source="direct"`` rather than the ``"builtin"`` the tick guards use:
 # ``run_one_job`` — the function these refusals stop us reaching — records its
@@ -564,14 +555,12 @@ HEALTH_FLUSH_PATCHED = '''        # kube-agents patch: 'skipped' is terminal, so
 
 TOOLS_IMPORT = (
     "    resume_job,\n"
-    "    update_job,\n"
-    ")\n"
+    "    update_job)\n"
 )
 
 TOOLS_IMPORT_PATCHED = (
     "    resume_job,\n"
-    "    update_job,\n"
-    ")\n"
+    "    update_job)\n"
     "\n"
     "# kube-agents patch: a dispatched occurrence that never ran used to leave\n"
     "# nothing behind but a return value the caller may not be reading. See\n"
@@ -588,13 +577,13 @@ TOOLS_IMPORT_PATCHED = (
 # does.
 TOOLS_REGISTER_GUARD = (
     "        if not try_register_running_job(job_id):\n"
-    "            return {\n"
+    '            return {"claimed": True, "success": False, "error": _ALREADY_RUNNING_ERROR}\n'
 )
 
 TOOLS_REGISTER_GUARD_PATCHED = (
     "        if not try_register_running_job(job_id):\n"
-    "            # kube-agents patch: the claim above already advanced\n"
-    "            # next_run_at, so this refusal costs a scheduled occurrence.\n"
+    "            # kube-agents patch: the claim above is already taken, so this\n"
+    "            # refusal loses the run that was asked for.\n"
     "            # See tools/cron_skip_ledger.py.\n"
     "            record_skip(\n"
     "                job_id,\n"
@@ -602,11 +591,11 @@ TOOLS_REGISTER_GUARD_PATCHED = (
     "                reason=SKIP_ALREADY_RUNNING,\n"
     "                detail=(\n"
     '                    "A run of this job was already in flight in this "\n'
-    '                    "process when the fire was claimed; the occurrence was "\n'
-    '                    "dropped, not queued."\n'
+    '                    "process when the fire was claimed; the requested run "\n'
+    '                    "was dropped, not queued."\n'
     "                ),\n"
     "            )\n"
-    "            return {\n"
+    '            return {"claimed": True, "success": False, "error": _ALREADY_RUNNING_ERROR}\n'
 )
 
 # Inserted by apply_cron_tick_lock_scope.py — this applier must run after it.
@@ -634,7 +623,7 @@ TOOLS_LOCK_GUARD_PATCHED = (
     "                reason=SKIP_ALREADY_RUNNING_ELSEWHERE,\n"
     "                detail=(\n"
     '                    "Another process held this job\'s run lock when the "\n'
-    '                    "fire was claimed; the occurrence was dropped, not "\n'
+    '                    "fire was claimed; the requested run was dropped, not "\n'
     '                    "queued."\n'
     "                ),\n"
     "            )\n"

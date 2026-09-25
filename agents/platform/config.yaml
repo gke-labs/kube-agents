@@ -95,10 +95,10 @@ mcp_servers:
   # unions the two — but repeating it here keeps this file from reading as if
   # gke were the one server without these settings.
   #
-  # `--header User-Agent: …` names this product and the build it came from, so
-  # the API team serving the endpoint can attribute the traffic;
+  # `--header User-Agent: …` names this product, the build it came from and its
+  # execution mode, so the API team serving the endpoint can attribute the traffic;
   # deploy/shared/defaults/config.yaml carries the full rationale, including
-  # where the version comes from. That merge unions the two arg lists, so this
+  # where the version and the mode come from. That merge unions the two arg lists, so this
   # copy has to stay character-identical to the one there. Drift does not
   # produce two headers, which is the intuitive guess and the wrong one: the
   # union dedups, so the repeated `--header` token collapses and the divergent
@@ -112,7 +112,7 @@ mcp_servers:
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
-      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION}"
+      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
       - "https://container.googleapis.com/mcp"
     lazy: true
     connect_timeout: 30
@@ -131,10 +131,10 @@ mcp_servers:
 # inject_memory_provider_tools() bails unless it is listed, and that injection is
 # the only path by which the provider's tools reach the model. It is on both keys
 # because a kanban worker resolves its toolsets from `cli`
-# (_resolve_worker_cli_toolsets in hermes_cli/kanban_db.py) while the API server
-# path uses `api_server`; a specialist reached either way must see the same
-# memory. Which tools that actually yields is decided by the provider — under
-# `memory.read_only` below it is the two read tools and nothing else.
+# (_resolve_worker_cli_toolsets in hermes_cli/kanban_db_dispatch.py) while the
+# API server path uses `api_server`; a specialist reached either way must see
+# the same memory. Which tools that actually yields is decided by the provider
+# — under `memory.read_only` below it is the two read tools and nothing else.
 #
 # The toolset also surfaces Hermes' own built-in `memory` tool (MEMORY.md /
 # USER.md), whose check_fn is unconditional. It is inert here for the same reason
@@ -168,7 +168,7 @@ toolsets:
 
 # Per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet
 # audits outgrow: the cost audit runs ten checks against every cluster and the
-# drift audit nineteen, plus enumeration, the SOP read, and the publish harness.
+# drift audit twenty, plus enumeration, the SOP read, and the publish harness.
 # Three separate runs died on `Iteration budget exhausted (90/90)` — reported as
 # a `timed_out` kanban event, though the run was actively heartbeating and no
 # clock ran out. 250 is roughly triple the observed near-miss.

@@ -16,6 +16,10 @@
 
 set -Eeuo pipefail
 
+# This script's own name, for the abort banner when it runs piped through
+# stdin (curl | bash): bash then has no file to name its frames after.
+UPGRADE_SCRIPT_NAME="upgrade.sh"
+
 # ANSI Color Tokens
 C_CYAN="\033[1;36m"
 C_GREEN="\033[1;32m"
@@ -48,6 +52,9 @@ PARAM_KEEP_IMAGE_TAG="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
+# Empty means "whatever the loaded configuration says", which is how this ran
+# before the flag existed: the namespace came from install.env alone.
+PARAM_AGENT_NAMESPACE=""
 PARAM_IMAGE_TAG="${IMAGE_TAG:-${BAKED_RELEASE_VERSION:-}}"
 TEMP_REPO_DIR=""
 
@@ -62,7 +69,30 @@ on_error() {
   local exit_code="$1"
   local line_no="$2"
   local bash_cmd="$3"
-  echo -e "\n${C_RED}${C_BOLD}✗ Upgrade error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}${C_RESET}" >&2
+  # An inherited firing inside a subshell: `set -E` hands this trap to every
+  # `$(...)`, and a probe whose miss the caller handles (`if !`, `||`) still
+  # fires it there on bash 3.2 (macOS's /bin/bash) before the caller is
+  # consulted. The parent decides: it prints the banner and writes the report
+  # itself when the failure reaches it, and nothing when it is handled. Exit,
+  # not return: command substitution does not inherit errexit, so a returning
+  # handler would let a multi-step probe run on past its failure. Process
+  # substitution (`< <(...)`) keeps the counter at 0 on bash 3.2 and clears
+  # the trap inline instead.
+  if [ "${BASH_SUBSHELL:-0}" -gt 0 ]; then
+    exit "$exit_code"
+  fi
+  # The frame that ran the failing command: a sourced library's file and the
+  # function it was in, or this script and `main` at top level. $LINENO alone
+  # counts from the top of whichever file the command sat in, so a bare line
+  # number sent the reader to that line of upgrade.sh instead. Piped through
+  # stdin, bash labels this script's frames `main` or not at all, and $0 is
+  # `bash`; both read as the script by name.
+  local source_file="${BASH_SOURCE[1]:-}"
+  case "$source_file" in
+    ""|main) source_file="$UPGRADE_SCRIPT_NAME" ;;
+  esac
+  local func_name="${FUNCNAME[1]:-main}"
+  echo -e "\n${C_RED}${C_BOLD}✗ Upgrade error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}${C_RESET}" >&2
   write_report "FAILED" 2>/dev/null || true
   # A tfvars the generator was midway through writing is mode 600, carries
   # every secret this run was given, and is named one character from the file
@@ -115,9 +145,11 @@ Options:
                            install's real Terraform state. Changes nothing.
                            Exit 0 = in sync, 2 = there are changes, 1 = error.
   --dry-run                Preview upgrade plan and configuration state without touching cloud resources
-  --project-id ID          GCP Target Project ID
-  --cluster-name NAME      GKE Target Cluster Name
-  --region REGION          GKE GCP Region
+  --gcp-project-id ID      GCP Target Project ID
+  --gke-cluster-name NAME  GKE Target Cluster Name
+  --gcp-region REGION      GKE GCP Region
+  --agent-namespace NS     Kubernetes namespace the release lives in
+                           (default: the install's own, else kubeagents-system)
   --image-tag TAG          Validated immutable release tag or full commit SHA (required)
   --keep-image-tag         Upgrade everything except the images, leaving them on
                            the tag the install already serves. Use instead of
@@ -126,7 +158,7 @@ Options:
 
 Examples:
   # Perform full atomic upgrade of harness, operator, and skills
-  ./upgrade.sh --non-interactive --project-id="my-gcp-project" --cluster-name="platform-agent-host"
+  ./upgrade.sh --non-interactive --gcp-project-id="my-gcp-project" --gke-cluster-name="platform-agent-host"
 
   # Dry-run upgrade preview
   ./upgrade.sh --dry-run --upgrade-mode=full
@@ -334,6 +366,68 @@ matches_release_bundle_ref() {
   return 1
 }
 
+# Sets RECORDED_PLUGIN_IMAGE_TAG_KEYS to the Helm keys, one per line, of the
+# plugin image tags the release's user-supplied values record
+# (`plugins.<name>.image.tag`), for the harness step to re-tag with the agent
+# and sandbox tags. Read from the recorded values rather than from the enabled
+# flags because the composition records the tag for a disabled plugin too;
+# derived from the values rather than from a list of plugin names so that a
+# plugin added to the chart and the composition is covered without a change
+# here. The chart the keys are applied to is pinned to this script's commit by
+# the source check, so its `plugins` block matches.
+#
+# A read that fails is an error, not an empty list: an empty list would run
+# the pre-fix re-tag and leave the plugin images behind, with the omission
+# surfacing only from the image check after the Helm move. It assigns rather
+# than prints, as gke_dns_endpoint_flag does, so that the caller runs it as a
+# plain command: print_error writes to stdout, which a command substitution
+# would swallow, and under `set -E` the ERR trap would fire in the
+# substitution's subshell and again in the parent. `trap - ERR` inside its own
+# substitutions for the same reason, on bash 3.2 in particular. Arguments:
+# release, namespace.
+RECORDED_PLUGIN_IMAGE_TAG_KEYS=""
+recorded_plugin_image_tag_keys() {
+  local release="$1" namespace="$2" values keys stderr_file
+  RECORDED_PLUGIN_IMAGE_TAG_KEYS=""
+  # stderr kept apart from the JSON: Helm writes warnings there on successful
+  # commands too (a group-readable kubeconfig, for one), and merged into the
+  # capture they would break the jq parse of values that are fine.
+  stderr_file="$(mktemp)"
+  if ! values="$(trap - ERR; helm get values "$release" -n "$namespace" -o json 2>"$stderr_file")"; then
+    print_error "Could not read the values of Helm release '${release}' in '${namespace}' to find the plugin image tags: $(cat "$stderr_file")"
+    rm -f "$stderr_file"
+    return 1
+  fi
+  if ! keys="$(trap - ERR; jq -r '(.plugins // {}) | if type == "object" then to_entries[] | select(((.value.image.tag? // "") | tostring) != "") | "plugins.\(.key).image.tag" else error("plugins is not an object") end' <<<"$values" 2>"$stderr_file")"; then
+    print_error "Could not read the plugin image tags from the values of Helm release '${release}': $(cat "$stderr_file")"
+    rm -f "$stderr_file"
+    return 1
+  fi
+  rm -f "$stderr_file"
+  RECORDED_PLUGIN_IMAGE_TAG_KEYS="$keys"
+}
+
+# Sets HARNESS_RETAG_KEYS, the Helm keys the harness step re-tags: the agent
+# and sandbox tags, then every plugin tag the release records. A function of
+# its own so the assembly runs under test with a stub helm, rather than being
+# pinned by the text of the case branch. A read loop rather than the bash 4
+# array builtin: operators run this from macOS, whose bash is 3.2. Arguments:
+# release, namespace.
+HARNESS_RETAG_KEYS=()
+harness_retag_keys() {
+  local release="$1" namespace="$2" key
+  HARNESS_RETAG_KEYS=("platformAgent.deployment.image.tag" "agentSandbox.image.tag")
+  recorded_plugin_image_tag_keys "$release" "$namespace"
+  # An if, not `[ -n ] &&`: with nothing recorded the here-string is one empty
+  # line, the test fails, the loop's status is that failure, and under
+  # `set -e` the harness step would stop on an install with no plugins.
+  while IFS= read -r key; do
+    if [ -n "$key" ]; then
+      HARNESS_RETAG_KEYS+=("$key")
+    fi
+  done <<<"$RECORDED_PLUGIN_IMAGE_TAG_KEYS"
+}
+
 # The two refusals that do not need a ref to make sense: an unversioned source
 # directory, and a dirty one. Split out of verify_local_source_ref because a
 # tagless run still applies this checkout's Terraform and charts to a live
@@ -430,12 +524,14 @@ parse_args() {
       --plan) PARAM_PLAN="true"; shift ;;
       --keep-image-tag) PARAM_KEEP_IMAGE_TAG="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
-      --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
-      --project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
-      --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
-      --cluster-name) PARAM_CLUSTER_NAME="$2"; shift 2 ;;
-      --region=*) PARAM_REGION="${1#*=}"; shift ;;
-      --region) PARAM_REGION="$2"; shift 2 ;;
+      --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
+      --gcp-project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
+      --gke-cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
+      --gke-cluster-name) PARAM_CLUSTER_NAME="$2"; shift 2 ;;
+      --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
+      --gcp-region) PARAM_REGION="$2"; shift 2 ;;
+      --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
+      --agent-namespace) PARAM_AGENT_NAMESPACE="$2"; shift 2 ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
       --image-tag) PARAM_IMAGE_TAG="$2"; shift 2 ;;
       --help|-h) show_help; exit 0 ;;
@@ -580,6 +676,12 @@ main() {
   print_info "Target Image Tag: ${C_BOLD}${PARAM_IMAGE_TAG}${C_RESET}"
 
   local required_tools=(gcloud kubectl helm)
+  # jq: the harness step's plugin re-tag reads the release's values with it,
+  # and the post-upgrade image check that harness and full modes run has
+  # needed it all along. The operator step does neither.
+  if [ "$PARAM_UPGRADE_MODE" != "operator" ]; then
+    required_tools+=(jq)
+  fi
   if [ "$PARAM_UPGRADE_MODE" = "full" ]; then
     required_tools+=(terraform)
   fi
@@ -638,7 +740,7 @@ main() {
     target_project="$(gcloud config get-value project 2>/dev/null || true)"
   fi
   if [ -z "$target_project" ]; then
-    print_error "A GCP project is required. Pass --project-id or configure one with gcloud."
+    print_error "A GCP project is required. Pass --gcp-project-id or configure one with gcloud."
     exit 1
   fi
 
@@ -715,7 +817,11 @@ main() {
   # shellcheck disable=SC2086
   gcloud container clusters get-credentials "$target_cluster" --location="$target_region" --project="$target_project" $GKE_DNS_ENDPOINT_FLAG
 
-  local target_namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+  # --agent-namespace beats the loaded configuration for this run, the way the
+  # three coordinates above do. Empty falls through to install.env's NAMESPACE
+  # and then to DEFAULT_NAMESPACE, which is what every run did before the flag.
+  local target_namespace="${PARAM_AGENT_NAMESPACE:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
+  export NAMESPACE="$target_namespace"
 
   if [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_PLAN" = "true" ]; then
     # A PLAN's reference point is Terraform state, not the cluster, so the tag
@@ -882,7 +988,13 @@ main() {
       # at the same commit, and the shell the agent reaches over ssh is the
       # half that runs the new tools. Retagging the agent alone leaves the
       # StatefulSet on the previous image.
-      helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag"
+      # The plugin images move with them for the same reason, when the
+      # release records them: the operator renders them into the gateway as
+      # stage-<plugin> init containers or plugin-<name> image volumes, and
+      # the image check below reads both. A plain call, not a substitution: a
+      # failed read stops the run here, once, with its own message shown.
+      harness_retag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"
+      helm_retag "${HARNESS_RETAG_KEYS[@]}"
       print_success "Platform Agent deployment upgraded successfully!"
       ;;
 

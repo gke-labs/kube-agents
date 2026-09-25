@@ -31,10 +31,12 @@ and then allowed to close the card with just that. A worker holding a 5.5 KB
 answer follows the schema and throws it away.
 
 Worse, ``summary`` cannot carry a report even if a worker tries: the kernel
-writes the completion event as (``hermes_cli/kanban_db.py``)::
+writes the completion event as (``hermes_cli/kanban_db.py``, ``complete_task``
+handing ``_completed_event_payload`` the summary)::
 
-    ev_summary = (summary if summary is not None else result) or ""
-    ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
+    handoff_summary = summary if summary is not None else result
+    ...
+    "summary": _first_line(event_summary, 400) or None
 
 First line only, 400 characters, no ellipsis. The chat notifier reads that field
 and nothing else, so a multi-line summary loses everything after line one
@@ -101,7 +103,7 @@ whatever it contains" for the life of the process.
 On the worker path that was harmless by accident. ``dispatch_in_gateway`` moves
 the *dispatcher loop* into the gateway, not the worker —
 ``gateway/kanban_watchers.py``'s ``_kanban_dispatcher_watcher`` calls
-``kanban_db.dispatch_once`` with no ``spawn_fn``, so ``_default_spawn`` still
+``kanban_db_dispatch.dispatch_once`` with no ``spawn_fn``, so ``_default_spawn`` still
 ``subprocess.Popen``s ``hermes -p <profile> chat -q "work kanban task t_…"``.
 One process per dispatch means the set holds one id and dies with the attempt
 that created it.
@@ -323,11 +325,13 @@ NEW_RESULT_DESCRIPTION = (
     "lives, because Google Chat drops tables."
 )
 
+# Upstream's ``_handle_complete`` has raised the check through ``_check`` (a
+# ``_Reject`` the ``_kanban_handler`` wrapper renders as a tool error) since
+# v2026.9.14; the replacement returns ``tool_error`` directly, which the same
+# wrapper passes through unchanged.
 OLD_GATE = (
-    "    if not (summary or result):\n"
-    "        return tool_error(\n"
-    "            \"provide at least one of: summary (preferred), result\"\n"
-    "        )\n"
+    "    _check(summary or result, "
+    "\"provide at least one of: summary (preferred), result\")\n"
 )
 
 # ``summary`` is folded separately because ``require_result`` only owns

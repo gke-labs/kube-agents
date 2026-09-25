@@ -1,6 +1,6 @@
 ---
 name: uninstall-kube-agents
-description: Discovers and removes provisioned kube-agents GCP/GKE infrastructure.
+description: Uninstall kube-agents (the Kubernetes Agentic Harness) — discover and remove the GCP/GKE infrastructure an install provisioned. Use when asked to uninstall, remove, or tear down kube-agents from a project or cluster.
 ---
 
 # Uninstall Kubernetes Agentic Harness (kube-agents)
@@ -14,9 +14,9 @@ To run the project teardown non-interactively:
 ```bash
 curl -fsSL https://gke-labs.github.io/kube-agents/uninstall.sh | bash -s -- \
   --non-interactive \
-  --project-id="<PROJECT_ID>" \
-  --cluster-name="<CLUSTER_NAME>" \
-  --region="<REGION>"
+  --gcp-project-id="<PROJECT_ID>" \
+  --gke-cluster-name="<CLUSTER_NAME>" \
+  --gcp-region="<REGION>"
 ```
 
 The engine is `lifecycle.sh destroy` in `terraform/examples/full-install`, run against the

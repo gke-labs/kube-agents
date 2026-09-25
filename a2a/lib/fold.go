@@ -5,13 +5,56 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// TasksStream is the JetStream stream holding a2a.tasks.> (provisioned by the
-// deployment, W2).
-const TasksStream = "TASKS"
+const (
+	// TasksStream is the JetStream stream holding a2a.tasks.> (provisioned by
+	// the deployment, W2).
+	TasksStream = "TASKS"
+
+	// EphemeralConsumerInactiveThreshold is how long the server keeps an
+	// ephemeral consumer this module creates on TASKS after its last client
+	// went away. TasksGet sets it on the replay's ordered consumer and the
+	// worker adapter sets it on a session's named consumers, so the two
+	// reap on the same clock.
+	//
+	// It is set explicitly because nats.go's ordered-consumer default is five
+	// MINUTES (v1.53.1, jetstream/ordered.go:635; the caller's value replaces
+	// it only when non-zero, :646), and stopping an ordered iterator never
+	// deletes the consumer behind it (orderedSubscription.Stop, :364). With
+	// the default in place every tasks/get left a consumer on TASKS for five
+	// minutes, so the count tracked the call rate over that window rather
+	// than the replays in flight, against a max_consumers sized for the
+	// latter (#1739).
+	//
+	// The threshold is the only cleanup: TasksGet does not delete the
+	// consumer it creates, and must not be made to. The delete is a publish
+	// on $JS.API.CONSUMER.DELETE.TASKS.*, a subject the rendered bridge
+	// grant withholds, and a refused publish on a request subject gets no
+	// reply at all -- the caller blocks to its own deadline while the
+	// violation arrives out of band, on the connection's async error
+	// handler. Both halves were measured: re-adding a synchronous delete
+	// here takes a replay from 0.11s to 30.07s and logs one Error-level
+	// permissions violation per call, which is the line an operator is
+	// taught to read as a missing grant.
+	//
+	// Widening the grant instead is the fix that suggests itself, and it is
+	// worse than the leak it closes. A wildcard is the only form on offer:
+	// nats.go names an ordered consumer <prefix>_<serial> and bumps the
+	// serial on every reset (v1.53.1, jetstream/ordered.go:629), so no
+	// exact-name grant can cover one. And DELETE.TASKS.* is a wildcard over
+	// consumer names, not over the consumers its holder created, so it would
+	// hand everything carrying the bridge password delete on any consumer on
+	// TASKS -- the gateway's own gateway-relay durable included. That is the
+	// same argument sessionConsumer makes for MSG.NEXT in the worker adapter
+	// (adapter.go:816), and the stated reason the adapter uses named
+	// consumers rather than ordered ones. Reclaim the slot sooner by
+	// shortening this constant, not by adding a delete or a grant.
+	EphemeralConsumerInactiveThreshold = 5 * time.Second
+)
 
 // Task is the A2A Task materialized by folding a task's event stream —
 // tasks/get with no live executor required.
@@ -28,6 +71,38 @@ type Task struct {
 	// metric by the caller, never allowed to disturb the terminal state or
 	// kill the fold.
 	PostFinalDropped int
+	// FinalMessage is the terminal status-update's message, when it carried
+	// one. The executors write their reason there (`reason: <token>[ -
+	// detail]`), and a reader classifying a failed terminal needs it from
+	// the fold as much as from the live event.
+	FinalMessage *Message
+	// SubmittedMissing reports that the first event folded was not a
+	// `submitted` status-update — assertion 9's observation, the sibling of
+	// PostFinalDropped for assertion 10.
+	//
+	// Surfaced like it but NOT counted like it: TasksGet logs it, and does
+	// not add it to protocolViolations. PostFinalDropped counts a publisher
+	// breaking the protocol; the common cause of this one is TASKS' own
+	// per-subject limit doing exactly what it was configured to do, and a
+	// counter that rises when our own retention policy works is a counter
+	// nobody can alert on.
+	//
+	// It exists because the head of a task's history can now go missing
+	// without anything else saying so. TASKS carries a per-subject message
+	// limit with discard=old, so a task that outruns it loses its OLDEST
+	// events first, and its oldest event is exactly the `submitted` one.
+	// Without this field a truncated replay is a short history that reads
+	// like a real one; with it, the degradation is observable at the reader.
+	//
+	// Truncation is not the only way to set it. A task whose executor died
+	// before publishing anything replays as its supervisor's synthesized
+	// terminal alone, and that is also a history that does not start at
+	// `submitted`. The field says what was observed — the head is not
+	// there — and does not claim to know which.
+	//
+	// Never set on an empty fold: no events is not a missing head, it is a
+	// task with nothing on the stream, which the caller can already see.
+	SubmittedMissing bool
 }
 
 // Artifact returns the merged artifact with the given name, or nil.
@@ -46,7 +121,10 @@ func (t *Task) Artifact(name string) *Artifact {
 // surfaces them as a warning and a metric; the fold survives.
 func FoldTask(taskID string, events []*Envelope) (*Task, error) {
 	task := &Task{ID: taskID}
-	for _, env := range events {
+	for i, env := range events {
+		if i == 0 {
+			task.SubmittedMissing = !isSubmittedEvent(env)
+		}
 		if env.TaskID != taskID {
 			return nil, &ProtocolError{Msg: fmt.Sprintf("event for task %q on task %q's stream", env.TaskID, taskID)}
 		}
@@ -76,6 +154,9 @@ func FoldTask(taskID string, events []*Envelope) (*Task, error) {
 			task.State = s.Status.State
 			task.Final = s.Final
 			task.StatusHistory = append(task.StatusHistory, s.Status.State)
+			if s.Final {
+				task.FinalMessage = s.Status.Message
+			}
 		case KindArtifactUpdate:
 			var a ArtifactUpdate
 			if err := json.Unmarshal(env.Payload, &a); err != nil {
@@ -90,6 +171,25 @@ func FoldTask(taskID string, events []*Envelope) (*Task, error) {
 		}
 	}
 	return task, nil
+}
+
+// isSubmittedEvent reports whether this envelope is the `submitted`
+// status-update assertion 9 requires a task's history to open with.
+//
+// A malformed payload answers false rather than raising: FoldTask reaches its
+// own parse below and reports the malformation as the ProtocolError it is, and
+// this must not pre-empt that with a worse-scoped error. False is also the
+// right answer on its own terms — an event nobody can parse is not a readable
+// `submitted`.
+func isSubmittedEvent(env *Envelope) bool {
+	if env == nil || env.Kind != KindStatusUpdate {
+		return false
+	}
+	var s StatusUpdate
+	if err := json.Unmarshal(env.Payload, &s); err != nil {
+		return false
+	}
+	return s.Status.State == StateSubmitted
 }
 
 // mergeArtifact applies one artifact-update: append chunks extend the
@@ -131,11 +231,26 @@ func TaskReplaySubjects(addressee, taskID string) []string {
 // wherever the stream put it, and whichever came second is the post-final
 // drop.
 func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task, error) {
+	task, _, err := c.tasksGet(ctx, addressee, taskID)
+	return task, err
+}
+
+// TasksGetAttributed is TasksGet plus the subject the terminal arrived on:
+// the task's events subject when an executor wrote it, its supervisor
+// subject when the gateway did, "" when the task is not final. The subject
+// rides beside the Task rather than in it, because a Task is the fold of
+// bare envelopes and the live fold and the replay must stay equal (assertion
+// 11); which subject carried the terminal is a fact about the replay.
+func (c *Client) TasksGetAttributed(ctx context.Context, addressee, taskID string) (*Task, string, error) {
+	return c.tasksGet(ctx, addressee, taskID)
+}
+
+func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task, string, error) {
 	_, js := c.conn()
 	subjects := TaskReplaySubjects(addressee, taskID)
 	stream, err := js.Stream(ctx, TasksStream)
 	if err != nil {
-		return nil, fmt.Errorf("stream %s: %w", TasksStream, err)
+		return nil, "", fmt.Errorf("stream %s: %w", TasksStream, err)
 	}
 	// Snapshot the replay horizon first: fold what the stream holds now, and
 	// terminate deterministically even while the task is still emitting.
@@ -149,7 +264,7 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 			if errors.Is(err, jetstream.ErrMsgNotFound) {
 				continue
 			}
-			return nil, fmt.Errorf("replay horizon for %s: %w", taskID, err)
+			return nil, "", fmt.Errorf("replay horizon for %s: %w", taskID, err)
 		}
 		found = true
 		if msg.Sequence > last {
@@ -160,18 +275,19 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 		// No events in the retention window: the A2A answer is
 		// TaskNotFound, not an empty Task indistinguishable from a broken
 		// one.
-		return nil, &A2AError{Code: CodeTaskNotFound, Message: fmt.Sprintf("task %q has no events in the retention window", taskID)}
+		return nil, "", &A2AError{Code: CodeTaskNotFound, Message: fmt.Sprintf("task %q has no events in the retention window", taskID)}
 	}
 	cons, err := js.OrderedConsumer(ctx, TasksStream, jetstream.OrderedConsumerConfig{
-		FilterSubjects: subjects,
-		DeliverPolicy:  jetstream.DeliverAllPolicy,
+		FilterSubjects:    subjects,
+		DeliverPolicy:     jetstream.DeliverAllPolicy,
+		InactiveThreshold: EphemeralConsumerInactiveThreshold,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("ordered consumer for %s: %w", taskID, err)
+		return nil, "", fmt.Errorf("ordered consumer for %s: %w", taskID, err)
 	}
 	it, err := cons.Messages()
 	if err != nil {
-		return nil, fmt.Errorf("replay messages for %s: %w", taskID, err)
+		return nil, "", fmt.Errorf("replay messages for %s: %w", taskID, err)
 	}
 	defer it.Stop()
 	// it.Next does not observe ctx on its own; stopping the iterator is what
@@ -179,17 +295,21 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 	stopWatch := context.AfterFunc(ctx, it.Stop)
 	defer stopWatch()
 	var events []*Envelope
+	// One subject per folded event, in step with events: FoldTask sees only
+	// envelopes, and the subject of the terminal is what tells an executor's
+	// word from the supervisor's after the fold.
+	var eventSubjects []string
 	for {
 		msg, err := it.Next()
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, fmt.Errorf("replay for %s: %w", taskID, ctx.Err())
+				return nil, "", fmt.Errorf("replay for %s: %w", taskID, ctx.Err())
 			}
-			return nil, fmt.Errorf("replay next for %s: %w", taskID, err)
+			return nil, "", fmt.Errorf("replay next for %s: %w", taskID, err)
 		}
 		meta, err := msg.Metadata()
 		if err != nil {
-			return nil, fmt.Errorf("replay metadata for %s: %w", taskID, err)
+			return nil, "", fmt.Errorf("replay metadata for %s: %w", taskID, err)
 		}
 		subject := msg.Subject()
 		env, err := ParseEnvelope(msg.Data())
@@ -217,6 +337,7 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 				c.log.Warn("a2a replay folding envelope whose writer disagrees with its subject (advisory)", "subject", subject, "err", aerr)
 			}
 			events = append(events, env)
+			eventSubjects = append(eventSubjects, subject)
 		}
 		// Two exits: the snapshotted horizon, or nothing left pending — the
 		// horizon message itself may have aged out between snapshot and
@@ -227,14 +348,48 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 	}
 	task, err := FoldTask(taskID, events)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	terminalSubject := ""
+	if task.Final {
+		terminalSubject = finalSubject(events, eventSubjects)
 	}
 	if task.PostFinalDropped > 0 {
 		c.protocolViolations.Add(int64(task.PostFinalDropped))
 		c.log.Warn("a2a events after final dropped from fold",
 			"task", taskID, "dropped", task.PostFinalDropped)
 	}
-	return task, nil
+	if task.SubmittedMissing {
+		// Not a protocol violation and not counted as one — see the
+		// field. The line is the whole point of the field: without it a
+		// replay whose head was evicted is a short history that reads
+		// like a complete one.
+		opensAt := "<no status event>"
+		if len(task.StatusHistory) > 0 {
+			opensAt = string(task.StatusHistory[0])
+		}
+		c.log.Warn("a2a task replayed without its submitted event",
+			"task", taskID, "events", len(events), "opensAt", opensAt)
+	}
+	return task, terminalSubject, nil
+}
+
+// finalSubject is the subject of the event that made the fold final: the
+// first final status-update in stream order, which is the one FoldTask
+// honoured (everything after it is a post-final drop). The envelopes were
+// already parsed once by FoldTask, which rejected any malformed one, so the
+// second parse here cannot fail on anything the fold accepted.
+func finalSubject(events []*Envelope, subjects []string) string {
+	for i, env := range events {
+		if env.Kind != KindStatusUpdate {
+			continue
+		}
+		var s StatusUpdate
+		if err := json.Unmarshal(env.Payload, &s); err == nil && s.Final {
+			return subjects[i]
+		}
+	}
+	return ""
 }
 
 // ValidateArtifacts enforces assertion 18: a completed task carries at least

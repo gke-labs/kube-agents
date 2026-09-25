@@ -1187,7 +1187,8 @@ profile config knows which case it is in.
 `memory_is_read_only()` reads `memory.read_only` through `load_config()`, which
 resolves via `HERMES_HOME` and is therefore profile-scoped — a kanban worker is
 launched with `HERMES_HOME` pointed at `profiles/platform`
-(`hermes_cli/kanban_db.py`). It **defaults to False**: a profile that says nothing
+(`hermes_cli/kanban_db_dispatch.py`, `env["HERMES_HOME"] = profile_home`). It
+**defaults to False**: a profile that says nothing
 keeps its write tools, and a config read that raises does not silently disarm the
 front door.
 

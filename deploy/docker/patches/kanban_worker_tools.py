@@ -23,13 +23,13 @@ the ``kanban`` toolset to create cards.
 
 ``agents/chat/SOUL.md`` §1.5 already states the boundary in prose:
 
-    Never call ``kanban_complete``, ``kanban_block``, ``kanban_heartbeat``, or
-    ``kanban_link`` — those belong to the specialist actually doing the work,
-    not the front door.
+    Never call ``kanban_complete``, ``kanban_block``, ``kanban_heartbeat``,
+    ``kanban_link``, ``kanban_request_review``, or ``kanban_request_changes`` —
+    those belong to the specialist actually doing the work, not the front door.
 
 Prose is not free. Hermes has no per-tool denylist — ``agent.disabled_toolsets``
-is toolset-level, and ``_strip_blocked_tools`` in ``tools/delegate_tool.py`` is
-scoped to delegation — so those schemas ship on every single front-door model
+is toolset-level, and ``_strip_blocked_tools`` in
+``tools/delegate_tool_toolsets.py`` is scoped to delegation — so those schemas ship on every single front-door model
 call and the rule has to be re-read and re-obeyed each time. Measured with
 ``hermes prompt-size`` on 2026-08-05, the tools below cost the Chat Agent
 **10,041 characters (~2,510 tokens) per call** for capabilities it is forbidden
@@ -47,12 +47,38 @@ tool                    chars
 ``kanban_attachments``     728
 ======================  ======
 
+v2026.9.14 added two more to the same family, ``kanban_request_review`` and
+``kanban_request_changes``. Both open with upstream's ``_worker_guard`` — the
+delegated-child rejection, the task-id requirement and
+``_enforce_worker_task_ownership`` — which is a no-op for a process with no
+``HERMES_KANBAN_TASK``, so an orchestrator profile offered either schema could
+call it against any card. They join the list; their schema cost was not part
+of the 2026-08-05 measurement.
+
+Hiding them costs the front door no part of the review flow, because upstream
+never gave the card's creator a role in it. ``kanban_request_review`` parks the
+card in ``review``; the dispatcher's review lane (``kanban.review_dispatch``,
+default on) then claims it from ``review`` for a *reviewer worker* -- the
+``reviewer=`` profile, else the assignee, with the bundled ``sdlc-review`` skill
+force-loaded -- and that worker approves with ``kanban_complete`` or returns
+the card with ``kanban_request_changes``. ``kanban_db.request_changes`` refuses
+anything else: it requires the card to be ``running`` under a run whose
+``claimed`` event says ``source_status == "review"``, so an orchestrator
+calling it against a card sitting in ``review`` gets ``task is not in an active
+review run`` whether or not the schema is offered. The human overrides are
+CLI-only (``hermes kanban complete`` approves; ``hermes kanban reopen-review``
+sends back). The creator sees the outcome the way it sees any other: the
+reviewer's approval completes the card and its result posts to the thread.
+Whether a ``review_requested`` / ``changes_requested`` event wakes the creator
+is ``kanban.wake_on_events``' to say (``gateway/kanban_notifier.py``), and the
+deployed ``agents/chat/config.yaml`` lists the failure kinds only.
+
 ``check_kanban_worker_mode`` supplies the missing third gate. Nothing changes
 for a worker: the dispatcher sets ``HERMES_KANBAN_TASK`` before spawning it
-(``hermes_cli/kanban_db.py``, ``_default_spawn``), so a worker keeps every tool
-it has today. Orchestrator profiles keep ``kanban_create``, ``kanban_show``,
-``kanban_list``, ``kanban_comment`` and ``kanban_unblock`` — exactly the surface
-SOUL.md permits them.
+(``hermes_cli/kanban_db_dispatch.py``, ``_default_spawn``), so a worker keeps
+every tool it has today. Orchestrator profiles keep ``kanban_create``,
+``kanban_show``, ``kanban_list``, ``kanban_comment`` and ``kanban_unblock`` —
+exactly the surface SOUL.md permits them.
 
 A cron run is deliberately treated as *not* a worker's own card here, which is
 consistent with ``tools/cron_run_scope.py``: a dispatched run borrows the
@@ -69,22 +95,24 @@ _is_delegated_child_context(): return False``, and
 ``model_tools._compute_tool_definitions`` skips its ``HERMES_KANBAN_TASK``
 force-add of the ``kanban`` toolset for the same reason. Reading only the env
 var made this the one kanban gate in the file that answered *True* for a child —
-exactly inverted, since the child was then the only caller offered the seven
+exactly inverted, since the child was then the only caller offered the nine
 tools below and none of the five an orchestrator keeps.
 
 Nothing reaches that inversion today, and it is worth being precise about why,
 because the reason lives in a file nobody editing this one would think to read.
-``tools/delegate_tool.py`` blocks the toolset twice over: ``_strip_blocked_tools``
-adds ``kanban`` to the names it removes from the child's inherited toolsets, and
-``child_disabled_toolsets`` appends ``"kanban"`` unconditionally, so a child's
+``tools/delegate_tool_toolsets.py`` blocks the toolset twice over:
+``_strip_blocked_tools`` adds ``kanban`` to the names it removes from the
+child's inherited toolsets, and ``child_disabled_toolsets`` appends
+``"kanban"`` unconditionally, so a child's
 tool assembly contains no kanban tool and never evaluates this gate at all.
 Measured in the image on 2026-08-08 against the child's real shape
 (``enabled=[kanban, web]``, ``disabled=[kanban]``): zero kanban tools. Remove the
-strip and the same child is handed precisely the seven. Had one ever been
-called, six would have been refused anyway — ``_reject_delegated_child_mutation``
+strip and the same child is handed precisely the nine. Had one ever been
+called, eight would have been refused anyway — ``_reject_delegated_child_mutation``
 guards ``_handle_complete``, ``_handle_block``, ``_handle_heartbeat``,
-``_handle_link``, ``_handle_attach`` and ``_handle_attach_url`` before they touch
-the board — and the seventh, ``_handle_attachments``, is a read whose default
+``_handle_link``, ``_handle_attach``, ``_handle_attach_url``,
+``_handle_request_review`` and ``_handle_request_changes`` before they touch
+the board — and the ninth, ``_handle_attachments``, is a read whose default
 task id ``_default_task_id`` already withholds from a child. So this gate is the
 layer under two working layers, which is what buys it the freedom to answer
 ``on_unknown=False`` below, where ``hermes_cli/kanban_guardrail_exit.py`` — which
@@ -117,6 +145,11 @@ WORKER_ONLY_TOOLS = (
     "kanban_attach",
     "kanban_attach_url",
     "kanban_attachments",
+    # v2026.9.14's review flow: the implementer hands the card to review, the
+    # reviewer (itself a dispatcher-spawned worker) hands it back. Both are
+    # opened with upstream's ``_worker_guard``.
+    "kanban_request_review",
+    "kanban_request_changes",
 )
 
 

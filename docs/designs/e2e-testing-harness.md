@@ -8,11 +8,11 @@
 
 The `kube-agents` test execution model partitions tests across three distinct automation tiers:
 
-| Tier                            | Trigger                                                                                                      | Purpose                                                                                               | Execution Target                                                         |
-| :------------------------------ | :----------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------- |
-| **Tier 1: PR CI**               | Pull Request (`pull_request`)                                                                                | Fast, offline unit and structural validation on every change                                          | `make coverage`, `make validate`, `make docs-check`                      |
-| **Tier 2: RC Promotion Gate**   | Release Candidate build (`rc-release-pipeline.yml`)                                                          | Validates candidate container images on a freshly provisioned GKE cluster before tagging `_validated` | `make test-e2e` (`scripts/release/execute_e2e_tests.py`)                 |
-| **Tier 3: Nightly & On-Demand** | Dispatched daily by `nightly-scheduler.yml`; on-demand via `nightly-pipeline.yml` or `e2e-manual-runner.yml` | Full matrix across multi-cluster environments, audit streams, and GPU/scarcity stockout scenarios     | `make test-e2e` with `FLEET_AUDIT_STREAMS=all`, `STOCKOUT_SCENARIOS=all` |
+| Tier                            | Trigger                                                                                                                          | Purpose                                                                                               | Execution Target                                                         |
+| :------------------------------ | :------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------- |
+| **Tier 1: PR CI**               | Pull Request (`pull_request`)                                                                                                    | Fast, offline unit and structural validation on every change                                          | `make coverage`, `make validate`, `make docs-check`                      |
+| **Tier 2: RC Promotion Gate**   | Release Candidate build (`rc-release-pipeline.yml`)                                                                              | Validates candidate container images on a freshly provisioned GKE cluster before tagging `_validated` | `make test-e2e` (`scripts/release/execute_e2e_tests.py`)                 |
+| **Tier 3: Nightly & On-Demand** | Dispatched daily by `staging-promotion-scheduler.yml`; on-demand via `staging-promotion-pipeline.yml` or `e2e-manual-runner.yml` | Full matrix across multi-cluster environments, audit streams, and GPU/scarcity stockout scenarios     | `make test-e2e` with `FLEET_AUDIT_STREAMS=all`, `STOCKOUT_SCENARIOS=all` |
 
 Tier 2's "freshly provisioned" is the intent. What the pipeline does today, and why it differs,
 is in [`scripts/release/README.md`](../../scripts/release/README.md).
@@ -59,7 +59,7 @@ Validates the full incident investigation loop from alert ingestion to GitOps PR
 Exercises bidirectional communication through Google Chat:
 
 - Posts a structured test message to the configured Google Chat Space via GCP Pub/Sub and verifies the agent returns the expected calculation or status response.
-- Automatically skips if Google Chat credentials are unconfigured in the execution environment.
+- Fails at once when `CHAT_SPACE_ID` is unset; reads the space back with the service account (app authentication) and falls back to the OTA user credential on a denial.
 
 ---
 

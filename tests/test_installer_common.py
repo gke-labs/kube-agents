@@ -19,6 +19,32 @@ from tests.testing.common import get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
+_GKE_DNS_ENDPOINT = _REPO_ROOT / "scripts" / "installer" / "gke_dns_endpoint.sh"
+
+# The two ERR-trap tests below are real only on a bash that runs an inherited
+# ERR trap inside a `$(...)` whose failure the caller handles: bash 3.2 does,
+# bash 4.4 and 5.x do not (measured), so on the latter they pass with or
+# without the guard. They skip there rather than read as coverage; the
+# source-shape test in ToleratedProbesClearErrTrapTest is the regression
+# guard on every bash.
+# The trap writes to stderr: the substitution's stdout is the value being
+# captured, so a trap that echoed there would be swallowed with it.
+_INHERITED_TRAP_PROBE = (
+    "set -E; trap 'echo FIRED >&2' ERR; "
+    "probe() { if ! x=$(false); then :; fi; }; probe"
+)
+
+
+def _bash_runs_inherited_err_trap_in_substitution():
+    proc = subprocess.run(["bash", "-c", _INHERITED_TRAP_PROBE], capture_output=True, text=True)
+    return "FIRED" in proc.stderr
+
+
+_SKIP_UNLESS_TRAP_FIRES = (
+    "this bash does not run an inherited ERR trap inside a $(...) the caller "
+    "handles, so the guard cannot be seen missing here; "
+    "ToleratedProbesClearErrTrapTest pins it by shape"
+)
 
 # installer_common.sh's contract: the caller defines the print helpers.
 _PRINT_STUBS = """
@@ -68,10 +94,19 @@ CERT_MANAGER_RELEASE_STATE = _state_doc(
       "instances": [{"index_key": 0, "attributes": {"id": "cert-manager", "name": "cert-manager"}}]}]
 )
 
-# A kubectl that finds a cert-manager Deployment and nothing else; the
-# current-context read answers with a name that is not this install's, so the
-# generator's credential recovery stays out of the way.
+# A kubectl that finds a cert-manager Deployment on this install's cluster.
 _CERT_MANAGER_PRESENT_KUBECTL = (
+    "#!/usr/bin/env bash\n"
+    'case "$*" in\n'
+    '  *"get deployment cert-manager"*) exit 0 ;;\n'
+    '  *"current-context"*) echo "gke_test-project_us-central1_test-cluster"; exit 0 ;;\n'
+    "esac\n"
+    "exit 1\n"
+)
+
+# A kubectl whose current-context points at some other cluster; the cert-manager
+# probe and credential recovery must not touch it.
+_CERT_MANAGER_OTHER_CONTEXT_KUBECTL = (
     "#!/usr/bin/env bash\n"
     'case "$*" in\n'
     '  *"get deployment cert-manager"*) exit 0 ;;\n'
@@ -118,6 +153,7 @@ class InstallerCommonTest(unittest.TestCase):
         kms_versions="",
         sa_describe_stub="exit 1",
         gcloud_stderr=None,
+        get_credentials_stub=None,
     ):
         """Source installer_common.sh with print stubs and run `script`.
 
@@ -140,11 +176,17 @@ class InstallerCommonTest(unittest.TestCase):
             state_file = pathlib.Path(tmp) / "default.tfstate"
             if gcloud_stdout is not None:
                 state_file.write_text(gcloud_stdout)
+            get_cred_case = (
+                f"  *\"clusters get-credentials\"*) {get_credentials_stub} ;;\n"
+                if get_credentials_stub
+                else ""
+            )
             gcloud = bin_dir / "gcloud"
             gcloud.write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
                 f"  *\"clusters describe\"*) {describe_stub} ;;\n"
+                f"{get_cred_case}"
                 f"  *\"keys versions list\"*) printf '%s' '{kms_versions}'; exit 0 ;;\n"
                 f"  *\"service-accounts describe\"*) {sa_describe_stub} ;;\n"
                 "esac\n"
@@ -246,6 +288,25 @@ class InstallerCommonTest(unittest.TestCase):
             gcloud_exit=1,
         )
         self.assertIn("done", proc.stdout, proc.stderr)
+        self.assertNotIn("ERR_TRAP_FIRED", proc.stderr)
+
+    def test_missing_deployment_does_not_fire_err_trap(self):
+        # running_image_tag's kubectl probe: no Deployment to read (a first
+        # install, or a context that cannot reach the cluster) is an empty
+        # answer the caller handles, not an abort. Same mechanism as above:
+        # inside the $(...) the probe is a bare failing command, so without
+        # `trap - ERR` in the substitution bash 3.2 fires the inherited trap
+        # there (#1798). The default kubectl stub exits 1.
+        if not _bash_runs_inherited_err_trap_in_substitution():
+            self.skipTest(_SKIP_UNLESS_TRAP_FIRES)
+        script = (
+            "set -E\n"
+            "trap 'echo \"ERR_TRAP_FIRED\" >&2' ERR\n"
+            'tag="$(running_image_tag kubeagents-system)"\n'
+            'echo "tag=[$tag] done"\n'
+        )
+        proc = self._run(script)
+        self.assertIn("tag=[] done", proc.stdout, proc.stderr)
         self.assertNotIn("ERR_TRAP_FIRED", proc.stderr)
 
     # ── tf_state_manages_resource: whose release is this? ────────────────────
@@ -357,6 +418,55 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("enable_cert_manager        = true", dest.read_text())
+
+    def test_tfvars_keeps_cert_manager_when_kubectl_context_is_not_this_cluster(self):
+        # A stale or different kubectl context must not probe the wrong cluster
+        # and wrongly disable cert-manager on the target cluster.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub=_autopilot_describe_stub(),
+                kubectl_script=_CERT_MANAGER_OTHER_CONTEXT_KUBECTL,
+                gcloud_exit=1,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("enable_cert_manager        = true", dest.read_text())
+
+    def test_tfvars_adoption_path_resolves_dns_endpoint_flag(self):
+        # When adopting an existing cluster (create_cluster=false), get-credentials
+        # must resolve --dns-endpoint via gke_dns_endpoint_flag so clusters publishing
+        # only a DNS endpoint can be reached.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            cred_log = pathlib.Path(out_dir) / "get_credentials.log"
+            describe_stub = (
+                'case "$*" in\n'
+                '  *controlPlaneEndpointsConfig*) printf "cluster-dns.gke.goog\\tTrue\\n"; exit 0 ;;\n'
+                '  *currentMasterVersion*) printf "1.31.5-gke.1023000\\n"; exit 0 ;;\n'
+                '  *) printf "True\\n"; exit 0 ;;\n'
+                'esac'
+            )
+            get_cred_stub = (
+                'case "$*" in\n'
+                '  *--help*) echo "--dns-endpoint"; exit 0 ;;\n'
+                f'  *) echo "$*" >> "{cred_log}"; exit 0 ;;\n'
+                'esac'
+            )
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub=describe_stub,
+                get_credentials_stub=get_cred_stub,
+                kubectl_script=_CERT_MANAGER_PRESENT_KUBECTL,
+                gcloud_exit=1,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertTrue(cred_log.exists(), "get-credentials was not called")
+            logged_args = cred_log.read_text()
+            self.assertIn("--dns-endpoint", logged_args)
+            self.assertIn("test-cluster", logged_args)
 
     # ── check_service_account_ownership: the 409 a second install hits (#1294) ─
 
@@ -618,7 +728,7 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("create_cluster             = true", content)
 
     def test_tfvars_fresh_create_honours_cluster_mode(self):
-        # --cluster-mode reaches the generator through the exported environment. The probe found
+        # --gke-cluster-mode reaches the generator through the exported environment. The probe found
         # nothing, so the interview's choice is the only shape on offer.
         #
         # Asks for "standard" specifically: autopilot is now DEFAULT_CLUSTER_MODE,
@@ -685,10 +795,68 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("enable_gvisor_node_pool    = true", content)
             self.assertIn('agent_runtime_class        = "gvisor"', content)
 
+    def test_tfvars_carry_accept_no_network_policy(self):
+        # The module's postcondition reads the variable, not install.sh's flag,
+        # so the generator has to emit it -- false by default, true when the
+        # install accepted a cluster without enforcement (#1682).
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("accept_no_network_policy   = false", dest.read_text())
+
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "ACCEPT_NO_NETWORK_POLICY": "true"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("accept_no_network_policy   = true", dest.read_text())
+
+    def test_tfvars_carry_model_max_tokens(self):
+        # Empty and unset both take DEFAULT_MODEL_MAX_TOKENS (0), which renders
+        # nothing; a value is emitted as a bare HCL number, not a string.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, "model_max_tokens   = 0"),
+                ({"MODEL_MAX_TOKENS": ""}, "model_max_tokens   = 0"),
+                ({"MODEL_MAX_TOKENS": "4096"}, "model_max_tokens   = 4096"),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    def test_tfvars_refuse_a_model_max_tokens_that_is_not_a_whole_number(self):
+        # upgrade.sh regenerates from install.env without install.sh's
+        # interview, so the generator is the check that reaches it; a bare
+        # word would otherwise fail at terraform's parser.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("4k", "-1", "4096.5"):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "MODEL_MAX_TOKENS": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn("MODEL_MAX_TOKENS", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
     def test_tfvars_gvisor_on_autopilot_asks_for_runtime_class_only(self):
         # enable_gvisor_node_pool fails the plan on Autopilot, which ships the
         # gvisor RuntimeClass natively. Passing ENABLE_GVISOR straight through
-        # made --gvisor=true unusable there rather than sandboxing the agent.
+        # made --enable-gvisor=true unusable there rather than sandboxing the agent.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
@@ -855,7 +1023,7 @@ class InstallerCommonTest(unittest.TestCase):
         )
 
     def test_tfvars_autopilot_floor_names_a_way_out_for_every_caller(self):
-        # The abort's remedy has to work for whoever hit it. --gvisor=false is
+        # The abort's remedy has to work for whoever hit it. --enable-gvisor=false is
         # install.sh's; upgrade.sh rejects that flag and reads install.env
         # instead, so naming only the flag sends its callers to a dead end.
         proc = self._run(
@@ -867,7 +1035,7 @@ class InstallerCommonTest(unittest.TestCase):
             describe_stub=_autopilot_describe_stub("1.26.9-gke.9999"),
         )
         self.assertIn("rc=1", proc.stdout, proc.stderr)
-        self.assertIn("--gvisor=false", proc.stderr)
+        self.assertIn("--enable-gvisor=false", proc.stderr)
         self.assertIn("install.env", proc.stderr)
 
     def test_tfvars_gvisor_off_clears_the_floor_on_a_sub_floor_autopilot(self):
@@ -933,9 +1101,10 @@ class InstallerCommonTest(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
             # Recovery is gated on the current context being this install's
-            # cluster; the stub answers with the expected gke_<p>_<r>_<c> name.
+            # cluster; the stub answers with the expected gke_<p>_<r>_<c> name
+            # and asserts that secret reads explicitly pass --context.
             '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            f'  *"get secret platform-agent-secrets"*) printf "%s" "{recovered_b64}" ;;\n'
+            f'  *"get secret platform-agent-secrets"*--context\\ gke_test-project_us-central1_test-cluster*) printf "%s" "{recovered_b64}" ;;\n'
             "  *) exit 1 ;;\n"
             "esac\n"
         )
@@ -1542,6 +1711,31 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("Rolling back", proc.stderr)
 
+    def test_missing_release_does_not_fire_err_trap(self):
+        # A first install onto an existing cluster: `helm status` exits 1
+        # because no release exists, helm_release_status answers empty and the
+        # caller carries on. Under the front doors' `set -E` the $(...) around
+        # the probe inherits their ERR trap, and on bash 3.2 (macOS's default)
+        # the trap fires inside the subshell unless `trap - ERR` clears it
+        # there: an abort banner and a FAILED report from a successful run
+        # (#1798).
+        if not _bash_runs_inherited_err_trap_in_substitution():
+            self.skipTest(_SKIP_UNLESS_TRAP_FIRES)
+        helm_script = (
+            '#!/usr/bin/env bash\n'
+            'echo "Error: release: not found" >&2\n'
+            'exit 1\n'
+        )
+        script = (
+            "set -E\n"
+            "trap 'echo \"ERR_TRAP_FIRED\" >&2' ERR\n"
+            'status="$(helm_release_status kube-agents kubeagents-system)"\n'
+            'echo "status=[$status] done"\n'
+        )
+        proc = self._run_helm_test(script, helm_script)
+        self.assertIn("status=[] done", proc.stdout, proc.stderr)
+        self.assertNotIn("ERR_TRAP_FIRED", proc.stderr)
+
     # ── clear_failed_initial_helm_release: the retry after a first apply died ─
 
     # The state coordinates the function reads through tf_state_read; the
@@ -1951,6 +2145,39 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "")
 
 
+class ToleratedProbesClearErrTrapTest(unittest.TestCase):
+    """The library's tolerated probes clear the inherited ERR trap inside their $(...).
+
+    The front doors' own handlers exit a subshell silently, so a probe there
+    needs no guard; this library cannot know its caller's trap, so its probes
+    guard themselves. The behavioural tests above cannot see the guard missing
+    on the bash CI runs, so this pins the shape: each probe whose non-zero exit
+    the caller handles begins its substitution with `trap - ERR;`. Dropping the
+    prefix at any of them brings back the bash 3.2 abort banner and FAILED
+    report under a caller whose trap is not subshell-aware (#1798), and this is
+    the test that goes red for it.
+    """
+
+    # (file, guarded substring, how many times it appears). The unguarded form
+    # is the same text without the prefix, and must not appear at all.
+    GUARDED_PROBES = (
+        (_INSTALLER_COMMON, 'response=$(trap - ERR; curl ', 1),
+        (_INSTALLER_COMMON, 'image="$(trap - ERR; kubectl get deployment ', 1),
+        (_INSTALLER_COMMON, 'status_json="$(trap - ERR; helm status ', 1),
+        (_INSTALLER_COMMON, 'history_json="$(trap - ERR; helm history ', 2),
+        (_INSTALLER_COMMON, 'last_good_rev="$(trap - ERR; printf ', 1),
+        (_GKE_DNS_ENDPOINT, 'described=$(trap - ERR; gcloud container clusters describe ', 1),
+    )
+
+    def test_each_tolerated_probe_clears_the_trap_inside_its_substitution(self):
+        sources = {}
+        for path, guarded, count in self.GUARDED_PROBES:
+            source = sources.setdefault(path, path.read_text())
+            unguarded = guarded.replace("trap - ERR; ", "")
+            with self.subTest(file=path.name, probe=unguarded.strip()):
+                self.assertEqual(source.count(guarded), count, f"{path.name}: {guarded!r}")
+                self.assertNotIn(unguarded, source, f"{path.name}: a probe lost its `trap - ERR`")
+
+
 if __name__ == "__main__":
     unittest.main()
-

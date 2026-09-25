@@ -11,6 +11,7 @@ script fails loudly when its own inputs are wrong, rather than exiting 0
 having read nothing.
 """
 
+import hashlib
 import os
 import pathlib
 import re
@@ -126,6 +127,8 @@ class _StubKubectl:
         cr_reason="Reconciled",
         deployment_missing=False,
         images_json=None,
+        agent_release="kube-agents",
+        plugin_releases="",
     ):
         """Run the script against one or more stubbed reads of the template.
 
@@ -156,8 +159,15 @@ class _StubKubectl:
                 """
             )
         else:
+            # Refuse a template read that does not ask for image volumes, so the
+            # tests below go red if the range is dropped rather than passing on
+            # a listing the stub would print whatever it was asked.
             template_branch = textwrap.dedent(
                 f"""\
+                if [[ "$*" != *'volumes[*]}}{{.name}}={{.image.reference}}'* ]]; then
+                  echo 'stub kubectl: the template read does not cover image volumes' >&2
+                  exit 1
+                fi
                 count_file="{stub_dir}/calls"
                 count=$(cat "$count_file" 2>/dev/null || echo 0)
                 echo $((count + 1)) >"$count_file"
@@ -172,6 +182,14 @@ class _StubKubectl:
             textwrap.dedent(
                 f"""\
                 #!/usr/bin/env bash
+                if [[ "$*" == *release-name* && "$*" == *platformagent* ]]; then
+                  printf '%s\\n' '{agent_release}'
+                  exit 0
+                fi
+                if [[ "$*" == *agentplugin* ]]; then
+                  printf '%s\\n' '{plugin_releases}'
+                  exit 0
+                fi
                 if [[ "$*" == *status.phase* ]]; then
                   echo '  platform-agent: {cr_phase}'
                   echo '    Ready=False {cr_reason}'
@@ -243,6 +261,124 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("3 release image", result.stdout)
+
+    def test_it_fails_when_a_plugin_image_volume_is_on_an_older_tag(self):
+        """On a cluster with ImageVolumeSource the plugin image is a volume.
+
+        The reference lives under .volumes[].image, not in a container, and a
+        re-tag that left it behind is the same defect as a stale init
+        container (#1808).
+        """
+        result = self._run(
+            f"""
+            sandbox-credential-cleanup={_GHCR}/platform-agent:{_TAG}
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            fluent-bit=docker.io/fluent/fluent-bit:5.1.2
+            platform-agent-data-vol=
+            plugin-pubsubplatform={_GHCR}/pubsub-platform:{_OLD}
+            """,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"plugin-pubsubplatform: {_GHCR}/pubsub-platform:{_OLD}", result.stdout)
+        self.assertIn("Only plugin images are off the tag", result.stdout)
+        self.assertIn("--set plugins.<name>.image.tag", result.stdout)
+
+    def test_a_plugin_installed_outside_the_release_is_not_judged(self):
+        """agentplugins/*/install.sh releases a plugin on its own, at its own tag.
+
+        The operator stages it like any other, but no re-tag of this release
+        moves it, so it is reported and left out of the verdict.
+        """
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            stage-pubsubplatform={_GHCR}/pubsub-platform:{_OLD}
+            plugin-gkestockoutinvestigator={_GHCR}/gke-stockout-investigator:{_OLD}
+            """,
+            plugin_releases="pubsubplatform=pubsubplatform\ngkestockoutinvestigator=gkestockoutinvestigator",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 release image(s)", result.stdout)
+        self.assertIn("Not judged, installed outside the release", result.stdout)
+        self.assertIn("stage-pubsubplatform", result.stdout)
+
+    def test_a_plugin_of_the_release_on_an_older_tag_still_fails(self):
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            plugin-pubsubplatform={_GHCR}/pubsub-platform:{_OLD}
+            """,
+            plugin_releases="pubsubplatform=kube-agents",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"plugin-pubsubplatform: {_GHCR}/pubsub-platform:{_OLD}", result.stdout)
+
+    def test_without_a_release_on_the_agent_every_plugin_counts(self):
+        """A kustomize install has no Helm annotation; nothing is skipped."""
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            plugin-pubsubplatform={_GHCR}/pubsub-platform:{_OLD}
+            """,
+            agent_release="",
+            plugin_releases="pubsubplatform=pubsubplatform",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"plugin-pubsubplatform: {_GHCR}/pubsub-platform:{_OLD}", result.stdout)
+
+    @staticmethod
+    def _operator_name(prefix, plugin, limit):
+        """buildPluginStagingContainerName / buildPluginVolumeName, mirrored."""
+        name = prefix + plugin
+        if len(name) > limit:
+            digest = hashlib.sha256(plugin.encode()).hexdigest()[:8]
+            name = name[: limit - 9] + "-" + digest
+        return name
+
+    def test_a_truncated_staging_container_name_still_finds_its_plugin(self):
+        """Past 35 characters the operator cuts stage-<name> and appends a hash."""
+        plugin = "a-plugin-with-a-very-long-name-that-gets-hashed"
+        entry = self._operator_name("stage-", plugin, 35)
+        self.assertNotEqual(entry, "stage-" + plugin)
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            {entry}={_GHCR}/pubsub-platform:{_OLD}
+            """,
+            plugin_releases=f"{plugin}=standalone",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Not judged", result.stdout)
+
+    def test_a_truncated_volume_name_still_finds_its_plugin(self):
+        """Past 63 characters the operator cuts plugin-<name> the same way."""
+        plugin = "a-plugin-whose-name-is-long-enough-that-its-volume-name-passes-sixty-three"
+        entry = self._operator_name("plugin-", plugin, 63)
+        self.assertNotEqual(entry, "plugin-" + plugin)
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            {entry}={_GHCR}/pubsub-platform:{_OLD}
+            """,
+            plugin_releases=f"{plugin}=kube-agents",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"{entry}: {_GHCR}/pubsub-platform:{_OLD}", result.stdout)
+
+    def test_a_volume_without_an_image_reference_is_not_counted(self):
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            platform-agent-data-vol=
+            tmp-scratch=
+            """,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 release image(s)", result.stdout)
+
+    def test_the_template_read_covers_image_volumes(self):
+        text = _SCRIPT.read_text()
+        self.assertIn("{range .spec.template.spec.volumes[*]}{.name}={.image.reference}", text)
 
     def test_it_fails_when_the_agent_is_pinned_to_an_older_tag(self):
         # spec.deployment.image pinned to a full reference, so the tag the

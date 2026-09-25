@@ -85,8 +85,8 @@ steps:
         #
         # KUBE_AGENTS_VERSION is the User-Agent this image's remote MCP calls
         # send. hack/ci-deploy.sh passes the pull-request tag, so an evaluation
-        # cluster's traffic reads as `kube-agents/pr-1234-abc1234` in the
-        # serving team's logs rather than being counted as a release.
+        # cluster's traffic reads as `kube-agents/pr-1234-abc1234 (daemon)` in
+        # the serving team's logs rather than being counted as a release.
         docker build \
           --platform linux/amd64 \
           -t "$_PLATFORM_URI" \

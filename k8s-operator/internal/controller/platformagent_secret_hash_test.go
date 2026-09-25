@@ -18,6 +18,10 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
@@ -74,9 +78,13 @@ func secretHashTestPodSpec() *corev1.PodSpec {
 	}
 }
 
+// secretHashTestSecret carries a UID because the digest is keyed by it and the
+// fake client mints none: a real API server sets one on every object. Derived
+// from the name so two fixtures for the same Secret agree, the way two reads of
+// one live Secret do.
 func secretHashTestSecret(name string, data map[string][]byte) *corev1.Secret {
 	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test-ns"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test-ns", UID: types.UID("uid-of-" + name)},
 		Data:       data,
 	}
 }
@@ -213,6 +221,117 @@ func TestSecretEnvHashChangesWhenAReferencedValueChanges(t *testing.T) {
 	}
 	if after == before {
 		t.Errorf("digest %s survived a rotated key, so nothing would roll the pod", before)
+	}
+}
+
+// A label or annotation on the Secret bumps its resourceVersion and changes
+// nothing a container can see. The digest has to ignore it, which is why it is
+// keyed by the UID and not by the resourceVersion.
+func TestSecretEnvHashDoesNotMoveOnAMetadataOnlyWrite(t *testing.T) {
+	agent := secretHashTestAgent()
+	r, cl := secretHashTestReconciler(
+		secretHashTestSecret("platform-agent-secrets", map[string][]byte{
+			"API_SERVER_KEY":     []byte("first"),
+			"SESSION_KV_API_KEY": []byte("second"),
+		}),
+		secretHashTestSecret("team-slack", map[string][]byte{"bot-token": []byte("xoxb")}),
+	)
+	ctx := context.Background()
+
+	before, err := r.secretEnvHash(ctx, agent, secretHashTestPodSpec())
+	if err != nil {
+		t.Fatalf("secretEnvHash before: %v", err)
+	}
+
+	relabelled := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "platform-agent-secrets", Namespace: "test-ns"}, relabelled); err != nil {
+		t.Fatalf("read the Secret back: %v", err)
+	}
+	versionBefore := relabelled.ResourceVersion
+	relabelled.Labels = map[string]string{"managed-by": "someone-else"}
+	relabelled.Annotations = map[string]string{"note": "no value changed"}
+	if err := cl.Update(ctx, relabelled); err != nil {
+		t.Fatalf("relabel the Secret: %v", err)
+	}
+	bumped := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "platform-agent-secrets", Namespace: "test-ns"}, bumped); err != nil {
+		t.Fatalf("re-read the Secret: %v", err)
+	}
+	if bumped.ResourceVersion == versionBefore {
+		t.Fatal("the fixture did not bump resourceVersion, so this proves nothing")
+	}
+
+	after, err := r.secretEnvHash(ctx, agent, secretHashTestPodSpec())
+	if err != nil {
+		t.Fatalf("secretEnvHash after: %v", err)
+	}
+	if after != before {
+		t.Errorf("digest moved on a metadata-only write, which would roll the pod for nothing: %s then %s", before, after)
+	}
+}
+
+// The annotation is readable by anyone who can read pods, and the pod spec
+// names every Secret and key that went into it. An unkeyed SHA-256 over the
+// values would let that reader verify guesses at a low-entropy value offline;
+// the digest is keyed by the Secret's UID so that it cannot.
+func TestSecretEnvHashIsNotTheUnkeyedDigestOfTheValues(t *testing.T) {
+	agent := secretHashTestAgent()
+	values := map[string][]byte{
+		"API_SERVER_KEY":     []byte("first"),
+		"SESSION_KV_API_KEY": []byte("second"),
+	}
+	slack := map[string][]byte{"bot-token": []byte("xoxb")}
+	r, _ := secretHashTestReconciler(
+		secretHashTestSecret("platform-agent-secrets", values),
+		secretHashTestSecret("team-slack", slack),
+	)
+	ctx := context.Background()
+
+	got, err := r.secretEnvHash(ctx, agent, secretHashTestPodSpec())
+	if err != nil {
+		t.Fatalf("secretEnvHash: %v", err)
+	}
+
+	// What an offline guesser can compute from the pod spec and a guess at the
+	// values: the construction this file used before it was keyed.
+	material := map[string]string{
+		"platform-agent-secrets/API_SERVER_KEY":     base64.StdEncoding.EncodeToString(values["API_SERVER_KEY"]),
+		"platform-agent-secrets/SESSION_KV_API_KEY": base64.StdEncoding.EncodeToString(values["SESSION_KV_API_KEY"]),
+		"team-slack/bot-token":                      base64.StdEncoding.EncodeToString(slack["bot-token"]),
+	}
+	encoded, err := json.Marshal(material)
+	if err != nil {
+		t.Fatalf("marshal the material: %v", err)
+	}
+	if unkeyed := sha256.Sum256(encoded); got == hex.EncodeToString(unkeyed[:]) {
+		t.Error("the digest is the unkeyed SHA-256 of the values, so a reader of the annotation can verify guesses offline")
+	}
+
+	// The same values under a different UID digest differently: the UID is in
+	// the key, which is also why a deleted-and-recreated Secret rolls the pod
+	// once even when its values came back unchanged.
+	recreated := secretHashTestSecret("platform-agent-secrets", values)
+	recreated.UID = "a-uid-minted-by-the-recreate"
+	r2, _ := secretHashTestReconciler(recreated, secretHashTestSecret("team-slack", slack))
+	again, err := r2.secretEnvHash(ctx, agent, secretHashTestPodSpec())
+	if err != nil {
+		t.Fatalf("secretEnvHash after the recreate: %v", err)
+	}
+	if again == got {
+		t.Error("the same values under a different Secret UID digest the same, so the UID is not in the key")
+	}
+
+	// Every Secret the pod reads is in the key, not just the first: recreating
+	// the other one alone moves the digest too.
+	recreatedSlack := secretHashTestSecret("team-slack", slack)
+	recreatedSlack.UID = "a-uid-minted-by-recreating-team-slack"
+	r3, _ := secretHashTestReconciler(secretHashTestSecret("platform-agent-secrets", values), recreatedSlack)
+	third, err := r3.secretEnvHash(ctx, agent, secretHashTestPodSpec())
+	if err != nil {
+		t.Fatalf("secretEnvHash after recreating team-slack: %v", err)
+	}
+	if third == got {
+		t.Error("the same values under a different team-slack UID digest the same, so only the first Secret's UID is in the key")
 	}
 }
 

@@ -126,16 +126,16 @@ scenario can be quiet, or expect and announce the gap.
 The scenario ids below are the contract of the in-flight Phase 2 scenario branch
 (`feat/domain-scenarios`); the names here are the source of truth its specs assert on.
 
-| Defect                                                                                                                                                                                                                          | Where                                | Fixture role         | Asserting scenario                                                                                                                                                                   |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `checkout-gateway`, two replicas, no PDB (the SOP's no-pdb check flags multi-replica only)                                                                                                                                      | `seeded-a` / ns `seeded-reliability` | `no-pdb-workload`    | `obtainability-planted-pdb`, `cluster-agent-healthy-workload-no-finding`, `cluster-agent-stalled-controller-healthy-silence`                                                         |
-| `debug-binding`, a cluster-scoped ClusterRoleBinding of cluster-admin to the `seeded-security` default SA (the compliance SOP reads ClusterRoleBindings only)                                                                   | `seeded-a`                           | `rbac-overgrant`     | `compliance-rbac-overgrant`, `security-overgrant-probe`, `security-overgrant-remediation-proposal`                                                                                   |
-| `payments-api`, deterministic OOM crashloop                                                                                                                                                                                     | `seeded-a` / ns `seeded-debug`       | `crashloop-workload` | `cluster-agent-crashloop-debug`, `cluster-agent-crashloop-fix-request`, `cluster-agent-crashloop-misleading-symptom`, `cluster-agent-crashloop-evidence-chain`, `rca-remediation-pr` |
-| `pinned-inference-pool`: one zone, autoscaler pinned at one node, HPA wants more replicas than the pool can place, leaving a standing Pending backlog (no figure: the count is a load calculation and moves between projects)   | `seeded-a` / ns `seeded-capacity`    | `hpa-saturated`      | `stockout-pinned-pool`, `cluster-agent-pending-replicas-capped-pool`                                                                                                                 |
-| `idle-batch-pool`, zero non-system pods (tainted so it stays that way)                                                                                                                                                          | `seeded-a`                           | `idle-nodepool`      | `fleet-cost-idle-pool`                                                                                                                                                               |
-| `orphan-pd-1`, `orphan-pd-2`, unattached disks                                                                                                                                                                                  | project, `var.zone`                  | — (GCE-level)        | `fleet-cost-idle-pool`                                                                                                                                                               |
-| Control plane one minor behind REGULAR default                                                                                                                                                                                  | `seeded-b`                           | `version-laggard`    | `upgrade-readiness-lagging-cluster`, `upgrades-lagging-master-probe`, `upgrades-fleet-version-table`, `upgrades-fleet-rollout-stall`, `upgrades-fleet-readiness-exclusion`           |
-| Master authorized networks absent, normalized to OFF (peers run it ON with an open block, whose contents the drift SOP never compares); all three clusters carry `environment=seeded` so the drift cohort is exactly this fleet | `seeded-c`                           | `drift-outlier`      | `consistency-drift-outlier`                                                                                                                                                          |
+| Defect                                                                                                                                                                                                                          | Where                                | Fixture role         | Asserting scenario                                                                                                                                                                                                     |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `checkout-gateway`, two replicas, no PDB (the SOP's no-pdb check flags multi-replica only)                                                                                                                                      | `seeded-a` / ns `seeded-reliability` | `no-pdb-workload`    | `obtainability-planted-pdb`, `cluster-agent-healthy-workload-no-finding`, `cluster-agent-stalled-controller-healthy-silence`                                                                                           |
+| `debug-binding`, a cluster-scoped ClusterRoleBinding of cluster-admin to the `seeded-security` default SA (the compliance SOP reads ClusterRoleBindings only)                                                                   | `seeded-a`                           | `rbac-overgrant`     | `compliance-rbac-overgrant`, `security-overgrant-probe`, `security-overgrant-remediation-proposal`                                                                                                                     |
+| `payments-api`, deterministic OOM crashloop                                                                                                                                                                                     | `seeded-a` / ns `seeded-debug`       | `crashloop-workload` | `cluster-agent-crashloop-debug`, `cluster-agent-crashloop-fix-request`, `cluster-agent-crashloop-misleading-symptom`, `cluster-agent-crashloop-evidence-chain`, `rca-remediation-pr`                                   |
+| `pinned-inference-pool`: one zone, autoscaler pinned at one node, HPA wants more replicas than the pool can place, leaving a standing Pending backlog (no figure: the count is a load calculation and moves between projects)   | `seeded-a` / ns `seeded-capacity`    | `hpa-saturated`      | `stockout-pinned-pool`, `cluster-agent-pending-replicas-capped-pool`                                                                                                                                                   |
+| `idle-batch-pool`, zero non-system pods (tainted so it stays that way)                                                                                                                                                          | `seeded-a`                           | `idle-nodepool`      | `fleet-cost-idle-pool`                                                                                                                                                                                                 |
+| `orphan-pd-1`, `orphan-pd-2`, unattached disks                                                                                                                                                                                  | project, `var.zone`                  | — (GCE-level)        | `fleet-cost-idle-pool`                                                                                                                                                                                                 |
+| Control plane one minor behind REGULAR default                                                                                                                                                                                  | `seeded-b`                           | `version-laggard`    | `upgrade-readiness-lagging-cluster`, `upgrades-lagging-master-probe`, `upgrades-fleet-version-table`, `upgrades-fleet-rollout-stall`, `upgrades-fleet-readiness-exclusion`, `upgrades-master-behind-offered-elsewhere` |
+| Master authorized networks absent, normalized to OFF (peers run it ON with an open block, whose contents the drift SOP never compares); all three clusters carry `environment=seeded` so the drift cohort is exactly this fleet | `seeded-c`                           | `drift-outlier`      | `consistency-drift-outlier`                                                                                                                                                                                            |
 
 The `environment=seeded` resource label is the cohort confinement, the same class of
 fixture-determinism as the pool taints: the drift SOP resolves environment from
@@ -223,22 +223,15 @@ fixture; that fallback was activation blocker A5 in `bench/tasks/DRAFTS.md`. See
 for the spec side, including how the verifier keeps "the fixture is gone" (a fail)
 apart from "the cluster was unreachable" (an error).
 
-## The presubmit's two consumers outside the role catalog
+## The presubmit's one consumer outside the role catalog
 
-`hack/ci-eval-pr.sh` addresses this fleet directly in two places, both discovering by
-the same two labels and the trailing `-<slot>` name segment, and `fixtures.json`'s
-description names both as the sanctioned exceptions to its rule.
+`hack/ci-eval-pr.sh` addresses this fleet directly in one place, §3b, the log-fixture
+subject, which `fixtures.json`'s description names as the sanctioned exception to its
+rule. It mutates nothing in-cluster, and nothing in the job repairs a drifted fleet:
+the hourly scan above detects one, and a manual `tofu apply` per project corrects it.
 
-**§2c, the slot-a heal (#1278),** is the only consumer that mutates the fleet. On every
-presubmit it reads **slot a**'s `default-pool` node count and resizes it to two when it
-finds fewer -- the standing state `main.tf` declares, so a later `tofu apply` is a
-no-op. It touches nothing else: not the fixtures, not `node_config`, not the state
-file; a project with no seeded fleet, an unreadable count, or a failed resize each
-produce a warning and nothing more, and `FLEET_HEAL_SEEDED_A=0` turns it off. The cost
-paragraph at the end of this README says why the pool is two nodes.
-
-**§3b, the log-fixture subject,** mutates nothing in-cluster. On every presubmit in a
-fleet-carrying project it discovers **slot c** by the same two labels, verifies
+On every presubmit in a fleet-carrying project §3b discovers **slot c** by the same
+two labels and the trailing `-<slot>` name segment, verifies
 its `default` namespace is empty, runs `get-credentials` against it, and hands its
 name to the gpu-stress-test stack, which then creates no per-run cluster: the task's
 synthetic `hypercomputer-agent`/`hpa-controller` Cloud Logging entries name the slot-c
@@ -263,7 +256,8 @@ Applying this stack is what makes it true. It provisions
 the project and nothing else, and grants `roles/iam.serviceAccountTokenCreator` on that
 account to the members in `var.fleet_reader_token_creators` — which defaults to
 `prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com`, the identity every
-presubmit runs as, and to `eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com`,
+presubmit runs as, to `eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com`,
+the nightly periodic's, and to `eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com`,
 the CI health bot, whose hourly fixture-state scan reads every pool project's fleet as
 the reader and holds nothing else on the project
 ([`docs/ci-health.md`](../../../docs/ci-health.md), "The seeded-fleet scan").
@@ -321,9 +315,9 @@ nothing else, once the fleet is at steady state. Two conditions qualify that:
 enrolling `seeded-a`/`seeded-c` in REGULAR can surface a transient upgrade 3.1
 `master-behind` on them until GKE auto-upgrades their masters in the 03:00
 window, and upgrade 3.3 `fleet-spread` is computed over **every** cluster the
-audit reads in the project, not just the seeded trio — a `platform-agent-host`
-or transient `eval-pr*` cluster running a minor ahead of the channel default
-pushes project-wide spread to two and attaches an undeclared `minor` to
+audit reads, in every project the credential can list, not just the seeded
+trio — a `platform-agent-host` or transient `eval-pr*` cluster running a minor
+ahead of the channel default pushes fleet-wide spread to two and attaches an undeclared `minor` to
 `seeded-b`. Neither breaks any scenario (the objectives are `report_contains`,
 not exclusivity checks), but both make this table temporarily incomplete. Everything else the baseline used to trip is closed in the stack
 itself (Workload Identity and `GKE_METADATA` everywhere, legacy metadata endpoints
@@ -378,5 +372,4 @@ rest. Four of the nodes are e2-small; `seeded-a`'s default pool is two e2-medium
 since #1278 (roughly $25 per month more than the one it ran on), because a single
 e2-medium's 940m allocatable CPU is fully claimed by GKE system pods and the planted
 `payments-api` / `checkout-gateway` fixtures went Pending — the comment on
-`seeded_a_default` in `main.tf` has the numbers, and `hack/ci-eval-pr.sh` section 2c
-resizes a one-node pool back to two at lease time until every project is re-applied.
+`seeded_a_default` in `main.tf` has the numbers.

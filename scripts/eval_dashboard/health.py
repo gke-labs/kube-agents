@@ -6,25 +6,29 @@ same mechanical procedure: open the dashboard, find the reds of the last few
 hours, ask whether the same cases failed on unrelated pull requests (a shared
 fixture broke -- #1278), whether the repetitions were lost to 429s and empty
 records rather than graded (a quota storm -- #1225, #1097), whether runs
-died before any task ran (setup failures), or whether the build cluster lost
-the node the pod was on (lost pods -- #1478). Nobody derives that from a
-heatmap at 8am, so this turns the procedure into a job.
+died before any task ran (setup failures), whether the build cluster lost
+the node the pod was on (lost pods -- #1478), or whether Prow killed the
+runs at the job deadline with nothing graded (deadline kills -- #1894).
+Nobody derives that from a heatmap at 8am, so this turns the procedure into
+a job.
 
 It is a pure function: data.json (schema v1, SCHEMA.md) plus the previously
 written health.json in -- and, when the hourly seeded-fleet scan has
 published one, fixture-state.json (scripts/eval_dashboard/fixture_state.py)
 -- health.json out::
 
-    {state, since, cause, failing_cases, evidence, advice, slow, metrics, generated_at}
+    {state, since, cause, failing_cases, evidence, advice, slow, pool, metrics, generated_at}
 
 `state` is GREEN, DEGRADED or OUTAGE. The rules are the module-level
 constants below -- each names the incident it was tuned on -- and the state
 machine that applies hysteresis to them is `transition`. The previous state
 is an input (`--prev`) rather than something remembered, so the scheduled
-job that runs this is stateless between ticks. `slow` is the one finding
-that is not a state: a gate whose green runs take far longer than usual
-(rule 7, #1586) is a note the poster sends once and the Brief shows, while
-the state stays what the rules above say.
+job that runs this is stateless between ticks. `slow` and `pool` are the
+findings that are not states: green runs taking far longer than usual
+(rule 7, #1586), and runs waiting in a queue before they start (rule 8,
+#1607, read from the pool-pressure periodic's artifact rather than measured
+here). The poster sends each once and the Brief shows them, while the state
+stays what the rules above say.
 
 The credibility test is the replay: `--replay` walks a data.json as if the
 job had run every `--step` and prints the state timeline, and
@@ -50,6 +54,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import math
 import pathlib
 import re
 import sys
@@ -82,10 +87,15 @@ STORM = "storm"
 SETUP_DEATHS = "setup_deaths"
 LOST_PODS = "lost_pods"
 FIXTURE_DRIFT = "fixture_drift"
-# The conditions whose evidence is not a full run -- a count of runs that
-# never became one, or the fleet scan's verdict; rule 6's entry check takes
-# the evidence itself as currency.
-COUNTED_CONDITIONS = (SETUP_DEATHS, LOST_PODS, FIXTURE_DRIFT)
+# A ceiling wave: enough repetitions across enough pull requests ended at the
+# harness's delegation wait with the worker still running (rule 2b, #1874).
+DELEGATION_CEILING = "delegation_ceiling"
+# Rule 3d (#1894): runs Prow killed at the job deadline with no verdict.
+DEADLINE_KILL = "deadline_kill"
+# The conditions whose evidence is a count rather than a full run's
+# signature -- runs that never became one, runs Prow killed, or the fleet
+# scan's verdict; rule 6's entry check takes the count itself as currency.
+COUNTED_CONDITIONS = (SETUP_DEATHS, LOST_PODS, FIXTURE_DRIFT, DEADLINE_KILL)
 
 # Prow's job verdicts (SCHEMA.md: runs[].result). ABORTED is a superseded
 # push, not a statement about the gate, and is counted nowhere below except
@@ -101,6 +111,16 @@ REP_RESULT_INFRA = "infra"
 REP_PASS = "pass"
 REP_FAIL = "fail"
 REP_STORM = "storm"
+# The fourth kind: a repetition the harness stopped watching with its worker
+# still running -- the delegation wait (AGENT_DELEGATION_TIMEOUT) ran out
+# before anything was delivered. The scorer grades it `infra` under a reason
+# that leads with this marker (bench/kube_agents_bench/scoring.py, #1874).
+# Not a storm rep: the agent ran and nothing was lost to 429s, so it stays out
+# of rule 2's count and of every pass-rate denominator; rule 2b below counts
+# it on its own. test_eval_dashboard_health.py reads the literal out of the
+# scorer so the two cannot drift.
+REP_CEILING = "ceiling"
+DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 
 # How old data.json may be before health.json is flagged stale. The
 # collector writes `stale_after_s` when it knows its own cadence
@@ -176,6 +196,34 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # in a run are background noise on any day and must not hold GREEN off.
 STORM_RUN_SIGNATURE_REPS = 5
 
+# --- Rule 2b: delegation ceiling -> DEGRADED (#1874, #1879) -------------------
+# Incident: the platform agent's kanban dispatcher stalls under load ("ready
+# queue non-empty ... 0 workers spawned", 23 warnings on the 2026-09-21
+# nightly, #1879), or workers run past the harness's wait. Every repetition
+# that reaches AGENT_DELEGATION_TIMEOUT with nothing delivered is a `ceiling`
+# rep (REP_CEILING above): not graded and not a storm rep, so on its own it
+# is neither a collapse for rule 1 nor a count for rule 2, and the suite
+# reports the run NOT EVALUATED. Without this rule a fleet-wide stall read
+# GREEN here while every pull request was told to rerun: visible on each
+# run, named nowhere.
+#
+# The rule is rule 2's shape over ceiling reps, same thresholds and window:
+# CEILING_MIN_REPS across CEILING_MIN_PRS distinct pull requests among the
+# runs that finished inside CEILING_WINDOW. Three PRs because one project's
+# worker can be slow on one PR's task without saying anything about the
+# fleet; fifteen reps because one or two per run is a slow worker on a slow
+# day, while five per run three times over is the 2026-09-19 nightly's shape
+# (13 of 116) spread across presubmits. Ranked below the storm on purpose: a
+# 429-starved worker hits the same wait, so when both fire the quota is the
+# cause and the ceiling wave is evidence beside it.
+CEILING_WINDOW = STORM_WINDOW
+CEILING_MIN_REPS = STORM_MIN_REPS
+CEILING_MIN_PRS = STORM_MIN_PRS
+# A finished run carrying at least this many ceiling repetitions is still
+# inside the wave for recovery purposes (rule 6), as STORM_RUN_SIGNATURE_REPS
+# is for a storm.
+CEILING_RUN_SIGNATURE_REPS = STORM_RUN_SIGNATURE_REPS
+
 # --- Rule 3: setup deaths -> DEGRADED (#1172, #1176) -------------------------
 # Incident: a stuck Helm release record left by ci-teardown poisoned pool
 # projects, and the next pull request to lease one died at deploy with
@@ -218,6 +266,34 @@ LOST_POD_SPAN = timedelta(minutes=30)
 LOST_POD_MIN = 3
 LOST_POD_EVENT_MIN = 8
 POD_EVENT_NODE_NOT_READY = "NodeNotReady"
+
+# --- Rule 3d: deadline kills -> OUTAGE (#1894) -------------------------------
+# Incident: from the evening of 2026-09-22 (UTC) the Hermes bump wedged the
+# workers (#1880) and presubmit runs were killed at Prow's 360m deadline with
+# every unit at the delegation ceiling and nothing graded -- 33 kills against
+# 10 verdicts in the fixture's 32 hours -- and the bot stayed GREEN: a
+# deadline death after a successful deploy matched no rule.
+#
+# The rule: a run is a deadline kill when it concluded FAILURE with no eval
+# verdict, is neither a lost pod nor a conflicted merge, and lasted at least
+# PROW_JOB_TIMEOUT minus DEADLINE_KILL_MARGIN. Not "no tasks": since #1875 the
+# harness records cases as they finish, so a killed run may carry graded
+# tasks and still no verdict. DEADLINE_KILL_MIN of them finishing inside
+# DEADLINE_KILL_WINDOW on DEADLINE_KILL_MIN_PRS distinct pull requests is an
+# OUTAGE -- the gate can pass nobody -- ranked below a shared break, which
+# names cases, and above every DEGRADED condition. Recovery is
+# RECOVERY_GREEN_RUNS runs WITH A VERDICT, green or red, on distinct pull
+# requests after the last kill: a red that graded proves the gate grades.
+#
+# The timeout is the job's decoration_config.timeout in oss-test-infra
+# (prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml); data.json
+# does not carry it. The margin covers the 362-365 minutes Prow records for
+# a killed run without reaching a long green.
+PROW_JOB_TIMEOUT = timedelta(minutes=360)
+DEADLINE_KILL_MARGIN = timedelta(minutes=15)
+DEADLINE_KILL_WINDOW = timedelta(hours=2)
+DEADLINE_KILL_MIN = 3
+DEADLINE_KILL_MIN_PRS = 2
 # The lost-pod advice names the loss on the reader's clock, the way
 # post_health.py writes every time a person reads (docs/ci-health.md, Times);
 # zone and label are fixed together there and mirrored here rather than
@@ -269,13 +345,15 @@ EVIDENCE_MAX_PRS = 6
 # Entering OUTAGE or DEGRADED needs the condition to be current, not merely
 # inside the window: one of the last TRANSITION_MIN_RUNS completed full runs
 # has to carry the condition's signature (the rules themselves already need
-# three runs' worth of evidence). Setup deaths are exempt -- they are not
-# full runs, so the count is the currency. Leaving for GREEN needs
+# three runs' worth of evidence). COUNTED_CONDITIONS are exempt -- setup
+# deaths, lost pods, deadline kills and fixture drift have no signature on a
+# full run, so the count is the currency. Leaving for GREEN needs
 # RECOVERY_GREEN_RUNS consecutive green runs on distinct pull requests, all
 # finished after the incident began and none carrying the signature of the
 # condition being left -- a single lucky green does not declare victory, and
 # the runs that made the incident cannot end it (#1213 is the false-green
-# risk in the other direction).
+# risk in the other direction). A deadline-kill OUTAGE is left on the same
+# count of runs WITH A VERDICT, green or red (`recovered`).
 TRANSITION_MIN_RUNS = 3
 RECOVERY_GREEN_RUNS = 3
 
@@ -290,8 +368,15 @@ RECOVERY_GREEN_RUNS = 3
 # broken and /retest does not help.
 #
 # The rule: the median wall clock of the newest SLOW_RUNS full runs -- a
-# concluded run of at least SLOW_MIN_TASKS cases (the presubmit runs 18; a
-# run Prow cut short at its ceiling recorded fewer and is not one) -- all of
+# concluded run of at least SLOW_MIN_TASKS cases (one fewer than the
+# presubmit file lists, read from hack/eval/presubmit-cases.txt: 11 for the
+# twelve cases the presubmit runs since 2026-09-22, when it became the
+# blocking roster only, #1023, having run 18-19 before; a run Prow cut short
+# at its ceiling recorded fewer and is not one; the floor was a literal 15
+# until the roster shrank under it, which would have made every run since a
+# partial one and the rule silent, so it follows the file and sits one
+# demotion below the roster on purpose, an admission or a demotion moving
+# it without an edit here) -- all of
 # them finished inside SLOW_WINDOW, is at least SLOW_FACTOR times the median
 # of the full runs of the trailing SLOW_BASELINE before them, given at least
 # SLOW_BASELINE_MIN_RUNS of those. Medians rather than the p90 the issue
@@ -304,11 +389,55 @@ RECOVERY_GREEN_RUNS = 3
 # hovering at the bar is one episode rather than a note every tick.
 SLOW_RUNS = 5
 SLOW_WINDOW = timedelta(hours=6)
-SLOW_MIN_TASKS = 15
+
+
+def _slow_min_tasks(default: int = 11) -> int:
+    """One fewer than the presubmit file's case count; `default` when the
+    file cannot be read (a checkout without hack/eval/, an old era)."""
+    try:
+        cases = eval_rosters.presubmit_cases()
+    except (OSError, ValueError):
+        return default
+    return max(1, len(cases) - 1) if cases else default
+
+
+SLOW_MIN_TASKS = _slow_min_tasks()
 SLOW_BASELINE = timedelta(days=7)
 SLOW_BASELINE_MIN_RUNS = 20
 SLOW_FACTOR = 1.2
 SLOW_CLEAR_FACTOR = 1.1
+
+# --- Rule 8: a backed-up pool -> a note beside the state, never a state (#1607)
+# Runs are timed from their start, so nothing else here sees a run that sat in
+# the queue first. The pool-pressure periodic (#1069) measures that hourly and
+# already grades itself against the runbook's thresholds; this rule reads its
+# verdict rather than deriving a second one.
+#
+# A note, not a state: the runs still pass, they just start late, and DEGRADED
+# would tell people to retest, which lengthens the queue being reported.
+# Unlike rule 7 it is not held back outside GREEN -- a different job reading
+# different data cannot be the incident's own symptom, and when leases are the
+# incident the wait is the explanation.
+#
+# POOL_STALE_AFTER is the dead-man's switch: latest-build.txt keeps resolving
+# after the periodic dies, so a stopped job reads as an unchanging healthy
+# artifact. Two missed hourly runs plus the job's 30m timeout is 2.5h, rounded
+# up so a run that starts late is not a stale reading.
+POOL_STALE_AFTER = timedelta(hours=3)
+POOL_BREACH = "BREACH"
+POOL_UNMEASURED = "UNMEASURED"
+POOL_STALE = "STALE"
+SECONDS_PER_MINUTE = 60
+# Longer than a queued run can really have waited: the sweep only looks back a
+# week. Past it the figure is corrupt, and dating a backlog from it puts the
+# start outside the range a datetime can hold.
+POOL_MAX_WAIT = timedelta(days=30)
+# pool_pressure.py buckets waits by UTC calendar day and emits no row for a day
+# with no runs, so the newest row is not always the newest day. "Last 24h" from
+# window_end spans two such days; a row older than that is a different day's
+# number under the digest's heading.
+POOL_DIGEST_DAYS = 2
+POOL_DAY_FORMAT = "%Y-%m-%d"
 
 # --- Roster ------------------------------------------------------------------
 # The admitted roster is the source of truth for what can red a pull request
@@ -335,6 +464,8 @@ CAUSE_STORM = "quota storm window {start}–{end} UTC"
 CAUSE_SETUP = "setup/clone failures on {count} runs ({prs})"
 CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build node {start}–{end} UTC"
 CAUSE_FIXTURE_DRIFT = "seeded fixture drift: {roles} out of designed state on {projects} pool project(s)"
+CAUSE_CEILING = "delegation ceiling: {reps} repetitions on {prs} PRs ended with the worker still running {start}–{end} UTC"
+CAUSE_DEADLINE_KILL = "deadline kills: {count} runs on {prs} PRs killed at the {minutes}-minute deadline with no verdict {start}–{end} UTC"
 ADVICE_OUTAGE = "Don't retest yet; the failing cases share a cause. Tracking: {tracking}"
 ADVICE_OUTAGE_NO_ISSUE = "no issue filed yet — file one with the presubmit-gate label"
 ADVICE_STORM = "Retest after {when} UTC; runs started inside the storm lose repetitions to 429s."
@@ -352,9 +483,26 @@ ADVICE_FIXTURE_DRIFT = (
     "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change;"
     " retest once the fleet owner has re-applied bench/tf/fleet there (README, State and reconcile)."
 )
+ADVICE_CEILING = (
+    "Retest once workers are finishing again; those runs read NOT EVALUATED, not red."
+    " platform-agent-gateway.log in a run's artifacts says whether the dispatcher stalled (#1879) or 429s starved the workers."
+)
+ADVICE_DEADLINE_KILL = (
+    "Don't retest; runs are being killed at the {minutes}-minute deadline before anything is graded,"
+    " so nothing can pass. Tracking: {tracking}"
+)
 ADVICE_RECOVERING = (
     "The condition has cleared; a retest is reasonable. GREEN is reported"
     " after {count} consecutive green runs on distinct PRs."
+)
+# Leaving a deadline-kill outage: a verdict either way proves the gate grades
+# (`recovered`); the evidence line names the bar with recovery_bar().
+RECOVERY_BAR_GREEN = "green runs"
+RECOVERY_BAR_VERDICT = "runs with a verdict"
+ADVICE_RECOVERING_VERDICT = (
+    "The condition has cleared; a retest is reasonable. GREEN is reported once"
+    " the newest {count} runs with a verdict, green or red, are on distinct PRs"
+    " and all finished after the last kill."
 )
 ADVICE_STALE = "data.json last refreshed {generated_at} ({age} ago); the dashboard refresh is stalled and this state is that old."
 ADVICE_GREEN = ""
@@ -369,9 +517,10 @@ GZIP_SUFFIX = ".gz"
 # every phrase STORM_REASON_RE matches sits inside the first 96 characters
 # of the harness's phrasings, and the dashboard keeps 300.
 TRIM_REASON_CHARS = 96
-# The optional "how the build ended" run fields (SCHEMA.md) the trimmer
-# carries when the source has them; absent stays absent.
-ENDED_FIELDS = ("has_build_log", "pod_phase", "pod_node", "pod_last_event", "merge_conflict")
+# The optional run fields (SCHEMA.md) the trimmer carries when the source has
+# them; absent stays absent: how the build ended, and the eval's own verdict,
+# which is what tells a deadline kill from a long red.
+ENDED_FIELDS = ("has_build_log", "pod_phase", "pod_node", "pod_last_event", "merge_conflict", "eval_verdict")
 
 UTC = timezone.utc
 
@@ -421,6 +570,8 @@ def rep_kind(rep: dict) -> str:
     result = rep.get("result")
     if result == REP_RESULT_PASS:
         return REP_PASS
+    if DELEGATION_CEILING_MARKER in (rep.get("reason") or ""):
+        return REP_CEILING
     if result == REP_RESULT_INFRA:
         return REP_STORM
     if STORM_REASON_RE.search(rep.get("reason") or ""):
@@ -429,11 +580,11 @@ def rep_kind(rep: dict) -> str:
 
 
 class Task:
-    __slots__ = ("fails", "name", "passes", "storms")
+    __slots__ = ("ceilings", "fails", "name", "passes", "storms")
 
     def __init__(self, task: dict):
         self.name = task.get("name") or ""
-        self.passes = self.fails = self.storms = 0
+        self.passes = self.fails = self.storms = self.ceilings = 0
         reps = task.get("reps")
         if reps is None:
             # No per-rep detail (SCHEMA.md: absence means unknown); the
@@ -445,6 +596,8 @@ class Task:
                 self.passes += 1
             elif kind == REP_STORM:
                 self.storms += 1
+            elif kind == REP_CEILING:
+                self.ceilings += 1
             else:
                 self.fails += 1
 
@@ -459,7 +612,7 @@ class Task:
 
 
 class Run:
-    __slots__ = ("build_id", "duration", "finished", "has_build_log", "merge_conflict", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
@@ -482,6 +635,11 @@ class Run:
         # Unknown stays a setup death: a document written before the collector
         # recorded the field must keep reading the way it did.
         self.merge_conflict = run.get("merge_conflict") if isinstance(run.get("merge_conflict"), bool) else None
+        # The eval loop's own verdict (SCHEMA.md, optional): None when the
+        # run never reached one, which a deadline kill never does. A document
+        # without the key is unknown, not "no verdict": it never makes a kill.
+        self.eval_verdict = run.get("eval_verdict") if isinstance(run.get("eval_verdict"), str) else None
+        self.eval_verdict_recorded = "eval_verdict" in run
 
     @property
     def full(self) -> bool:
@@ -498,8 +656,12 @@ class Run:
         return sum(task.storms for task in self.tasks)
 
     @property
+    def ceiling_reps(self) -> int:
+        return sum(task.ceilings for task in self.tasks)
+
+    @property
     def total_reps(self) -> int:
-        return sum(task.passes + task.fails + task.storms for task in self.tasks)
+        return sum(task.passes + task.fails + task.storms + task.ceilings for task in self.tasks)
 
     @property
     def lost_pod(self) -> bool:
@@ -523,6 +685,34 @@ class Run:
             and self.duration is not None
             and self.duration < SETUP_DEATH_MAX_DURATION
         )
+
+    @property
+    def deadline_kill(self) -> bool:
+        """Rule 3d's unit: Prow's deadline ended it, not the eval."""
+        return (
+            self.result == RUN_FAILURE
+            and self.eval_verdict_recorded
+            and self.eval_verdict is None
+            and not self.lost_pod
+            and self.merge_conflict is not True
+            and self.duration is not None
+            and self.duration >= PROW_JOB_TIMEOUT - DEADLINE_KILL_MARGIN
+        )
+
+    @property
+    def has_verdict(self) -> bool:
+        """Reached a verdict, which is what proves the gate grades: the
+        eval's own, or -- only for a document written before `eval_verdict`
+        existed, which is never a kill -- a concluded run. Either way at
+        least one repetition has to have been graded: NOT EVALUATED records
+        as RED (SCHEMA.md; the collector reads the `Failed` word), and a red
+        whose every repetition was lost to infrastructure graded nothing. A
+        recorded null is no verdict whatever the run carries: the harness
+        died after some cases and before its line."""
+        graded = any(task.graded for task in self.tasks)
+        if self.eval_verdict is not None:
+            return graded
+        return not self.eval_verdict_recorded and self.result in (RUN_SUCCESS, RUN_FAILURE) and graded
 
     def collapsed_cases(self) -> set[str]:
         return {task.name for task in self.tasks if task.collapsed}
@@ -713,6 +903,33 @@ def storm(full_runs, now: datetime) -> dict:
     }
 
 
+def delegation_ceiling(full_runs, now: datetime) -> dict:
+    """Rule 2b. Returns {fires, reps, prs, start, end, evidence, signature_runs, runs}."""
+    window = _in_window(full_runs, now, CEILING_WINDOW)
+    hit = [run for run in window if run.ceiling_reps > 0]
+    reps = sum(run.ceiling_reps for run in hit)
+    prs = _prs(hit)
+    fires = reps >= CEILING_MIN_REPS and len(prs) >= CEILING_MIN_PRS
+    start = min((run.finished for run in hit), default=None)
+    end = max((run.finished for run in hit), default=None)
+    evidence = []
+    if hit:
+        evidence.append(
+            f"delegation ceiling: {reps} reps across {len(prs)} PRs ended with the worker still running"
+            f" in runs finishing {hhmm(start)}–{hhmm(end)} UTC; nothing graded, nothing counted against a case"
+        )
+    return {
+        "fires": fires,
+        "reps": reps,
+        "prs": prs,
+        "start": start,
+        "end": end,
+        "evidence": evidence if fires else [],
+        "signature_runs": {run.build_id for run in hit if run.ceiling_reps >= CEILING_RUN_SIGNATURE_REPS},
+        "runs": len(hit),
+    }
+
+
 def setup_deaths(runs, now: datetime) -> dict:
     """Rule 3. Returns {fires, deaths, prs, evidence}."""
     deaths = [run for run in _in_window(runs, now, SETUP_DEATH_WINDOW) if run.setup_death]
@@ -726,6 +943,31 @@ def setup_deaths(runs, now: datetime) -> dict:
             f" in the last {int(SETUP_DEATH_WINDOW.total_seconds() // 3600)}h ({_pr_list(prs)})"
         )
     return {"fires": fires, "deaths": deaths, "prs": prs, "evidence": evidence}
+
+
+def deadline_kills(runs, now: datetime) -> dict:
+    """Rule 3d. Returns {fires, killed, prs, start, end, evidence}."""
+    killed = [run for run in _in_window(runs, now, DEADLINE_KILL_WINDOW) if run.deadline_kill]
+    prs = _prs(killed)
+    start = min((run.finished for run in killed), default=None)
+    end = max((run.finished for run in killed), default=None)
+    evidence = []
+    if killed:
+        evidence.append(_deadline_cause(killed, prs, start, end) + f" ({_pr_list(prs)})")
+    return {
+        "fires": len(killed) >= DEADLINE_KILL_MIN and len(prs) >= DEADLINE_KILL_MIN_PRS,
+        "killed": killed,
+        "prs": prs,
+        "start": start,
+        "end": end,
+        "evidence": evidence,
+    }
+
+
+def _deadline_cause(killed, prs, start, end) -> str:
+    return CAUSE_DEADLINE_KILL.format(
+        count=len(killed), prs=len(prs), minutes=int(PROW_JOB_TIMEOUT.total_seconds() // 60), start=hhmm(start), end=hhmm(end)
+    )
 
 
 def node_counts(runs) -> dict[str, int]:
@@ -888,7 +1130,10 @@ def pr_caused_reds(full_runs, roster: Roster) -> int:
             prs_by_case.setdefault(case, set()).add(run.pr)
     count = 0
     for run in full_runs:
-        if run.result != RUN_FAILURE:
+        # A killed run that recorded cases (#1875) stays in the population --
+        # its collapse still makes another PR's red shared -- but is never the
+        # PR's own: the kill is the gate's, whatever those cases did.
+        if run.result != RUN_FAILURE or run.deadline_kill:
             continue
         mine = run.collapsed_cases() & roster.at(run.started or run.finished)
         if mine and all(prs_by_case[case] == {run.pr} for case in mine):
@@ -909,6 +1154,10 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
     own = pr_caused_reds(full, roster)
     deaths = sum(1 for run in window if run.setup_death)
     lost = sum(1 for run in window if run.lost_pod)
+    kills = [run for run in window if run.deadline_kill]
+    # A killed run that recorded cases (#1875) is already among the full
+    # reds (and never among the PR's own, see pr_caused_reds).
+    kills_not_counted = sum(1 for run in kills if not run.full)
     out = {
         "window_hours": int(METRICS_WINDOW.total_seconds() // 3600),
         "full_runs": len(full),
@@ -917,15 +1166,19 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
         "red_runs": reds,
         # The digest's split of the reds: the pull request's own, and
         # everything else (shared breaks, storms, empty records, setup
-        # deaths, lost pods) as "infra".
+        # deaths, lost pods, deadline kills) as "infra".
         "pr_caused_reds": own,
-        "infra_reds": reds - own + deaths + lost,
+        "infra_reds": reds - own + deaths + lost + kills_not_counted,
         "green_rate": round(len(green) / len(concluded), 3) if concluded else None,
         "aborted_runs": sum(1 for run in window if run.result not in (RUN_SUCCESS, RUN_FAILURE)),
         "setup_deaths": deaths,
         "lost_pods": lost,
+        "deadline_kills": len(kills),
         "infra_rep_rate": round(storm_reps / reps, 3) if reps else None,
         "infra_reps": storm_reps,
+        # Apart from the storm's count: repetitions the harness stopped
+        # watching at its delegation ceiling with the worker still running.
+        "ceiling_reps": sum(run.ceiling_reps for run in full),
     }
     for pct in WALL_CLOCK_PERCENTILES:
         value = percentile(walls, pct)
@@ -980,6 +1233,291 @@ def slow_evidence(slow: dict) -> str:
         f" (median {slow['median_s'] // 60}) against a {slow['baseline_days']}-day typical of"
         f" {slow['baseline_p50_s'] // 60} min (p90 {slow['baseline_p90_s'] // 60}); {lost}"
     )
+
+
+def _as_seconds(minutes) -> int | None:
+    """pool-pressure.json reports minutes; health.json stores seconds.
+
+    The product is what gets checked, not the input: json.loads returns both
+    `1e308`, finite until multiplied, and integers no float can hold. Bools
+    are a data error rather than 1 and 0, as render.is_number has it.
+    """
+    if not isinstance(minutes, (int, float)) or isinstance(minutes, bool):
+        return None
+    try:
+        seconds = float(minutes) * SECONDS_PER_MINUTE
+    except OverflowError:  # an int too large to be a float
+        return None
+    return int(seconds) if math.isfinite(seconds) else None
+
+
+def _section(artifact: dict, key: str) -> dict:
+    """A named object out of the artifact, `{}` when it is anything else.
+
+    pool-pressure.json is another job's output and nothing validates its shape
+    on the way in. A wrong type raises inside adjudicate, and the Actions step
+    calling it has no continue-on-error, so one malformed artifact would stop
+    the dashboard and the chat bot every 15 minutes until someone noticed.
+    """
+    value = artifact.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _rows(section: dict, key: str = "days") -> list:
+    """An array field, `[]` when the artifact put something else there."""
+    rows = section.get(key)
+    return rows if isinstance(rows, list) else []
+
+
+def wait_text(seconds) -> str:
+    """A measured wait: "24s" below a minute, "22 min" above. Whole minutes
+    would print an ordinary 24-second wait as "0 min". post_health imports it
+    so the chat message and the evidence line agree."""
+    if seconds is None:
+        return "?"
+    return f"{int(seconds)}s" if seconds < SECONDS_PER_MINUTE else f"{seconds // SECONDS_PER_MINUTE} min"
+
+
+def minutes_text(seconds) -> str:
+    """A threshold, which the runbook always states in whole minutes.
+
+    post_health imports it, as it does wait_text, so the chat message and the
+    evidence line cannot drift.
+    """
+    return "?" if seconds is None else str(int(seconds // SECONDS_PER_MINUTE))
+
+
+def _longest_wait_s(queue: dict) -> int | None:
+    """The longest current wait for a project, or None if Deck was not read.
+
+    None and zero say different things -- "we cannot tell" against "nothing is
+    waiting" -- and the message gate treats them differently. A figure over
+    POOL_MAX_WAIT is dropped like an unparseable one: it costs its own run,
+    not the tick that would otherwise date a backlog from it and raise.
+    """
+    if not queue.get("read"):
+        return None
+    cap = int(POOL_MAX_WAIT.total_seconds())
+    waits = [_as_seconds(run.get("minutes")) for run in _rows(queue, "waiting_runs") if isinstance(run, dict)]
+    return max([w for w in waits if w is not None and w <= cap], default=0)
+
+
+def _over_limit(row: dict, thresholds: dict) -> bool:
+    """Whether a stretch's own percentiles are over either limit.
+
+    `days[]` rows carry the periodic's `breached` flag; the recent block does
+    not, because it is evidence and never a verdict. Strict `>` and either
+    half, as `DayRow.breached` compares. False when a limit is missing: the
+    question cannot be answered, and the periodic's own flagged day can.
+    """
+    limits = (_as_seconds(thresholds.get("p50_minutes")), _as_seconds(thresholds.get("p95_minutes")))
+    return any(
+        limit is not None and (_as_seconds(row.get(key)) or 0) > limit
+        for key, limit in zip(("p50_minutes", "p95_minutes"), limits)
+    )
+
+
+def _worst_breached_day(trend: dict, thresholds: dict) -> dict | None:
+    """The `days[]` row that breached hardest, or None if no day did.
+
+    Hardest is the largest excess over either limit, so a day that went over on
+    p95 alone is still picked ahead of a quiet one. A row's own `breached` flag
+    is what `trend.breached_days` is built from, sample minimum included.
+    """
+    days = [d for d in _rows(trend) if isinstance(d, dict) and d.get("breached")]
+    if not days:
+        return None
+    # Through _as_seconds on both sides: the ratio is the same in either unit,
+    # and it is the file's existing filter for a figure that is not a number.
+    limits = (_as_seconds(thresholds.get("p50_minutes")), _as_seconds(thresholds.get("p95_minutes")))
+
+    def excess(row: dict) -> float:
+        return max(
+            (_as_seconds(row.get(key)) or 0) / limit if limit else 0
+            for key, limit in zip(("p50_minutes", "p95_minutes"), limits)
+        )
+
+    return max(days, key=excess)
+
+
+def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict | None:
+    """Rule 8: the note's numbers while the pool is backed up, else None.
+
+    `artifact` is the pool-pressure periodic's pool-pressure.json, None when
+    the job has published none. `prev` is the previous tick's note and carries
+    the episode's `since`, as rule 7's does. The verdict is the periodic's and
+    is not re-derived; staleness is the exception, because an artifact cannot
+    report that it has stopped being written.
+    """
+    if not isinstance(artifact, dict):
+        return None
+    measured = parse_iso(artifact.get("window_end"))
+    verdict = artifact.get("verdict")
+    if measured is None or now - measured > POOL_STALE_AFTER:
+        # Stale outranks the verdict it carries: the numbers may be hours old.
+        verdict = POOL_STALE
+    elif verdict not in (POOL_BREACH, POOL_UNMEASURED):
+        return None
+    # `since` opens on the first note and carries through the episode, but a
+    # BREACH does not inherit one from a stretch that only ever said the queue
+    # could not be read: "runs are waiting since Monday" over two days nobody
+    # measured claims more than the readings do. `breach_seen` is what makes
+    # the two directions differ -- a breach that goes STALE and comes back
+    # keeps its real start, because that start was measured.
+    before = prev or {}
+    breach_seen = bool(before.get("breach_seen")) or verdict == POOL_BREACH
+    carried = before.get("since") if verdict != POOL_BREACH or before.get("breach_seen") else None
+    note = {
+        "since": carried or iso(now),
+        "verdict": verdict,
+        "breach_seen": breach_seen,
+        "measured_at": iso(measured) if measured else None,
+    }
+    if verdict == POOL_STALE:
+        # No numbers at all. A reading from hours ago is not evidence about
+        # now, and a field that is present will eventually be rendered as
+        # though it were current.
+        return note
+    trend = _section(artifact, "trend")
+    pool = _section(artifact, "pool")
+    thresholds = _section(artifact, "thresholds")
+    # The numbers that justify the verdict, not the window's. The periodic
+    # breaches on a single day's row or on a run waiting past p95 right now
+    # (pool_pressure.py's `breached_days or live_breach`) and never on the
+    # seven-day aggregate, which after one bad day sits back inside its own
+    # limit -- printing it under "onboard a project" contradicts the alert.
+    #
+    # The recent stretch comes first when it has the runs to be judged and is
+    # itself over a limit, because a verdict that lasts a week outlives the day
+    # that earned it: a Thursday incident is otherwise evidenced by Monday. It
+    # has to breach on its own to be quoted at all -- a stretch inside both
+    # limits is the same contradiction, only newer. Below the sample floor, or
+    # back inside them, the worst breached day is what is left to show.
+    recent = _section(artifact, "recent")
+    quotable = bool(recent.get("judged")) and _over_limit(recent, thresholds)
+    day = {} if quotable else (_worst_breached_day(trend, thresholds) or {})
+    source = recent if quotable else day
+    longest = _longest_wait_s(_section(artifact, "queue"))
+    limit_p50 = _as_seconds(thresholds.get("p50_minutes"))
+    backlog = None if longest is None or limit_p50 is None else longest > limit_p50
+    return note | {
+        "day": day.get("day"),
+        "window_hours": recent.get("hours") if quotable else None,
+        "p50_s": _as_seconds(source.get("p50_minutes")),
+        "p95_s": _as_seconds(source.get("p95_minutes")),
+        # The longest current wait, and whether it is a backlog. Judged once
+        # here: the alert, the digest and the Brief all ask, and a verdict
+        # lasting a week outlives the queue that earned it. Against the p50
+        # limit, the periodic's own bar for a bad day -- `over_threshold`, the
+        # subset already past p95, misses a pool full all afternoon at half an
+        # hour a run. None when nothing can answer: Deck unread, or no limit.
+        "waiting_longest_s": longest,
+        "waiting_now": backlog,
+        # When this backlog began, not when the episode did: the verdict spans
+        # a week, so "waiting since Monday" can stand over a Thursday jam. The
+        # oldest queued run dates it, and only while there is one.
+        "waiting_since": iso(measured - timedelta(seconds=longest)) if backlog else None,
+        "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
+        "threshold_p50_s": limit_p50,
+        "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
+        "free": pool.get("free"),
+        "total": pool.get("total"),
+        "cause": artifact.get("cause"),
+        # The cap the newest run in the window ran under. Only the
+        # CONCURRENCY_CAP message quotes it, and without it that message
+        # cannot say what to raise the cap from.
+        "max_concurrency": artifact.get("max_concurrency"),
+    }
+
+
+def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
+    """The digest's `typical wait`: the median of the artifact's newest day.
+
+    `trend.p50_minutes` is the seven-day figure and belongs to the note; the
+    digest headline says "last 24h", so it reads the newest judged `days[]`
+    row. None when there is no artifact, it is too old, or every row inside the
+    heading went unjudged -- a quiet weekend would otherwise print Friday's
+    median as today's.
+    """
+    if not isinstance(artifact, dict):
+        return None
+    measured = parse_iso(artifact.get("window_end"))
+    if measured is None or now - measured > POOL_STALE_AFTER:
+        return None
+    # The newest judged row, not the newest row. The producer withholds a
+    # verdict below its sample floor, and at 13:00 UTC today's row holds only
+    # the overnight runs -- one slow run would otherwise be the morning's
+    # typical wait. Withholding the figure instead costs the headline on every
+    # quiet morning, and a night with no runs at all already falls back, since
+    # the producer writes no row for an empty day. Rows are oldest first, so
+    # the first one outside POOL_DIGEST_DAYS ends the walk.
+    for row in reversed(_rows(_section(artifact, "trend"))):
+        if not isinstance(row, dict):
+            continue
+        try:
+            day = datetime.strptime(row["day"], POOL_DAY_FORMAT).date()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (measured.date() - day).days >= POOL_DIGEST_DAYS:
+            break
+        if row.get("judged"):
+            return _as_seconds(row.get("p50_minutes"))
+    return None
+
+
+def pool_evidence(pool: dict) -> str:
+    if pool["verdict"] == POOL_STALE:
+        return (
+            f"queue wait unmeasured: last reading {pool['measured_at'] or 'never'};"
+            " the hourly pool-pressure job has missed the last few"
+        )
+    if pool["verdict"] == POOL_UNMEASURED:
+        return "pool pressure: the hourly check ran but could not read how long recent runs waited"
+    # UNKNOWN *is* the pool read failing, so the counts are absent on exactly
+    # the breach that most wants explaining. Say the wait and stop.
+    counted = pool["free"] is not None and pool["total"] is not None
+    projects = f"; {pool['free']} of {pool['total']} projects free" if counted else ""
+    return f"backed-up pool: {pool_measurement(pool)}{projects}"
+
+
+def pool_span(pool: dict) -> str | None:
+    """Which stretch the note's numbers cover, or None when it carries none.
+
+    `pool_note` sets `window_hours` when the periodic could judge the recent
+    stretch and `day` when it fell back to the worst breached day, so the three
+    readers that quote numbers do not each decide which it was. A label with no
+    numbers under it is worse than no label: a breach carried by the live queue
+    alone has neither, and would otherwise read "median wait ?".
+    """
+    if pool.get("p50_s") is None and pool.get("p95_s") is None:
+        return None
+    hours = pool.get("window_hours")
+    if hours:
+        return f"last {hours}h"
+    return f"worst day {pool['day']}" if pool.get("day") else None
+
+
+def pool_measurement(pool: dict) -> str:
+    """Where the breach is, in the periodic's own terms: the stretch it
+    measured, the live queue, or both. post_health and the page read the same
+    fields."""
+    parts = []
+    span = pool_span(pool)
+    if span:
+        parts.append(
+            f"{span} median {wait_text(pool['p50_s'])} against"
+            f" {minutes_text(pool['threshold_p50_s'])} min,"
+            f" p95 {wait_text(pool['p95_s'])} against"
+            f" {minutes_text(pool['threshold_p95_s'])}"
+        )
+    if pool.get("over_threshold"):
+        parts.append(
+            f"{pool['over_threshold']} run{'' if pool['over_threshold'] == 1 else 's'}"
+            f" waiting now past {minutes_text(pool['threshold_p95_s'])} min"
+        )
+    # A BREACH always has one or the other; this is what a contract violation
+    # reads as, rather than a sentence with a blank in it.
+    return "; ".join(parts) or "the periodic reported a breach with no measured stretch and no live queue"
 
 
 # --------------------------------------------------------------------------- #
@@ -1042,6 +1580,11 @@ def all_tracking(cases: list[str], notes: dict, issue) -> list[str]:
     return issues
 
 
+def recovery_bar(condition: str | None) -> str:
+    """What `recovered` counts on the way out of `condition`, in words."""
+    return RECOVERY_BAR_VERDICT if condition == DEADLINE_KILL else RECOVERY_BAR_GREEN
+
+
 def advice_for(
     state: str,
     condition: str | None,
@@ -1058,14 +1601,24 @@ def advice_for(
     the lost-pod advice's nodes, time and count."""
     if state == GREEN:
         return ADVICE_GREEN
+    if recovering and condition == DEADLINE_KILL:
+        return ADVICE_RECOVERING_VERDICT.format(count=RECOVERY_GREEN_RUNS)
     if recovering:
         return ADVICE_RECOVERING.format(count=RECOVERY_GREEN_RUNS)
     if condition == SHARED_BREAK:
         issues = all_tracking(cases, notes, issue)
         return ADVICE_OUTAGE.format(tracking=", ".join(issues) if issues else ADVICE_OUTAGE_NO_ISSUE)
+    if condition == DEADLINE_KILL:
+        issues = all_tracking(cases, notes, issue)
+        return ADVICE_DEADLINE_KILL.format(
+            minutes=int(PROW_JOB_TIMEOUT.total_seconds() // 60),
+            tracking=", ".join(issues) if issues else ADVICE_OUTAGE_NO_ISSUE,
+        )
     if condition == STORM:
         when = hhmm(storm_end + STORM_COOLDOWN) if storm_end else "the storm ends"
         return ADVICE_STORM.format(when=when)
+    if condition == DELEGATION_CEILING:
+        return ADVICE_CEILING
     if condition == LOST_PODS:
         incident = incident or {}
         return ADVICE_LOST_PODS.format(
@@ -1094,19 +1647,27 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     full_runs = [run for run in visible if run.full]
     r1 = shared_break(full_runs, now, roster)
     r2 = storm(full_runs, now)
+    r2b = delegation_ceiling(full_runs, now)
     r3 = setup_deaths(visible, now)
     r3b = lost_pods(visible, now)
     r3c = fixture_drift(fixture_state_doc, now)
+    r3d = deadline_kills(visible, now)
 
     if r1["fires"]:
         state, condition = OUTAGE, SHARED_BREAK
         cause = CAUSE_SHARED_BREAK.format(cases=", ".join(r1["cases"]))
+    elif r3d["fires"]:
+        state, condition = OUTAGE, DEADLINE_KILL
+        cause = _deadline_cause(r3d["killed"], r3d["prs"], r3d["start"], r3d["end"])
     elif r3b["fires"]:
         state, condition = DEGRADED, LOST_PODS
         cause = CAUSE_LOST_PODS.format(count=len(r3b["lost"]), prs=len(r3b["prs"]), start=hhmm(r3b["start"]), end=hhmm(r3b["end"]))
     elif r2["fires"]:
         state, condition = DEGRADED, STORM
         cause = CAUSE_STORM.format(start=hhmm(r2["start"]), end=hhmm(r2["end"]))
+    elif r2b["fires"]:
+        state, condition = DEGRADED, DELEGATION_CEILING
+        cause = CAUSE_CEILING.format(reps=r2b["reps"], prs=len(r2b["prs"]), start=hhmm(r2b["start"]), end=hhmm(r2b["end"]))
     elif r3["fires"]:
         state, condition = DEGRADED, SETUP_DEATHS
         cause = CAUSE_SETUP.format(count=len(r3["deaths"]), prs=_pr_list(r3["prs"]))
@@ -1116,20 +1677,22 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     else:
         state, condition, cause = GREEN, None, ""
 
-    evidence = r1["evidence"] + r3b["evidence"] + r2["evidence"] + r3["evidence"] + r3c["evidence"] + r1["pr_caused"]
+    evidence = r1["evidence"] + r3d["evidence"] + r3b["evidence"] + r2["evidence"] + r2b["evidence"] + r3["evidence"] + r3c["evidence"] + r1["pr_caused"]
     if r1["fires"] and r2["fires"]:
         # Both true at once on 2026-09-02: the break is the state, the
         # storm is context the reader still needs.
         evidence.append(CAUSE_STORM.format(start=hhmm(r2["start"]), end=hhmm(r2["end"])) + " overlaps the break")
 
     # Currency for rule 6's entry check: whether one of the newest full runs
-    # carries the firing condition's signature. Setup deaths and lost pods
-    # are not full runs; their count is their currency.
+    # carries the firing condition's signature. Setup deaths, lost pods and
+    # deadline kills are counted, not signed; their count is their currency.
     recent = full_runs[-TRANSITION_MIN_RUNS:]
     if condition == SHARED_BREAK:
         signature = r1["signature_runs"]
     elif condition == STORM:
         signature = {run.build_id for run in full_runs if run.storm_reps > 0}
+    elif condition == DELEGATION_CEILING:
+        signature = {run.build_id for run in full_runs if run.ceiling_reps > 0}
     else:
         signature = set()
     current = condition in COUNTED_CONDITIONS or any(run.build_id in signature for run in recent)
@@ -1141,8 +1704,14 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         incident = {"prs": r1["prs"], "runs": r1["runs"], "window_start": None, "window_end": None}
     elif condition == STORM:
         incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"])}
+    elif condition == DELEGATION_CEILING:
+        # `reps` beside the storm's keys: the message says how many
+        # repetitions ended at the wait, not only how many runs held one.
+        incident = {"prs": r2b["prs"], "runs": r2b["runs"], "reps": r2b["reps"], "window_start": iso(r2b["start"]), "window_end": iso(r2b["end"])}
     elif condition == SETUP_DEATHS:
         incident = {"prs": r3["prs"], "runs": len(r3["deaths"]), "window_start": None, "window_end": None}
+    elif condition == DEADLINE_KILL:
+        incident = {"prs": r3d["prs"], "runs": len(r3d["killed"]), "window_start": iso(r3d["start"]), "window_end": iso(r3d["end"])}
     elif condition == LOST_PODS:
         incident = {
             "prs": r3b["prs"],
@@ -1179,20 +1748,33 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         "full_runs": full_runs,
         "last_setup_death": max((run.finished for run in visible if run.setup_death), default=None),
         "last_lost_pod": max((run.finished for run in visible if run.lost_pod), default=None),
+        "last_deadline_kill": max((run.finished for run in visible if run.deadline_kill), default=None),
         "roster": roster,
         "fixture": r3c,
     }
 
 
-def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster, last_lost_pod: datetime | None = None) -> bool:
+def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster, last_lost_pod: datetime | None = None, last_deadline_kill: datetime | None = None) -> bool:
     """Rule 6's exit: the last RECOVERY_GREEN_RUNS full runs are green, on
     distinct pull requests, all finished after the incident began, and none
     carries the signature of the condition being left -- a collapse of one
     of its cases for a shared break, STORM_RUN_SIGNATURE_REPS storm
-    repetitions for a storm, a setup death after it for setup deaths, a lost
-    pod after it for lost pods. Judged from the runs themselves rather than
+    repetitions for a storm, CEILING_RUN_SIGNATURE_REPS ceiling repetitions
+    for a delegation-ceiling wave, a setup death after it for setup deaths,
+    a lost pod after it for lost pods. A deadline-kill outage is the one
+    exception: the same count of runs with a verdict, green or red, after the
+    last kill. Judged from the runs themselves rather than
     from the rule's window, so the runs that constituted the incident never
     count as its recovery once the window has rolled past them."""
+    if prev.get("condition") == DEADLINE_KILL:
+        # A verdict either way is the proof: the gate is grading again. Green
+        # alone would hold the outage through a stretch of honest reds.
+        recent = [run for run in full_runs if run.has_verdict][-RECOVERY_GREEN_RUNS:]
+        if len(recent) < RECOVERY_GREEN_RUNS:
+            return False
+        if any(run.finished <= since or (last_deadline_kill is not None and run.finished <= last_deadline_kill) for run in recent):
+            return False
+        return len(_prs(recent)) >= RECOVERY_GREEN_RUNS
     recent = full_runs[-RECOVERY_GREEN_RUNS:]
     if len(recent) < RECOVERY_GREEN_RUNS:
         return False
@@ -1209,6 +1791,7 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
     carries = {
         SHARED_BREAK: lambda run: bool(run.collapsed_cases() & cases & roster.at(run.started or run.finished)),
         STORM: lambda run: run.storm_reps >= STORM_RUN_SIGNATURE_REPS,
+        DELEGATION_CEILING: lambda run: run.ceiling_reps >= CEILING_RUN_SIGNATURE_REPS,
         SETUP_DEATHS: lambda run: last_setup_death is not None and run.finished <= last_setup_death,
         LOST_PODS: lambda run: last_lost_pod is not None and run.finished <= last_lost_pod,
     }.get(condition, lambda run: False)
@@ -1281,7 +1864,7 @@ def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
         if fixture_drift_hold(assessed["fixture"], prev.get("incident")) is None:
             return _keep(GREEN, None, "", [], now, recovering=False)
         return _keep(prev_state, prev_condition, prev.get("cause") or "", [], since, recovering=False)
-    if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"], assessed["roster"], assessed["last_lost_pod"]):
+    if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"], assessed["roster"], assessed["last_lost_pod"], assessed.get("last_deadline_kill")):
         return _keep(GREEN, None, "", [], now, recovering=False)
     return _keep(prev_state, prev_condition, prev.get("cause") or "", prev.get("failing_cases") or [], since, recovering=True)
 
@@ -1307,6 +1890,7 @@ def adjudicate(
     runs: list | None = None,
     wall_clock: datetime | None = None,
     posted: dict | None = None,
+    pool_pressure: dict | None = None,
     fixture_state_doc: dict | None = None,
 ) -> dict:
     """data.json + previous health.json -> health.json (as a dict).
@@ -1317,9 +1901,12 @@ def adjudicate(
     poster's state file (post_health.py), read for the tracking issue the
     bot filed: it rides in `issue` and the advice while the state is not
     GREEN and the condition is the one it was filed for (issue_for), and is
-    dropped on recovery. `fixture_state_doc` is the hourly fleet scan's
-    fixture-state.json when one is published; rule 3c reads it and the
-    `fixture_state` block below summarises it for the poster.
+    dropped on recovery; it also holds the pool episode's start across a tick
+    that read no artifact. `pool_pressure` is the pool-pressure periodic's
+    artifact (rule 8); absent, the note and the digest's wait are None.
+    `fixture_state_doc` is the hourly fleet scan's fixture-state.json when one
+    is published; rule 3c reads it and the `fixture_state` block below
+    summarises it for the poster.
     """
     if runs is None:
         runs = load_runs(data)
@@ -1335,7 +1922,7 @@ def adjudicate(
     evidence = list(assessed["evidence"])
     if decided["recovering"]:
         evidence.append(
-            f"condition cleared; waiting for {RECOVERY_GREEN_RUNS} consecutive green runs"
+            f"condition cleared; waiting for {RECOVERY_GREEN_RUNS} consecutive {recovery_bar(decided['condition'])}"
             " on distinct PRs before reporting GREEN"
         )
     elif decided["state"] != assessed["state"] and SEVERITY[assessed["state"]] > SEVERITY[decided["state"]]:
@@ -1347,6 +1934,13 @@ def adjudicate(
     # the previous tick's numbers: the assessment's incident describes the
     # raw state, not the one being reported.
     incident = assessed["incident"] if decided["state"] == assessed["state"] else (prev or {}).get("incident")
+    if decided["condition"] == DEADLINE_KILL and decided["state"] != GREEN and isinstance(incident, dict):
+        # The rule's window slides, so `window_start` is the oldest kill still
+        # inside it; the outage's first kill is kept across ticks for the
+        # surfaces that date the whole episode (the comment, the issue).
+        previous = (prev or {}).get("incident") if (prev or {}).get("condition") == DEADLINE_KILL and (prev or {}).get("state") != GREEN else None
+        starts = [s for s in ((previous or {}).get("first_kill"), (previous or {}).get("window_start"), incident.get("window_start")) if s]
+        incident = dict(incident, first_kill=min(starts) if starts else None)
     advice = advice_for(
         decided["state"], decided["condition"], decided["failing_cases"], assessed["storm_end"], notes or {}, decided["recovering"], issue, incident
     )
@@ -1360,6 +1954,29 @@ def adjudicate(
     slow = slow_gate(assessed["full_runs"], now, (prev or {}).get("slow") or None) if decided["state"] == GREEN else None
     if slow:
         evidence.append(slow_evidence(slow))
+    # Rule 8 rides beside the state in every state, unlike rule 7: the wait is
+    # a different job's measurement of different data, so it cannot be this
+    # incident's own symptom, and when leases are the incident it is the
+    # explanation.
+    # Aged against the wall clock: `now` is data.json's horizon, and one Prow
+    # stall freezes it and the artifact together, so the switch never fires.
+    pool_clock = wall_clock or now
+    # A tick that read no artifact writes no note, so the next one has no
+    # `prev` note to take the episode start from. health.json carries it
+    # across those ticks itself: it is written every tick, muted or not,
+    # where the poster's state file freezes on a mute or a crash and would
+    # hand a later episode an older episode's start.
+    prior = ((prev or {}).get("pool") or {})
+    before_metrics = (prev or {}).get("metrics") or {}
+    held = prior.get("since") or before_metrics.get("pool_since")
+    # Whether the open episode has ever measured a breach, carried the same way
+    # and for the same reason as its start: pool_note refuses to date a breach
+    # from a monitoring-only stretch, and a blind tick must not answer that
+    # question by forgetting.
+    seen = prior.get("breach_seen") if prior else before_metrics.get("pool_breach_seen")
+    pool = pool_note(pool_pressure, pool_clock, {"since": held, "breach_seen": bool(seen)})
+    if pool:
+        evidence.append(pool_evidence(pool))
     stale_after = DEFAULT_STALE_AFTER
     if isinstance(data.get("stale_after_s"), (int, float)):
         stale_after = timedelta(seconds=data["stale_after_s"])
@@ -1385,10 +2002,24 @@ def adjudicate(
         "stale": stale,
         "fixture_state": fixture_state_block(assessed["fixture"]),
         "slow": slow,
+        "pool": pool,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,
         "generated_at": iso(now),
     }
+    # Beside the digest's other 24h numbers, but not derived from the runs
+    # `metrics` reads -- the wait comes from the periodic, not from data.json.
+    out["metrics"]["queue_wait_p50_s"] = pool_wait_p50_s(pool_pressure, pool_clock)
+    # Whether the artifact was there at all, which no other field answers: the
+    # note is None both for a healthy pool and for a fetch that failed, and
+    # queue_wait_p50_s is None on a quiet day too. The poster needs the
+    # difference -- going blind must not read as the episode ending.
+    out["metrics"]["queue_wait_read"] = isinstance(pool_pressure, dict)
+    # The open episode's start, kept only across blind ticks: a tick that read
+    # the artifact and wrote no note ended the episode, so the next breach is
+    # a new one and starts from its own clock.
+    out["metrics"]["pool_since"] = pool["since"] if pool else (None if out["metrics"]["queue_wait_read"] else held)
+    out["metrics"]["pool_breach_seen"] = pool["breach_seen"] if pool else (False if out["metrics"]["queue_wait_read"] else bool(seen))
     if age is not None:
         out["metrics"]["data_age_s"] = int(age.total_seconds())
     return out
@@ -1486,8 +2117,8 @@ def trim(data: dict, start: datetime, end: datetime, source: str) -> dict:
 
     Runs that finished in [start, end); per run build_id, pr, started,
     finished, result, duration_s and tasks, plus how the build ended
-    (has_build_log, the pod_* trio, merge_conflict) when the source recorded
-    it; per task
+    (has_build_log, the pod_* trio, merge_conflict) and eval_verdict when the
+    source recorded them; per task
     name, result and reps; per rep result and the first TRIM_REASON_CHARS of
     the reason (null for passing reps, as the collector writes them).
     """
@@ -1607,6 +2238,7 @@ def parse_args(argv):
         help="evaluate as of this time and skip the staleness check (default: data.json's generated_at, aged against the wall clock)",
     )
     parser.add_argument("--fixture-status", type=pathlib.Path, help="optional fixtures.json to surface in metrics")
+    parser.add_argument("--pool-pressure", type=pathlib.Path, help="the pool-pressure periodic's pool-pressure.json, for rule 8 (missing is fine)")
     parser.add_argument("--fixture-state", type=pathlib.Path, help="the hourly fleet scan's fixture-state.json, for the fixture_drift condition (missing is fine)")
     parser.add_argument("--case-notes", type=pathlib.Path, default=DEFAULT_CASE_NOTES, help="case-notes.yaml for tracking issues")
     roster = parser.add_mutually_exclusive_group()
@@ -1654,6 +2286,7 @@ def main(argv=None) -> int:
             notes,
             wall_clock=None if args.now else wall_clock,
             posted=load_json(args.posted_state),
+            pool_pressure=load_json(args.pool_pressure),
             fixture_state_doc=load_json(args.fixture_state),
         )
         text = json.dumps(health, indent=2) + "\n"

@@ -7,12 +7,16 @@
 #
 # Usage (AI Agents & Non-Interactive Automation):
 #   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
-#     --non-interactive --project-id="my-gcp-project" --cluster-name="platform-agent-host"
+#     --non-interactive --gcp-project-id="my-gcp-project" --gke-cluster-name="platform-agent-host"
 #
 # Designed for Google Cloud Shell, Linux, macOS, and AI Agent harnesses.
 # ==============================================================================
 
 set -Eeuo pipefail
+
+# This script's own name, for the abort banner when it runs piped through
+# stdin (curl | bash): bash then has no file to name its frames after.
+INSTALL_SCRIPT_NAME="install.sh"
 
 # ─── Install sources ──────────────────────────────────────────────────────────
 # Where the sources come from when this script runs alone (curl | bash) and
@@ -54,6 +58,20 @@ readonly NODE_POOL_UPDATE_POLL_INTERVAL_SECS="${NODE_POOL_UPDATE_POLL_INTERVAL_S
 readonly NODE_POOL_UPDATE_POLL_MAX_RETRIES="${NODE_POOL_UPDATE_POLL_MAX_RETRIES:-3}"
 readonly GKE_OP_STATUS_DONE="DONE"
 readonly GKE_OP_STATUS_RUNNING="RUNNING"
+# What a run records about NetworkPolicy enforcement on the cluster it installs
+# onto: the install report's network_policy_enforcement field carries one of the
+# three values, and the composition stamps the third onto the PlatformAgent as
+# the annotation, so the choice to install without enforcement outlives the
+# terminal (issue #1682).
+readonly NETWORK_POLICY_ENFORCEMENT_ANNOTATION="kubeagents.x-k8s.io/network-policy-enforcement"
+readonly NP_ENFORCEMENT_ENFORCED="enforced"
+readonly NP_ENFORCEMENT_ENABLED_BY_INSTALL="enabled-by-install"
+readonly NP_ENFORCEMENT_ABSENT_ACCEPTED="absent-accepted"
+# The report field's key, and the value in the report until a run has decided.
+readonly NETWORK_POLICY_REPORT_FIELD="network_policy_enforcement"
+NETWORK_POLICY_ENFORCEMENT=""
+# Whether note_stale_network_policy_acceptance has spoken this run.
+NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="false"
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -98,7 +116,30 @@ on_error() {
   local exit_code="$1"
   local line_no="$2"
   local bash_cmd="$3"
-  echo -e "\n\033[91m\033[1m✗ Error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
+  # An inherited firing inside a subshell: `set -E` hands this trap to every
+  # `$(...)`, and a probe whose miss the caller handles (`if !`, `||`) still
+  # fires it there on bash 3.2 (macOS's /bin/bash) before the caller is
+  # consulted. The parent decides: it prints the banner and writes the report
+  # itself when the failure reaches it, and nothing when it is handled. Exit,
+  # not return: command substitution does not inherit errexit, so a returning
+  # handler would let a multi-step probe run on past its failure. Process
+  # substitution (`< <(...)`) keeps the counter at 0 on bash 3.2 and clears
+  # the trap inline instead.
+  if [ "${BASH_SUBSHELL:-0}" -gt 0 ]; then
+    exit "$exit_code"
+  fi
+  # The frame that ran the failing command: a sourced library's file and the
+  # function it was in, or this script and `main` at top level. $LINENO alone
+  # counts from the top of whichever file the command sat in, so a bare line
+  # number sent the reader to that line of install.sh instead. Piped through
+  # stdin, bash labels this script's frames `main` or not at all, and $0 is
+  # `bash`; both read as the script by name.
+  local source_file="${BASH_SOURCE[1]:-}"
+  case "$source_file" in
+    ""|main) source_file="$INSTALL_SCRIPT_NAME" ;;
+  esac
+  local func_name="${FUNCNAME[1]:-main}"
+  echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
   write_json_report "FAILED" "${line_no}" "${bash_cmd}" 2>/dev/null || true
   # A half-written install.env must not be left where the next run would load
   # it. The real file is only ever moved into place complete.
@@ -257,11 +298,13 @@ load_legacy_vars_file() {
 bootstrap_install_env() {
   local file="${1:-}"
   # NAMESPACE reaches terraform.tfvars, and it is a name kubectl tooling
-  # commonly exports. Only install.env may set it: a value inherited from the
-  # shell would put a fresh release into a namespace the agent's fixed gateway
-  # endpoint does not serve, and record nothing that says why. Cleared before
-  # the file is read (and whether or not there is one), so the file's own key
-  # is the only way in.
+  # commonly exports. An inherited value would put a fresh release into a
+  # namespace the agent's fixed gateway endpoint does not serve, and record
+  # nothing that says why, so it is cleared before the file is read (and
+  # whether or not there is one). Two things may set it after that, both
+  # deliberate acts rather than inherited ones: this file's own key, and
+  # --agent-namespace, which main() exports over the top once parse_args has
+  # run.
   unset NAMESPACE
   [ -n "$file" ] || return 0
   if [ ! -f "$file" ]; then
@@ -326,7 +369,7 @@ bootstrap_install_env() {
 #
 # Scanned here rather than in parse_args because the loads run at source time,
 # before it. An exact match only: --help-me is not --help, and a value that
-# merely contains the word (--project-id=help-desk) is not the flag.
+# merely contains the word (--gcp-project-id=help-desk) is not the flag.
 wants_help_only() {
   local arg
   for arg in "$@"; do
@@ -380,7 +423,8 @@ PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
 # fills in install.defaults.env's answer once the helpers are sourced.
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
 PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-}"
-# Set-ness, never ${VAR:-...}: `--gvisor=` with no value sets this to the empty
+PARAM_ENABLE_GKE_BACKUP_PLAN="${ENABLE_GKE_BACKUP_PLAN:-}"
+# Set-ness, never ${VAR:-...}: `--enable-gvisor=` with no value sets this to the empty
 # string, and that has to survive to the validator in main rather than being
 # silently read back as the default. The default itself comes from
 # install.defaults.env, sourced above — and again through
@@ -389,7 +433,7 @@ PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-}"
 #
 # Leaving PARAM_ENABLE_GVISOR *unset* when neither name is set is what makes
 # that second route work. Assigning the empty string here would be
-# indistinguishable from `--gvisor=`: under curl | bash there is no
+# indistinguishable from `--enable-gvisor=`: under curl | bash there is no
 # install.defaults.env beside the script, so DEFAULT_ENABLE_GVISOR is unset at
 # this point, and resolve_shared_defaults' own ${PARAM_ENABLE_GVISOR-...} would
 # see a variable already set and leave it empty for the validator to reject.
@@ -399,7 +443,7 @@ elif [ -n "${DEFAULT_ENABLE_GVISOR+x}" ]; then
   PARAM_ENABLE_GVISOR="$DEFAULT_ENABLE_GVISOR"
 fi
 # HERMES_DASHBOARD_ENABLED as well as ENABLE_WEBUI: the flag is spelled
-# --enable-web-ui and the install records the setting under the Hermes name, so
+# --enable-hermes-dashboard and the install records the setting under the Hermes name, so
 # a file written from a previous install carries the second spelling and only
 # the second. The same asymmetry applies to MEMORY / MEMORY_PROVIDER below and
 # to GOOGLE_CHAT_ENABLED below.
@@ -421,6 +465,8 @@ PARAM_MIGRATE_NODE_POOLS="${MIGRATE_NODE_POOLS:-}"
 PARAM_MIGRATE_NODE_POOLS_PASSED="false"
 PARAM_ENABLE_NETWORK_POLICY="${ENABLE_NETWORK_POLICY:-}"
 PARAM_ENABLE_NETWORK_POLICY_PASSED="false"
+PARAM_ACCEPT_NO_NETWORK_POLICY="${ACCEPT_NO_NETWORK_POLICY:-}"
+PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED="false"
 PARAM_ALLOW_UNVERIFIED_SOURCE="${ALLOW_UNVERIFIED_SOURCE:-false}"
 # "<repo_dir>@<ref>" already checked by verify_local_source_ref, so the pre-flight
 # check and the one at the workspace step do not report the same verdict twice.
@@ -443,7 +489,25 @@ CLI_CHAT_SUB_NAME=""
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
+# Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
+# as an empty MODEL_DEFAULT_NAME takes the provider's default model.
+PARAM_MODEL_MAX_TOKENS="${MODEL_MAX_TOKENS:-}"
 PARAM_USER_PROFILE_ENABLED="${USER_PROFILE_ENABLED:-}"
+# Slack, seeded from the loaded configuration exactly as Google Chat is above,
+# and for the same reason: the chat interview reads these rather than the
+# SLACK_* variables directly, so a --slack-* flag and an install.env key reach
+# it by one route, and a re-run that repeats no flag keeps what the last
+# install recorded rather than clearing it.
+PARAM_ENABLE_SLACK="${SLACK_ENABLED:-}"
+PARAM_SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
+PARAM_SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
+PARAM_SLACK_ALLOWED_USERS="${SLACK_ALLOWED_USERS:-}"
+PARAM_SLACK_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}"
+PARAM_SLACK_HOME_CHANNEL_NAME="${SLACK_HOME_CHANNEL_NAME:-}"
+# bootstrap_install_env clears NAMESPACE before reading
+# install.env, so this seeds from the file alone; --agent-namespace is the
+# other way in.
+PARAM_AGENT_NAMESPACE="${NAMESPACE:-}"
 
 show_help() {
   cat << EOF
@@ -458,22 +522,31 @@ Flags for AI Agents & Automation:
                                 pre-apply checks, print lifecycle commands, and
                                 exit without applying
   --dry-run                     Validate prerequisites & output config/plan without creating resources
-  --project-id=ID               Target GCP Project ID
-  --region=REGION               Target GCP Region (default: install.defaults.env
+  --gcp-project-id=ID           Target GCP Project ID
+  --gcp-region=REGION           Target GCP Region (default: install.defaults.env
                                 DEFAULT_REGION, currently us-central1)
-  --cluster-name=NAME           GKE Cluster Name (default: DEFAULT_CLUSTER_NAME,
+  --gke-cluster-name=NAME       GKE Cluster Name (default: DEFAULT_CLUSTER_NAME,
                                 currently platform-agent-host)
-  --cluster-mode=MODE           Shape of a cluster this run creates: autopilot | standard
+  --gke-cluster-mode=MODE       Shape of a cluster this run creates: autopilot | standard
                                 (default: DEFAULT_CLUSTER_MODE, currently autopilot).
                                 Autopilot clusters are regional. Passing this flag with
-                                autopilot and a zonal --region is an error; leaving it
-                                unset at a zonal --region builds Standard instead.
+                                autopilot and a zonal --gcp-region is an error; leaving it
+                                unset at a zonal --gcp-region builds Standard instead.
                                 Ignored when installing onto a cluster that already
                                 exists — its live shape wins.
+  --agent-namespace=NAMESPACE   Kubernetes namespace the release installs into
+                                (default: DEFAULT_NAMESPACE, currently kubeagents-system).
+                                The chart wires the agent's model-gateway endpoint to this
+                                namespace, so changing it is for CI and second installs
   --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai
                                 (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
-  --vertex-project-id=ID        GCP project serving Vertex AI models (default: --project-id)
+  --model-max-tokens=N          Output tokens the gateway asks the provider for on a
+                                request that names none, for a self-hosted backend
+                                whose prompt and output share one window
+                                (default: DEFAULT_MODEL_MAX_TOKENS, currently 0:
+                                no max_tokens is rendered)
+  --vertex-project-id=ID        GCP project serving Vertex AI models (default: --gcp-project-id)
   --vertex-location=LOCATION    Vertex AI serving location, a region or "global"
                                 (default: DEFAULT_VERTEX_LOCATION, currently global)
   --vertex-manage-serving-project=BOOL
@@ -498,10 +571,14 @@ Flags for AI Agents & Automation:
   --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: DEFAULT_PERMISSION_SET, currently read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
-  --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation
+  --enable-gvisor[=true|false]  Enable GKE Sandbox (gVisor) runtime isolation
                                 (default: DEFAULT_ENABLE_GVISOR, currently true)
-  --enable-web-ui=true|false    Enable Hermes Web UI port 9119 dashboard
+  --enable-hermes-dashboard[=true|false]
+                                Enable Hermes Web UI port 9119 dashboard
                                 (default: DEFAULT_ENABLE_WEBUI, currently false)
+  --enable-gke-backup-plan[=true|false]
+                                Provision a GKE Backup Plan for the cluster
+                                (default: DEFAULT_ENABLE_GKE_BACKUP_PLAN, currently false)
   --user-profile-enabled=BOOL   Enable user profile persona extensions
                                 (default: DEFAULT_USER_PROFILE_ENABLED,
                                 currently false)
@@ -536,11 +613,16 @@ Flags for AI Agents & Automation:
                                 See 'make mirror-images'
   --allow-unverified-source     Provision from a dirty or mismatched checkout (local script edits
                                 are applied even though the deployed image was built elsewhere)
-  --enable-google-chat          Enable Google Chat integration
-  --enable-pubsub-platform      Enable Pub/Sub platform adapter AgentPlugin (default: false)
-  --enable-stockout-investigator
+  --enable-google-chat[=true|false]
+                                Enable Google Chat integration
+  --enable-slack[=true|false]   Enable the Slack socket-mode relay. Non-interactively
+                                this requires --slack-bot-token and --slack-app-token
+  --enable-pubsub-platform[=true|false]
+                                Enable Pub/Sub platform adapter AgentPlugin (default: false)
+  --enable-stockout-investigator[=true|false]
                                 Enable GKE Stockout Investigator AgentPlugin (default: false)
-  --allowed-users=EMAILS        Comma-separated user emails allowed to talk to the
+  --google-chat-allowed-users=EMAILS
+                                Comma-separated user emails allowed to talk to the
                                 agent over Google Chat. Empty allows all users
   --chat-topic-name=TOPIC       Pub/Sub topic name for Google Chat
                                 (default: DEFAULT_CHAT_TOPIC_NAME,
@@ -552,12 +634,30 @@ Flags for AI Agents & Automation:
                                 (default: DEFAULT_GOOGLE_CHAT_MODE, currently default)
   --google-chat-home-channel=SPACE_ID
                                 Google Chat space ID for unsolicited alerts/messages (e.g. spaces/AAAA...)
-  --migrate-node-pools          Opt in to migrating legacy node pools to GKE_METADATA on an existing
-                                cluster (recreates nodes and restarts workloads; required on clusters
-                                with legacy pools, else install aborts)
-  --enable-network-policy       Opt in to enabling legacy Calico NetworkPolicy addon and enforcement
-                                on an existing GKE Standard cluster without Dataplane V2 (may recreate
-                                nodes and restart workloads; required on such clusters, else install aborts)
+  --slack-bot-token=TOKENS      Comma-separated Slack bot tokens (xoxb-...), one per
+                                workspace the agent serves. The relay keys each one by
+                                the team it authenticates as
+  --slack-app-token=TOKEN       Slack socket-mode app-level token (xapp-...)
+  --slack-allowed-users=USERS   Comma-separated Slack user IDs allowed to talk to the
+                                agent. Empty allows all users
+  --slack-home-channel=CHANNEL  Slack channel ID for unsolicited alerts/messages (e.g. C01234567)
+  --slack-home-channel-name=NAME
+                                Display name of that channel (e.g. #gke-alerts)
+  --migrate-node-pools          Authorize migrating an existing cluster's legacy node pools to
+                                GKE_METADATA. Recreates those nodes and restarts every workload on
+                                them, kube-agents' or not. Without it a cluster with legacy pools is
+                                refused unchanged (REFUSED_MISSING_NODE_POOL_MIGRATION); there is no
+                                install without Workload Identity. The cluster's owner decides this.
+  --enable-network-policy       Authorize enabling the legacy Calico NetworkPolicy addon and
+                                enforcement on an existing GKE Standard cluster that has neither it
+                                nor Dataplane V2. May recreate nodes and restart workloads. One of
+                                two answers for such a cluster; the other is below, and without
+                                either the cluster is refused unchanged (REFUSED_MISSING_NETWORK_POLICY).
+                                The cluster's owner decides this.
+  --accept-no-network-policy    Install onto such a cluster without modifying it. Every NetworkPolicy
+                                kube-agents ships is then inert, including the ones that confine the
+                                agent's shell sandbox; the choice is recorded in the install report
+                                and on the PlatformAgent. Mutually exclusive with the flag above.
   --menu, --config              Launch interactive Day-2 Control Panel Menu (raspi-config style)
   -h, --help, -?                Show this help message
 
@@ -571,6 +671,56 @@ Configuration file:
 EOF
 }
 
+# The value an --enable-* flag carries: `--flag` is true, `--flag=VALUE` is
+# VALUE. The empty string of `--enable-gvisor=` is preserved rather than read
+# back as true, because main's validator has to see it and reject it -- the
+# invariant PARAM_ENABLE_GVISOR's set-ness dance above exists to protect.
+#
+# Defined here and not in scripts/installer/installer_common.sh, where shared
+# installer code belongs: parse_args is the first statement of main(), the
+# workspace step that sources installer_common.sh has not run by then, and
+# under `curl … | bash` there is no checkout to source it from at all. Nothing
+# duplicates it -- install.sh is the only front door with --enable-* toggles.
+flag_bool_value() {
+  case "${1:-}" in
+    *=*) printf '%s' "${1#*=}" ;;
+    *) printf 'true' ;;
+  esac
+}
+
+# Rejects a toggle value that is neither true nor false, naming the flag that
+# carried it. Called from parse_args, on what the caller actually typed, and
+# never on a PARAM_* that install.env or the environment seeded: those are read
+# through is_truthy, which takes True/yes/y/1/on, and the documentation tells
+# operators to hand-write that file. Judging a seeded value here would abort a
+# re-run over a spelling the rest of the pipeline accepts, naming a flag the
+# operator never passed.
+#
+# Empty is rejected rather than waved through as "nobody chose". Only the `=`
+# form can produce it -- the bare flag yields "true" -- so it is always
+# something a caller typed, and it cannot mean "leave the setting alone":
+# PARAM_ENABLE_SLACK and PARAM_ENABLE_GOOGLE_CHAT are seeded from install.env
+# precisely so a re-run that says nothing keeps the integration on, and an empty
+# assignment discards that seed. `${PARAM_ENABLE_SLACK:-$DEFAULT_SLACK_ENABLED}`
+# then falls back to the default rather than to the recorded value, so
+# `--enable-slack=` out of a wrapper expanding an unset variable would remove a
+# working relay in silence.
+#
+# Lives beside flag_bool_value for the same reason that one is not in
+# scripts/installer/installer_common.sh.
+validate_bool_flag_value() {
+  local flag="$1" value="${2:-}"
+  if [ -z "$value" ]; then
+    print_error "${flag}= was given an empty value."
+    print_info "Pass ${flag} on its own, or ${flag}=true, or ${flag}=false."
+    exit 1
+  fi
+  if [[ ! "$value" =~ ^(true|false)$ ]]; then
+    print_error "${flag} must be either true or false."
+    exit 1
+  fi
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -578,12 +728,14 @@ parse_args() {
       --generate-only) PARAM_GENERATE_ONLY="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --menu|--config|--configure|menu|config) PARAM_MENU_MODE="true"; shift ;;
-      --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
-      --region=*) PARAM_REGION="${1#*=}"; shift ;;
-      --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
-      --cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
+      --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
+      --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
+      --gke-cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
+      --gke-cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
+      --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
+      --model-max-tokens=*) PARAM_MODEL_MAX_TOKENS="${1#*=}"; shift ;;
       --vertex-project-id=*) PARAM_VERTEX_PROJECT_ID="${1#*=}"; shift ;;
       --vertex-location=*) PARAM_VERTEX_LOCATION="${1#*=}"; shift ;;
       --vertex-manage-serving-project=*) PARAM_VERTEX_MANAGE_SERVING_PROJECT="${1#*=}"; shift ;;
@@ -598,21 +750,44 @@ parse_args() {
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
-      --gvisor=*) PARAM_ENABLE_GVISOR="${1#*=}"; shift ;;
-      --enable-web-ui=*|--enable-webui=*|--webui=*) PARAM_ENABLE_WEBUI="${1#*=}"; shift ;;
-      --enable-web-ui|--enable-webui|--webui) PARAM_ENABLE_WEBUI="true"; shift ;;
+      --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
+      # Validated here and again in main(). The second check is not redundant:
+      # PARAM_ENABLE_WEBUI is seeded from the recorded value and resolved with
+      # ${VAR:-...}, which reads an empty assignment as "unset" and hands back
+      # DEFAULT_ENABLE_WEBUI -- so `--enable-hermes-dashboard=` out of a wrapper
+      # expanding an unset variable arrived at main() as a valid "false" and
+      # took a running dashboard down. Only parse_args still knows the value
+      # came from the command line.
+      --enable-hermes-dashboard|--enable-hermes-dashboard=*)
+        PARAM_ENABLE_WEBUI="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_WEBUI"; shift ;;
       --user-profile-enabled=*) PARAM_USER_PROFILE_ENABLED="${1#*=}"; shift ;;
-      --enable-pubsub-platform=*|--enable-pubsub=*) PARAM_ENABLE_PUBSUB_PLATFORM="${1#*=}"; shift ;;
-      --enable-pubsub-platform|--enable-pubsub) PARAM_ENABLE_PUBSUB_PLATFORM="true"; shift ;;
-      --enable-stockout-investigator=*|--enable-stockout=*) PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${1#*=}"; shift ;;
-      --enable-stockout-investigator|--enable-stockout) PARAM_ENABLE_STOCKOUT_INVESTIGATOR="true"; shift ;;
+      --enable-gke-backup-plan|--enable-gke-backup-plan=*)
+        PARAM_ENABLE_GKE_BACKUP_PLAN="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GKE_BACKUP_PLAN"; shift ;;
+      --enable-pubsub-platform|--enable-pubsub|--enable-pubsub-platform=*|--enable-pubsub=*)
+        PARAM_ENABLE_PUBSUB_PLATFORM="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_PUBSUB_PLATFORM"; shift ;;
+      --enable-stockout-investigator|--enable-stockout|--enable-stockout-investigator=*|--enable-stockout=*)
+        PARAM_ENABLE_STOCKOUT_INVESTIGATOR="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"; shift ;;
       --memory=*) PARAM_MEMORY="${1#*=}"; shift ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
       --registry-prefix=*) PARAM_REGISTRY_PREFIX="${1#*=}"; shift ;;
       --third-party-registry-prefix=*) PARAM_THIRD_PARTY_REGISTRY_PREFIX="${1#*=}"; shift ;;
       --allow-unverified-source|--allow-dirty) PARAM_ALLOW_UNVERIFIED_SOURCE="true"; shift ;;
-      --enable-google-chat|--google-chat) PARAM_ENABLE_GOOGLE_CHAT="true"; shift ;;
-      --allowed-users=*) PARAM_ALLOWED_USERS="${1#*=}"; shift ;;
+      --enable-google-chat|--google-chat|--enable-google-chat=*|--google-chat=*)
+        PARAM_ENABLE_GOOGLE_CHAT="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GOOGLE_CHAT"; shift ;;
+      --enable-slack|--enable-slack=*)
+        PARAM_ENABLE_SLACK="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_SLACK"; shift ;;
+      --google-chat-allowed-users=*) PARAM_ALLOWED_USERS="${1#*=}"; shift ;;
+      --slack-bot-token=*) PARAM_SLACK_BOT_TOKEN="${1#*=}"; shift ;;
+      --slack-app-token=*) PARAM_SLACK_APP_TOKEN="${1#*=}"; shift ;;
+      --slack-allowed-users=*) PARAM_SLACK_ALLOWED_USERS="${1#*=}"; shift ;;
+      --slack-home-channel=*) PARAM_SLACK_HOME_CHANNEL="${1#*=}"; shift ;;
+      --slack-home-channel-name=*) PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"; shift ;;
       --chat-topic-name=*) PARAM_CHAT_TOPIC_NAME="${1#*=}"; shift ;;
       --chat-sub-name=*) PARAM_CHAT_SUB_NAME="${1#*=}"; CLI_CHAT_SUB_NAME="${1#*=}"; shift ;;
       --google-chat-mode=*) PARAM_GOOGLE_CHAT_MODE="${1#*=}"; shift ;;
@@ -635,6 +810,16 @@ parse_args() {
       --enable-network-policy)
         PARAM_ENABLE_NETWORK_POLICY="true"
         PARAM_ENABLE_NETWORK_POLICY_PASSED="true"
+        shift
+        ;;
+      --accept-no-network-policy=*)
+        PARAM_ACCEPT_NO_NETWORK_POLICY="${1#*=}"
+        PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED="true"
+        shift
+        ;;
+      --accept-no-network-policy)
+        PARAM_ACCEPT_NO_NETWORK_POLICY="true"
+        PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED="true"
         shift
         ;;
       -h|--help|-\?|help) show_help; exit 0 ;;
@@ -752,8 +937,8 @@ resolve_creatable_cluster_mode() {
   fi
   # A defaulted Autopilot steps aside at a zonal location rather than failing:
   # nobody asked for Autopilot here, and the alternative is an abort blaming
-  # --region for a shape the installer chose itself. An explicit
-  # --cluster-mode=autopilot still fails in require_creatable_cluster_mode —
+  # --gcp-region for a shape the installer chose itself. An explicit
+  # --gke-cluster-mode=autopilot still fails in require_creatable_cluster_mode —
   # that request is impossible, not merely inconvenient.
   if [ "${DEFAULT_CLUSTER_MODE}" = "autopilot" ] && ! location_is_region "$location"; then
     echo "standard"
@@ -772,12 +957,12 @@ resolve_creatable_cluster_mode() {
 require_creatable_cluster_mode() {
   local mode="${1:-}" location="${2:-}"
   if ! is_valid_cluster_mode "$mode"; then
-    print_error "--cluster-mode must be either autopilot or standard (got '${mode}')."
+    print_error "--gke-cluster-mode must be either autopilot or standard (got '${mode}')."
     exit 1
   fi
   if [ "$mode" = "autopilot" ] && ! location_is_region "$location"; then
-    print_error "GKE Autopilot clusters are regional: --region must be a region such as us-central1, not '${location}'."
-    print_info "For a zonal cluster, pass --cluster-mode=standard."
+    print_error "GKE Autopilot clusters are regional: --gcp-region must be a region such as us-central1, not '${location}'."
+    print_info "For a zonal cluster, pass --gke-cluster-mode=standard."
     exit 1
   fi
 }
@@ -1059,7 +1244,7 @@ warn_unrecorded_interview_answers() {
   local key recorded current drifted=""
   for key in GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS \
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME \
-    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME PLATFORM_AGENT_PERMISSION_SET \
+    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET \
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY \
     USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
     grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null || continue
@@ -1096,12 +1281,121 @@ warn_unrecorded_interview_answers() {
   print_info "Or re-run './install.sh --menu' and use Save & Apply, which writes them for you."
 }
 
+# The one answer checked on every run, TTY or not, and unlike the interview
+# answers above a missing line counts: an agent-driven install passes
+# --accept-no-network-policy on the command line and never sees a prompt, and
+# if the file does not record it, the next generator run -- upgrade.sh, the
+# Day-2 menu -- emits accept_no_network_policy = false and the module refuses
+# the plan for the very enforcement this install already accepted. Still a
+# warning rather than a write, for the reasons warn_unrecorded_interview_answers
+# gives.
+note_unrecorded_network_policy_acceptance() {
+  local file="${1:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  # The decision, not the flag: a flag passed against a cluster that already
+  # enforces accepted nothing, and recording it would waive the module's check
+  # for the life of the install.
+  [ "${NETWORK_POLICY_ENFORCEMENT:-}" = "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ] || return 0
+  local recorded
+  recorded="$(recorded_install_env_value "$file" ACCEPT_NO_NETWORK_POLICY 2>/dev/null || true)"
+  ! is_truthy "${recorded:-false}" || return 0
+  print_warning "This run installs without NetworkPolicy enforcement, and ${file} does not record it."
+  print_info "Add ACCEPT_NO_NETWORK_POLICY=true to ${file}. upgrade.sh and the Day-2 menu regenerate from the file, and without the key the next apply is refused for the enforcement this install accepted."
+}
+
+# The converse, so the key retires: a file that still records
+# ACCEPT_NO_NETWORK_POLICY=true once the cluster enforces -- confined later
+# with --enable-network-policy, moved to Dataplane V2, or a created cluster
+# under a copied install.env -- keeps every later upgrade.sh and Day-2 apply
+# emitting accept_no_network_policy = true, and the module's postcondition,
+# the one guard against policies going silently inert again, never fires for
+# that install. Nothing rewrites install.env, so the operator is told once.
+note_stale_network_policy_acceptance() {
+  local file="${1:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  [ "$NETWORK_POLICY_STALE_ACCEPTANCE_NOTED" != "true" ] || return 0
+  case "${NETWORK_POLICY_ENFORCEMENT:-}" in
+    "$NP_ENFORCEMENT_ENFORCED" | "$NP_ENFORCEMENT_ENABLED_BY_INSTALL") ;;
+    *) return 0 ;;
+  esac
+  local recorded
+  recorded="$(recorded_install_env_value "$file" ACCEPT_NO_NETWORK_POLICY 2>/dev/null || true)"
+  is_truthy "${recorded:-false}" || return 0
+  NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="true"
+  print_warning "${file} records ACCEPT_NO_NETWORK_POLICY=true, but cluster '${CLUSTER_NAME:-}' enforces NetworkPolicy now."
+  print_info "Remove that line. While it stays, every later upgrade.sh and Day-2 apply waives the check that would refuse this install if enforcement were ever lost again."
+}
+
+# A flag that beats install.env for a single run, against a file this installer
+# will not rewrite. Says so, because the reversal is silent at both ends: the
+# run that passes the flag looks like it took effect permanently, and the next
+# run that omits it re-reads the file and quietly undoes the change.
+#
+# Only reachable on an existing install.env. A first install records both keys
+# from the same PARAM_*, so there is nothing to warn about there.
+#
+# Fires on -y as well, unlike warn_unrecorded_interview_answers: that one skips
+# non-interactive runs because their answers came from flags and the file, with
+# no third source to surprise anyone. Here the flag IS the surprise, and headless
+# is the route these flags were added for.
+#
+# Pass compare_as_bool=true for a key the rest of the pipeline reads through
+# is_truthy, and both sides are then read the same way. Neither is canonical:
+# install.env is hand-written and render_install_env.sh copies a GitHub variable
+# in verbatim, so the recorded value can be True/yes/on/1 -- and the same PARAM_*
+# is seeded from that value, so on a run that passes no flag the "flag value" is
+# that spelling too. Comparing the two as strings reports a disagreement that
+# does not exist, and the operator gets the destructive consequence line for a
+# reversal that cannot happen: the next run re-reads True, is_truthy accepts it,
+# and nothing changes. NAMESPACE is a string and keeps the literal comparison --
+# `true` is a legal namespace name, and reading a recorded `yes` against a
+# flagged `true` as agreement would drop a warning about a release moving.
+#
+# repeat_on names the routes that accept the flag: --agent-namespace is taken
+# by install.sh, upgrade.sh and --menu; --enable-gke-backup-plan is install.sh-only.
+warn_flag_beats_unrecorded_file_value() {
+  local file="$1" key="$2" flag="$3" value="$4" consequence="$5" compare_as_bool="${6:-false}" repeat_on="${7:-every later install.sh run}"
+  [ -n "$value" ] || return 0
+  if grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null; then
+    local recorded
+    recorded="$(recorded_install_env_value "$file" "$key")"
+    if [ "$compare_as_bool" = "true" ]; then
+      if is_truthy "$recorded"; then
+        is_truthy "$value" && return 0
+      else
+        ! is_truthy "$value" && return 0
+      fi
+    else
+      [ "$recorded" != "$value" ] || return 0
+    fi
+    print_warning "${flag}=${value} applies to this run only: ${file} records ${key}=${recorded}."
+  else
+    print_warning "${flag}=${value} applies to this run only: ${file} records no ${key}."
+  fi
+  print_info "$consequence"
+  print_info "Set ${key}=${value} in ${file}, or repeat ${flag} on ${repeat_on}."
+}
+
 bootstrap_install_env_file() {
   local destination="${1:-}" image_tag="${2:-}"
   [ -n "$destination" ] || return 0
   if [ -f "$destination" ]; then
     print_info "Left your install configuration as you wrote it: ${destination}"
     warn_unrecorded_interview_answers "$destination"
+    note_unrecorded_network_policy_acceptance "$destination"
+    # The two flags that override a recorded value for one run. This function
+    # never rewrites an existing file, so only a first install can record either
+    # on the operator's behalf.
+    warn_flag_beats_unrecorded_file_value "$destination" NAMESPACE --agent-namespace \
+      "${PARAM_AGENT_NAMESPACE:-}" \
+      "A later run without it resolves the default namespace, renders tfvars for that one, looks for the recovered Secret there, and is refused by lifecycle.sh's guard_release_namespace." \
+      false \
+      "every later install.sh, upgrade.sh and --menu run"
+    warn_flag_beats_unrecorded_file_value "$destination" ENABLE_GKE_BACKUP_PLAN --enable-gke-backup-plan \
+      "${PARAM_ENABLE_GKE_BACKUP_PLAN:-}" \
+      "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
+      true \
+      "every later install.sh run"
     return 0
   fi
   if [ "$PARAM_DRY_RUN" = "true" ]; then
@@ -1129,6 +1423,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" CLUSTER_MODE "${CLUSTER_MODE:-}"
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
+  write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
@@ -1164,7 +1459,16 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   write_env_var "$tmp" ENABLE_STOCKOUT_INVESTIGATOR "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
-  
+  # Recorded only when this run accepted it -- the decision, not the flag: a
+  # flag passed against a cluster that already enforces accepted nothing. The
+  # key is a standing decision about this cluster, and every later generator
+  # run -- upgrade.sh, the Day-2 menu -- must carry it, or it emits
+  # accept_no_network_policy = false and the module refuses the plan this
+  # install already passed.
+  if [ "${NETWORK_POLICY_ENFORCEMENT:-}" = "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
+    write_env_var "$tmp" ACCEPT_NO_NETWORK_POLICY "true"
+  fi
+
   write_env_var "$tmp" REGISTRY_PREFIX "${REGISTRY_PREFIX:-}"
   if [ -n "${THIRD_PARTY_REGISTRY_PREFIX:-}" ]; then
     write_env_var "$tmp" THIRD_PARTY_REGISTRY_PREFIX "${THIRD_PARTY_REGISTRY_PREFIX}"
@@ -1173,16 +1477,30 @@ bootstrap_install_env_file() {
   # defaults, and a default copied here would freeze at this release; the
   # install that did set one (a second install in the project) must keep it,
   # because losing the line renames -- that is, replaces -- the account.
-  # NAMESPACE is deliberately not in the list: it is a variable kubectl
-  # tooling commonly exports, and freezing a stray shell value into the
-  # install's configuration would move the release on the next apply. An
-  # install that means it writes the key into install.env by hand.
+  # NAMESPACE is not in that list, and is handled separately below: the
+  # ambient variable must not be frozen, but a flag must be.
   local identity_key
   for identity_key in PLATFORM_AGENT_GSA_NAME GITHUB_MINTER_GSA_NAME LITELLM_GSA_NAME GKE_DB_KMS_KEYRING GKE_DB_KMS_KEY; do
     if [ -n "${!identity_key:-}" ]; then
       write_env_var "$tmp" "$identity_key" "${!identity_key}"
     fi
   done
+  # NAMESPACE, and only when --agent-namespace put it there.
+  #
+  # NAMESPACE itself in the ambient environment is not consulted:
+  # bootstrap_install_env clears it so a stray shell value does not move
+  # the release on the next apply. PARAM_AGENT_NAMESPACE carries only the two
+  # deliberate routes -- this file's own key, and the flag.
+  #
+  # Recorded rather than left to the operator, because the flag is the only one
+  # of those routes that leaves no trace of itself. A second install that
+  # passed it once and omits it next time resolves ${NAMESPACE:-$DEFAULT_NAMESPACE}
+  # back to the default: write_tfvars_from_state then renders the wrong
+  # namespace, the Secret-recovery loop looks for the tokens somewhere they are
+  # not, and lifecycle.sh's guard_release_namespace refuses the install.
+  if [ -n "${PARAM_AGENT_NAMESPACE:-}" ]; then
+    write_env_var "$tmp" NAMESPACE "$PARAM_AGENT_NAMESPACE"
+  fi
   if ! is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
     printf '\n%s\n' "# PERSIST_SECRETS_ON_DISK=false: credentials are deliberately absent." >> "$tmp"
     write_env_var "$tmp" PERSIST_SECRETS_ON_DISK "false"
@@ -1464,7 +1782,7 @@ resolve_shared_defaults() {
   PARAM_MODEL_PROVIDER="${PARAM_MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   PARAM_REGISTRY_PREFIX="${PARAM_REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}"
   PARAM_PERMISSION_SET="${PARAM_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
-  # ${VAR-...}, not ${VAR:-...}: an explicit `--gvisor=` sets it to empty, and
+  # ${VAR-...}, not ${VAR:-...}: an explicit `--enable-gvisor=` sets it to empty, and
   # that has to survive to the validator rather than being read as the default.
   PARAM_ENABLE_GVISOR="${PARAM_ENABLE_GVISOR-$DEFAULT_ENABLE_GVISOR}"
   PARAM_ENABLE_WEBUI="${PARAM_ENABLE_WEBUI:-$DEFAULT_ENABLE_WEBUI}"
@@ -1595,6 +1913,12 @@ wait_for_rollout() {
   local deployment="$1"
   local namespace="$2"
   local timeout_secs="$3"
+  local context="${4:-}"
+
+  local ctx_flag=()
+  if [ -n "$context" ]; then
+    ctx_flag=(--context "$context")
+  fi
 
   local started=$SECONDS
   local log_file=""
@@ -1602,7 +1926,7 @@ wait_for_rollout() {
 
   local rc=0
   run_with_spinner "$deployment" "$log_file" \
-    kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s" || rc=$?
+    kubectl rollout status "deployment/${deployment}" -n "$namespace" "${ctx_flag[@]}" --timeout="${timeout_secs}s" || rc=$?
 
   # Published for the caller's failure message. How long the wait actually ran is
   # the diagnostic: a ProgressDeadlineExceeded that comes back in seconds is a
@@ -1635,9 +1959,15 @@ wait_for_deployment_object() {
   local deployment="$1"
   local namespace="$2"
   local timeout_secs="$3"
+  local context="${4:-}"
+
+  local ctx_flag=()
+  if [ -n "$context" ]; then
+    ctx_flag=(--context "$context")
+  fi
 
   local deadline=$((SECONDS + timeout_secs))
-  while ! kubectl get deployment "$deployment" -n "$namespace" >/dev/null 2>&1; do
+  while ! kubectl get deployment "$deployment" -n "$namespace" "${ctx_flag[@]}" >/dev/null 2>&1; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       return 1
     fi
@@ -1953,6 +2283,7 @@ write_json_report() {
   "permission_set": "$(json_escape "${permission_set:-}")",
   "gvisor_enabled": ${enable_gvisor:-null},
   "memory_mode": "$(json_escape "${memory_mode:-}")",
+  "${NETWORK_POLICY_REPORT_FIELD}": "$(json_escape "${NETWORK_POLICY_ENFORCEMENT:-}")",
   "gitops_repo": "$(json_escape "$report_gitops_repo")",
   "install_env_file": "$(json_escape "${INSTALL_ENV_FILE:-}")",
   "timestamp": "$(json_escape "$timestamp")"
@@ -2027,9 +2358,20 @@ print_generate_only_handoff() {
   echo -e "    gcloud container node-pools update <node-pool> --cluster=${cluster_name} --location=${region} --project=${project_id} --workload-metadata=GKE_METADATA"
   echo ""
   echo -e "  • ${C_CYAN}NetworkPolicy Enforcement (pre-existing cluster without Dataplane V2):${C_RESET}"
-  echo -e "    # Note: Enabling Calico may recreate nodes and restart workloads."
+  if [ "${NETWORK_POLICY_ENFORCEMENT:-}" = "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
+    echo -e "    # Nothing to run: this run accepted installing without enforcement, and the generated"
+    echo -e "    # terraform.tfvars carries accept_no_network_policy = true. Every NetworkPolicy kube-agents"
+    echo -e "    # ships will be inert, the agent sandbox's included. To enforce instead, run the two commands"
+    echo -e "    # below and set accept_no_network_policy = false (ACCEPT_NO_NETWORK_POLICY in install.env)."
+  else
+    echo -e "    # Note: Enabling Calico may recreate nodes and restart workloads."
+  fi
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --update-addons=NetworkPolicy=ENABLED"
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --enable-network-policy"
+  if [ "${NETWORK_POLICY_ENFORCEMENT:-}" != "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
+    echo -e "    # Or leave the cluster as it is: accept_no_network_policy = true in terraform.tfvars (what --accept-no-network-policy"
+    echo -e "    # writes) installs without enforcement; every NetworkPolicy kube-agents ships is then inert, the agent sandbox's included."
+  fi
   echo ""
   echo -e "  • ${C_CYAN}GitHub App PEM Import (before apply, when GitOps minter is enabled):${C_RESET}"
   echo -e "    # Note: the two create commands report ALREADY_EXISTS on a re-run, which is safe to ignore."
@@ -2374,6 +2716,56 @@ ensure_existing_cluster_workload_identity() {
   fi
 }
 
+# What installing without NetworkPolicy enforcement costs, printed wherever the
+# choice is offered or applied. Precise on purpose: the usual argument for
+# accepting -- "we trust the workloads in this cluster" -- is about the
+# operator's workloads, and the confinement at stake is ours. The shell
+# sandbox is where model-authored commands run, and a NetworkPolicy is the
+# only thing between it and the VPC. An operator who reads this and still
+# says yes has made an informed decision, which is more than an abort-or-
+# enable-Calico fork gives them.
+print_no_network_policy_consequences() {
+  local cluster_name="$1"
+  print_warning "Installing onto '$cluster_name' WITHOUT NetworkPolicy enforcement. The cluster is not modified."
+  print_info "Every NetworkPolicy this install ships is accepted by the API server and enforced by nothing:"
+  print_info "  • the agent pod's ingress restriction and egress confinement (otherwise port 443 outside private ranges, and named in-cluster peers)"
+  print_info "  • the shell sandbox's deny-all policy, which otherwise allows only cluster DNS and the credential proxy"
+  print_info "  • the LiteLLM gateway, GitHub token minter and Hindsight policies"
+  print_info "What is lost is the confinement of kube-agents' own workloads, not of yours: the sandbox that runs model-authored commands can reach anything routable in this VPC. Trusting the workloads already in this cluster is a different decision."
+  print_info "Recorded as ${NETWORK_POLICY_REPORT_FIELD}=${NP_ENFORCEMENT_ABSENT_ACCEPTED} in the install report and as the ${NETWORK_POLICY_ENFORCEMENT_ANNOTATION} annotation on the PlatformAgent. To confine it later, enable Dataplane V2 or the Calico addon on the cluster and re-run the installer."
+}
+
+# The interactive fork for an adopted cluster that enforces no NetworkPolicy.
+# Three answers, and the default is the one that changes nothing: enable
+# Calico (a control-plane update that may recreate nodes), install without
+# enforcement (the cluster is untouched; print_no_network_policy_consequences
+# says what that costs), or stop. Sets the two PARAM_ variables; the caller
+# acts on them. Never reached without a controlling TTY: an agent-driven run
+# has to pass one of the two flags, and the skill tells it to ask first.
+prompt_network_policy_choice() {
+  local cluster_name="$1"
+  local np_choice=""
+  print_warning "Existing cluster '$cluster_name' enforces no NetworkPolicy (neither Dataplane V2 nor the legacy Calico addon)."
+  print_info "  e) enable the legacy Calico addon and enforcement now: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents"
+  print_info "  a) install without NetworkPolicy enforcement: the cluster is not modified, and every policy kube-agents ships stays inert, including the ones confining the agent's shell sandbox"
+  print_info "  n) stop here, changing nothing"
+  prompt_read "Choose (e/a/N)" np_choice "n"
+  case "$np_choice" in
+    [Ee])
+      PARAM_ENABLE_NETWORK_POLICY="true"
+      PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+      ;;
+    [Aa])
+      PARAM_ENABLE_NETWORK_POLICY="false"
+      PARAM_ACCEPT_NO_NETWORK_POLICY="true"
+      ;;
+    *)
+      PARAM_ENABLE_NETWORK_POLICY="false"
+      PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+      ;;
+  esac
+}
+
 # NetworkPolicy enforcement on a pre-existing cluster is the third such
 # behaviour: every NetworkPolicy this install ships — LiteLLM's, the
 # minter's, Hindsight's, and the ones the operator generates around the
@@ -2381,9 +2773,12 @@ ensure_existing_cluster_workload_identity() {
 # V2 nor the legacy Calico addon, which is GKE Standard's default shape.
 # Clusters created by this repository's gke-cluster module have Dataplane V2;
 # clusters created by other Terraform configurations or pre-existing Standard
-# clusters may have neither Dataplane V2 nor Calico, requiring explicit opt-in
-# to enable the legacy Calico addon. The gke-cluster module's postcondition
-# backstops bare-Terraform installs.
+# clusters may have neither Dataplane V2 nor Calico. Such a cluster has three
+# outcomes, and the operator picks: enable the legacy Calico addon
+# (--enable-network-policy, a control-plane update), install without
+# enforcement (--accept-no-network-policy, the cluster untouched and the
+# choice on record), or refuse. The gke-cluster module's postcondition
+# backstops bare-Terraform installs, relaxed by the same variable.
 ensure_existing_cluster_network_policy() {
   local project_id="$1" cluster_name="$2" region="$3"
   local cluster_info
@@ -2404,31 +2799,29 @@ ensure_existing_cluster_network_policy() {
   fi
   if [ "$dp_provider" = "ADVANCED_DATAPATH" ]; then
     print_success "Existing cluster '$cluster_name' runs Dataplane V2; NetworkPolicy enforcement is built in."
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENFORCED"
     return 0
   fi
   if [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ]; then
     print_success "Existing cluster '$cluster_name' already enforces NetworkPolicy (legacy Calico addon)."
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENFORCED"
     return 0
   fi
 
-  if [ -z "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-}}" ]; then
-    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
-      PARAM_ENABLE_NETWORK_POLICY="false"
-    else
-      local np_choice=""
-      prompt_read "Existing cluster '$cluster_name' does not enforce NetworkPolicy (kube-agents requires Dataplane V2 or Calico). Enabling Calico may recreate nodes and restart workloads. Declining ends the install (kube-agents requires NetworkPolicy enforcement). Enable Calico NetworkPolicy now? (y/N)" np_choice "n"
-      if is_truthy "$np_choice"; then
-        PARAM_ENABLE_NETWORK_POLICY="true"
-      else
-        PARAM_ENABLE_NETWORK_POLICY="false"
-      fi
-    fi
+  # No prompt here: by the time a run reaches this step the answer was given,
+  # at prompt_existing_cluster_opt_ins or by a flag, and the preflight has
+  # refused a run that has neither. The consequences were stated there too;
+  # this step only says it is proceeding as accepted.
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+    print_warning "Installing onto '$cluster_name' WITHOUT NetworkPolicy enforcement, as accepted above. The cluster is not modified."
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
+    return 0
   fi
 
   if ! is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
     print_error "Existing cluster '$cluster_name' has neither Dataplane V2 nor legacy Calico NetworkPolicy."
-    print_info "kube-agents requires NetworkPolicy enforcement. Enabling Calico may recreate nodes and restart workloads."
-    print_info "Explicit opt-in was not provided (--enable-network-policy). Refusing to proceed without NetworkPolicy enforcement."
+    print_info "Enabling Calico may recreate nodes and restart workloads; installing without enforcement leaves the agent sandbox unconfined on the network. The cluster's owner decides which."
+    print_info "Explicit opt-in was not provided (--enable-network-policy or --accept-no-network-policy). Refusing to proceed."
     return 1
   fi
 
@@ -2462,6 +2855,7 @@ ensure_existing_cluster_network_policy() {
       print_warning "Operation wait returned non-zero (it may have finished between list and wait); proceeding..."
   fi
   print_warning "Legacy Network Policy enabled. FQDN-based NetworkPolicies stay unsupported without Dataplane V2."
+  NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENABLED_BY_INSTALL"
 }
 
 # Interactively prompts for existing-cluster opt-in mutations before the Step 11 summary
@@ -2497,8 +2891,9 @@ prompt_existing_cluster_opt_ins() {
     fi
   fi
 
-  # Calico NetworkPolicy opt-in prompt
-  if [ -z "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-}}" ]; then
+  # The NetworkPolicy fork: enable Calico, accept the absence, or stop
+  if [ -z "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-}}" ] && \
+     [ -z "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-}}" ]; then
     local cluster_info
     cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
       --location="$region" --project="$project_id" \
@@ -2508,13 +2903,35 @@ prompt_existing_cluster_opt_ins() {
       IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
     fi
     if [ -n "$status" ] && [ "$dp_provider" != "ADVANCED_DATAPATH" ] && [ "$legacy_np" != "True" ] && [ "$legacy_np" != "true" ]; then
-      local np_choice=""
-      prompt_read "Existing cluster '$cluster_name' does not enforce NetworkPolicy (kube-agents requires Dataplane V2 or Calico). Enabling Calico may recreate nodes and restart workloads. Declining ends the install (kube-agents requires NetworkPolicy enforcement). Authorize enabling Calico NetworkPolicy now? (y/N)" np_choice "n"
-      if is_truthy "$np_choice"; then
-        PARAM_ENABLE_NETWORK_POLICY="true"
-      else
-        PARAM_ENABLE_NETWORK_POLICY="false"
-      fi
+      prompt_network_policy_choice "$cluster_name"
+    fi
+  fi
+}
+
+# After the existing-cluster prompt and before install.env is written: carry
+# an "install without NetworkPolicy enforcement" answer into the files.
+#
+# The answer arrives after the generator ran, and the generated tfvars must
+# hold it -- the module's postcondition reads accept_no_network_policy, not
+# the flag -- so regenerate from the same inputs plus the answer. The
+# generator reuses the API_SERVER_KEY it exported on the first pass, so
+# nothing new is minted. Then settle what install.env will record, which is
+# the decision rather than the flag: the flag against a cluster that already
+# enforces accepted nothing, and an unreadable cluster decides nothing (the
+# preflight refuses it a few steps on). The preflight reaches the same answer
+# and prints it; this only settles it before the bootstrap writes the file.
+settle_network_policy_acceptance() {
+  local project_id="$1" cluster_name="$2" region="$3" tfvars_file="$4" image_tag="$5"
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}" && ! is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}"; then
+    export ACCEPT_NO_NETWORK_POLICY="true"
+    KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
+      write_tfvars_from_state "$tfvars_file" "$image_tag"
+  fi
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+    local np_probe=0
+    is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_probe=$?
+    if [ "$np_probe" -eq 1 ]; then
+      NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
     fi
   fi
 }
@@ -2596,11 +3013,16 @@ is_existing_cluster_network_policy_satisfied() {
 
 check_existing_cluster_network_policy_preflight() {
   local project_id="$1" cluster_name="$2" region="$3"
-  [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ] || return 0
+  # A cluster this run creates comes up on Dataplane V2.
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" != "false" ]; then
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENFORCED"
+    return 0
+  fi
 
   local np_status=0
   is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
   if [ "$np_status" -eq 0 ]; then
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENFORCED"
     return 0
   fi
 
@@ -2611,18 +3033,45 @@ check_existing_cluster_network_policy_preflight() {
     exit 1
   fi
 
+  # The third answer: install anyway, on record, without touching the cluster.
+  # The generated tfvars carry accept_no_network_policy = true, which is what
+  # gets the plan past the module's postcondition.
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+    print_no_network_policy_consequences "$cluster_name"
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
+    # The settle step and this preflight each describe the cluster once. If
+    # the first describe failed and this one succeeded, install.env was just
+    # written without the key and nobody said so; the note reads the decision
+    # and the file, so asking it again here closes that gap.
+    note_unrecorded_network_policy_acceptance "$INSTALL_ENV_FILE"
+    return 0
+  fi
+
   if ! is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
     print_error "Existing cluster '$cluster_name' enforces no NetworkPolicy (neither Dataplane V2 nor legacy Calico)."
-    print_info "kube-agents requires NetworkPolicy enforcement to isolate agent execution sandboxes."
-    print_info "The Terraform apply will refuse an existing cluster without Dataplane V2 or NetworkPolicy enforcement."
-    print_info "Enabling Calico may recreate nodes and restart workloads. Because explicit opt-in was not granted, provisioning cannot proceed."
-    print_info "Aborting before making any cluster changes. Pass --enable-network-policy or set ENABLE_NETWORK_POLICY=true to authorize."
+    print_info "kube-agents ships NetworkPolicies that isolate the agent's execution sandbox; on this cluster they would be accepted and inert, and the Terraform apply refuses the plan."
+    print_info "Two ways forward, and the cluster's owner chooses:"
+    print_info "  --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents."
+    print_info "  --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement: the cluster is not modified, and the agent sandbox is unconfined on the network. Recorded in the report and on the PlatformAgent."
+    print_info "Neither was given. Aborting before making any cluster changes."
     write_json_report "REFUSED_MISSING_NETWORK_POLICY"
     exit 1
   fi
 }
 
-# Validates explicit values for existing-cluster opt-in flags (loud like --gvisor)
+# --model-max-tokens: a whole number of tokens, or empty for none. Refused here
+# rather than left to Terraform's type check so the message names the flag; the
+# tfvars generator checks again for the front doors that regenerate from
+# install.env without this interview. Needs installer_common.sh sourced.
+validate_model_max_tokens() {
+  local value="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"
+  if [ -n "$value" ] && ! is_non_negative_integer "$value"; then
+    print_error "--model-max-tokens must be a whole number of tokens (0 or empty leaves the gateway default unset), got '${value}'."
+    return 1
+  fi
+}
+
+# Validates explicit values for existing-cluster opt-in flags (loud like --enable-gvisor)
 validate_existing_cluster_opt_in_flags() {
   if { [ "${PARAM_MIGRATE_NODE_POOLS_PASSED:-false}" = "true" ] || [ -n "${PARAM_MIGRATE_NODE_POOLS:-}" ]; } && \
      [[ ! "$PARAM_MIGRATE_NODE_POOLS" =~ ^(true|false)$ ]]; then
@@ -2633,6 +3082,30 @@ validate_existing_cluster_opt_in_flags() {
      [[ ! "$PARAM_ENABLE_NETWORK_POLICY" =~ ^(true|false)$ ]]; then
     print_error "--enable-network-policy must be either true or false."
     exit 1
+  fi
+  if { [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" = "true" ] || [ -n "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" ]; } && \
+     [[ ! "$PARAM_ACCEPT_NO_NETWORK_POLICY" =~ ^(true|false)$ ]]; then
+    print_error "--accept-no-network-policy must be either true or false."
+    exit 1
+  fi
+  # Two answers to one question. A run carrying both would enable Calico and
+  # then record that it did not, so it is refused before it reads the cluster
+  # -- unless exactly one came from the command line, in which case the flag
+  # beats the recorded value for this run, as install.env's contract says.
+  # That is the documented "confine it later" path: an install that recorded
+  # ACCEPT_NO_NETWORK_POLICY=true re-run with --enable-network-policy.
+  if [ "${PARAM_ENABLE_NETWORK_POLICY:-}" = "true" ] && [ "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" = "true" ]; then
+    if [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" = "true" ] && [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" != "true" ]; then
+      print_info "--enable-network-policy overrides the ACCEPT_NO_NETWORK_POLICY=true your install configuration records, for this run. Remove that line once Calico is on, or every later upgrade waives the enforcement check."
+      PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+    elif [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" = "true" ] && [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" != "true" ]; then
+      print_info "--accept-no-network-policy overrides the ENABLE_NETWORK_POLICY=true your install configuration records, for this run."
+      PARAM_ENABLE_NETWORK_POLICY="false"
+    else
+      print_error "--enable-network-policy and --accept-no-network-policy are two answers to one question; pass one (as flags, or as ENABLE_NETWORK_POLICY / ACCEPT_NO_NETWORK_POLICY in install.env)."
+      print_info "The first enables the legacy Calico addon on the cluster (may recreate nodes); the second installs without NetworkPolicy enforcement and changes nothing."
+      exit 1
+    fi
   fi
 }
 
@@ -2803,8 +3276,10 @@ summarize_existing_cluster_mutations() {
   else
     if is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
       echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Will enable${C_RESET} legacy Calico addon & enforcement (${C_YELLOW}may recreate nodes, restart workloads${C_RESET})"
+    elif is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Absent, accepted${C_RESET} (--accept-no-network-policy: cluster unchanged; ${C_YELLOW}every NetworkPolicy kube-agents ships is inert, the agent sandbox included${C_RESET}; recorded on the PlatformAgent)"
     else
-      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_RED}Refused${C_RESET} (opt-in not provided; pass --enable-network-policy; install will abort)"
+      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_RED}Refused${C_RESET} (opt-in not provided; pass --enable-network-policy or --accept-no-network-policy; install will abort)"
     fi
   fi
 
@@ -2997,6 +3472,11 @@ run_menu_system() {
   # hand-authored file is what the panel opens on, whichever order the two
   # files disagree in.
   load_install_env "$INSTALL_ENV_FILE" || true
+  # That reload unsets NAMESPACE on its way in, for the reason
+  # bootstrap_install_env does -- so --agent-namespace, which main() applied
+  # before dispatching here, has to be applied again or the panel opens on the
+  # default namespace and its Save & Apply writes tfvars for that one.
+  apply_agent_namespace_override
   # ...and the same for the memory setting, which the two files spell
   # differently (install.env MEMORY, legacy vars.sh MEMORY_PROVIDER) so load
   # order alone cannot make the input win. Save & Apply generates tfvars
@@ -3251,8 +3731,54 @@ run_menu_system() {
 }
 
 # ─── Main Installer Procedure ──────────────────────────────────────────────────
+# The Slack token guard. Placed after write_tfvars_from_state rather than in the
+# chat step that asks for Slack, because that generator's Secret-recovery loop is
+# what can still supply the tokens: it reads them off the live
+# '${PLATFORM_AGENT_SECRET}' Secret whenever kubectl's context is this cluster,
+# which covers both PERSIST_SECRETS_ON_DISK=false (their only home by design) and
+# a fresh clone adopting an existing install. A copy in the chat step would
+# refuse those runs before the thing that answers them had run, and it would buy
+# nothing: this still lands before the apply, and before it nothing has been
+# provisioned.
+#
+# Runs on the exported SLACK_* the generator leaves behind, so a re-run that
+# recovers both tokens proceeds and one that recovers neither stops rather than
+# reaching a CrashLooping relay. This applies to interactive and unattended
+# runs alike: if the tokens are still missing after the interview and Secret
+# recovery, proceeding would CrashLoop the relay.
+require_slack_tokens_after_recovery() {
+  is_truthy "${SLACK_ENABLED:-}" || return 0
+  local slack_missing=""
+  [ -n "${SLACK_BOT_TOKEN:-}" ] || slack_missing="${slack_missing} --slack-bot-token (SLACK_BOT_TOKEN)"
+  [ -n "${SLACK_APP_TOKEN:-}" ] || slack_missing="${slack_missing} --slack-app-token (SLACK_APP_TOKEN)"
+  if [ -n "$slack_missing" ]; then
+    print_error "--enable-slack needs a bot token and an app token. Missing:${slack_missing}."
+    print_info "They are not in ${INSTALL_ENV_FILE} (PERSIST_SECRETS_ON_DISK=false keeps them out) and the live '${PLATFORM_AGENT_SECRET}' Secret does not carry them either. Pass them as flags, answer both prompts on an interactive run, or drop --enable-slack."
+    exit 1
+  fi
+}
+
+# The namespace the run installs into, once parse_args has had its say.
+#
+# bootstrap_install_env cleared NAMESPACE before install.env was read so that an
+# inherited variable could not redirect the install; a flag is a
+# deliberate act, so it is allowed back in here. PARAM_AGENT_NAMESPACE empty
+# leaves the variable unset and every reader falls back to DEFAULT_NAMESPACE,
+# exactly as before.
+#
+# A function rather than three lines inside main(), for two reasons: the menu
+# path reloads install.env and so has to re-apply it, and a test can only pin an
+# export it is able to call -- one that re-implements these lines passes just as
+# well after they are deleted.
+apply_agent_namespace_override() {
+  if [ -n "${PARAM_AGENT_NAMESPACE:-}" ]; then
+    export NAMESPACE="$PARAM_AGENT_NAMESPACE"
+  fi
+}
+
 main() {
   parse_args "$@"
+  apply_agent_namespace_override
   if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_GENERATE_ONLY" = "true" ]; then
     print_error "--dry-run and --generate-only are different modes and cannot be combined."
     return 2
@@ -3383,7 +3909,7 @@ main() {
   fi
 
   if [ -z "$project_id" ]; then
-    print_error "No GCP project selected. Re-run with --project-id=<project-id>."
+    print_error "No GCP project selected. Re-run with --gcp-project-id=<project-id>."
     exit 1
   fi
 
@@ -3412,7 +3938,7 @@ main() {
     prompt_read "Target GCP Region" region "${active_region:-$DEFAULT_REGION}"
   fi
 
-  # Checked here as well as after the menu below so a bad --cluster-mode fails
+  # Checked here as well as after the menu below so a bad --gke-cluster-mode fails
   # before the rest of the interview, not after it.
   local cluster_mode="${PARAM_CLUSTER_MODE:-}"
   [ -z "$cluster_mode" ] || require_creatable_cluster_mode "$cluster_mode" "$region"
@@ -3435,8 +3961,8 @@ main() {
 
   local cluster_name="${PARAM_CLUSTER_NAME:-}"
   # Set on the branches where the user has demonstrably asked for a cluster
-  # that does not exist yet, which is the only case --cluster-mode decides.
-  # Picking one out of the discovered list, or naming one with --cluster-name,
+  # that does not exist yet, which is the only case --gke-cluster-mode decides.
+  # Picking one out of the discovered list, or naming one with --gke-cluster-name,
   # does not qualify: the generator probes those and the live shape wins.
   local ask_cluster_shape="false"
   if [ "$cluster_choice" = "1" ]; then
@@ -3487,7 +4013,7 @@ main() {
       fi
     fi
   fi
-  # Only when --cluster-mode said nothing: a flag the caller passed is an
+  # Only when --gke-cluster-mode said nothing: a flag the caller passed is an
   # answer already, and re-asking would let a mis-keyed menu choice override
   # it.
   #
@@ -3503,7 +4029,7 @@ main() {
     [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     local mode_choice="" menu_default=""
     local autopilot_option="Autopilot — Google manages the nodes and you pay per Pod; regional only, and gVisor comes from its built-in RuntimeClass"
-    local standard_option="Standard — you size and pay for the node pool; carries the GKE Sandbox pool for --gvisor, and is the only shape that can be zonal"
+    local standard_option="Standard — you size and pay for the node pool; carries the GKE Sandbox pool for --enable-gvisor, and is the only shape that can be zonal"
     menu_default="$(resolve_creatable_cluster_mode "" "$region")"
     if [ "$menu_default" = "autopilot" ]; then
       prompt_menu "Which shape should the GKE cluster be, if this run creates it?" \
@@ -3532,7 +4058,7 @@ main() {
   # resolve_creatable_cluster_mode applies it. Explaining the demotion is the
   # caller's job so the resolver can echo the mode and nothing else.
   #
-  # This matters most on the --cluster-name path, where ask_cluster_shape is
+  # This matters most on the --gke-cluster-name path, where ask_cluster_shape is
   # false and the check below therefore never runs: a named cluster that does
   # not exist yet would otherwise be written as autopilot at a zone and
   # rejected by the module's precondition at terraform validate, after the
@@ -3541,14 +4067,14 @@ main() {
   cluster_mode="$(resolve_creatable_cluster_mode "$cluster_mode" "$region")"
   # ask_cluster_shape gates the message for the same reason it gates the check
   # below: on both adoption paths no cluster is created by this run, so the
-  # advice to "pass --region with a region" would point at a location the
-  # target cluster does not live at. On --cluster-name that is not merely
+  # advice to "pass --gcp-region with a region" would point at a location the
+  # target cluster does not live at. On --gke-cluster-name that is not merely
   # noise — write_tfvars_from_state probes with --location "$REGION", so
   # re-running with the suggested region misses the live cluster, takes the
   # confirmed-NOT_FOUND branch, and creates a second one under -auto-approve.
   if [ "$ask_cluster_shape" = "true" ] && [ -z "$cluster_mode_requested" ] &&
     [ "$cluster_mode" != "$DEFAULT_CLUSTER_MODE" ]; then
-    print_info "Location '${region}' is a zone and Autopilot clusters are regional, so a cluster created by this run will be Standard. Pass --region with a region to get the default Autopilot shape."
+    print_info "Location '${region}' is a zone and Autopilot clusters are regional, so a cluster created by this run will be Standard. Pass --gcp-region with a region to get the default Autopilot shape."
   fi
 
   # Only where a cluster is about to be created. Adopting a discovered cluster
@@ -3581,15 +4107,16 @@ main() {
   # install.env is a file the documentation now tells operators to hand-write.
   # A string compare against the lowercase literal would read
   # `GOOGLE_CHAT_ENABLED=True` as off, drop chat_choice to 4 and plan the
-  # Pub/Sub topic away, while upgrade.sh read the same file as enabled. The
-  # sibling booleans fail loudly on their ^(true|false)$ validators instead;
-  # only these two are silent.
+  # Pub/Sub topic away, while upgrade.sh read the same file as enabled. Every
+  # --enable-* toggle is read this way; the ^(true|false)$ validators run in
+  # parse_args, on what a caller typed on the command line, so a hand-written
+  # spelling in install.env never reaches one.
   local chat_choice=""
-  if is_truthy "$PARAM_ENABLE_GOOGLE_CHAT" && is_truthy "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"; then
+  if is_truthy "$PARAM_ENABLE_GOOGLE_CHAT" && is_truthy "${PARAM_ENABLE_SLACK:-$DEFAULT_SLACK_ENABLED}"; then
     chat_choice="3"
   elif is_truthy "$PARAM_ENABLE_GOOGLE_CHAT"; then
     chat_choice="1"
-  elif is_truthy "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"; then
+  elif is_truthy "${PARAM_ENABLE_SLACK:-$DEFAULT_SLACK_ENABLED}"; then
     chat_choice="2"
   fi
   # Nothing configured and nobody to ask: "None", as before. Left unset when
@@ -3608,8 +4135,9 @@ main() {
   local google_chat_enabled="false"
   local slack_enabled="false"
   # Empty by default: the allowlist is opt-in, and an unset list allows all users.
-  # PARAM_ALLOWED_USERS carries both --allowed-users and the loaded ALLOWED_USERS,
-  # so an install that had an allowlist keeps it on a re-run that says nothing.
+  # PARAM_ALLOWED_USERS carries both --google-chat-allowed-users and the loaded
+  # ALLOWED_USERS, so an install that had an allowlist keeps it on a re-run that
+  # says nothing.
   local allowed_users="${PARAM_ALLOWED_USERS:-}"
   local allowed_users_hint=""
   if [ -z "$allowed_users" ]; then
@@ -3623,13 +4151,25 @@ main() {
     exit 1
   fi
   local google_chat_home_channel="${PARAM_GOOGLE_CHAT_HOME_CHANNEL:-}"
-  # Seeded from the environment so the non-interactive path can carry the
-  # Slack settings: prompt_read keeps a non-empty current value there.
-  local slack_bot_token="${SLACK_BOT_TOKEN:-}"
-  local slack_app_token="${SLACK_APP_TOKEN:-}"
-  local slack_allowed_users="${SLACK_ALLOWED_USERS:-}"
-  local slack_home_channel="${SLACK_HOME_CHANNEL:-}"
-  local slack_home_channel_name="${SLACK_HOME_CHANNEL_NAME:-}"
+  # Seeded from PARAM_SLACK_*, which carry both the --slack-* flags and the
+  # loaded SLACK_* keys, so the non-interactive path can carry the Slack
+  # settings: prompt_read keeps a non-empty current value there.
+  local slack_bot_token="${PARAM_SLACK_BOT_TOKEN:-}"
+  local slack_app_token="${PARAM_SLACK_APP_TOKEN:-}"
+  local slack_allowed_users="${PARAM_SLACK_ALLOWED_USERS:-}"
+  local slack_home_channel="${PARAM_SLACK_HOME_CHANNEL:-}"
+  local slack_home_channel_name="${PARAM_SLACK_HOME_CHANNEL_NAME:-}"
+
+  # No Slack token check here. The obvious place for one is this step -- Slack
+  # is asked for here and the relay cannot open a socket without both tokens --
+  # but a refusal here cannot tell "the operator never supplied them" from
+  # "write_tfvars_from_state has not run yet". Its Secret-recovery loop
+  # (installer_common.sh) reads them off the live Secret whenever kubectl's
+  # context is this cluster, which is exactly the fresh-clone adoption case its
+  # own comment names as its reason to exist: no install.env, no tokens on the
+  # command line, and both sitting in the cluster. require_slack_tokens_after_recovery
+  # makes the same check once that loop has had its turn and still before the
+  # apply, so nothing is provisioned either way.
 
   # One definition for both arms that ask it. Arms 2 and 3 ran identical
   # copies, and the copies are what drifted: the "pass the current value, not
@@ -3658,7 +4198,8 @@ main() {
     # Same shape as allowed_users_hint above: an empty list has to read as a
     # deliberate choice rather than as a missing default.
     [ -z "$slack_allowed_users" ] && slack_allowed_hint="empty list"
-    prompt_read "Slack Bot Token (xoxb-...)" slack_bot_token "$slack_bot_token" true "$bot_hint"
+    prompt_read "Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)" \
+      slack_bot_token "$slack_bot_token" true "$bot_hint"
     prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
     prompt_read "Allowed Slack User IDs / Emails (comma-separated)" \
       slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
@@ -3695,6 +4236,54 @@ main() {
       google_chat_home_channel "$google_chat_home_channel"
   }
 
+  # Both chat platforms are opt-in and default off, so this is the common
+  # install, and the terminal is the only way to reach the agent. Printed again
+  # at the end of main(), beside the Google Chat and Slack instructions.
+  #
+  # project_id, region and cluster_name are all set by earlier steps, and
+  # NAMESPACE is exported before the menu runs.
+  _prompt_no_chat_enabled() {
+    print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
+
+    # gcloud rejects --dns-endpoint on clusters without an external DNS
+    # endpoint, so print the resolved flag rather than a literal one. Resolved
+    # up here because it can warn on stderr, which would otherwise split the
+    # block below.
+    #
+    # This is step 6 of the interview and the apply that creates the cluster is
+    # step 12, so on a fresh install -- and on every --dry-run and
+    # --generate-only run -- there is nothing to describe yet. That is not a
+    # failure: the helper leaves GKE_DNS_ENDPOINT_FLAG empty and the command
+    # below prints without --dns-endpoint, which is the only command there is
+    # anything to print before the cluster exists. The copy in the completion
+    # banner runs after the apply and resolves the real flag.
+    #
+    # What keeps that miss silent is `trap - ERR` inside the helper's own
+    # describe, not the guard here: bash 3.2 runs the inherited ERR trap in the
+    # substitution's subshell, which nothing on this line can reach. The guard
+    # covers the other half -- a non-zero return from the helper -- and matches
+    # the two get-credentials sites further down. The reset keeps the variable
+    # defined whatever the helper does.
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
+
+    echo ""
+    echo -e "${C_CYAN}${C_BOLD}--- [Talking to the Agent from a Terminal] ---${C_RESET}"
+    echo -e "With no chat platform, the terminal is the way in. Point kubectl at the cluster,"
+    echo -e "then open a Hermes session in the agent container:"
+    echo ""
+    # The `:+` keeps the empty flag from leaving a trailing space.
+    echo -e "  ${C_BOLD}gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}${GKE_DNS_ENDPOINT_FLAG:+ ${GKE_DNS_ENDPOINT_FLAG}}${C_RESET}"
+    echo -e "  ${C_BOLD}kubectl exec -it deploy/${PLATFORM_AGENT_DEPLOYMENT} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} -c ${PLATFORM_AGENT_CONTAINER} -- hermes -p ${PLATFORM_AGENT_HERMES_PROFILE}${C_RESET}"
+    echo ""
+    # The pod runs three containers and hosts more than one Hermes profile, so
+    # a command missing -c or -p lands somewhere by accident.
+    echo -e "  ${C_CYAN}-p ${PLATFORM_AGENT_HERMES_PROFILE} reaches the Platform Agent directly, bypassing the Planning${C_RESET}"
+    echo -e "  ${C_CYAN}Agent front door where a chat message would have landed.${C_RESET}"
+    echo ""
+    echo -e "  To add a chat platform later, re-run ${C_BOLD}./install.sh --enable-google-chat${C_RESET} or ${C_BOLD}./install.sh --enable-slack${C_RESET}."
+  }
+
   case "$chat_choice" in
     1)
       google_chat_enabled="true"
@@ -3711,7 +4300,7 @@ main() {
       _prompt_slack_settings
       ;;
     4)
-      print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
+      _prompt_no_chat_enabled
       ;;
   esac
 
@@ -3726,6 +4315,8 @@ main() {
   if [ -z "$model_default_name" ]; then
     model_default_name="$(default_model_for_provider "$model_provider")"
   fi
+  local model_max_tokens="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"
+  validate_model_max_tokens || exit 1
 
   # Vertex authenticates with Workload Identity rather than an API key, so these
   # two are the only credentials it needs. The project defaults to the install
@@ -3734,7 +4325,7 @@ main() {
   # DEFAULT_VERTEX_LOCATION in scripts/installer/installer_common.sh.
   local vertex_project_id="${PARAM_VERTEX_PROJECT_ID:-$project_id}"
   local vertex_location="${PARAM_VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
-  # Loud like --gvisor and --enable-web-ui, not lenient like the chat booleans:
+  # Loud like --enable-gvisor and --enable-hermes-dashboard, not lenient like the chat booleans:
   # a typo read as false would silently skip the two serving-project resources,
   # and the first sign would be the gateway's 403 on its first model call.
   local vertex_manage_serving_project="${PARAM_VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}"
@@ -4047,18 +4638,26 @@ main() {
     warn_on_overreaching_custom_roles "$custom_roles"
   fi
   # No `:-` fallback: resolve_shared_defaults already applied
-  # DEFAULT_ENABLE_GVISOR with ${VAR-...}, which leaves `--gvisor=` (set, but
+  # DEFAULT_ENABLE_GVISOR with ${VAR-...}, which leaves `--enable-gvisor=` (set, but
   # empty) empty on purpose so the validator below rejects it instead of
   # silently reading it as the default.
   local enable_gvisor="$PARAM_ENABLE_GVISOR"
   if [[ ! "$enable_gvisor" =~ ^(true|false)$ ]]; then
-    print_error "--gvisor must be either true or false."
+    print_error "--enable-gvisor must be either true or false."
     exit 1
   fi
   if [[ ! "$PARAM_ENABLE_WEBUI" =~ ^(true|false)$ ]]; then
-    print_error "--enable-web-ui must be either true or false."
+    print_error "--enable-hermes-dashboard must be either true or false."
     exit 1
   fi
+  # The remaining --enable-* toggles are checked in parse_args, not here.
+  # flag_bool_value extracts what they carry without checking it, and every
+  # read below goes through is_truthy, where anything that is not "true" is
+  # false -- so `--enable-slack=ture` would provision an install with Slack off
+  # and say nothing. Checking them at the point they are parsed is what keeps
+  # the check on the value a caller typed: by this line the same PARAM_* also
+  # holds whatever install.env seeded, where True/yes/on are spellings the
+  # documentation invites and is_truthy honours.
   validate_existing_cluster_opt_in_flags
   # An agent that forgets every conversation is the worse default, so memory is
   # on unless it is turned off. The choice decides two things: whether the
@@ -4119,8 +4718,8 @@ main() {
     # prompt_menu answers an empty line with option 1, so the current value has
     # to be listed first — otherwise the "(Default)" label contradicts what a
     # bare Enter actually produces. The value reaching here is the sandbox
-    # unless --gvisor=false said otherwise, so the usual order is Yes first;
-    # the else branch keeps an explicit --gvisor=false from being re-enabled by
+    # unless --enable-gvisor=false said otherwise, so the usual order is Yes first;
+    # the else branch keeps an explicit --enable-gvisor=false from being re-enabled by
     # someone confirming the prompt. Option 2 is "the other one" either way.
     local gvisor_choice=""
     local gvisor_yes="Yes - gVisor Secure Kernel Sandbox (Hardened Workload Isolation)"
@@ -4280,13 +4879,30 @@ main() {
   export CLUSTER_MODE="$cluster_mode"
   export REGION="$region"
   export ENABLE_GVISOR="$enable_gvisor"
+  # The generator emits it into terraform.tfvars, where the gke-cluster
+  # module's postcondition reads it, defaulting the line to false itself.
+  # Exported only when a flag or install.env set it: the prompt gates read
+  # ${PARAM_...:-${ACCEPT_NO_NETWORK_POLICY:-}}, so an unconditional "false"
+  # here would count as an answer and silence the three-way prompt on every
+  # interactive run.
+  if [ -n "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" ]; then
+    export ACCEPT_NO_NETWORK_POLICY="$PARAM_ACCEPT_NO_NETWORK_POLICY"
+  fi
   # No GVISOR_POOL_NAME. It has no flag and no interview question, so anything
   # exported here would be a constant written over whatever install.env says --
   # the generator already applies DEFAULT_GVISOR_POOL_NAME when nothing sets it,
-  # which leaves the operator's value free to win. The same reasoning keeps
-  # ENABLE_GKE_BACKUP_PLAN out of this block.
+  # which leaves the operator's value free to win.
+  #
+  # ENABLE_GKE_BACKUP_PLAN used to be kept out for that same reason. It has a
+  # flag now, so it is exported when something chose -- the flag, or install.env,
+  # which seeds PARAM_ENABLE_GKE_BACKUP_PLAN. Empty still means nobody chose, and
+  # the generator's DEFAULT_ENABLE_GKE_BACKUP_PLAN decides as it did before.
+  if [ -n "${PARAM_ENABLE_GKE_BACKUP_PLAN:-}" ]; then
+    export ENABLE_GKE_BACKUP_PLAN="$PARAM_ENABLE_GKE_BACKUP_PLAN"
+  fi
   export MODEL_PROVIDER="$model_provider"
   export MODEL_DEFAULT_NAME="$model_default_name"
+  export MODEL_MAX_TOKENS="$model_max_tokens"
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
   export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"
@@ -4344,12 +4960,24 @@ main() {
   # leave this unset so an unfindable key stays an error for them.
   KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
     write_tfvars_from_state "$tfvars_file" "$image_tag"
+  # After the generator, because its Secret-recovery loop is the thing that can
+  # still supply the tokens; before the apply, because a relay without them
+  # CrashLoops.
+  require_slack_tokens_after_recovery
   print_success "Terraform input saved to: $tfvars_file"
 
   # Before the summary, the confirmation and the dry-run exit alike: a
   # service account the apply would 409 on is something to know before
   # answering "proceed", and it costs a describe per account. Read-only.
   check_service_account_ownership || exit 1
+
+  # Prompt for opt-ins on existing cluster mutations before the summary
+  # checkpoint -- and before install.env is written, so an answer given here
+  # is recorded there.
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
+    prompt_existing_cluster_opt_ins "$project_id" "$cluster_name" "$region"
+    settle_network_policy_acceptance "$project_id" "$cluster_name" "$region" "$tfvars_file" "$image_tag"
+  fi
 
   # Written once, and only when there is nothing there. The probed cluster
   # shape is deliberately NOT recorded: a file that is read as configuration
@@ -4358,11 +4986,6 @@ main() {
   # stops a hand-written CLUSTER_MODE=standard from planning a live Autopilot
   # cluster's replacement.
   bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"
-
-  # Prompt for opt-ins on existing cluster mutations before the summary checkpoint
-  if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
-    prompt_existing_cluster_opt_ins "$project_id" "$cluster_name" "$region"
-  fi
 
   # Pre-Flight Summary & Final Confirmation Checkpoint
   print_step "11. Pre-Flight Configuration Summary"
@@ -4435,13 +5058,13 @@ main() {
       is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
       if [ "$np_status" -eq 2 ]; then
         print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' could not be queried."
-      elif [ "$np_status" -ne 0 ]; then
+      elif [ "$np_status" -ne 0 ] && ! is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
         if is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
           print_info "Dry-run: skipping terraform plan because Calico has not yet been applied to the live cluster (a real run enables Calico prior to apply)."
         else
           print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' enforces no NetworkPolicy (postcondition would fail)."
-          print_info "A real run will abort unless authorized with --enable-network-policy or ENABLE_NETWORK_POLICY=true."
-          print_info "To remediate manually beforehand, run these two commands in this order:"
+          print_info "A real run will abort unless told which way to go: --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon, a control-plane update that may recreate nodes; --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement and leaves the cluster as it is."
+          print_info "To enable enforcement by hand beforehand, run these two commands in this order:"
           print_info "  gcloud container clusters update $cluster_name --location $region --project $project_id --update-addons=NetworkPolicy=ENABLED"
           print_info "  gcloud container clusters update $cluster_name --location $region --project $project_id --enable-network-policy"
         fi
@@ -4455,6 +5078,11 @@ main() {
           print_info "  gcloud container node-pools update <pool-name> --cluster $cluster_name --location $region --project $project_id --workload-metadata=GKE_METADATA"
         fi
       else
+        # Reached with an unenforcing cluster only under --accept-no-network-policy,
+        # whose tfvars carry the variable that passes the module's postcondition.
+        if [ "$np_status" -ne 0 ]; then
+          print_no_network_policy_consequences "$cluster_name"
+        fi
         print_info "Previewing the resources a real run would create (terraform plan)..."
         (
           cd "$(tf_compose_dir "$repo_dir")"
@@ -4486,6 +5114,7 @@ main() {
   # they are: this sits above the (Y/n/g) prompt, so both routes cross it.
   check_existing_cluster_node_pools_preflight "$project_id" "$cluster_name" "$region"
   check_existing_cluster_network_policy_preflight "$project_id" "$cluster_name" "$region"
+  note_stale_network_policy_acceptance "$INSTALL_ENV_FILE"
 
   if [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     local confirm_choice=""
@@ -4531,6 +5160,9 @@ main() {
   # halts before permanent control-plane modifications (Workload Identity, CMEK).
   if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
     ensure_existing_cluster_network_policy "$project_id" "$cluster_name" "$region"
+    # Calico just went on under --enable-network-policy: a recorded acceptance
+    # is stale from here.
+    note_stale_network_policy_acceptance "$INSTALL_ENV_FILE"
     ensure_existing_cluster_workload_identity "$project_id" "$cluster_name" "$region"
     ensure_existing_cluster_cmek "$project_id" "$cluster_name" "$region"
   fi
@@ -4597,13 +5229,22 @@ main() {
   # shellcheck disable=SC2086
   gcloud container clusters get-credentials "$cluster_name" --location "$region" \
     --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null
-  if ! kubectl get ns "$namespace" >/dev/null 2>&1; then
+  local expected_ctx
+  expected_ctx="$(gke_context_name)"
+  local current_ctx
+  current_ctx="$(kubectl config current-context 2>/dev/null || true)"
+  if [ "$current_ctx" != "$expected_ctx" ]; then
+    print_error "kubectl current-context ('${current_ctx}') does not match expected cluster context '${expected_ctx}'."
+    print_info "Failed to switch kubectl context to '${expected_ctx}'. Refusing to run health checks on the wrong cluster."
+    exit 1
+  fi
+  if ! kubectl get ns "$namespace" --context "$expected_ctx" >/dev/null 2>&1; then
     print_error "Namespace '${namespace}' was not created. Installation is incomplete."
     exit 1
   fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do
-    if ! wait_for_deployment_object "$deployment" "$namespace" "$DEPLOYMENT_APPEAR_TIMEOUT_SECS"; then
+    if ! wait_for_deployment_object "$deployment" "$namespace" "$DEPLOYMENT_APPEAR_TIMEOUT_SECS" "$expected_ctx"; then
       print_error "Expected deployment '$deployment' was not created within ${DEPLOYMENT_APPEAR_TIMEOUT_SECS}s."
       # platform-agent-gateway is the agent, and the sandbox is the one thing
       # that stops the operator writing it while leaving everything else
@@ -4611,8 +5252,8 @@ main() {
       # CR rather than in any of the logs an operator would reach for first.
       if [ "$deployment" = "$PLATFORM_AGENT_DEPLOYMENT" ] && [ "$enable_gvisor" = "true" ]; then
         print_info "The agent asks for the ${C_BOLD}gvisor${C_RESET} RuntimeClass; the operator will not create its Deployment until that RuntimeClass exists."
-        print_info "Read the reason with: ${C_BOLD}kubectl get platformagent -n ${namespace} -o jsonpath='{.items[*].status.conditions}'${C_RESET}"
-        print_info "Re-run with ${C_BOLD}--gvisor=false${C_RESET} to run the agent on the standard container runtime instead."
+        print_info "Read the reason with: ${C_BOLD}kubectl get platformagent -n ${namespace} --context ${expected_ctx} -o jsonpath='{.items[*].status.conditions}'${C_RESET}"
+        print_info "Re-run with ${C_BOLD}--enable-gvisor=false${C_RESET} to run the agent on the standard container runtime instead."
       fi
       exit 1
     fi
@@ -4620,7 +5261,7 @@ main() {
     # so a couple of minutes is normal. Running past the budget means "still
     # coming up", not "broken": say so and keep the summary below, which carries
     # the chat links and port-forward command.
-    if ! wait_for_rollout "$deployment" "$namespace" "$ROLLOUT_TIMEOUT_SECS"; then
+    if ! wait_for_rollout "$deployment" "$namespace" "$ROLLOUT_TIMEOUT_SECS" "$expected_ctx"; then
       slow_rollouts+=("$deployment")
       print_warning "$deployment did not report ready (after ${ROLLOUT_ELAPSED_SECS}s)."
     fi
@@ -4679,6 +5320,12 @@ main() {
   if [ "${slack_enabled:-false}" = "true" ]; then
     echo ""
     IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
+  fi
+  # Repeated here, where the two printers above give their instructions. Arm 4
+  # prints it as well, for the runs that never reach the end of main().
+  if [ "$chat_choice" = "4" ]; then
+    echo ""
+    _prompt_no_chat_enabled
   fi
 }
 

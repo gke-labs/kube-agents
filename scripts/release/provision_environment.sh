@@ -126,6 +126,51 @@ if provision_is_truthy "${LONG_LIVED_ENVIRONMENT:-}"; then
   [ "$ALLOWLIST_STATUS" -eq 0 ] || exit 1
 fi
 
+# Everything install.sh would refuse this configuration for, checked here.
+#
+# Above the teardown, for the reason the minter and allowlist guards give: the
+# refusal otherwise arrives from `./install.sh` at the bottom of this script,
+# by which point `teardown_run` has destroyed the environment — and on the
+# autopush/staging rebuild path that is a long-lived install left down over a
+# typo in a GitHub variable or an unset secret.
+#
+# Each of these is knowable before anything is destroyed, so each is checked
+# before anything is destroyed. Keep this in step with install.sh's parse-time
+# validators and its Slack token guard: a refusal added there and not mirrored
+# here reverts to failing after the teardown.
+INSTALL_REFUSAL_STATUS=0
+
+for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED; do
+  [ -n "${!_bool_var:-}" ] || continue
+  _canonical="$(canonical_bool "${!_bool_var}")"
+  case "$_canonical" in
+    true | false) ;;
+    *)
+      echo "::error title=${_bool_var} is not a boolean::'${!_bool_var}' is neither true nor false, and this script passes it to install.sh as a flag, whose validator exits 1 on it. Refusing before the teardown rather than after. Set ${_bool_var} on this GitHub environment to true or false."
+      echo "==> ${_bool_var}='${!_bool_var}' is not a boolean." >&2
+      INSTALL_REFUSAL_STATUS=1
+      ;;
+  esac
+done
+
+# install.sh refuses --enable-slack without both tokens when there is no tty,
+# which is this job. Its own guard runs after the Secret-recovery loop, which
+# can read them off a live install -- but this script has just destroyed that
+# install by the time it runs, so nothing can recover them here and the refusal
+# is certain.
+if provision_is_truthy "${SLACK_ENABLED:-}"; then
+  SLACK_MISSING=""
+  [ -n "${SLACK_BOT_TOKEN:-}" ] || SLACK_MISSING="${SLACK_MISSING} SLACK_BOT_TOKEN"
+  [ -n "${SLACK_APP_TOKEN:-}" ] || SLACK_MISSING="${SLACK_MISSING} SLACK_APP_TOKEN"
+  if [ -n "${SLACK_MISSING}" ]; then
+    echo "::error title=Slack is enabled with no tokens::SLACK_ENABLED is set on this environment but${SLACK_MISSING} reached this job empty, and install.sh refuses --enable-slack without both. Refusing to tear down '${GKE_CLUSTER_NAME:-this environment}' for an install that cannot complete. Check the secret is set on the GitHub environment this job binds to, and that the calling pipeline still invokes this workflow with \`secrets: inherit\`."
+    echo "==> Slack enabled with missing:${SLACK_MISSING}." >&2
+    INSTALL_REFUSAL_STATUS=1
+  fi
+fi
+
+[ "$INSTALL_REFUSAL_STATUS" -eq 0 ] || exit 1
+
 TEARDOWN_LOG="$(mktemp)"
 
 echo "==> Tearing down the existing environment (${TEARDOWN_TARGET}) via canonical uninstall.sh..."
@@ -172,13 +217,31 @@ esac
 
 rm -f "${TEARDOWN_LOG}"
 
+# The GitHub variables this script turns into `--enable-*` flags travel
+# through canonical_bool (from teardown_common.sh): the spelling
+# check has to happen before the teardown, and the canonicalisation is the same
+# call.
 INSTALL_ARGS=(
   --non-interactive -y
-  --project-id="${GCP_PROJECT_ID}"
-  --region="${GCP_REGION}"
-  --cluster-name="${GKE_CLUSTER_NAME}"
+  --gcp-project-id="${GCP_PROJECT_ID}"
+  --gcp-region="${GCP_REGION}"
+  --gke-cluster-name="${GKE_CLUSTER_NAME}"
   --image-tag="${IMAGE_TAG}"
 )
+
+# Everything below reaches install.sh as a flag rather than as an inherited
+# environment variable. The two routes are not equivalent: install.env is
+# sourced with `set -a` and so beats an exported variable of the same name, and
+# these environments render an install.env from their GitHub variables -- so a
+# setting passed only by export is silently overridden by whatever the rendered
+# file happens to say. A flag is the one thing that wins for a single run.
+if [ -n "${NAMESPACE:-}" ]; then
+  INSTALL_ARGS+=(--agent-namespace="${NAMESPACE}")
+fi
+
+if [ -n "${GKE_CLUSTER_MODE:-${CLUSTER_MODE:-}}" ]; then
+  INSTALL_ARGS+=(--gke-cluster-mode="${GKE_CLUSTER_MODE:-${CLUSTER_MODE}}")
+fi
 
 if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
   INSTALL_ARGS+=(--enable-google-chat)
@@ -196,6 +259,41 @@ if [ -n "${CHAT_TOPIC_NAME:-}" ]; then
   INSTALL_ARGS+=(--chat-topic-name="${CHAT_TOPIC_NAME}")
 fi
 
+# The Google Chat allowlist. Empty is NOT "no opinion" -- the operator turns an
+# absent list into allow-all -- which is why provision_check_allowlist above
+# refuses an empty one on a long-lived environment. Passing it explicitly means
+# the value this job was given is the value the install gets.
+if [ -n "${GOOGLE_CHAT_ALLOWED_USERS:-${ALLOWED_USERS:-}}" ]; then
+  INSTALL_ARGS+=(--google-chat-allowed-users="${GOOGLE_CHAT_ALLOWED_USERS:-${ALLOWED_USERS}}")
+fi
+
+if [ "${SLACK_ENABLED:-false}" = "true" ]; then
+  INSTALL_ARGS+=(--enable-slack)
+  # install.sh refuses --enable-slack without both tokens when there is no tty,
+  # which is this job. Passing them unconditionally inside this branch keeps
+  # that refusal about a genuinely missing secret rather than about the route
+  # it travelled.
+  INSTALL_ARGS+=(--slack-bot-token="${SLACK_BOT_TOKEN:-}")
+  INSTALL_ARGS+=(--slack-app-token="${SLACK_APP_TOKEN:-}")
+  if [ -n "${SLACK_ALLOWED_USERS:-}" ]; then
+    INSTALL_ARGS+=(--slack-allowed-users="${SLACK_ALLOWED_USERS}")
+  fi
+  if [ -n "${SLACK_HOME_CHANNEL:-}" ]; then
+    INSTALL_ARGS+=(--slack-home-channel="${SLACK_HOME_CHANNEL}")
+  fi
+  if [ -n "${SLACK_HOME_CHANNEL_NAME:-}" ]; then
+    INSTALL_ARGS+=(--slack-home-channel-name="${SLACK_HOME_CHANNEL_NAME}")
+  fi
+fi
+
+if [ -n "${ENABLE_GKE_BACKUP_PLAN:-}" ]; then
+  INSTALL_ARGS+=(--enable-gke-backup-plan="$(canonical_bool "${ENABLE_GKE_BACKUP_PLAN}")")
+fi
+
+if [ -n "${HERMES_DASHBOARD_ENABLED:-}" ]; then
+  INSTALL_ARGS+=(--enable-hermes-dashboard="$(canonical_bool "${HERMES_DASHBOARD_ENABLED}")")
+fi
+
 if [ -n "${MODEL_PROVIDER:-}" ]; then
   INSTALL_ARGS+=(--model-provider="${MODEL_PROVIDER}")
 fi
@@ -205,7 +303,7 @@ if [ -n "${MODEL_DEFAULT_NAME:-}" ]; then
 fi
 
 if [ -n "${ENABLE_GVISOR:-}" ]; then
-  INSTALL_ARGS+=(--gvisor="${ENABLE_GVISOR}")
+  INSTALL_ARGS+=(--enable-gvisor="$(canonical_bool "${ENABLE_GVISOR}")")
 fi
 
 if [ -n "${PLATFORM_AGENT_PERMISSION_SET:-}" ]; then

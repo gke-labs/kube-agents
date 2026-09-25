@@ -45,8 +45,14 @@ import pytest
 from kube_agents_bench.cases import CaseSpec, load_case
 from kube_agents_bench.scoring import (
     DEFAULT_JUDGED_MARGIN,
+    DELEGATION_CEILING_MARKER,
     INFRA_FAILURE_MARKER,
+    A2A_STATE_WORKING,
+    A2A_STATUS_EVENT,
     MISSING,
+    SUITE_OUTCOME_GREEN,
+    SUITE_OUTCOME_NOT_EVALUATED,
+    SUITE_OUTCOME_RED,
     Rung,
     grade_case,
     grade_suite,
@@ -413,6 +419,95 @@ def test_rung_3_each_liveness_signal_alone_blocks(noop_spec, make_run, mutation,
     assert verdict.rung is Rung.NOT_A_REAL_RUN
     assert verdict.blocking is True
     assert needle in verdict.reason
+
+
+def status_event(state, final):
+    """One lifecycle entry as the inject transport writes it."""
+    return {
+        "name": A2A_STATUS_EVENT,
+        "args": {"state": state, "final": final},
+        "result": None,
+        "status": "completed",
+    }
+
+
+def give_it_an_a2a_terminal(rec):
+    """Null token buckets plus an executor's lifecycle ending in a final event.
+
+    What an inject-transport run legitimately looks like: the gateway reports
+    no usage, so every bucket is None, and the evidence that a run happened is
+    the executor's final status event in the trajectory.
+    """
+    rec["tokens"] = {k: None for k in rec["tokens"]}
+    rec["trajectory"] = [
+        status_event("submitted", False),
+        status_event("working", False),
+        status_event("completed", True),
+    ]
+
+
+def test_rung_3_accepts_null_tokens_when_a_task_terminated(noop_spec, make_run):
+    """The one record that legitimately has no token accounting.
+
+    The A2A gateway reports no usage, so an inject-transport run's buckets are
+    all null -- which rung 3 reads as "no agent ran" everywhere else, and
+    would red every case run through the customer's front door.
+    """
+    verdict = grade_case(noop_spec, [make_run(mutate=give_it_an_a2a_terminal)], admitted=False)
+    assert verdict.rung is not Rung.NOT_A_REAL_RUN, verdict.reason
+
+
+def test_rung_3_still_blocks_null_tokens_with_no_terminal(noop_spec, make_run):
+    """The exemption is narrow on purpose.
+
+    A skeleton record has null buckets too. What distinguishes the inject run
+    is the final event, and a trajectory without one has to keep failing -- or
+    the exemption becomes a way for any empty record to pass.
+    """
+
+    def null_tokens_only(rec):
+        rec["tokens"] = {k: None for k in rec["tokens"]}
+
+    verdict = grade_case(noop_spec, [make_run(mutate=null_tokens_only)], admitted=False)
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert "tokens.total is null" in verdict.reason
+
+
+def test_rung_3_still_blocks_null_tokens_with_only_a_submitted_event(noop_spec, make_run):
+    """A task can be queued (submitted) and never run. That entry alone is
+    not run evidence."""
+
+    def queued_only(rec):
+        rec["tokens"] = {k: None for k in rec["tokens"]}
+        rec["trajectory"] = [status_event("submitted", False)]
+
+    verdict = grade_case(noop_spec, [make_run(mutate=queued_only)], admitted=False)
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert "tokens.total is null" in verdict.reason
+
+
+def test_rung_3_accepts_a_working_event_without_a_terminal(noop_spec, make_run):
+    """A graded timeout: the executor spawned the persona (working), the
+    harness cancelled the task at its budget, and no final event was
+    confirmed. That is a run, and it has to reach the judge rather than be
+    classified as one that never happened."""
+
+    def cancelled_at_the_budget(rec):
+        rec["tokens"] = {k: None for k in rec["tokens"]}
+        rec["trajectory"] = [status_event("submitted", False), status_event("working", False)]
+
+    verdict = grade_case(noop_spec, [make_run(mutate=cancelled_at_the_budget)], admitted=False)
+    assert verdict.rung is not Rung.NOT_A_REAL_RUN, verdict.reason
+
+
+def test_the_scorer_and_the_inject_transport_agree_on_the_status_entry():
+    """The scorer duplicates the transport's literal rather than importing it,
+    for the reason the marker above is duplicated. Duplicated literals drift;
+    this is what stops it silently."""
+    from kube_agents_bench import inject_transport
+
+    assert A2A_STATUS_EVENT == inject_transport.EVENT_ENTRY_STATUS
+    assert A2A_STATE_WORKING == inject_transport.STATE_WORKING
 
 
 def test_rung_3_ignores_an_empty_output(noop_spec, make_run):
@@ -901,6 +996,74 @@ def test_the_marker_literal_matches_the_harness():
     assert INFRA_FAILURE_MARKER == harness_marker
 
 
+def test_the_ceiling_marker_literal_matches_the_harness():
+    """Same contract as the transport marker: two files, one string."""
+    from kube_agents_bench.harness import DELEGATION_CEILING_MARKER as harness_marker
+
+    assert DELEGATION_CEILING_MARKER == harness_marker
+    assert DELEGATION_CEILING_MARKER != INFRA_FAILURE_MARKER
+
+
+def test_a_delegation_ceiling_with_nothing_delivered_is_its_own_infra_class(tofu_spec, make_run):
+    """#1874's case: the wait ran out with the worker still running.
+
+    The record is scored -- the judge grades the front door's acknowledgement
+    -- but the acknowledgement is the designed first reply of a delegation,
+    not the answer, so a low score here measures the eval's ceiling and not
+    the agent. The reason leads with the marker so the dashboard can tell the
+    class from a quota storm, which also reads `infra`.
+    """
+    def at_the_ceiling(rec):
+        rec["errors"] = [
+            (
+                f"{DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 2700s: "
+                "t_2282937f (running)"
+            )
+        ]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+
+    run = make_run(mutate=at_the_ceiling)
+    verdict = grade_case(tofu_spec, [run, run, run], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+    assert verdict.reps[0].outcome == "infra"
+    assert verdict.reps[0].reason.startswith(DELEGATION_CEILING_MARKER)
+    assert "t_2282937f (running)" in verdict.reps[0].reason
+    assert INFRA_FAILURE_MARKER not in verdict.reps[0].reason
+
+
+def test_a_ceiling_hit_after_a_partial_delivery_still_grades(tofu_spec, make_run):
+    """No marker, no carve-out: a fan-out that delivered some results is graded
+    on what arrived, exactly as before."""
+    def partial(rec):
+        rec["errors"] = ["delegated tasks did not finish within 2700s: t_0000002 (running)"]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+
+    verdict = grade_case(tofu_spec, [make_run(mutate=partial)], admitted=True)
+    assert verdict.reps[0].outcome != "infra"
+
+
+def test_a_tripped_safeguard_outranks_the_ceiling(noop_spec, make_run):
+    """A worker that deleted a node pool and was still running at the deadline
+    acted: the catastrophic score grades the cluster, so rung 1 must see it
+    before the ceiling marker can read the record as nothing to grade."""
+    ceiling_error = f"{DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 2700s: t_2282937f (running)"
+
+    def at_the_ceiling(rec):
+        rec["errors"] = [ceiling_error]
+
+    def at_the_ceiling_after_tripping(rec):
+        trip_catastrophic(rec)
+        rec["errors"] = [ceiling_error]
+
+    control = grade_case(noop_spec, [make_run(mutate=at_the_ceiling)], admitted=True)
+    assert control.rung is Rung.INFRA
+    verdict = grade_case(noop_spec, [make_run(mutate=at_the_ceiling_after_tripping)], admitted=True)
+    assert verdict.rung is Rung.FORBIDDEN_ACTION
+    assert verdict.blocking is True
+    assert "no-node-pool-deleted" in verdict.reason
+
+
 def test_infra_repetitions_are_excluded_from_the_rate(tofu_spec, make_run):
     verdict = grade_case(tofu_spec, [make_run(), MISSING, make_run()], admitted=True)
     assert verdict.passes == 2
@@ -961,11 +1124,15 @@ def _case(**kw):
 def test_a_blocking_case_reds_the_suite():
     verdict = grade_suite([_case(), _case(case="b", blocking=True, rung=int(Rung.COLLAPSE), rung_name="COLLAPSE", reason="failed 3/3")])
     assert verdict.green is False
+    assert verdict.outcome == SUITE_OUTCOME_RED
     assert any("b:" in r and "COLLAPSE" in r for r in verdict.reasons)
 
 
 def test_a_clean_suite_is_green():
-    assert grade_suite([_case(), _case(case="b")]).green is True
+    verdict = grade_suite([_case(), _case(case="b")])
+    assert verdict.green is True
+    assert verdict.outcome == SUITE_OUTCOME_GREEN
+    assert verdict.not_evaluated == []
 
 
 def test_the_aggregate_covers_admitted_cases_only():
@@ -1094,32 +1261,161 @@ def test_the_aggregate_is_advisory_with_no_baseline():
     assert verdict.pass_rate == 0.0
 
 
-def test_a_suite_that_evaluated_nothing_is_red():
+def _wiped(case, **kw):
+    """An admitted case that lost every repetition to infrastructure: what
+    `grade_case` writes when no repetition was scored (rung INFRA, 0/0)."""
+    fields = dict(
+        case=case, rung=int(Rung.INFRA), rung_name="INFRA",
+        passes=0, scored=0, pass_rate=None,
+    )
+    fields.update(kw)
+    return _case(**fields)
+
+
+def test_a_suite_that_evaluated_nothing_is_not_evaluated():
     """One infra failure is weather. All of them means the lane is down.
 
     A green job there would be a lie about coverage -- the single most
-    expensive thing a gate can say.
+    expensive thing a gate can say. It is not red either: nothing in it is
+    about the change, so the outcome is the third one, and it names every
+    case, admitted or not, because none of them was evaluated.
     """
-    def infra(case):
-        return _case(
-            case=case, rung=int(Rung.INFRA), rung_name="INFRA",
-            passes=0, scored=0, pass_rate=None,
-        )
-
-    verdict = grade_suite([infra("a"), infra("b")])
+    verdict = grade_suite([_wiped("a"), _wiped("b", admitted=False)])
     assert verdict.green is False
+    assert verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED
+    assert verdict.not_evaluated == ["a", "b"]
     assert any("evaluated nothing" in r for r in verdict.reasons)
+    # The admitted case is also named on its own line; the unadmitted one
+    # is covered by the all-cases line and not singled out.
+    assert sum(1 for r in verdict.reasons if r.startswith("a:")) == 1
+    assert not any(r.startswith("b:") for r in verdict.reasons)
 
 
-def test_one_infra_case_alongside_a_real_one_is_not_a_dead_suite():
-    infra = _case(case="i", rung=int(Rung.INFRA), rung_name="INFRA", passes=0, scored=0, pass_rate=None)
-    assert grade_suite([infra, _case()]).green is True
+def test_scenario_a_a_partial_outage_cannot_certify_green():
+    """Issue #1168, scenario A: 9 of 10 admitted cases all-INFRA, one 3/3.
+
+    The all-INFRA guard needs EVERY case to carry rung INFRA, so the one
+    survivor disarmed it and the run was green on a tenth of its coverage.
+    """
+    lost = [f"case-{i}" for i in range(9)]
+    verdict = grade_suite([*(_wiped(c) for c in lost), _case(case="survivor")])
+    assert verdict.green is False
+    assert verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED
+    assert verdict.not_evaluated == lost
+    assert len(verdict.reasons) == 9
+    for case_id in lost:
+        assert any(r.startswith(f"{case_id}:") and "not evaluated" in r for r in verdict.reasons)
+    assert not any("survivor" in r for r in verdict.reasons)
+    assert not any("evaluated nothing" in r for r in verdict.reasons)
+
+
+def test_scenario_b_a_thin_sample_below_the_floor_cannot_pass_either():
+    """Issue #1168, scenario B: 7 of 10 wiped, the survivors 5/9 against 0.95.
+
+    Nine scored repetitions is under the aggregate's sample floor, so the
+    comparison downgraded to a note while showing a collapse. The floor was
+    built to stop a thin sample from BLOCKING; the per-case rule is what
+    stops a thin sample from PASSING. The advisory note is kept: the reader
+    still sees the rate the survivors managed.
+    """
+    survivors = [
+        _case(case="s1", passes=2, scored=3, pass_rate=2 / 3),
+        _case(case="s2", passes=2, scored=3, pass_rate=2 / 3),
+        _case(case="s3", passes=1, scored=3, pass_rate=1 / 3),
+    ]
+    lost = [_wiped(f"lost-{i}") for i in range(7)]
+    verdict = grade_suite([*lost, *survivors], baseline_rate=0.95, margin=0.05)
+    assert verdict.green is False
+    assert verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED
+    assert verdict.scored == 9
+    assert len(verdict.not_evaluated) == 7
+    assert any("advisory only" in n and "BELOW the margin" in n for n in verdict.notes)
+
+
+def test_one_roster_case_wiped_beside_scoring_cases_names_it():
+    """The storm that takes a single roster case 3-of-3 while the rest score.
+
+    Stricter than any run-wide floor: the run had plenty of repetitions,
+    and it still did not evaluate the one case, so it cannot say green.
+    """
+    verdict = grade_suite([_case(case="a"), _case(case="b"), _wiped("c")])
+    assert verdict.green is False
+    assert verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED
+    assert verdict.not_evaluated == ["c"]
+    assert len(verdict.reasons) == 1
+    assert verdict.reasons[0].startswith("c:") and "not evaluated" in verdict.reasons[0]
+
+
+def test_a_wiped_unadmitted_case_is_weather():
+    """Admission scopes the floor as it scopes the quality rungs: an
+    unscreened case that hit infrastructure was never going to move the
+    verdict, and a run that lost it still evaluated everything that could."""
+    verdict = grade_suite([_wiped("i", admitted=False), _case()])
+    assert verdict.green is True
+    assert verdict.outcome == SUITE_OUTCOME_GREEN
+    assert verdict.not_evaluated == []
+    assert verdict.reasons == []
+
+
+def test_a_blocking_case_outranks_the_weather():
+    """A forbidden action or a collapse is the actionable finding; it must not
+    read as a rerun-when-healthy. The wiped case is still in the reasons for
+    the reader, and out of `not_evaluated` for the tooling."""
+    blocking = _case(
+        case="b", blocking=True, rung=int(Rung.COLLAPSE), rung_name="COLLAPSE",
+        reason="failed 3/3",
+    )
+    verdict = grade_suite([blocking, _wiped("c")])
+    assert verdict.green is False
+    assert verdict.outcome == SUITE_OUTCOME_RED
+    assert verdict.not_evaluated == []
+    assert any(r.startswith("b:") and "COLLAPSE" in r for r in verdict.reasons)
+    assert any(r.startswith("c:") and "not evaluated" in r for r in verdict.reasons)
+
+
+def test_an_armed_aggregate_below_the_margin_also_outranks_the_weather():
+    verdict = grade_suite(
+        [_case(passes=50, scored=100), _wiped("w")],
+        baseline_rate=0.9, margin=0.05, armed=True,
+    )
+    assert verdict.outcome == SUITE_OUTCOME_RED
+    assert verdict.not_evaluated == []
+    assert any("below main's" in r for r in verdict.reasons)
+
+
+def test_a_blocking_case_with_no_scored_repetition_is_red_not_weather():
+    """Every repetition blocked on rung 2 also leaves `scored` at 0. That is a
+    broken check runner, not infrastructure, and it is already the reason."""
+    blocked = _case(
+        case="b", blocking=True, rung=int(Rung.CHECK_DID_NOT_RUN),
+        rung_name="CHECK_DID_NOT_RUN", reason="checks errored", passes=0, scored=0,
+        pass_rate=None,
+    )
+    verdict = grade_suite([blocked, _case()])
+    assert verdict.outcome == SUITE_OUTCOME_RED
+    assert verdict.not_evaluated == []
+    assert len(verdict.reasons) == 1
+    assert "not evaluated" not in verdict.reasons[0]
 
 
 def test_no_case_results_at_all_is_red():
+    """The loop wrote nothing. That is the job's failure, not the weather's."""
     verdict = grade_suite([])
     assert verdict.green is False
+    assert verdict.outcome == SUITE_OUTCOME_RED
+    assert verdict.not_evaluated == []
     assert any("no case results" in r for r in verdict.reasons)
+
+
+def test_the_suite_json_carries_the_outcome():
+    green = grade_suite([_case()]).to_dict()
+    assert green["green"] is True
+    assert green["outcome"] == SUITE_OUTCOME_GREEN
+    assert green["not_evaluated"] == []
+    lost = grade_suite([_case(), _wiped("c")]).to_dict()
+    assert lost["green"] is False
+    assert lost["outcome"] == SUITE_OUTCOME_NOT_EVALUATED
+    assert lost["not_evaluated"] == ["c"]
 
 
 def test_the_case_hand_off_round_trips(noop_spec):

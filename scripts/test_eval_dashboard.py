@@ -439,6 +439,10 @@ class RosterPageTest(unittest.TestCase):
         self.assertEqual(status({"name": "a", "active": True}, frozenset(), {"a": "2026-09-02"}), ("demoted", "2026-09-02"))
         self.assertEqual(status({"name": "a", "active": True}, frozenset(), {}), ("held_out", None))
         self.assertEqual(status({"name": "a", "active": False, "nightly_active": True}, frozenset({"a"}), {}), ("nightly_only", None))
+        # Since 2026-09-22 a demoted case is a nightly case (#1023): the date
+        # on the roster page is read on the nightly branch too, or the two
+        # demotions on record would render as plain "nightly only".
+        self.assertEqual(status({"name": "a", "active": False, "nightly_active": True}, frozenset(), {"a": "2026-09-02"}), ("demoted", "2026-09-02"))
         self.assertEqual(status({"name": "a"}, frozenset({"a"}), {}), ("retired", None))
         self.assertEqual(status({"name": "a", "active": True}, None, {}), ("blocking", None), "no roster reads as blocking")
 
@@ -513,16 +517,17 @@ class ReleasesAndPendingTest(unittest.TestCase):
 
 
 class RenderedPagesTest(unittest.TestCase):
-    def test_five_pages_are_written_and_none_names_the_legacy_page(self):
+    def test_six_pages_are_written_and_none_names_the_legacy_page(self):
         out_dir, _, tmp = render_fixture(fixture_data())
         self.addCleanup(tmp.cleanup)
-        self.assertEqual(sorted(p.name for p in out_dir.iterdir()), ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html"])
-        for page in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html"):
+        self.assertEqual(sorted(p.name for p in out_dir.iterdir()), ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html", "trend.html", "trend.json"])
+        for page in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html", "trend.html"):
             text = (out_dir / page).read_text()
             self.assertNotIn("legacy", text.lower(), page)
             self.assertIn('href="grid.html"', text, page)
             self.assertIn('href="cases.html"', text, page)
             self.assertIn('href="nightly.html"', text, page)
+            self.assertIn('href="trend.html"', text, page)
         for template in TEMPLATES:
             self.assertNotIn("legacy", template.read_text().lower(), template.name)
 
@@ -651,7 +656,7 @@ class CaseNotesTest(unittest.TestCase):
         for name in ("agent-kanban-smoke", "capacity-pinned-pool-probe", "compliance-rbac-overgrant", "gpu-stress-test-diagnosis"):
             self.assertIn(name, notes)
         self.assertEqual(notes["compliance-rbac-overgrant"]["issues"], ["#998", "#985", "#1171"])
-        self.assertEqual(notes["capacity-pinned-pool-probe"]["issues"], ["#1010"])
+        self.assertEqual(notes["capacity-pinned-pool-probe"]["issues"], ["#1840", "#1874"])
         for entry in notes.values():
             self.assertEqual(set(entry), {"note", "issues"})
 

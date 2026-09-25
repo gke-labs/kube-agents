@@ -518,7 +518,9 @@ func TestTheSessionIdentityIsRenderedUnderNextAndRemovedUnderToday(t *testing.T)
 	}
 
 	// The gateway is told the name, rather than baking a default that is
-	// wrong on every renamed CR.
+	// wrong on every renamed CR. It renders only once the callout serves,
+	// so report that first; this test is about the name, not the gate.
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
 	dep := &appsv1.Deployment{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-gateway", Namespace: "test-ns"}, dep); err != nil {
 		t.Fatalf("gateway Deployment: %v", err)

@@ -241,6 +241,20 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "[]")
 
+    def test_tfvar_ignores_state_lock_messages(self):
+        """tfvar should ignore acquiring and releasing state lock messages."""
+        lock_output = (
+            "Acquiring state lock. This may take a few moments...\n"
+            '"custom-sa"\n'
+            "Releasing state lock. This may take a few moments..."
+        )
+        proc = self._run_guard(
+            'printf "[%s]" "$(tfvar agent_service_account_id)"',
+            tfvar_agent_sa=lock_output,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "[custom-sa]")
+
     def test_the_default_gsa_name_comes_from_the_defaults_file(self):
         """lifecycle.sh sources install.defaults.env rather than spelling the
         name a third time; a guard against the module default is only right

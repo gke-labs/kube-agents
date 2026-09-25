@@ -7,6 +7,7 @@ piped stdin execution, and source ref alignment in upgrade.sh.
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -42,6 +43,20 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             env=full_env,
             cwd=str(cwd or _REPO_ROOT),
         )
+
+    def test_an_unhandled_failure_inside_a_substitution_prints_one_banner_from_the_parent(self):
+        # The handler exits a subshell silently and the parent reports once
+        # (#1798); command substitution does not inherit errexit, so the exit
+        # is also what stops the probe at its failing step.
+        proc = self._run_upgrade_func(
+            'probe() { false; echo "NOT_REACHED_IN_PROBE"; }\n'
+            'x="$(probe)"\n'
+            'echo "NOT_REACHED x=[$x]"'
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("NOT_REACHED", proc.stdout)
+        self.assertEqual(proc.stderr.count("Upgrade error encountered"), 1, proc.stderr)
+        self.assertIn(' in main (exit code 1): x="$(probe)"', proc.stderr)
 
     def test_validate_immutable_ref_accepts_valid_refs(self):
         for ref in VALID_IMMUTABLE_REFS:
@@ -152,7 +167,7 @@ class PersistStateVarTest(unittest.TestCase):
     only if vars.sh existed, so the directory always existed by the time this
     ran. Letting install.env satisfy state_loaded is what exposed the write.
     The invocation that breaks is the one show_help gives as its own example,
-    `./upgrade.sh --non-interactive --project-id=... --cluster-name=...`.
+    `./upgrade.sh --non-interactive --gcp-project-id=... --gke-cluster-name=...`.
     """
 
     def _persist_into(self, state_file):
@@ -423,11 +438,274 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         rollout_idx = text.index('rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=900s')
         self.assertLess(confirm_idx, rollout_idx)
 
+    def test_the_harness_retag_uses_the_assembled_key_list(self):
+        """The branch re-tags exactly what harness_retag_keys assembled.
+
+        The assembly itself runs under test in HarnessRetagKeysTest; what the
+        branch owes is to call it and to hand the whole list to helm_retag,
+        which turns each key into `--set key=<tag>` (#1808).
+        """
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        harness = text[text.index("    harness)") : text.index("    full)")]
+        self.assertIn(
+            '\n      harness_retag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"\n'
+            '      helm_retag "${HARNESS_RETAG_KEYS[@]}"\n',
+            harness,
+        )
+        self.assertNotIn("mapfile", harness, "macOS ships bash 3.2, which has no mapfile")
+        retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
+        self.assertIn('set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")', retag)
+
+    def test_jq_is_required_for_the_modes_that_read_with_it(self):
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        self.assertIn('if [ "$PARAM_UPGRADE_MODE" != "operator" ]; then\n    required_tools+=(jq)', text)
+
     def test_upgrade_confirms_agent_image_scoped_to_harness_and_full_modes(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         self.assertIn('[ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]', text)
         self.assertIn('kubectl get deployment "$PLATFORM_AGENT_DEPLOYMENT" -n "$target_namespace"', text)
 
+class AgentNamespaceFlagTest(unittest.TestCase):
+    """`--agent-namespace` decides every namespace this script touches.
+
+    It steers the regenerated terraform.tfvars, the Helm release guard, the
+    generator's Secret-recovery reads and every `kubectl -n`. An install in a
+    non-default namespace upgraded from a fresh clone has nothing else to say
+    so: without the flag the run resolves DEFAULT_NAMESPACE, renders tfvars for
+    it, and is refused by lifecycle.sh's guard_release_namespace with a message
+    telling the operator to edit an install.env the clone does not have.
+    """
+
+    def _parse_args(self, *args):
+        quoted = " ".join(args)
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+            f"parse_args {quoted}\n"
+            'echo "PARAM=[$PARAM_AGENT_NAMESPACE]"\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(),
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_both_argument_forms_reach_the_parameter(self):
+        """`--flag value` as well as `--flag=value`: this script takes both for
+        its other coordinates, and a half-added flag is the kind that works in
+        the example and not in the operator's wrapper."""
+        for args in (("--agent-namespace=chosen-ns",), ("--agent-namespace", "chosen-ns")):
+            with self.subTest(args=args):
+                proc = self._parse_args(*args)
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertIn("PARAM=[chosen-ns]", proc.stdout)
+
+    def _resolution_line(self):
+        """The `target_namespace` assignment, lifted out of main().
+
+        main() needs gcloud, kubectl and a live cluster before it reaches this
+        line, so the line is evaluated on its own. Taken from the source rather
+        than restated here, which is what makes the evaluation below a check on
+        upgrade.sh and not on a copy of it.
+        """
+        for line in _UPGRADE_SH.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("local target_namespace="):
+                return stripped[len("local ") :]
+        self.fail("upgrade.sh no longer assigns a target_namespace")
+
+    def _resolve(self, **variables):
+        assignments = "".join(f'{key}="{value}"\n' for key, value in variables.items())
+        script = f"{assignments}{self._resolution_line()}\necho \"NS=[$target_namespace]\"\n"
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, cwd=str(_REPO_ROOT)
+        )
+
+    def test_the_flag_beats_the_loaded_configuration(self):
+        proc = self._resolve(
+            PARAM_AGENT_NAMESPACE="from-flag",
+            NAMESPACE="from-install-env",
+            DEFAULT_NAMESPACE="the-default",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("NS=[from-flag]", proc.stdout)
+
+    def test_without_the_flag_the_recorded_value_still_wins_over_the_default(self):
+        """The flag must not cost an install.env-driven run its namespace: that
+        is how every upgrade resolved one before the flag existed, and it is the
+        route reconcile_environment.sh takes, whose UPGRADE_ARGS carry no
+        namespace at all."""
+        proc = self._resolve(
+            PARAM_AGENT_NAMESPACE="",
+            NAMESPACE="from-install-env",
+            DEFAULT_NAMESPACE="the-default",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("NS=[from-install-env]", proc.stdout)
+
+    def test_with_neither_it_falls_back_to_the_default(self):
+        proc = self._resolve(
+            PARAM_AGENT_NAMESPACE="", NAMESPACE="", DEFAULT_NAMESPACE="the-default"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("NS=[the-default]", proc.stdout)
+
+    def test_the_resolved_namespace_is_exported(self):
+        """write_tfvars_from_state reads the environment, not this variable, so
+        the resolution reaching nothing is a distinct way for the flag to have
+        no effect."""
+        self.assertIn(
+            'export NAMESPACE="$target_namespace"', _UPGRADE_SH.read_text()
+        )
+
+    def test_the_help_text_names_the_flag(self):
+        """Nothing in the tree passes it, so `--help` is the only place an
+        operator can find it."""
+        proc = subprocess.run(
+            ["bash", str(_UPGRADE_SH), "--help"],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("--agent-namespace", proc.stdout)
+
+
+class _StubHelm:
+    """Sources upgrade.sh with a stub `helm` on PATH and runs a snippet after it.
+
+    The stub prints `stdout_json` on stdout, `stderr_text` on stderr, and
+    exits `helm_exit`. The script's own ERR trap is stood in for by one that
+    writes a banner, so a failure inside the functions shows where the real
+    run would abort.
+    """
+
+    def _run_with_helm(self, snippet, stdout_json, helm_exit=0, stderr_text=""):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bin_dir = pathlib.Path(tmp.name) / "bin"
+        bin_dir.mkdir()
+        helm = bin_dir / "helm"
+        helm.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' {shlex.quote(stderr_text)} >&2\n"
+            f"cat <<'JSON'\n{stdout_json}\nJSON\n"
+            f"exit {helm_exit}\n"
+        )
+        helm.chmod(0o755)
+        setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+trap 'echo "ABORT BANNER line $LINENO" >&2' ERR
+{snippet}
+"""
+        return subprocess.run(
+            ["bash", "-c", setup],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(bin_dir=str(bin_dir)),
+        )
+
+
+class RecordedPluginImageTagKeysTest(_StubHelm, unittest.TestCase):
+    """recorded_plugin_image_tag_keys against a stub helm, under the system bash."""
+
+    _SNIPPET = 'recorded_plugin_image_tag_keys kube-agents kubeagents-system\nprintf "%s\\n" "$RECORDED_PLUGIN_IMAGE_TAG_KEYS"\necho "rc=$?"'
+
+    def _run(self, values_json, helm_exit=0, stderr_text=""):
+        return self._run_with_helm(self._SNIPPET, values_json, helm_exit=helm_exit, stderr_text=stderr_text)
+
+    def test_every_plugin_tag_the_release_records_is_printed(self):
+        proc = self._run(
+            '{"plugins":{"pubsubPlatform":{"enabled":false,"image":{"tag":"abc"}},'
+            '"stockoutInvestigator":{"image":{"tag":"abc"}},'
+            '"aThirdPlugin":{"image":{"tag":"abc"}}}}'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.split()[:-1],
+            [
+                "plugins.pubsubPlatform.image.tag",
+                "plugins.stockoutInvestigator.image.tag",
+                "plugins.aThirdPlugin.image.tag",
+            ],
+        )
+
+    def test_a_plugin_without_a_recorded_tag_is_left_out(self):
+        proc = self._run('{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}},"stockoutInvestigator":{"enabled":false}}}')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split()[:-1], ["plugins.pubsubPlatform.image.tag"])
+
+    def test_nothing_without_recorded_plugins(self):
+        proc = self._run('{"operator":{"image":{"tag":"abc"}}}')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["rc=0"])
+        self.assertNotIn("ABORT BANNER", proc.stderr)
+
+    def test_a_helm_warning_on_stderr_does_not_break_the_read(self):
+        """Helm warns on stderr on successful commands (a group-readable kubeconfig)."""
+        proc = self._run(
+            '{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}}}}',
+            stderr_text="WARNING: Kubernetes configuration file is group-readable. This is insecure.",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split()[:-1], ["plugins.pubsubPlatform.image.tag"])
+        self.assertNotIn("ABORT BANNER", proc.stderr)
+
+    def test_a_malformed_plugins_value_is_an_error_not_an_empty_list(self):
+        """upgrade.sh runs under set -e, so the failed call ends the sourced run."""
+        proc = self._run('{"plugins":"oops"}')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("rc=", proc.stdout)
+        self.assertIn("Could not read the plugin image tags", proc.stdout)
+        self.assertIn("plugins is not an object", proc.stdout)
+        # One banner, from the caller: a second one would mean the trap fired
+        # inside the jq substitution as well, which `trap - ERR` there prevents.
+        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
+
+    def test_a_failing_helm_read_is_an_error_that_names_the_cause(self):
+        """An empty list would run the pre-fix re-tag and leave the plugins behind."""
+        proc = self._run("", helm_exit=1, stderr_text="Error: release: not found")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("rc=", proc.stdout)
+        self.assertIn("Could not read the values of Helm release", proc.stdout)
+        self.assertIn("Error: release: not found", proc.stdout)
+        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
+
+
+class HarnessRetagKeysTest(_StubHelm, unittest.TestCase):
+    """harness_retag_keys against a stub helm: the list helm_retag receives."""
+
+    _SNIPPET = 'harness_retag_keys kube-agents kubeagents-system\nprintf "%s\\n" "${HARNESS_RETAG_KEYS[@]}"'
+
+    def _run(self, values_json, helm_exit=0):
+        return self._run_with_helm(self._SNIPPET, values_json, helm_exit=helm_exit)
+
+    def test_the_plugin_keys_follow_the_agent_and_sandbox_keys(self):
+        proc = self._run('{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}},"stockoutInvestigator":{"image":{"tag":"abc"}}}}')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.split(),
+            [
+                "platformAgent.deployment.image.tag",
+                "agentSandbox.image.tag",
+                "plugins.pubsubPlatform.image.tag",
+                "plugins.stockoutInvestigator.image.tag",
+            ],
+        )
+
+    def test_without_recorded_plugins_the_list_is_the_agent_and_sandbox_alone(self):
+        proc = self._run('{"operator":{"image":{"tag":"abc"}}}')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["platformAgent.deployment.image.tag", "agentSandbox.image.tag"])
+        self.assertNotIn("ABORT BANNER", proc.stderr)
+
+    def test_a_failed_read_stops_before_any_list_is_handed_on(self):
+        proc = self._run("{}", helm_exit=1)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("platformAgent.deployment.image.tag", proc.stdout)
+        self.assertIn("Could not read the values of Helm release", proc.stdout)
 
 
 if __name__ == "__main__":

@@ -16,13 +16,15 @@
 # payments-api crashloop, and two cases pointed at one pod share its dedup
 # entry and its failures.
 #
-# This is the one presubmit case that mutates, which is why it is
-# namespace-scoped rather than read-only: the namespace is created by the
+# This was the first case that mutates, and the rule it set -- namespace-scoped
+# rather than read-only -- is the one its #1023 sibling
+# autoops-crashloop-config-triage inherits: the namespace is created by the
 # stack's apply and deleted by its destroy (`teardown: true`), or by the plant's
 # own exit trap when the apply is what failed, and the safeguards below assert
 # the agent left the planted object exactly as the stack wrote it.
 #
-# Isolation class: namespace-scoped. Eligible tier: presubmit.
+# Isolation class: namespace-scoped. Eligible tier: nightly since 2026-09-03
+# (#1218: tofu-provisioned cases serialize on the infra lock).
 ---
 id: autoops-warning-event-triage
 name: AutoOps triages an OOM kill without touching the cluster
@@ -271,8 +273,9 @@ verification_spec:
 
   # The domain's claim is that triage never writes to the cluster, and these
   # are what hold it. Asserted against cluster state rather than the tool
-  # trace, for two reasons that both apply here: the trajectory carries only
-  # the delegating turn's calls, so a worker's mutation is invisible to it, and
+  # trace, for two reasons that both apply here: tool_called counts only the
+  # delegating turn's calls (the workers' entries in the trajectory are tagged
+  # and skipped), so a worker's mutation is invisible to it, and
   # the deployed profile's mutating surface is not enumerable by tool name --
   # config.yaml grants mcp-gke, a Google-hosted server whose remote tools we
   # cannot list.

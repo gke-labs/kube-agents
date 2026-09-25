@@ -38,11 +38,15 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # that can carry the gVisor node pool. Set create_cluster = false to install
 # onto an existing cluster (it must already have Workload Identity and enforce
 # NetworkPolicy, or the plan is refused; CMEK on it stays a gcloud step outside
-# Terraform).
-# cluster_mode            = "standard"
-# create_cluster          = false
-# enable_gvisor_node_pool = true
-# gvisor_pool_name        = "gvisor-pool"
+# Terraform). accept_no_network_policy = true admits a cluster with no
+# enforcement and leaves it as it is: every NetworkPolicy the install ships is
+# then inert, and the PlatformAgent carries the
+# kubeagents.x-k8s.io/network-policy-enforcement annotation to say so.
+# cluster_mode             = "standard"
+# create_cluster           = false
+# accept_no_network_policy = false
+# enable_gvisor_node_pool  = true
+# gvisor_pool_name         = "gvisor-pool"
 
 # Sandboxing on Autopilot, which has the gvisor RuntimeClass built in and no
 # node pool to provision. enable_gvisor_node_pool must stay false there.
@@ -90,6 +94,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # provider's default model; set the matching *_api_key above).
 # model_provider     = "gemini"
 # model_default_name = ""
+# Output tokens the gateway asks for on a request that names none; 0 renders
+# nothing. For a self-hosted backend whose prompt and output share one window.
+# model_max_tokens   = 0
 
 # Vertex AI / Model Garden instead of an API-key provider — see variables.tf.
 # vertex_project_id defaults to the install's project; vertex_location defaults
@@ -113,6 +120,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # credentials Secret and the CR's slack section turns on. Creating the Slack
 # app (Socket Mode + bot scopes) stays manual — see the README.
 # enable_slack            = true
+# Comma-separate several to serve more than one Slack workspace.
 # slack_bot_token         = "xoxb-..."
 # slack_app_token         = "xapp-..."
 # slack_allowed_users     = ["U01234567"]
@@ -149,7 +157,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # shared cluster, install cert-manager separately and set this to false.
 # enable_cert_manager  = true
 # enable_webhooks      = true
-# cert_manager_version = "v1.21.1"
+# cert_manager_version = "v1.21.2"
 
 # Anything the variables above do not reach. Deep-merged over the values this
 # composition computes, so one leaf can be set without restating its block.

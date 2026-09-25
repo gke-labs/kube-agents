@@ -45,12 +45,12 @@ window, not the delivery lifecycle. Concretely:
 
 Streams bind to the payload spec's subjects and topic classes:
 
-| Stream           | Subjects             | Retention                                   | Consumers                                                                                                                                                                                                                                                                                                                |
-| :--------------- | :------------------- | :------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TASKS`          | `a2a.tasks.>`        | Age window W (72h dev default), R3          | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events`, never a consume. |
-| `DIRECTORY`      | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3               | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                              |
-| `TOPICS-STATE`   | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3 | Read latest-per-subject                                                                                                                                                                                                                                                                                                  |
-| `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3                          |                                                                                                                                                                                                                                                                                                                          |
+| Stream           | Subjects             | Retention                                                        | Consumers                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| :--------------- | :------------------- | :--------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TASKS`          | `a2a.tasks.>`        | Age window W (72h dev default), `max_msgs_per_subject: 4096`, R3 | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events` and `…supervisor` together, in stream order, never a consume; the supervisor's terminal has its own subject token since 9/9, and both match this stream's filter. |
+| `DIRECTORY`      | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3                                    | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `TOPICS-STATE`   | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3                      | Read latest-per-subject                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 State and journal topics both live under `a2a.topics.>`, so the two topic streams' subject
 lists are rendered per topic from the provisioned registry - which topics exist is already
@@ -71,6 +71,119 @@ the PV and stalls the whole JetStream deployment, which would take `runtime-stat
 replay completeness degrades oldest-first - a running task's early events can age out of
 a flooded stream - and the byte-headroom alert below exists so that state is paged on
 before it is reached.
+
+`TASKS` carries one further limit, `max_msgs_per_subject` (4096; amended 9/16). The cap
+above is stream-wide, so one runaway task - a looping harness, a gigabyte of streamed
+artifact text - could consume the whole 20GiB budget and, under `discard: old`, evict
+every other session's history on the way out. The per-subject cap makes a runaway pay
+for its own runaway and nobody else's. Be precise about what it is not: a session's
+publish grant is `a2a.tasks.<pod>.*.events` - the task id is not part of the attested
+claim, so the grant cannot name one - and a session can therefore mint unbounded
+distinct subjects by inventing task ids. A per-subject cap is not a per-publisher
+budget, and JetStream has none to reach for. Closing that is a change to the callout's
+narrowing, not a stream flag.
+
+The replay consequence, stated rather than discovered later, because `discard: old`
+evicts the OLDEST message on a subject first: the oldest event on a task's `…events`
+subject is its `submitted` status-update, which assertion 9 requires and which
+`FoldTask` folds into `StatusHistory[0]`. A task past the cap replays without its head -
+the terminal state survives, the beginning does not. That is only acceptable because the
+fold now says so. `lib.Task` carries `SubmittedMissing`, the assertion-9 observation and
+the sibling of `PostFinalDropped` for assertion 10, so a truncated replay is a
+degradation a reader can see rather than a short history it cannot distinguish from a
+real one. On the number, sized against the publisher that means it rather than the
+well-behaved one: the render sets no `max_payload`, so NATS' 1MiB default is the
+per-message ceiling and 4096 messages is a ~4GiB worst case on one subject - a fifth of
+the stream. The worker adapter's own result chunks are 256KiB, so a task built out of
+those reaches nearer 1GiB at the same count, but that is a property of one publisher and
+not a bound the bus enforces. A chat-driven task emits single digits to low hundreds of
+events; reaching 4096 is already a loop or a gigabyte of streamed artifact text. The
+alternative that would refuse the write instead of evicting the head, per-subject
+`discard: new`, is unavailable: JetStream only honours it under stream-wide `discard:
+new`, which contradicts the rule in the paragraph above.
+
+The cap is not on `…events` alone, and the class it also lands on fails more quietly, so
+the cap does not ship on its own. A task's `…in` subject holds its originating
+`kind:message` submission and then every steer, follow-up and cancel sent afterwards, all
+under the same 4096. A worker reads that subject on every start to recover the request it
+is executing. Steers are `kind:message` too, and no envelope field marks one as the
+submission, so a scan from the beginning returns the oldest surviving steer once the head
+is evicted, and the worker executes it as if it were the request. There is no
+`SubmittedMissing` on this side, because nothing folds `…in`, so the substitution would be
+invisible to the worker and to a reader alike. Reaching 4096 inbound messages on one task
+takes a looping delegator rather than a chat, and the only publisher to `…in` is the
+gateway - a session's grants carry no publish there at all. So it is rarer than the
+`…events` case. But where that one degrades a history, this one changes what the task is,
+which is why it is closed here rather than accepted.
+
+The fix puts the answer on the pod rather than on the message. The gateway publishes the
+submission before it spawns the session pod, and the ack carries that message's stream
+sequence, so the spawner can simply say which one it means: `A2A_ORIGIN_SEQ` in the pod's
+env. The adapter opens its `origin` consumer at that sequence and checks what comes back,
+because nats-server does not reject an evicted start sequence - it silently delivers the
+next message the filter matches, which on this subject is exactly the steer. A mismatch is
+a refusal to run, naming both sequences. Marking the submission on the envelope instead
+was the obvious cheaper move and does not work: an unmarked head means either "evicted" or
+"published by an older gateway", and those are the two cases the check exists to separate.
+Evidence about a message cannot travel on that message. On the pod, absence is
+unambiguous - it means an older spawner - and a current spawner that cannot determine a
+sequence writes `unknown` rather than going quiet, so the degraded path is legible instead
+of merely silent.
+
+A get-by-sequence would have been simpler than a consumer and is not available: a session's
+grants withhold `STREAM.MSG.GET` and `DIRECT.GET` on purpose, since neither is
+subject-scoped and one grant for either reads the whole task plane. A consumer's filter
+subject rides its CREATE subject and is already granted per session, so the check costs no
+new reach - only a different `deliver` policy on a consumer the worker already creates.
+
+Worth being exact about how loud the refusal actually is, because it is quieter than it
+reads. The worker returns the error and exits non-zero, so the message naming both sequences
+lands in the pod's log and nowhere else. What the delegator sees is the supervisor's sweep
+closing the task `failed` with its generic note - "session pod exited without a terminal
+event" - which is a visible failure but not a diagnosis. That is still the right trade
+against the alternative this replaces, where the worker ran the wrong input and reported
+success. But the refusal is deterministic and permanent, so an operator who does not read
+the pod log before the sweep deletes it gets a task that fails forever with no stated cause.
+Carrying the reason onto the bus means the worker publishing its own terminal, which it does
+not do here - not because the ids are out of reach, but because the adapter takes
+`contextId` and `correlationId` off the origin envelope and nowhere else, and that read sits
+downstream of the refusal. The values are already on the pod: the spawner annotates every
+session pod with both before it starts. Left open below.
+
+What an install that already has a `TASKS` stream gets from the cap is nothing, and the
+deployment says that rather than implying otherwise. Provisioning is create-only - the
+`stream info X || stream add X` guards never edit - so every limit this render has gained
+since an install's stream was created is absent from that stream, and a re-run does not
+add it. That is a property of the identity and not only of the script: the grant the
+callout mints for the provision principal is `$JS.API.STREAM.CREATE.<s>` and
+`$JS.API.STREAM.INFO.<s>` per stream and nothing else, so the Job could not edit a stream
+if it tried. Converging would mean adding `$JS.API.STREAM.UPDATE` to the one principal
+that runs unattended on every reconcile, next to the DELETE and PURGE that entry already
+refuses itself for the reason written beside them. The provision script's closing block
+reads the live stream back and reports the gap: it names the `nats stream edit` that
+closes it, and what the edit costs. Applying a per-subject cap is a tightening, and a
+tightening evicts on every subject already over the limit the moment it lands.
+Truncating a running install's task history as an automatic side effect of an operator
+upgrade is not a decision provisioning takes on an operator's behalf, so it reports and
+exits clean. What it reports that way is the absent bound - a stream carrying no
+per-subject limit at all. A stream carrying some other finite cap is bounded already, so
+it is reported as drift between the stream and the render rather than as that gap; an
+operator who chose the number is not told their stream predates the limit. The
+`max_consumers` gap in the same
+block is treated the other way - it refuses - because a short consumer budget is not a
+bound the install never had but a shortfall with a load-time failure already attached.
+
+Where that report lands bounds what it is worth, so it is worth saying plainly: the
+provision Job's pod log, and nowhere else. The script exits 0, the reconcile reads the
+Job's `Complete` condition and nothing else, and no Event, no CR condition and no status
+field records that the stream is still unbounded - an install that predates this render
+reads `Ready` with the gap open, exactly as it did before. The 24h TTL removes the
+finished Job and the next reconcile recreates it under the same digested name, so the
+report reappears roughly daily rather than expiring; it is still a pod log, and someone
+has to go and read it. Surfacing it where an operator would see it without being told to
+look is deferred for the same reason the `max_consumers` refusal's own CR surfacing is -
+status plumbing with a blast radius of its own, which is a change about status and not
+about the bus render.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
@@ -128,23 +241,35 @@ API server - zero key handling, works on any conformant cluster - with local JWT
 verification against the API server's `openid/v1/jwks` endpoint as the offline
 alternative.
 
-Status (amended 9/4, the callout armed; amended 9/8, sessions moved): the render now
-carries the `auth_callout` block, and a principal authenticates one of two ways.
-**Through the callout**, by presenting a projected ServiceAccount token: the bus
-provisioning Job, and every spawned session pod. **Statically**, from `nats.conf` and
-listed in `auth_users`: the callout itself, which cannot authenticate through the thing
-it is; the chatops gateway, purely as sequencing, since it has a ServiceAccount and its
-client program lands separately from this render; `web`, because a browser never can;
-`seed`, because the hand-applied seed tooling is applied rather than rendered and
-dropping its user would refuse an object already running; `sys`, a human at a
-port-forward; and the shared `worker`, which is now a shrinking residue rather than the
-session story — no session pod authenticates as it, and what keeps it alive is the seed
-tooling's twin and the agent-side workloads that have not moved, the platform agent pod
-and the Hermes bridge sidecar beside it among them.
+Status (amended 9/4, the callout armed; amended 9/8, sessions moved; amended 9/15,
+`worker` retired): the render now carries the `auth_callout` block, and a principal
+authenticates one of two ways. **Through the callout**, by presenting a projected
+ServiceAccount token: the bus provisioning Job, every spawned session pod, and the
+platform agent container. **Statically**, from `nats.conf` and listed in `auth_users`:
+the callout itself, which cannot authenticate through the thing it is; the chatops
+gateway, purely as sequencing, since it has a ServiceAccount and its client program
+lands separately from this render; `web`, because a browser never can; `seed`, because
+the hand-applied seed tooling is applied rather than rendered and dropping its user
+would refuse an object already running; `sys`, a human at a port-forward; and `bridge`,
+the Hermes bridge sidecar.
 
-Three of those are permanent - the callout, which cannot authenticate through itself;
-`web`, because a browser never can; and `sys`, which is a human rather than a workload -
-and the rest are waiting on something nameable. The single
+The shared `worker` user is gone. It was one credential held by two workloads that
+happen to share a pod — the bridge sidecar, which drives the task plane, and the `a2a`
+CLI in the agent container, which reads and writes the topic blackboard — so its grant
+set was the union of two unrelated jobs, and either workload could do the other's. It
+split into `agent` and `bridge`, and neither holds the other's streams.
+
+Four of those static users are permanent - the callout, which cannot authenticate
+through itself; `web`, because a browser never can; `sys`, which is a human rather than
+a workload; and `bridge`, for a reason worth stating because it looks like an omission.
+The callout keys its map on the ServiceAccount username `TokenReview` returns, and a
+sidecar shares its pod's ServiceAccount. A token presented by the bridge would therefore
+resolve to the `agent` entry rendered for the container beside it, and each would hold
+the union of the two grant sets - `worker` rebuilt under a new name, arrived at by
+moving the bridge onto the mechanism meant to narrow it. `Narrowing` does not help: it
+is pod-scoped, and both workloads are in the same pod. The bridge gets a token when it
+stops sharing a pod with the agent, which is the same event that retires it. The rest
+are waiting on something nameable. The single
 source for all of it - the config's APP and `$SYS` static user blocks, the callout's map,
 and the `NATS_USER` a client is handed so it can set its inbox prefix - is
 `platformagent_a2a_identities.go`; before the callout those three lived in a config
@@ -183,11 +308,37 @@ Layout:
   session grants do. The addressee token in the task subjects (payload spec
   0.4) is what makes these grants expressible - executor-granularity at connect time,
   with per-task scoping the parked tightening under the authority work.
+- **Three task-subject classes, and the publish grants split along them** (9/9, payload
+  spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
+  supervisor's - one writer class each, which is the whole point: a consumer derives the
+  publisher from the subject, so a class with two rendered writers derives nothing. A
+  supervisor terminal sitting on the executor's subject is exactly what a hostile executor
+  would forge, so the supervisor's terminal grant and the executor's must not name the
+  same subject. **The grant lists are the render's, not this document's**:
+  `platformagent_a2a_identities.go` and the golden
+  `a2a/authcallout/testdata/rendered-nats.conf` are what to read and what to reconcile
+  toward, and the rule above is what they are meant to satisfy - an earlier draft of this
+  bullet had it the other way round and enumerated the lists here as canonical, which
+  invites squaring the render against prose. Two consequences of the split the render does
+  not show on its face. First, the supervisor grant is a wildcard over the ADDRESSEE
+  (`a2a.tasks.*.*.supervisor`), not a scope to the sessions the gateway spawned, which a
+  static render cannot express - so it reaches every profile's supervisor subject too, and
+  a profile task's `…supervisor` must not be modelled as unreachable. Second, the class
+  that is not yet single-writer is `…events`, and the holder is the static `worker`
+  credential the Hermes bridge authenticates with: its `a2a.tasks.*.*.events` wildcards the
+  addressee token, so it reaches session and profile subjects alike until that credential
+  is retired. A session's grant, by contrast, is derived per incarnation by the auth
+  callout and reaches only its own pod's `…events`. `spec-a2a-payloads.md` states the
+  consumer rule that rests on all of this and enumerates what is not yet decision-grade -
+  including a redirection route onto `…supervisor` that no assertion pins. Read that
+  section before treating any class as closed.
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
   grants are part of being a JetStream client at all: the `$JS.API` subjects a role's
   streams and buckets need, enumerated per stream and per verb where the caller set is
-  known (the worker's list is the operator's `a2aWorkerJetStreamGrants`; a user still
-  holding `$JS.API.>` holds playground posture); `$JS.ACK.<its streams>.>` for explicit
+  known (the bridge's list is the operator's `a2aBridgeJetStreamGrants`, the agent
+  CLI's is `a2aAgentJetStreamGrants` and the gateway's is
+  `a2aGatewayJetStreamGrants`; no rendered principal holds `$JS.API.>` any more, and a
+  user that gains one back holds playground posture); `$JS.ACK.<its streams>.>` for explicit
   acks - an ack is a publish, and missing this grant means every consumer redelivers
   forever while TCP health stays green, the NR-5 incident class created at connect time;
   and `$JS.FC.>` for flow control. The inbox rule cuts both ways, too: a client whose subscribe grant
@@ -199,9 +350,15 @@ Layout:
   and a consumer, never the caller, so an unscoped `$JS.ACK.>` lets any holder `+TERM`
   another principal's in-flight delivery. That narrowing has landed: every rendered
   principal's ack grant is scoped to the streams it consumes with explicit ack -
-  `$JS.ACK.TASKS.>` for the gateway and the shared worker - and the principals whose reads
+  `$JS.ACK.TASKS.>` for the gateway and the bridge - and the principals whose reads
   are ordered or ack-none hold no ack grant at all. What scoping still cannot express is
   per-consumer scope inside a granted stream, since NATS wildcards match whole tokens.
+  Enumerating leaves one refusal that is expected rather than a fault: the gateway's
+  `tasks/get` replay reads through an ordered consumer whose reset path publishes
+  `$JS.API.CONSUMER.DELETE.TASKS.<server-generated name>` and ignores the answer, so a
+  reconnect writes one refusal per replay in flight into the bus log and into the
+  gateway's own log at Error. That subject is the only violation a rendered principal
+  produces by design; any other one is a missed grant.
 - **Topic publish grants are exact, never namespace wildcards.** Publish grants match
   the provisioned topic list subject-for-subject. A wildcard over a topic namespace
   turns provisioned-only into silent loss - a publish to an unprovisioned topic sails
@@ -244,13 +401,24 @@ Layout:
   auth callout - `web` is browser-facing and therefore permanently statically
   authenticated, so the callout never reaches it:
   durability is a body field, so withholding the legacy `DURABLE.CREATE` subject does not
-  prevent a durable - `max_consumers` per stream bounds the cost instead; ack policy is
+  prevent a durable - `max_consumers` per stream bounds the cost instead (amended 9/16:
+  on `TASKS` that bound is no longer the flat 64 but a number derived from
+  `spec.harness.tuning.maxSessions`, since a session pod creates three consumers there
+  and a stream that cannot hold the configured concurrency refuses a legitimate session.
+  The trade is stated where it is made: an install that raises `maxSessions` raises
+  `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small
+  install would silently tighten a working one, so the render takes the larger of 64 and
+  the derived budget. Because creates never edit, an install whose `maxSessions` already
+  exceeds what its stream holds is under-provisioned today, and the check is reached on
+  an operator upgrade alone with no CR edit involved - it runs last, after every other
+  stream and bucket, so the refusal leaves a fully provisioned bus short one limit rather
+  than a half-built one); ack policy is
   the same class of body field, so a hostile holder can create an explicit-ack consumer
   it holds no grant to ack - endless redeliveries, churn against the server, and an
   amplifier for the deliver-subject write below; within the four
   granted streams consumer names are the caller's choice, so `web` can pull a delivery
   off another reader's consumer or retune it through create-as-update - a route that
-  reaches the gateway's relay durable from `worker` too, measured on the render: one
+  reaches the gateway's relay durable from `bridge` too, measured on the render: one
   permitted `$JS.API.CONSUMER.CREATE.TASKS.gateway-relay` retunes its filter subject, and
   one carrying `inactive_threshold` has the server reap it, ack floor and all, with
   `CONSUMER.DELETE` refused in the same run; and a consumer's
@@ -268,7 +436,7 @@ Layout:
   itself. A watcher on `a2a.agents.>` - exactly `gateway`'s subscribe grant, and inside
   `web`'s `a2a.>` - is not that principal: measured, DIRECTORY stayed empty.
   This survives per-stream scoping of any user that may create consumers at all, the
-  worker included; the closure is not holding `CONSUMER.CREATE`, which is a consumer
+  bridge included; the closure is not holding `CONSUMER.CREATE`, which is a consumer
   created per task by the dispatcher. Per-name scoping is **not** available as a
   mitigation _where the caller chooses its own consumer names_: NATS wildcards match whole
   tokens, so a `web-*` grant matches a consumer literally named `web-*` and nothing else -
@@ -346,10 +514,13 @@ The callout reads an identity-to-permissions map rendered by the operator (**ame
 callout-authenticated principal, keyed by the ServiceAccount as TokenReview spells it
 (`system:serviceaccount:<namespace>:<name>`), rendered into ConfigMap
 `<agent>-a2a-authmap` under key `identities.json`. **Amended 9/8:** that is now two
-entries - the provisioning Job and the session principal. The agent pod is **not** among
-them: it connects as the static shared `worker`, and a map entry no token can ever match
-authenticates nobody. Nor is the gateway - also a static `nats.conf` user for now - and
-there is no audit exporter or janitor yet. The designed shape is one entry per
+entries - the provisioning Job and the session principal. **Amended 9/15:** three, the
+platform agent container having joined them when `worker` was retired; its entry is
+keyed on the agent's own ServiceAccount and carries the blackboard grants and nothing
+else. The bridge sidecar is **not** among them and cannot be, for the ServiceAccount
+reason in the status section above: it would key to the agent's entry. Nor is the
+gateway - also a static `nats.conf` user for now - and there is no audit exporter or
+janitor yet. The designed shape is one entry per
 `AgentProfile` rendered from the CR's bus grants, which arrives with the CRD.
 
 The session entry is a different kind of entry and the difference is load-bearing. Every
@@ -382,13 +553,61 @@ version it is serving and exposes it at runtime on `/status` and `/readyz`, so "
 says X" is checkable against the running system rather than against the rendered object.
 
 **What ships today is coarser than that sentence, and the gap is deliberate.** The
-condition is on the `PlatformAgent`, not on an `AgentProfile`, because neither the CRD
-nor the dispatcher exists yet. For the same reason the second half of the sentence -
-"nothing dispatches before that condition is true" - is not yet enforced by anything:
-the operator writes `BusCredentialsReady` and no code in this repository reads it. The
-dispatcher that would is the intended reader, so the condition is deliberately built
-ahead of its consumer rather than being dead code; but until that consumer exists the
-ordering is a published signal an operator can watch, not a gate. **Amended 9/8.** It asserts that the callout Deployment is Available with
+condition is on the `PlatformAgent`, not on an `AgentProfile`, because the profile CRD
+does not exist yet.
+
+**Amended 9/16: the second half of the sentence is enforced now.** "Nothing dispatches
+before that condition is true" used to describe an intention - the operator wrote
+`BusCredentialsReady` and no code in this repository read it. The dispatcher it was
+waiting for turns out to be one that already ships: the A2A gateway is what spawns
+session pods and relays their work onto the bus. It is not the only thing that
+dispatches, since the Hermes bridge sidecar holds a durable on the task subjects too,
+but it is the only one whose work needs the callout: a session pod authenticates with a
+projected token and nothing else mints that. The gateway's own connection does not need
+it. The gateway is a static principal in `auth_users`, exactly as the bridge is. So the
+operator withholds the gateway Deployment's _creation_ until the condition is true
+(`a2aGatewayWaitsForCallout`), and reconciles it normally once it exists. Creation
+only, and the distinction is the whole design: a callout outage after
+the gateway is up is an outage, not a reason to freeze a running gateway's image and
+environment at whatever the outage happened to interrupt - and the session pods already
+spawned carry an `ownerReference` to that Deployment, so withholding it is not a neutral
+act. The ordering holds where it is a real ordering, without making the callout a
+liveness dependency of everything downstream. One caveat, because it is visible in a
+`kubectl get` transcript: `syncBusCredentialsReady` is deferred to the way out of the
+reconcile, so a gate reading the condition sees it one pass old. Stale-false costs only
+a delay: the gateway is held one more pass and the held reconcile requeues. Stale-true
+is a wrong answer, and worth naming as one - the gate can let a first creation through
+on a callout that was serving as recently as the previous pass and is not serving now.
+What bounds it is that one pass, the same window the condition's own doc comment already
+accepts. The gate's other read is deliberately not left to a cache, because there the
+asymmetry runs the other way: whether the gateway Deployment already exists is asked of
+the API server live rather than of the Deployment informer, since a stale _hit_ - an
+informer that has not yet seen the Deployment gone - answers "already there" and lets it
+be re-created while the condition is false, which is the single thing the gate exists to
+prevent. A stale NotFound costs one held pass and a requeue.
+
+**Amended 9/17: the hold is on the phase now.** The condition the gate reads is a claim
+about the callout as a whole - every replica ready and on the current spec - and that is
+strictly more than a new gateway needs, because the callout replicas form a queue group
+and one of them serving answers every authorization request. A callout stuck at one of
+two ready therefore withholds a _first_ gateway creation for as long as it stays there,
+which on a cluster with no headroom for the second pod is indefinite. The strict rule is
+kept on purpose: `ReadyReplicas` and `UpdatedReplicas` are independent counts, so "at
+least one ready" cannot tell one ready replica on the current template from two ready
+replicas on the previous one, and letting a gateway through against a callout that never
+accepted the current identity map is a worse failure than delaying one. What changes is
+that the delay stopped being invisible. Under `mode: next` the A2A gateway is one of the
+workloads `Ready` is computed from (`readSplitWorkloads`), so an install held at the gate
+reads `Provisioning` with a message naming the Deployment, beside the
+`BusCredentialsReady` that says why - rather than a `Ready: True` sitting above a `False`
+condition and contradicting it. A safe one-replica rule does exist, and is a follow-up
+rather than part of this design: `ReadyReplicas + UpdatedReplicas - Replicas` is a lower
+bound on the pods that are both ready and on the current template, so testing it against
+one can never read true when none is, and its only error direction is a false negative
+while terminated pods are still counted - which costs exactly the held pass and requeue
+that stale-false already costs.
+
+**Amended 9/8.** The condition asserts that the callout Deployment is Available with
 every replica ready - and since the readiness probe answers 503 until a map is being
 served AND the replica is attached to the bus, that means every replica is serving one
 and can be reached to answer with it. The bus half of that probe was added after the
@@ -430,6 +649,46 @@ default ServiceAccount token already carries - so without the binding the bus wo
 any readable token in the cluster as proof of that pod's identity. A long-lived client
 MUST re-read the file when it reconnects rather than caching its first read, or it fails
 exactly when the bus restarts, which this spec calls a routine operation.
+
+The audience also has to be reserved, and reserving it is not the same as owning it. The
+projection is the platform-agent container's, but the callout resolves the POD's
+ServiceAccount, so any container in that pod presenting a token for this audience
+authenticates as `agent` - and `spec.deployment.sidecarVolumes` and `.extraVolumes` are
+copied into the pod verbatim. The operator therefore refuses and strips user-authored
+volumes by SOURCE as well as by name: a projection of this audience under any name, and a
+`secret` volume or projected `secret` source naming one of the three Secrets the bus
+renders. (Those two source fields only - the ones that mount the Secret into the
+container. `csi.nodePublishSecretRef` and the storage drivers' `secretRef` hand it to a
+node plugin instead, and are not matched.) The three are `<agent>-a2a-nats-creds`,
+which holds the static users' passwords; `<agent>-a2a-nats-config`, whose `nats.conf`
+interpolates every one of those passwords in clear text; and `<agent>-a2a-callout-keys`,
+which signs the bus's own tokens. The Secrets are cheaper than the projection, because
+reading one needs no token at all. All of them are closed together, because closing one
+narrows the expensive route, leaves the cheap ones, and names the class while doing it.
+
+Two layers, and they are not the same layer. The admission refusal is unconditional, is
+the only one that tells the CR's author why, and covers mounts as well as volumes:
+`extraVolumeMounts` and the sidecar and init containers' `volumeMounts` are all checked
+against the reserved names. The render strip is gated on the A2A surface, so it runs
+under `next` and not under `today` (and on a CR whose `spec.mode` this build does not
+recognise, which `a2aAgentSurface` counts as the new surface on purpose - see the comment
+on that function). On the mounts it goes further than admission does: besides the
+reserved names it drops any mount naming a volume it has just dropped by source, because
+a volume dropped while a mount still names it is a Deployment the API server refuses. Neither
+layer touches `sidecars[].env` or `.envFrom`, which reach the same Secrets with no volume
+at all; that is deliberate, because it is the supported route for the Hermes bridge
+sidecar, which is meant to hold `bridge-password`.
+
+Read on the right terms, which are narrower than the mechanism suggests: KSA tokens are
+pod-scoped and the callout cannot see which container presented one, so this is a guard
+against a misconfigured CR rather than a boundary against a hostile sidecar. It is worth
+having because the CR is authored by the platform operator and not by the agent -
+[`security-requirements.md`](../security-requirements.md) already puts administrator-supplied volumes and mounts outside
+the sandbox guarantee for the same reason. What would change that reading is a change in
+who may write the CR: a tenant-facing role on `platformagents`, or the CR moving into a
+repository the agent can open pull requests against. The only construction that would be
+a boundary is a separate pod for the bus identity, which is also what the `bridge`
+sidecar's static password is waiting on.
 
 The callout service runs in its own `AUTH` account - not `$SYS`, despite subscribing to
 a `$SYS.REQ.*` subject - with 2 replicas, joined in a queue group. The queue group is
@@ -597,5 +856,17 @@ Both run against `kind`.
 - **Which server error flips a client to terminal close** rather than transient reconnect is
   unconfirmed - the worked example never logged it. NR-3 closes this for the future and the
   uncertainty does not change NR-1 or NR-2.
+- **The origin refusal states its reason only in the pod log.** `fetchOriginAtSeq` names both
+  sequences and exits; the sweep then closes the task with the supervisor's generic note, so a
+  permanent, deterministic failure reaches its requester with no cause attached. The worker
+  does not publish its own terminal here because the adapter learns `contextId` and
+  `correlationId` from the origin envelope and nowhere else, and that assignment is downstream
+  of the refusal - a wiring gap in the adapter, not missing information. The ids are on the
+  pod object already: the spawner writes `a2a.kubeagents.dev/context-id` and
+  `…/correlation-id` as annotations on every session pod, and the supervisor's sweep reads
+  both back off the pod when it closes an orphan. Closing this is a downward-API `fieldRef`
+  on those two annotations, beside the `metadata.name` one that env block already carries -
+  not new plumbing from the gateway. Deferred because the branch needs the submission evicted
+  before the pod's first fetch, which is the 4096-message shape above. Unowned.
 - **Sizing.** TBD: message rates per stream class once the payload spec settles, and PV
   sizing from W times those rates.

@@ -44,7 +44,7 @@ variable "sink_name" {
 }
 
 variable "ack_deadline_seconds" {
-  description = "How long the detector has to ack a message before Pub/Sub redelivers it. The detector acks on successful parse, so this only needs to cover parsing, not the managedFields join or the inject."
+  description = "How long the detector has to ack a message before Pub/Sub redelivers it. The ack follows the managedFields join, and synchronous pull does not extend the deadline underneath a running handler, so this has to cover a whole batch's live-object lookups. The detector caps a batch's join with its own --batch-join-budget flag, defaulting to 30s, half this default; the two are not wired together — the detector reads this value at startup and warns when its budget takes more than half of it, but it does not adopt it — so lowering this below 60 means passing a smaller --batch-join-budget to the detector to match."
   type        = number
   default     = 60
 

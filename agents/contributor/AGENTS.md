@@ -143,7 +143,9 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
 2. Trigger a clean bot pass yourself - comment `/review` (or `/review all`
    for a wider re-check). A clean pass is what puts the change in front of a
    human reviewer; `/request-review` assigns one immediately when a review
-   never arrives or you have answered a finding you disagree with.
+   never arrives or you have answered a finding you disagree with. It reacts
+   👀 to the comment when it requested someone and 😕 when it declined; the
+   workflow run's annotations say why.
 3. Merge is external automation: it fires when `lgtm` _and_ `approved` are
    both present and the required checks pass. You never merge.
 

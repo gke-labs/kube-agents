@@ -257,6 +257,7 @@ layout:
 ├── fleet/                         # project-level policy; platform-tier Agent CR + identity
 ├── knowledge/                     # OKF base (§5)
 ├── policy/                        # admission policies (ValidatingAdmissionPolicy; Gatekeeper/Kyverno)
+├── .kube-agents/intent.yaml       # paths an audit reads for declared-intent notes (§5)
 └── .github/workflows/ (or .ci/)   # the actuation pipeline config (customer's CI/CD)
 ```
 
@@ -304,7 +305,9 @@ The six types are the canonical starting set; `type` is an **open convention, no
 types are added by PR as needs arise. Layout mirrors OKF: `knowledge/{index.md, <type>/…}`; markdown
 links form the knowledge graph; optional `log.md` for history. Agents **read** OKF for context and
 **propose** updates via PR (curate-as-code); humans approve. OKF holds durable knowledge only —
-**not** session state.
+**not** session state. An entry of any type may carry `declares:`, a list of
+`{check, namespace, object}` items (plus `cluster` for a one-cluster choice) that an audit reads as a
+declared posture; `.kube-agents/intent.yaml` at the repository root names the paths it reads them from.
 
 ## 6. Session-state contract (mem0 deferred post-v1)
 

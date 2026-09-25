@@ -231,45 +231,64 @@ class ConfigReadTest(unittest.TestCase):
         self.assertFalse(tirith_fail_open({"security": {"tirith_fail_open": False}}))
 
 
-# The shape of the upstream cron arm the applier rewrites, reduced to something
-# that parses on its own. Byte-identical to /opt/hermes/tools/approval.py for the
-# four anchored lines — if upstream moves, the image build fails at the applier,
-# not here.
+# The shape of the upstream unattended branch the applier inserts into, reduced
+# to something that parses on its own. Byte-identical to
+# /opt/hermes/tools/approval.py (v2026.9.14) for the three anchored lines — if
+# upstream moves, the image build fails at the applier, not here.
 #
-# The single-query arm above the cron one is why the anchor no longer starts at
-# `if not is_cli ...`: v2026.8.19 interposed it there, and an anchor that spans
-# both is an anchor upstream can break by adding a third. Kept in the fixture so
-# a future re-derivation back to the outer `if` fails here rather than in CI.
+# The per-context arm the patch used to anchor on is gone: upstream folded the
+# single-query and cron arms into ``_unattended_contexts()`` plus one
+# ``_unattended_deny`` that returns before Tirith unless the mode is deny. The
+# fixture keeps that shape so a future re-derivation back to an inline
+# ``_get_cron_approval_mode() == "deny"`` arm fails here rather than in CI.
 UPSTREAM = '''\
+from tools import approval_context
+
+
+def _unattended_contexts():
+    contexts = []
+    if _is_single_query_approval_context():
+        contexts.append(_SINGLE_QUERY_CTX)
+    if _is_cron_approval_context():
+        contexts.append(_CRON_CTX)
+    return contexts
+
+
+def _unattended_deny(command, ctx):
+    if ctx.mode() != "deny":
+        return None
+    return {"approved": False, "message": "denied"}
+
+
 def check_all_command_guards(command, env_type):
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = False
+    # Outside CLI/gateway/ask flows we never block on approvals: each
+    # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
-        if _is_single_query_approval_context():
-            if _get_single_query_approval_mode() == "deny":
-                return {"approved": False, "message": "single-query denied"}
-            # single_query_mode: approve — fall through to auto-approve below.
-        # Cron sessions: respect cron_mode config
-        if _is_cron_approval_context():
-            if _get_cron_approval_mode() == "deny":
-                # Run detection to get a description for the block message
-                return {"approved": False, "message": "denied"}
+        for ctx in _unattended_contexts():
+            result = _unattended_deny(command, ctx)
+            if result is not None:
+                return result
         return {"approved": True, "message": None}
     return {"approved": True, "message": None}
 '''
 
-# _run_approval_gate's cron arm: the same comment, the same two tests, the same
-# compare, at the same indentation. It differs only in going straight to the
-# return — it already holds a description — which is exactly what the anchor's
-# trailing detection comment keys on.
+# _run_approval_gate's unattended loop at v2026.9.14: the same ``for ctx in
+# _unattended_contexts():`` header at the same depth (under ``if not is_cli and
+# not is_gateway:``, without ``check_all_command_guards``'s ``and not is_ask``),
+# branching on ``ctx.mode()`` rather than calling ``_unattended_deny``. The
+# anchor's first line rules it out on the ``if``, its third on the call.
 APPROVAL_GATE_TWIN = '''\
 def _run_approval_gate(command, pattern_key, description):
-    if True:
-        # Cron sessions: respect cron_mode config
-        if _is_cron_approval_context():
-            if _get_cron_approval_mode() == "deny":
+    is_cli = _is_interactive_cli()
+    is_gateway = _is_gateway_approval_context()
+    if not is_cli and not is_gateway:
+        for ctx in _unattended_contexts():
+            if ctx.mode() == "deny":
                 return {"approved": False, "message": "gate denied"}
+            break
     return {"approved": True, "message": None}
 '''
 
@@ -300,8 +319,13 @@ class ApplierTest(unittest.TestCase):
         root, target = self.write(UPSTREAM)
         applier.apply(root)
         patched = target.read_text()
-        self.assertIn('if _cron_mode == "deny":', patched)
+        self.assertIn("result = _unattended_deny(command, ctx)", patched)
         self.assertIn('"message": "denied"', patched)
+        # And it lands ahead of upstream's loop, not inside or after it.
+        self.assertLess(
+            patched.index("from tools.cron_tirith_scan import cron_tirith_block"),
+            patched.index("for ctx in _unattended_contexts():\n            result"),
+        )
 
     def test_the_scan_is_skipped_on_the_deny_arm(self):
         """Upstream already scans there; scanning twice is a second subprocess."""
@@ -319,8 +343,8 @@ class ApplierTest(unittest.TestCase):
     def test_a_missing_anchor_fails_the_build(self):
         root, _ = self.write(
             UPSTREAM.replace(
-                "# Run detection to get a description for the block message",
-                "# Run detection",
+                "result = _unattended_deny(command, ctx)",
+                "result = _unattended_deny(ctx, command)",
             )
         )
         with self.assertRaises(SystemExit) as caught:
@@ -328,16 +352,21 @@ class ApplierTest(unittest.TestCase):
         self.assertIn("found 0", str(caught.exception))
 
     def test_the_approval_gate_twin_is_not_mistaken_for_the_cron_arm(self):
-        """Both open identically; only the detection comment tells them apart."""
+        """Both loop over the contexts; the anchor keys on the _unattended_deny call.
+
+        The assertions check the consequence: the import landed once, and the
+        gate's loop came through untouched (still branching on ctx.mode(), no
+        _cron_mode local), which it could not have if the anchor had matched it.
+        """
         root, target = self.write(APPROVAL_GATE_TWIN + "\n\n" + UPSTREAM)
         applier.apply(root)
         patched = target.read_text()
         self.assertEqual(
             1, patched.count("from tools.cron_tirith_scan import cron_tirith_block")
         )
-        # The gate's own arm is untouched: still a bare compare, no local.
-        gate = patched.split("def check_all_command_guards")[0]
-        self.assertIn('if _get_cron_approval_mode() == "deny":', gate)
+        # The gate's own loop is untouched: still branching on ctx.mode(), no local.
+        gate = patched.split("def _unattended_contexts")[0]
+        self.assertIn('if ctx.mode() == "deny":', gate)
         self.assertNotIn("_cron_mode", gate)
 
     def test_a_duplicated_anchor_fails_the_build(self):
@@ -356,12 +385,16 @@ class ApplierTest(unittest.TestCase):
         self.assertIn("does not exist", str(caught.exception))
 
     def test_the_patch_is_not_applied_twice(self):
-        """Re-running must fail rather than nest a second copy of the arm."""
+        """Re-running must fail rather than stack a second copy of the arm.
+
+        The insert leaves its anchor in place, so the count check alone would
+        pass a second time; the marker check is what refuses.
+        """
         root, _ = self.write(UPSTREAM)
         applier.apply(root)
         with self.assertRaises(SystemExit) as caught:
             applier.apply(root)
-        self.assertIn("found 0", str(caught.exception))
+        self.assertIn("already patched", str(caught.exception))
 
 
 if __name__ == "__main__":

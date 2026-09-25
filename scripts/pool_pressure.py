@@ -148,6 +148,10 @@ SEGMENT_UNMEASURED = "not measured"
 SEGMENT_LABEL_WIDTH = max(len(label) for _, label in SEGMENT_LABELS) + 1
 SEGMENT_VALUE_WIDTH = len(SEGMENT_UNMEASURED)
 
+# What the per-day table and the recent row print in place of percentiles drawn
+# from too few runs.
+TOO_FEW_RUNS = "(too few runs to judge)"
+
 # Prow build IDs are Twitter snowflakes: the top bits are milliseconds since a
 # fixed epoch. That makes a build ID a timestamp, so the window can be narrowed
 # before a single object is read -- the difference between reading 400 files and
@@ -218,6 +222,19 @@ DEFAULT_DEADLINE_SECONDS = 600
 # Below this, a day's percentiles are printed but not allowed to trip the
 # threshold on their own. Two samples can put any number at p95.
 MIN_SAMPLES_FOR_DAILY_VERDICT = 5
+
+# What the alert quotes, against the seven-day window the verdict is judged on:
+# one bad Monday otherwise prints its numbers under a Thursday incident. Three
+# hours because the periodic is hourly, so an hour-wide window is as old as it
+# is wide, and because a two-hour jam is two thirds of three hours and moves
+# the median where six hours moves only p95. A quiet stretch holds too few runs
+# to judge, which costs nothing: the alert fires on Deck's live queue and takes
+# its remedy from Boskos, and neither samples.
+RECENT_WINDOW_HOURS = 3
+
+# Withholds the recent percentiles as MIN_SAMPLES_FOR_DAILY_VERDICT withholds a
+# day's, for the same reason and at the same count.
+MIN_SAMPLES_FOR_RECENT_VERDICT = MIN_SAMPLES_FOR_DAILY_VERDICT
 
 PERCENTILE_P50 = 50
 PERCENTILE_P95 = 95
@@ -342,7 +359,7 @@ XML_ATTRIBUTE_ESCAPES = XML_TEXT_ESCAPES + (
 # the run that had a source failure to report. Everything outside XML 1.0's
 # Char production is dropped before it reaches an attribute or text node.
 XML_INVALID_CHARS = re.compile(
-    "[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]"
+    r"[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]"
 )
 
 
@@ -1133,6 +1150,28 @@ def daily_rows(waits: List[Wait]) -> List[DayRow]:
     return [DayRow(day, by_day[day]) for day in sorted(by_day)]
 
 
+def recent_row(waits: List[Wait], window_end: datetime) -> dict:
+    """The last RECENT_WINDOW_HOURS of the sweep, for the alert to quote.
+
+    Filters the waits the sweep already holds, so it costs no reads. Below
+    MIN_SAMPLES_FOR_RECENT_VERDICT the percentiles are None rather than a
+    number over a handful of runs, and `runs` says why.
+    """
+    start = window_end - timedelta(hours=RECENT_WINDOW_HOURS)
+    recent = [w for w in waits if w.created >= start]
+    minutes = [w.minutes for w in recent]
+    judged = len(recent) >= MIN_SAMPLES_FOR_RECENT_VERDICT
+    return {
+        "hours": RECENT_WINDOW_HOURS,
+        "window_start": start.strftime(TIMESTAMP_FORMAT),
+        "runs": len(recent),
+        "judged": judged,
+        "p50_minutes": round(percentile(minutes, PERCENTILE_P50), 1) if judged else None,
+        "p95_minutes": round(percentile(minutes, PERCENTILE_P95), 1) if judged else None,
+        "worst_minutes": round(max(minutes), 1) if judged else None,
+    }
+
+
 def outliers(waits: List[Wait], threshold_minutes: float) -> List[Wait]:
     over = [w for w in waits if w.minutes > threshold_minutes]
     over.sort(key=lambda w: w.total_seconds, reverse=True)
@@ -1279,6 +1318,9 @@ def summarise(
             "p95_minutes": p95_limit,
             "outlier_minutes": outlier_limit,
         },
+        # Evidence, not a verdict: `breached` stays on the daily rows and the
+        # live queue, so TestGrid's row does not move with this block.
+        "recent": recent_row(waits, window_end),
         "trend": {
             "read": trend.ok,
             "error": trend.error,
@@ -1386,7 +1428,7 @@ def render(summary: dict) -> str:
         for row in trend["days"]:
             concurrency = "-" if row["max_concurrency"] is None else str(row["max_concurrency"])
             flag = "  BREACH" if row["breached"] else ""
-            thin = "" if row["judged"] else "  (too few runs to judge)"
+            thin = "" if row["judged"] else f"  {TOO_FEW_RUNS}"
             out.append(
                 f"{row['day']:<12}{row['runs']:>6}{_fmt(row['p50_minutes']):>9}"
                 f"{_fmt(row['p95_minutes']):>9}{_fmt(row['worst_minutes']):>9}"
@@ -1396,6 +1438,17 @@ def render(summary: dict) -> str:
             f"\n{'window':<12}{trend['runs']:>6}{_fmt(trend['p50_minutes']):>9}"
             f"{_fmt(trend['p95_minutes']):>9}{_fmt(trend['worst_minutes']):>9}"
         )
+        # The stretch the chat alert quotes, on the same columns as the days
+        # above it, so the two can be compared without arithmetic.
+        recent = summary["recent"]
+        label = f"last {recent['hours']}h"
+        if recent["judged"]:
+            out.append(
+                f"{label:<12}{recent['runs']:>6}{_fmt(recent['p50_minutes']):>9}"
+                f"{_fmt(recent['p95_minutes']):>9}{_fmt(recent['worst_minutes']):>9}"
+            )
+        else:
+            out.append(f"{label:<12}{recent['runs']:>6}   {TOO_FEW_RUNS}")
         if trend["elapsed_seconds"]:
             out.append(
                 f"{trend['builds_read']} builds read in "

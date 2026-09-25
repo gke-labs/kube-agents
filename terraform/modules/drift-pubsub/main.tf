@@ -167,11 +167,14 @@ resource "google_pubsub_subscription_iam_member" "detector_subscriber" {
 # _check_subscription_exists) needs viewer as well, and without it fails with a
 # PermissionDenied that reads nothing like a missing grant.
 #
-# The drift detector as built does not make that call: it pulls straight away,
-# so subscriber alone would carry it. Viewer stays because `gcloud pubsub
-# subscriptions describe` needs it and that is the first command anyone runs
-# against an empty topic -- and because a detector that later adopts the
-# adapter's preflight would otherwise fail in that unreadable way.
+# The drift detector now makes one: a startup subscriptions.get reading the
+# configured ackDeadlineSeconds, so it can warn when --batch-join-budget would
+# hold a batch past it. This grant is what keeps that call from failing. It is
+# advisory on the detector's side -- a probe that is denied logs that the budget
+# went unchecked and the loop pulls anyway -- so removing viewer degrades the
+# warning rather than breaking ingestion. Viewer would stay regardless: `gcloud
+# pubsub subscriptions describe` needs it, and that is the first command anyone
+# runs against an empty topic.
 resource "google_pubsub_subscription_iam_member" "detector_viewer" {
   project      = var.project_id
   subscription = google_pubsub_subscription.drift_audit.id

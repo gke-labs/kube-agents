@@ -1,7 +1,13 @@
-# ACTIVE — an entry in hack/eval/presubmit-cases.txt since 2026-08-25,
-# and since 2026-08-26 THE AUDIT-MACHINERY CANARY: the one full audit scenario
-# kept in the presubmit. It exercises SOP dispatch, delegation to a worker,
-# the GitHub token minter, and the ledger write end to end, and it is the
+# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-09-22;
+# a presubmit entry from 2026-08-25 until then, and from 2026-08-26 THE
+# AUDIT-MACHINERY CANARY: the one full audit scenario the presubmit kept.
+# Demoted from the blocking roster on 2026-09-02 (#1171) and, when the
+# presubmit became the blocking roster only (#1023), moved to the nightly
+# with the other held-out cases (413/677 graded presubmit repetitions
+# 2026-09-15 to 09-22), which put the fleet-audits domain back on the
+# docs/designs/domains.yaml allowlist (#1876). Re-admission bar: #1171's.
+# It exercises SOP dispatch, delegation to a worker, the GitHub token
+# minter, and the ledger write end to end, and it is the
 # scenario that proved that chain — measured 606s clean on 2026-08-26 (build
 # 2092638061140643840, project kube-agents-evals-3), every exact check green.
 # The other audit domains are covered by snappy probes instead (a full audit
@@ -31,10 +37,11 @@
 # carries, not which cluster it reaches.
 #
 # Domain: fleet-audits (SOP machinery; the slug is docs/designs/domains.yaml's
-# and this task is its only carrier). The compliance-audit SOP is the vehicle;
-# the ai-security-audit SOP is the same machinery's second stream and gets its
-# own scenario at the nightly tier — its planted defect would be an
-# internet-reachable model server or plaintext registry credential.
+# — this task carried it alone until #1023). The compliance-audit SOP is the
+# vehicle; the ai-security-audit SOP is the same machinery's second stream,
+# and ai-security-planted-model-audit carries it in the nightly over a
+# per-run planted defect (a floating model-image tag and a plaintext
+# registry credential).
 # Journey: a scheduled audit SOP runs end to end — delegates to a worker,
 # sweeps the fleet, and files a ledger issue a human can act on.
 #
@@ -52,8 +59,8 @@
 # remediation pull requests and closes findings that stopped reproducing.
 # Presubmit-eligible because that write path is pinned per eval project to a
 # throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
-# blocker A1, now closed. Eligible tier: presubmit, and active there
-# since 2026-08-25.
+# blocker A1, now closed. Eligible tier: presubmit once re-admitted; active
+# there 2026-08-25 to 2026-09-22, nightly since.
 id: compliance-rbac-overgrant
 name: Security sweep finds the cluster-admin over-grant
 # The prompt no longer asks for a summary in the final answer: the SOP's
@@ -147,8 +154,9 @@ verification_spec:
       scope: finding_ids
       any_of_phrases: ["cluster-admin-binding", "wildcard-rbac"]
   # Cluster-state safeguard: "the fleet came out the way it went in."
-  # tool_called cannot see worker mutations (the trajectory carries only the
-  # delegating turn's calls), so read-only is asserted against the cluster
+  # tool_called cannot see worker mutations (it counts only the delegating
+  # turn's calls; the workers' entries in the trajectory are tagged and
+  # skipped), so read-only is asserted against the cluster
   # itself: the planted defect object must survive the audit untouched.
   # Addressed by fixture ROLE, so the check reads the cluster that carries the
   # over-granted binding in whichever eval project this run leased -- see

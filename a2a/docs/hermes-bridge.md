@@ -52,8 +52,9 @@ flip runbook that step is a blocker, not tidiness.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the
-webhook validates sidecar `securityContext` and nothing else about it). The bridge
-depends on exactly that gap - its `NATS_URL` and credentials arrive as sidecar env.
+webhook checks a sidecar's `securityContext`, and checks its `volumeMounts` against the
+reserved volume names, and nothing else about it). The bridge depends on exactly that
+gap - its `NATS_URL` and credentials arrive as sidecar env.
 Closing it breaks this deployment method, so it stays open as a stated trade while the
 bridge exists; the bridge's demolition removes the reason.
 
@@ -73,29 +74,104 @@ running (the executor role). That collapse is exactly what makes it a stand-in -
 the real dispatcher arrives, the roles separate again and the bridge has nothing left to
 do.
 
-On the W6 install the bridge connects as the static `worker` user, whose grants already
-cover it: subscribe `a2a.tasks.>`, publish `a2a.tasks.*.*.events`, plus the JetStream
-tax and `$KV.runtime-state.>` for the in-flight registry below. The tax is not
-`$JS.API.>`: it is the `$JS.API` subjects the bridge emits on TASKS and
-`KV_runtime-state` — stream info, consumer create, pull, direct get, and the KV
-watcher's consumer delete — named one by one, with the CLI's topic-stream reads, in the
-operator's `a2aWorkerJetStreamGrants`; `$JS.ACK.TASKS.>`, ack scoped to the one stream this user
-consumes with explicit ack (unscoped `$JS.ACK.>` is a cross-principal +TERM); `$JS.FC.>`;
-and `_INBOX.worker.>`.
+The bridge connects as the static `bridge` user, whose grants are written for this
+program and nothing else: subscribe `a2a.tasks.platform.*.in`, publish
+`a2a.tasks.platform.*.events`, `$KV.runtime-state.>` both ways for the in-flight
+registry below, and `_INBOX.bridge.>`. Nothing wider - a bridge that can publish
+submissions is a bridge that can impersonate the gateway.
 
-**This is now the bridge's own debt rather than the deployment's posture.** The auth
-callout has armed and session pods authenticate as themselves, so the shared static user
-is no longer "the playground" — it is a residue, and this program is one of the reasons
-it survives. `cmd/hermes-bridge/main.go` sets `nats.UserInfo` from the environment and
-has no token path, so it cannot present a projected ServiceAccount token even though the
-callout would resolve one. Note what it would present it _as_: there is no `agent`
-principal in the rendered map and deliberately so, so moving the bridge means giving it
-an identity of its own rather than reaching for one already waiting.
+The JetStream tax is not `$JS.API.>`: it is the `$JS.API` subjects the bridge emits on
+TASKS and `KV_runtime-state` — stream info, consumer create, pull, direct get, and the
+KV watcher's consumer delete — named one by one in the operator's
+`a2aBridgeJetStreamGrants`; plus `$JS.ACK.TASKS.>`, ack scoped to the one stream this
+user consumes with explicit ack (unscoped `$JS.ACK.>` is a cross-principal +TERM), and
+`$JS.FC.>`. Reads go through `DIRECT.GET` and not `STREAM.MSG.GET`; the provision script
+sets `--allow-direct` on every stream so nats.go picks that route, and only that route
+is granted.
 
-The target shape, unchanged: a dedicated `bridge` identity with subscribe
-`a2a.tasks.platform.*.in`, publish `a2a.tasks.platform.*.events`, its own inbox prefix,
-and the KV grant. Nothing wider - a bridge that can publish submissions is a bridge that
-can impersonate the gateway.
+Note which delete is in that list and which is not: `$JS.API.CONSUMER.DELETE` is granted
+for `KV_runtime-state`, for the watcher, and withheld for TASKS. The bridge calls
+`lib.TasksGet` on every task it dispatches, and a call that finds events creates an ordered
+consumer on TASKS; nothing deletes it. It is reaped by the five-second inactive threshold
+`TasksGet` sets on it, which is why the replay costs a consumer slot for the calls of the last
+five seconds rather than for the last five minutes of them (gke-labs/kube-agents#1739) without
+the bridge needing a destructive verb on TASKS. The slot outlives the call it served: the
+threshold runs from the call returning, not from it starting. A call on a task the retention window no longer holds
+creates no consumer at all -- the horizon read returns `TaskNotFound` before the consumer is
+created. Either way the call emits no refused publish of its own. One does arrive if the
+ordered consumer resets mid-replay -- a bus reconnect is enough -- because nats.go deletes
+the consumer it replaces: that publish on `$JS.API.CONSUMER.DELETE.TASKS.<name>` is refused,
+which costs a log line and leaves the consumer it could not delete to the same threshold.
+It is the one violation this grant produces by design, so any other `Permissions Violation`
+in the bridge's log still means what it says.
+
+**Static is the answer here, not a residue.** `bridge` replaced the shared `worker` user
+rather than inheriting it, and it stays a password principal on purpose. The auth
+callout keys its map on the username TokenReview returns, which names a ServiceAccount;
+a sidecar shares its pod's ServiceAccount, so a projected token would resolve the bridge
+to the same map entry as the `agent` principal in the container beside it and hand each
+of them the union of the two grant sets — which is the `worker` user rebuilt under a new
+name. The callout cannot see which container opened a connection, and `Narrowing` is
+pod-scoped, so no map shape available today separates them. The bridge gets a token when
+it stops sharing a pod with the agent, which is the same event that retires it.
+
+What the split bought, measured from this side: the bridge holds no grant on
+`TOPICS-STATE` or `TOPICS-JOURNAL` at all — not the reads and not the writes. The
+blackboard belongs to the `a2a` CLI in the agent container, which is now its own callout
+principal. `TestBridgeJetStreamGrantOnARealServer`'s refused table is where that is
+measured.
+
+### Migrating an existing sidecar
+
+An install whose `spec.deployment.sidecars` entry still names the retired user fails
+closed rather than quietly: `worker` is gone from the rendered `nats.conf`, so the
+sidecar's connect is refused at authentication and the container crash-loops. Because it
+shares the agent's pod, the pod does not reach Ready — the same failure shape the
+`mode: today` flip produces above. Two edits, both in the sidecar's own `env`:
+`NATS_USER` becomes `bridge`, and `NATS_PASSWORD`'s `secretKeyRef.key` becomes
+`bridge-password`. The Secret is the same `<agent>-a2a-nats-creds`; the operator fills the
+new key on the next reconcile. It does not remove the old one: `ensureA2ACredsSecret` only
+fills keys that are missing or empty and never prunes, so `worker-password` stays in the
+Secret of an upgraded install indefinitely. It is dead data rather than a live credential —
+`worker` is no longer a user in the rendered `nats.conf`, so presenting that password
+authenticates to nothing — but the key's presence is not evidence the sidecar has been
+migrated, and a reader checking whether an install has taken the split should read
+`nats.conf` or the sidecar's `env`, not the Secret's key set.
+
+Both edits are in `env`, and that is the supported route on purpose. A `sidecarVolumes`
+entry that mounts `<agent>-a2a-nats-creds` — or the `<agent>-a2a-nats-config` or
+`<agent>-a2a-callout-keys` Secret, or a projection of the `a2a-bus` audience under any
+name — is refused at admission, and stripped from the render on an install running the
+A2A surface, because a volume hands a second container far more than the `bridge`
+principal's one password. `<agent>-a2a-nats-creds` and the `nats.conf` in
+`<agent>-a2a-nats-config` both carry `sys-password`, which is the `$SYS` account, and
+`<agent>-a2a-callout-keys` holds the issuer seed the auth callout signs with. The
+agent's own credential is in none of them: under the callout the `agent` principal has
+no shared secret at all, and the `a2a-bus` audience projection is the only route to it
+as a credential. The seed is a way to mint one, which is the other reason that Secret is
+not something to hand a sidecar.
+
+A third edit is owed only by an install that overrode `BRIDGE_PROFILE`, and its failure
+lands in an unhelpful place. The retired `worker` user's subscribe grant was
+`a2a.tasks.*.*.in` — the addressee position was a wildcard, so pointing the bridge at
+another addressee just worked. `bridge`'s grants name `platform` literally
+(`a2aBridgeAddressee`, which is also `defaultProfile` in the bridge's own `main.go`: one
+value living in two modules that cannot import each other). Override the env now and the
+intake half still works — the consumer is created and pulled over `$JS.API`, where the
+filter subject rides in the request body and no subject grant sees it — so the other
+addressee's task is delivered. It stops there. `accept` publishes `submitted` on
+`a2a.tasks.<other>.*.events` before it puts anything on the worker queue, and that subject
+is not in the publish list, so the publish is refused, the submission is dropped, and
+Hermes is never spawned. The refusal does not read as one: a rejected JetStream publish is
+a reply that never arrives, so the bridge logs a timeout and the submitter waits on a task
+that got no terminal event and was never run. Leave the env unset, or widen the grant in
+the operator to match — the two have to move together.
+
+The agent container is the other half of the same change and needs no edit: the operator
+stops rendering `NATS_USER`/`NATS_PASSWORD` there and mounts a projected token instead.
+One user-visible consequence — topic entries the `a2a` CLI writes now carry
+`from.session` of `agent` rather than `worker`, so a query matching on the old value
+returns nothing for entries written after the upgrade.
 
 ## Lifecycle, steering, cancel
 
@@ -104,8 +180,17 @@ ack just redelivers), `working` when the subprocess spawns, the stdout as a `res
 artifact (chunked if large), one terminal `status-update` with `final: true`. A nonzero
 exit is terminal `failed` with the exit code and a stderr tail in the status message. A
 submission with no text parts is terminal `rejected`. New-task detection is the
-dispatcher's rule: empty `…events` subject means new; anything on `…in` for a task with
-a terminal event is acked with a warning and nothing else.
+dispatcher's rule, and 9/9 widened it: BOTH event subjects empty means new, not `…events`
+alone (profiles spec). The bridge satisfies that without a change of its own, because it
+asks `lib.TasksGet` rather than reading a subject - and `tasks/get` folds `…events` and
+`…supervisor` together, so a platform task carrying a supervisor terminal and nothing on
+`…events` comes back `final` and is acked with a warning, not run again. That matters here
+because the gateway's supervisor grant is an addressee wildcard, so such a task is
+constructible. The component that does NOT get this for free is the worker adapter, whose
+`priorEvents` deliberately replaced `lib.TasksGet` with a consumer on its own `…events`
+(a session's grants reach neither `STREAM.INFO` nor a get-by-subject) and so cannot see a
+terminal its own predecessor's supervisor declared. Anything on `…in` for a task with a
+terminal event is acked with a warning and nothing else.
 
 **Steering:** `hermes chat -Q -q` is one-shot - there is no stdin to inject into. A
 follow-up message to a running task is acked and answered with a non-final status
@@ -122,8 +207,21 @@ matching the profile's `activeDeadlineSeconds`) takes the same kill path and lan
 
 ## Supervision
 
-The bridge is its own janitor, per the ratified split - every task's supervisor is the
-component that spawned its execution. Two failure classes:
+The bridge finalizes its own orphans, which is not the same as being their supervisor.
+The ratified split says every task's supervisor is the component that spawned its
+execution; the bridge spawned its own execution, so there is no separate supervisor to
+be - and no supervisor WRITE either.
+
+**It is not a supervisor principal, and 9/9's subject split does not move it.** The
+gateway spawns session pods and finalizes tasks it did not execute, so it publishes on
+`…supervisor`, a subject no executor reaches. The bridge is the executor. When it
+finalizes an orphan it is finishing its OWN task across a restart, as itself, so its
+terminal stays on `…events` where every other event it writes goes, and its `from`
+agrees with that subject like any executor's. Profile-addressed tasks have no
+supervisor ROLE until the dispatcher lands - though the gateway's rendered grant is an
+addressee wildcard and reaches their `…supervisor` regardless, which the profiles spec
+spells out; that is a gap the profiles
+spec names, not one this sweep fills. Two failure classes:
 
 - **The subprocess dies under a live bridge.** The runner sees the exit and publishes
   terminal `failed` with the evidence. Ordinary executor path, nothing special.
@@ -139,6 +237,14 @@ expected-last-subject-sequence pinned to the last event the fold saw. A dying
 subprocess's flush racing the sweep wins cleanly, the CAS is rejected, and the sweep
 re-reads instead of double-finalizing. Whichever writer loses lands in the
 warn-and-drop path like any other post-final event.
+
+That still holds here after 9/9, and it is worth saying why, because the profiles spec
+records that the same CAS stopped protecting the dispatcher's janitor on that date.
+Expected-last-subject-sequence is per subject. The janitor's terminal moved to
+`…supervisor` while the executor kept writing `…events`, so the two writers stopped
+sharing the subject the CAS is evaluated on. The bridge's sweep reads and writes the
+same `…events` subject as the runner it is racing, so the racing write still
+invalidates the expectation and the server still refuses the loser.
 
 The sweep assumes incarnations are serial. That assumption is real on this install -
 the kubelet restarts the sidecar container in place, and the operator renders the agent
@@ -173,4 +279,8 @@ runs executions as Jobs, where the problem does not exist.
 A task published to `a2a.tasks.platform.<id>.in` on the W6 install returns the platform
 agent's real answer as a `result` artifact. Cancel works. The event sequence passes
 the lifecycle conformance assertions (9, 10, 12, 13, 14, 15, 18), table-driven like the
-`a2a/lib` conformance suite.
+`a2a/lib` conformance suite. Two of those changed meaning on 9/9 without changing number:
+9 gained the supervisor-only-terminal exception and 10 now spans both event subjects, and
+the bridge's own tests still assert the single-subject form. They pass because a
+platform task has no supervisor writing to it in practice, not because they cover the
+new wording - so do not read a green bridge suite as coverage of the split.

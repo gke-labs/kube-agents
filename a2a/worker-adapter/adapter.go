@@ -60,6 +60,21 @@ type Config struct {
 	// Empty means the addressee is the profile (dispatcher-spawned shape).
 	Session string
 
+	// OriginSeq is the TASKS stream sequence of the submission this process
+	// exists to execute, from the spawner's own PubAck (lib.EnvOriginSeq).
+	//
+	// Zero means nobody told us, and the two ways that happens are not the
+	// same. A spawner older than the variable, a by-hand run, and the
+	// dispatcher-spawned shape all leave it unset, and those fall back to
+	// scanning the subject. A current spawner that could not determine a
+	// sequence sends lib.OriginSeqUnknown instead, which OriginSeqStated
+	// records: the fallback is the same read, but it is a read we know is
+	// unverifiable rather than one we assume is fine.
+	OriginSeq uint64
+	// OriginSeqStated is true when the spawner set lib.EnvOriginSeq at all,
+	// whatever it said. It separates "not told" from "told: unknown".
+	OriginSeqStated bool
+
 	// HarnessCommand is the full argv of the harness. Tests point it at a
 	// stub; the pod default is the native binary with the stream-json flags.
 	HarnessCommand []string
@@ -146,16 +161,24 @@ const (
 	// reaped session leaves three consumers on TASKS forever, and the
 	// successor incarnation — which mints a fresh name — leaves three more.
 	//
-	// nats.go's ordered consumers use five seconds and the same number is
-	// used here, but NOT because the threshold only fires after the pod is
-	// gone -- an earlier version of this comment claimed that and it is not
+	// This is lib.EphemeralConsumerInactiveThreshold, the five seconds
+	// lib.TasksGet sets on its replay consumer, so the module's ephemerals
+	// on TASKS reap on one clock. An earlier version of this comment said
+	// the number came from nats.go's ordered consumers, which "use five
+	// seconds": they do not. The ordered-consumer default is five MINUTES
+	// (nats.go v1.53.1, jetstream/ordered.go:635, replaced only by a caller's
+	// non-zero value at :646) -- wrong by 60x -- and that belief is what let
+	// TasksGet ship with the default in place (#1739).
+	//
+	// The threshold is short NOT because it only fires after the pod is gone
+	// -- an earlier version of this comment claimed that too and it is not
 	// true. A disconnect longer than five seconds reaps these consumers with
 	// the adapter still very much alive, and because they are MemoryStorage
 	// with Replicas 1 a nats-server restart destroys them outright. Both are
 	// routine. What makes the short threshold safe is not that the window
 	// never opens; it is that consumeIn supervises its own consumer and
 	// rebuilds it when it does.
-	consumerInactiveThreshold = 5 * time.Second
+	consumerInactiveThreshold = lib.EphemeralConsumerInactiveThreshold
 
 	// inRecreateAttempts and inRecreateBackoff bound the in consumer's
 	// recovery after the server drops it. Five seconds apart for a minute is
@@ -894,7 +917,108 @@ func (a *adapter) priorEvents(ctx context.Context) (*lib.Task, error) {
 
 // fetchOrigin reads the task's originating kind:message envelope off the
 // TASKS stream by subject and returns it with its stream sequence.
+//
+// Told which sequence the submission is (lib.EnvOriginSeq, which the gateway
+// sets from its own PubAck), it reads that one and refuses anything else.
+// Not told, it falls back to the scan below, which is the historical
+// behaviour and is unsafe in one specific way the scan cannot detect — see
+// fetchOriginByScan.
 func (a *adapter) fetchOrigin(ctx context.Context) (*lib.Envelope, uint64, error) {
+	if a.cfg.OriginSeq > 0 {
+		return a.fetchOriginAtSeq(ctx, a.cfg.OriginSeq)
+	}
+	if a.cfg.OriginSeqStated {
+		// The spawner is current and still could not name the submission.
+		// The scan is all that is left, but a reader should not have to
+		// infer from silence that it ran unverified.
+		a.log.Warn("the spawner could not name this task's submission; falling back to scanning the in subject, which cannot tell an evicted submission from a steer",
+			"task", a.cfg.TaskID)
+	}
+	return a.fetchOriginByScan(ctx)
+}
+
+// fetchOriginAtSeq reads exactly the message the spawner named.
+//
+// It is a start-sequence consumer rather than a direct get on purpose. A
+// get-by-sequence (STREAM.MSG.GET, or DIRECT.GET on an allow-direct stream)
+// is not a subject-scoped operation: one grant for it reads every message in
+// TASKS, which is the whole task plane, and the callout withholds it for that
+// reason (authcallout/session.go). A consumer's filter subject rides its
+// CREATE subject and is already granted per session, so this costs no new
+// reach at all — only a different DeliverPolicy on a consumer the worker
+// already creates.
+//
+// The refusal is the point. nats-server does not reject a start sequence that
+// has been evicted; it silently starts at the next message the filter
+// matches, which on this subject is the oldest surviving steer — measured, not
+// assumed (TestFetchOriginRefusesASteerWhenTheCapEvictedTheSubmission). So
+// the check is on what came back rather than on whether the call errored.
+func (a *adapter) fetchOriginAtSeq(ctx context.Context, want uint64) (*lib.Envelope, uint64, error) {
+	subject := lib.TaskInSubject(a.cfg.Addressee(), a.cfg.TaskID)
+	deadline := time.Now().Add(originFetchDeadline)
+	cons, consErr := a.sessionConsumer(ctx, lib.SessionConsumerOrigin, subject, jetstream.ConsumerConfig{
+		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
+		OptStartSeq:   want,
+	})
+	for {
+		if consErr == nil {
+			batch, err := cons.FetchNoWait(1)
+			if err == nil {
+				for msg := range batch.Messages() {
+					meta, merr := msg.Metadata()
+					if merr != nil {
+						return nil, 0, fmt.Errorf("origin metadata: %w", merr)
+					}
+					if meta.Sequence.Stream != want {
+						return nil, 0, fmt.Errorf("the submission for task %s is gone from %s: it was stream sequence %d and the oldest message left is %d, so TASKS evicted it (max_msgs_per_subject with discard=old). Refusing to run: the message at %d is a steer or follow-up, not the request",
+							a.cfg.TaskID, subject, want, meta.Sequence.Stream, meta.Sequence.Stream)
+					}
+					env, perr := lib.ParseEnvelope(msg.Data())
+					if perr != nil {
+						return nil, 0, fmt.Errorf("the submission for task %s at %s sequence %d does not parse: %w", a.cfg.TaskID, subject, want, perr)
+					}
+					if env.Kind != lib.KindMessage {
+						return nil, 0, fmt.Errorf("the submission for task %s at %s sequence %d is kind %q, not %q", a.cfg.TaskID, subject, want, env.Kind, lib.KindMessage)
+					}
+					return env, meta.Sequence.Stream, nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			if consErr != nil {
+				return nil, 0, fmt.Errorf("consumer on %s: %w", subject, consErr)
+			}
+			return nil, 0, fmt.Errorf("nothing at or after stream sequence %d on %s within %s", want, subject, originFetchDeadline)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		case <-time.After(originFetchPoll):
+		}
+		if consErr != nil {
+			cons, consErr = a.sessionConsumer(ctx, lib.SessionConsumerOrigin, subject, jetstream.ConsumerConfig{
+				DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
+				OptStartSeq:   want,
+			})
+		}
+	}
+}
+
+// fetchOriginByScan takes the first kind:message on the subject.
+//
+// This is what every worker did before the spawner started naming the
+// submission, and it is kept for the shapes that have no spawner to name it:
+// a run by hand against a bus with no callout, and the dispatcher-spawned
+// shape where the addressee is the profile. It is wrong in one case it cannot
+// see. The subject's head is the submission and everything after it is a
+// steer, follow-up or cancel, all under one max_msgs_per_subject; steers are
+// kind:message too and no envelope field marks the submission, so past the cap
+// this returns the oldest surviving steer and the worker executes it as the
+// request. Detecting that needs either the stream's first sequence
+// (STREAM.INFO) or a get-by-subject, and a session's grants withhold both —
+// which is why the fix was to have the spawner say, not to have the worker
+// look.
+func (a *adapter) fetchOriginByScan(ctx context.Context) (*lib.Envelope, uint64, error) {
 	subject := lib.TaskInSubject(a.cfg.Addressee(), a.cfg.TaskID)
 	deadline := time.Now().Add(originFetchDeadline)
 	// One consumer for the whole wait. Creating it per iteration left up to

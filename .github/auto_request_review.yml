@@ -10,6 +10,7 @@ reviewers:
       - jayantid
       - toshiowang
       - dshnayder
+      - bnaylor
     # Mirrors the eval-crew alias in OWNERS_ALIASES: only it can /approve a
     # change to hack/eval/presubmit-cases.txt or hack/eval/blocking-roster.txt
     # (#1546; hack/OWNERS). Keep the two lists identical. A mixed pull request

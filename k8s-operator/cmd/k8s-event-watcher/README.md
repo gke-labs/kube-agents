@@ -163,7 +163,7 @@ To watch every managed cluster from a single watcher process, point the watcher 
 
 > **The directory is read once, at startup.** It is a snapshot taken at boot, not something the watcher tracks. A cluster onboarded afterwards is not watched until the watcher restarts, and a cluster torn down afterwards leaves its informer retrying against a control plane that no longer exists. Restarting the process — or the Pod — re-reads the directory and reconciles both. Periodic re-scanning is follow-up work, not implemented here.
 
-In a running Platform Agent pod. Note `--in-cluster` alongside `--profiles-dir`: the management cluster has to be watched from the first second of a fresh install, before `cluster_agent_reconcile.py` has run and given it a profile like every other cluster in the project. Cluster sources are additive, so this watches the host **plus** every profile cluster — except that once the host's own profile exists, the direct entry absorbs it (see the note on duplicates below):
+In a running Platform Agent pod. Note `--in-cluster` alongside `--profiles-dir`: the management cluster has to be watched from the first second of a fresh install, before `cluster_agent_reconcile.py` has run and given it a profile like every other cluster in every project in scope. Cluster sources are additive, so this watches the host **plus** every profile cluster — except that once the host's own profile exists, the direct entry absorbs it (see the note on duplicates below):
 
 ```bash
 ./k8s-event-watcher \
@@ -191,6 +191,7 @@ YAML
 
 Notes:
 
+- **The scan itself is not in this binary.** Reading the profiles directory, parsing each `cluster_identity`, resolving the address through the GKE API, and attaching the token all live in [`internal/clusterprofiles`](../../internal/clusterprofiles/), which stops at a `rest.Config` per cluster so the drift detector can reuse it. What this binary adds is the client, the log lines, and the metrics below — so the behaviour described here is split across the two, and a change to any of it starts there.
 - A subdirectory counts as a cluster only if its `config.yaml` carries a complete `cluster_identity`. That is how non-cluster profiles (`default`, `platform`) are skipped, without hardcoding their names.
 - **The address comes from the GKE API, not from a file in the profile.** The watcher calls `clusters.get` on each identity and builds the client from what GKE reports. A profile's `kubeconfig.yaml` is deliberately not read: since the shell moved into its own pod, that file is written by `gcloud container clusters get-credentials` onto the sandbox's volume, where uid 1000 — the model's own account — can rewrite it. This process attaches a `cloud-platform` bearer token to whatever host its config names, so honouring a model-writable address would hand that token to an attacker-chosen endpoint. The API answer cannot be tampered with in the same way, and it costs `container.clusters.get`, which both `roles/container.clusterViewer` and `roles/container.viewer` grant and the agent's identity already holds.
 - **A cluster the GKE API will not describe is skipped and counted** — deleted between scaffolding and this start, or outside what the pod's identity may read. Guessing an address from the name would produce a watcher reporting events for a control plane nobody confirmed.

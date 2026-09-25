@@ -183,7 +183,7 @@ and says so below:
 - **Node-pool skew** (§3.2). Per pool, the target control plane's minor minus the pool's minor:
   more than 2, or a different major, blocks the control-plane upgrade until the pool moves
   (GKE keeps nodes within two minors of the control plane); exactly 2 is at the ceiling and
-  goes in the note. Autopilot members read `n/a`, as the SOP's `pool-skew` check does.
+  goes in the note. Autopilot members read `n/a`.
 
 A member is `blocked` when any rule blocks, whatever else could not be evaluated; `unknown` when
 nothing blocked but a rule could not be evaluated (the cluster read failed, there is no target,

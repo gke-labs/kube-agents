@@ -395,12 +395,10 @@ class TestTheApplier(unittest.TestCase):
             + "    return kb.complete_task(tid, summary=summary, result=result)\n"
             "\n"
             "def _handle_create(args):\n"
-            "    with _conn() as conn:\n"
-            "        if True:\n"
-            "            new_task = kb.get_task(conn, new_tid)\n"
-            "            subscribed = _maybe_auto_subscribe(conn, new_tid)\n"
-            "            _kanban_inherit_worker_subs(conn, new_tid)\n"
-            "    return new_tid\n",
+            "    with _board(args.get('board')) as (kb, conn):\n"
+            "        new_tid = kb.create_task(conn, title=title)\n"
+            "        landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)\n"
+            "        return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))\n",
             encoding="utf-8",
         )
 
@@ -440,12 +438,31 @@ class TestTheApplier(unittest.TestCase):
             self.applier.apply(self.tmp)
 
     def test_a_missing_create_anchor_fails_the_build(self):
-        source = self.patched().replace(
-            "_kanban_inherit_worker_subs", "_kanban_inherit_worker_subs_v2"
-        )
+        source = self.patched().replace("_CREATED_FIELDS", "_CREATED_FIELDS_V2")
         self.target.write_text(source, encoding="utf-8")
         with self.assertRaises(SystemExit):
             self.applier.apply(self.tmp)
+
+    def test_the_create_hook_stacks_with_auto_subscribe_in_either_order(self):
+        """Both patches hook the same upstream line, so neither may depend on
+        the other having run: kanban_auto_subscribe is a retirement candidate
+        (upstream inherits the creator's subscriptions itself since
+        v2026.9.14), and retiring it must not break this applier."""
+        import apply_kanban_auto_subscribe as auto_subscribe
+
+        for first, second in ((auto_subscribe, self.applier), (self.applier, auto_subscribe)):
+            self.setUp()
+            first.apply(self.tmp)
+            second.apply(self.tmp)
+            out = self.patched()
+            read_back = out.index("landed = _fields(kb.get_task(conn, new_tid)")
+            self.assertLess(read_back, out.index("_kanban_record_worker_child(conn, new_tid)"))
+            self.assertLess(read_back, out.index("_kanban_inherit_worker_subs(conn, new_tid)"))
+            self.assertLess(out.index("_kanban_record_worker_child(conn, new_tid)"), out.index("return _ok("))
+            self.assertLess(out.index("_kanban_inherit_worker_subs(conn, new_tid)"), out.index("return _ok("))
+            import ast
+
+            ast.parse(out)
 
 
 if __name__ == "__main__":

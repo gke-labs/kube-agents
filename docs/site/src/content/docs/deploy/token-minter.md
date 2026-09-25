@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) repository-scoped GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion`, `fleet-audit`, and `github-issue-resolver` skills. The GitHub App's private key never leaves GCP KMS.
+Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) repository-scoped GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion`, `fleet-audit`, and `github-issue-resolver` skills, and read-only tokens for the credential broker's own clones of the repositories registered as context. The GitHub App's private key never leaves GCP KMS.
 
 GCP half (minter GSA, Workload Identity binding, import-only KMS signing key): [`terraform/modules/github-minter`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter).
 Kubernetes half (Deployment, Service, NetworkPolicy, KSA, rule ConfigMap, `github-app-credentials` Secret): the chart's `githubMinter.*` values; the dev copy is `make -C k8s-operator deploy-github`.
@@ -27,7 +27,13 @@ Create the repo under an organization, or transfer an existing one into it. A fr
 
 ## Single-organization scoping boundary
 
-Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A single PlatformAgent instance and its associated Minty deployment manage multiple repositories within the primary GitHub Organization where the GitHub App is installed. Additional repositories registered under `managed_repos` in the `gitops-state` ConfigMap must belong to this primary organization. The ConfigMap's `context_repos` key is not minted for: the policy is synced from `managed_repos` only, so a context repository is readable only if it needs no token.
+Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A single PlatformAgent instance and its associated Minty deployment manage multiple repositories within the primary GitHub Organization where the GitHub App is installed. Additional repositories registered under `managed_repos` in the `gitops-state` ConfigMap must belong to this primary organization, and so must the repositories registered under its `context_repos` key.
+
+## Read-only tokens for context repositories
+
+A repository registered under `context_repos` — a Terraform repository an audit reads for declared intent — gets a read-only grant, not the write one. The operator renders a policy per same-organization context repository carrying the `platform-agent-read-scope` scope alone, which grants `contents: read` and nothing else. The credential broker requests a token from that scope for its own content-mode clone of the repository, presents it to that one `git` process, and installs it nowhere: the agent sandbox never holds it, and the broker's write gate still refuses a `commit` or `push` to a context repository. A repository registered under both keys is managed and keeps its write policy.
+
+The GitHub App must be installed on each context repository, as it must on each managed one; a private repository the App is not installed on fails to clone as before. A cross-organization entry is skipped with an operator log line. A rule ConfigMap whose `default.yaml` predates the read scope renders no context policies — upgrade the chart or the kustomize template to get it.
 
 ## Setup and Key Provisioning
 
@@ -42,7 +48,7 @@ Before enabling the token minter, ensure you have:
 3. **GitHub App:**
    - Created in GitHub (`Settings -> Developer settings -> GitHub Apps`).
    - Repository permissions: `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`.
-   - Installed onto the target organization and repository.
+   - Installed onto the target organization, the GitOps repository, and every repository registered under `context_repos`.
    - If created under a personal user account, "Where can this GitHub App be installed?" must be set to "Any account (Public)".
 4. **App ID:** The numeric App ID from the GitHub App settings page.
 5. **Private Key (`.pem`):** Generated and downloaded from the GitHub App settings page (needed for initial Cloud KMS import).
@@ -54,9 +60,9 @@ During initial installation, `install.sh` can create the Cloud KMS keyring/key a
 
 ```bash
 ./install.sh --non-interactive \
-  --project-id="YOUR_GCP_PROJECT_ID" \
-  --cluster-name="platform-agent-host" \
-  --region="us-central1" \
+  --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
   --gitops-org="YOUR_GITHUB_ORG" \
   --gitops-repo="YOUR_GITOPS_REPO" \
   --github-app-id="YOUR_GITHUB_APP_ID" \
@@ -79,9 +85,9 @@ For automated CI/CD pipelines, release automation, or production environments wh
    Once the key holds an `ENABLED` version in Cloud KMS, invoke `install.sh` without `--github-pem-path`:
    ```bash
    ./install.sh --non-interactive \
-     --project-id="YOUR_GCP_PROJECT_ID" \
-     --cluster-name="platform-agent-host" \
-     --region="us-central1" \
+     --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+     --gke-cluster-name="platform-agent-host" \
+     --gcp-region="us-central1" \
      --gitops-org="YOUR_GITHUB_ORG" \
      --gitops-repo="YOUR_GITOPS_REPO" \
      --github-app-id="YOUR_GITHUB_APP_ID"
@@ -122,7 +128,7 @@ Names and values baked into the deployment templates ([`k8s-operator/config/inte
 - **Kubernetes Service / Deployment:** `github-token-minter` (namespace `kubeagents-system`), listening on port `8080` with a `/version` health endpoint.
 - **Image:** substituted from `GITHUB_MINTER_IMAGE`, run as `/minty server run`. The upstream reference and pin live in `images.json`; see the [Docker images](docker-images.md) inventory.
 - **Kubernetes SA:** `kubeagents-github-minter`, Workload-Identity-bound to GSA `kubeagents-github-minter-gsa` (which holds `roles/cloudkms.signerVerifier` on the KMS key).
-- **Scope:** the ConfigMap rule exposes a `platform-agent-scope` scope granting `contents: write`, `pull_requests: write`, and `issues: write`; requests must pass this in the `scope` field.
+- **Scopes:** the ConfigMap rule exposes two. `platform-agent-scope` grants `contents: write`, `pull_requests: write`, and `issues: write`, and is what the agent's managed repositories ride. `platform-agent-read-scope` grants `contents: read` alone, and is what the credential broker requests for its clone of a context repository. A request names one in its `scope` field.
 - The App ID is injected from the `github-app-credentials` Secret, and the KMS key reference (`projects/.../cryptoKeyVersions/<n>`) points at the configured key version (the chart's `githubMinter.kms.keyVersion`), which must be ENABLED — i.e. imported — before the Deployment passes readiness.
 
 ## Manual testing
@@ -151,7 +157,7 @@ curl -i -X POST http://github-token-minter.kubeagents-system.svc.cluster.local:8
   -d '{"org_name":"<org>","repositories":["<repo>"],"scope":"platform-agent-scope"}'
 ```
 
-A 200 response whose body is the short-lived, repository-scoped GitHub installation token means the pipeline works end-to-end.
+A 200 response whose body is the short-lived, repository-scoped GitHub installation token means the pipeline works end-to-end. Put `platform-agent-read-scope` in `scope` to check the read-only grant: the token returned can clone the repository and nothing more.
 
 ## Where to go next
 

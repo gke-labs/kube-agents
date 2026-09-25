@@ -17,12 +17,14 @@ following an instruction into a dead end.
 and cannot cover any of this: the edit lives inside Hermes' own module, and the
 unit suite never sees the file that ships.
 
-The module is loaded by path rather than imported as
-``plugins.platforms.google_chat.adapter`` so the gate does not depend on the
-package's ``__init__`` being importable at build time. ``adapter.py`` imports
-``gateway.*`` at module level, so ``_load`` puts the tree on ``sys.path`` first,
-the way verify_kanban_worker_tools.py and its siblings do. Running the script
-from ``/opt/hermes`` is not enough on its own: for ``python3 script.py``,
+The module is imported as ``plugins.platforms.google_chat.adapter`` with the
+tree under test at the front of ``sys.path``, and ``_load`` then checks that
+the module Python resolved is the file under ``root``. Loading it by path, the
+way verify_slack_code_emphasis.py does, stopped being possible at v2026.9.14:
+the adapter now does ``from .cards import ...``, and a relative import needs a
+parent package. ``adapter.py`` imports ``gateway.*`` at module level too, so
+the ``sys.path`` insert is load-bearing either way. Running the script from
+``/opt/hermes`` is not enough on its own: for ``python3 script.py``,
 ``sys.path[0]`` is the script's directory, not the working directory.
 """
 
@@ -30,11 +32,17 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import importlib.util
+import importlib
 import sys
 from pathlib import Path
 
 RELATIVE = "plugins/platforms/google_chat/adapter.py"
+
+#: The import name of the adapter under test. The relative imports inside it
+#: (``from .cards import ...``) only resolve when it is imported as a member of
+#: its package, so this is the name Python is asked for; ``_load`` then checks
+#: the file it found is the one under ``root``.
+MODULE = "plugins.platforms.google_chat.adapter"
 
 # Verbatim fragments of what upstream shipped. Substrings rather than a language
 # heuristic: these four are the exact text that reached a user's thread, and
@@ -66,9 +74,10 @@ def _load(root: Path):
         raise _fail(f"{path} does not exist")
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    spec = importlib.util.spec_from_file_location("gc_adapter_verify", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = importlib.import_module(MODULE)
+    loaded = Path(getattr(module, "__file__", "") or "").resolve()
+    if loaded != path.resolve():
+        raise _fail(f"{MODULE} resolved to {loaded}, not to {path}")
     return module
 
 

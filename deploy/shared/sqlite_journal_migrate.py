@@ -3,8 +3,8 @@
 
 Hermes reads `database.journal_mode` from its config and creates a fresh database in
 that mode, but it never downgrades one whose header already reads WAL:
-apply_wal_with_fallback (hermes_state.py) returns an on-disk WAL database before it
-consults the setting, because a live downgrade under a concurrent opener would destroy
+apply_wal_with_fallback (hermes_state_wal.py, re-exported by hermes_state.py) returns an
+on-disk WAL database before it consults the setting, because a live downgrade under a concurrent opener would destroy
 committed-but-uncheckpointed frames. So on a volume that ran in WAL before the pin —
 every install this was written for (#610) — the pin alone changes nothing, and the
 databases keep corrupting on the gofer mount the pin exists to protect them from.

@@ -91,10 +91,10 @@ with sqlite3.connect(KV) as kv:
         (SPACE, json.dumps({"platform": "slack", "chat_id": "C0WRONG"})),
     )
 
-from hermes_cli import kanban_db as K  # noqa: E402
+from hermes_cli import kanban_db_connect as KC  # noqa: E402
 import tools.kanban_tools as kt  # noqa: E402
 
-conn = K.connect(DB)
+conn = KC.connect(DB)
 
 
 def subs(task_id):

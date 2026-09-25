@@ -39,6 +39,7 @@ SANDBOX_HOME_ROOTS="${SANDBOX_HOME_ROOTS:-. profiles/platform}"
 # home root above, so a home that gains a database gains a tripwire with it.
 AGENT_POD_DATABASES="${AGENT_POD_DATABASES:-kanban.db state.db}"
 AGENT_POD_DATABASE_NOTE="NOT-THE-AGENT-POD-DATABASE.txt"
+SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION"
 
 # Every name under $DATA is owned by uid 1000 and survives a pod recycle, so any
 # path below it that this script hands to root may be a symlink the model planted
@@ -375,6 +376,11 @@ done
 #    are different volumes that only happen to share a path: forwarding the agent
 #    container's value would point every skill here at a directory this container
 #    does not have the moment an install moves `spec.harness.hermes.agentHome`.
+#    The profile within that root is narrowed later, per session, by
+#    sandbox-session-command, from the profile name the agent image's ssh
+#    client sends as HERMES_PROFILE_HOME (the AcceptEnv in sshd_config's agent
+#    Match block); that is a name rebased onto this root, never a path from
+#    the other one.
 #
 #    They have to be set at all because step 1a is only half the delivery. A
 #    SKILL.md says `"$HERMES_HOME"/scripts/github_token_refresh.py` as often as it
@@ -396,7 +402,7 @@ setenv_args="PATH=\"$SANDBOX_PATH\" HERMES_HOME=\"$DATA\" PLATFORM_AGENT_HOME=\"
 # every caller once it is off the agent's pod — which the sandbox being here
 # already means — so a session that has the URL and not this one reaches the
 # listener and is refused by it.
-for name in CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE; do
+for name in $SANDBOX_FORWARDED_ENV_NAMES; do
   value="${!name-}"
   if [ -z "$value" ]; then
     continue
