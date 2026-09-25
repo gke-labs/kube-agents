@@ -13,9 +13,16 @@ from admin_console.project_config import (
 
 class ProjectConfigTest(unittest.TestCase):
     def test_loads_only_valid_deployment_coordinates(self):
+        """The `export` spelling is read, and only the allowlisted keys are.
+
+        install.env.example documents bare `K=V`, but the installers source the
+        file, so `export K=V` is valid there and a hand-edited install.env may
+        carry it. Everything outside the allowlist -- the API keys and tokens
+        this file also holds -- must stay unread.
+        """
         with tempfile.TemporaryDirectory() as directory:
-            state = Path(directory) / "vars.sh"
-            state.write_text(
+            install_env = Path(directory) / "install.env"
+            install_env.write_text(
                 "\n".join(
                     (
                         "export PROJECT_ID=test-project-01",
@@ -28,7 +35,7 @@ class ProjectConfigTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            target = load_provisioned_target(state)
+            target = load_provisioned_target(install_env)
 
         self.assertIsNotNone(target)
         assert target is not None
@@ -37,14 +44,14 @@ class ProjectConfigTest(unittest.TestCase):
         self.assertEqual(target.location, "us-east4")
         self.assertEqual(target.namespace, "kubeagents-system")
 
-    def test_rejects_shell_expression_in_project_value(self):
+    def test_rejects_shell_expression_in_an_exported_project_value(self):
         with tempfile.TemporaryDirectory() as directory:
-            state = Path(directory) / "vars.sh"
-            state.write_text(
+            install_env = Path(directory) / "install.env"
+            install_env.write_text(
                 "export PROJECT_ID=$(touch /tmp/portal-must-not-execute)\n",
                 encoding="utf-8",
             )
-            self.assertIsNone(load_provisioned_target(state))
+            self.assertIsNone(load_provisioned_target(install_env))
 
     def test_loads_a_hand_authored_install_env(self):
         """install.env is a dotenv: bare `K=V`, no `export`.
@@ -68,7 +75,7 @@ class ProjectConfigTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            target = load_provisioned_target(Path(directory) / "absent.sh", install_env)
+            target = load_provisioned_target(install_env)
 
         self.assertIsNotNone(target)
         assert target is not None
@@ -77,13 +84,21 @@ class ProjectConfigTest(unittest.TestCase):
         self.assertEqual(target.location, "us-east4")
         self.assertEqual(target.namespace, "kubeagents-system")
 
-    def test_the_input_wins_over_the_legacy_state_file(self):
-        """Both exist during the migration, and they can disagree. The
-        installers load install.env last, so the portal must too or it offers a
-        cluster the installer is not pointed at."""
+    def test_a_legacy_vars_sh_is_not_read_at_all(self):
+        """install.env is the only source; k8s-operator/scripts/vars.sh is not.
+
+        Nothing has written that file since the installers switched to
+        install.env, so a copy still on disk is state from an install that has
+        since been re-run. Merging it in -- which this used to do, with
+        install.env winning key by key -- let its keys survive wherever
+        install.env happened to be silent, which is how a stale region and
+        namespace reached the portal. Every key it sets here is one install.env
+        does not, so anything but the install.env values fails this test.
+        """
         with tempfile.TemporaryDirectory() as directory:
-            state = Path(directory) / "vars.sh"
-            state.write_text(
+            legacy_state = Path(directory) / "k8s-operator" / "scripts"
+            legacy_state.mkdir(parents=True)
+            (legacy_state / "vars.sh").write_text(
                 "export PROJECT_ID=stale-project-01\n"
                 "export CLUSTER_NAME=stale-cluster-01\n"
                 "export REGION=us-central1\n"
@@ -95,27 +110,29 @@ class ProjectConfigTest(unittest.TestCase):
                 "PROJECT_ID=test-project-01\nCLUSTER_NAME=test-cluster-01\n",
                 encoding="utf-8",
             )
-            target = load_provisioned_target(state, install_env)
+            target = load_provisioned_target(install_env)
 
         assert target is not None
         self.assertEqual(target.project_id, "test-project-01")
         self.assertEqual(target.cluster_name, "test-cluster-01")
-        # Not overridden by the input, so the recorded value stands rather than
-        # reverting to the default.
-        self.assertEqual(target.location, "us-central1")
-        self.assertEqual(target.namespace, "agents")
+        # install.env sets neither, and the legacy file cannot supply them any
+        # more, so both fall back to the defaults.
+        self.assertEqual(target.location, "")
+        self.assertEqual(target.namespace, "kubeagents-system")
 
-    def test_rejects_shell_expression_in_an_install_env_too(self):
-        """The never-sourced guarantee covers both files."""
+    def test_rejects_shell_expression_in_a_bare_install_env_assignment(self):
+        """The never-sourced guarantee holds for the documented spelling too.
+
+        The exported spelling is covered above; this is the one
+        install.env.example tells operators to write.
+        """
         with tempfile.TemporaryDirectory() as directory:
             install_env = Path(directory) / "install.env"
             install_env.write_text(
                 "PROJECT_ID=$(touch /tmp/portal-must-not-execute)\n",
                 encoding="utf-8",
             )
-            self.assertIsNone(
-                load_provisioned_target(Path(directory) / "absent.sh", install_env)
-            )
+            self.assertIsNone(load_provisioned_target(install_env))
 
 
 class VariableReferencesTest(unittest.TestCase):
@@ -129,7 +146,7 @@ class VariableReferencesTest(unittest.TestCase):
     def _target(self, body: str, directory: str):
         install_env = Path(directory) / "install.env"
         install_env.write_text(body, encoding="utf-8")
-        return load_provisioned_target(Path(directory) / "absent.sh", install_env)
+        return load_provisioned_target(install_env)
 
     def test_a_reference_to_an_earlier_key_resolves(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -188,7 +205,7 @@ class VariableReferencesTest(unittest.TestCase):
 
     def test_a_reference_to_a_non_allowlisted_key_is_not_resolved(self):
         """Only allowlisted keys enter the expansion scope, so the API keys and
-        tokens these files also hold never reach it."""
+        tokens install.env also holds never reach it."""
         with tempfile.TemporaryDirectory() as directory:
             target = self._target(
                 "GEMINI_API_KEY=must-not-be-read\n"
@@ -199,18 +216,32 @@ class VariableReferencesTest(unittest.TestCase):
         assert target is not None
         self.assertEqual(target.cluster_name, "")
 
-    def test_install_env_can_reference_a_key_from_the_legacy_state_file(self):
-        """Both are sourced, vars.sh first, so a reference across them works."""
+    def test_a_reference_to_a_key_only_the_legacy_state_file_sets_is_literal(self):
+        """The expansion scope is install.env and nothing else.
+
+        This used to resolve: the legacy vars.sh was read first and seeded the
+        scope, so install.env could name a key only that file set. Now the file
+        is not read, so the reference is left as written and fails validation
+        -- the same visible answer as any other unresolvable reference, rather
+        than a cluster name built out of state from a superseded install.
+        """
         with tempfile.TemporaryDirectory() as directory:
-            state = Path(directory) / "vars.sh"
-            state.write_text("export PROJECT_ID=test-project-01\n", encoding="utf-8")
+            legacy_state = Path(directory) / "k8s-operator" / "scripts"
+            legacy_state.mkdir(parents=True)
+            (legacy_state / "vars.sh").write_text(
+                "export NAMESPACE=stale-namespace\n", encoding="utf-8"
+            )
             install_env = Path(directory) / "install.env"
             install_env.write_text(
-                "CLUSTER_NAME=${PROJECT_ID}-host\nREGION=us-east4\n", encoding="utf-8"
+                "PROJECT_ID=test-project-01\n"
+                "CLUSTER_NAME=${NAMESPACE}-host\n"
+                "REGION=us-east4\n",
+                encoding="utf-8",
             )
-            target = load_provisioned_target(state, install_env)
+            target = load_provisioned_target(install_env)
         assert target is not None
-        self.assertEqual(target.cluster_name, "test-project-01-host")
+        self.assertEqual(target.cluster_name, "")
+        self.assertEqual(target.namespace, "kubeagents-system")
 
     def test_command_substitution_is_still_never_expanded(self):
         """Expanding `$VAR` must not have opened the door to `$(...)`."""

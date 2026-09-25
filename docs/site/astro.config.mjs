@@ -108,6 +108,7 @@ export default defineConfig({
             { label: 'Quick start (GKE)', link: '/install/quickstart-gke/' },
             { label: 'Manual install', link: '/install/manual/' },
             { label: 'Helm and Kind', link: '/install/helm-and-kind/' },
+            { label: 'Upgrade', link: '/install/upgrade/' },
             { label: 'Uninstall', link: '/install/uninstall/' },
           ],
         },

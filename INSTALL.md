@@ -31,8 +31,9 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
 7. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
-8. [Teardown & Cleanup](#teardown--cleanup)
-9. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+8. [Upgrading](#upgrading)
+9. [Teardown & Cleanup](#teardown--cleanup)
+10. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
 ---
 
@@ -820,6 +821,27 @@ For developer testing on a workstation against a local cluster (e.g., Kind) or f
    ```bash
    make dev-rebuild-agent ARGS="platform"
    ```
+
+## Upgrading
+
+To move a configured `kube-agents` installation to a newer release, run the `upgrade.sh` published
+for that release. It carries its own version, so the run names no image tag, and it reuses the
+install checkout — and the `install.env` in it — that `install.sh` left in `$HOME/kube-agents`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/upgrade.sh | bash -s -- \
+  --non-interactive \
+  --gcp-project-id="<PROJECT_ID>" \
+  --gke-cluster-name="<CLUSTER_NAME>" \
+  --gcp-region="<REGION>"
+```
+
+From a checkout, run `./upgrade.sh` with the same flags. An unpacked release bundle carries sources
+and no configuration, so copy the install's `install.env` into it first, or point
+`KUBE_AGENTS_INSTALL_ENV` at one. `--image-tag` overrides the version the script carries and exists
+for development and CI/CD testing; `--plan` reports what a full upgrade would change without
+changing anything. The upgrade modes, the previews, and the refusals are in
+[the Upgrade page](docs/site/src/content/docs/install/upgrade.md).
 
 ## Teardown & Cleanup
 

@@ -246,48 +246,7 @@ else
   unset _install_env_dir
 fi
 
-# The state file install.env replaces. Loaded FIRST so install.env wins on
-# every key it carries, and only from a checkout -- a fresh clone has none.
-# This is the migration: an existing install keeps working with no action from
-# its owner, and the run writes their values into install.env on the way out.
-#
-# Resolved against the same checkout, for the same reason: under
-# `curl … | bash` a script-relative path names the invocation directory, not
-# the clone the migration has to read.
-LEGACY_VARS_FILE=""
-if [ -f "${_state_repo_dir}/k8s-operator/scripts/vars.sh" ]; then
-  LEGACY_VARS_FILE="${_state_repo_dir}/k8s-operator/scripts/vars.sh"
-fi
 unset _state_repo_dir
-
-load_legacy_vars_file() {
-  local file="${1:-}"
-  [ -n "$file" ] && [ -f "$file" ] || return 0
-  if ! bash -n "$file" 2>/dev/null; then
-    print_error "Legacy install state '$file' is not valid shell and could not be loaded."
-    exit 1
-  fi
-  set -a
-  # shellcheck disable=SC1090
-  . "$file"
-  set +a
-  # stderr, like the load message below and for the same reason.
-  print_warning "Loaded legacy install state from ${file}; install.env replaces it." >&2
-  # Telling the operator to delete vars.sh is only safe once its values are
-  # somewhere else, and this function cannot promise that. bootstrap_install_env_file
-  # is the sole writer, it runs near the end of main(), and it returns early
-  # when install.env already exists -- so --help, --menu, --dry-run, any abort,
-  # and every run against a file the operator wrote themselves reach the write
-  # never or as a no-op. An existing install.env is the dangerous case rather
-  # than the safe-looking one: `cp install.env.example install.env` carries no
-  # MEMORY, so discarding vars.sh there loses the only record that the install
-  # runs Hindsight, and the next apply derives multiuser_memory and tears it down.
-  if [ -f "$INSTALL_ENV_FILE" ]; then
-    print_info "${INSTALL_ENV_FILE} already exists and this run will not rewrite it. Copy anything you still need from vars.sh into it before deleting vars.sh." >&2
-  else
-    print_info "Once this run creates ${INSTALL_ENV_FILE}, check it against vars.sh and then delete vars.sh." >&2
-  fi
-}
 
 # Named apart from installer_common.sh's load_install_env, which this file
 # sources later and which upgrade.sh and uninstall.sh use. The two differ on
@@ -381,7 +340,6 @@ wants_help_only() {
 }
 
 if ! wants_help_only "$@"; then
-  load_legacy_vars_file "$LEGACY_VARS_FILE"
   bootstrap_install_env "$INSTALL_ENV_FILE"
 fi
 
@@ -459,6 +417,10 @@ memory_mode_from_provider() {
   esac
 }
 PARAM_MEMORY="${MEMORY:-$(memory_mode_from_provider "${MEMORY_PROVIDER:-}")}"
+PARAM_MEMORY_EXPLICIT="false"
+if [ -n "$PARAM_MEMORY" ]; then
+  PARAM_MEMORY_EXPLICIT="true"
+fi
 PARAM_ALLOWED_USERS="${ALLOWED_USERS:-}"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
 PARAM_MIGRATE_NODE_POOLS="${MIGRATE_NODE_POOLS:-}"
@@ -771,7 +733,24 @@ parse_args() {
       --enable-stockout-investigator|--enable-stockout|--enable-stockout-investigator=*|--enable-stockout=*)
         PARAM_ENABLE_STOCKOUT_INVESTIGATOR="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"; shift ;;
-      --memory=*) PARAM_MEMORY="${1#*=}"; shift ;;
+      # Validated for emptiness here, ahead of resolve_shared_defaults.
+      # PARAM_MEMORY is seeded from MEMORY and resolved with
+      # ${PARAM_MEMORY:-$DEFAULT_MEMORY}, so `--memory=` out of a wrapper
+      # expanding an unset variable would arrive at main() as the well-formed
+      # default ("file") WITH PARAM_MEMORY_EXPLICIT="true" -- replacing a
+      # recorded MEMORY=hindsight and telling write_tfvars_from_state not to
+      # probe the live cluster before planning hindsight-postgresql away.
+      --memory=*)
+        PARAM_MEMORY="${1#*=}"
+        if [ -n "$PARAM_MEMORY" ]; then
+          PARAM_MEMORY_EXPLICIT="true"
+        else
+          print_error "--memory= was given an empty value."
+          print_info "Pass --memory=off, --memory=file, or --memory=hindsight, or omit the flag to keep the recorded setting."
+          exit 1
+        fi
+        shift
+        ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
       --registry-prefix=*) PARAM_REGISTRY_PREFIX="${1#*=}"; shift ;;
       --third-party-registry-prefix=*) PARAM_THIRD_PARTY_REGISTRY_PREFIX="${1#*=}"; shift ;;
@@ -1748,9 +1727,6 @@ source_provisioning_helpers() {
     exit 1
   fi
   SCRIPT_DIR="${repo_dir}/scripts/installer"
-  # The legacy state file, still at its original address: an install made
-  # before the move has one there and nowhere else.
-  VARS_FILE="${repo_dir}/k8s-operator/scripts/vars.sh"
   # shellcheck source=/dev/null
   source "$helper_script"
   # gke_dns_endpoint_flag, for the credentials fetch before the health checks.
@@ -3449,39 +3425,28 @@ run_menu_system() {
 
   local repo_dir
   repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local vars_file="${repo_dir}/k8s-operator/scripts/vars.sh"
   local helper_script="${repo_dir}/scripts/installer/installer_common.sh"
 
   if [ ! -f "$helper_script" ]; then
     print_error "Cannot find installer helpers at $helper_script."
     exit 1
   fi
-  export VARS_FILE="$vars_file"
   # shellcheck disable=SC1090
   source "$helper_script"
 
-  if [ -f "$vars_file" ]; then
-    # shellcheck disable=SC1090
-    if ! source "$vars_file"; then
-      print_error "Configuration state is invalid and could not be loaded: $vars_file"
-      exit 1
-    fi
-  fi
-  # install.env was already loaded at startup, but sourcing vars.sh just now put
-  # the derived state back over the top of it. Re-apply the input so the
-  # hand-authored file is what the panel opens on, whichever order the two
-  # files disagree in.
+  # install.env is already loaded at startup; re-apply it here so the panel
+  # always opens on the operator's own input, whatever the sourced helpers
+  # left in the environment.
   load_install_env "$INSTALL_ENV_FILE" || true
   # That reload unsets NAMESPACE on its way in, for the reason
   # bootstrap_install_env does -- so --agent-namespace, which main() applied
   # before dispatching here, has to be applied again or the panel opens on the
   # default namespace and its Save & Apply writes tfvars for that one.
   apply_agent_namespace_override
-  # ...and the same for the memory setting, which the two files spell
-  # differently (install.env MEMORY, legacy vars.sh MEMORY_PROVIDER) so load
-  # order alone cannot make the input win. Save & Apply generates tfvars
-  # directly, without passing through the parameter block that resolves this
-  # pair on install.sh's own run.
+  # ...and the memory setting needs normalizing, because install.env spells it
+  # MEMORY while the provisioner reads MEMORY_PROVIDER. Save & Apply generates
+  # tfvars directly, without passing through the parameter block that resolves
+  # this pair on install.sh's own run.
   normalize_memory_vars
 
   local project_id="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}"
@@ -3516,11 +3481,11 @@ run_menu_system() {
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   # Not the fresh-install default. The control panel describes an install that
-  # already exists and its Save & Apply re-applies what it displays, so a
-  # vars.sh with no ENABLE_GVISOR has to read as the standard runtime — that is
-  # what such a cluster is actually running. Defaulting on here would show
-  # "gVisor Sandbox" for an unsandboxed install and then provision a node pool
-  # nobody asked for on the next apply.
+  # already exists and its Save & Apply re-applies what it displays, so an
+  # install.env with no ENABLE_GVISOR has to read as the standard runtime —
+  # that is what such a cluster is actually running. Defaulting on here would
+  # show "gVisor Sandbox" for an unsandboxed install and then provision a node
+  # pool nobody asked for on the next apply.
   local enable_gvisor="${ENABLE_GVISOR:-false}"
   # DEFAULT_ENABLE_WEBUI is "false" and the paragraph above applies to it too:
   # the panel has to read as what an unconfigured install is running. Flipping
@@ -3714,7 +3679,16 @@ run_menu_system() {
         #
         # No re-source: save_env_var exports as it writes, so the environment
         # write_tfvars_from_state reads is already current.
-        write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
+        #
+        # KUBE_AGENTS_REQUIRE_MEMORY_ANSWER, because run_lifecycle_apply below
+        # is a full apply. This panel is the front door most likely to reach the
+        # generator with no memory answer at all -- normalize_memory_vars returns
+        # immediately when install.env carries no MEMORY line, and --menu is
+        # dispatched before the prerequisite check, so kubectl may not even be
+        # usable -- and an operator reaches it to change a model provider, not to
+        # decide the fate of a database.
+        KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
+          write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
         # A provider or minter switch is where a new fixed-name GSA is first
         # planned on an existing install, so the 409 check runs here too.
         check_service_account_ownership || exit 1
@@ -4622,7 +4596,7 @@ main() {
   permission_set=$(printf '%s' "$permission_set" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   # require_supported_permission_set (installer_common.sh) is the one home for
   # the accepted vocabulary and for the explanation the removed admin bundle
-  # gets -- a PLATFORM_AGENT_PERMISSION_SET inherited from a vars.sh or a CI
+  # gets -- a PLATFORM_AGENT_PERMISSION_SET carried in install.env or a CI
   # environment variable written before the removal lands here.
   require_supported_permission_set "$permission_set" || exit 1
   local custom_roles="${PARAM_CUSTOM_ROLES:-}"
@@ -4783,6 +4757,7 @@ main() {
       hindsight) memory_choice="2" ;;
       off) memory_choice="3" ;;
     esac
+    local memory_seed_choice="$memory_choice"
     case "$memory_choice" in
       2) mem_tag_hind=" (Default)" ;;
       3) mem_tag_off=" (Default)" ;;
@@ -4802,6 +4777,32 @@ main() {
       2) memory_mode="hindsight" ;;
       3) memory_mode="off" ;;
     esac
+    # Not unconditional, which is what it used to be. When nothing stated a
+    # memory mode, resolve_shared_defaults has already put DEFAULT_MEMORY
+    # (`file`) into PARAM_MEMORY, so the seed above is 1 and the "(Default)" tag
+    # sits on the file store because of a project-wide default, not because this
+    # install chose it. prompt_menu returns that same 1 for a bare enter, so
+    # marking it explicit turns "the operator said nothing" into "the operator
+    # chose file" -- and that skips live_hindsight_state in the generator, which
+    # is the whole of what stands between a Hindsight install whose install.env
+    # predates the MEMORY key and an apply that deletes hindsight-postgresql and
+    # its database. That is the population the retirement of vars.sh created:
+    # before it, a pre-0.4.0 checkout seeded this prompt on option 2 from the
+    # MEMORY_PROVIDER that file carried, so enter kept Hindsight.
+    #
+    # Moving off the seeded option is a statement, and so is an install.env or
+    # --memory that set PARAM_MEMORY_EXPLICIT before the interview. What is left
+    # -- accepting the seed when nothing seeded it -- is deliberately read as
+    # "no answer" and handed to the probe. A typed "1" is indistinguishable from
+    # enter here (prompt_menu returns the number either way), so it is read the
+    # same: on a cluster running Hindsight the generator then preserves it and
+    # says so, and the pre-flight summary shows the store the apply will keep
+    # before anything is applied. Losing an argument with the operator that way
+    # costs one re-run with --memory=file; losing it the other way costs the
+    # database.
+    if [ "$PARAM_MEMORY_EXPLICIT" = "true" ] || [ "$memory_choice" != "$memory_seed_choice" ]; then
+      PARAM_MEMORY_EXPLICIT="true"
+    fi
   fi
 
   # bootstrap_install_env_file records PARAM_MEMORY, not this local, so the
@@ -4821,7 +4822,7 @@ main() {
   # alongside whichever provider is chosen — two competing stores in front of one
   # agent. Every provider here replaces it rather than supplementing it. Nothing
   # about memory keys off this flag, so an upgrade cannot read a false left in an
-  # old vars.sh as "this install wanted no memory".
+  # old install.env as "this install wanted no memory".
   #
   # `none` rather than an empty string: the choice has to survive the trip
   # through the CR, and an absent provider takes the CRD default. The operator
@@ -4832,14 +4833,16 @@ main() {
   # install to ask (the CRD default, common.sh, and both profiles' config.yaml),
   # and `file` is what an install that says nothing about memory gets — the same
   # store those installs already had before the searchable one existed.
+  # When PARAM_MEMORY_EXPLICIT is false (--non-interactive with neither
+  # install.env nor --memory), leave MEMORY_PROVIDER empty when calling
+  # write_tfvars_from_state so the generator can preserve a live Hindsight
+  # deployment on an existing cluster before falling back to multiuser_memory.
   local memory_enabled="false"
-  # memory_provider_from_mode (installer_common.sh) owns the mode → provider
-  # table; upgrade.sh and the Day-2 menu resolve the same pair through it, and a
-  # second copy here is how the three drift. It returns empty for a mode it does
-  # not recognise, which is what the fallback covers.
-  local memory_provider
-  memory_provider="$(memory_provider_from_mode "$memory_mode")"
-  [ -n "$memory_provider" ] || memory_provider="$DEFAULT_MEMORY_PROVIDER"
+  local memory_provider=""
+  if [ "$PARAM_MEMORY_EXPLICIT" = "true" ]; then
+    memory_provider="$(memory_provider_from_mode "$memory_mode")"
+    [ -n "$memory_provider" ] || memory_provider="$DEFAULT_MEMORY_PROVIDER"
+  fi
 
   print_step "10. Resolving Install Configuration"
   local registry_prefix="${PARAM_REGISTRY_PREFIX%/}"
@@ -4958,8 +4961,31 @@ main() {
   # install.sh is the one front door allowed to mint an API_SERVER_KEY, and only
   # after the generator has tried the live Secret. upgrade.sh and uninstall.sh
   # leave this unset so an unfindable key stays an error for them.
+  #
+  # KUBE_AGENTS_REQUIRE_MEMORY_ANSWER: "could not tell whether the cluster runs
+  # Hindsight" has to stop this run rather than fall through to multiuser_memory
+  # and let an apply delete the database. Unconditional, including under
+  # --dry-run and --generate-only, because both of those write this same
+  # tfvars_file in the real composition directory and --generate-only exists
+  # precisely to hand it to `lifecycle.sh apply` -- so a guess here is applied
+  # either way, just later and by someone who did not see the run that made it.
+  # That is why this does not take the warn-under---dry-run shape the coordinate
+  # checks use: those refuse before writing anything.
+  #
+  # Only reachable when nothing stated a memory mode -- PARAM_MEMORY_EXPLICIT is
+  # false, which left MEMORY_PROVIDER empty above -- and never on a cluster that
+  # does not exist yet. uninstall.sh deliberately does not opt in.
   KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
+    KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
     write_tfvars_from_state "$tfvars_file" "$image_tag"
+  if [ "$PARAM_MEMORY_EXPLICIT" != "true" ]; then
+    memory_provider="${MEMORY_PROVIDER:-$DEFAULT_MEMORY_PROVIDER}"
+    export MEMORY_PROVIDER="$memory_provider"
+    if [ "$memory_provider" = "kube_agents_memory" ]; then
+      memory_mode="hindsight"
+      PARAM_MEMORY="hindsight"
+    fi
+  fi
   # After the generator, because its Secret-recovery loop is the thing that can
   # still supply the tokens; before the apply, because a relay without them
   # CrashLoops.

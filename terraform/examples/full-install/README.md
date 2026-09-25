@@ -135,7 +135,8 @@ adopts the Cloud KMS resources GCP refuses to delete, which a bare
 The composition ships no backend block, so a hand-driven apply uses local
 state in this directory. For an install whose state must outlive the checkout
 — anything driven by `install.sh`, whose companion `uninstall.sh` and
-`upgrade.sh` run from fresh clones — set `KUBE_AGENTS_STATE_BUCKET` before any
+`upgrade.sh` may run from a fresh clone, a release bundle, or the install
+checkout in `$HOME/kube-agents` — set `KUBE_AGENTS_STATE_BUCKET` before any
 `lifecycle.sh` subcommand:
 
 ```bash

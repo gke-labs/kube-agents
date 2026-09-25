@@ -24,18 +24,17 @@ should set `KUBE_AGENTS_LEASE_SESSION`; the parent-pid fallback is stable only
 within one shell.
 
 Which installs are protected is discovered, never hardcoded: the checkout's
-`install.env` records the install it is pointed at (and a legacy
-`k8s-operator/scripts/vars.sh` still counts, so a checkout from before the
-change stays protected), and `$KUBE_AGENTS_LIVE_TEST_ENVS` (default
+`install.env` records the install it is pointed at, and
+`$KUBE_AGENTS_LIVE_TEST_ENVS` (default
 `$XDG_CONFIG_HOME/kube-agents/live-test-envs.json`, falling back to `~/.config`,
 see `scripts/live_test_envs.example.json`) adds installs you protect but have no
 checkout for. With neither present nothing is protected and the hook is a no-op.
 
 This file is the source of truth for which commands count as mutations and for
 which configuration keys are read; `admin_console/project_config.py` parses the
-same files for a different purpose, and both must be updated if the on-disk
-format changes. Both accept `K=V` and `export K=V`, because install.env is a
-hand-authored dotenv and vars.sh was generated with `printf %q`.
+same file for a different purpose, and both must be updated if the on-disk
+format changes. Both accept `K=V` and `export K=V`: install.env is a
+hand-authored dotenv, and a hand may well write `export`.
 
 Usage:
   live_test_lease.py status  [--env NAME] [--json]
@@ -111,8 +110,8 @@ SESSION_CONTINUES = frozenset({"clear", "resume"})
 # of truth: DEFAULT_NAMESPACE in install.defaults.env.
 DEFAULT_NAMESPACE = "kubeagents-system"
 
-# Only these keys are read out of an install's configuration. Both files are
-# mode-600 and hold credentials as well as coordinates, and neither is ever
+# Only these keys are read out of an install's configuration. The file is
+# mode-600 and holds credentials as well as coordinates, and is never
 # sourced -- sourcing a file to read a handful of variables out of it executes
 # everything else in there. No ZONE: the installer writes REGION for every
 # install (installer_common.sh), and a zonal location would derive an Artifact
@@ -123,11 +122,10 @@ DEFAULT_NAMESPACE = "kubeagents-system"
 VARS_KEYS = ("PROJECT_ID", "CLUSTER_NAME", "REGION", "NAMESPACE",
              "REGISTRY_PREFIX", "CHAT_TOPIC_NAME")
 
-# The two files an install's configuration can live in, relative to a checkout
-# root. install.env is the hand-authored input; vars.sh is the generated state
-# it replaced, still read so a checkout from before the change stays protected.
+# Where an install's configuration lives, relative to a checkout root.
+# install.env is the hand-authored input every front door reads; the generated
+# state file it replaced is gone, and so is the code that read it.
 INSTALL_ENV_RELPATH = ("install.env",)
-VARS_SH_RELPATH = ("k8s-operator", "scripts", "vars.sh")
 
 
 def state_dir():
@@ -250,7 +248,7 @@ _REFERENCE = re.compile(
 def _expand(value, scope):
     """Substitute `$VAR` and `${VAR}` from keys the file has already set.
 
-    The installers load these files with `set -a; . install.env; set +a`, and
+    The installers load the file with `set -a; . install.env; set +a`, and
     install.env.example advertises shell syntax -- so `CLUSTER_NAME=${PROJECT_ID}-host`
     is legal and the installers resolve it. Reading it literally instead is the
     silent failure this guard exists to prevent: the context below becomes
@@ -264,7 +262,7 @@ def _expand(value, scope):
     expand from its own environment and from any other assignment in the file;
     both are deliberate. Reading the environment would make protection depend on
     the shell a command happened to run in, and keeping non-allowlisted values
-    out of `scope` keeps the API keys and tokens these files also hold out of
+    out of `scope` keeps the API keys and tokens the file also holds out of
     this function entirely.
 
     A reference `scope` cannot resolve is left as written rather than dropped:
@@ -274,34 +272,31 @@ def _expand(value, scope):
     protection at all.
 
     `admin_console/project_config.py` carries the same expansion for the same
-    files; change both together.
+    file; change both together.
     """
     return _REFERENCE.sub(
         lambda m: scope.get(m.group(1) or m.group(2), m.group(0)), value
     )
 
 
-def _parse_install_state(text, scope=None):
+def _parse_install_state(text):
     """The allowlisted coordinates out of an install configuration, unquoted.
 
-    Accepts both spellings, because the two files differ: vars.sh is generated
-    with `printf %q` and carries `export K=V`, while install.env is a
-    hand-authored `K=V` dotenv. A parser that insisted on `export` would read
-    nothing out of install.env and report the install as unprotected -- silently,
-    which is the failure mode this whole guard exists to prevent.
+    Accepts `K=V` and `export K=V` alike. install.env is a hand-authored
+    dotenv, and a hand may well write `export`; a parser that insisted on it
+    would read nothing out of the usual file and report the install as
+    unprotected -- silently, which is the failure mode this whole guard exists
+    to prevent.
 
     A plain identifier arrives bare and anything else arrives quoted. shlex
     unquotes both; a value it cannot parse is dropped rather than guessed at.
 
     Lines are read in order and a later assignment to the same key wins, as it
     would when the shell sources the file. `scope` accumulates across the call
-    so a later assignment can reference an earlier one; pass the same dict for
-    vars.sh and install.env to let the second reference the first, matching the
-    order the front doors source them in.
+    so a later assignment can reference an earlier one.
     """
     found = {}
-    if scope is None:
-        scope = {}
+    scope = {}
     for line in text.splitlines():
         match = _ASSIGNMENT.match(line)
         if not match:
@@ -322,8 +317,8 @@ def _parse_install_state(text, scope=None):
     return found
 
 
-def find_install_state(cwd):
-    """(install_env, vars_sh) for the checkout governing `cwd`; either may be None.
+def find_install_env(cwd):
+    """The `install.env` of the checkout governing `cwd`, or None.
 
     Walks up because commands run from anywhere in the checkout, and the
     installers act on the install the configuration names whatever the working
@@ -334,60 +329,39 @@ def find_install_state(cwd):
     is already seven down -- into silently unprotected, which is
     indistinguishable from the intended "nothing configured" state.
 
-    Both files are returned from the FIRST level that has either, rather than
-    each being searched independently: a checkout mid-migration has both, and
-    they describe one install. Taking install.env from one level and a vars.sh
-    from a parent checkout would invent a third.
+    Callers use the returned path as the install's identity, so it must be
+    stable for a given checkout.
     """
     if not cwd:
-        return (None, None)
+        return None
     path = os.path.abspath(cwd)
     while True:
         install_env = os.path.join(path, *INSTALL_ENV_RELPATH)
-        vars_sh = os.path.join(path, *VARS_SH_RELPATH)
-        has_env = os.path.isfile(install_env)
-        has_vars = os.path.isfile(vars_sh)
-        if has_env or has_vars:
-            return (install_env if has_env else None,
-                    vars_sh if has_vars else None)
+        if os.path.isfile(install_env):
+            return install_env
         parent = os.path.dirname(path)
         if parent == path:
-            return (None, None)
+            return None
         path = parent
 
 
-def find_vars_sh(cwd):
-    """The single path that names the install governing `cwd`, or None.
-
-    install.env when there is one, since it is the input and wins on every key.
-    Callers use this as the install's identity, so it must be stable for a
-    given checkout rather than switching between the two files.
-    """
-    install_env, vars_sh = find_install_state(cwd)
-    return install_env or vars_sh
-
-
-def _read_install_state(path, scope=None):
+def _read_install_state(path):
     if not path:
         return {}
     try:
         with open(path) as fh:
-            return _parse_install_state(fh.read(), scope)
+            return _parse_install_state(fh.read())
     except OSError:
         return {}
 
 
-def _install_from_state(install_env, vars_sh):
-    """One Install merged from whichever of the two files exist.
+def _install_from_state(install_env):
+    """One Install read out of a checkout's `install.env`, or None.
 
-    vars.sh first, install.env over the top: the hand-authored input wins,
-    matching the order every shell front door loads them in. The two share one
-    expansion scope for the same reason, so a `$VAR` in install.env can name a
-    key vars.sh set.
+    Assignments are read in order into a single expansion scope, so a later
+    `$VAR` can name a key an earlier line set, as sourcing the file would.
     """
-    scope = {}
-    fields = _read_install_state(vars_sh, scope)
-    fields.update(_read_install_state(install_env, scope))
+    fields = _read_install_state(install_env)
     if not fields:
         return None
     project = fields.get("PROJECT_ID")
@@ -403,7 +377,7 @@ def _install_from_state(install_env, vars_sh):
         namespace=fields.get("NAMESPACE") or DEFAULT_NAMESPACE,
         registry=fields.get("REGISTRY_PREFIX"),
         markers=markers,
-        source=install_env or vars_sh,
+        source=install_env,
     )
 
 
@@ -458,8 +432,7 @@ def resolve_installs(cwd=None, also=None):
     installs, by_context = {}, {}
     discovered = []
     for where in (cwd or os.environ.get("CLAUDE_CWD") or os.getcwd(), also):
-        install_env, vars_sh = find_install_state(where) if where else (None, None)
-        found = _install_from_state(install_env, vars_sh)
+        found = _install_from_state(find_install_env(where)) if where else None
         if found:
             discovered.append(found)
     for install in discovered + _installs_from_config():
@@ -1373,7 +1346,7 @@ def current_context_install(installs, kubeconfig=None):
     return answer
 
 
-def install_from_vars_sh(installs, cwd):
+def install_from_install_env(installs, cwd):
     """Which protected install a checkout's installers are pointed at.
 
     The installers read the checkout's `install.env` and act on the install it
@@ -1385,14 +1358,13 @@ def install_from_vars_sh(installs, cwd):
     `install_from_markers` exists to resolve, on the one path that already
     knows the answer exactly.
     """
-    install_env, vars_sh = find_install_state(cwd)
-    path = install_env or vars_sh
+    path = find_install_env(cwd)
     if not path:
         return None
     for install in installs.values():
         if install.source == path:
             return install
-    derived = _install_from_state(install_env, vars_sh)
+    derived = _install_from_state(path)
     if not derived:
         return None
     return install_for_context(installs, derived.context)
@@ -1633,7 +1605,7 @@ def classify(command, installs, cwd=None, _depth=0):
         # thing the installer does, so `terraform apply` there is an install.
         if binary in ("terraform", "tofu"):
             if positional(args) in TERRAFORM_MUTATING:
-                target = (marker or line_marker or install_from_vars_sh(installs, cwd)
+                target = (marker or line_marker or install_from_install_env(installs, cwd)
                           or current_context_install(installs, ambient_kubeconfig))
                 if target:
                     return target, "terraform %s" % positional(args)
@@ -1651,7 +1623,7 @@ def classify(command, installs, cwd=None, _depth=0):
                 if target:
                     return target, "agent plugin installer (%s)" % hit
                 continue
-            target = marker or line_marker or install_from_vars_sh(installs, cwd)
+            target = marker or line_marker or install_from_install_env(installs, cwd)
             if not target:
                 # None here means "resolved, and it is not a protected
                 # install" -- a real answer, not a shrug. Only UNKNOWN is a
@@ -1935,8 +1907,7 @@ def main():
         installs.setdefault(name, install)
     if not installs:
         print("No protected install found. This checkout has no install.env "
-              "(nor a legacy k8s-operator/scripts/vars.sh) and %s does not "
-              "list one." % config_path(), file=sys.stderr)
+              "and %s does not list one." % config_path(), file=sys.stderr)
         return 2
 
     try:

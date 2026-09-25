@@ -153,6 +153,7 @@ class InstallerCommonTest(unittest.TestCase):
         kms_versions="",
         sa_describe_stub="exit 1",
         gcloud_stderr=None,
+        gcloud_extra_cases="",
         get_credentials_stub=None,
     ):
         """Source installer_common.sh with print stubs and run `script`.
@@ -161,6 +162,10 @@ class InstallerCommonTest(unittest.TestCase):
         `gcloud_exit` for `storage cat` calls on the state object;
         `clusters describe` runs `describe_stub` (default: exit 1, meaning
         the cluster does not exist).
+
+        `gcloud_extra_cases` is spliced in ahead of those arms, for the
+        subcommands the default stub does not model — `get-credentials` and
+        its `--help` probe.
         """
         # A failing `storage cat` with no stderr of its own reads as "absent":
         # that is what every pre-existing caller meant by gcloud_exit=1, and
@@ -185,6 +190,7 @@ class InstallerCommonTest(unittest.TestCase):
             gcloud.write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
+                f"{gcloud_extra_cases}"
                 f"  *\"clusters describe\"*) {describe_stub} ;;\n"
                 f"{get_cred_case}"
                 f"  *\"keys versions list\"*) printf '%s' '{kms_versions}'; exit 0 ;;\n"
@@ -194,6 +200,7 @@ class InstallerCommonTest(unittest.TestCase):
                 f"[ -f '{state_file}' ] && cat '{state_file}'\n"
                 f"exit {gcloud_exit}\n"
             )
+
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
             # Hermetic kubectl: the generator recovers credentials from the
             # live Secret when it can, and a developer's real kube context
@@ -206,6 +213,10 @@ class InstallerCommonTest(unittest.TestCase):
                     "PROJECT_ID": "test-project",
                     "CLUSTER_NAME": "test-cluster",
                     "REGION": "us-central1",
+                    # The generator reads both as ${VAR:-}, so empty is unset;
+                    # a developer's exported memory mode must not steer a test.
+                    "MEMORY": "",
+                    "MEMORY_PROVIDER": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -956,7 +967,7 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('agent_runtime_class        = ""', content)
 
     def test_tfvars_unset_gvisor_skips_the_autopilot_floor(self):
-        # uninstall.sh treats vars.sh as optional -- the documented
+        # uninstall.sh treats install.env as optional -- the documented
         # `curl ... | bash` teardown runs from a fresh clone that has none --
         # and calls this bare under `set -e` before lifecycle.sh destroy. If an
         # unset ENABLE_GVISOR defaulted on, the floor check would abort the
@@ -1021,6 +1032,297 @@ class InstallerCommonTest(unittest.TestCase):
             'memory_provider          = "multiuser_memory"',
             self._tfvars(env={"API_SERVER_KEY": "k"}),
         )
+
+    # `kubectl get … --ignore-not-found -o name` prints the object's own
+    # name when it is there and nothing at all when the API server says it
+    # is not, which is how the probe tells the two apart. Exiting 0 in
+    # silence, as this stub used to, is the *absent* answer.
+    _HINDSIGHT_KUBECTL = (
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        '  *"current-context"*) echo "gke_test-project_us-central1_test-cluster"; exit 0 ;;\n'
+        '  *"get statefulset hindsight-postgresql"*"--context gke_test-project_us-central1_test-cluster"*)\n'
+        '    echo "statefulset.apps/hindsight-postgresql"; exit 0 ;;\n'
+        "esac\n"
+        "exit 1\n"
+    )
+
+    def test_memory_provider_preserves_live_hindsight_on_existing_cluster_when_unspecified(self):
+        """When neither MEMORY nor MEMORY_PROVIDER is set (e.g., a non-interactive
+        re-install without install.env or --memory), write_tfvars_from_state probes
+        the live cluster and preserves kube_agents_memory if Hindsight is deployed,
+        while still respecting an explicit MEMORY=file override."""
+        hindsight_kubectl = self._HINDSIGHT_KUBECTL
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$? provider=${{MEMORY_PROVIDER:-}}"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf 'True\\n'; exit 0",
+                kubectl_script=hindsight_kubectl,
+            )
+            self.assertIn("rc=0 provider=kube_agents_memory", proc.stdout, proc.stderr)
+            self.assertIn('memory_provider          = "kube_agents_memory"', dest.read_text())
+
+            # An explicit MEMORY=file (--memory=file or install.env) still wins.
+            proc_explicit = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$? provider=${{MEMORY_PROVIDER:-}}"',
+                env={"API_SERVER_KEY": "k", "MEMORY": "file"},
+                describe_stub="printf 'True\\n'; exit 0",
+                kubectl_script=hindsight_kubectl,
+            )
+            self.assertIn("rc=0", proc_explicit.stdout, proc_explicit.stderr)
+            self.assertIn('memory_provider          = "multiuser_memory"', dest.read_text())
+
+    def test_found_hindsight_is_called_preserved_only_to_a_caller_that_applies(self):
+        """The found arm is said per caller, as the could-not-ask arm is.
+
+        install.sh and upgrade.sh opt in and apply next, so "preserved … to
+        replace it" is true for them. uninstall.sh does not opt in and runs
+        lifecycle.sh destroy straight after generating, so telling it the
+        database is kept would be false; it gets the same provider with a
+        statement that holds for a teardown too.
+        """
+        for label, extra_env, expected, forbidden in (
+            ("applier", {"KUBE_AGENTS_REQUIRE_MEMORY_ANSWER": "true"}, "so it is preserved", None),
+            ("teardown", {}, "to match the live install", "preserved"),
+        ):
+            with self.subTest(caller=label), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    'print_info() { echo "INFO: $*" >&2; }; '
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env={"API_SERVER_KEY": "k", **extra_env},
+                    describe_stub="printf 'True\\n'; exit 0",
+                    kubectl_script=self._HINDSIGHT_KUBECTL,
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn('memory_provider          = "kube_agents_memory"', dest.read_text())
+                self.assertIn("This cluster runs the Hindsight memory store", proc.stderr)
+                self.assertIn(expected, proc.stderr)
+                if forbidden:
+                    self.assertNotIn(forbidden, proc.stderr)
+
+    # ── the live Hindsight probe: found / confirmed absent / could not ask ───
+    #
+    # The third outcome is the point of these. Reading "could not ask" as
+    # "not deployed" writes memory_provider = "multiuser_memory" and the apply
+    # deletes hindsight-postgresql and the volume holding the database.
+
+    # What gke_context_name() builds from _run's exported coordinates.
+    _THIS_CLUSTERS_CONTEXT = "gke_test-project_us-central1_test-cluster"
+
+    def _kubectl_that_cannot_answer(self):
+        """kubectl is pointed at this cluster but its reads fail for a reason
+        that is not NotFound — the shape of an expired credential, a 403, a
+        missing auth plugin, or an API server that times out."""
+        return (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            f'  *"current-context"*) echo "{self._THIS_CLUSTERS_CONTEXT}"; exit 0 ;;\n'
+            "esac\n"
+            'echo "Unable to connect to the server: dial tcp 10.0.0.2:443: i/o timeout" >&2\n'
+            "exit 1\n"
+        )
+
+    def _kubectl_that_says_not_found(self):
+        """kubectl is pointed at this cluster and the API server answers
+        NotFound for both objects — a real, trustworthy absence."""
+        return (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            f'  *"current-context"*) echo "{self._THIS_CLUSTERS_CONTEXT}"; exit 0 ;;\n'
+            "esac\n"
+            'echo "Error from server (NotFound): the server could not find the requested resource" >&2\n'
+            "exit 1\n"
+        )
+
+    def test_memory_probe_refuses_an_applying_caller_when_the_cluster_cannot_be_asked(self):
+        """A kubectl failure that is not NotFound must stop install.sh and
+        upgrade.sh rather than default to multiuser_memory."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_info() { echo "INFO: $*" >&2; }; '
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "KUBE_AGENTS_REQUIRE_MEMORY_ANSWER": "true"},
+                describe_stub="printf 'True\\n'; exit 0",
+                kubectl_script=self._kubectl_that_cannot_answer(),
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("Cannot tell whether this cluster runs the Hindsight", proc.stderr)
+            # The reason reaches the operator, not just the verdict.
+            self.assertIn("i/o timeout", proc.stderr)
+            # The remedy has to work for whoever hit it: upgrade.sh has no
+            # --memory flag, so recording MEMORY is what gets named first.
+            self.assertIn("MEMORY=hindsight|file|off", proc.stderr)
+            # And nothing was written: a refusal that leaves tfvars behind is a
+            # refusal the next run reads as configuration.
+            self.assertFalse(dest.exists(), proc.stderr)
+
+    def test_memory_probe_warns_rather_than_refuses_for_a_caller_that_did_not_opt_in(self):
+        """uninstall.sh does not opt in: a destroy removes the store either
+        way, and an install has to keep a working way to remove itself."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*" >&2; }; '
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf 'True\\n'; exit 0",
+                kubectl_script=self._kubectl_that_cannot_answer(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("Could not tell whether this cluster runs the Hindsight", proc.stderr)
+            self.assertIn('memory_provider          = "multiuser_memory"', dest.read_text())
+
+    def test_memory_probe_takes_a_definite_no_on_both_objects_as_a_real_absence(self):
+        """The one answer that does mean "no Hindsight here" still defaults,
+        and does it quietly — otherwise every ordinary install warns.
+
+        Two shapes, because --ignore-not-found changed which one is common: a
+        current kubectl exits 0 and prints nothing, while the API server's own
+        "Error from server (NotFound)" still arrives from older builds and for
+        a namespace that does not exist, where --ignore-not-found does not
+        apply. Both are the server having answered; neither may warn."""
+        shapes = {
+            "silent under --ignore-not-found": (
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"current-context"*) echo "{self._THIS_CLUSTERS_CONTEXT}"; exit 0 ;;\n'
+                "esac\n"
+                "exit 0\n"
+            ),
+            "Error from server (NotFound)": self._kubectl_that_says_not_found(),
+        }
+        for shape, kubectl_script in shapes.items():
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    'print_warning() { echo "WARN: $*" >&2; }; '
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env={"API_SERVER_KEY": "k", "KUBE_AGENTS_REQUIRE_MEMORY_ANSWER": "true"},
+                    describe_stub="printf 'True\\n'; exit 0",
+                    kubectl_script=kubectl_script,
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertNotIn("Hindsight", proc.stderr)
+                self.assertIn('memory_provider          = "multiuser_memory"', dest.read_text())
+
+    def test_memory_probe_is_not_fooled_by_a_failure_that_merely_says_not_found(self):
+        """The regression this probe exists for. A workstation without the GKE
+        auth plugin fails with "executable gke-gcloud-auth-plugin not found" —
+        no API server was reached at all, but a substring match for "not found"
+        scores the whole cluster as having no Hindsight and the apply deletes
+        the database. Only the API server's own "Error from server (NotFound)"
+        is an absence."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            no_auth_plugin = (
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"current-context"*) echo "{self._THIS_CLUSTERS_CONTEXT}"; exit 0 ;;\n'
+                "esac\n"
+                'echo "Unable to connect to the server: getting credentials: exec: '
+                'executable gke-gcloud-auth-plugin not found" >&2\n'
+                "exit 1\n"
+            )
+            proc = self._run(
+                'print_info() { echo "INFO: $*" >&2; }; '
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "KUBE_AGENTS_REQUIRE_MEMORY_ANSWER": "true"},
+                describe_stub="printf 'True\\n'; exit 0",
+                kubectl_script=no_auth_plugin,
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("Cannot tell whether this cluster runs the Hindsight", proc.stderr)
+            self.assertIn("gke-gcloud-auth-plugin", proc.stderr)
+            self.assertFalse(dest.exists(), proc.stderr)
+
+    def test_memory_probe_does_not_run_at_all_for_a_cluster_that_does_not_exist(self):
+        """A first install has nothing to preserve, and must not be stopped by
+        a question about a cluster that is not there yet."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "KUBE_AGENTS_REQUIRE_MEMORY_ANSWER": "true"},
+                kubectl_script=self._kubectl_that_cannot_answer(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('memory_provider          = "multiuser_memory"', dest.read_text())
+
+    def test_memory_probe_fetches_credentials_for_a_terraform_managed_cluster(self):
+        """The `get-credentials` gate in write_tfvars_from_state is `cluster_exists = "true"`,
+        not `create_cluster = "false"`.
+
+        On a Terraform-managed cluster (`gcloud_stdout=MANAGED_CLUSTER_STATE`,
+        so `create_cluster = "true"` and `cluster_exists = "true"`), an
+        adoption-only gate (`create_cluster = "false"`) skips `get-credentials`
+        and leaves `live_hindsight_state` without a kubeconfig context for the
+        cluster it needs to probe. Here `kubectl config current-context` only
+        reports the cluster's context after `gcloud container clusters
+        get-credentials` has actually run.
+        """
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            cred_marker = pathlib.Path(out_dir) / "credentials.fetched"
+            extra_cases = (
+                f'  *"get-credentials --help"*) exit 0 ;;\n'
+                f'  *"get-credentials"*) : > "{cred_marker}"; exit 0 ;;\n'
+            )
+            kubectl_requiring_get_credentials = (
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"current-context"*) [ -f "{cred_marker}" ] && echo "{self._THIS_CLUSTERS_CONTEXT}"; exit 0 ;;\n'
+                '  *"statefulset hindsight-postgresql"*) echo "statefulset.apps/hindsight-postgresql"; exit 0 ;;\n'
+                "esac\n"
+                "exit 1\n"
+            )
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "KUBE_AGENTS_REQUIRE_MEMORY_ANSWER": "true"},
+                gcloud_stdout=MANAGED_CLUSTER_STATE,
+                describe_stub="printf 'True\\n'; exit 0",
+                gcloud_extra_cases=extra_cases,
+                kubectl_script=kubectl_requiring_get_credentials,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertTrue(cred_marker.exists(), "get-credentials was not called for a Terraform-managed cluster")
+            tfvars = dest.read_text()
+            self.assertIn("create_cluster             = true", tfvars)
+            self.assertIn('memory_provider          = "kube_agents_memory"', tfvars)
+
+    def test_the_generators_credentials_fetch_asks_for_the_dns_endpoint(self):
+        """Without --dns-endpoint the fetch fails on a DNS-endpoint-only
+        cluster, the context gate misses, and every check that gate protects is
+        skipped against a cluster `terraform apply` reaches fine."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            recorded = pathlib.Path(out_dir) / "get-credentials.args"
+            # A gcloud that supports the flag, and a cluster publishing a DNS
+            # endpoint that accepts external traffic. `describe` answers on the
+            # --format it is given, as the real one does.
+            extra_cases = (
+                f'  *"get-credentials --help"*) echo "  --dns-endpoint"; exit 0 ;;\n'
+                f'  *"get-credentials"*) printf \'%s\\n\' "$*" >> "{recorded}"; exit 0 ;;\n'
+            )
+            describe_stub = (
+                'case "$*" in\n'
+                "  *dnsEndpointConfig*) printf 'gke-abc.us-central1.gke.goog\\tTrue\\n'; exit 0 ;;\n"
+                "esac\n"
+                "printf 'True\\n'; exit 0"
+            )
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "MEMORY": "file"},
+                describe_stub=describe_stub,
+                gcloud_extra_cases=extra_cases,
+                kubectl_script=self._kubectl_that_says_not_found(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertTrue(recorded.exists(), f"get-credentials never ran: {proc.stderr}")
+            self.assertIn("--dns-endpoint", recorded.read_text())
 
     def test_tfvars_autopilot_floor_names_a_way_out_for_every_caller(self):
         # The abort's remedy has to work for whoever hit it. --enable-gvisor=false is
@@ -1591,16 +1893,17 @@ class InstallDefaultsFileTest(unittest.TestCase):
 
 
 class NormalizeMemoryVarsTest(unittest.TestCase):
-    """install.env's MEMORY must beat a migrated vars.sh's MEMORY_PROVIDER.
+    """install.env's MEMORY must beat an inherited MEMORY_PROVIDER.
 
-    The two files spell the setting differently, so the load order that gives
-    install.env the last word on every other key cannot do it for this one. The
-    pre-install.env installer wrote `export MEMORY_PROVIDER=...` into vars.sh
-    and every migrated install still has it; install.sh's migration writes only
-    MEMORY. write_tfvars_from_state prefers MEMORY_PROVIDER, so without the
-    normalizer the stale provider won and an upgrade regenerated the tfvars
-    against the old store -- the apply then deleting the Hindsight API and its
-    Postgres. #1060 item 5, on the front doors install.sh does not cover.
+    The input and the generator spell the setting differently, so the load
+    order that gives install.env the last word on every other key cannot do it
+    for this one. MEMORY_PROVIDER still reaches a run from the environment --
+    a CI job, a dev shell that sourced scripts/installer/vars.sh, or an
+    install.env that carries both -- and write_tfvars_from_state prefers it, so
+    without the normalizer the inherited provider wins and an upgrade
+    regenerates the tfvars against the wrong store, the apply then deleting the
+    Hindsight API and its Postgres. #1060 item 5, on the front doors install.sh
+    does not cover.
     """
 
     _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
@@ -1616,8 +1919,8 @@ class NormalizeMemoryVarsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc.stdout.strip()
 
-    def test_the_install_env_mode_overrides_a_legacy_provider(self):
-        """A legacy vars.sh says the file store, the operator's install.env says
+    def test_the_install_env_mode_overrides_an_inherited_provider(self):
+        """The environment says the file store, the operator's install.env says
         Hindsight, and the generated provider must be Hindsight's."""
         self.assertEqual(
             "P=kube_agents_memory",
@@ -1637,8 +1940,8 @@ class NormalizeMemoryVarsTest(unittest.TestCase):
                 )
 
     def test_nothing_recorded_leaves_the_provider_alone(self):
-        """An install that never carried MEMORY -- a vars.sh-only install that
-        has not been migrated yet -- must keep the provider it has."""
+        """An install whose configuration never carried MEMORY must keep the
+        provider it was given."""
         self.assertEqual(
             "P=kube_agents_memory",
             self._normalize('MEMORY_PROVIDER=kube_agents_memory'),
@@ -1653,21 +1956,29 @@ class NormalizeMemoryVarsTest(unittest.TestCase):
             self._normalize('MEMORY_PROVIDER=kube_agents_memory\nMEMORY=hindsigt'),
         )
 
-    def test_the_front_doors_that_load_both_files_call_it(self):
-        """upgrade.sh, uninstall.sh and install.sh's Day-2 menu each source a
-        legacy vars.sh and then load install.env over it, and each generates
+    def test_the_front_doors_that_generate_tfvars_call_it(self):
+        """upgrade.sh, uninstall.sh and install.sh's Day-2 menu each load
+        install.env into an environment they did not clear, and each generates
         tfvars without passing through install.sh's parameter block. A caller
-        that loads both and skips the normalizer has the defect back."""
+        that skips the normalizer has the defect back."""
         for name in ("upgrade.sh", "uninstall.sh", "install.sh"):
             with self.subTest(name=name):
                 self.assertIn(
                     "normalize_memory_vars",
                     (_REPO_ROOT / name).read_text(),
-                    f"{name} loads vars.sh and install.env; it must normalize the pair",
+                    f"{name} generates tfvars outside install.sh's parameter "
+                    "block; it must normalize MEMORY against MEMORY_PROVIDER",
                 )
 
 
 class HelmReleaseSelfHealingTest(unittest.TestCase):
+    # Appended to an ensure_clean_helm_release call: reports the flag
+    # upgrade.sh's restore_moved_checkout reads to say "after repairing the
+    # pending Helm release" instead of "Nothing was applied", and keeps the
+    # function's own exit code. test_upgrade_script.py sets the flag by hand to
+    # pin that reader; these pin the writer, at each arm that repairs.
+    _REPORT_REPAIRED = '; rc=$?; echo "REPAIRED=[${HELM_RELEASE_REPAIRED:-}]"; exit "$rc"'
+
     def _run_helm_test(self, script, helm_script, env_overrides=None, extra_bins=None):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -1707,9 +2018,13 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
             'echo "unexpected helm call: $*" >&2\n'
             'exit 1\n'
         )
-        proc = self._run_helm_test('ensure_clean_helm_release kube-agents kubeagents-system', helm_script)
+        proc = self._run_helm_test(
+            'ensure_clean_helm_release kube-agents kubeagents-system' + self._REPORT_REPAIRED,
+            helm_script,
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("Rolling back", proc.stderr)
+        self.assertIn("REPAIRED=[]", proc.stdout, proc.stderr)
 
     def test_missing_release_does_not_fire_err_trap(self):
         # A first install onto an existing cluster: `helm status` exits 1
@@ -1870,10 +2185,15 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
             '  *) echo "unexpected helm call: $*" >&2; exit 1 ;;\n'
             'esac\n'
         )
-        proc = self._run_helm_test('ensure_clean_helm_release kube-agents kubeagents-system', helm_script)
+        proc = self._run_helm_test(
+            'ensure_clean_helm_release kube-agents kubeagents-system' + self._REPORT_REPAIRED,
+            helm_script,
+        )
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("Automatic uninstall is blocked", proc.stderr)
         self.assertNotIn("UNINSTALL EXECUTED", proc.stderr)
+        # A refusal repaired nothing, and must not claim to have.
+        self.assertIn("REPAIRED=[]", proc.stdout, proc.stderr)
 
     def test_pending_install_uninstalls_when_opted_in(self):
         helm_script = (
@@ -1885,12 +2205,13 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
             'esac\n'
         )
         proc = self._run_helm_test(
-            'ensure_clean_helm_release kube-agents kubeagents-system',
+            'ensure_clean_helm_release kube-agents kubeagents-system' + self._REPORT_REPAIRED,
             helm_script,
             env_overrides={"ALLOW_UNINSTALL_PENDING_RELEASE": "true"},
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Successfully cleaned up stuck pending-install release", proc.stderr)
+        self.assertIn("REPAIRED=[true]", proc.stdout, proc.stderr)
 
     def test_pending_upgrade_recovers_to_last_good_revision(self):
         helm_script = (
@@ -1902,9 +2223,13 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
             '  *) echo "unexpected helm call: $*" >&2; exit 1 ;;\n'
             'esac\n'
         )
-        proc = self._run_helm_test('ensure_clean_helm_release kube-agents kubeagents-system', helm_script)
+        proc = self._run_helm_test(
+            'ensure_clean_helm_release kube-agents kubeagents-system' + self._REPORT_REPAIRED,
+            helm_script,
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Rolling back 'kube-agents' to revision 2", proc.stderr)
+        self.assertIn("REPAIRED=[true]", proc.stdout, proc.stderr)
 
     def test_pending_upgrade_without_prior_good_revision_refuses_uninstall_by_default(self):
         helm_script = (
@@ -1916,10 +2241,15 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
             '  *) echo "unexpected helm call: $*" >&2; exit 1 ;;\n'
             'esac\n'
         )
-        proc = self._run_helm_test('ensure_clean_helm_release kube-agents kubeagents-system', helm_script)
+        proc = self._run_helm_test(
+            'ensure_clean_helm_release kube-agents kubeagents-system' + self._REPORT_REPAIRED,
+            helm_script,
+        )
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("Automatic uninstall is blocked", proc.stderr)
         self.assertNotIn("UNINSTALL EXECUTED", proc.stderr)
+        # A refusal repaired nothing, and must not claim to have.
+        self.assertIn("REPAIRED=[]", proc.stdout, proc.stderr)
 
     def test_pending_upgrade_without_prior_good_revision_uninstalls_when_opted_in(self):
         helm_script = (
@@ -1932,11 +2262,12 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
             'esac\n'
         )
         proc = self._run_helm_test(
-            'ensure_clean_helm_release kube-agents kubeagents-system',
+            'ensure_clean_helm_release kube-agents kubeagents-system' + self._REPORT_REPAIRED,
             helm_script,
             env_overrides={"ALLOW_UNINSTALL_PENDING_RELEASE": "true"},
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REPAIRED=[true]", proc.stdout, proc.stderr)
 
     def test_pending_upgrade_in_flight_waits_and_succeeds_when_deployed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2144,6 +2475,38 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
 
+class GkeDnsEndpointHelperFallbackTest(unittest.TestCase):
+    """Sourcing installer_common.sh without its gke_dns_endpoint.sh sibling."""
+
+    def test_missing_gke_dns_endpoint_helper_warns_and_installs_stub(self):
+        """When `gke_dns_endpoint.sh` is absent beside `installer_common.sh`,
+        sourcing warns on stderr and defines a stub `gke_dns_endpoint_flag`
+        that clears `GKE_DNS_ENDPOINT_FLAG` rather than aborting."""
+        with tempfile.TemporaryDirectory() as tmp:
+            isolated_common = pathlib.Path(tmp) / "installer_common.sh"
+            isolated_common.write_text(_INSTALLER_COMMON.read_text(), encoding="utf-8")
+            defaults_file = _REPO_ROOT / "install.defaults.env"
+            proc = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f'KUBE_AGENTS_INSTALL_DEFAULTS="{defaults_file}" source "{isolated_common}"\n'
+                    'GKE_DNS_ENDPOINT_FLAG="stale"\n'
+                    'gke_dns_endpoint_flag test-cluster us-central1 test-project\n'
+                    'echo "FLAG=[$GKE_DNS_ENDPOINT_FLAG]"\n',
+                ],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(),
+                cwd=tmp,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn(
+            f"Cannot find {tmp}/gke_dns_endpoint.sh; reaching clusters over their IP endpoint.",
+            proc.stderr,
+        )
+        self.assertIn("FLAG=[]", proc.stdout)
+
 
 class ToleratedProbesClearErrTrapTest(unittest.TestCase):
     """The library's tolerated probes clear the inherited ERR trap inside their $(...).
@@ -2166,6 +2529,7 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
         (_INSTALLER_COMMON, 'status_json="$(trap - ERR; helm status ', 1),
         (_INSTALLER_COMMON, 'history_json="$(trap - ERR; helm history ', 2),
         (_INSTALLER_COMMON, 'last_good_rev="$(trap - ERR; printf ', 1),
+        (_INSTALLER_COMMON, 'out="$({ trap - ERR; kubectl get ', 1),
         (_GKE_DNS_ENDPOINT, 'described=$(trap - ERR; gcloud container clusters describe ', 1),
     )
 

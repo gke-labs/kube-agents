@@ -8,7 +8,11 @@
 #
 # Usage:
 #   ./uninstall.sh [options]
-#   curl -fsSL https://gke-labs.github.io/kube-agents/uninstall.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/uninstall.sh | bash
+#
+# The release-pinned script tears the install down with its own release's
+# engine. A copy carrying no baked version falls back to the engine on main,
+# which is not the one that built the install.
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -30,6 +34,14 @@ C_RESET="\033[0m"
 # before it has a checkout to read it from; tests/test_install_script.py pins
 # the three equal.
 KUBE_AGENTS_REPO_URL="https://github.com/gke-labs/kube-agents.git"
+# The install checkout install.sh leaves when it runs outside one. install.sh
+# and upgrade.sh define the same function; tests/test_upgrade_script.py pins
+# the paths all three build equal. Every caller here checks HOME first.
+kube_agents_clone_dir() { printf '%s/kube-agents' "${HOME:?the teardown looks for the install checkout under HOME when it does not run from one}"; }
+# The file whose presence makes a directory a kube-agents checkout this script
+# can drive, and the shared installer library inside it.
+KUBE_AGENTS_ENGINE_MARKER="terraform/examples/full-install/lifecycle.sh"
+KUBE_AGENTS_INSTALLER_COMMON_MARKER="scripts/installer/installer_common.sh"
 
 # Process Lock File & Error Trap Handling
 #
@@ -248,18 +260,6 @@ EOF
   print_success "Uninstall report written to: $report_file"
 }
 
-persist_state_var() {
-  local state_file="$1"
-  local var_name="$2"
-  local var_value="$3"
-  if [ -f "$state_file" ]; then
-    grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$state_file" > "${state_file}.tmp" || true
-    mv "${state_file}.tmp" "$state_file"
-  fi
-  printf 'export %s=%q\n' "$var_name" "$var_value" >> "$state_file"
-  chmod 600 "$state_file" 2>/dev/null || true
-}
-
 # Decide WHERE the state lives before pinning the backend. Exporting
 # KUBE_AGENTS_STATE_BUCKET first would make lifecycle.sh's ensure_backend
 # `terraform init -reconfigure` onto the (possibly empty) remote prefix —
@@ -319,9 +319,166 @@ resolve_state_location() {
   fi
 }
 
+# Locate the install's configuration:
+#   1. KUBE_AGENTS_INSTALL_ENV when explicitly set
+#   2. The checkout this script runs from (when it has one)
+#   3. The working directory the operator invoked it from
+#   4. The install checkout install.sh leaves in $HOME/kube-agents (consulted
+#      only on non-checkout runs — when install_checkout is non-empty because
+#      neither script_dir nor $(pwd) is a checkout — matching install.sh and
+#      upgrade.sh so a developer clone or unpacked bundle without its own
+#      install.env never reaches into $HOME/kube-agents/install.env)
+# Defined above main() rather than sourced from installer_common.sh because the
+# --source-ref arm hands over before any checkout with installer_common.sh is
+# sourced, and because the lookup itself decides which checkout's configuration
+# to read.
+resolve_uninstall_env_file() {
+  local candidate_repo_dir="${1:-}"
+  local install_checkout="${2:-}"
+  if [ -n "${KUBE_AGENTS_INSTALL_ENV:-}" ]; then
+    echo "$KUBE_AGENTS_INSTALL_ENV"
+  elif [ -n "$candidate_repo_dir" ] && [ -f "${candidate_repo_dir}/install.env" ]; then
+    echo "${candidate_repo_dir}/install.env"
+  elif [ -f "$(pwd)/install.env" ]; then
+    echo "$(pwd)/install.env"
+  elif [ -n "$install_checkout" ] && [ -f "${install_checkout}/install.env" ]; then
+    echo "${install_checkout}/install.env"
+  elif [ -n "$candidate_repo_dir" ]; then
+    echo "${candidate_repo_dir}/install.env"
+  else
+    echo "$(pwd)/install.env"
+  fi
+}
+
+# What a guessed install.env says about the three command-line coordinates,
+# printed as one word:
+#   confirms   -- it records all three, and each matches its flag;
+#   differs    -- it records one that contradicts its flag;
+#   incomplete -- nothing contradicts, but it lacks one of the three, so the
+#                 flags cannot confirm it (an absent key is not a match);
+#   unreadable -- sourcing it failed, e.g. it expands a variable that is unset
+#                 under the inherited `set -u`.
+# Only "confirms" lets a guess be read. Called only when all three PARAM_* are
+# set.
+#
+# Read in a SUBSHELL, unlike every other read of this file. It is asked only
+# about files the lookup guessed at, and sourcing one into this shell merely to
+# inspect it would export its NAMESPACE, MEMORY, GITOPS_* and state-bucket keys
+# -- and there is no taking an open-ended set of keys back out again. `set -a`
+# is still needed inside, because the file's own assignments are plain. The
+# file's own output is discarded so only the verdict reaches stdout; a failure
+# while sourcing ends the subshell with no verdict, which is what "unreadable"
+# stands for, and the warning the caller prints names it.
+guessed_env_verdict() {
+  local env_file="$1" verdict=""
+  verdict="$(
+    unset PROJECT_ID CLUSTER_NAME REGION NAMESPACE
+    set -a
+    # shellcheck disable=SC1090
+    . "$env_file" >/dev/null 2>&1
+    set +a
+    if { [ -n "${PROJECT_ID:-}" ] && [ "$PROJECT_ID" != "$PARAM_PROJECT_ID" ]; } ||
+      { [ -n "${CLUSTER_NAME:-}" ] && [ "$CLUSTER_NAME" != "$PARAM_CLUSTER_NAME" ]; } ||
+      { [ -n "${REGION:-}" ] && [ "$REGION" != "$PARAM_REGION" ]; }; then
+      echo "differs"
+    elif [ -z "${PROJECT_ID:-}" ] || [ -z "${CLUSTER_NAME:-}" ] || [ -z "${REGION:-}" ]; then
+      echo "incomplete"
+    else
+      echo "confirms"
+    fi
+  )" || verdict=""
+  printf '%s\n' "${verdict:-unreadable}"
+}
+
+# Whether resolve_uninstall_env_file reached env_file only through its
+# last-resort step, ${install_checkout}/install.env: a file nobody named, found
+# by searching $HOME, rather than one reached through KUBE_AGENTS_INSTALL_ENV,
+# the checkout or the working directory. On a workstation holding a current
+# install it belongs to THAT install, whichever one the flags name. Shared by
+# the local and --source-ref arms so both judge provenance the same way.
+env_file_is_a_home_guess() {
+  local env_file="$1" candidate_repo_dir="$2" install_checkout="$3"
+  [ -z "${KUBE_AGENTS_INSTALL_ENV:-}" ] &&
+    { [ -z "$candidate_repo_dir" ] || [ ! -f "${candidate_repo_dir}/install.env" ]; } &&
+    [ ! -f "$(pwd)/install.env" ] &&
+    [ -n "$install_checkout" ] &&
+    [ "$env_file" = "${install_checkout}/install.env" ] &&
+    [ -f "$env_file" ]
+}
+
+# Why a $HOME guess must not be read on a run whose three coordinate flags are
+# all set, as a clause for the "Not reading" warning; nothing when it confirms
+# them. A guess nobody named must not refuse or abort a teardown the flags fully
+# describe: loading exits on a file that is not valid shell or fails while
+# sourced, and the coordinate check refuses one that disagrees -- right for a
+# file the operator pointed at, wrong for one found by searching $HOME.
+guessed_env_skip_reason() {
+  local env_file="$1"
+  if ! bash -n "$env_file" 2>/dev/null; then
+    echo "it is not valid shell"
+    return 0
+  fi
+  case "$(guessed_env_verdict "$env_file")" in
+    confirms) ;;
+    differs) echo "it records a different install" ;;
+    incomplete) echo "it does not record all of PROJECT_ID, CLUSTER_NAME and REGION, so the flags cannot confirm it belongs to the install being torn down" ;;
+    *) echo "it failed while being read (such as expanding a variable that is not set)" ;;
+  esac
+}
+
+# Compare the command-line coordinates against what install.env itself recorded.
+# A piped teardown loads $HOME/kube-agents/install.env (with `set -a`) whichever
+# cluster the flags name, so without this check every non-coordinate setting in
+# install A's file -- NAMESPACE, MEMORY, GITOPS_*, PLATFORM_AGENT_GSA_NAME, and
+# custom KUBE_AGENTS_STATE_BUCKET / KUBE_AGENTS_STATE_PREFIX keys -- stays in
+# the environment and steers the state lookup and terraform.tfvars generation
+# for install B. Same split as upgrade.sh: a real run refuses, a dry-run warns.
+check_uninstall_coordinate_conflicts() {
+  local env_file="$1"
+  local coordinate_conflicts=""
+  if [ -n "$PARAM_PROJECT_ID" ] && [ -n "${PROJECT_ID:-}" ] && [ "$PARAM_PROJECT_ID" != "$PROJECT_ID" ]; then
+    coordinate_conflicts="${coordinate_conflicts}    --gcp-project-id=${PARAM_PROJECT_ID}, but PROJECT_ID=${PROJECT_ID}"$'\n'
+  fi
+  if [ -n "$PARAM_CLUSTER_NAME" ] && [ -n "${CLUSTER_NAME:-}" ] && [ "$PARAM_CLUSTER_NAME" != "$CLUSTER_NAME" ]; then
+    coordinate_conflicts="${coordinate_conflicts}    --gke-cluster-name=${PARAM_CLUSTER_NAME}, but CLUSTER_NAME=${CLUSTER_NAME}"$'\n'
+  fi
+  if [ -n "$PARAM_REGION" ] && [ -n "${REGION:-}" ] && [ "$PARAM_REGION" != "$REGION" ]; then
+    coordinate_conflicts="${coordinate_conflicts}    --gcp-region=${PARAM_REGION}, but REGION=${REGION}"$'\n'
+  fi
+  if [ -n "$coordinate_conflicts" ]; then
+    if [ "$PARAM_DRY_RUN" = "true" ]; then
+      print_warning "${env_file} was written for another install, and this preview reads it anyway:"
+      printf '%s' "$coordinate_conflicts" >&2
+    else
+      print_error "Refusing to tear down: ${env_file} records a different install than the flags name."
+      printf '%s' "$coordinate_conflicts" >&2
+      print_info "Teardown resolves its Terraform state backend and regenerates terraform.tfvars from that file, so this would read one install's configuration while tearing down another. Point KUBE_AGENTS_INSTALL_ENV at the install.env of the install you are tearing down, run from its checkout, or drop the flags that disagree with it."
+      exit 1
+    fi
+  fi
+}
+
 main() {
   parse_args "$@"
   print_banner
+
+  # An explicit pointer at a file that is not there is a typo, and every arm
+  # below reads it: the --source-ref handover forwards the coordinates it holds
+  # to the pinned release, and the local arms regenerate terraform.tfvars from
+  # it. Continuing would fall back to DEFAULT_CLUSTER_NAME, DEFAULT_REGION and
+  # gcloud's active project -- on a GCE host, the machine's own project -- and
+  # aim a destroy at whatever that names.
+  #
+  # This is not the data-protection kind of check a teardown must never be
+  # blocked by (see the ENABLE_GVISOR note further down): unsetting the variable
+  # or fixing the path clears it, and a teardown with no pointer at all still
+  # runs on flags alone. install.sh's bootstrap_install_env and upgrade.sh
+  # refuse the same way, on the same INSTALL_ENV_EXPLICIT reasoning.
+  if [ -n "${KUBE_AGENTS_INSTALL_ENV:-}" ] && [ ! -f "${KUBE_AGENTS_INSTALL_ENV}" ]; then
+    print_error "KUBE_AGENTS_INSTALL_ENV names '${KUBE_AGENTS_INSTALL_ENV}', which does not exist."
+    print_info "Point it at the install's install.env, or unset it to search this checkout, the current directory, and the install checkout in \$HOME/kube-agents."
+    exit 1
+  fi
 
   print_step "1. Discovering Installed Infrastructure Elements"
 
@@ -335,6 +492,146 @@ main() {
     # this main() would source files the clone does not carry. The exec also
     # releases the flock for the dispatched script and skips the temp-dir
     # cleanup trap, which must not delete a tree that is still executing.
+    #
+    # Resolve install.env here before handing over: the cloned script's own
+    # repo_dir is the fresh temp clone below, which carries no configuration,
+    # and pre-0.4.0 releases do not read install.env at all. Forwarding the
+    # resolved coordinates in the target script's flag dialect (and exporting
+    # KUBE_AGENTS_INSTALL_ENV for 0.4.0+ refs) keeps the documented `--source-ref`
+    # one-liner aimed at the install checkout rather than falling back to
+    # DEFAULT_CLUSTER_NAME and gcloud's active project in the child.
+    local wrapper_checkout=""
+    if [ -f "${script_dir}/${KUBE_AGENTS_ENGINE_MARKER}" ]; then
+      wrapper_checkout="$script_dir"
+    elif [ -f "$(pwd)/${KUBE_AGENTS_ENGINE_MARKER}" ]; then
+      wrapper_checkout="$(pwd)"
+    fi
+    local handoff_install_checkout=""
+    if [ -z "$wrapper_checkout" ] && [ -n "${HOME:-}" ]; then
+      handoff_install_checkout="$(kube_agents_clone_dir)"
+    fi
+    local handoff_env_file
+    handoff_env_file="$(resolve_uninstall_env_file "$wrapper_checkout" "$handoff_install_checkout")"
+
+    # Provenance decides whether that answer is an instruction or a guess, so
+    # the branch it came from is recomputed here. The last-resort arm of the
+    # lookup is $HOME/kube-agents/install.env -- the installer's own checkout,
+    # which on a workstation holding a current install belongs to THAT install.
+    # This arm is where that matters most: --source-ref exists precisely for the
+    # installs the post-Terraform refs did not make, and an install old enough
+    # to need it has no install.env of its own for the lookup to find first.
+    local handoff_env_is_a_guess="false"
+    local handoff_env_was_dropped="false"
+    if env_file_is_a_home_guess "$handoff_env_file" "$wrapper_checkout" "$handoff_install_checkout"; then
+      handoff_env_is_a_guess="true"
+    fi
+    # A $HOME guess is never read unless all three command-line coordinates
+    # confirm it. Any file at $HOME/kube-agents/install.env was written by a
+    # >= 0.4.0 install (pre-Terraform releases wrote no install.env), so reading
+    # it on a flagless or partially-flagged --source-ref run would fill the
+    # unnamed coordinates (such as CLUSTER_NAME when only project and region are
+    # given) from the workstation's current install and aim the legacy
+    # uninstaller at that cluster. And when all three coordinates ARE on the
+    # command line and contradict the guess, dropping it avoids the coordinate
+    # conflict refusal below and keeps `set -a` from exporting the stranger's
+    # NAMESPACE, MEMORY, GITOPS_* and state-bucket keys into the child release.
+    #
+    # Only when all three coordinates are given on the command line and the
+    # $HOME file records all three and matches each is it read, so its
+    # NAMESPACE and other settings travel with the confirmed target. A file
+    # that omits a key is not confirmed by it: any flag would "agree" with an
+    # absent PROJECT_ID, and loading it would hand the child that file's state
+    # backend under another install's name.
+    if [ "$handoff_env_is_a_guess" = "true" ] &&
+      { [ -z "$PARAM_PROJECT_ID" ] || [ -z "$PARAM_CLUSTER_NAME" ] || [ -z "$PARAM_REGION" ]; } &&
+      [ -f "$handoff_env_file" ]; then
+      print_warning "Not reading ${handoff_env_file}: --source-ref is for tearing down an older release, this file was found only by searching \$HOME, and not all three of --gcp-project-id, --gke-cluster-name and --gcp-region were given to confirm it belongs to the install being torn down."
+      print_info "Pass all three of --gcp-project-id, --gke-cluster-name and --gcp-region to name the install to tear down, or point KUBE_AGENTS_INSTALL_ENV at ${handoff_env_file} (or run from ${handoff_install_checkout}) if that file is the one you mean."
+      handoff_env_file=""
+      handoff_env_was_dropped="true"
+    elif [ "$handoff_env_is_a_guess" = "true" ]; then
+      # All three flags are set here.
+      local handoff_env_skip_reason
+      handoff_env_skip_reason="$(guessed_env_skip_reason "$handoff_env_file")"
+      if [ -n "$handoff_env_skip_reason" ]; then
+        print_warning "Not reading ${handoff_env_file}: ${handoff_env_skip_reason}, it was found by searching \$HOME rather than named, and the flags already say which install to tear down."
+        print_info "Forwarding --gcp-project-id=${PARAM_PROJECT_ID}, --gke-cluster-name=${PARAM_CLUSTER_NAME} and --gcp-region=${PARAM_REGION} to the '${PARAM_SOURCE_REF}' release. Point KUBE_AGENTS_INSTALL_ENV at an install.env to have one read instead."
+        handoff_env_file=""
+        handoff_env_was_dropped="true"
+      fi
+    fi
+
+    unset PROJECT_ID CLUSTER_NAME REGION NAMESPACE
+    if [ -n "$handoff_env_file" ] && [ -f "$handoff_env_file" ]; then
+      if ! bash -n "$handoff_env_file" 2>/dev/null; then
+        print_error "Install configuration '$handoff_env_file' is not valid shell and could not be loaded."
+        exit 1
+      fi
+      set -a
+      # shellcheck disable=SC1090
+      . "$handoff_env_file"
+      set +a
+      print_success "Loaded install configuration from: ${handoff_env_file}"
+      check_uninstall_coordinate_conflicts "$handoff_env_file"
+      export KUBE_AGENTS_INSTALL_ENV="$handoff_env_file"
+    else
+      # Silence here is what makes this arm dangerous. Nothing is forwarded, and
+      # the pinned release -- which for pre-0.4.0 refs does not read install.env
+      # at all -- falls straight back to DEFAULT_CLUSTER_NAME, DEFAULT_REGION and
+      # gcloud's active project, which on a GCE host is the machine's own. Same
+      # shape of warning as the local arms print, and a warning rather than a
+      # refusal because a teardown on flags alone is a supported way to run this
+      # (I4: an install has to keep a working way to remove itself).
+      #
+      # Skipped when a file was found and deliberately not read: the warning
+      # above already named it and said why, and "none was found" would
+      # contradict it.
+      if [ "$handoff_env_was_dropped" != "true" ]; then
+        local handoff_searched="${PWD}"
+        if [ -n "$wrapper_checkout" ] && [ "$wrapper_checkout" != "${PWD}" ]; then
+          handoff_searched="${wrapper_checkout} or ${handoff_searched}"
+        fi
+        if [ -n "$handoff_install_checkout" ] && [ "$handoff_install_checkout" != "${PWD}" ]; then
+          handoff_searched="${handoff_searched} or ${handoff_install_checkout}"
+        fi
+        print_warning "No install configuration (install.env) was found in ${handoff_searched}."
+      fi
+    fi
+
+    # What the child will actually be told, flag-or-file per coordinate. Computed
+    # here rather than next to dispatch_args below so that the report after it
+    # comes before the clone, alongside the warnings above it.
+    local eff_project_id="${PARAM_PROJECT_ID:-${PROJECT_ID:-}}"
+    local eff_cluster_name="${PARAM_CLUSTER_NAME:-${CLUSTER_NAME:-}}"
+    local eff_region="${PARAM_REGION:-${REGION:-}}"
+    local eff_agent_namespace="${PARAM_AGENT_NAMESPACE:-${NAMESPACE:-}}"
+
+    # Every coordinate the child will NOT be told, named once and from the values
+    # above rather than per arm. Per-arm warnings covered "no file" and "a $HOME
+    # guess not read", but not a loaded install.env that lacks one of the three
+    # keys: that coordinate was silently not forwarded and the pinned release
+    # fell back to its own default. Asking what is about to be forwarded covers
+    # every arm that exists now and any added later. A warning, not a refusal:
+    # a teardown on partial configuration is supported (I4).
+    local unforwarded=""
+    [ -n "$eff_project_id" ] || unforwarded="${unforwarded:+${unforwarded}, }--gcp-project-id"
+    [ -n "$eff_cluster_name" ] || unforwarded="${unforwarded:+${unforwarded}, }--gke-cluster-name"
+    [ -n "$eff_region" ] || unforwarded="${unforwarded:+${unforwarded}, }--gcp-region"
+    if [ -z "$eff_project_id" ] && [ -z "$eff_cluster_name" ] && [ -z "$eff_region" ]; then
+      print_warning "No coordinates are being forwarded, so the '${PARAM_SOURCE_REF}' release will aim at its own defaults and gcloud's active project."
+    elif [ -n "$unforwarded" ]; then
+      local project_fallback=""
+      if [ -z "$eff_project_id" ]; then
+        project_fallback=" (gcloud's active project, for the project)"
+      fi
+      print_warning "Not forwarding ${unforwarded} to the '${PARAM_SOURCE_REF}' release: neither the command line nor a loaded install.env gives a value, so that release will fall back to its own default${project_fallback}."
+    fi
+    # The dropped-guess arm above already named its own remedy, pointing at the
+    # file it did not read.
+    if [ -n "$unforwarded" ] && [ "$handoff_env_was_dropped" != "true" ]; then
+      print_info "Pass --gcp-project-id/--gke-cluster-name/--gcp-region, or point KUBE_AGENTS_INSTALL_ENV at the install's install.env, to name the install you mean."
+    fi
+
     TEMP_REPO_DIR="$(mktemp -d)"
     repo_dir="${TEMP_REPO_DIR}/kube-agents"
     print_info "Fetching the teardown engine pinned at '${PARAM_SOURCE_REF}'..."
@@ -370,26 +667,26 @@ main() {
     if [ "$PARAM_DRY_RUN" = "true" ]; then
       dispatch_args+=(--dry-run)
     fi
-    if [ -n "$PARAM_PROJECT_ID" ]; then
-      dispatch_args+=("${flag_project_id}=$PARAM_PROJECT_ID")
+    if [ -n "$eff_project_id" ]; then
+      dispatch_args+=("${flag_project_id}=$eff_project_id")
     fi
-    if [ -n "$PARAM_CLUSTER_NAME" ]; then
-      dispatch_args+=("${flag_cluster_name}=$PARAM_CLUSTER_NAME")
+    if [ -n "$eff_cluster_name" ]; then
+      dispatch_args+=("${flag_cluster_name}=$eff_cluster_name")
     fi
-    if [ -n "$PARAM_REGION" ]; then
-      dispatch_args+=("${flag_region}=$PARAM_REGION")
+    if [ -n "$eff_region" ]; then
+      dispatch_args+=("${flag_region}=$eff_region")
     fi
     # Only to a release that parses it. Older ones do not, and passing it there
     # is the same "Unknown parameter" exit the dialect choice above avoids.
-    if [ -n "$PARAM_AGENT_NAMESPACE" ] && grep -q -- '--agent-namespace' "${repo_dir}/uninstall.sh"; then
-      dispatch_args+=(--agent-namespace="$PARAM_AGENT_NAMESPACE")
+    if [ -n "$eff_agent_namespace" ] && grep -q -- '--agent-namespace' "${repo_dir}/uninstall.sh"; then
+      dispatch_args+=(--agent-namespace="$eff_agent_namespace")
     fi
     print_info "Handing over to the '${PARAM_SOURCE_REF}' release's own uninstall.sh..."
     TEMP_REPO_DIR=""
     exec bash "${repo_dir}/uninstall.sh" "${dispatch_args[@]}"
-  elif [ -f "${script_dir}/terraform/examples/full-install/lifecycle.sh" ]; then
+  elif [ -f "${script_dir}/${KUBE_AGENTS_ENGINE_MARKER}" ]; then
     repo_dir="$script_dir"
-  elif [ -f "$(pwd)/terraform/examples/full-install/lifecycle.sh" ]; then
+  elif [ -f "$(pwd)/${KUBE_AGENTS_ENGINE_MARKER}" ]; then
     repo_dir="$(pwd)"
   else
     TEMP_REPO_DIR="$(mktemp -d)"
@@ -407,37 +704,78 @@ main() {
   # Defaults, validators, and the terraform.tfvars generator shared with
   # install.sh. Print helpers are already defined above, as the file expects.
   # shellcheck disable=SC1091
-  source "${repo_dir}/scripts/installer/installer_common.sh"
-  # Legacy state first, then install.env over the top of it, so the
-  # hand-authored input wins. Both are optional here: unlike upgrade.sh, a
-  # teardown can proceed on --gcp-project-id/--gke-cluster-name/--gcp-region alone.
-  if [ -f "${repo_dir}/k8s-operator/scripts/vars.sh" ]; then
-    # shellcheck disable=SC1091
-    if ! source "${repo_dir}/k8s-operator/scripts/vars.sh"; then
-      print_error "Configuration state is invalid and could not be loaded."
-      exit 1
-    fi
-    print_success "Loaded configuration state from k8s-operator/scripts/vars.sh"
+  source "${repo_dir}/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}"
+  # install.env is optional here: unlike upgrade.sh, a teardown can proceed on
+  # --gcp-project-id/--gke-cluster-name/--gcp-region alone. On a non-checkout
+  # run (TEMP_REPO_DIR is non-empty, e.g. curl … | bash), the lookup reaches
+  # $HOME/kube-agents/install.env as step 4; on a checkout run without its own
+  # install.env, install_checkout stays empty so the run never reaches into
+  # $HOME/kube-agents/install.env and destroys another install.
+  local install_checkout=""
+  if [ -n "${TEMP_REPO_DIR:-}" ] && [ -n "${HOME:-}" ]; then
+    install_checkout="$(kube_agents_clone_dir)"
   fi
   local install_env_file
-  install_env_file="$(default_install_env_file "$repo_dir")"
+  install_env_file="$(resolve_uninstall_env_file "$repo_dir" "$install_checkout")"
+  # The same rule the --source-ref arm applies. With all three coordinates on
+  # the command line, a file found only by searching $HOME is read only when it
+  # records and matches all three; otherwise it would refuse on the coordinate
+  # check (or abort while loading) a teardown the flags fully name, and every
+  # way out that refusal offers is closed: the install being torn down has no
+  # install.env here to point at or run from, and dropping the flags aims the
+  # run at the other install. With fewer flags it is still loaded and still
+  # checked, since it supplies the coordinates the flags left out.
+  if [ -n "$PARAM_PROJECT_ID" ] && [ -n "$PARAM_CLUSTER_NAME" ] && [ -n "$PARAM_REGION" ] &&
+    env_file_is_a_home_guess "$install_env_file" "$repo_dir" "$install_checkout"; then
+    local install_env_skip_reason
+    install_env_skip_reason="$(guessed_env_skip_reason "$install_env_file")"
+    if [ -n "$install_env_skip_reason" ]; then
+      print_warning "Not reading ${install_env_file}: ${install_env_skip_reason}, it was found by searching \$HOME rather than named, and the flags already say which install to tear down."
+      print_info "Tearing down on --gcp-project-id=${PARAM_PROJECT_ID}, --gke-cluster-name=${PARAM_CLUSTER_NAME} and --gcp-region=${PARAM_REGION}. Point KUBE_AGENTS_INSTALL_ENV at an install.env to have one read instead."
+      install_env_file=""
+    fi
+  fi
+  local state_loaded="false"
+  # Clear any shell-exported coordinates before sourcing the file: load_install_env
+  # only unsets NAMESPACE, so without this an exported REGION or PROJECT_ID in
+  # the operator's shell would suppress the guessed-coordinate warning below or
+  # trigger a false conflict blaming install.env.
+  unset PROJECT_ID CLUSTER_NAME REGION
   if load_install_env "$install_env_file"; then
+    state_loaded="true"
     print_success "Loaded install configuration from: ${install_env_file}"
   fi
   # GITOPS_ORG / GITOPS_REPO are the names; a configuration still carrying
   # GITHUB_ORG / GITHUB_REPO is accepted with a warning.
   normalize_gitops_repo_vars
-  # Same shape, for the memory setting: install.env records MEMORY, a migrated
-  # vars.sh still carries the old MEMORY_PROVIDER, and the file loaded second
-  # has to win. This teardown regenerates tfvars before destroying.
+  # install.env records the operator-facing MEMORY; MEMORY_PROVIDER is the name
+  # the generator reads. This teardown regenerates tfvars before destroying.
   normalize_memory_vars
 
   local target_project="${PARAM_PROJECT_ID:-${PROJECT_ID:-}}"
   local target_cluster="${PARAM_CLUSTER_NAME:-${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}}"
   local target_region="${PARAM_REGION:-${REGION:-$DEFAULT_REGION}}"
+  # Which of the three nobody actually named. A teardown is allowed to run on
+  # defaults -- that is what makes `./uninstall.sh` in a checkout work -- but it
+  # is not allowed to be quiet about it: the same three lines are printed
+  # whether they name the install the operator meant or a guess, and the
+  # confirmation prompt below reads exactly those lines.
+  local guessed_coordinates=""
+  if [ -z "$PARAM_CLUSTER_NAME" ] && [ -z "${CLUSTER_NAME:-}" ]; then
+    guessed_coordinates="${guessed_coordinates}    cluster '${target_cluster}' is installer_common.sh's default, not this install's"$'\n'
+  fi
+  if [ -z "$PARAM_REGION" ] && [ -z "${REGION:-}" ]; then
+    guessed_coordinates="${guessed_coordinates}    region '${target_region}' is installer_common.sh's default, not this install's"$'\n'
+  fi
 
   if [ -z "$target_project" ]; then
     target_project="$(gcloud config get-value project 2>/dev/null || true)"
+    if [ -n "$target_project" ]; then
+      # gcloud answers from the user's configuration, and on a GCE instance
+      # (Cloud Shell, a Cloudtop, a CI runner) from the metadata server -- which
+      # names the project the machine lives in, not the one being torn down.
+      guessed_coordinates="${guessed_coordinates}    project '${target_project}' came from gcloud's active configuration, not from this install"$'\n'
+    fi
   fi
   if [ -z "$target_project" ]; then
     print_error "A GCP project is required. Pass --gcp-project-id or configure one with gcloud."
@@ -446,6 +784,18 @@ main() {
 
   print_info "GCP Target Project: ${C_BOLD}${target_project}${C_RESET}"
   print_info "GKE Target Cluster: ${C_BOLD}${target_cluster}${C_RESET} (${target_region})"
+  if [ "$state_loaded" = "true" ]; then
+    check_uninstall_coordinate_conflicts "$install_env_file"
+  fi
+  if [ -n "$guessed_coordinates" ]; then
+    if [ "$state_loaded" = "true" ]; then
+      print_warning "Some of what this teardown is aimed at was not recorded in ${install_env_file}:"
+    else
+      print_warning "No install configuration (install.env) was found, so some of what this teardown is aimed at is a guess:"
+    fi
+    printf '%s' "$guessed_coordinates" >&2
+    print_info "Pass --gcp-project-id/--gke-cluster-name/--gcp-region, or point KUBE_AGENTS_INSTALL_ENV at the install's install.env, to say which install this is."
+  fi
   if [ "$PARAM_DRY_RUN" = "true" ]; then
     print_step "2. Dry-Run Uninstall Preview"
     echo -e "  • ${C_CYAN}Target Cluster:${C_RESET} ${target_cluster} in ${target_project} (${target_region})"
@@ -521,22 +871,6 @@ main() {
 
   print_step "2. Executing Automated Teardown Engine"
 
-  # Keep the state file agreeing with the confirmed target: the tfvars
-  # generator below reads the environment, but a saved vars.sh that names a
-  # different cluster would mislead the next tool that sources it.
-  local state_file="${repo_dir}/k8s-operator/scripts/vars.sh"
-  if [ -f "$state_file" ]; then
-    if [ -n "$PARAM_PROJECT_ID" ]; then
-      persist_state_var "$state_file" PROJECT_ID "$target_project"
-    fi
-    if [ -n "$PARAM_CLUSTER_NAME" ]; then
-      persist_state_var "$state_file" CLUSTER_NAME "$target_cluster"
-    fi
-    if [ -n "$PARAM_REGION" ]; then
-      persist_state_var "$state_file" REGION "$target_region"
-    fi
-  fi
-
   # terraform destroy still evaluates the configuration, so required variables
   # must be present even from a fresh clone; the placeholder key feeds nothing
   # that survives the destroy.
@@ -563,11 +897,9 @@ main() {
     cd "$compose_dir"
     ./lifecycle.sh destroy -auto-approve -input=false
   )
-  # The derived state goes; install.env stays. It is the operator's own file,
-  # not something this tool generated, and deleting it would throw away the
-  # configuration a re-install would otherwise reuse. Say so rather than
-  # leaving a file behind silently.
-  rm -f "$state_file"
+  # install.env stays. It is the operator's own file, not something this tool
+  # generated, and deleting it would throw away the configuration a re-install
+  # would otherwise reuse. Say so rather than leaving a file behind silently.
   if [ -f "$install_env_file" ]; then
     print_info "Left your install configuration in place: ${install_env_file}"
   fi

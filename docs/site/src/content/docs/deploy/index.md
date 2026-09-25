@@ -16,3 +16,5 @@ Pages in this section:
 - [**Telemetry**](/kube-agents/deploy/telemetry/) — OpenTelemetry + Prometheus + Cloud Logging.
 - [**GitOps with ArgoCD**](/kube-agents/deploy/gitops-argocd/) — standing up the reconciler that applies what the agent proposes.
 - [**Rolling back a release**](/kube-agents/deploy/rollback/) — moving an install from GA release N back to N-1 with the N-1 checkout's `upgrade.sh`, and what that leaves in place.
+
+The forward move lives with the installer: [Upgrading an install](/kube-agents/install/upgrade/) takes an install to a newer release, and the pages here cover what surrounds it.

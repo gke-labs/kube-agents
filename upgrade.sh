@@ -6,12 +6,14 @@
 #
 # Usage:
 #   ./upgrade.sh [options]
-#   curl -fsSL https://gke-labs.github.io/kube-agents/upgrade.sh | bash -s -- \
-#     --upgrade-mode=full --image-tag=<SEMVER_TAG_OR_FULL_COMMIT_SHA>
+#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/upgrade.sh | bash -s -- \
+#     --non-interactive --gcp-project-id="my-gcp-project" --gke-cluster-name="platform-agent-host"
 #
-# Run this from the directory holding your original install checkout: the
-# upgrade refuses to re-render cluster configuration without the install's
-# install.env (a legacy k8s-operator/scripts/vars.sh also satisfies it).
+# The release-pinned script carries its own version, so no image tag is passed.
+# It upgrades the install whose checkout the installer left in $HOME/kube-agents,
+# reading the install.env in it; KUBE_AGENTS_INSTALL_ENV points at a
+# configuration held somewhere else. The upgrade refuses to re-render cluster
+# configuration without one.
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -37,6 +39,28 @@ BAKED_RELEASE_VERSION=""
 # before it has a checkout to read it from; tests/test_install_script.py pins
 # the three equal.
 KUBE_AGENTS_REPO_URL="https://github.com/gke-labs/kube-agents.git"
+# Where install.sh leaves the sources when it runs as curl | bash, and so where
+# this script looks for them rather than fetching its own copy: that checkout is
+# also where the install's install.env lives.
+#
+# A function rather than a constant so that HOME expands only when a clone is
+# needed: a run from a checkout never looks for one, and HOME is unset in some
+# service environments (a systemd system unit, a container with no passwd
+# entry), where `set -u` would otherwise stop the script on this line.
+kube_agents_clone_dir() { printf '%s/kube-agents' "${HOME:?the upgrader looks for the install checkout under HOME when it does not run from one}"; }
+# A path every kube-agents revision tracks, back to release 0.1.0. An existing
+# clone is moved to the requested release only when its HEAD tracks this file,
+# so a repository that merely shares the directory name is left alone.
+KUBE_AGENTS_CLONE_MARKER="install.sh"
+KUBE_AGENTS_INSTALLER_COMMON_MARKER="scripts/installer/installer_common.sh"
+# The fetch depth the fresh clone uses, and that a clone which is already
+# shallow (one an earlier install left) keeps; a complete clone is fetched
+# without it so it does not become shallow.
+KUBE_AGENTS_FETCH_DEPTH_OPT="--depth=1"
+# The file an unpacked release bundle carries to say which release it is.
+# package_release_bundle.sh writes it into every bundle it produces, with
+# `version=` and `tag=` both set to the release tag.
+readonly KUBE_AGENTS_RELEASE_BUNDLE_MARKER=".release-bundle"
 
 # Default CLI Configuration
 PARAM_UPGRADE_MODE="full"
@@ -57,8 +81,125 @@ PARAM_REGION=""
 PARAM_AGENT_NAMESPACE=""
 PARAM_IMAGE_TAG="${IMAGE_TAG:-${BAKED_RELEASE_VERSION:-}}"
 TEMP_REPO_DIR=""
+# Set when this run detached the install's own checkout onto the target
+# release. Everything that can still refuse the upgrade — the configuration
+# load, the missing-project exit, the credentials fetch, the Helm release
+# guard, the KMS and service-account guards, Terraform itself — runs after that
+# move, so a run that fails one of them would otherwise leave the operator's
+# directory on a revision the cluster is not on, and the next install.sh,
+# uninstall.sh or hand-run terraform in it would drive an N+1 engine against an
+# N install. The move is undone on a failed exit, and only while nothing has
+# been applied yet: once the first object is on the cluster the checkout and
+# the install are converging, and putting it back would be the lie instead.
+MOVED_CHECKOUT_DIR=""
+MOVED_CHECKOUT_PREV_HEAD=""
+MOVED_CHECKOUT_PREV_BRANCH=""
+MOVED_CHECKOUT_TFVARS_PATH=""
+MOVED_CHECKOUT_PREV_TFVARS=""
+UPGRADE_APPLY_STARTED="false"
+HELM_RELEASE_REPAIRED="false"
+# Set when the sources came from a checkout that was already on disk rather
+# than from a fetch this run made. See verify_local_source_ref: a tag in a
+# directory this run did not fetch is only as trustworthy as wherever it came
+# from, and before this arm existed the tagged path always fetched from
+# KUBE_AGENTS_REPO_URL.
+SOURCES_ADOPTED_CHECKOUT="false"
+
+# ─── Process Lock File ───────────────────────────────────────────────────────
+# install.sh and uninstall.sh have always taken one; the upgrade had not, and
+# it now moves $HOME/kube-agents onto the release it is applying. Two runs at
+# once would take turns detaching that one checkout while both read terraform
+# and charts out of it, so the second would apply a composition assembled from
+# whichever revision the first had it on at the time.
+#
+# Same lock file as install.sh: both front doors adopt and move the one
+# checkout in $HOME/kube-agents (each detaches its HEAD with its own
+# refresh_existing_clone; this script also returns it with
+# restore_moved_checkout on a pre-apply refusal), and both write
+# gitignored terraform.tfvars under its composition directory. An install and an
+# upgrade running at once would take turns moving that one directory while both
+# read terraform and charts out of it.
+#
+# The KUBE_AGENTS_SOURCE_ONLY guard is install.sh's and is load-bearing here
+# too -- the test suite sources this file, and a lock taken at source time
+# would make the suite serialise against itself.
+LOCK_FILE="${KUBE_AGENTS_LOCK_FILE:-/tmp/kube-agents-install.lock}"
+if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ] && command -v flock >/dev/null 2>&1; then
+  if ( : >"$LOCK_FILE" ) 2>/dev/null && exec 200>"$LOCK_FILE"; then
+    if ! flock -n 200 2>/dev/null; then
+      echo -e "  \033[93m⚠ Another instance of the kube-agents installer or upgrade is currently running. Exiting.\033[0m" >&2
+      exit 1
+    fi
+  fi
+fi
+
+# Remember the gitignored terraform.tfvars in an adopted checkout before
+# write_tfvars_from_state overwrites it for the target release. A git checkout
+# back to the previous revision leaves untracked and gitignored files behind, so
+# without this a run that refuses after write_tfvars_from_state (the KMS or
+# service-account guard in full mode) would return the checkout to N while
+# leaving N+1's terraform.tfvars sitting in its composition directory.
+snapshot_moved_checkout_tfvars() {
+  local tfvars_path="$1"
+  [ -n "$MOVED_CHECKOUT_DIR" ] || return 0
+  MOVED_CHECKOUT_TFVARS_PATH="$tfvars_path"
+  if [ -f "$tfvars_path" ]; then
+    MOVED_CHECKOUT_PREV_TFVARS="$(umask 077 && mktemp "${TMPDIR:-/tmp}/kube-agents-prev-tfvars.XXXXXX")"
+    cp -p "$tfvars_path" "$MOVED_CHECKOUT_PREV_TFVARS"
+  fi
+}
+
+restore_moved_checkout() {
+  [ -n "$MOVED_CHECKOUT_DIR" ] || return 0
+  [ -d "$MOVED_CHECKOUT_DIR" ] || return 0
+  local target="$MOVED_CHECKOUT_PREV_HEAD" what="$MOVED_CHECKOUT_PREV_HEAD"
+  if [ -n "$MOVED_CHECKOUT_PREV_BRANCH" ]; then
+    target="$MOVED_CHECKOUT_PREV_BRANCH"
+    what="branch '${MOVED_CHECKOUT_PREV_BRANCH}'"
+  fi
+  if [ -n "$MOVED_CHECKOUT_TFVARS_PATH" ]; then
+    if [ -n "$MOVED_CHECKOUT_PREV_TFVARS" ] && [ -f "$MOVED_CHECKOUT_PREV_TFVARS" ]; then
+      mv -f "$MOVED_CHECKOUT_PREV_TFVARS" "$MOVED_CHECKOUT_TFVARS_PATH"
+    else
+      rm -f -- "$MOVED_CHECKOUT_TFVARS_PATH"
+    fi
+    MOVED_CHECKOUT_TFVARS_PATH=""
+    MOVED_CHECKOUT_PREV_TFVARS=""
+  fi
+  # Best effort by necessity: this runs from the EXIT trap of a run that has
+  # already failed, and a checkout the operator has since edited is theirs to
+  # resolve. Say so either way rather than restoring silently.
+  if git -C "$MOVED_CHECKOUT_DIR" checkout --quiet "$target" 2>/dev/null; then
+    local pre_apply_repairs=""
+    if [ "${SESSION_KV_KEYS_PATCHED:-false}" = "true" ] || [ "${SANDBOX_KEYS_PATCHED:-false}" = "true" ]; then
+      pre_apply_repairs="reconciling Secret keys in step 3"
+    fi
+    if [ "${HELM_RELEASE_REPAIRED:-false}" = "true" ]; then
+      if [ -n "$pre_apply_repairs" ]; then
+        pre_apply_repairs="${pre_apply_repairs} and repairing the pending Helm release"
+      else
+        pre_apply_repairs="repairing the pending Helm release"
+      fi
+    fi
+    if [ -n "$pre_apply_repairs" ]; then
+      print_info "The new release was not applied (after ${pre_apply_repairs}), so ${MOVED_CHECKOUT_DIR} was returned to ${what}."
+    else
+      print_info "Nothing was applied, so ${MOVED_CHECKOUT_DIR} was returned to ${what}."
+    fi
+  else
+    print_warning "Could not return ${MOVED_CHECKOUT_DIR} to ${what}; it is still on the revision this run checked out. 'git -C ${MOVED_CHECKOUT_DIR} checkout ${target}' undoes it."
+  fi
+  MOVED_CHECKOUT_DIR=""
+}
 
 cleanup() {
+  local exit_code="$?"
+  if [ "$exit_code" -ne 0 ] && [ "$UPGRADE_APPLY_STARTED" != "true" ]; then
+    restore_moved_checkout
+  fi
+  if [ -n "$MOVED_CHECKOUT_PREV_TFVARS" ] && [ -f "$MOVED_CHECKOUT_PREV_TFVARS" ]; then
+    rm -f -- "$MOVED_CHECKOUT_PREV_TFVARS"
+  fi
   if [ -n "$TEMP_REPO_DIR" ] && [ -d "$TEMP_REPO_DIR" ]; then
     rm -rf -- "$TEMP_REPO_DIR"
   fi
@@ -150,10 +291,14 @@ Options:
   --gcp-region REGION      GKE GCP Region
   --agent-namespace NS     Kubernetes namespace the release lives in
                            (default: the install's own, else kubeagents-system)
-  --image-tag TAG          Validated immutable release tag or full commit SHA (required)
+  --image-tag TAG          Validated immutable release tag or full commit SHA.
+                           Developer and CI/CD testing only: an official release
+                           bakes its own version into this script and upgrades to
+                           it, so an upgrade to a published release passes no tag.
   --keep-image-tag         Upgrade everything except the images, leaving them on
                            the tag the install already serves. Use instead of
-                           --image-tag, not alongside it.
+                           --image-tag, not alongside it; a script carrying a
+                           baked release version already has one, and refuses it.
   --help, -h               Show this help message
 
 Examples:
@@ -196,22 +341,6 @@ json_escape() {
   value=${value//$'\r'/\\r}
   value=${value//$'\t'/\\t}
   printf '%s' "$value"
-}
-
-# Persist one variable into a legacy vars.sh, for an install that still has
-# one. Nothing in this repository re-sources it -- the exports after each call
-# are what this run reads -- but a tool still pointed at the old file would
-# otherwise name a different target than the one this run acts on.
-persist_state_var() {
-  local state_file="$1"
-  local var_name="$2"
-  local var_value="$3"
-  if [ -f "$state_file" ]; then
-    grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$state_file" > "${state_file}.tmp" || true
-    mv "${state_file}.tmp" "$state_file"
-  fi
-  printf 'export %s=%q\n' "$var_name" "$var_value" >> "$state_file"
-  chmod 600 "$state_file" 2>/dev/null || true
 }
 
 random_hex_32() {
@@ -352,18 +481,72 @@ backfill_sandbox_ssh_key() {
 matches_release_bundle_ref() {
   local repo_dir="$1"
   local expected_ref="$2"
-  local bundle_file="${repo_dir}/.release-bundle"
+  local bundle_file="${repo_dir}/${KUBE_AGENTS_RELEASE_BUNDLE_MARKER}"
 
   if [ -f "$bundle_file" ]; then
     local bundle_version bundle_tag
     bundle_version="$(grep -E "^version=" "$bundle_file" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || echo "")"
     bundle_tag="$(grep -E "^tag=" "$bundle_file" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || echo "")"
-    if [ -n "$bundle_version" ] && { [ "$bundle_version" = "$expected_ref" ] || [ "$bundle_tag" = "$expected_ref" ]; }; then
-      echo "$bundle_version"
+    # Either field answers the question. This repository's packager writes both,
+    # but deploy/release-versioning.md documents a match on "version or tag",
+    # and requiring version= first turned a marker carrying only tag= into a
+    # refusal of the very release it names.
+    if [ -n "$expected_ref" ] && { [ "$bundle_version" = "$expected_ref" ] || [ "$bundle_tag" = "$expected_ref" ]; }; then
+      echo "${bundle_version:-$bundle_tag}"
       return 0
     fi
   fi
   return 1
+}
+
+# What release a non-Git source tree says it is, or "" when it says nothing.
+#
+# Two statements are consulted, because the bundle marker is not the only shape
+# a stale tree arrives in. A bundle this repository packaged carries the marker.
+# A copy of one with the marker removed, or a tree from a release predating the
+# marker, still carries the version package_release_bundle.sh stamps into every
+# root script, so the tree's own root scripts answer where the marker cannot.
+#
+# The order among those scripts matters, and upgrade.sh is deliberately last.
+# The way an operator runs a newer upgrader against an older unpacked tree is
+# `curl -o upgrade.sh …/<new>/upgrade.sh` inside it — which overwrites the one
+# file being consulted, so it would report the new version and the tree would
+# pass as matching while carrying the old release's Terraform, charts and CRDs.
+# The packager stamps install.sh and uninstall.sh with the same version, and
+# neither is in the way of that download, so they answer for the tree rather
+# than for the script that happens to be running.
+#
+# What this still cannot see: a tree that was never stamped at all -- GitHub's
+# auto-generated "Source code" archive of a tag is the plain repository content,
+# where BAKED_RELEASE_VERSION is empty. Such a directory is indistinguishable
+# from any other unversioned directory, and the arm below accepts it on the
+# running script's baked version, which is what tests/test_upgrade_script.py's
+# test_verify_local_source_ref_accepts_baked_release_in_non_git_dir pins.
+release_version_of_source_tree() {
+  local repo_dir="$1"
+  local marker="${repo_dir}/${KUBE_AGENTS_RELEASE_BUNDLE_MARKER}"
+  local declared=""
+
+  if [ -f "$marker" ]; then
+    declared="$(grep -E "^version=" "$marker" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || echo "")"
+    if [ -z "$declared" ]; then
+      declared="$(grep -E "^tag=" "$marker" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || echo "")"
+    fi
+  fi
+  if [ -z "$declared" ]; then
+    local stamped_script
+    for stamped_script in install.sh uninstall.sh upgrade.sh; do
+      [ -f "${repo_dir}/${stamped_script}" ] || continue
+      declared="$(grep -m1 -E '^BAKED_RELEASE_VERSION=' "${repo_dir}/${stamped_script}" 2>/dev/null | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || echo "")"
+      # An empty stamp is the plain repository content, not an answer; keep
+      # asking, so a tree carrying one unstamped script and one stamped one
+      # still reports the release it came from.
+      if [ -n "$declared" ]; then
+        break
+      fi
+    done
+  fi
+  echo "$declared"
 }
 
 # Sets RECORDED_PLUGIN_IMAGE_TAG_KEYS to the Helm keys, one per line, of the
@@ -469,6 +652,32 @@ verify_local_source_clean() {
   print_success "Verified the upgrade sources are a clean checkout of $(git -C "$repo_dir" rev-parse --short HEAD)."
 }
 
+# What the canonical repository says a release tag names, printed as a commit
+# SHA. Returns 1 when the remote could not be asked, and 2 when it answered and
+# carries no such tag: `git ls-remote` exits 0 with no output for a missing ref,
+# and the two need different remedies (retry the network, or delete the tag).
+#
+# Asked for the peeled form first: an annotated tag's own object is not the
+# commit, and comparing a checkout's HEAD against it would never match.
+# kube-agents' release tags are lightweight today, which is the second query.
+remote_release_tag_commit() {
+  local expected_ref="$1" listing="" commit=""
+  listing="$(git ls-remote --tags "$KUBE_AGENTS_REPO_URL" "$expected_ref" 2>/dev/null)" || return 1
+  commit="$(printf '%s\n' "$listing" | awk -v ref="refs/tags/${expected_ref}^{}" -F'\t' '$2 == ref {print $1; exit}')"
+  if [ -z "$commit" ]; then
+    commit="$(printf '%s\n' "$listing" | awk -v ref="refs/tags/${expected_ref}" -F'\t' '$2 == ref {print $1; exit}')"
+  fi
+  [ -n "$commit" ] || return 2
+  printf '%s' "$commit"
+}
+
+# Whether the ref names a commit outright rather than a tag. A 40-character
+# object name is self-verifying — a checkout cannot hold a different tree under
+# the same SHA — so it needs no second opinion from the remote.
+ref_is_commit_sha() {
+  printf '%s' "${1:-}" | grep -Eq '^[0-9a-fA-F]{40}$'
+}
+
 verify_local_source_ref() {
   local repo_dir="$1"
   local expected_ref="$2"
@@ -481,6 +690,18 @@ verify_local_source_ref() {
       if bundle_version="$(matches_release_bundle_ref "$repo_dir" "$expected_ref")"; then
         print_success "Verified upgrade sources match official release bundle ${bundle_version}."
         return 0
+      fi
+      # BAKED_RELEASE_VERSION belongs to the script that is RUNNING, not to the
+      # directory it was handed: a piped release one-liner carries its own
+      # version wherever it is run. So when the directory says which release it
+      # is and disagrees, that is the answer -- without this, standing in an
+      # unpacked older bundle and piping a newer upgrade.sh applied the old
+      # tree's Terraform and charts at the new tag and called it verified.
+      local tree_release=""
+      tree_release="$(release_version_of_source_tree "$repo_dir")"
+      if [ -n "$tree_release" ] && [ "$tree_release" != "$expected_ref" ]; then
+        print_error "Refusing to upgrade from '${repo_dir}': it is release '${tree_release}', not '${expected_ref}'."
+        return 1
       fi
       print_success "Verified upgrade sources match baked official release ${BAKED_RELEASE_VERSION}."
       return 0
@@ -503,15 +724,223 @@ verify_local_source_ref() {
     print_error "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
     return 1
   fi
+  # Whose '0.6.0' is this? For sources this run fetched, the answer is settled:
+  # they came from KUBE_AGENTS_REPO_URL under refs/tags. For a checkout that
+  # was already on disk it is not, because the tag was resolved out of that
+  # checkout's own object database — a tag fetched from a fork, or made by hand
+  # with `git tag 0.6.0`, resolves just as well and would be applied to the live
+  # install under the release's image tag. Before this script reused the
+  # install's checkout, the tagged path always fetched, so this asks the
+  # canonical repository the question that fetch used to answer implicitly.
+  #
+  # Skipped for a commit SHA, which is self-verifying, and only warned about in
+  # a preview, which changes nothing and is also the mode an operator reaches
+  # for when the network is the thing that is broken. A real upgrade refuses,
+  # including when the remote cannot be reached: the fetch it replaces needed
+  # the network too.
+  if [ "$SOURCES_ADOPTED_CHECKOUT" = "true" ] && ! ref_is_commit_sha "$expected_ref"; then
+    local preview_only="false" remote_commit="" remote_rc=0
+    if [ "$PARAM_DRY_RUN" = "true" ] || [ "$PARAM_PLAN" = "true" ]; then
+      preview_only="true"
+    fi
+    remote_commit="$(remote_release_tag_commit "$expected_ref")" || remote_rc=$?
+    if [ "$remote_rc" -eq 2 ]; then
+      if [ "$preview_only" = "true" ]; then
+        print_warning "${KUBE_AGENTS_REPO_URL} does not carry '${expected_ref}', so the '${expected_ref}' in ${repo_dir} is not a published release. This preview reads the local one."
+      else
+        print_error "Refusing to upgrade from ${repo_dir}: ${KUBE_AGENTS_REPO_URL} does not carry '${expected_ref}', so that checkout's '${expected_ref}' is not a published release."
+        print_info "That checkout's tag did not come from the release. Delete it ('git -C ${repo_dir} tag -d ${expected_ref}'), or pass a release tag ${KUBE_AGENTS_REPO_URL} publishes."
+        return 1
+      fi
+    elif [ "$remote_rc" -ne 0 ]; then
+      if [ "$preview_only" = "true" ]; then
+        print_warning "Could not ask ${KUBE_AGENTS_REPO_URL} what '${expected_ref}' names, so this preview is trusting the tag in ${repo_dir}."
+      else
+        print_error "Could not ask ${KUBE_AGENTS_REPO_URL} what '${expected_ref}' names, and ${repo_dir} was not fetched by this run, so its '${expected_ref}' cannot be confirmed as the release."
+        return 1
+      fi
+    elif [ "$remote_commit" != "$expected_commit" ]; then
+      if [ "$preview_only" = "true" ]; then
+        print_warning "The '${expected_ref}' in ${repo_dir} is ${expected_commit}, but ${KUBE_AGENTS_REPO_URL} names ${remote_commit}. This preview reads the local one."
+      else
+        print_error "Refusing to upgrade from ${repo_dir}: its '${expected_ref}' is ${expected_commit}, but ${KUBE_AGENTS_REPO_URL} names ${remote_commit}."
+        print_info "That checkout's tag did not come from the release. Delete or re-point it ('git -C ${repo_dir} tag -d ${expected_ref}'), or run the upgrade from a directory this script can fetch into."
+        return 1
+      fi
+    fi
+  fi
   if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=no)" ]; then
-    if [ "$PARAM_DRY_RUN" = "true" ]; then
-      print_warning "Dry-run is using uncommitted source changes; a real upgrade would require a clean checkout."
+    # Both previews warn, the way verify_local_source_clean's do and for the
+    # same reason: they change nothing, and a preview of what the working tree
+    # WOULD apply is the one command that answers "what have I edited here".
+    # Every tagged --plan reaches this, whichever checkout it runs from: the
+    # script's own, the working directory, or an install checkout reused
+    # because it is already at the ref. It used to refuse here, which took the
+    # drift report away from an operator whose checkout carries a stray edit;
+    # it now warns in all three, as --dry-run always did.
+    if [ "$PARAM_DRY_RUN" = "true" ] || [ "$PARAM_PLAN" = "true" ]; then
+      print_warning "This preview is using uncommitted source changes; a real upgrade would require a clean checkout."
     else
       print_error "Refusing to upgrade from a dirty checkout because its scripts do not exactly match '$expected_ref'."
       return 1
     fi
   fi
   print_success "Verified upgrade scripts and image ref resolve to commit ${expected_commit}."
+}
+
+# ─── The install checkout ─────────────────────────────────────────────────────
+# The two functions below are copies of install.sh's. They cannot live in
+# scripts/installer/installer_common.sh, which every other shared helper does:
+# that file is sourced out of the very checkout these two go and find, so they
+# have to run before there is anything to source. install.sh carries its own
+# copy of the install.env loader for the same reason (installer_common.sh
+# explains it there), and tests/test_upgrade_script.py pins the pair equal.
+
+# Fetch one ref from KUBE_AGENTS_REPO_URL into a clone, leaving it in FETCH_HEAD.
+# A 40-hex ref is fetched by object name; anything else is a release tag,
+# fetched under its own name so verify_local_source_ref can resolve it. $3 is
+# the depth option or empty: the fresh clone passes it, an existing clone only
+# when it is already shallow.
+fetch_source_ref() {
+  local repo_dir="$1"
+  local expected_ref="$2"
+  local depth_opt="${3:-}"
+  if [[ "$expected_ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    git -C "$repo_dir" fetch ${depth_opt:+"$depth_opt"} "$KUBE_AGENTS_REPO_URL" "$expected_ref"
+  else
+    git -C "$repo_dir" fetch ${depth_opt:+"$depth_opt"} "$KUBE_AGENTS_REPO_URL" "+refs/tags/${expected_ref}:refs/tags/${expected_ref}"
+  fi
+}
+
+# Move a clone left by an earlier install (or a plain `git clone`) to the
+# requested ref. Only the arm that runs without a checkout calls this: the two
+# arms that run this script from one never move it. A clean kube-agents
+# worktree whose HEAD is not already the ref is detached at it, a branch it was
+# on (main, say) being left behind; the ref is fetched first only when the clone
+# does not have it. Every other case prints which one applied and returns 0 so
+# verify_local_source_ref, which runs next, reports it in its own words: a
+# directory that is not the root of a Git worktree or whose HEAD is not a
+# kube-agents revision, a dirty tree, or a fetch or checkout that fails
+# (offline, a tag that does not exist).
+refresh_existing_clone() {
+  local repo_dir="$1"
+  local expected_ref="$2"
+  local head_commit="" expected_commit="" head_branch="" depth_opt=""
+  # -e "$repo_dir/.git" (a directory, or the file a linked worktree carries)
+  # rules out a plain directory inside a Git-managed HOME, which
+  # --is-inside-work-tree alone would accept and every -C command below would
+  # then act on: HOME itself would be fetched into and detached.
+  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || [ ! -e "${repo_dir}/.git" ]; then
+    print_info "Using existing repository at $repo_dir as-is: it is not the root of a Git worktree."
+    return 0
+  fi
+  if ! head_commit="$(git -C "$repo_dir" rev-parse --verify HEAD 2>/dev/null)"; then
+    print_info "Using existing repository at $repo_dir as-is: it has no commit checked out."
+    return 0
+  fi
+  # ls-tree reads the tree object only, so a blobless clone answers without
+  # fetching a blob.
+  if [ -z "$(git -C "$repo_dir" ls-tree --name-only HEAD -- "$KUBE_AGENTS_CLONE_MARKER" 2>/dev/null)" ]; then
+    print_info "Using existing repository at $repo_dir as-is: its HEAD is not a kube-agents revision (no $KUBE_AGENTS_CLONE_MARKER), so it was not moved."
+    return 0
+  fi
+  if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=no)" ]; then
+    print_info "Using existing repository at $repo_dir without modifying local changes: the checkout is dirty, so '$expected_ref' was not fetched into it."
+    return 0
+  fi
+  head_branch="$(git -C "$repo_dir" symbolic-ref --short -q HEAD || true)"
+  if expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
+    if [ "$head_commit" = "$expected_commit" ]; then
+      print_info "Using existing repository at $repo_dir: already at '$expected_ref' ($head_commit)."
+      return 0
+    fi
+    print_info "Using existing repository at $repo_dir: it already has '$expected_ref' ($expected_commit); checking it out."
+  else
+    if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+      depth_opt="$KUBE_AGENTS_FETCH_DEPTH_OPT"
+    fi
+    print_info "Using existing repository at $repo_dir: fetching '$expected_ref' from $KUBE_AGENTS_REPO_URL..."
+    if ! fetch_source_ref "$repo_dir" "$expected_ref" "$depth_opt"; then
+      print_warning "Could not fetch '$expected_ref' into $repo_dir; the checkout stays at $head_commit."
+      return 0
+    fi
+    expected_commit="FETCH_HEAD"
+  fi
+  if ! git -C "$repo_dir" checkout --detach "$expected_commit"; then
+    print_warning "Could not check out '$expected_ref' in $repo_dir; the checkout stays at $head_commit."
+    return 0
+  fi
+  if [ -n "$head_branch" ]; then
+    print_info "Moved $repo_dir from branch '$head_branch' ($head_commit) to '$expected_ref' (detached HEAD). The branch is left where it was and 'git checkout $head_branch' returns to it; untracked files such as install.env are kept."
+  else
+    print_info "Moved $repo_dir from $head_commit to '$expected_ref' (detached HEAD). 'git checkout $head_commit' returns to the previous revision; untracked files such as install.env are kept."
+  fi
+}
+
+# Whether a directory may be adopted as this run's sources. Stricter than
+# [ -d ] on purpose: verify_local_source_ref accepts anything that is not a Git
+# worktree as soon as the script's own baked release version equals the
+# requested ref — the default on every release copy — so a stale unpacked
+# bundle or an unrelated tree left at this path would be announced as verified
+# release sources and then applied to a live install. The first three checks
+# match refresh_existing_clone's, and the fourth requires kube-agents' own
+# installer helper in HEAD alongside install.sh; a directory that fails them is
+# left alone and the run fetches its engine instead.
+is_kube_agents_clone() {
+  local repo_dir="$1"
+  [ -n "$repo_dir" ] && [ -d "$repo_dir" ] || return 1
+  git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+  [ -e "${repo_dir}/.git" ] || return 1
+  git -C "$repo_dir" rev-parse --verify HEAD >/dev/null 2>&1 || return 1
+  [ -n "$(git -C "$repo_dir" ls-tree --name-only HEAD -- "$KUBE_AGENTS_CLONE_MARKER" 2>/dev/null)" ] &&
+    [ -n "$(git -C "$repo_dir" ls-tree --name-only HEAD -- "$KUBE_AGENTS_INSTALLER_COMMON_MARKER" 2>/dev/null)" ]
+}
+
+# Whether a checkout already sits on the requested ref. A preview may take its
+# sources from the install's own checkout only in that case, because then
+# nothing has to move for it.
+clone_head_is_ref() {
+  local repo_dir="$1"
+  local expected_ref="$2"
+  local head_commit="" expected_commit=""
+  head_commit="$(git -C "$repo_dir" rev-parse --verify HEAD 2>/dev/null)" || return 1
+  expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)" || return 1
+  [ "$head_commit" = "$expected_commit" ]
+}
+
+# Where this run's install configuration is, in install.sh's order of
+# preference: an explicit KUBE_AGENTS_INSTALL_ENV, then the checkout the run's
+# own sources came from, then the directory the operator is standing in, and
+# the checkout discovered in HOME last.
+#
+# That last position is the point. A workstation that manages two installs has
+# one $HOME/kube-agents and one install.env in it, so preferring it would load
+# install A's chat space, allowed users, namespace and GitOps repository into a
+# run the operator started in install B's directory and pointed at install B's
+# cluster — and a full upgrade re-renders B from all of it. The flags name the
+# cluster; they do not name the configuration.
+resolve_install_env_file() {
+  local repo_dir="$1"
+  local install_checkout="${2:-}"
+  if [ -n "${KUBE_AGENTS_INSTALL_ENV:-}" ]; then
+    echo "${KUBE_AGENTS_INSTALL_ENV}"
+    return 0
+  fi
+  if [ "$repo_dir" != "$install_checkout" ] && [ -f "${repo_dir}/install.env" ]; then
+    echo "${repo_dir}/install.env"
+    return 0
+  fi
+  if [ -f "$(pwd)/install.env" ]; then
+    echo "$(pwd)/install.env"
+    return 0
+  fi
+  if [ -n "$install_checkout" ] && [ -f "${install_checkout}/install.env" ]; then
+    echo "${install_checkout}/install.env"
+    return 0
+  fi
+  # Nothing exists yet. Naming the sources' own directory keeps the refusal
+  # below pointing at the file the installer would have written.
+  default_install_env_file "$repo_dir"
 }
 
 # Parameter Parsing
@@ -576,6 +1005,167 @@ run_lifecycle() {
   )
 }
 
+checkout_owns_run_config() {
+  local candidate="$1"
+  [ -f "${candidate}/install.env" ] || return 1
+  if [ -n "${KUBE_AGENTS_INSTALL_ENV:-}" ]; then
+    # The same file, however it is spelled. An operator can point this at the
+    # checkout's own install.env through a relative path, a symlink, or a
+    # doubled slash, and a string compare would answer "no" and send a run that
+    # is already reading that checkout's config off to a temporary clone. -ef
+    # compares device and inode, so it answers for the file. The string compare
+    # is only a fallback for a path that does not exist, which main() refuses
+    # before this is ever reached (see the KUBE_AGENTS_INSTALL_ENV check next to
+    # the --dry-run/--plan conflict); it stays for the source-only callers that
+    # reach this function without going through main().
+    if [ -e "$KUBE_AGENTS_INSTALL_ENV" ]; then
+      [ "$KUBE_AGENTS_INSTALL_ENV" -ef "${candidate}/install.env" ]
+    else
+      [ "$KUBE_AGENTS_INSTALL_ENV" = "${candidate}/install.env" ]
+    fi
+    return
+  fi
+  if [ -f "$(pwd)/install.env" ] && ! [ "$(pwd)/install.env" -ef "${candidate}/install.env" ]; then
+    return 1
+  fi
+  return 0
+}
+
+# Put this run's sources on disk, and name the install checkout it found. Both
+# land in the variables named by $1 and $2 rather than being echoed, because
+# the progress lines would otherwise be captured along with the paths — the
+# arrangement, and the arm structure, of install.sh's acquire_source_repo.
+#
+# A tagless run cannot fetch its own engine — there is no tag to fetch — and
+# cannot compare the checkout against a ref it was not given. Both are things
+# the tag makes possible rather than things the run needs.
+#
+# What the tag does NOT excuse is the state of the checkout itself: a tagless
+# run still applies this directory's Terraform and charts to a live install, so
+# verify_local_source_clean runs either way and only the ref comparison is
+# conditional.
+acquire_upgrade_sources() {
+  local repo_var="$1"
+  local checkout_var="$2"
+  local expected_ref="$3"
+  # Named differently from the caller's variables on purpose: bash scopes
+  # locals dynamically, so a local sharing a name with the variable named in
+  # $1 or $2 would be the one printf -v writes to, and the caller would read
+  # back an empty string.
+  local resolved_dir="" found_checkout="" script_dir="" script_path="${BASH_SOURCE[0]:-}"
+  # Under `curl … | bash` there is no script file on disk. At the top level
+  # `${BASH_SOURCE[0]:-}` is empty there; inside a function — which is where
+  # this runs — what bash reports depends on its version: `main` or nothing on
+  # the releases on_error's comment above describes, and `$0` on bash 5.3
+  # (measured): `bash` for the documented one-liner, or the interpreter's own
+  # path (`/bin/bash`) when it is invoked by path. None of them names this
+  # script. An unguarded `dirname` turns the empty value, `main` and a bare
+  # `bash` into `.`, and `pwd` into the directory the operator is standing in,
+  # which would skip the checkout arms below. Two checks share the job:
+  # requiring a non-empty path that names an existing file rejects the empty
+  # value, `main` and a bare `bash` (short of a file by that name in the
+  # working directory), and the installer-helper marker check that follows
+  # rejects the interpreter's directory, which carries no checkout.
+  if [ -n "$script_path" ] && [ -f "$script_path" ]; then
+    script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd || echo "")"
+  fi
+  if [ -n "$script_dir" ] && [ -f "${script_dir}/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ]; then
+    resolved_dir="$script_dir"
+  elif [ -f "$(pwd)/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ] && {
+    [ -z "$expected_ref" ] || ! is_kube_agents_clone "$(pwd)"
+  }; then
+    resolved_dir="$(pwd)"
+  elif [ -z "$expected_ref" ]; then
+    print_error "--plan and --keep-image-tag have to run from a kube-agents checkout: without --image-tag there is no ref to fetch the engine at."
+    exit 1
+  else
+    # The checkout install.sh left behind is preferred over a fresh copy of the
+    # same sources, because it is not only sources: the install's install.env
+    # sits in it, and the upgrade refuses to re-render the install without one.
+    # Fetching into a temporary directory instead is what made the documented
+    # install and the documented upgrade disagree.
+    #
+    # Only inside this arm, and only when that checkout owns this run's
+    # install.env. A run that already has a checkout keeps it, so a CI job that
+    # checked out the ref it is reconciling is never redirected at whatever an
+    # earlier install happened to leave in HOME. A developer clone in $(pwd)
+    # without install.env yields to HOME's install checkout rather than being
+    # detached onto the release tag, and a second install configured from
+    # $(pwd)/install.env or KUBE_AGENTS_INSTALL_ENV outside HOME's checkout
+    # fetches a temporary engine instead of overwriting HOME's terraform.tfvars.
+    local clone_dir=""
+    if [ -n "${HOME:-}" ]; then
+      clone_dir="$(kube_agents_clone_dir)"
+    fi
+    if [ -f "$(pwd)/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ] && checkout_owns_run_config "$(pwd)"; then
+      found_checkout="$(pwd)"
+    elif [ -n "$clone_dir" ] && is_kube_agents_clone "$clone_dir" && checkout_owns_run_config "$clone_dir"; then
+      found_checkout="$clone_dir"
+    fi
+    # A preview promises to change nothing, and the operator's checkout is part
+    # of "nothing": moving it to the requested release would leave the next
+    # thing run from that directory — install.sh, uninstall.sh, terraform by
+    # hand — on a revision the cluster is not on, after a command that said it
+    # had changed nothing. So a preview never moves the checkout: it reuses it
+    # only when it is already at the ref, and otherwise reads its engine from a
+    # temporary copy, loading only the install's configuration from the
+    # checkout. Reuse is not read-only: `--plan` over an at-ref checkout
+    # regenerates its terraform.tfvars and initialises .terraform/ there, as a
+    # real upgrade would; neither is tracked, and HEAD stays where it was.
+    local preview="false"
+    if [ "$PARAM_PLAN" = "true" ] || [ "$PARAM_DRY_RUN" = "true" ]; then
+      preview="true"
+    fi
+    if [ -n "$found_checkout" ] && [ "$preview" = "false" ]; then
+      resolved_dir="$found_checkout"
+      # Read before the move, so the EXIT trap can undo it if this run refuses
+      # later. refresh_existing_clone is pinned byte-equal to install.sh's, so
+      # the bookkeeping sits here rather than inside it: install.sh moves a
+      # clone it made, this moves the operator's own directory.
+      local prev_head="" prev_branch="" now_head="" had_ref="false"
+      prev_head="$(git -C "$resolved_dir" rev-parse --verify HEAD 2>/dev/null || echo "")"
+      prev_branch="$(git -C "$resolved_dir" symbolic-ref --short -q HEAD || true)"
+      if [ -n "$expected_ref" ] && git -C "$resolved_dir" rev-parse --verify "${expected_ref}^{commit}" >/dev/null 2>&1; then
+        had_ref="true"
+      fi
+      refresh_existing_clone "$resolved_dir" "$expected_ref"
+      now_head="$(git -C "$resolved_dir" rev-parse --verify HEAD 2>/dev/null || echo "")"
+      if [ -n "$prev_head" ] && [ -n "$now_head" ] && [ "$prev_head" != "$now_head" ]; then
+        MOVED_CHECKOUT_DIR="$resolved_dir"
+        MOVED_CHECKOUT_PREV_HEAD="$prev_head"
+        MOVED_CHECKOUT_PREV_BRANCH="$prev_branch"
+      fi
+      if [ "$had_ref" = "true" ]; then
+        SOURCES_ADOPTED_CHECKOUT="true"
+      fi
+    elif [ -n "$found_checkout" ] && clone_head_is_ref "$found_checkout" "$expected_ref"; then
+      resolved_dir="$found_checkout"
+      SOURCES_ADOPTED_CHECKOUT="true"
+      print_info "Using the install checkout at ${resolved_dir}: it is already at '${expected_ref}'."
+    else
+      if [ -n "$found_checkout" ]; then
+        print_info "Previewing '${expected_ref}' from a temporary copy: ${found_checkout} is on another revision, and a preview does not move it."
+      fi
+      TEMP_REPO_DIR="$(mktemp -d)"
+      resolved_dir="${TEMP_REPO_DIR}/kube-agents"
+      print_info "Fetching the upgrade engine for '${expected_ref}'..."
+      git clone --filter=blob:none --no-checkout "$KUBE_AGENTS_REPO_URL" "$resolved_dir"
+      # Through fetch_source_ref, the way install.sh fetches: by object name for
+      # a commit SHA and under refs/tags for a release, and from the repository
+      # URL rather than the clone's own origin.
+      fetch_source_ref "$resolved_dir" "$expected_ref" "$KUBE_AGENTS_FETCH_DEPTH_OPT"
+      git -C "$resolved_dir" checkout --detach FETCH_HEAD
+    fi
+  fi
+  if [ -n "$expected_ref" ]; then
+    verify_local_source_ref "$resolved_dir" "$expected_ref"
+  else
+    verify_local_source_clean "$resolved_dir"
+  fi
+  printf -v "$repo_var" '%s' "$resolved_dir"
+  printf -v "$checkout_var" '%s' "$found_checkout"
+}
+
 main() {
   parse_args "$@"
   print_banner
@@ -601,7 +1191,7 @@ main() {
     print_info "No --image-tag given; the plan will use the tag this install is already running."
   elif [ -z "$PARAM_IMAGE_TAG" ]; then
     if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
-      print_error "--image-tag is required; use a validated release tag or full commit SHA."
+      print_error "--image-tag is required; this copy of the script carries no baked release version. Re-run the release-pinned script for the version you want, or pass a validated release tag or full commit SHA."
       exit 1
     fi
     if [ -c /dev/tty ] && ( : </dev/tty ) 2>/dev/null; then
@@ -617,7 +1207,7 @@ main() {
         exit 1
       fi
     else
-      print_error "--image-tag is required when no interactive terminal is available (e.g. curl | bash)."
+      print_error "--image-tag is required when no interactive terminal is available and this copy of the script carries no baked release version. Re-run the release-pinned script for the version you want, or pass --image-tag."
       exit 1
     fi
   fi
@@ -634,46 +1224,27 @@ main() {
     *) print_error "Unsupported upgrade mode '$PARAM_UPGRADE_MODE'. Use full, harness, or operator."; exit 1 ;;
   esac
 
-  # A tagless run cannot fetch its own engine — there is no tag to fetch — and
-  # cannot compare the checkout against a ref it was not given. Both are things
-  # the tag makes possible rather than things the run needs.
-  #
-  # What the tag does NOT excuse is the state of the checkout itself: a tagless
-  # run still applies this directory's Terraform and charts to a live install,
-  # so verify_local_source_clean runs either way and only the ref comparison is
-  # conditional.
-  local script_dir repo_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [ -f "${script_dir}/scripts/installer/installer_common.sh" ]; then
-    repo_dir="$script_dir"
-    if [ -n "$PARAM_IMAGE_TAG" ]; then
-      verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
-    else
-      verify_local_source_clean "$repo_dir"
-    fi
-  elif [ -f "$(pwd)/scripts/installer/installer_common.sh" ]; then
-    repo_dir="$(pwd)"
-    if [ -n "$PARAM_IMAGE_TAG" ]; then
-      verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
-    else
-      verify_local_source_clean "$repo_dir"
-    fi
-  elif [ -z "$PARAM_IMAGE_TAG" ]; then
-    print_error "--plan and --keep-image-tag have to run from a kube-agents checkout: without --image-tag there is no ref to fetch the engine at."
+  if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_PLAN" = "true" ]; then
+    print_error "--dry-run and --plan are different previews and cannot be combined: --dry-run answers offline from configuration, --plan answers from the install's Terraform state."
     exit 1
-  else
-    TEMP_REPO_DIR="$(mktemp -d)"
-    repo_dir="${TEMP_REPO_DIR}/kube-agents"
-    print_info "Fetching the upgrade engine for '${PARAM_IMAGE_TAG}'..."
-    git clone --filter=blob:none --no-checkout "$KUBE_AGENTS_REPO_URL" "$repo_dir"
-    git -C "$repo_dir" fetch --depth=1 origin "$PARAM_IMAGE_TAG"
-    git -C "$repo_dir" checkout --detach FETCH_HEAD
-    verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
   fi
 
-  print_step "1. Validating Upgrade Target & Environment"
-  print_info "Upgrade Mode: ${C_BOLD}${PARAM_UPGRADE_MODE}${C_RESET}"
-  print_info "Target Image Tag: ${C_BOLD}${PARAM_IMAGE_TAG}${C_RESET}"
+  # An explicit pointer at a file that is not there is a typo, not a lookup
+  # order to fall through. Naming it here is the parity install.sh already has
+  # in bootstrap_install_env; without it the run ends at "No install
+  # configuration (install.env) was found in <somewhere>", which blames a
+  # directory the operator never chose and never prints the path they did.
+  #
+  # Before acquire_upgrade_sources on purpose. The pointer is also what
+  # checkout_owns_run_config compares against, so a nonexistent one makes the
+  # install checkout look like somebody else's and sends the run off to clone
+  # the engine into a temporary directory first -- work thrown away, and a
+  # worse directory to be named in the refusal that follows.
+  if [ -n "${KUBE_AGENTS_INSTALL_ENV:-}" ] && [ ! -f "${KUBE_AGENTS_INSTALL_ENV}" ]; then
+    print_error "KUBE_AGENTS_INSTALL_ENV names '${KUBE_AGENTS_INSTALL_ENV}', which does not exist."
+    print_info "Point it at the install's install.env, or unset it to search this run's sources, the current directory, and the install checkout in \$HOME/kube-agents."
+    exit 1
+  fi
 
   local required_tools=(gcloud kubectl helm)
   # jq: the harness step's plugin re-tag reads the release's values with it,
@@ -693,43 +1264,57 @@ main() {
     fi
   done
 
+  local repo_dir="" install_checkout=""
+  acquire_upgrade_sources repo_dir install_checkout "$PARAM_IMAGE_TAG"
+
+  print_step "1. Validating Upgrade Target & Environment"
+  print_info "Upgrade Mode: ${C_BOLD}${PARAM_UPGRADE_MODE}${C_RESET}"
+  print_info "Target Image Tag: ${C_BOLD}${PARAM_IMAGE_TAG}${C_RESET}"
+
   # Shared defaults, the install.env loader, and the terraform.tfvars generator.
   # Sourced here rather than just before the generator, because the state load
   # below needs load_install_env. Print helpers are already defined above, as
   # the file expects.
   # shellcheck disable=SC1091
-  source "${repo_dir}/scripts/installer/installer_common.sh"
+  source "${repo_dir}/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}"
 
-  # Two sources, in this order, so the hand-authored input wins: a legacy
-  # vars.sh from an install that predates install.env, then install.env over
-  # the top of it. Either one on its own is enough to upgrade.
-  local state_file="${repo_dir}/k8s-operator/scripts/vars.sh"
+  # install.env is the install's configuration, and the only one. It is resolved
+  # against the install checkout as well as this run's sources, because a
+  # preview reads its engine from a temporary copy, which has no install.env.
   local install_env_file
-  install_env_file="$(default_install_env_file "$repo_dir")"
-  local state_loaded="false"
-  if [ -f "$state_file" ]; then
-    # shellcheck disable=SC1090,SC1091
-    if ! source "$state_file"; then
-      print_error "Configuration state is invalid and could not be loaded."
-      exit 1
-    fi
-    state_loaded="true"
-    print_success "Loaded existing configuration state from k8s-operator/scripts/vars.sh"
-  fi
+  install_env_file="$(resolve_install_env_file "$repo_dir" "$install_checkout")"
+  # Clear any shell-exported coordinates before sourcing the file: load_install_env
+  # only unsets NAMESPACE, so without this an install.env that omits REGION while
+  # the caller's shell exports REGION=europe-west1 would make the cross-check
+  # below blame install.env for a value the file never recorded.
+  unset PROJECT_ID CLUSTER_NAME REGION
   if load_install_env "$install_env_file"; then
-    state_loaded="true"
     print_success "Loaded install configuration from: ${install_env_file}"
-  fi
-  if [ "$state_loaded" != "true" ]; then
-    print_warning "No install configuration (install.env) and no saved state (k8s-operator/scripts/vars.sh) was found in ${repo_dir}."
+  else
+    local searched="${repo_dir}"
+    if [ -n "$install_checkout" ] && [ "$install_checkout" != "$repo_dir" ]; then
+      searched="${searched} or ${install_checkout}"
+    fi
+    print_warning "No install configuration (install.env) was found in ${searched}."
+    # Fail closed, and do it here: the upgrade re-renders the PlatformAgent
+    # Custom Resource from this file, so upgrading without it would silently
+    # reset chat, allowed users, dashboard, and model-provider configuration to
+    # blank defaults. The refusal used to sit below the --dry-run exit, which
+    # made the preview answer "here is what would happen" to a run that would
+    # in fact have refused -- and .agents/skills/upgrade-kube-agents/SKILL.md
+    # offers --dry-run as the pre-flight check. A preview of a run that cannot
+    # happen is worth nothing, so both previews stop here with the real run.
+    print_error "Refusing to upgrade without the installation's configuration."
+    print_info "Run upgrade.sh from the directory holding the install's install.env, point KUBE_AGENTS_INSTALL_ENV at one, or keep the install checkout the installer left in \$HOME/kube-agents."
+    exit 1
   fi
   # GITOPS_ORG / GITOPS_REPO are the names; a configuration still carrying
   # GITHUB_ORG / GITHUB_REPO is accepted with a warning. Runs after the load and
   # before anything reads the coordinates.
   normalize_gitops_repo_vars
-  # Same shape, for the memory setting: install.env records MEMORY, a migrated
-  # vars.sh still carries the old MEMORY_PROVIDER, and the file loaded second
-  # has to win.
+  # install.env records the operator-facing MEMORY; MEMORY_PROVIDER is the name
+  # the chart and the generator read. Derived here, after the load and before
+  # anything reads it.
   normalize_memory_vars
 
   local target_project="${PARAM_PROJECT_ID:-${PROJECT_ID:-}}"
@@ -747,9 +1332,42 @@ main() {
   print_info "GCP Target Project: ${C_BOLD}${target_project}${C_RESET}"
   print_info "GKE Target Cluster: ${C_BOLD}${target_cluster}${C_RESET} (${target_region})"
 
-  if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_PLAN" = "true" ]; then
-    print_error "--dry-run and --plan are different previews and cannot be combined: --dry-run answers offline from configuration, --plan answers from the install's Terraform state."
-    exit 1
+  # The loaded configuration records the install it belongs to, and the flags
+  # can name a different one. The lookup order is what usually keeps those in
+  # step -- standing in an install's directory upgrades that install -- but the
+  # piped one-liner has nowhere to stand, so $HOME/kube-agents/install.env is
+  # what gets loaded whatever --gke-cluster-name says. A full upgrade
+  # re-renders the PlatformAgent CR from that file, so the mismatch does not
+  # merely upgrade the wrong install: it writes A's chat space, allowed users,
+  # model provider and NAMESPACE into B. Unlike the dirty-checkout check, both
+  # a real run and --plan refuse here; only --dry-run reports it and goes on.
+  #
+  # Unconditional: a run with no configuration at all has already stopped above.
+  local coordinate_conflicts=""
+  if [ -n "$PARAM_PROJECT_ID" ] && [ -n "${PROJECT_ID:-}" ] && [ "$PARAM_PROJECT_ID" != "$PROJECT_ID" ]; then
+    coordinate_conflicts="${coordinate_conflicts}    --gcp-project-id=${PARAM_PROJECT_ID}, but PROJECT_ID=${PROJECT_ID}"$'\n'
+  fi
+  if [ -n "$PARAM_CLUSTER_NAME" ] && [ -n "${CLUSTER_NAME:-}" ] && [ "$PARAM_CLUSTER_NAME" != "$CLUSTER_NAME" ]; then
+    coordinate_conflicts="${coordinate_conflicts}    --gke-cluster-name=${PARAM_CLUSTER_NAME}, but CLUSTER_NAME=${CLUSTER_NAME}"$'\n'
+  fi
+  if [ -n "$PARAM_REGION" ] && [ -n "${REGION:-}" ] && [ "$PARAM_REGION" != "$REGION" ]; then
+    coordinate_conflicts="${coordinate_conflicts}    --gcp-region=${PARAM_REGION}, but REGION=${REGION}"$'\n'
+  fi
+  if [ -n "$coordinate_conflicts" ]; then
+    # Only --dry-run warns and goes on: it exits immediately below without
+    # touching the checkout. --plan would go on to write terraform.tfvars and
+    # run lifecycle.sh plan (which reconfigures .terraform/ in repo_dir),
+    # diffing one install's configuration against another's state while
+    # rewriting the first install's checkout.
+    if [ "$PARAM_DRY_RUN" = "true" ]; then
+      print_warning "${install_env_file} was written for another install, and this preview reads it anyway:"
+      printf '%s' "$coordinate_conflicts" >&2
+    else
+      print_error "Refusing to upgrade: ${install_env_file} records a different install than the flags name."
+      printf '%s' "$coordinate_conflicts" >&2
+      print_info "A full upgrade re-renders the PlatformAgent CR from that file, so this would write one install's configuration into another. Point KUBE_AGENTS_INSTALL_ENV at the install.env of the install you are upgrading, run from its checkout, or drop the flags that disagree with it."
+      exit 1
+    fi
   fi
 
   if [ "$PARAM_DRY_RUN" = "true" ]; then
@@ -762,36 +1380,6 @@ main() {
     exit 0
   fi
 
-  # Fail closed without any configuration: the upgrade re-renders the
-  # PlatformAgent Custom Resource from it, so upgrading without it would
-  # silently reset chat, allowed users, dashboard, and model-provider
-  # configuration to blank defaults.
-  if [ "$state_loaded" != "true" ]; then
-    print_error "Refusing to upgrade without the installation's configuration."
-    print_info "Run upgrade.sh from the directory holding the install's install.env, point KUBE_AGENTS_INSTALL_ENV at one, or restore k8s-operator/scripts/vars.sh."
-    exit 1
-  fi
-
-  # Keep a legacy vars.sh agreeing with the confirmed target, the way
-  # uninstall.sh does, so no tool still pointed at it names another cluster.
-  #
-  # Only into a vars.sh that is already there, the way uninstall.sh guards the
-  # same three calls. persist_state_var's append is unconditional -- only its
-  # grep/mv rewrite tests for the file -- so on an install.env-only install the
-  # redirect would open a path under k8s-operator/scripts/, a directory this
-  # release no longer creates, and `set -Eeuo pipefail` would abort the upgrade
-  # at step 1. The exports below are what the rest of this run actually reads.
-  if [ -f "$state_file" ]; then
-    if [ -n "$PARAM_PROJECT_ID" ]; then
-      persist_state_var "$state_file" PROJECT_ID "$target_project"
-    fi
-    if [ -n "$PARAM_CLUSTER_NAME" ]; then
-      persist_state_var "$state_file" CLUSTER_NAME "$target_cluster"
-    fi
-    if [ -n "$PARAM_REGION" ]; then
-      persist_state_var "$state_file" REGION "$target_region"
-    fi
-  fi
   export PROJECT_ID="$target_project"
   export CLUSTER_NAME="$target_cluster"
   export REGION="$target_region"
@@ -923,7 +1511,7 @@ main() {
 
   # The release guard runs before the tfvars generation on purpose: a
   # pre-Terraform install deserves this message, not whatever the generator
-  # trips over first (its vars.sh may lack the credentials the generator
+  # trips over first (its install.env may lack the credentials the generator
   # recovers from the live Secret).
   if ! helm status "$KUBE_AGENTS_HELM_RELEASE" -n "$target_namespace" >/dev/null 2>&1; then
     print_error "No Helm release '${KUBE_AGENTS_HELM_RELEASE}' in namespace '$target_namespace'."
@@ -941,10 +1529,24 @@ main() {
       print_warning "Helm release '${KUBE_AGENTS_HELM_RELEASE}' is currently in '${current_helm_status}'. Note: rollback is skipped in plan mode."
     fi
   fi
+  # Snapshot any pre-existing terraform.tfvars in an adopted checkout before
+  # write_tfvars_from_state overwrites it: if full or harness later refuses
+  # before UPGRADE_APPLY_STARTED, restore_moved_checkout puts the previous
+  # tfvars back (or removes the newly created one) alongside the previous commit.
+  local tfvars_file="${repo_dir}/terraform/examples/full-install/terraform.tfvars"
+  snapshot_moved_checkout_tfvars "$tfvars_file"
   # NAMESPACE steers the generator's Secret-recovery reads (install.env omits
   # credentials when PERSIST_SECRETS_ON_DISK=false; the live Secret has them).
+  #
+  # KUBE_AGENTS_REQUIRE_MEMORY_ANSWER: an upgrade applies (and --plan renders
+  # the same tfvars), so if the generator cannot tell whether this cluster runs
+  # the Hindsight memory store and nothing named a memory mode, it must stop
+  # rather than fall through to multiuser_memory and plan the database away.
+  # An install.env that records MEMORY never reaches that branch. uninstall.sh
+  # deliberately does not opt in.
   NAMESPACE="$target_namespace" \
-    write_tfvars_from_state "${repo_dir}/terraform/examples/full-install/terraform.tfvars" "$PARAM_IMAGE_TAG"
+    KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
+    write_tfvars_from_state "$tfvars_file" "$PARAM_IMAGE_TAG"
 
   if [ "$PARAM_PLAN" = "true" ]; then
     print_step "4. Planning (read-only)"
@@ -974,9 +1576,21 @@ main() {
     exit "$plan_status"
   fi
 
+  # UPGRADE_APPLY_STARTED is set inside each arm below rather than here, and
+  # the difference is load-bearing. Both previews have exited above, so it is
+  # tempting to read "past the previews" as "past the point of no return" — but
+  # two arms still refuse after the dispatch and before they write anything:
+  # full runs the minter/KMS guard and the service-account 409 check, and
+  # harness reads the release's values to learn which plugin tags to move. A run
+  # that stops on one of those has applied none of the new release, so the
+  # checkout this run detached has to go back. Each arm therefore flips the gate
+  # on its own last line before its first mutating command, and
+  # UpgradeRunContractTest.test_the_apply_gate_sits_after_every_refusal_in_its_arm
+  # pins that placement, which is otherwise unreachable from the test suite.
   case "$PARAM_UPGRADE_MODE" in
     operator)
       print_step "4. Upgrading Kubernetes Operator (CRDs & Controller Manager)"
+      UPGRADE_APPLY_STARTED="true"
       apply_crd_upgrades
       helm_retag "operator.image.tag"
       print_success "Kubernetes Operator upgraded successfully!"
@@ -994,20 +1608,21 @@ main() {
       # the image check below reads both. A plain call, not a substitution: a
       # failed read stops the run here, once, with its own message shown.
       harness_retag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"
+      # After the read, not before it: `helm get values` is the last thing this
+      # arm does that can fail without having changed anything.
+      UPGRADE_APPLY_STARTED="true"
       helm_retag "${HARNESS_RETAG_KEYS[@]}"
       print_success "Platform Agent deployment upgraded successfully!"
       ;;
 
     full)
       print_step "4. Executing Full Atomic Upgrade (Terraform + Helm)"
-      apply_crd_upgrades
       # install.sh's post-generation minter guard, without its import step:
       # an upgrade never imports the App key, so an install.env that enables the
       # minter against a key with no ENABLED version would wedge the apply on
       # the minter's readiness until the helm timeout fails the upgrade.
       # Refuse up front instead and name the two ways out.
-      if grep -q '^enable_github_minter = true$' \
-        "${repo_dir}/terraform/examples/full-install/terraform.tfvars" 2>/dev/null; then
+      if grep -q '^enable_github_minter = true$' "$tfvars_file" 2>/dev/null; then
         minter_enabled_version="$(kms_key_enabled_version "${KMS_KEY:-$DEFAULT_KMS_KEY}" \
           "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "${REGION}")" "${PROJECT_ID}")"
         if [ -z "$minter_enabled_version" ]; then
@@ -1020,6 +1635,10 @@ main() {
       # new fixed-name GSA on an install that has been running without one, so
       # the 409 check install.sh runs before its apply runs here too.
       check_service_account_ownership || exit 1
+      # Both guards above are refusals, and apply_crd_upgrades is the first
+      # write this arm makes, so the gate belongs between them.
+      UPGRADE_APPLY_STARTED="true"
+      apply_crd_upgrades
       # A full terraform apply against the regenerated tfvars: both image tags
       # move, and every setting recorded in install.env is re-rendered — the successor
       # of the old path's re-render of the CR from saved state.

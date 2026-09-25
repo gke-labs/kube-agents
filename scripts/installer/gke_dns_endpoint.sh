@@ -19,9 +19,11 @@
 # most wrong, so this reads the cluster's configuration up front instead.
 #
 # This file is deliberately dependency-free -- no colours, no state file, no
-# print_* helpers -- because it is sourced by three shell libraries that do not
-# share anything else: scripts/installer/common.sh, hack/ci-env.sh, and
-# scripts/release/common.sh.
+# print_* helpers -- because the callers that want the predicate share nothing
+# else with each other. Keep it that way, so that taking the predicate never
+# means taking anything along with it. scripts/installer/README.md holds the
+# roster of who sources it; do not restate it here, where any list of them goes
+# stale the next time something new does.
 #
 # The Python equivalent, used by the agent at runtime, is
 # agents/platform/scripts/gke_endpoint.py. Keep the two predicates in step.

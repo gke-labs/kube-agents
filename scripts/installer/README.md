@@ -107,12 +107,32 @@ reach `write_tfvars_from_state` and the `TF_VAR_*` handoff, both of which read t
 environment. Order of authority is **flag, then file, then an exported variable, then
 the defaults above** — `set -a` sourcing means a key the file carries overwrites an
 export of the same name, so a flag is what overrides a recorded value for one run.
-One key ignores the environment: the front doors clear a shell-exported `NAMESPACE`
-before reading the file, because kubectl tooling exports that name and the value now
-reaches the Helm release's namespace. The file and `--agent-namespace` are the two
-routes in. The dev tooling's `load_state` clears it the same way.
+One key ignores the environment in every front door: `install.sh`, `upgrade.sh`, and
+`uninstall.sh` clear a shell-exported `NAMESPACE` before reading the file, because kubectl
+tooling exports that name and the value now reaches the Helm release's namespace. The file
+and `--agent-namespace` are the two routes in (`common.sh`'s `load_state` clears it the
+same way). `upgrade.sh` and `uninstall.sh` also clear shell-exported `PROJECT_ID`,
+`CLUSTER_NAME`, and `REGION` before reading `install.env`, so ambient GCP exports in the
+caller's shell cannot steer a Day-2 run at a different cluster or be mistaken for keys
+recorded in `install.env` — pass `--gcp-project-id`, `--gke-cluster-name`, and `--gcp-region`
+when `install.env` omits them (or when tearing down a pre-`install.env` install); when both
+a flag and `install.env` name a coordinate and disagree, `upgrade.sh` and `uninstall.sh`
+refuse rather than mixing two installs' settings.
 `KUBE_AGENTS_INSTALL_ENV` points at a different path, which is how CI renders one from
 its own variables rather than keeping install state on an ephemeral runner.
+
+Which file that is, for a front door that has to go and find one: `KUBE_AGENTS_INSTALL_ENV`
+first, then the checkout the run's own sources came from, then the working directory,
+and last — when `install.sh`, `upgrade.sh`, or `uninstall.sh` runs from outside a
+checkout (such as the release-pinned one-liner, which has no checkout of its own) — the install
+checkout in `$HOME/kube-agents`. A checkout run of any of the three front doors never falls
+through to `$HOME/kube-agents`, and on a piped run `$HOME/kube-agents` is last rather than first
+so that a workstation managing two installs acts on the one whose directory the operator is
+standing in, not whichever one that shared checkout belongs to. The one additional gate on
+`uninstall.sh` is `--source-ref`: because that handover exists to tear down an older release
+(and pre-`0.4.0` installs wrote no `install.env`), a file found only at
+`$HOME/kube-agents/install.env` is skipped unless all three of `--gcp-project-id`,
+`--gke-cluster-name`, and `--gcp-region` are given on the command line and match it.
 
 `install.sh` reads it and does not rewrite it. It creates one at the end of a first
 install, when there is nothing there, and never touches it again; the Day-2 menu's
@@ -136,7 +156,10 @@ That precedence has a sharp edge on an install that already exists. A key missin
 into `terraform.tfvars`, and `upgrade.sh --upgrade-mode=full` then plans the destruction of
 whatever the default does not mention. `ENABLE_GVISOR` absent destroys the gVisor node pool
 on a Standard cluster (`write_tfvars_from_state` falls back to `false` for that key, not to
-`install.defaults.env`'s `true`); `MEMORY` absent destroys the Hindsight API and its Postgres;
+`install.defaults.env`'s `true`); `MEMORY` absent falls back to `file` unless
+`write_tfvars_from_state` finds a live Hindsight deployment (`hindsight-postgresql` or
+`hindsight-api`) on the target cluster, in which case `kube_agents_memory` is preserved
+(`--memory=file` or `MEMORY=file` is required to tear it down);
 `ENABLE_GKE_BACKUP_PLAN` absent destroys the backup plan; `ENABLE_STOCKOUT_INVESTIGATOR`
 absent destroys the stockout log sink, its alerts topic and subscription, and their IAM
 grants; `ENABLE_PUBSUB_PLATFORM` absent removes the adapter plugin from the release (the
@@ -147,6 +170,19 @@ The file `install.sh` writes at the end of a first install carries every one of 
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
 configuration first and real drift second.
+
+`MEMORY` is the only one of the keys above that the generator goes and asks the cluster
+about, because it is the only one whose default deletes data rather than infrastructure
+Terraform can build again. That probe has three outcomes, not two. Found and confirmed
+absent behave as above; the third is "could not ask" — no `kubectl`, a context pointing at
+another cluster, an expired credential, a timeout — and there `install.sh` and `upgrade.sh`
+stop and say so rather than read silence as "no Hindsight here". Answer the question
+instead: record `MEMORY=hindsight|file|off` in `install.env` (`install.sh` also takes
+`--memory=`, and `MEMORY=…` in the environment answers for one run), or restore access to
+the cluster and re-run. The recording is named first because `upgrade.sh` has no `--memory`
+flag and would answer it with `Unknown parameter`. `uninstall.sh` does not stop, because a
+teardown removes the store either way and an install has to keep a working way to remove
+itself.
 
 Loading the input first is also what fixes non-interactive re-runs (#1060). Every
 `PARAM_X="${VAR:-}"` seed already knew how to inherit from the environment; giving it a
@@ -219,26 +255,22 @@ pre-existing clusters (testing environments only).
 
 ### The predecessor: `vars.sh`
 
-`k8s-operator/scripts/vars.sh` was the generated state file `install.env` replaces. No
-front door writes one any more. Every reader still accepts one so that an install
-predating the change keeps working with no action from its owner: each loads `vars.sh`
-first and `install.env` over the top, so the input wins. `install.sh` additionally
-migrates — it reads a legacy `vars.sh` and warns, and a full run that has no `install.env`
-yet writes those values into one on the way out, after which the old file can be deleted.
-A run that already has an `install.env` does not: `bootstrap_install_env_file` treats an
-existing file as the operator's, so the legacy values are loaded for that run and recorded
-nowhere. Delete `vars.sh` only once `install.env` carries what you need from it.
+`k8s-operator/scripts/vars.sh` was the generated state file `install.env` replaced in 0.4.0.
+No front door or Python helper reads, writes, or inspects it any more; `install.env` is the
+sole install configuration input, and pre-0.4.0 checkouts without `install.env` are not
+supported.
 
-One writer is left, and it is not an install one. The dev tooling under `scripts/dev/`
-records whether it created the throwaway Artifact Registry (`DEV_ARTIFACT_REGISTRY_CREATED`)
-through `save_var`, which lands in `scripts/installer/vars.sh` beside these helpers. That
-file is developer scratch state, git-ignored, and holds nothing an install is configured
-from; deleting it costs at most one redundant registry check.
+One separate file of the same name remains, and it is not an install configuration: the
+dev tooling under `scripts/dev/` records whether it created the throwaway Artifact Registry
+(`DEV_ARTIFACT_REGISTRY_CREATED`) through `save_var`, which lands in
+`scripts/installer/vars.sh` beside these helpers. That file is developer scratch state,
+git-ignored, and holds nothing an install is configured from; deleting it costs at most one
+redundant registry check.
 
 Both Python readers — `scripts/live_test_lease.py` and `admin_console/project_config.py`
-— match an allowlist of assignments with a regex and never source either file, because
-both hold credentials. They accept `K=V` and `export K=V` alike, since `install.env` is a
-dotenv and `vars.sh` was generated with `printf %q`.
+— match an allowlist of assignments in `install.env` with a regex and never source it,
+because it holds credentials. They accept `K=V` and `export K=V` alike, since `install.env`
+is a hand-authored dotenv and a hand may well write `export`.
 
 ## File directory
 
@@ -259,7 +291,7 @@ dotenv and `vars.sh` was generated with `printf %q`.
   (`hack/ci-deploy.sh`) use — colour output, `init_var`/`load_state`,
   registry and third-party-image resolution, cluster connection helpers. Sources
   `installer_common.sh`, so nothing is defined twice.
-- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. Kept out of `common.sh` and free of its helpers so `hack/ci-env.sh`, `scripts/release/common.sh`, `upgrade.sh`, and the staging-workload scripts can source the one predicate without also taking on the state file. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched.
+- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. Kept out of `common.sh` and free of its helpers so that everything needing the one predicate can source it without also taking on the state file: `installer_common.sh`, `common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, the release scripts (`scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`), the staging-workload scripts, and `scripts/test_integration_contracts.py` and `agents/platform/scripts/test_gke_endpoint_parity.py`, which source it to hold it in step with `agents/platform/scripts/gke_endpoint.py`. `installer_common.sh` needs it for the credentials fetch the `terraform.tfvars` generator makes against an existing cluster, and sources it by path from its own directory; a caller that reaches the generator through `installer_common.sh` alone gets a warning and a stub that leaves the flag empty, which is still the command that reaches every cluster with a routable IP endpoint. That graceful path does not extend to `install.sh` and `common.sh`, which source the file directly and would fail on a tree that does not carry it. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched.
 - **[min_versions.sh](min_versions.sh)**: minimum tool versions, side-effect-free so
   `install.sh` can source it standalone before any checkout exists.
 - **[print_instructions_gchat.sh](print_instructions_gchat.sh)** /

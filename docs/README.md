@@ -437,6 +437,7 @@ only what the title does not say.
 | `install/prerequisites.md` | Site page | What must be in place before provisioning: tooling, GCP project, what a pre-existing cluster must already have, cert-manager, chat platform, LLM credentials. | Prerequisites | — |
 | `install/manual.md` | Site page | Installing the Platform Agent workspace into an existing Hermes-compatible harness by hand. | Copy workspace, register, wire infra | — |
 | `install/helm-and-kind.md` | Site page | Points to the canonical Helm chart and Terraform modules in `main` (published from the first `X.Y.Z` tag) and states Kind is unsupported. | Chart/module pointers, no Kind | — |
+| `install/upgrade.md` | Site page | Moving an existing install to a newer release with `upgrade.sh`: the upgrade modes, how the target version is resolved, previewing, and the refusals that land before any of the new release is applied. | Release-pinned one-liner, upgrade modes, tag resolution, refusals | Operators upgrading an install |
 | `install/uninstall.md` | Site page | Removing the agent, operator, and provisioned GCP resources; agent-only vs full teardown. | Teardown | — |
 | `deploy/index.md` | Site page | Hub for the deploy section: Docker, Kustomize, Minty, release versioning, telemetry, GitOps. | Navigation | — |
 | `deploy/kustomize.md` | Site page | What ships in `deploy/kustomize/` and what the operator lays down on top of it. | Base vs operator-created objects | — |

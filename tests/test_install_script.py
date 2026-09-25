@@ -885,13 +885,8 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             "configuration; the probe is authoritative on every run",
         )
 
-    def test_the_installer_no_longer_writes_the_state_file(self):
-        """vars.sh is read as a legacy input and never generated.
-
-        Regenerating it would put the old two-file model back: a derived file
-        that other tools read, drifting from the input that actually decides
-        the install.
-        """
+    def test_the_installer_neither_writes_nor_reads_the_state_file(self):
+        """k8s-operator/scripts/vars.sh is retired and never written, read, or inspected by install.sh."""
         source = _INSTALL_SH.read_text()
         self.assertNotIn(
             "write_state_var",
@@ -899,12 +894,71 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             "install.sh must not write vars.sh; install.env is the input and "
             "terraform.tfvars the only derived artifact",
         )
-        self.assertIn(
+        self.assertNotIn(
             "load_legacy_vars_file",
             source,
-            "an existing install's vars.sh must still be read, so upgrading "
-            "needs no action from its owner",
+            "install.sh must not source the legacy state file; install.env "
+            "is the only configuration input",
         )
+        self.assertNotIn(
+            "k8s-operator/scripts/vars.sh",
+            source,
+            "install.sh must not reference k8s-operator/scripts/vars.sh",
+        )
+        # The runtime half does not reproduce a removed failure — there is no
+        # longer any code for it to fail against — so it is a guard against the
+        # lookup coming back: a checkout carrying the retired file, with the
+        # bootstrap pointed at the install.env beside it and the run standing in
+        # it, so a reintroduced read relative to either the target or the
+        # working directory would put CLUSTER_NAME in the environment.
+        #
+        # install.sh is copied into that checkout and sourced from the copy,
+        # rather than sourced from this repository. The source-time bootstrap
+        # resolves install.env against `dirname "${BASH_SOURCE[0]}"` first and
+        # $HOME/kube-agents last, so sourcing the tracked path with no explicit
+        # pointer reads whichever install.env the developer keeps here — the run
+        # would answer differently on different machines, and a real CLUSTER_NAME
+        # would satisfy the assertion below for entirely the wrong reason. HOME
+        # moves with it, for the last arm of the same resolution. The pointer
+        # stays unset on purpose: with KUBE_AGENTS_INSTALL_ENV set, every shape
+        # of this lookup the installer has ever had returned early.
+        #
+        # The read this PR removed was `${_state_repo_dir}/k8s-operator/scripts/
+        # vars.sh`. The copy has no scripts/installer/installer_common.sh beside
+        # it, so _resolve_repo_dir_for_state falls through to $HOME/kube-agents;
+        # the retired file is staged there as well, and the run asserts that is
+        # where the resolver points (_state_repo_dir itself is unset once the
+        # source-time bootstrap is done), so the historical shape is exercised
+        # rather than only reads relative to the script or the working directory.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkout = pathlib.Path(tmpdir) / "checkout"
+            home = pathlib.Path(tmpdir) / "home"
+            checkout.mkdir()
+            home.mkdir()
+            for root in (checkout, home / "kube-agents"):
+                retired = root / "k8s-operator" / "scripts" / "vars.sh"
+                retired.parent.mkdir(parents=True)
+                retired.write_text('export CLUSTER_NAME="from-retired-vars"\n')
+            script_copy = checkout / "install.sh"
+            shutil.copy(_INSTALL_SH, script_copy)
+            missing_env = checkout / "install.env"
+            env = get_isolated_test_env(overrides={"HOME": str(home)})
+            for var in ("KUBE_AGENTS_INSTALL_ENV", "CLUSTER_NAME", "PROJECT_ID", "REGION"):
+                env.pop(var, None)
+            proc = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{script_copy}"\n'
+                f'INSTALL_ENV_EXPLICIT="false"; bootstrap_install_env "{missing_env}"\n'
+                'echo "STATE_REPO_DIR=$(_resolve_repo_dir_for_state)"\n'
+                'echo "CLUSTER=${CLUSTER_NAME:-<unset>}"\n',
+                env,
+                cwd=checkout,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(f"STATE_REPO_DIR={home / 'kube-agents'}\n", proc.stdout)
+            self.assertIn("CLUSTER=<unset>", proc.stdout)
+            # The isolation itself, not just its consequence: the bootstrap
+            # announces every file it reads, and this run has none to read.
+            self.assertNotIn("Loaded install configuration from", proc.stderr)
 
     def test_parse_args_enable_google_chat(self):
         """Verifies parse_args captures --enable-google-chat."""
@@ -2134,7 +2188,11 @@ class NonInteractiveRerunInheritanceTest(unittest.TestCase):
             env_file = pathlib.Path(tmp) / "install.env"
             env_file.write_text(contents)
             full_env = get_isolated_test_env(
-                overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file)}
+                overrides={
+                    "KUBE_AGENTS_INSTALL_ENV": str(env_file),
+                    "MEMORY": "",
+                    "MEMORY_PROVIDER": "",
+                }
             )
             return subprocess.run(
                 ["bash", "-c",
@@ -2205,6 +2263,234 @@ class NonInteractiveRerunInheritanceTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertIn("M=off", proc.stdout)
+
+    # ── whether anybody actually stated a memory mode ───────────────────────
+    #
+    # install.sh's half of the Hindsight guard. The generator's live probe only
+    # fires when install.sh hands it an empty MEMORY_PROVIDER, and it does that
+    # only while PARAM_MEMORY_EXPLICIT is false. A change that sets the flag
+    # unconditionally, or that restores the old unconditional
+    # memory_provider_from_mode / DEFAULT_MEMORY_PROVIDER fallback ahead of the
+    # generator, makes the probe dead code for the front door the guard is
+    # about — and every other test in this file stays green.
+
+    def test_a_configuration_with_no_memory_line_states_no_memory_mode(self):
+        """The run the guard exists for: --non-interactive with an install.env
+        that never mentions memory (or one copied from the example, where the
+        MEMORY line is commented out)."""
+        proc = self._params(
+            "PROJECT_ID=p\n", 'echo "M=[$PARAM_MEMORY] E=$PARAM_MEMORY_EXPLICIT"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("M=[] E=false", proc.stdout)
+
+    def test_either_recorded_spelling_states_a_memory_mode(self):
+        for contents in ("MEMORY=file\n", "MEMORY_PROVIDER=kube_agents_memory\n"):
+            with self.subTest(contents=contents.strip()):
+                proc = self._params(contents, 'echo "E=$PARAM_MEMORY_EXPLICIT"')
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertIn("E=true", proc.stdout)
+
+    def test_the_memory_flag_states_a_memory_mode(self):
+        """--memory= wins over a file that says nothing, and has to mark the
+        answer as given: an operator who typed it must not have the cluster
+        consulted behind their back."""
+        proc = self._params(
+            "PROJECT_ID=p\n",
+            'parse_args --memory=file; echo "M=$PARAM_MEMORY E=$PARAM_MEMORY_EXPLICIT"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("M=file E=true", proc.stdout)
+
+    def test_nothing_is_chosen_ahead_of_the_generator_when_no_mode_was_stated(self):
+        """The gate that leaves MEMORY_PROVIDER empty for the generator.
+
+        Pinned against the source because the block sits deep inside main(),
+        after the whole interview. What matters is that the assignment is
+        conditional on PARAM_MEMORY_EXPLICIT and that the generator is told to
+        refuse rather than default when it cannot ask the cluster.
+        """
+        source = _INSTALL_SH.read_text()
+        gate = '  if [ "$PARAM_MEMORY_EXPLICIT" = "true" ]; then\n' \
+               '    memory_provider="$(memory_provider_from_mode "$memory_mode")"\n'
+        self.assertIn(gate, source)
+        self.assertIn("KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \\\n", source)
+        # And the answer the generator reaches is read back, so the summary and
+        # the recorded install.env agree with the tfvars.
+        self.assertIn('    memory_provider="${MEMORY_PROVIDER:-$DEFAULT_MEMORY_PROVIDER}"', source)
+
+    def test_the_generators_hindsight_answer_is_what_install_env_records(self):
+        """The read-back after write_tfvars_from_state, run rather than pinned.
+
+        bootstrap_install_env_file records MEMORY from PARAM_MEMORY, which until
+        this block still holds DEFAULT_MEMORY (`file`). If the generator's probe
+        found Hindsight and generated kube_agents_memory, but PARAM_MEMORY kept
+        `file`, the next run would read MEMORY=file as an explicit choice, skip
+        the probe, and plan hindsight-postgresql away — the loss the guard
+        exists to prevent, one run later. So the block is lifted out of main()
+        and executed: an unstated mode that the generator resolved to Hindsight
+        is recorded as `hindsight`; any other answer, or a stated mode, leaves
+        PARAM_MEMORY alone.
+        """
+        source = _INSTALL_SH.read_text()
+        opening = (
+            '  if [ "$PARAM_MEMORY_EXPLICIT" != "true" ]; then\n'
+            '    memory_provider="${MEMORY_PROVIDER:-$DEFAULT_MEMORY_PROVIDER}"\n'
+        )
+        self.assertEqual(source.count(opening), 1, "the read-back block moved or was duplicated")
+        start = source.index(opening)
+        block = source[start : source.index("\n  fi\n", start) + len("\n  fi\n")]
+        cases = (
+            # (PARAM_MEMORY_EXPLICIT, MEMORY_PROVIDER from the generator, expected PARAM_MEMORY)
+            ("false", "kube_agents_memory", "hindsight"),
+            ("false", "", "file"),
+            ("true", "kube_agents_memory", "file"),
+        )
+        for explicit, generated, expected in cases:
+            with self.subTest(explicit=explicit, generated=generated):
+                proc = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        "set -u\n"
+                        f'PARAM_MEMORY_EXPLICIT="{explicit}"; PARAM_MEMORY="file"; memory_mode="file"\n'
+                        'DEFAULT_MEMORY_PROVIDER="multiuser_memory"\n'
+                        + (f'MEMORY_PROVIDER="{generated}"\n' if generated else "unset MEMORY_PROVIDER\n")
+                        + block
+                        + 'echo "PARAM_MEMORY=${PARAM_MEMORY} MODE=${memory_mode}"\n',
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=get_isolated_test_env(),
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(f"PARAM_MEMORY={expected} MODE={expected}\n", proc.stdout)
+
+    def test_every_generator_call_that_is_followed_by_an_apply_asks_for_an_answer(self):
+        """One call site carrying the opt-in is not the property that matters.
+
+        The assertion above is a substring, so a second call site added without
+        `KUBE_AGENTS_REQUIRE_MEMORY_ANSWER` keeps it green while walking
+        straight into the default the guard exists to prevent — which is what
+        happened to the Day-2 "Save & Apply" panel, whose next statement is a
+        full `terraform apply`. So enumerate the call sites instead.
+
+        `settle_network_policy_acceptance` is the one exemption, and it is not
+        a hole: it re-renders after main()'s guarded call has already exported
+        a settled `MEMORY_PROVIDER`, so the generator takes the explicit branch
+        and never reaches the probe.
+        """
+        lines = _INSTALL_SH.read_text().splitlines()
+        unguarded = []
+        for index, line in enumerate(lines):
+            code_line = line.split("#", 1)[0].strip()
+            if not re.search(r"\bwrite_tfvars_from_state\b", code_line) or code_line.startswith("write_tfvars_from_state()"):
+                continue
+            # Collect the `VAR=value \` continuation lines the call hangs off,
+            # plus the call line itself for single-line `VAR=value fn ...`.
+            prefix, back = [line], index - 1
+            while back >= 0 and lines[back].rstrip().endswith("\\"):
+                prefix.append(lines[back])
+                back -= 1
+            if "KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true" in "\n".join(prefix):
+                continue
+            # Named by the function it sits in, not by a line number an edit
+            # anywhere above would move.
+            enclosing = next(
+                (
+                    lines[back][: lines[back].index("()")]
+                    for back in range(index, -1, -1)
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\(\) \{$", lines[back])
+                ),
+                f"<top level, line {index + 1}>",
+            )
+            unguarded.append(enclosing)
+
+        self.assertEqual(
+            unguarded,
+            ["settle_network_policy_acceptance"],
+            "a generator call site gained or lost the memory opt-in; if the new one "
+            "is followed by an apply it needs KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true",
+        )
+
+    def test_accepting_the_memory_prompts_unseeded_default_is_not_an_answer(self):
+        """A bare enter on the memory menu must not count as a stated mode.
+
+        resolve_shared_defaults puts DEFAULT_MEMORY (`file`) into PARAM_MEMORY
+        before the interview, so the menu is seeded on option 1 and carries the
+        "(Default)" tag even when nothing chose it — and prompt_menu returns
+        that same 1 for enter as for a typed "1". Marking the answer explicit
+        there skips live_hindsight_state in the generator, and a Hindsight
+        install whose install.env predates the MEMORY key then has
+        hindsight-postgresql and its database planned away by the apply that
+        follows. Before this branch retired vars.sh, such a checkout seeded the
+        prompt on option 2 out of the MEMORY_PROVIDER that file carried, so
+        enter kept Hindsight; the probe is what replaced that seed, and the
+        interactive path has to be able to reach it.
+
+        Pinned against the source, and by enumeration rather than substring:
+        the block sits inside main()'s interview behind a TTY, where the
+        harness in this file cannot reach it, and a substring assertion stays
+        green when a second, unconditional assignment is added beside the
+        guarded one — which is exactly how the Day-2 panel above slipped
+        through.
+        """
+        lines = _INSTALL_SH.read_text().splitlines()
+        # The only two conditions under which an answer counts as stated.
+        guards = {
+            # Something set PARAM_MEMORY before the interview: install.env's
+            # MEMORY or MEMORY_PROVIDER, or MEMORY in the environment.
+            'if [ -n "$PARAM_MEMORY" ]; then',
+            # The interview: a statement is either one that arrived before it,
+            # or the operator moving off the option the seed put under them.
+            'if [ "$PARAM_MEMORY_EXPLICIT" = "true" ] || '
+            '[ "$memory_choice" != "$memory_seed_choice" ]; then',
+        }
+        # Any spelling that sets it true — quoted or not, exported, or sharing
+        # a line with other statements — not only the one this was written
+        # against. One that shares a line has no guard line of its own above
+        # it, so it is reported rather than silently skipped.
+        assignment = re.compile(r"""(?:^|[\s;])(?:export\s+)?PARAM_MEMORY_EXPLICIT=(["']?)true\1(?=\s|;|$)""")
+        unguarded = []
+        seen = 0
+        for index, line in enumerate(lines):
+            if line.lstrip().startswith("#") or not assignment.search(line):
+                continue
+            seen += 1
+            if line.strip() != 'PARAM_MEMORY_EXPLICIT="true"':
+                unguarded.append((index + 1, line.strip()))
+                continue
+            preceding = next(
+                (
+                    lines[back].strip()
+                    for back in range(index - 1, -1, -1)
+                    if lines[back].strip()
+                ),
+                "",
+            )
+            if preceding not in guards:
+                unguarded.append((index + 1, preceding))
+
+        self.assertGreater(seen, 0, "the enumerator found no assignment at all")
+        self.assertEqual(
+            unguarded,
+            [],
+            "PARAM_MEMORY_EXPLICIT is set true under a condition this test does not "
+            "know. An answer counts as stated only when something stated it; "
+            "otherwise the generator's live Hindsight probe is skipped on the one "
+            "path it was added for",
+        )
+
+        # And the seed is taken before the menu renders, or the comparison
+        # above compares the answer against itself and is always false.
+        source = "\n".join(lines)
+        self.assertIn('local memory_seed_choice="$memory_choice"', source)
+        self.assertLess(
+            source.index('local memory_seed_choice="$memory_choice"'),
+            source.index(
+                'prompt_menu "Should the agent remember things between conversations?"'
+            ),
+        )
 
     def test_the_dashboard_inherits_through_its_recorded_spelling_too(self):
         proc = self._params(
@@ -4044,7 +4330,7 @@ class InstallEnvIsCreatedInTheCheckoutTest(unittest.TestCase):
     """
 
     def _resolved_paths(self, cwd, home, extra_env=None):
-        """What install.sh picks for install.env and the legacy vars.sh.
+        """What install.sh picks for install.env.
 
         Piped into `bash -s` rather than sourced by path, because that is the
         whole point: `source /abs/path/install.sh` sets BASH_SOURCE and the
@@ -4060,9 +4346,7 @@ class InstallEnvIsCreatedInTheCheckoutTest(unittest.TestCase):
         full_env = get_isolated_test_env(overrides=overrides)
         if "KUBE_AGENTS_INSTALL_ENV" not in (extra_env or {}):
             full_env.pop("KUBE_AGENTS_INSTALL_ENV", None)
-        script = _INSTALL_SH.read_text() + (
-            '\necho "ENV=$INSTALL_ENV_FILE"\necho "LEGACY=$LEGACY_VARS_FILE"\n'
-        )
+        script = _INSTALL_SH.read_text() + '\necho "ENV=$INSTALL_ENV_FILE"\n'
         return subprocess.run(
             ["bash", "-s"], input=script,
             capture_output=True, text=True, env=full_env, cwd=str(cwd),
@@ -4107,18 +4391,6 @@ class InstallEnvIsCreatedInTheCheckoutTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn(f"ENV={named}", proc.stdout)
-
-    def test_the_legacy_vars_file_is_looked_for_in_the_same_checkout(self):
-        """Same root cause, same fix: resolved script-relative, a piped re-run
-        against an existing clone never found the legacy file and silently
-        skipped the migration it exists for."""
-        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
-            legacy = pathlib.Path(home) / "kube-agents" / "k8s-operator" / "scripts"
-            legacy.mkdir(parents=True)
-            (legacy / "vars.sh").write_text("export PROJECT_ID=from-the-legacy-file\n")
-            proc = self._resolved_paths(tmp, home)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn(f"LEGACY={legacy}/vars.sh", proc.stdout)
 
 
 class ServiceAccountOwnershipIsCheckedOnEveryApplyDoorTest(unittest.TestCase):
@@ -6792,6 +7064,61 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         # Not "[]": the empty assignment reaches main() as a well-formed
         # "false", which is what makes it silent.
         self.assertIn("RESOLVED=[false]", proc.stdout)
+
+    def test_an_empty_memory_value_is_refused_against_a_seed(self):
+        """`--memory=` out of a wrapper expanding an unset variable must fail at parse_args.
+
+        Without the parse-time check, `--memory=` sets PARAM_MEMORY="" AND
+        PARAM_MEMORY_EXPLICIT="true", and resolve_shared_defaults then turns ""
+        into DEFAULT_MEMORY ("file") before main()'s validator runs -- both
+        overwriting a recorded MEMORY=hindsight and telling
+        write_tfvars_from_state not to probe the live cluster before planning
+        hindsight-postgresql away.
+        """
+        proc = self._parse_args("--memory=", MEMORY="hindsight")
+        self.assertNotIn("PASSED", proc.stdout)
+        self.assertIn(
+            "--memory= was given an empty value",
+            proc.stdout + proc.stderr,
+        )
+
+    def test_an_empty_memory_value_would_resolve_to_the_default_with_explicit_true(self):
+        """Why the refusal above must live in parse_args and not wait for main().
+
+        Driven through resolve_shared_defaults with PARAM_MEMORY="" and
+        PARAM_MEMORY_EXPLICIT="true": `${PARAM_MEMORY:-$DEFAULT_MEMORY}` turns
+        the empty string into "file", which main()'s validator accepts while
+        PARAM_MEMORY_EXPLICIT stays "true".
+        """
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+            'PARAM_MEMORY=""\n'
+            'PARAM_MEMORY_EXPLICIT="true"\n'
+            "resolve_shared_defaults\n"
+            'echo "RESOLVED=[$PARAM_MEMORY] EXPLICIT=[$PARAM_MEMORY_EXPLICIT]"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("", encoding="utf-8")
+            env = get_isolated_test_env(
+                overrides={
+                    "HOME": tmp,
+                    "KUBE_AGENTS_INSTALL_ENV": str(empty_env),
+                    "MEMORY": "hindsight",
+                }
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=tmp,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("RESOLVED=[file] EXPLICIT=[true]", proc.stdout)
+
+
 class InstallerHelpersDetachFromTheTerminalTest(PtyChildTestMixin, unittest.TestCase):
     """The helpers that run install.sh functions must not hand them a terminal.
 
