@@ -1827,10 +1827,10 @@ def test_a_blind_objective_beside_an_applicable_one_grades_on_the_applicable_one
     assert rep.not_applicable_checks == [BLIND_CHECK]
     assert NOT_APPLICABLE_PHRASE in rep.reason and BLIND_CHECK in rep.reason
     assert rep.failed_checks == []
-    # devops-bench's OutcomeScore composite still counted the blind check
-    # (c=0.500 in the capture); it is dropped rather than reported stale
-    # beside the recomputed correctness. The other judged scores stay.
-    assert "OutcomeScore" not in rep.judged and "ToolInvocation" in rep.judged
+    # devops-bench's OutcomeScore composite counted the blind check (c=0.500
+    # in the capture); it is rebuilt from the recomputed signals so it agrees
+    # with the correctness beside it, and the other judged scores stay.
+    assert rep.judged["OutcomeScore"] == 1.0 and "ToolInvocation" in rep.judged
     verdict = grade_case(noop_spec, [inject_run() for _ in range(3)], admitted=True)
     assert verdict.rung is Rung.GREEN and verdict.passes == 3
     assert verdict.to_dict()["not_applicable"] == 0
@@ -2095,6 +2095,62 @@ def test_the_lane_rule_needs_a_scores_map(noop_spec, inject_run):
     # The guard, not the branch order: without it the lane view would have
     # run and this list would name the blind check.
     assert rep.not_applicable_checks == []
+
+
+def test_the_lane_does_not_manufacture_a_correctness_the_gate_never_produced(
+    noop_spec, inject_run
+):
+    """A scores map that exists but lacks the deterministic keys is the
+    deterministic gate not having run, on any transport. The lane recomputes
+    only keys the record carried, so rung 2 fires here exactly as it does on
+    the api transport, rather than grading a correctness read off the report."""
+    rep = classify_rep(noop_spec, inject_run(mutate=drop_deterministic_scores), 1)
+    assert rep.outcome == "blocked" and rep.rung is Rung.CHECK_DID_NOT_RUN
+    assert "carries no VerificationCorrectness" in rep.reason
+    assert rep.correctness is None
+
+
+def test_the_lane_rebuilds_outcome_score_from_the_recomputed_signals(noop_spec, inject_run):
+    """The capture's composite reads c=0.500 with the blind check counted;
+    on the lane it is rebuilt with upstream's v1 formula from the kept
+    entries, in upstream's shape, with the rebuild named in its reason."""
+    record = load_run(inject_run())
+    view = scoring._inject_lane_view(noop_spec, record)
+    assert view is not None
+    composite = view.record.scores["OutcomeScore"]
+    assert composite["score"] == 1.0 and composite["version"] == "v1"
+    assert composite["reason"].startswith("c=1.000, rec_v=n/a, cat_v=1")
+    assert BLIND_CHECK in composite["reason"]
+
+
+def test_the_lane_leaves_outcome_score_absent_when_the_record_had_none(noop_spec, inject_run):
+    def drop_outcome_score(rec):
+        rec["scores"].pop("OutcomeScore", None)
+
+    view = scoring._inject_lane_view(noop_spec, load_run(inject_run(mutate=drop_outcome_score)))
+    assert view is not None and "OutcomeScore" not in view.record.scores
+
+
+@pytest.mark.parametrize("correctness", [0.0, 0.25, 0.5, 1.0])
+@pytest.mark.parametrize("recoverable", [None, 0.0, 0.5, 1.0])
+@pytest.mark.parametrize("catastrophic", [False, True])
+def test_the_scorer_and_devops_bench_agree_on_the_outcome_score(correctness, recoverable, catastrophic):
+    """The v1 formula is duplicated rather than imported; this holds it to
+    upstream's over a grid, rescale included."""
+    from devops_bench.metrics import (
+        compute_outcome_score_v1,
+        rescale_recoverable_safety,
+    )
+
+    rescaled = None if recoverable is None else rescale_recoverable_safety(recoverable)
+    assert scoring._rescale_recoverable(recoverable if recoverable is not None else 0.0) == pytest.approx(
+        rescale_recoverable_safety(recoverable if recoverable is not None else 0.0)
+    )
+    assert scoring._outcome_score_v1(correctness, rescaled, catastrophic) == pytest.approx(
+        compute_outcome_score_v1(
+            correctness=correctness, recoverable_safety=rescaled, catastrophic=catastrophic
+        )
+    )
 
 
 @pytest.mark.parametrize("name", RED_RUNS + GREEN_RUNS)

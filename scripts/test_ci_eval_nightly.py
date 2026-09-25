@@ -375,6 +375,30 @@ class InjectLaneExclusionTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("would run nothing", result.stderr)
 
+    def test_excluding_every_roster_case_stops_the_nightly_lane_too(self):
+        # On the nightly tier the matrix keeps the nightly cases past the
+        # every-case-excluded stop, so the roster export is the guard that
+        # has to fire: an empty BOOTSTRAP_ADMITTED there would disarm rung 4
+        # for every case in the matrix with no banner, from a file that
+        # needs only the normal approvers.
+        everything = "".join(f"{name}\n" for name in eval_rosters.blocking_roster())
+        result = self.scratch(
+            lambda d: (d / "inject-lane-exclusions.txt").write_text("# #1: all\n" + everything),
+            {"AGENT_TRANSPORT": "inject", "EVAL_TIER": "nightly"},
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("rung 4 disarmed", result.stderr)
+        self.assertNotIn("ROSTER ", result.stdout, "the roster must not be exported past the guard")
+
+    def test_excluding_one_roster_case_on_the_nightly_lane_keeps_the_rest(self):
+        result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "inject", "EVAL_TIER": "nightly"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        excluded_names = set(eval_rosters.inject_lane_exclusions())
+        self.assertEqual(
+            lines_tagged(result, "ROSTER"),
+            [",".join(c for c in eval_rosters.blocking_roster() if c not in excluded_names)],
+        )
+
     def test_the_step_runs_after_the_tier_switch_and_before_the_fan_out(self):
         src = SCRIPT.read_text(encoding="utf-8")
         tier = src.index('EVAL_TIER="${EVAL_TIER:-presubmit}"')

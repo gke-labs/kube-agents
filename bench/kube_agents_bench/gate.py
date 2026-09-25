@@ -757,16 +757,24 @@ def _record_for_case(
         return f"{case_id}: no version key on this run, so nothing to file it under"
 
     reps = [r for r in (case.get("reps") or []) if isinstance(r, dict)]
-    # A repetition the inject lane set aside (#2039) is not this store's
-    # evidence: the record is main's api-lane record, a line built from a
-    # transport that blinds one of the case's checks would not be comparable
-    # with it, and BaselineRecord has no column that could carry the
-    # outcome without dropping it. Skip the case, saying which outcome.
-    set_aside = sum(1 for r in reps if r.get("outcome") == REP_OUTCOME_NOT_APPLICABLE)
+    # A repetition the inject lane touched (#2039) is not this store's
+    # evidence -- whether it was set aside whole (outcome `not_applicable`)
+    # or graded with one of its checks set aside (a `pass` or `fail` whose
+    # `not_applicable_checks` is non-empty, the captured agent-kanban-smoke
+    # shape). The record is main's api-lane record, filed at a version key
+    # that carries no transport; a 3/3 line graded on half the case's
+    # objectives would sit beside it as if comparable, and admission reads
+    # it. BaselineRecord has no column that could carry the outcome without
+    # dropping it. Skip the case, saying so.
+    set_aside = sum(
+        1
+        for r in reps
+        if r.get("outcome") == REP_OUTCOME_NOT_APPLICABLE or r.get("not_applicable_checks")
+    )
     if set_aside:
         return (
-            f"{case_id}: {set_aside} of {len(reps)} repetition(s) {NOT_APPLICABLE_PHRASE}; "
-            "not recorded, the store holds api-lane evidence only"
+            f"{case_id}: {set_aside} of {len(reps)} repetition(s) {NOT_APPLICABLE_PHRASE} "
+            "(whole, or one of its checks); not recorded, the store holds api-lane evidence only"
         )
     scored = [r for r in reps if r.get("outcome") in ("pass", "fail")]
     if not scored:

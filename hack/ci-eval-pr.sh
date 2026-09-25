@@ -1932,6 +1932,17 @@ while IFS= read -r NAME; do
   fi
   BLOCKING_ROSTER_DEFAULT="${BLOCKING_ROSTER_DEFAULT:+${BLOCKING_ROSTER_DEFAULT},}${NAME}"
 done <<< "${BLOCKING_ROSTER_ENTRIES}"
+# The file guard above cannot see the lane's drop: an exclusion list that
+# names every roster case would leave the export empty on the inject lane
+# with rung 4 disarmed for whatever the matrix still holds (the nightly tier
+# keeps its own cases past the every-case-excluded stop) and no banner,
+# because no name is misspelled. Stop instead: the exclusion file needs only
+# the normal approvers, and it must not be able to do what the roster file
+# is guarded against.
+if [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ]; then
+  echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+  exit 1
+fi
 
 export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-${BLOCKING_ROSTER_DEFAULT}}"
 

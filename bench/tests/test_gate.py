@@ -841,6 +841,37 @@ def test_record_skips_a_case_that_produced_no_pass_or_fail(tmp_path, capsys):
     assert list(store.glob("*.jsonl")) == []
 
 
+def test_record_skips_a_case_the_inject_lane_set_aside_whole(tmp_path, capsys):
+    """Every repetition `not_applicable`: nothing scored, and the skip line
+    names that outcome rather than calling it blocked or infrastructure."""
+    store = store_with(tmp_path)
+    doc = case_file(
+        tmp_path, "a", version_key=KEY, scored=0, passes=0,
+        reps=[{"outcome": "not_applicable", "not_applicable_checks": ["card"]}] * 3,
+    )
+    assert run_record(store, doc) == 0
+    printed = capsys.readouterr().out
+    assert "3 of 3 repetition(s) not applicable on this transport" in printed
+    assert "not recorded, the store holds api-lane evidence only" in printed
+    assert "blocked or hit infrastructure" not in printed
+    assert list(store.glob("*.jsonl")) == []
+
+
+def test_record_skips_a_case_graded_with_a_check_set_aside(tmp_path, capsys):
+    """The captured inject shape: three passes, each with the tool_called
+    check set aside. Recording it would file a 3/3 line, graded on half the
+    case's objectives, beside the api lane's record at the same version key
+    -- evidence the api lane would not have produced, and admission reads it."""
+    store = store_with(tmp_path)
+    doc = case_file(
+        tmp_path, "a", version_key=KEY,
+        reps=[{"outcome": "pass", "not_applicable_checks": ["the-kanban-card-was-actually-filed"]}] * 3,
+    )
+    assert run_record(store, doc) == 0
+    assert "not recorded, the store holds api-lane evidence only" in capsys.readouterr().out
+    assert list(store.glob("*.jsonl")) == []
+
+
 def test_record_keeps_blocked_and_infra_out_of_the_rate_but_in_the_line(tmp_path):
     """Dropping them silently would make a case that half-crashes look
     perfectly reliable in its own history."""
