@@ -261,6 +261,9 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.FirstEventGrace <= 0 {
 		o.Config.FirstEventGrace = defaultFirstEventGrace
 	}
+	if o.Config.SessionTTL <= 0 {
+		o.Config.SessionTTL = defaultSessionTTL
+	}
 	g := &Gateway{
 		turnBudget:     turnTimeout,
 		cfg:            o.Config,

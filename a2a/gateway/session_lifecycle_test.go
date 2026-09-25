@@ -192,6 +192,80 @@ func TestSessionRecordRetainedWhileActiveTaskWithinDeadline(t *testing.T) {
 	}
 }
 
+// TestReapSessionUnderLockReverificationProtectsUpdatedRecord verifies that
+// reapSession's under-lock re-check protects a session record when a turn or pod
+// arrives between the reap scan and lock acquisition (stale scan record presented).
+func TestReapSessionUnderLockReverificationProtectsUpdatedRecord(t *testing.T) {
+	r := startRig(t)
+	r.g.cfg.SessionTTL = 24 * time.Hour
+	ctx := context.Background()
+
+	// Case 1: Fresh activity landed in KV between scan and lock
+	convFreshActivity := "discord:g1/reap-race-activity"
+	recFresh := &SessionRecord{
+		Key:          convFreshActivity,
+		ContextID:    "ctx-race-activity",
+		LastActivity: time.Now().UTC(), // fresh activity
+	}
+	if err := r.g.reg.Put(ctx, recFresh); err != nil {
+		t.Fatal(err)
+	}
+
+	// Present a stale record (expired LastActivity) to reapSession
+	staleRecActivity := &SessionRecord{
+		Key:          convFreshActivity,
+		ContextID:    "ctx-race-activity",
+		LastActivity: time.Now().UTC().Add(-48 * time.Hour),
+	}
+	r.g.reapSession(ctx, staleRecActivity)
+
+	// Under-lock re-check must see fresh LastActivity and preserve the record
+	got, err := r.g.reg.Get(ctx, convFreshActivity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("expected record with fresh activity in KV to survive stale reapSession call")
+	}
+
+	// Case 2: A pod was incarnated in KV between scan and lock
+	convPodSpawned := "discord:g1/reap-race-pod"
+	recPod := &SessionRecord{
+		Key:          convPodSpawned,
+		ContextID:    "ctx-race-pod",
+		PodName:      "chat-worker-spawned",
+		LastActivity: time.Now().UTC().Add(-48 * time.Hour),
+	}
+	if err := r.g.reg.Put(ctx, recPod); err != nil {
+		t.Fatal(err)
+	}
+
+	staleRecPod := &SessionRecord{
+		Key:          convPodSpawned,
+		ContextID:    "ctx-race-pod",
+		PodName:      "", // stale scan saw no pod
+		LastActivity: time.Now().UTC().Add(-48 * time.Hour),
+	}
+	r.g.reapSession(ctx, staleRecPod)
+
+	gotPod, err := r.g.reg.Get(ctx, convPodSpawned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPod == nil {
+		t.Fatal("expected record with active pod in KV to survive stale reapSession call")
+	}
+}
+
+// TestGatewayDirectConfigDefaultsSessionTTL verifies that when Config is constructed
+// directly without SessionTTL, New defaults SessionTTL to defaultSessionTTL (7 days).
+func TestGatewayDirectConfigDefaultsSessionTTL(t *testing.T) {
+	r := startRig(t)
+	if r.g.cfg.SessionTTL != defaultSessionTTL {
+		t.Fatalf("expected New() to default SessionTTL to %v, got %v", defaultSessionTTL, r.g.cfg.SessionTTL)
+	}
+}
+
 // TestScanSessionsResumableCursor verifies Defect 2:
 // ScanSessions streams records via a callback and supports pausing and
 // resuming across a cursor without rescanning from the beginning.
@@ -464,6 +538,10 @@ func TestReapOnceResumableCursor(t *testing.T) {
 	if timeoutCursor == "" {
 		t.Fatal("expected reapCursor to be saved when reap pass is interrupted by context cancellation")
 	}
+	wantCursor := kvKey(timeoutPass[0])
+	if timeoutCursor != wantCursor {
+		t.Fatalf("expected timeoutCursor = %q (last successfully completed record), got %q", wantCursor, timeoutCursor)
+	}
 }
 
 // TestReapOnceResumableCursorAfterDelete verifies that when a reap pass deletes
@@ -623,44 +701,25 @@ func TestLateTaskEventForPrunedSessionDroppedWithoutRequeueLoop(t *testing.T) {
 }
 
 // TestLiveSessionLifecycleAgainstCluster exercises session record pruning and retention against
-// a live NATS deployment when A2A_LIVE_NATS_URL is set (e.g. against kyber-test).
+// a live NATS deployment when A2A_LIVE_NATS_URL and A2A_LIVE_GATEWAY_PASSWORD are set.
 func TestLiveSessionLifecycleAgainstCluster(t *testing.T) {
 	url := os.Getenv("A2A_LIVE_NATS_URL")
-	if url == "" {
-		t.Skip("A2A_LIVE_NATS_URL not set; skipping live cluster verification")
+	gwPass := os.Getenv("A2A_LIVE_GATEWAY_PASSWORD")
+	if url == "" || gwPass == "" {
+		t.Skip("live NATS env not set (A2A_LIVE_NATS_URL, A2A_LIVE_GATEWAY_PASSWORD); see TestLiveAgainstInstallNATS")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	nc, err := nats.Connect(url)
+	client, err := lib.Connect(ctx, url,
+		lib.WithName("a2a-gateway-livetest-lifecycle"),
+		lib.WithNATSOptions(
+			nats.UserInfo("gateway", gwPass),
+			nats.CustomInboxPrefix("_INBOX.gateway"),
+		))
 	if err != nil {
-		t.Fatalf("nats connect: %v", err)
-	}
-	defer nc.Close()
-
-	js, err := jetstream.New(nc)
-	if err != nil {
-		t.Fatalf("jetstream: %v", err)
-	}
-
-	_, _ = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:      lib.TasksStream,
-		Subjects:  []string{"a2a.tasks.>"},
-		Retention: jetstream.LimitsPolicy,
-		MaxAge:    72 * time.Hour,
-	})
-	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.SessionStateBucket})
-	if err != nil {
-		kv, err = js.KeyValue(ctx, lib.SessionStateBucket)
-		if err != nil {
-			t.Fatalf("kv session-state: %v", err)
-		}
-	}
-
-	client, err := lib.Connect(ctx, url, lib.WithName("gateway-livetest-client"))
-	if err != nil {
-		t.Fatalf("lib.Connect: %v", err)
+		t.Fatalf("gateway connect: %v", err)
 	}
 	defer client.Close()
 
@@ -735,5 +794,5 @@ func TestLiveSessionLifecycleAgainstCluster(t *testing.T) {
 	}
 
 	// Clean up recent record
-	_ = kv.Delete(ctx, kvKey(recentKey))
+	_ = reg.DeleteSession(ctx, recentKey)
 }

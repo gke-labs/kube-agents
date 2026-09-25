@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hkdf"
 	"crypto/sha256"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -324,6 +325,13 @@ func TestFromEnvSessionTTL(t *testing.T) {
 		if _, err := FromEnv(); err == nil {
 			t.Fatalf("A2A_SESSION_TTL=%q accepted", bad)
 		}
+	}
+
+	// Refusal when SessionTTL <= TaskDeadline
+	t.Setenv("A2A_SESSION_TTL", "96h")
+	t.Setenv("A2A_TASK_DEADLINE_SECONDS", fmt.Sprintf("%d", int((100*time.Hour).Seconds())))
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("expected refusal when SessionTTL <= TaskDeadline, got nil")
 	}
 }
 
