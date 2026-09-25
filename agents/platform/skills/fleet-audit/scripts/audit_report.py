@@ -710,8 +710,8 @@ RUN_RECORD_SOURCES_KEY = "sources"
 RUN_RECORD_ON_DEMAND_KEY = "on_demand"
 ENV_AUDIT_ON_DEMAND = "AUDIT_ON_DEMAND"
 ENV_HERMES_KANBAN_TASK = "HERMES_KANBAN_TASK"
-TRUTHY_ENV_STRINGS = ("1", "true", "yes", "on")
-FALSY_ENV_STRINGS = ("0", "false", "no", "off")
+TRUTHY_ENV_STRINGS = ("1", "true", "yes", "on", "t", "y", "enable", "enabled")
+FALSY_ENV_STRINGS = ("0", "false", "no", "off", "f", "n", "disable", "disabled")
 # When `start` opened this run. The collector manifest is the one input
 # `finish` takes from outside the run and the one `start` cannot scrub: its
 # path lives in the SOP's text rather than in code, so `start` does not know
@@ -8966,6 +8966,39 @@ def ack_remediate_requests(
         )
 
 
+def normalize_env_boolean(val: str) -> str:
+    """Normalize an environment variable boolean string by stripping quotes, whitespace, and leading '='."""
+    cleaned = val.strip().strip("'\"")
+    if cleaned.startswith("="):
+        cleaned = cleaned[1:].strip().strip("'\"")
+    return cleaned.lower()
+
+
+def env_on_demand() -> bool | None:
+    """Return explicit or ambient on-demand state from the environment, if any (#1929).
+
+    Checked in order:
+    1. `AUDIT_ON_DEMAND` (explicit env override: truthy vs falsy strings).
+       Unrecognized non-empty values emit a warning to stderr.
+    2. `HERMES_KANBAN_TASK` (present when run with cwd under a kanban workspace directory).
+    """
+    env_override = os.environ.get(ENV_AUDIT_ON_DEMAND)
+    if env_override is not None and env_override.strip():
+        norm = normalize_env_boolean(env_override)
+        if norm in TRUTHY_ENV_STRINGS:
+            return True
+        if norm in FALSY_ENV_STRINGS:
+            return False
+        log(
+            f"ignoring unrecognized {ENV_AUDIT_ON_DEMAND}={env_override!r}; "
+            f"expected truthy ({', '.join(TRUTHY_ENV_STRINGS)}) or "
+            f"falsy ({', '.join(FALSY_ENV_STRINGS)})"
+        )
+    if bool(os.environ.get(ENV_HERMES_KANBAN_TASK)):
+        return True
+    return None
+
+
 def is_on_demand(
     args: argparse.Namespace | None = None, record: dict | None = None
 ) -> bool:
@@ -8977,12 +9010,14 @@ def is_on_demand(
     Checked in order:
     1. Explicit CLI override: `--on-demand` / `--no-on-demand` on `start` or `finish`.
     2. Run record: `start` records `on_demand` into scratch state so `finish`
-       preserves the flag even if the worker did not pass it to `finish`.
+       preserves the flag (both positive and negative) even if the worker did not
+       pass it to `finish`.
     3. Environment markers (secondary fallbacks; in the deployed sandbox,
        the SSH crossing drops dispatcher environment variables when commands
        run from profile home per deploy/sandbox/session-command.sh, so callers
        cannot rely on ambient env and must pass `--on-demand` to `start` explicitly):
-       - `AUDIT_ON_DEMAND` (explicit env override: 1/true/yes/on vs 0/false/no/off)
+       - `AUDIT_ON_DEMAND` (explicit env override: 1/true/yes/on/t/y/enable/enabled
+         vs 0/false/no/off/f/n/disable/disabled; unrecognized values warn to stderr)
        - `HERMES_KANBAN_TASK` (present when run with cwd under a kanban workspace
          directory or in local testing)
     """
@@ -8992,15 +9027,9 @@ def is_on_demand(
             return bool(flag)
     if record is not None and RUN_RECORD_ON_DEMAND_KEY in record:
         return bool(record[RUN_RECORD_ON_DEMAND_KEY])
-    env_override = os.environ.get(ENV_AUDIT_ON_DEMAND)
-    if env_override is not None and env_override.strip():
-        norm = env_override.strip().lower()
-        if norm in TRUTHY_ENV_STRINGS:
-            return True
-        if norm in FALSY_ENV_STRINGS:
-            return False
-    if bool(os.environ.get(ENV_HERMES_KANBAN_TASK)):
-        return True
+    env_val = env_on_demand()
+    if env_val is not None:
+        return env_val
     return False
 
 
@@ -9743,10 +9772,8 @@ def handle_start(args: argparse.Namespace) -> None:
     declarations_path = write_declarations(audit_id, repo, declarations)
     if getattr(args, "on_demand", None) is not None:
         on_demand = bool(args.on_demand)
-    elif is_on_demand(args):
-        on_demand = True
     else:
-        on_demand = None
+        on_demand = env_on_demand()
     write_run_record(
         audit_id,
         repo,

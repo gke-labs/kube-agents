@@ -5260,6 +5260,28 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         self.assertIn(audit_report.RUN_RECORD_ON_DEMAND_KEY, record)
         self.assertFalse(record[audit_report.RUN_RECORD_ON_DEMAND_KEY])
 
+    def test_start_records_negative_on_demand_from_audit_on_demand_env(self):
+        with patch.dict(os.environ, {"AUDIT_ON_DEMAND": "false"}):
+            self.assertEqual(
+                self.run_main(["start", "--audit", DECLARING_AUDIT]),
+                0,
+            )
+        record = self.record_without_stamp(DECLARING_AUDIT)
+        self.assertIsNotNone(record)
+        self.assertIn(audit_report.RUN_RECORD_ON_DEMAND_KEY, record)
+        self.assertFalse(record[audit_report.RUN_RECORD_ON_DEMAND_KEY])
+
+    def test_start_falsy_audit_on_demand_overrides_kanban_env_in_record(self):
+        with patch.dict(os.environ, {"AUDIT_ON_DEMAND": "0", "HERMES_KANBAN_TASK": "t_audit_card_123"}):
+            self.assertEqual(
+                self.run_main(["start", "--audit", DECLARING_AUDIT]),
+                0,
+            )
+        record = self.record_without_stamp(DECLARING_AUDIT)
+        self.assertIsNotNone(record)
+        self.assertIn(audit_report.RUN_RECORD_ON_DEMAND_KEY, record)
+        self.assertFalse(record[audit_report.RUN_RECORD_ON_DEMAND_KEY])
+
     def test_start_clears_yesterdays_record_before_anything_can_fail(self):
         # Every step between the top of `start` and the write can raise. A
         # `start` that died in between must not leave the previous run's
@@ -11985,9 +12007,29 @@ class TestSilentVerdict(HarnessTestCase):
         self.assertTrue(out["silent_ok"])
 
     def test_audit_on_demand_normalized_truth_grammar(self):
-        """AUDIT_ON_DEMAND accepts normalized truthy strings (1, true, TRUE, yes, on) (#1929)."""
+        """AUDIT_ON_DEMAND accepts normalized truthy strings (1, true, yes, on, t, y, enable, enabled, quotes, =1) (#1929)."""
         doc = make_doc(findings=[])
-        for val in ("1", "true", "True", "TRUE", "yes", "YES", "on", "ON"):
+        for val in (
+            "1",
+            "true",
+            "True",
+            "TRUE",
+            "yes",
+            "YES",
+            "on",
+            "ON",
+            "t",
+            "T",
+            "y",
+            "Y",
+            "enable",
+            "ENABLE",
+            "enabled",
+            "ENABLED",
+            '"on"',
+            "'true'",
+            "=1",
+        ):
             with patch.dict(os.environ, {"AUDIT_ON_DEMAND": val}):
                 out = self.finish_json(doc)
             self.assertFalse(out["silent_ok"], f"Expected silent_ok=False for AUDIT_ON_DEMAND={val!r}")
@@ -11995,10 +12037,51 @@ class TestSilentVerdict(HarnessTestCase):
     def test_audit_on_demand_negative_overrides_kanban_env(self):
         """AUDIT_ON_DEMAND with negative values overrides HERMES_KANBAN_TASK (#1929)."""
         doc = make_doc(findings=[])
-        for val in ("0", "false", "False", "FALSE", "no", "NO", "off", "OFF"):
+        for val in (
+            "0",
+            "false",
+            "False",
+            "FALSE",
+            "no",
+            "NO",
+            "off",
+            "OFF",
+            "f",
+            "F",
+            "n",
+            "N",
+            "disable",
+            "DISABLE",
+            "disabled",
+            "DISABLED",
+            '"off"',
+            "'false'",
+            "=0",
+        ):
             with patch.dict(os.environ, {"AUDIT_ON_DEMAND": val, "HERMES_KANBAN_TASK": "t_audit_card_123"}):
                 out = self.finish_json(doc)
             self.assertTrue(out["silent_ok"], f"Expected silent_ok=True for AUDIT_ON_DEMAND={val!r}")
+
+    def test_audit_on_demand_unrecognized_value_warns_to_stderr(self):
+        """Unrecognized non-empty AUDIT_ON_DEMAND warns to stderr and does not force on-demand (#1929)."""
+        doc = make_doc(findings=[])
+        with patch.dict(os.environ, {"AUDIT_ON_DEMAND": "invalid_mode"}):
+            out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
+        self.assertIn("ignoring unrecognized AUDIT_ON_DEMAND='invalid_mode'", self.err)
+        self.assertIn("expected truthy", self.err)
+
+    def test_start_negative_on_demand_persisted_in_record_overrides_kanban_env_at_finish(self):
+        """Negative AUDIT_ON_DEMAND at start persists into record and overrides kanban env at finish (#1929)."""
+        with patch.dict(os.environ, {"AUDIT_ON_DEMAND": "false"}):
+            self.assertEqual(
+                self.run_main(["start", "--audit", AUDIT]),
+                0,
+            )
+        doc = make_doc(findings=[])
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123", "AUDIT_ON_DEMAND": ""}):
+            out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
 
     def test_a_partial_run_is_never_silent(self):
         """The exact shape that went silent on 2026-08-03."""
