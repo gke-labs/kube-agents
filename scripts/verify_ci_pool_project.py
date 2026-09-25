@@ -45,7 +45,8 @@ _FLEET_CATALOG = _ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 # the only place the counts appear, and the script exits 0 whether it wrote
 # every role file or none -- an absent kubeconfig becomes `status: error` on
 # the checks that needed it rather than killing the job, which is what that
-# script is for -- so the numbers are the whole signal.
+# script is for -- so the numbers are the whole signal. The one exception is
+# exit 3, a read-only credential it could not mint: nothing written, no line.
 _FLEET_SUMMARY = re.compile(
     r"Seeded-fleet kubeconfigs: (?P<written>\d+) role\(s\) written to \S+, "
     r"(?P<unresolved>\d+) on clusters that could not be resolved or reached, "

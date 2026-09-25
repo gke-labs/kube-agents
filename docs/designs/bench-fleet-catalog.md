@@ -246,8 +246,7 @@ nightly's, and to the CI health bot, so an apply lets `hack/fleet-kubeconfigs.sh
 impersonate the reader. A
 check on such a project cannot write what it grades.
 
-Every registered pool project binds it (read on 2026-09-24). A project without it does
-not read the fleet at all: `hack/fleet-kubeconfigs.sh` writes nothing, exits 3, and
+A project without it does not read the fleet at all: `hack/fleet-kubeconfigs.sh` writes nothing, exits 3, and
 `hack/ci-eval-pr.sh` stops the run at its fleet step rather than grading under the
 runner's own credential.
 

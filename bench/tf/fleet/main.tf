@@ -134,7 +134,7 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 # is what closes the write path -- see variables.tf for why the default lives
 # there rather than in the caller. A project with no entry still gets the
 # account, but fleet-kubeconfigs.sh refuses to read the fleet on the runner's
-# own credential, so a presubmit that leases it stops at its fleet step.
+# own credential, so a run that leases it stops at its fleet step.
 resource "google_service_account_iam_member" "fleet_reader_token_creators" {
   for_each           = toset(var.fleet_reader_token_creators)
   service_account_id = google_service_account.fleet_reader.name

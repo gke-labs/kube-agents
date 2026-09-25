@@ -266,8 +266,8 @@ account, and `hack/fleet-kubeconfigs.sh` writes each kubeconfig with an `exec:` 
 naming `hack/fleet-reader-credential.sh`, which mints a token as that account whenever
 `kubectl` asks for one.
 
-Without the grant the script writes nothing and exits 3, and the presubmit stops at that
-step. On a fleet only you use, leave `FLEET_READONLY_SA` unset and set
+Without the grant the script writes nothing and exits 3, and a run that leases the project —
+presubmit or nightly — stops at that step. On a fleet only you use, leave `FLEET_READONLY_SA` unset and set
 `FLEET_ALLOW_RUNNER_CREDENTIAL=1` to read it on your own credential. The alternative
 was reading the fleet as the runner's own identity, which holds `roles/container.admin` among the twelve project roles
 `scripts/provision_ci_pool_project.sh` grants at onboarding (`PROW_RUNNER_ROLES` in
