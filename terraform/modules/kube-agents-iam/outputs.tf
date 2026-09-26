@@ -23,3 +23,21 @@ output "scoped_service_accounts" {
   value       = { for key in keys(local.scoped_pool) : key => google_service_account.scoped[key].email }
 }
 
+output "scope_projects" {
+  description = <<-EOT
+    The projects beyond project_id that scope.projects named, each bound with
+    scope_roles. The host project is omitted even when scope.projects names it,
+    because it carries project_roles already.
+  EOT
+  value       = sort(tolist(local.scope_projects))
+}
+
+output "scope_roles" {
+  description = <<-EOT
+    The roles bound in every scope project: the module's read allowlist
+    (local.scope_role_allowlist in scope.tf) intersected with project_roles.
+    Surfaced so the ceiling a scoped project grants can be asserted on rather
+    than inferred from the allowlist and the role list separately.
+  EOT
+  value       = local.scope_roles
+}

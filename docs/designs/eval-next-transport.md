@@ -1,9 +1,11 @@
 # The eval transport under `spec.mode: next`
 
-> **STATUS — design of record; stage 1 partially built.** The gateway has the inject adapter and
-> the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator renders the door only
-> under its eval flag. Still unbuilt: the bridge image the eval install needs, `hack/ci-deploy.sh`
-> has no mode flag, the presubmit install runs `today`, and stage 2 (Chat ingress) is not started.
+> **STATUS — design of record; stage 1 built, off by default.** The gateway has the inject adapter
+> and the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator renders the door
+> only under its eval flag; `EVAL_MODE_NEXT=1` on the presubmit scripts builds the bridge image,
+> flips the install, declares the sidecar and runs the matrix through the door (The CI flag). The
+> presubmit still runs `today` unless a job sets the flag, and stage 2 (Chat ingress) is not
+> started.
 > The measurement that motivates the document is on
 > gke-labs/kube-agents#1661; the presubmit run it cites is build `2100310325382352896`. The A2A
 > owner answered the first draft's questions on 2026-09-17 and reviewed the draft the same day;
@@ -309,14 +311,26 @@ gate, an `authority` block that names a real principal, and the reply rendered i
 
 **Which verifiers work.** `report_contains` reads the answer text and works unchanged.
 `resource_property` and `fleet_resource_property` read the cluster and never touched the
-transport. `tool_called` reads the trajectory, which on this path has tool-call data only when
-the executor publishes `activity` artifacts; the Hermes bridge publishes
-status updates and a `result` artifact and no `activity` or `progress` artifacts, while the
-worker adapter publishes `activity` and `progress` beside the result, so a case
-that gates on `tool_called` has no data on stage 1 until the bridge publishes activity or the
-persona moves to the worker path. `worker_commands` reads the kanban worker logs by card id; on
+transport. `tool_called` reads the trajectory, which on this path carries no tool-call data:
+the relay never posts `activity` artifacts to a conversation, so a transport that reads one
+sees none whatever the executor publishes, and recording them is transport work of its own. The
+executors differ beneath that — the Hermes bridge publishes status updates and a `result`
+artifact and no `activity` or `progress` artifacts, while the worker adapter publishes `activity`
+and `progress` beside the result — so a case that gates on `tool_called` has no data on stage 1
+until both the executor publishes activity and the transport records it. `worker_commands` reads
+the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
-signals), and until then a case that gates on it has no data on stage 1 either.
+signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
+as a failure meanwhile: on a record whose trajectory is this transport's envelope with no tool
+call in it, the scorer sets every `tool_called`, `worker_commands` and `worker_agents` entry aside as not
+applicable and grades the checks that remain; a case with no other objective is not graded on
+the lane rather than collapsed, and the rule retires itself on the first record that carries a
+tool entry ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
+cannot show") — which, as above, is transport work that is not filed. A case whose premise
+needs the front door — `agent-kanban-smoke`, which grades
+the chat profile's `kanban_create` — is a different matter: the door addresses `platform`
+directly, so `hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the
+reason, and the api lane's roster is untouched.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
@@ -330,7 +344,7 @@ session pod waits on the profile and dispatcher work, which has no date, and the
 none for the bridge's retirement: it goes when profiles land and the retirement ordering is
 written. Stage 1 builds against the bridge
 ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md)), a sidecar declared on the CR
-through `spec.deployment.sidecars` whose image has no build configuration in this repository. A
+through `spec.deployment.sidecars` whose image `a2a/Dockerfile.hermes-bridge` builds, CI-only. A
 case addresses `platform` and does not care who answers; when the persona moves to a worker the
 addressee stays `platform`, which is what the addressee token is for. An install under `next`
 with no sidecar declared has a bus with nobody consuming `platform` tasks, and every case on the
@@ -345,21 +359,30 @@ long as the two ahead of them run. The eval install's sidecar therefore sets
 and the `submitted`-only classification above is the backstop rather than the fix: a queued
 repetition that reaches the deadline is infrastructure, not a failed case, but it has still
 spent its budget waiting. Two pieces of stage-1 work follow from building against the bridge,
-neither of which exists today: nothing in this repository or the presubmit produces the bridge
-image, and nothing declares the sidecar. The bridge doc says the image is fork-built for the
-playground, the platform-agent image plus the bridge binary, in neither `images.json` nor the
-release pipeline, and that it joins the release surface at stage-2 graduation or dies before it.
-Stage 1 therefore adds a bridge Dockerfile beside the three A2A Dockerfiles in `a2a/`, built in
-the same step the CI flag section gives the A2A images and tagged per pull request into the pool
-project's registry, CI-only and not in `images.json`, consistent with that statement; and
-`hack/ci-deploy.sh` under the flag declares the sidecar on the CR through
-`spec.deployment.sidecars` with that image, the bus URL and credentials the bridge doc lists as
-its env, and `BRIDGE_CONCURRENCY` at or above `EVAL_TASK_PARALLELISM`; and a look-ahead in the
-bridge's worker, which before it spawns replays the task's `in` subject for a trailing `cancel`,
-the one-subject read `tasks/get` already does on events, and finalizes `canceled-before-start`
-when it finds one, so a cancel already in the stream is honoured without a spawn. Whether the
-bridge image build lands in this repository, and the look-ahead with it, are the A2A owner's
-call, and the open question below.
+and both are the CI flag's (decided 2026-09-18 by the A2A owner on gke-labs/kube-agents#1661,
+with the conditions below). `a2a/Dockerfile.hermes-bridge` sits beside the three A2A
+Dockerfiles: the platform-agent image plus the bridge binary, built in the same Cloud Build as
+the A2A images (a step of its own, after the platform image) and tagged per pull request into the
+pool project's registry,
+`FROM` the platform-agent image that build produced by the tag it just pushed and never a
+registry default, so the sidecar and the agent container it shares a pod with are one build;
+CI-only, outside `images.json`, with the exclusion stated in `hack/check-image-inventory.sh`
+and the bridge doc's provenance paragraph saying the same. `hack/ci-deploy.sh` under the flag
+declares the sidecar on the CR through `spec.deployment.sidecars` once the bus is up (a bridge
+that starts before NATS resolves crash-loops the agent's pod), with that image, the bus URL and
+the `bridge` user's password from the operator's creds Secret as the bridge doc lists its env,
+and `BRIDGE_CONCURRENCY` set to `EVAL_TASK_PARALLELISM`, sized against the bridge's fixed queue
+as well: the queue behind the workers holds 1024 accepted tasks before the bridge finalizes one
+as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The
+sidecar also carries the agent container's own environment, mounts, security context and
+resources, derived from the rendered Deployment at deploy time rather than copied into the
+script: the bridge's subprocess stands in for the `hermes chat -q` a kanban worker spawns inside
+the agent container, and that is the environment such a worker inherits. The one mount not
+carried is the projected bus token, which the webhook reserves for the agent container. The
+third piece, a look-ahead in the bridge's worker that before it spawns replays the task's `in`
+subject for a trailing `cancel` and finalizes `canceled-before-start` when it finds one, so a
+cancel already in the stream is honoured without a spawn, was decided the same day and is
+tracked as its own issue.
 
 ### The direct-bus transport, kept as a diagnostic
 
@@ -494,47 +517,58 @@ Deployment's generation, merge-patches the CR, and waits for the generation to m
 asking any workload for status, because the flip is a rollout and a status read before it lands
 describes the old pods. It then gates, in order, on the NATS StatefulSet, the callout Deployment,
 the provisioning Job reaching `complete` (the Job depends on the callout and has been measured at
-19.5 minutes under adverse conditions, so its bound is generous), and the agent Deployment. It
-reports the A2A gateway's state and last log lines and never gates on it: the gateway refuses to
-start without a backend, and the eval install has none until the inject adapter is rendered. The
-same flag is what the operator renders the inject adapter's env, Service and NetworkPolicy
-under; once it does, the gateway starts and the flag can gate on it too. The flag reaches the
-operator as an operator environment variable, the pattern the A2A image overrides use, and not
-as a CRD field (decided 2026-09-17 by the A2A owner on the adapter's issue): the door maps a
-body-supplied principal, and nothing a customer can set on a `PlatformAgent` may render it. The
-rendered object set with the flag unset carries no inject Service, env or NetworkPolicy, and that
-is a property for the conformance suite to check rather than a comment to trust. The A2A images
-the flip needs are built in the same Cloud Build step as the other images and set on the
-operator, because the defaults point at a registry the pool projects cannot pull from; the bridge
-image is built in that step too, and the flip declares the bridge sidecar on the CR with it (the
-executor paragraph in stage 1 says what the sidecar carries), because a flip without the sidecar
-leaves a bus on which nobody consumes `platform` tasks. The eval matrix in `hack/ci-eval-pr.sh`
-is unchanged.
+19.5 minutes under adverse conditions, so its bound is generous), and the agent Deployment. Then
+the door and the executor. The deploy arms the gateway's inject door on the operator under the
+same flag (`A2A_INJECT_BACKEND=true` through the chart's `operator.extraEnv`, beside the A2A
+image overrides) and waits for the door's Service and token Secret; it then declares the bridge
+sidecar on the CR through `spec.deployment.sidecars` (the executor paragraph in stage 1 says
+what the sidecar carries), waits for the agent Deployment to roll once more, and ends on the
+bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
+bridge leaves a bus on which nobody answers. It reports the A2A gateway's state and last log
+lines and does not gate on it: the door gives the gateway the backend it lacked, so it now
+starts, but a gateway that is down is what the harness classifies as infrastructure on every
+case, and gating it is the change that follows the first measured run through the door. The
+flag reaches the operator as an operator environment variable, the pattern the A2A image
+overrides use, and not as a CRD field (decided 2026-09-17 by the A2A owner on the adapter's
+issue): the door maps a body-supplied principal, and nothing a customer can set on a
+`PlatformAgent` may render it. The rendered object set with the flag unset carries no inject
+Service, env or NetworkPolicy, and that is a property for the conformance suite to check rather
+than a comment to trust. The A2A images the flip needs, and the bridge image, are built in the
+same Cloud Build as the other images (two steps of their own, no-ops with the flag unset) and the
+three are set on the operator, because its defaults point at a registry the pool projects cannot
+pull from. Under the same flag
+`hack/ci-eval-pr.sh` runs the matrix through the door: it exports `AGENT_TRANSPORT=inject` and
+`AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door, and
+changes nothing else about the run except the matrix itself, from which the inject lane's
+exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather than
+on this flag) then leaves out the cases whose premise needs the chat front door. With the flag
+unset both scripts are byte for byte what they were, and the presubmit's own tests hold that.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.
 The next stack still has holes independent of any case (no resource requests on the NATS,
-gateway or provisioning pods, a gateway with no backend until the adapter lands, no executor
-until the sidecar is declared, images in a
-private registry), and a default-on flip would red every pull request for reasons none of them
-caused. And until a case sends through the gateway, a run under `next` measures nothing a run
-under `today` does not; the flag exists so the matrix can be run against `next` on demand while
-stage 1 lands.
+gateway or provisioning pods, images in a private registry, and whatever the first runs through
+the door find), and a default-on flip would red every pull request for reasons none of them
+caused. And the record that earns `next` a place in what every pull request measures is built by
+running it: a scheduled lane on `main` under the flag, with a record of its own, not the
+presubmit. That lane is not built yet, and the flag does not admit it as it stands: section 2b of
+the deploy refuses `EVAL_MODE_NEXT=1` on a Prow run with no pull request, because `bench-gate`
+would append that run's samples to `main`'s baseline, the window every pull request is judged
+against. The lane's change is what gives such a run a store of its own and lifts that refusal for
+it; until then the flag runs on a pull request's presubmit, on demand.
 
 ## Open questions
 
 Marked open on purpose; this document does not pick. The first draft's two questions for the A2A
 owner, which executor answers `platform` and whether delegation becomes a child task on the bus,
 were answered on 2026-09-17 and are recorded above as decisions, as was how the eval flag
-reaches the operator (The CI flag). What remains is the eval crew's, and one item the A2A
-owner's:
+reaches the operator (The CI flag). Whether the bridge image build lands in this repository, and
+the bridge look-ahead with it, was the A2A owner's and was answered on 2026-09-18 on
+gke-labs/kube-agents#1661: both yes, the build CI-only and `FROM` the same run's platform-agent
+image, outside `images.json` with the exclusion written into the inventory check, and the
+look-ahead a read rather than a consume; the executor paragraph in stage 1 records it. What
+remains is the eval crew's:
 
 - **Which reply stage 2 grades,** the bus events of the task the gateway opened or the Chat
   thread. The principle prefers the thread; the bus events grade one hop short and need no Chat
   read credential. The eval crew decides when the stage is built.
-- **Whether the bridge image build lands in this repository, and the bridge look-ahead with it.**
-  Stage 1 needs a bridge image the presubmit can pull, and the bridge doc says no build config
-  for it ships here. The proposal in stage 1 is a CI-only Dockerfile beside the A2A ones, outside
-  `images.json`, and a pre-spawn look-ahead for a trailing cancel in the bridge's worker, without
-  which a late-binding bridge spawns a cancelled submission before killing it; the A2A owner
-  decides both.

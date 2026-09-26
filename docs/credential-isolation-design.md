@@ -137,9 +137,8 @@ resolver — and it does not close that path either. Adding a NetworkPolicy is m
 policies selecting one Pod are unioned and the API has no deny rule — and the gateway Pod
 is already selected for egress
 by the `<agent>-gateway-netpol` this same operator renders (unless
-`spec.networkPolicy.enabled: false` withholds it — on a Helm install the one shape where
-the allowlist stands alone and enforces; a Kustomize install's static
-`platform-agent-core-egress` still selects the same Pod), which permits the metadata
+`spec.networkPolicy.enabled: false` withholds it, the one shape where the allowlist
+stands alone and enforces), which permits the metadata
 path. So enabling the allowlist widens what the Pod may send and narrows nothing; it is
 an auditable object rather than a control until that gateway policy is narrowed. It would
 in any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. See
@@ -253,10 +252,12 @@ already have.
 
 They cannot go behind the proxy, because the sandbox is not the client — it is
 the server. `session_kv_server.py` runs in the sandbox and binds
-`127.0.0.1:8699`; its callers are the event watcher in `agent-api-auth`,
-the Platform MCP server, the `incident_context` plugin, and the gateway's
-kanban notifier, which keys a delivered triage report to the thread it went
-into. The key exists so
+`127.0.0.1:8699`; its callers are the event watcher and the drift detector in
+`agent-api-auth`, the Platform MCP server, the `incident_context` plugin, the
+gateway's kanban notifier, which keys a delivered triage report to the thread it
+went into, the chat adapter's scheduled-report relay, and the two findings
+scripts. Deliberately not stated as a total: the list has grown twice and a
+count is the part that goes stale first. The key exists so
 that the server can reject a request that did not come from one of them, which
 means the server has to hold it. The salt is read by the Chat Agent plugins,
 which also run in the sandbox, before any identity is written to disk; hashing
@@ -267,12 +268,13 @@ Deliberately _not_ `API_SERVER_KEY`: that value is the non-secret loopback
 sentinel `cluster-internal-trusted`, so reusing it here would authenticate
 nothing. Both keys are optional in the CRD, so a Secret without them yields
 containers without the variables rather than a pod that will not start. What
-that costs is worth stating precisely, because one of the three consequences is
-not a degradation: the `k8s-event-watcher` in `agent-api-auth`
+that costs is worth stating precisely, because two of the consequences are
+not degradations: the `k8s-event-watcher` in `agent-api-auth`
 authenticates to the Session KV server with `SESSION_KV_API_KEY` and treats an
 empty value as fatal, so it exits on every start and **no cluster events are
 watched at all** — silently, since the container stays Ready and no probe covers
-the watcher. The other two are degradations: the Session KV server refuses every
+the watcher. The drift detector, in the same container and on the same key,
+fails the same way and as quietly, where an install has enabled it. The rest are degradations: the Session KV server refuses every
 authenticated request with a 503 and says why, and identity hashing falls back
 to a per-process random salt with one warning.
 
@@ -321,8 +323,12 @@ including:
 - interactive TTY programs and password prompts;
 - arbitrary binary or unbounded streaming input/output;
 - file paths that refer to sandbox-only files;
-- background processes or commands that outlive the request; and
-- commands exceeding request, output, or timeout limits.
+- background processes or commands that outlive the request;
+- commands exceeding request, output, or timeout limits; and
+- more commands at once than the broker's concurrency cap admits
+  (`CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS`, 8 by default): a request waits
+  up to 60 seconds for a slot and is then refused with `503
+CREDENTIAL_PROXY_BUSY`.
 
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
@@ -636,10 +642,12 @@ per-invocation timeout. A shallow clone plus the ceiling would bound both and is
 the right follow-up; neither alone does.
 
 Separately, the content routes raise the request-body cap to twice the
-total-payload limit, and the listener is threaded with no connection cap, so peak
-heap is roughly concurrency times that figure. None of this is reachable from
-outside the Pod, but it is worth knowing before the flag is armed anywhere it
-matters.
+total-payload limit, and the listener is threaded with no connection cap, so
+peak heap on those routes is roughly concurrency times that figure: the bodies
+are read before any command runs, so the broker's command cap does not bound
+them, and the git these verbs run is serialised by the store's lock rather than
+counted against that cap. None of this is reachable from outside the Pod, but
+it is worth knowing before the flag is armed anywhere it matters.
 
 Every verb takes a lock for its whole duration. The handler is threaded, so two
 requests naming one handle genuinely interleave, and each verb is a read-then-act
@@ -781,6 +789,55 @@ Consequences:
   interactive verbs (`exec`, `attach`, `debug`, `port-forward`, `proxy`),
   `logs --follow`, anything watching with `-w`, and any command whose caller
   supplied its own `--timeout` or `--request-timeout`.
+- The broker reads a command's output as it streams and keeps at most
+  `CREDENTIAL_PROXY_MAX_OUTPUT_BYTES` of each stream (8 MiB as the operator
+  deploys it); the rest is drained and dropped, so what a command prints past
+  the cap costs the broker nothing. The same bound applies to the decoded
+  text's UTF-8 size, so output that is not UTF-8, whose every byte becomes a
+  three-byte replacement character, cannot cost more than text does. At most
+  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` requests that run commands are in
+  flight at once (8; the operator sets it, as it sets the output cap, and
+  reserves the name). A slot is held from admission until the response is on
+  the wire, because everything a request costs lives that long: a child
+  process plus about six times the output cap of transient copies in the
+  broker (the captured streams, their decoded text, the JSON body and its
+  encoding). The two caps together are therefore what the broker container's
+  memory limit is sized against, and they move with that limit in the
+  operator rather than through the CR. The exec and vcs routes hold a slot;
+  the vcs route reads its body, which may carry a bundle of tens of MiB, only
+  once admitted, while the exec route's body (at most 1 MiB) is read before.
+  The forge refresh (a short call to the minter), the content workspace's git
+  (serialised by the store's own lock) and the Cloud API relay (a bounded read
+  of its own) take none. A request that waits more than 60 seconds for a slot
+  is answered `503 CREDENTIAL_PROXY_BUSY`, which the sandbox CLIs print as
+  `the credential proxy is at its limit of 8 concurrent commands and this request waited 60s without reaching a free slot; retry shortly`.
+  A long-running command holds its slot for as long as it runs, and a caller
+  that stops reading its response is given up on after 60 seconds so that it
+  cannot keep one.
+- An exec command whose caller disconnects while it runs is ended rather than
+  left to run to its deadline for nobody: `SIGTERM`, then `SIGKILL` two
+  seconds later, to the whole process group it started. The same two-step end
+  applies at the deadline. On both the exec and vcs routes, a caller that
+  disconnects while queued for a slot is dropped without anything being
+  started; a vcs verb's own git commands, once started, run to completion
+  unwatched. Slots go in arrival order, so the caller refused after the wait
+  is the one that waited longest. Disconnecting means the peer closed for good
+  (`POLLHUP` on the broker's Unix socket); a peer that only shut its writing
+  half is still answered, and a broker spoken to over TCP, where a closed peer
+  and a half-closed one look alike, runs its commands unwatched.
+- All the commands one request runs share one deadline,
+  `CREDENTIAL_PROXY_TIMEOUT_SECONDS` (five minutes) counted from admission: a
+  vcs publish's several network git commands, and a first kubectl's
+  credential fetch (itself on the shorter kubectl deadline) followed by the
+  kubectl, are each capped to what is left of it. A vcs body must also arrive
+  within 60 seconds of admission. Envoy's stream idle timeout in front of the
+  runtime is twenty minutes: the broker writes nothing to a stream until the
+  request is answered, so the silent worst case is that deadline plus the
+  slot wait, the kill grace and the drain, a little over six minutes at the
+  defaults, and a silent request that reaches its deadline is still answered
+  with its partial output and the timed-out notice rather than reset by Envoy
+  first. An operator raising `CREDENTIAL_PROXY_TIMEOUT_SECONDS` keeps the
+  Envoy timeout above it plus the minute.
 
 ### Cloud API reads
 

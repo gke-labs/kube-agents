@@ -10,8 +10,8 @@ only with an `approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNE
 [`hack/OWNERS`](../hack/OWNERS) scopes `blocking-roster.txt` and
 `hack/eval/presubmit-cases.txt` — what blocks and what runs on every pull request — to that
 alias with `no_parent_owners`, so a root approver does not count for either. Nothing else
-carries the rule: `hack/eval/nightly-cases.txt`, a new case directory under `bench/tasks/`
-and the script itself need only the normal approvers
+carries the rule: `hack/eval/nightly-cases.txt`, `hack/eval/inject-lane-exclusions.txt`, a new
+case directory under `bench/tasks/` and the script itself need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the script's step-0 revalidation treats `docs/` as
 inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -232,6 +232,39 @@ nothing on the pull request that introduces it and is first seen by the next nig
 finishes grading. The eval crew took that trade with the policy; the way to close it is a
 GitHub-write probe cheap enough to earn a roster seat on its nightly record, and until one
 exists a pull request that touches that path should say what it ran by hand.
+
+## The inject lane
+
+When the presubmit matrix runs through the A2A gateway's inject door — the harness's
+`AGENT_TRANSPORT=inject`, which `hack/ci-eval-pr.sh` exports under `EVAL_MODE_NEXT=1`
+([`docs/designs/eval-next-transport.md`](designs/eval-next-transport.md), "The CI flag") — the
+roster above is still the roster:
+nothing in the two roster files changes, and every case not named in the lane's exclusion list
+(below) runs and can red the job exactly as on the api lane. Two things differ, and they are
+kept apart on purpose.
+
+A check the transport blinds is the scorer's business. The door's record carries no tool calls
+and no card ids, so `tool_called`, `worker_commands` and `worker_agents` see nothing there; `bench-gate` sets
+those entries aside as not applicable on that transport and grades the rest, and a case whose
+only objectives are of that kind is reported `NOT_GRADED_ON_TRANSPORT` rather than collapsed —
+evaluated, outside the pass rate, never weather
+([`docs/designs/eval-scorer.md`](designs/eval-scorer.md), "The inject lane sets aside what its
+transport cannot show"). No roster edit is involved, and the rule retires itself once the
+executor's tool calls reach the record.
+
+A premise the transport removes is the lane's exclusion list,
+`hack/eval/inject-lane-exclusions.txt`. The door addresses `platform` directly, so a case that
+grades the chat front door's own behaviour — `agent-kanban-smoke`, whose objective is the
+default profile filing a `kanban_create` before a specialist answers — has no front door in its
+path, and grading its answer alone would pass a premise the case does not have there.
+`hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
+the log; on the api lane the file changes nothing. Each entry carries its reason as the comment
+block above it, naming the issue that decides when it goes, and `scripts/test_eval_rosters.py`
+holds every entry to that, the way the validator's `FIXTURE_NOT_READY` holds a case with no
+fixture to an issue. An entry is not a demotion: the case stays in `presubmit-cases.txt` and on
+the blocking roster, runs on every pull request over the api transport, and can still red one.
+The file needs the normal approvers, not the eval-crew rule, for the same reason
+`nightly-cases.txt` does — it changes what one lane runs, not what can red a pull request.
 
 ## Demoting a flaky case
 

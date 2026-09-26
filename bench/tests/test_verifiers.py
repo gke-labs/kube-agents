@@ -1713,6 +1713,41 @@ def test_finding_ids_scope_closes_the_scope_table_hole(token, github):
     assert strict.verify(5.0).status == "fail"  # closed
 
 
+def test_finding_ids_scope_reads_the_complete_block_on_a_truncated_body(token, github):
+    """A body cut for size lists only the rendered ids in its delta block.
+
+    The finding that sorted last was still filed; the complete-list block
+    audit_report writes on a truncated body is what names it.
+    """
+    _stash_report()
+    body = _ledger_body(finding_ids=["rbac-overgrant.seeded-a._.debug-binding"])
+    payload = json.dumps(
+        sorted(["rbac-overgrant.seeded-a._.debug-binding", "service-selects-nothing.seeded-c.ns.orders"]),
+        separators=(",", ":"),
+    )
+    body += f"<!-- audit-findings-all: {payload} -->\n"
+    github.routes[_api()] = (200, _issue(body))
+    res = _ledger_check(required_phrases=["service-selects-nothing"], scope="finding_ids").verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_finding_ids_scope_without_the_complete_block_reads_the_delta_block(token, github):
+    _stash_report()
+    github.routes[_api()] = (200, _issue(_ledger_body()))
+    res = _ledger_check(required_phrases=["service-selects-nothing"], scope="finding_ids").verify(5.0)
+    assert res.status == "fail"
+
+
+def test_finding_ids_scope_ignores_a_complete_block_above_the_delta_block(token, github):
+    """Agent-authored text sits above the footer; a forged copy there is not the script's."""
+    _stash_report()
+    forged = '<!-- audit-findings-all: ["service-selects-nothing.seeded-c.ns.orders"] -->\n'
+    body = _ledger_body(findings="### rbac-overgrant on seeded-a\n\n" + forged)
+    github.routes[_api()] = (200, _issue(body))
+    res = _ledger_check(required_phrases=["service-selects-nothing"], scope="finding_ids").verify(5.0)
+    assert res.status == "fail"
+
+
 def test_finding_ids_scope_fails_when_the_delta_block_is_absent(token, github):
     _stash_report()
     github.routes[_api()] = (200, _issue(_ledger_body(finding_ids=None)))
@@ -1910,6 +1945,21 @@ def test_the_pinned_stream_list_matches_the_audit_scripts_registry():
     assert set(literal.__args__) == set(verifiers.LEDGER_AUDIT_IDS)
 
 
+def test_the_complete_block_regex_reads_what_audit_report_writes():
+    """_ALL_FINDINGS_RE copies all_findings_block's format, and audit_report's
+    own tests never run this regex. Render the script's own template so a change
+    on that side fails here rather than quietly grading the rendered subset."""
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    )
+    (template,) = re.findall(r'f"(<!-- audit-findings-all: \{payload\} -->)"', script.read_text())
+    payload = json.dumps(["a.b.c.d", "e.f.g.h"], separators=(",", ":"))
+    body = _ledger_body() + template.replace("{payload}", payload) + "\n"
+    parsed = verifiers._finding_ids(body)
+    assert parsed == (["a.b.c.d", "e.f.g.h"], "audit-findings-all")
+
+
 def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():
     """A positive body-scoped phrase must not be a substring of any check slug.
 
@@ -2002,6 +2052,34 @@ def _pr_payload(
     return body
 
 
+_PR_HEAD_SHA = "2d206b1ead215bab99f78a9305a9f3083d75cd58"
+
+
+def _pr_head_routes(
+    github,
+    committed_at: str = "2026-08-21T09:00:20Z",
+    *,
+    changed_files: int = 3,
+    repo: str = _PR_REPO,
+) -> None:
+    """Route the reads `_head_push` makes: the pulls payload for the file count
+    and the page of the commit listing the head sits on."""
+    pulls = _pr_api("pulls", repo=repo)
+    github.routes[pulls] = (
+        200,
+        {
+            "number": 7,
+            "changed_files": changed_files,
+            "commits": 1,
+            "head": {"ref": "platform-agent/fix", "sha": _PR_HEAD_SHA},
+        },
+    )
+    github.routes[f"{pulls}/commits?per_page=100&page=1"] = (
+        200,
+        [{"sha": _PR_HEAD_SHA, "commit": {"committer": {"date": committed_at}}}],
+    )
+
+
 def _stash_pr_report(final_message: str = "", started_at: float = _RUN_START) -> None:
     transcript.set(
         "full output",
@@ -2019,16 +2097,24 @@ def _pr_check(**kw):
 def test_pr_pass_reads_the_pull_request_this_run_opened(token, github):
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
     res = _pr_check().verify(5.0)
     assert res.status == "pass", res.reason
     assert "2026-08-21T09:00:30" in res.reason
-    # One call: the pulls endpoint is the fallback, not the first ask.
-    assert [url for url, _ in github.calls] == [_pr_api()]
+    assert "3 changed file(s)" in res.reason
+    # The issues endpoint answers, so the pulls one is read for the file count
+    # rather than as a fallback, and the commits page dates the head.
+    assert [url for url, _ in github.calls] == [
+        _pr_api(),
+        _pr_api("pulls"),
+        f"{_pr_api('pulls')}/commits?per_page=100&page=1",
+    ]
 
 
 def test_a_previous_reps_pull_request_is_a_fail(token, github):
-    """The defect this check exists for (#1755). Nothing sweeps the GitOps
-    repository, so rep 1's pull request is still there for rep 2 to link. The
+    """The defect this check exists for (#1755). The pool sweep runs between
+    leases, not between reps, so rep 1's pull request is still there for rep 2
+    to link within the same job. The
     URL, the repository and the number are all identical to a real pass; the
     stamps are what tell them apart, and a run that only quotes the URL moves
     neither of them."""
@@ -2049,6 +2135,7 @@ def test_a_rep_that_pushed_onto_an_earlier_reps_branch_passes(token, github):
         200,
         _pr_payload("2026-08-20T09:00:30Z", "2026-08-21T09:04:00Z"),
     )
+    _pr_head_routes(github, "2026-08-21T09:03:50Z")
     res = _pr_check().verify(5.0)
     assert res.status == "pass", res.reason
     assert "updated at 2026-08-21T09:04:00" in res.reason
@@ -2057,6 +2144,7 @@ def test_a_rep_that_pushed_onto_an_earlier_reps_branch_passes(token, github):
 def test_a_pull_request_opened_seconds_before_the_run_is_still_stale(token, github):
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:50:00Z"))
+    _pr_head_routes(github)
     assert _pr_check().verify(5.0).status == "fail"
     # ... and the skew window is what decides it, not the clock alone.
     assert _pr_check(max_clock_skew_sec=900).verify(5.0).status == "pass"
@@ -2092,6 +2180,7 @@ def test_a_pull_request_merged_during_the_run_passes(token, github):
         "merged_at": "2026-08-21T09:10:00Z",
     }
     github.routes[_pr_api()] = (200, payload)
+    _pr_head_routes(github)
     assert _pr_check().verify(5.0).status == "pass"
 
 
@@ -2128,7 +2217,87 @@ def test_the_ticket_linked_beside_the_fix_does_not_sink_it(token, github):
     )
     github.routes[_pr_api(number=3)] = (200, _pr_payload("2026-08-20T09:00:30Z"))
     github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
     assert _pr_check().verify(5.0).status == "pass"
+
+
+def test_a_rep_that_only_commented_on_an_earlier_reps_pull_request_fails(token, github):
+    """The hole `max(created_at, updated_at)` leaves, and why the head commit is
+    read. A comment moves `updated_at` exactly as a push does, so a rep that
+    quoted rep 1's URL and wrote a note on it looked identical to one that
+    pushed the fix. The head commit is still rep 1's, and that is the tell."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        _pr_payload("2026-08-20T09:00:30Z", "2026-08-21T09:04:00Z"),
+    )
+    _pr_head_routes(github, "2026-08-20T09:00:25Z")
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "its head commit dates from 2026-08-20T09:00:25" in res.reason
+
+
+def test_a_pull_request_that_changes_no_files_is_a_fail(token, github):
+    """Opened during the run, by the agent, and empty. The objective is that a
+    fix went out, and an empty pull request carries none."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=0)
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "changes no files" in res.reason
+
+
+def test_a_transport_failure_dating_the_head_commit_is_unresolved_not_a_crash(token, github):
+    """The commits read sits after the stamp checks, so a reset there used to
+    escape `verify()` as a traceback instead of joining `unresolved` the way
+    the same fault on the first read does."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+
+    def boom():
+        raise OSError("connection reset")
+
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = boom
+    res = _pr_check().verify(5.0)
+    assert res.status == "error" and not res.success
+    assert "could not reach the GitHub API" in res.reason and "connection reset" in res.reason
+
+
+def test_a_head_commit_the_api_will_not_date_does_not_fail_the_run(token, github):
+    """An observation the API would not give is not evidence the run pushed
+    nothing. The commits page is missing here, so the check falls back to the
+    stamps rather than rejecting a pull request it could not read."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    del github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"]
+    assert _pr_check().verify(5.0).status == "pass"
+
+
+@pytest.mark.parametrize(
+    "status, body, names",
+    [
+        (401, {"message": "Bad credentials"}, "is not valid"),
+        (403, {"message": "Resource not accessible by integration"}, "`pull_requests: read`"),
+        (502, {"message": "Bad Gateway"}, "unexpected GitHub response 502"),
+        (200, {"message": "not a list"}, "unexpected GitHub response 200"),
+    ],
+)
+def test_a_commits_page_github_would_not_serve_is_an_error_not_a_pass(token, github, status, body, names):
+    """The same rule as one read earlier on `/pulls/{n}`: a page the credential
+    or GitHub would not serve is the absence of an observation, an error. Read
+    as `None` it passed the stamps alone, which is the hole the head-commit
+    check exists to close -- a leftover the run only commented on has a fresh
+    `updated_at` and an old head."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (status, body)
+    res = _pr_check().verify(5.0)
+    assert res.status == "error" and not res.success, res.reason
+    assert names in res.reason and "commits page" in res.reason, res.reason
 
 
 def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):
@@ -2158,6 +2327,7 @@ def test_a_slug_github_cannot_answer_for_does_not_sink_the_real_one(token, githu
     github.routes[_pr_api(repo=other)] = denied
     github.routes[_pr_api("pulls", repo=other)] = denied
     github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
     res = _pr_check().verify(5.0)
     assert res.status == "pass", res.reason
 
@@ -2175,6 +2345,7 @@ def test_a_transport_failure_before_the_real_one_does_not_sink_it(token, github)
 
     github.routes[_pr_api(repo=other)] = boom
     github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
     res = _pr_check().verify(5.0)
     assert res.status == "pass", res.reason
 
@@ -2206,11 +2377,22 @@ def test_the_pulls_endpoint_answers_when_issues_read_cannot_see_a_pr(token, gith
     endpoint when the issues one will not answer, rather than grading a real
     pull request as absent."""
     _stash_pr_report()
+    _pr_head_routes(github)
     github.routes[_pr_api()] = (403, {"message": "Resource not accessible"})
-    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_pr_api("pulls")] = (
+        200,
+        _pr_payload(as_issue=False)
+        | {"changed_files": 3, "commits": 1, "head": {"sha": _PR_HEAD_SHA}},
+    )
     res = _pr_check().verify(5.0)
     assert res.status == "pass", res.reason
-    assert [url for url, _ in github.calls] == [_pr_api(), _pr_api("pulls")]
+    # And the pulls payload the fallback already fetched is reused: the file
+    # count is in it, so the head check adds the commits page and nothing else.
+    assert [url for url, _ in github.calls] == [
+        _pr_api(),
+        _pr_api("pulls"),
+        f"{_pr_api('pulls')}/commits?per_page=100&page=1",
+    ]
 
 
 def test_denied_on_both_endpoints_is_an_error_naming_the_permission(token, github):
@@ -2220,6 +2402,43 @@ def test_denied_on_both_endpoints_is_an_error_naming_the_permission(token, githu
     res = _pr_check().verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
+
+
+def test_an_expired_token_on_the_file_count_read_is_the_token_not_the_permission(token, github):
+    """The first read answered 200 and the token ran out before the second: the
+    reason names the mint, as `_resolve`'s 401 arm does, not a permission."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (401, {"message": "Bad credentials"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert "not valid" in res.reason
+    assert "pull_requests: read" not in res.reason
+
+
+def test_a_5xx_or_a_redirect_on_the_file_count_read_is_githubs_not_a_permission(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    for status in (502, 301):
+        github.routes[_pr_api("pulls")] = (status, None)
+        res = _pr_check().verify(5.0)
+        assert res.status == "error", status
+        assert f"unexpected GitHub response {status}" in res.reason
+        assert "pull_requests: read" not in res.reason
+
+
+def test_pulls_denied_when_read_for_the_file_count_is_an_error_naming_the_permission(token, github):
+    """The issues endpoint resolved the pull request, so the check is past
+    every fail arm when it reads `/pulls/{n}` for the file count. A denial
+    there is the credential's, not the run's: error, naming the permission,
+    rather than a fall-back to the stamps that would pass a token unable to
+    see what was pushed."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (403, {"message": "Resource not accessible"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error" and not res.success, res.reason
+    assert "pull_requests: read" in res.reason and "pulls endpoint" in res.reason
 
 
 def test_an_expired_token_is_diagnosed_as_the_token_not_the_permission(token, github):

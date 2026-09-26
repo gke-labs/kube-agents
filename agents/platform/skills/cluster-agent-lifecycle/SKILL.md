@@ -90,12 +90,12 @@ both directions:
   cluster kube-agents itself runs on. The scope is the management project alone unless the
   `PlatformAgent` declares `spec.scope`; the only exceptions are clusters named in
   `spec.scope.exclude.clusters` or, for one more release, bare names in `RECONCILE_EXCLUDE`. A
-  project the pod cannot list, or a folder or organisation it cannot read (whose previous members are then carried forward frozen, with no CREATE under them), is recorded with its outcome in `fleet_scope.json` at the root of the data volume (`/opt/data`, beside `profiles/`; the reconcile's own `HERMES_HOME`, not a profile's) (written by every run except `--dry-run`) and
+  project the pod cannot list, or a folder, organisation, Shared VPC host or Metrics Scope it cannot read (whose previous members are then carried forward frozen, with no CREATE under them), is recorded with its outcome in `fleet_scope.json` at the root of the data volume (`/opt/data`, beside `profiles/`; the reconcile's own `HERMES_HOME`, not a profile's) (written by every run except `--dry-run`) and
   skipped for that run rather than guessed at. The management cluster is included because its own workloads fail like any other cluster's,
   and the agent that triages a Kubernetes event is the one scoped to the cluster that raised it.
 - **Prune** — a profile is deleted when its GKE cluster is definitively gone (a `NotFound` from
   `gcloud container clusters describe`), when it belongs to an excluded cluster, which must not
-  carry a profile even though that cluster exists, or when its project has left the scope, over two clean runs: a clean run (no project unreachable, every folder and organisation resolved `ok` or `over-cap`, the management project resolved, listed its own clusters and unchanged since the last run, the scope file readable) that finds a previously in-scope project absent marks it `retiring` in
+  carry a profile even though that cluster exists, or when its project has left the scope, over two clean runs: a clean run (no project unreachable, every folder, organisation, Shared VPC host and Metrics Scope resolved `ok` or `over-cap`, the management project resolved, listed its own clusters and unchanged since the last run, the scope file readable) that finds a previously in-scope project absent marks it `retiring` in
   `fleet_scope.json`; the next clean run prunes its profiles. A profile whose project the scope never produced, or whose prune waits for that second run, is
   kept and listed as `unmanaged`; one whose identity could not be read is kept and appears under the report's
   `skipped_no_identity`, and under the snapshot's `profiles` once an earlier run has read its identity. This closes the loop when a cluster is deleted

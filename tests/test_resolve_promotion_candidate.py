@@ -4,10 +4,17 @@ The script decides two things the nightly pipeline branches on, and confusing
 them is the failure worth guarding against:
 
   skip_pipeline   nothing to deploy at all
-  skip_promotion  deploy and test, but push no tag
+  skip_promotion  deploy and test, but nominate nothing and push no tag
 
 Every skip is exit 0. The only exit 1 is a tag that does not resolve, or one the
 RC pipeline never validated.
+
+Since the release-candidate eval became a gate, the promotion path has two tags
+rather than one — evalcand_<core> starts the eval, staging_<core> deploys on a
+green verdict — and the skip keys on either being present. Both are checked
+because they went out of step during the transition: candidates promoted before
+the gate landed carry a staging_ tag and no evalcand_ one, and keying on the
+nomination alone would re-nominate every one of them.
 """
 
 import pathlib
@@ -89,6 +96,7 @@ class ResolvePromotionCandidateTest(unittest.TestCase):
         self.assertEqual(out["rc_tag"], "rc_2608191200_2222222_validated")
         self.assertEqual(out["commit_sha"], newer)
         self.assertNotEqual(out["commit_sha"], older)
+        self.assertEqual(out["evalcand_tag"], "evalcand_2608191200_2222222")
         self.assertEqual(out["staging_tag"], "staging_2608191200_2222222")
         self.assertEqual(out["skip_pipeline"], "false")
         self.assertEqual(out["skip_promotion"], "false")
@@ -103,7 +111,12 @@ class ResolvePromotionCandidateTest(unittest.TestCase):
         self.assertEqual(out["commit_sha"], "")
 
     def test_already_promoted_skips_only_the_promotion(self):
-        """The matrix still runs. Only the tag push is gated on eligibility."""
+        """The matrix still runs. Only the promotion path is gated on eligibility.
+
+        This is the transition case: the commit carries a staging_ tag from before
+        the eval gate existed, so there is no evalcand_ tag to key on. Without the
+        staging_ check it would be nominated afresh and re-measured for hours.
+        """
         repo_dir, git = self._repo()
         head = git("rev-parse", "HEAD").stdout.strip()
         git("tag", "-a", "rc_2608191200_2222222_validated", "-m", "Validated")
@@ -114,6 +127,63 @@ class ResolvePromotionCandidateTest(unittest.TestCase):
         self.assertEqual(out["commit_sha"], head)
         self.assertEqual(out["skip_pipeline"], "false", "an already-promoted night still deploys and tests")
         self.assertEqual(out["skip_promotion"], "true")
+
+    def test_already_nominated_skips_the_promotion_path(self):
+        """An evalcand_ tag means the eval has already been paid for.
+
+        Re-nominating would push nothing — ensure_git_tag no-ops on a tag already
+        at that commit — so no second eval would start and the pipeline would then
+        poll for a verdict it had not asked for. Skipping states the same outcome
+        up front.
+        """
+        repo_dir, git = self._repo()
+        head = git("rev-parse", "HEAD").stdout.strip()
+        git("tag", "-a", "rc_2608191200_2222222_validated", "-m", "Validated")
+        git("tag", "-a", "evalcand_2608191200_2222222", "-m", "Already nominated")
+
+        proc, out = self._run(repo_dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(out["commit_sha"], head)
+        self.assertEqual(out["skip_pipeline"], "false", "an already-nominated night still deploys and tests")
+        self.assertEqual(out["skip_promotion"], "true")
+        self.assertIn("already nominated", out["skip_reason"])
+
+    def test_an_evalcand_tag_on_another_commit_does_not_block_this_one(self):
+        repo_dir, git = self._repo()
+        git("tag", "-a", "evalcand_2608181000_1111111", "-m", "Nominated earlier")
+        candidate = self._commit(repo_dir, git, "second")
+        git("tag", "-a", "rc_2608191200_2222222_validated", "-m", "Validated")
+
+        proc, out = self._run(repo_dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(out["commit_sha"], candidate)
+        self.assertEqual(out["skip_promotion"], "false")
+
+    def test_both_tags_are_emitted_and_share_a_core(self):
+        """The nomination and the promotion have to name the same candidate."""
+        repo_dir, git = self._repo()
+        git("tag", "-a", "rc_2608191200_2222222_validated", "-m", "Validated")
+
+        proc, out = self._run(repo_dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(out["evalcand_tag"], "evalcand_2608191200_2222222")
+        self.assertEqual(out["staging_tag"], "staging_2608191200_2222222")
+
+    def test_no_candidate_emits_an_empty_evalcand_tag_rather_than_a_malformed_one(self):
+        """The tag is derived from an RC tag, so with no candidate there is nothing to derive from.
+
+        No job reads it on this night — `skip_pipeline` is what step 4 gates on,
+        and it is true here — so the assertion is about what the script emits
+        rather than about what is pushed. Empty is the reading every consumer
+        already has a branch for; `evalcand_` with an absent core is a shape that
+        clears a prefix check, reaches whichever step later stops gating on
+        `skip_pipeline`, and fires no eval job when it is pushed.
+        """
+        repo_dir, _ = self._repo()
+
+        proc, out = self._run(repo_dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(out["evalcand_tag"], "")
 
     def test_a_staging_tag_on_another_commit_does_not_block_this_one(self):
         repo_dir, git = self._repo()

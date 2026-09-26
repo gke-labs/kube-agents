@@ -449,10 +449,10 @@ canonical walkthroughs.
 
 ### Agent runtime knobs
 
-`platformAgent.harness.hermes`, `platformAgent.harness.memory`, and
-`platformAgent.deployment.availability` expose the remaining PlatformAgent CR
-fields, so a chart install can reach every field of the CR without editing it
-by hand. Each one defaults
+`platformAgent.harness.hermes`, `platformAgent.harness.memory`,
+`platformAgent.harness.driftDetector`, and `platformAgent.deployment.availability`
+expose the remaining PlatformAgent CR fields, so a chart install can reach every
+field of the CR without editing it by hand. Each one defaults
 to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset.
@@ -495,7 +495,7 @@ node's cache. The chart and the Terraform composition agree on `Always` for the
 mutable-tag case they were both written for; an install at a pinned release
 tag is the case that wants the override.
 
-Four knobs need context beyond the chart:
+Five knobs need context beyond the chart:
 
 - `deployment.availability.runtimeClassName` defaults to `gvisor`, because the
   agent executes model-authored commands and an unsandboxed pod shares the node
@@ -529,6 +529,12 @@ Four knobs need context beyond the chart:
 - `harness.hermes.dashboardEnabled` defaults to `null`, which leaves the field
   out of the CR so the CRD default (`true`) applies. Set it explicitly when an
   install must pin the dashboard on or off rather than float with the CRD.
+- `harness.driftDetector.enabled` needs
+  [`terraform/modules/drift-pubsub`](../../terraform/modules/drift-pubsub/)
+  applied against the project first. The chart does not check, and neither does
+  the detector: enabled without a subscription to read, it comes up and retries
+  a pull that cannot succeed for the life of the pod, never exits, and leaves
+  the pod Ready. That is why it defaults to off.
 
 ### Plugins & Runtime Tuning
 
@@ -552,6 +558,18 @@ before any GKE call. The
 `scoped_service_accounts` output when `scoped_clusters` is set. See the site's
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
+
+### Projects in scope
+
+`platformAgent.scope` is rendered as `spec.scope` on the `PlatformAgent`: the GCP projects,
+beyond the one the agent runs in, whose GKE clusters get a Cluster Agent, and the projects and
+clusters it leaves unmanaged (the
+[CRD reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/operator/platformagent-crd.md#specscope)
+documents the field). An empty scope is a present block with empty lists, and the chart renders it whenever it is given one, `{}` included, because the reconcile reads an emptied `projects` list as the declaration that drops projects. `null`, the chart's default, is not an empty scope: it is the chart being told nothing, and the composition never tells it nothing. The block is never dropped for being empty. While no earlier revision rendered the block, a `null` leaves a scope the CR already carries alone, because Helm patches a custom resource from the difference between its rendered manifests; once a revision has rendered it, a render without it removes `spec.scope` from the CR, which the reconcile reads as no declaration (the management project alone, nothing retired), so `null` clears a scope without retiring its projects and emptying `projects` is how projects are dropped. The
+`terraform/examples/full-install` composition always passes a map, so on that path a project
+leaves the scope by being removed from `projects` and applied. Once a release has rendered the block the value is the declaration: the installer refuses the next full upgrade over a `spec.scope` edited by hand until `install.env` records it or the CR is put back, and a retag, or a hand-driven composition apply whose rendered scope is unchanged, leaves the edit in place because Helm sends only the difference between its rendered manifests.
+The agent's service account needs the read roles in each project named; the composition binds
+them from the same value, and a chart installed on its own needs them granted by hand.
 
 ### ServiceAccount ownership
 

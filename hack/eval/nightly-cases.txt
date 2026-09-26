@@ -21,7 +21,7 @@
 # presubmit" and "not admitted" are the same set and this file is where a
 # held-out case lives: the seven cases the presubmit had been running
 # without letting them block moved here that day, each with its hold-out
-# reason as the # line above it (the last section of this file). This is
+# reason as the # line above it (their own section of this file). This is
 # the default home for a new case too (decided 2026-09-15 on #1546 and
 # #1564): it lands here, the nightly builds its record in the evidence
 # store -- one data point a night, three repetitions -- and a presubmit
@@ -66,14 +66,21 @@
 # 2026-09-23 added upgrades-master-behind-offered-elsewhere (~45min at the 900s
 # band; its runs measured 327s-1191s, the audit band's spread again) and
 # gitops-drift-out-of-band-triage (#1827, ~45min at its 900s hint).
-# Forty-four cases, ~1011-1031min serial. The
+# Forty-four cases, ~1011-1031min serial. 2026-09-25 adds the two
+# obtainability probes (#1841), unhinted and probe-shaped (~200s a
+# repetition, ~10min each at three): forty-six cases, ~1031-1051min serial.
+# 2026-09-25 also added obtainability-planted-orphan-service (~45min at the
+# 900s band; tofu, so it serializes on the infra lock with the other tofu
+# cases). Forty-seven cases, ~1076-1096min serial. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
-# herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
-# at its default 3 (#1491). At the ~1.15x the presubmit realised on
-# whole-job wall clock at parallelism 4 under daytime quota contention that
-# would be ~879-897min, over the deadline; 480m holds only if the nightly,
-# alone on the model quota at that hour and two lanes wider, realises ~1.9x
-# or better. Night one (2026-09-16, build 2100374258805903360, #1491)
+# herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=8 (6 from #1491 until
+# oss-test-infra#2707, 2026-09-25; the arithmetic that follows was done at
+# six) and EVAL_REPETITIONS at its default 3. At the ~1.15x the presubmit
+# realised on whole-job wall clock at parallelism 4 under daytime quota
+# contention that would be ~879-897min, over the deadline; 480m holds only
+# if the nightly, alone on the model quota at that hour and two lanes
+# wider, realises ~1.9x or better. Night one (2026-09-16, build
+# 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
 # so the five additions are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
@@ -96,11 +103,11 @@
 # 5.4-5.8x over parallelism 6, so 5h39m on the lightest night and the Prow
 # deadline on the two heaviest (09-18 and 09-21, 8h00m, nothing recorded).
 # The worst measured night does not fit at parallelism 6 today, and this
-# edit adds nothing to it. oss-test-infra#2707 (open, approved 2026-09-22)
-# moves the periodic to EVAL_TASK_PARALLELISM=8, at which the worst night's
-# 2693 serial minutes project to ~5.6h of fan-out plus ~20 minutes of build
-# and deploy, inside 480m with about two hours to spare; until it merges a
-# heavy night is a truncated night, whichever file its cases are listed in.
+# edit adds nothing to it. oss-test-infra#2707 (merged 2026-09-25) moved the
+# periodic to EVAL_TASK_PARALLELISM=8, at which the worst night's 2693 serial
+# minutes project to ~5.6h of fan-out plus ~20 minutes of build and deploy,
+# inside 480m with about two hours to spare; the nights before it a heavy
+# night was a truncated night, whichever file its cases were listed in.
 # The seven now record one data point a night here where they recorded ten
 # to sixty a day in the presubmit; the admission edit for any of them cites
 # this record, so the record is thinner and the wait is longer by design.
@@ -112,9 +119,9 @@
 # minutes, on nights the 2026-09-22 paragraph already says can truncate.
 #
 # 2026-09-25 adds cluster-agent-unlocated-crashloop-debug (#1670): one case,
-# three units, ~36 serial minutes at its 720s hint. With the 2026-09-23
-# additions above it grows the matrix to forty-six cases and 138 units,
-# ~1083-1103 serial minutes, on nights the 2026-09-22 paragraph already says
+# three units, ~36 serial minutes at its 720s hint. With the 2026-09-25
+# additions above it grows the matrix to forty-eight cases and 144 units,
+# ~1112-1132 serial minutes, on nights the 2026-09-22 paragraph already says
 # can truncate.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
@@ -277,6 +284,13 @@
 # (`patch_readiness.py`) computes the route check.
 ./tasks/upgrades-master-behind-offered-elsewhere/task.yaml
 
+# The obtainability stream's collector case, nightly from the start: a per-run
+# plant (`prebuilt/orphan-service`) of a ClusterIP Service whose selector
+# matches no pod, graded on §3.16 `service-selects-nothing` reaching the
+# ledger. The collector (`collect.py`) computes the check. Priced with the
+# 900s audit band.
+./tasks/obtainability-planted-orphan-service/task.yaml
+
 # Blocker: never run (`validated: false`). Issue #953: unlocated cluster
 # crashloop debugging (omits "Find the cluster it is running on", requiring the
 # Platform Agent to discover the target cluster via fleet enumeration before
@@ -422,3 +436,12 @@
 
 # A simple case that can run on kind.
 ./tasks/chat-routing-own-cluster-namespaces/task.yaml
+
+# The two obtainability-journey probes: CUJ1's Day-0 design discipline and
+# CUJ3's Day-2 window planning, graded on the report and the worker
+# commands through the eval harness (their live siblings under bench/cuj/
+# need a full install and stay manual). Both probe live GCP advice APIs in
+# the eval project; neither reads the seeded fleet. `validated: false`
+# until their first observed runs.
+./tasks/obtainability-design-quota-vs-capacity/task.yaml
+./tasks/obtainability-window-planning-probe/task.yaml

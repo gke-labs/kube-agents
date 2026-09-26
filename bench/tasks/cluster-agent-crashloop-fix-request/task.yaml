@@ -6,11 +6,10 @@
 # closed when GoogleCloudPlatform/oss-test-infra#2661 merged on 2026-08-25:
 # the Prow job now exports EVAL_GITHUB_APP_ID, and the repo-side half
 # (ci-deploy.sh mapping each pool project to its *-infra repo and scoping the
-# minter to it) was already on main. A5's residual applies as it does to every
-# fleet case — until the fleet_reader_token_creators grant is applied in the
-# leased project, the safeguard below still runs, but under the runner's own
-# read-write identity, which is a privilege gap rather than a functional
-# block.
+# minter to it) was already on main. A5 is a precondition of the run: without
+# the fleet_reader_token_creators grant in the leased project,
+# hack/fleet-kubeconfigs.sh refuses to read the fleet and the run stops before
+# any case.
 #
 # What keeps it out of the presubmit is that it has never been run. It stays that way
 # until it has been watched to both pass and fail (`validated: false`);
@@ -172,8 +171,9 @@ verification_spec:
     role: objective
     mode: assert
     check:
-      # Not report_contains: a substring passes on an invented URL, and on the
-      # PR an earlier rep opened, since nothing sweeps the GitOps repository.
+      # Not report_contains: a substring passes on an invented URL, and on
+      # the PR an earlier rep opened. This resolves the URL and reads the head
+      # commit, so a rep that only quoted an earlier rep's PR fails.
       type: pull_request_opened
       owner: gke-agentic
   - name: rca-names-the-oom

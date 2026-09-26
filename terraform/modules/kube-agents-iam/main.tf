@@ -2,6 +2,20 @@ resource "google_service_account" "agent" {
   project      = var.project_id
   account_id   = var.service_account_id
   display_name = var.display_name
+
+  # The scope's bindings are local.scope_role_allowlist intersected with
+  # project_roles (scope.tf). A project_roles that carries neither of the two
+  # roles able to list and get clusters -- `custom` with an admin-only or a
+  # custom-IAM-role list, or [] -- would leave every scoped project declared
+  # in the CR and unable to be listed or have a profile created, while
+  # Terraform said nothing. Held here because the scope binding's for_each is
+  # empty in exactly that case and cannot carry the precondition itself.
+  lifecycle {
+    precondition {
+      condition     = length(local.scope_projects) == 0 || local.scope_can_manage
+      error_message = "scope.projects names projects but project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) carries neither roles/container.clusterViewer nor roles/container.viewer, the two roles that list and get clusters; a custom IAM role is not carried into scoped projects. Add one of the two (it is bound in the host project as well) or empty scope.projects."
+    }
+  }
 }
 
 resource "google_service_account_iam_member" "workload_identity" {

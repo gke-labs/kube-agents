@@ -71,6 +71,20 @@ spec:
     memory:
       {{- . | nindent 6 }}
     {{- end }}
+    {{- $drift := .Values.platformAgent.harness.driftDetector | default dict }}
+    {{- /*
+      Rendered only when an install says something about it, which is why
+      `enabled: null` rather than `false` is the value shipped: the CRD already
+      defaults it off, and a chart that wrote the default would make every
+      install look like one that had considered drift detection and declined.
+    */}}
+    {{- with include "kube-agents.compactFields" (dict
+          "enabled" $drift.enabled
+          "subscription" $drift.subscription
+          "gitopsManagers" $drift.gitopsManagers) }}
+    driftDetector:
+      {{- . | nindent 6 }}
+    {{- end }}
     {{- $tuning := deepCopy (.Values.platformAgent.harness.tuning | default dict) }}
     {{- if and .Values.plugins (and .Values.plugins.stockoutInvestigator .Values.plugins.stockoutInvestigator.enabled) }}
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
@@ -186,6 +200,24 @@ spec:
       audience: {{ $wif.audience | quote }}
       serviceAccountEmail: {{ $wif.serviceAccountEmail | quote }}
     {{- end }}
+  {{- /*
+    Rendered whenever the install carries the value, empty lists included, and never
+    through compactFields or `with`, which would drop an emptied block: the reconcile
+    reads a present block with an empty projects list as the declaration that drops
+    projects, and an absent block as no declaration at all
+    (docs/designs/multi-project-scope.md §7). `kindIs "map"` is the test because the
+    default is null and a null user value deletes the key, both of which render no
+    block, while `{}` is a present map that `with` would skip.
+  */}}
+  {{- $scope := .Values.platformAgent.scope }}
+  {{- if kindIs "map" $scope }}
+  {{- $scopeExclude := $scope.exclude | default dict }}
+  scope:
+    projects: {{ $scope.projects | default list | toJson }}
+    exclude:
+      projects: {{ $scopeExclude.projects | default list | toJson }}
+      clusters: {{ $scopeExclude.clusters | default list | toJson }}
+  {{- end }}
   {{- /*
     `with`, not `if`: an empty value must OMIT the field, not render it as "". Omitting is
     what leaves the operator free to discover a collector; an explicit "" would look like

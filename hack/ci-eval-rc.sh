@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Release-candidate eval (the periodic job's entrypoint)
+# Release-candidate eval (the postsubmit job's entrypoint)
 # ==============================================================================
 # Resolve the newest release candidate, check it out, deploy its published
-# images, and evaluate them. Non-gating: the verdict is reported, and nothing
-# here can hold up a release. How wide that evaluation is depends on a tier
-# switch that has not landed yet -- see RC_EVAL_TIER below, which is the one
-# place in this file describing something the repository does not have.
+# images, and evaluate them. GATING: the verdict this writes is what decides
+# whether the candidate reaches the staging cluster. Step 5 of
+# staging-promotion-pipeline.yml polls this run's artifacts and pushes the
+# staging_ tag staging-deploy.yml triggers on only when the summary below says
+# GREEN. How wide that evaluation is, RC_EVAL_TIER below decides: the presubmit
+# matrix, and deliberately not the full catalog, because the step that waits
+# for this verdict gives up before the full catalog finishes.
+#
+# The word in the summary is the verdict, not this script's exit status, and the
+# three-way split is why. An exit status has two values and this lane has three
+# outcomes: a candidate that failed the catalog, a candidate that passed it, and
+# a run that measured nothing at all -- a lease that never came, a deploy that
+# failed, a dormancy gate. Collapsing the third into either of the others is a
+# candidate held back for a broken lane or promoted on an eval that never ran.
 #
 # The four steps, and why they need a driver at all:
 #
@@ -59,29 +69,53 @@
 # config's to run -- as a separate step, unconditionally, whatever this script
 # exits with. hack/ci-teardown.sh explains what a leased project left holding a
 # live install does to the next lease that gets it (#1006), and this lane
-# borrows the same pool the presubmit eval does, so skipping it is the one way
-# a non-gating lane can still cost somebody a run.
+# borrows the same pool the presubmit eval does, so skipping it costs somebody
+# else a run on top of whatever it cost this one.
 #
-# The path of this file is a CONTRACT: the periodic job in oss-test-infra
+# The path of this file is a CONTRACT: post-kube-agents-eval-rc in oss-test-infra
 # invokes hack/ci-eval-rc.sh by name. Do not rename it.
 # ==============================================================================
 
 set -euo pipefail
 
-# The tier exported to ci-eval-pr.sh. NOTHING READS IT TODAY: the switch that
-# would is #1175's and is not on main, so `grep EVAL_TIER` finds only this file.
-# Every run therefore measures the presubmit matrix, and the NOTE below prints
-# for every candidate rather than only for old ones. That is a smaller run than
-# the lane intends, not a wrong one, which is why it is a note and not a
-# failure. The export is here so the lane widens to the full catalog on the day
-# that switch merges, with no edit to this file.
+# The tier exported to ci-eval-pr.sh, and so which matrix this lane grades:
+# `presubmit` is the merge-blocking set in eval/presubmit-cases.txt, `nightly`
+# appends eval/nightly-cases.txt. Counted from those files rather than stated
+# here, because both move: at the time of writing they are 12 and 30, so 42
+# cases, and at three repetitions 36 units against 126.
 #
-# `nightly` and not a value of this lane's own, because #1175's switch rejects
-# anything it does not know: a value invented here would exit 1 the day the two
-# land together. What distinguishes this run from the main-branch nightly is
-# RC_COMMIT_SHA, which ci-eval-pr.sh already reads as the third condition on
-# the baseline store, so the tier does not have to carry that meaning too.
-readonly RC_EVAL_TIER="nightly"
+# It is the smaller one because of the clock, not because the other cases are
+# unwanted. Step 5 of staging-promotion-pipeline.yml waits 330 minutes for this
+# verdict and then withdraws the nomination, and that 330 is the last of three
+# ceilings: a GitHub-hosted job is killed at 360, so the waiting job is capped
+# at 345 to leave itself room to write a summary. The nightly tier does not fit
+# under it. ci-kube-agents-eval-nightly grades the same 126 units on the same
+# pool, and in the week to 2026-09-23 its two runs that finished took 357 and
+# 401 minutes while four were killed at its own 480-minute deadline.
+#
+# The 36-unit matrix does fit, and that is measured rather than derived. The
+# presubmit runs it on the same pool at the same repetition count, so its
+# fan-out is the same work this lane does: three runs that reached a verdict on
+# 2026-09-24 spent 83, 110 and 143 minutes in it. Add the ~20 minutes of lease,
+# build and deploy this lane pays before grading starts and the poller keeps
+# real headroom under 330 even on the slow end. What that does not cover is a
+# run whose cases stall rather than run: #1840's delegation block costs 45
+# minutes per repetition, and enough of those exceed any budget. That failure
+# is unsettled, so it withdraws the nomination and the next night asks again.
+#
+# This read `nightly` from #1230 until now, under a comment saying #1175's
+# switch was not on main so nothing read the export. That was true when it was
+# written and false when it merged: #1175 landed 12:18 on 2026-09-05 and #1230
+# 12:47, twenty-nine minutes later. The lane therefore graded the full catalog
+# from its first run, unintentionally, and the timeout in oss-test-infra was
+# sized for the matrix the comment described. #1620 grew the nightly roster at
+# 00:07 on 2026-09-16; every run of this lane from that morning on was killed
+# at its deadline. #1842 holds the measurements.
+#
+# Widening this back to `nightly` needs the verdict to arrive somewhere that is
+# not a GitHub-hosted job holding a connection open for it. Until then the full
+# catalog runs in the nightly periodic, where nothing is waiting on the clock.
+readonly RC_EVAL_TIER="presubmit"
 
 # Written by resolve-rc-target.sh through RC_TARGET_OUTPUT: the tag and commit
 # in key=value form, for anything downstream that needs to know what was
@@ -110,16 +144,10 @@ readonly PROW_DECK_BUILD_BASE="https://oss.gprow.dev/view/gs/kube-agents-prow/lo
 # leased project and measure something that was never published.
 readonly DEPLOY_RC_MARKER="RC_COMMIT_SHA"
 
-# The same question asked of the candidate's ci-eval-pr.sh, with a softer
-# answer: absent, the tier switch is not there to read and the run measures
-# the presubmit matrix. Absent is the norm until #1175 lands, so expect this
-# one to fire on every candidate for now.
-readonly EVAL_TIER_MARKER="EVAL_TIER"
-
 # The siblings this script drives. Named because each name is a contract with
-# hack/ -- the marker greps above read the same files the invocations below
-# run, and a rename that moved one and not the other would leave this grepping
-# a file nobody was about to execute.
+# hack/ -- the marker grep above reads the same file one of the invocations
+# below runs, and a rename that moved one and not the other would leave it
+# grepping a file nobody was about to execute.
 readonly DEPLOY_SCRIPT="ci-deploy.sh"
 readonly EVAL_SCRIPT="ci-eval-pr.sh"
 readonly RESOLVE_SCRIPT="resolve-rc-target.sh"
@@ -149,7 +177,7 @@ readonly RC_VERDICT_JSON_FILE="eval-verdict.json"
 main() {
   local script_dir repo_root rc_commit_sha rc_tag original_ref
   local artifacts_dir summary_path verdict_path deck_url
-  local deploy_status eval_status eval_partial verdict
+  local deploy_status eval_status eval_partial verdict suite_not_evaluated
 
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   repo_root="$(cd "${script_dir}/.." && pwd)"
@@ -251,9 +279,10 @@ main() {
     echo "       Measure a candidate cut after that path landed, or pin one with RC_TAG." >&2
     exit 1
   fi
-  if ! grep -q "${EVAL_TIER_MARKER}" "${script_dir}/${EVAL_SCRIPT}"; then
-    echo "NOTE: ${rc_tag} carries no ${EVAL_TIER_MARKER} switch, so this run measures the presubmit matrix rather than the full ${RC_EVAL_TIER} catalog. Expected until that switch lands; the verdict is valid for the cases it ran."
-  fi
+  # No equivalent guard on the candidate's ci-eval-pr.sh: a candidate cut
+  # before #1175 has no tier switch to read, and the matrix it falls back to is
+  # the presubmit one this lane exports anyway. The two agree, so there is
+  # nothing to warn about. Widening RC_EVAL_TIER would bring the check back.
 
   # ─── Steps 3 and 4: deploy the candidate, then grade it ───────────────────
   # RC_COMMIT_SHA is what puts ci-deploy.sh on the published-image path and
@@ -282,6 +311,13 @@ main() {
   # "is this candidate worse than main".
   eval_status=0
   eval_partial=0
+  # Set only where the JSON confirms bench-gate declined to certify, and read
+  # by the reporting step below. A flag rather than a second look at
+  # eval_status, because the status no longer identifies that branch on its
+  # own: the preflight case below also reports NOT RUN, on any non-zero status
+  # including a 2 that argparse or `uv run` produced, and re-deriving would
+  # hand it the infrastructure paragraph it did not earn.
+  suite_not_evaluated="false"
   if [ "${deploy_status}" -ne 0 ]; then
     verdict="NOT RUN"
     echo "ERROR: deploying ${rc_tag} (${rc_commit_sha:0:7}) failed with status ${deploy_status}, so the candidate was never evaluated. This is not a verdict on the candidate." >&2
@@ -306,7 +342,31 @@ main() {
       # outside Prow with no ARTIFACTS to find the JSON in, stays a RED; so
       # does a 2 whose JSON is the EXIT trap's partial table.
       verdict="NOT RUN"
+      suite_not_evaluated="true"
       echo "NOTE: evaluating ${rc_tag} (${rc_commit_sha:0:7}) could not certify a verdict (status ${eval_status}): an admitted case lost every repetition to infrastructure. This is not a verdict on the candidate; rerun when the environment is healthy." >&2
+    elif [ -n "${artifacts_dir}" ] && [ ! -f "${artifacts_dir}/${RC_VERDICT_FILE}" ]; then
+      # The case before the one above: an eval that never reached its roll-up
+      # at all, so there is no verdict file of either kind to read a word out
+      # of. ci-eval-pr.sh exits 1 for its own preflight refusals as well as for
+      # a red catalog -- a ledger token that would not mint, a runner image
+      # short of `uv`, an EVAL_REPETITIONS that is not a positive integer --
+      # and all of those happen before the first case runs. bench-gate's
+      # --markdown-out is what separates them: the roll-up writes it, so its
+      # absence means no case was graded.
+      #
+      # Which matters more here than it reads. RED is settled: step 5b leaves
+      # the evalcand_ tag in place, resolve_promotion_candidate.sh skips the
+      # commit from then on, and the candidate is never measured again. Calling
+      # a preflight failure RED therefore retires a candidate over a broken
+      # runner. NOT RUN withdraws the nomination instead and a later nightly
+      # asks again, which is the right answer for a run that measured nothing.
+      #
+      # The two branches do not overlap: a run bench-gate declined to certify
+      # (#1787) wrote both verdict files on its way out, so it is caught above
+      # and never reaches here; a run that stopped short of the roll-up wrote
+      # neither, so the JSON check above cannot fire on it.
+      verdict="NOT RUN"
+      echo "ERROR: evaluating ${rc_tag} (${rc_commit_sha:0:7}) failed with status ${eval_status} without writing ${RC_VERDICT_FILE}, so no case was graded. This is not a verdict on the candidate." >&2
     else
       verdict="RED"
     fi
@@ -322,7 +382,7 @@ main() {
   echo "🏷️ RELEASE CANDIDATE EVAL"
   echo "Candidate:   ${rc_tag} (${rc_commit_sha})"
   echo "Tier:        ${RC_EVAL_TIER}"
-  echo "Verdict:     ${verdict} (advisory: this lane gates nothing)"
+  echo "Verdict:     ${verdict} (GREEN promotes this candidate to staging)"
   if [ -n "${deck_url}" ]; then
     echo "Artifacts:   ${deck_url}"
   fi
@@ -344,14 +404,19 @@ main() {
         echo "| Run | ${deck_url} |"
       fi
       echo
-      echo "Advisory. This lane reports and does not gate: a red verdict here"
-      echo "does not hold a release, and the non-inferiority comparison stays"
-      echo "advisory while the baseline store is maturing."
+      echo "This verdict decides whether the candidate reaches staging. Step 5"
+      echo "of staging-promotion-pipeline.yml reads the row above out of this file:"
+      echo "GREEN pushes the staging_ tag that deploys the candidate, RED holds"
+      echo "it back for good, and NOT RUN withdraws the nomination so a later"
+      echo "run can measure the same candidate again. The non-inferiority"
+      echo "comparison inside the eval stays advisory while the baseline store"
+      echo "is maturing, and does not contribute to the word above."
       echo
-      # The verdict, not the status: a 2 the JSON did not confirm is RED
-      # above, and this paragraph would tell the reader the opposite of the
-      # row three lines up. The status keeps the failed deploy's NOT RUN out.
-      if [ "${verdict}" = "NOT RUN" ] && [ "${eval_status}" -eq "${EVAL_NOT_EVALUATED_STATUS}" ]; then
+      # The branch that ran, not the status it ran on. The other two routes to
+      # NOT RUN -- a failed deploy, and an eval that stopped before the roll-up
+      # -- have their own paragraphs below and would be described wrongly by
+      # this one.
+      if [ "${suite_not_evaluated}" = "true" ]; then
         echo "The run could not certify a verdict: an admitted case lost every"
         echo "repetition to infrastructure, so the candidate was not measured"
         echo "on it. Nothing here is a judgement on the candidate; rerun when"
@@ -368,6 +433,12 @@ main() {
         echo "The candidate was never evaluated: deploying it failed with"
         echo "status ${deploy_status}. Nothing here is a judgement on the"
         echo "candidate. The build log above is where it stopped."
+      elif [ "${eval_status}" -ne 0 ]; then
+        echo "The eval exited ${eval_status} without writing"
+        echo "\`${RC_VERDICT_FILE}\`, so it stopped before grading a case --"
+        echo "a preflight refusal rather than a red catalog. Nothing here is a"
+        echo "judgement on the candidate. The build log above is where it"
+        echo "stopped."
       else
         echo "No \`${RC_VERDICT_FILE}\` was written: the run did not reach the"
         echo "verdict step. The build log above is where it stopped."
@@ -378,13 +449,13 @@ main() {
 
   # The restore hint is the EXIT trap's, so that the failure paths get it too.
 
-  # The failing step's own status is preserved rather than forced to 0. Which
-  # one the job reports is the JOB's decision (an `|| true` in its config),
-  # kept there so "non-gating" is one line in the config a reader can see,
-  # instead of a swallowed exit code here that makes a red run
-  # indistinguishable from a green one to anything reading exit statuses.
-  # Deploy first: on that path eval_status is 0 because the eval never ran,
-  # and returning it would call a run that measured nothing a success.
+  # The failing step's own status is preserved rather than forced to 0, which is
+  # what makes the Prow job red and the failure visible to a human reading Deck.
+  # It is deliberately NOT what the promotion reads: the status cannot say which
+  # of the two non-green outcomes happened, and the poller consults it only to
+  # contradict the summary written above. Deploy first: on that path eval_status
+  # is 0 because the eval never ran, and returning it would call a run that
+  # measured nothing a success.
   if [ "${deploy_status}" -ne 0 ]; then
     exit "${deploy_status}"
   fi

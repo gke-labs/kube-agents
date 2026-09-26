@@ -48,7 +48,7 @@ from kube_agents_bench.baselines import CaseOutOfScope
 from kube_agents_bench.gate import REPORT_EXCERPT_MAX_CHARS, _report_excerpt, main
 from kube_agents_bench.scoring import MISSING
 
-from conftest import FIXTURE_RUNS, GREEN_RUNS, RED_RUNS, read_fixture, write_run
+from conftest import FIXTURE_RUNS, GREEN_RUNS, INJECT_RUN, RED_RUNS, read_fixture, write_run
 from kube_agents_bench.evidence_store import _key_segments
 from test_evidence_store import FakeGcloud
 
@@ -165,6 +165,65 @@ def test_a_partially_passing_case_is_unstable(kanban_task, tmp_path):
     out = tmp_path / "case.json"
     run_case(kanban_task, [FIXTURE_RUNS / GREEN_RUNS[0], FIXTURE_RUNS / RED_RUNS[0]], out)
     assert payload(out)["label"] == "UNSTABLE"
+
+
+def test_an_inject_record_grades_on_the_check_its_transport_can_see(
+    kanban_task, tmp_path, monkeypatch, capsys
+):
+    """The measurement run's agent-kanban-smoke (#2039): a correct answer and
+    a tool_called check blind on the inject transport. Admitted, three such
+    repetitions used to collapse; the lane sets the blind check aside and the
+    grading line says so."""
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
+    out = tmp_path / "case.json"
+    assert run_case(kanban_task, [FIXTURE_RUNS / INJECT_RUN] * 3, out) == 0
+    printed = capsys.readouterr().out
+    assert "Task agent-kanban-smoke Result: [PASSED]" in printed
+    assert "rep 1: pass -- VerificationCorrectness=1.0 [1 check(s) not applicable on this transport" in printed
+    doc = payload(out)
+    assert doc["passes"] == 3 and doc["scored"] == 3 and doc["not_applicable"] == 0
+    assert doc["reps"][0]["not_applicable_checks"] == ["the-kanban-card-was-actually-filed"]
+
+
+def inject_record_with_only_the_blind_check() -> dict:
+    """The captured inject record as a case declaring the tool_called check
+    and nothing else would have written it."""
+    results = json.loads((FIXTURE_RUNS / INJECT_RUN / "results.json").read_text(encoding="utf-8"))
+    rec = results[0]
+    rec["verification_report"] = [
+        e for e in rec["verification_report"] if e["name"] == "the-kanban-card-was-actually-filed"
+    ]
+    rec["scores"]["VerificationCorrectness"] = 0.0
+    return {"results": results}
+
+
+def test_a_case_the_lane_cannot_grade_gets_its_own_label(write_task, tmp_path, monkeypatch, capsys):
+    task = write_task(
+        "card-only",
+        {
+            "id": "card-only",
+            "name": "Card only",
+            "verification_spec": [
+                {
+                    "name": "the-kanban-card-was-actually-filed",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["kanban_create"]},
+                }
+            ],
+        },
+    )
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "card-only")
+    runs = [write_run(tmp_path / f"run_{i}", inject_record_with_only_the_blind_check()) for i in range(3)]
+    out = tmp_path / "case.json"
+    assert run_case(task, runs, out) == 0
+    printed = capsys.readouterr().out
+    assert "Task card-only Result: [NOT_GRADED_ON_TRANSPORT] not graded on this transport" in printed
+    assert "rep 1: not_applicable -- not applicable on this transport" in printed
+    doc = payload(out)
+    assert doc["label"] == gate.LABEL_NOT_GRADED_ON_TRANSPORT
+    assert doc["blocking"] is False
+    assert doc["rung_name"] == "NOT_GRADED_ON_TRANSPORT"
+    assert doc["scored"] == 0 and doc["not_applicable"] == 3
 
 
 def test_an_expected_fail_case_failing_is_labelled_as_such(write_task, tmp_path, capsys):
@@ -444,6 +503,51 @@ def test_a_green_suite_exits_zero(tmp_path, capsys):
     rc = main(["suite", "--case-result", str(case_file(tmp_path, "a"))])
     assert rc == 0
     assert "**GREEN**" in capsys.readouterr().out
+
+
+def not_graded_case_file(tmp_path: Path, name: str, **fields) -> Path:
+    """A hand-off for a case the inject lane could not grade (#2039)."""
+    doc = {
+        "rung": 98,
+        "rung_name": "NOT_GRADED_ON_TRANSPORT",
+        "reason": "not graded on this transport: every objective check (x) is not applicable on this transport",
+        "passes": 0,
+        "scored": 0,
+        "not_applicable": 3,
+        "pass_rate": None,
+    }
+    doc.update(fields)
+    return case_file(tmp_path, name, **doc)
+
+
+def test_a_not_graded_case_beside_a_green_one_is_green_and_named(tmp_path, capsys):
+    md = tmp_path / "verdict.md"
+    js = tmp_path / "verdict.json"
+    rc = main(
+        [
+            "suite",
+            "--case-result", str(case_file(tmp_path, "a")),
+            "--case-result", str(not_graded_case_file(tmp_path, "b")),
+            "--markdown-out", str(md), "--json-out", str(js),
+        ]
+    )
+    assert rc == 0
+    text = md.read_text(encoding="utf-8")
+    assert "**GREEN**" in text
+    assert "_1 case(s) not graded on this transport" in text
+    assert "### Why" not in text, "a not-graded case is not a reason against green"
+    assert "| `b` | obtainability | NOT_GRADED_ON_TRANSPORT (rung 98) | 0/0 |" in text
+    doc = json.loads(js.read_text(encoding="utf-8"))
+    assert doc["not_graded"] == ["b"] and doc["not_evaluated"] == []
+
+
+def test_a_suite_of_only_not_graded_cases_exits_two_with_the_transport_banner(tmp_path, capsys):
+    rc = main(["suite", "--case-result", str(not_graded_case_file(tmp_path, "a"))])
+    assert rc == gate.SUITE_EXIT_NOT_EVALUATED
+    printed = capsys.readouterr().out
+    assert "**NOT EVALUATED**" in printed
+    assert "nothing on this transport could be graded" in printed
+    assert "rerun when the environment is healthy" not in printed
 
 
 def test_a_red_suite_exits_one(tmp_path, capsys):
@@ -737,6 +841,37 @@ def test_record_skips_a_case_that_produced_no_pass_or_fail(tmp_path, capsys):
     assert list(store.glob("*.jsonl")) == []
 
 
+def test_record_skips_a_case_the_inject_lane_set_aside_whole(tmp_path, capsys):
+    """Every repetition `not_applicable`: nothing scored, and the skip line
+    names that outcome rather than calling it blocked or infrastructure."""
+    store = store_with(tmp_path)
+    doc = case_file(
+        tmp_path, "a", version_key=KEY, scored=0, passes=0,
+        reps=[{"outcome": "not_applicable", "not_applicable_checks": ["card"]}] * 3,
+    )
+    assert run_record(store, doc) == 0
+    printed = capsys.readouterr().out
+    assert "3 of 3 repetition(s) not applicable on this transport" in printed
+    assert "not recorded, the store holds api-lane evidence only" in printed
+    assert "blocked or hit infrastructure" not in printed
+    assert list(store.glob("*.jsonl")) == []
+
+
+def test_record_skips_a_case_graded_with_a_check_set_aside(tmp_path, capsys):
+    """The captured inject shape: three passes, each with the tool_called
+    check set aside. Recording it would file a 3/3 line, graded on half the
+    case's objectives, beside the api lane's record at the same version key
+    -- evidence the api lane would not have produced, and admission reads it."""
+    store = store_with(tmp_path)
+    doc = case_file(
+        tmp_path, "a", version_key=KEY,
+        reps=[{"outcome": "pass", "not_applicable_checks": ["the-kanban-card-was-actually-filed"]}] * 3,
+    )
+    assert run_record(store, doc) == 0
+    assert "not recorded, the store holds api-lane evidence only" in capsys.readouterr().out
+    assert list(store.glob("*.jsonl")) == []
+
+
 def test_record_keeps_blocked_and_infra_out_of_the_rate_but_in_the_line(tmp_path):
     """Dropping them silently would make a case that half-crashes look
     perfectly reliable in its own history."""
@@ -942,6 +1077,29 @@ def test_the_suite_aggregate_comes_from_the_store_not_a_flag(
     printed = capsys.readouterr().out
     assert "main: 100.0%" in printed
     assert "advisory" not in printed
+
+
+def test_the_baseline_leaves_out_a_case_the_lane_did_not_grade(tmp_path, capsys):
+    """An admitted case the inject lane could not grade is on neither side
+    of the aggregate: its `scored` is 0 on the run, and main's evidence for
+    it (api-lane, at a key that carries no transport) must not be pooled
+    against a run that graded nothing of it. Here `a` is 14/21 on main and
+    `c` 21/21; pooled the baseline would read 83.3%, and the run's 2/3 on
+    `a` alone would sit below the margin for nothing."""
+    store = store_with(
+        tmp_path,
+        *[baseline_line("a", runs=3, passes=2, at=f"2026-08-0{i + 1}T00:00:00Z") for i in range(7)],
+        *[baseline_line("c", runs=3, passes=3, at=f"2026-08-0{i + 1}T00:00:00Z") for i in range(7)],
+    )
+    a = case_file(tmp_path, "a", version_key=KEY, passes=2, scored=3, pass_rate=2 / 3)
+    c = not_graded_case_file(tmp_path, "c", version_key=KEY)
+    assert main([
+        "suite", "--case-result", str(a), "--case-result", str(c),
+        "--baseline-dir", str(store), "--min-scored", "1",
+    ]) == 0
+    printed = capsys.readouterr().out
+    assert "main: 66.7%" in printed
+    assert "BELOW the margin" not in printed
 
 
 def test_the_aggregate_reds_when_the_store_says_main_did_better(tmp_path, monkeypatch):

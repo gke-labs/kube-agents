@@ -260,6 +260,7 @@ module "kube_agents_iam" {
   namespace          = var.namespace
   project_roles      = local.agent_project_roles
   scoped_clusters    = var.scoped_clusters
+  scope              = var.scope
   service_account_id = var.agent_service_account_id
   # The KSA half of the Workload Identity member; the same variable is the
   # chart's platformAgent.security.serviceAccountName below. The variable's
@@ -618,6 +619,26 @@ resource "helm_release" "kube_agents" {
           }
         ]
       }
+      # The same object the IAM module bound above, so the CR declares no
+      # project the module did not also bind. Always rendered, empty lists
+      # included: the reconcile reads a present block with an empty projects
+      # list as the declaration that drops projects, and an absent block as no
+      # declaration at all (docs/designs/multi-project-scope.md §7), so
+      # removing the last scoped project here has to reach the CR as an
+      # emptied block, never as a missing one.
+      scope = {
+        projects = var.scope.projects
+        exclude = {
+          projects = var.scope.exclude.projects
+          clusters = [
+            for cluster in var.scope.exclude.clusters : {
+              projectId   = cluster.project_id
+              location    = cluster.location
+              clusterName = cluster.cluster_name
+            }
+          ]
+        }
+      }
       credentials = {
         create = true
         data   = local.credentials
@@ -721,8 +742,12 @@ resource "helm_release" "kube_agents" {
   # cert_manager is listed even when enable_cert_manager is false — depends_on to
   # a resource with count = 0 is satisfied immediately, so it costs nothing in
   # that case and is the ordering guarantee in the case that matters.
+  # module.kube_agents_iam, so the scope's per-project bindings exist before
+  # the CR that declares those projects is written; the values above already
+  # depend on the module's service account, not on its bindings.
   depends_on = [
     module.gke_cluster,
+    module.kube_agents_iam,
     google_project_service.vertex_ai,
     google_project_iam_member.litellm_vertex_user,
     helm_release.cert_manager,

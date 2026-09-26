@@ -576,6 +576,11 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
             "the ENABLE_GVISOR export must come before write_tfvars_from_state, "
             "which is what runs the floor check.",
         )
+        # The scope keys for the same reason: the generator's triple check and
+        # terraform's variable validation both run on the destroy path.
+        scope_at = text.find('export SCOPE_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""')
+        self.assertNotEqual(scope_at, -1, "uninstall.sh must blank the SCOPE_* keys")
+        self.assertLess(scope_at, call_at)
 
 
 class UninstallSummaryDisclosureTest(unittest.TestCase):

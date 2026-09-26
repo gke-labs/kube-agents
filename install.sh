@@ -316,6 +316,15 @@ bootstrap_install_env() {
     fi
     return 0
   fi
+  # The scope keys render into the PlatformAgent and are recorded only by a
+  # first install, so once this file exists it is the only way in for them,
+  # as load_install_env makes it for upgrade.sh, uninstall.sh and the menu: a
+  # value inherited from the shell would declare a project the file does not
+  # record, applied for this run and dropped again, with its profiles, by the
+  # next run from a clean shell. A first install, which has no file yet, keeps
+  # the environment and records it; a typed --scope-* flag still overrides
+  # for one run and is warned about.
+  unset SCOPE_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -419,6 +428,14 @@ PARAM_KMS_KEY="${KMS_KEY:-}"
 # helpers are sourced, so no default is spelled twice.
 PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-}"
 PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
+# The multi-project scope (spec.scope): empty means the management project
+# alone, so there is no default to resolve.
+PARAM_SCOPE_PROJECTS="${SCOPE_PROJECTS:-}"
+PARAM_SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}"
+PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
+# Whether a --scope-* flag was typed: the Day-2 menu reads the keys from
+# install.env alone and refuses a flag it would otherwise validate and drop.
+SCOPE_FLAG_PASSED="false"
 # Empty means "not chosen", like PARAM_MODEL_PROVIDER above; resolve_shared_defaults
 # fills in install.defaults.env's answer once the helpers are sourced.
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
@@ -571,6 +588,13 @@ Flags for AI Agents & Automation:
   --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: DEFAULT_PERMISSION_SET, currently read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
+  --scope-projects=IDS          GCP projects beyond the install's whose GKE clusters get a
+                                Cluster Agent (space- or comma-separated); the agent's
+                                service account is granted the read roles in each
+  --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
+                                unmanaged
+  --scope-exclude-clusters=TRIPLES
+                                Clusters to leave unmanaged, each as project/location/cluster
   --enable-gvisor[=true|false]  Enable GKE Sandbox (gVisor) runtime isolation
                                 (default: DEFAULT_ENABLE_GVISOR, currently true)
   --enable-hermes-dashboard[=true|false]
@@ -721,6 +745,27 @@ validate_bool_flag_value() {
   fi
 }
 
+# A scope flag given nothing cannot mean "leave the recorded scope alone" (the
+# flag is what overrides the file for one run) and must not mean "drop every
+# project" in silence: applied, an empty --scope-projects= would revoke the
+# scoped projects' roles and retire their profiles while install.env still
+# named them, and the next upgrade would add them back. Refused, like an empty
+# toggle; the file is where a scope is emptied on purpose.
+require_scope_flag_value() {
+  local flag="$1" value="${2:-}" key
+  # A value that is nothing but separators (`,`, a space) renders the same
+  # empty list an empty value does, so it is refused the same way.
+  [[ "$value" == *[![:space:],]* ]] && return 0
+  case "$flag" in
+    --scope-projects) key="SCOPE_PROJECTS" ;;
+    --scope-exclude-projects) key="SCOPE_EXCLUDE_PROJECTS" ;;
+    *) key="SCOPE_EXCLUDE_CLUSTERS" ;;
+  esac
+  print_error "${flag}= was given an empty value."
+  print_info "To clear it, set ${key}= (empty) in install.env and re-run; to keep the recorded value, omit the flag."
+  exit 1
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -750,6 +795,15 @@ parse_args() {
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
+      --scope-projects=*)
+        PARAM_SCOPE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_PROJECTS"; shift ;;
+      --scope-exclude-projects=*)
+        PARAM_SCOPE_EXCLUDE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_PROJECTS"; shift ;;
+      --scope-exclude-clusters=*)
+        PARAM_SCOPE_EXCLUDE_CLUSTERS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_CLUSTERS"; shift ;;
       --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
       # Validated here and again in main(). The second check is not redundant:
       # PARAM_ENABLE_WEBUI is seeded from the recorded value and resolved with
@@ -1373,7 +1427,9 @@ warn_flag_beats_unrecorded_file_value() {
     print_warning "${flag}=${value} applies to this run only: ${file} records no ${key}."
   fi
   print_info "$consequence"
-  print_info "Set ${key}=${value} in ${file}, or repeat ${flag} on ${repeat_on}."
+  # %q, because the scope keys are the first list-valued values through here and
+  # a space-separated one printed bare would not paste back as one assignment.
+  print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${flag} on ${repeat_on}."
 }
 
 bootstrap_install_env_file() {
@@ -1396,6 +1452,22 @@ bootstrap_install_env_file() {
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
       true \
       "every later install.sh run"
+    # The scope keys: a flag applies its declaration for this run, and the
+    # next full upgrade regenerates from the file, so a project the file does
+    # not name is dropped again, its bindings revoked and its profiles retired.
+    local scope_key scope_flag scope_value
+    for scope_key in SCOPE_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
+      case "$scope_key" in
+        SCOPE_PROJECTS) scope_flag="--scope-projects"; scope_value="${PARAM_SCOPE_PROJECTS:-}" ;;
+        SCOPE_EXCLUDE_PROJECTS) scope_flag="--scope-exclude-projects"; scope_value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}" ;;
+        *) scope_flag="--scope-exclude-clusters"; scope_value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}" ;;
+      esac
+      warn_flag_beats_unrecorded_file_value "$destination" "$scope_key" "$scope_flag" \
+        "$scope_value" \
+        "A later run without it regenerates the scope from the file: a project the file does not name is dropped from the scope on the next full upgrade, its read roles revoked and its Cluster Agent profiles retired over the reconcile's next two clean runs." \
+        false \
+        "every later install.sh run"
+    done
     return 0
   fi
   if [ "$PARAM_DRY_RUN" = "true" ]; then
@@ -1447,6 +1519,13 @@ bootstrap_install_env_file() {
   if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
     write_env_var "$tmp" PLATFORM_AGENT_CUSTOM_ROLES "${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   fi
+  # Recorded even when empty: the generator renders the scope block from these
+  # on every run, and a later upgrade.sh that finds no line renders the same
+  # empty block, so the presence of the keys is what tells an operator where
+  # a project is declared.
+  write_env_var "$tmp" SCOPE_PROJECTS "${SCOPE_PROJECTS:-}"
+  write_env_var "$tmp" SCOPE_EXCLUDE_PROJECTS "${SCOPE_EXCLUDE_PROJECTS:-}"
+  write_env_var "$tmp" SCOPE_EXCLUDE_CLUSTERS "${SCOPE_EXCLUDE_CLUSTERS:-}"
   write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
   write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
@@ -2384,8 +2463,15 @@ print_generate_only_handoff() {
   echo -e "    (cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_loc} -key-ring=${minter_keyring} -key=${minter_key} -private-key=@<path-to-pem>)"
   echo ""
   echo -e "${C_BOLD}2. Apply via lifecycle.sh (remote state in GCS):${C_RESET}"
+  echo -e "  # On an existing install only: first apply the chart's CRDs through the install's own context,"
+  echo -e "  # never the current one. Neither Helm nor lifecycle.sh upgrades them, and a field the served"
+  echo -e "  # schema lacks is otherwise pruned from the PlatformAgent for good."
+  echo -e "  gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}"
+  echo -e "  kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
   echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
+  echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
+  echo -e "  # carries that SCOPE_PROJECTS does not name is replaced by this apply."
   echo ""
   echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
   echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
@@ -3718,6 +3804,18 @@ run_menu_system() {
         # A provider or minter switch is where a new fixed-name GSA is first
         # planned on an existing install, so the 409 check runs here too.
         check_service_account_ownership || exit 1
+        # The menu edits no scope key, so the keys are the recorded ones; this
+        # still refuses a re-apply over a scope the CR gained by hand since.
+        # The menu establishes no kubeconfig context of its own, so fetch one
+        # first, as main() does before its summary; the check refuses if the
+        # fetch did not land.
+        GKE_DNS_ENDPOINT_FLAG=""
+        gke_dns_endpoint_flag "$cluster_name" "$REGION" "$PROJECT_ID" || true
+        # shellcheck disable=SC2086
+        gcloud container clusters get-credentials "$cluster_name" --location "$REGION" \
+          --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+        refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+        apply_crd_upgrades "$repo_dir"
         print_info "Re-applying the install to GKE cluster '$cluster_name' (terraform apply)..."
         run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-$(date -u +%Y%m%dT%H%M%SZ).log"
         print_success "Configuration applied!"
@@ -3786,6 +3884,13 @@ main() {
   print_banner
 
   if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
+    # The menu reloads install.env and reads the scope keys from it alone; a
+    # flag here would be validated and then dropped without a word.
+    if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
+      print_error "--menu takes no --scope-* flag: it edits install.env in place and reads the scope keys from there."
+      print_info "Set SCOPE_PROJECTS, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
+      exit 1
+    fi
     run_menu_system
     exit 0
   fi
@@ -3854,7 +3959,7 @@ main() {
   # tooling; gke-gcloud-auth-plugin allows kubectl to authenticate to GKE.
   # Everything is checked up front rather than discovered halfway through with
   # the cluster already created.
-  for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin; do
+  for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin python3; do
     if command -v "$tool" >/dev/null 2>&1; then
       print_success "Found CLI tool: $tool"
     else
@@ -4626,6 +4731,9 @@ main() {
   # environment variable written before the removal lands here.
   require_supported_permission_set "$permission_set" || exit 1
   local custom_roles="${PARAM_CUSTOM_ROLES:-}"
+  local scope_projects="${PARAM_SCOPE_PROJECTS:-}"
+  local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
+  local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"
   # This rule is also written in init_var_platform_agent_permission_set
   # (scripts/installer/common.sh), which has no caller left in the repository
   # -- the numbered provision scripts that used to invoke it went with #797. So
@@ -4924,6 +5032,9 @@ main() {
   export API_SERVER_KEY="$api_server_key"
   export PLATFORM_AGENT_PERMISSION_SET="$permission_set"
   export PLATFORM_AGENT_CUSTOM_ROLES="$custom_roles"
+  export SCOPE_PROJECTS="$scope_projects"
+  export SCOPE_EXCLUDE_PROJECTS="$scope_exclude_projects"
+  export SCOPE_EXCLUDE_CLUSTERS="$scope_exclude_clusters"
   export GITOPS_ORG="$github_org"
   export GITOPS_REPO="$github_repo"
   # One release of overlap: the agent runtime and the chart still speak
@@ -4970,6 +5081,22 @@ main() {
   # service account the apply would 409 on is something to know before
   # answering "proceed", and it costs a describe per account. Read-only.
   check_service_account_ownership || exit 1
+  # For the same reason, and only for a run that will apply: the apply renders
+  # spec.scope from the keys over the live PlatformAgent, and a scope it
+  # carries that neither the release record nor the keys account for is
+  # refused here, before the operator confirms, the App key is imported or an
+  # adopted cluster is changed, rather than replaced. The context is fetched
+  # here because the generator fetches one only for an adoption; a fetch that
+  # does not land is the check's own refusal. A first install has no cluster
+  # yet and skips this.
+  if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ] && [ "$PARAM_DRY_RUN" != "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ]; then
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
+    # shellcheck disable=SC2086
+    gcloud container clusters get-credentials "$cluster_name" --location "$region" \
+      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+    refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+  fi
 
   # Prompt for opt-ins on existing cluster mutations before the summary
   # checkpoint -- and before install.env is written, so an answer given here
@@ -5189,18 +5316,17 @@ main() {
   # Terraform, which never recorded it, plans a create. Whenever the cluster
   # is already there -- adopted, or created by this state on the attempt that
   # died -- and only for a release no revision of which ever served. The
-  # generator fetched credentials on the adoption path alone, so fetch them
-  # here for the other; the check itself refuses to look at any other context.
+  # context is the one fetched before the step-11 summary for the scope check
+  # (with the DNS-endpoint flag step 13 passes, since without it the fetch
+  # fails on a DNS-endpoint-only cluster and the context gate below does not
+  # match); the check itself refuses to look at any other context.
   if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
-    # With the DNS-endpoint flag step 13 passes: without it the fetch fails on
-    # a DNS-endpoint-only cluster, the context gate below does not match, and
-    # the check skips exactly the retry it exists for.
-    GKE_DNS_ENDPOINT_FLAG=""
-    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
-    # shellcheck disable=SC2086
-    gcloud container clusters get-credentials "$cluster_name" --location "$region" \
-      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
     clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE" "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+    # A re-run is how INSTALL.md says to change configuration, and Helm never
+    # upgrades CRDs, so the schema is applied here as upgrade.sh applies it
+    # before its own apply; a field the served CRD lacked would otherwise be
+    # pruned from the CR, and stay pruned.
+    apply_crd_upgrades "$repo_dir"
   fi
 
   local provisioning_log

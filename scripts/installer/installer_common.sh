@@ -116,6 +116,25 @@ readonly PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET="platform-agent-shell-autho
 # interactive dev prompt ever reaches it.
 readonly IMAGE_TAG_FALLBACK="latest"
 
+# ─── Multi-project scope ──────────────────────────────────────────────────────
+# One SCOPE_EXCLUDE_CLUSTERS entry names a cluster as project/location/cluster:
+# the separator, and the shape an entry has to have to be rendered at all.
+readonly SCOPE_CLUSTER_TRIPLE_SEPARATOR="/"
+readonly SCOPE_CLUSTER_TRIPLE_PATTERN='^[^/]+/[^/]+/[^/]+$'
+# kubectl's answers for a cluster that serves no PlatformAgent type at all, and
+# helm's for a release that does not exist: on a first adoption both mean there
+# is nothing live to protect, not that the read failed.
+readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="the server doesn't have a resource type|could not find the requested resource"
+readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
+# The two verdicts refuse_apply_over_undeclared_scope's python half prints
+# on its first line.
+readonly SCOPE_VERDICT_OK="ok"
+readonly SCOPE_VERDICT_REFUSE="refuse"
+# Its two modes: refuse (the default, every apply) or warn (upgrade.sh --plan,
+# which applies nothing).
+readonly SCOPE_CHECK_MODE_REFUSE="refuse"
+readonly SCOPE_CHECK_MODE_WARN="warn"
+
 # Suffix appended when deriving Google Chat Pub/Sub subscription name from a custom topic (#1397).
 readonly CHAT_SUBSCRIPTION_SUFFIX="-sub"
 
@@ -404,6 +423,12 @@ load_install_env() {
   # the file is read (and whether or not there is one), so the file's own key
   # is the only way in.
   unset NAMESPACE
+  # The scope keys likewise: they render into the PlatformAgent, and only
+  # install.sh's first install records them, so on upgrade.sh, uninstall.sh
+  # and the Day-2 menu the file is the only way in. A value inherited from the
+  # shell would declare a project the file does not record, and the next run
+  # from a clean shell would drop it again and retire its profiles.
+  unset SCOPE_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -792,8 +817,14 @@ hcl_bool() {
 # items. Both separators, because --custom-roles documents "space- or
 # comma-separated".
 hcl_csv_list() {
-  local csv="${1:-}" out="[" first=true item
+  local csv="${1:-}" out="[" first=true item had_noglob=false
   local IFS=$', \t\n'
+  # Globbing off around the unquoted split: an entry such as *-sandbox (a
+  # scope exclusion) would otherwise be replaced by whatever files match it
+  # in the working directory. Saved and restored by hand; bash 3.2 has no
+  # `local -`.
+  case "$-" in *f*) had_noglob=true ;; esac
+  set -f
   for item in $csv; do
     item="${item#"${item%%[![:space:]]*}"}"
     item="${item%"${item##*[![:space:]]}"}"
@@ -802,7 +833,274 @@ hcl_csv_list() {
     out+="$(hcl_str "$item")"
     first=false
   done
+  $had_noglob || set +f
   printf '%s]' "$out"
+}
+
+# The three SCOPE_* keys as the composition's `scope` object: `projects` and
+# `exclude.projects` are lists like every other list key, `exclude.clusters`
+# is one project/location/cluster triple per entry. Always a full block, empty
+# lists included -- the reconcile reads an emptied projects list as the
+# declaration that drops projects and a missing block as no declaration
+# (docs/designs/multi-project-scope.md §7). Shape only: the caller has already
+# run require_scope_cluster_triples, and the patterns, caps and repeats the
+# CRD enforces are the module variable's validations, which fail the plan
+# before any binding.
+hcl_scope_block() {
+  local projects="${1:-}" exclude_projects="${2:-}" exclude_clusters="${3:-}"
+  local clusters="[" first=true entry project location cluster had_noglob=false
+  local IFS=$', \t\n'
+  case "$-" in *f*) had_noglob=true ;; esac
+  set -f
+  for entry in $exclude_clusters; do
+    [ -n "$entry" ] || continue
+    IFS="$SCOPE_CLUSTER_TRIPLE_SEPARATOR" read -r project location cluster <<<"$entry"
+    $first || clusters+=", "
+    clusters+="{ project_id = $(hcl_str "$project"), location = $(hcl_str "$location"), cluster_name = $(hcl_str "$cluster") }"
+    first=false
+  done
+  $had_noglob || set +f
+  clusters+="]"
+  printf 'scope = {\n  projects = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
+    "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$exclude_projects")" "$clusters"
+}
+
+# Every SCOPE_EXCLUDE_CLUSTERS entry is project/location/cluster, or the run
+# stops before a file is written and names the entry. Caller defines
+# print_error.
+require_scope_cluster_triples() {
+  local entries="${1:-}" entry had_noglob=false
+  local IFS=$', \t\n'
+  case "$-" in *f*) had_noglob=true ;; esac
+  set -f
+  for entry in $entries; do
+    [ -n "$entry" ] || continue
+    if ! [[ "$entry" =~ $SCOPE_CLUSTER_TRIPLE_PATTERN ]]; then
+      $had_noglob || set +f
+      print_error "SCOPE_EXCLUDE_CLUSTERS entry '${entry}' is not project${SCOPE_CLUSTER_TRIPLE_SEPARATOR}location${SCOPE_CLUSTER_TRIPLE_SEPARATOR}cluster. Name each excluded cluster by its project ID, location and name in install.env."
+      return 1
+    fi
+  done
+  $had_noglob || set +f
+}
+
+# Refuses a full apply that would replace a scope the live PlatformAgent
+# carries and nothing this install wrote accounts for.
+#
+# The chart renders spec.scope from the keys on every full apply, and Helm
+# patches a custom resource from the difference between its rendered
+# manifests, so the first apply that renders the block replaces whatever the
+# CR holds -- and the reconcile reads the emptied projects list as the
+# declaration that retires those projects' profiles. Three values decide:
+#
+#   L  the live CR's spec.scope;
+#   R  the release record's platformAgent.scope (helm get values): what the
+#      installer last rendered, absent before the first apply that carried
+#      the value, and never anything else, because the retag modes reuse the
+#      record as it is. Read from the latest revision and from the last
+#      revision that served (deployed or superseded), because a failed
+#      upgrade leaves its values as the latest revision while the CR still
+#      holds the served one, and the retry must not read that as a hand edit;
+#   K  the scope the SCOPE_* keys declare now.
+#
+# Refused when L is present and non-empty, L != R and L != K: the CR carries a
+# declaration the installer did not write and the keys do not reproduce. Every
+# other case passes -- nothing live to protect; L == R, the installer wrote it
+# and the keys are the new declaration, emptying it included; L == K, the
+# operator recorded it. No PlatformAgent type served, no CR, no release: pass.
+# L, R and K are the projects and exclusions; the folders and organizations
+# lists phase 2 added are reported when the CR carries them and never weighed,
+# because the chart renders neither and an apply leaves them as they are.
+# Anything that stops the read -- no context for this install in the
+# kubeconfig, the CR or the record unreadable -- is a refusal, because the
+# apply itself needs no kubeconfig (the helm provider authenticates with a
+# token against the endpoint) and would go ahead over a scope nobody read.
+# $1 namespace; $2 "warn" turns every refusal into a warning (upgrade.sh
+# --plan applies nothing). Caller defines print_error / print_info /
+# print_warning.
+refuse_apply_over_undeclared_scope() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" mode="${2:-$SCOPE_CHECK_MODE_REFUSE}"
+  local expected_ctx cr_json record_json err_file verdict first_line
+  expected_ctx="$(gke_context_name)"
+  if ! kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1; then
+    _scope_check_failed "$mode" "the kubeconfig has no context '${expected_ctx}' to read the PlatformAgent through (run: gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID})"
+    return $?
+  fi
+  err_file="$(mktemp)"
+  # `trap - ERR` for the bash 3.2 reason write_tfvars_from_state gives: the
+  # misses classified below are ordinary answers, not aborts.
+  if ! cr_json="$(trap - ERR; kubectl --context "$expected_ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>"$err_file")"; then
+    if grep -qiE "$KUBECTL_NO_RESOURCE_TYPE_PATTERN" "$err_file"; then
+      rm -f "$err_file"
+      return 0
+    fi
+    _scope_check_failed "$mode" "the PlatformAgent in namespace '${namespace}' could not be read through context '${expected_ctx}': $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+    local rc=$?
+    rm -f "$err_file"
+    return $rc
+  fi
+  local served_json="{}" served_rev=""
+  if ! record_json="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>"$err_file")"; then
+    if grep -qiE "$HELM_RELEASE_NOT_FOUND_PATTERN" "$err_file"; then
+      record_json="{}"
+    else
+      _scope_check_failed "$mode" "the values of release '${KUBE_AGENTS_HELM_RELEASE}' in namespace '${namespace}' could not be read: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+      local rc=$?
+      rm -f "$err_file"
+      return $rc
+    fi
+  else
+    # The last revision that served, and only when the latest did not (a
+    # failed or pending upgrade): its values are what the CR still holds. On a
+    # healthy release the latest revision is the one record, so a hand edit
+    # that happens to restore an earlier scope is still a hand edit. A history
+    # that cannot be read leaves only the latest revision to compare against.
+    served_rev="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>/dev/null \
+      | python3 -c '
+import json, sys
+statuses = sys.argv[1].split()
+revisions = json.load(sys.stdin) or []
+latest = max(revisions, key=lambda r: r["revision"], default=None)
+served = [] if latest is None or latest.get("status") in statuses else [
+    r["revision"] for r in revisions if r.get("status") in statuses
+]
+print(max(served) if served else "")
+' "$HELM_SERVED_REVISION_STATUSES" 2>/dev/null || true)"
+    if [ -n "$served_rev" ]; then
+      served_json="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" --revision "$served_rev" -o json 2>/dev/null || echo '{}')"
+    fi
+  fi
+  # Normalises L, R and K to sorted lists and rules. Values arrive as argv and
+  # on stdin, never interpolated into the program text. stderr goes to the
+  # file, not into the verdict: an interpreter that warns at startup and exits
+  # 0 would otherwise put its warning where the first line is read.
+  if ! verdict="$(trap - ERR; printf '%s\n\x1e\n%s\n\x1e\n%s\n' "$cr_json" "$record_json" "$served_json" | python3 -c '
+import json, re, sys
+cr_text, record_text, served_text = sys.stdin.read().split("\x1e\n", 2)
+ok, refuse = sys.argv[1], sys.argv[2]
+keys = sys.argv[3:6]
+
+def split(value):
+    return [item for item in re.split(r"[,\s]+", value) if item]
+
+def normalise(scope):
+    scope = scope or {}
+    exclude = scope.get("exclude") or {}
+    clusters = sorted(
+        {(c["projectId"], c["location"], c["clusterName"]) for c in exclude.get("clusters") or []}
+    )
+    return {
+        "projects": sorted(set(scope.get("projects") or [])),
+        "exclude": {"projects": sorted(set(exclude.get("projects") or [])), "clusters": clusters},
+    }
+
+def is_empty(scope):
+    return not (scope["projects"] or scope["exclude"]["projects"] or scope["exclude"]["clusters"])
+
+items = json.loads(cr_text).get("items") or []
+if len(items) > 1:
+    sys.exit("more than one PlatformAgent is served: " + ", ".join(i["metadata"]["name"] for i in items))
+live_raw = items[0].get("spec", {}).get("scope") if items else None
+if live_raw is None:
+    print(ok)
+    sys.exit(0)
+live = normalise(live_raw)
+# The container lists phase 2 added to the CR. The chart renders neither and
+# the installer has no key for them, so an apply leaves them as they are; they
+# are reported on the second output line, never weighed in the verdict.
+containers = " ".join(
+    k + ": " + " ".join(sorted(set(live_raw.get(k) or [])))
+    for k in ("folders", "organizations") if live_raw.get(k)
+)
+if is_empty(live):
+    print(ok)
+    print(containers)
+    sys.exit(0)
+def recorded(text):
+    raw = ((json.loads(text or "{}") or {}).get("platformAgent") or {}).get("scope")
+    return normalise(raw) if raw is not None else None
+
+records = [r for r in (recorded(record_text), recorded(served_text)) if r is not None]
+declared = normalise({
+    "projects": split(keys[0]),
+    "exclude": {
+        "projects": split(keys[1]),
+        "clusters": [dict(zip(("projectId", "location", "clusterName"), t.split("/"))) for t in split(keys[2])],
+    },
+})
+if live in records or live == declared:
+    print(ok)
+    print(containers)
+    sys.exit(0)
+print(refuse)
+print(containers)
+print(items[0]["metadata"]["name"])
+print("SCOPE_PROJECTS=" + json.dumps(" ".join(live["projects"])))
+print("SCOPE_EXCLUDE_PROJECTS=" + json.dumps(" ".join(live["exclude"]["projects"])))
+print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live["exclude"]["clusters"])))
+' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>"$err_file")"; then
+    _scope_check_failed "$mode" "the live and recorded scope could not be compared: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+    local rc=$?
+    rm -f "$err_file"
+    return $rc
+  fi
+  rm -f "$err_file"
+  first_line="${verdict%%$'\n'*}"
+  local containers lines cr_name
+  lines="${verdict#*$'\n'}"
+  [ "$lines" != "$verdict" ] || lines=""
+  containers="${lines%%$'\n'*}"
+  if [ -n "$containers" ]; then
+    print_info "The PlatformAgent also declares ${containers}, which the installer has no key for yet; this apply renders no container list and leaves them as they are."
+  fi
+  [ "$first_line" != "$SCOPE_VERDICT_OK" ] || return 0
+  lines="${lines#*$'\n'}"
+  cr_name="${lines%%$'\n'*}"
+  lines="${lines#*$'\n'}"
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    print_warning "The PlatformAgent '${cr_name}' in namespace '${namespace}' declares a scope this install did not write and install.env does not carry. A full upgrade would replace it, and the reconcile would retire the projects it drops; the plan below shows the change. Record the live declaration in install.env first:"
+  else
+    print_error "The PlatformAgent '${cr_name}' in namespace '${namespace}' declares a scope this install did not write and install.env does not carry. The first apply whose rendered scope differs from the recorded one replaces it, and the reconcile then retires the projects it drops, deleting their Cluster Agent profiles over its next two clean runs."
+    print_info "Record the live declaration in install.env and re-run:"
+  fi
+  while IFS= read -r first_line; do
+    print_info "  ${first_line}"
+  done <<<"$lines"
+  [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+  print_info "Or, if install.env is right and the PlatformAgent is not, edit the PlatformAgent's spec.scope to what install.env declares and re-run; the apply then renders the same value it already holds."
+  return 1
+}
+
+# The check above could not decide. A refusal, except under "warn" (a plan
+# applies nothing), where it is a warning and the run goes on.
+_scope_check_failed() {
+  local mode="$1" reason="$2"
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    print_warning "The scope check did not run: ${reason}. The full upgrade runs it and refuses if it cannot."
+    return 0
+  fi
+  print_error "Refusing to apply: ${reason}."
+  print_info "The apply would render spec.scope from install.env over whatever the PlatformAgent holds, and a scope it holds that install.env does not declare would be replaced. Fix the read, or record the live declaration in install.env, and re-run."
+  return 1
+}
+
+# Helm never touches the crds/ directory on upgrade -- that is Helm's own
+# documented behaviour, and the Terraform helm provider inherits it -- so CRD
+# schema changes are applied here first, by every front door that re-applies
+# the chart to a cluster that already runs it: upgrade.sh's full and operator
+# modes, an install.sh re-run and the Day-2 menu (INSTALL.md names the last
+# two as the way to change configuration). A field the served CRD lacks is
+# pruned from the CR on write, and pruned for good on this path: the release
+# record then carries the value, the next render equals the record, and Helm
+# sends only the difference between its rendered manifests. Server-side apply,
+# because these objects are large and have had several owners; through the
+# install's own context by name, never the current one. $1 is the checkout.
+apply_crd_upgrades() {
+  local repo_dir="${1:?repository directory}"
+  print_info "Applying CRD updates from charts/kube-agents/crds..."
+  kubectl --context "$(gke_context_name)" apply --server-side --force-conflicts \
+    -f "${repo_dir}/charts/kube-agents/crds/" >/dev/null
 }
 
 # The raw state object, as this install keeps it in GCS. Read straight from
@@ -1787,6 +2085,10 @@ write_tfvars_from_state() {
     print_error "MODEL_MAX_TOKENS='${model_max_tokens}' is not a whole number of tokens. Set a non-negative integer, or leave it empty, in install.env."
     return 1
   fi
+  # A triple the block cannot render stops the run here, with the file
+  # untouched, rather than at terraform's parser with a message naming
+  # neither the key nor the entry.
+  require_scope_cluster_triples "${SCOPE_EXCLUDE_CLUSTERS:-}" || return 1
 
   local old_umask
   old_umask="$(umask)"
@@ -1861,6 +2163,13 @@ write_tfvars_from_state() {
     if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
       echo "project_roles  = $(hcl_csv_list "${PLATFORM_AGENT_CUSTOM_ROLES:-}")"
     fi
+    echo ""
+    echo "# The projects beyond project_id whose GKE clusters get a Cluster Agent, and"
+    echo "# what to leave unmanaged (SCOPE_PROJECTS, SCOPE_EXCLUDE_PROJECTS,"
+    echo "# SCOPE_EXCLUDE_CLUSTERS in install.env). Always written, so this file states"
+    echo "# the declaration the composition renders either way, empty lists included;"
+    echo "# an emptied projects list is the declaration that drops projects."
+    hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}"
     echo ""
     local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
     local chat_sub="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"

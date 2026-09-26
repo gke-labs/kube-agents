@@ -708,5 +708,51 @@ class HarnessRetagKeysTest(_StubHelm, unittest.TestCase):
         self.assertIn("Could not read the values of Helm release", proc.stdout)
 
 
+class ScopeCheckWiringTest(unittest.TestCase):
+    """The pre-apply scope check sits where the apply is, and only there: the
+    full arm refuses before `run_lifecycle ... apply`, a plan warns, and the
+    retag modes -- which re-render the release's recorded values and change
+    nothing about the scope -- do not call it."""
+
+    def setUp(self):
+        self.text = _UPGRADE_SH.read_text()
+
+    def test_full_mode_refuses_before_the_crd_apply_and_the_terraform_apply(self):
+        # Before the CRD apply as well as the Terraform apply: a refusal leaves
+        # the served schema and the release as they were (the credentials
+        # fetch and the two Secret backfills above the arm have run).
+        full = self.text[self.text.index("    full)\n"):]
+        check = full.index('refuse_apply_over_undeclared_scope "$target_namespace" || exit 1')
+        crds = full.index('apply_crd_upgrades "$repo_dir"')
+        apply = full.index("apply -auto-approve -input=false")
+        self.assertLess(check, crds)
+        self.assertLess(crds, apply)
+
+    def test_a_plan_warns_and_never_refuses(self):
+        plan = self.text[self.text.index('if [ "$PARAM_PLAN" = "true" ]; then\n    print_step "4. Planning'):]
+        plan = plan[:plan.index("plan -detailed-exitcode")]
+        self.assertIn('refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"\n', plan)
+
+    def test_the_retag_modes_do_not_call_it(self):
+        for mode in ("    operator)\n", "    harness)\n"):
+            arm = self.text[self.text.index(mode):]
+            arm = arm[:arm.index("      ;;\n")]
+            with self.subTest(mode=mode.strip()):
+                self.assertNotIn("refuse_apply_over_undeclared_scope", arm)
+
+    def test_python3_is_a_required_tool(self):
+        self.assertIn("local required_tools=(gcloud kubectl helm python3)", self.text)
+
+    def test_the_crd_apply_is_the_shared_one(self):
+        # Hoisted into installer_common.sh so install.sh re-runs and the menu
+        # apply the CRDs the same way; upgrade.sh keeps calling it in the two
+        # modes that roll the operator.
+        self.assertNotIn("apply_crd_upgrades() {", self.text)
+        self.assertEqual(self.text.count('apply_crd_upgrades "$repo_dir"'), 2)
+        common = (_REPO_ROOT / "scripts" / "installer" / "installer_common.sh").read_text()
+        self.assertIn("apply_crd_upgrades() {", common)
+        self.assertIn('kubectl --context "$(gke_context_name)" apply --server-side --force-conflicts', common)
+
+
 if __name__ == "__main__":
     unittest.main()

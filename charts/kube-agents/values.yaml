@@ -441,14 +441,20 @@ hindsight:
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
-    # Recall is CPU-bound on the in-process cross-encoder reranker; see the
-    # template before raising these — more CPU has been measured to buy
-    # nothing on e2-standard-4, and a request of 4 CPUs never schedules there.
-    # Steady-state usage is ~9m against the 2-CPU request; right-sizing
-    # requests.cpu is tracked in #1637.
+    # The request covers steady state: at rest the API sits near 9m of CPU,
+    # and the request is what the scheduler places, what Autopilot bills and
+    # what a ResourceQuota counts, so it stays small. The limit is the ceiling
+    # recall may burst to on the in-process cross-encoder reranker; CPU above
+    # the request is best-effort, so on a node shared with other CPU-heavy
+    # tenants the request is the number to raise. An Autopilot cluster without
+    # Pod bursting resets the limit to the request, so raise the request there
+    # too if recall is slow. Raising the limit buys nothing: more CPU has been
+    # measured to change no recall latency on e2-standard-4, and a request of
+    # 4 CPUs never schedules there (docs/designs/memory.md, "What a recall
+    # costs"; k8s-operator/config/integrations/hindsight/api.yaml is canonical).
     resources:
       requests:
-        cpu: "2"
+        cpu: 250m
         memory: 1Gi
       limits:
         cpu: "4"
@@ -607,6 +613,23 @@ platformAgent:
       enabled: null # CRD default: false
       provider: "" # CRD default: multiuser_memory
       userProfileEnabled: null # CRD default: false
+    # Out-of-band change detection. The drift-detector reads GKE
+    # admin-activity audit records from a Pub/Sub subscription and reports the
+    # ones a person made outside git, so it needs that subscription to exist:
+    # apply terraform/modules/drift-pubsub against this project before
+    # enabling it. Left off, the whole block is omitted and the detector is
+    # shipped in the image without being started.
+    driftDetector:
+      enabled: null # CRD default: false
+      # The subscription carrying the audit records. Empty takes the
+      # detector's own default, which is the name the drift-pubsub module
+      # creates; set it only for one made by hand or renamed.
+      subscription: ""
+      # Comma-separated managedFields managers that are the GitOps controller
+      # — "argocd-controller", "flux". Empty still reports who changed what,
+      # but never marks a change as one a controller may already have
+      # reverted.
+      gitopsManagers: ""
     # Unsupported switches. Nothing under here carries a compatibility promise:
     # a field may change meaning, change default, or be removed between
     # releases, and an install that sets one is expected to re-check it at every
@@ -807,6 +830,42 @@ platformAgent:
       # roles. The federated principal needs only roles/iam.workloadIdentityUser
       # on it.
       serviceAccountEmail: ""
+  # The GCP projects, beyond the one the agent runs in, whose GKE clusters the
+  # hourly Cluster Agent reconcile enumerates, and what it leaves unmanaged:
+  # rendered as spec.scope on the PlatformAgent (the CRD reference on the site
+  # documents the field). The agent's service account needs the read roles in
+  # each project named; the Terraform composition binds them from the same
+  # value it passes here, and a chart installed on its own needs them granted
+  # by hand.
+  #
+  # A map renders the block as it is, empty lists included: an empty scope is a
+  # present block with empty lists, which the reconcile reads as the
+  # declaration that drops projects (their Cluster Agent profiles retire over
+  # its next two clean runs), so the composition always passes a map and a
+  # project leaves the scope by being removed from projects. null, the default,
+  # is not an empty scope: it is the chart being told nothing and renders no
+  # block. While no earlier revision rendered the block, that leaves a scope the
+  # CR already carries alone, because Helm sends only the difference between
+  # its rendered manifests; once a revision has rendered it, a render without
+  # it removes spec.scope from the CR, which the reconcile reads as no
+  # declaration (the management project alone, nothing retired), so null clears
+  # a scope without retiring its projects and emptying projects is how projects
+  # are dropped. The block is never dropped for being empty.
+  # Once a release has rendered the block the value is the declaration: the
+  # installer refuses the next full upgrade over a spec.scope edited by hand
+  # until install.env records it or the CR is put back, and a retag, or a
+  # hand-driven composition apply whose rendered scope is unchanged, leaves the
+  # edit in place.
+  #
+  #   scope:
+  #     projects: [payments-prod, payments-staging]
+  #     exclude:
+  #       projects: ["*-sandbox"]     # project IDs or shell-style globs
+  #       clusters:                   # one cluster, by the full triple
+  #         - projectId: payments-staging
+  #           location: us-central1
+  #           clusterName: scratch-cluster
+  scope: null
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
     # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /

@@ -372,7 +372,7 @@ resource "null_resource" "drift" {
       cat > "$payload_file" <<PAYLOAD
       {
         "kind": "gitops-drift",
-        "summary": "${var.drift_principal} patch ${local.resource_path} on cluster ${var.host_cluster_name}, fields owned by ${var.gitops_field_manager}, ${var.drift_field_manager}",
+        "summary": "${var.drift_principal} patched ${local.resource_path} on cluster ${var.host_cluster_name}, fields owned by ${var.gitops_field_manager}, ${var.drift_field_manager}",
         "cluster": "${var.host_cluster_name}",
         "project": "$project",
         "location": "${var.host_cluster_location}",

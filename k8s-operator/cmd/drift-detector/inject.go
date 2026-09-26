@@ -150,6 +150,33 @@ const (
 	perRecordInjectBudget = 5 * time.Second
 )
 
+// pastTenseVerbs renders an audit verb as the past tense the summary sentence
+// needs. The summary reads "<principal> <verb> <object> on cluster <name>", so
+// the raw verb makes it an imperative -- "alice@example.com patch
+// customresourcedefinitions/… on cluster prod" -- which parses as an
+// instruction to the reader rather than a report of what happened. That is the
+// wrong reading for the one line a human uses to decide whether to care.
+//
+// Keyed on the audit verb, which is the trailing component of methodName (see
+// methodVerb). What bounds the set to five is the logging sink's filter alone
+// (terraform/modules/drift-pubsub), an unanchored
+// methodName=~"create|patch|update|delete" -- unanchored being why
+// deletecollection arrives at all. The subresource filter is no help here: it
+// keys on Resource.Subresource, not on the verb, and an exec arrives as
+// pods.exec.create, so it would land on "create" either way.
+//
+// Anything not listed falls through unchanged, which is today's behaviour and
+// reads no worse than it does now -- an unexpected verb means the sink filter
+// changed, which is worth seeing verbatim rather than guessing a conjugation
+// for.
+var pastTenseVerbs = map[string]string{
+	"create":           "created",
+	"update":           "updated",
+	"patch":            "patched",
+	"delete":           "deleted",
+	"deletecollection": "deleted a collection of",
+}
+
 // DriftInjectPayload is the JSON this binary posts as the inject message. Field
 // names are snake_case to match the event watcher's payload, so a skill reading
 // both signals does not need two naming conventions.
@@ -801,7 +828,7 @@ func driftSummary(event DriftEvent) string {
 	record := event.Record
 
 	summary := fmt.Sprintf("%s %s %s on cluster %s",
-		record.Principal, record.Verb, record.Resource, record.Cluster)
+		record.Principal, pastTenseVerb(record.Verb), record.Resource, record.Cluster)
 
 	if event.Outcome != joinEnriched {
 		return fmt.Sprintf("%s (field ownership not read: %s)", summary, event.Outcome)
@@ -813,6 +840,15 @@ func driftSummary(event DriftEvent) string {
 		return fmt.Sprintf("%s, fields owned by %s", summary, managers)
 	}
 	return summary
+}
+
+// pastTenseVerb conjugates one audit verb for the summary, leaving anything
+// pastTenseVerbs does not name exactly as it arrived.
+func pastTenseVerb(verb string) string {
+	if past, ok := pastTenseVerbs[verb]; ok {
+		return past
+	}
+	return verb
 }
 
 // ownerManagers lists the managers holding fields on the object, for the

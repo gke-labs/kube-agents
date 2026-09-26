@@ -321,6 +321,8 @@ data:
       "projects": [],
       "folders": [],
       "organizations": [],
+      "sharedVpcHosts": [],
+      "metricsScopes": [],
       "exclude": {
         "projects": [],
         "clusters": []
@@ -870,6 +872,8 @@ spec:
               value: /etc/credential-proxy/policy.json
             - name: CREDENTIAL_PROXY_MAX_OUTPUT_BYTES
               value: "8388608"
+            - name: CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
+              value: "8"
             - name: CREDENTIAL_PROXY_STATE_DIR
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET
@@ -943,8 +947,8 @@ spec:
               ephemeral-storage: 2Gi
               memory: 1Gi
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: 500m
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -1469,6 +1473,8 @@ spec:
                   resource: limits.memory
             - name: EVENT_WATCHER_ENABLED
               value: "true"
+            - name: DRIFT_DETECTOR_ENABLED
+              value: "false"
             - name: CREDENTIAL_PROXY_ROLE
               value: api-proxy
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:latest

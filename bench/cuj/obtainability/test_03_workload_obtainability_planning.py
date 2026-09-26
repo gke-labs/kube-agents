@@ -18,17 +18,38 @@ from cuj.utils.interaction import (
 from cuj.utils.milestones import Milestone, MilestoneSuite
 from cuj.utils.scenario import Scenario
 
-ALLOWED_ZONES = {"us-central1-a", "us-east4-a"}
+# us-east4 has no v5e zone at all (`calendar-mode` returns NOT_SUPPORTED for
+# every zone there, verified live 2026-09-21); europe-west4-b is a v5e zone
+# the API returns windows for. A contract naming a zone the API can never
+# recommend is unsatisfiable by any honest run.
+ALLOWED_ZONES = {"us-central1-a", "europe-west4-b"}
 ALLOWED_REGIONS = {zone.rsplit("-", 1)[0] for zone in ALLOWED_ZONES}
 JOB_DURATION = timedelta(hours=12)
+# The API's minimum reservable window is one day ("The time window is too
+# short. It should be at least 1 days.", verified live): the probe reserves
+# the day, the 12-hour job runs inside it.
+RESERVATION_FLOOR = timedelta(days=1)
 PLANNING_HORIZON = timedelta(hours=48)
 CALL_DELAY_TOLERANCE = timedelta(minutes=30)
+# The method the live endpoint names for this call
+# (X-Google-Esf-Cloud-Client-Params on a real `gcloud beta compute advice
+# calendar-mode` call); there is no alpha spelling.
 OBTAINABILITY_PLANNING_METHODS = {
-    "compute.alpha.AdviceService.CalendarMode",
+    "compute.beta.AdviceService.CalendarMode",
     "compute.advice.calendarMode",
 }
 TPU_V5E_VM_FAMILY = "VM_FAMILY_CLOUD_TPU_LITE_POD_SLICE_CT5LP"
-REQUIRED_SKILLS = {"gke-batch-hpc", "gke-workload-scaling"}
+# The API counts chips (a real request for 64 v5e nodes carries
+# acceleratorCount 256); the user and this test count nodes, and the
+# evidence must carry both so the arithmetic is checkable.
+TPU_V5E_CHIPS_PER_NODE = 4
+NODE_COUNT = 64
+CHIP_COUNT = NODE_COUNT * TPU_V5E_CHIPS_PER_NODE
+REQUIRED_SKILLS = {
+    "capacity-obtainability",
+    "gke-batch-hpc",
+    "gke-workload-scaling",
+}
 FORBIDDEN_OPERATIONS = {
     "apply_manifest",
     "create_cluster",
@@ -39,8 +60,8 @@ FORBIDDEN_OPERATIONS = {
 
 PROMPT = """Act as my batch scheduling partner. Plan a 64-node TPU v5e \
 training job that must run for 12 hours and finish within the next 48 hours. \
-Evaluate us-central1-a and us-east4-a using live \
-compute.alpha.AdviceService.CalendarMode evidence. Rank the predicted capacity \
+Evaluate us-central1-a and europe-west4-b using live \
+compute.beta.AdviceService.CalendarMode evidence. Rank the predicted capacity \
 windows across regions and recommend an exact UTC start time and zone. Generate \
 a Dynamic Workload Scheduler ProvisioningRequest and a paired Kueue LocalQueue \
 targeting that recommended region, zone, and window. This is planning-only: do \
@@ -62,8 +83,12 @@ ACCEPTANCE_CRITERIA = (
     ),
     AcceptanceCriterion(
         "ac03-multi-region-windows-evaluated",
-        "kube-agents evaluates predicted capacity windows across regions.",
-        "CalendarMode analysis contains valid windows in at least two regions",
+        "kube-agents evaluates predicted capacity windows across both "
+        "candidate regions; a region with no obtainable window is covered "
+        "by its per-zone status, since live capacity weather is not the "
+        "agent's to command.",
+        "every listed window is valid and windows plus zoneStatuses cover "
+        "both allowed regions",
     ),
     AcceptanceCriterion(
         "ac04-windows-ranked",
@@ -120,8 +145,10 @@ MILESTONES = (
     ),
     Milestone(
         "m3-batch-skills-loaded",
-        "The Platform Agent loads the batch and scaling skills used by this backend.",
-        "the platform task loads gke-batch-hpc and gke-workload-scaling",
+        "The Platform Agent loads the obtainability, batch, and scaling "
+        "skills used by this backend.",
+        "the platform task loads capacity-obtainability, gke-batch-hpc, and "
+        "gke-workload-scaling",
         ("m2-platform-task-created",),
     ),
     Milestone(
@@ -200,30 +227,65 @@ def _is_tpu_v5e(value: Any) -> bool:
     return re.sub(r"[^a-z0-9]", "", str(value or "").casefold()) == "tpuv5e"
 
 
+def _named_zones(value: Any) -> set[str]:
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found |= _named_zones(key)
+            found |= _named_zones(item)
+    elif isinstance(value, list):
+        for item in value:
+            found |= _named_zones(item)
+    elif isinstance(value, str):
+        found.add(value.removeprefix("zones/"))
+    return found
+
+
+def _zone_evaluated(spec: dict[str, Any], details: dict[str, Any], zone: str) -> bool:
+    # Proof the probe evaluated the user's zone, in either of the two honest
+    # forms a worker records: the request scoped to it via locationPolicy, or
+    # a region-wide probe whose recorded analysis names the zone — as the
+    # recommended location, with a per-zone status, or anywhere inside the
+    # API's verbatim response shape (recommendations[].spec...), which is
+    # why the search walks the structure rather than fixed paths. Exact
+    # string match after stripping the "zones/" prefix, so us-central1-a
+    # never matches us-central1-ai1a. An analysis that names no zone at all
+    # fails: there is nothing to check.
+    locations = _mapping(_mapping(spec.get("locationPolicy")).get("locations"))
+    preference = _mapping(locations.get(f"zones/{zone}")).get("preference")
+    if str(preference or "").upper() == "ALLOW":
+        return True
+    return zone in _named_zones(_mapping(details.get("analysis")))
+
+
 def _valid_obtainability_planning_call(
     item: dict[str, Any], created_at: datetime | None
 ) -> bool:
     details = _mapping(item.get("details"))
-    region = str(details.get("region") or "")
     request = _mapping(details.get("request"))
+    # The skill's canonical record carries region and nodeCount inside
+    # `request` (one object, "do not rename keys"); the recorder the live
+    # runs went through projects them at the top of `details` too. Both
+    # spellings of the same honest record are accepted; test_05 mirrors
+    # this in _record_region.
+    region = str(request.get("region") or details.get("region") or "")
     specs = _mapping(request.get("futureResourcesSpecs"))
     if len(specs) != 1:
         return False
     spec = _mapping(next(iter(specs.values())))
-    locations = _mapping(_mapping(spec.get("locationPolicy")).get("locations"))
     zone = next((zone for zone in ALLOWED_ZONES if zone.startswith(region + "-")), "")
-    location = _mapping(locations.get(f"zones/{zone}"))
     time_range = _mapping(spec.get("timeRangeSpec"))
     earliest = _timestamp(time_range.get("startTimeNotEarlierThan"))
     latest = _timestamp(time_range.get("startTimeNotLaterThan"))
     aggregate = _mapping(
         _mapping(spec.get("targetResources")).get("aggregateResources")
     )
+    reservation_seconds = int(RESERVATION_FLOOR.total_seconds())
     return (
         details.get("apiMethod") in OBTAINABILITY_PLANNING_METHODS
         and region in ALLOWED_REGIONS
         and bool(zone)
-        and str(location.get("preference") or "").upper() == "ALLOW"
+        and _zone_evaluated(spec, details, zone)
         and created_at is not None
         and earliest is not None
         and latest is not None
@@ -234,11 +296,12 @@ def _valid_obtainability_planning_call(
         + PLANNING_HORIZON
         - JOB_DURATION
         + CALL_DELAY_TOLERANCE
-        and _duration_seconds(time_range.get("minDuration")) == 43200
-        and _duration_seconds(time_range.get("maxDuration")) == 43200
+        and _duration_seconds(time_range.get("minDuration")) == reservation_seconds
+        and _duration_seconds(time_range.get("maxDuration")) == reservation_seconds
         and aggregate.get("vmFamily") == TPU_V5E_VM_FAMILY
         and aggregate.get("workloadType") == "BATCH"
-        and _integer(aggregate.get("acceleratorCount")) == 64
+        and _integer(aggregate.get("acceleratorCount")) == CHIP_COUNT
+        and _integer(request.get("nodeCount", details.get("nodeCount"))) == NODE_COUNT
     )
 
 
@@ -305,8 +368,14 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         for item in advice_calls
         if _valid_obtainability_planning_call(item, created_at)
     ]
+    # The same two-place read as the validator: the canonical record keeps
+    # region inside request, the live recorder projects it at the top too.
     call_regions = {
-        str(_mapping(item.get("details")).get("region") or "")
+        str(
+            _mapping(_mapping(item.get("details")).get("request")).get("region")
+            or _mapping(item.get("details")).get("region")
+            or ""
+        )
         for item in valid_calls
     }
     analysis_records = _completed_records(
@@ -322,7 +391,20 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         item for item in _list(analysis.get("windows")) if isinstance(item, dict)
     ]
     valid_windows = [item for item in windows if _valid_window(item, created_at)]
-    regions = {str(item["region"]) for item in valid_windows}
+    # Coverage, not luck: a region the live API reports as stocked out
+    # cannot produce a valid window, so its honest per-zone status covers
+    # it. Verified live 2026-09-22: us-central1-a returned NO_CAPACITY
+    # while europe-west4-b returned a real window.
+    zone_statuses = _mapping(analysis.get("zoneStatuses"))
+    # zoneStatuses keys may carry the API's "zones/" prefix — the spelling
+    # _named_zones and test_05 already strip — so strip it here too before
+    # the membership test.
+    covered_regions = {str(item["region"]) for item in valid_windows} | {
+        str(zone).removeprefix("zones/").rsplit("-", 1)[0]
+        for zone, status in zone_statuses.items()
+        if str(zone).removeprefix("zones/") in ALLOWED_ZONES
+        and str(status or "").strip()
+    }
     ranks = [item.get("rank") for item in windows]
     ranked = (
         bool(windows)
@@ -344,7 +426,12 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         and top_start is not None
         and top_start.strftime("%Y-%m-%d") in final_output
         and top_start.strftime("%H:%M") in final_output
-        and "UTC" in final_output.upper()
+        # An RFC 3339 timestamp with a Z suffix IS a UTC statement; the
+        # word is only required when the answer paraphrases the time.
+        and (
+            "UTC" in final_output.upper()
+            or str(top.get("startTime") or "") in final_output
+        )
     )
 
     artifacts = projected_records(interaction, "artifacts")
@@ -399,8 +486,16 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     )
     suite.record(
         "ac03-multi-region-windows-evaluated",
-        len(valid_windows) == len(windows) and len(regions) >= 2,
-        {"windows": windows, "regions": sorted(regions)},
+        # No bool(windows) guard: a day with no window anywhere is covered
+        # by a complete zoneStatuses map, and covered_regions is empty when
+        # both windows and zoneStatuses are.
+        len(valid_windows) == len(windows)
+        and covered_regions == ALLOWED_REGIONS,
+        {
+            "windows": windows,
+            "zoneStatuses": zone_statuses,
+            "coveredRegions": sorted(covered_regions),
+        },
         blocked_by=tuple(dict.fromkeys((*interaction_blocker, *evidence_blocker))),
     )
     suite.record(

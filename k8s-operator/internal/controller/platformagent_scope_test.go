@@ -124,6 +124,33 @@ func TestRenderScopeJSONRendersContainersSorted(t *testing.T) {
 	}
 }
 
+func TestRenderScopeJSONRendersSelectorsSorted(t *testing.T) {
+	// The phase 3 selectors are rendered under their own keys, sorted, and an
+	// absent list renders as [] so the reader never sees null. They sit between
+	// organizations and exclude so the file reads in the design's selector order.
+	scope := &agentv1alpha1.ScopeSpec{
+		SharedVpcHosts: []string{"vpc-host-prod", "vpc-host-dev"},
+		MetricsScopes:  []string{"ops-metrics-b", "ops-metrics-a"},
+	}
+	got := renderScopeJSON(scopeTestAgent(scope))
+	for _, want := range []string{
+		"\"sharedVpcHosts\": [\n    \"vpc-host-dev\",\n    \"vpc-host-prod\"\n  ]",
+		"\"metricsScopes\": [\n    \"ops-metrics-a\",\n    \"ops-metrics-b\"\n  ]",
+		"\"projects\": []",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("render lacks %q:\n%s", want, got)
+		}
+	}
+	org, shared, metrics, ex := strings.Index(got, "\"organizations\""), strings.Index(got, "\"sharedVpcHosts\""), strings.Index(got, "\"metricsScopes\""), strings.Index(got, "\"exclude\"")
+	if !(org < shared && shared < metrics && metrics < ex) {
+		t.Errorf("selectors must render after organizations, sharedVpcHosts before metricsScopes, and both before exclude:\n%s", got)
+	}
+	if none := renderScopeJSON(scopeTestAgent(&agentv1alpha1.ScopeSpec{})); !strings.Contains(none, "\"sharedVpcHosts\": []") || !strings.Contains(none, "\"metricsScopes\": []") {
+		t.Errorf("an empty block must render empty selector lists, got:\n%s", none)
+	}
+}
+
 func TestRenderScopeJSONExcludeOnlyIsRendered(t *testing.T) {
 	// An install migrating only its exclusions still needs them applied.
 	scope := &agentv1alpha1.ScopeSpec{Exclude: &agentv1alpha1.ScopeExcludeSpec{

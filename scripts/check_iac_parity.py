@@ -4,7 +4,6 @@
 Several static files hand-maintain the same DNS egress rule (port 53):
 * charts/kube-agents/templates/litellm.yaml
 * charts/kube-agents/templates/github-minter.yaml
-* deploy/kustomize/platform/networkpolicy-core-egress.yaml
 * examples/litellm-chatgpt-subscription/networkpolicy.yaml
 * examples/litellm-gemini/networkpolicy.yaml
 * examples/vllm-gemma/networkpolicy.yaml
@@ -31,15 +30,14 @@ To avoid DNS outages, every static DNS rule must provide:
    169.254.20.10/32 (NodeLocal DNSCache) and 169.254.169.254/32 (Cloud DNS for GKE)
    literals are required because the wildcard peer no longer reaches those resolvers.
 
-Note on peer sets and house shape (#747 B5):
-Do not assert strict byte-identity across all files. Today, seven copies carry a
-three-entry except list (RFC 1918) and include 169.254.169.254/32, while
-deploy/kustomize/platform/networkpolicy-core-egress.yaml carries the 5-entry house
-shape (adding 100.64.0.0/10 and 169.254.0.0/16, which is more contained and
-mirrors the operator-generated external egress policy). When 169.254.0.0/16 is
-excepted, the link-local resolver literals become mandatory. Pod selector peers
-(k8s-app: kube-dns, k8s-app: node-local-dns) are present in all copies for in-cluster
-pod-backed DNS, but this script enforces the required IP blocks and protocols.
+Note on peer sets (#747 B5):
+Do not assert strict byte-identity across all files. Today, every copy carries a
+three-entry except list (RFC 1918) and includes 169.254.169.254/32; a copy may
+except more (100.64.0.0/10 and 169.254.0.0/16, as the operator-generated external
+egress policy does), and when 169.254.0.0/16 is excepted, the link-local resolver
+literals become mandatory. Pod selector peers (k8s-app: kube-dns,
+k8s-app: node-local-dns) are present in all copies for in-cluster pod-backed DNS,
+but this script enforces the required IP blocks and protocols.
 
 Scope:
 This check audits deployable Infrastructure-as-Code manifest files matching
@@ -114,7 +112,6 @@ DISCOVERY_FILE_PATTERNS: tuple[str, ...] = (
 STATIC_NETWORK_POLICIES: tuple[str, ...] = (
     "charts/kube-agents/templates/litellm.yaml",
     "charts/kube-agents/templates/github-minter.yaml",
-    "deploy/kustomize/platform/networkpolicy-core-egress.yaml",
     "examples/litellm-chatgpt-subscription/networkpolicy.yaml",
     "examples/litellm-gemini/networkpolicy.yaml",
     "examples/vllm-gemma/networkpolicy.yaml",
@@ -152,9 +149,6 @@ REQUIRED_WILDCARD_CIDR = "0.0.0.0/0"
 REQUIRED_EXCEPT_MINIMUM: frozenset[str] = frozenset(
     {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
 )
-HOUSE_SHAPE_EXCEPT: frozenset[str] = frozenset(
-    {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"}
-)
 
 PROTOCOL_TCP: str = "TCP"
 PROTOCOL_UDP: str = "UDP"
@@ -180,11 +174,6 @@ YAML_DOC_SEPARATOR_RE = re.compile(r"^---(?:\s.*)?$", flags=re.MULTILINE)
 NETWORK_POLICY_KIND_RE = re.compile(
     r"^\s*kind:\s*['\"]?NetworkPolicy['\"]?", flags=re.MULTILINE
 )
-
-
-def is_house_shape(except_list: Iterable[str]) -> bool:
-    """Return True if the except list satisfies the 5-entry house shape."""
-    return HOUSE_SHAPE_EXCEPT.issubset(set(except_list))
 
 
 def governs_egress(spec: object) -> bool:

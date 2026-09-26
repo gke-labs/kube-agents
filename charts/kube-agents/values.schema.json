@@ -532,6 +532,21 @@
                 }
               }
             },
+            "driftDetector": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": ["boolean", "null"]
+                },
+                "subscription": {
+                  "type": "string"
+                },
+                "gitopsManagers": {
+                  "type": "string"
+                }
+              }
+            },
             "experimental": {
               "type": "object",
               "additionalProperties": false,
@@ -666,6 +681,49 @@
                 },
                 "serviceAccountEmail": {
                   "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "scope": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "projects": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "exclude": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "projects": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "clusters": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["projectId", "location", "clusterName"],
+                    "properties": {
+                      "projectId": {
+                        "type": "string"
+                      },
+                      "location": {
+                        "type": "string"
+                      },
+                      "clusterName": {
+                        "type": "string"
+                      }
+                    }
+                  }
                 }
               }
             }
