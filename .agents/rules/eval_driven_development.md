@@ -25,7 +25,9 @@ secrets. For cases that read the seeded fleet, whether through `fixtures:` or by
 agent, is expected to have one. A stock install sandboxes the agent, which the harness's
 `kubectl port-forward` cannot reach; [`bench/README.md`](../../bench/README.md#sandboxed-installs)
 has the ways round that. There is no path around the loop: a pull request that changes agent
-behaviour without eval evidence is not ready for review.
+behaviour without eval evidence is not ready for review. In a stack the evidence may sit on the
+sibling that makes the behaviour observable, on the terms "What does not count" sets out; what it
+may not do is not exist.
 
 ## The loop
 
@@ -123,6 +125,11 @@ is this loop and nothing less:
 - green: the three runs (directories or a one-line summary each) against the branch's build;
 - where the case is registered, or the one-line exemption.
 
+A stacked change whose case sits on an already-merged sibling writes that in place of all four: the
+sibling's number, the case it carries, and the line in the sibling's body that accepts the
+hand-off. It is the only substitute for the list above, and "What does not count" sets out when it
+is available.
+
 ## What does not count
 
 - A unit test with a mocked model. That is a test; it goes where
@@ -130,6 +137,15 @@ is this loop and nothing less:
 - A case run once, or a green you did not see. Three passing runs, observed.
 - A red you did not see. If you cannot run the case before the change, you do not know it tests
   the change.
+- A case deferred to another pull request in a stack. The change merges with this pull request, so
+  the case merges with it. "The next one carries it" is a hand-off nobody has accepted, and two
+  bodies that each point at the other leave `main` holding a change no case covers. Where the
+  behaviour genuinely cannot be observed until a sibling lands, the case belongs to that sibling on
+  two conditions: the sibling's body accepts the hand-off, and the sibling merges first, so the
+  case is on `main` no later than the change it covers. A case sitting in an open sibling's diff
+  meets neither bar on its own — a branch closed or superseded next week takes the case with it and
+  leaves behind the uncovered change this rule exists to prevent, which is what a promise does. So
+  the reviewer's thread stays open until the sibling has merged, not until it carries the case.
 
 ## Finding a case
 
