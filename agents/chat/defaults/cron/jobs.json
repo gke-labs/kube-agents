@@ -59,6 +59,21 @@
       "risk": "low",
       "enabled": true,
       "deliver": "local"
+    },
+    {
+      "id": "first-run-quick-value-audit",
+      "name": "First-Run Quick Value Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "* * * * *",
+        "display": "* * * * *"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "first_run_audit_gate.py",
+      "risk": "low",
+      "enabled": true,
+      "deliver": "local"
     }
   ]
 }

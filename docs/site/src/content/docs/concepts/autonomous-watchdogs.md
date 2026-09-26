@@ -30,6 +30,32 @@ The result is an ordinary cron run in a `hermes cron tick` process of its own �
 
 The rosters, with exact cron expressions, enabled state, and prompts, are generated from the two `jobs.json` files on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Nine governance jobs ship, all enabled on the Platform Agent's roster — the fleet audits below. Further entries share that roster without being watchdogs, all `no_agent` and none running a model: `github-repo-watcher`, a poller described under [Pollers file cards](#pollers-file-cards-watchdogs-deliver-reports); `eod-event-watcher-daily-report`, a weekday script that renders the k8s-event-watcher recap from the session ledger; `findings-morning-nudge`, which names the findings queue's top critical items and repeats them every morning for as long as the sweep still reports them, posting on a morning with none only when the message would differ from the last one sent; `kanban-workspace-gc`, which collects finished workers' workspaces; `kanban-board-health`, which names any kanban card blocked for more than a day, with its kind, reason and the commands to unblock or archive it, once a day until someone acts, because a worker's or operator's block is sticky by design and a card nobody was told about would otherwise wait forever; `chat-delivery-watch`, which keeps a per-job count of scheduled reports that failed to reach chat and, past a threshold, opens a GitHub ledger issue and writes an `ALERT` line that fluent-bit ships to Cloud Logging, the two channels that still work when chat does not ([the relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) explains why it uses neither chat nor a `PlatformAgent` condition yet); `stall-watch`, which every half hour runs the Cluster Agent's `stall_report.py` over the non-system namespaces of every running or reconciling cluster that has a Cluster Agent, keeps a ledger, and on a new stall files one kanban card per namespace, at most three a tick, for that cluster's Cluster Agent to run `gke-stall-detection`, the card's progress reaching chat through the subscription row the script writes, with one chat line when the card opens and one when it closes; and `feedback-prompt`, which posts one feedback request in the home channel a week after its first tick, at most once per install, with `FEEDBACK_PROMPT_ENABLED` and `FEEDBACK_PROMPT_DELAY` in the CR's `spec.deployment.env` as its per-install switch and delay ([Reference → Cron jobs](/kube-agents/reference/cron-jobs/) describes the message and the two markers behind "once").
 
+### First-Run Quick Value Audit
+
+After the bootstrap inventory scan completes, the **First-Run Quick Value Audit** (`first-run-quick-value-audit`) triggers automatically to surface high-impact findings within the first 2 hours of installation. Without this, a user installing on Tuesday would wait up to 6 days for cost optimization findings (the Fleet Waste Audit runs weekly on Monday), and up to 24 hours for security and reliability findings.
+
+The first-run sequence files kanban cards for four audits:
+
+| Audit | What It Finds |
+| ----- | ------------- |
+| Fleet Waste Audit | Idle PVs, unattached disks, reserved IPs, over-provisioned pools |
+| Security & RBAC Posture | Overprivileged service accounts, missing network policies |
+| Workload Reliability | Missing probes, PDB gaps, restart loops |
+| Stockout Prevention | Capacity risks, single-zone stockouts |
+
+The audits use the same SOPs as their scheduled counterparts — only the trigger differs. Results are delivered to chat and posted as GitHub ledger issues with remediation PRs where applicable.
+
+**Once-only guarantee:** The gate script writes `.first-run-audits-filed` only after ALL cards are successfully filed. This marker persists on the data volume, so:
+- Pod restarts do not re-trigger the audits
+- Upgrades and reinstalls do not re-trigger
+- If any card fails to file, the marker is not written and the job retries on the next tick
+
+**Manual re-run:** To re-run the first-run audits after they have completed:
+1. Archive the existing kanban cards (required — each card holds an idempotency key)
+2. Delete `/opt/data/.first-run-audits-filed`
+
+After first-run, the regular schedules take over: security and reliability audits run daily, cost and capacity audits run weekly.
+
 ### The nine fleet audits
 
 Each audit reads its SOP, executes read-only checks against the fleet, writes a validated findings file, and hands it to the [`fleet-audit`](/kube-agents/skills/) skill's `audit_report.py` helper. The helper owns every git and `gh` operation and renders every body itself — the model never writes one.
