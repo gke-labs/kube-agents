@@ -692,8 +692,13 @@ class ConfigBackfillTest(unittest.TestCase):
             "is about keeping",
         )
         self.assertEqual(live["monitoring"]["install_id"], "abc123")
-        for key in ("toolsets", "platform_toolsets", "kanban", "agent"):
+        for key in ("toolsets", "platform_toolsets", "kanban", "agent", "context_file_max_chars"):
             self.assertIn(key, live, f"{key} was lost to the managed strip and not restored")
+        self.assertEqual(
+            live.get("context_file_max_chars"),
+            100000,
+            "context_file_max_chars must be backfilled into existing PVC config",
+        )
 
 
 class RemoteMcpUserAgentRepairTest(unittest.TestCase):
@@ -882,7 +887,7 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         """
         block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
         script = "set -e\n"
-        for name in ("sync_profile_skills", "repair_remote_mcp_user_agent"):
+        for name in ("sync_profile_skills", "repair_remote_mcp_user_agent", "backfill_config_from_template"):
             script += _extract_shell_function(name) + "\n"
         script += block
         with tempfile.TemporaryDirectory() as tmp:
@@ -893,8 +898,10 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             (template_dir / "SOUL.md").write_text("persona\n", encoding="utf-8")
             profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
             profile.mkdir(parents=True)
+            cluster_cfg = self._scaffolded_cluster_profile(self._OLD_HEADER)
+            cluster_cfg.pop("context_file_max_chars", None)
             (profile / "config.yaml").write_text(
-                yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+                yaml.safe_dump(cluster_cfg, sort_keys=False),
                 encoding="utf-8",
             )
             venv = root / "install" / ".venv" / "bin"
@@ -926,6 +933,11 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
                     f"the loop left {name} on the header it was scaffolded with",
                 )
         self.assertEqual(live["cluster_identity"], self._IDENTITY)
+        self.assertEqual(
+            live.get("context_file_max_chars"),
+            100000,
+            "the loop must backfill context_file_max_chars from the cluster template onto existing profiles",
+        )
         self.assertEqual(persona, "persona\n", "the persona copy beside the repair stopped running")
         self.assertIn("User-Agent repair", proc.stdout)
 
@@ -1553,9 +1565,9 @@ class PlatformFrontDoorTest(unittest.TestCase):
         )
 
     def test_step_2_6b_fills_the_platform_config_with_step_2ds_own_program(self):
-        """One program, two callers — asserted on the source, not on a copy of it.
+        """One program, three callers — asserted on the source, not on a copy of it.
 
-        The rule step 2.6b needs is exactly step 2d's: restore a key the image declares
+        The rule step 2.6b and the cluster loop need is exactly step 2d's: restore a key the image declares
         and the live file has lost, never overrule one the agent wrote. Re-implementing
         it here is the failure this catches, because the second copy would drift towards
         the three-way merge that #658 removed — and the two files it governs are the two
@@ -1571,13 +1583,18 @@ class PlatformFrontDoorTest(unittest.TestCase):
         ]
         self.assertEqual(
             len(callers),
-            2,
-            f"expected step 2d and step 2.6b to be the only callers, found {callers}",
+            3,
+            f"expected step 2d, step 2.6 cluster loop, and step 2.6b to be the only callers, found {callers}",
         )
         self.assertIn(
             "$PLATFORM_TEMPLATE/config.yaml",
             source,
             "step 2.6b must fill from the platform profile's image template",
+        )
+        self.assertIn(
+            "$CLUSTER_TEMPLATE/config.yaml",
+            source,
+            "step 2.6 cluster loop must fill from the cluster profile's image template",
         )
 
     def test_step_2_6b_runs_only_at_the_front_door_and_only_on_the_primary(self):

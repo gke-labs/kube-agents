@@ -23,6 +23,12 @@ model:
   base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
   api_key: none
 
+# Context file character cap. Hermes dynamically scales the cap to 6% of the
+# model's context window, but falls back to a 20,000-char floor whenever
+# context_length is unknown. Pinned to 100,000 chars to match shared defaults
+# and prevent truncation of personas and instructions as they evolve (issue #1957).
+context_file_max_chars: 100000
+
 # MCP Servers configuration. Read-only diagnostics surface only.
 mcp_servers:
   # Remote MCP endpoints, proxied over stdio by mcp-remote. The explicit
