@@ -170,6 +170,53 @@
           "why": "the outlier facet. Anyone enabling authorized networks on slot c gives the drift cohort a 3/3 agreement and consistency-authorized-networks-probe nothing to find"
         }
       ]
+    },
+    "deprecated-api-caller": {
+      "cluster_slot": "a",
+      "namespace": "seeded-deprecation",
+      "probes": [
+        "cronjob/legacy-endpoints-writer",
+        "service/legacy-endpoints-lane",
+        "endpoints/legacy-endpoints-lane"
+      ],
+      "fixture": "legacy-endpoints-writer CronJob merge-patches an annotation onto the hand-written Endpoints v1 object legacy-endpoints-lane every ten minutes. Endpoints is deprecated and still served (the fleet README says since when and for how long), so on every fleet master each write is audit-stamped k8s.io/deprecated=true, with no k8s.io/removed-release label and no Recommender insight",
+      "state": [
+        {
+          "subject": "cronjob/legacy-endpoints-writer",
+          "path": "spec.schedule",
+          "op": "eq",
+          "value": "*/10 * * * *",
+          "why": "the cadence a case's audit-log window assumes: one deprecated-API entry inside any window of ten minutes or more. A slower schedule leaves windows with no entry, and a case reading the trail sees a caller that has gone quiet rather than a fixture that changed"
+        },
+        {
+          "subject": "cronjob/legacy-endpoints-writer",
+          "path": "spec.suspend",
+          "op": "none_eq",
+          "value": true,
+          "why": "a suspended CronJob writes nothing, so the audit trail ages out while every probe still passes -- the one shape presence probing cannot tell from healthy"
+        },
+        {
+          "subject": "cronjob/legacy-endpoints-writer",
+          "path": "spec.jobTemplate.spec.template.spec.serviceAccountName",
+          "op": "eq",
+          "value": "legacy-endpoints-writer",
+          "why": "the principal a case's log filter keys on (system:serviceaccount:seeded-deprecation:legacy-endpoints-writer plus methodName io.k8s.core.v1.endpoints.patch). kube-system's endpoint-controller stamps k8s.io/deprecated=true on every Service's Endpoints too, so the label alone identifies nothing, and a writer running as any other account is invisible to the filter"
+        },
+        {
+          "subject": "job?app=legacy-endpoints-writer",
+          "path": "status.conditions[?(@.type=='Failed')].status",
+          "op": "none_eq",
+          "value": "True",
+          "why": "any retained Job with the Failed condition is a run that wrote nothing: the writer's BROKEN exit (a master below 1.33, RBAC or egress lost), a pod the deadline killed, or a pod the controller could never create. The condition, not the pod counter: a Job whose pod was never admitted fails with the counter absent, and one whose pod was replaced mid-run fails with it at 2. ttlSecondsAfterFinished 900 clears a transient in fifteen minutes; a failure that persists is the fixture, not the weather"
+        },
+        {
+          "subject": "endpoints/legacy-endpoints-lane",
+          "path": "subsets[*].addresses[*].ip",
+          "op": "any_eq",
+          "value": "192.0.2.10",
+          "why": "the hand-written subset on a selector-less Service, which the endpoints controller leaves alone. An Endpoints without it was rewritten or replaced, and the object the writer patches is no longer the planted one"
+        }
+      ]
     }
   }
 }

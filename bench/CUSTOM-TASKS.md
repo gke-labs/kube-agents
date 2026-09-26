@@ -582,7 +582,7 @@ ones it saw to `<role>.confirmed`. A labelled cluster is not the same thing as a
 an apply that created the clusters and stopped before the Kubernetes provider ran leaves a trio that
 answers every API call and holds none of the objects — and this manifest is what lets an object that
 disappears _later_ be read as a destroyed fixture rather than an environment that was never ready.
-Probing the object rather than only its namespace matters because four of the seven roles are
+Probing the object rather than only its namespace matters because four of the eight roles are
 cluster-scoped and have no namespace to probe: a namespace-only gate published them unconditionally,
 and `compliance-rbac-overgrant` then reported a catastrophic `fail` against an agent that had
 touched nothing. Every subject a check asserts on must therefore appear in its role's `probes`, in

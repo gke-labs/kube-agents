@@ -1686,7 +1686,7 @@ class FleetResourcePropertyVerifier(ResourcePropertyVerifier):
     subject is a legitimately absent object such as a pathless ``absent``, the
     namespace containing it. Anything else is an environment that was never
     ready, which is an error and not the agent's doing. The first draft of this
-    gate confirmed only the NAMESPACE, which four of the seven roles do not
+    gate confirmed only the NAMESPACE, which four of the eight roles do not
     have: on a live-but-empty cluster ``compliance-rbac-overgrant`` reported a
     catastrophic ``fail`` against an agent that had touched nothing.
 

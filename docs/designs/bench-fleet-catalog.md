@@ -90,24 +90,25 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Eight fixtures: seven across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
-four seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security` and
-`seeded-capacity`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
+Nine fixtures: eight across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
+five seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security`,
+`seeded-capacity` and `seeded-deprecation`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
 only and no workloads at all: `b` is the held-back control plane, `c` is the configuration
 outlier. Every cluster is labelled `environment=seeded`, which is what confines the drift
 cohort to these three and keeps `platform-agent-host` and transient `eval-pr*` clusters
 from voting on the baseline.
 
-| Role                 | Slot    | Day | What is planted                                                                       |
-| -------------------- | ------- | --- | ------------------------------------------------------------------------------------- |
-| `rbac-overgrant`     | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA |
-| `no-pdb-workload`    | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB           |
-| `crashloop-workload` | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop |
-| `hpa-saturated`      | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                 |
-| `idle-nodepool`      | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                   |
-| `orphan-disks`       | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                      |
-| `version-laggard`    | b       | 0   | Control plane one minor behind the REGULAR channel default                            |
-| `drift-outlier`      | c       | 1   | Master authorized networks absent, where a and b carry an open block                  |
+| Role                    | Slot    | Day | What is planted                                                                                                                                                               |
+| ----------------------- | ------- | --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rbac-overgrant`        | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                                                                         |
+| `no-pdb-workload`       | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                                                                   |
+| `crashloop-workload`    | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                         |
+| `hpa-saturated`         | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                         |
+| `deprecated-api-caller` | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight |
+| `idle-nodepool`         | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                           |
+| `orphan-disks`          | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                              |
+| `version-laggard`       | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                    |
+| `drift-outlier`         | c       | 1   | Master authorized networks absent, where a and b carry an open block                                                                                                          |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
@@ -128,7 +129,7 @@ neither is going to be obvious from a slug.
 
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
-`seeded-role=idle-batch` on the idle pool's taint — so two of the eight roles are called
+`seeded-role=idle-batch` on the idle pool's taint — so two of the nine roles are called
 one thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
@@ -148,10 +149,12 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Five of the eight are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
-`crashloop-workload`, `hpa-saturated` and `version-laggard`, covering security, reliability,
-cluster debugging, remediation, capacity and upgrades between them. A corpus that leans on
-these can go green the day the fleet applies.
+Six of the nine are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
+`crashloop-workload`, `hpa-saturated`, `version-laggard` and `deprecated-api-caller`,
+covering security, reliability, cluster debugging, remediation, capacity, upgrades and API
+deprecation between them. A corpus that leans on these can go green the day the fleet
+applies; the caller's first run is a Job the apply itself waits on, so its audit trail
+exists before the apply returns.
 
 `drift-outlier` waits a day. The drift SOP excludes a cluster whose `createTime` is under
 24 hours old from every cohort, so on apply day the `(standard, seeded)` cohort has zero

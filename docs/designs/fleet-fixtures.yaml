@@ -37,7 +37,7 @@
 slots:
   - slot: a
     suffix: a
-    carries: The four seeded workload namespaces and the two defect node pools
+    carries: The five seeded workload namespaces and the two defect node pools
   - slot: b
     suffix: b
     carries: The held-back control plane, and no workloads
@@ -91,6 +91,26 @@ fixtures:
       is not the role slug, see bench-fleet-catalog.md. The desired replica
       count is not stable across projects (measured 3/2/3 on 2026-08-24), so
       assert the pin and the unmet demand and never a number.
+
+  - role: deprecated-api-caller
+    slot: a
+    available_from_day: 0
+    objects:
+      - cronjob/legacy-endpoints-writer
+      - service/legacy-endpoints-lane
+      - endpoints/legacy-endpoints-lane
+    namespace: seeded-deprecation
+    defect: >-
+      A CronJob on a dedicated ServiceAccount that merge-patches an annotation
+      onto a hand-written Endpoints v1 object every ten minutes. Endpoints is
+      deprecated and still served (the fleet README says since when), so on
+      every fleet master each write is audit-stamped k8s.io/deprecated=true
+      with no k8s.io/removed-release label and no Recommender insight; a case
+      reads the trail by principal plus methodName, never by the label alone,
+      because kube-system's endpoint-controller is stamped the same way. The
+      first run is a Job the apply waits on, so day 0 already has an entry.
+      The writer refuses to write below 1.33, so a master that old shows as a
+      retained failed Job rather than as a silent fixture.
 
   - role: idle-nodepool
     slot: a
