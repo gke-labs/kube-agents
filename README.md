@@ -56,11 +56,17 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --permission-set="read-only"
 ```
 
-Or delegate setup directly to your AI coding agent:
+Or give this prompt to an AI coding assistant. It needs no checkout of this repository, and tells the assistant to confirm the target with you and show you the `--dry-run` summary before it creates any cloud resources:
 
 ```text
-"Using kube-agents/INSTALL.md provision the latest official release of k8s agentic harness"
+Install the latest official release of kube-agents (github.com/gke-labs/kube-agents) into my GCP project.
+Follow INSTALL.md from that release tag — do not invent installer URLs, namespaces, or model names.
+First inspect my gcloud project and existing GKE clusters and confirm the target, cluster, model provider,
+and credential with me. Run install.sh with --dry-run and show me its printed summary before you change anything.
+Only run the real install after I say yes.
 ```
+
+The full procedure behind the prompt, including the credential and consent-flag checks, is in [INSTALL.md](INSTALL.md#ai-assisted-installation).
 
 Prefer to drive the engine by hand? Unpack `kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (recommended), or clone the repository at an official release tag if a Git checkout is needed:
 
