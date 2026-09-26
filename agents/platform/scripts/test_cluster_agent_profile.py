@@ -552,29 +552,17 @@ class ResolveProfilesBaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="test-prof-") as tmpdir:
             profile_home = Path(tmpdir) / "profiles" / "platform"
             (profile_home / "profiles").mkdir(parents=True)
-            (profile_home / "profile.yaml").touch()
             with mock.patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}, clear=True):
                 self.assertEqual(cap._resolve_data_root(), Path(tmpdir))
                 self.assertEqual(cap._resolve_profiles_base(), Path(tmpdir) / "profiles")
 
-    def test_resolves_when_data_root_ends_with_reserved_or_cluster_name_and_has_profiles_dir(self):
-        with tempfile.TemporaryDirectory(prefix="test-data-root-") as tmpdir:
-            data_root = Path(tmpdir) / "profiles" / "default"
-            (data_root / "profiles").mkdir(parents=True)
-            (data_root / "config.yaml").write_text("model: default\n", encoding="utf-8")
-            (data_root / "SOUL.md").write_text("Default persona\n", encoding="utf-8")
-            with mock.patch.dict(os.environ, {"HERMES_HOME": str(data_root)}, clear=True):
-                self.assertEqual(cap._resolve_data_root(), data_root)
-                self.assertEqual(cap._resolve_profiles_base(), data_root / "profiles")
-
-        with tempfile.TemporaryDirectory(prefix="test-data-cluster-") as tmpdir:
-            data_root = Path(tmpdir) / "profiles" / "cluster-data"
-            (data_root / "profiles").mkdir(parents=True)
-            (data_root / "config.yaml").write_text("model: default\n", encoding="utf-8")
-            (data_root / "SOUL.md").write_text("Default persona\n", encoding="utf-8")
-            with mock.patch.dict(os.environ, {"HERMES_HOME": str(data_root)}, clear=True):
-                self.assertEqual(cap._resolve_data_root(), data_root)
-                self.assertEqual(cap._resolve_profiles_base(), data_root / "profiles")
+    def test_resolves_when_cluster_profile_home_contains_profiles_directory(self):
+        with tempfile.TemporaryDirectory(prefix="test-cluster-prof-") as tmpdir:
+            cluster_home = Path(tmpdir) / "profiles" / "cluster-prod-east"
+            (cluster_home / "profiles").mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"HERMES_HOME": str(cluster_home)}, clear=True):
+                self.assertEqual(cap._resolve_data_root(), Path(tmpdir))
+                self.assertEqual(cap._resolve_profiles_base(), Path(tmpdir) / "profiles")
 
 
 class ListProfilesTest(unittest.TestCase):

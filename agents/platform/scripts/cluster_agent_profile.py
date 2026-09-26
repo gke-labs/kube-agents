@@ -27,7 +27,7 @@ from pathlib import Path
 
 import sandbox_exec
 from gke_endpoint import dns_endpoint_args
-from profile_scaffold import HERMES_BIN, PROFILE_MARKER, backfill_cron_file, ensure_profile, is_scaffolded, overlay_template
+from profile_scaffold import HERMES_BIN, backfill_cron_file, ensure_profile, is_scaffolded, overlay_template
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
@@ -60,19 +60,6 @@ def _resolve_data_root() -> Path:
         raw_home.parent.name == PROFILES_DIR_NAME
         and (raw_home.name in RESERVED_PROFILES or raw_home.name.startswith(CLUSTER_PROFILE_PREFIX))
     ):
-        # Disambiguate a profile home from a real data root whose path ends with
-        # `profiles/<reserved|cluster-*>`. If `raw_home / PROFILES_DIR_NAME` exists as a
-        # directory and `raw_home` carries no registered profile markers (`profile.yaml`,
-        # `USER.md`), `raw_home` is itself a data root holding profiles, not a profile home.
-        # (Note: a real data root is the `default` profile home and thus carries `SOUL.md`
-        # and `config.yaml`, so only registered profile markers indicate a profile home).
-        if (raw_home / PROFILES_DIR_NAME).is_dir():
-            has_profile_markers = any(
-                (raw_home / marker).is_file()
-                for marker in (PROFILE_MARKER, IDENTITY_FILE)
-            )
-            if not has_profile_markers:
-                return raw_home
         return raw_home.parent.parent
     return raw_home
 

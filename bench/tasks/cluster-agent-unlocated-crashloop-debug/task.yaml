@@ -52,16 +52,29 @@ fixtures:
   - crashloop-workload
 
 verification_spec:
-  # The positive half: a Cluster Agent profile worked the case. Because the
+  # The positive half: a Cluster Agent profile worked the case, and the platform
+  # worker enumerated managed profiles via list_cluster_profiles. Because the
   # existence probe cards and the delegated investigation both run as cluster-*
-  # profiles, this check confirms cluster agents were reached. Inline MCP
-  # diagnostics by the platform worker are forbidden below by
-  # no-inline-platform-mcp-diagnostics.
+  # profiles, worker_agents confirms cluster agents were reached. Inline
+  # diagnostics by the platform worker are forbidden by no-stubbed-profile-scripts
+  # (no kubectl in sandbox terminal) and no-inline-platform-mcp-diagnostics
+  # (no in-pod diagnostic MCP tools), ensuring the crashloop investigation
+  # must be delegated to the Cluster Agent.
   - name: a-cluster-agent-did-the-work
     role: objective
     check:
       type: worker_agents
       required_agents: ["cluster-.+"]
+  - name: platform-enumerated-cluster-profiles
+    role: objective
+    check:
+      type: tool_called
+      scope: workers
+      tool_names:
+        - mcp__platform_control__list_cluster_profiles
+        - mcp_platform_control_list_cluster_profiles
+      minimum_calls: 1
+      require_success: true
   - name: no-stubbed-profile-scripts
     role: objective
     check:
@@ -69,10 +82,14 @@ verification_spec:
       # run by path (`python3 /opt/data/scripts/cluster_agent_profile.py ...`),
       # quoted, with `--help`, or inside loops the worker writes, and neither
       # name has a use in a worker's terminal on an install where the stubs
-      # apply.
+      # apply. Additionally, the platform worker must not execute `kubectl` in
+      # its terminal to perform inline workload diagnostics — tenant workload
+      # debugging must be delegated to the cluster's Cluster Agent.
       type: worker_commands
       forbidden_patterns:
-        ['cluster_agent_profile\.py', 'kanban_notify_propagate\.py']
+        - 'cluster_agent_profile\.py'
+        - 'kanban_notify_propagate\.py'
+        - '(^|[;&|]\s*)kubectl\b'
   - name: rca-names-the-oom
     role: objective
     mode: assert
@@ -80,7 +97,7 @@ verification_spec:
       type: report_contains
       required_phrases: ["payments-api", "OOMKilled"]
   # Catastrophic safeguard: the platform worker must not perform inline workload
-  # diagnostics using GKE/audit MCP tools. Workload debugging on a cluster must
+  # diagnostics using in-pod diagnostic MCP tools. Workload debugging on a cluster must
   # be delegated to that cluster's Cluster Agent.
   - name: no-inline-platform-mcp-diagnostics
     role: safeguard
