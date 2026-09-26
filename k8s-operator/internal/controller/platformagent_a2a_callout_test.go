@@ -469,7 +469,7 @@ func TestTheSessionIdentityIsRenderedUnderNextAndRemovedUnderToday(t *testing.T)
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, discordBotSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()

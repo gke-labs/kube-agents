@@ -446,8 +446,9 @@ adapter's `verifiedBy: chat-event-topic-iam` and its allowed-users gate exactly 
 Chat adapter" section has them: the gate is the operator-pinned allowed-users set carried as
 environment, and the `verifiedBy` value names a project-IAM boundary, not a per-request proof. It
 lands in the same change that gives the gateway rendered under `next` the credential proxy's chat
-relay URL as its backend, so an install with Google Chat configured has a gateway that starts
-without a Discord Secret; a render that drops the relay URL leaves a gateway on the door alone,
+relay URL as its backend, and teaches the operator's own backend check the same (the render
+withholds a gateway it believes has no backend, `a2aGatewayBackend`), so an install with Google
+Chat configured has a gateway that is rendered and starts without a Discord Secret; a render that drops the relay URL leaves a gateway on the door alone,
 which the read route reports as inject-only and the stage's preflight fails as infrastructure
 before any case runs, the guard paragraph in stage 1 saying why the guard no longer catches it.
 And it settles the one-backend guard with the Slack adapter in flight, so the relay URL beside a
