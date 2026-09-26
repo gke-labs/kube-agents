@@ -9,9 +9,13 @@ package hermesbridge
 // `hooks.outbound` config entry POSTs every pre_tool_call and post_tool_call
 // to a URL, fire-and-forget through a bounded queue, signed with HMAC-SHA256
 // when the variable named by `secret_env` is set. The bridge listens on a
-// loopback address (the sidecar shares the pod's network namespace), and the
-// platform profile's config carries one entry pointing at it
-// (a2a/persona/platform/hooks.overlay.yaml, merged in only under mode: next).
+// loopback address (the sidecar shares the pod's network namespace), and
+// hands each child the entry through hermes's managed scope: a per-task
+// directory holding the operator's managed config.yaml and .env with a
+// hooks.outbound entry added, named by HERMES_MANAGED_DIR in the child's
+// environment. Only the bridge's children carry the hook, so a kanban
+// worker or cron tick under the same profile never POSTs anywhere, and a
+// pod with no bridge has nothing to POST at.
 //
 // Correlation is the signature. Nothing in the delivery names the A2A task:
 // hermes's own task_id is the kanban card or a fresh UUID, cwd and profile
@@ -38,33 +42,60 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"sigs.k8s.io/yaml"
+
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 const (
-	// DefaultActivityListen is the loopback address the door binds. It is
-	// the host:port in the profile's hooks.overlay.yaml, and a test pins the
-	// two to each other. The pod's other listeners are hermes's API server
+	// DefaultActivityListen is the loopback address the door binds; the
+	// URL each child is handed is whatever the door actually bound. The
+	// pod's other listeners are hermes's API server
 	// on 8642 and the agent-api-auth container on 8643 (bound on every
 	// interface, so a loopback bind there fails too), the dashboard on 9119;
 	// 8651 is clear of all of them.
 	DefaultActivityListen = "127.0.0.1:8651"
-	// ActivityPath is the door's one route; hooks.overlay.yaml names it too.
+	// ActivityPath is the door's one route.
 	ActivityPath = "/hermes/tool-events"
 	// ActivitySecretEnv is the variable hermes reads the signing key from
 	// (the `secret_env` of the hooks.outbound entry); the bridge sets it per
 	// child. In a single-profile CLI process hermes's secret scope falls
 	// through to the process environment, which is what makes this work.
 	ActivitySecretEnv = "A2A_ACTIVITY_SECRET"
-	// ActivityURLEnv tells the child where its deliveries go. hermes does
-	// not read it - the URL lives in its config - it is for the record and
-	// for test stubs standing in for hermes.
+	// ActivityURLEnv tells the child where its deliveries go. hermes reads
+	// the URL from the managed config the bridge writes; the variable is for
+	// the record and for test stubs standing in for hermes.
 	ActivityURLEnv = "A2A_ACTIVITY_URL"
+	// ManagedDirEnv is hermes's managed-scope override: a directory whose
+	// config.yaml is deep-merged per leaf over the profile's and whose .env
+	// is loaded last. The operator sets it on the agent container (and so
+	// on the sidecar) to /etc/hermes; the bridge points each child at its
+	// own copy with the hook added.
+	ManagedDirEnv = "HERMES_MANAGED_DIR"
+	// DefaultManagedDir is hermes's managed-scope default when the variable
+	// is unset, read only when the directory exists.
+	DefaultManagedDir = "/etc/hermes"
+	managedConfigFile = "config.yaml"
+	managedEnvFile    = ".env"
+	// The hooks.outbound entry the bridge writes for its child. The timeout
+	// is longer than activityPublishTimeout: the door publishes on the
+	// delivery, and a timed-out delivery is retried, which would be a
+	// duplicate call in the trace.
+	hookEntryName      = "a2a-bridge-activity"
+	hookTimeoutSeconds = 10
+	hooksKey           = "hooks"
+	hooksOutboundKey   = "outbound"
+	// childScopeDirMode: the copy carries the managed .env, credentials
+	// included, so it is the bridge's alone.
+	childScopeDirMode  = 0o700
+	childScopeFileMode = 0o600
 	// DefaultProgressInterval is the heartbeat cadence. The relay renders
 	// progress as one edited chat line, so this is one edit per minute.
 	DefaultProgressInterval = 60 * time.Second
@@ -79,8 +110,8 @@ const (
 	activityBodyCap = 1 << 20
 	// activityPublishTimeout bounds one artifact publish; the trace is
 	// telemetry and must never stall the run or the terminal. hermes waits
-	// on the delivery for hooks.overlay.yaml's timeout, which is longer, so
-	// a slow publish is not a retried (duplicated) delivery.
+	// on the delivery for the hook entry's timeout, which is longer, so a
+	// slow publish is not a retried (duplicated) delivery.
 	activityPublishTimeout = 5 * time.Second
 	// activityDrainTimeout bounds finalize's flush of the calls still open,
 	// so a slow bus cannot spend the terminal's budget.
@@ -127,15 +158,19 @@ const (
 // a Google OAuth access token, a Google API key, a GitHub token, a
 // user:password given to curl's -u, or a key that looks like a secret
 // followed by its value - with or without the quotes and spaces a JSON body
-// or a header puts around the separator. Anything else the model pastes
-// into a command line ships.
-// activityEntryBudget bounds the activity parts one task publishes. The
-// trace rides the task's own events subject, which the TASKS stream caps at
-// 4096 messages per subject with discard-old, so a run that published a part
-// per call without bound would evict its own submitted and working events and
-// read as never started. 3000 leaves room for the four lifecycle events, a
-// two-hour run's heartbeats (120 at the default interval), a chunked result
-// and the truncation marker. A variable only so a test can lower it.
+// or a header puts around the separator, and as a command-line flag with
+// its value after a space (--token v, --access-token v, --password v).
+// Anything else the model pastes into a command line ships, a bare -p v
+// included, since -p is a port as often as a password.
+// activityEntryBudget bounds the parts one task publishes on its trace and
+// its heartbeat together. Both ride the task's own events subject, which
+// the TASKS stream caps at 4096 messages per subject with discard-old, so a
+// run that published without bound - a looping persona, or a short
+// heartbeat interval under a long deadline - would evict its own submitted
+// and working events and read as never started. One counter for both
+// artifacts keeps the sum under the cap whatever the knobs say; 3000 leaves
+// room for the four lifecycle events, a chunked result and the truncation
+// marker. A variable only so a test can lower it.
 var activityEntryBudget = 3000
 
 var (
@@ -148,6 +183,7 @@ var (
 		regexp.MustCompile(`(?i)basic\s+[A-Za-z0-9+/=]{8,}`),
 		regexp.MustCompile(`(?i)(?:^|\s)(?:-u|--user)[\s=]+\S+:\S+`),
 		regexp.MustCompile(`(?i)(token|secret|password|passwd|api[_-]?key|credential)s?["']?\s*[=:]\s*["']?[^"'\s,}]+`),
+		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z-]*(token|secret|password|passwd|api[_-]?key|credential)s?\s+\S+`),
 	}
 )
 
@@ -200,7 +236,7 @@ type activityState struct {
 	openOrder []string                 // their ids, in start order
 	seen      map[string]struct{}      // delivery ids, so a hermes retry is one call
 	calls     int
-	published int // activity parts sent; the budget counts these
+	published int // trace and heartbeat parts sent; the budget counts these
 	dropped   int // calls past the budget, reported once at the terminal
 	lastTool  string
 	startedAt time.Time
@@ -233,14 +269,18 @@ func newActivityState(withKey bool) (*activityState, error) {
 	return a, nil
 }
 
-// childEnv is what the door adds to the hermes child's environment.
-func (a *activityState) childEnv(url string) []string {
+// childEnv is what the door adds to the hermes child's environment: the
+// signing key, the door's URL for the record, and the managed scope that
+// carries the hook. Last wins among duplicates in exec.Cmd.Env, so the
+// scope override replaces the sidecar's inherited one.
+func (a *activityState) childEnv(url, managedDir string) []string {
 	if a.key == "" {
 		return nil
 	}
 	return []string{
 		ActivitySecretEnv + "=" + a.key,
 		ActivityURLEnv + "=" + url,
+		ManagedDirEnv + "=" + managedDir,
 	}
 }
 
@@ -344,7 +384,7 @@ func (a *activityState) progressLine(now time.Time) string {
 	return line
 }
 
-// underBudget says whether the next activity part may go out, counting it
+// underBudget says whether the next trace part may go out, counting it
 // either way: past the budget the call is counted as dropped and reported
 // once by the marker finalize publishes. Caller holds run.mu, which is what
 // orders this against finalize's drain.
@@ -356,6 +396,18 @@ func (a *activityState) underBudget() bool {
 		return true
 	}
 	a.dropped++
+	return false
+}
+
+// heartbeatUnderBudget is underBudget for a progress part: past the budget
+// the heartbeat simply stops, uncounted - the marker counts calls.
+func (a *activityState) heartbeatUnderBudget() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.published < activityEntryBudget {
+		a.published++
+		return true
+	}
 	return false
 }
 
@@ -454,6 +506,58 @@ func redactValue(v any) any {
 	return v
 }
 
+// --- the child's managed scope ---
+
+// childManagedScope writes the per-task managed directory: the source scope's
+// config.yaml with the door's hooks.outbound entry added (appended to any the
+// source already carries) and its .env verbatim. Returns the directory; the
+// caller removes it once the child has exited.
+func (b *Bridge) childManagedScope(taskID string) (string, error) {
+	dir := filepath.Join(b.cfg.ScratchDir, taskID)
+	if err := os.MkdirAll(dir, childScopeDirMode); err != nil {
+		return "", fmt.Errorf("child scope dir: %w", err)
+	}
+	cfg := map[string]any{}
+	src := b.cfg.ManagedScopeDir
+	if src != "" {
+		if raw, err := os.ReadFile(filepath.Join(src, managedConfigFile)); err == nil {
+			if err := yaml.Unmarshal(raw, &cfg); err != nil {
+				return "", fmt.Errorf("managed config %s: %w", src, err)
+			}
+			if cfg == nil {
+				cfg = map[string]any{}
+			}
+		}
+		if raw, err := os.ReadFile(filepath.Join(src, managedEnvFile)); err == nil {
+			if err := os.WriteFile(filepath.Join(dir, managedEnvFile), raw, childScopeFileMode); err != nil {
+				return "", fmt.Errorf("child scope env: %w", err)
+			}
+		}
+	}
+	hooks, _ := cfg[hooksKey].(map[string]any)
+	if hooks == nil {
+		hooks = map[string]any{}
+	}
+	outbound, _ := hooks[hooksOutboundKey].([]any)
+	outbound = append(outbound, map[string]any{
+		"name":       hookEntryName,
+		"url":        b.ActivityURL(),
+		"events":     []any{hookPreToolCall, hookPostToolCall},
+		"secret_env": ActivitySecretEnv,
+		"timeout":    hookTimeoutSeconds,
+	})
+	hooks[hooksOutboundKey] = outbound
+	cfg[hooksKey] = hooks
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("child scope config: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, managedConfigFile), out, childScopeFileMode); err != nil {
+		return "", fmt.Errorf("child scope config: %w", err)
+	}
+	return dir, nil
+}
+
 // --- the door ---
 
 // listenActivity binds the door. Called from New so the address is known
@@ -533,9 +637,13 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	// observe under run.mu: it closes the call, and a finalize slipping in
+	// between the close and the publish would find nothing open to report
+	// and the entry would then be dropped as post-terminal - present in the
+	// trace neither as completed nor as interrupted.
 	act := run.act.Load()
+	run.mu.Lock()
 	if entry, ok := act.observe(d); ok {
-		run.mu.Lock()
 		if run.state == stateRunning {
 			if act.underBudget() {
 				b.publishActivityEntry(run, entry)
@@ -543,8 +651,8 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		} else {
 			b.cfg.Logger.Warn("activity delivery after the terminal; dropped", "task", run.origin.TaskID, "tool", entry.Tool)
 		}
-		run.mu.Unlock()
 	}
+	run.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -587,7 +695,7 @@ func (b *Bridge) runActivity(run *taskRun) {
 			return
 		case <-tick:
 			run.mu.Lock()
-			if run.state == stateRunning {
+			if run.state == stateRunning && a.heartbeatUnderBudget() {
 				b.publishProgress(run, a.progressLine(time.Now()))
 			}
 			run.mu.Unlock()
