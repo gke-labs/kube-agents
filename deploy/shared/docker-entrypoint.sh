@@ -21,9 +21,6 @@ umask 0002
 # come up; every other non-zero exit there is still fatal. Change both together.
 readonly SANDBOX_MIRROR_RETRY_RC=2
 readonly OTEL_FLAG_DISABLED="--disabled"
-# The bridge's webhook fragment, shipped beside the A2A skill tree; step 2.7
-# merges it into the platform profile only when step 2.6a-bis's probe says next.
-readonly A2A_HOOKS_OVERLAY="/opt/a2a-template/hooks.overlay.yaml"
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
@@ -1432,14 +1429,6 @@ sys.exit(0 if runtime_mode.is_next() else 1)
 A2A_PYEOF
 }
 
-# The probe's answer is also what step 2.7 gates the bridge's webhook fragment
-# on, so it is kept rather than recomputed: two probes would be two readers of
-# one decision, and a managed .env that changed between them would give the
-# skill and the hook different answers on the same boot. The fragment ships
-# in the same image as the skill tree (a COPY beside it in the Dockerfile),
-# so gating the probe on the skills directory covers both. Empty means today, or
-# undecided — either way 2.7 leaves the hook out, which is the safe side.
-A2A_MODE_NEXT=""
 if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
     # `|| rc=$?` keeps the non-zero answers out of set -e's reach — "today"
     # is a return value here, not a failure.
@@ -1450,7 +1439,6 @@ if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
         case $a2a_probe_rc in
             0)
                 a2a_overlay=/opt/a2a-template/skills
-                A2A_MODE_NEXT=1
                 echo "Next stack: overlaying the A2A topics skill into the platform profile"
                 ;;
             2)
@@ -1623,29 +1611,6 @@ fi
 # absent, overlays_for() finds no files, and apply_overlay reads that as "the operator
 # withdrew the overlay" and deletes every profile's last-applied record. A container that
 # cannot see what the operator rendered must not get to decide what the operator said.
-#
-# One profile takes one more file than the operator rendered: on the next stack the
-# platform profile also merges the bridge's webhook fragment ($A2A_HOOKS_OVERLAY,
-# gated by 2.6a-bis), which points Hermes' outbound hooks at the hermes-bridge
-# sidecar. It rides the SAME invocation as the operator's overlays, as an extra
-# --overlay, and that is load-bearing: profile_overlay.py keeps ONE last-applied
-# record per profile and undoes it before applying, so a second invocation would
-# first strip what the first one merged. Passing it here also gives it the same
-# lifecycle as an operator overlay — a boot that no longer passes it (a flip back
-# to today, or an image without the file) unapplies it from the record, whether or
-# not step 2.6 force-synced config.yaml that boot (it does not at the front door).
-#
-# The argument is conditional and this is POSIX sh, so the list is built with
-# `set --` inside a function, where the positional parameters are the function's
-# own; at top level that would clobber the command this script finally execs.
-merge_profile_overlays() {
-    _profile_dir=$1
-    set -- --profile-dir "$_profile_dir" --overlay-dir "$OVERLAY_DIR"
-    if [ "$(basename "$_profile_dir")" = "platform" ] && [ -n "${A2A_MODE_NEXT:-}" ] && [ -f "$A2A_HOOKS_OVERLAY" ]; then
-        set -- "$@" --overlay "$A2A_HOOKS_OVERLAY"
-    fi
-    "$INSTALL_DIR/.venv/bin/python3" "$OVERLAY_SCRIPT" "$@"
-}
 if [ -f "$OVERLAY_SCRIPT" ] && [ -d "$OVERLAY_DIR" ]; then
     # Every profile directory is reconciled — including ones with no overlay, so a
     # withdrawn overlay is undone rather than left applied. Which files apply to a given
@@ -1656,7 +1621,7 @@ if [ -f "$OVERLAY_SCRIPT" ] && [ -d "$OVERLAY_DIR" ]; then
     for d in "$TARGET_DIR"/profiles/*; do
         [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
         name=$(basename "$d")
-        merge_profile_overlays "$d" \
+        "$INSTALL_DIR/.venv/bin/python3" "$OVERLAY_SCRIPT" --profile-dir "$d" --overlay-dir "$OVERLAY_DIR" \
             || echo "WARN: overlay sync failed for profile '$name'; settings it carries will not apply" >&2
     done
 

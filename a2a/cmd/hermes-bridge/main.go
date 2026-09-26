@@ -114,6 +114,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		// The activity door (a2a/hermes-bridge/activity.go): on by default at
 		// the address the platform profile's hooks.overlay.yaml names.
 		ActivityListen:   activityListen(envOr("BRIDGE_ACTIVITY_LISTEN", hermesbridge.DefaultActivityListen)),
+		ScratchDir:       os.Getenv("BRIDGE_SCRATCH_DIR"),
 		ProgressInterval: progressInterval(envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)),
 		Logger:           log,
 	}

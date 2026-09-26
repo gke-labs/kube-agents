@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -78,6 +79,15 @@ type Config struct {
 	// to DefaultActivityListen; the zero value here is "off" so a bridge
 	// under test binds nothing it did not ask for.
 	ActivityListen string
+	// ManagedScopeDir is hermes's managed scope as this process sees it:
+	// the directory whose config.yaml and .env each child's own scope is
+	// copied from before the hook is added (activity.go). Empty takes
+	// $HERMES_MANAGED_DIR, else /etc/hermes when it exists, else nothing
+	// to copy.
+	ManagedScopeDir string
+	// ScratchDir holds the per-task managed scopes (default: hermes-bridge
+	// under the temp dir). Each is removed when its child exits.
+	ScratchDir string
 	// ProgressInterval is the heartbeat cadence on the progress artifact.
 	// Zero takes the default (60s), as every other field here does; a
 	// negative value turns the heartbeat off. The daemon maps its
@@ -114,6 +124,16 @@ func (c *Config) defaults() {
 	}
 	if c.ProgressInterval == 0 {
 		c.ProgressInterval = DefaultProgressInterval
+	}
+	if c.ManagedScopeDir == "" {
+		if v := strings.TrimSpace(os.Getenv(ManagedDirEnv)); v != "" {
+			c.ManagedScopeDir = v
+		} else if st, err := os.Stat(DefaultManagedDir); err == nil && st.IsDir() {
+			c.ManagedScopeDir = DefaultManagedDir
+		}
+	}
+	if c.ScratchDir == "" {
+		c.ScratchDir = filepath.Join(os.TempDir(), "hermes-bridge")
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -482,8 +502,14 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
 		return
 	}
-	if extra := act.childEnv(b.ActivityURL()); extra != nil {
-		cmd.Env = append(os.Environ(), extra...)
+	if b.activityLn != nil {
+		scope, err := b.childManagedScope(taskID)
+		if err != nil {
+			b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
+			return
+		}
+		defer os.RemoveAll(scope)
+		cmd.Env = append(os.Environ(), act.childEnv(b.ActivityURL(), scope)...)
 	}
 
 	run.mu.Lock()

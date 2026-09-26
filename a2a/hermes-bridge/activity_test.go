@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"sigs.k8s.io/yaml"
-
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -272,37 +270,60 @@ print("key=" + ("set" if KEY else "unset") + " url=" + ("set" if URL else "unset
 	}
 }
 
-// The profile's hook and the bridge's door are one contract in two files.
-func TestActivity_ProfileHookNamesTheDoor(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "persona", "platform", "hooks.overlay.yaml"))
-	if err != nil {
-		t.Fatalf("hooks.overlay.yaml: %v", err)
-	}
-	var cfg struct {
-		Hooks struct {
-			Outbound []struct {
-				Name      string   `json:"name"`
-				URL       string   `json:"url"`
-				Events    []string `json:"events"`
-				SecretEnv string   `json:"secret_env"`
-			} `json:"outbound"`
-		} `json:"hooks"`
-	}
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+// Each child gets its own managed scope: the source scope's config with the
+// door's hook added, its .env verbatim, named by HERMES_MANAGED_DIR, and
+// removed once the child has exited.
+func TestActivity_ChildGetsItsOwnManagedScope(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "config.yaml"), []byte("model:\n  default: pinned/model\nhooks:\n  outbound:\n    - name: theirs\n      url: https://audit.example/\n      events: [post_tool_call]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Hooks.Outbound) != 1 {
-		t.Fatalf("hooks.outbound has %d entries, want the bridge's one", len(cfg.Hooks.Outbound))
+	if err := os.WriteFile(filepath.Join(src, ".env"), []byte("PINNED_KEY=pinned-value\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	hook := cfg.Hooks.Outbound[0]
-	if want := "http://" + DefaultActivityListen + ActivityPath; hook.URL != want {
-		t.Fatalf("hook url = %q, bridge door = %q", hook.URL, want)
+	scratch := t.TempDir()
+	_, url := startServer(t)
+	b := startBridgeCfg(t, url, hermesStub(t, `
+d = os.environ["HERMES_MANAGED_DIR"]
+print("DIR=" + d)
+print(open(os.path.join(d, "config.yaml")).read())
+print("ENV=" + open(os.path.join(d, ".env")).read().strip())
+`), func(c *Config) { c.ManagedScopeDir = src; c.ScratchDir = scratch })
+	c := gatewayClient(t, url)
+	submit(t, c, "task-scope", "show your scope")
+	task := waitTerminal(t, c, "task-scope")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s", task.State)
 	}
-	if hook.SecretEnv != ActivitySecretEnv {
-		t.Fatalf("hook secret_env = %q, bridge sets %q", hook.SecretEnv, ActivitySecretEnv)
+	out := task.Artifact(lib.ArtifactResult).Parts[0].Text
+	want := filepath.Join(scratch, "task-scope")
+	if !strings.Contains(out, "DIR="+want) {
+		t.Fatalf("child scope dir: %s", out)
 	}
-	if strings.Join(hook.Events, ",") != hookPreToolCall+","+hookPostToolCall {
-		t.Fatalf("hook events = %v", hook.Events)
+	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "timeout: 10", "ENV=PINNED_KEY=pinned-value"} {
+		if !strings.Contains(out, needle) {
+			t.Fatalf("child scope lacks %q:\n%s", needle, out)
+		}
+	}
+	if _, err := os.Stat(want); !os.IsNotExist(err) {
+		t.Fatalf("child scope %s not removed after the task (err=%v)", want, err)
+	}
+}
+
+// Without a source scope the child still gets one, holding only the hook.
+func TestActivity_ChildScopeWithoutASourceHoldsOnlyTheHook(t *testing.T) {
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+d = os.environ["HERMES_MANAGED_DIR"]
+print(open(os.path.join(d, "config.yaml")).read())
+print("ENV_PRESENT=" + str(os.path.exists(os.path.join(d, ".env"))))
+`), func(c *Config) { c.ManagedScopeDir = filepath.Join(t.TempDir(), "absent"); c.ScratchDir = t.TempDir() })
+	c := gatewayClient(t, url)
+	submit(t, c, "task-scope-bare", "show your scope")
+	task := waitTerminal(t, c, "task-scope-bare")
+	out := task.Artifact(lib.ArtifactResult).Parts[0].Text
+	if !strings.Contains(out, "name: "+hookEntryName) || strings.Contains(out, "model:") || !strings.Contains(out, "ENV_PRESENT=False") {
+		t.Fatalf("bare scope = %s", out)
 	}
 }
 
@@ -452,9 +473,9 @@ func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
 }
 
 func TestRedactInput_ValuesUnderInnocentKeys(t *testing.T) {
-	in := `{"command": "curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' -u admin:hunter2 -d '{\"password\":\"hunter3\", \"token\": \"hunter4\"}' -H 'Authorization: Basic dXNlcjpodW50ZXIy' https://x; export GH=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345; gcloud --access-token=ya29.a0AfH6SMBxyzxyzxyzxyzxyzxyz ls", "plain": "kubectl get pods -n kube-system", "id": 9007199254740993}`
+	in := `{"command": "kubectl --token eyJhbGciOiJSUzI1NiIsImtpZCI6In0 get pods; gcloud x --password hunter5; curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' -u admin:hunter2 -d '{\"password\":\"hunter3\", \"token\": \"hunter4\"}' -H 'Authorization: Basic dXNlcjpodW50ZXIy' https://x; export GH=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345; gcloud --access-token=ya29.a0AfH6SMBxyzxyzxyzxyzxyzxyz ls", "plain": "kubectl get pods -n kube-system", "id": 9007199254740993}`
 	out := string(redactInput(json.RawMessage(in)))
-	for _, leaked := range []string{"abcdefghijklmnopqrstuvwxyz0123", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "ya29.a0AfH6SMB", "hunter2", "hunter3", "hunter4", "dXNlcjpodW50ZXIy"} {
+	for _, leaked := range []string{"abcdefghijklmnopqrstuvwxyz0123", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "ya29.a0AfH6SMB", "hunter2", "hunter3", "hunter4", "dXNlcjpodW50ZXIy", "eyJhbGciOiJSUzI1NiIsImtpZCI6In0", "hunter5"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
@@ -496,5 +517,29 @@ print("done")
 	trail := eventTrail(t, replayEvents(t, url, "task-budget"))
 	if trail[len(trail)-1] != "completed/final" || trail[len(trail)-2] != "result" || trail[len(trail)-3] != "activity" {
 		t.Fatalf("marker not ahead of the result: %v", trail)
+	}
+}
+
+// The heartbeat shares the budget: a short interval under a long run cannot
+// spend the subject either. Past the budget it simply stops, and the marker
+// counts calls, not heartbeats.
+func TestActivity_HeartbeatSharesTheBudget(t *testing.T) {
+	prev := activityEntryBudget
+	activityEntryBudget = 2
+	t.Cleanup(func() { activityEntryBudget = prev })
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+time.sleep(1.0)
+print("done")
+`), func(c *Config) { c.ProgressInterval = 50 * time.Millisecond })
+	c := gatewayClient(t, url)
+	submit(t, c, "task-heartbeat-budget", "wait")
+	task := waitTerminal(t, c, "task-heartbeat-budget")
+	progress := task.Artifact(lib.ArtifactProgress)
+	if progress == nil || len(progress.Parts) != 2 {
+		t.Fatalf("progress parts = %v, want exactly the budget (2)", progress)
+	}
+	if got := activityEntries(t, task); len(got) != 0 {
+		t.Fatalf("heartbeats produced a marker or entries: %+v", got)
 	}
 }

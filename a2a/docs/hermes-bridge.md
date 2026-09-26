@@ -221,11 +221,16 @@ its outbound webhooks: a `hooks.outbound` entry in the profile's config POSTs ev
 HMAC-SHA256 signed when the variable its `secret_env` names is set. The bridge listens
 for those on a loopback address in the pod (`BRIDGE_ACTIVITY_LISTEN`, default
 `127.0.0.1:8651`, clear of hermes's API server on 8642 and the agent-api-auth
-listener on 8643; `off` closes the door; any other value has to match the URL in the
-profile's hook, or hermes delivers to a port with nobody behind it), and the platform
-profile carries the entry pointing at it — `a2a/persona/platform/hooks.overlay.yaml`, which the entrypoint merges
-into the profile only under `mode: next`, because in `mode: today` there is no sidecar and
-every tool call would otherwise try a dead port twice and log a warning.
+listener on 8643; `off` closes the door) and hands each child the entry through hermes's
+managed scope: before spawning, it writes a per-task directory holding the operator's
+managed `config.yaml` with a `hooks.outbound` entry added (URL the door actually bound,
+`secret_env: A2A_ACTIVITY_SECRET`, appended to any entry the operator's own managed config
+carries) and the managed `.env` verbatim, and names it in the child's `HERMES_MANAGED_DIR`
+(the source is `$HERMES_MANAGED_DIR` as the sidecar sees it, else `/etc/hermes` when it
+exists; `BRIDGE_SCRATCH_DIR` is where the copies live, removed when the child exits). The
+hook therefore exists only in processes the bridge spawned: a kanban worker or cron tick
+under the same profile never POSTs anywhere, a pod with no bridge has nothing to POST at,
+and nothing about the profile's shipped config or the image changes for it.
 
 Nothing in a delivery names the A2A task: hermes's own `task_id` is the kanban card or a
 fresh UUID, `cwd` and `profile` are shared by every process under the profile, and the URL
@@ -233,9 +238,7 @@ does not expand environment variables. So the bridge gives each child a random k
 environment under `A2A_ACTIVITY_SECRET` (and the door's URL under `A2A_ACTIVITY_URL`, for
 the record; hermes reads the URL from its config), and a delivery belongs to whichever in-flight
 task's key verifies its signature — at most `BRIDGE_CONCURRENCY` keys to try. Unsigned or
-unmatched deliveries (kanban workers and cron ticks under the same profile) are answered
-204 and dropped, so they cost their sender nothing per call beyond one "deliveries will be
-UNSIGNED" line at its start.
+unmatched deliveries are answered 204 and dropped.
 
 What goes on the bus, one `data` part per invocation at `post_tool_call`, a superset of the
 worker adapter's `{"tool","input"}` so one fold reads both executors:

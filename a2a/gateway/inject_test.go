@@ -2230,13 +2230,13 @@ func TestInjectReadRouteReadsAFinishedTasksTraceByTaskID(t *testing.T) {
 	}
 }
 
-// TestInjectReadRouteOmitsTheTraceForAnUnknownTaskID: a task id the stream
-// has nothing for is the empty state, not a failure -- no activity key,
-// because no stream was read, and no error, because the gateway looked and
-// found nothing rather than failing to look. Both on a released
-// conversation, whose record knows no such task and falls back to its
-// current addressee, and on one that never had a turn, whose record does
-// not exist and which the probe does not read the bus for at all.
+// TestInjectReadRouteOmitsTheTraceForAnUnknownTaskID: a task id the record
+// never held is the empty state, not a failure -- no activity key, because
+// no stream was read (an id the conversation does not own is never
+// formatted into a subject), and no error, because the gateway looked at
+// its record and found nothing rather than failing to look. Both on a
+// released conversation, whose history knows no such task, and on one that
+// never had a turn, whose record does not exist.
 func TestInjectReadRouteOmitsTheTraceForAnUnknownTaskID(t *testing.T) {
 	r := startInjectRig(t)
 	reply := r.inject(t, "case-unknown-task", injectTestAuthor, "think quietly")

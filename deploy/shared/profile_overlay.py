@@ -122,43 +122,16 @@ _ABSENT = _Absent()
 def merge(base, overlay):
     """Recursive merge. Dicts merge, lists union (preserving order), scalars replace.
 
-    List union is what plugins.enabled wants: the image's built-ins plus whatever the
-    operator adds. It is deploy/docker/merge_configs.py's rule extended to items that
-    are not hashable (see _union).
+    List union matches deploy/docker/merge_configs.py, and is what plugins.enabled
+    wants: the image's built-ins plus whatever the operator adds.
     """
     if isinstance(base, dict) and isinstance(overlay, dict):
         for k, v in overlay.items():
             base[k] = merge(base[k], v) if k in base else v
         return base
     if isinstance(base, list) and isinstance(overlay, list):
-        return _union(base, overlay)
+        return list(dict.fromkeys(base + overlay))
     return overlay
-
-
-def _union(base, overlay):
-    """base + overlay, first occurrence wins, order kept - dict.fromkeys for lists whose
-    items may be unhashable. `hooks.outbound` is a list of mappings; a mapping in a
-    set-keyed union raises, and one raise here used to fail the whole profile's merge,
-    taking the operator's own settings down with the entry that tripped it."""
-    seen = set()
-    out = []
-    for item in base + overlay:
-        try:
-            key = ("h", item)
-            hash(key)
-        except TypeError:
-            try:
-                key = ("j", json.dumps(item, sort_keys=True, default=str))
-            except TypeError:
-                # A mapping whose keys will not sort or serialise (a bare
-                # `on:` read as a bool beside a string key): keep it rather
-                # than fail the merge, at the cost of not deduplicating it.
-                key = ("r", repr(item))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-    return out
 
 
 def unapply(current, applied, before=_ABSENT):
