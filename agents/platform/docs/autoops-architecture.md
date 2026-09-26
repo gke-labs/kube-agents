@@ -432,9 +432,13 @@ static filters).
 
 The adapter is now built end to end — ingestion, classification, the `managedFields` join across
 every cluster the Platform Agent has onboarded, and the inject itself — and the daemon routes the
-kind to its own chat alert and its own triage card. It stays a candidate rather than going live for
-one reason: no image builds or launches the detector, so an operator runs it by hand and no
-installation detects drift on its own. What the domain is waiting on is deployment, not design.
+kind to its own chat alert and its own triage card. The agent images now carry the detector and the
+credential proxy's entrypoint starts it, so what an install still needs is
+`spec.harness.driftDetector.enabled` set on its `PlatformAgent` and the `drift-pubsub` Terraform
+module applied. Only the first is a start gate: without it the detector ships and does not run,
+while enabling it without the module gives a detector that runs and retries a pull that cannot
+succeed. Either way no drift is detected. What the domain is waiting on is that provisioning, not
+design.
 
 **Obtainability governance — the same two contracts.** A completely different domain, engineered
 independently, arrived at the same shape. It also closes the quota and capacity gap that previously

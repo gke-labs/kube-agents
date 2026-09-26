@@ -154,6 +154,46 @@ variable "scoped_clusters" {
   default  = []
 }
 
+variable "scope" {
+  description = <<-EOT
+    The GCP projects beyond project_id whose GKE clusters the Cluster Agent
+    reconcile enumerates, and what it leaves unmanaged: `spec.scope` on the
+    PlatformAgent CR, declared once here and reaching both halves of the
+    install from this one value. The kube-agents-iam module binds its read
+    allowlist (scope_roles: the read subset of the default project roles,
+    intersected with the roles the host project got) in each project, and the
+    chart renders the same object into the CR, so the IAM and the declaration
+    cannot name different projects, and the bindings exist before the CR that
+    declares them is written (the module refuses the plan when the host role
+    set carries neither of the two roles that list and get clusters). Ordering
+    is not propagation: a first install's one-shot inventory sweep may name a
+    scoped project as denied, and the hourly reconcile creates its profiles
+    once the grant has propagated.
+
+    Empty, the default, binds nothing and renders a scope block with empty
+    lists, which declares that the management project alone is in scope.
+    Removing a project from `projects` on a later apply revokes its bindings
+    and retires its Cluster Agent profiles over the reconcile's next two clean
+    runs. `exclude.projects` takes project IDs or shell-style globs;
+    `exclude.clusters` names single clusters by the full triple, because a
+    cluster name is unique only within a project and location. Neither
+    exclusion changes IAM. Folders and organisations are not inputs yet.
+  EOT
+  type = object({
+    projects = optional(list(string), [])
+    exclude = optional(object({
+      projects = optional(list(string), [])
+      clusters = optional(list(object({
+        project_id   = string
+        location     = string
+        cluster_name = string
+      })), [])
+    }), {})
+  })
+  nullable = false
+  default  = {}
+}
+
 variable "agent_service_account_id" {
   description = "IAM service account ID for the agent's GSA. The module default (kubeagents-platform-gsa) is one fixed name per project, so a second install in the same project must set its own — the collision otherwise surfaces as alreadyExists halfway through the second install's first apply. Null selects the module default. Two limits before relying on it: the vertex_ai and github-minter paths create their own fixed-name GSAs, named by litellm_service_account_id and github_minter_service_account_id rather than by this variable (the minter's authorization rule does track this one — the composition passes the resulting email as githubMinter.allowedServiceAccount), and the Workload Identity binding is keyed on namespace/KSA rather than on a cluster, so a distinct GSA name un-collides creation, not identity: set agent_ksa_name too, or installs sharing the agent namespace can each mint the other's tokens."
   type        = string

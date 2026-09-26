@@ -35,10 +35,10 @@
 # "-<slot>" segment, so the prefix and the location stay the Terraform's
 # business.
 #
-# A cluster that cannot be reached -- including a leased project where the
-# stack was never applied at all, which is a live possibility while the pool is
-# being filled out -- leaves its roles' files ABSENT rather than stale or
-# wrong, and this script still exits 0. That is deliberate: the verifier turns a
+# A cluster that cannot be reached leaves its roles' files ABSENT rather than
+# stale or wrong, and this script still exits 0. (A leased project where the
+# stack was never applied has no reader account either, so it stops at the
+# credential gate below instead.) That is deliberate: the verifier turns a
 # missing file into `status: "error"` naming the role AND the project, which
 # fails exactly the checks that needed that cluster instead of the whole job,
 # and it never falls back to the ambient kubeconfig -- falling back is the bug
@@ -68,9 +68,20 @@
 #   FLEET_CATALOG             path to fixtures.json
 #   BENCH_FLEET_KUBECONFIG_DIR  where to write; defaults under TMPDIR
 #   FLEET_READONLY_SA         service account to mint a read-only token for
+#   FLEET_ALLOW_RUNNER_CREDENTIAL  1 to run without FLEET_READONLY_SA on a
+#                             fleet only you use (the files then carry your
+#                             own credential; the script says so). The CI
+#                             scripts refuse it in a Prow job.
+#   FLEET_MINT_RETRY_SECONDS  wait between the gate's mint attempts (default
+#                             5; tests set 0)
 #
 # Output: exports BENCH_FLEET_KUBECONFIG_DIR when sourced; prints it on stdout
 # when executed. Everything else this script says goes to stderr.
+#
+# Exit status: 0; 1 for bad inputs, a malformed catalog or a temp file that
+# could not be made; _FLEET_EXIT_READONLY_UNAVAILABLE (3) when the read-only
+# credential is unset or cannot be minted -- the output directory is removed
+# and nothing is written then.
 # ==============================================================================
 
 _FLEET_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -79,6 +90,19 @@ _FLEET_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # caller-supplied path is otherwise one typo'd BENCH_FLEET_KUBECONFIG_DIR away
 # from deleting something that matters.
 _FLEET_MARKER=".kube-agents-fleet-kubeconfigs"
+
+# Read-only credential unset or unmintable. Distinct from 1 so ci-eval-pr.sh
+# stops on this and still only warns on an unusable catalog or directory.
+_FLEET_EXIT_READONLY_UNAVAILABLE=3
+# The gate's one mint is retried on a transient: in the eval it runs 20-30
+# minutes into a leased job, after the deploy already proved the binding, and
+# a one-off IAM blip there would end a three-hour run charged to the branch.
+# The checks' own mints retry inside the verifier's poll loop, so the gate
+# should be no stricter than they are. A PERMISSION_DENIED is not retried:
+# it is the binding, and it will not change in fifteen seconds.
+_FLEET_MINT_ATTEMPTS=3
+_FLEET_MINT_RETRY_SECONDS="${FLEET_MINT_RETRY_SECONDS:-5}"
+_FLEET_MINT_DENIED_PATTERN="PERMISSION_DENIED"
 
 # The exec-credential plugin each rewritten kubeconfig points at, and the
 # schema its reply speaks. Absolute, because kubectl resolves `command`
@@ -254,38 +278,18 @@ _fleet_discover_clusters() {
 # that read these kubeconfigs start hours after this runs, so a baked token
 # would be expired for most of them; the file carries an exec entry pointing at
 # fleet-reader-credential.sh instead, which mints against the clock of the check
-# and caches between them. The mint below still happens, and is still what
-# decides whether the file is rewritten at all: it proves the caller can
-# actually impersonate $2 before the credential is committed to, so a project
-# missing the token-creator binding warns here and keeps its own credential
-# rather than producing a kubeconfig that fails later, one check at a time.
+# and caches between them. Nothing is minted here: the gate above proved the
+# caller can impersonate $2, and this only reads gcloud's server and CA and
+# writes the exec entry.
 #
 # The replacement file is composed from scratch and moved into place, so a
-# failure at any step leaves the gcloud-written credential intact rather than a
-# context wired to a user that does not exist. It is composed with a here-doc
+# failure at any step leaves the gcloud-written file whole for the caller to
+# remove, rather than a context wired to a user that does not exist. It is composed with a here-doc
 # rather than `kubectl config set-credentials --token=...` because that form
 # puts a live bearer token in argv, where `ps` and `set -x` can both read it.
 _fleet_use_readonly_token() {
   local kubeconfig="$1" sa="$2"
-  local token server ca errors staged
-  errors="$(mktemp)" || return 1
-  # NOT 2>&1. On the SUCCESS path gcloud prints "WARNING: This command is using
-  # service account impersonation..." to stderr; folding that into stdout makes
-  # $token a multi-line blob that set-credentials still accepts, and every
-  # subsequent API call 401s while this script reports success.
-  token="$(gcloud auth print-access-token --impersonate-service-account="$sa" 2>"$errors")" || {
-    echo "WARNING: could not mint a read-only token for ${sa}: $(tr '\n' ' ' <"$errors")" >&2
-    rm -f "$errors"
-    return 1
-  }
-  rm -f "$errors"
-  # Belt and braces for the same failure: an OAuth2 bearer token is a run of
-  # unreserved characters, so anything with whitespace or punctuation in it is
-  # diagnostic text that leaked into stdout, not a credential.
-  if [ -z "$token" ] || printf '%s' "$token" | LC_ALL=C grep -q '[^A-Za-z0-9._~+/=-]'; then
-    echo "WARNING: what gcloud returned for ${sa} is not a bare access token; refusing to write it" >&2
-    return 1
-  fi
+  local server ca staged
 
   server="$(KUBECONFIG="$kubeconfig" kubectl config view --raw --minify \
     -o jsonpath='{.clusters[0].cluster.server}')" || return 1
@@ -334,6 +338,94 @@ _fleet_use_readonly_token() {
   return 0
 }
 
+# The reader bench/tf/fleet provisions in $1, the one default every CI caller
+# shares (hack/ci-deploy.sh's pre-flight and hack/ci-eval-pr.sh's export).
+_fleet_default_reader() {
+  printf 'seeded-fleet-reader@%s.iam.gserviceaccount.com' "$1"
+}
+
+# What a CI script should export as FLEET_READONLY_SA for a run in $1: the
+# value already set wins; otherwise nothing when the caller opted into its own
+# credential (a developer running these scripts against a project of their
+# own, where roles/owner cannot impersonate the reader), else the default. An
+# empty result is what lets the gate honour the opt-in, since it consults
+# FLEET_ALLOW_RUNNER_CREDENTIAL only when no account is named.
+_fleet_reader_for_run() {
+  if [ -n "${FLEET_READONLY_SA:-}" ]; then
+    printf '%s' "$FLEET_READONLY_SA"
+  elif [ "${FLEET_ALLOW_RUNNER_CREDENTIAL:-}" = "1" ]; then
+    printf ''
+  else
+    _fleet_default_reader "$1"
+  fi
+}
+
+# A Prow job: JOB_NAME or PULL_NUMBER set, the signal hack/ci-deploy.sh
+# derives IS_PROW_RUN from. The gate's message and the opt-in refusal below
+# both turn on it.
+_fleet_under_prow() {
+  [ -n "${JOB_NAME:-}" ] || [ -n "${PULL_NUMBER:-}" ]
+}
+
+# The opt-in is for a developer's own fleet. In a Prow job it would quietly
+# restore, for every leased run, the write-credential fallback the gate
+# replaces, so the CI scripts refuse it before choosing a reader.
+_fleet_refuse_opt_in_under_prow() {
+  if _fleet_under_prow && [ "${FLEET_ALLOW_RUNNER_CREDENTIAL:-}" = "1" ]; then
+    echo "ERROR: FLEET_ALLOW_RUNNER_CREDENTIAL=1 is set in a Prow job. The opt-in is for a developer's own fleet; a leased run reads the shared fleet as its reader or not at all. Remove it from the job's environment." >&2
+    return 1
+  fi
+  return 0
+}
+
+# An OAuth2 bearer token is a run of unreserved characters; anything else is
+# gcloud's stderr leaked into stdout.
+_fleet_bare_token() {
+  [ -n "$1" ] && ! printf '%s' "$1" | LC_ALL=C grep -q '[^A-Za-z0-9._~+/=-]'
+}
+
+# Refuse to write kubeconfigs that would carry the caller's own credential.
+# The runner's identity holds container.admin on a fleet every open PR shares,
+# so a check made with it proves nothing; the old warn-and-fall-back ran
+# unread on two pool projects for a day. This is the one mint: the binding is
+# per account, not per cluster, so it settles every slot before anything is
+# written, and the per-file rewrite below mints nothing.
+# FLEET_ALLOW_RUNNER_CREDENTIAL=1 opts out, for a fleet only you use.
+_fleet_require_readonly_credential() {
+  local sa="$1" project="$2" errors token
+  if [ -z "$sa" ]; then
+    [ "${FLEET_ALLOW_RUNNER_CREDENTIAL:-}" = "1" ] && return 0
+    echo "ERROR: FLEET_READONLY_SA is unset; refusing to write kubeconfigs that carry the runner's own credential, which can WRITE to the shared fleet. Set FLEET_READONLY_SA=$(_fleet_default_reader "$project"), or FLEET_ALLOW_RUNNER_CREDENTIAL=1 on a fleet only you use." >&2
+    return "$_FLEET_EXIT_READONLY_UNAVAILABLE"
+  fi
+  errors="$(mktemp)" || return 1
+  local attempt=1
+  while ! token="$(gcloud auth print-access-token --impersonate-service-account="$sa" 2>"$errors")"; do
+    if [ "$attempt" -lt "$_FLEET_MINT_ATTEMPTS" ] && ! grep -q "$_FLEET_MINT_DENIED_PATTERN" "$errors"; then
+      attempt=$((attempt + 1))
+      sleep "$_FLEET_MINT_RETRY_SECONDS"
+      continue
+    fi
+    # One message, owned here: the callers add no repair of their own. A job
+    # is told the pool repair; a laptop is not, since off Prow the mint fails
+    # because the operator's account cannot impersonate the reader, which is
+    # not a defect in the project.
+    if _fleet_under_prow; then
+      echo "ERROR: cannot mint a read-only token as ${sa}: $(tr '\n' ' ' <"$errors"). Nothing written. Grant this job's identity roles/iam.serviceAccountTokenCreator on that account: re-apply bench/tf/fleet against ${project}, or bind it by hand." >&2
+    else
+      echo "ERROR: cannot mint a read-only token as ${sa}: $(tr '\n' ' ' <"$errors"). Nothing written. Off Prow that is usually this account lacking roles/iam.serviceAccountTokenCreator on it (roles/owner does not include it); a pool project's fleet is read from Prow. On a fleet only you use, unset FLEET_READONLY_SA and set FLEET_ALLOW_RUNNER_CREDENTIAL=1." >&2
+    fi
+    rm -f "$errors"
+    return "$_FLEET_EXIT_READONLY_UNAVAILABLE"
+  done
+  rm -f "$errors"
+  if ! _fleet_bare_token "$token"; then
+    echo "ERROR: gcloud returned something other than a bare access token for ${sa}; nothing written." >&2
+    return "$_FLEET_EXIT_READONLY_UNAVAILABLE"
+  fi
+  return 0
+}
+
 write_fleet_kubeconfigs() {
   local catalog project dir sa
   catalog="${FLEET_CATALOG:-${_FLEET_SCRIPT_DIR}/../bench/tf/fleet/fixtures.json}"
@@ -377,6 +469,10 @@ write_fleet_kubeconfigs() {
     return 1
   fi
   rm -rf "$dir"
+  # After the rm: a refused run must not leave a previous run's files --
+  # credentials for a previous project -- where a caller that still exports
+  # BENCH_FLEET_KUBECONFIG_DIR would read them.
+  _fleet_require_readonly_credential "$sa" "$project" || return $?
   (umask 077 && mkdir -p "$dir/clusters") || return 1
   : >"${dir}/${_FLEET_MARKER}"
   # So a check that cannot resolve its role can name the project it was looking
@@ -420,7 +516,11 @@ write_fleet_kubeconfigs() {
     fi
     rm -f "$errors"
     if [ -n "$sa" ] && ! _fleet_use_readonly_token "$slot_config" "$sa"; then
-      echo "WARNING: ${cluster} kubeconfig keeps the runner's own credential; FLEET_READONLY_SA=${sa} could not be used" >&2
+      # The mint passed the gate, so this is gcloud's kubeconfig being
+      # unreadable. Drop it: a role file is a read-only credential or absent.
+      echo "WARNING: ${cluster} kubeconfig could not be rewritten to ${sa}; dropped. Every check naming a role on slot '${slot}' will report status=error." >&2
+      rm -f "$slot_config"
+      continue
     fi
     chmod 600 "$slot_config"
     # Which cluster each resolved slot IS, for hack/fleet-fixture-state.py:
@@ -432,7 +532,7 @@ write_fleet_kubeconfigs() {
   done <<<"$discovered"
 
   if [ "$labelled" -eq 0 ]; then
-    echo "WARNING: project ${project} carries no clusters labelled environment=seeded,managed-by=kube-agents-seeded-fleet. If the pool leased a project the fleet stack was never applied to, apply bench/tf/fleet/ there; until then every fleet check in this run reports status=error." >&2
+    echo "WARNING: project ${project} carries no clusters labelled environment=seeded,managed-by=kube-agents-seeded-fleet. Apply bench/tf/fleet/ there (an apply that made the reader account but no clusters reads like this); until then every fleet check in this run reports status=error." >&2
   elif [ "$found" -eq 0 ]; then
     # Clusters are there and labelled; not one of them resolved. Telling this
     # operator to apply the stack would send them to re-create what already

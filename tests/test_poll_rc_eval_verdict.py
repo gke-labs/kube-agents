@@ -712,6 +712,29 @@ class PollTest(unittest.TestCase):
         self.assertEqual(build_id, "100")
         self.assertGreater(clock.t, 45 * 60)
 
+    def test_a_timeout_keeps_the_build_link_when_the_build_drops_out_of_the_listing(self):
+        """The link is remembered from the sweep that saw it, not read off the last one.
+
+        A TIMEOUT is reached from whichever sweep happened to cross the deadline,
+        and that sweep need not have found anything: an archive that goes
+        unreadable, or a build that ages out of the scan window, sends scan_once
+        down its never-ran path with no prefix to return. Taking the prefix from
+        there reports a TIMEOUT whose summary carries no link to the build that
+        timed out — the single thing an operator needs from it, since the whole
+        advice for a TIMEOUT is to go and read that build.
+        """
+        running = {"100": build(running=True)}
+        (verdict, build_id, base), _ = self._poll(
+            [running, {}],
+            appear_deadline_minutes=45,
+            deadline_minutes=330,
+            interval_seconds=1800,
+        )
+        self.assertEqual(verdict, poller.VERDICT_TIMEOUT)
+        self.assertEqual(build_id, "100")
+        self.assertIsNotNone(base)
+        self.assertIn("100", base)
+
     def test_a_listing_outage_outlasting_the_short_clock_reports_never_ran(self):
         """The appearance clock runs whether or not the bucket is readable.
 

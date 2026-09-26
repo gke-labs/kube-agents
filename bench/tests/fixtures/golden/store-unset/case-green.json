@@ -11,6 +11,7 @@
   "notes": [],
   "passes": 3,
   "scored": 3,
+  "not_applicable": 0,
   "pass_rate": 1.0,
   "judged_means": {
     "OutcomeValidity": {
@@ -42,7 +43,8 @@
         "OutcomeScore": 1.0
       },
       "latency": 46.67580479523167,
-      "total_tokens": 135281
+      "total_tokens": 135281,
+      "not_applicable_checks": []
     },
     {
       "index": 2,
@@ -59,7 +61,8 @@
         "OutcomeScore": 1.0
       },
       "latency": 47.00481715425849,
-      "total_tokens": 135195
+      "total_tokens": 135195,
+      "not_applicable_checks": []
     },
     {
       "index": 3,
@@ -76,7 +79,8 @@
         "OutcomeScore": 1.0
       },
       "latency": 46.67580479523167,
-      "total_tokens": 135281
+      "total_tokens": 135281,
+      "not_applicable_checks": []
     }
   ],
   "admission_reason": "admitted by BOOTSTRAP_ADMITTED (transition bridge)",

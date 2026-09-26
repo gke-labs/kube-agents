@@ -675,7 +675,9 @@ main() {
   print_info "Upgrade Mode: ${C_BOLD}${PARAM_UPGRADE_MODE}${C_RESET}"
   print_info "Target Image Tag: ${C_BOLD}${PARAM_IMAGE_TAG}${C_RESET}"
 
-  local required_tools=(gcloud kubectl helm)
+  # python3: installer_common's state readers and the pre-apply scope check
+  # compare JSON with it.
+  local required_tools=(gcloud kubectl helm python3)
   # jq: the harness step's plugin re-tag reads the release's values with it,
   # and the post-upgrade image check that harness and full modes run has
   # needed it all along. The operator step does neither.
@@ -882,16 +884,6 @@ main() {
     backfill_sandbox_ssh_key "$target_namespace"
   fi
 
-  # Helm never touches the crds/ directory on upgrade — that is Helm's own
-  # documented behaviour, and the Terraform helm provider inherits it — so CRD
-  # schema changes are applied here first, for every mode that rolls the
-  # operator. Server-side apply, because these objects are large and have had
-  # several owners.
-  apply_crd_upgrades() {
-    print_info "Applying CRD updates from charts/kube-agents/crds..."
-    kubectl apply --server-side --force-conflicts -f "${repo_dir}/charts/kube-agents/crds/" >/dev/null
-  }
-
   # The chart-only fast path: a mode that moves no GCP resource re-tags the
   # images it owns on the live release and leaves the rest of the values as
   # they are. The regenerated tfvars carry the same new tag, so the next full
@@ -948,6 +940,8 @@ main() {
 
   if [ "$PARAM_PLAN" = "true" ]; then
     print_step "4. Planning (read-only)"
+    # A plan applies nothing, so the scope check speaks and does not refuse.
+    refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"
     print_info "Comparing this checkout's composition against the install's Terraform state."
     local plan_status=0
     run_lifecycle "${repo_dir}/terraform/examples/full-install" \
@@ -977,7 +971,7 @@ main() {
   case "$PARAM_UPGRADE_MODE" in
     operator)
       print_step "4. Upgrading Kubernetes Operator (CRDs & Controller Manager)"
-      apply_crd_upgrades
+      apply_crd_upgrades "$repo_dir"
       helm_retag "operator.image.tag"
       print_success "Kubernetes Operator upgraded successfully!"
       ;;
@@ -1000,7 +994,14 @@ main() {
 
     full)
       print_step "4. Executing Full Atomic Upgrade (Terraform + Helm)"
-      apply_crd_upgrades
+      # First in this arm, so a refusal applies nothing and leaves the served
+      # schema as it was (the credentials fetch, the Secret backfills and a
+      # pending release's rollback above have run): the apply renders
+      # spec.scope from install.env over
+      # the live CR, and a scope the CR carries that neither the release
+      # record nor the keys account for is refused here rather than replaced.
+      refuse_apply_over_undeclared_scope "$target_namespace" || exit 1
+      apply_crd_upgrades "$repo_dir"
       # install.sh's post-generation minter guard, without its import step:
       # an upgrade never imports the App key, so an install.env that enables the
       # minter against a key with no ENABLED version would wedge the apply on

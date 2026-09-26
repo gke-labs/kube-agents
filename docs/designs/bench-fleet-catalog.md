@@ -246,17 +246,16 @@ nightly's, and to the CI health bot, so an apply lets `hack/fleet-kubeconfigs.sh
 impersonate the reader. A
 check on such a project cannot write what it grades.
 
-No pool project is in that state yet. Every one had its fleet applied before that
-default landed, so the impersonation fails, `hack/fleet-kubeconfigs.sh` warns per
-cluster, and the safeguards read under the runner's own credential like everything else.
-gke-labs/kube-agents#903 tracks the per-project re-apply that closes it.
+A project without it does not read the fleet at all: `hack/fleet-kubeconfigs.sh` writes nothing, exits 3, and
+`hack/ci-eval-pr.sh` stops the run at its fleet step rather than grading under the
+runner's own credential.
 
 What is not narrowed is the harness. `hack/ci-eval-pr.sh` runs as
 `prowjob-default-sa@kube-agents-prow`, which holds `container.admin` and eleven other
 project roles in every pool project (`PROW_RUNNER_ROLES` in
 `scripts/verify_ci_pool_project.py`), with no RBAC narrowing it inside the clusters. That
-is the credential the reader replaces, and until the re-apply it is the one every fleet
-check reads under.
+is the credential the reader replaces; the runner refuses to write a role kubeconfig that
+would carry it.
 
 The agent under test is a different identity, and it is already narrow.
 `kubeagents-platform-gsa@<project>` holds the eight read-only roles in

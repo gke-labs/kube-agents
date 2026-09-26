@@ -1,139 +1,46 @@
 ---
-title: Kustomize
-description: What ships in deploy/kustomize/ and what the operator lays down on top of it.
+title: Network policies and Service
+description: The gateway NetworkPolicy and the Service the operator renders for the Platform Agent, and how to adjust the CIDRs they carry.
 sidebar:
   order: 1
 ---
 
-The shipping Kustomize base at [`deploy/kustomize/`](https://github.com/gke-labs/kube-agents/tree/main/deploy/kustomize) is intentionally small — the operator lays down most of the concrete Kubernetes objects (`Deployment`, `ConfigMap`s, RBAC) itself when it reconciles a `PlatformAgent` CR.
+The operator lays down every concrete Kubernetes object for the Platform Agent — the `Deployment`, `ConfigMap`s, RBAC, the `Service` and the `NetworkPolicy` — when it reconciles a `PlatformAgent` CR. No static copy of the Service or the network policies ships in the repository: the objects below exist only as the operator renders them, and each carries an owner reference to the CR that produced it. The remote Kustomize base that used to ship at `deploy/kustomize/platform` is gone; an overlay that still lists it as a resource fails to build, and the fix is to drop that resource, because the gateway policy and Service the operator renders already cover what it applied.
 
-## What's in the repo today
+## The gateway NetworkPolicy
 
-```text
-deploy/
-├── docker/
-│   ├── Dockerfile              # multi-target Dockerfile (see Docker images)
-│   ├── cloudbuild.yaml
-│   └── merge_configs.py
-├── kustomize/
-│   ├── gke-dataplane-v2/       # GKE Dataplane V2 FQDN network policy overlay
-│   │   ├── fqdn-networkpolicy.yaml
-│   │   └── kustomization.yaml
-│   └── platform/
-│       ├── kustomization.yaml                 # Kustomize entrypoint
-│       ├── networkpolicy-apiserver-egress.yaml # Egress policy for Kubernetes Control Plane
-│       ├── networkpolicy-core-egress.yaml      # Egress policy for DNS and GCP Metadata
-│       ├── networkpolicy-external-egress.yaml  # Egress policy for External HTTPS CIDRs
-│       ├── networkpolicy-ingress.yaml          # Ingress policy for Hermes API & Dashboard
-│       ├── networkpolicy-internal-egress.yaml  # Egress policy for LiteLLM, vLLM, Minty, OTel
-│       └── service.yaml                       # ClusterIP Service for the Platform Agent
-└── shared/
-    ├── docker-entrypoint.sh
-    ├── envoy-credential-proxy.yaml
-    ├── start-services.sh
-    └── defaults/config.yaml
-```
+The operator renders one `NetworkPolicy` over the agent Pod, `<agent-name>-gateway-netpol`, covering:
 
-The Kustomize surface at [`deploy/kustomize/platform/`](https://github.com/gke-labs/kube-agents/tree/main/deploy/kustomize/platform) includes the base Service and modular network isolation policies:
+- **Ingress** — the Hermes API (`8642`), the credential proxy (`8643`) and, when `harness.hermes.dashboardEnabled` is set, the dashboard (`9119`), from Pods in the agent's own namespace.
+- **DNS and metadata egress** — CoreDNS and NodeLocal DNSCache, the cluster's DNS ClusterIP, and the GCP metadata server (`169.254.169.254/32` and `169.254.169.252/32`). The metadata address is also a DNS peer, on port `53` alone, because it is the resolver on a [Cloud DNS for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/cloud-dns) cluster.
+- **In-cluster egress** — LiteLLM, vLLM, the GitHub token minter, Hindsight and the managed OTel collector.
+- **Control-plane egress** — the Kubernetes API server, at the endpoints the operator discovers.
+- **External egress** — HTTPS (`443`) to `0.0.0.0/0` minus the private ranges, unless FQDN filtering is on.
 
-- [`networkpolicy-ingress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-ingress.yaml) — Explicitly allowlists required Ingress ports (`8642`, `8643`, `9119`) from within the namespace.
-- [`networkpolicy-core-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-core-egress.yaml) — Egress for CoreDNS/NodeLocal DNS and GCP Workload Identity / Metadata server (`169.254.169.254/32` and `169.254.169.252/32`). The metadata address is also a DNS peer, on port `53` alone, because it is the resolver on a [Cloud DNS for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/cloud-dns) cluster.
-- [`networkpolicy-internal-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-internal-egress.yaml) — Egress for in-cluster services (LiteLLM, vLLM Gemma, GitHub Token Minter, and GKE Managed OTel Collector).
-- [`networkpolicy-apiserver-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-apiserver-egress.yaml) — Egress to the Kubernetes Control Plane API Server (`10.96.0.1/32`).
-- [`networkpolicy-external-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-external-egress.yaml) — Egress to external HTTPS endpoints (`0.0.0.0/0:443`) with RFC 1918 exclusions to prevent lateral movement.
-- [`service.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/service.yaml) — ClusterIP Service for the Platform Agent.
+[Security and IAM](/kube-agents/reference/security-and-iam/) is canonical for the full rule set and why each peer is there. `spec.networkPolicy.enabled: false` stops policy generation and deletes the policies the operator manages; [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specnetworkpolicy) is canonical for that field.
 
 ### GKE Dataplane V2 & FQDN Network Policies
 
 > [!IMPORTANT]
-> **GKE Dataplane V2 Requirement**: The FQDN-based network policy features under [`deploy/kustomize/gke-dataplane-v2/`](https://github.com/gke-labs/kube-agents/tree/main/deploy/kustomize/gke-dataplane-v2/) (`FQDNNetworkPolicy` custom resource `networking.gke.io/v1alpha1`) **require GKE Dataplane V2** (`--enable-dataplane-v2`) **and FQDN Network Policy enabled** (`--enable-fqdn-network-policy`) on your Google Kubernetes Engine (GKE) cluster (running GKE 1.26.4-gke.500 or 1.27.1-gke.400 or later). Standard clusters running kube-proxy without Dataplane V2 will not enforce or support `FQDNNetworkPolicy` objects.
+> **GKE Dataplane V2 Requirement**: Setting the annotation `kubeagents.x-k8s.io/enable-fqdn-network-policy: "true"` on the `PlatformAgent` CR makes the operator render a companion `FQDNNetworkPolicy` (`networking.gke.io/v1alpha1`) and omit the blanket `0.0.0.0/0:443` rule. That custom resource **requires GKE Dataplane V2** (`--enable-dataplane-v2`) **and FQDN Network Policy enabled** (`--enable-fqdn-network-policy`) on your Google Kubernetes Engine (GKE) cluster (running GKE 1.26.4-gke.500 or 1.27.1-gke.400 or later). Standard clusters running kube-proxy without Dataplane V2 will not enforce or support `FQDNNetworkPolicy` objects.
 
 ### Configuring NetworkPolicy for GKE Private Clusters, Dataplane V2, & Custom CIDRs
 
-The base [`networkpolicy-apiserver-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-apiserver-egress.yaml) defaults the Kubernetes API Server egress CIDR to `10.96.0.1/32` (standard Kubernetes `kubernetes.default.svc` ClusterIP).
-
 > [!IMPORTANT]
-> **Kubernetes API Server Egress on GKE Dataplane V2**: On GKE Dataplane V2, eBPF performs Destination NAT (DNAT) on `kubernetes.default.svc` ClusterIP traffic to the control plane's internal endpoint before `NetworkPolicy` evaluation. Because Kubernetes NetworkPolicy `ipBlock` evaluates the post-DNAT destination address, the default ClusterIP `10.96.0.1/32` will not match.
+> **Kubernetes API Server Egress on GKE Dataplane V2**: On GKE Dataplane V2, eBPF performs Destination NAT (DNAT) on `kubernetes.default.svc` ClusterIP traffic to the control plane's internal endpoint before `NetworkPolicy` evaluation. Because Kubernetes NetworkPolicy `ipBlock` evaluates the post-DNAT destination address, a rule naming only the ClusterIP (`10.96.0.1/32` on a classic service range) will not match.
 >
-> - **Operator Deployments**: The operator automatically discovers the real control plane endpoint IPs (from `default/kubernetes` Endpoints, `KUBERNETES_SERVICE_HOST`, and Service ClusterIP). You can supply custom CIDRs (including private fleet cluster control plane subnets like `172.16.0.0/28` and Private Service Connect VIPs) via the `kubeagents.x-k8s.io/apiserver-cidr` or `kubeagents.x-k8s.io/custom-egress-cidrs` annotation on the `PlatformAgent` CR, or the `KUBERNETES_API_SERVER_CIDR` environment variable on the operator deployment. To enable strict domain-level FQDN egress filtering on Dataplane V2 in operator mode, set the annotation `kubeagents.x-k8s.io/enable-fqdn-network-policy: "true"` on the `PlatformAgent` CR so the operator omits the blanket `0.0.0.0/0:443` IP rule.
-> - **Static Kustomize Deployments**: When deploying with Kustomize, override the API server CIDR by patching the dedicated `platform-agent-apiserver-egress` policy directly.
+> The operator discovers the real control plane endpoint IPs (from `default/kubernetes` Endpoints, `KUBERNETES_SERVICE_HOST`, and the Service ClusterIP). You can supply custom CIDRs (including private fleet cluster control plane subnets like `172.16.0.0/28` and Private Service Connect VIPs) via the `kubeagents.x-k8s.io/apiserver-cidr` or `kubeagents.x-k8s.io/custom-egress-cidrs` annotation on the `PlatformAgent` CR, or the `KUBERNETES_API_SERVER_CIDR` environment variable on the operator deployment.
 
 > [!IMPORTANT]
 > **Workload Identity metadata egress**: On GKE Dataplane V1 (iptables), the node DNATs `169.254.169.254:80` to the node-local metadata daemon at `169.254.169.252:988` in `nat PREROUTING` before `NetworkPolicy` is evaluated. Dataplane V2 (eBPF) evaluates policy pre-NAT at the socket layer, where the `169.254.169.254/32` rule on port `80` satisfies it directly. Ports `8080` and `987` (ALTS DirectPath) are intentionally omitted under least privilege since agent components authenticate over standard REST ADC. That deviates from Google's guidance, which recommends allowing both and warns that workloads omitting them "might experience disruptions during auto-upgrades" — if a token fetch starts failing during a node auto-upgrade, check the drop's destination port before looking elsewhere.
 >
-> - **Operator Deployments**: The operator generates both rules (`169.254.169.254/32` on port `80` and `169.254.169.252/32` on port `988`), covering both dataplanes out of the box. The cluster DNS ClusterIP is discovered from the `kube-system/kube-dns` Service; the metadata daemon container port is discovered from the `kube-system/gke-metadata-server` DaemonSet (falling back to port `988` and IP `169.254.169.252` if undiscoverable). Either can be overridden via the `kubeagents.x-k8s.io/dns-cluster-ip` / `kubeagents.x-k8s.io/metadata-daemon-ip` annotations, the typed `spec.networkPolicy` block on the CR, or the `KUBERNETES_DNS_CLUSTER_IP` / `KUBERNETES_METADATA_DAEMON_IP` operator environment variables — in that precedence order, ahead of discovery. [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specnetworkpolicy) is canonical for the typed field, including `enabled: false`, which stops policy generation and deletes the policies the operator manages — the gateway `NetworkPolicy`, the `FQDNNetworkPolicy` that `kubeagents.x-k8s.io/enable-fqdn-network-policy` turns on, and the shared `litellm-policy` (if LiteLLM is present).
-> - **Static Kustomize Deployments**: [`networkpolicy-core-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-core-egress.yaml) ships both rules directly, covering both Dataplane V1 and Dataplane V2 out of the box.
+> The operator generates both rules (`169.254.169.254/32` on port `80` and `169.254.169.252/32` on port `988`), covering both dataplanes out of the box. The cluster DNS ClusterIP is discovered from the `kube-system/kube-dns` Service; the metadata daemon container port is discovered from the `kube-system/gke-metadata-server` DaemonSet (falling back to port `988` and IP `169.254.169.252` if undiscoverable). Either can be overridden via the `kubeagents.x-k8s.io/dns-cluster-ip` / `kubeagents.x-k8s.io/metadata-daemon-ip` annotations, the typed `spec.networkPolicy` block on the CR, or the `KUBERNETES_DNS_CLUSTER_IP` / `KUBERNETES_METADATA_DAEMON_IP` operator environment variables — in that precedence order, ahead of discovery. [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specnetworkpolicy) is canonical for the typed field, including `enabled: false`, which stops policy generation and deletes the policies the operator manages — the gateway `NetworkPolicy`, the `FQDNNetworkPolicy` that `kubeagents.x-k8s.io/enable-fqdn-network-policy` turns on, and the shared `litellm-policy` (if LiteLLM is present).
 
-Do **not** edit base manifests directly. If your cluster uses a different service CIDR, is a GKE Dataplane V2 cluster, is managing private-endpoint fleet clusters, or is a GKE Private Cluster with a specific Control Plane VIP range (e.g., `172.16.0.0/28`), override the CIDR cleanly in your deployment overlay using a Kustomize patch in your `kustomization.yaml`:
+Do **not** edit the rendered policy in the cluster: the operator applies it with server-side apply on every reconcile and reverts a hand edit. Change the annotations or the `spec.networkPolicy` block on the CR instead.
 
-```yaml
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-resources:
-  - github.com/gke-labs/kube-agents//deploy/kustomize/platform?ref=main
+## The Service
 
-patches:
-  # 1. Patch API Server Control Plane CIDR / VIP (for Private Clusters / Fleet)
-  - target:
-      group: networking.k8s.io
-      version: v1
-      kind: NetworkPolicy
-      name: platform-agent-apiserver-egress
-    patch: |-
-      - op: replace
-        path: /spec/egress/0/to/0/ipBlock/cidr
-        value: "172.16.0.0/28" # Replace with your GKE Control Plane VIP range, fleet cluster CIDR, or endpoint IP
-
-  # 2. (Optional) Patch CoreDNS ClusterIP if your cluster uses a custom Service CIDR without NodeLocal DNSCache
-  - target:
-      group: networking.k8s.io
-      version: v1
-      kind: NetworkPolicy
-      name: platform-agent-core-egress
-    patch: |-
-      # Appended, not replaced at an index: the peer list is edited from several
-      # branches, and a positional path silently retargets when a peer is
-      # inserted above it. The default 10.96.0.10/32 stays and reaches nothing
-      # on a cluster that does not use it.
-      - op: add
-        path: /spec/egress/0/to/-
-        value:
-          ipBlock:
-            cidr: "10.0.0.10/32" # Replace with your custom kube-system/kube-dns Service ClusterIP
-```
-
-> [!NOTE]
-> **Modular NetworkPolicies**: Because network policies are decomposed by concern (`platform-agent-ingress`, `platform-agent-core-egress`, `platform-agent-internal-egress`, `platform-agent-apiserver-egress`, `platform-agent-external-egress`), patches target dedicated resources directly rather than relying on brittle positional array indices within a single monolithic policy. The GKE Dataplane V2 overlay (`gke-dataplane-v2/`) deletes `platform-agent-external-egress` via `$patch: delete` and supplies `FQDNNetworkPolicy` without impacting other policies.
-
-The canonical ClusterIP Service definition for the Platform Agent is defined in [`service.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/service.yaml):
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: platform-agent
-  namespace: kubeagents-system
-  labels:
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/instance: kubeagents-system-platform-agent
-    app.kubernetes.io/part-of: kube-agents
-    app.kubernetes.io/managed-by: kustomize
-spec:
-  selector:
-    app: platform-agent-gateway
-  ports:
-    - name: api
-      protocol: TCP
-      port: 8642
-      targetPort: 8643
-    - name: dashboard
-      protocol: TCP
-      port: 9119
-      targetPort: 9119
-  type: ClusterIP
-```
-
-The `app.kubernetes.io/*` labels follow the project-wide contract that makes the whole kube-agents footprint selectable in one query — [Resource labels](/kube-agents/reference/resource-labels/) is canonical for what each key means and why `component` and `version` are absent. The `selector` matches what the operator labels its gateway pods, `<agent-name>-gateway`. It is the one object in this overlay that depends on the agent being named `platform-agent`: the NetworkPolicies beside it select `app.kubernetes.io/name`, which the operator stamps as a constant whatever the CR is called. Rename the agent and this Service needs the same edit; they do not.
+The operator applies a `ClusterIP` Service named after the CR (`platform-agent` on a stock install) whose selector matches what it labels its gateway pods, `<agent-name>-gateway`, plus `kubeagents.io/is-leader: "true"` when the agent runs more than one replica. Its `app.kubernetes.io/*` labels follow the project-wide contract that makes the whole kube-agents footprint selectable in one query — [Resource labels](/kube-agents/reference/resource-labels/) is canonical for what each key means and why `component` and `version` are absent.
 
 The exposed ports:
 

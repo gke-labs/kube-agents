@@ -94,7 +94,9 @@ _NO_WORKER_CALLS_REASON = (
 # (gke-labs/kube-agents#982) on a report the OutcomeValidity judge scored
 # 1.00, and enumerating markdown shapes in every task.yaml would only encode
 # one run's formatting.
-_MARKDOWN_NOISE = str.maketrans("", "", "*_`")
+# Markdown emphasis is dropped; the typographic apostrophe folds to ASCII
+# so a pattern spells each contraction ("don't") exactly once.
+_MARKDOWN_NOISE = str.maketrans({"*": None, "_": None, "`": None, "’": "'"})
 
 
 def _normalize(text: str) -> str:
@@ -117,6 +119,16 @@ def _normalize(text: str) -> str:
     return collapsed.lower()
 
 
+def _normalize_lines(text: str) -> str:
+    """``_normalize`` applied per line, newlines kept.
+
+    ``forbidden_patterns`` need a boundary a Markdown bullet or heading can
+    end on; the whitespace collapse above would otherwise fuse a negated
+    bullet into its unnegated neighbour before the regex runs.
+    """
+    return "\n".join(_normalize(line) for line in text.splitlines())
+
+
 @VERIFIERS.register("report_contains")
 class ReportContainsVerifier(BaseVerifier):
     """Exact phrase checks against the agent's answer.
@@ -124,6 +136,14 @@ class ReportContainsVerifier(BaseVerifier):
     Substring matching, deliberately: the task author chose the phrase (a
     planted defect's name, a required noun), so an exact match is fair.
     Anything fuzzier belongs to the judge, not to a blocking check.
+    ``forbidden_patterns`` is the one regex exception, for the shape a
+    substring cannot express: a banned word whose negated uses are
+    legitimate ("no guarantee"). Each is ``re.search``ed against a
+    line-preserving variant of the same normalization — newlines survive,
+    so a Markdown bullet or heading with no terminal punctuation is its own
+    segment and a pattern may anchor on ``\\n``; the flat collapse would
+    otherwise fuse a negated bullet into its unnegated neighbour before the
+    regex runs.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
     Markdown emphasis dropped, whitespace runs collapsed. These are the
@@ -151,7 +171,15 @@ class ReportContainsVerifier(BaseVerifier):
     # spellings ("HPA" / "HorizontalPodAutoscaler"), all-of required_phrases
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
+    forbidden_patterns: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
+
+    @field_validator("forbidden_patterns")
+    @classmethod
+    def _forbidden_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            re.compile(pattern)
+        return patterns
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -163,20 +191,26 @@ class ReportContainsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=_NO_TRANSCRIPT_REASON,
             )
-        text = _normalize(
-            snap.final_message if self.scope == "final" else snap.output
-        )
+        raw = snap.final_message if self.scope == "final" else snap.output
+        text = _normalize(raw)
         missing = [p for p in self.required_phrases if _normalize(p) not in text]
         present = [p for p in self.forbidden_phrases if _normalize(p) in text]
+        pattern_hits = [
+            p for p in self.forbidden_patterns if re.search(p, _normalize_lines(raw))
+        ]
         any_of_miss = bool(self.any_of_phrases) and not any(
             _normalize(p) in text for p in self.any_of_phrases
         )
-        if missing or present or any_of_miss:
+        if missing or present or pattern_hits or any_of_miss:
             parts = []
             if missing:
                 parts.append(f"required phrases absent from the report: {missing}")
             if present:
                 parts.append(f"forbidden phrases present in the report: {present}")
+            if pattern_hits:
+                parts.append(
+                    f"forbidden patterns matched in the report: {pattern_hits}"
+                )
             if any_of_miss:
                 parts.append(
                     f"none of the alternative phrasings present: {self.any_of_phrases}"
@@ -195,6 +229,10 @@ class ReportContainsVerifier(BaseVerifier):
             f"all {len(self.required_phrases)} required phrase(s)",
             f"none of {len(self.forbidden_phrases)} forbidden",
         ]
+        if self.forbidden_patterns:
+            satisfied.append(
+                f"none of {len(self.forbidden_patterns)} forbidden pattern(s)"
+            )
         if self.any_of_phrases:
             satisfied.append(
                 f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
@@ -394,6 +432,15 @@ _LEDGER_FOOTER_RE = re.compile(
 _DELTA_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
+# Mirrors the output of its `all_findings_block`, which the script writes but
+# never parses, so no test on that side checks this regex against it
+# (`test_the_complete_block_regex_reads_what_audit_report_writes` does): every finding id
+# in the document plus the collector-held ids, written only when the body cut
+# findings for space. The delta block above then lists the rendered ones
+# alone, and a finding filed but cut would read as never filed.
+_ALL_FINDINGS_RE = re.compile(
+    r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
+)
 
 # Bound on issue URLs fetched from one report. An audit reply names its ledger
 # once; anything past a handful is a report to look at by hand, not a set of
@@ -459,6 +506,12 @@ _NO_RUN_CLOCK_REASON = (
 # _MAX_LEDGER_CANDIDATES exists: a remediation reply links the PR it opened,
 # and a report naming a dozen is one to read by hand.
 _MAX_PR_CANDIDATES = 8
+
+# Page size for the pull request's commit listing. The head is on the last
+# page, so the page number is computed from the total the pulls endpoint
+# reports; GitHub caps the listing at 250, and a pull request longer than that
+# simply yields no head commit rather than the wrong one.
+_PR_COMMITS_PAGE_SIZE = 100
 
 _NO_PR_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
@@ -708,7 +761,7 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
     """The ledger footer's ``(audit id, generated-at)``, or None when absent.
 
     The LAST match, not the first. ``render_issue_body`` assembles the body as
-    ``fixed + findings + withheld + evidence + footer``, so every byte the
+    ``fixed + findings + held + declared + withheld + evidence + footer``, so every byte the
     agent authored — finding titles and impacts through ``clip_text``, which
     redacts credentials and clips length but neither strips backticks nor
     flattens newlines, and evidence excerpts into a raw fenced block — sits
@@ -720,7 +773,7 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
     hidden ``audit-findings`` delta block is rendered after it — but nothing
     the agent writes can ever appear below it, so the final match is the one
     ``audit_report.py`` wrote. Same reason ``_finding_ids`` reads
-    ``matches[-1]``.
+    the last match.
     """
     match = None
     for match in _LEDGER_FOOTER_RE.finditer(body):
@@ -753,18 +806,30 @@ def _parse_github_time(value: Any) -> datetime | None:
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
-def _finding_ids(body: str) -> list[str] | None:
-    """This run's finding ids from the hidden delta block, or None when absent."""
-    matches = _DELTA_RE.findall(body)
-    if not matches:
+def _finding_ids(body: str) -> tuple[list[str], str] | None:
+    """This run's finding ids and the block they came from, or None when the ledger carries no block.
+
+    The complete-list block when the body has one, since only a truncated body
+    writes it and there the delta block holds the rendered subset; the delta
+    block otherwise, which then names every finding. Both by their last match,
+    for the reason ``_parse_footer`` gives, and the complete list only BELOW
+    the last delta block, where ``_render_footer`` puts it: an untruncated
+    body has no real one, so a copy an agent wrote into a finding above the
+    footer would otherwise outrank the delta block that does.
+    """
+    deltas = list(_DELTA_RE.finditer(body))
+    if not deltas:
         return None
+    last = deltas[-1]
+    complete = [m for m in _ALL_FINDINGS_RE.finditer(body) if m.start() > last.end()]
+    source = "audit-findings-all" if complete else "audit-findings"
     try:
-        ids = json.loads(matches[-1])
+        ids = json.loads((complete or deltas)[-1].group(1))
     except (ValueError, TypeError):
         return None
     if not isinstance(ids, list):
         return None
-    return [i for i in ids if isinstance(i, str)]
+    return [i for i in ids if isinstance(i, str)], source
 
 
 @VERIFIERS.register("ledger_issue_contains")
@@ -833,7 +898,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     recommendations, and the scope table.
 
     ``finding_ids`` — only the ids in the hidden ``<!-- audit-findings: … -->``
-    delta block, which ``audit_report.py`` derives as
+    delta block (or, on a body truncated for size, the
+    ``<!-- audit-findings-all: … -->`` block listing every filed and
+    collector-held finding),
+    which ``audit_report.py`` derives as
     ``<check>.<cluster>.<namespace>.<object>``. Use it whenever the phrase is a
     CLUSTER name: the body's scope table names every audited cluster on every
     run, so ``required_phrases: ["seeded-c"]`` against ``body`` would pass on a
@@ -1160,16 +1228,22 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             )
 
         if self.scope == "finding_ids":
-            ids = _finding_ids(ledger["body"])
-            if ids is None:
+            parsed = _finding_ids(ledger["body"])
+            if parsed is None:
                 return done(
                     False,
                     f"{ledger['slug']} carries no readable "
-                    "<!-- audit-findings: [...] --> delta block, so the findings "
+                    "<!-- audit-findings: [...] --> delta block (or a malformed "
+                    "audit-findings-all block below it), so the findings "
                     "this run filed cannot be read off it",
                 )
+            ids, source = parsed
             text = "\n".join(ids).lower()
-            surface = f"the {len(ids)} finding id(s) on {ledger['slug']}"
+            # Which block: a truncated body with no complete list below its
+            # delta block (over the script's cap, or a drifted format) grades
+            # the rendered subset, and the reason should say so rather than
+            # read as a finding the agent never filed.
+            surface = f"the {len(ids)} finding id(s) in {ledger['slug']}'s {source} block"
         else:
             text = ledger["body"].lower()
             surface = f"the body of {ledger['slug']}"
@@ -1222,20 +1296,26 @@ class PullRequestOpenedVerifier(BaseVerifier):
     WHY THIS EXISTS. The remediation cases used to grade on a
     ``report_contains`` over ``["github.com/", "/pull/"]``, which asks only
     that the reply hold a URL-shaped string. Nothing is fetched, so an invented
-    link passes; and nothing sweeps the eval GitOps repositories, so a pull
-    request an earlier rep opened is still there and still linkable. Repeats of
-    a case were being graded against a pile of their own earlier output (#1755).
+    link passes; and the pool sweep runs between leases rather than between
+    reps, so a pull request an earlier rep of the same job opened is still there
+    and still linkable. Repeats of a case were being graded against a pile of their
+    own earlier output (#1755).
 
     WHAT IT ASSERTS. The reply names a github.com pull request URL; GitHub
     resolves it; the number is a pull request and not an issue; it lives under
-    ``owner`` when one is set; it is not closed unmerged; and it was written --
+    ``owner`` when one is set; it is not closed unmerged; it was written --
     created or updated -- at or after this run started, less
-    ``max_clock_skew_sec``. Updating counts because
-    the skill reuses a branch and edits the pull request already open on it --
-    which also means the stamp proves only that the pull request was written to
-    during the run, by anyone. One surviving candidate is enough — a reply may
-    link the ticket it came from beside the fix — and a candidate GitHub cannot
-    answer for ends the check only when no other candidate passes.
+    ``max_clock_skew_sec``; it changes at least one file; and its head commit
+    is no older than the same start. Updating counts because the skill reuses a
+    branch and edits the pull request already open on it, which is the
+    documented behaviour rather than a defect -- so the stamp alone proves only
+    that somebody wrote to the pull request, and the head commit is what
+    separates a run that pushed a fix from one that left a comment. That is
+    also what makes reps inside a job gradable: rep 2 pushing onto rep 1's
+    branch moves the head commit, rep 2 quoting rep 1's URL does not. One
+    surviving candidate is enough — a reply may link the ticket it came from
+    beside the fix — and a candidate GitHub cannot answer for ends the check
+    only when no other candidate passes.
 
     WHICH ENDPOINT. ``/issues/{n}`` first: a pull request is an issue to that
     API, the response carries ``created_at``, and it is the endpoint the read
@@ -1246,7 +1326,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
     ``status="error"`` naming the permission to add, never a fail: an
     unreadable API is the absence of an observation. 404 on both is either the
     number or a repository this credential cannot see; nothing in the API
-    separates them, so both are graded as absence.
+    separates them, so both are graded as absence. ``_head_push`` then reads
+    ``/pulls/{n}`` outright, which needs ``pull_requests: read`` --
+    ``hack/ci-eval-pr.sh`` mints it.
     """
 
     type: Literal["pull_request_opened"]
@@ -1309,6 +1391,109 @@ class PullRequestOpenedVerifier(BaseVerifier):
             f"unexpected GitHub response {status_code} for "
             f"{owner}/{repo}#{number}; this check could not be evaluated"
         )
+
+    def _head_push(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        resolved: dict,
+        token: str,
+        budget: float,
+    ) -> tuple[int | None, datetime | None, str | None]:
+        """``(changed files, head commit date, unevaluable reason)``.
+
+        Both reads want ``pull_requests: read``. ``/pulls/{n}`` carries the
+        file count and the commit total, and is skipped when ``_resolve``
+        already fell through to it; dating the head commit needs the commits
+        listing, whose last page holds it. ``/commits/{sha}`` would be one call
+        and wants ``contents: read``, which grading does not carry.
+
+        A page GitHub has not got (404, or one the head is not on) dates
+        nothing, comes back ``None``, and the caller does not reject on it: an
+        observation the API would not give is not evidence that a run pushed
+        nothing. A page it would not serve -- 401, 403, a 5xx -- is the
+        credential's or GitHub's fault, and is an unevaluable reason exactly
+        as on ``/pulls/{n}``; folding it into ``None`` would pass a leftover
+        the run only wrote to.
+        """
+        base = f"https://api.github.com/repos/{owner}/{repo}"
+        payload = resolved
+        if "changed_files" not in payload:
+            status, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
+            # The same three readings `_resolve` gives this endpoint: 401 is
+            # the token, 403 is the permission, anything else is GitHub's.
+            if status == 401:
+                return (
+                    None,
+                    None,
+                    f"GitHub answered 401 for {owner}/{repo}#{number} on the pulls "
+                    f"endpoint: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                    "an installation token expires an hour after it is minted — so "
+                    "this check could not be evaluated",
+                )
+            if status == 403:
+                return (
+                    None,
+                    None,
+                    f"GitHub denied {owner}/{repo}#{number} on the pulls endpoint; "
+                    f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                    "`pull_requests: read` to grade what a run pushed, so this "
+                    "check could not be evaluated",
+                )
+            if status != 200 or not isinstance(payload, dict):
+                return (
+                    None,
+                    None,
+                    f"unexpected GitHub response {status} for {owner}/{repo}#{number} "
+                    "on the pulls endpoint; this check could not be evaluated",
+                )
+        changed = payload.get("changed_files")
+        changed = changed if isinstance(changed, int) else None
+        total = payload.get("commits")
+        head_sha = (payload.get("head") or {}).get("sha") or ""
+        if not isinstance(total, int) or total < 1:
+            return changed, None, None
+        page = (total + _PR_COMMITS_PAGE_SIZE - 1) // _PR_COMMITS_PAGE_SIZE
+        status, commits = _http_get_json(
+            f"{base}/pulls/{number}/commits"
+            f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
+            token,
+            budget,
+        )
+        if status == 404:
+            return changed, None, None
+        if status == 401:
+            return (
+                None,
+                None,
+                f"GitHub answered 401 for {owner}/{repo}#{number} on the commits "
+                f"page: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                "an installation token expires an hour after it is minted — so "
+                "this check could not be evaluated",
+            )
+        if status == 403:
+            return (
+                None,
+                None,
+                f"GitHub denied {owner}/{repo}#{number} on the commits page; "
+                f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                "`pull_requests: read` to grade what a run pushed, so this "
+                "check could not be evaluated",
+            )
+        if status != 200 or not isinstance(commits, list):
+            return (
+                None,
+                None,
+                f"unexpected GitHub response {status} for {owner}/{repo}#{number} "
+                "on the commits page; this check could not be evaluated",
+            )
+        for entry in reversed(commits):
+            if not isinstance(entry, dict) or entry.get("sha") != head_sha:
+                continue
+            committer = (entry.get("commit") or {}).get("committer") or {}
+            return changed, _parse_github_time(committer.get("date")), None
+        return changed, None, None
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -1402,13 +1587,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # later rep pushes onto the branch the first one used, `gh pr
             # create` answers "already exists", and the skill edits that pull
             # request and returns its URL. That work lands in `updated_at`
-            # alone. The stamp moves on any write by anyone, so a rep that only
-            # comments on a leftover passes too; the head commit would separate
-            # the two and the ledger App cannot read it. A rep that resubmits
-            # byte-identical content writes nothing at all -- the skill raises
-            # before the push -- so a correct rep lands here too, which is why
-            # the reason names both readings. Sweeping the GitOps repository
-            # between reps (#1755 item 2) is what removes leftovers.
+            # alone. The stamp moves on any write by anyone, so passing here is
+            # necessary and not sufficient -- the head commit check below is
+            # what says the run pushed something. A rep that resubmits
+            # byte-identical content writes nothing at all (the skill raises
+            # before the push), so a correct rep lands here too, which is why
+            # the reason names both readings.
             updated = _parse_github_time(payload.get("updated_at"))
             touched = updated if updated and updated > created else created
             age = (started - touched).total_seconds()
@@ -1420,14 +1604,43 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "resubmitted unchanged"
                 )
                 continue
+            # What the stamp above cannot say: whether the run pushed a fix or
+            # only wrote to a pull request. `updated_at` moves on a comment and
+            # on a label. The head commit moves on neither.
+            try:
+                changed, pushed, unevaluable = self._head_push(
+                    owner, repo, number, payload, token, budget
+                )
+            except OSError as exc:
+                unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                continue
+            if unevaluable:
+                unresolved.append(unevaluable)
+                continue
+            if changed == 0:
+                rejected.append(
+                    f"{slug}: changes no files, so it carries no proposed fix"
+                )
+                continue
+            if pushed and (started - pushed).total_seconds() > self.max_clock_skew_sec:
+                rejected.append(
+                    f"{slug}: its head commit dates from {pushed.isoformat()}, "
+                    f"before this run started ({started.isoformat()}) — this run "
+                    "wrote to a pull request an earlier one pushed the fix to"
+                )
+                continue
             return done(
                 True,
                 f"{slug} was {'opened' if touched == created else 'updated'} at "
-                f"{touched.isoformat()}, during this run",
+                f"{touched.isoformat()}, during this run, and carries "
+                f"{changed if changed is not None else 'an unreported number of'} "
+                "changed file(s)",
                 raw={
                     "pull_request": slug,
                     "created_at": created.isoformat(),
                     "updated_at": updated.isoformat() if updated else None,
+                    "changed_files": changed,
+                    "head_committed_at": pushed.isoformat() if pushed else None,
                 },
             )
 

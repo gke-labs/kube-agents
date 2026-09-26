@@ -311,7 +311,7 @@ class HealthyScan(ScanHarness):
         calls = self.calls()
         reader = "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com"
         self.assertEqual(calls[0], f"gcloud auth print-access-token --impersonate-service-account={reader}", "the pre-flight mint comes first")
-        # The runner minted as the reader for the rewrite, and the state
+        # The runner minted as the reader once, at its gate, and the state
         # script's describes ran under the impersonation property (which
         # the stub cannot see, but the kubeconfig rewrite it can: every
         # kubectl read after the rewrite went through the exec credential,

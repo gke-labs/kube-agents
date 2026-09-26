@@ -10,6 +10,7 @@ import datetime
 import json
 import pathlib
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -543,6 +544,23 @@ class InstallerCommonTest(unittest.TestCase):
                 env={"NAMESPACE": "stray-from-kubectl-tooling"},
             )
             self.assertIn("NS=from-the-file", proc.stdout, proc.stderr)
+
+    def test_load_install_env_drops_a_shell_exported_scope(self):
+        # The keys render into the PlatformAgent and only install.sh's first
+        # install records them, so on upgrade.sh, uninstall.sh and the menu the
+        # file is the only way in; an inherited value would declare a project
+        # the next clean-shell run drops again.
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("PROJECT_ID=p\n")
+            stray = {"SCOPE_PROJECTS": "stray-project", "SCOPE_EXCLUDE_PROJECTS": "*-stray",
+                     "SCOPE_EXCLUDE_CLUSTERS": "s/l/c"}
+            probe = 'echo "P=${SCOPE_PROJECTS:-unset} X=${SCOPE_EXCLUDE_PROJECTS:-unset} C=${SCOPE_EXCLUDE_CLUSTERS:-unset}"'
+            proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
+            self.assertIn("P=unset X=unset C=unset", proc.stdout, proc.stderr)
+            env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\n")
+            proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
+            self.assertIn("P=from-the-file X=unset C=unset", proc.stdout, proc.stderr)
 
     def test_service_account_ownership_still_refuses_on_a_clean_absence(self):
         proc = self._run(
@@ -2167,6 +2185,11 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
         (_INSTALLER_COMMON, 'history_json="$(trap - ERR; helm history ', 2),
         (_INSTALLER_COMMON, 'last_good_rev="$(trap - ERR; printf ', 1),
         (_GKE_DNS_ENDPOINT, 'described=$(trap - ERR; gcloud container clusters describe ', 1),
+        (_INSTALLER_COMMON, 'cr_json="$(trap - ERR; kubectl --context ', 1),
+        (_INSTALLER_COMMON, 'record_json="$(trap - ERR; helm get values ', 1),
+        (_INSTALLER_COMMON, 'served_rev="$(trap - ERR; helm history ', 1),
+        (_INSTALLER_COMMON, 'served_json="$(trap - ERR; helm get values ', 1),
+        (_INSTALLER_COMMON, 'verdict="$(trap - ERR; printf ', 1),
     )
 
     def test_each_tolerated_probe_clears_the_trap_inside_its_substitution(self):
@@ -2177,6 +2200,329 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
             with self.subTest(file=path.name, probe=unguarded.strip()):
                 self.assertEqual(source.count(guarded), count, f"{path.name}: {guarded!r}")
                 self.assertNotIn(unguarded, source, f"{path.name}: a probe lost its `trap - ERR`")
+
+
+class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
+    """The three SCOPE_* keys become the composition's `scope` object.
+
+    Always a full block, empty lists included: the reconcile reads an emptied
+    projects list as the declaration that drops projects and a missing block as
+    no declaration (docs/designs/multi-project-scope.md §7), so the generator
+    never omits it. Only the shape of an excluded cluster is checked here; the
+    CRD's patterns, caps and repeats are the module variable's validations.
+    """
+
+    # The generator harness, borrowed rather than inherited: subclassing the
+    # concrete test class would run its whole suite a second time.
+    _run = InstallerCommonTest._run
+    _tfvars = InstallerCommonTest._tfvars
+
+    EMPTY_BLOCK = (
+        "scope = {\n"
+        "  projects = []\n"
+        "  exclude = {\n"
+        "    projects = []\n"
+        "    clusters = []\n"
+        "  }\n"
+        "}\n"
+    )
+
+    def _scope_env(self, **keys):
+        env = {"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "",
+               "SCOPE_EXCLUDE_CLUSTERS": ""}
+        env.update(keys)
+        return env
+
+    def test_an_install_with_no_scope_key_renders_an_empty_present_block(self):
+        content = self._tfvars(self._scope_env())
+        self.assertIn(self.EMPTY_BLOCK, content)
+
+    def test_the_keys_are_carried_verbatim_into_the_block(self):
+        content = self._tfvars(self._scope_env(
+            SCOPE_PROJECTS="payments-prod, payments-staging",
+            SCOPE_EXCLUDE_PROJECTS="*-sandbox kube-agents-demo-0[2-9]",
+            SCOPE_EXCLUDE_CLUSTERS="payments-staging/us-central1/scratch-cluster,p2/us-east1-b/c2",
+        ))
+        self.assertIn(
+            "scope = {\n"
+            '  projects = ["payments-prod", "payments-staging"]\n'
+            "  exclude = {\n"
+            '    projects = ["*-sandbox", "kube-agents-demo-0[2-9]"]\n'
+            '    clusters = [{ project_id = "payments-staging", location = "us-central1", cluster_name = "scratch-cluster" }, '
+            '{ project_id = "p2", location = "us-east1-b", cluster_name = "c2" }]\n'
+            "  }\n"
+            "}\n",
+            content,
+        )
+
+    def test_a_glob_is_never_expanded_against_the_working_directory(self):
+        # hcl_csv_list splits an unquoted string; with globbing on, *-sandbox
+        # beside a file named team-a-sandbox renders the file name.
+        with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as out_dir:
+            for name in ("team-a-sandbox", "team-b-sandbox"):
+                (pathlib.Path(cwd) / name).write_text("")
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'cd "{cwd}" && write_tfvars_from_state "{dest}"; echo "rc=$?"; '
+                'case "$-" in *f*) echo "noglob-left-on" ;; *) echo "noglob-restored" ;; esac',
+                env=self._scope_env(SCOPE_EXCLUDE_PROJECTS="*-sandbox", SCOPE_PROJECTS="*-sandbox"),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("noglob-restored", proc.stdout)
+            content = dest.read_text()
+            self.assertIn('projects = ["*-sandbox"]', content)
+            self.assertNotIn("team-a-sandbox", content)
+
+    def test_a_malformed_cluster_entry_is_refused_before_the_file_is_written(self):
+        for bad in ("payments-staging/us-central1", "a/b/c/", "a//c", "/b/c", "a/b/c/d"):
+            with self.subTest(entry=bad), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env=self._scope_env(SCOPE_EXCLUDE_CLUSTERS=f"a-good/us-central1/one, {bad}"),
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(f"SCOPE_EXCLUDE_CLUSTERS entry '{bad}' is not project/location/cluster",
+                              proc.stderr + proc.stdout)
+                self.assertFalse(dest.exists(), "no tfvars is written for an entry the block cannot render")
+                self.assertFalse((pathlib.Path(out_dir) / "terraform.tfvars.tmp").exists())
+
+
+_LIVE_SCOPE_CR = (
+    '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"projects":["p3-project","p2-project"],'
+    '"exclude":{"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}]}'
+)
+_LIVE_SCOPE_LINES = (
+    'SCOPE_PROJECTS="p2-project p3-project"',
+    'SCOPE_EXCLUDE_PROJECTS=""',
+    'SCOPE_EXCLUDE_CLUSTERS="p2-project/us-central1/c1"',
+)
+
+
+class PreApplyScopeCheckTest(unittest.TestCase):
+    """refuse_apply_over_undeclared_scope: L (live CR), R (release record),
+    K (the keys). Refused only when L is present and non-empty and matches
+    neither R nor K; every read that cannot decide fails closed, except under
+    "warn", where a plan applies nothing.
+    """
+
+    def _run(self, cr, record, keys=None, mode="", context_present=True, served=None, latest_failed=True,
+             python_noise=False):
+        """cr / record: a JSON string the stub prints, or one of the failure
+        spellings: 'notype', 'norelease', 'err'. served: the values of the
+        previous revision; with latest_failed the history reads deployed then
+        failed, otherwise superseded then deployed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            ctx_rc = 0 if context_present else 1
+            cr_case = {
+                "notype": 'echo "error: the server doesn\x27t have a resource type \\"platformagents\\"" >&2; exit 1',
+                "err": 'echo "Unable to connect to the server: dial tcp: i/o timeout" >&2; exit 1',
+            }.get(cr, f"printf '%s\\n' '{cr}'; exit 0")
+            record_case = {
+                "norelease": 'echo "Error: release: not found" >&2; exit 1',
+                "err": 'echo "Error: Kubernetes cluster unreachable" >&2; exit 1',
+            }.get(record, f"printf '%s\\n' '{record}'; exit 0")
+            (bin_dir / "kubectl").write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"config get-contexts"*) exit {ctx_rc} ;;\n'
+                f'  *"get platformagents"*) {cr_case} ;;\n'
+                "esac\nexit 1\n"
+            )
+            if served is None:
+                history = '[{"revision": 3, "status": "deployed"}]'
+                served_case = "exit 1"
+            else:
+                history = ('[{"revision": 3, "status": "deployed"}, {"revision": 4, "status": "failed"}]'
+                           if latest_failed else
+                           '[{"revision": 3, "status": "superseded"}, {"revision": 4, "status": "deployed"}]')
+                served_case = f"printf '%s\\n' '{served}'; exit 0"
+            (bin_dir / "helm").write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"get values"*"--revision 3"*) {served_case} ;;\n'
+                f'  *"get values"*) {record_case} ;;\n'
+                f"  *\"history\"*) printf '%s\\n' '{history}'; exit 0 ;;\n"
+                "esac\nexit 1\n"
+            )
+            if python_noise:
+                # An interpreter that writes to stderr and exits 0: PYTHONWARNINGS,
+                # -X dev, a half-installed prefix. The verdict must not read it.
+                real = shutil.which("python3")
+                (bin_dir / "python3").write_text(
+                    "#!/usr/bin/env bash\n"
+                    'echo "warning: stderr noise from the interpreter" >&2\n'
+                    f'exec "{real}" "$@"\n'
+                )
+            for stub in ("kubectl", "helm") + (("python3",) if python_noise else ()):
+                path = bin_dir / stub
+                path.chmod(path.stat().st_mode | stat.S_IEXEC)
+            env = {"PROJECT_ID": "test-project", "CLUSTER_NAME": "test-cluster", "REGION": "us-central1",
+                   "SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
+            env.update(keys or {})
+            body = (
+                "set -u\n"
+                'print_error() { echo "ERROR: $*"; }; print_info() { echo "INFO: $*"; }\n'
+                'print_warning() { echo "WARN: $*"; }; print_success() { :; }\n'
+                f'source "{_INSTALLER_COMMON}"\n'
+                f'refuse_apply_over_undeclared_scope kubeagents-system {mode}; echo "rc=$?"\n'
+            )
+            return subprocess.run(["bash", "-c", body], capture_output=True, text=True,
+                                  env=get_isolated_test_env(overrides=env, bin_dir=str(bin_dir)),
+                                  cwd=str(_REPO_ROOT))
+
+    def _assert_rc(self, proc, rc):
+        self.assertIn(f"rc={rc}", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_nothing_live_to_protect_passes_silently(self):
+        for label, cr in (
+            ("no PlatformAgent type served", "notype"),
+            ("no PlatformAgent", '{"items":[]}'),
+            ("a CR without a scope block", '{"items":[{"metadata":{"name":"platform-agent"},"spec":{}}]}'),
+            ("a present but empty block", '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{}}}]}'),
+        ):
+            with self.subTest(case=label):
+                proc = self._run(cr, "norelease")
+                self._assert_rc(proc, 0)
+                self.assertNotIn("WARN", proc.stdout)
+                self.assertNotIn("ERROR", proc.stdout)
+
+    def test_a_hand_declared_scope_with_no_record_and_no_keys_is_refused_with_the_lines(self):
+        proc = self._run(_LIVE_SCOPE_CR, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn("declares a scope this install did not write and install.env does not carry", proc.stdout)
+        self.assertIn("retires the projects it drops", proc.stdout)
+        for line in _LIVE_SCOPE_LINES:
+            with self.subTest(line=line):
+                self.assertIn(f"INFO:   {line}", proc.stdout)
+        self.assertIn("edit the PlatformAgent", proc.stdout)
+
+    def test_keys_that_carry_the_live_scope_pass_whatever_their_spelling(self):
+        # Order, separators and repeats are spelling: every list is compared
+        # as a set, the cluster triples included (the CR's list is a map keyed
+        # on the triple, so it never repeats; a repeated triple in install.env
+        # is Terraform's distinct validation to refuse, with its own message).
+        proc = self._run(_LIVE_SCOPE_CR, "norelease", keys={
+            "SCOPE_PROJECTS": "p3-project,p2-project p2-project",
+            "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1, p2-project/us-central1/c1",
+        })
+        self._assert_rc(proc, 0)
+
+    def test_a_scope_the_installer_wrote_may_be_changed_or_emptied(self):
+        # L == R: the record shows the installer rendered it; the keys are the
+        # new declaration, and dropping the last project needs no override.
+        record = ('{"platformAgent":{"scope":{"projects":["p2-project","p3-project"],"exclude":{"projects":[],'
+                  '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        for keys in ({}, {"SCOPE_PROJECTS": "p2-project"}, {"SCOPE_PROJECTS": "p2-project p3-project p4-project"}):
+            with self.subTest(keys=keys):
+                self._assert_rc(self._run(_LIVE_SCOPE_CR, record, keys=keys), 0)
+
+    def test_a_failed_upgrades_values_do_not_make_the_served_scope_a_hand_edit(self):
+        # Revision 4 failed with projects [p2]; the CR still holds revision 3's
+        # [p2, p3]. The retry with the same keys must pass, not tell the operator
+        # to record a scope the installer itself wrote.
+        latest = '{"platformAgent":{"scope":{"projects":["p2-project"],"exclude":{"projects":[],"clusters":[]}}}}'
+        served = ('{"platformAgent":{"scope":{"projects":["p3-project","p2-project"],"exclude":{"projects":[],'
+                  '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        proc = self._run(_LIVE_SCOPE_CR, latest, keys={"SCOPE_PROJECTS": "p2-project"}, served=served)
+        self._assert_rc(proc, 0)
+        # And without a served revision that matches, the same shape is refused.
+        proc = self._run(_LIVE_SCOPE_CR, latest, keys={"SCOPE_PROJECTS": "p2-project"}, served=latest)
+        self._assert_rc(proc, 1)
+
+    def test_a_previous_revisions_scope_is_not_a_record_once_the_latest_served(self):
+        # Revision 3 (superseded) rendered [p2, p3]; revision 4 (deployed)
+        # rendered [p2] and the CR held it, until a hand edit put p3 back. The
+        # latest revision served, so it is the one record: the hand edit is
+        # refused, not read as the installer's own earlier declaration.
+        latest = '{"platformAgent":{"scope":{"projects":["p2-project"],"exclude":{"projects":[],"clusters":[]}}}}'
+        previous = ('{"platformAgent":{"scope":{"projects":["p3-project","p2-project"],"exclude":{"projects":[],'
+                    '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        proc = self._run(_LIVE_SCOPE_CR, latest, keys={"SCOPE_PROJECTS": "p2-project"},
+                         served=previous, latest_failed=False)
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS="p2-project p3-project"', proc.stdout)
+
+    def test_containers_on_the_live_cr_are_reported_and_never_weighed(self):
+        # folders and organizations (phase 2) have no installer key and the
+        # chart renders neither, so an apply leaves them alone: a CR carrying
+        # only containers passes with a note, and a refused mixed edit still
+        # prints the three lines it can reproduce plus the note.
+        only_containers = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"folders":["123456789012"],'
+                           '"organizations":["987654321098"]}}}]}')
+        proc = self._run(only_containers, "norelease")
+        self._assert_rc(proc, 0)
+        self.assertIn("also declares folders: 123456789012 organizations: 987654321098, which the installer has no key for yet", proc.stdout)
+        mixed = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"projects":["p2-project"],'
+                 '"folders":["123456789012"]}}}]}')
+        proc = self._run(mixed, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS="p2-project"', proc.stdout)
+        self.assertIn("also declares folders: 123456789012, which the installer has no key for yet", proc.stdout)
+
+    def test_a_hand_edit_after_the_installer_wrote_it_is_refused(self):
+        # L != R (p3-project and the exclusion were added by hand) and L != K.
+        record = '{"platformAgent":{"scope":{"projects":["p2-project"],"exclude":{"projects":[],"clusters":[]}}}}'
+        proc = self._run(_LIVE_SCOPE_CR, record, keys={"SCOPE_PROJECTS": "p2-project"})
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS="p2-project p3-project"', proc.stdout)
+
+    def test_a_hand_set_exclusion_alone_is_protected(self):
+        cr = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"exclude":{"projects":["*-sandbox"]}}}}]}')
+        proc = self._run(cr, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_EXCLUDE_PROJECTS="*-sandbox"', proc.stdout)
+
+    def test_warn_mode_speaks_and_passes(self):
+        proc = self._run(_LIVE_SCOPE_CR, "norelease", mode="warn")
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: The PlatformAgent 'platform-agent'", proc.stdout)
+        self.assertIn("the plan below shows the change", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+
+    def test_a_missing_context_refuses_and_names_the_fetch(self):
+        # The apply needs no kubeconfig (the helm provider authenticates with a
+        # token against the endpoint), so a check that could not read must
+        # stop the run rather than let the apply proceed over a scope nobody read.
+        proc = self._run(_LIVE_SCOPE_CR, "norelease", context_present=False)
+        self._assert_rc(proc, 1)
+        self.assertIn("ERROR: Refusing to apply: the kubeconfig has no context 'gke_test-project_us-central1_test-cluster'", proc.stdout)
+        self.assertIn("gcloud container clusters get-credentials test-cluster --location us-central1 --project test-project", proc.stdout)
+
+    def test_a_missing_context_only_warns_under_a_plan(self):
+        proc = self._run(_LIVE_SCOPE_CR, "norelease", mode="warn", context_present=False)
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: The scope check did not run: the kubeconfig has no context", proc.stdout)
+
+    def test_interpreter_noise_on_stderr_does_not_become_a_refusal(self):
+        record = ('{"platformAgent":{"scope":{"projects":["p2-project","p3-project"],"exclude":{"projects":[],'
+                  '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        proc = self._run(_LIVE_SCOPE_CR, record, python_noise=True)
+        self._assert_rc(proc, 0)
+        self.assertNotIn("declares a scope", proc.stdout)
+        # And a genuine failure still carries the interpreter's message.
+        two = '{"items":[{"metadata":{"name":"a"},"spec":{"scope":{"projects":["p2-project"]}}},{"metadata":{"name":"b"},"spec":{}}]}'
+        proc = self._run(two, "norelease", python_noise=True)
+        self._assert_rc(proc, 1)
+        self.assertIn("more than one PlatformAgent is served", proc.stdout)
+
+    def test_a_read_that_cannot_decide_fails_closed_unless_warning(self):
+        for label, cr, record in (
+            ("the CR", "err", "norelease"),
+            ("the record", _LIVE_SCOPE_CR, "err"),
+            ("two PlatformAgents",
+             '{"items":[{"metadata":{"name":"a"},"spec":{"scope":{"projects":["p2-project"]}}},{"metadata":{"name":"b"},"spec":{}}]}',
+             "norelease"),
+        ):
+            with self.subTest(case=label):
+                proc = self._run(cr, record)
+                self._assert_rc(proc, 1)
+                self.assertIn("ERROR: Refusing to apply:", proc.stdout)
+                proc = self._run(cr, record, mode="warn")
+                self._assert_rc(proc, 0)
+                self.assertIn("WARN: The scope check did not run:", proc.stdout)
 
 
 if __name__ == "__main__":

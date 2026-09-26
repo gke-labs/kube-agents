@@ -1,9 +1,10 @@
 # Fleet Audit — The Collector Manifest
 
-> **STATUS — design of record; the `finish` side is implemented, two collectors ship.**
+> **STATUS — design of record; the `finish` side is implemented, three collectors ship.**
 > `audit_report.py finish` accepts a manifest through `--manifest-file` and applies every rule in
 > §3. `agents/platform/skills/fleet-audit/scripts/fleet_drift.py` emits one for the
-> `fleet-consistency-drift` stream and `patch_readiness.py` one for `security-patch-orchestrator`;
+> `fleet-consistency-drift` stream, `patch_readiness.py` one for `security-patch-orchestrator`, and
+> `collect.py` one each for `obtainability-audit`, `compliance-audit` and `ai-security-audit`;
 > each stream's SOP runs its collector and passes the flag, and every other stream
 > publishes on the document's own attestation, exactly as it did before the flag existed.
 
@@ -92,6 +93,7 @@ status surface and the collectors' own bookkeeping, and `finish` ignores them to
 | `clusters[].outcome`                       | **read**         | `collected` means the collector read the target and vouches for `commands`. `unreachable` and `gate-failed` mean it did not, and `error` says why; the document accounts for such a target or is refused. `out-of-scope` means the target is not this audit's: it is not cross-checked, the document need not list it, and it contributes no gap (logged once at INFO).              |
 | `clusters[].commands[]`                    | **read**         | One record per check per target: the check slug, the literal command, its exit code. `rc == 0` is what makes a check "run" for the rules below. `duration_s` and `output_sha256` are carried, not read.                                                                                                                                                                              |
 | `clusters[].checks_not_applicable[]`       | **read**         | Checks the collector itself dispositioned as having nothing to run against on this target. The collector is the authority on applicability; §3.1 holds the document to it in both directions.                                                                                                                                                                                        |
+| `clusters[].checks_unevaluated[]`          | **read**         | `{check, reason}` for a check whose own read failed on this target, so it neither ran nor was found inapplicable. The document may list it in neither `checks_run` nor `checks_not_applicable`, and must carry `limitations` on that target, which makes the run partial.                                                                                                            |
 | `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is carried, not read by `finish`: the stream's SOP says whether the model copies it or re-judges it against fleet context. |
 | `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                                     |
 | `finished_at`                              | **read**         | When the collector stopped. Compared against the `started_at` the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted.       |
@@ -113,7 +115,7 @@ narrowed reads as a complete one and lets `finish` resolve every finding outside
 within the manifest and stable between runs, so a collector sweeping clusters names each one
 `<project>/<location>/<name>` — a GKE name is unique only inside one project and location, and a
 name qualified only where it collides today moves when the rest of the fleet changes, which is a
-finding announced resolved and refiled as new. The drift and patch collectors do this, and their SOPs carry
+finding announced resolved and refiled as new. The drift, patch and `collect.py` collectors do this, and their SOPs carry
 the qualified form into `scope.clusters[].name`, which is the key §3.1 matches on. The qualification stops at the
 target name: a candidate's `object` names the bare resource, because the identity tuple
 already carries the qualified cluster and `_shorten_id` spends a duplicate on the segment it
@@ -148,6 +150,11 @@ before any `gh` call:
   inapplicable there, or the document's `checks_not_applicable` names a check the manifest ran to
   `rc == 0` without itself declaring inapplicable. Applicability is corroborated, never prohibited:
   a check the collector never reached still takes the model's judgement.
+- A target's `checks_run` or `checks_not_applicable` names a check the manifest lists in that
+  target's `checks_unevaluated`, or the manifest lists any there and the target carries no
+  `limitations`. The check's own read failed, so it neither ran nor was found inapplicable; naming it
+  in `limitations` makes the run partial and keeps what it filed open, where either list would let a
+  clean document resolve findings over a read that never happened.
 
 ### 3.2 Evidence — `adopt_collector_evidence`, `adopt_arm_impact`
 

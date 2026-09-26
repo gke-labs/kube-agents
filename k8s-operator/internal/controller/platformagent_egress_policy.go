@@ -69,13 +69,12 @@ package controller
 //     accepted by the API server, stored, and returned by kubectl get exactly
 //     like an enforced one. There is no field, condition or event to read.
 //   - It can be undone from outside, and today it is. Policies selecting one
-//     Pod are additive, and two others select this one and permit the metadata
+//     Pod are additive, and another selects this one and permits the metadata
 //     path: <name>-gateway-netpol, which this same operator renders on every
 //     reconcile (buildNetworkPolicy — 169.254.169.254/32 on TCP 80, the
 //     discovered metadata-daemon port (988 by default) to both link-local
 //     metadata addresses, and TCP 443 to 0.0.0.0/0 minus
-//     the private ranges), and platform-agent-core-egress from
-//     deploy/kustomize/platform, on installs that apply it. So the policy
+//     the private ranges). So the policy
 //     below denies the metadata server, and the Pod it selects can still
 //     reach it. Narrowing the gateway policy is not done here: the metadata
 //     path is still what Workload Identity uses, and the broker Pod is the one
@@ -254,9 +253,8 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	// rule the allowlist is equivalent to a total egress block. kube-dns is the
 	// CoreDNS Service in kube-system; node-local-dns is the NodeLocal DNSCache
 	// DaemonSet, which also answers on a link-local address of its own. The
-	// same two peers appear in charts/kube-agents/templates/litellm.yaml and in
-	// deploy/kustomize/platform/networkpolicy-core-egress.yaml, and the
-	// resolved ClusterIP peers join them for the VIP-matching dataplanes.
+	// same two peers appear in charts/kube-agents/templates/litellm.yaml, and
+	// the resolved ClusterIP peers join them for the VIP-matching dataplanes.
 	//
 	// The metadata address is on this rule, and on port 53 only. Under Cloud DNS
 	// for GKE the node answers DNS at 169.254.169.254:53 and a Pod's resolv.conf

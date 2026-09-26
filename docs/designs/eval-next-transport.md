@@ -311,14 +311,26 @@ gate, an `authority` block that names a real principal, and the reply rendered i
 
 **Which verifiers work.** `report_contains` reads the answer text and works unchanged.
 `resource_property` and `fleet_resource_property` read the cluster and never touched the
-transport. `tool_called` reads the trajectory, which on this path has tool-call data only when
-the executor publishes `activity` artifacts; the Hermes bridge publishes
-status updates and a `result` artifact and no `activity` or `progress` artifacts, while the
-worker adapter publishes `activity` and `progress` beside the result, so a case
-that gates on `tool_called` has no data on stage 1 until the bridge publishes activity or the
-persona moves to the worker path. `worker_commands` reads the kanban worker logs by card id; on
+transport. `tool_called` reads the trajectory, which on this path carries no tool-call data:
+the relay never posts `activity` artifacts to a conversation, so a transport that reads one
+sees none whatever the executor publishes, and recording them is transport work of its own. The
+executors differ beneath that — the Hermes bridge publishes status updates and a `result`
+artifact and no `activity` or `progress` artifacts, while the worker adapter publishes `activity`
+and `progress` beside the result — so a case that gates on `tool_called` has no data on stage 1
+until both the executor publishes activity and the transport records it. `worker_commands` reads
+the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
-signals), and until then a case that gates on it has no data on stage 1 either.
+signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
+as a failure meanwhile: on a record whose trajectory is this transport's envelope with no tool
+call in it, the scorer sets every `tool_called`, `worker_commands` and `worker_agents` entry aside as not
+applicable and grades the checks that remain; a case with no other objective is not graded on
+the lane rather than collapsed, and the rule retires itself on the first record that carries a
+tool entry ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
+cannot show") — which, as above, is transport work that is not filed. A case whose premise
+needs the front door — `agent-kanban-smoke`, which grades
+the chat profile's `kanban_create` — is a different matter: the door addresses `platform`
+directly, so `hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the
+reason, and the api lane's roster is untouched.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
@@ -527,8 +539,10 @@ three are set on the operator, because its defaults point at a registry the pool
 pull from. Under the same flag
 `hack/ci-eval-pr.sh` runs the matrix through the door: it exports `AGENT_TRANSPORT=inject` and
 `AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door, and
-changes nothing else about the run. With the flag unset both scripts are byte for byte what
-they were, and the presubmit's own tests hold that.
+changes nothing else about the run except the matrix itself, from which the inject lane's
+exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather than
+on this flag) then leaves out the cases whose premise needs the chat front door. With the flag
+unset both scripts are byte for byte what they were, and the presubmit's own tests hold that.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.

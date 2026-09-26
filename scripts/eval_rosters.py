@@ -35,6 +35,13 @@ EVAL_DIR = REPO_ROOT / "hack" / "eval"
 PRESUBMIT_CASES_FILE = EVAL_DIR / "presubmit-cases.txt"
 NIGHTLY_CASES_FILE = EVAL_DIR / "nightly-cases.txt"
 BLOCKING_ROSTER_FILE = EVAL_DIR / "blocking-roster.txt"
+# The inject lane's exclusions (#2039): case ids the script drops from TASKS
+# under AGENT_TRANSPORT=inject, each with its reason as the comment block
+# directly above it.
+INJECT_LANE_EXCLUSIONS_FILE = EVAL_DIR / "inject-lane-exclusions.txt"
+# An issue reference a reason must carry, so every exclusion names what
+# decides when it goes.
+ISSUE_REFERENCE_RE = re.compile(r"#\d+")
 
 # One case-file entry: the path the script hands to devops-bench, relative to
 # bench/. Anchored, so a commented-out copy is not an entry.
@@ -126,3 +133,35 @@ def nightly_cases(path: pathlib.Path = NIGHTLY_CASES_FILE) -> list[str]:
 
 def blocking_roster(path: pathlib.Path = BLOCKING_ROSTER_FILE) -> list[str]:
     return parse_blocking_roster(path.read_text(encoding="utf-8"))
+
+
+def parse_lane_exclusions(text: str) -> dict[str, str]:
+    """Case ids of a lane-exclusion file, each with the reason above it.
+
+    The shape is the blocking roster's -- one id per line, ``#`` comments --
+    plus a convention the reason test enforces: the comment lines directly
+    above an entry (up to the previous blank line or entry) are its reason.
+    A header comment separated from the first entry by a blank line is not a
+    reason. The shell reads only the ids, exactly as ``entries`` does; this
+    parser exists so the roster test can hold every exclusion to a reason.
+    """
+    reasons: dict[str, str] = {}
+    pending: list[str] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            pending = []
+            continue
+        if stripped.startswith("#"):
+            # One marker only: a reason that opens with an issue number
+            # (`# #2039: ...`, or `##2039` by mistake) keeps its `#`.
+            pending.append(stripped[1:].strip())
+            continue
+        case = stripped.split("#", 1)[0].strip()
+        reasons[case] = " ".join(part for part in pending if part)
+        pending = []
+    return reasons
+
+
+def inject_lane_exclusions(path: pathlib.Path = INJECT_LANE_EXCLUSIONS_FILE) -> dict[str, str]:
+    return parse_lane_exclusions(path.read_text(encoding="utf-8"))

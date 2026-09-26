@@ -39,6 +39,11 @@ import (
 // refused, and the refusal is indistinguishable from a bad credential. The
 // answer is not to hope the propagation wins; it is to have a condition that
 // says whether it has, and for the thing that dispatches work to wait on it.
+// The dispatcher that ships, the A2A gateway, waits on a narrower reading of
+// the same Deployment rather than on this condition: its replicas form a
+// queue group, so one serving on the current spec is enough for a new
+// gateway, and a2aCalloutCanServeANewGateway asks exactly that. This
+// condition keeps asking about the callout as a whole.
 //
 // **What this asserts, exactly.** The callout Deployment is Available with all
 // replicas ready. Since the callout's readiness probe answers 503 until it is

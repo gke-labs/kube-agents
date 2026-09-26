@@ -33,8 +33,8 @@
 # A5 cleared on main earlier: hack/fleet-kubeconfigs.sh writes one kubeconfig
 # per fixture ROLE and the cluster-state safeguard below resolves its role
 # through fleet_resource_property, so it grades the seeded cluster rather than
-# platform-agent-host. What is left of A5 is which identity that kubeconfig
-# carries, not which cluster it reaches.
+# platform-agent-host. A5 is a precondition of the run: without the reader
+# grant, hack/fleet-kubeconfigs.sh writes no kubeconfig and the run stops.
 #
 # Domain: fleet-audits (SOP machinery; the slug is docs/designs/domains.yaml's
 # — this task carried it alone until #1023). The compliance-audit SOP is the

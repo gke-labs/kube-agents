@@ -237,12 +237,12 @@ func TestANextInstallCountsItsA2AGateway(t *testing.T) {
 }
 
 // TestAWithheldA2AGatewayIsNotReady is the one that matters. The creation gate
-// holds the A2A gateway while BusCredentialsReady is false, which on a callout
-// short of its replica count is indefinite. Before this, the CR read Ready: True
-// the whole time, directly beside a BusCredentialsReady of False — two
-// conditions contradicting each other, with nothing saying the absent gateway
-// was the consequence. The hold is still the behaviour; what changes is that the
-// phase admits it and the message names the object.
+// holds the A2A gateway until one callout replica is ready on the current spec
+// (a2aCalloutCanServeANewGateway), which on a callout with no such replica is
+// indefinite. Before this, the CR read Ready: True the whole time with no
+// dispatcher in the namespace and nothing saying the absent gateway was the
+// consequence. The hold is still the behaviour; what changes is that the phase
+// admits it and the message names the object.
 func TestAWithheldA2AGatewayIsNotReady(t *testing.T) {
 	agent := splitReadinessNextAgent()
 	phase, msg := settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))

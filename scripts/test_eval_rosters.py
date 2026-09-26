@@ -99,6 +99,7 @@ ADDED_AFTER_THE_SPLIT = [
     "gitops-drift-out-of-band-triage",  # the drift half of incident-triage, PR #1827
     "cluster-agent-delegation-profile-lookup",  # #1840's delegation route, PR #1917
     "upgrades-master-behind-offered-elsewhere",  # the patch collector's §3.1 route check, with patch_readiness.py
+    "obtainability-planted-orphan-service",  # the obtainability collector's §3.16 check, with collect.py
 ]
 # Appended at the tail of the nightly file.
 ADDED_AT_THE_TAIL = [
@@ -114,6 +115,12 @@ MOVED_TO_NIGHTLY = [
     "upgrades-fleet-readiness-exclusion",
     "upgrades-api-deprecation-clean-repo",
     "cluster-agent-crashloop-fix-request",
+]
+# Registered after the moved block, in file order, by the pull request that
+# authored each case.
+ADDED_AFTER_THE_MOVE = [
+    "obtainability-design-quota-vs-capacity",  # the two obtainability-journey probes, PR #1841
+    "obtainability-window-planning-probe",
 ]
 
 # Admitted after the split, each by a pull request that cited the record
@@ -226,7 +233,7 @@ class SplitLostNothingTest(unittest.TestCase):
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases_less_the_promoted_plus_the_held_out(self):
         promoted = {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
         expected = [c for c in NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY if c not in promoted]
-        self.assertEqual(eval_rosters.nightly_cases(), expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL)
+        self.assertEqual(eval_rosters.nightly_cases(), expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE)
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
         for case, _ in PROMOTED_AFTER_THE_SPLIT:
@@ -246,6 +253,71 @@ class SplitLostNothingTest(unittest.TestCase):
     def test_the_script_parses(self):
         result = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+# The inject lane's exclusions at their introduction (#2039, 2026-09-25): the
+# one presubmit case whose premise needs the chat front door. An edit to the
+# file edits this set in the same pull request, for the reason the sets above
+# are pinned.
+INJECT_LANE_EXCLUDED = [
+    "agent-kanban-smoke",  # #2039: grades kanban_create by the front door; the inject door addresses platform directly
+]
+
+
+class InjectLaneExclusionsTest(unittest.TestCase):
+    """hack/eval/inject-lane-exclusions.txt: the lane-level list, checked here.
+
+    A per-case marker would change what the api lane does to the case; a
+    list read only under AGENT_TRANSPORT=inject changes nothing there. The
+    shape is FIXTURE_NOT_READY's -- an exclusion with a reason -- and every
+    entry must name a registered case, carry a reason, and cite the issue
+    that decides when the entry goes.
+    """
+
+    def test_the_parser_reads_the_reason_block_above_each_entry(self):
+        text = (
+            "# header, not a reason\n"
+            "\n"
+            "# #1: first line\n"
+            "# second line\n"
+            "a-case\n"
+            "b-case  # trailing note is not the reason\n"
+            "\n"
+            "c-case\n"
+            "\n"
+            "##2: marker with no space keeps its issue number\n"
+            "d-case\n"
+        )
+        self.assertEqual(
+            eval_rosters.parse_lane_exclusions(text),
+            {"a-case": "#1: first line second line", "b-case": "", "c-case": "", "d-case": "#2: marker with no space keeps its issue number"},
+        )
+        # The shell reads the same file with the plain entry parser.
+        self.assertEqual(eval_rosters.entries(text), ["a-case", "b-case", "c-case", "d-case"])
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual(list(eval_rosters.inject_lane_exclusions()), INJECT_LANE_EXCLUDED)
+
+    def test_every_exclusion_names_a_registered_case(self):
+        registered = set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases())
+        for case in eval_rosters.inject_lane_exclusions():
+            with self.subTest(case=case):
+                self.assertTrue((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").is_file(), f"{case} has no task.yaml")
+                self.assertIn(case, registered, f"{case} runs on no lane, so there is nothing to exclude it from")
+
+    def test_every_exclusion_carries_a_reason_that_names_an_issue(self):
+        for case, reason in eval_rosters.inject_lane_exclusions().items():
+            with self.subTest(case=case):
+                self.assertTrue(reason, f"{case}: no reason in the comment block above it")
+                self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
+
+    def test_an_exclusion_is_not_a_demotion(self):
+        # The api lane's roster is untouched by an entry here: the excluded
+        # case still runs on every pull request and can still red one.
+        for case in INJECT_LANE_EXCLUDED:
+            with self.subTest(case=case):
+                self.assertIn(case, eval_rosters.presubmit_cases())
+                self.assertIn(case, eval_rosters.blocking_roster())
 
 
 if __name__ == "__main__":

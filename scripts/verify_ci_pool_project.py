@@ -32,13 +32,25 @@ _UPSTREAM_SLUG = "gke-labs/kube-agents"
 _CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
 _CHART_VALUES = _ROOT / "charts" / "kube-agents" / "values.yaml"
 _FLEET_KUBECONFIGS = _ROOT / "hack" / "fleet-kubeconfigs.sh"
+# The runner refuses to write kubeconfigs on the caller's own credential unless
+# told to. The fleet check tells it: an operator, even a project owner, holds no
+# token-creator on the reader (roles/owner does not carry
+# iam.serviceAccounts.getAccessToken), and this one-off read of a project the
+# operator owns is not the shared-fleet hazard the refusal exists for. The
+# reader's bindings are checked in check_iam_and_service_accounts instead.
+FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV = "FLEET_ALLOW_RUNNER_CREDENTIAL"
+# The runner's `_FLEET_EXIT_READONLY_UNAVAILABLE`: its credential gate refused
+# this caller before reading anything, whatever the line says. That is about
+# the credential the verifier ran with, never about the project.
+FLEET_EXIT_READONLY_UNAVAILABLE = 3
 _FLEET_CATALOG = _ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 
 # The summary hack/fleet-kubeconfigs.sh prints to stderr on its way out. It is
 # the only place the counts appear, and the script exits 0 whether it wrote
 # every role file or none -- an absent kubeconfig becomes `status: error` on
 # the checks that needed it rather than killing the job, which is what that
-# script is for -- so the numbers are the whole signal.
+# script is for -- so the numbers are the whole signal. The one exception is
+# exit 3, a read-only credential it could not mint: nothing written, no line.
 _FLEET_SUMMARY = re.compile(
     r"Seeded-fleet kubeconfigs: (?P<written>\d+) role\(s\) written to \S+, "
     r"(?P<unresolved>\d+) on clusters that could not be resolved or reached, "
@@ -212,6 +224,15 @@ PROW_RUNNER_MEMBER = "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gse
 # holding no role there at all (gke-labs/kube-agents#1491).
 NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
 
+# The pull-request sweep (hack/ci_sweep_agent_pulls.py, the periodic
+# ci-kube-agents-pull-sweep on main) signs the agent's App through each
+# project's copy of the key, so it needs signer on that key and nothing on the
+# project. A project without the grant fails every ten-minute sweep from the
+# first, so the check names the one command that adds it -- the provisioning
+# script must not be re-run on a registered project (docs/ci-pool-projects.md
+# section 8).
+PULL_SWEEP_MEMBER = "serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+
 # Every identity that leases a pool project and runs hack/ci-eval-pr.sh in it,
 # as (label, the job it runs, member). Each must hold PROW_RUNNER_ROLES on the
 # project and roles/iam.serviceAccountTokenCreator on the fleet reader, and a
@@ -233,8 +254,9 @@ CI_HEALTH_BOT_MEMBER = "serviceAccount:eval-dashboard-publisher@kube-agents-prow
 # What a runner loses without the token-creator grant; the bot's loss is
 # different and is spelled out in its own entry below.
 _RUNNER_WITHOUT_TOKEN_CREATOR = (
-    "every fleet check it runs in this project runs under its own read-write "
-    "credential. Re-apply bench/tf/fleet against {project_id}."
+    "every run it makes in this project stops at the fleet-credentials step: "
+    "hack/fleet-kubeconfigs.sh refuses to read the fleet on the runner's own "
+    "read-write credential. Re-apply bench/tf/fleet against {project_id}."
 )
 
 # Every member that must hold roles/iam.serviceAccountTokenCreator on the
@@ -430,7 +452,9 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # The listing is not the only thing that can be refused. A cluster that the
 # listing returned and `get-credentials` would not open is unread for the same
 # reason and to the same effect, and so is one skipped because a temporary file
-# could not be created. Sources: hack/fleet-kubeconfigs.sh lines 394 and 386.
+# could not be created, or dropped because the file gcloud wrote could not be
+# rewritten to the reader's exec credential (a local fault, not a pool state).
+# Sources: the three per-cluster WARNING lines in hack/fleet-kubeconfigs.sh.
 #
 # One of these, or _FLEET_COULD_NOT_LOOK, must be present before an unresolved
 # role may be excused. Excusing on the *absence* of a "looked and found wrong"
@@ -440,7 +464,8 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # stays non-zero so :406 is silent, something else resolves so :411 is silent,
 # and its roles increment `unresolved` with nothing printed at all.
 _FLEET_UNREACHABLE = re.compile(
-    r"no credentials for seeded cluster|could not create a temporary file", re.I
+    r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to",
+    re.I,
 )
 
 
@@ -1031,12 +1056,12 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
 
     # The runner's permission to borrow the seeded fleet's read-only account.
     # Without it hack/fleet-kubeconfigs.sh cannot mint a token for
-    # seeded-fleet-reader, so every role kubeconfig keeps the runner's own
-    # roles/container.admin credential on a fleet all open pull requests share --
-    # loud in the log, but the run still passes, which is why this went unnoticed
-    # across the whole pool (gke-labs/kube-agents#1051). bench/tf/fleet now
-    # defaults the grant, so a project failing here was last applied before that
-    # default landed and needs `tofu apply` against its seeded-fleet state.
+    # seeded-fleet-reader, writes nothing, and every run that leases the
+    # project stops at its fleet step. (Before it refused, it warned and read the
+    # fleet on the runner's own roles/container.admin, unnoticed across the whole
+    # pool: gke-labs/kube-agents#1051.) bench/tf/fleet now defaults the grant, so
+    # a project failing here was last applied before that default landed and
+    # needs `tofu apply` against its seeded-fleet state.
     fleet_reader_email = f"seeded-fleet-reader@{project_id}.iam.gserviceaccount.com"
     rc, out, err = run_cmd([
         "gcloud", "iam", "service-accounts", "get-iam-policy",
@@ -1481,8 +1506,9 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
             "Not checked",
             warnings=[
                 "kubectl is not on PATH, so the planted fixtures were not checked. "
-                f"Install it and re-run, or run FLEET_PROJECT_ID={project_id} "
-                "hack/fleet-kubeconfigs.sh by hand and read its summary line."
+                f"Install it and re-run, or run {FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV}=1 "
+                f"FLEET_PROJECT_ID={project_id} hack/fleet-kubeconfigs.sh by hand and "
+                "read its summary line."
             ],
         )
 
@@ -1497,6 +1523,11 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
             FLEET_PROJECT_ID=project_id,
             BENCH_FLEET_KUBECONFIG_DIR=target,
         )
+        # Forced, not defaulted: this check has decided the operator's own
+        # credential is acceptable, and a shell that exports the opt-in blank
+        # or as 0 would otherwise turn a healthy project into exit 3.
+        if not env.get("FLEET_READONLY_SA"):
+            env[FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV] = "1"
         rc, _, err = run_cmd(
             ["bash", str(_FLEET_KUBECONFIGS)], timeout=FLEET_TIMEOUT_SECONDS, env=env
         )
@@ -1630,7 +1661,10 @@ def _fleet_presence_result(
     if not match:
         last = (err.strip().splitlines() or ["no output"])[-1]
         if rc != 0:
-            reason = _unread_reason(err)
+            # Exit 3 is the gate, before any read, in every shape it prints,
+            # and its one line is the reason whole; the other codes are unread
+            # only when stderr says why.
+            reason = last if rc == FLEET_EXIT_READONLY_UNAVAILABLE else _unread_reason(err)
             if reason:
                 return CheckResult(
                     name,
@@ -1913,6 +1947,9 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     status is one of {"ok", "failed", "unverified"}, and the token is only ever
     returned, never logged: it is a live credential for every repository in the
     installation.
+
+    The token is narrowed to LEDGER_READ_PERMISSIONS, the three reads grading
+    pins, whatever the App is granted.
     """
 
     def _b64(raw: bytes) -> bytes:
@@ -2279,6 +2316,7 @@ def check_token_minter(
     versions_checked = False
     key_checked = False
     signer_checked = False
+    sweeper_missing = False
     gsa_checked = False
 
     # Which version matters is the chart's business, not KMS's. The pool
@@ -2400,8 +2438,8 @@ def check_token_minter(
         if not _record_unreadable(
             err,
             f"Failed reading IAM policy for KMS key {key}: {err.strip()[:160]}",
-            f"Could not read the IAM policy on KMS key {key}, so the minter GSA's signing rights were "
-            "not checked",
+            f"Could not read the IAM policy on KMS key {key}, so the minter GSA's and the pull-request "
+            "sweeper's signing rights were not checked",
             details,
             warnings,
         ):
@@ -2416,6 +2454,15 @@ def check_token_minter(
             if f"serviceAccount:{minter_gsa}" not in signers:
                 passed = False
                 details.append(f"{minter_gsa} lacks roles/cloudkms.signerVerifier on {key}; it cannot sign a JWT")
+            if PULL_SWEEP_MEMBER not in signers:
+                passed = False
+                sweeper_missing = True
+                details.append(
+                    f"{PULL_SWEEP_MEMBER} lacks roles/cloudkms.signerVerifier on {key}; the pull-request "
+                    "sweep cannot sign here. Grant it without re-running the provisioning script: "
+                    f"gcloud kms keys add-iam-policy-binding {key} --keyring={keyring} --location={location} "
+                    f"--project={project_id} --member={PULL_SWEEP_MEMBER} --role=roles/cloudkms.signerVerifier"
+                )
         except Exception as exc:
             passed = False
             details.append(f"Failed parsing KMS key IAM policy: {exc}")
@@ -2510,12 +2557,33 @@ def check_token_minter(
         [
             ("the imported key versions", versions_checked),
             ("the key's purpose, algorithm and import-only setting", key_checked),
-            ("the minter GSA's signing rights", signer_checked),
+            ("the minter GSA's and the sweeper's signing rights", signer_checked),
             ("the minter GSA's Workload Identity binding", gsa_checked),
         ]
     )
     signing_version = f" v{probe_version}" if probe_version else ""
-    if not passed:
+    if not passed and sweeper_missing and len(details) == 1:
+        # The one failed item is the grant a project registered before the
+        # sweep existed never got (5.5). The headline says so, or an operator
+        # scanning it goes looking at the PEM -- and it calls the minter whole
+        # only when every read that would say so happened; a denied read
+        # leaves `details` empty and `partial` naming what went unchecked.
+        sweeper = "the pull-request sweeper lacks signer on the key (the detail has the one-off grant)"
+        if not partial:
+            message = f"Minter provisioned; {sweeper}"
+        else:
+            # The signer row is the minter's alone here: the sweeper's half of
+            # it is the failure, and cannot sit in the "verified" list.
+            rest = _partial_summary(
+                [
+                    ("the imported key versions", versions_checked),
+                    ("the key's purpose, algorithm and import-only setting", key_checked),
+                    ("the minter GSA's signing rights", signer_checked),
+                    ("the minter GSA's Workload Identity binding", gsa_checked),
+                ]
+            )
+            message = f"{sweeper[0].upper()}{sweeper[1:]}; {rest}"
+    elif not passed:
         message = "Token minter not provisioned / PEM key missing or wrong"
     elif partial:
         message = partial

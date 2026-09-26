@@ -395,8 +395,8 @@ func TestReconcileA2AGatedByMode(t *testing.T) {
 	if err := cl.List(ctx, jobs); err != nil || len(jobs.Items) == 0 {
 		t.Errorf("provision Job not rendered under next (err=%v, n=%d)", err, len(jobs.Items))
 	}
-	// The gateway waits on BusCredentialsReady (see the gate tests); under
-	// next with a serving callout it renders like the rest.
+	// The gateway waits on a serving callout replica (see the gate tests);
+	// under next with a serving callout it renders like the rest.
 	letTheGatewayThrough(t, ctx, cl, r, req, agent)
 	dep := &appsv1.Deployment{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-gateway", Namespace: "test-ns"}, dep); err != nil {
@@ -1818,11 +1818,11 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 
 	// The gateway is the first object cleanupA2A deletes, so it is the object
 	// this test's early-exit argument turns on -- and reconcileA2A withholds
-	// its creation until BusCredentialsReady is True. Driving reconcileA2A
-	// directly never publishes that condition, so without this the gateway is
-	// never created and the "it is gone after cleanup" row below asserts the
+	// its creation until a callout replica reports serving. The fake client
+	// runs no Deployment controller, so without this the gateway is never
+	// created and the "it is gone after cleanup" row below asserts the
 	// absence of an object the render never made.
-	busCredentialsAreReady(agent)
+	theCalloutIsServing(t, ctx, cl, r, agent)
 	// The teardown list carries the inject door's four objects, which render
 	// only under the operator's flag; set it, so the precondition below
 	// covers them rather than failing on objects the render was told not to
@@ -2572,7 +2572,7 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
-	// The A2A gateway is withheld until BusCredentialsReady is True, and it is
+	// The A2A gateway is withheld until a callout replica serves, and it is
 	// one of the objects this test has to look at. Report the callout serving
 	// so the walk below has a gateway to walk.
 	letTheGatewayThrough(t, ctx, cl, r, req, agent)
@@ -2682,7 +2682,7 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 	// reach. Two must be there or this proves nothing about them: the NATS
 	// StatefulSet, which carries the nats.conf digest on its pod template and
 	// is the exact regression above, and the A2A gateway Deployment, which the
-	// creation gate withholds until BusCredentialsReady is True -- so a test
+	// creation gate withholds until a callout replica serves -- so a test
 	// that does not open the gate walks a namespace with no gateway in it and
 	// reports green on coverage it never had.
 	for _, want := range []string{

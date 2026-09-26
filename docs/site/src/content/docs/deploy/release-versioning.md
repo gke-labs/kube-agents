@@ -15,30 +15,51 @@ older release's checkout, and what they leave as it is.
 
 ## Tag and artifact taxonomy
 
-Every commit and build progresses through five distinct lifecycle tiers:
+Every commit and build progresses through six distinct lifecycle tiers:
 
-| Tier                       | Format                                | Trigger                       | Purpose and guarantees                                                                                                 |
-| :------------------------- | :------------------------------------ | :---------------------------- | :--------------------------------------------------------------------------------------------------------------------- |
-| **Candidate Build**        | `<COMMIT_SHA>` (bare 40-char SHA)     | Push to `main` branch         | Developer build in GHCR; container images built once.                                                                  |
-| **Release Candidate (RC)** | `rc_YYMMDDHHMM_<SHORT_SHA>`           | 3-hour cron / manual dispatch | Candidate build selected for live cluster testing.                                                                     |
-| **RC Validated**           | `rc_YYMMDDHHMM_<SHORT_SHA>_validated` | Successful GKE E2E suite      | Quality gate: proof that `install.sh` succeeded on a real GKE cluster.                                                 |
-| **Staging Promoted**       | `staging_YYMMDDHHMM_<SHORT_SHA>`      | Successful nightly matrix     | Quality gate for GA: the full nightly E2E matrix passed on the commit. Also the deploy trigger for the staging estate. |
-| **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Weekly cron / manual dispatch | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default).    |
+| Tier                       | Format                                | Trigger                       | Purpose and guarantees                                                                                                                                   |
+| :------------------------- | :------------------------------------ | :---------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Candidate Build**        | `<COMMIT_SHA>` (bare 40-char SHA)     | Push to `main` branch         | Developer build in GHCR; container images built once.                                                                                                    |
+| **Release Candidate (RC)** | `rc_YYMMDDHHMM_<SHORT_SHA>`           | 3-hour cron / manual dispatch | Candidate build selected for live cluster testing.                                                                                                       |
+| **RC Validated**           | `rc_YYMMDDHHMM_<SHORT_SHA>_validated` | Successful GKE E2E suite      | Quality gate: proof that `install.sh` succeeded on a real GKE cluster.                                                                                   |
+| **Eval Candidate**         | `evalcand_YYMMDDHHMM_<SHORT_SHA>`     | Successful nightly matrix     | Nomination, not a promotion: starts the agent eval against the candidate's images, over the same case matrix that gates a pull request. Deploys nothing. |
+| **Staging Promoted**       | `staging_YYMMDDHHMM_<SHORT_SHA>`      | Green eval on the nomination  | Quality gate for GA: the nightly E2E matrix and the agent eval both passed. Also the deploy trigger for the staging estate.                              |
+| **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Weekly cron / manual dispatch | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default).                                      |
 
 Only a staging-promoted commit is releasable. An `rc_*_validated` tag records the narrow
-three-hourly suite; the GA gate reads the `staging_<ts>_<sha>` tag that the nightly pipeline
-pushes after the full matrix passes.
+three-hourly suite; the GA gate reads the `staging_<ts>_<sha>` tag, which the nightly pipeline
+pushes only after the full matrix passes and the agent eval it nominated the candidate for comes
+back green.
+
+The two-tag split is what makes the eval a gate rather than a report. Both tags name the same
+candidate and the eval runs between them: pushing `evalcand_<core>` starts the eval against the
+candidate's published images, and the pipeline waits for its verdict before pushing
+`staging_<core>`. One tag could not do both — the staging deploy would reach the cluster in
+minutes while the eval was still hours from an answer. An `evalcand_` tag with no `staging_` tag
+beside it is therefore a candidate the eval rejected, one whose eval has not finished, or — rarely —
+one whose eval never returned a verdict and whose nomination the pipeline then failed to withdraw.
+Nothing deploys from any of them.
+
+Withdrawal is the difference between the first case and the last. A rejected candidate keeps its
+`evalcand_` tag for good, which is what stops every later nightly re-measuring a build already
+judged. A candidate whose eval broke before measuring anything has its tag deleted instead, so the
+next nightly can pick the same commit up and ask again; if that deletion fails, the nightly run
+fails with it, and the tag has to be deleted by hand before the commit can be measured.
 
 ## Release cadence
 
 The RC pipeline, the nightly staging promotion, and the GA release all run on schedules,
 with manual dispatches available for overrides and off-schedule releases.
 
-| Step                        | When it runs                                                                                                  |
-| :-------------------------- | :------------------------------------------------------------------------------------------------------------ |
-| RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate has already been tried.   |
-| Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate. One already promoted is re-tested, not re-tagged. |
-| GA release                  | Weekly on Fridays at 05:17 UTC, or when a maintainer dispatches it.                                           |
+| Step                        | When it runs                                                                                                               |
+| :-------------------------- | :------------------------------------------------------------------------------------------------------------------------- |
+| RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate has already been tried.                |
+| Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate. One already nominated or promoted is re-tested, not re-tagged. |
+| GA release                  | Weekly on Fridays at 05:17 UTC, or when a maintainer dispatches it.                                                        |
+
+A staging promotion is not finished when its matrix goes green. The eval runs between the
+nomination and the tag and takes hours, so the `staging_*` tag can appear most of a working day
+after the run that produced it started.
 
 Scheduled runs start when GitHub's scheduler picks them up, so the minute is a floor, not a
 promise. A scheduled GA release ships unattended on Fridays if a new staging-promoted

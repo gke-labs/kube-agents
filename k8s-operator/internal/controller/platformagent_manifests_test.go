@@ -1422,6 +1422,21 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	if len(container.Command) != 1 || container.Command[0] != "/usr/local/bin/start-services" {
 		t.Errorf("unexpected proxy command: %v", container.Command)
 	}
+	// Pinned here as well as in the goldens: a golden regeneration blesses
+	// whatever the builder renders, so a request that drifted back down would
+	// otherwise pass every test. 500m is what lets a mint finish inside its
+	// five-second timeouts while an evicted pod's replacement warms up, and
+	// 512Mi is the memory Autopilot admits a 500m pod at, declared so the
+	// rendered request is the admitted one on both cluster modes.
+	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
+		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
+	}
+	if got := container.Resources.Requests.Memory().String(); got != "512Mi" {
+		t.Errorf("expected a 512Mi memory request on the proxy container, got %s", got)
+	}
+	if got := container.Resources.Limits.Cpu().String(); got != "1" {
+		t.Errorf("expected the proxy CPU limit left at 1, got %s", got)
+	}
 	env := make(map[string]corev1.EnvVar)
 	for _, item := range container.Env {
 		env[item.Name] = item
@@ -1483,6 +1498,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 				Deployment: &agentv1alpha1.DeploymentSpec{
 					Env: []corev1.EnvVar{
 						{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "1024"},
+						{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: "64"},
 						{Name: "UNRESERVED_PASSENGER", Value: "arrived"},
 					},
 				},
@@ -1506,6 +1522,13 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	if got := env["CREDENTIAL_PROXY_MAX_OUTPUT_BYTES"]; got != want {
 		t.Errorf("expected the proxy output cap %s, got %q — a CR override must not reach it", want, got)
 	}
+	// The concurrency cap is the other half of what the limit is sized
+	// against, so it is the operator's in the same way: set here, and not a
+	// CR's to raise past what the limit below can hold.
+	const wantConcurrent = "8"
+	if got := env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"]; got != wantConcurrent {
+		t.Errorf("expected the proxy concurrency cap %s, got %q — a CR override must not reach it", wantConcurrent, got)
+	}
 	// The measured worst case, so a future reduction of the cap has to argue
 	// with the number rather than pass silently.
 	const largestObservedDump = 3866719
@@ -1519,42 +1542,42 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 
 	// The other half of the argument, which the floor above cannot make: a cap
 	// this side of the fleet's needs is still wrong if the container cannot
-	// hold it. Five live copies of a capped output exist per in-flight command
-	// -- subprocess bytes, slice, decoded str, JSON-escaped str, encoded
-	// response -- and the commands in flight are one per kanban worker plus
-	// the front-door session. Nothing bounds that concurrency inside the
-	// proxy; it is a ThreadingHTTPServer. So the burst has to fit under the
-	// memory limit alongside what the container holds at rest, or an OOMKill
-	// takes gcloud, kubectl, gh and git away from every agent the proxy serves.
+	// hold it. credential_proxy.py reads a command's output as it streams,
+	// keeps at most the cap per stream and bounds the decoded text to the
+	// same size, so what the broker holds per in-flight request is about six
+	// times the cap, transiently: the two capped stream buffers, their decoded
+	// text, and the JSON body and its encoding (measured at 48 MiB per request
+	// against the 8 MiB cap for text, 37 MiB for bytes that are not UTF-8).
+	// A request holds its slot until its response is written, and concurrency
+	// is bounded inside the broker by CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS,
+	// read here off the rendered env like the output cap, so the test models
+	// what the operator deploys rather than a copy of it. The burst has to
+	// fit under the memory limit alongside what the container holds at rest,
+	// or an OOMKill takes gcloud, kubectl, gh and git away from every agent
+	// the proxy serves.
 	//
-	// Five workers rather than defaultKanbanMaxInProgress, because that
-	// default is overridable and resolveResources sizes the agent container
-	// for the five-way fan-out it has actually observed. The proxy is sized
-	// for the same install.
-	//
-	// And two capped streams per command, not one. `_execute` truncates stdout
-	// and stderr in two independent calls -- see the pair of `self._truncate`
-	// lines in credential_proxy.py -- so the cap is a per-stream ceiling and a
-	// single command can hold 2x it. Modelling one stream understates the
-	// burst by half, which is the direction that lets a too-large cap pass.
+	// The children -- one kubectl or gcloud per in-flight command -- are
+	// outside this arithmetic. A kubectl listing thousands of objects runs to
+	// hundreds of MiB on its own, and the rest of the limit is what holds it.
 	//
 	// The resting footprint is the container's own memory request rather than
 	// a measured constant: the ~250Mi the old sidecar held steady was mostly
 	// the event watcher's informer caches, which stayed in the gateway Pod
 	// when #913 moved the proxy out, and the request is upstream's statement
 	// of what this pod holds with nothing in flight.
-	const copiesPerCommand = 5
-	const streamsPerCommand = 2
-	const observedFanOut = 5
-	inFlight := int64(observedFanOut + 1)
-	burst := int64(capBytes) * copiesPerCommand * streamsPerCommand * inFlight
+	const copiesPerCommand = 6
+	inFlight, err := strconv.ParseInt(env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"], 10, 64)
+	if err != nil || inFlight < 1 {
+		t.Fatalf("proxy concurrency cap %q is not a positive integer", env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"])
+	}
+	burst := int64(capBytes) * copiesPerCommand * inFlight
 	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
 	if steadyStateBytes == 0 {
 		t.Fatal("the proxy container declares no memory request, so the burst below has no resting footprint to add to")
 	}
 	limit := proxy.Resources.Limits.Memory().Value()
 	if burst+steadyStateBytes > limit {
-		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands, which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit or lower the cap",
+		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS), which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit, or lower one of the two caps",
 			capBytes, burst, inFlight, limit, steadyStateBytes)
 	}
 }
@@ -1894,161 +1917,6 @@ func TestEventWatcherTokenEnvMatchesStartServices(t *testing.T) {
 	t.Fatalf("%s passes --token-env=%s, but the container hosting the watcher has no such variable; the watcher will exit on every start", path, tokenEnv)
 }
 
-func TestKustomizeNetworkPolicies_PodSelectorMatchesCommonLabels(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "platform-agent",
-			Namespace: "kubeagents-system",
-		},
-	}
-	expectedLabels := commonLabels(agent)
-	expectedName := expectedLabels[labelName] // "platform-agent"
-
-	policyFiles := []string{
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-ingress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-core-egress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-internal-egress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-apiserver-egress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-external-egress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "gke-dataplane-v2", "fqdn-networkpolicy.yaml"),
-	}
-
-	for _, path := range policyFiles {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("failed to read policy file %s: %v", path, err)
-		}
-		var manifest struct {
-			Metadata struct {
-				Name string `yaml:"name"`
-			} `yaml:"metadata"`
-			Spec struct {
-				PodSelector struct {
-					MatchLabels map[string]string `yaml:"matchLabels"`
-				} `yaml:"podSelector"`
-			} `yaml:"spec"`
-		}
-		if err := yaml.Unmarshal(data, &manifest); err != nil {
-			t.Fatalf("failed to unmarshal YAML %s: %v", path, err)
-		}
-		got := manifest.Spec.PodSelector.MatchLabels[labelName]
-		if got != expectedName {
-			t.Errorf("policy %s (%s): expected podSelector.matchLabels[%q]=%q, got %q", manifest.Metadata.Name, path, labelName, expectedName, got)
-		}
-	}
-}
-
-// TestKustomizeCoreEgressDNSPeersMatchTheOperator pins the static Kustomize DNS
-// rule to the one buildNetworkPolicy renders. They are two hand-maintained
-// copies of the same peer list, and nothing else compares them: the only other
-// test reading these files checks podSelector alone.
-//
-// The drift is not hypothetical. Every other static copy in the tree — the
-// chart's litellm and github-minter policies, the LiteLLM integration base, the
-// examples — already named the Cloud DNS resolver while this file did not, and
-// no test noticed until a Cloud DNS install lost name resolution. The regression
-// this catches is the reverse: someone edits the builder, `go test ./...` stays
-// green, and Kustomize installs quietly get a different resolver set.
-//
-// It compares ipBlock CIDRs only. The selector peers are equivalent but not
-// textually comparable across a Go literal and a YAML document, and pinning
-// those would make the test fail on cosmetic edits rather than on drift.
-func TestKustomizeCoreEgressDNSPeersMatchTheOperator(t *testing.T) {
-	path := filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-core-egress.yaml")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("failed to read %s: %v", path, err)
-	}
-	var manifest struct {
-		Spec struct {
-			Egress []struct {
-				Ports []struct {
-					Port int32 `yaml:"port"`
-				} `yaml:"ports"`
-				To []struct {
-					IPBlock struct {
-						CIDR string `yaml:"cidr"`
-					} `yaml:"ipBlock"`
-				} `yaml:"to"`
-			} `yaml:"egress"`
-		} `yaml:"spec"`
-	}
-	if err := yaml.Unmarshal(data, &manifest); err != nil {
-		t.Fatalf("failed to unmarshal %s: %v", path, err)
-	}
-
-	// The static file's DNS rule carries a 0.0.0.0/0 peer with an except list,
-	// which the operator's does not; compare the single-host grants, which are
-	// the resolvers themselves.
-	static := map[string]bool{}
-	for _, rule := range manifest.Spec.Egress {
-		isDNS := len(rule.Ports) > 0
-		for _, port := range rule.Ports {
-			if port.Port != dnsPort {
-				isDNS = false
-			}
-		}
-		if !isDNS {
-			continue
-		}
-		for _, peer := range rule.To {
-			if strings.HasSuffix(peer.IPBlock.CIDR, "/32") || strings.HasSuffix(peer.IPBlock.CIDR, "/128") {
-				static[peer.IPBlock.CIDR] = true
-			}
-		}
-	}
-
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
-	}
-	// Every port-53 rule, not egressCIDRsForPort, which returns at the first one
-	// it finds. The static side above iterates the whole file, and comparing one
-	// operator rule against all of the manifest's would report parity for a
-	// second operator rule nobody had mirrored — the exact drift this test is
-	// here to catch, and a split into two port-53 rules is a plausible edit given
-	// that separate rules are how this policy keeps grants from widening one
-	// another.
-	rendered := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
-	operator := map[string]bool{}
-	for _, rule := range rendered.Spec.Egress {
-		// Written out rather than through ruleNamesPort, which counts a rule with
-		// no ports as naming every one of them. That is right for its callers and
-		// wrong here: such a rule's peers are not DNS peers, and folding them into
-		// this set would report drift against the static file for peers the static
-		// file's DNS rule was never supposed to carry.
-		namesDNS := false
-		for _, candidate := range rule.Ports {
-			if candidate.Port != nil && candidate.Port.IntValue() == dnsPort {
-				namesDNS = true
-				break
-			}
-		}
-		if !namesDNS {
-			continue
-		}
-		for _, peer := range rule.To {
-			if peer.IPBlock == nil {
-				continue
-			}
-			if strings.HasSuffix(peer.IPBlock.CIDR, "/32") || strings.HasSuffix(peer.IPBlock.CIDR, "/128") {
-				operator[peer.IPBlock.CIDR] = true
-			}
-		}
-	}
-
-	for cidr := range operator {
-		if !static[cidr] {
-			t.Errorf("the operator's DNS rule grants %s and %s does not; a Kustomize install gets a "+
-				"different resolver set from an operator-managed one", cidr, filepath.Base(path))
-		}
-	}
-	for cidr := range static {
-		if !operator[cidr] {
-			t.Errorf("%s grants %s on port 53 and the operator's DNS rule does not", filepath.Base(path), cidr)
-		}
-	}
-}
-
 // fqdnPatternsFromPolicy returns the egress match patterns buildFQDNNetworkPolicy emits.
 func fqdnPatternsFromPolicy(t *testing.T) []string {
 	t.Helper()
@@ -2099,10 +1967,10 @@ func fqdnPatternToRegexp(t *testing.T, pattern string) *regexp.Regexp {
 }
 
 // TestFQDNPatternList_MatchesRealHostnames pins the egress allowlist against
-// hostnames the gateway actually dials. TestFQDNPatternList_MatchesKustomizeManifest
-// only proves the two copies of the list agree — it would pass just as happily
-// if both were wrong, which is how "*.gke.goog" was first shipped one label
-// short of every DNS control-plane endpoint it was added to allow.
+// hostnames the gateway actually dials rather than against another copy of the
+// list — a copy-to-copy comparison passes just as happily when both are wrong,
+// which is how "*.gke.goog" was first shipped one label short of every DNS
+// control-plane endpoint it was added to allow.
 func TestFQDNPatternList_MatchesRealHostnames(t *testing.T) {
 	patterns := fqdnPatternsFromPolicy(t)
 
@@ -2142,39 +2010,6 @@ func TestFQDNPatternList_MatchesRealHostnames(t *testing.T) {
 		if !matched {
 			t.Errorf("no FQDN egress pattern matches %q; the gateway cannot reach it under FQDN network policy (patterns: %v)", host, patterns)
 		}
-	}
-}
-
-func TestFQDNPatternList_MatchesKustomizeManifest(t *testing.T) {
-	goPatterns := fqdnPatternsFromPolicy(t)
-
-	path := filepath.Join("..", "..", "..", "deploy", "kustomize", "gke-dataplane-v2", "fqdn-networkpolicy.yaml")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("failed to read %s: %v", path, err)
-	}
-	var manifest struct {
-		Spec struct {
-			Egress []struct {
-				Matches []struct {
-					Pattern string `yaml:"pattern"`
-				} `yaml:"matches"`
-			} `yaml:"egress"`
-		} `yaml:"spec"`
-	}
-	if err := yaml.Unmarshal(data, &manifest); err != nil {
-		t.Fatalf("failed to unmarshal %s: %v", path, err)
-	}
-	if len(manifest.Spec.Egress) == 0 {
-		t.Fatalf("expected egress in YAML manifest %s", path)
-	}
-	var yamlPatterns []string
-	for _, m := range manifest.Spec.Egress[0].Matches {
-		yamlPatterns = append(yamlPatterns, m.Pattern)
-	}
-
-	if !reflect.DeepEqual(goPatterns, yamlPatterns) {
-		t.Errorf("FQDN patterns diverge between Go code and YAML manifest: Go=%v, YAML=%v", goPatterns, yamlPatterns)
 	}
 }
 
@@ -5466,6 +5301,243 @@ func TestDeploymentEnvCannotOverrideTheEventWatcherSwitch(t *testing.T) {
 				t.Errorf("the operator's value must win over spec.deployment.env, got %q", found[0])
 			}
 		})
+	}
+}
+
+// agentWithDriftDetector builds a PlatformAgent whose harness names the drift
+// detector. The harness triple is filled in, because the detector's own gate
+// requires it and a fixture without it would make every "enabled" case look
+// like a disabled one for the wrong reason; the tests that care about a missing
+// triple clear a field themselves.
+func agentWithDriftDetector(drift *agentv1alpha1.DriftDetectorSpec) *agentv1alpha1.PlatformAgent {
+	a := newTestPlatformAgent()
+	a.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID:     "test-project",
+		Location:      "us-central1",
+		ClusterName:   "test-cluster",
+		DriftDetector: drift,
+	}
+	return a
+}
+
+// The default has to be "not detecting", which is the opposite of the watcher's
+// and for a reason the watcher does not have: the detector reads a Pub/Sub
+// subscription that only exists where the drift-pubsub Terraform module was
+// applied. A resolver that read absence as on would start, on every install
+// without one, a process that never exits and never reports a change: the
+// subscription is not checked at startup and the failing pull is retried for the
+// life of the pod, on a pod that stays Ready throughout.
+func TestDriftDetectorDefaultsOffWhenUnspecified(t *testing.T) {
+	if driftDetectorEnabled(newTestPlatformAgent()) {
+		t.Error("an agent with no harness at all must not run the detector")
+	}
+	if driftDetectorEnabled(agentWithTuning(nil)) {
+		t.Error("a harness that says nothing about the detector must not run it")
+	}
+	if driftDetectorEnabled(agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{})) {
+		t.Error("a driftDetector block with no enabled key must not run the detector")
+	}
+	if !driftDetectorEnabled(agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})) {
+		t.Error("enabled: true with a complete harness must run the detector")
+	}
+	if driftDetectorEnabled(agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(false)})) {
+		t.Error("enabled: false must turn the detector off")
+	}
+}
+
+// Enabling it is necessary and not sufficient. The detector checks the cluster
+// name it is given against the cluster its credentials actually reach and stops
+// on a disagreement, so starting it with a half-filled harness gives a restart
+// loop rather than a degraded detector. The gate is here, in the operator,
+// because that is the layer that can see the whole harness.
+func TestDriftDetectorStaysOffWithoutTheWholeHarnessTriple(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		clear func(*agentv1alpha1.HarnessSpec)
+	}{
+		{"no project", func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "" }},
+		{"no location", func(h *agentv1alpha1.HarnessSpec) { h.Location = "" }},
+		{"no cluster name", func(h *agentv1alpha1.HarnessSpec) { h.ClusterName = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+			tc.clear(agent.Spec.Harness)
+			if driftDetectorEnabled(agent) {
+				t.Errorf("enabled: true with %s must not start the detector", tc.name)
+			}
+		})
+	}
+}
+
+// A populated projectId is not a usable one. The detector refuses an all-digits
+// --project before it starts any loop, and start-services.sh always passes
+// --in-cluster and --profiles-dir, so that refusal is always reachable in the
+// shipped path -- which makes a numeric projectId the restart loop the gate's own
+// doc comment says it prevents. Nothing else reading the harness triple minds a
+// number, so the install is otherwise healthy and nothing else would catch it.
+//
+// The pairs below are the detector's own boundary, not a restatement of the gate:
+// a project ID must begin with a lowercase letter, so all-digits is the whole test
+// and anything with one non-digit is an ID. The mixed cases are what a mutation
+// widening the check to "contains a digit" would take down.
+func TestDriftDetectorGateRejectsAProjectNumber(t *testing.T) {
+	for _, tc := range []struct {
+		project string
+		want    bool
+	}{
+		{"123456789012", false},
+		{"0", false},
+		{"test-project", true},
+		{"project-123456789012", true},
+		{"123456789012-project", true},
+		{"my-project-2", true},
+	} {
+		t.Run(tc.project, func(t *testing.T) {
+			agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+			agent.Spec.Harness.ProjectID = tc.project
+			if got := driftDetectorEnabled(agent); got != tc.want {
+				t.Errorf("driftDetectorEnabled with projectId %q = %v, want %v", tc.project, got, tc.want)
+			}
+		})
+	}
+}
+
+// The gate must refuse exactly what the detector refuses, and the two implement
+// the test separately -- isProjectNumber here, looksLikeProjectNumber in
+// cmd/drift-detector/main.go, each with its own copy of the digit set. A gate that
+// drifted narrower would admit a project the binary rejects, which is the defect
+// above returning; one that drifted wider would report a working install as off,
+// which is silent. This pins the character set rather than the two functions,
+// because the operator does not import the detector's package.
+func TestDriftDetectorGateUsesTheDetectorsDigitSet(t *testing.T) {
+	if driftDetectorProjectNumberDigits != "0123456789" {
+		t.Errorf("digit set = %q, want the detector's 0123456789", driftDetectorProjectNumberDigits)
+	}
+	if isProjectNumber("") {
+		t.Error("an empty project is absent, not a number; the triple check reports that")
+	}
+}
+
+// The entrypoint reads these six and nothing else carries the configuration into
+// the pod. Written on every reconcile rather than only when the detector is on,
+// for the same reason the watcher's switch is: from outside the container an
+// install that never asked for drift detection and one whose detector cannot
+// start look identical, and the Deployment is where that is answered.
+//
+// The harness triple is repeated under the detector's own names rather than read
+// from GKE_PROJECT_ID and friends, which buildPodTemplateSpec sets on the agent
+// container and not on this sidecar. Asserting the values here is what catches a
+// later change that assumes the two containers share an environment.
+func TestCredentialProxyCarriesTheDriftDetectorEnvironment(t *testing.T) {
+	agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{
+		Enabled:        ptr.To(true),
+		Subscription:   "drift-audit-sub",
+		GitopsManagers: "argocd-controller,flux",
+	})
+
+	want := map[string]string{
+		"DRIFT_DETECTOR_ENABLED":          "true",
+		"DRIFT_DETECTOR_PROJECT_ID":       "test-project",
+		"DRIFT_DETECTOR_CLUSTER_LOCATION": "us-central1",
+		"DRIFT_DETECTOR_CLUSTER_NAME":     "test-cluster",
+		"DRIFT_DETECTOR_SUBSCRIPTION":     "drift-audit-sub",
+		"DRIFT_DETECTOR_GITOPS_MANAGERS":  "argocd-controller,flux",
+	}
+
+	got := map[string][]string{}
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		if _, ours := want[e.Name]; ours {
+			got[e.Name] = append(got[e.Name], e.Value)
+		}
+	}
+	for name, value := range want {
+		if len(got[name]) != 1 {
+			t.Fatalf("want exactly one %s, got %d (%q)", name, len(got[name]), got[name])
+		}
+		if got[name][0] != value {
+			t.Errorf("%s = %q, want %q", name, got[name][0], value)
+		}
+	}
+}
+
+// An unconfigured detector still gets its switch, set to "false" rather than
+// left out, and gets none of its settings. Both halves matter. The switch is
+// there so that a Deployment says whether the detector is meant to be running;
+// the settings are not, because every install that has not applied the
+// drift-pubsub module is in this state, and writing them would repeat the
+// harness triple under five more names on every credential proxy in the fleet
+// for a process that is not started.
+//
+// The CR supplies all six here to make the second half a real assertion rather
+// than an observation about a fixture: the names are reserved in
+// mergeCredentialProxyEnv whether or not the operator writes them, so an entry
+// the operator skips has to be dropped, not passed through.
+func TestCredentialProxyDisablesTheDriftDetectorWhenUnconfigured(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{
+			{Name: "DRIFT_DETECTOR_ENABLED", Value: "true"},
+			{Name: "DRIFT_DETECTOR_PROJECT_ID", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_CLUSTER_LOCATION", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_CLUSTER_NAME", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_SUBSCRIPTION", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_GITOPS_MANAGERS", Value: "cr-supplied"},
+		},
+	}
+
+	var switches []string
+	var settings []string
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		switch {
+		case e.Name == "DRIFT_DETECTOR_ENABLED":
+			switches = append(switches, e.Value)
+		case strings.HasPrefix(e.Name, "DRIFT_DETECTOR_"):
+			settings = append(settings, e.Name+"="+e.Value)
+		}
+	}
+	if len(switches) != 1 || switches[0] != "false" {
+		t.Errorf("DRIFT_DETECTOR_ENABLED = %q, want exactly one \"false\"", switches)
+	}
+	if len(settings) != 0 {
+		t.Errorf("a detector that is off must carry no settings, got %q", settings)
+	}
+}
+
+// Same property as the watcher's switch, and the same failure mode if it breaks:
+// `containers[].env` is a listType=map keyed on name, so a duplicate makes the
+// Deployment unappliable and the operator stops reconciling altogether. The
+// operator appends these six after mergeCredentialProxyEnv runs, so the only
+// thing standing between a CR naming one of them and a frozen reconcile is the
+// reserved list.
+func TestDeploymentEnvCannotOverrideTheDriftDetectorEnvironment(t *testing.T) {
+	names := []string{
+		"DRIFT_DETECTOR_ENABLED",
+		"DRIFT_DETECTOR_PROJECT_ID",
+		"DRIFT_DETECTOR_CLUSTER_LOCATION",
+		"DRIFT_DETECTOR_CLUSTER_NAME",
+		"DRIFT_DETECTOR_SUBSCRIPTION",
+		"DRIFT_DETECTOR_GITOPS_MANAGERS",
+	}
+
+	agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+	for _, name := range names {
+		agent.Spec.Deployment.Env = append(agent.Spec.Deployment.Env, corev1.EnvVar{Name: name, Value: "cr-supplied"})
+	}
+
+	counts := map[string]int{}
+	values := map[string]string{}
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		counts[e.Name]++
+		values[e.Name] = e.Value
+	}
+	for _, name := range names {
+		if counts[name] != 1 {
+			t.Fatalf("want exactly one %s entry, got %d; server-side apply rejects a duplicate key in env", name, counts[name])
+		}
+		if values[name] == "cr-supplied" {
+			t.Errorf("%s took its value from spec.deployment.env; the operator's must win", name)
+		}
 	}
 }
 

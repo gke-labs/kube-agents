@@ -202,11 +202,13 @@ FOOTER_MARKER = "<!-- kube-agents: local addition (auto-injected by sync-upstrea
 # Upstream skills are copied over verbatim on every sync (the local dir is rmtree'd first), so any
 # local edits are wiped. Anything this repository needs an upstream skill to say therefore belongs
 # here rather than in the skill file: these footers are the single source of truth for it and are
-# re-appended after each sync. Three things need saying today — the GKE create/lifecycle skills must
+# re-appended after each sync. Four things need saying today — the GKE create/lifecycle skills must
 # keep pointing at this repo's Cluster Agent profile lifecycle, which upstream knows nothing about
 # (see agents/platform/skills/cluster-agent-lifecycle/SKILL.md for the mechanics they reference),
-# gke-networking must not present `--dns-endpoint` as unconditionally safe, and gke-upgrades must
-# point at this repo's fleet-upgrade-verification skill for executed per-member version checks.
+# gke-networking must not present `--dns-endpoint` as unconditionally safe, gke-upgrades must
+# point at this repo's fleet-upgrade-verification skill for executed per-member version checks, and
+# gke-batch-hpc and gke-workload-scaling must preflight GPU/TPU and large-shape requests into
+# capacity-obtainability.
 SKILL_FOOTERS = {
     "gke-cluster-creation": f"""{FOOTER_MARKER}
 
@@ -315,6 +317,30 @@ When the checklist's deprecated-API item comes up, the same skill's `api_depreca
 the linked GitOps repositories' manifests for apiVersions the target removes and reports each with
 its replacement and the commit it read; run it with `--target-version` and the version report's
 `--output`. It reads Git only: point at GKE Deprecation Insights for live client usage.
+""",
+    "gke-batch-hpc": f"""{FOOTER_MARKER}
+
+## Before scheduling a GPU/TPU batch job with a deadline
+
+Before recommending a start time, zone, or capacity path for a GPU/TPU or large-shape batch job —
+especially one that must finish inside a horizon — load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its **Future windows**
+section: verify the regional quota for the exact accelerator metric, probe
+`gcloud beta compute advice calendar-mode` once per candidate region for the job's shape, count,
+duration, and horizon, and rank the returned windows. That skill owns the probe's flags, the
+chips-per-node arithmetic, the ranking rule, and the paired ProvisioningRequest + LocalQueue
+shapes; follow it rather than restating them here.
+""",
+    "gke-workload-scaling": f"""{FOOTER_MARKER}
+
+## Before recommending GPU/TPU or large-shape capacity for a scale-up
+
+Before recommending capacity for a GPU/TPU or large-shape scale-up, load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its diagnostics: the
+regional quota for the exact accelerator metric, then live obtainability advice for the requested
+shape across zones and provisioning models — and, for a deadline-bound batch scale-up, its
+**Future windows** section (`gcloud beta compute advice calendar-mode`). That skill owns what to
+probe and how to report it; follow it rather than restating it here.
 """,
 }
 

@@ -120,8 +120,8 @@ func TestAgentsGolden(t *testing.T) {
 		},
 		{
 			// A spec.scope block. Diff this against platformagent-tagged.yaml and the
-			// whole of what phases 1 and 2 of docs/designs/multi-project-scope.md render is
-			// one ConfigMap key, scope.json, sorted regardless of declaration order (projects, folders, organisations, exclusions);
+			// whole of what phases 1 to 3 of docs/designs/multi-project-scope.md render is
+			// one ConfigMap key, scope.json, sorted regardless of declaration order (projects, folders, organisations, Shared VPC hosts, Metrics Scopes, exclusions);
 			// the optional volume, its mount and KUBEAGENTS_SCOPE_FILE are in every
 			// expected output because they do not depend on the field being set.
 			name:         "PlatformAgentScope",

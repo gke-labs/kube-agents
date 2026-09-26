@@ -214,9 +214,10 @@ The chain, end to end:
 4. `kube_agents_bench.fleet.kubeconfig_for_role` turns the role into that path, and the
    verifier binds it to the check's `kubeconfig`.
 
-A role that will not resolve — the stack was never applied in the leased project, its
-apply stopped before planting that fixture, the runner never ran, or that cluster was
-unreachable — is `status: "error"` naming the role and the project. It never falls back
+A role that will not resolve — its apply stopped before planting that fixture, the runner
+never ran, or that cluster was unreachable — is `status: "error"` naming the role and the
+project. (A project the stack was never applied to has no reader account either, so a run
+stops at the credential gate before any check.) It never falls back
 to the ambient kubeconfig, which points at the agent's host cluster and carries no
 fixture; that fallback was activation blocker A5 in `bench/tasks/DRAFTS.md`. See
 [Addressing a seeded-fleet fixture by role](../../CUSTOM-TASKS.md#addressing-a-seeded-fleet-fixture-by-role)
@@ -266,8 +267,10 @@ account, and `hack/fleet-kubeconfigs.sh` writes each kubeconfig with an `exec:` 
 naming `hack/fleet-reader-credential.sh`, which mints a token as that account whenever
 `kubectl` asks for one.
 
-Without the grant the script warns loudly on every run and the kubeconfigs carry the
-runner's own identity, which holds `roles/container.admin` among the twelve project roles
+Without the grant the script writes nothing and exits 3, and a run that leases the project —
+presubmit or nightly — stops at that step. On a fleet only you use, leave `FLEET_READONLY_SA` unset and set
+`FLEET_ALLOW_RUNNER_CREDENTIAL=1` to read it on your own credential. The alternative
+was reading the fleet as the runner's own identity, which holds `roles/container.admin` among the twelve project roles
 `scripts/provision_ci_pool_project.sh` grants at onboarding (`PROW_RUNNER_ROLES` in
 `scripts/verify_ci_pool_project.py` is the list) — measured, not assumed:
 `kubectl auth can-i delete deployments -n seeded-debug` answers yes. There are zero
@@ -275,8 +278,8 @@ ClusterRoleBindings or RoleBindings on these clusters naming any `*.gserviceacco
 subject; authorization comes entirely from the GKE IAM webhook, so there is nothing to
 narrow in-cluster either.
 
-The default landed after the pool was provisioned, so a project applied before it still
-lacks the binding — `scripts/verify_ci_pool_project.py` fails such a project, and
+The default landed after the pool was provisioned; a project applied before it and never
+re-applied lacks the binding — `scripts/verify_ci_pool_project.py` fails such a project, and
 re-applying this stack against it is the repair. Where the grant is in place the property
 is checkable rather than asserted:
 
@@ -305,8 +308,10 @@ Three things about this are worth stating rather than assuming:
   `WARNING: This command is using service account impersonation...` to stderr. Capturing
   it with `2>&1` yields a two-line blob that `kubectl config set-credentials` accepts
   without complaint, after which every API call 401s while the script reports success —
-  a silent break of exactly the path this section recommends. The script captures stderr
-  separately and rejects anything that is not a bare token.
+  a silent break of exactly the path this section recommends. The gate captures stderr
+  separately and rejects anything that is not a bare token; it is the only mint the
+  runner makes, since the binding is per account and `fleet-reader-credential.sh` mints
+  its own at check time.
 
 ## Accepted background findings
 

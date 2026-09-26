@@ -137,6 +137,24 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # means naming the roles, so that the grant is explicit and reviewed.
 # permission_set = "read-only"
 
+# Multi-project scope: the projects beyond project_id whose GKE clusters get a
+# Cluster Agent, and what to leave unmanaged. The IAM module binds the read
+# roles in each listed project and the chart renders the same object into the
+# PlatformAgent CR. Omit the block, or leave the lists empty, for the
+# management project alone. A PlatformAgent that already declares spec.scope
+# by hand: copy it here before the first apply, which renders the block for
+# the first time and replaces the live lists with these. Folders and
+# organisations are not inputs yet.
+# scope = {
+#   projects = ["payments-prod", "payments-staging"]
+#   exclude = {
+#     projects = ["*-sandbox"]
+#     clusters = [
+#       { project_id = "payments-staging", location = "us-central1", cluster_name = "scratch-cluster" },
+#     ]
+#   }
+# }
+
 # Optional scheduled backups of the release namespace. Off by default in both
 # install paths: Backup for GKE bills per backed-up pod and per GB of snapshot
 # storage, and the snapshots contain the agent's credentials Secret.

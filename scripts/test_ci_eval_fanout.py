@@ -196,23 +196,44 @@ class DelegationCeilingTest(unittest.TestCase):
         # up while the holder was still legitimately running.
         # And on a stream another case in the run also writes, the holder
         # waits its turn on the stream lock first, so the wait is that figure
-        # times the cases on the stream (stream_case_count); a case alone on
-        # its stream, or writing none, keeps the single-unit figure.
+        # times the cases on the stream (stream_case_count), plus the infra
+        # queue the stream's stack-bearing cases may hold it through
+        # (stream_stack_wait); a case alone on its stream, or writing none,
+        # keeps the single-unit figure -- plus one INFRA_LOCK_DEADLINE when it
+        # writes none and carries a stack, since its previous rep holds the
+        # task lock while queued on lock-infra. The in-flight grace a
+        # ledger-writing unit may spend before its run is in the per-case
+        # figure too, so a holder that spends it does not push its waiter past
+        # the deadline.
         unit = lifted("run_one_unit")
-        deadline = 'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600) ))"'
+        deadline = 'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"'
+        ledgerless_stack = (
+            'if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then\n'
+            "    lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))\n"
+            "  fi"
+        )
         self.assertIn(deadline, unit)
+        self.assertIn(ledgerless_stack, unit)
+        grace = re.search(r"^readonly EVAL_INFLIGHT_GRACE_SECONDS=\d+$", SCRIPT.read_text(encoding="utf-8"), re.M)
+        self.assertIsNotNone(grace)
         self.assertIn('lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"', unit)
+        computed = deadline + "; " + ledgerless_stack + '; echo "${lock_deadline}"'
         body = "\n".join(
             [
                 lifted("unit_delegation_timeout"),
+                grace.group(0),
                 'export AGENT_DELEGATION_TIMEOUT="2700"',
+                "INFRA_LOCK_DEADLINE=900",
                 'stream_case_count() { echo "${CASES_ON_STREAM}"; }',
-                'CASES_ON_STREAM=1 name=compliance-rbac-overgrant audit_id=compliance-audit; ' + deadline + '; echo "${lock_deadline}"',
-                'CASES_ON_STREAM=1 name=capacity-pinned-pool-probe audit_id=; ' + deadline + '; echo "${lock_deadline}"',
-                'CASES_ON_STREAM=2 name=consistency-drift-outlier audit_id=fleet-consistency-drift; ' + deadline + '; echo "${lock_deadline}"',
+                'stream_stack_wait() { echo "${STACK_WAIT:-0}"; }',
+                "CASES_ON_STREAM=1 STACK_WAIT=0 name=compliance-rbac-overgrant audit_id=compliance-audit has_stack=\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= has_stack=\n" + computed,
+                "CASES_ON_STREAM=2 STACK_WAIT=0 name=consistency-drift-outlier audit_id=fleet-consistency-drift has_stack=\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=900 name=compliance-rbac-overgrant audit_id=compliance-audit has_stack=1\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= has_stack=1\n" + computed,
             ]
         )
-        self.assertEqual(run_bash(body).stdout.split(), ["3600", "3300", "7200"])
+        self.assertEqual(run_bash(body).stdout.split(), ["3900", "3600", "7800", "4800", "4500"])
 
 
 class PerCaseGradingTest(unittest.TestCase):
@@ -235,11 +256,13 @@ mint_ledger_token() { return 0; }
 unit_delegation_timeout() { echo 1800; }
 ledger_audit_id_for_task() { echo ""; }
 stream_case_count() { echo 1; }
+stream_stack_wait() { echo 0; }
 _ts_lines() { cat; }
 uv() { echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }
 finish_case() { echo "FINISH_CASE $2 after rep ${rep}"; }
 STATE_DIR="$(mktemp -d)"; ARTIFACT_DIR="$(mktemp -d)"; BENCH_DIR=/tmp
-EVAL_REPETITIONS=3; INFRA_LOCK_DEADLINE=1
+EVAL_REPETITIONS=3; INFRA_LOCK_DEADLINE=1; EVAL_INFLIGHT_GRACE_SECONDS=300
+release_inflight_note() { :; }
 EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_LOCATION=
 """
 

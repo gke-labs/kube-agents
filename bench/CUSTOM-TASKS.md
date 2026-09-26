@@ -369,7 +369,7 @@ silently running the check with defaults.
 | `report_contains`         | `required_phrases` (all must appear), `any_of_phrases` (at least one must), `forbidden_phrases` (none may), `scope` (`final` \| `full`, default `final`)                                                      | Case-insensitive substring checks against the agent's answer, not the cluster. `final` is what the user ultimately receives: the delegating turn's closing message plus, when work was delegated, the delivered card results and artifacts — poll-turn recitals excluded. `full` is the accumulated output (every settled closer on top of that), which passes a phrase merely quoted in progress chatter and false-fails a forbidden phrase in quoted material; use it only for genuinely whole-transcript checks. Registered from this repository's `kube_agents_bench.verifiers` via the `devops_bench.verifiers` entry point.                                                                                                                                                                                                                                                |
 | `tool_called`             | `tool_names` (required), `minimum_calls` (default 1), `require_success` (default false), `scope` (`router` \| `workers` \| `all`, default `router`)                                                           | Counts the calls in the chosen `scope`: `router` (default) is the **delegating turn's** calls only — poll turns are excluded by design and the delegated workers' calls, which the harness appends to the trajectory tagged with the profile that made them, are skipped by that tag; `workers` counts those tagged entries instead, the one deterministic check that sees which MCP tool a worker reached for; `all` counts both. `workers` and `all` return `status: "error"` on a trajectory with no tagged entry (no card delegated, or the capture did not run). A call is intent, not effect: mutation safeguards stay cluster-state checks (`resource_property`). `require_success: true` skips calls the harness marked `status: "error"` — set it on objectives (a failed call produced no effect); leave it off in safeguards, where an attempt should trip the check. |
 | `ledger_issue_contains`   | `audit` (required, one of the eight fleet-audit stream ids), `required_phrases`, `any_of_phrases`, `forbidden_phrases`, `scope` (`body` \| `finding_ids`, default `body`), `max_clock_skew_sec` (default 120) | The same phrase semantics as `report_contains`, but against the **GitHub ledger issue this run published** rather than the chat reply — the surface a fleet audit actually writes its findings to. See [Grading a fleet audit](#grading-a-fleet-audit) below, which you must read before using it: it needs a credential, and its freshness binding is what stops it passing forever.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `pull_request_opened`     | `owner` (the organisation the PR must sit under, `""` for any), `max_clock_skew_sec` (default 120)                                                                                                            | Resolves every `github.com/<owner>/<repo>/pull/<n>` URL in the agent's reply through the GitHub API and passes when one of them is a pull request under `owner`, not closed unmerged, that this run created or updated. What a remediation case grades on, in place of `report_contains` over `/pull/`. See [Grading a remediation pull request](#grading-a-remediation-pull-request).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `pull_request_opened`     | `owner` (the organisation the PR must sit under, `""` for any), `max_clock_skew_sec` (default 120)                                                                                                            | Resolves every `github.com/<owner>/<repo>/pull/<n>` URL in the agent's reply through the GitHub API and passes when one of them is a pull request under `owner`, not closed unmerged, that this run created or updated, that changes at least one file, and whose head commit is no older than the run. What a remediation case grades on, in place of `report_contains` over `/pull/`. See [Grading a remediation pull request](#grading-a-remediation-pull-request).                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `fleet_resource_property` | every `resource_property` field except `kubeconfig`, plus `fixture_role` (**required**)                                                                                                                       | `resource_property` against the **standing seeded fleet**, addressed by the ROLE a fixture plays rather than by cluster name. Also splits "the fixture is gone" (a fail) from "the cluster was unreachable" (an error), which upstream cannot. See [Addressing a seeded-fleet fixture by role](#addressing-a-seeded-fleet-fixture-by-role).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
 The three transcript verifiers read the run's stash (`kube_agents_bench/transcript.py`), so unlike
@@ -420,7 +420,12 @@ body would pass a run that swept the fleet and faulted nobody. The hidden
 `<!-- audit-findings: [...] -->` block carries the ids `audit_report.py` derived as
 `<check>.<cluster>.<namespace>.<object>`, so a name appears there only when a finding was actually
 filed against it. The same argument applies to any planted _object_ name that a clean inventory
-table would also mention.
+table would also mention. On a body truncated for size the delta block lists only the rendered findings, and the scope
+reads the `<!-- audit-findings-all: [...] -->` block the script adds there instead, so a filed
+finding that sorted last still counts. The script leaves that block out when it would exceed
+`ALL_FINDINGS_BLOCK_CAP` in `audit_report.py` (12,000 characters, roughly 160 ids of 70
+characters); past that only the rendered findings and the collector-held ids count, so a case
+graded this way needs a fleet whose findings stay under it.
 
 **Credential.** A GitHub token in the verifier process's environment: `BENCH_GITHUB_TOKEN`
 preferred, `GITHUB_TOKEN` as a fallback. It needs one permission, `issues: read`, on the eval
@@ -492,28 +497,35 @@ repository, and the URL comes back in the final answer: `submit_suggestion.py` r
 `execute_code`, so no distinct tool name reaches the trajectory to assert on.
 
 `report_contains` over `["github.com/", "/pull/"]` was the first way to grade that, and it cannot
-work. It reads the reply as text and fetches nothing, so an invented URL passes — and nothing
-sweeps the GitOps repositories between repetitions, so the pull request rep 1 opened is still
+work. It reads the reply as text and fetches nothing, so an invented URL passes — and the
+repetitions of a case share one GitOps repository, so the pull request rep 1 opened is still
 there for rep 2 and rep 3 to link. The repeats of a case were grading each other's leftovers.
 
 `pull_request_opened` resolves the URL instead and compares GitHub's stamps against
 `TranscriptSnapshot.started_at`, less `max_clock_skew_sec` for the gap between GitHub's clock and
 the runner's. Created during the run passes, and so does updated during it: the
 skill derives the branch from the change, so a later repetition pushes onto the branch the first
-one used and edits the pull request already open on it. That stamp moves on any write by anyone,
-so what it proves is that the pull request was written to during the run — a repetition that only
-comments on a leftover passes as well. Telling those apart needs the head commit, which the ledger
-App cannot read; sweeping the GitOps repository between repetitions is what removes leftovers.
-A pull request closed without being merged is rejected: closing moves `updated_at` too, and what
-the case grades is that the fix went out. `owner: gke-agentic` pins the organisation, a fair exact
+one used and edits the pull request already open on it. The stamp cannot decide on its own — it
+moves on a comment as readily as on a push — so the check also reads the head commit, and fails a
+pull request that changes no files or whose head commit predates the run. That is what makes
+repetitions inside one lease gradable: rep 2 pushing onto rep 1's branch moves the head commit,
+rep 2 quoting rep 1's URL does not. A Prow periodic (`hack/ci_sweep_agent_pulls.py --pool`, run
+from `main` only) closes the agent's leftovers in free pool projects every ten minutes and deletes
+their branches (a leftover branch refuses an identical fix "nothing to commit"), so a lease
+rarely inherits one; when it does, the head-commit check is what keeps it from grading.
+A pull request closed without being merged is rejected: closing moves `updated_at` too, and
+what the case grades is that the fix went out. `owner: gke-agentic` pins the organisation, a fair exact
 match across every pool project that breaks loudly if the organisation ever moves.
 
 It reads `BENCH_GITHUB_TOKEN` exactly as `ledger_issue_contains` does, and `hack/ci-eval-pr.sh`
 mints that token for every fan-out unit, not only the audit ones. It asks `/repos/{o}/{r}/issues/{n}`
 first, because a pull request is an issue to that API and `issues: read` is what the ledger App
-carries; `/pulls/{n}` is tried only when that is denied or absent. The check errors only on a fault
-of ours: a 401, which is the token having expired rather than a permission, and a denial from both
-endpoints, which names `pull_requests: read` as the permission to add. Everything else is graded.
+carries; `/pulls/{n}` is tried when that is denied or absent, and read anyway for the file count
+and commit total, which the issues payload does not carry. Both want `pull_requests: read`, which
+`hack/ci-eval-pr.sh` asks for at mint. The check errors only on a fault
+of ours: a 401, which is the token having expired rather than a permission; a denial from both
+endpoints, or from `/pulls/{n}` when it is read for the file count, which names `pull_requests: read`
+as the permission to add; and an API it could not reach. Everything else is graded.
 A 403 from one endpoint proves the repository is reachable, so the other's 404 is the number's own;
 404 from both is either the number or a repository this credential cannot see, and nothing in the
 API separates them. Both fail. Erroring instead would red the eval job for every open pull request
@@ -586,7 +598,8 @@ rather than resolved by listing order.
 **An unresolvable role is loud.** No `BENCH_FLEET_KUBECONFIG_DIR`, no file for the role, a role
 whose cluster the runner could not reach, or a fixture that was never planted, all produce
 `status: "error"` naming the role _and the project the runner looked in_ — the pool leases projects
-at random and a project the fleet stack was never applied to is a live possibility. It never falls
+at random. (A project the fleet stack was never applied to has no reader account, so the run stops
+at the credential gate before any check.) It never falls
 back to the ambient kubeconfig; that fallback is the defect this type exists to remove.
 
 **Fail versus error, which is the point of the type.** A safeguard that cannot tell "the agent

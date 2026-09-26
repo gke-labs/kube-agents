@@ -1176,13 +1176,10 @@ choice of transport rather than a special case.
 
 **Egress.** A pod that cannot resolve the host makes no calls, so the FQDN
 network policy is part of the credential plane whether or not it looks like it.
-The allowed hosts derive from the configured forges, in both places the policy is
-written: the operator renders it in
-`k8s-operator/internal/controller/platformagent_manifests.go`, which is what a
-real install gets, and `deploy/kustomize/gke-dataplane-v2/fqdn-networkpolicy.yaml`
-carries the dev path. Both have to derive it, because changing only the kustomize
-copy leaves every shipped install unable to reach the forge it was configured
-for. This is also the clearest case for deriving rather than listing: a
+The allowed hosts derive from the configured forges where the policy is written:
+the operator renders it in
+`k8s-operator/internal/controller/platformagent_manifests.go`, and no static copy
+of it ships. This is also the clearest case for deriving rather than listing: a
 self-managed GitLab is at a customer-chosen hostname, so no literal in this
 repository could ever have covered it.
 

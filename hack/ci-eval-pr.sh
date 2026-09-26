@@ -31,6 +31,10 @@ set -euo pipefail
 readonly EVAL_PRESUBMIT_CASES_FILE="eval/presubmit-cases.txt"
 readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
+# A fourth file, read beside them and applied on one lane only (#2039): the
+# cases the inject lane does not run, because their premise needs the chat
+# front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
+readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
 
 # What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
 # when the run could not be evaluated: an admitted case lost every repetition
@@ -58,6 +62,26 @@ readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
 # fan-out on one listener that the first unit to finish tears down. The base
 # sits clear of the API range (28642 + seq) for any matrix this job runs.
 readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
+
+# release_inflight_note (beside the ledger reset, section 5): the sandbox
+# pod's shell container, the scratch directory audit_report.py writes its
+# in-flight note under, the bound on one `kubectl exec` round trip, and how
+# long a unit waits for a live run to release its own note before removing
+# it. The unit's delegation ceiling is not the worker's death -- the record
+# under AGENT_DELEGATION_TIMEOUT below shows a worker rewriting its ledger
+# five minutes after the wait gave up -- so a note found at the next unit's
+# start may still be a live run's; 300s covers that record. The lock
+# deadline in run_one_unit grants each unit this on top of its ceiling and
+# the 600s for grading and teardown, so a unit that spends the grace does
+# not push its same-task waiter past its deadline. The round-trip allowance
+# is what the outer timeout adds to the grace for the exec's own setup. The
+# poll step is how often the pod's shell looks for the note during the grace.
+readonly EVAL_SANDBOX_CONTAINER="shell"
+readonly EVAL_SANDBOX_SCRATCH_DIR="/opt/data/scratch"
+readonly EVAL_SANDBOX_EXEC_TIMEOUT="30s"
+readonly EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS=60
+readonly EVAL_INFLIGHT_GRACE_SECONDS=300
+readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
 
 # ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
 # A push that changes only inert files re-runs this whole job and aborts the
@@ -843,8 +867,9 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # Clusters are found by label rather than by name, so this does not need to
 # know the leased project's cluster prefix or region.
 #
-# Non-fatal by design: an unreachable seeded cluster -- or a leased project the
-# fleet was never applied to -- leaves its roles' files absent, and
+# Non-fatal by design, with one exception (the read-only credential, below,
+# which a project the fleet was never applied to also lacks): an unreachable
+# seeded cluster leaves its roles' files absent, and
 # `fleet_resource_property` turns that into status=error naming the role and
 # the project: failing the checks that needed that cluster rather than the job,
 # and never silently reading platform-agent-host instead.
@@ -863,9 +888,10 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # one namespace read per probe -- seconds, against a job measured in tens
 # of minutes.
 #
-# The `||` catches a REPOSITORY bug only: a missing or malformed
-# bench/tf/fleet/fixtures.json, or an unusable output directory. Every
-# environmental failure -- no fleet in this project, a cluster that will not
+# The `||` catches two things. Exit 3 is the read-only credential unavailable
+# and ends the job (below). Any other non-zero is a REPOSITORY bug -- a missing
+# or malformed bench/tf/fleet/fixtures.json, an unusable output directory --
+# and warns. Every other environmental failure -- a cluster that will not
 # answer, a fixture that was never planted -- returns 0 with a warning of its
 # own and leaves the affected roles' files absent, which is the whole design.
 
@@ -880,22 +906,29 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # The other half is the token-creator grant -- `fleet_reader_token_creators`
 # in bench/tf/fleet/variables.tf, which defaults to both runners, the
 # presubmit's and the nightly's, and to the CI health bot, so an apply of that
-# stack grants each. In a project whose fleet was applied before that default
-# landed, `gcloud auth print-access-token
-# --impersonate-service-account` fails, fleet-kubeconfigs.sh warns per cluster,
-# and the role kubeconfigs keep the runner's own read-write credential. That is
-# a privilege gap on a fleet every open PR shares, not a functional one: the
-# files are still written, still point at the right seeded cluster, and every
-# check still grades the right object. `scripts/verify_ci_pool_project.py`
-# fails a project missing the binding. See bench/tf/fleet/README.md, "A
-# read-only credential for evaluations".
-export FLEET_READONLY_SA="${FLEET_READONLY_SA:-seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
+# stack grants each. A project without the binding stops the run here: the
+# runner refuses to write kubeconfigs carrying this job's own read-write
+# credential onto a fleet every open PR shares. A precondition, not a repair:
+# the grant is `fleet_reader_token_creators`, and
+# `scripts/verify_ci_pool_project.py` fails a project missing it. See
+# bench/tf/fleet/README.md, "A read-only credential for evaluations".
+# FLEET_ALLOW_RUNNER_CREDENTIAL=1 is a developer's opt-in for a fleet only they
+# use, and a Prow job refuses it: set there it would restore the fallback.
+# shellcheck source=hack/fleet-kubeconfigs.sh
+source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
+_fleet_refuse_opt_in_under_prow || exit 1
+FLEET_READONLY_SA="$(_fleet_reader_for_run "${PROJECT_ID}")"
 
 profile_begin "fleet-kubeconfigs: seeded-fleet credentials"
 STEP_START=$SECONDS
-# shellcheck source=hack/fleet-kubeconfigs.sh
-source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
-write_fleet_kubeconfigs || echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2
+write_fleet_kubeconfigs || {
+  fleet_rc=$?
+  if [ "$fleet_rc" -eq "$_FLEET_EXIT_READONLY_UNAVAILABLE" ]; then
+    echo "FATAL: stopping at the fleet step: the seeded fleet cannot be read as its reader, and it is not graded with the runner's write credential." >&2
+    exit 1
+  fi
+  echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2
+}
 echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 
 # Section 2c resized slot a's default pool to two nodes here (#1278). The incident's
@@ -1198,10 +1231,11 @@ ledger_reset_token() { # <owner/repo>
 }
 
 # The audit id a case grades its ledger under: the `audit:` key of its
-# ledger_issue_contains checks in task.yaml (each of the nine audit cases
-# carries one; two consistency cases share fleet-consistency-drift and two
-# patch cases share security-patch-orchestrator, and the reset is per stream,
-# so each pair retires one ledger). Empty for a case that writes no ledger.
+# ledger_issue_contains checks in task.yaml (each of the ten audit cases
+# carries one; two consistency cases share fleet-consistency-drift, two
+# patch cases share security-patch-orchestrator and two obtainability cases
+# share obtainability-audit, and the reset is per stream, so each pair
+# retires one ledger). Empty for a case that writes no ledger.
 ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
   local file="$1"
   case "${file}" in /*) ;; *) file="${BENCH_DIR}/${file}" ;; esac
@@ -1263,6 +1297,112 @@ reset_audit_ledgers() { # <label> [audit-id]
   out="$(LEDGER_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_audit_ledgers.py" "${args[@]}" 2>&1)" || rc=$?
   [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Ledger reset (${label}): /"
   [ "${rc}" -eq 0 ] || echo "WARNING: Ledger reset (${label}): the helper exited ${rc}; ${scope} may keep an open ledger and this run grades against it as every run before did." >&2
+  return 0
+}
+
+# ─── In-flight notes: release what a dead repetition left on the sandbox ─────
+# `audit_report.py start` leaves an in-flight note for its stream on the
+# sandbox pod's own volume, /opt/data/scratch/inflight_<audit>.json, and
+# refuses while one younger than its TTL exists; `finish` removes it. A
+# repetition whose worker dies between the two -- max_turns, a pod restart,
+# a dispatcher that never served the card's retry -- leaves the note, and
+# inside one run the next repetition of the case starts inside that TTL
+# and is refused at `start`; on a stream two cases share (the
+# consistency pair, the patch pair) so is the sibling case's first
+# repetition, which waits on the stream lock and starts right after. That is
+# a 0/3 that reads as agent failure and was the harness's. The note is the
+# run's, not the ledger's, so the ledger reset above cannot clear it; this
+# does, per unit, from the same place the ledger reset runs (under the task
+# lock and the stream lock, before devops-bench) and just before it, for
+# that unit's stream alone. Not at lease time: the per-unit release covers a
+# note an earlier lease left as well.
+#
+# A unit that ended on its delegation ceiling may have left a worker that is
+# still running, and its note is then a live run's: removing it at once would
+# start the next repetition over that worker, the overlap the note exists to
+# refuse. So a note that is present is given EVAL_INFLIGHT_GRACE_SECONDS to
+# be released by its own `finish` first, and removed only if it is still
+# there after that; the log line says which. The wait comes BEFORE the
+# ledger reset for the same stream: a `finish` that lands while the ledger is
+# open rewrites it and the reset then retires it in one step, whereas a
+# `finish` that lands after the reset finds no open ledger, opens a fresh one
+# carrying that worker's findings, and this unit's own `start` then carries
+# them -- the pre-filed ledger the per-unit reset exists to prevent.
+#
+# The removal runs in the sandbox pod (`kubectl exec`; the harness holds
+# admin on the leased project's host cluster), pinned the way hack/ci-env.sh
+# pins its log collection: to AGENT_CLUSTER_CONTEXT, the host cluster of THIS
+# lease -- the task loop's tofu stacks repoint the ambient context at their
+# own clusters -- and it refuses a context that does not name PROJECT_ID, an
+# unset namespace, and an audit id that is not a bare label, so it cannot
+# reach another project's pod or a path outside scratch; the path is handed
+# to the pod's shell as a positional, never spliced into a command line. The
+# pod is the operator's StatefulSet for the agent, `<agent>-shell`
+# (shellSandboxName in k8s-operator/internal/controller/shell_sandbox_manifests.go;
+# hack/ci-deploy.sh waits on statefulset/platform-agent-shell), one replica,
+# container `shell`; EVAL_SANDBOX_POD names another. Only the note goes: the
+# `.lock` beside it is the guard's, created once and never removed.
+# A release that cannot run says so and the run goes on as it did before the
+# guard: the note expires on its own, and a repetition refused at `start`
+# prints `START REFUSED` naming the in-flight run, so the artifacts tell a
+# left note from a worker that never ran. It never reds a pull request. The
+# exec is bounded outside kubectl as well: --request-timeout covers the
+# upgrade round trip only, not the stream, and a stream hung on a wedged
+# volume would otherwise hold the task and stream locks until the sibling
+# units gave up on them.
+# Returns 0 whatever happens; the reason it could not release is printed.
+release_inflight_note() { # <label> <audit-id>
+  local label="$1" audit_id="$2" pod ns ctx note out rc=0
+  pod="${EVAL_SANDBOX_POD:-${AGENT_SERVICE_NAME}-shell-0}"
+  ns="${TARGET_NAMESPACE:-}"
+  ctx="${AGENT_CLUSTER_CONTEXT:-}"
+  case "${audit_id}" in
+    "" | *[!A-Za-z0-9_.-]*)
+      echo "In-flight note (${label}): skipped, audit id '${audit_id}' is not a bare label; the stream keeps whatever note is on the sandbox"
+      return 0 ;;
+  esac
+  if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ]; then
+    echo "In-flight note (${label}): skipped, PROJECT_ID, AGENT_CLUSTER_CONTEXT or TARGET_NAMESPACE is unset; the ${audit_id} stream keeps whatever note is on the sandbox"
+    return 0
+  fi
+  case "${ctx}" in
+    "gke_${PROJECT_ID}_"*) ;;
+    *)
+      echo "WARNING: In-flight note (${label}): skipped, AGENT_CLUSTER_CONTEXT=${ctx} does not name PROJECT_ID=${PROJECT_ID}; the ${audit_id} stream keeps whatever note is on the sandbox" >&2
+      return 0 ;;
+  esac
+  if ! command -v kubectl >/dev/null 2>&1; then
+    echo "In-flight note (${label}): skipped, no kubectl on PATH; the ${audit_id} stream keeps whatever note is on the sandbox"
+    return 0
+  fi
+  note="${EVAL_SANDBOX_SCRATCH_DIR}/inflight_${audit_id}.json"
+  # The grace wait plus one exec round trip; absent `timeout`, unbounded as
+  # the dashboard hook above is.
+  local budget=$((EVAL_INFLIGHT_GRACE_SECONDS + EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS))
+  local bound=(timeout --foreground "${budget}")
+  command -v timeout >/dev/null 2>&1 || bound=()
+  # Single quotes on purpose: $1 (the note), $2 (the grace) and $3 (the poll
+  # step) are the pod shell's own positionals, so the path is never spliced
+  # into the script.
+  # shellcheck disable=SC2016
+  out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec "${pod}" -c "${EVAL_SANDBOX_CONTAINER}" \
+    --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
+    sh -c '
+      n=0
+      while [ -e "$1" ] && [ "$n" -lt "$2" ]; do sleep "$3"; n=$((n + $3)); done
+      if [ -e "$1" ]; then rm -f -- "$1" && echo "removed $1 after waiting ${n}s for its run"
+      elif [ "$n" -gt 0 ]; then echo "released by its own run after ${n}s: $1"
+      else echo "none at $1"; fi
+    ' sh "${note}" "${EVAL_INFLIGHT_GRACE_SECONDS}" "${EVAL_INFLIGHT_POLL_STEP_SECONDS}" 2>&1)" || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    echo "In-flight note (${label}): ${out}"
+  else
+    # 124 is timeout(1)'s own status for a command it had to stop. It stops
+    # kubectl; the shell loop in the pod is not signalled and ends at its
+    # next write to the closed stream, which comes after its rm.
+    [ "${rc}" -eq 124 ] && out="timed out after ${budget}s; the loop left in the pod may still remove the note${out:+; ${out}}"
+    echo "WARNING: In-flight note (${label}): kubectl exec into ${ns}/${pod} exited ${rc} (${out}); the ${audit_id} stream keeps whatever note is on the sandbox, and a repetition refused at start prints START REFUSED naming it." >&2
+  fi
   return 0
 }
 
@@ -1474,11 +1614,13 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 6. Task Matrix Execution Loop
-# The matrix is data, not code: three files under hack/eval/, read here at
+# The matrix is data, not code: four files under hack/eval/, read here at
 # startup (#1546, 2026-09-15). presubmit-cases.txt is what every pull request
 # runs (TASKS), nightly-cases.txt is what EVAL_TIER=nightly appends
-# (NIGHTLY_TASKS), and blocking-roster.txt, read further down, is what can red
-# a pull request on a graded failure (BOOTSTRAP_ADMITTED). The split exists
+# (NIGHTLY_TASKS), blocking-roster.txt, read further down, is what can red
+# a pull request on a graded failure (BOOTSTRAP_ADMITTED), and
+# inject-lane-exclusions.txt, read after the tier switch, is what the inject
+# lane leaves out of both (#2039). The split exists
 # so OWNERS can tell them apart: hack/OWNERS puts the two presubmit files
 # under the eval-crew alias and lets the nightly file and this script fall
 # through to the root approvers. Each file's header says what belongs in it;
@@ -1559,8 +1701,8 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # seat on that record; measured cost, presubmit redundancy or grading
 # something outside the core journeys keep a case there for good. The file's
 # header carries the budget arithmetic against the periodic's 480m deadline
-# at EVAL_TASK_PARALLELISM=6 (#1491; oss-test-infra#2707, open, moves it to
-# 8), and that is the copy to keep current. Since 2026-09-22 (#1023) the
+# at EVAL_TASK_PARALLELISM=8 (6 from #1491 until oss-test-infra#2707, merged
+# 2026-09-25), and that is the copy to keep current. Since 2026-09-22 (#1023) the
 # presubmit file is the blocking roster and nothing else, so this file is
 # also where every held-out case lives, with its hold-out reason.
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
@@ -1603,6 +1745,63 @@ case "${EVAL_TIER}" in
     exit 1
     ;;
 esac
+
+# ─── The inject lane's exclusions (#2039) ────────────────────────────────────
+# Under AGENT_TRANSPORT=inject -- the harness's own switch, which the
+# EVAL_MODE_NEXT=1 block above exports before this point -- the matrix goes
+# through the gateway's inject door, which addresses `platform` directly: a
+# case whose premise needs the chat front door cannot hold there whatever
+# the agent does. hack/eval/inject-lane-exclusions.txt names those cases,
+# each with its reason as the comment block above it (the file's header and
+# scripts/test_eval_rosters.py hold every entry to one), and this drops them
+# from TASKS before TASK_NAMES and the fan-out are built from it, so the
+# suite grades and reports the cases that ran. Read on every lane, so a
+# missing file or an entry naming no case fails here rather than on the
+# lane that needs it; applied on the inject lane only, so the api lane's
+# matrix stays byte for byte the presubmit file. Not a demotion: the roster
+# files are untouched. The names dropped here are kept in
+# INJECT_LANE_DROPPED (empty on every other lane) so the BOOTSTRAP_ADMITTED
+# export below leaves them out too -- a roster name the suite never grades
+# would otherwise trip bench-gate's misspelled-roster banner on every run
+# of the lane. A check the transport blinds (tool_called, worker_commands,
+# worker_agents) is the scorer's to set aside, not this file's:
+# docs/designs/eval-scorer.md, "The inject lane".
+INJECT_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
+INJECT_LANE_EXCLUDED="$(roster_entries "${INJECT_LANE_EXCLUSIONS_FILE}")"
+INJECT_LANE_DROPPED=""
+# Every entry must be a registered case id, spelled exactly as the matrix
+# spells it: the drop below is an exact match against the matrix's names,
+# so a variant a filesystem test would accept (`agent-kanban-smoke/`) would
+# pass here and match nothing there, leaving the case running on the lane
+# with nothing said. Registered means the presubmit or the nightly file --
+# a nightly-only case may be excluded from an inject nightly.
+REGISTERED_CASE_NAMES="$(printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | sed -e 's#^\./tasks/##' -e 's#/task\.yaml$##')"
+while IFS= read -r NAME; do
+  if [ -z "${NAME}" ]; then continue; fi
+  if ! grep -qxF -- "${NAME}" <<< "${REGISTERED_CASE_NAMES}"; then
+    echo "ERROR: ${INJECT_LANE_EXCLUSIONS_FILE}: '${NAME}' is not a case id in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; an exclusion that matches nothing would leave the case it meant running on the inject lane." >&2
+    exit 1
+  fi
+done <<< "${INJECT_LANE_EXCLUDED}"
+if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LANE_EXCLUDED}" ]; then
+  INJECT_LANE_KEPT=()
+  for ENTRY in "${TASKS[@]}"; do
+    NAME="$(basename "$(dirname "${ENTRY}")")"
+    if grep -qxF -- "${NAME}" <<< "${INJECT_LANE_EXCLUDED}"; then
+      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${NAME} leaves the matrix -- its premise needs the chat front door (${EVAL_INJECT_LANE_EXCLUSIONS_FILE})"
+      INJECT_LANE_DROPPED="${INJECT_LANE_DROPPED}${NAME}
+"
+    else
+      INJECT_LANE_KEPT+=("${ENTRY}")
+    fi
+  done
+  TASKS=(${INJECT_LANE_KEPT[@]+"${INJECT_LANE_KEPT[@]}"})
+  if [ "${#TASKS[@]}" -eq 0 ]; then
+    echo "ERROR: every case in the matrix is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run nothing and report green." >&2
+    exit 1
+  fi
+  echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${#TASKS[@]} task(s) remain in the matrix"
+fi
 
 # Floor for VerificationCorrectness on a repetition of a task that declares a
 # verification_spec. 1.0 while every declared objective is meant to hold
@@ -1866,8 +2065,30 @@ while IFS= read -r NAME; do
     echo "ERROR: ${BLOCKING_ROSTER_FILE}: '${NAME}' is not a case in ${PRESUBMIT_CASES_FILE}; the blocking roster is a subset of the presubmit." >&2
     exit 1
   fi
+  # A roster case the inject lane's exclusion step dropped from the matrix
+  # (INJECT_LANE_DROPPED, empty on every other lane) leaves the export too:
+  # it is still checked against the presubmit above, because the file is
+  # the api lane's roster and stays a subset of it, but a name that arms a
+  # case the suite never grades would trip bench-gate's "BOOTSTRAP_ADMITTED
+  # names no graded case" banner on every run of the lane, and that banner
+  # exists to catch a misspelled roster entry.
+  if [ -n "${INJECT_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${INJECT_LANE_DROPPED:-}"; then
+    continue
+  fi
   BLOCKING_ROSTER_DEFAULT="${BLOCKING_ROSTER_DEFAULT:+${BLOCKING_ROSTER_DEFAULT},}${NAME}"
 done <<< "${BLOCKING_ROSTER_ENTRIES}"
+# The file guard above cannot see the lane's drop: an exclusion list that
+# names every roster case would leave the export empty on the inject lane
+# with rung 4 disarmed for whatever the matrix still holds (the nightly tier
+# keeps its own cases past the every-case-excluded stop) and no banner,
+# because no name is misspelled. Stop instead: the exclusion file needs only
+# the normal approvers, and it must not be able to do what the roster file
+# is guarded against. An explicit BOOTSTRAP_ADMITTED in the job's
+# environment, empty included, is the stated way to mean it, and wins below.
+if [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -n "${INJECT_LANE_DROPPED:-}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
+  echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+  exit 1
+fi
 
 export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-${BLOCKING_ROSTER_DEFAULT}}"
 
@@ -1972,6 +2193,7 @@ unit_cost_hint() {
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     consistency-no-environment-label) echo 900 ;;
     upgrades-master-behind-offered-elsewhere) echo 900 ;;
+    obtainability-planted-orphan-service) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # Nightly-only since 2026-09-22 (#1023; held out on #1171 and #1189),
     # presubmit before that. The canary measured 1002s median, 2074s p90,
@@ -2053,6 +2275,7 @@ unit_delegation_timeout() {
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere) echo 3000 ;;
+    obtainability-planted-orphan-service) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
 }
@@ -2159,6 +2382,22 @@ stream_case_count() { # <audit-id>
     done
   fi
   echo $(( n > 1 ? n : 1 ))
+}
+
+# How long a stream's lock can be held by holders still queued on lock-infra:
+# INFRA_LOCK_DEADLINE once per stack-bearing case on the stream, 0 for a
+# stream with none or an empty id. A stack-bearing unit takes its stream lock
+# before the infra lock, so its sibling on the stream waits out that queue
+# too, and a stream deadline that counted run time alone gave up first.
+stream_stack_wait() { # <audit-id>
+  local n=0 i
+  if [ -n "$1" ]; then
+    for i in "${!TASKS[@]}"; do
+      if [ -n "${TASK_HAS_STACK[i]}" ] \
+        && [ "$(ledger_audit_id_for_task "${TASKS[i]}" 2>/dev/null)" = "$1" ]; then n=$((n + 1)); fi
+    done
+  fi
+  echo $(( n * INFRA_LOCK_DEADLINE ))
 }
 
 # ─── Per-case grading and recording, inside the fan-out ─────────────────────
@@ -2283,35 +2522,50 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # writes none, and the deadline for the locks below. The task lock is held
   # for the holder's whole unit, so the wait must outlast one: the unit's
   # delegation ceiling plus grading and teardown (about 300s on the record;
-  # 600s here). A fixed 1800s deadline under a 3000s ceiling would make a
+  # 600s here), plus the grace a ledger-writing unit may spend before its
+  # run waiting for a live predecessor to release its in-flight note
+  # (EVAL_INFLIGHT_GRACE_SECONDS; the 600 was sized before that wait
+  # existed and did not include it). A fixed 1800s deadline under a 3000s ceiling would make a
   # same-task successor give up while its predecessor was still legitimately
   # running -- 24% of presubmit runs launch compliance rep 2 within 2090s of
   # rep 1 (385 logs, 09-04 to 09-15). On a stream another case in this run
   # also writes, the holder first waits its turn on the stream lock, so the
-  # deadline is that figure times the cases on the stream; alone on its
-  # stream, or writing none, a case keeps the single-unit figure. The infra
-  # lock keeps its default: audit units carry no stack.
+  # deadline is that figure times the cases on the stream, plus the infra
+  # queue its stack-bearing cases may hold the stream through
+  # (stream_stack_wait); alone on its stream, or writing none, a case keeps
+  # the single-unit figure -- plus, for a stack-bearing case writing none, one
+  # INFRA_LOCK_DEADLINE, because its previous rep holds the task lock while
+  # queued on lock-infra, and no stream term counts that wait. The infra
+  # lock keeps its default: it is taken last, after any stream wait, so it is
+  # held only while this unit's own stack is in use.
   local audit_id lock_deadline
   audit_id="$(ledger_audit_id_for_task "${task}")"
-  lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600) ))"
+  lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"
+  if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then
+    lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))
+  fi
   if ! lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"; then
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
   fi
-  if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra" "${INFRA_LOCK_DEADLINE}"; then
-    lock_release "${STATE_DIR}/lock-task-${name}"
-    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
-    return 0
-  fi
   # A ledger-writing unit also holds the stream lock from here until its
   # state files are written, released with the task lock below: two cases on
-  # one stream (the consistency pair, the patch pair) must not reset and
-  # rewrite each other's ledger mid-run. The same scaled
-  # deadline: a waiter here outlasts the other cases' units on the stream.
+  # one stream (the consistency pair, the patch pair, the obtainability pair)
+  # must not reset and rewrite each other's ledger mid-run. The same scaled
+  # deadline: a waiter here outlasts the other cases' units on the stream,
+  # infra queue included. Taken before the infra lock, not after: a stack-bearing unit that shares
+  # its stream with a stackless one would otherwise sit on the infra lock for
+  # the whole of the other's audit, and every tofu unit behind it would run
+  # out its INFRA_LOCK_DEADLINE waiting on a lane nothing is using.
   if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}" "${lock_deadline}"; then
-    [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${audit_id} stream lock" >&2
+    return 0
+  fi
+  if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra" "${INFRA_LOCK_DEADLINE}"; then
+    [ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
     return 0
   fi
   # This unit's own token, minted rather than inherited, and minted after the
@@ -2325,12 +2579,19 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} could not mint a ledger token" >&2
     return 0
   fi
-  # This stream's open ledger, closed before the unit runs and while the task
-  # lock keeps its sibling repetitions out and the stream lock keeps the other
-  # case on the same stream out: repetitions 2 and 3 audit from the empty
-  # ledger repetition 1 had (the lease-time reset above). Only this stream's
-  # label, so an audit case on another stream in another lane keeps its own.
+  # This stream's in-flight note on the sandbox pod first, left by a
+  # repetition that died between `start` and `finish` and released under
+  # these locks so the next `start` of the stream is not refused for a run
+  # that is over; a live worker's note is waited on, and that wait sits
+  # before the reset so its `finish` lands in the ledger the reset retires
+  # (release_inflight_note says why the order matters). Then this stream's
+  # open ledger, closed before the unit runs and while the task lock keeps its
+  # sibling repetitions out and the stream lock keeps the other case on the
+  # same stream out: repetitions 2 and 3 audit from the empty ledger
+  # repetition 1 had (the lease-time reset above). Only this stream's label,
+  # so an audit case on another stream in another lane keeps its own.
   if [ -n "${audit_id}" ]; then
+    release_inflight_note "${name} rep ${rep}" "${audit_id}"
     reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
   fi
   if [ -n "${reuse}" ]; then
@@ -2532,6 +2793,18 @@ announce_suite_verdict() {
       "${verdict_json}" "${EVAL_VERDICT_OUTCOME_NOT_EVALUATED}" 2>/dev/null; then
     not_evaluated="true"
   fi
+  # Two things write that outcome (bench/kube_agents_bench/scoring.py,
+  # grade_suite): weather that took an admitted case or every case, which
+  # lists the lost cases under `not_evaluated`, and an inject-lane run whose
+  # every case was set aside as not graded on its transport, which lists
+  # nothing there and the cases under `not_graded`. The final line says
+  # which, because the two ask for opposite actions: a rerun, or a roster.
+  local graded_nothing="false"
+  if [ "${not_evaluated}" = "true" ] && \
+    python3 -c 'import json, sys; v = json.load(open(sys.argv[1])); sys.exit(0 if not v.get("not_evaluated") and v.get("not_graded") else 1)' \
+      "${verdict_json}" 2>/dev/null; then
+    graded_nothing="true"
+  fi
   # The final line keeps the `PR Smoke Test Evaluation Failed` and
   # `(Total Duration: Ns)` anchors that scripts/eval_dashboard/collect.py
   # matches, so a not-evaluated run does not lose its final line on the
@@ -2539,6 +2812,10 @@ announce_suite_verdict() {
   if [ "${suite_status}" -eq 0 ]; then
     echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Succeeded (Total Duration: ${total_duration}s) ==="
     return 0
+  fi
+  if [ "${graded_nothing}" = "true" ]; then
+    echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- NOT EVALUATED: every case in the matrix was not graded on this transport (every objective check not applicable), so this run graded nothing and cannot certify green. Not a finding against the change and not an environment failure: the lane's roster is what to fix. See ${verdict_md} (Total Duration: ${total_duration}s)"
+    return "${EVAL_SUITE_NOT_EVALUATED_STATUS}"
   fi
   if [ "${not_evaluated}" = "true" ]; then
     echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed -- NOT EVALUATED: an admitted case (or every case) lost every repetition to infrastructure, so this run cannot certify green. Not a finding against the change: rerun when the environment is healthy rather than debugging it. See ${verdict_md} (Total Duration: ${total_duration}s)"

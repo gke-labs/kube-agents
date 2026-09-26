@@ -142,7 +142,9 @@ absent destroys the stockout log sink, its alerts topic and subscription, and th
 grants; `ENABLE_PUBSUB_PLATFORM` absent removes the adapter plugin from the release (the
 composition owns no Pub/Sub resource for it alone); `GOOGLE_CHAT_ENABLED` absent removes the
 Chat topic and subscription; `PLATFORM_AGENT_PERMISSION_SET` absent falls back to `read-only`
-and drops the custom roles.
+and drops the custom roles; `SCOPE_PROJECTS` absent renders an empty scope block, which revokes
+the read roles in every project it named and retires those projects' Cluster Agent profiles
+over the reconcile's next two clean runs.
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
@@ -181,6 +183,58 @@ instead, and later runs recover them from the live `platform-agent-secrets` Secr
 when kubectl's current context is this install's cluster). `API_SERVER_KEY` is generated
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
+
+### Projects in scope
+
+`SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` are the
+`PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install from the
+same value: the generator renders them as the composition's `scope` object, the IAM module
+binds the read roles in every project named, and the chart renders the same object into the
+CR. The lists are space- or comma-separated like every other list key; an excluded project may
+be a shell-style glob; an excluded cluster is `project/location/cluster`, and an entry that
+does not split into three parts stops the run before `terraform.tfvars` is written. The
+patterns, caps and repeats the CRD enforces are checked by the module's variable validation,
+which fails the plan before any binding.
+
+The block is written on every run, empty lists included: an emptied `projects` list is the
+declaration that drops projects, and a missing block would declare nothing, so removing a
+project from `SCOPE_PROJECTS` and running `upgrade.sh --upgrade-mode=full` is how a project
+leaves the scope. A file that lacks the keys declares an empty scope, like every absent key
+(the list above). Only full mode applies the keys; `harness` and `operator` retags re-render
+the release's recorded values and change nothing about the scope. `upgrade.sh`, `uninstall.sh`
+and the Day-2 menu read the keys from `install.env` alone (`load_install_env` drops a value
+inherited from the shell, as it does `NAMESPACE`, and `install.sh` does the same once an
+`install.env` exists); `install.sh` also takes the three `--scope-*` flags, and on a first install
+the environment, and records them, and an empty `--scope-*=` is refused. A malformed `SCOPE_EXCLUDE_CLUSTERS` entry stops every front door but `uninstall.sh`,
+retags included, until the line is fixed; there is no bypass.
+
+Before a full apply the front doors read the live `PlatformAgent` through the install's own
+kubeconfig context and refuse when it carries a scope that neither the release record nor the
+keys account for, printing the three lines that reproduce it; a read that cannot decide (no
+context, an unreadable CR or release) refuses too, because the apply itself needs no kubeconfig
+and would go ahead over a scope nobody read (`refuse_apply_over_undeclared_scope` in
+`installer_common.sh`; `upgrade.sh --plan` warns instead). An `install.sh` re-run and the
+menu apply the chart's CRDs before their apply, as `upgrade.sh` does, so the block lands on
+every front door rather than being pruned by a served schema that predates the field.
+
+The bindings live in projects the applying identity has to be able to set IAM policy in. A
+scoped project that is deleted, or whose owner revokes that permission, fails the refresh or
+destroy of its bindings on every later plan, full upgrade and uninstall. Remove it from
+`SCOPE_PROJECTS` and forget its bindings from state, from the composition directory the last
+`lifecycle.sh` run initialised against the install's backend:
+
+```bash
+cd terraform/examples/full-install
+terraform state list | grep 'scope_roles\["<project>/' | while IFS= read -r address; do
+  terraform state rm "$address"
+done
+```
+
+The grants left in the unreachable project are orphaned, not revoked. A `custom` permission set
+made of custom IAM roles cannot declare a scope: a custom IAM role is never carried into scoped
+projects (only the six predefined read roles in `scope.tf`'s allowlist are, those of them the host
+project holds), and the plan is refused until `PLATFORM_AGENT_CUSTOM_ROLES` carries
+`roles/container.clusterViewer` or `roles/container.viewer`.
 
 ### Cluster adoption and component toggles
 

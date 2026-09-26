@@ -1225,6 +1225,14 @@ users:
 YAML
     ;;
   "auth print-access-token "*)
+    # STUB_TOKEN_FAIL fails every mint; with STUB_TOKEN_FAIL_TIMES it fails
+    # only that many, counted off the calls already logged above.
+    if [ -n "${STUB_TOKEN_FAIL:-}" ]; then
+      prior=$(( $(grep -c '^auth print-access-token' "$STUB_LOG") - 1 ))
+      if [ -z "${STUB_TOKEN_FAIL_TIMES:-}" ] || [ "$prior" -lt "$STUB_TOKEN_FAIL_TIMES" ]; then
+        echo "$STUB_TOKEN_FAIL" >&2; exit 1
+      fi
+    fi
     [ -n "${STUB_TOKEN_WARNING:-}" ] && echo "$STUB_TOKEN_WARNING" >&2
     printf '%s\\n' "${STUB_TOKEN:-ya29.a0AfB_byTOKEN}"
     ;;
@@ -1423,6 +1431,7 @@ def test_a_listing_that_fails_is_a_warning_and_not_a_dead_job(shell, tmp_path):
         FLEET_PROJECT_ID="p",
         FLEET_CATALOG=str(_CATALOG),
         BENCH_FLEET_KUBECONFIG_DIR=str(out),
+        FLEET_ALLOW_RUNNER_CREDENTIAL="1",
         STUB_LIST_FAIL="ERROR: (gcloud.container.clusters.list) PERMISSION_DENIED",
     )
     assert done.returncode == 0, done.stderr
@@ -1444,6 +1453,7 @@ def test_labelled_clusters_that_all_resolve_to_nothing_say_so(shell, tmp_path):
         FLEET_PROJECT_ID="p",
         FLEET_CATALOG=str(_CATALOG),
         BENCH_FLEET_KUBECONFIG_DIR=str(out),
+        FLEET_ALLOW_RUNNER_CREDENTIAL="1",
         STUB_CLUSTERS=(
             "seeded-a\tus-central1-a\nold-a\tus-central1-a\n"
             "seeded-b\tus-central1-a\nold-b\tus-central1-a\n"
@@ -1503,62 +1513,42 @@ def test_the_kubeconfig_carries_no_baked_token(shell, tmp_path):
     assert "token:" not in body
 
 
-def test_the_mint_still_gates_the_rewrite(shell, tmp_path):
-    """The write-time mint survives the move to an exec entry, on purpose.
-
-    Nothing in the composed file needs the token any more, so the mint exists
-    only to prove the caller can impersonate the account before the credential
-    is committed to. Without it a project missing the token-creator binding
-    would get a well-formed kubeconfig that fails later, one check at a time,
-    instead of the warning and the fallback it gets today.
-    """
+def test_the_rewrite_mints_nothing(shell, tmp_path):
+    """The gate owns the one mint. The rewrite reads gcloud's server and CA
+    and writes the exec entry; a second mint here proved nothing (the binding
+    is per account) and was one more place for a transient to drop a slot."""
     target = tmp_path / "slot.kubeconfig"
     _kubeconfig_stub(target)
-    done = shell(
-        f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com',
-        STUB_TOKEN="ERROR: (gcloud.auth) Permission denied",
-    )
-    assert done.returncode != 0
-    assert "gke-gcloud-auth-plugin" in target.read_text()
-    assert "fleet-reader-credential.sh" not in target.read_text()
+    done = shell(f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com')
+    assert done.returncode == 0, done.stderr
+    assert "fleet-reader-credential.sh" in target.read_text()
+    assert not any("print-access-token" in line for line in shell.log.read_text().splitlines())
 
 
-def test_the_impersonation_warning_does_not_break_the_mint_probe(shell, tmp_path):
-    """A regression test for a bug this had.
+def test_the_impersonation_warning_does_not_break_the_gates_mint(shell):
+    """A regression test for a bug the mint had.
 
     `gcloud auth print-access-token --impersonate-service-account=...` prints
     "WARNING: This command is using service account impersonation..." to stderr
     on the SUCCESS path. Capturing it with `2>&1` made $token a multi-line blob
     that kubectl still accepted, so every API call 401'd while the script
-    reported success -- a silent read-only rollout that authenticated as
-    nobody. The token no longer reaches the file, but it still decides whether
-    the file is rewritten, so folding stderr in would now reject a mint that
-    succeeded.
+    reported success. The gate captures stderr apart, so the warning is not a
+    refusal.
     """
-    target = tmp_path / "slot.kubeconfig"
-    _kubeconfig_stub(target)
     done = shell(
-        f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com',
+        "_fleet_require_readonly_credential reader@x.iam.gserviceaccount.com p",
         STUB_TOKEN_WARNING="WARNING: This command is using service account impersonation.",
     )
     assert done.returncode == 0, done.stderr
-    assert "fleet-reader-credential.sh" in target.read_text()
-    assert "WARNING" not in target.read_text()
 
 
-def test_a_token_that_is_not_a_token_leaves_the_original_credential_alone(
-    shell, tmp_path
-):
-    target = tmp_path / "slot.kubeconfig"
-    _kubeconfig_stub(target)
+def test_the_gate_refuses_a_token_that_is_not_a_token(shell):
     done = shell(
-        f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com',
+        "_fleet_require_readonly_credential reader@x.iam.gserviceaccount.com p",
         STUB_TOKEN="ERROR: (gcloud.auth) Permission denied",
     )
-    assert done.returncode != 0
-    assert "not a bare access token" in done.stderr
-    # Not a broken file: the caller warns and keeps its own credential.
-    assert "gke-gcloud-auth-plugin" in target.read_text()
+    assert done.returncode == 3
+    assert "other than a bare access token" in done.stderr
 
 
 def test_a_kubeconfig_with_no_server_is_not_rewritten(shell, tmp_path):
@@ -1606,6 +1596,9 @@ def _provision(shell, tmp_path, **env) -> Path:
         "STUB_NAMESPACES": (
             "seeded-debug seeded-reliability seeded-security seeded-capacity"
         ),
+        # Most tests are about discovery and presence, not the credential, so
+        # they run the way a laptop does; the credential tests override this.
+        "FLEET_ALLOW_RUNNER_CREDENTIAL": "1",
     }
     settings.update(env)
     _provision.last = shell("write_fleet_kubeconfigs", **settings)  # type: ignore[attr-defined]
@@ -1661,27 +1654,156 @@ def test_a_read_only_service_account_reaches_every_role_file(shell, tmp_path):
     assert "--impersonate-service-account=seeded-fleet-reader@p" in call
 
 
-def test_an_unusable_read_only_account_warns_and_keeps_running(shell, tmp_path):
-    """Loudly degraded, not dead: the checks still need to run, and a write
-    credential reading a fixture is a smaller problem than no result at all."""
+def test_a_reader_that_cannot_be_minted_stops_the_runner_before_any_file(shell, tmp_path):
+    """The warn-and-fall-back this replaces ran unread on two pool projects for
+    a day: a check made with the runner's write credential proves nothing, so
+    the run stops instead, with nothing written -- and nothing left. A previous
+    run's files are credentials for a previous project, and a caller that still
+    exports BENCH_FLEET_KUBECONFIG_DIR would otherwise read them."""
+    stale = tmp_path / "out"
+    stale.mkdir()
+    (stale / ".kube-agents-fleet-kubeconfigs").touch()
+    (stale / "crashloop-workload.kubeconfig").write_text("a previous project's credential\n")
+    out = _provision(
+        shell,
+        tmp_path,
+        FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
+        STUB_TOKEN_FAIL="ERROR: (gcloud.auth.print-access-token) PERMISSION_DENIED: Failed to impersonate",
+    )
+    done = _provision.last
+    assert done.returncode == 3, done.stderr
+    assert out == stale and not out.exists()
+    # Off Prow the message names the developer's route, not a repair to a
+    # pool project the operator's account was never meant to impersonate.
+    assert "FLEET_ALLOW_RUNNER_CREDENTIAL=1" in done.stderr
+    assert "re-apply" not in done.stderr
+    # A denial is the binding, not weather: one attempt, no wait.
+    assert _mints(shell) == 1
+
+
+def _mints(shell) -> int:
+    return sum(1 for line in shell.log.read_text().splitlines() if line.startswith("auth print-access-token"))
+
+
+def test_a_transient_mint_failure_is_retried_and_the_run_goes_on(shell, tmp_path):
+    """In the eval the gate runs 20-30 minutes into a leased job; a one-off
+    IAM blip there must not end the run when the next attempt would pass."""
+    out = _provision(
+        shell,
+        tmp_path,
+        FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
+        STUB_TOKEN_FAIL="ERROR: (gcloud.auth.print-access-token) UNAVAILABLE: The service is currently unavailable.",
+        STUB_TOKEN_FAIL_TIMES="1",
+        FLEET_MINT_RETRY_SECONDS="0",
+    )
+    done = _provision.last
+    assert done.returncode == 0, done.stderr
+    assert (out / "crashloop-workload.kubeconfig").exists()
+    assert _mints(shell) == 2
+
+
+def test_a_transient_that_never_clears_stops_after_the_attempts(shell, tmp_path):
+    out = _provision(
+        shell,
+        tmp_path,
+        FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
+        STUB_TOKEN_FAIL="ERROR: (gcloud.auth.print-access-token) UNAVAILABLE: The service is currently unavailable.",
+        STUB_TOKEN_FAIL_TIMES="9",
+        FLEET_MINT_RETRY_SECONDS="0",
+    )
+    done = _provision.last
+    assert done.returncode == 3, done.stderr
+    assert not out.exists()
+    assert "UNAVAILABLE" in done.stderr
+    assert _mints(shell) == 3
+
+
+def test_under_prow_the_gate_names_the_pool_repair_not_the_opt_in(shell, tmp_path):
+    """The same failure in a leased job is a project missing its binding; the
+    one message is the gate's, so the CI scripts add no repair of their own."""
+    _provision(
+        shell,
+        tmp_path,
+        FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
+        FLEET_ALLOW_RUNNER_CREDENTIAL="",
+        JOB_NAME="pull-kube-agents-smoke-test",
+        STUB_TOKEN_FAIL="ERROR: (gcloud.auth.print-access-token) PERMISSION_DENIED: Failed to impersonate",
+    )
+    done = _provision.last
+    assert done.returncode == 3, done.stderr
+    assert "re-apply bench/tf/fleet against kube-agents-evals" in done.stderr
+    assert "FLEET_ALLOW_RUNNER_CREDENTIAL" not in done.stderr
+    assert "seeded-fleet-reader@p" in done.stderr
+    assert "PERMISSION_DENIED" in done.stderr
+    assert "roles/iam.serviceAccountTokenCreator" in done.stderr
+
+
+def test_a_token_that_is_not_a_token_stops_the_runner(shell, tmp_path):
     out = _provision(
         shell,
         tmp_path,
         FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
         STUB_TOKEN="ERROR: (gcloud.auth) Permission denied",
     )
+    assert _provision.last.returncode == 3, _provision.last.stderr
+    assert not out.exists()
+    assert "other than a bare access token" in _provision.last.stderr
+
+
+def test_no_read_only_account_and_no_opt_in_stops_the_runner(shell, tmp_path):
+    out = _provision(shell, tmp_path, FLEET_ALLOW_RUNNER_CREDENTIAL="")
     done = _provision.last
-    assert done.returncode == 0, done.stderr
-    assert "could not be used" in done.stderr
+    assert done.returncode == 3, done.stderr
+    assert not out.exists()
+    assert "FLEET_READONLY_SA=seeded-fleet-reader@kube-agents-evals" in done.stderr
+    assert "FLEET_ALLOW_RUNNER_CREDENTIAL=1" in done.stderr
+
+
+def test_the_opt_in_still_says_the_credential_can_write(shell, tmp_path):
+    """A fleet only you use may be read with your own credential, but the
+    script keeps saying what that credential can do."""
+    out = _provision(shell, tmp_path)
+    assert _provision.last.returncode == 0, _provision.last.stderr
     assert (out / "crashloop-workload.kubeconfig").exists()
-    assert "gke-gcloud-auth-plugin" in (out / "crashloop-workload.kubeconfig").read_text()
-
-
-def test_no_read_only_account_says_the_credential_can_write(shell, tmp_path):
-    """The honest default. These kubeconfigs can delete the shared fleet."""
-    _provision(shell, tmp_path)
     assert "the runner's own credential" in _provision.last.stderr
     assert "can WRITE to the shared fleet" in _provision.last.stderr
+
+
+def test_a_rewrite_that_fails_drops_the_cluster_rather_than_keeping_the_credential(
+    shell, tmp_path
+):
+    """Past the gate the mint is good, so a rewrite can only fail on the
+    kubeconfig gcloud wrote (here: no server). The file goes rather than
+    staying on the runner's identity; its roles report status=error."""
+    out = _provision(
+        shell,
+        tmp_path,
+        FLEET_READONLY_SA="seeded-fleet-reader@p.iam.gserviceaccount.com",
+        STUB_SERVER="",
+    )
+    done = _provision.last
+    assert done.returncode == 0, done.stderr
+    assert list(out.glob("*.kubeconfig")) == []
+    assert "dropped" in done.stderr
+    assert "0 role(s) written" in done.stderr
+
+
+def test_the_executed_form_exits_with_the_gate_code(tmp_path):
+    done = subprocess.run(
+        ["bash", str(_SCRIPT)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            "PATH": os.environ["PATH"],
+            "HOME": str(tmp_path),
+            "FLEET_PROJECT_ID": "some-project",
+            "FLEET_CATALOG": str(_CATALOG),
+            "BENCH_FLEET_KUBECONFIG_DIR": str(tmp_path / "out"),
+        },
+    )
+    assert done.returncode == 3, done.stderr
+    assert done.stdout == ""
 
 
 def test_every_file_the_runner_writes_is_readable_only_by_the_runner(shell, tmp_path):
@@ -1814,6 +1936,7 @@ def test_a_project_with_no_seeded_fleet_says_so_and_still_exits_zero(shell, tmp_
         FLEET_PROJECT_ID="kube-agents-evals-3",
         FLEET_CATALOG=str(_CATALOG),
         BENCH_FLEET_KUBECONFIG_DIR=str(out),
+        FLEET_ALLOW_RUNNER_CREDENTIAL="1",
         STUB_CLUSTERS="",
     )
     assert done.returncode == 0, done.stderr
@@ -1831,6 +1954,7 @@ def test_gclouds_own_words_survive_into_the_warning(shell, tmp_path):
         FLEET_PROJECT_ID="kube-agents-evals",
         FLEET_CATALOG=str(_CATALOG),
         BENCH_FLEET_KUBECONFIG_DIR=str(out),
+        FLEET_ALLOW_RUNNER_CREDENTIAL="1",
         STUB_CLUSTERS="seeded-a\tus-central1-a\n",
         STUB_CREDS_FAIL="ERROR: (gcloud.container.clusters.get-credentials) ResponseError: code=403",
     )

@@ -4164,23 +4164,34 @@ class FailedInitialReleaseIsClearedBeforeTheApplyTest(unittest.TestCase):
         self.assertLess(cmek, clear)
         self.assertLess(clear, apply)
 
-    def test_it_is_gated_on_the_cluster_existing_and_fetches_its_credentials(self):
+    def test_it_is_gated_on_the_cluster_existing_and_runs_on_the_context_fetched_before_the_summary(self):
         # Existing, not adopted: a cluster this state created on the attempt
         # that died exists with create_cluster = true, and its retry hits the
         # same Helm refusal. The generator fetched credentials on the adoption
-        # path alone, so this branch fetches them itself.
+        # path alone, so main() fetches them itself for any existing cluster,
+        # once, before the step-11 summary (the scope check needs them there
+        # too), and step 12's gate reuses that context rather than fetching
+        # again.
         clear = self.source.index('clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"')
-        gate = self.source.rfind('if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then', 0, clear)
+        summary = self.source.index('print_step "11. Pre-Flight Configuration Summary"')
+        gate = self.source.rfind(
+            'if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ] && [ "$PARAM_DRY_RUN" != "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ]; then',
+            0, summary)
         self.assertGreater(gate, 0)
         credentials = self.source.index('gcloud container clusters get-credentials "$cluster_name"', gate)
-        self.assertLess(credentials, clear)
-        # Nothing else opens between the gate and the call.
-        self.assertNotIn("\n  fi\n", self.source[gate:clear])
+        self.assertLess(credentials, summary)
+        self.assertLess(summary, clear)
         # The fetch reaches a DNS-endpoint-only cluster the way step 13's does;
         # a plain one fails there, and the context gate then skips the check.
         flag = self.source.index('gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id"', gate)
         self.assertLess(flag, credentials)
-        self.assertIn("$GKE_DNS_ENDPOINT_FLAG", self.source[credentials:clear])
+        self.assertIn("$GKE_DNS_ENDPOINT_FLAG", self.source[credentials:summary])
+        # Step 12 still gates the clear on the cluster existing, opens nothing
+        # else before the call, and fetches nothing of its own.
+        step12_gate = self.source.rfind('if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then', 0, clear)
+        self.assertGreater(step12_gate, summary)
+        self.assertNotIn("\n  fi\n", self.source[step12_gate:clear])
+        self.assertNotIn("get-credentials", self.source[step12_gate:clear])
 
 
 class TheCloneDirectoryNeedsHomeOnlyWhenCloningTest(unittest.TestCase):
@@ -5998,6 +6009,9 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--slack-allowed-users": ("PARAM_SLACK_ALLOWED_USERS", "U123,U456"),
         "--slack-home-channel": ("PARAM_SLACK_HOME_CHANNEL", "C01234567"),
         "--slack-home-channel-name": ("PARAM_SLACK_HOME_CHANNEL_NAME", "#gke-alerts"),
+        "--scope-projects": ("PARAM_SCOPE_PROJECTS", "payments-prod,payments-staging"),
+        "--scope-exclude-projects": ("PARAM_SCOPE_EXCLUDE_PROJECTS", "*-sandbox"),
+        "--scope-exclude-clusters": ("PARAM_SCOPE_EXCLUDE_CLUSTERS", "payments-staging/us-central1/scratch"),
     }
 
     def test_each_value_flag_reaches_its_variable(self):
@@ -7025,6 +7039,253 @@ class BannerColourVariablesAreDefinedTest(unittest.TestCase):
             "they come from scripts/installer/common.sh, which it does not source",
         )
 
+
+class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
+    """The scope flags follow the install.env contract every other key does.
+
+    A first install records the three keys, empty included, so the file says
+    where a project is declared. A re-run never rewrites the file, so a flag
+    that disagrees with it gets the same one-run warning --agent-namespace and
+    --enable-gke-backup-plan get, naming the line to add and the consequence:
+    the next full upgrade regenerates from the file and drops the project.
+    """
+
+    def _run(self, script, env=None):
+        return subprocess.run(
+            ["bash", "-c",
+             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+             'source scripts/installer/installer_common.sh\n'
+             'resolve_shared_defaults\n'
+             'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n' + script],
+            capture_output=True, text=True,
+            env=get_isolated_test_env(overrides={
+                "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
+                **(env or {}),
+            }),
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_a_first_install_records_the_three_keys_even_when_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "new.install.env"
+            loaded = pathlib.Path(tmp) / "loaded.install.env"
+            loaded.write_text("")
+            loaded.chmod(0o600)
+            # Exported after the load, as main() exports the flags' values: the
+            # loader drops an inherited key once an install.env exists.
+            proc = self._run(
+                'export SCOPE_PROJECTS="payments-prod payments-staging" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""\n'
+                f'bootstrap_install_env_file "{dest}" some-tag >/dev/null\ncat "{dest}"',
+                env={"KUBE_AGENTS_INSTALL_ENV": str(loaded)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_PROJECTS=payments-prod\\ payments-staging$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_PROJECTS=''$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_CLUSTERS=''$", re.MULTILINE))
+
+    def test_an_inherited_scope_key_is_dropped_once_install_env_exists(self):
+        # The hazard load_install_env closes for the other front doors: a
+        # shell-exported value applied for one run over a file that does not
+        # record it is dropped again by the next run. A file that carries the
+        # key sets it; a first install (no file) keeps the environment.
+        probe = 'echo "P=${PARAM_SCOPE_PROJECTS:-unset} X=${PARAM_SCOPE_EXCLUDE_PROJECTS:-unset} C=${PARAM_SCOPE_EXCLUDE_CLUSTERS:-unset}"'
+        stray = {"SCOPE_PROJECTS": "stray-project", "SCOPE_EXCLUDE_PROJECTS": "*-stray",
+                 "SCOPE_EXCLUDE_CLUSTERS": "s/l/c"}
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("PROJECT_ID=p\n")
+            env_file.chmod(0o600)
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{probe}'],
+                capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file), **stray}),
+            )
+            self.assertIn("P=unset X=unset C=unset", proc.stdout, proc.stderr)
+            env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\n")
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{probe}'],
+                capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file), **stray}),
+            )
+            self.assertIn("P=from-the-file X=unset C=unset", proc.stdout, proc.stderr)
+        # No file: a first install seeds from the environment and records it.
+        with tempfile.TemporaryDirectory() as tmp:
+            script_copy = pathlib.Path(tmp) / "install.sh"
+            script_copy.write_text(_INSTALL_SH.read_text())
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{script_copy}"\n{probe}'],
+                capture_output=True, text=True, cwd=tmp,
+                env=get_isolated_test_env(overrides={"HOME": tmp, **stray}),
+            )
+            self.assertIn("P=stray-project X=*-stray C=s/l/c", proc.stdout, proc.stderr)
+
+    def test_a_flag_that_disagrees_with_the_recorded_file_warns_and_names_the_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = pathlib.Path(tmp) / "install.env"
+            existing.write_text("SCOPE_PROJECTS=payments-prod\n")
+            existing.chmod(0o600)
+            proc = self._run(
+                'PARAM_SCOPE_PROJECTS="payments-prod,payments-staging"\n'
+                f'bootstrap_install_env_file "{existing}" some-tag',
+                env={"KUBE_AGENTS_INSTALL_ENV": str(existing)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = proc.stdout + proc.stderr
+            self.assertIn("--scope-projects=payments-prod,payments-staging applies to this run only", out)
+            self.assertIn("records SCOPE_PROJECTS=payments-prod", out)
+            self.assertIn("retired over the reconcile's next two clean runs", out)
+            # Spelled as install.env records it (%q), so the line pastes back as is.
+            self.assertIn("Set SCOPE_PROJECTS=payments-prod\\,payments-staging in", out)
+            self.assertEqual(existing.read_text(), "SCOPE_PROJECTS=payments-prod\n")
+
+    def test_the_remedy_for_a_space_separated_flag_pastes_back_as_one_assignment(self):
+        # The scope keys are the first list-valued values through the warning;
+        # printed bare, `Set SCOPE_PROJECTS=a b in ...` would source as the
+        # command `b` with SCOPE_PROJECTS=a in its environment.
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = pathlib.Path(tmp) / "install.env"
+            existing.write_text("SCOPE_PROJECTS=payments-prod\n")
+            existing.chmod(0o600)
+            proc = self._run(
+                'PARAM_SCOPE_PROJECTS="payments-prod payments-staging"\n'
+                f'bootstrap_install_env_file "{existing}" some-tag',
+                env={"KUBE_AGENTS_INSTALL_ENV": str(existing)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = proc.stdout + proc.stderr
+            # The value carries a backslash-escaped space, so the token is
+            # "anything but an unescaped space" up to the trailing " in ".
+            printed = re.search(r"Set (SCOPE_PROJECTS=(?:\\.|\S)+) in ", out)
+            self.assertIsNotNone(printed, out)
+            self.assertEqual(printed.group(1), "SCOPE_PROJECTS=payments-prod\\ payments-staging")
+            # And the assignment as printed round-trips through a sourcing shell.
+            check = subprocess.run(
+                ["bash", "-c", f'set -eu; {printed.group(1)}; printf "%s" "$SCOPE_PROJECTS"'],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(check.stdout, "payments-prod payments-staging")
+
+    def test_a_run_without_a_scope_flag_over_a_recorded_file_is_silent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = pathlib.Path(tmp) / "install.env"
+            existing.write_text("SCOPE_PROJECTS=payments-prod\nSCOPE_EXCLUDE_CLUSTERS=p/l/c\n")
+            existing.chmod(0o600)
+            proc = self._run(
+                f'bootstrap_install_env_file "{existing}" some-tag',
+                env={"KUBE_AGENTS_INSTALL_ENV": str(existing)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotIn("applies to this run only", proc.stdout + proc.stderr)
+
+    def test_an_empty_scope_flag_is_refused_at_parse_time(self):
+        # Applied, an empty flag would drop every scoped project for one run
+        # while install.env still named them; the file is where a scope is
+        # emptied on purpose.
+        for flag, key in (("--scope-projects", "SCOPE_PROJECTS"),
+                          ("--scope-exclude-projects", "SCOPE_EXCLUDE_PROJECTS"),
+                          ("--scope-exclude-clusters", "SCOPE_EXCLUDE_CLUSTERS")):
+            for value in ("", ",", " ", " , "):
+                with self.subTest(flag=flag, value=value):
+                    proc = subprocess.run(
+                        ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nparse_args {shlex.quote(flag + "=" + value)}\necho REACHED'],
+                        capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                    )
+                    self.assertNotIn("REACHED", proc.stdout)
+                    out = proc.stdout + proc.stderr
+                    self.assertIn(f"{flag}= was given an empty value", out)
+                    # The remedy names the flag's own key: an operator clearing an
+                    # exclusion must not be told to empty the project list.
+                    self.assertIn(f"set {key}= (empty) in install.env", out)
+
+    def test_the_flags_are_in_the_help_text(self):
+        proc = subprocess.run(
+            ["bash", str(_INSTALL_SH), "--help"],
+            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+        )
+        help_text = proc.stdout + proc.stderr
+        for flag in ("--scope-projects=IDS", "--scope-exclude-projects=IDS", "--scope-exclude-clusters=TRIPLES"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, help_text)
+
+
+class ScopeCheckWiringTest(unittest.TestCase):
+    """install.sh runs the pre-apply scope check where it is about to apply
+    and can read: before the step-11 summary and the confirmation, after its
+    own credentials fetch, for a run that will apply (a first install has no
+    cluster; --dry-run and --generate-only apply nothing); and the Day-2
+    menu's Save & Apply, which fetches a context of its own first. The CRD
+    apply sits at step 12 and in the menu, after the check and before the apply."""
+
+    def setUp(self):
+        self.text = _INSTALL_SH.read_text()
+
+    def test_the_check_runs_after_a_fetch_and_before_the_summary_only_for_an_applying_run(self):
+        ownership = self.text.index("check_service_account_ownership || exit 1\n  # For the same reason")
+        gate = self.text.index('if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ] && [ "$PARAM_DRY_RUN" != "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ]; then')
+        fetch = self.text.index('gcloud container clusters get-credentials "$cluster_name" --location "$region" \\\n      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true\n    refuse_apply_over_undeclared_scope')
+        check = self.text.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n')
+        summary = self.text.index('print_step "11. Pre-Flight Configuration Summary"')
+        self.assertLess(ownership, gate)
+        self.assertLess(gate, fetch)
+        self.assertLess(fetch, check)
+        self.assertLess(check, summary)
+
+    def test_the_crds_are_applied_at_step_12_before_the_apply_on_the_one_fetched_context(self):
+        # INSTALL.md names a re-run and the menu as the way to change
+        # configuration; Helm never upgrades CRDs, so a field the served schema
+        # lacked would be pruned from the CR, and stay pruned. The context is
+        # the one fetched before the summary: main() fetches once for an
+        # existing cluster, not again at step 12.
+        step12 = self.text.index('print_step "12. Applying the Install (Terraform + Helm)"')
+        clear = self.text.index('clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE" "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1')
+        crds = self.text.index('apply_crd_upgrades "$repo_dir"\n  fi\n')
+        apply = self.text.index('run_lifecycle_apply "$repo_dir" "$provisioning_log"')
+        self.assertLess(step12, clear)
+        self.assertLess(clear, crds)
+        self.assertLess(crds, apply)
+        self.assertNotIn("refuse_apply_over_undeclared_scope", self.text[step12:apply])
+        main_fetch = 'gcloud container clusters get-credentials "$cluster_name" --location "$region" \\\n      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true'
+        self.assertEqual(self.text.count(main_fetch), 1)
+
+    def test_the_menu_fetches_a_context_then_checks_then_applies_the_crds_before_its_apply(self):
+        menu = self.text[self.text.index("run_menu_system()"):]
+        fetch = menu.index('gcloud container clusters get-credentials "$cluster_name" --location "$REGION"')
+        check = menu.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1')
+        crds = menu.index('apply_crd_upgrades "$repo_dir"')
+        apply = menu.index('run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-')
+        self.assertLess(fetch, check)
+        self.assertLess(check, crds)
+        self.assertLess(crds, apply)
+
+    def test_the_menu_refuses_a_scope_flag(self):
+        proc = subprocess.run(
+            ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nparse_args --menu --scope-projects=p\necho "PASSED=$SCOPE_FLAG_PASSED"'],
+            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+        )
+        self.assertIn("PASSED=true", proc.stdout, proc.stderr)
+        dispatch = self.text.index('if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then')
+        refusal = self.text.index("--menu takes no --scope-* flag")
+        run = self.text.index("    run_menu_system\n    exit 0")
+        self.assertLess(dispatch, refusal)
+        self.assertLess(refusal, run)
+
+    def test_the_generate_only_handoff_says_the_check_does_not_run_there(self):
+        self.assertIn("The live-scope check does not run here", self.text)
+
+    def test_the_generate_only_handoff_applies_the_crds_before_the_apply(self):
+        # lifecycle.sh applies no CRDs; on an existing install a field the
+        # served schema lacks would be pruned from the CR and never re-sent.
+        handoff = self.text[self.text.index('2. Apply via lifecycle.sh'):]
+        fetch = handoff.index("gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}")
+        crds = handoff.index("kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/")
+        apply = handoff.index("./lifecycle.sh apply")
+        self.assertLess(fetch, crds)
+        self.assertLess(crds, apply)
+        # Never the current context: every CRD apply this change ships names the install's own.
+        self.assertNotIn("\n  kubectl apply --server-side", handoff[:apply])
+
+    def test_python3_is_a_required_tool(self):
+        self.assertIn("for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin python3; do", self.text)
 
 
 if __name__ == "__main__":

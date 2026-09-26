@@ -163,6 +163,11 @@ AUDITS: dict[str, AuditSpec] = {
             "legacy-metadata",
             "public-control-plane",
             "podsecurity-gaps",
+            "kcc-object-wedged",
+            "image-floating-tag",
+            "unbound-sa-automount",
+            "lb-world-open",
+            "anonymous-rbac-binding",
         ),
     ),
     "security-patch-orchestrator": AuditSpec(
@@ -196,6 +201,18 @@ AUDITS: dict[str, AuditSpec] = {
             "probes-readiness",
             "probes-liveness",
             "single-replica",
+            "schedule-never-succeeds",
+            "rollout-drops-traffic",
+            "strategy-causes-downtime",
+            "cronjob-runs-overlap",
+            "service-selects-nothing",
+            "service-port-unresolved",
+            "liveness-preempts-readiness",
+            "spread-not-achieved",
+            "prestop-outlives-grace",
+            "rwo-claim-contended",
+            "hpa-floors-at-one",
+            "pdb-overlapping",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -455,7 +472,11 @@ DELTA_RE = re.compile(
 # same rename for its stream, for the same reason, so every patch finding is
 # re-spelled on its first run under the collector and scheme 3's ledgers and
 # remediation pull requests cannot be joined against it.
-ID_SCHEME = 4
+#
+# 5: `collect.py` makes the same rename for the obtainability, compliance and
+# ai-security streams, which until then published the bare names their
+# documents wrote.
+ID_SCHEME = 5
 # Joins a qualified cluster name's `<project>/<location>/<name>` segments.
 QUALIFIED_TARGET_SEPARATOR = "/"
 # `<project>/<location>/<name>`: the segments of a qualified cluster name.
@@ -626,6 +647,11 @@ MAX_IDENT_CHARS = 320
 # between a stream that publishes and one that 422s every morning forever.
 MAX_BODY_CHARS = 65_536
 BODY_BUDGET = 60_000
+# Ceiling on the `audit-findings-all` block a truncated ledger carries. It is
+# charged against the findings when the body is truncated anyway, so it is
+# bounded to a slice of the budget: past this a fleet keeps its findings and
+# loses the complete list.
+ALL_FINDINGS_BLOCK_CAP = 12_000
 MAX_SCOPE_ROWS = 60
 MAX_DELTA_ROWS = 50
 # Rows in the ledger's `## Declared intent` table: postures a check would have
@@ -2965,6 +2991,36 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
             for entry in manifest_cluster.get("checks_not_applicable") or []
             if isinstance(entry, dict)
         }
+        # A check whose own read failed did not run and is not inapplicable,
+        # so it may sit in neither list; it belongs in `limitations`, which
+        # makes the run partial and keeps every finding it filed here open.
+        # Declared not applicable instead, it would leave the denominator and
+        # a clean document would resolve those findings over a read that never
+        # happened.
+        collector_unevaluated = {
+            str(entry.get("check"))
+            for entry in manifest_cluster.get("checks_unevaluated") or []
+            if isinstance(entry, dict)
+        }
+        misfiled = sorted(collector_unevaluated & (set(claimed) | set(checks_na(cluster))))
+        if misfiled:
+            raise ValidationError(
+                f"scope.clusters: {name!r} reports {', '.join(repr(s) for s in misfiled)} "
+                f"as run or not applicable, but the collector manifest for {audit_id} "
+                f"lists them in checks_unevaluated on {name!r}: the read each check "
+                "depends on failed, so it neither ran nor was found inapplicable. "
+                "Leave them out of checks_run and checks_not_applicable and name "
+                "them in this target's `limitations`."
+            )
+        if collector_unevaluated and not str(cluster.get("limitations", "")).strip():
+            raise ValidationError(
+                f"scope.clusters: {name!r} has no `limitations`, but the collector "
+                f"manifest for {audit_id} lists "
+                f"{', '.join(repr(s) for s in sorted(collector_unevaluated))} in "
+                f"checks_unevaluated on {name!r}. Name each one and the read that "
+                "failed in `limitations`, so the run reports the gap instead of "
+                "publishing over it."
+            )
         for slug in claimed:
             if slug not in ok_checks:
                 raise ValidationError(
@@ -4229,6 +4285,23 @@ def delta_block(ids: list[str]) -> str:
     )
 
 
+def all_findings_block(ids: list[str]) -> str:
+    """Every id the delta block would carry uncut, for a body that could not render them all.
+
+    The document's findings and the collector-held ids both, so a grader that
+    reads this block in place of the delta block loses neither half.
+
+    Machine-read by graders and never by `finish`: the delta still joins
+    against `audit-findings`, the rendered set, for the reason `compute_delta`
+    gives. What this adds is the one fact a truncated body otherwise loses --
+    that a finding cut for space was filed at all. Empty when the list would
+    exceed `ALL_FINDINGS_BLOCK_CAP`.
+    """
+    payload = json.dumps(sorted(set(ids)), separators=(",", ":"))
+    block = f"<!-- audit-findings-all: {payload} -->"
+    return block if len(block) <= ALL_FINDINGS_BLOCK_CAP else ""
+
+
 def parse_delta_block(body: str | None) -> list[str]:
     """Read the finding ids out of a previous issue body ([] when absent/unparseable)."""
     body = normalise_newlines(body)
@@ -4433,7 +4506,7 @@ def parse_held_ids(body: str | None) -> list[str]:
 def _scope_spellings(body: str, clusters: Iterable[str] = ()) -> dict[str, set[str]]:
     """{bare cluster name: every `<project>/<location>/<name>` it could stand for}.
 
-    Schemes 3 and 4 moved a stream's cluster names from bare to qualified, so a
+    Schemes 3 to 5 moved a stream's cluster names from bare to qualified, so a
     `Where:` line written before the move names a cluster no collector
     candidate spells that way any more. The Scope row beside it has the
     project and location that qualify it; a name audited at two locations has
@@ -4479,7 +4552,7 @@ def _respelled_rows(
     Under another scheme a row naming a bare cluster is also spelled with the
     name qualified from the body's Scope table (`_scope_spellings`), and that
     spelling wins when the collector's `flagged` ids carry it and not the bare
-    one. Schemes 3 and 4 moved a stream's clusters from bare to qualified
+    one. Schemes 3 to 5 moved a stream's clusters from bare to qualified
     names; matched on the bare spelling alone, its first run under the
     collector held nothing, and a clean document closed the ledger over
     findings the collector still flagged. A name two clusters share is
@@ -6430,7 +6503,7 @@ def _render_findings(
 
 
 def _render_footer(
-    audit_id: str, generated_at: datetime, rendered_ids: list[str]
+    audit_id: str, generated_at: datetime, rendered_ids: list[str], all_block: str = ""
 ) -> list[str]:
     return [
         "",
@@ -6441,6 +6514,7 @@ def _render_footer(
         "live fleet; every one carries the exact command it was derived from.",
         "",
         delta_block(rendered_ids),
+        *([all_block] if all_block else []),
         "",
     ]
 
@@ -6995,6 +7069,13 @@ def render_issue_body(
     # select_rendered_findings. The held *rows* are not charged here — they
     # are measured after the findings, below, so they can never displace one.
     overhead = len("\n".join(fixed + declared_section + withheld_section))
+    # The complete id list — the document's findings and the held ids, the
+    # delta block's two halves at full width — rides only a truncated body,
+    # and which findings are cut is not known until they are selected. So
+    # select once without it and, only when that cut something, again with it
+    # charged: charging it up front cut findings from a body that would
+    # otherwise have rendered them all, to make room for a list of the cut.
+    all_block = all_findings_block(finding_ids(findings) + held_ids)
     overhead += len("\n".join(_render_footer(audit_id, generated_at, held_ids)))
     # And the held span's smallest form, so the list the next run carries
     # from is never the thing the findings squeeze out.
@@ -7005,19 +7086,28 @@ def render_issue_body(
         # part of any single finding's charged cost.
         overhead += index_overhead(findings, states, pr_urls)
 
-    findings_lines, omitted = _render_findings(
-        findings,
-        max(BODY_BUDGET - overhead, 0),
-        states=states,
-        pr_urls=pr_urls,
-        gaps=gaps,
-    )
+    def select(extra: int) -> tuple[list[str], list[dict]]:
+        return _render_findings(
+            findings,
+            max(BODY_BUDGET - overhead - extra, 0),
+            states=states,
+            pr_urls=pr_urls,
+            gaps=gaps,
+        )
+
+    findings_lines, omitted = select(0)
+    if omitted and all_block:
+        findings_lines, omitted = select(len("\n" + all_block))
     omitted_ids = {str(f.get("id", "")) for f in omitted}
     rendered_ids = [fid for fid in finding_ids(findings) if fid not in omitted_ids]
 
     # The held ids ride the block after the rendered ones: that is what makes
     # the next run's `previous_ids` remember them.
-    footer = _render_footer(audit_id, generated_at, rendered_ids + held_ids)
+    # The complete list rides only a truncated body; an untruncated one
+    # already names every finding in the block above.
+    footer = _render_footer(
+        audit_id, generated_at, rendered_ids + held_ids, all_block if omitted else ""
+    )
     # The held rows come out of whatever the document's findings left, ahead
     # of the evidence appendix and never ahead of a finding: full rows, then
     # identity lines alone, then a one-line note, then the span and its id
