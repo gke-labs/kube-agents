@@ -404,10 +404,11 @@ resource "kubernetes_pod_disruption_budget_v1" "inference_server" {
 # apply day.
 #
 # Asserted by the deprecated-api-caller role in fixtures.json; no scenario
-# reads it yet. The role asserts a retained *failed* Job is absent (backoffLimit
-# 0 makes any failure the BROKEN exit) and deliberately not that a succeeded
-# one is present: successfulJobsHistoryLimit keeps three old successes, so a
-# succeeded assertion would never go red after the caller broke.
+# reads it yet. The role asserts that no retained Job carries the Failed
+# condition (backoffLimit 0 makes any failure the BROKEN exit) and deliberately
+# not that a succeeded one is present: the first-run Job below has no TTL and
+# stays Complete for the life of the cluster, so a succeeded assertion would
+# never go red after the caller broke.
 resource "kubernetes_namespace_v1" "seeded_deprecation" {
   metadata {
     name   = "seeded-deprecation"

@@ -224,7 +224,7 @@ def healthy_world(*projects):
             "cronjob/legacy-endpoints-writer": {"spec": {"schedule": "*/10 * * * *", "suspend": False, "jobTemplate": {"spec": {"template": {"spec": {"serviceAccountName": "legacy-endpoints-writer"}}}}}},
             "service/legacy-endpoints-lane": {"spec": {"clusterIP": "None"}},
             "endpoints/legacy-endpoints-lane": {"subsets": [{"addresses": [{"ip": "192.0.2.10"}], "ports": [{"port": 9}]}]},
-            "job?app=legacy-endpoints-writer": {"items": [{"status": {"succeeded": 1, "failed": 0}}]},
+            "job?app=legacy-endpoints-writer": {"items": [{"status": {"succeeded": 1, "conditions": [{"type": "Complete", "status": "True"}]}}]},
         },
         "describe": {project: {"seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1"}} for project in projects},
         "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},

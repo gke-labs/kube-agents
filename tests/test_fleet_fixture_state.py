@@ -142,8 +142,15 @@ def _node(*, ready: str = "True", taint: str | None = "idle-batch") -> dict:
     return node
 
 
-def _writer_job(*, failed: int = 0, succeeded: int = 1) -> dict:
-    return {"status": {"succeeded": succeeded, "failed": failed}}
+def _writer_job(*, failed: bool = False, counter: int | None = None) -> dict:
+    """A retained writer Job. ``failed`` sets the Failed condition; ``counter`` is the
+    pod-failure counter, which a Job whose pod was never admitted leaves absent."""
+    if not failed:
+        return {"status": {"succeeded": 1, "conditions": [{"type": "Complete", "status": "True"}]}}
+    status: dict = {"conditions": [{"type": "Failed", "status": "True"}]}
+    if counter is not None:
+        status["failed"] = counter
+    return {"status": status}
 
 
 def _writer_cronjob(*, suspend: bool = False, schedule: str = "*/10 * * * *") -> dict:
@@ -197,7 +204,6 @@ def _healthy_world() -> dict:
             },
             "node?cloud.google.com/gke-nodepool=idle-batch-pool": {"items": [_node()]},
             "cronjob/legacy-endpoints-writer": _writer_cronjob(),
-            "service/legacy-endpoints-lane": {"spec": {"clusterIP": "None"}},
             "endpoints/legacy-endpoints-lane": {"subsets": [{"addresses": [{"ip": "192.0.2.10"}], "ports": [{"port": 9}]}]},
             "job?app=legacy-endpoints-writer": {"items": [_writer_job()]},
         },
@@ -519,12 +525,21 @@ class PassTest(_Harness):
         # The Jobs are read by label, in the role's namespace; nothing named.
         assert "get job -l app=legacy-endpoints-writer -n seeded-deprecation" in self.log.read_text()
         # failedJobsHistoryLimit 1: one retained failure is what a broken caller leaves.
-        world["kubectl"]["job?app=legacy-endpoints-writer"] = {"items": [_writer_job(failed=1, succeeded=0)]}
+        world["kubectl"]["job?app=legacy-endpoints-writer"] = {"items": [_writer_job(failed=True, counter=1)]}
         done = self.run_script(world)
         assert "1 drifted" in done.stderr, done.stderr
         body = self.drift_files()["deprecated-api-caller"]
-        assert "job?app=legacy-endpoints-writer status.failed none_eq 1: observed 1" in body, body
+        assert "job?app=legacy-endpoints-writer status.conditions[?(@.type=='Failed')].status none_eq \"True\"" in body, body
         assert "spec.schedule" not in body
+        # A Job whose pod was never admitted (ServiceAccount gone, quota, admission) fails
+        # with the pod counter absent; a Job whose pod was replaced mid-run fails with it
+        # at 2. The condition catches both shapes a counter assertion would miss.
+        for shape in (_writer_job(failed=True), _writer_job(failed=True, counter=2)):
+            world["kubectl"]["job?app=legacy-endpoints-writer"] = {"items": [shape]}
+            self.provision()
+            done = self.run_script(world)
+            assert "1 drifted" in done.stderr, done.stderr
+            assert "status.conditions[?(@.type=='Failed')].status none_eq \"True\"" in self.drift_files()["deprecated-api-caller"]
         # A suspended CronJob is the other silent shape.
         world["kubectl"]["job?app=legacy-endpoints-writer"] = {"items": [_writer_job()]}
         world["kubectl"]["cronjob/legacy-endpoints-writer"] = _writer_cronjob(suspend=True)

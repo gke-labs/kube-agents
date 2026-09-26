@@ -204,10 +204,10 @@
         },
         {
           "subject": "job?app=legacy-endpoints-writer",
-          "path": "status.failed",
+          "path": "status.conditions[?(@.type=='Failed')].status",
           "op": "none_eq",
-          "value": 1,
-          "why": "backoffLimit 0 makes any retained failed Job the writer's BROKEN exit -- a master below 1.33 where nothing is stamped, or RBAC or egress lost -- and each failed run is a ten-minute gap in the trail. ttlSecondsAfterFinished 900 clears a transient in fifteen minutes; a failure that persists is the fixture, not the weather"
+          "value": "True",
+          "why": "any retained Job with the Failed condition is a run that wrote nothing: the writer's BROKEN exit (a master below 1.33, RBAC or egress lost), a pod the deadline killed, or a pod the controller could never create. The condition, not the pod counter: a Job whose pod was never admitted fails with the counter absent, and one whose pod was replaced mid-run fails with it at 2. ttlSecondsAfterFinished 900 clears a transient in fifteen minutes; a failure that persists is the fixture, not the weather"
         },
         {
           "subject": "endpoints/legacy-endpoints-lane",
