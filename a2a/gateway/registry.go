@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -274,6 +275,22 @@ func (r *Registry) DropTask(ctx context.Context, taskID string) error {
 	return kv.Delete(ctx, taskKey(taskID))
 }
 
+// DeleteSession retires a session record once its retention horizon has passed.
+// In JetStream KV under --history=1, kv.Delete publishes a KV-Operation: DEL
+// marker that displaces the record value while retaining a ~100-byte tombstone
+// on the key's subject. This bounds bucket growth to a marker per conversation
+// rather than accumulating full records, rosters, and task histories.
+func (r *Registry) DeleteSession(ctx context.Context, sessionKey string) error {
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return err
+	}
+	if err := kv.Delete(ctx, kvKey(sessionKey)); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return fmt.Errorf("session %s: %w", sessionKey, err)
+	}
+	return nil
+}
+
 // SessionForTask resolves the task index, or "" if the task is unknown.
 func (r *Registry) SessionForTask(ctx context.Context, taskID string) (string, error) {
 	kv, err := r.kv(ctx)
@@ -290,30 +307,81 @@ func (r *Registry) SessionForTask(ctx context.Context, taskID string) (string, e
 	return string(entry.Value()), nil
 }
 
-// Sessions lists every session record — the reap loop's scan.
-func (r *Registry) Sessions(ctx context.Context) ([]*SessionRecord, error) {
+// SessionCallback is invoked for each session record in a scan.
+// Returning false halts the scan early without error.
+type SessionCallback func(rec *SessionRecord) (bool, error)
+
+// ScanSessions streams session records via a callback, starting from the given cursor.
+// It supports cursor resumption across passes: keys are sorted lexicographically,
+// and when cursor is non-empty, records with keys <= cursor are skipped.
+// If the scan reaches the end of the bucket, it returns nextCursor="", done=true, err=nil.
+// If the scan is interrupted (by timeout, context cancellation, or callback returning false),
+// it returns the last successfully visited key as nextCursor, done=false, and any error.
+func (r *Registry) ScanSessions(ctx context.Context, cursor string, cb SessionCallback) (nextCursor string, done bool, err error) {
 	kv, err := r.kv(ctx)
 	if err != nil {
-		return nil, err
+		return "", false, err
 	}
 	lister, err := kv.ListKeysFiltered(ctx, "sessions.>")
 	if err != nil {
-		return nil, err
+		return "", false, err
 	}
-	var recs []*SessionRecord
+	defer func() {
+		_ = lister.Stop()
+	}()
+
+	var keys []string
 	for key := range lister.Keys() {
+		if ctx.Err() != nil {
+			return cursor, false, ctx.Err()
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	lastVisited := cursor
+	for _, key := range keys {
+		if cursor != "" && key <= cursor {
+			continue
+		}
+		if ctx.Err() != nil {
+			return lastVisited, false, ctx.Err()
+		}
 		entry, err := kv.Get(ctx, key)
 		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			continue
 		}
 		if err != nil {
-			return nil, err
+			return lastVisited, false, err
 		}
 		var rec SessionRecord
 		if err := json.Unmarshal(entry.Value(), &rec); err != nil {
 			continue // a malformed record must not kill the reaper
 		}
-		recs = append(recs, &rec)
+		cont, err := cb(&rec)
+		if err != nil {
+			return lastVisited, false, err
+		}
+		if ctx.Err() != nil {
+			return lastVisited, false, ctx.Err()
+		}
+		lastVisited = key
+		if !cont {
+			return lastVisited, false, nil
+		}
+	}
+	return "", true, nil
+}
+
+// Sessions lists every session record.
+func (r *Registry) Sessions(ctx context.Context) ([]*SessionRecord, error) {
+	var recs []*SessionRecord
+	_, _, err := r.ScanSessions(ctx, "", func(rec *SessionRecord) (bool, error) {
+		recs = append(recs, rec)
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return recs, nil
 }

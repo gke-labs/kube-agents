@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -23,9 +24,8 @@ const (
 
 // reapLoop enforces the idle TTL — a session silent past the TTL loses its
 // pod — and the ask bound (boundAskCopy), which runs on every record the
-// scan visits, pod or no pod. Nothing is saved first, because the stream
-// already has everything — that's the whole point of the transcript of
-// record. The KV entry stays, holding the contextId.
+// scan visits, pod or no pod. It also enforces SessionTTL, deleting session
+// records that have been idle past the retention horizon.
 func (g *Gateway) reapLoop(ctx context.Context) {
 	ticker := time.NewTicker(reapInterval)
 	defer ticker.Stop()
@@ -42,60 +42,128 @@ func (g *Gateway) reapLoop(ctx context.Context) {
 func (g *Gateway) reapOnce(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, reapPassTimeout)
 	defer cancel()
-	recs, err := g.reg.Sessions(ctx)
-	if err != nil {
-		g.log.Error("reap: session scan failed", "err", err)
-		return
+
+	g.mu.Lock()
+	cursor := g.reapCursor
+	g.mu.Unlock()
+
+	nextCursor, done, err := g.reg.ScanSessions(ctx, cursor, func(rec *SessionRecord) (bool, error) {
+		g.reapSession(ctx, rec)
+		if g.reapScanHook != nil {
+			return g.reapScanHook(rec), nil
+		}
+		return true, nil
+	})
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		g.log.Error("reap: session scan failed", "err", err, "cursor", cursor)
 	}
-	for _, rec := range recs {
-		g.boundAskCopy(ctx, rec)
-		if rec.PodName == "" {
-			continue // nothing incarnated (the Hermes-first world, or already reaped)
-		}
-		if rec.ActiveTask != nil && !rec.ActiveTask.Detached {
-			continue // never delete a pod out from under a running task
-		}
-		if time.Since(rec.LastActivity) < g.cfg.IdleTTL {
-			continue
+
+	g.mu.Lock()
+	if done {
+		g.reapCursor = ""
+	} else if nextCursor != "" {
+		g.reapCursor = nextCursor
+	}
+	g.mu.Unlock()
+}
+
+func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
+	g.boundAskCopy(ctx, rec)
+
+	// Check if the session record itself has outlived the retention horizon.
+	// Prune records older than SessionTTL whose pod has been reaped (or never
+	// incarnated). If an ActiveTask is present, only prune if it has also
+	// outlived its execution deadline (stale/abandoned executor).
+	if g.cfg.SessionTTL > 0 && rec.PodName == "" &&
+		!rec.LastActivity.IsZero() &&
+		time.Since(rec.LastActivity) >= g.cfg.SessionTTL {
+		if rec.ActiveTask != nil && !rec.ActiveTask.SubmittedAt.IsZero() &&
+			time.Since(rec.ActiveTask.SubmittedAt) < g.cfg.TaskDeadline {
+			return
 		}
 		l := g.lockSession(rec.Key)
 		l.Lock()
-		// Re-run every predicate on the fresh record under the lock: a
-		// message that arrived between scan and lock may have started a task
-		// or reset the idle clock, and reap must never delete a pod out from
-		// under either.
 		fresh, err := g.reg.Get(ctx, rec.Key)
-		if err != nil || fresh == nil || fresh.PodName == "" ||
-			(fresh.ActiveTask != nil && !fresh.ActiveTask.Detached) ||
-			time.Since(fresh.LastActivity) < g.cfg.IdleTTL {
-			l.Unlock()
-			continue
-		}
-		// A detached task does not exempt the session, so reap may delete a
-		// pod whose harness is still working — the supervisor rule is what
-		// keeps that from being a silent stop: its terminal `canceled` goes
-		// on the stream before the pod goes. A publish failure keeps the
-		// pod (and the reap retries next cycle) rather than stranding the
-		// task non-terminal for the retention window.
-		if !g.closeDetachedBeforeDelete(ctx, fresh) {
-			l.Unlock()
-			continue
-		}
-		if g.spawner != nil {
-			if err := g.spawner.Delete(ctx, fresh.PodName); err != nil {
-				g.log.Error("reap: pod delete failed", "pod", fresh.PodName, "err", err)
+		if err == nil && fresh != nil && fresh.PodName == "" &&
+			!fresh.LastActivity.IsZero() &&
+			time.Since(fresh.LastActivity) >= g.cfg.SessionTTL {
+			if fresh.ActiveTask != nil && !fresh.ActiveTask.SubmittedAt.IsZero() &&
+				time.Since(fresh.ActiveTask.SubmittedAt) < g.cfg.TaskDeadline {
 				l.Unlock()
-				continue
+				return
 			}
-		}
-		g.log.Info("reaped idle session", "session", fresh.Key, "pod", fresh.PodName)
-		// The pod was an incarnation, not the identity: contextId persists.
-		fresh.PodName = ""
-		if err := g.reg.Put(ctx, fresh); err != nil {
-			g.log.Error("reap: record write failed", "session", fresh.Key, "err", err)
+			if err := g.reg.DeleteSession(ctx, fresh.Key); err != nil {
+				g.log.Error("reap: session record delete failed", "session", fresh.Key, "err", err)
+			} else {
+				g.log.Info("reaped expired session record", "session", fresh.Key, "lastActivity", fresh.LastActivity)
+				if fresh.ActiveTask != nil {
+					_ = g.reg.DropTask(ctx, fresh.ActiveTask.TaskID)
+					g.mu.Lock()
+					delete(g.relays, fresh.ActiveTask.TaskID)
+					delete(g.taskSessions, fresh.ActiveTask.TaskID)
+					g.mu.Unlock()
+				}
+				for _, t := range fresh.Tasks {
+					_ = g.reg.DropTask(ctx, t.ID)
+					g.mu.Lock()
+					delete(g.relays, t.ID)
+					delete(g.taskSessions, t.ID)
+					g.mu.Unlock()
+				}
+			}
+			l.Unlock()
+			return
 		}
 		l.Unlock()
 	}
+
+	if rec.PodName == "" {
+		return // nothing incarnated (the Hermes-first world, or already reaped)
+	}
+	if rec.ActiveTask != nil && !rec.ActiveTask.Detached {
+		return // never delete a pod out from under a running task
+	}
+	if time.Since(rec.LastActivity) < g.cfg.IdleTTL {
+		return
+	}
+	l := g.lockSession(rec.Key)
+	l.Lock()
+	// Re-run every predicate on the fresh record under the lock: a
+	// message that arrived between scan and lock may have started a task
+	// or reset the idle clock, and reap must never delete a pod out from
+	// under either.
+	fresh, err := g.reg.Get(ctx, rec.Key)
+	if err != nil || fresh == nil || fresh.PodName == "" ||
+		(fresh.ActiveTask != nil && !fresh.ActiveTask.Detached) ||
+		time.Since(fresh.LastActivity) < g.cfg.IdleTTL {
+		l.Unlock()
+		return
+	}
+	// A detached task does not exempt the session, so reap may delete a
+	// pod whose harness is still working — the supervisor rule is what
+	// keeps that from being a silent stop: its terminal `canceled` goes
+	// on the stream before the pod goes. A publish failure keeps the
+	// pod (and the reap retries next cycle) rather than stranding the
+	// task non-terminal for the retention window.
+	if !g.closeDetachedBeforeDelete(ctx, fresh) {
+		l.Unlock()
+		return
+	}
+	if g.spawner != nil {
+		if err := g.spawner.Delete(ctx, fresh.PodName); err != nil {
+			g.log.Error("reap: pod delete failed", "pod", fresh.PodName, "err", err)
+			l.Unlock()
+			return
+		}
+	}
+	g.log.Info("reaped idle session", "session", fresh.Key, "pod", fresh.PodName)
+	// The pod was an incarnation, not the identity: contextId persists
+	// until SessionTTL expires.
+	fresh.PodName = ""
+	if err := g.reg.Put(ctx, fresh); err != nil {
+		g.log.Error("reap: record write failed", "session", fresh.Key, "err", err)
+	}
+	l.Unlock()
 }
 
 // boundAskCopy is the independent bound the content posture owes the `ask`
