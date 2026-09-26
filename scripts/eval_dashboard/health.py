@@ -86,6 +86,10 @@ SHARED_BREAK = "shared_break"
 STORM = "storm"
 SETUP_DEATHS = "setup_deaths"
 LOST_PODS = "lost_pods"
+# runs[].eval_outcome, as the collector writes it from the suite's own
+# eval-verdict.json (SCHEMA.md): the run could not be evaluated. Carried on
+# Run for gate_comment.py; no rule here reads it.
+EVAL_OUTCOME_NOT_EVALUATED = "not_evaluated"
 FIXTURE_DRIFT = "fixture_drift"
 # A ceiling wave: enough repetitions across enough pull requests ended at the
 # harness's delegation wait with the worker still running (rule 2b, #1874).
@@ -521,6 +525,9 @@ TRIM_REASON_CHARS = 96
 # them; absent stays absent: how the build ended, and the eval's own verdict,
 # which is what tells a deadline kill from a long red.
 ENDED_FIELDS = ("has_build_log", "pod_phase", "pod_node", "pod_last_event", "merge_conflict", "eval_verdict")
+# The suite's own verdict (SCHEMA.md, `eval_outcome`): kept by --trim so a
+# fixture cut from a data.json holding a not-evaluated run replays as one.
+SUITE_FIELDS = ("eval_outcome", "not_evaluated")
 
 UTC = timezone.utc
 
@@ -612,7 +619,7 @@ class Task:
 
 
 class Run:
-    __slots__ = ("build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
@@ -640,6 +647,13 @@ class Run:
         # without the key is unknown, not "no verdict": it never makes a kill.
         self.eval_verdict = run.get("eval_verdict") if isinstance(run.get("eval_verdict"), str) else None
         self.eval_verdict_recorded = "eval_verdict" in run
+        # True when the suite's own verdict said the run could not be
+        # evaluated (SCHEMA.md, `eval_outcome`), with the case ids it named.
+        # Absent reads as a run the suite graded, as every record did before
+        # the field existed.
+        self.not_evaluated = run.get("eval_outcome") == EVAL_OUTCOME_NOT_EVALUATED
+        named = run.get("not_evaluated")
+        self.not_evaluated_cases = [str(c) for c in named if isinstance(c, str)] if isinstance(named, list) else []
 
     @property
     def full(self) -> bool:
@@ -2152,7 +2166,7 @@ def trim(data: dict, start: datetime, end: datetime, source: str) -> dict:
             # Kept as written so a fixture cut from a two-tier data.json
             # replays the same filter the live tick applies.
             entry[tiers.TIER_KEY] = run[tiers.TIER_KEY]
-        for key in ENDED_FIELDS:
+        for key in ENDED_FIELDS + SUITE_FIELDS:
             if key in run:
                 entry[key] = run[key]
         runs.append(entry)

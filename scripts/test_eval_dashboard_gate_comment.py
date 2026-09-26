@@ -528,7 +528,7 @@ class WhenItComments(Harness):
         rc, err = self.tick(data(*greens, aborted, setup, emptied), green_health())
         self.assertEqual(rc, 0)
         self.assertEqual(self.gh.calls, [])
-        self.assertIn("gate comments: 0 red runs", err)
+        self.assertIn("gate comments: 0 runs (red, lost or not evaluated)", err)
         self.assertEqual(self.recorded()["last_comment_tick"], NOW.isoformat())
 
     def test_only_runs_since_the_last_tick_and_the_first_tick_looks_back_an_hour(self):
@@ -655,6 +655,110 @@ class WhenItComments(Harness):
 
         self.assertEqual((gate_comment.CLS_SHARED, gate_comment.CLS_ONLY_THIS_PR, gate_comment.CLS_STORM), (classify.CLS_SHARED, classify.CLS_ONLY_THIS_PR, classify.CLS_STORM))
         self.assertEqual(gate_comment.ONLY_PR_WINDOW, classify.ONLY_PR_WINDOW)
+
+
+
+def not_evaluated(build, pr, finished, lost=("security-overgrant-probe",), every=False, minutes=27, **fields):
+    """A run the suite could not evaluate (SCHEMA.md, `eval_outcome`): the
+    lost cases graded nothing, the rest passed, Prow says FAILURE, and the
+    suite's list names the lost ones."""
+    names = sorted(ADMITTED)
+    tasks = [task(n, "iii" if (every or n in lost) else "ppp") for n in names] + [task(HELD_OUT, "iii" if every else "ppp")]
+    raw = run(build, pr, finished, tasks=tasks, result="FAILURE", minutes=minutes)
+    raw.update({"eval_outcome": "not_evaluated", "not_evaluated": names + [HELD_OUT] if every else list(lost), **fields})
+    return raw
+
+
+def storm_health():
+    return {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": [], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00"}}
+
+
+class NotEvaluatedComment(Harness):
+    """A run the suite itself could not evaluate gets the ⚪ one-liner, not
+    the hard-failure comment: the cases the suite named, that nothing was
+    graded for them, that nothing about the change is implied, and to
+    retest once the environment is healthy."""
+
+    def test_the_shape_without_an_incident(self):
+        mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5))
+        rc, _ = self.tick(data(mine, *green_others()), green_health())
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
+        body = self.gh.bodies()[0]
+        lines = body.split("\n")
+        self.assertEqual(lines[0], gate_comment.MARKER)
+        self.assertEqual(lines[1], "### ⚪ Smoke gate: run not evaluated")
+        self.assertEqual(
+            lines[3],
+            "> `security-overgrant-probe` lost every repetition to infrastructure before the agent could be graded."
+            " The suite could certify nothing, so Prow reports the run red; nothing was graded for it"
+            " and nothing about your change is implied. Retest once the environment is healthy."
+            " [Details →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=100)",
+        )
+        self.assertEqual(lines[5], "Ran 27 min on evals-23 · [build log](https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1300/pull-kube-agents-smoke-test/100)")
+        for absent in ("hard failure", "absolute check", "❌", "Incident brief", "| Case |"):
+            self.assertNotIn(absent, body)
+        self.assertEqual(self.recorded()["comments"]["1300"], {"comment_id": 501, "build_id": "100", "at": NOW.isoformat()})
+
+    def test_is_red_is_false_for_it_and_true_for_the_same_record_without_the_field(self):
+        raw = not_evaluated(100, 1300, NOW - timedelta(minutes=5))
+        self.assertFalse(gate_comment.is_red(health.Run(raw)))
+        self.assertTrue(health.Run(raw).not_evaluated)
+        self.assertEqual(health.Run(raw).not_evaluated_cases, ["security-overgrant-probe"])
+        del raw["eval_outcome"]
+        self.assertTrue(gate_comment.is_red(health.Run(raw)), "without the suite's word it is the hard failure it always was")
+        self.assertFalse(health.Run(raw).not_evaluated)
+
+    def test_two_lost_cases_are_named_together(self):
+        mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), lost=("agent-kanban-smoke", "security-overgrant-probe"))
+        self.tick(data(mine, *green_others()), green_health())
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertTrue(box.startswith("> `agent-kanban-smoke` and `security-overgrant-probe` lost every repetition to infrastructure"), box)
+        self.assertIn("nothing was graded for them", box)
+
+    def test_every_case_lost_says_so(self):
+        mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), every=True)
+        self.tick(data(mine, *green_others()), green_health())
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertTrue(box.startswith("> Every case lost every repetition to infrastructure before the agent could be graded. The suite evaluated nothing"), box)
+
+    def test_inside_a_declared_storm_the_box_names_it_and_links_the_brief(self):
+        mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5))
+        self.tick(data(mine, *green_others()), storm_health())
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertIn("before the agent could be graded — a quota storm is declared on the gate right now.", box)
+        self.assertTrue(box.endswith("[Details →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=100) · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html#since=2026-09-08T13:00:00Z&view=gate)"), box)
+
+    def test_the_same_build_is_never_commented_on_twice_and_a_later_one_edits(self):
+        first = not_evaluated(100, 1300, NOW - timedelta(minutes=30))
+        self.tick(data(first, *green_others()), green_health())
+        self.tick(data(first, *green_others()), green_health(), now=NOW + timedelta(minutes=15))
+        self.assertEqual(len(self.gh.writes()), 1)
+        later = NOW + timedelta(hours=1)
+        second = run(101, 1300, later - timedelta(minutes=5), failing=["security-overgrant-probe"])
+        self.tick(data(first, second, *green_others()), green_health(), now=later)
+        self.assertEqual(self.gh.writes()[-1], ("PATCH", "repos/gke-labs/kube-agents/issues/comments/501"))
+        self.assertEqual(self.recorded()["comments"]["1300"]["build_id"], "101")
+        self.assertTrue(self.gh.bodies()[-1].split("\n")[1].startswith("### ❌ Smoke gate: failed · 1 of"), "the retest's real red replaces it in place")
+
+    def test_a_gate_case_that_collapsed_on_the_same_run_is_named_under_the_white_heading(self):
+        # The suite's roster is the branch's and the dashboard's can be
+        # newer: the suite said not evaluated, the dashboard sees a collapse.
+        # The verdict stays the suite's; the author is told what to read.
+        tasks = [task(n, "iii" if n == "security-overgrant-probe" else "fff" if n == "agent-kanban-smoke" else "ppp") for n in sorted(ADMITTED)]
+        mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=tasks, result="FAILURE")
+        mine.update({"eval_outcome": "not_evaluated", "not_evaluated": ["security-overgrant-probe"]})
+        self.tick(data(mine, *green_others()), green_health())
+        lines = self.gh.bodies()[0].split("\n")
+        self.assertEqual(lines[1], "### ⚪ Smoke gate: run not evaluated")
+        self.assertIn("Retest once the environment is healthy. `agent-kanban-smoke` also failed every graded repetition here; read its transcript before retesting. [Details →]", lines[3])
+
+    def test_dry_run_prints_it(self):
+        rc, err = self.tick(data(not_evaluated(100, 1300, NOW - timedelta(minutes=5)), *green_others()), green_health(), dry_run=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.gh.writes(), [])
+        self.assertIn("### ⚪ Smoke gate: run not evaluated", err)
+        self.assertIn("gate comments: 1 run (red, lost or not evaluated)", err)
 
 
 if __name__ == "__main__":

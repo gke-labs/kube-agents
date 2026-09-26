@@ -847,6 +847,9 @@ function runsListHtml(inWindow, inc, title) {
     if (run.cls === "deadline-kill") note = `<span class="chip inf">killed at the deadline${measured(run) ? `, ${plural((run.cases || []).length, "case")} recorded first` : ""}</span>`;
     else if (run.setup_death) note = '<span class="chip inf">died in setup</span>';
     else if (!measured(run)) note = `<span class="chip inf">${run.result === "ABORTED" ? "aborted" : "no cases recorded"}</span>`;
+    // The suite's own verdict (classify.py): nothing was graded for the lost
+    // cases, so neither "all gate cases passed" nor a failure chip is true.
+    else if (run.verdict === "not_evaluated") note = `<span class="chip inf">not evaluated · ${esc(plural((run.not_evaluated || []).length, "case"))} lost</span>`;
     // A run whose every recorded case went ungraded (a storm, or every
     // worker at the delegation ceiling) passed nothing; the chips say why.
     else if (!failed.length) note = (run.cases || []).some((c) => c.outcome !== "infra") ? '<span class="chip ok">all gate cases passed</span>' : '<span class="chip inf">nothing graded</span>';
@@ -869,12 +872,16 @@ function numbers(sinceMs, untilMs) {
   const green = done.filter(isGreen);
   const reds = done.length - green.length;
   const own = done.filter((r) => !isGreen(r) && r.verdict === "red").length;
+  // Named inside the gate's reds, where health.py's infra_reds (the daily
+  // digest's "N infra") also counts them, so the two surfaces agree on the
+  // number; the tile just says how many of them the suite could not evaluate.
+  const notEvaluated = done.filter((r) => r.verdict === "not_evaluated").length;
   const deaths = all.filter((r) => r.setup_death).length;
   const walls = done.map((r) => (parseIso(r.finished) ?? 0) - (parseIso(r.started) ?? 0)).filter((w) => w > 0).sort((a, b) => a - b);
   const p = (q) => (walls.length ? walls[Math.round(q * (walls.length - 1))] : null);
   let reps = 0, lost = 0;
   for (const run of full) for (const c of run.cases || []) { reps += repTotal(c.reps); lost += c.reps.infra; }
-  return { full: full.length, prs: new Set(full.map((r) => r.pr).filter((x) => x != null)).size, green: green.length, reds, own, infra: reds - own + deaths, deaths, p50: p(0.5), p90: p(0.9), lostShare: reps ? lost / reps : null, aborted: all.filter((r) => !concluded(r)).length };
+  return { full: full.length, prs: new Set(full.map((r) => r.pr).filter((x) => x != null)).size, green: green.length, reds, own, infra: reds - own + deaths, notEvaluated, deaths, p50: p(0.5), p90: p(0.9), lostShare: reps ? lost / reps : null, aborted: all.filter((r) => !concluded(r)).length };
 }
 
 function tile(key, value, detail) {
@@ -886,7 +893,7 @@ function numbersHtml(sinceMs, untilMs) {
   return `<div class="tiles">` +
     tile("Runs", `${n.full}`, `${plural(n.prs, "PR")} · ${n.aborted} aborted or unfinished`) +
     tile("Green", n.full ? `${n.green}<small>/ ${n.green + n.reds}</small>` : "—", n.green + n.reds ? `${pct(n.green / (n.green + n.reds))} of concluded runs` : "no concluded runs") +
-    tile("Reds", `${n.reds}`, `${n.own} look like the PR · ${n.infra} the gate's (incl. ${n.deaths} setup ${n.deaths === 1 ? "death" : "deaths"})`) +
+    tile("Reds", `${n.reds}`, `${n.own} look like the PR · ${n.infra} the gate's (incl. ${n.deaths} setup ${n.deaths === 1 ? "death" : "deaths"}${n.notEvaluated ? `, ${n.notEvaluated} not evaluated` : ""})`) +
     tile("Wall clock", n.p50 != null ? `${Math.round(n.p50 / 60000)}<small>min p50</small>` : "—", n.p90 != null ? `${Math.round(n.p90 / 60000)} min p90` : "no timings") +
     tile("Reps lost", n.lostShare != null ? `${(100 * n.lostShare).toFixed(1)}<small>%</small>` : "—", "429s and empty records, over all repetitions") +
     `</div>`;
@@ -1095,8 +1102,14 @@ function runDoHtml(text) {
 
 function whatToDoHtml(run) {
   const items = [];
+  if (run.verdict === "not_evaluated") {
+    // The suite's own verdict: the lost cases are listed under "Not graded"
+    // above, and the gate found nothing against the change.
+    items.push(runDoHtml(run.do || "Retest once the environment is healthy."));
+    items.push("<li>Prow reports the run red because the suite could certify nothing, not because a check failed; there is no absolute-check failure to look for in the build log.</li>");
+  }
   // A deadline kill keeps its `do` whether or not cases finished before it.
-  if ((!measured(run) || run.cls === "deadline-kill") && run.do) items.push(runDoHtml(run.do));
+  else if ((!measured(run) || run.cls === "deadline-kill") && run.do) items.push(runDoHtml(run.do));
   else if (run.setup_death || (!measured(run) && run.verdict === "infra")) items.push("<li><b>Retest.</b> Nothing ran, so nothing here is about your change.</li>");
   else if (!measured(run) && run.verdict === "green") items.push("<li><b>Nothing.</b> The gate revalidated this branch's earlier green run.</li>");
   else if (!measured(run)) items.push("<li><b>Read the build log.</b> The failure is before the eval loop; a broken image build or deploy on this branch looks like this.</li>");

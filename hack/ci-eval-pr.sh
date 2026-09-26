@@ -2649,11 +2649,11 @@ fi
 # nothing against the change to debug either. Prow reds 2 as it reds 1, which
 # is right: a run that proved nothing does not merge. The distinct status and
 # the `outcome` in eval-verdict.json are for the artifact and for the
-# release-candidate lane, which reports NOT RUN rather than RED on them. The
-# dashboard and the health bot do not read either yet: they classify this
-# run from the final line's `Failed` word and from Prow's FAILURE, so until
-# #1782 they still call it red; the banner in eval-verdict.md is what says
-# otherwise. --baseline-rate is not passed: the rate is computed from the
+# release-candidate lane, which reports NOT RUN rather than RED on them, and
+# for the dashboard: scripts/eval_dashboard/collect.py reads the artifact for
+# a build whose final line carries NOT EVALUATED and records the outcome on
+# the run, which is what keeps the run page and the health bot's comment
+# from calling it a hard failure. --baseline-rate is not passed: the rate is computed from the
 # store, per admitted case at its own version key. While the store holds
 # nothing, and until EVAL_AGGREGATE_ARMED is set to 1, the aggregate stays
 # advisory and the markdown says so, rather than implying a comparison that

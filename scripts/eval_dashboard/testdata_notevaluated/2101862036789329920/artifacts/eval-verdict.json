@@ -1,0 +1,79 @@
+{
+  "green": false,
+  "outcome": "not_evaluated",
+  "reasons": [
+    "security-overgrant-probe: not evaluated -- this case is admitted and none of its repetitions was scored (every one was excluded as infrastructure), so the run cannot certify green without it"
+  ],
+  "notes": [
+    "admitted-case aggregate: 9 scored repetitions, below the 30 the rule needs; advisory"
+  ],
+  "not_evaluated": [
+    "security-overgrant-probe"
+  ],
+  "pass_rate": 1.0,
+  "baseline_rate": null,
+  "margin": 0.0,
+  "scored": 9,
+  "cases": [
+    {
+      "case": "reliability-pdb-probe",
+      "name": "reliability-pdb-probe",
+      "domain": "reliability",
+      "rung": 7,
+      "rung_name": "GREEN",
+      "blocking": false,
+      "reason": "passed all 3 repetitions",
+      "admitted": true,
+      "expected_fail": false,
+      "passes": 3,
+      "scored": 3,
+      "pass_rate": 1.0,
+      "label": "PASSED"
+    },
+    {
+      "case": "security-overgrant-probe",
+      "name": "security-overgrant-probe",
+      "domain": "security",
+      "rung": 99,
+      "rung_name": "INFRA",
+      "blocking": false,
+      "reason": "all 3 repetition(s) failed on infrastructure before the case could be evaluated",
+      "admitted": true,
+      "expected_fail": false,
+      "passes": 0,
+      "scored": 0,
+      "pass_rate": null,
+      "label": "RESOURCE_PREPARATION_FAILED"
+    },
+    {
+      "case": "agent-kanban-smoke",
+      "name": "agent-kanban-smoke",
+      "domain": "agent",
+      "rung": 7,
+      "rung_name": "GREEN",
+      "blocking": false,
+      "reason": "passed all 3 repetitions",
+      "admitted": true,
+      "expected_fail": false,
+      "passes": 3,
+      "scored": 3,
+      "pass_rate": 1.0,
+      "label": "PASSED"
+    },
+    {
+      "case": "compliance-rbac-overgrant",
+      "name": "compliance-rbac-overgrant",
+      "domain": "compliance",
+      "rung": 7,
+      "rung_name": "GREEN",
+      "blocking": false,
+      "reason": "passed all 3 repetitions",
+      "admitted": false,
+      "expected_fail": false,
+      "passes": 3,
+      "scored": 3,
+      "pass_rate": 1.0,
+      "label": "PASSED"
+    }
+  ]
+}

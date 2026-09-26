@@ -10,12 +10,13 @@ interface::
 
     classify_run(run, runs, health_at=None, now=None, admitted=None) -> {
         "build": str, "pr": int|None, "headline": str, "lede": str,
-        "verdict": "red" | "green" | "infra",
+        "verdict": "red" | "green" | "infra" | "not_evaluated",
         "cases": [{"case", "outcome", "cls", "also_failing_prs",
                    "pass_rate_30d", "reason", "excerpt", "rep_n", "do",
                    "admitted", "reps"}],
         "matches_incident": bool,
-        # run-level detail: "setup_death", "storm_reps", "ceiling_reps", "cls", "do"
+        # run-level detail: "setup_death", "storm_reps", "ceiling_reps", "cls",
+        # "do", "not_evaluated"
     }
 
 The first line of keys is the contract other callers rely on; the rest is
@@ -60,6 +61,19 @@ run-level class -- a FAILURE with no eval verdict that ran to the job's
 timeout -- and the one that may carry cases: the harness records each case
 as it finishes (#1875), so the cases graded before Prow stopped the run are
 classified and shown, under the kill's headline and ``do``.
+
+``not_evaluated`` is a verdict of its own, and the only one the run brings
+with it: the suite itself said so (``runs[].eval_outcome``, SCHEMA.md --
+an admitted case, or every case, lost every repetition to infrastructure,
+so the job exited 2 and could certify nothing). It is read before every
+rule above and is never folded into ``red`` or ``infra``: red would send
+the author to a build log for an absolute check that did not trip, and
+infra would count it among the gate's failures when nothing was graded.
+The cases are still classified, so the page can list what was lost -- and
+so a gate case that failed every graded repetition on the same run is
+named in the lede: the suite's roster is the branch's and the dashboard's
+can be newer, so the suite may not have counted it. The verdict stays the
+suite's; the author is told what to read before retesting.
 
 ``runs`` may carry the nightly periodic's runs beside the presubmit's
 (SCHEMA.md: ``runs[].tier``; ``tiers.py``). Every rule above reads the
@@ -187,6 +201,10 @@ RUN_SUCCESS = "SUCCESS"
 RUN_FAILURE = "FAILURE"
 RUN_ABORTED = "ABORTED"
 
+# runs[].eval_outcome, as the collector writes it from the suite's own
+# eval-verdict.json (SCHEMA.md); scoring.py's SUITE_OUTCOME_NOT_EVALUATED.
+EVAL_OUTCOME_NOT_EVALUATED = "not_evaluated"
+
 OUTCOME_PASSED = "passed"
 OUTCOME_PARTIAL = "partial"
 OUTCOME_FAILED = "failed"
@@ -200,6 +218,7 @@ CLS_DEADLINE = "deadline-kill"
 VERDICT_RED = "red"
 VERDICT_GREEN = "green"
 VERDICT_INFRA = "infra"
+VERDICT_NOT_EVALUATED = "not_evaluated"
 
 # --- Roster -------------------------------------------------------------------
 # Only an admitted case reds a pull request (AGENTS.md, "The behavioural
@@ -227,6 +246,7 @@ DO_DEADLINE_KILL = "Retest once the brief says runs are finishing again. Prow ki
 DO_DEADLINE_KILL_RECOVERING = "Read the build log before retesting. Other PRs' runs are finishing, so this kill may be the branch: a change that hangs the eval ends this way, and each kill holds the gate out of GREEN."
 DO_MERGE_CONFLICT = "Rebase on main and push. A retest re-runs the same conflicted merge."
 DO_UNCLEAR = "Read the transcript. Nothing else on the gate matches this failure yet, so it may be yours."
+DO_NOT_EVALUATED = "Retest once the environment is healthy. Nothing was graded for the lost cases, so nothing here is about your change."
 DO_HELD_OUT = "Nothing for the gate; this case is held out and does not block."
 DO_PASSED = ""
 
@@ -381,6 +401,23 @@ def is_lost_pod(run: dict) -> bool:
         and str(run.get("result") or "").upper() == RUN_FAILURE
         and (run.get("pod_last_event") == POD_EVENT_NODE_NOT_READY or run.get("has_build_log") is False)
     )
+
+
+def is_not_evaluated(run: dict) -> bool:
+    """The suite's own verdict said the run could not be evaluated
+    (SCHEMA.md, `eval_outcome`; absent is a run recorded before the field or
+    one the suite did grade, and reads as it always did)."""
+    return run.get("eval_outcome") == EVAL_OUTCOME_NOT_EVALUATED
+
+
+def not_evaluated_cases(run: dict, cases: list[dict] = ()) -> list[str]:
+    """The case ids the suite named (`runs[].not_evaluated`), else the
+    admitted cases that graded nothing here -- the shape the suite names
+    when the record predates the list."""
+    named = run.get("not_evaluated")
+    if isinstance(named, list) and named:
+        return [str(c) for c in named]
+    return [c["case"] for c in cases if c["admitted"] and c["outcome"] == OUTCOME_INFRA]
 
 
 def is_merge_conflict(run: dict) -> bool:
@@ -831,6 +868,23 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
     return head, lede + held_note, VERDICT_RED
 
 
+def not_evaluated_headline(lost: list[str], cases: list[dict]) -> tuple[str, str, str]:
+    """(headline, lede, verdict) for a run the suite could not evaluate."""
+    recorded = {c["case"] for c in cases}
+    every = bool(recorded) and recorded <= set(lost)
+    if every:
+        head = "Not evaluated: every case lost every repetition to infrastructure."
+    else:
+        head = f"Not evaluated: {_plural(len(lost), 'gate case')} lost every repetition to infrastructure."
+    names = ", ".join(lost)
+    lede = (
+        f"Nothing was graded for {names}, so the gate could certify nothing and found nothing against the change."
+        if names
+        else "Nothing was graded, so the gate could certify nothing and found nothing against the change."
+    ) + " The job exited 2 and Prow reports it red; no absolute check tripped."
+    return head, lede, VERDICT_NOT_EVALUATED
+
+
 def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now: datetime | None = None, admitted: frozenset | None = None) -> dict:
     """See the module docstring. `admitted` overrides the roster read from
     the checkout (tests, and a replay over history when the roster moved)."""
@@ -848,6 +902,36 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
     base = {"build": build, "pr": run.get("pr"), "cases": [], "matches_incident": False}
 
     tasks = run_tasks(run)
+    if is_not_evaluated(run):
+        # The suite's own verdict, before every rule (module docstring).
+        # The cases are still classified so the page can list what was
+        # lost; the headline, the verdict and the `do` are the run's.
+        gate, nightly = split_tiers(runs)
+        others = _other_pr_runs(run, gate)
+        rates = case_pass_rates(gate, anchor)
+        run_storm = storm_reps(run) >= STORM_RUN_SIGNATURE_REPS
+        run_ceiling = ceiling_reps(run) >= STORM_RUN_SIGNATURE_REPS
+        cases = [classify_case(t, run, others, admitted, health_at, rates, run_storm, nightly) for t in tasks]
+        cases = [c for c in cases if c["outcome"] is not None]
+        lost = not_evaluated_cases(run, cases)
+        headline, lede, verdict = not_evaluated_headline(lost, cases)
+        collapsed = [c["case"] for c in cases if c["admitted"] and c["outcome"] == OUTCOME_FAILED]
+        if collapsed:
+            lede += f" {', '.join(collapsed)} also failed every graded repetition here; read {'its' if len(collapsed) == 1 else 'their'} transcript before retesting."
+        return dict(
+            base,
+            headline=headline,
+            lede=lede + ("" if condition != CONDITION_STORM else " A quota storm is declared right now."),
+            verdict=verdict,
+            cases=cases,
+            matches_incident=(condition == CONDITION_STORM and run_storm) or (condition == CONDITION_DELEGATION_CEILING and run_ceiling),
+            setup_death=False,
+            cls=None,
+            do=DO_NOT_EVALUATED,
+            storm_reps=storm_reps(run),
+            ceiling_reps=ceiling_reps(run),
+            not_evaluated=lost,
+        )
     if not tasks:
         result = str(run.get("result") or "").upper()
         length = run_length(run)

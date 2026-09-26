@@ -106,8 +106,8 @@ the same layout and is collected from the moment it starts running.
   repetition to infrastructure; the job exits `2` and the line carries
   `NOT EVALUATED` between the anchors) records as `RED` here, because the
   collector reads the `Failed` word and not the words after it; the
-  verdict's own `outcome` is in the run's `eval-verdict.json`, which nothing
-  on the dashboard reads yet. `null` when the log has no such line — the job ended before its
+  verdict's own `outcome` travels as `eval_outcome` below, so a reader of
+  this field alone keeps working. `null` when the log has no such line — the job ended before its
   verdict: Prow's deadline (it delivers SIGTERM and records `FAILURE`, not
   `ABORTED`; build 2092688354838581248 below is one), a death before the
   cases, or step 0's revalidation (a `SUCCESS`). A record written before
@@ -243,6 +243,28 @@ the same layout and is collected from the moment it starts running.
   printed `CONFLICT`. A merge that failed any other way is `false` — a full
   disk fails the merge too, and that is the pool's problem. Absent means
   unknown and reads as a setup crash, as it did before the field existed.
+
+- `eval_outcome`, `not_evaluated` — **optional, additive**: the suite's own
+  verdict for a run it could not evaluate. `bench-gate suite` writes
+  `eval-verdict.json` into the job's artifacts (`hack/ci-eval-pr.sh`; Prow
+  uploads it as `artifacts/eval-verdict.json` beside the log), and its
+  `outcome` is `not_evaluated` when an admitted case, or every case, lost
+  every repetition to infrastructure — the job then exits `2` and its final
+  line carries `NOT EVALUATED` between the anchors above. For a build whose
+  final line carries that marker, and only for one, the collector reads that
+  one artifact; when its `outcome` agrees, the run carries
+  `eval_outcome: "not_evaluated"` and `not_evaluated: [<case id>, ...]`, the
+  case ids the suite named (empty when the artifact names none; an entry
+  that does not match the case-id grammar the pages use, stated under "URL
+  contract" below, is dropped, and the list is cut at 64 entries, because
+  the artifact is the pull request's own and the ids are posted in the bot's
+  comment). A line
+  without an agreeing artifact writes neither field and a warning, and the
+  run is the plain `RED` its `Failed` word says — the same double check the
+  script makes before it prints the marker, so a broken invocation cannot
+  dress itself as weather. `eval_verdict` stays `RED` either way. Absent
+  means the suite graded the run, or the record predates the field; both
+  read as they always did.
 
 A truncated log yields a **partial run** (fewer tasks, fallback duration),
 never an error. A task line whose name matches nothing under `bench/tasks/`
@@ -437,6 +459,22 @@ what the renderer does with them.
   and `health.py` excludes it from `setup_deaths` and `infra_reds`.
   `gate_comment.py` does not read it; no comment is left either way.
   Absent reads as a setup crash.
+- `runs[].eval_outcome`, `runs[].not_evaluated` — an `eval_outcome` of
+  `not_evaluated` is a run verdict of its own, read before every other
+  rule and never folded into `red` or `infra`: `classify.py` verdicts the
+  run `not_evaluated` with a headline naming the lost cases (the suite's
+  list, else the admitted cases that graded nothing) and a retest-when-
+  healthy `do`, and never the "absolute rule tripped" text; `gate_comment.py`
+  answers `is_red` false for it and leaves the one-line ⚪ "run not
+  evaluated" comment naming those cases; `render.py` passes the verdict
+  and the list through to `brief.json`, where the run page and the Brief's
+  run rows label the run and the Reds tile says how many of the gate's reds
+  were not evaluated (the count stays inside `infra_reds`, so the tile and
+  the daily digest agree). A gate case that failed every graded repetition
+  on the same run is named in the lede and the comment (the suite's roster
+  is the branch's; the dashboard's can be newer). `health.py` carries both
+  on `Run`, keeps them through `--trim`, and no rule reads them. Absent
+  reads as a run the suite graded.
 
 ### `coverage` — from `docs/designs/domains.yaml`
 
@@ -643,17 +681,19 @@ pending[], releases[], nightly{}, trend{}}`. `runs[]` is the **presubmit's** las
 `data.json`, oldest first — a nightly run is nobody's pull request and is
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
-`infra` = the gate's), `headline`, `lede`, `matches_incident`,
+`infra` = the gate's, `not_evaluated` = the suite graded nothing it could
+certify on), `headline`, `lede`, `matches_incident`,
 `setup_death`, `storm_reps`, `ceiling_reps`, `do`, the run-level `cls`
 (`setup` for a setup death or a lost pod, `deadline-kill`, `only-this-pr`
 for a conflicted merge, else `null` — a run whose classes are per case),
 `eval_verdict` (present only when the `data.json` record carries the key,
 so the Brief's recovery count out of a deadline-kill outage can tell a
-recorded `null` from a pre-field record), `cases[]` (`{case, outcome, cls,
-also_failing_prs, pass_rate_30d, reason, excerpt, rep_n, do, admitted, reps,
-nightly_failed_recent}`, `reps` being `{pass, fail, infra, ceiling}`) and
-`health_at` (the verdict in force when it
-finished, from history; `null` without history). `rep_n` is the 1-based
+recorded `null` from a pre-field record), `not_evaluated[]` (the case ids
+the suite could not evaluate; empty on every other verdict), `cases[]`
+(`{case, outcome, cls, also_failing_prs, pass_rate_30d, reason, excerpt, rep_n,
+do, admitted, reps, nightly_failed_recent}`, `reps` being `{pass, fail, infra,
+ceiling}`) and `health_at` (the verdict in force when it finished, from
+history; `null` without history). `rep_n` is the 1-based
 repetition the row is about — the one whose `reason` is shown, else the
 one whose `excerpt` is (`null` when there is neither); the pages link that
 repetition's transcript, rep 1's when it is `null`. `also_failing_prs` and
@@ -936,6 +976,20 @@ PR 1446's build log keeps the clone header and the failing tail, and its
 | 2098383791838990336 | PR 1118 — node went NotReady 2h08m in; no build-log.txt; `has_build_log: false`                                            |
 | 2098418565454499840 | PR 1446 — clone failed (merge conflict) in 0 s; log and `clone-records.json` present, last event `Started`, phase `Failed` |
 
+`testdata_notevaluated/` holds one **derived** build: no
+`pull-kube-agents-smoke-test` run had ended with the not-evaluated verdict
+when the fixture was written (the verdict itself landed on 2026-09-21), so
+this one is shaped from the repetition-era builds above and labelled here
+rather than passed off as real. Its build id, PR number, commit shas and
+project are stand-ins; the `Task ... Result:` lines, the `rep N:` grading
+lines, the final line and `artifacts/eval-verdict.json` are in the shapes
+`bench-gate` and `hack/ci-eval-pr.sh` print for the state. Replace it with a
+real build when one is on record.
+
+| build               | why it is here                                                                                                                   |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| 2101862036789329920 | one admitted case lost every repetition to infrastructure; final line says `NOT EVALUATED`; `artifacts/eval-verdict.json` agrees |
+
 `testdata_rc/` holds one **real** `post-kube-agents-eval-rc` build — the
 release-candidate job, which is a postsubmit, so its `started.json` carries no
 `pull` key and its log carries no PR number:
@@ -1032,4 +1086,7 @@ derives the trend from them and renders the page.
 for two windows of the week of 2026-09-01 (PR #913's last runs on 09-04/05;
 the crashloop outage of 09-07/08 with PR #608's 15-case red inside it),
 trimmed to the fields `classify.py` reads, for `test_eval_dashboard_classify.py`
-and the page tests.
+and the page tests — plus one **derived** run, build 2097362141184626688,
+the `testdata_notevaluated/` build re-dated into the outage window so the
+not-evaluated verdict is classified and rendered beside the real week; its
+`trimmed.derived` note says so.

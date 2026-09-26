@@ -48,7 +48,8 @@ every other page unaffected; a tick that cannot download that last read at all
 store was not read for that tick, and the next tick recovers. The read reaches two weeks past the page's 90-day
 window so the first drawn night's admission window is as whole as the gate's.
 The same tick comments on each pull request whose run went red, whose
-build node went away, or whose run Prow killed at the deadline (`gate_comment.py`), files the tracking issue a new
+build node went away, whose run Prow killed at the deadline, or whose run
+the suite could not evaluate (`gate_comment.py`), files the tracking issue a new
 OUTAGE lacks or the one a build-cluster node loss or a seeded-fixture drift
 owes its owner (`gate_issue.py`), and appends `health.json` to a history
 feed. A second job in the same workflow, on its own hourly cron, scans every
@@ -351,10 +352,11 @@ wait is a fixed 24-hour figure that is not in the run data.
 Each tick, `scripts/eval_dashboard/gate_comment.py` finds the
 `pull-kube-agents-smoke-test` runs in `data.json` that finished since its last
 tick and concluded `FAILURE` with at least one graded repetition — not aborted
-runs, not setup deaths, not a suite that lost every repetition to a storm — and
+runs, not setup deaths, not a suite that lost every repetition to a storm, and
+not a run the suite itself marked not evaluated (`runs[].eval_outcome`) — and
 leaves one comment on each pull request (the newest red run per pull request
-when there are several). Two shapes outside that filter also get one, below:
-a lost pod and a deadline kill.
+when there are several). Three shapes outside that filter also get one, below:
+a not-evaluated run, a lost pod and a deadline kill.
 
 - a heading, `❌ Smoke gate: failed · 3 of 14 cases`, or `· hard failure` when
   the run failed with no gate case failing all of its repetitions (an absolute
@@ -398,16 +400,35 @@ delegation-ceiling condition above: DEGRADED under its own name, its own
 message and advice, so a fleet-wide worker stall (#1879) is named here rather
 than read only as "not evaluated" on every pull request.
 
-A run the suite marked **not evaluated** because one admitted case lost every
-repetition to infrastructure while other cases were graded is, to this filter,
-a `FAILURE` with graded repetitions and no gate case failing all of its
-repetitions, so it draws the comment with the hard-failure heading. The comment
-does not read the suite's `outcome`; the banner at the top of that run's
-`eval-verdict.md` is what says the run is not a finding against the change.
+Three other shapes get a comment, each one line with the same marker and
+dedupe. A run the suite marked **not evaluated** — an admitted case, or every
+case, lost every repetition to infrastructure, so `hack/ci-eval-pr.sh` exited
+2 and Prow recorded a `FAILURE` — is not a red to the tick: the collector
+recorded the suite's `outcome` on the run (`runs[].eval_outcome`,
+`SCHEMA.md`), so the comment names the cases the suite listed in
+`runs[].not_evaluated` and says nothing about the change is implied:
 
-Two shapes the red comment does not cover get one of their own. The first is a lost pod (the
-build node went away under the job, #1478). It is one line, same marker and
-dedupe:
+```text
+### ⚪ Smoke gate: run not evaluated
+
+> `security-overgrant-probe` lost every repetition to infrastructure before
+> the agent could be graded. The suite could certify nothing, so Prow reports
+> the run red; nothing was graded for it and nothing about your change is
+> implied. Retest once the environment is healthy. [Details →](run.html#build=<build id>)
+
+Ran 27 min on evals-11 · build log
+```
+
+When every recorded case was lost the box says so instead of naming them.
+While `health.json`'s condition is `storm` it adds "a quota storm is declared
+on the gate right now" and links the brief. A gate case that failed every
+graded repetition on the same run (the dashboard's roster can be newer than
+the branch's) is named in a second sentence, with its transcript to read
+before retesting; the heading stays ⚪, because the suite is the verdict's
+owner.
+
+The second is a lost pod (the build node went away under the job, #1478), a
+zero-task run:
 
 ```text
 ### ⚪ Smoke gate: run lost
@@ -425,7 +446,7 @@ runs on M PRs that lost their build node") and the incident brief link. Prow's
 build-log page shows the pod's events. Setup deaths and conflicted merges stay
 silent; the build log says which it was.
 
-The second is a run Prow killed at the job deadline with no verdict (#1894),
+The third is a run Prow killed at the job deadline with no verdict (#1894),
 whether or not some cases finished first: the same one-line shape under `⚪
 Smoke gate: run killed at the deadline`, saying when it was killed and that no
 verdict was reached. While `health.json`'s condition is `deadline_kill` the box
