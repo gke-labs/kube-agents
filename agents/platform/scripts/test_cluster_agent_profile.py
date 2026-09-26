@@ -791,5 +791,67 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         )
 
 
+class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
+    def setUp(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        self.task_path = (
+            repo_root
+            / "bench"
+            / "tasks"
+            / "cluster-agent-unlocated-crashloop-debug"
+            / "task.yaml"
+        )
+        self.assertTrue(self.task_path.is_file(), f"missing {self.task_path}")
+        self.data = yaml.safe_load(self.task_path.read_text(encoding="utf-8"))
+
+    def test_no_stubbed_profile_scripts_forbids_kubectl_variations(self):
+        spec = self.data.get("verification_spec", [])
+        no_stubbed = next(
+            (c for c in spec if c.get("name") == "no-stubbed-profile-scripts"),
+            None,
+        )
+        self.assertIsNotNone(no_stubbed, "missing no-stubbed-profile-scripts check")
+        assert no_stubbed is not None
+        forbidden = no_stubbed.get("check", {}).get("forbidden_patterns", [])
+        kubectl_pats = [p for p in forbidden if "kubectl" in p]
+        self.assertEqual(len(kubectl_pats), 1, f"expected 1 kubectl pattern, got {kubectl_pats}")
+        pattern = re.compile(kubectl_pats[0])
+
+        matching_commands = [
+            "kubectl get pods",
+            "KUBECONFIG=/tmp/k kubectl -n seeded-debug get pods",
+            "for c in a b; do kubectl --context $c get pods; done",
+            "$(kubectl config current-context)",
+            "`kubectl config current-context`",
+            "timeout 60 kubectl get pods",
+            "/usr/bin/kubectl get pods",
+            "./kubectl get pods",
+            '"kubectl" get pods',
+            "'kubectl' get pods",
+            "echo test && kubectl get pods",
+            "echo test; kubectl get pods",
+            "echo test | kubectl get pods",
+        ]
+        for cmd in matching_commands:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(
+                    pattern.search(cmd),
+                    f"pattern {pattern.pattern!r} failed to match forbidden command {cmd!r}",
+                )
+
+        non_matching_commands = [
+            "python3 /opt/data/scripts/gitops_workspace.py",
+            "cat README.md",
+            "git status",
+            "echo 'kube-agents repo'",
+        ]
+        for cmd in non_matching_commands:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(
+                    pattern.search(cmd),
+                    f"pattern {pattern.pattern!r} falsely matched {cmd!r}",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

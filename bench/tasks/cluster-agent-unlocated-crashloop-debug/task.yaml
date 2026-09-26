@@ -84,12 +84,15 @@ verification_spec:
       # name has a use in a worker's terminal on an install where the stubs
       # apply. Additionally, the platform worker must not execute `kubectl` in
       # its terminal to perform inline workload diagnostics — tenant workload
-      # debugging must be delegated to the cluster's Cluster Agent.
+      # debugging must be delegated to the cluster's Cluster Agent. The kubectl
+      # pattern matches bare invocations, env assignments (KUBECONFIG=... kubectl),
+      # loops (do kubectl), subshells ($(kubectl)), backticks (`kubectl`),
+      # wrappers (timeout 60 kubectl), paths (/usr/bin/kubectl), and quoted forms.
       type: worker_commands
       forbidden_patterns:
         - 'cluster_agent_profile\.py'
         - 'kanban_notify_propagate\.py'
-        - '(^|[;&|]\s*)kubectl\b'
+        - '(?:^|[\s;&|(`"''/])kubectl\b'
   - name: rca-names-the-oom
     role: objective
     mode: assert
