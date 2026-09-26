@@ -13,8 +13,9 @@ so is the 2026-09-22 decision that the presubmit runs the blocking roster
 only (HELD_OUT_TO_NIGHTLY: the seven held-out cases that left the presubmit
 file for the nightly one that day) -- and the nightly file holds the
 script's nightly array plus the nine cases the TASKS array held commented
-out, which the same decision moved into the nightly (#1546, #1564), less
-the cases promoted out of it since, plus the seven. A later roster change
+out, which the same decision moved into the nightly (#1546, #1564), plus
+whatever landed there since (ADDED_AFTER_THE_SPLIT, ADDED_AFTER_THE_MOVED_BLOCK),
+less the cases promoted out of it since, plus the seven. A later roster change
 edits the expected sets here in the same pull request; that is the point of
 pinning them, since the files are what the eval-crew rule in hack/OWNERS
 guards.
@@ -114,6 +115,16 @@ MOVED_TO_NIGHTLY = [
     "upgrades-fleet-readiness-exclusion",
     "upgrades-api-deprecation-clean-repo",
     "cluster-agent-crashloop-fix-request",
+]
+# Registered after the moved-in nine, which is why this is a second list and
+# not more entries in ADDED_AFTER_THE_SPLIT: those nine sit between the two in
+# the file, so file order is not registration order. Newest last. The consumer
+# migration's two cases (#1246 PR-2): a full issue-resolver run and a
+# read-back on an existing proposal's branch, both writing to the eval GitOps
+# repository, both nightly on measured cost.
+ADDED_AFTER_THE_MOVED_BLOCK = [
+    "vcs-issue-resolver-triage",
+    "vcs-review-feedback-read-back",
 ]
 # Registered after the moved block, in file order, by the pull request that
 # authored each case.
@@ -231,8 +242,14 @@ class SplitLostNothingTest(unittest.TestCase):
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases_less_the_promoted_plus_the_held_out(self):
         promoted = {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
-        expected = [c for c in NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY if c not in promoted]
-        self.assertEqual(eval_rosters.nightly_cases(), expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE)
+        expected = [
+            c
+            for c in NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + ADDED_AFTER_THE_MOVED_BLOCK
+            if c not in promoted
+        ]
+        self.assertEqual(
+            eval_rosters.nightly_cases(), expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
+        )
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
         for case, _ in PROMOTED_AFTER_THE_SPLIT:

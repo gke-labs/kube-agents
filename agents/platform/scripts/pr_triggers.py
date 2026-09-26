@@ -42,7 +42,8 @@ repeated beats one that fires off a line nobody can see.
 **Has it already answered?** By its own marker in its own comment, and nothing
 else. There is no state file, no database, no label: a request is unanswered
 when no comment written by the agent on that pull request carries
-`<!-- agent-answered:<node-id> -->`. Counting only *self-authored* markers is
+`<!-- agent-answered:<comment-ref> -->`, where the ref is the forge-neutral
+`<kind>-<id>` the verb surface reports. Counting only *self-authored* markers is
 load-bearing — a marker scan that trusted any comment would let anyone suppress
 a request by pasting the string, which is the same trap
 `docs/designs/fleet-audit-issue-ledger.md` §3.1 records for the issue ledger.
@@ -120,9 +121,24 @@ HIDING_CHARS = "<[]"
 ANSWERED_MARKER = "agent-answered"
 REFUSED_MARKER = "agent-refused"
 
-#: Deliberately permissive about the id: GraphQL node ids are base64-ish and the
-#: alphabet is not documented as stable. Over-matching here costs nothing — the
-#: id is only ever compared for equality against one the forge just gave us.
+#: Deliberately permissive about the ref. It is `"{kind}-{id}"` today, but the
+#: alphabet a forge spends on the id half is not something to pin from here, and
+#: over-matching costs nothing: the ref is only ever compared for equality
+#: against one the forge just gave us.
+#:
+#: The charset also still admits the base64 node ids this scheme used before the
+#: refs, which keeps an older build's markers *parsing* and does not keep the
+#: requests they closed closed. Parsing puts `IC_kwDOABC123` into the handled
+#: set; the comment being judged now carries `issue-2847263`; the two are not
+#: equal and never will be, because nothing on this side can map one to the
+#: other. So the first tick after the refs land re-answers every request that
+#: was outstanding with an old-style marker on it, exactly once — the reply it
+#: writes carries a ref-shaped marker, which does match. That is the migration's
+#: cost and it is paid in public, on somebody's review thread. It is accepted
+#: rather than fixed because the fix is to carry a forge's own id vocabulary
+#: above the boundary for a release, which is the thing this layer exists not to
+#: do. Matching the old spelling is still worth doing: it keeps `refused_refs`
+#: counting old refusals, so the ten-per-pull-request budget is not reset too.
 MARKER_RE = re.compile(
     r"<!--\s*agent-(answered|refused)\s*:\s*([A-Za-z0-9_=+/\-]+)\s*-->"
 )
@@ -141,7 +157,7 @@ class Trigger:
     conversation to find out what is wanted.
     """
 
-    node_id: str
+    ref: str
     author: str
     #: "slash" | "mention"
     kind: str
@@ -198,7 +214,7 @@ def unwrap_code_span(request: str) -> str:
     return request if "`" in inner else inner.strip()
 
 
-def find_trigger(body: str, self_login: str, node_id: str, author: str):
+def find_trigger(body: str, self_login: str, ref: str, author: str):
     """The trigger in one comment, or None.
 
     A command wins over a mention when both are present: the reviewer typed a
@@ -212,17 +228,17 @@ def find_trigger(body: str, self_login: str, node_id: str, author: str):
         if any(char in raw for char in HIDING_CHARS):
             return None
         request = unwrap_code_span(raw.strip())
-        return Trigger(node_id=node_id, author=author, kind="slash", request=request)
+        return Trigger(ref=ref, author=author, kind="slash", request=request)
 
     if self_login and mention_re(self_login).match(text):
-        return Trigger(node_id=node_id, author=author, kind="mention", request="")
+        return Trigger(ref=ref, author=author, kind="mention", request="")
 
     return None
 
 
-def marker(node_id: str, kind: str = ANSWERED_MARKER) -> str:
-    """The HTML comment that records having handled `node_id`."""
-    return f"<!-- {kind}:{node_id} -->"
+def marker(ref: str, kind: str = ANSWERED_MARKER) -> str:
+    """The HTML comment that records having handled the comment `ref` names."""
+    return f"<!-- {kind}:{ref} -->"
 
 
 def strip_markers(text: str) -> str:
@@ -233,7 +249,7 @@ def strip_markers(text: str) -> str:
     prompt invites the model to imitate the syntax in prose it writes itself,
     which `reply` would then stamp a second, real marker onto.
 
-    This is for display only. `handled_node_ids` still reads raw bodies, because
+    This is for display only. `handled_refs` still reads raw bodies, because
     a body the agent has stripped is not the record the forge holds.
 
     **Substituted to a fixpoint, not once.** Deleting a match splices what sat
@@ -242,7 +258,7 @@ def strip_markers(text: str) -> str:
     `<!-- agent-<!-- agent-answered:IC -->answered:IC -->` leaves a live
     `<!-- agent-answered:IC -->` behind. That is not cosmetic where `_post` uses
     this as the boundary keeping a marker the model wrote from becoming a real
-    one — a leftover naming another node id closes that request for good, at
+    one — a leftover naming another ref closes that request for good, at
     both readers, with silence as the reviewer's only signal.
 
     The loop terminates because every pass that changes anything deletes at
@@ -294,8 +310,8 @@ def is_addressable_bot(comment, allowed: set[str]) -> bool:
     return not comment.is_bot or normalise_login(comment.author) in allowed
 
 
-def _marked_node_ids(comments, self_login: str, kinds) -> set[str]:
-    """Node ids carrying one of `kinds` in a comment the agent wrote itself.
+def _marked_refs(comments, self_login: str, kinds) -> set[str]:
+    """Comment refs carrying one of `kinds`, in a comment the agent wrote itself.
 
     Only comments whose author normalises to `self_login` are read: see the
     module docstring for why that restriction is the whole security of the
@@ -306,23 +322,23 @@ def _marked_node_ids(comments, self_login: str, kinds) -> set[str]:
     for comment in comments:
         if normalise_login(comment.author) != wanted:
             continue
-        for kind, node_id in MARKER_RE.findall(comment.body or ""):
+        for kind, ref in MARKER_RE.findall(comment.body or ""):
             if kind in kinds:
-                found.add(node_id)
+                found.add(ref)
     return found
 
 
-def handled_node_ids(comments, self_login: str) -> set[str]:
-    """Node ids already answered or refused, per the agent's own comments."""
-    return _marked_node_ids(comments, self_login, ("answered", "refused"))
+def handled_refs(comments, self_login: str) -> set[str]:
+    """Comments already answered or refused, per the agent's own comments."""
+    return _marked_refs(comments, self_login, ("answered", "refused"))
 
 
-def refused_node_ids(comments, self_login: str) -> set[str]:
-    """Node ids the agent has already refused on this pull request.
+def refused_refs(comments, self_login: str) -> set[str]:
+    """Comments the agent has already refused on this pull request.
 
     Counted rather than merely tested, because refusals are bounded per pull
     request as well as per tick: each one is a public comment, and an account
     that cannot be acted on at all should not be able to make the agent write
     an unbounded number of them.
     """
-    return _marked_node_ids(comments, self_login, ("refused",))
+    return _marked_refs(comments, self_login, ("refused",))

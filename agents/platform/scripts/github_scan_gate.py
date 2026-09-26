@@ -42,14 +42,17 @@ sweep that raises cannot take its siblings down with it — the isolation that
 separate jobs would have given for free, and the reason the ``except`` below is
 deliberately broad.
 
-Each sweep owns its own repo resolution and ``gh`` preflight rather than
-inheriting one from here. That is not an oversight: ``resolver.py poll``
-already does both and already reports precise reason codes
-(``GH_CLI_NOT_FOUND`` vs ``GITHUB_AUTH_NOT_CONFIGURED`` vs
-``GITHUB_TOKEN_REFRESH_FAILED`` vs ``GIT_REPO_UNPARSEABLE`` vs
-``REPO_UNREACHABLE``) that a hoisted preflight here could only flatten or
-duplicate. ``reason`` is rendered through verbatim, so the set is open by
-design and a sweep may add to it without a change here.
+Each sweep owns its own repo resolution and its own credential check rather
+than inheriting one from here. That is not an oversight: ``resolver.py poll``
+already does both and already reports precise reason codes — the broker's own
+refusal codes (``FORGE_UNAUTHENTICATED`` vs ``FORGE_NOT_FOUND`` vs
+``FORGE_RATE_LIMITED``) when the forge refused, and ``CONFIGMAP_READ_FAILED``
+vs ``BROKER_UNREACHABLE`` vs ``REPO_UNREACHABLE`` when the fault was on this
+side — that a hoisted preflight here could only flatten or duplicate. This side
+adds two of its own, ``GIT_REPO_UNPARSEABLE`` for a repository value read
+before there is anyone to ask about it and ``SANDBOX_UNREACHABLE`` for a
+command that never ran. ``reason`` is rendered through verbatim, so the set is
+open by design and a sweep may add to it without a change here.
 
 Consolidating did take something away: an operator could previously stop one
 poller by disabling its roster entry. ``GITHUB_WATCHER_SWEEPS`` gives that back.
@@ -150,9 +153,11 @@ def _slug(text: str) -> str:
 def _key_part(text: str) -> str:
     """Sanitise an opaque id for an idempotency key, preserving case.
 
-    Deliberately not `_slug`: GraphQL node ids are base64 and case-carrying, so
-    folding them would let two distinct comments share a key and the second
-    request would be silently deduped away as a duplicate of the first.
+    Deliberately not `_slug`: a comment ref carries whatever case the forge
+    put in it, and folding it would let two distinct comments share a key —
+    the second request then silently deduped away as a duplicate of the first.
+    Nothing says a forge's ids are case-insensitive, and one that spends base64
+    on them, as the shipped one's node ids do, collides immediately.
     """
     return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-")
 
@@ -394,11 +399,14 @@ REFUSAL_BODY = (
 )
 
 
-def _forge_warning(error: Exception) -> str:
+def _forge_detail(error: Exception) -> str:
     reason = getattr(error, "reason", type(error).__name__)
     value = getattr(error, "value", "")
-    detail = reason + (f" ({value})" if value else "")
-    return f"⚠️ **GitHub PR watcher is not running:** {detail}"
+    return reason + (f" ({value})" if value else "")
+
+
+def _forge_warning(error: Exception) -> str:
+    return f"⚠️ **GitHub PR watcher is not running:** {_forge_detail(error)}"
 
 
 def _int_env(name: str, default: int) -> int:
@@ -437,9 +445,11 @@ def _post_body(provider, repo: str, pr, body: str) -> None:
     guaranteed failure that read as a graceful degrade (#1030).
 
     None of it survives the split into separate pods. There is no volume both
-    sides mount, so `post_comment` takes the text and sends it on fd 0, which
-    is the one channel that crosses a pod boundary. `audit_report.BODY_STDIN`
-    took the same exit from the other side.
+    sides mount, so `post_comment` takes the text and hands it to the verb as a
+    field, which travels as JSON on fd 0 through the one channel that crosses a
+    pod boundary. `audit_report.BODY_STDIN` still takes the older exit from the
+    other side: the same fd, carrying the document itself rather than a request
+    containing it.
     """
     provider.post_comment(repo, pr, body)
 
@@ -459,10 +469,10 @@ def _pr_card(pr, triggers: list, repo: str, now: datetime | None = None) -> Card
 
     ``now`` is injected so the bucketing below is testable.
     """
-    node_ids = [t.trigger.node_id for t in triggers]
+    refs = [t.trigger.ref for t in triggers]
     bucket = (now or datetime.now(timezone.utc)).strftime(CARD_BUCKET_FORMAT)
     asks = "\n".join(
-        f"- `{t.trigger.node_id}` — @{t.comment.author} ({t.trigger.kind}): "
+        f"- `{t.trigger.ref}` — @{t.comment.author} ({t.trigger.kind}): "
         f"{t.trigger.summary}"
         for t in triggers
     )
@@ -507,7 +517,7 @@ def _pr_card(pr, triggers: list, repo: str, now: datetime | None = None) -> Card
         # worker on a request that was answered in between finds the marker and
         # stops.
         idempotency_key=(
-            f"pr-conv-{_slug(repo)}-{pr.number}-{_key_part(node_ids[0])}-{bucket}"
+            f"pr-conv-{_slug(repo)}-{pr.number}-{_key_part(refs[0])}-{bucket}"
         ),
     )
 
@@ -538,54 +548,115 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
         return SweepResult()
 
     provider = forge.provider_for()
-    try:
-        provider.preflight()
-        viewer = provider.viewer_login()
-        if not viewer:
-            # Without an identity the sweep cannot tell its own pull requests
-            # from a stranger's, nor its own comments from a reviewer's. Both
-            # readings fail dangerously, so it stops — loudly.
-            return SweepResult(
-                warnings=[
-                    "⚠️ **GitHub PR watcher is not running:** the GitHub "
-                    "credential could not name the account it authenticates as, "
-                    "so the agent cannot recognise its own pull requests."
-                ]
-            )
-        prs: list[tuple[str, forge.PullRequest]] = []
-        for r in repos:
+    prs: list[tuple[str, forge.PullRequest]] = []
+    # Repositories whose credential could not name the account it authenticates
+    # as. Without that identity the sweep cannot tell its own pull requests from
+    # a stranger's, nor its own comments from a reviewer's; both readings fail
+    # dangerously, so the repository is skipped rather than half-swept.
+    nameless: list[str] = []
+    # Repositories the sweep could not read at all, with the reason. Separate
+    # from `nameless` because they are a different message: one is a credential
+    # that answered and could not name itself, the other is a call that did not
+    # come back.
+    refused: list[tuple[str, forge.ForgeError]] = []
+    for r in repos:
+        # Per repository and not once for the sweep, because identity is a
+        # property of a forge and an install serving two of them
+        # authenticates as two accounts. It is not free on the second
+        # repository of one forge -- the provider's cache is keyed by
+        # repository, so each one costs a lookup of its own -- but every
+        # `identity` answer carries the viewer, so a repository whose
+        # permission check has already run pays nothing here.
+        #
+        # The refusal is caught per repository and not around the loop. Around
+        # it, a dead credential on the second repository -- or one on a host
+        # the broker has no module for, which raises rather than answering --
+        # discarded the pull requests already collected from the first and
+        # filed no cards for a repository that was working, every tick until
+        # somebody fixed the other one.
+        try:
+            viewer = provider.viewer_login(r)
+            if not viewer:
+                nameless.append(r)
+                continue
             for pr in provider.list_open_prs(r):
                 if forge.is_agent_pull_request(pr, r, viewer) and not pr.is_ignored:
                     prs.append((r, pr))
-    except forge.ForgeError as error:
-        return SweepResult(warnings=[_forge_warning(error)])
+        except forge.ForgeError as error:
+            refused.append((r, error))
+    if refused and len(refused) == len(repos):
+        # Nothing was swept, so there is no partial result to report and the
+        # first refusal is the whole story -- the same single warning the
+        # sweep returned before it read repositories one at a time.
+        #
+        # Counted, not inferred from an empty `prs`. Having no open agent pull
+        # request is the ordinary state of a healthy repository, so "no cards
+        # and something refused" is true on most ticks of a partial outage --
+        # which took this return, announced the watcher was not running at all
+        # and named no repository, while the branch below had the operator's
+        # actual message. It also skipped `provider.truncations()` for the
+        # repositories that were read.
+        return SweepResult(warnings=[_forge_warning(refused[0][1])])
+    if nameless:
+        warnings.append(
+            "⚠️ **The PR watcher is not running on** "
+            + ", ".join(f"`{name}`" for name in sorted(nameless))
+            + " — the credential there could not name the account it "
+            "authenticates as, so the agent cannot recognise its own pull "
+            "requests."
+        )
+    for name, error in sorted(refused, key=lambda item: item[0]):
+        # "The others" means the ones that were actually swept, which is not
+        # every other managed repository when the block above has already taken
+        # some out: a repository whose credential could not name itself is
+        # skipped too, and telling an operator it was swept sends them looking
+        # for a result that was never produced.
+        others = (
+            "The other managed repositories were swept."
+            if not nameless
+            else "The managed repositories not named in this report were swept."
+        )
+        warnings.append(
+            f"⚠️ **The PR watcher is not running on** `{name}` — "
+            f"{_forge_detail(error)}. {others}"
+        )
 
     cap = _max_per_tick()
     refusal_budget = _max_refusals_per_pr()
     allowed_bots = pr_triggers.bot_allowlist()
     pending: list[_Pending] = []
     refusals: list[_Pending] = []
-    unreadable: list[tuple[str, int]] = []
+    unreadable: list[tuple[str, int, str]] = []
     indeterminate = 0
     # Refusals already on each pull request, so the bound is a total rather than
     # a per-tick allowance that resets every ten minutes.
     refused_so_far: dict[tuple[str, int], int] = {}
 
     for repo, pr in prs:
+        # Cached from the pass above, where a repository whose credential could
+        # not name itself was dropped — so this is a lookup-free re-read of a
+        # login already known to be non-empty.
+        viewer = provider.viewer_login(repo)
         try:
             comments = provider.list_comments(repo, pr)
-        except forge.ForgeError:
+        except forge.ForgeError as refusal:
             # One pull request that will not load must not blind the sweep for
             # the others. Collected into a single warning below rather than one
             # line each, so a repo-wide outage is one message.
-            unreadable.append((repo, pr.number))
+            #
+            # The reason travels with it because the two that land here send an
+            # operator to different places: a transport or credential fault
+            # clears itself and needs nothing, while a conversation too long to
+            # read in one page never clears and needs the thread split or the
+            # request repeated in a new comment.
+            unreadable.append((repo, pr.number, refusal.reason))
             continue
 
-        handled = pr_triggers.handled_node_ids(comments, viewer)
-        refused_so_far[(repo, pr.number)] = len(pr_triggers.refused_node_ids(comments, viewer))
+        handled = pr_triggers.handled_refs(comments, viewer)
+        refused_so_far[(repo, pr.number)] = len(pr_triggers.refused_refs(comments, viewer))
 
         for comment in comments:
-            if comment.node_id in handled:
+            if comment.ref in handled:
                 continue
             if forge.normalise_login(comment.author) == viewer:
                 continue
@@ -594,7 +665,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
                 # Answering one is how two agents end up talking to each other.
                 continue
             trigger = pr_triggers.find_trigger(
-                comment.body, viewer, comment.node_id, comment.author
+                comment.body, viewer, comment.ref, comment.author
             )
             if trigger is None:
                 continue
@@ -618,14 +689,34 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     if unreadable:
         warnings.append(
             "⚠️ **GitHub PR watcher could not read** "
-            + ", ".join(f"{repo}#{n}" for repo, n in sorted(unreadable))
+            + ", ".join(f"{repo}#{n} ({reason})" for repo, n, reason in sorted(unreadable))
             + " — those conversations were skipped this tick."
+        )
+        # A conversation too long for one page never clears on its own, and the
+        # watcher runs every ten minutes with `deliver: "chat"`: without a way
+        # out named here, that is 144 identical warnings a day in the room.
+        if any(reason == forge.REASON_CONVERSATION_TRUNCATED for _, _, reason in unreadable):
+            warnings[-1] += (
+                f" For {forge.REASON_CONVERSATION_TRUNCATED}, this repeats every"
+                f" tick until the pull request closes: label it `{forge.IGNORE_LABEL}`"
+                " to stop this warning, or split the thread."
+            )
+    # Drained here rather than warned about where it happens, because the same
+    # listing fills its page on every tick and on more than one repository. A
+    # listing read short is not an error the sweep can recover from — it simply
+    # did not see everything — so it is reported once and the tick continues.
+    truncated = provider.truncations()
+    if truncated:
+        warnings.append(
+            f"⚠️ **GitHub PR watcher read only the first {forge.LISTING_CEILING} of** "
+            + ", ".join(f"{note}" for note in sorted(set(truncated)))
+            + " — anything past that was not swept this tick."
         )
     # Oldest first, so a burst of new comments cannot starve a request that has
     # been waiting. Ordering is global rather than per pull request because the
     # cap is global.
-    pending.sort(key=lambda p: (p.comment.created_at, p.comment.node_id))
-    refusals.sort(key=lambda p: (p.comment.created_at, p.comment.node_id))
+    pending.sort(key=lambda p: (p.comment.created_at, p.comment.ref))
+    refusals.sort(key=lambda p: (p.comment.created_at, p.comment.ref))
 
     posted_refusals = 0
     dropped_refusals = 0
@@ -643,10 +734,10 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
             # marker is written, so nothing is claimed to have been handled.
             dropped_refusals += 1
             continue
-        body = f"{REFUSAL_BODY}\n\n{pr_triggers.marker(item.trigger.node_id, pr_triggers.REFUSED_MARKER)}"
+        body = f"{REFUSAL_BODY}\n\n{pr_triggers.marker(item.trigger.ref, pr_triggers.REFUSED_MARKER)}"
         if dry_run:
             sys.stderr.write(
-                f"github_scan_gate: would refuse {item.trigger.node_id} "
+                f"github_scan_gate: would refuse {item.trigger.ref} "
                 f"on {item.repo}#{item.pr.number} (@{item.comment.author})\n"
             )
             posted_refusals += 1
@@ -685,12 +776,12 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
         # contract: a forge with no reactions returns False and nothing changes.
         if dry_run:
             sys.stderr.write(
-                f"github_scan_gate: would acknowledge {item.comment.node_id} "
+                f"github_scan_gate: would acknowledge {item.comment.ref} "
                 f"on {item.repo}#{item.pr.number}\n"
             )
-        elif provider.supports_acknowledge:
+        elif provider.supports_acknowledge(item.repo):
             try:
-                provider.acknowledge(item.repo, item.comment)
+                provider.acknowledge(item.repo, item.pr, item.comment)
             except forge.ForgeError:
                 pass
         by_pr[(item.repo, item.pr.number)].append(item)

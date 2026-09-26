@@ -68,9 +68,9 @@ class ParseTest(unittest.TestCase):
 
         Without the refusal, `file:///github.com/o/r` splits to an empty host
         and a path the lift then reads as a GitHub remote, while
-        `file:///gitlab.com/g/p` yields a hostless ref that
-        `forge.provider_for` maps to `GitHubProvider` — one URL admitted as a
-        forge it is not, and one routed to the wrong provider in silence.
+        `file:///gitlab.com/g/p` yields a hostless ref the broker's registry
+        hands to the install's default forge — one URL admitted as a forge it
+        is not, and one routed to the wrong forge in silence.
         """
         for value in (
             "file:///github.com/acme/toolkit",

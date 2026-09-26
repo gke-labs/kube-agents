@@ -273,6 +273,27 @@ class ArrayHygieneTest(unittest.TestCase):
                     f"{audit} is audit-shaped and must carry an explicit unit_cost_hint in the 600-1300s band, not the 200s default",
                 )
 
+    def test_the_version_control_cases_are_priced_above_the_default(self):
+        # Neither is audit-shaped, so the check above does not reach them, and
+        # both are far above the 200s default: measured on
+        # `dev-vcs2-20260915a`, the resolver runs 1424s a repetition and is the
+        # single most expensive unit in the nightly. Left at the default it
+        # launched in the last cost tier of each repetition, which is exactly
+        # what the deadline kill truncates first.
+        hint_fn = lifted_block(r"^unit_cost_hint\(\) \{.*?^\}$")
+        for case, floor in (
+            ("vcs-issue-resolver-triage", 1300),
+            ("vcs-review-feedback-read-back", 600),
+        ):
+            with self.subTest(case=case):
+                result = run_bash(f"{hint_fn}\nunit_cost_hint {case}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertGreaterEqual(
+                    int(result.stdout.strip()),
+                    floor,
+                    f"{case} is measured well above the 200s default and must carry an explicit unit_cost_hint",
+                )
+
 
 def exclusions_block() -> str:
     """The inject lane's exclusion step (#2039): the read, the existence

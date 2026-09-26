@@ -53,9 +53,12 @@
 # ~63min at its 1250s hint) and the nine this decision moved here, of which
 # eight are deployer: noop and probe-shaped (~200s a repetition, ~10min each
 # at three) and fleet-cost-idle-pool is a full cost audit priced with the
-# 900s audit band (~45min). 2026-09-16 added incident-triage-oom-event-probe
-# (#1023, ~45min at its measured 737s/599s/1357s). 2026-09-21 added #1103's
-# two tofu cases (ai-security-planted-model-audit ~73min at its 1450s hint,
+# 900s audit band (~45min). 2026-09-16 added three: incident-triage-oom-event-probe
+# (#1023, ~45min at its measured 737s/599s/1357s) and the consumer
+# migration's two (#1246 PR-2), measured on a live install rather than
+# priced: the resolver 1424s and the read-back 546-654s a repetition, ~100min
+# at three. 2026-09-21 added #1103's two tofu cases
+# (ai-security-planted-model-audit ~73min at its 1450s hint,
 # autoops-crashloop-config-triage ~45min at the 900s band; both serialize on
 # the infra lock with the two incumbents) and consistency-no-environment-label
 # (#1818, ~28min at its measured 381s/385s/880s -- a full fleet audit, and the
@@ -66,21 +69,21 @@
 # 2026-09-23 added upgrades-master-behind-offered-elsewhere (~45min at the 900s
 # band; its runs measured 327s-1191s, the audit band's spread again) and
 # gitops-drift-out-of-band-triage (#1827, ~45min at its 900s hint).
-# Forty-four cases, ~1011-1031min serial. 2026-09-25 adds the two
+# Forty-six cases, ~1111-1131min serial. 2026-09-25 adds the two
 # obtainability probes (#1841), unhinted and probe-shaped (~200s a
-# repetition, ~10min each at three): forty-six cases, ~1031-1051min serial.
+# repetition, ~10min each at three): forty-eight cases, ~1131-1151min serial.
 # The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=8 (6 from #1491 until
 # oss-test-infra#2707, 2026-09-25; the arithmetic that follows was done at
 # six) and EVAL_REPETITIONS at its default 3. At the ~1.15x the presubmit
 # realised on whole-job wall clock at parallelism 4 under daytime quota
-# contention that would be ~879-897min, over the deadline; 480m holds only
+# contention that would be ~983-1001min, over the deadline; 480m holds only
 # if the nightly, alone on the model quota at that hour and two lanes
-# wider, realises ~1.9x or better. Night one (2026-09-16, build
+# wider, realises ~2.3x or better. Night one (2026-09-16, build
 # 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
-# so the five additions are priced inside its headroom. The first nights after this change measure it:
+# so the nine additions since are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
 # order. A deadline kill is survivable by design -- the cost-hinted queue
@@ -113,7 +116,7 @@
 # 2026-09-23 adds cluster-agent-delegation-profile-lookup (#1840): one case,
 # three units, ~36 serial minutes at its 720s hint (four clean dev-install
 # repetitions measured 710-1325s). With the 2026-09-23 additions above it
-# grows the matrix to forty-five cases and 135 units, ~1047-1067 serial
+# grows the matrix to forty-nine cases and 147 units, ~1167-1187 serial
 # minutes, on nights the 2026-09-22 paragraph already says can truncate.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
@@ -344,6 +347,22 @@
 # than a cluster-agent one because AGENT_SERVICE_NAME is a single global
 # target (A2), which shapes what the case asserts rather than blocking it.
 ./tasks/cluster-agent-crashloop-fix-request/task.yaml
+
+# The consumer migration's two cases (#1246 PR-2). Both write to the eval
+# GitOps repository -- an issue apiece for the first, a pull request apiece
+# for the second -- on the same terms rca-remediation-pr already holds a
+# presubmit seat under: a throwaway repository we own and a token scoped to
+# it. Here rather than the presubmit on cost: each drives a full skill
+# procedure (poll, claim, investigate, transition; prepare, two submits, a
+# read-back) rather than a probe. Measured on `dev-vcs2-20260915a`: the
+# resolver 1424s, the read-back 546-654s. Only the read-back is red on main;
+# the resolver passes there too and is kept as a regression guard over the
+# largest consumer this migration rewrites -- each task.yaml header says
+# which it is and shows its run ids. Priced at 1400 and 700 respectively in
+# unit_cost_hint, so the resolver -- the most expensive unit in the nightly --
+# launches in the first cost tier rather than the last.
+./tasks/vcs-issue-resolver-triage/task.yaml
+./tasks/vcs-review-feedback-read-back/task.yaml
 
 # ── Moved here 2026-09-22 from the presubmit file (#1023) ───────────────────
 # The seven cases the presubmit ran without letting them block, when the

@@ -1166,12 +1166,13 @@ wrong if the sandbox ever holds credentials of its own.
 
 The sandbox has three directories that matter and only one of them keeps anything.
 
-| Path                    | Backing                        | Owner    | What it is                   |
-| ----------------------- | ------------------------------ | -------- | ---------------------------- |
-| `/opt/data`             | `data` PVC                     | uid 1000 | the model's work             |
-| `/home/agent`           | the container's ephemeral disk | uid 1000 | the login's home             |
-| `/home/hermes`          | the container's ephemeral disk | uid 1001 | the trusted principal's home |
-| `/var/lib/sandbox-sshd` | `sshd` PVC                     | root     | the host keys                |
+| Path                    | Backing                        | Owner    | What it is                      |
+| ----------------------- | ------------------------------ | -------- | ------------------------------- |
+| `/opt/data`             | `data` PVC                     | uid 1000 | the model's work                |
+| `/home/agent`           | the container's ephemeral disk | uid 1000 | the login's home                |
+| `/home/hermes`          | the container's ephemeral disk | uid 1001 | the trusted principal's home    |
+| `/var/lib/sandbox-sshd` | `sshd` PVC                     | root     | the host keys                   |
+| `/opt/vcs/libexec`      | the image                      | root     | what the trusted principal runs |
 
 **The homes are ephemeral on purpose.** `agent` owns `/home/agent/.bashrc`, bash sources
 it for a non-interactive `ssh host cmd`, and the model can delete Debian's
@@ -1216,6 +1217,23 @@ under [The SSH principal cannot be the shell user](#the-ssh-principal-cannot-be-
 a kubeconfig names an `exec` credential plugin and `kubectl` runs it, so one the model
 can author is arbitrary code execution as `hermes`. `/opt/data` is now durable as well
 as model-writable, which makes it a worse place for that file rather than a better one.
+
+**The same rule reaches what an agent-pod caller executes here, not just what it reads.**
+The shared scripts are staged twice. `/opt/data/scripts` is the model's copy — that is
+the path every SKILL.md names, the entrypoint replaces it from the image on each start,
+and an edit the model makes to it stands until then. `/opt/vcs/libexec/platform` is the
+second copy, root-owned and mode 0755, and it is the one a caller that logs in as
+`hermes` runs: the pull-request and issue crons forward a forge verb into this container
+rather than holding a forge CLI themselves, and running the model's copy over that
+session would be the credential handed to whatever the model last wrote there. The whole
+import closure is staged, because `sys.path[0]` is the script's own directory and a
+module missing from the root-owned copy would be found in the model's one instead. The
+build proves the staging is complete by importing each entry point and reading `__file__`
+off every module that loaded: one that resolved outside the root-owned copy and the
+standard library fails the image. What those scripts put on `sys.path` themselves — the
+two agent-pod directories they use to find their siblings — is left off when the file
+they are running from is the root-owned copy, so a gap a later edit opens has nothing
+model-writable to fall through to.
 
 `volumeClaimTemplates` is immutable, so an install that already ran the single-volume
 layout does not roll into this one. The StatefulSet has to be deleted with
@@ -1892,13 +1910,28 @@ is not on the build PATH.
 
 `gh` needed one step the others did not.
 [`github_scan_gate.py`](../../agents/platform/scripts/github_scan_gate.py) runs
-`resolver.py poll` as a `no_agent` cron script in the pod, and the resolver shells out to
-`gh` at every call site. Both modules funnel those invocations through one function —
+`resolver.py poll` as a `no_agent` cron script in the pod, and the resolver shelled out to
+`gh` at every call site. Both modules funnelled those invocations through one function —
 `forge.run_gh` and `resolver._run_gh_once` — so routing that pair through
 `sandbox_exec.run` carried the whole sweep across without moving the script. Both files
 also run on the far side of the boundary when the model invokes them from its shell, and
 one call site serves both: `sandbox_enabled()` reads an agent-pod file, so in the sandbox
 it is false and `run()` executes locally.
+
+Neither of those two functions exists any more. The consumer migration replaced every `gh`
+call in both with a version-control verb, over the same `sandbox_exec.run` and for the
+same reason — the credential is on the far side. What this paragraph describes is the
+shape that made the crossing cheap enough to do at all.
+
+It did not stay one seam, and the reason is worth keeping. `forge.py` crosses per verb: it
+runs a copy of itself in the sandbox (`forge.SANDBOX_FORGE`) and gets one answer back, so
+the gate's sweep is a sequence of small crossings. `resolver.py` crosses **once, as the
+whole subcommand** (`resolver._forward_to_sandbox`), because a poll visits every managed
+repository and the per-call shape paid an ssh hop for each one — against a budget spent on
+the connection as readily as on the forge. Crossing once also keeps the ranking, the
+sanitizer and the JSON envelope on one side, so a connection that drops mid-poll drops a
+whole poll rather than half of one. The two shapes answer different questions: how many
+calls the work is, and whether a partial result is worth anything.
 
 `git` is the one that turns on placement. `credential_proxy.py::_execute` confines a git
 command's working directory to `CREDENTIAL_PROXY_WORKSPACE_ROOT` and re-runs it on the
@@ -2425,8 +2458,11 @@ exist and takes the same fork for the whole run. An unreachable broker answers "
 publishes through the leased clone, which is the one question in a run where falling back beats
 failing — every other call still fails loudly. It answers "no" by code as well as by status:
 `CONTENT_WORKSPACES_DISABLED` on a 404 says the broker does not have them armed, where a bare
-404 says that and "no such route" indistinguishably. The migrated skills are
-`submit-suggestion` and `fleet-audit`, and `fleet-audit` needed the read side to replace what
+404 says that and "no such route" indistinguishably. The migrated skills were
+`submit-suggestion` and `fleet-audit`. `submit-suggestion` has since left content mode
+entirely — the version-control verbs give it a real checkout in its own container, with the
+credential in another, so there is nothing for the contentless fork to buy — and what is
+written here now describes `fleet-audit` alone. It needed the read side to replace what
 the clone used to answer: `list` pages the repository's tracked files, `read` fetches them
 singly or in a batch, and `grep` searches them, which is how a remediation path stays something
 discovered rather than invented when there is nothing local to search.

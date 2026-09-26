@@ -38,12 +38,14 @@ SCRIPTS = Path(__file__).resolve().parent
 # from the verb name because the naming is the contract: `issue-list` returns
 # `issues`, and a forge that returned something else has not implemented the
 # verb the caller asked for.
-CONCEPTS = {"proposal": "proposal", "issue": "issue"}
+CONCEPTS = {"proposal": "proposal", "issue": "issue", "label": "label"}
 
 # The fields a caller may rely on, per concept. A forge may not omit one and may
 # not add its own vocabulary alongside them -- the second is the failure that
 # matters, because a caller that finds `head.ref` in the answer starts using it.
 SHAPES: dict[str, frozenset[str]] = {
+    # `sourceRepo` and `sourceRevision` sit beside `source` because a branch
+    # name alone answers neither "whose branch is this" nor "what is on it now".
     "proposal": frozenset(
         {
             "number",
@@ -51,7 +53,10 @@ SHAPES: dict[str, frozenset[str]] = {
             "state",
             "draft",
             "author",
+            "labels",
             "source",
+            "sourceRepo",
+            "sourceRevision",
             "target",
             "url",
             "created",
@@ -73,10 +78,35 @@ SHAPES: dict[str, frozenset[str]] = {
             "body",
         }
     ),
-    "comment": frozenset({"author", "created", "body", "url"}),
+    # `id` and `kind` are what `proposal-acknowledge` takes back; `ref` is the
+    # two together, and the only one of the three unique across endpoints.
+    # `path` and `line` are empty except on an inline review comment.
+    # `bot` is the forge's own answer about the author, carried beside `author`
+    # because it cannot be read off it: every login is normalised on the way
+    # through (GitHub's `[bot]` suffix is stripped), so the spelling a caller
+    # sees no longer says what the forge said.
+    "comment": frozenset(
+        {"id", "ref", "kind", "author", "bot", "created", "body", "url", "path", "line"}
+    ),
+    "commit": frozenset({"sha", "author", "committed", "message", "url"}),
+    "label": frozenset({"name", "color", "description"}),
 }
+COMMENT_KINDS = frozenset({"issue", "review_comment", "review"})
 
 PROPOSAL_STATES = frozenset({"open", "closed", "merged"})
+
+# Payload fields that hold text a caller wrote, as opposed to an identifier or
+# an enumerated value the protocol fixed. These are what must never reach a
+# path, a query string or an argv.
+PROSE_FIELDS = ("title", "body", "comment", "description")
+
+# The write verbs that carry none of it. Named, because "the fixture has no
+# prose in it" is otherwise indistinguishable from "the fixture forgot to put
+# any in", and the second is how the check above goes quiet. `issue-close`'s
+# `reason` is on this side of the line: the forge takes two fixed words for it,
+# so it is an enumeration spelled in letters rather than something a caller
+# wrote.
+PROSELESS_WRITES = frozenset({"proposal-close", "issue-close"})
 
 
 TESTDATA = Path(__file__).resolve().parent / "testdata" / "providers"
@@ -104,7 +134,17 @@ class Recorded:
             return "diff --git a/x b/x\n"
         if not self.responses:
             raise AssertionError(f"the forge made an unfixtured call: {method} {path}")
-        return self.responses.pop(0)
+        answer = self.responses.pop(0)
+        # A recorded *refusal*: `{"__status__": 404}` is what the transport
+        # would have raised for that call, so a verb whose logic turns on one
+        # (label-ensure's read-then-create) can be pinned by a fixture too.
+        if isinstance(answer, dict) and "__status__" in answer:
+            raise WorkspaceError(
+                answer.get("__detail__") or "recorded refusal",
+                status=int(answer["__status__"]),
+                code="FORGE_CALL_FAILED",
+            )
+        return answer
 
 
 def forge_cases() -> list[tuple[str, type]]:
@@ -139,7 +179,9 @@ class ContractTest(unittest.TestCase):
 
     def test_a_forge_ships_a_fixture_for_every_verb_it_claims(self):
         # The check that keeps the rest of this file from passing vacuously: a
-        # forge could claim all eight and be tested on none.
+        # forge could claim every verb it serves and be tested on none. No
+        # count here on purpose -- the number has changed with each slice of
+        # the migration, and a comment carrying it goes stale the next time.
         for name, forge, directory in self.instances():
             for verb in forge.verbs:
                 with self.subTest(forge=name, verb=verb):
@@ -181,6 +223,17 @@ class ContractTest(unittest.TestCase):
                         self.assertEqual(
                             set(answer["comment"]), SHAPES["comment"]
                         )
+                        self.assertIn(answer["comment"]["kind"], COMMENT_KINDS)
+                    elif action == "commits":
+                        self.assertEqual(
+                            sorted(answer), sorted(["commits", "count", "truncated"])
+                        )
+                        self.assertEqual(answer["count"], len(answer["commits"]))
+                        for item in answer["commits"]:
+                            self.assertEqual(set(item), SHAPES["commit"])
+                    elif action == "acknowledge":
+                        self.assertEqual(set(answer), {"acknowledged"})
+                        self.assertIsInstance(answer["acknowledged"], bool)
                     elif action == "list":
                         key = f"{concept}s"
                         self.assertEqual(
@@ -238,6 +291,92 @@ class ContractTest(unittest.TestCase):
                     self.assertTrue(answer["comments"])
                     for item in answer["comments"]:
                         self.assertEqual(set(item), SHAPES["comment"])
+                        self.assertIn(item["kind"], COMMENT_KINDS)
+                    if verb == "proposal-view":
+                        # A proposal's discussion spans every kind a forge
+                        # has; the recording carries all three so a forge that
+                        # read only the conversation would be caught here.
+                        self.assertGreaterEqual(len({c["kind"] for c in answer["comments"]}), 2)
+                        created = [c["created"] for c in answer["comments"]]
+                        self.assertEqual(created, sorted(created))
+
+    def test_a_read_conversation_declares_itself_truncated(self):
+        """The one sub-listing, held to the same promise as the listings.
+
+        A conversation read short is worse than a listing read short. The
+        caller that reads one is working out which requests it already
+        answered, by looking for its own markers in the list it got back: a
+        marker past the ceiling is a request that reads as unanswered, and
+        answering it again writes another comment that lands past the ceiling
+        too. `forge.BrokerProvider.list_comments` refuses on this flag, and it
+        can only refuse if every forge sets it.
+        """
+        for name, forge, directory in self.instances():
+            for verb in ("proposal-view", "issue-view"):
+                if verb not in forge.verbs:
+                    continue
+                fixture = self.load(directory, verb)
+                if not fixture["payload"].get("comments"):
+                    continue
+                with self.subTest(forge=name, verb=verb):
+                    full, _ = self.invoke(forge, verb, fixture)
+                    self.assertEqual(full["commentCount"], len(full["comments"]))
+                    self.assertIsInstance(full["commentsTruncated"], bool)
+
+                    payload = dict(fixture["payload"], limit=1)
+                    short, _ = self.invoke(forge, verb, {**fixture, "payload": payload})
+                    self.assertTrue(short["commentsTruncated"])
+                    self.assertGreaterEqual(len(short["comments"]), 1)
+
+    def test_any_one_page_of_a_conversation_filling_truncates_it(self):
+        """Each page in turn, because one forge's conversation is several.
+
+        The test above cannot see which page the flag came from: at `limit=1`
+        every recorded page fills, so a forge that judged only the first of
+        them passes. GitHub splits a proposal's conversation across three
+        endpoints and a reviewer picks one of them blind, so a flag taken from
+        one page is a conversation that reads as complete while an arbitrary
+        number of requests sit past the ceiling -- the caller then answers the
+        same request on every tick forever.
+
+        So: for each recorded page, replay the verb with `limit` set to that
+        page's length and every *other* page trimmed below it. Only the chosen
+        page fills, and the flag has to come from it. A forge that dropped any
+        page from the judgement fails on that page's turn, and one that judged
+        a page after filtering its rows -- a bodiless review is not an
+        utterance, but it is still a row the forge sent -- fails on the page
+        that holds one.
+        """
+        for name, forge, directory in self.instances():
+            for verb in ("proposal-view", "issue-view"):
+                if verb not in forge.verbs:
+                    continue
+                fixture = self.load(directory, verb)
+                if not fixture["payload"].get("comments"):
+                    continue
+                pages = [
+                    index
+                    for index, answer in enumerate(fixture["responses"])
+                    if isinstance(answer, list) and answer
+                ]
+                for filled in pages:
+                    limit = len(fixture["responses"][filled])
+                    responses = [
+                        answer[: limit - 1]
+                        if isinstance(answer, list) and index != filled
+                        else answer
+                        for index, answer in enumerate(fixture["responses"])
+                    ]
+                    with self.subTest(forge=name, verb=verb, page=filled):
+                        answer, _ = self.invoke(
+                            forge,
+                            verb,
+                            {
+                                "payload": dict(fixture["payload"], limit=limit),
+                                "responses": responses,
+                            },
+                        )
+                        self.assertTrue(answer["commentsTruncated"])
 
     # -- what the forge asked for -------------------------------------------
 
@@ -245,6 +384,16 @@ class ContractTest(unittest.TestCase):
         # The transport owns the host. A forge that returned an absolute URL
         # would be choosing where the credential is presented, which is the one
         # decision the host allowlist exists to keep away from it.
+        #
+        # `assertIn("acme/infra", path)` is the fixtures' repository, and it is
+        # why the route a filtered `issue-list` takes is not covered here: with
+        # a `query` or an `excludeLabels` GitHub's module leaves the listing
+        # endpoint for `search/issues`, which carries the repository as a `q`
+        # qualifier rather than in the path. The fixtures hold the unfiltered
+        # request, and a contract shared by every forge cannot prescribe one
+        # forge's search grammar. That route is pinned per forge instead --
+        # `test_vcs_broker.py`'s `test_issue_list_with_a_query_goes_through_search`
+        # and `test_issue_list_excludes_labels_at_the_forge_not_on_the_page`.
         for name, forge, directory in self.instances():
             for verb in forge.verbs:
                 fixture = self.load(directory, verb)
@@ -262,23 +411,59 @@ class ContractTest(unittest.TestCase):
     def test_a_write_verb_sends_its_prose_in_a_body(self):
         # Not in a path and not in a query. What a caller wrote must not end up
         # in an argv, in `ps`, or in a `CalledProcessError` some layer logs.
+        #
+        # Every free-text field, not just `body`. Reading only `body` made this
+        # vacuous for most of the write verbs -- `issue-update` carries a title,
+        # `label-ensure` a description, and neither was checked -- and a
+        # fixture that happens to omit the one field the test reads is exactly
+        # how a contract stops holding without anyone noticing. The verbs that
+        # carry no prose at all are named below rather than left to be inferred
+        # from a fixture.
         for name, forge, directory in self.instances():
             for verb in forge.verbs:
-                if not verb.endswith(("-create", "-comment")):
+                if not verb.endswith(("-create", "-comment", "-update", "-close", "-ensure")):
                     continue
                 fixture = self.load(directory, verb)
-                prose = fixture["payload"].get("body") or ""
+                prose = [
+                    value
+                    for field in PROSE_FIELDS
+                    for value in [fixture["payload"].get(field)]
+                    if isinstance(value, str) and value.strip()
+                ]
                 with self.subTest(forge=name, verb=verb):
-                    _, api = self.invoke(forge, verb, fixture)
-                    method, path, params, body, _raw = api.calls[-1]
-                    self.assertEqual(method, "POST")
-                    self.assertIsInstance(body, dict)
-                    if prose:
-                        self.assertIn(prose, [str(value) for value in body.values()])
-                        self.assertNotIn(prose, path)
-                        self.assertNotIn(
-                            prose, [str(value) for value in (params or {}).values()]
+                    if verb in PROSELESS_WRITES:
+                        self.assertEqual(
+                            prose, [], f"{verb} is listed as carrying no prose"
                         )
+                    else:
+                        self.assertTrue(
+                            prose,
+                            f"{verb}'s fixture carries no free text, so this "
+                            "verb is not covered by the contract at all",
+                        )
+                    _, api = self.invoke(forge, verb, fixture)
+                    writes = [c for c in api.calls if c[0] in {"POST", "PATCH", "PUT"}]
+                    self.assertTrue(writes, "no write was made")
+                    for text in prose or [None]:
+                        # The call that carried it is not always the first
+                        # write: an update applies its labels before it patches
+                        # the text, and a create-or-update may precede both with
+                        # a read. So take the write the text is actually in, and
+                        # fall back to the first only for a verb with no prose.
+                        carrying = [
+                            c
+                            for c in writes
+                            if text and text in [str(v) for v in (c[3] or {}).values()]
+                        ]
+                        method, path, params, body, _raw = (carrying or writes)[0]
+                        self.assertIn(method, {"POST", "PATCH", "PUT"})
+                        self.assertIsInstance(body, dict)
+                        if text:
+                            self.assertIn(text, [str(value) for value in body.values()])
+                            self.assertNotIn(text, path)
+                            self.assertNotIn(
+                                text, [str(value) for value in (params or {}).values()]
+                            )
 
     def test_the_shared_validators_reject_the_same_inputs_for_every_forge(self):
         # Validation is a property of the caller's request, not of a forge's
@@ -292,18 +477,34 @@ class ContractTest(unittest.TestCase):
             "proposal-create": {"title": "t", "source": "--upload-pack=x", "target": "main"},
             "issue-create": {"title": "", "body": "b"},
             "issue-list": {"labels": "bug"},
-            "proposal-list": {"state": "merged"},
+            "proposal-list": [{"state": "merged"}, {"page": 0}],
+            "proposal-update": {"number": 4321, "labelsAdd": ["ok", ""]},
+            "proposal-close": {"number": -1},
+            "proposal-commits": [{"number": "x"}, {"number": 1, "page": "2"}],
+            # Two, because this verb carries two identifiers and a forge that
+            # checked only the one it happens to use would refuse a different
+            # set of requests from its neighbours.
+            "proposal-acknowledge": [
+                {"number": 0, "comment": {"id": 9, "kind": "issue"}},
+                {"number": 1, "comment": {"id": "9", "kind": "issue"}},
+            ],
+            "issue-update": {"number": 1, "title": "   "},
+            "issue-close": {"number": 1, "reason": "wontfix"},
+            "label-ensure": {"name": ""},
         }
         for name, forge, _ in self.instances():
-            for verb, payload in bad.items():
+            for verb, payloads in bad.items():
                 if verb not in forge.verbs:
                     continue
-                with self.subTest(forge=name, verb=verb):
-                    api = Recorded([])
-                    method = getattr(forge, verb.replace("-", "_"))
-                    with self.assertRaises(WorkspaceError):
-                        method(api, "acme/infra", payload)
-                    self.assertEqual(api.calls, [])
+                if isinstance(payloads, dict):
+                    payloads = [payloads]
+                for payload in payloads:
+                    with self.subTest(forge=name, verb=verb, payload=payload):
+                        api = Recorded([])
+                        method = getattr(forge, verb.replace("-", "_"))
+                        with self.assertRaises(WorkspaceError):
+                            method(api, "acme/infra", payload)
+                        self.assertEqual(api.calls, [])
 
     # -- the prohibition ----------------------------------------------------
 

@@ -1,0 +1,199 @@
+# A second revision on an existing pull request, read back from the forge
+# before it is described.
+#
+# WHY THIS IS RED ON MAIN, measured rather than argued. The read-back is the
+# step that stops a worker reporting a change it did not make, and
+# `pr-conversation/SKILL.md` Step 2b records that happening live: "a worker
+# whose `prepare` was blocked replied that it had raised the memory limit and
+# the replica count, and left a branch holding neither." On main the command
+# that step gives is `gh api "repos/<owner>/<repo>/pulls/<N>/commits"`, and
+# main's broker has no verb that lists a proposal's revisions -- so a worker
+# there has no second way to ask, and reaches for the forge CLI.
+#
+# Run against `main-4556bc68` on 2026-09-16 (`run_20260916_124250_298278`,
+# 405s) the route check failed and nothing else did:
+#
+#   the-forge-was-reached-without-a-cli            fail
+#     forbidden pattern '(^|&&|;|\|)\s*gh\s' matched
+#     'gh pr list --repo dshnayder-org/infra' and
+#     'gh pr view 189 --repo dshnayder-org/infra --json title,url,headRefName,body,commits'
+#   one-pull-request-with-two-revisions-reported   pass
+#
+# (That second check has since been split in two -- `pull_request_opened`
+# over the URL and `report_contains` over the subject -- when main stopped
+# accepting a substring test over "/pull/"; the run above predates it.)
+#
+# That is the shape to notice: the ANSWER was right -- one pull request, two
+# revisions, the dictated subject, the sha reported -- and the only thing wrong
+# was how the worker got it. Green on `dev-vcs2-20260915a` three times
+# (`run_20260916_125415_955821`, `run_20260916_130438_742662`,
+# `run_20260916_131343_768502`; 35, 30 and 48 worker commands, no `gh` among
+# them).
+#
+# Note what the red is and is not. It is NOT the `rc: 127` from the 2026-08-28
+# audit -- PR-1 ships a `gh` shim in the sandbox that routes to the broker, so
+# those commands succeeded. The red is the route: with no verb to call, the
+# agent falls back to the forge CLI surface to read its own branch back, which
+# is exactly the dependency this migration removes.
+#
+# WHAT IS GRADED, AND WHY IT IS NOT A `required_patterns` ROUTE CHECK. The
+# first draft of this case asserted that a worker ran `vcs.py proposal
+# commits`. That check cannot be made sound, for two reasons found by running
+# it:
+#
+#   1. The worker log records only the FIRST command of a compound block and
+#      summarises the rest as "+ N commands" -- the text of the others is not
+#      in the log at all, so a verb invoked as the second command of a block is
+#      invisible to `worker_commands` no matter how the pattern is written.
+#   2. `harness._worker_commands` reads only the cards in `awaited`, which come
+#      from the ROUTER's delegations. A step the run leaves to a second card
+#      the harness never awaited is never read. Seen on
+#      `run_20260915_215946_825232`: the graded card held the first change
+#      only, and `vcs.py proposal commits 188 --repo dshnayder-org/infra`
+#      succeeded in a card outside the run.
+#
+# A `required_patterns` check therefore fails silently when the capture misses,
+# which looks exactly like the feature not working -- the worst kind of false
+# red. `forbidden_patterns` has no such problem: a hit is positive evidence
+# that a command was run, and a miss is the passing case. So the route
+# assertion here is the negative one, and it is the check that carries the
+# red: on main the worker reaches for the forge CLI to read its own branch
+# back, and after the migration it does not.
+#
+# The outcome side is the dictated commit subject. The prompt fixes the second
+# revision's message, so the report can be asserted on a literal. This says a
+# second revision exists and the agent described it; it does not by itself
+# prove a read-back, and it is not claimed to.
+#
+# WHY THE READ-BACK AND NOT THE SWEEP. `pr-conversation`'s sweep answers
+# comments written by somebody else, and an agent that is the only actor in a
+# repository cannot seed one for itself: its own comments are filtered out by
+# login, on purpose, so a self-seeded thread is a sweep that correctly finds
+# nothing. The read-back is the part of that skill a single actor can drive.
+#
+# TWO CHANGES, NOT ONE, and the second on the first one's branch. That is the
+# path submit-suggestion Step 5 describes and the one whose semantics this
+# migration changes: `submit` now adds to the branch rather than recutting it,
+# and refuses outright if somebody else has moved it. A single-change prompt
+# would never reach it.
+#
+# NO FIXTURES AND NO CLUSTER. The changes are to a file the case names rather
+# than to a seeded manifest, so nothing here depends on the seeded fleet -- the
+# difference between a case that runs in any dev project and one parked behind
+# a fleet-activation step (see vcs-history-only-fact, parked exactly there).
+# Whether a proposed fix is a good fix is rca-remediation-pr's question; this
+# case asks whether the agent can put a second revision on a branch and find
+# out from the forge that it landed.
+#
+# WHAT IT LEAVES BEHIND: one open pull request per run on the GitOps
+# repository, permanently -- the same unbounded accumulation
+# rca-remediation-pr accepts, and for the same reason: nothing closes a pull
+# request opened through submit-suggestion. Every run writes the same path on
+# its own branch, which never merges, so the runs do not collide. The case
+# asserts on its own run's output rather than on repository state, so the pile
+# does not make it flake.
+#
+# Measured cost: 405s red, 546-654s green -- one prepare, two submits, one
+# read-back. The green runs are longer because the verb route does the
+# read-back the CLI route skipped.
+#
+# No `domain:`: rca-remediation-pr owns the remediation journey -- a proposed
+# fix landing as a pull request -- and this case proposes no fix. It grades a
+# route, like vcs-history-only-fact.
+id: vcs-review-feedback-read-back
+name: A second revision on a pull request, read back from the forge before it is described
+prompt: >-
+  Do all of the following as ONE delegated task, in order — do not split it
+  across several tasks.
+
+  Open a pull request against the GitOps repository this install manages,
+  following the submit-suggestion skill. It should add a file `EVAL-NOTES.md`
+  at the repository root containing a single line: `read-back check`.
+
+  Then treat this as review feedback on that same pull request: the reviewer
+  asks for a second line, `confirmed from the forge`, in the same file. Put it
+  on the pull request's own branch — do not open a second pull request — and
+  give that revision exactly this commit message subject, verbatim:
+  `eval: confirmed from the forge`.
+
+  Before you describe that second change, confirm from the forge that it
+  actually landed on the branch. Report the pull request URL, the sha of the
+  last revision on the branch and the first line of that revision's message.
+expected_output: >-
+  One pull request against the GitOps repository, carrying two revisions on its
+  own branch: the file added, then the second line appended under the subject
+  `eval: confirmed from the forge`. The agent reached the forge through the
+  version-control verbs rather than a forge CLI, and the final answer gives the
+  pull request URL together with that revision's sha and its subject line.
+  A run that opened a second pull request for the "review feedback", or put
+  the second revision on a branch other than the first pull request's, did
+  not do what was asked, however complete its report reads.
+infrastructure:
+  deployer: noop
+validated: false
+owner: dshnayder
+
+verification_spec:
+  # THE RED, and the one check that sees the route. On main the broker has no
+  # verb that lists a proposal's revisions and `pr-conversation/SKILL.md` Step
+  # 2b sends the agent to `gh api`, so the worker reaches the forge through the
+  # CLI and this check fails. After the migration the verb exists, the SKILL.md
+  # points at it, and nothing shells out.
+  - name: the-forge-was-reached-without-a-cli
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: worker_commands
+      # A command word, not a substring: `/opt/vcs/libexec/git` is the
+      # sanctioned local git and must not trip this; a bare `git clone` or any
+      # `gh` at the start of a command or after a shell join must.
+      forbidden_patterns:
+        - '(^|&&|;|\|)\s*gh\s'
+        - '(^|&&|;|\|)\s*git\s+(clone|fetch|pull|push|ls-remote)\b'
+  - name: the-pull-request-is-real-and-this-runs
+    role: objective
+    mode: assert
+    check:
+      # Not `report_contains` over "github.com/" and "/pull/": a substring
+      # passes on an invented URL and on the pull request an earlier rep left
+      # behind (#1755, and `test_no_task_still_grades_a_pull_request_by_substring`
+      # refuses the old shape). This resolves the URL the report names through
+      # GitHub and requires a pull request that was created or updated during
+      # this run and is not closed unmerged.
+      type: pull_request_opened
+      # Any organisation, deliberately, where the remediation cases pin
+      # `gke-agentic`: this case is also run by hand against the dev install,
+      # whose GitOps repository is not under that organisation, and the
+      # question here is "this run's pull request", not "which org".
+      owner: ""
+  - name: the-second-revision-carries-the-dictated-subject
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The commit subject the prompt dictates, which only a second revision
+      # can carry. No `forbidden_phrases` for the second pull request the
+      # prompt forbids: `report_contains` is a normalised substring test with no
+      # notion of negation, and the prompt hands the worker the words, so a
+      # compliant report saying "no second pull request was opened" would fail
+      # the objective for having done exactly what was asked.
+      required_phrases:
+        - "eval: confirmed from the forge"
+      # Be clear about what the objective checks therefore do NOT see. Together
+      # they say: a real pull request this run wrote to, and a report naming
+      # the dictated subject. A worker that misread "review feedback" as a
+      # fresh change, cut a second branch, committed under the same subject and
+      # opened a second pull request passes both -- the second pull request is
+      # real and this run's too -- and passes the route check. Nothing
+      # objective here observes the one-pull-request half: `worker_commands`
+      # records only the first command of a compound block, so a second
+      # `prepare`/`submit` may not be in the log to forbid, and there is no
+      # fixture whose pull request the second revision could be required to
+      # land on -- the prompt's first paragraph is what opens it. That half is
+      # graded by the judge against `expected_output`, which names a second pull
+      # request or a second branch as a failure in so many words. The three
+      # green runs in the pull request that added this case were checked by
+      # hand against the forge (one pull request each, two revisions, eval PRs
+      # #196-#199 closed afterwards); the nightly relies on the judge.

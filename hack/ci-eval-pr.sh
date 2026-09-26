@@ -2226,6 +2226,13 @@ unit_cost_hint() {
     # the tofu cases; the hint stays at the presubmit measurement until the
     # presubmit record says otherwise.
     incident-triage-oom-event-probe) echo 700 ;;
+    # Nightly-only since this change (#1246 PR-2). Measured on
+    # `dev-vcs2-20260915a`: the resolver 1424s a repetition, the read-back
+    # 546-654s there and 683-982s in the later runs. The resolver is the most
+    # expensive unit in the nightly, so at the 200s default it launched in the
+    # last cost tier and was what the deadline truncated first.
+    vcs-issue-resolver-triage) echo 1400 ;;
+    vcs-review-feedback-read-back) echo 700 ;;
     # Nightly-only since #1840. Median of four clean dev-install repetitions
     # (710/710/735/1325s, 2026-09-23): the platform worker fans out to every
     # Cluster Agent profile in the fleet before the payments-api one reports.

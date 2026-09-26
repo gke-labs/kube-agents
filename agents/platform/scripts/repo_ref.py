@@ -206,10 +206,10 @@ def parse(value: object) -> RepoRef:
         # to the shorthand lift below. `file:///github.com/o/r` splits to an
         # empty host and a path whose first segment is a known host, so the
         # lift would read it as a GitHub remote; `file:///gitlab.com/g/p` would
-        # instead yield a hostless ref, which `forge.provider_for` maps to
-        # `GitHubProvider` by default -- the silent fallback this module exists
-        # to remove. The lift is for a bare `github.com/o/r`, and only the
-        # branch below produces one.
+        # instead yield a hostless ref, which `providers.registry.resolve`
+        # hands to the install's default forge -- the silent fallback this
+        # module exists to remove. The lift is for a bare `github.com/o/r`, and
+        # only the branch below produces one.
         if not host:
             raise RepoRefError(value)
     else:

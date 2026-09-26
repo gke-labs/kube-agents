@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The seven validators every forge's verbs run on their arguments.
+"""The eight validators every forge's verbs run on their arguments.
 
 Shared rather than per-forge because the thing being validated is the caller's
 request, not the forge's API. `limit` bounds a page because a listing nobody
@@ -85,6 +85,23 @@ def validate_limit(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise WorkspaceError("limit must be a positive number of items")
     return min(value, MAX_PAGE_SIZE)
+
+
+def validate_page(value: Any) -> int:
+    """Which page of a listing, counted from 1.
+
+    The listings that take it -- proposals and a proposal's commits -- are the
+    two a caller reads to the end: a sweep that misses the proposal past the
+    ceiling never answers it, and a claim checked against a commit list that
+    stops short of the tip is checked against the wrong list. `truncated: true`
+    on one page is the invitation to ask for the next. There is no ceiling on
+    the number here; the caller that walks pages decides how far it will go.
+    """
+    if value is None:
+        return 1
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise WorkspaceError("page must be a positive page number, counted from 1")
+    return value
 
 
 def validate_state(value: Any) -> str:

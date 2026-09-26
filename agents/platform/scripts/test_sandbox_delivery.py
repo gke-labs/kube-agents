@@ -22,13 +22,24 @@ Run: python3 agents/platform/scripts/test_sandbox_delivery.py
 from __future__ import annotations
 
 import ast
+import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "agents/platform/scripts"
+SKILL_SCRIPTS = REPO / "agents/platform/skills"
 DOCKERFILE = REPO / "deploy/sandbox/Dockerfile"
+
+# The second staging directory: root-owned, and the one the agent pod's crons
+# run over ssh. Everything else here is about what the *model* can run; this is
+# about what the trusted login runs, which must not be a file the model owns.
+TRUSTED_DIR = "/opt/vcs/libexec/platform"
 
 # Where an agent is told what to run. The cluster files are here because cluster
 # profiles run in the same pod as the platform agent and reach the same sandbox —
@@ -111,6 +122,117 @@ def stubbed_scripts() -> set[str]:
             r"agent-pod-only-stub\.py\s+(/opt/defaults/scripts/\S+)", text
         )
     }
+
+
+def forwarded_paths() -> dict[str, str]:
+    """Every script an agent-pod cron runs in the sandbox as `hermes`.
+
+    Imported rather than listed as strings so the test moves when the constant
+    does. A third crossing added later belongs here; nothing else in the suite
+    will notice it otherwise.
+    """
+    # resolver.py lives in its skill, not in `scripts/`, so its directory is not
+    # already on the path the way `forge`'s is.
+    sys.path.insert(0, str(SKILL_SCRIPTS / "github-issue-resolver/scripts"))
+    try:
+        import forge
+        import resolver
+    finally:
+        sys.path.pop(0)
+
+    return {
+        "forge": forge.SANDBOX_FORGE,
+        "resolver": resolver.SANDBOX_RESOLVER,
+    }
+
+
+# Where the agent pod's copy of a shared script looks for its siblings. Both are
+# chowned to `agent` at boot, so neither may be on the import path of the copy
+# the sandbox runs as `hermes`.
+AGENT_WRITABLE = ("/opt/data", "/opt/defaults")
+
+
+def staged_source(name: str) -> Path | None:
+    """The file in this checkout that the Dockerfile stages under `TRUSTED_DIR`."""
+    for path in (SCRIPTS / name, *SKILL_SCRIPTS.glob(f"*/scripts/{name}")):
+        if path.exists():
+            return path
+    return None
+
+
+# Imports every staged module as if it lived under the trusted directory, then
+# reports what is on `sys.path`. Run in a subprocess so this suite's own
+# interpreter is not the one whose path and module table get rewritten.
+#
+# The trick is the finder: each staged name is loaded from this checkout, but
+# with `__file__` set to its path under `TRUSTED_DIR`, which is the one thing
+# the guard in each of those modules reads. Every module in the closure has to
+# believe it, not only the entry point -- `resolver` importing a `vcs_client`
+# that thought it was in the checkout would append the agent-writable
+# directories on `vcs_client`'s behalf and the probe would blame the wrong file.
+PATH_PROBE = r"""
+import importlib, importlib.abc, importlib.machinery, importlib.util, json, sys
+STAGED, TRUSTED, WRITABLE = json.loads(sys.argv[1]), sys.argv[2], tuple(json.loads(sys.argv[3]))
+sys.dont_write_bytecode = True
+
+class Staged(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        real = STAGED.get(name)
+        if real is None:
+            return None
+        loader = importlib.machinery.SourceFileLoader(name, real)
+        spec = importlib.util.spec_from_loader(name, loader, origin=f"{TRUSTED}/{name}.py")
+        spec.has_location = True
+        return spec
+
+sys.meta_path.insert(0, Staged())
+report = {"failed": {}, "on_path": {}}
+for name in sorted(STAGED):
+    before = list(sys.path)
+    try:
+        importlib.import_module(name)
+    except Exception as error:  # noqa: BLE001 -- the report is the point
+        report["failed"][name] = repr(error)
+        continue
+    added = [entry for entry in sys.path if entry not in before]
+    bad = [entry for entry in added if entry.startswith(WRITABLE)]
+    if bad:
+        report["on_path"][name] = bad
+report["final"] = [entry for entry in sys.path if entry.startswith(WRITABLE)]
+print(json.dumps(report))
+"""
+
+
+def trusted_path_report() -> dict:
+    """What `sys.path` holds after every staged module has loaded as the trusted copy.
+
+    A behavioural check, not a pattern match. An earlier shape of this walked
+    the AST for `sys.path.append("/opt/data/...")` with a string literal, which
+    caught that spelling and nothing else: the same directory behind a named
+    constant -- the style AGENTS.md asks for -- or through `extend`, `+=` or a
+    slice assignment passed it untouched. Importing the modules and reading the
+    path is indifferent to how the entry got there.
+    """
+    staged = {}
+    for name in sorted(dockerfile_paths(TRUSTED_DIR)):
+        path = staged_source(name)
+        if path is not None and path.suffix == ".py":
+            staged[path.stem] = str(path)
+    done = subprocess.run(
+        [
+            sys.executable, "-c", PATH_PROBE,
+            json.dumps(staged), TRUSTED_DIR, json.dumps(list(AGENT_WRITABLE)),
+        ],
+        capture_output=True, text=True, check=False,
+        # The checkout's script directories, so a staged module's own import of
+        # an *unstaged* sibling still resolves -- the closure test beside this
+        # one is what says there are none; this one is about the path.
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(
+            [str(SCRIPTS), *(str(d) for d in SKILL_SCRIPTS.glob("*/scripts"))]
+        )},
+    )
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout.strip().splitlines()[-1])
 
 
 def local_imports(path: Path, universe: set[str]) -> set[str]:
@@ -211,6 +333,113 @@ class SandboxDelivery(unittest.TestCase):
             {k: sorted(v) for k, v in gaps.items()},
             "these skill scripts import shared modules the sandbox does not have",
         )
+
+    def test_every_forwarded_script_is_the_root_owned_copy(self):
+        """A cron forwards as `hermes`, so it must not run a file uid 1000 owns.
+
+        /opt/data is the agent's volume and an edit there survives until the next
+        restart -- the smoke test plants one deliberately. Forwarding to that copy
+        would run the model's code with the cron's credential.
+
+        Both entry points are checked, not just the first one found: forge.py's
+        hop was moved here and resolver.py's was left behind under /opt/data for
+        a review round, which is the failure this shape of test exists to stop
+        repeating.
+        """
+        staged = dockerfile_paths(TRUSTED_DIR)
+        for name, path in forwarded_paths().items():
+            with self.subTest(entry_point=name):
+                self.assertTrue(
+                    path.startswith(TRUSTED_DIR + "/"),
+                    f"the forwarded path {path} is not under {TRUSTED_DIR}",
+                )
+                self.assertIn(Path(path).name, staged)
+
+    def test_the_root_owned_copy_is_closed_under_import(self):
+        """A module missing here is not an error: it is found under /opt/data.
+
+        `sys.path[0]` is the script's own directory, so the fallback is silent
+        and it is the agent-owned copy -- the boundary gone with nothing to show
+        for it. deploy/sandbox/trusted-closure-guard.py catches this at build
+        time by reading `__file__` off what actually loaded; this catches it at
+        review time, on a tree nobody has to build.
+        """
+        staged = dockerfile_paths(TRUSTED_DIR)
+        universe = self.shared | {Path(p).name for p in forwarded_paths().values()}
+        seen: set[str] = set()
+        pending = {Path(p).name for p in forwarded_paths().values()}
+        while pending:
+            name = pending.pop()
+            seen.add(name)
+            for path in (SCRIPTS / name, *SKILL_SCRIPTS.glob(f"*/scripts/{name}")):
+                if path.exists():
+                    pending |= local_imports(path, universe) - seen
+                    break
+        self.assertEqual(
+            set(),
+            seen - staged,
+            f"these modules are imported by a forwarded script but not staged "
+            f"in {TRUSTED_DIR}",
+        )
+
+    def test_no_staged_script_puts_an_agent_writable_directory_on_its_path(self):
+        """Staging the closure root-owned is undone if the path reaches back out.
+
+        `/opt/defaults/scripts` and `/opt/data/scripts` are appended, so they are
+        reached only for a module nothing else supplies -- which is exactly the
+        module a closure gap leaves open, and exactly the file uid 1000 gets to
+        write. The build guard proves the closure is complete for what loads at
+        import time and, since the same review round, that nothing agent-writable
+        is left on the path for a deferred import to find; this is the same
+        property checked at review time, on a tree nobody has to build, by
+        loading every staged module as the trusted copy and reading `sys.path`.
+        """
+        report = trusted_path_report()
+        self.assertEqual(
+            {},
+            report["failed"],
+            "a staged module did not import as the trusted copy; the closure "
+            "test above should have named the missing sibling",
+        )
+        self.assertEqual(
+            {},
+            report["on_path"],
+            f"these are staged in {TRUSTED_DIR} and put an agent-writable "
+            "directory on sys.path when they load as the trusted copy; gate it on "
+            "the file's own location, the way vcs_client.py does",
+        )
+        self.assertEqual([], report["final"])
+
+    def test_the_path_probe_sees_a_module_that_reaches_back_out(self):
+        """The probe has to fail on the thing it exists to catch, or it proves nothing.
+
+        A named constant, not a literal -- the spelling the earlier AST walk
+        was blind to.
+        """
+        staged = {
+            path.stem: str(path)
+            for path in (staged_source(n) for n in dockerfile_paths(TRUSTED_DIR))
+            if path is not None and path.suffix == ".py"
+        }
+        with tempfile.TemporaryDirectory() as scratch:
+            leak = Path(scratch) / "leaky.py"
+            leak.write_text(
+                "import sys\nAGENT_SCRIPTS = '/opt/data/scripts'\n"
+                "sys.path.extend([AGENT_SCRIPTS])\n"
+            )
+            done = subprocess.run(
+                [
+                    sys.executable, "-c", PATH_PROBE,
+                    json.dumps({**staged, "leaky": str(leak)}), TRUSTED_DIR,
+                    json.dumps(list(AGENT_WRITABLE)),
+                ],
+                capture_output=True, text=True, check=True,
+                env={**os.environ, "PYTHONPATH": os.pathsep.join(
+                    [str(SCRIPTS), *(str(d) for d in SKILL_SCRIPTS.glob("*/scripts"))]
+                )},
+            )
+        report = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(report["on_path"], {"leaky": ["/opt/data/scripts"]})
 
     def test_nothing_baked_names_the_agent_images_interpreter(self):
         """`#!/opt/hermes/.venv/bin/python3` resolves in one image and not the other.

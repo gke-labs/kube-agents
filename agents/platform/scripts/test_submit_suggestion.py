@@ -8,17 +8,22 @@ path keeps the coverage without a third discovery step.
 Run:
   python3 -m unittest discover -s agents/platform/scripts -p 'test_submit_suggestion.py' -v
 
-Real git against a local bare repository throughout. A recorded runner would
-make most of this vacuous — `--force-with-lease` either refuses a diverged
-remote or it does not, and only a real push can tell you which.
+Real git against a local repository throughout, with the broker faked at the
+one seam the script has: `vcs_client.call`. A recorded runner on this side
+would make most of it vacuous — whether a second round extends a branch or
+diverges from it is a question only real objects answer — while a real broker
+would need a credential CI does not have. So the fake serves bundles out of a
+real repository and pushes them back into it, and the proposals it keeps are a
+table.
 """
 
-import dataclasses
+from __future__ import annotations
+
+import base64
 import importlib.util
 import io
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -26,33 +31,20 @@ import tempfile
 from unittest import mock
 import unittest
 from contextlib import redirect_stdout
+from itertools import count
 from pathlib import Path
-from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-import content_workspace  # noqa: E402
-import credential_proxy  # noqa: E402
-import credential_proxy_client  # noqa: E402
-
-
-@dataclasses.dataclass
-class GitResult:
-    """What the broker's `_git` reads off a run: an exit code, not a returncode."""
-
-    exit_code: int
-    stdout: str
-    stderr: str
 import gitops_workspace  # noqa: E402
+import vcs_client  # noqa: E402
+from providers import validate_branch  # noqa: E402
 
 SUBJECT = (
-    HERE.parent
-    / "skills"
-    / "submit-suggestion"
-    / "scripts"
-    / "submit_suggestion.py"
+    HERE.parent / "skills" / "submit-suggestion" / "scripts" / "submit_suggestion.py"
 )
+REAL_GIT = shutil.which("git") or "/usr/bin/git"
 
 
 def _load_subject():
@@ -64,1788 +56,1455 @@ def _load_subject():
 
 submit_suggestion = _load_subject()
 
+GIT_ENV = {
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@x",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@x",
+}
 
-def git(argv, cwd):
+
+def git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["git", *argv], cwd=str(cwd), check=True, capture_output=True, text=True
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=check,
+        env={**os.environ, **GIT_ENV},
     )
+
+
+class FakeBroker:
+    """A real repository on one side, a table of proposals on the other.
+
+    Faithful where the script can tell the difference: `clone` bundles from a
+    working copy the way the broker does, `publish` unbundles and pushes so the
+    next clone sees the branch, and the proposals answer in the neutral shape
+    with the forge's own vocabulary nowhere in them.
+    """
+
+    def __init__(self, origin: Path, scratch: Path):
+        self.origin = origin
+        self.scratch = scratch
+        # What the remote calls its default. The real broker reads it from the
+        # remote's HEAD, and a fleet whose trunk is not `main` is exactly the
+        # case the protected-branch list cannot cover.
+        self.default_branch = "main"
+        self.proposals: list[dict] = []
+        self.calls: list[tuple[str, dict]] = []
+        self.numbers = count(101)
+        self.serial = count()
+        self.create_fails_with: Exception | None = None
+        self.update_fails_with: Exception | None = None
+        self.identity_fails_with: Exception | None = None
+        # Who the credential authenticates as, which is what `proposal_create`
+        # records as the author. Set it to somebody else and the proposals this
+        # fake already holds become a stranger's.
+        self.viewer = "kube-agents"
+
+    def __call__(self, verb: str, payload: dict) -> dict:
+        self.calls.append((verb, dict(payload)))
+        return getattr(self, verb.replace("-", "_"))(payload)
+
+    def payloads(self, verb: str) -> list[dict]:
+        return [payload for seen, payload in self.calls if seen == verb]
+
+    # -- repository verbs ------------------------------------------------
+
+    def _serving_copy(self) -> Path:
+        work = self.scratch / f"serve-{next(self.serial)}"
+        git(self.scratch, "clone", "--quiet", str(self.origin), work.name)
+        return work
+
+    def clone(self, payload):
+        branch = payload.get("branch") or self.default_branch
+        work = self._serving_copy()
+        git(work, "checkout", "--quiet", "-B", branch, f"origin/{branch}")
+        bundle = work.parent / f"{work.name}.bundle"
+        git(work, "bundle", "create", str(bundle), "HEAD", branch)
+        blob = bundle.read_bytes()
+        return {
+            "forge": "local",
+            "repo": payload["repository"],
+            "branch": branch,
+            "revision": git(work, "rev-parse", "HEAD").stdout.strip(),
+            "size": len(blob),
+            "bundleBase64": base64.b64encode(blob).decode("ascii"),
+        }
+
+    def publish(self, payload):
+        branch = payload["branch"]
+        if payload.get("advance") and not [
+            proposal
+            for proposal in self.proposals
+            if proposal["state"] == "open" and proposal["source"] == branch
+        ]:
+            # `vcs_broker._require_open_proposal`, which runs on every
+            # `advance` publish: the flag says this copy was taken of a
+            # proposal branch in order to add to it, so a branch carrying no
+            # open proposal is refused before anything is pushed. Kept here
+            # because a fake that pushes anyway can prove a route the shipped
+            # broker refuses -- which it did, for a refusal whose advice was a
+            # dead end on the real thing.
+            raise vcs_client.VcsError(
+                f"`advance` says {branch} is a proposal branch this copy was "
+                "cloned in order to add to, but no open proposal on this "
+                "repository has it as its source.",
+                code="CLONED_BRANCH",
+            )
+        work = self._serving_copy()
+        bundle = work.parent / f"{work.name}.in.bundle"
+        bundle.write_bytes(base64.b64decode(payload["bundleBase64"]))
+        git(work, "fetch", "--quiet", str(bundle), f"refs/heads/{branch}:refs/heads/{branch}")
+        git(work, "push", "--quiet", "origin", f"refs/heads/{branch}:refs/heads/{branch}")
+        tip = git(work, "rev-parse", f"refs/heads/{branch}").stdout.strip()
+        return {"forge": "local", "repo": payload["repository"], "branch": branch, "revision": tip}
+
+    # -- collaboration verbs ---------------------------------------------
+
+    def identity(self, payload):
+        if self.identity_fails_with:
+            raise self.identity_fails_with
+        return {"identity": {"login": self.viewer, "canWrite": True}}
+
+    def proposal_list(self, payload):
+        found = [
+            proposal
+            for proposal in self.proposals
+            if payload.get("source") in (None, proposal["source"])
+            and payload.get("state", "open") in ("all", proposal["state"])
+            and payload.get("target") in (None, proposal["target"])
+        ]
+        return {"proposals": found, "count": len(found), "truncated": False}
+
+    def proposal_create(self, payload):
+        if self.create_fails_with:
+            raise self.create_fails_with
+        number = next(self.numbers)
+        proposal = {
+            "number": number,
+            "title": payload["title"],
+            "body": payload.get("body", ""),
+            "state": "open",
+            "draft": False,
+            "author": self.viewer,
+            "source": payload["source"],
+            # Where the branch is when the proposal is read, which is what
+            # `translate.proposal` reports as the forge does: the last
+            # revision the branch was at, merged or not.
+            "sourceRevision": self._tip(payload["source"]),
+            "target": payload["target"],
+            "url": f"https://forge.test/acme/infra/pull/{number}",
+            "created": "2026-09-15T00:00:00Z",
+            "updated": "2026-09-15T00:00:00Z",
+        }
+        self.proposals.append(proposal)
+        return {"proposal": proposal}
+
+    def proposal_update(self, payload):
+        if self.update_fails_with:
+            raise self.update_fails_with
+        for proposal in self.proposals:
+            if proposal["number"] == payload["number"]:
+                for field in ("title", "body"):
+                    if payload.get(field) is not None:
+                        proposal[field] = payload[field]
+                return {"proposal": proposal}
+        raise AssertionError(f"no proposal {payload['number']}")
+
+    def _tip(self, branch: str) -> str:
+        shown = git(self.origin, "rev-parse", f"refs/heads/{branch}", check=False)
+        return shown.stdout.strip() if shown.returncode == 0 else ""
 
 
 @unittest.skipIf(shutil.which("git") is None, "git is not on PATH")
 class SubmitSuggestionTestCase(unittest.TestCase):
-    """A real origin, a real clone, and `gh` stubbed at the module boundary."""
-
-    def patch_attr(self, target, name, value):
-        patcher = patch.object(target, name, value)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.tmp_path = Path(self.tmp.name)
-        self.root = self.tmp_path / "gitops"
-        self.origin = self.seed_origin()
+        base = Path(self.tmp.name)
 
-        # The token broker is a live sidecar in the pod and irrelevant here.
-        self.patch_attr(
-            submit_suggestion, "refresh_git_credentials", lambda repo=None: "t"
-        )
-        # Progress chatter on stderr, useful in the pod, noise in a test run.
-        self.patch_attr(submit_suggestion, "log", lambda msg: None)
+        self.origin = base / "origin"
+        self.origin.mkdir()
+        git(self.origin, "init", "--quiet", "--initial-branch=main")
+        (self.origin / "app.yaml").write_text("replicas: 1\n")
+        git(self.origin, "add", "-A")
+        git(self.origin, "commit", "--quiet", "-m", "seed")
 
-        # Everything resolves to the local bare repo instead of github.com.
-        real_resolve = gitops_workspace.resolve_repo
+        self.served = base / "served"
+        self.served.mkdir()
+        self.broker = FakeBroker(self.origin, self.served)
 
-        def local_resolve(workspace=None):
-            if workspace is not None:
-                return real_resolve(workspace=workspace)
-            return "acme/fleet"
-
-        self.patch_attr(gitops_workspace, "resolve_repo", local_resolve)
-        self.patch_attr(
-            gitops_workspace,
-            "get_managed_github_repos",
-            lambda: ["acme/fleet", "acme/secondary-repo"],
-        )
-        # The broker's write gate caches this list in a module global with a
-        # five-minute TTL, so without the reset a value another test warmed
-        # would decide the gate rather than the stub above.
-        credential_proxy._managed_repository_cache = None
-        self.addCleanup(
-            setattr, credential_proxy, "_managed_repository_cache", None
-        )
-        real_ensure = gitops_workspace.ensure_workspace
-
-        def local_ensure(repo, runner, **kwargs):
-            kwargs.setdefault("root", self.root)
-            kwargs["remote_url"] = str(self.origin)
-            return real_ensure(repo, runner, **kwargs)
-
-        self.patch_attr(gitops_workspace, "ensure_workspace", local_ensure)
-
-        env = patch.dict(
-            os.environ,
-            {
-                "HERMES_KANBAN_TASK": "t_card",
-                "HERMES_SESSION_ID": "",
-                "GITOPS_BASE_BRANCH": "",
-                # Directory mode, explicitly. `prepare` asks the broker whether
-                # it has content workspaces armed, and an inherited
-                # CREDENTIAL_PROXY_URL from the developer's shell would send
-                # that question somewhere real.
-                "CREDENTIAL_PROXY_URL": "",
-            },
-        )
-        env.start()
-        self.addCleanup(env.stop)
-        # Memoised per clone, and these clones live at per-test temp paths.
-        gitops_workspace.forget_base_branch()
-        self.addCleanup(gitops_workspace.forget_base_branch)
-
-        # `gh pr create` needs a GitHub. Record the call instead.
-        self.gh_calls = []
-        self.gh_stub = _GhStub(self)
-        self.patch_attr(submit_suggestion, "subprocess", self.gh_stub)
-
-        # `--body-file` is confined to the scratch directory, which on a test
-        # machine is not /opt/data/scratch. Point it at one this test owns —
-        # the confinement is what is under test, not the path it names.
-        self.scratch_dir = self.tmp_path / "body-scratch"
-        self.scratch_dir.mkdir()
-        self.patch_attr(submit_suggestion, "SCRATCH_DIR", str(self.scratch_dir))
-
-    def seed_origin(self, branch: str = "main", name: str | None = None) -> Path:
-        repo_name = name or (f"origin_{branch.replace('/', '_')}.git" if branch != "main" else "origin.git")
-        origin = self.tmp_path / repo_name
-        seed = self.tmp_path / f"seed_{branch.replace('/', '_')}"
-        seed.mkdir()
-        for cmd in (
-            ["git", "init", "--quiet", "--bare", f"--initial-branch={branch}", str(origin)],
-            ["git", "init", "--quiet", f"--initial-branch={branch}", str(seed)],
+        root = base / "vcs"
+        for attribute, value in (
+            ("ROOT", root),
+            ("SESSIONS", root / ".sessions"),
+            ("LOCAL_GIT", REAL_GIT),
+            ("call", self.broker),
         ):
-            subprocess.run(cmd, check=True, capture_output=True)
-        (seed / "README.md").write_text("seed\n" if branch == "main" else f"seed {branch}\n", encoding="utf-8")
-        for argv in (
-            ["config", "user.email", "t@example.com"],
-            ["config", "user.name", "T"],
-            ["add", "README.md"],
-            ["commit", "--quiet", "-m", f"seed {branch}"],
-            ["remote", "add", "origin", str(origin)],
-            ["push", "--quiet", "origin", branch],
+            patch = mock.patch.object(vcs_client, attribute, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+        self.scratch = base / "scratch"
+        self.scratch.mkdir()
+        patch = mock.patch.object(submit_suggestion, "SCRATCH_DIR", str(self.scratch))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+        self.logged: list[str] = []
+        patch = mock.patch.object(submit_suggestion, "log", self.logged.append)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+        for name, value in (
+            ("resolve_repo", lambda workspace=None: "acme/infra"),
+            ("get_managed_github_repos", lambda: []),
         ):
-            git(argv, seed)
-        return origin
+            patch = mock.patch.object(gitops_workspace, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
 
-    # -- helpers ---------------------------------------------------------- #
+    # -- helpers ----------------------------------------------------------
 
-    def prepare(self, branch="platform-agent/fix-netpol", lease=None, repo=None):
-        args = ["prepare", "--branch", branch]
-        if lease:
-            args += ["--lease", lease]
-        if repo:
-            args += ["--repo", repo]
-        out = io.StringIO()
-        with redirect_stdout(out):
-            submit_suggestion.dispatch(args)
-        return json.loads(out.getvalue())
+    def run_subject(self, *argv) -> tuple[int, str]:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = submit_suggestion.dispatch(list(argv))
+        return code, buffer.getvalue().strip()
 
-    def submit(
-        self,
-        branch,
-        workspace,
-        lease=None,
-        title="t",
-        body="b",
-        body_file=None,
-        keep_description=False,
-    ):
-        args = [
-            "submit",
-            "--branch", branch,
-            "--workspace", str(workspace),
-            "--repo", "acme/fleet",
-        ]
-        if title is not None:
-            args += ["--title", title]
-        if body_file is not None:
-            args += ["--body-file", str(body_file)]
-        elif body is not None:
-            args += ["--body", body]
-        if keep_description:
-            args.append("--keep-description")
-        if lease:
-            args += ["--lease", lease]
-        out = io.StringIO()
-        with redirect_stdout(out):
-            submit_suggestion.dispatch(args)
-        return out.getvalue().strip()
+    def prepare(self, branch="platform-agent/scale-web", **extra) -> dict:
+        argv = ["prepare", "--branch", branch]
+        for flag, value in extra.items():
+            argv += [f"--{flag.replace('_', '-')}"] + ([] if value is True else [str(value)])
+        _, out = self.run_subject(*argv)
+        return json.loads(out)
 
-    def commit(self, workspace, name="clusters/prod/netpol.yaml"):
-        path = Path(workspace) / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("kind: NetworkPolicy\n", encoding="utf-8")
-        git(["add", name], workspace)
-        git(["commit", "--quiet", "-m", "add netpol"], workspace)
+    def edit(self, prepared: dict, text: str = "replicas: 3\n") -> None:
+        (Path(prepared["workspace"]) / "app.yaml").write_text(text)
 
-    def origin_git(self, argv):
-        """Inspect the bare origin.
+    def body_file(self, text: str = "why this change\n") -> str:
+        path = self.scratch / "body.md"
+        path.write_text(text)
+        return str(path)
 
-        `--git-dir` rather than `cwd`: a developer with
-        `safe.bareRepository = explicit` in their global config — the hardening
-        git ships as a recommendation — gets exit 128 for the cwd form.
+    def remote_branches(self) -> list[str]:
+        listing = git(self.origin, "branch", "--format=%(refname:short)")
+        return listing.stdout.split()
+
+    def existing_proposal(self, branch: str, target: str = "main", **fields) -> dict:
+        return self.broker.proposal_create(
+            {"title": "under review", "body": "somebody else wrote this", "source": branch, "target": target, **fields}
+        )["proposal"]
+
+    # -- prepare ----------------------------------------------------------
+
+    def test_prepare_cuts_a_new_branch_from_the_base(self):
+        prepared = self.prepare()
+        self.assertEqual(prepared["repo"], "acme/infra")
+        self.assertEqual(prepared["branch"], "platform-agent/scale-web")
+        self.assertEqual(prepared["base"], "main")
+        self.assertEqual(prepared["started_from"], "main")
+        self.assertEqual(prepared["proposal"], "")
+        copy = Path(prepared["workspace"])
+        self.assertTrue((copy / "app.yaml").is_file())
+        self.assertEqual(
+            git(copy, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
+            "platform-agent/scale-web",
+        )
+
+    def test_prepare_leaves_nothing_behind_when_it_refuses_the_name(self):
+        """The refusal says to use another name, so this one must be free to retry.
+
+        The copy has to come down before the spent-branch question can be
+        answered -- it is a question about the copy. Keeping it after the
+        refusal left a tree and a session record under the very name the caller
+        was just told to stop using, and the next `prepare` of it refused for
+        having found a copy instead.
         """
-        out = subprocess.run(
-            ["git", f"--git-dir={self.origin}", *argv],
-            check=True, capture_output=True, text=True,
+        branch = "platform-agent/scale-web"
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        (self.origin / "app.yaml").write_text("replicas: 9\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one")
+        git(self.origin, "checkout", "--quiet", "main")
+        (self.origin / "app.yaml").write_text("replicas: 7\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one, squashed")
+        self.existing_proposal(branch)["state"] = "merged"
+        for proposal in self.broker.proposals:
+            proposal["state"] = "merged"
+
+        with self.assertRaises(ValueError):
+            self.prepare(branch)
+        self.assertEqual(list(vcs_client.ROOT.glob("*/.git")), [])
+        with self.assertRaises(vcs_client.VcsError):
+            vcs_client.resolve_session("acme/infra", key=branch)
+        # And the name works on the next attempt, which is what the refusal
+        # told the caller to do -- with the flag, since the branch is genuinely
+        # still there.
+        self.assertEqual(self.prepare(branch, allow_reused_branch=True)["branch"], branch)
+
+    def test_prepare_takes_a_copy_of_a_branch_that_already_has_a_proposal(self):
+        # Step 5 of the SKILL: another round on a proposal under review. The
+        # branch's own revisions have to come down with it -- cutting it afresh
+        # from the base is what replaced every reviewed revision.
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        self.run_subject("submit", "--branch", branch, "--title", "first round", "--body", "b")
+        reviewed = git(self.origin, "rev-parse", f"refs/heads/{branch}").stdout.strip()
+
+        again = self.prepare(branch, force=True)
+        self.assertEqual(again["started_from"], branch)
+        self.assertEqual(again["base"], "main")
+        self.assertTrue(again["proposal"].endswith("/101"))
+        self.assertEqual(
+            git(Path(again["workspace"]), "rev-parse", "HEAD").stdout.strip(), reviewed
         )
-        return out.stdout
 
-    def origin_branches(self):
-        return self.origin_git(["branch", "--format=%(refname:short)"]).split()
+    def test_prepare_refuses_a_branch_whose_open_proposal_is_somebody_elses(self):
+        """The refusal the broker makes at `publish`, made before the work.
 
+        `prepare` reads an open proposal on the branch as "this run is adding
+        to it" and never asked whose it was; `publish --advance` is then
+        refused `CLONED_BRANCH` by the broker because the author is not this
+        credential. Between them the whole turn is written into a copy of
+        somebody else's branch and thrown away at the end of it. Reachable
+        because branch names here are derived, so a human can have opened a
+        pull request from one.
+        """
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        self.run_subject("submit", "--branch", branch, "--title", "first round", "--body", "b")
+        # The same branch, the same open proposal -- and now the credential is
+        # somebody else, which is the collision seen from this side.
+        self.broker.viewer = "a-colleague"
 
-# --------------------------------------------------------------------------- #
-# Branch names the skill must never touch
-# --------------------------------------------------------------------------- #
+        cloned = len(self.broker.payloads("clone"))
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("prepare", "--branch", branch, "--force")
+        self.assertIn("a-colleague", str(caught.exception))
+        self.assertIn("kube-agents", str(caught.exception))
+        self.assertIn("branch name of your own", str(caught.exception))
+        # And it stopped before the copy: nothing was cloned for this call.
+        self.assertEqual(len(self.broker.payloads("clone")), cloned)
 
+    def test_prepare_still_adds_to_the_install_s_own_proposal_under_another_spelling(self):
+        """`kube-agents[bot]` and `kube-agents` are one account.
 
-class TestCheckBranch(unittest.TestCase):
-    def test_a_protected_branch_is_refused(self):
-        for branch in ("main", "master", "production", "MAIN", " main "):
-            with self.subTest(branch=branch):
-                with self.assertRaises(ValueError) as caught:
-                    submit_suggestion.check_branch(branch)
-                self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+        The provider strips an automation's marking off every author it emits
+        and the credential store keeps it, so the raw comparison makes an
+        install a stranger to its own proposals and refuses every second round
+        on an App-authenticated install -- which is all of them.
+        """
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        self.run_subject("submit", "--branch", branch, "--title", "first round", "--body", "b")
+        self.broker.viewer = "kube-agents[bot]"
 
-    def test_a_protected_branch_is_refused_through_a_ref_prefix(self):
-        # "refs/heads/main".lower() is not in PROTECTED_BRANCHES, but pushing
-        # it moves main all the same. The check must compare the short name,
-        # whatever form the caller used.
-        for branch in ("refs/heads/main", "refs/heads/MASTER", "REFS/HEADS/production"):
-            with self.subTest(branch=branch):
-                with self.assertRaises(ValueError) as caught:
-                    submit_suggestion.check_branch(branch)
-                self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+        again = self.prepare(branch, force=True)
+        self.assertEqual(again["started_from"], branch)
 
-    def test_an_empty_branch_is_refused_before_the_protected_list(self):
-        # `"".lower() in PROTECTED_BRANCHES` is False, so an empty name would
-        # otherwise sail through and push whatever HEAD happens to be.
+    def test_the_marking_rule_is_the_broker_s_and_not_a_narrower_copy(self):
+        """Any bracketed suffix, because that is what `vcs_broker._login_key` folds.
+
+        This side cannot import the broker, so the rule is restated -- and a
+        restatement that is narrower is worse than none: the broker would
+        accept the `advance` while this side refuses the round outright, and
+        which of the two answers the agent gets would depend on how the forge
+        happens to spell its automations.
+        """
+        self.assertEqual(
+            submit_suggestion._login_key("kube-agents[bot]"),
+            submit_suggestion._login_key("Kube-Agents"),
+        )
+        for marking in ("[bot]", "[app]", "[BOT]", "[service account]"):
+            with self.subTest(marking=marking):
+                self.assertEqual(
+                    submit_suggestion._login_key(f"kube-agents{marking}"),
+                    "kube-agents",
+                )
+        # Not a suffix, so not a marking: two accounts stay two.
+        self.assertNotEqual(
+            submit_suggestion._login_key("kube-agents[bot]-staging"),
+            submit_suggestion._login_key("kube-agents"),
+        )
+
+    def test_prepare_refuses_a_branch_name_whose_squash_merged_branch_is_still_there(self):
+        """The reuse the docstring promises, on the forge default that breaks it.
+
+        Squash-merge leaves the source branch on the remote at a revision the
+        base does not contain, so a branch cut fresh from the base does not
+        build on it and `publish` is refused as `BRANCH_DIVERGED` -- after the
+        agent has written the whole change. Refused here instead, where the
+        fault is and before the work.
+        """
+        branch = "platform-agent/scale-web"
+        # The first round: a branch with a commit on it, and a proposal that is
+        # then squash-merged -- the content lands on main as a new revision and
+        # the branch is left where it was.
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one")
+        git(self.origin, "checkout", "--quiet", "main")
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one, squashed")
+        merged = self.existing_proposal(branch)
+        merged["state"] = "merged"
+
+        with self.assertRaises(ValueError) as caught:
+            self.prepare(branch)
+        message = str(caught.exception)
+        self.assertIn("BRANCH_DIVERGED", message)
+        self.assertIn(merged["url"], message)
+        self.assertIn("has not used", message)
+        # The revision named is the one the remote's branch is actually at.
+        self.assertIn(merged["sourceRevision"][:12], message)
+
+    def test_a_repository_that_deletes_merged_branches_can_reuse_the_name(self):
+        """The refusal above is right only while the remote still holds the branch.
+
+        GitHub's "automatically delete head branches" is on in plenty of
+        repositories, and there it deletes the branch as it squash-merges. The
+        name is then free, `publish` would create it and succeed, and the check
+        cannot tell the two cases apart: no read verb in the vocabulary reports
+        whether a branch exists. So the caller says which it is, and is told
+        what it is being trusted about.
+        """
+        branch = "platform-agent/scale-web"
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one")
+        git(self.origin, "checkout", "--quiet", "main")
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one, squashed")
+        merged = self.existing_proposal(branch)
+        merged["state"] = "merged"
+        # What deleting the head branch looks like from here: the remote no
+        # longer has it, and the revision it was at is still unreachable from
+        # the base, so `stale_tip` answers exactly as it does above.
+        git(self.origin, "branch", "--quiet", "-D", branch)
+
+        prepared = self.prepare(branch, allow_reused_branch=True)
+
+        self.assertEqual(prepared["branch"], branch)
+        standing = git(Path(prepared["workspace"]), "rev-parse", "--abbrev-ref", "HEAD")
+        self.assertEqual(standing.stdout.strip(), branch)
+        # Trusted, not silently. If the caller was wrong, this line is what
+        # makes the BRANCH_DIVERGED at the end of the turn legible.
+        said = "\n".join(self.logged)
+        self.assertIn("BRANCH_DIVERGED", said)
+        self.assertIn(merged["url"], said)
+
+    def test_prepare_names_the_real_tip_of_a_long_spent_branch(self):
+        """The tip is the proposal's `sourceRevision`, not the last commit of a page.
+
+        `proposal-commits` is oldest first and bounded, so for a proposal past
+        the page its last entry was an old revision -- one the base may well
+        contain while the real tip is not. Six commits, then a squash-merge:
+        the refusal has to name the sixth, and it has to refuse at all.
+        """
+        branch = "platform-agent/scale-web"
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        for n in range(6):
+            (self.origin / "app.yaml").write_text(f"replicas: {n + 2}\n")
+            git(self.origin, "commit", "--quiet", "-am", f"round one, step {n}")
+        tip = git(self.origin, "rev-parse", "HEAD").stdout.strip()
+        git(self.origin, "checkout", "--quiet", "main")
+        (self.origin / "app.yaml").write_text("replicas: 7\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one, squashed")
+        merged = self.existing_proposal(branch)
+        merged["state"] = "merged"
+
+        with self.assertRaises(ValueError) as caught:
+            self.prepare(branch)
+        self.assertIn(tip[:12], str(caught.exception))
+        # Answered off the proposal itself. Asserting the whole sequence and
+        # not the absence of one verb: `submit_suggestion` issues no
+        # `proposal-commits` on any path, so a check for that alone passes
+        # however many calls `prepare` makes.
+        self.assertEqual(
+            [verb for verb, _ in self.broker.calls],
+            ["proposal-list", "proposal-list", "clone"],
+        )
+
+    def test_prepare_reuses_a_name_whose_branch_was_merged_whole(self):
+        """The case that works, and it must keep working.
+
+        A proposal merged with a merge commit leaves its tip reachable from the
+        base, so a fresh cut descends from what the remote holds and `publish`
+        fast-forwards it. Refusing here on the mere existence of a spent
+        proposal would stop the reuse the naming convention is built on.
+
+        The accepting direction of the `merge-base` check, and the test has to
+        show the check ran: an earlier shape of this test passed because the
+        fake answered an empty commit list and `stale_tip` returned before
+        comparing anything.
+        """
+        branch = "platform-agent/scale-web"
+        git(self.origin, "checkout", "--quiet", "-b", branch)
+        (self.origin / "app.yaml").write_text("replicas: 2\n")
+        git(self.origin, "commit", "--quiet", "-am", "round one")
+        tip = git(self.origin, "rev-parse", "HEAD").stdout.strip()
+        git(self.origin, "checkout", "--quiet", "main")
+        git(self.origin, "merge", "--quiet", "--no-ff", "-m", "merge round one", branch)
+        merged = self.existing_proposal(branch)
+        merged["state"] = "merged"
+
+        with mock.patch.object(
+            submit_suggestion.vcs_client, "local", wraps=vcs_client.local
+        ) as local:
+            prepared = self.prepare(branch)
+        self.assertEqual(prepared["branch"], branch)
+        self.assertEqual(prepared["base"], "main")
+        compared = [
+            call.args[1] for call in local.call_args_list
+            if call.args[1][:2] == ["merge-base", "--is-ancestor"]
+        ]
+        self.assertEqual(compared, [["merge-base", "--is-ancestor", tip, "HEAD"]])
+
+    def test_prepare_is_unbothered_by_a_name_nobody_has_used(self):
+        """The ordinary card, and the one the extra lookup must not cost anything.
+
+        One `proposal-list` for the open proposal, one for the name's history,
+        and nothing else across the seam. The open-proposal lookup is the first
+        of the two -- it decides which arm `prepare` takes -- and the
+        spent-name lookup is the second, which is the whole of what the check
+        added here.
+        """
+        self.prepare()
+        self.assertEqual(
+            [verb for verb, _ in self.broker.calls],
+            ["proposal-list", "proposal-list", "clone"],
+        )
+
+    def test_prepare_reads_the_base_off_the_open_proposal_not_the_default_branch(self):
+        git(self.origin, "checkout", "--quiet", "-b", "release")
+        git(self.origin, "checkout", "--quiet", "main")
+        branch = "platform-agent/scale-web"
+        self.existing_proposal(branch, target="release")
+        git(self.origin, "branch", branch, "main")
+        self.assertEqual(self.prepare(branch)["base"], "release")
+
+    def test_check_branch_refuses_an_empty_name_before_the_protected_list(self):
+        # `--branch ""` and `--branch "  "` reach here as a falsy name. Without
+        # this arm `_short_branch("")` is "", which is in no protected set, and
+        # the empty name goes on to be a directory key and a `switch --create`.
         for branch in ("", "   ", None):
             with self.subTest(branch=branch):
                 with self.assertRaises(ValueError) as caught:
                     submit_suggestion.check_branch(branch)
                 self.assertIn("must not be empty", str(caught.exception))
 
-    def test_a_suggestion_branch_passes_and_is_trimmed(self):
+    def test_check_branch_refuses_the_standing_protected_names(self):
+        # The list that needs no environment to be set, and the `refs/heads/`
+        # and `heads/` spellings of it -- a caller that passes a full ref would
+        # otherwise walk straight past a set holding only the short names.
+        for name in submit_suggestion.PROTECTED_BRANCHES:
+            for branch in (name, f"refs/heads/{name}", f"heads/{name}"):
+                with self.subTest(branch=branch):
+                    with self.assertRaises(ValueError) as caught:
+                        submit_suggestion.check_branch(branch)
+                    self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+
+    def test_check_branch_accepts_a_suggestion_branch_and_hands_back_a_trimmed_name(self):
+        # The accepting direction, and the return value: every caller uses what
+        # comes back rather than what it passed in, so the trim is load-bearing.
         self.assertEqual(
-            submit_suggestion.check_branch("  platform-agent/fix  "),
-            "platform-agent/fix",
+            submit_suggestion.check_branch("  platform-agent/scale-web  "),
+            "platform-agent/scale-web",
         )
 
-    def test_configured_gitops_base_branch_is_refused(self):
-        with mock.patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "custom-gitops-base"}):
+    def test_check_branch_refuses_a_run_branch(self):
+        # `run/**` is the harness's own namespace. A suggestion pushed there is
+        # not reviewed by anyone; it is picked up as if a run had produced it.
+        for branch in ("run/nightly", "refs/heads/run/1234", "RUN/Loud"):
             with self.assertRaises(ValueError) as caught:
-                submit_suggestion.check_branch("custom-gitops-base")
-            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
-            with self.assertRaises(ValueError) as caught:
-                submit_suggestion.check_branch("refs/heads/custom-gitops-base")
-            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
-
-        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-cred-base"}):
-            with self.assertRaises(ValueError) as caught:
-                submit_suggestion.check_branch("custom-cred-base")
-            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
-            with self.assertRaises(ValueError) as caught:
-                submit_suggestion.check_branch("heads/custom-cred-base")
+                submit_suggestion.check_branch(branch)
             self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
 
-    def test_explicit_base_branch_is_refused(self):
+    def test_check_branch_refuses_the_configured_base_branch(self):
+        # A fleet that renamed its trunk says so in one of these two, and the
+        # list of three would otherwise wave the rename straight through.
+        for variable in ("GITOPS_BASE_BRANCH", "CREDENTIAL_PROXY_BASE_BRANCH"):
+            with mock.patch.dict(os.environ, {variable: "custom-trunk"}):
+                for branch in ("custom-trunk", "refs/heads/custom-trunk", "heads/custom-trunk"):
+                    with self.assertRaises(ValueError) as caught:
+                        submit_suggestion.check_branch(branch)
+                    self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+
+    def test_check_branch_refuses_a_base_branch_passed_in(self):
         with self.assertRaises(ValueError) as caught:
             submit_suggestion.check_branch("custom-base", base_branch="custom-base")
         self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+        self.assertEqual(
+            submit_suggestion.check_branch("platform-agent/x", base_branch="custom-base"),
+            "platform-agent/x",
+        )
+
+    def test_prepare_refuses_a_protected_branch(self):
+        for branch in ("main", "MASTER", "refs/heads/production"):
+            with self.assertRaises(ValueError) as caught:
+                self.run_subject("prepare", "--branch", branch)
+            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+        self.assertEqual(self.broker.calls, [])
+
+    def test_prepare_refuses_the_branch_it_would_be_proposing_onto(self):
+        # The list of three cannot name a fleet's own trunk. This is the guard
+        # that can: the base comes back from the broker's clone, so a repository
+        # whose default branch is `trunk` refuses `--branch trunk` here rather
+        # than at the push.
+        git(self.origin, "branch", "trunk", "main")
+        self.broker.default_branch = "trunk"
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("prepare", "--branch", "trunk")
+        self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+        self.assertIn("same as the base branch", str(caught.exception))
+
+    def test_prepare_refuses_a_name_git_will_not_take_as_a_branch(self):
+        """The guard on the switch's exit status, reached without a mock.
+
+        `check_branch` validates the protected-name list, not git's ref syntax,
+        so a name git will not take gets past it, the clone happens, and `git
+        switch --create` exits 128. `branch` reports that rather than raising,
+        so without the guard `prepare` prints a JSON line naming a branch the
+        copy is not standing on and the whole turn is spent editing the base.
+
+        The names are chosen to reach that guard against the real broker and
+        not only this fake. A space, `..` or a trailing `.lock` would not: the
+        GitHub provider runs `validate_branch` over the `source` of the
+        `proposal-list` that `open_proposal` sends first, and refuses all three
+        there, before anything is cloned. `BRANCH_RE` is a character class, so
+        a name whose characters it allows can still be one git rejects for
+        where they sit -- a trailing separator, an empty component, a component
+        ending in a dot. Those are the ones below, and the assertion that they
+        clear `validate_branch` is what keeps them that way.
+        """
+        for branch in (
+            "platform-agent/x/",
+            "platform-agent/a//b",
+            "platform-agent/x.",
+        ):
+            with self.subTest(branch=branch):
+                self.assertEqual(validate_branch(branch), branch)
+                with self.assertRaises(vcs_client.VcsError) as caught:
+                    self.run_subject("prepare", "--branch", branch)
+                self.assertIn("could not take the branch", str(caught.exception))
+                self.assertEqual(self.broker.payloads("publish"), [])
+
+    def test_prepare_refuses_a_repository_outside_the_managed_list(self):
+        with mock.patch.object(
+            gitops_workspace, "get_managed_github_repos", lambda: ["acme/infra"]
+        ):
+            with self.assertRaises(ValueError) as caught:
+                self.run_subject("prepare", "--branch", "b", "--repo", "other/elsewhere")
+        self.assertIn("not in the managed repositories list", str(caught.exception))
+        self.assertEqual(self.broker.calls, [])
+
+    def test_prepare_is_refused_when_the_managed_list_cannot_be_read(self):
+        # Fail-closed, and pinned here because nothing else would go red if
+        # `validate_repo` were ever taught to read a failed ConfigMap read as an
+        # empty allowlist -- after which every `--repo` the model names is
+        # accepted whenever that read hiccups, and the suite stays green.
+        with mock.patch.object(
+            gitops_workspace, "get_managed_github_repos",
+            mock.Mock(side_effect=RuntimeError("ConfigMap missing")),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.run_subject("prepare", "--branch", "b")
+        self.assertEqual(self.broker.calls, [])
+
+    def test_prepare_honours_repo_over_the_resolved_default(self):
+        self.prepare(repo="acme/other")
+        self.assertEqual(self.broker.payloads("clone")[0]["repository"], "acme/other")
+
+    def test_prepare_refuses_to_replace_a_copy_holding_unpublished_work(self):
+        branch = "platform-agent/scale-web"
+        prepared = self.prepare(branch)
+        self.edit(prepared)
+        vcs_client.commit("not yet published", ["app.yaml"], spec="acme/infra")
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            self.run_subject("prepare", "--branch", branch)
+        self.assertIn("unpublished revision", str(caught.exception))
+        # And `--force` is the way past it, named in the refusal itself.
+        self.assertIn("--force", str(caught.exception))
+        self.prepare(branch, force=True)
+
+    def test_two_cards_on_one_repository_get_two_working_copies(self):
+        # The scratch root is shared by every card in this container. Keyed on
+        # the repository alone, the second card's `prepare` either refused or,
+        # with `--force`, deleted the first card's unpublished work.
+        first = self.prepare("platform-agent/scale-web")
+        self.edit(first, "replicas: 3\n")
+        vcs_client.commit("first card", ["app.yaml"], spec="acme/infra")
+
+        second = self.prepare("platform-agent/other")
+        self.assertNotEqual(second["workspace"], first["workspace"])
+        self.edit(second, "replicas: 9\n")
+
+        # Neither card can see the other's work, and the first one's revision
+        # is still there to publish.
+        self.assertEqual((Path(first["workspace"]) / "app.yaml").read_text(), "replicas: 3\n")
+        self.assertEqual(
+            git(Path(first["workspace"]), "log", "-1", "--format=%s").stdout.strip(),
+            "first card",
+        )
+        self.assertEqual(
+            git(Path(second["workspace"]), "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
+            "platform-agent/other",
+        )
+
+    def test_submit_sends_the_copy_keyed_on_the_branch_it_names(self):
+        # Two copies of one repository, and `--repo` names both. The branch is
+        # what tells them apart: submitting the second card's change must not
+        # publish the first card's.
+        first = self.prepare("platform-agent/scale-web")
+        self.edit(first, "replicas: 3\n")
+        second = self.prepare("platform-agent/other")
+        self.edit(second, "replicas: 9\n")
+
+        self.run_subject(
+            "submit", "--branch", "platform-agent/other",
+            "--repo", "acme/infra", "--title", "t", "--body", "b",
+        )
+        self.assertIn("platform-agent/other", self.remote_branches())
+        self.assertNotIn("platform-agent/scale-web", self.remote_branches())
+
+    # -- submit -----------------------------------------------------------
+
+    def test_submit_publishes_the_branch_and_opens_the_proposal(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        code, out = self.run_subject(
+            "submit",
+            "--branch", "platform-agent/scale-web",
+            "--title", "fix(capacity): raise the replica floor",
+            "--body-file", self.body_file(),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "https://forge.test/acme/infra/pull/101")
+        self.assertIn("platform-agent/scale-web", self.remote_branches())
+        created = self.broker.payloads("proposal-create")[0]
+        self.assertEqual(created["source"], "platform-agent/scale-web")
+        self.assertEqual(created["target"], "main")
+        self.assertEqual(created["body"], "why this change\n")
+        # The commit is the change, not the whole tree of the container.
+        published = self.broker.payloads("publish")[0]
+        self.assertEqual(published["target"], "main")
+        self.assertIs(published["advance"], False)
+
+    def test_submit_is_refused_when_the_managed_list_cannot_be_read(self):
+        # The same gate on the way out. A copy already prepared is not a repository
+        # already cleared: the allowlist is re-read, and a read that raises refuses.
+        prepared = self.prepare()
+        self.edit(prepared)
+        with mock.patch.object(
+            gitops_workspace, "get_managed_github_repos",
+            mock.Mock(side_effect=RuntimeError("ConfigMap missing")),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.run_subject(
+                    "submit", "--branch", "platform-agent/scale-web",
+                    "--title", "t", "--body", "b",
+                )
+        self.assertNotIn("platform-agent/scale-web", self.remote_branches())
+
+    def test_a_second_round_updates_the_proposal_instead_of_failing_to_open_one(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject("submit", "--branch", "platform-agent/scale-web", "--title", "first", "--body", "one")
+        again = self.prepare("platform-agent/scale-web", force=True)
+        self.edit(again, "replicas: 5\n")
+        _, out = self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "second", "--body", "two"
+        )
+        self.assertEqual(out, "https://forge.test/acme/infra/pull/101")
+        self.assertEqual(len(self.broker.payloads("proposal-create")), 1)
+        self.assertEqual(self.broker.proposals[0]["title"], "second")
+        self.assertEqual(self.broker.proposals[0]["body"], "two")
+        # The branch was extended rather than replaced: both revisions are on it.
+        log = git(self.origin, "log", "--format=%s", "refs/heads/platform-agent/scale-web")
+        self.assertEqual(log.stdout.split("\n")[:2], ["second", "first"])
+
+    def test_the_second_round_tells_the_broker_it_means_to_extend_the_branch(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject("submit", "--branch", "platform-agent/scale-web", "--title", "first", "--body", "one")
+        again = self.prepare("platform-agent/scale-web", force=True)
+        self.edit(again, "replicas: 5\n")
+        self.run_subject("submit", "--branch", "platform-agent/scale-web", "--title", "second", "--body", "two")
+        self.assertTrue(self.broker.payloads("publish")[1]["advance"])
+        self.assertEqual(self.broker.payloads("publish")[1]["clonedFrom"], "platform-agent/scale-web")
+
+    def test_keep_description_leaves_the_body_alone_and_still_publishes(self):
+        branch = "platform-agent/scale-web"
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject("submit", "--branch", branch, "--title", "first", "--body", "one")
+        again = self.prepare(branch, force=True)
+        self.edit(again, "replicas: 7\n")
+        _, out = self.run_subject(
+            "submit", "--branch", branch, "--title", "a merge commit", "--keep-description"
+        )
+        self.assertEqual(out, "https://forge.test/acme/infra/pull/101")
+        self.assertEqual(self.broker.proposals[0]["title"], "first")
+        self.assertEqual(self.broker.proposals[0]["body"], "one")
+        self.assertEqual(self.broker.payloads("proposal-update"), [])
+        self.assertEqual(len(self.broker.payloads("publish")), 2)
+        # Both halves of what the notice now claims: the title did not reach
+        # the proposal, and it is still what the pending edit was recorded
+        # under. The earlier wording said "ignored", which was false here.
+        self.assertTrue(
+            any("does not reach the proposal" in line for line in self.logged)
+        )
+        self.assertTrue(
+            any("commit message" in line for line in self.logged)
+        )
+
+    def test_keep_description_with_no_open_proposal_refuses_before_publishing(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web", "--keep-description"
+            )
+        self.assertIn("no proposal is open", str(caught.exception))
+        self.assertEqual(self.broker.payloads("publish"), [])
+        self.assertNotIn("platform-agent/scale-web", self.remote_branches())
+
+    def test_submit_refuses_a_copy_standing_on_another_branch(self):
+        """And does not offer that branch: the copy is not this caller's.
+
+        Nothing is keyed on the branch asked for, so the copy came from the
+        keyless fallback and the scratch root is shared -- it is whichever
+        single copy of the repository is here, which on a pod running two
+        cards is the sibling card's, mid-edit. "Pass the branch you are
+        actually on" would have this caller commit those edits under its own
+        title and open a pull request for them, so the refusal names the
+        branch as somebody else's and sends the caller to `prepare`.
+        """
+        prepared = self.prepare()
+        self.edit(prepared)
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("submit", "--branch", "platform-agent/something-else", "--title", "t", "--body", "b")
+        said = str(caught.exception)
+        self.assertIn("is on branch 'platform-agent/scale-web'", said)
+        self.assertIn("was taken for 'platform-agent/scale-web'", said)
+        self.assertIn("prepare --branch platform-agent/something-else", said)
+        self.assertNotIn("pass the branch you are actually on", said)
+        self.assertEqual(self.broker.payloads("publish"), [])
+        # And the sibling's edits are still uncommitted, where it left them.
+        self.assertEqual(git(Path(prepared["workspace"]), "status", "--porcelain").stdout.split(), ["M", "app.yaml"])
+
+    def test_submit_inside_the_callers_own_copy_still_offers_the_branch_it_is_on(self):
+        """The keyed lookup answered, so the other branch is the caller's too.
+
+        `prepare --branch A` then a hand-cut B inside that tree: A still names
+        the copy, so `submit --branch A` finds it by key and the branch it is
+        standing on is one this caller cut. Here the shorter advice is right,
+        and it is the advice the refusal above has to withhold.
+        """
+        prepared = self.prepare()
+        git(Path(prepared["workspace"]), "checkout", "--quiet", "-b", "platform-agent/second-thought")
+        self.edit(prepared)
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b")
+        said = str(caught.exception)
+        self.assertIn("is on branch 'platform-agent/second-thought'", said)
+        self.assertIn("pass the branch you are actually on", said)
+        self.assertEqual(self.broker.payloads("publish"), [])
+
+    def test_submit_finds_a_copy_whose_key_is_not_the_branch_it_is_standing_on(self):
+        """The fallback lookup has a proceed path, and it used to end in "no local copy".
+
+        `prepare --branch A` keys the copy on A. An agent that then cuts B
+        inside that tree and submits B resolves through the keyless fallback,
+        gets past the "you are on another branch" check because it is standing
+        on B -- and then `commit` and `publish` asked for the copy keyed on B,
+        which is the lookup that had already failed.
+        """
+        prepared = self.prepare()
+        workspace = Path(prepared["workspace"])
+        git(workspace, "checkout", "--quiet", "-b", "platform-agent/second-thought")
+        self.edit(prepared)
+
+        _, out = self.run_subject(
+            "submit",
+            "--branch",
+            "platform-agent/second-thought",
+            "--title",
+            "second thought",
+            "--body",
+            "why",
+        )
+
+        self.assertEqual(out, "https://forge.test/acme/infra/pull/101")
+        published = self.broker.payloads("publish")
+        self.assertEqual([item["branch"] for item in published], ["platform-agent/second-thought"])
+        self.assertEqual(self.broker.proposals[0]["source"], "platform-agent/second-thought")
+
+    def test_submit_refuses_without_a_title_and_a_body(self):
+        self.prepare()
+        for argv in (
+            ("submit", "--branch", "b", "--title", "t"),
+            ("submit", "--branch", "b", "--body", "only a body"),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                self.run_subject(*argv)
+            self.assertIn("--title and one of --body / --body-file", str(caught.exception))
+
+    def test_submit_refuses_a_protected_branch(self):
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("submit", "--branch", "main", "--title", "t", "--body", "b")
+        self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+
+    def test_submit_refuses_a_base_that_is_the_branch_itself(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit",
+                "--branch", "platform-agent/scale-web",
+                "--base", "platform-agent/scale-web",
+                "--title", "t",
+                "--body", "b",
+            )
+        self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+        self.assertEqual(self.broker.payloads("publish"), [])
+
+    def test_submit_commits_the_tracked_changes_the_copy_holds_under_the_title(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "one file", "--body", "b"
+        )
+        listing = git(self.origin, "show", "--name-only", "--format=%s", "refs/heads/platform-agent/scale-web")
+        self.assertEqual(listing.stdout.split(), ["one", "file", "app.yaml"])
+
+    def test_submit_refuses_rather_than_sweeping_a_file_the_agent_never_staged(self):
+        """The SKILL forbids `git add .`; a helper doing it for them forbids nothing.
+
+        The copy is a real clone on a filesystem the agent also scratches in, so
+        the untracked file here is as likely to be a debug dump as a manifest.
+        Refusing names it and says what to do; the alternatives are shipping it
+        in a public proposal or dropping a real change without saying so.
+        """
+        prepared = self.prepare()
+        self.edit(prepared)
+        (Path(prepared["workspace"]) / "scratch.log").write_text("debug\n")
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+            )
+        self.assertIn("scratch.log", str(caught.exception))
+        self.assertEqual(self.broker.payloads("publish"), [])
+
+    def test_submit_records_a_new_file_the_agent_staged_itself(self):
+        """Staging is the agent saying this one belongs, which is the whole gate."""
+        prepared = self.prepare()
+        self.edit(prepared)
+        (Path(prepared["workspace"]) / "new.yaml").write_text("added\n")
+        vcs_client.local(
+            vcs_client.resolve_session("acme/infra"), ["add", "--", "new.yaml"], "add"
+        )
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "two files", "--body", "b"
+        )
+        listing = git(self.origin, "show", "--name-only", "--format=%s", "refs/heads/platform-agent/scale-web")
+        self.assertEqual(listing.stdout.split(), ["two", "files", "app.yaml", "new.yaml"])
+
+    def test_submit_takes_a_copy_the_agent_committed_itself(self):
+        # The SKILL has always let the agent commit; nothing here insists on
+        # making the revision, only that there is one.
+        prepared = self.prepare()
+        self.edit(prepared)
+        vcs_client.commit("the agent's own message", spec="acme/infra")
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+        )
+        subject = git(self.origin, "log", "--format=%s", "-1", "refs/heads/platform-agent/scale-web")
+        self.assertEqual(subject.stdout.strip(), "the agent's own message")
+
+    def test_a_retry_after_the_create_failed_opens_the_proposal_it_never_got(self):
+        """Publish landed, `proposal-create` did not: the retry has to reach it.
+
+        Without this the second `submit` finds nothing new to send and is
+        refused before the step that failed, and `prepare` is no way out either
+        -- it cuts the branch afresh and the broker refuses the publish as
+        `BRANCH_DIVERGED`. The `git push --force-with-lease` + `gh pr create`
+        pair this replaced was idempotent on retry.
+        """
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.broker.create_fails_with = vcs_client.VcsError(
+            "secondary rate limit", code="FORGE_RATE_LIMITED"
+        )
+        with self.assertRaises(vcs_client.VcsError):
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+            )
+        published = git(self.origin, "rev-parse", "refs/heads/platform-agent/scale-web")
+        self.assertTrue(published.stdout.strip())
+
+        self.broker.create_fails_with = None
+        _, url = self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+        )
+        self.assertEqual(url, self.broker.proposals[0]["url"])
+        # And it did not publish a second time: there was nothing new to send.
+        self.assertEqual(len(self.broker.payloads("publish")), 1)
+
+    def test_a_retry_after_the_second_round_update_failed_reaches_the_update(self):
+        """The same shape one round later, and it used to have no route at all.
+
+        Publish lands, `proposal-update` fails -- the rate limit or 5xx the
+        first-round comment already names. Reading `already_published` only when
+        no proposal was open meant the retry went back through `publish`, which
+        answers "there are no new revisions to publish" because the tip it is
+        being asked to send is the one it just sent. The description update the
+        retry exists for is on the far side of that refusal.
+        """
+        first = self.prepare()
+        self.edit(first)
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+        )
+        self.assertEqual(len(self.broker.proposals), 1)
+
+        second = self.prepare(force=True)
+        self.edit(second, "replicas: 4\n")
+        self.broker.update_fails_with = vcs_client.VcsError(
+            "secondary rate limit", code="FORGE_RATE_LIMITED"
+        )
+        with self.assertRaises(vcs_client.VcsError):
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web",
+                "--title", "round two", "--body", "b",
+            )
+        self.assertEqual(len(self.broker.payloads("publish")), 2)
+
+        self.broker.update_fails_with = None
+        _, url = self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web",
+            "--title", "round two", "--body", "b",
+        )
+        self.assertEqual(url, self.broker.proposals[0]["url"])
+        self.assertEqual(self.broker.proposals[0]["title"], "round two")
+        # And it did not publish a third time: there was nothing new to send.
+        self.assertEqual(len(self.broker.payloads("publish")), 2)
+
+    def test_a_second_round_that_changes_only_the_description_reaches_the_update(self):
+        """Step 5 with nothing to commit: a corrected title or body.
+
+        A fresh `prepare` is a copy *of* the branch with nothing published from
+        it, so `already_published` cannot see the earlier publish, and `publish`
+        refuses a copy with no new revisions. The proposal is open and the
+        branch is where it should be; the update is what the round is for.
+        """
+        first = self.prepare()
+        self.edit(first)
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+        )
+        self.prepare(force=True)
+        _, url = self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web",
+            "--title", "the title the reviewer asked for", "--body", "and the body",
+        )
+        self.assertEqual(url, self.broker.proposals[0]["url"])
+        self.assertEqual(self.broker.proposals[0]["title"], "the title the reviewer asked for")
+        self.assertEqual(self.broker.proposals[0]["body"], "and the body")
+        self.assertEqual(len(self.broker.payloads("publish")), 1)
+        self.assertTrue(any("nothing" in line and "refreshing" in line for line in self.logged))
+
+    def test_submit_refuses_a_description_only_round_on_somebody_else_s_proposal(self):
+        """The one route to `proposal-update` that no publish stands in front of.
+
+        `prepare` warns rather than refuses when the `identity` lookup failed,
+        on the reasoning that the publish settles ownership afterwards. This
+        round has no publish: nothing was committed, so `submit` skips straight
+        to `proposal-update`, which is a plain forge verb with no
+        `_require_open_proposal` behind it. Without a check here the stranger's
+        title and body are overwritten by a run that pushed nothing.
+        """
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        self.run_subject("submit", "--branch", branch, "--title", "first round", "--body", "b")
+        # The collision, arriving the only way it can reach `submit`: the
+        # credential is somebody else now, and the lookup that would have said
+        # so at `prepare` was down for that call.
+        self.broker.viewer = "a-colleague"
+        self.broker.identity_fails_with = vcs_client.VcsError(
+            "the forge did not answer", code="FORGE_CALL_FAILED"
+        )
+        self.prepare(branch, force=True)
+        self.broker.identity_fails_with = None
+
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit", "--branch", branch, "--title", "not theirs", "--body", "nor this"
+            )
+        self.assertIn("kube-agents", str(caught.exception))
+        self.assertIn("a-colleague", str(caught.exception))
+        # And the description is as its author left it.
+        self.assertEqual(self.broker.payloads("proposal-update"), [])
+        self.assertEqual(self.broker.proposals[0]["title"], "first round")
+
+    def test_submit_refuses_the_refresh_it_cannot_establish_ownership_for(self):
+        """A failed lookup is not a pass on the route that nothing else guards.
+
+        Empty from `this_install` means "do not compare", which is right where
+        the broker compares next and wrong here, where it does not. A lookup
+        the forge could not answer is therefore a refusal on this route and a
+        warning on every other one.
+        """
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        self.run_subject("submit", "--branch", branch, "--title", "first round", "--body", "b")
+        self.prepare(branch, force=True)
+        self.broker.identity_fails_with = vcs_client.VcsError(
+            "the forge did not answer", code="FORGE_CALL_FAILED"
+        )
+
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit", "--branch", branch, "--title", "round two", "--body", "b"
+            )
+        self.assertIn("who this install is", str(caught.exception))
+        self.assertEqual(self.broker.payloads("proposal-update"), [])
+
+    def test_a_proposal_closed_mid_round_says_so_instead_of_crying_security(self):
+        """A reviewer merging while the agent works is ordinary, not an attack.
+
+        The second round's copy is taken *of* the branch, so with the proposal
+        gone `base` falls through to the branch itself and the branch-on-its-own
+        -base refusal fires -- a CRITICAL SECURITY REFUSAL naming a state that is
+        nothing of the kind, advising a separate feature branch when the real
+        answer is that there is no proposal left to add to.
+        """
+        branch = "platform-agent/scale-web"
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject("submit", "--branch", branch, "--title", "first", "--body", "one")
+        again = self.prepare(branch, force=True)
+        self.edit(again, "replicas: 5\n")
+        self.broker.proposals[0]["state"] = "merged"
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("submit", "--branch", branch, "--title", "second", "--body", "two")
+        said = str(caught.exception)
+        self.assertIn("no proposal is open", said)
+        self.assertNotIn("SECURITY REFUSAL", said)
+        self.assertEqual(len(self.broker.payloads("proposal-create")), 1)
+
+    def test_keep_description_on_a_closed_proposal_does_not_send_the_caller_in_a_circle(self):
+        """Its refusal names `--title`/`--body-file`, which land on the same state."""
+        branch = "platform-agent/scale-web"
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject("submit", "--branch", branch, "--title", "first", "--body", "one")
+        again = self.prepare(branch, force=True)
+        self.edit(again, "replicas: 5\n")
+        self.broker.proposals[0]["state"] = "closed"
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("submit", "--branch", branch, "--keep-description")
+        self.assertIn("no proposal is open", str(caught.exception))
+
+    def test_a_closed_proposal_is_not_escapable_with_a_base_either(self):
+        """Because the broker shuts that door, the refusal must not open it.
+
+        A copy taken *of* the branch publishes with `advance`, and the broker
+        refuses an `advance` publish onto a branch carrying no open proposal --
+        `--base` changes the target, not that. A refusal that offered it would
+        be sending the agent to a 409 it reaches *after* writing the change.
+        """
+        branch = "platform-agent/scale-web"
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject("submit", "--branch", branch, "--title", "first", "--body", "one")
+        again = self.prepare(branch, force=True)
+        self.edit(again, "replicas: 5\n")
+        self.broker.proposals[0]["state"] = "closed"
+        published = len(self.broker.payloads("publish"))
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit", "--branch", branch, "--base", "main",
+                "--title", "second", "--body", "two",
+            )
+        said = str(caught.exception)
+        self.assertIn("no proposal is open", said)
+        self.assertIn("--base does not get past that", said)
+        # Nothing further was sent: the refusal is ahead of the publish, which
+        # is the half that matters -- the 409 would arrive after the push.
+        self.assertEqual(len(self.broker.payloads("publish")), published)
+        self.assertEqual(len(self.broker.payloads("proposal-create")), 1)
+
+    def test_a_first_submission_with_nothing_to_publish_is_still_refused(self):
+        """The same state with no proposal open is a mistake, and stays one."""
+        self.prepare()
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+            )
+        self.assertIn("no new revisions", str(caught.exception))
+        self.assertEqual(self.broker.payloads("proposal-create"), [])
+
+    def test_resubmitting_an_open_proposal_with_nothing_new_is_not_an_error(self):
+        """SKILL.md's Step 3 says so -- "resubmitting is not an error" -- and a
+        card retry is the ordinary way there.
+
+        Under the `git push --force-with-lease` + `gh pr edit` pair this
+        replaced it was true; the publish refusal made it false for one round.
+        """
+        first = self.prepare()
+        self.edit(first)
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+        )
+        second = self.prepare(force=True)
+        self.edit(second, "replicas: 4\n")
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t2", "--body", "b"
+        )
+        published = len(self.broker.payloads("publish"))
+
+        _, url = self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web",
+            "--title", "t3", "--body", "b",
+        )
+        self.assertEqual(url, self.broker.proposals[0]["url"])
+        self.assertEqual(self.broker.proposals[0]["title"], "t3")
+        self.assertEqual(len(self.broker.payloads("publish")), published)
+
+    def test_a_proposal_opened_by_a_racing_run_is_updated_not_reported_as_failure(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        raced = self.existing_proposal("platform-agent/scale-web")
+        # The lookup before the publish is what would normally find it; this is
+        # the window after that read, so the fake refuses the create the way a
+        # forge does and the script has to ask again.
+        self.broker.create_fails_with = vcs_client.VcsError(
+            "a pull request for branch already exists", code="FORGE_REJECTED"
+        )
+        with mock.patch.object(submit_suggestion, "open_proposal", side_effect=[None, raced]):
+            _, out = self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b"
+            )
+        self.assertEqual(out, raced["url"])
+        self.assertEqual(self.broker.proposals[0]["title"], "t")
+
+    def test_a_create_that_fails_for_another_reason_is_not_swallowed(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.broker.create_fails_with = vcs_client.VcsError("base is protected", code="FORGE_REJECTED")
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            self.run_subject("submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b")
+        self.assertEqual(caught.exception.code, "FORGE_REJECTED")
+
+    def test_base_names_what_the_change_merges_into(self):
+        git(self.origin, "branch", "release", "main")
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b",
+            "--base", "release",
+        )
+        self.assertEqual(self.broker.payloads("proposal-create")[0]["target"], "release")
+        self.assertEqual(self.broker.payloads("publish")[0]["target"], "release")
+
+    def test_base_on_a_second_round_says_the_proposal_does_not_move(self):
+        """`--base` is read as a base, and is not a retarget.
+
+        It is what a caller reaches for when they mean "publish this onto
+        `release` instead", and the publish does honour it -- but no forge in
+        this protocol lets `proposal-update` move an open proposal's target, so
+        the proposal goes on pointing where it was opened. Silence there reads
+        as agreement, which is a round published against a base nobody is
+        reviewing it against.
+        """
+        git(self.origin, "branch", "release", "main")
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        self.run_subject("submit", "--branch", branch, "--title", "first round", "--body", "b")
+        proposal = self.broker.proposals[-1]
+        self.edit(self.prepare(branch, force=True), "replicas: 4\n")
+        self.logged.clear()
+
+        self.run_subject("submit", "--branch", branch, "--title", "second round", "--body", "b",
+                         "--base", "release")
+
+        said = "\n".join(self.logged)
+        self.assertIn("--base release", said)
+        self.assertIn(proposal["url"], said)
+        self.assertIn("still targets main", said)
+        # Said, not done: the publish goes where the flag says and the proposal
+        # stays where it was opened.
+        self.assertEqual(self.broker.payloads("publish")[-1]["target"], "release")
+        self.assertEqual(proposal["target"], "main")
+
+    # -- the description file ---------------------------------------------
+
+    def test_a_body_file_outside_scratch_is_refused(self):
+        self.prepare()
+        outside = Path(self.tmp.name) / "elsewhere.md"
+        outside.write_text("secrets\n")
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("submit", "--branch", "b", "--title", "t", "--body-file", str(outside))
+        self.assertIn("resolves outside", str(caught.exception))
+
+    def test_a_body_file_symlinked_out_of_scratch_is_refused(self):
+        self.prepare()
+        outside = Path(self.tmp.name) / "elsewhere.md"
+        outside.write_text("secrets\n")
+        link = self.scratch / "body.md"
+        link.symlink_to(outside)
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("submit", "--branch", "b", "--title", "t", "--body-file", str(link))
+        self.assertIn("resolves outside", str(caught.exception))
+
+    def test_an_empty_body_file_is_refused(self):
+        self.prepare()
+        empty = self.scratch / "body.md"
+        empty.write_text("   \n")
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject("submit", "--branch", "b", "--title", "t", "--body-file", str(empty))
+        self.assertIn("is empty", str(caught.exception))
+
+    # -- the call shapes that outlive a roll -------------------------------
+
+    def test_a_retired_flag_is_ignored_with_a_line_saying_so(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web", "--title", "t", "--body", "b",
+            "--workspace", "/opt/data/gitops/t_9f3c/acme__infra",
+            "--lease", "t_9f3c",
+        )
+        self.assertTrue(any("--workspace is no longer read" in line for line in self.logged))
+        self.assertTrue(any("--lease is no longer read" in line for line in self.logged))
+
+    def test_a_submit_with_no_copy_is_sent_to_prepare_and_not_to_clone(self):
+        """What the retired flags promise the caller will be told instead.
+
+        A command written against the old shape reaches `submit` with nothing
+        on the volume. `vcs_client`'s own refusal ends "Run `vcs.py clone
+        <url>` first", which is the wrong verb here: it brings the repository
+        down without cutting the branch, so the next `submit` is refused again
+        for standing on the trunk and there is a stray copy to clean up. The
+        refusal has to name `prepare`, which does both.
+        """
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web",
+                "--title", "t", "--body", "b",
+                "--workspace", "/opt/data/gitops/t_9f3c/acme__infra",
+            )
+        said = str(caught.exception)
+        self.assertIn("prepare", said)
+        self.assertIn("platform-agent/scale-web", said)
+        self.assertNotIn("vcs.py clone", said.split("(")[0])
+
+    def test_the_content_mode_submit_reaches_the_refusal_that_names_prepare(self):
+        """The shape that was actually live, not the one the flags were named for.
+
+        `--workspace`/`--lease` belong to the leased-clone mode. The operator
+        renders `CREDENTIAL_PROXY_CONTENT_WORKSPACE=1` unconditionally and
+        gives no field to turn it off, so the card in flight during a rollout
+        is calling content mode: `--handle … --from … --base … --base-sha …`.
+        Leave `--from` and `--delete` out of `RETIRED` and argparse exits on
+        "unrecognized arguments" before `handle_submit` is ever reached, which
+        is the one thing the shim exists to prevent.
+        """
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web",
+                "--title", "t", "--body", "b",
+                "--handle", "ws_7c21",
+                "--from", "/tmp/scratch",
+                "--base", "main",
+                "--base-sha", "a" * 40,
+                "--delete", "old/thing.yaml",
+            )
+        said = str(caught.exception)
+        self.assertIn("prepare", said)
+        self.assertIn("platform-agent/scale-web", said)
+
+    def test_the_read_half_of_content_mode_says_where_the_files_are(self):
+        """`list` and `fetch` were commands, so they fail before any flag is read.
+
+        `normalise_argv` prefixes an unrecognised argv with `submit`, which
+        turns `list --handle X` into `submit list --handle X` and loses the
+        whole call behind "unrecognized arguments: list". These two have
+        somewhere to send the caller that the retired flags do not -- the files
+        are on disk in the working copy -- so they say it.
+        """
+        for command in ("list", "fetch"):
+            with self.subTest(command=command):
+                with self.assertRaises(ValueError) as caught:
+                    self.run_subject(command, "--handle", "ws_7c21")
+                said = str(caught.exception)
+                self.assertIn(f"`{command}` is no longer a command", said)
+                self.assertIn("working copy", said)
+                self.assertIn("prepare", said)
+
+    def test_an_argv_with_no_subcommand_is_read_as_submit(self):
+        self.assertEqual(
+            submit_suggestion.normalise_argv(["--branch", "b", "--title", "t"]),
+            ["submit", "--branch", "b", "--title", "t"],
+        )
+        for argv in ([], ["prepare", "--branch", "b"], ["-h"]):
+            self.assertEqual(submit_suggestion.normalise_argv(argv), argv)
+
+    def test_the_two_commands_are_the_whole_surface(self):
+        # `list` and `fetch` were the read half of a mode where the agent had
+        # no checkout. It has one again.
+        self.assertEqual(submit_suggestion.COMMANDS, ("prepare", "submit"))
+        with self.assertRaises(SystemExit):
+            with mock.patch("sys.stderr", io.StringIO()):
+                submit_suggestion.build_parser().parse_args(["list", "--handle", "x"])
 
 
 class TestValidateRepo(unittest.TestCase):
-    def test_invalid_format_raises(self):
+    """The repository gate, asked directly rather than through a run.
+
+    Here because the gate is the one thing in this script standing between a
+    repository the model named and a credentialed push, and the properties that
+    make it a gate -- a malformed slug is refused, an unreadable allowlist is
+    refused -- are invisible in a run that supplies a well-formed slug and a
+    readable one.
+    """
+
+    def test_a_malformed_slug_is_refused(self):
         for bad in ("", "foo", "foo/bar/baz", None):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError) as caught:
                     submit_suggestion.validate_repo(bad)
                 self.assertIn("Invalid repository format", str(caught.exception))
 
-    def test_unmanaged_repo_raises_when_managed_repos_configured(self):
-        with patch.object(gitops_workspace, "get_managed_github_repos", return_value=["acme/managed"]):
-            with self.assertRaises(ValueError) as caught:
-                submit_suggestion.validate_repo("acme/unmanaged")
-            self.assertIn("not in the managed repositories list", str(caught.exception))
-
-    def test_managed_repo_passes(self):
-        with patch.object(gitops_workspace, "get_managed_github_repos", return_value=["acme/managed"]):
-            self.assertEqual(submit_suggestion.validate_repo("acme/managed"), "acme/managed")
-
-    def test_passes_when_no_managed_repos_configured(self):
-        with patch.object(gitops_workspace, "get_managed_github_repos", return_value=[]):
-            self.assertEqual(submit_suggestion.validate_repo("acme/any"), "acme/any")
-
-    def test_raises_when_get_managed_github_repos_fails(self):
-        with patch.object(
-            gitops_workspace,
-            "get_managed_github_repos",
-            side_effect=RuntimeError("kubectl failed: Forbidden"),
+    def test_an_unreadable_managed_list_is_refused_rather_than_read_as_empty(self):
+        with mock.patch.object(
+            gitops_workspace, "get_managed_github_repos",
+            mock.Mock(side_effect=RuntimeError("kubectl failed: Forbidden")),
         ):
             with self.assertRaises(RuntimeError) as caught:
                 submit_suggestion.validate_repo("acme/any")
-            self.assertIn("kubectl failed: Forbidden", str(caught.exception))
+        self.assertIn("kubectl failed: Forbidden", str(caught.exception))
 
+    def test_an_empty_managed_list_means_no_allowlist_is_configured(self):
+        # The other reading of an empty list, and the reason the one above
+        # matters: "" and "the read failed" must not arrive at the same place.
+        with mock.patch.object(gitops_workspace, "get_managed_github_repos", lambda: []):
+            with mock.patch.object(gitops_workspace, "validate_repo_org", lambda repo: repo):
+                self.assertEqual(submit_suggestion.validate_repo("acme/any"), "acme/any")
 
-# --------------------------------------------------------------------------- #
-# prepare — leasing a private clone
-# --------------------------------------------------------------------------- #
-
-
-class TestPrepare(SubmitSuggestionTestCase):
-    def test_it_hands_back_a_leased_workspace_on_the_new_branch(self):
-        payload = self.prepare()
-        workspace = Path(payload["workspace"])
-        self.assertEqual(payload["lease"], "t_card")
-        self.assertEqual(payload["repo"], "acme/fleet")
-        self.assertEqual(workspace, self.root / "t_card" / "acme__fleet")
-        self.assertTrue((workspace / ".git").is_dir())
-        head = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=str(workspace), check=True, capture_output=True, text=True,
-        )
-        self.assertEqual(head.stdout.strip(), "platform-agent/fix-netpol")
-
-    def test_the_lease_marker_names_this_skill(self):
-        # So an operator staring at /opt/data/gitops can tell which tree belongs
-        # to an audit and which to a suggestion.
-        payload = self.prepare()
-        record = gitops_workspace.read_lease(Path(payload["workspace"]).parent)
-        self.assertEqual(record["owner"], submit_suggestion.OWNER)
-        self.assertEqual(record["lease"], "t_card")
-
-    def test_two_cards_get_two_trees(self):
-        # The incident in one assertion: before leases both of these resolved to
-        # the same directory and the second `checkout -B` moved the first card's
-        # HEAD out from under it.
-        first = self.prepare(branch="platform-agent/one", lease="t_one")
-        second = self.prepare(branch="platform-agent/two", lease="t_two")
-        self.assertNotEqual(first["workspace"], second["workspace"])
-        for payload, branch in (
-            (first, "platform-agent/one"),
-            (second, "platform-agent/two"),
-        ):
-            head = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=payload["workspace"], check=True, capture_output=True, text=True,
-            )
-            self.assertEqual(head.stdout.strip(), branch)
-
-    def test_a_protected_branch_never_reaches_the_clone(self):
-        with self.assertRaises(ValueError):
-            self.prepare(branch="main")
-        self.assertFalse((self.root / "t_card").exists())
-
-    def test_prepare_when_branch_equals_base_branch_is_refused(self):
-        subprocess.run(
-            ["git", "branch", "staging", "HEAD"],
-            cwd=str(self.origin), check=True, capture_output=True,
-        )
-        with patch.object(gitops_workspace, "resolve_base_branch", return_value="staging"):
-            with self.assertRaises(ValueError) as caught:
-                self.prepare(branch="staging")
-            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
-            self.assertIn("head branch is the same as base branch", str(caught.exception))
-
-    def test_a_retried_card_reuses_its_branch_rather_than_failing(self):
-        # `-B`, not `-b`. A card that comes back from review runs prepare again.
-        first = self.prepare()
-        second = self.prepare()
-        self.assertEqual(first["workspace"], second["workspace"])
-        self.assertEqual(second["branch"], "platform-agent/fix-netpol")
-
-    def test_a_retry_starts_from_a_clean_tree(self):
-        payload = self.prepare()
-        stray = Path(payload["workspace"]) / "half-written.yaml"
-        stray.write_text("...\n", encoding="utf-8")
-        self.prepare()
-        self.assertFalse(stray.exists())
-
-    def test_prepare_refused_when_managed_repos_read_fails(self):
-        with patch.object(
-            gitops_workspace,
-            "get_managed_github_repos",
-            side_effect=RuntimeError("ConfigMap missing"),
-        ):
-            with self.assertRaises(RuntimeError):
-                self.prepare()
-
-
-# --------------------------------------------------------------------------- #
-# submit — pushing only what we own
-# --------------------------------------------------------------------------- #
-
-
-class TestSubmit(SubmitSuggestionTestCase):
-    def test_prepare_then_submit_lands_the_branch_and_opens_the_pr(self):
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        url = self.submit(payload["branch"], payload["workspace"])
-
-        self.assertEqual(url, "https://github.com/acme/fleet/pull/1")
-        self.assertIn("platform-agent/fix-netpol", self.origin_branches())
-        self.assertEqual(len(self.gh_calls), 1)
-        argv, cwd = self.gh_calls[0]
-        self.assertEqual(argv[:3], ["gh", "pr", "create"])
-        self.assertEqual(cwd, payload["workspace"])
-        self.assertIn("--repo", argv)
-        self.assertEqual(argv[argv.index("--repo") + 1], "acme/fleet")
-        self.assertEqual(argv[argv.index("--head") + 1], "platform-agent/fix-netpol")
-        self.assertEqual(argv[argv.index("--base") + 1], "main")
-
-    def test_submit_inherits_target_repo_from_prepare_lease(self):
-        """When prepare leases a non-default repo, submit without --repo uses it."""
-        payload = self.prepare(
-            branch="platform-agent/secondary-fix", repo="acme/secondary-repo"
-        )
-        self.commit(payload["workspace"])
-
-        args = [
-            "submit",
-            "--branch", "platform-agent/secondary-fix",
-            "--title", "fix",
-            "--body", "details",
-            "--workspace", payload["workspace"],
-            "--lease", payload["lease"],
-        ]
-        out = io.StringIO()
-        with redirect_stdout(out):
-            submit_suggestion.dispatch(args)
-
-        argv, _ = self.gh_calls[0]
-        self.assertEqual(argv[argv.index("--repo") + 1], "acme/secondary-repo")
-
-    def test_another_agents_workspace_is_refused(self):
-        # The check the credential proxy cannot make. The audit's tree holds a
-        # perfectly valid `.lease` — just not ours.
-        theirs = self.prepare(branch="platform-agent/theirs", lease="compliance-audit")
-        with self.assertRaises(PermissionError) as caught:
-            self.submit("platform-agent/theirs", theirs["workspace"], lease="t_card")
-        message = str(caught.exception)
-        self.assertIn("compliance-audit", message)
-        self.assertIn("t_card", message)
-        self.assertEqual(self.gh_calls, [])
-        self.assertNotIn("platform-agent/theirs", self.origin_branches())
-
-    def test_an_unleased_directory_is_refused(self):
-        # An agent that skipped `prepare` and ran the skill from its profile.
-        loose = self.tmp_path / "profile"
-        loose.mkdir()
-        with self.assertRaises(PermissionError):
-            self.submit("platform-agent/fix-netpol", loose)
-        self.assertEqual(self.gh_calls, [])
-
-    def test_submitting_the_wrong_branch_is_refused(self):
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        with self.assertRaises(ValueError) as caught:
-            self.submit("platform-agent/some-other", payload["workspace"])
-        self.assertIn("platform-agent/fix-netpol", str(caught.exception))
-        self.assertEqual(self.gh_calls, [])
-
-    def test_a_protected_branch_is_refused_before_anything_runs(self):
-        payload = self.prepare()
-        with self.assertRaises(ValueError) as caught:
-            self.submit("main", payload["workspace"])
-        self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
-        self.assertEqual(self.gh_calls, [])
-
-    def test_submit_when_branch_equals_base_branch_is_refused_before_push(self):
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        with patch.object(gitops_workspace, "resolve_base_branch", return_value="platform-agent/fix-netpol"):
-            with self.assertRaises(ValueError) as caught:
-                self.submit("platform-agent/fix-netpol", payload["workspace"])
-            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
-            self.assertIn("head branch is the same as base branch", str(caught.exception))
-        self.assertEqual(self.gh_calls, [])
-        self.assertNotIn("platform-agent/fix-netpol", self.origin_branches())
-
-    def test_submit_when_branch_equals_remote_default_branch_is_refused_even_with_base_override(self):
-        # Set origin default trunk to release-trunk (a non-standard trunk)
-        subprocess.run(["git", "--git-dir", str(self.origin), "branch", "release-trunk", "main"], check=True)
-        subprocess.run(["git", "--git-dir", str(self.origin), "symbolic-ref", "HEAD", "refs/heads/release-trunk"], check=True)
-
-        payload = self.prepare(branch="platform-agent/fix-netpol")
-        # Update local origin/HEAD to track the remote default release-trunk
-        subprocess.run(["git", "-C", str(payload["workspace"]), "remote", "set-head", "origin", "--auto"], check=True)
-        self.commit(payload["workspace"])
-        # Switch to release-trunk in workspace so assert_on_branch passes
-        subprocess.run(["git", "-C", str(payload["workspace"]), "checkout", "-B", "release-trunk"], check=True)
-        # Even if base is overridden to main, submitting on the repo's detected default branch (release-trunk) is refused
-        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "main"}):
-            with self.assertRaises(ValueError) as caught:
-                self.submit("release-trunk", payload["workspace"])
-            self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
-            self.assertIn("repository default branch 'release-trunk'", str(caught.exception))
-        self.assertEqual(self.gh_calls, [])
-
-    def test_a_second_round_of_review_feedback_keeps_the_first_round(self):
-        """Step 5, and the data loss it used to cause.
-
-        `prepare --branch <headRefName>` against an open pull request's branch
-        used to reset that branch onto `origin/main` and force-push, so round
-        two did not amend the pull request — it replaced every reviewed commit
-        with one that no longer contained them. `--force-with-lease` could not
-        object either: the clone had just fetched the very ref it would have
-        compared against.
-        """
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        self.submit(payload["branch"], payload["workspace"])
-
-        again = self.prepare()
-        self.assertEqual(again["started_from"], "origin/platform-agent/fix-netpol")
-        self.commit(again["workspace"], name="clusters/prod/netpol-v2.yaml")
-        self.submit(again["branch"], again["workspace"])
-
-        files = self.origin_git(
-            ["ls-tree", "-r", "--name-only", "platform-agent/fix-netpol"]
-        ).split()
-        self.assertIn("clusters/prod/netpol-v2.yaml", files)
-        self.assertIn(
-            "clusters/prod/netpol.yaml", files, "round one's reviewed work was erased"
-        )
-
-    def test_a_brand_new_branch_still_starts_from_the_base(self):
-        # The other half of the same rule: only an existing remote branch is
-        # continued. A new one must not inherit whatever a same-named branch
-        # once held, and must carry no commits but the base's.
-        payload = self.prepare(branch="platform-agent/brand-new")
-        self.assertEqual(payload["started_from"], "origin/main")
-        self.assertEqual(payload["base"], "main")
-
-    def test_resubmitting_returns_the_open_pr_instead_of_failing(self):
-        """`gh pr create` refuses after the push has already landed.
-
-        Reported as a failure, that is the worst possible shape: the branch is
-        updated and the reviewer sees the new commits, but the skill says the
-        submission failed — so the agent retries, pushes again, and fails
-        again, for as many rounds of feedback as the pull request gets.
-        """
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        first = self.submit(payload["branch"], payload["workspace"], title="round one")
-
-        again = self.prepare()
-        self.commit(again["workspace"], name="clusters/prod/netpol-v2.yaml")
-        second = self.submit(again["branch"], again["workspace"], title="round two")
-
-        self.assertEqual(second, first)
-        verbs = [argv[1:3] for argv, _ in self.gh_calls]
-        self.assertEqual(
-            verbs,
-            [["pr", "create"], ["pr", "create"], ["pr", "edit"], ["pr", "view"]],
-        )
-        # Refreshed, not merely located: the title and body describe the
-        # commits just pushed, and the old ones are no longer on the branch.
-        stub = submit_suggestion.subprocess
-        self.assertEqual(stub.titles["platform-agent/fix-netpol"], "round two")
-
-    def test_keep_description_leaves_the_open_pull_requests_body_alone(self):
-        """A caller that is not re-describing the change, only adding to it.
-
-        A conflict merge or a CI fix lands on a pull request that has been
-        under human review, and `submit`'s ordinary path overwrites the
-        description unconditionally. The loss is invisible — `submit` prints a
-        URL — and the only mitigation on offer otherwise is prose asking a
-        model to echo a multi-kilobyte markdown document back byte-for-byte.
-        """
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        authored = "## Context\n\nHand-written, with `backticks` and a list:\n- one\n"
-        first = self.submit(payload["branch"], payload["workspace"], body=authored)
-
-        again = self.prepare()
-        self.commit(again["workspace"], name="clusters/prod/netpol-v2.yaml")
-        second = self.submit(
-            again["branch"],
-            again["workspace"],
-            title=None,
-            body=None,
-            keep_description=True,
-        )
-
-        self.assertEqual(second, first)
-        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], authored)
-        self.assertEqual(self.gh_stub.titles["platform-agent/fix-netpol"], "t")
-        # The push still happened — this mode changes the description, nothing
-        # else — and no `pr edit` was issued at all.
-        self.assertIn(["pr", "create"], [argv[1:3] for argv, _ in self.gh_calls])
-        self.assertNotIn(["pr", "edit"], [argv[1:3] for argv, _ in self.gh_calls])
-
-    def test_keep_description_without_an_open_pull_request_says_so(self):
-        """There is no description to keep, so the flag is a caller error."""
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        with self.assertRaises(RuntimeError) as caught:
-            self.submit(
-                payload["branch"],
-                payload["workspace"],
-                title=None,
-                body=None,
-                keep_description=True,
-            )
-        self.assertIn("no pull request is open", str(caught.exception))
-        # The lookup itself is fine; what must not happen is falling through to
-        # a `create` with the empty title and body this mode allows.
-        verbs = [argv[1:3] for argv, _ in self.gh_calls]
-        self.assertEqual(verbs, [["pr", "view"]])
-
-    def test_a_description_without_keep_still_needs_a_title_and_a_body(self):
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        with self.assertRaises(ValueError) as caught:
-            self.submit(payload["branch"], payload["workspace"], title=None, body=None)
-        self.assertIn("--keep-description", str(caught.exception))
-
-    def test_a_body_survives_backticks_on_both_the_create_and_the_edit(self):
-        """argv is the wrong channel for a document a shell will see.
-
-        Inside double quotes bash expands backticks and `$(...)`, so a body
-        that reaches `gh` through a shell-built argv either loses its own text
-        or runs it. Every other body in this repository is handed over out of
-        band — `pr_conversation.py reply` takes a path it reads itself, and
-        `forge.post_comment` sends the text on fd 0 — and the pull request
-        description was the one that did not.
-        """
-        hostile = "Fixes the `main` branch.\n\nRun `id` to check. $(whoami)\n"
-        path = self.scratch_dir / "body.md"
-        path.write_text(hostile, encoding="utf-8")
-
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        self.submit(payload["branch"], payload["workspace"], body_file=path)
-        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], hostile)
-
-        again = self.prepare()
-        self.commit(again["workspace"], name="clusters/prod/netpol-v2.yaml")
-        self.submit(again["branch"], again["workspace"], body_file=path)
-        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], hostile)
-        # The edit hands it over as a file too, so the body never becomes a
-        # shell word on either path.
-        edits = [argv for argv, _ in self.gh_calls if argv[1:3] == ["pr", "edit"]]
-        self.assertTrue(edits)
-        for argv in edits:
-            self.assertIn("--body-file", argv)
-            self.assertNotIn("--body", argv)
-
-    def test_a_body_file_outside_scratch_is_refused(self):
-        """The file's contents are published, so the path is bounded.
-
-        `pr_conversation.py` and the issue resolver both bound theirs for this
-        reason. Unbounded, `--body-file /proc/self/environ` puts the agent
-        container's environment — `SESSION_KV_API_KEY`, and under `mode: next`
-        the bus password, which is not pod-scoped — into a public pull request
-        description. The agent does not have to intend it: Step 5 has it read
-        review comments, which are somebody else's text.
-        """
-        outside = self.tmp_path / "outside.md"
-        outside.write_text("secrets\n", encoding="utf-8")
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        with self.assertRaises(ValueError) as caught:
-            self.submit(payload["branch"], payload["workspace"], body_file=outside)
-        self.assertIn("resolves outside", str(caught.exception))
-        # Refused on argv alone, before the branch was pushed anywhere.
-        self.assertEqual([], self.gh_calls)
-
-    def test_a_symlink_out_of_scratch_is_refused(self):
-        """Resolved before the prefix test, so a link planted inside is not a way out."""
-        secret = self.tmp_path / "token"
-        secret.write_text("ghs_not_yours\n", encoding="utf-8")
-        link = self.scratch_dir / "body.md"
-        link.symlink_to(secret)
-
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        with self.assertRaises(ValueError) as caught:
-            self.submit(payload["branch"], payload["workspace"], body_file=link)
-        self.assertIn("resolves outside", str(caught.exception))
-
-    def test_a_body_file_that_is_missing_or_empty_is_refused(self):
-        """Named separately from "no body at all", which is the same outcome
-        by a different mistake — a heredoc that wrote nowhere."""
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        missing = self.scratch_dir / "gone.md"
-        with self.assertRaises(ValueError) as caught:
-            self.submit(payload["branch"], payload["workspace"], body_file=missing)
-        self.assertIn("does not exist", str(caught.exception))
-
-        blank = self.scratch_dir / "blank.md"
-        blank.write_text("\n  \n", encoding="utf-8")
-        with self.assertRaises(ValueError) as caught:
-            self.submit(payload["branch"], payload["workspace"], body_file=blank)
-        self.assertIn("is empty", str(caught.exception))
-
-    def test_keep_description_and_a_body_are_mutually_exclusive(self):
-        """A body handed over beside the flag is a body the run would discard.
-
-        Argparse refuses the combination rather than the run reading the file
-        and throwing the text away, which reported success for a description it
-        had not touched.
-        """
-        path = self.scratch_dir / "body.md"
-        path.write_text("new prose\n", encoding="utf-8")
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        for extra in (["--body", "b"], ["--body-file", str(path)]):
-            with self.subTest(extra=extra[0]):
-                with self.assertRaises(SystemExit):
-                    submit_suggestion.dispatch([
-                        "submit",
-                        "--branch", payload["branch"],
-                        "--workspace", str(payload["workspace"]),
-                        "--repo", "acme/fleet",
-                        "--keep-description",
-                        *extra,
-                    ])
-        self.assertEqual([], self.gh_calls)
-
-    def test_a_gh_failure_that_is_not_an_existing_pr_still_raises(self):
-        # The fallback must not swallow "not authenticated" or "base branch is
-        # protected" — those are real failures and the run has to stop.
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-
-        stub = submit_suggestion.subprocess
-        original = stub._create
-        stub._create = lambda argv, _stdin: subprocess.CompletedProcess(
-            argv, 1, "", "HTTP 403: Resource not accessible by integration\n"
-        )
-        self.addCleanup(setattr, stub, "_create", original)
-
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.submit(payload["branch"], payload["workspace"])
-
-    def test_submit_without_a_lease_or_a_session_says_what_to_pass(self):
-        """The unrecoverable loop, turned into one line of instruction.
-
-        Outside a kanban card neither HERMES_KANBAN_TASK nor HERMES_SESSION_ID
-        is set, and `lease_id` would mint `adhoc-<random>` — a different random
-        string in `submit`'s process than in `prepare`'s. The ownership check
-        would then refuse the workspace `prepare` had just handed over, and
-        would refuse it identically however many times the agent retried.
-        """
-        payload = self.prepare(lease="t_explicit")
-        self.commit(payload["workspace"])
-        with patch.dict(
-            os.environ, {"HERMES_KANBAN_TASK": "", "HERMES_SESSION_ID": ""}
+    def test_a_repository_outside_a_populated_managed_list_is_refused(self):
+        with mock.patch.object(
+            gitops_workspace, "get_managed_github_repos", lambda: ["acme/managed"]
         ):
             with self.assertRaises(ValueError) as caught:
-                self.submit(payload["branch"], payload["workspace"])
-        self.assertIn("--lease", str(caught.exception))
-        # And the documented round-trip works.
-        with patch.dict(
-            os.environ, {"HERMES_KANBAN_TASK": "", "HERMES_SESSION_ID": ""}
-        ):
-            url = self.submit(
-                payload["branch"], payload["workspace"], lease=payload["lease"]
-            )
-        self.assertTrue(url.startswith("https://github.com/acme/fleet/pull/"))
-
-    def test_someone_elses_branch_of_the_same_name_is_not_destroyed(self):
-        """`--force-with-lease`, and the reason it replaced a blind `-f`.
-
-        Two cards, two leases, the same branch name. The second one's remote ref
-        moved after its clone fetched it, so the push must abort rather than
-        throw away work that is not ours.
-        """
-        mine = self.prepare(branch="platform-agent/shared", lease="t_mine")
-        self.commit(mine["workspace"])
-
-        theirs = self.prepare(branch="platform-agent/shared", lease="t_theirs")
-        self.commit(theirs["workspace"], name="clusters/prod/theirs.yaml")
-        self.submit("platform-agent/shared", theirs["workspace"], lease="t_theirs")
-
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.submit("platform-agent/shared", mine["workspace"], lease="t_mine")
-
-        survivor = self.origin_git(
-            ["show", "--stat", "--format=", "platform-agent/shared"]
-        )
-        self.assertIn("theirs.yaml", survivor)
-
-    def test_the_push_asks_for_a_lease_not_a_bare_force(self):
-        seen = []
-        real = gitops_workspace.run_git
-
-        def record(argv, cwd, *, check=True):
-            seen.append(list(argv))
-            return real(argv, cwd, check=check)
-
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        with patch.object(gitops_workspace, "run_git", record):
-            self.submit(payload["branch"], payload["workspace"])
-
-        push = next(a for a in seen if a and a[0] == "push")
-        self.assertIn("--force-with-lease", push)
-        self.assertNotIn("-f", push)
-        self.assertNotIn("--force", push)
-
-    def test_every_git_call_names_a_working_directory(self):
-        # An unstated cwd is not "the obvious one": the credential proxy runs
-        # the real git in the sidecar's filesystem at whatever this process
-        # reports, and the sidecar's default holds no lease.
-        seen = []
-        real = gitops_workspace.run_git
-
-        def record(argv, cwd, *, check=True):
-            seen.append(cwd)
-            return real(argv, cwd, check=check)
-
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        with patch.object(gitops_workspace, "run_git", record):
-            self.submit(payload["branch"], payload["workspace"])
-
-        self.assertTrue(seen)
-        for cwd in seen:
-            self.assertTrue(str(cwd).strip(), "a git call ran with no cwd")
-
-    def test_submit_refused_when_managed_repos_read_fails(self):
-        payload = self.prepare()
-        self.commit(payload["workspace"])
-        with patch.object(
-            gitops_workspace,
-            "get_managed_github_repos",
-            side_effect=RuntimeError("ConfigMap missing"),
-        ):
-            with self.assertRaises(RuntimeError):
-                self.submit(payload["branch"], payload["workspace"])
-
-
-# --------------------------------------------------------------------------- #
-# The pre-`prepare` call shape
-# --------------------------------------------------------------------------- #
-
-
-class TestArgvCompatibility(unittest.TestCase):
-    def test_a_bare_flag_form_is_read_as_submit(self):
-        # A session already mid-flight when this ships must not die on
-        # "invalid choice".
-        self.assertEqual(
-            submit_suggestion.normalise_argv(["--branch", "b", "--title", "t"]),
-            ["submit", "--branch", "b", "--title", "t"],
-        )
-
-    def test_an_explicit_command_is_left_alone(self):
-        for command in submit_suggestion.COMMANDS:
-            with self.subTest(command=command):
-                self.assertEqual(
-                    submit_suggestion.normalise_argv([command, "--branch", "b"]),
-                    [command, "--branch", "b"],
-                )
-
-    def test_help_still_describes_the_whole_script(self):
-        for argv in ([], ["-h"], ["--help"]):
-            with self.subTest(argv=argv):
-                self.assertEqual(submit_suggestion.normalise_argv(argv), argv)
-
-
-# --------------------------------------------------------------------------- #
-# Content mode — the broker owns the checkout
-# --------------------------------------------------------------------------- #
-
-
-@unittest.skipIf(shutil.which("git") is None, "git is not on PATH")
-class TestContentMode(SubmitSuggestionTestCase):
-    """The same two commands, against a real broker-side store.
-
-    The store is the real `ContentWorkspaceStore` rather than a recording of it,
-    for the reason the module docstring gives about `--force-with-lease`: the
-    properties worth testing here — that the agent never receives a path, that a
-    moved base is refused — are properties of what git does, and a stub would
-    assert only that this test agrees with itself.
-
-    What is stubbed is the HTTP hop, at `_workspace_call`. It raises the same
-    two exception types the real transport raises for the same two conditions,
-    which is what the skill branches on.
-    """
-
-    def setUp(self):
-        super().setUp()
-        origin = self.origin
-        # `open` composes https://github.com/<owner>/<name>.git itself and takes
-        # no caller-supplied URL, by design — so the redirect to the local bare
-        # repo goes in at the runner, below the code under test.
-        url = "https://github.com/acme/fleet.git"
-
-        # The identity the real executor injects for every `git` it runs, from
-        # the product's own defaults rather than a name invented here. Without
-        # it this runner inherits whatever ~/.gitconfig the machine happens to
-        # have, so `commit` passes on a developer's laptop and exits 128 on a CI
-        # runner that has no global identity — the test would be measuring the
-        # machine rather than the code.
-        identity = {
-            "GIT_AUTHOR_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
-            "GIT_AUTHOR_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
-            "GIT_COMMITTER_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
-            "GIT_COMMITTER_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
-        }
-
-        def runner(argv, cwd):
-            argv = [str(origin) if token == url else token for token in argv]
-            completed = subprocess.run(
-                argv,
-                cwd=str(cwd),
-                capture_output=True,
-                text=True,
-                env={**os.environ, **identity},
-            )
-            return GitResult(completed.returncode, completed.stdout, completed.stderr)
-
-        self.store = content_workspace.ContentWorkspaceStore(
-            self.tmp_path / "broker" / "trees",
-            self.tmp_path / "agent-workspace",
-            runner,
-        )
-        self.verbs = []
-
-        # Routed through the broker's own handler rather than straight at the
-        # store, so the translation from payload to arguments is under test too.
-        route = credential_proxy.CredentialProxyHandler._workspace_route
-        store = self.store
-
-        class Router:
-            workspaces = store
-
-        def call(endpoint, verb, payload):
-            self.verbs.append(verb)
-            try:
-                body = route(Router(), verb, payload)
-            except content_workspace.ContentWorkspaceError as exc:
-                raise credential_proxy_client.WorkspaceRequestError(
-                    exc.status,
-                    {"status": "blocked", "code": exc.code, "message": str(exc)},
-                ) from exc
-            if body is None:
-                raise credential_proxy_client.WorkspaceRequestError(
-                    404, {"status": "not_found"}
-                )
-            return body
-
-        self.patch_attr(credential_proxy_client, "_workspace_call", call)
-        endpoint = patch.dict(
-            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}
-        )
-        endpoint.start()
-        self.addCleanup(endpoint.stop)
-
-    def create_custom_store(self, default_branch: str):
-        origin_custom = self.seed_origin(branch=default_branch)
-        url = "https://github.com/acme/fleet.git"
-        identity = {
-            "GIT_AUTHOR_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
-            "GIT_AUTHOR_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
-            "GIT_COMMITTER_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
-            "GIT_COMMITTER_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
-        }
-
-        def custom_runner(argv, cwd):
-            argv = [str(origin_custom) if token == url else token for token in argv]
-            completed = subprocess.run(
-                argv,
-                cwd=str(cwd),
-                capture_output=True,
-                text=True,
-                env={**os.environ, **identity},
-            )
-            return GitResult(completed.returncode, completed.stdout, completed.stderr)
-
-        safe_branch = default_branch.replace("/", "_")
-        custom_store = content_workspace.ContentWorkspaceStore(
-            self.tmp_path / "broker" / f"custom_trees_{safe_branch}",
-            self.tmp_path / f"agent-workspace_{safe_branch}",
-            custom_runner,
-        )
-
-        class CustomRouter:
-            workspaces = custom_store
-
-        route = credential_proxy.CredentialProxyHandler._workspace_route
-
-        def custom_call(endpoint, verb, payload):
-            self.verbs.append(verb)
-            try:
-                body = route(CustomRouter(), verb, payload)
-            except content_workspace.ContentWorkspaceError as exc:
-                raise credential_proxy_client.WorkspaceRequestError(
-                    exc.status,
-                    {"status": "blocked", "code": exc.code, "message": str(exc)},
-                ) from exc
-            if body is None:
-                raise credential_proxy_client.WorkspaceRequestError(
-                    404, {"status": "not_found"}
-                )
-            return body
-
-        return custom_store, custom_call
-
-    def scratch(self, files: dict) -> Path:
-        directory = self.tmp_path / "scratch"
-        for name, text in files.items():
-            path = directory / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
-        return directory
-
-    def prepare_content(self, branch="platform-agent/fix-netpol", repo=None):
-        argv = ["prepare", "--branch", branch]
-        if repo:
-            argv += ["--repo", repo]
-        out = io.StringIO()
-        with redirect_stdout(out):
-            submit_suggestion.dispatch(argv)
-        return json.loads(out.getvalue())
-
-    def submit_content(
-        self,
-        prepared,
-        source,
-        title="t",
-        body="b",
-        body_file=None,
-        keep_description=False,
-        deletes=(),
-        repo="acme/fleet",
-        base=None,
-    ):
-        argv = [
-            "submit",
-            "--branch", prepared["branch"],
-            "--handle", prepared["handle"],
-            "--from", str(source),
-            "--base-sha", prepared["baseSha"],
-            "--repo", repo,
-        ]
-        if base is not None:
-            argv += ["--base", base]
-        if title is not None:
-            argv += ["--title", title]
-        if body_file is not None:
-            argv += ["--body-file", str(body_file)]
-        elif body is not None:
-            argv += ["--body", body]
-        if keep_description:
-            argv.append("--keep-description")
-        for path in deletes:
-            argv += ["--delete", path]
-        out = io.StringIO()
-        with redirect_stdout(out):
-            submit_suggestion.dispatch(argv)
-        return out.getvalue().strip()
-
-    def test_prepare_hands_back_a_handle_and_no_path(self):
-        payload = self.prepare_content()
-        self.assertEqual(payload["mode"], "content")
-        self.assertEqual(payload["repo"], "acme/fleet")
-        self.assertEqual(payload["base"], "main")
-        self.assertEqual(len(payload["handle"]), 32)
-        # The whole point. A path in this JSON is a directory the agent can be
-        # told to `cd` into, and `.git` is inside it.
-        self.assertNotIn("workspace", payload)
-        self.assertNotIn("lease", payload)
-        for value in payload.values():
-            self.assertNotIn("/tmp", str(value))
-            self.assertFalse(str(value).startswith("/"))
-
-    def test_prepare_opens_the_repository_the_flag_names(self):
-        """`--repo` decides the repository in both modes or in neither.
-
-        Content mode read the default instead, so a fleet whose cards target
-        more than one GitOps repository had every suggestion opened against
-        whichever one `resolve_repo` answered with -- under a flag naming
-        another.
-        """
-        self.patch_attr(gitops_workspace, "resolve_repo", lambda workspace=None: "acme/secondary-repo")
-        payload = self.prepare_content(repo="acme/fleet")
-        self.assertEqual("acme/fleet", payload["repo"])
-
-    def test_submit_refuses_a_repository_outside_the_allowlist(self):
-        """The allowlist is checked before the credential is minted, not after.
-
-        Content-mode `submit` resolved `--repo` and went straight to
-        `refresh_git_credentials`, so argv the model controls named a repository
-        the operator never allowed, an installation token was minted for it, and
-        `gh pr create --repo` opened a pull request against it. Directory mode
-        and content-mode `prepare` both check; this path did not.
-        """
-        prepared = self.prepare_content()
-        source = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
-
-        minted = []
-        self.patch_attr(
-            submit_suggestion,
-            "refresh_git_credentials",
-            lambda repo=None: minted.append(repo) or "t",
-        )
-
-        with self.assertRaises(ValueError) as caught:
-            self.submit_content(prepared, source, repo="acme/not-managed")
+                submit_suggestion.validate_repo("acme/unmanaged")
         self.assertIn("not in the managed repositories list", str(caught.exception))
-        # The refusal has to land before the token exists. Minting first and
-        # failing afterwards still hands out a credential scoped to a repository
-        # nobody allowed.
-        self.assertEqual([], minted)
 
-    def test_prepare_then_submit_lands_the_branch_and_opens_the_pr(self):
-        prepared = self.prepare_content()
-        source = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
-        url = self.submit_content(prepared, source)
 
-        self.assertEqual(url, "https://github.com/acme/fleet/pull/1")
-        self.assertIn("platform-agent/fix-netpol", self.origin_branches())
-        files = self.origin_git(
-            ["ls-tree", "-r", "--name-only", "platform-agent/fix-netpol"]
-        ).split()
-        self.assertIn("clusters/prod/netpol.yaml", files)
-        self.assertEqual(
-            self.verbs, ["open", "open", "commit", "push", "close"]
-        )  # the first `open` is the availability probe
-
-    def test_the_pull_request_body_travels_on_stdin(self):
-        prepared = self.prepare_content()
-        source = self.scratch({"a.yaml": "kind: X\n"})
-        self.submit_content(prepared, source, body="a body\nover two lines\n")
-        argv, cwd = self.gh_calls[0]
-        self.assertEqual(argv[argv.index("--body-file") + 1], "-")
-        self.assertNotIn("--body", argv)
-        # No cwd either: in content mode there is no directory in this container
-        # for `gh` to run in, and it does not need one — every call names --repo.
-        self.assertIsNone(cwd)
-
-    def test_submit_content_when_branch_equals_base_branch_is_refused_before_commit_or_push(self):
-        prepared = self.prepare_content(branch="platform-agent/fix-netpol")
-        # Test with a non-default base branch name that is not in hardcoded PROTECTED_BRANCHES
-        release_base = "release/2026-08"
-        prepared["branch"] = release_base
-        source = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
-        self.verbs.clear()
-        with self.assertRaises(ValueError) as ctx:
-            self.submit_content(prepared, source, base=release_base)
-        self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
-        self.assertIn("is the same as base branch", str(ctx.exception))
-        self.assertNotIn("commit", self.verbs)
-        self.assertNotIn("push", self.verbs)
-
-        # Submitting to a run branch is refused by check_branch before reaching the broker (#1498)
-        run_base = "run/test-cluster/b-0011"
-        prepared["branch"] = run_base
-        with self.assertRaises(ValueError) as ctx:
-            self.submit_content(prepared, source, base=run_base)
-        self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
-        self.assertIn("is a protected base or run branch", str(ctx.exception))
-
-    def test_submit_content_when_base_omitted_resolves_fallback_and_refuses_when_branch_matches(self):
-        prepared = self.prepare_content(branch="platform-agent/fix-netpol")
-        # When --base is omitted, open_handle falls back to gitops_workspace.resolve_base_branch() (#1498).
-        # 1. With CREDENTIAL_PROXY_BASE_BRANCH configured, client-side check refuses matching branch before calling broker.
-        custom_base = "custom-release-base"
-        prepared["branch"] = custom_base
-        source = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
-        self.verbs.clear()
-        with patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": custom_base}):
-            with self.assertRaises(ValueError) as ctx:
-                self.submit_content(prepared, source, base=None)
-            self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
-            self.assertIn("is a protected base or run branch", str(ctx.exception))
-            self.assertNotIn("commit", self.verbs)
-            self.assertNotIn("push", self.verbs)
-
-        # 2. When --base and env overrides are omitted, open_handle falls back to "main".
-        # If the repository default branch is non-main (e.g. release-trunk), the client permits
-        # the submission call and the unmocked broker authoritatively refuses it upon commit/push (#1498).
-        custom_store, custom_call = self.create_custom_store("release-trunk")
-        self.patch_attr(credential_proxy_client, "_workspace_call", custom_call)
-
-        prepared2 = self.prepare_content(branch="platform-agent/feature-x")
-        self.assertEqual(prepared2["base"], "release-trunk")
-        prepared2["branch"] = "release-trunk"
-        source2 = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
-        self.verbs.clear()
-        with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as ctx:
-                self.submit_content(prepared2, source2, base=None)
-            self.assertIn("remote default", str(ctx.exception))
-            self.assertEqual(ctx.exception.status, 400)
-            self.assertEqual(ctx.exception.payload.get("code"), "workspace.invalid")
-            self.assertIn("commit", self.verbs)
-            self.assertNotIn("push", self.verbs)
-
-    def test_prepare_content_preserves_remote_default_branch_when_master(self):
-        # A repository whose default trunk is `master` rather than `main` must not have
-        # `main` forced onto it by the client during prepare (#1498).
-        origin_master = self.tmp_path / "origin_master.git"
-        seed_master = self.tmp_path / "seed_master"
-        seed_master.mkdir()
-        for cmd in (
-            ["git", "init", "--quiet", "--bare", "--initial-branch=master", str(origin_master)],
-            ["git", "init", "--quiet", "--initial-branch=master", str(seed_master)],
-        ):
-            subprocess.run(cmd, check=True, capture_output=True)
-        (seed_master / "README.md").write_text("master seed\n", encoding="utf-8")
-        for argv in (
-            ["config", "user.email", "t@example.com"],
-            ["config", "user.name", "T"],
-            ["add", "README.md"],
-            ["commit", "--quiet", "-m", "seed master"],
-            ["remote", "add", "origin", str(origin_master)],
-            ["push", "--quiet", "origin", "master"],
-        ):
-            git(argv, seed_master)
-
-        def master_runner(argv, cwd):
-            argv = [str(origin_master) if token == "https://github.com/acme/fleet.git" else token for token in argv]
-            completed = subprocess.run(
-                argv,
-                cwd=str(cwd),
-                capture_output=True,
-                text=True,
-                env={
-                    **os.environ,
-                    "GIT_AUTHOR_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
-                    "GIT_AUTHOR_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
-                    "GIT_COMMITTER_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
-                    "GIT_COMMITTER_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
-                },
-            )
-            return GitResult(completed.returncode, completed.stdout, completed.stderr)
-
-        master_store = content_workspace.ContentWorkspaceStore(
-            self.tmp_path / "broker" / "master_trees",
-            self.tmp_path / "agent-master-workspace",
-            master_runner,
-        )
-
-        class MasterRouter:
-            workspaces = master_store
-
-        route = credential_proxy.CredentialProxyHandler._workspace_route
-
-        def master_call(endpoint, verb, payload):
-            self.verbs.append(verb)
-            try:
-                return route(MasterRouter(), verb, payload)
-            except content_workspace.ContentWorkspaceError as exc:
-                raise credential_proxy_client.WorkspaceRequestError(
-                    exc.status,
-                    {"status": "blocked", "code": exc.code, "message": str(exc)},
-                ) from exc
-
-        self.patch_attr(credential_proxy_client, "_workspace_call", master_call)
-
-        # Prepare should discover master as base and succeed
-        prepared = self.prepare_content(branch="platform-agent/fix-for-master")
-        self.assertEqual(prepared["base"], "master")
-        self.assertEqual(prepared["branch"], "platform-agent/fix-for-master")
-
-        # Preparing on branch equal to base (master) is refused
-        with self.assertRaises(ValueError) as ctx:
-            self.prepare_content(branch="master")
-        self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
-
-        # Test with a non-protected default branch (release-trunk)
-        origin_custom = self.tmp_path / "origin_custom.git"
-        seed_custom = self.tmp_path / "seed_custom"
-        seed_custom.mkdir()
-        for cmd in (
-            ["git", "init", "--quiet", "--bare", "--initial-branch=release-trunk", str(origin_custom)],
-            ["git", "init", "--quiet", "--initial-branch=release-trunk", str(seed_custom)],
-        ):
-            subprocess.run(cmd, check=True, capture_output=True)
-        (seed_custom / "README.md").write_text("custom seed\n", encoding="utf-8")
-        for argv in (
-            ["config", "user.email", "t@example.com"],
-            ["config", "user.name", "T"],
-            ["add", "README.md"],
-            ["commit", "--quiet", "-m", "seed custom"],
-            ["remote", "add", "origin", str(origin_custom)],
-            ["push", "--quiet", "origin", "release-trunk"],
-            ["checkout", "-b", "feature/custom-base"],
-            ["push", "--quiet", "origin", "feature/custom-base"],
-            ["checkout", "release-trunk"],
-        ):
-            git(argv, seed_custom)
-
-        def custom_runner(argv, cwd):
-            argv = [str(origin_custom) if token == "https://github.com/acme/fleet.git" else token for token in argv]
-            completed = subprocess.run(
-                argv,
-                cwd=str(cwd),
-                capture_output=True,
-                text=True,
-                env={
-                    **os.environ,
-                    "GIT_AUTHOR_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
-                    "GIT_AUTHOR_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
-                    "GIT_COMMITTER_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
-                    "GIT_COMMITTER_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
-                },
-            )
-            return GitResult(completed.returncode, completed.stdout, completed.stderr)
-
-        custom_store = content_workspace.ContentWorkspaceStore(
-            self.tmp_path / "broker" / "custom_trees",
-            self.tmp_path / "agent-custom-workspace",
-            custom_runner,
-        )
-
-        class CustomRouter:
-            workspaces = custom_store
-
-        def custom_call(endpoint, verb, payload):
-            self.verbs.append(verb)
-            try:
-                return route(CustomRouter(), verb, payload)
-            except content_workspace.ContentWorkspaceError as exc:
-                raise credential_proxy_client.WorkspaceRequestError(
-                    exc.status,
-                    {"status": "blocked", "code": exc.code, "message": str(exc)},
-                ) from exc
-
-        self.patch_attr(credential_proxy_client, "_workspace_call", custom_call)
-
-        prepared_custom = self.prepare_content(branch="platform-agent/fix-custom")
-        self.assertEqual(prepared_custom["base"], "release-trunk")
-
-        # Preparing on branch equal to non-protected base (release-trunk) is refused by handle_prepare_content
-        # and cleanly closes the opened broker workspace without leaking handles (#1498).
-        self.verbs.clear()
-        with self.assertRaises(ValueError) as ctx:
-            self.prepare_content(branch="release-trunk")
-        self.assertIn("CRITICAL SECURITY REFUSAL", str(ctx.exception))
-        self.assertIn("is the same as base branch 'release-trunk'", str(ctx.exception))
-        self.assertIn("close", self.verbs)
-
-        # Opening with an explicit custom base preserves remote default in workspace.default_branch
-        # and refuses broker commit and push targeting the remote default (Thread 7).
-        ws_custom = custom_store.open("acme/fleet", base="feature/custom-base")
-        self.assertEqual(ws_custom.default_branch, "release-trunk")
-        self.assertEqual(ws_custom.base, "feature/custom-base")
-        with self.assertRaises(content_workspace.ContentWorkspaceError) as ctx_commit:
-            custom_store.commit(ws_custom.handle, "release-trunk", "hostile commit", [])
-        self.assertIn("remote default", str(ctx_commit.exception))
-        with self.assertRaises(content_workspace.ContentWorkspaceError) as ctx_push:
-            custom_store.push(ws_custom.handle, "release-trunk")
-        self.assertIn("remote default", str(ctx_push.exception))
-
-    def test_a_body_file_reaches_gh_intact_in_content_mode(self):
-        """The safe channel has to be the safe channel in both transports.
-
-        Content mode read `args.body` directly, so `--body-file` was accepted,
-        ignored, and the pull request opened with an empty description — on the
-        path every current install takes, because the operator renders
-        `CREDENTIAL_PROXY_CONTENT_WORKSPACE=1` unconditionally.
-        """
-        hostile = "Fixes the `main` branch.\n\nRun `id` to check. $(whoami)\n"
-        path = self.scratch_dir / "body.md"
-        path.write_text(hostile, encoding="utf-8")
-
-        prepared = self.prepare_content()
-        source = self.scratch({"a.yaml": "kind: X\n"})
-        self.submit_content(prepared, source, body=None, body_file=path)
-
-        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], hostile)
-
-    def test_keep_description_leaves_the_body_alone_in_content_mode(self):
-        """Round two under a handle used to overwrite a reviewed description.
-
-        `--keep-description` reached `create_pull_request` only from directory
-        mode; the content path passed the flag's absence, so the mode meant to
-        protect a human's prose did nothing on the transport that carries every
-        real submission.
-        """
-        authored = "## Context\n\nHand-written, with `backticks` and a list:\n- one\n"
-        first = self.prepare_content()
-        first_url = self.submit_content(
-            first, self.scratch({"a.yaml": "kind: X\n"}), body=authored
-        )
-
-        again = self.prepare_content()
-        second_url = self.submit_content(
-            again,
-            self.scratch({"b.yaml": "kind: Y\n"}),
-            body=None,
-            keep_description=True,
-        )
-
-        self.assertEqual(second_url, first_url)
-        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], authored)
-        # The commit still landed — this mode changes the description, nothing
-        # else — and `pr edit` never ran.
-        files = self.origin_git(
-            ["ls-tree", "-r", "--name-only", "platform-agent/fix-netpol"]
-        ).split()
-        self.assertIn("b.yaml", files)
-        self.assertNotIn(["pr", "edit"], [argv[1:3] for argv, _ in self.gh_calls])
-
-    def test_keep_description_without_an_open_pull_request_refuses_before_the_commit(self):
-        """The refusal has to land before the branch moves, not after.
-
-        The check used to live inside `create_pull_request`, which content mode
-        reaches only once the broker has committed and pushed. The error tells
-        the caller to retry with a body — and that retry finds the files
-        already on the branch, so `commit` reports nothing to do and refuses
-        too, leaving commits pushed, no pull request, and no way through this
-        script to open one.
-        """
-        prepared = self.prepare_content()
-        self.verbs.clear()
-        source = self.scratch({"a.yaml": "kind: X\n"})
-        with self.assertRaises(RuntimeError) as caught:
-            self.submit_content(prepared, source, body=None, keep_description=True)
-        self.assertIn("no pull request is open", str(caught.exception))
-        self.assertEqual([["pr", "view"]], [argv[1:3] for argv, _ in self.gh_calls])
-        # Nothing was committed and nothing was pushed, so the retry the error
-        # asks for is a retry that can work.
-        self.assertEqual([], self.verbs)
-        self.assertNotIn("platform-agent/fix-netpol", self.origin_branches())
-
-    def test_a_merged_pull_request_is_not_a_description_to_keep(self):
-        """`gh pr view` answers for a merged pull request too.
-
-        Branch names here are derived from the change, so a branch outlives the
-        pull request opened from it. Counting the merged one as "there is a
-        description to keep" made the run return that old URL and open nothing:
-        the commits landed, the log said `PR SUBMITTED SUCCESSFULLY`, and no
-        pull request existed for them.
-        """
-        first = self.prepare_content()
-        url = self.submit_content(first, self.scratch({"a.yaml": "kind: X\n"}))
-        branch = first["branch"]
-        self.gh_stub.closed_prs[branch] = self.gh_stub.open_prs.pop(branch)
-
-        again = self.prepare_content()
-        with self.assertRaises(RuntimeError) as caught:
-            self.submit_content(
-                again, self.scratch({"b.yaml": "kind: Y\n"}),
-                body=None, keep_description=True,
-            )
-        self.assertIn("no pull request is open", str(caught.exception))
-        self.assertNotIn(url, str(caught.exception))
-
-    def test_a_failed_lookup_is_not_read_as_an_absent_pull_request(self):
-        """An expired token and "there is no pull request" are opposite answers.
-
-        Collapsing both into "" told the agent to resubmit with a title and a
-        body — and on the transient it is, that resubmission finds the pull
-        request open after all and overwrites the reviewed description this
-        mode exists to protect.
-        """
-        prepared = self.prepare_content()
-        source = self.scratch({"a.yaml": "kind: X\n"})
-        stub = submit_suggestion.subprocess
-        stub._view = lambda argv: subprocess.CompletedProcess(
-            argv, 1, "", "HTTP 401: Bad credentials\n"
-        )
-
-        with self.assertRaises(RuntimeError) as caught:
-            self.submit_content(prepared, source, body=None, keep_description=True)
-        message = str(caught.exception)
-        self.assertIn("Bad credentials", message)
-        self.assertNotIn("no pull request is open", message)
-
-    def test_content_mode_needs_a_title_even_under_keep_description(self):
-        """The title is the commit message here, and only here.
-
-        Directory mode has already made the commit by the time `submit` runs,
-        so `--keep-description` can waive the title along with the body. Under
-        a handle this script makes the commit, and a commit with no message is
-        not something the broker can be asked for.
-        """
-        prepared = self.prepare_content()
-        self.verbs.clear()
-        source = self.scratch({"a.yaml": "kind: X\n"})
-        with self.assertRaises(ValueError) as caught:
-            self.submit_content(
-                prepared, source, title=None, body=None, keep_description=True
-            )
-        self.assertIn("--title is required with --handle", str(caught.exception))
-        self.assertEqual([], self.verbs)
-        self.assertEqual([], self.gh_calls)
-
-    def test_content_mode_without_keep_still_needs_a_title_and_a_body(self):
-        """The guard ran after the dispatch, so it never covered this path."""
-        prepared = self.prepare_content()
-        self.verbs.clear()
-        source = self.scratch({"a.yaml": "kind: X\n"})
-        with self.assertRaises(ValueError) as caught:
-            self.submit_content(prepared, source, title="t", body=None)
-        self.assertIn("--keep-description", str(caught.exception))
-        # Refused on argv alone: nothing was sent to the broker and no
-        # credential was spent.
-        self.assertEqual([], self.verbs)
-        self.assertEqual([], self.gh_calls)
-
-    def test_a_delete_reaches_the_commit(self):
-        prepared = self.prepare_content()
-        source = self.scratch({"a.yaml": "kind: X\n"})
-        self.submit_content(prepared, source, deletes=["README.md"])
-        files = self.origin_git(
-            ["ls-tree", "-r", "--name-only", "platform-agent/fix-netpol"]
-        ).split()
-        self.assertNotIn("README.md", files)
-
-    def test_a_symlink_in_the_scratch_directory_is_not_followed(self):
-        """A link resolves against the *agent's* filesystem.
-
-        Following one would read whatever it points at into a commit — the
-        agent's own token file included — while every string in the request
-        still looked like ordinary repository-relative content.
-        """
-        secret = self.tmp_path / "token"
-        secret.write_text("ghs_not_yours\n", encoding="utf-8")
-        source = self.scratch({"a.yaml": "kind: X\n"})
-        (source / "stolen.txt").symlink_to(secret)
-
-        changes = submit_suggestion.collect_changes(str(source), None)
-        self.assertEqual(list(changes), ["a.yaml"])
-
-    def test_submit_refuses_a_handle_with_nothing_to_send(self):
-        prepared = self.prepare_content()
-        with self.assertRaises(ValueError) as caught:
-            submit_suggestion.dispatch([
-                "submit",
-                "--branch", prepared["branch"],
-                "--title", "t", "--body", "b",
-                "--handle", prepared["handle"],
-            ])
-        self.assertIn("--from is required", str(caught.exception))
-        self.assertEqual(self.gh_calls, [])
-
-    def test_a_protected_branch_is_refused_before_the_broker_is_touched(self):
-        prepared = self.prepare_content()
-        self.verbs.clear()
-        source = self.scratch({"a.yaml": "kind: X\n"})
-        with self.assertRaises(ValueError) as caught:
-            self.submit_content({**prepared, "branch": "main"}, source)
-        self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
-        self.assertEqual(self.verbs, [])
-
-    def test_a_base_that_moved_under_the_same_file_is_refused(self):
-        """`--base-sha` is what makes a ten-minute suggestion safe to land."""
-        prepared = self.prepare_content()
-        # Someone else lands a change to the same file on main meanwhile.
-        seed = self.tmp_path / "meanwhile"
-        subprocess.run(
-            ["git", "clone", "--quiet", str(self.origin), str(seed)],
-            check=True, capture_output=True,
-        )
-        (seed / "clusters/prod").mkdir(parents=True)
-        (seed / "clusters/prod/netpol.yaml").write_text("kind: Other\n", encoding="utf-8")
-        for argv in (
-            ["config", "user.email", "o@example.com"],
-            ["config", "user.name", "O"],
-            ["add", "-A"],
-            ["commit", "--quiet", "-m", "theirs"],
-            ["push", "--quiet", "origin", "main"],
-        ):
-            git(argv, seed)
-
-        source = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
-        with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
-            self.submit_content(prepared, source)
-        self.assertEqual(caught.exception.status, 409)
-        # The broker names the colliding files in the refusal itself rather than
-        # in a field of its own, so a caller that only prints the message still
-        # tells its reader which file to re-read.
-        self.assertIn(
-            "clusters/prod/netpol.yaml", caught.exception.payload["message"]
-        )
-        self.assertEqual(self.gh_calls, [])
-
-    def test_a_failed_submit_still_releases_the_brokers_clone(self):
-        """The sidecar's disk is not something a retry loop may fill.
-
-        Every failure between `open` and the pull request used to leave a
-        checkout and a handle on the broker with nothing left that could name
-        them -- and the card that failed is the one an operator retries.
-        """
-        prepared = self.prepare_content()
-        source = self.scratch({"a.yaml": "kind: X\n"})
-        self.submit_content(prepared, source)
-        self.verbs.clear()
-
-        # The same bytes again: refused as a duplicate, mid-session.
-        again = self.prepare_content()
-        with self.assertRaises(ValueError):
-            self.submit_content(again, source)
-        self.assertIn("close", self.verbs)
-        self.assertEqual({}, self.store._workspaces)
-
-    def test_a_second_round_of_review_feedback_keeps_the_first_round(self):
-        """The data loss directory mode already shipped once, in the new path.
-
-        `commit` used to check out `origin/<base>` unconditionally, so round two
-        replaced every reviewed commit with one that no longer contained them —
-        and `--force-with-lease` could not object, because `commit` fetches the
-        very ref the lease compares against moments earlier.
-        """
-        first = self.prepare_content()
-        self.assertEqual(first["started_from"], "origin/main")
-        self.submit_content(first, self.scratch({"a.yaml": "kind: X\n"}))
-
-        second = self.prepare_content()
-        self.assertEqual(second["started_from"], "origin/platform-agent/fix-netpol")
-        self.submit_content(second, self.scratch({"b.yaml": "kind: Y\n"}))
-
-        files = self.origin_git(
-            ["ls-tree", "-r", "--name-only", "platform-agent/fix-netpol"]
-        ).split()
-        self.assertIn("b.yaml", files)
-        self.assertIn("a.yaml", files, "round one's reviewed work was erased")
-
-    def test_a_reopened_workspace_reads_the_branch_not_the_base(self):
-        """Otherwise round two edits the file as `main` has it.
-
-        Same failure as above by another route: the content is right on disk but
-        the agent was shown the wrong starting text, so its edit writes the
-        reviewed change back out of the file.
-        """
-        first = self.prepare_content()
-        self.submit_content(first, self.scratch({"README.md": "seed\nround one\n"}))
-
-        second = self.prepare_content()
-        scratch = self.tmp_path / "again"
-        with redirect_stdout(io.StringIO()):
-            submit_suggestion.dispatch([
-                "fetch",
-                "--handle", second["handle"],
-                "--path", "README.md",
-                "--to", str(scratch),
-                "--repo", "acme/fleet",
-            ])
-        self.assertEqual(
-            (scratch / "README.md").read_text(encoding="utf-8"), "seed\nround one\n"
-        )
-
-    def test_list_and_fetch_are_how_an_existing_file_gets_edited(self):
-        """There is no `cat` that reaches the checkout, so the skill carries one.
-
-        Without this the agent's only way to change an existing file would be to
-        rewrite it from memory.
-        """
-        prepared = self.prepare_content()
-        out = io.StringIO()
-        with redirect_stdout(out):
-            submit_suggestion.dispatch(
-                ["list", "--handle", prepared["handle"], "--repo", "acme/fleet"]
-            )
-        self.assertEqual(
-            [entry["path"] for entry in json.loads(out.getvalue())["entries"]],
-            ["README.md"],
-        )
-
-        scratch = self.tmp_path / "scratch"
-        out = io.StringIO()
-        with redirect_stdout(out):
-            submit_suggestion.dispatch([
-                "fetch",
-                "--handle", prepared["handle"],
-                "--path", "README.md",
-                "--to", str(scratch),
-                "--repo", "acme/fleet",
-            ])
-        self.assertEqual((scratch / "README.md").read_text(encoding="utf-8"), "seed\n")
-
-        (scratch / "README.md").write_text("seed\nand a line\n", encoding="utf-8")
-        self.submit_content(prepared, scratch)
-        landed = self.origin_git(
-            ["show", "platform-agent/fix-netpol:README.md"]
-        )
-        self.assertEqual(landed, "seed\nand a line\n")
-
-    def test_fetch_will_not_write_outside_the_scratch_directory(self):
-        # `--path` is repository-relative and the broker validates it, so the
-        # traversal is refused before anything is read rather than being
-        # normalised into something that lands somewhere unexpected here.
-        prepared = self.prepare_content()
-        scratch = self.tmp_path / "scratch"
-        with self.assertRaises(credential_proxy_client.WorkspaceRequestError):
-            submit_suggestion.dispatch([
-                "fetch",
-                "--handle", prepared["handle"],
-                "--path", "../../etc/passwd",
-                "--to", str(scratch),
-                "--repo", "acme/fleet",
-            ])
-        self.assertFalse(scratch.exists())
-
-    def test_a_missing_broker_falls_back_to_the_directory_path(self):
-        """Both mechanisms are live at once, and the agent asks rather than assumes."""
-
-        def unavailable(endpoint, verb, payload):
-            raise credential_proxy_client.WorkspaceUnavailable("not enabled")
-
-        with patch.object(credential_proxy_client, "_workspace_call", unavailable):
-            payload = self.prepare_content()
-        self.assertEqual(payload["mode"], "directory")
-        self.assertIn("workspace", payload)
-
-
-class _GhStub:
-    """Stand in for the `subprocess` module inside submit_suggestion.
-
-    Only `gh` is intercepted — it is the one tool that needs a real GitHub.
-    Everything else is handed to the real module so the git in these tests
-    stays real.
-
-    It models one behaviour beyond recording, because that behaviour is the
-    bug: GitHub refuses a second `pr create` for a branch that already has an
-    open pull request, and the refusal arrives *after* the push has landed. A
-    stub that always succeeded made the resubmission path untestable, which is
-    how the skill shipped exiting 1 on every round of review feedback.
-    """
-
-    def __init__(self, test):
-        self._test = test
-        self.open_prs: dict[str, str] = {}
-        self.titles: dict[str, str] = {}
-        self.bodies: dict[str, str] = {}
-        # Branches whose pull request `gh pr view` still resolves but whose
-        # state is no longer OPEN. The real CLI answers for a merged or closed
-        # pull request exactly as it does for an open one, and branch names
-        # here are reused across rounds, so this is a reachable state rather
-        # than a hypothetical.
-        self.closed_prs: dict[str, str] = {}
-
-    @staticmethod
-    def _body_of(argv, stdin):
-        """The description `gh` was handed, whichever channel carried it.
-
-        `--body-file -` is the one the code uses; the path and `--body` forms
-        are here because `gh` accepts them and a caller outside this repository
-        may still pass one.
-        """
-        if "--body-file" in argv:
-            path = argv[argv.index("--body-file") + 1]
-            if path == "-":
-                return stdin
-            return Path(path).read_text(encoding="utf-8")
-        return argv[argv.index("--body") + 1]
-
-    def __getattr__(self, name):
-        return getattr(subprocess, name)
-
-    def run(self, cmd, **kwargs):
-        argv = list(cmd)
-        if argv[:1] != ["gh"]:
-            return subprocess.run(cmd, **kwargs)
-        self._test.gh_calls.append((argv, kwargs.get("cwd")))
-        verb = argv[1:3]
-        stdin = kwargs.get("input")
-        if verb == ["pr", "create"]:
-            return self._create(argv, stdin)
-        if verb == ["pr", "edit"]:
-            return self._edit(argv, stdin)
-        if verb == ["pr", "view"]:
-            return self._view(argv)
-        return subprocess.CompletedProcess(argv, 0, "", "")
-
-    def _create(self, argv, stdin):
-        branch = argv[argv.index("--head") + 1]
-        if branch in self.open_prs:
-            # Verbatim shape of the real refusal, because the code keys on it.
-            return subprocess.CompletedProcess(
-                argv, 1, "",
-                f'a pull request for branch "{branch}" into branch "main" '
-                f"already exists:\n{self.open_prs[branch]}\n",
-            )
-        url = f"https://github.com/acme/fleet/pull/{len(self.open_prs) + 1}"
-        self.open_prs[branch] = url
-        self.titles[branch] = argv[argv.index("--title") + 1]
-        self.bodies[branch] = self._body_of(argv, stdin)
-        return subprocess.CompletedProcess(argv, 0, url + "\n", "")
-
-    def _edit(self, argv, stdin):
-        branch = argv[3]
-        if branch not in self.open_prs:
-            return subprocess.CompletedProcess(argv, 1, "", "no pull requests found\n")
-        self.titles[branch] = argv[argv.index("--title") + 1]
-        self.bodies[branch] = self._body_of(argv, stdin)
-        return subprocess.CompletedProcess(argv, 0, "", "")
-
-    def _view(self, argv):
-        """`gh pr view`, including the two answers that are not "here it is".
-
-        A branch with no pull request at all exits 1 with `no pull requests
-        found`. A branch whose pull request merged or closed exits *0* — the
-        real CLI does not filter by state — and the `--jq` on the command line
-        is what turns that into empty output. Modelling the jq rather than the
-        outcome is deliberate: the code under test is the query, so a stub that
-        answered "" directly would assert only that the test agrees with
-        itself.
-        """
-        branch = argv[3]
-        url = self.open_prs.get(branch) or self.closed_prs.get(branch)
-        if not url:
-            return subprocess.CompletedProcess(argv, 1, "", "no pull requests found\n")
-        state = "OPEN" if branch in self.open_prs else "MERGED"
-        jq = argv[argv.index("--jq") + 1]
-        wanted = re.search(r'select\(\.state == "([A-Z]+)"\)', jq)
-        # No `select` filters nothing, exactly as jq would not: a query that
-        # stopped asking for the state has to come back with the merged pull
-        # request here, or the test passes for a reason of its own making.
-        selected = "" if wanted and wanted.group(1) != state else url
-        return subprocess.CompletedProcess(
-            argv, 0, (selected + "\n") if selected else "", ""
-        )
-
-
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     unittest.main()

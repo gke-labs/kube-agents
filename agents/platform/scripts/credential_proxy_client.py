@@ -839,6 +839,26 @@ class WorkspaceUnavailable(RuntimeError):
     """The broker does not have content workspaces armed."""
 
 
+class BrokerDisconnected(RuntimeError):
+    """The connection broke after the request was on the wire.
+
+    Distinct from `urllib.error.URLError`, which `urllib` raises for a send
+    that never landed. Only `h.request(...)` is wrapped in it; `getresponse()`
+    and the body read after it are not, and `BrokerConnection.connect` clears
+    the socket timeout once connected — so a broker evicted or rolled
+    mid-request raises `http.client.RemoteDisconnected`, `IncompleteRead` or a
+    bare `ConnectionResetError` out of the read, none of them a `URLError`.
+
+    Translated here rather than caught by the caller because this module owns
+    the transport: `vcs_client` must import no network client of its own, and
+    `test_vcs.test_the_only_network_client_is_the_broker` holds it to that.
+
+    The two are worth telling apart downstream. A send that never landed
+    changed nothing; a connection that broke mid-answer may have been acted on
+    at the far end, and a retry has to be written knowing that.
+    """
+
+
 class WorkspaceRequestError(RuntimeError):
     """The broker refused. `status` and `payload` carry its answer verbatim."""
 
@@ -1177,13 +1197,33 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
         try:
             answer = json.load(exc)
         except (ValueError, TypeError):
+            # The status arrived but the body is not a refusal document. The
+            # status is the whole answer.
             raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
+        except (http.client.HTTPException, OSError) as broke:
+            # The body ran out mid-read instead: an `IncompleteRead`, or a
+            # `RemoteDisconnected`, or a reset socket. None of those is a
+            # `ValueError`, so the clause above does not see them, and the
+            # identical clause at the foot of this `try` cannot either --
+            # Python does not offer an exception raised inside an `except`
+            # block to that block's siblings. Without this arm it leaves
+            # `vcs_call` as a raw `http.client` type, which `vcs_client.call`
+            # has no arm for and every consumer is built on it having one.
+            raise BrokerDisconnected(f"{type(broke).__name__}: {broke}") from broke
         if answer.get("code") == "VCS_UNAVAILABLE":
             # A broker too old to have these routes at all. Distinguished from
             # every other refusal because it is the one a caller cannot fix by
             # asking differently.
             raise WorkspaceUnavailable(answer.get("error", "not available")) from exc
         raise WorkspaceRequestError(exc.code, answer) from exc
+    except urllib.error.URLError:
+        # Out untouched: the send never landed, and `vcs_client.call` has an
+        # arm that says so. Named before the clause below only because
+        # `URLError` is itself an `OSError` and would otherwise be swallowed by
+        # it and reported as a connection that broke mid-answer.
+        raise
+    except (http.client.HTTPException, OSError) as exc:
+        raise BrokerDisconnected(f"{type(exc).__name__}: {exc}") from exc
 
 
 class ApiSession:
