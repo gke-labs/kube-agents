@@ -120,7 +120,7 @@ Whether a check blocks on a single run or only across the three depends on who c
 - the planted defect is still there at the end of the run, asserted on the defect itself and not just the object carrying it;
 - the final report names it, checked against the report rather than the transcript;
 - the agent called the tool it says it read;
-- asked to run an audit, it triggered the job (`hermes cron run`) instead of re-enacting the audit in the session.
+- delegated one named audit stream, it ran that stream itself, `audit_report.py start` to `finish`, and the check is the ledger issue that run wrote (`ledger_issue_contains`), not a `hermes cron run` in the transcript: the sandbox shell has no `hermes`, no case grades the scheduled path, and a second `start` of a stream already in flight is refused rather than run (#1876, #1887).
 
 `tool_called` counts the router's calls by default (the workers' calls sit in the same trajectory, tagged, and `scope: workers` counts those instead), so a worker's tool choice is checkable by name while worker mutations are still caught by cluster state.
 

@@ -15,12 +15,15 @@ import copy
 import importlib.util
 import io
 import json
+import fcntl
 import os
+import stat
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import dataclass
@@ -586,6 +589,11 @@ class BaseTestCase(unittest.TestCase):
         )
         env.start()
         self.addCleanup(env.stop)
+        # Many tests run `start` more than once against one scratch directory
+        # and never `finish`; the in-flight note would refuse the second. The
+        # tests about the note itself put the real check back.
+        self.real_claim_in_flight = audit_report.claim_in_flight
+        self.patch_attr("claim_in_flight", lambda *a, **k: None)
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
         return json.dumps([{"number": number, "url": url}])
@@ -3948,6 +3956,288 @@ class TestStart(HarnessTestCase):
         # Autopilot fleet came from.
         self.assertIn("checks_not_applicable", contract)
         self.assertIn("reason", contract)
+
+    def test_a_second_start_is_refused_while_the_stream_is_in_flight(self):
+        """One stream, one run at a time, whoever started it (#1876).
+
+        Every path `start` scrubs is keyed by audit id on a volume every
+        session shares. The scheduler's lock keeps two ticks apart; a run
+        started from a session holds no lock, so `start` itself has to refuse
+        the second caller, or the tick landing mid-sweep wipes the first run's
+        state and both `finish` calls rewrite one ledger.
+        """
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("is in flight since", self.err)
+        self.assertIn("wait for its `finish` or report it", self.err)
+        # Labelled as a refused `start`, not a rejected document: every SOP
+        # reads `FINDINGS REJECTED` as "fix the file and re-run", and there
+        # is no file here.
+        self.assertIn("START REFUSED:", self.err)
+        self.assertNotIn("FINDINGS REJECTED", self.err)
+        # The refusal is addressed to the worker, and a worker has two
+        # options. The first wording offered an override "if you know it is
+        # dead"; on 2026-09-23 a refused session passed it 42 seconds later
+        # over a run that was alive. The flag is gone from the CLI, and the
+        # message carries nothing that reads as a hint that a way past
+        # exists.
+        self.assertNotIn("takeover", self.err.lower())
+        self.assertNotIn("override", self.err.lower())
+        # Nor does the message hand the worker a liveness test or a file.
+        # The second wording printed the note's pid, which is `start`'s own
+        # and always exited; that evening (build 2102875230451011584, rep 1)
+        # a refused worker ran `ps` on it, read the run as dead, and took
+        # over its own run. The note is a lease, not a process: no pid in
+        # the note, none in the refusal, no path either, and the message
+        # says so. (The pid is pinned by the word, not the number: the log
+        # prefix and the refusal both carry timestamps a small pid would
+        # match by accident.)
+        self.assertNotIn("pid", self.err.lower())
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertNotIn(str(note.parent), self.err)
+        self.assertIn("a lease on the stream, not a process", self.err)
+        self.assertEqual(set(json.loads(note.read_text())), {"audit", "started_at"})
+        # Refused means refused: the other run's note is still there.
+        self.assertTrue(note.is_file())
+        # There is no flag past the guard. The CLI had `--takeover` until
+        # 2026-09-24; both observation runs of #1876 saw a refused worker
+        # pass it within a minute over its own live run, and the sandbox
+        # shell cannot tell a worker from an operator, so the lever left the
+        # script. Releasing the stream early is an operator's action on the
+        # volume, documented in the cron README and not here.
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                audit_report.build_parser().parse_args(
+                    ["start", "--audit", AUDIT, "--takeover"]
+                )
+        self.assertNotIn("takeover", audit_report.build_parser().format_help().lower())
+        note.unlink()
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+
+    def test_a_half_written_note_is_a_claim_not_an_absence(self):
+        # A note that exists but does not parse (debris from a crash, an
+        # older shape, a hand edit) is a claim until its mtime ages out; a
+        # reader that took "does not parse" for "no note" would let two runs
+        # through on it.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text("")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("is in flight since", self.err)
+        self.assertEqual(note.read_text(), "")
+        # Once that note is older than the TTL it is debris like any other.
+        stale = time.time() - audit_report.INFLIGHT_TTL_SECONDS - 1
+        os.utime(note, (stale, stale))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+
+    def test_claims_for_one_stream_are_serialized(self):
+        # The stale-note path reads, unlinks and writes; by path, not by
+        # inode. Two `start`s inside that window would each remove the
+        # other's fresh note, so the whole claim runs under a lock.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        note.parent.mkdir(parents=True, exist_ok=True)
+        held = os.open(f"{note}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        claimed = threading.Event()
+        rival = threading.Thread(
+            target=lambda: (audit_report.claim_in_flight(AUDIT), claimed.set())
+        )
+        rival.start()
+        self.assertFalse(claimed.wait(0.3), "the rival claimed while the lock was held")
+        self.assertFalse(note.is_file())
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+        self.assertTrue(claimed.wait(5))
+        rival.join()
+        self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+
+    def test_a_failed_finish_frees_the_stream_and_a_dry_run_does_not(self):
+        # Eight of nine SOPs loop `start --repo A; finish --repo A; start
+        # --repo B` on a multi-repo install. A `finish` that died on a `gh`
+        # call must not leave B refused for two hours; a `--dry-run` is a
+        # preview mid-run and changes nothing.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertTrue(note.is_file())
+        self.assertEqual(self.run_finish(make_doc(), argv_extra=("--dry-run",)), 0, self.err)
+        self.assertTrue(note.is_file())
+        # Exit 2 is "fix the document and re-run `finish`" in every SOP: the
+        # run is still in flight while the worker edits, and a tick landing
+        # in that window must not scrub the document about to be resubmitted.
+        self.assertEqual(self.run_finish(make_doc(clusters=[])), 2)
+        self.assertIn("scope.clusters", self.err)
+        self.assertTrue(note.is_file())
+        self.harness.failures = {"issue create": 1}
+        self.assertEqual(self.run_finish(make_doc()), 1, self.err)
+        self.assertFalse(note.is_file())
+
+    def test_a_guard_that_cannot_be_taken_refuses_rather_than_running_unguarded(self):
+        # The guard exists so `start` never scrubs a run in flight. A lock it
+        # cannot open is a `start` that cannot know, so it exits 2 and touches
+        # nothing: not the other run's note, and not its state.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        note.parent.mkdir(parents=True, exist_ok=True)
+        theirs = json.dumps({"audit": AUDIT, "started_at": time.time()})
+        note.write_text(theirs)
+        real_open = os.open
+
+        def refuse_lock(path, flags, *rest):
+            # The lock itself cannot be opened (a directory in its place, a
+            # volume mounted read-only, a mode nobody can pass); everything
+            # else opens as usual.
+            if str(path).endswith(".lock"):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, flags, *rest)
+
+        with patch.object(audit_report.os, "open", side_effect=refuse_lock):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+        self.assertIn("in-flight guard", self.err)
+        self.assertIn("Permission denied", self.err)
+        # The error, not the path: a path in a refusal reads as a file to
+        # remove.
+        self.assertNotIn(str(note.parent), self.err)
+        self.assertEqual(note.read_text(), theirs)
+        self.assertFalse(Path(audit_report.run_record_path_for(AUDIT)).exists())
+
+    def test_a_clean_finish_releases_the_stream_too(self):
+        # The zero-finding run is the ordinary nightly outcome; it leaves by
+        # the close branch, which must free the stream like the publish one.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertTrue(note.is_file())
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertFalse(note.is_file())
+
+    def test_finish_releases_the_stream_and_a_stale_note_is_forgotten(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertTrue(note.is_file())
+        # A crash without `finish` must not block tomorrow's tick: the note
+        # is believed for INFLIGHT_TTL_SECONDS and no longer.
+        stale = json.loads(note.read_text())
+        stale["started_at"] -= audit_report.INFLIGHT_TTL_SECONDS + 1
+        note.write_text(json.dumps(stale))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertTrue(note.is_file())
+        audit_report.release_in_flight(AUDIT)
+        self.assertFalse(note.is_file())
+        # And `finish` is what releases it on the happy path.
+        Path(audit_report.inflight_path_for(AUDIT)).write_text(
+            json.dumps({"audit": AUDIT, "started_at": time.time()})
+        )
+        rc = self.run_finish(make_doc())
+        self.assertEqual(rc, 0, self.err)
+        self.assertFalse(note.is_file())
+
+    def test_a_note_write_that_fails_leaves_no_phantom_claim(self):
+        # `write_text` opens O_TRUNC and then writes. A write that fails on
+        # the shared volume (ENOSPC, EDQUOT, EIO) must not leave an empty
+        # note with a fresh mtime: `_in_flight_since` would honour it from
+        # the mtime and refuse every `start` of the stream, the scheduled
+        # tick's included, for two hours with no run behind it. The note is
+        # staged beside and moved into place, so a failure leaves nothing.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        with patch.object(
+            audit_report.os, "replace",
+            side_effect=OSError(28, "No space left on device"),
+        ):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+        self.assertIn("could not record the in-flight note", self.err)
+        self.assertIn("No space left on device", self.err)
+        self.assertFalse(note.exists(), "an empty note is a two-hour phantom claim")
+        self.assertFalse(Path(f"{note}.tmp").exists())
+        self.assertFalse(Path(audit_report.run_record_path_for(AUDIT)).exists())
+        # Nothing to release, so the retry is not refused.
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+
+    def test_a_lock_file_left_by_another_uid_does_not_refuse_the_stream(self):
+        # The lock file beside the note is created once and never removed.
+        # The sandbox container starts as root and a hand-run `start` over
+        # `kubectl exec` lands there, while the tick and every session run
+        # as uid 1000: a root-owned 0644 lock opened O_RDWR gave uid 1000
+        # EACCES on every later `start`, before the TTL was read, for good.
+        # flock needs no writable descriptor, so the lock opens read-only;
+        # a lock nobody can write must not refuse anyone.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        lock = Path(f"{note}.lock")
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.touch()
+        lock.chmod(0o444)
+        real_open = os.open
+        seen = []
+
+        def read_only_open(path, flags, *rest):
+            if str(path).endswith(".lock"):
+                seen.append(flags & os.O_ACCMODE)
+            return real_open(path, flags, *rest)
+
+        # Root ignores mode bits, so the flags are checked as well as the
+        # outcome: the lock must be opened read-only.
+        with patch.object(audit_report.os, "open", side_effect=read_only_open):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(seen, [os.O_RDONLY])
+        self.assertNotIn("START REFUSED", self.err)
+        self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+        # And the guard still holds behind that lock.
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+
+    def test_a_lock_created_under_a_restrictive_umask_still_opens_for_everyone(self):
+        # 0o644 is what `start` asks for; the kernel narrows it by the
+        # creator's umask. A root hand-run `start` under umask 077 (a common
+        # hardened shell profile) left a 0600 root:root lock, and since the
+        # lock has no TTL and is never removed, every later uid-1000 `start`
+        # of the stream failed the open for good. The umask is cleared for
+        # the create, and put back.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        lock = Path(f"{note}.lock")
+        self.assertFalse(lock.exists())
+        previous = os.umask(0o077)
+        self.addCleanup(os.umask, previous)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertNotIn("START REFUSED", self.err)
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o644)
+        # The process's own umask is restored after the create.
+        restored = os.umask(0o077)
+        self.assertEqual(restored, 0o077)
+        # And the guard still holds behind that lock.
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+
+    def test_a_start_that_fails_frees_the_stream_for_the_retry(self):
+        # The note means a run is under way. A `start` that raised left none
+        # behind, so the operator's retry must not be refused for it.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.failures = {"issue list": 1}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
+        self.assertFalse(Path(audit_report.inflight_path_for(AUDIT)).is_file())
+        self.harness.failures = {}
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
 
     def test_start_hands_over_the_findings_the_ledger_carries(self):
         # The worker cannot write `resolved_because` for a finding it was
@@ -11923,17 +12213,92 @@ class TestDispatchAndHandover(unittest.TestCase):
         self.assertIn("profile-cron-tick", bullet)
 
     def test_an_on_demand_run_triggers_the_schedule_rather_than_re_enacting_it(self):
-        """On demand means trigger the job, never run the audit inline.
+        """On demand means trigger the job, never run several audits inline.
 
         `hermes cron run` marks the job due and the next tick runs it in its
         own process; `cronjob(action='run')` falls back to executing it inside
         the calling session — which is the one turn budget five audits used to
         share — wherever the runtime cannot take a detached result.
+
+        Since #1887 a card that delegates exactly one stream per its SOP is
+        run by that worker through `start … finish`; the bullet carries the
+        guard that run relies on (#1876): `start` refuses while a run of the
+        stream is in flight, and the worker is told what the refusal means.
         """
         bullet = self.bullet("trigger the schedule, do not re-enact it")
         self.assertIn("hermes cron run", bullet)
         self.assertIn("HERMES_HOME=/opt/data/profiles/platform", bullet)
         self.assertIn("cronjob(action='run')", bullet)
+        # The absolute that #1887's skill section contradicted is gone: one
+        # delegated stream is the worker's to run; several never are.
+        self.assertNotIn("Never do the audit in the session", bullet)
+        self.assertIn("Never do more than one audit in the session", bullet)
+        self.assertIn("exactly one audit stream", bullet)
+        self.assertIn("audit_report.py start", bullet)
+        # The overlap guard is the script's in-flight note, not a ledger the
+        # in-session run never appears in; the worker is told what the
+        # refusal means and what to do (wait or report). The override is not
+        # named where the worker reads: a refused rep on 2026-09-23 passed
+        # `--takeover` 42 s after being told it was "not for you".
+        self.assertIn("refuses while a run of that stream is in flight", bullet)
+        self.assertIn("START REFUSED", bullet)
+        self.assertNotIn("--takeover", bullet)
+        # The note does not know sessions, so a worker's own second `start`
+        # is refused like a rival's (run 2, rep 1 of #1876's observation did
+        # exactly that). "Stop" then abandons a live run and leaves the note
+        # for two hours; the carve-out says continue that run to `finish`.
+        self.assertIn("already succeeded in this session", bullet)
+        self.assertIn("do not run `start` again", bullet)
+        # The carve-out is bounded by what released the lease, not by any
+        # `finish` having run: exit 0 and exit 1 release, exit 2 keeps the
+        # note (a rejected document is still the run in flight), so after an
+        # exit-2 `finish` the next step is `finish` again and not `start`.
+        self.assertIn("has released the lease since", bullet)
+        self.assertIn("stop and report the sweep as partial", bullet)
+        self.assertIn("run `finish` again, never `start`", bullet)
+
+    def test_the_skill_allows_one_stream_in_session_with_its_gaps_declared(self):
+        """The skill's copy of the guard sits on top of #1887's section.
+
+        #1887 tells a delegated worker to run one stream directly through the
+        two-command lifecycle. That run holds no scheduler lock, so the
+        section carries the in-flight guard (#1876): what `start` refuses,
+        what the refusal means, the one carve-out and its bound, and what the
+        note spans.
+        """
+        text = self.read("skills/fleet-audit/SKILL.md")
+        section = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
+        # #1887's two forms are still the frame.
+        self.assertIn("Run the audit directly", section)
+        self.assertIn("audit_report.py finish", section)
+        self.assertIn("2026-08-03", section)
+        self.assertIn("cronjob(action='run')", section)
+        # The guard bullet in form 1: refusal, label, no override, carve-out
+        # and its bound on what released the lease.
+        form_one = section.split("### 1.", 1)[1].split("### 2.", 1)[0]
+        self.assertIn("`start` refuses", form_one)
+        self.assertIn("START REFUSED", form_one)
+        self.assertIn("already succeeded in this session", form_one)
+        self.assertIn("do not run `start` again", form_one)
+        self.assertIn("has released the lease since", form_one)
+        self.assertIn("stop and report the sweep as partial", form_one)
+        self.assertIn("run `finish` again, never `start`", form_one)
+        # No override is named anywhere in the file: the CLI flag is gone
+        # (2026-09-24), and the operator's release lives in the cron README,
+        # which the worker does not read. The guard paragraph promises what
+        # the TTL delivers (a dead run costs at most the ticks inside two
+        # hours), not "never", and says what the lease spans: one pair, so a
+        # multi-repo loop reclaims per repository and a mid-loop refusal is
+        # a partial run, not "already running".
+        self.assertNotIn("takeover", text.lower())
+        self.assertNotIn("never blocks", section)
+        self.assertIn("at most the ticks", section)
+        self.assertIn("operator's action", section)
+        self.assertIn("one `start`-`finish` pair", section)
+        self.assertIn("taken between repositories", section)
+        # The exit-code paragraph tells a `START REFUSED` apart from a
+        # rejected document: there is nothing to fix and nothing to re-run.
+        self.assertIn("One exit 2 is not a document to fix", text)
 
     def test_the_worker_protocol_requires_the_url_in_the_summary(self):
         section = self.read("SOUL.md").split("## 1.")[0]

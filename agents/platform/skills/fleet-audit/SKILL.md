@@ -60,6 +60,17 @@ When you are delegated a task or kanban card to execute an audit stream followin
   2. Enumerate clusters and run the checks per the SOP.
   3. `./skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
 - **Do not reach for `hermes cron run` or say "queued for the next cron tick":** This request is an explicit on-demand audit execution, not a request to trigger the scheduled cron job. Execute the SOP directly and report the ledger issue URL in your result.
+- **`start` refuses while a run of that stream is in flight, a scheduled tick's or another session's:**
+  it exits 2 with a `START REFUSED` line that names the run (not a `FINDINGS REJECTED` line; there is
+  no document to fix). If it refuses, say the stream is already running and stop; there is no override
+  for you, and the refusal is not a problem to work around. One refusal is your own: the note does not
+  know sessions, so if your `start` for that stream already succeeded in this session, a second `start`
+  is refused like anyone's and your first run is untouched — do not run `start` again; continue the
+  sweep from the first `start`'s output to `finish`. That holds only while no `finish` for that stream
+  has released the lease since: a `finish` that published (exit 0) or died (exit 1) released it, and a
+  refusal after one is someone else's run — stop and report the sweep as partial. A `finish` that
+  exited 2 (`FINDINGS REJECTED`) kept the lease, so after it the run is still yours and the next step
+  is to fix the document and run `finish` again, never `start`.
 - **Alignment with `AGENTS.md`:** `AGENTS.md` ("'Run the `<x>` cron job now' → trigger the schedule, do not re-enact it") addresses requests asking to trigger the background cron job or to run multiple/all audits in a single session. When delegated a task to execute a single audit stream per its SOP, you are the dedicated worker session for that stream; execute the audit directly.
 - **A card whose result is "queued for later" must NEVER be marked `done` (#1876):** If an audit cannot be run in this session due to missing credentials or infrastructure failure, call `kanban_block` (or ask for input); **never** call `kanban_complete` claiming `done` when zero findings or ledger were produced.
 
@@ -103,6 +114,20 @@ empty findings documents, and published a fleet-wide all-clear.
 The scheduler holds a per-job lock for the length of a run, so a stream already in flight is not
 started a second time and cannot write its ledger issue twice. `cronjob(action='runs')` shows what
 is running and what each attempt did.
+
+A stream run as a delegated worker (form 1 above) holds no such lock, and the scheduler's ledger
+never sees it, so the guard lives in the script: `start` leaves an in-flight note for the stream and
+refuses while one younger than two hours exists, whichever side wrote it, and `finish` removes it
+when that `start`'s run is over, published (exit 0) or died (exit 1, whatever the cause), so a `finish` that died does not
+refuse the stream's next repository or your own retry. The note spans one `start`-`finish` pair, not
+a loop: a stream run repository by repository reclaims it at each `start`, so a refusal at
+`start --repo B` means the stream was taken between repositories; stop there and report the sweep
+as partial with B named as not audited. Two exits keep it: `--dry-run`, a preview mid-run, and exit
+2, a rejected document you are about to fix and resubmit, which is still the run in flight. If
+`start` cannot take the guard at all it exits 2 too, rather than run unguarded, also as
+`START REFUSED`. A run that died before `finish` is forgotten after those two hours, so a dead run
+costs the stream at most the ticks that fall inside them; releasing it sooner is an operator's action
+from outside the session.
 
 **Each run reports on itself. Your own answer is a roll-up, not a copy.** When triggering cron jobs, answer with one line per
 stream — the stream, and that it is queued for the next tick (or that the on-demand trigger is unavailable). The reports arrive through each run's
@@ -375,7 +400,9 @@ this run's `start` opened reaches exit 2 too: the collector writes to a fixed pa
 scrubbed between runs, so a run whose collector never ran finds the previous one's manifest sitting
 there, and cross-checking against a week-old reading of the fleet is worse than cross-checking
 against nothing. Re-run the collector. Exit 1 is fatal and means
-something else broke.
+something else broke. One exit 2 is not a document to fix: a `START REFUSED` line from `start` means
+the stream's in-flight guard held (see "Running a stream on demand"); there is nothing to edit and
+nothing to re-run until that run's `finish`.
 
 ### Partial coverage
 
