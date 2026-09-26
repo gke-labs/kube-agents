@@ -100,12 +100,11 @@ spec:
               value: "1"
             - name: TRANSFORMERS_OFFLINE
               value: "1"
-            # Extraction and consolidation run through the same LiteLLM gateway
+            # Extraction and consolidation run through the same inference gateway
             # the agents use, so model routing and cost attribution stay in one
-            # place. Short name, not an FQDN: it resolves to LiteLLM in the
-            # release namespace.
+            # place. Short name, not an FQDN: it resolves in the release namespace.
             - name: HINDSIGHT_API_LLM_BASE_URL
-              value: http://litellm/v1
+              value: http://inference-gateway/v1
             - name: HINDSIGHT_API_LLM_MODEL
               value: model-default
             # LiteLLM runs with no master key; the client library insists on a

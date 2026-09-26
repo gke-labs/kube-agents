@@ -622,12 +622,12 @@ class ConfigBackfillTest(unittest.TestCase):
     def test_a_key_the_live_file_lost_is_restored(self):
         """`model: {}` is what a save leaves behind; the template's block goes back in."""
         proc, live, _ = self._fill(
-            {"model": {"base_url": "http://litellm/v1", "api_mode": "chat_completions"}},
+            {"model": {"base_url": "http://inference-gateway/v1", "api_mode": "chat_completions"}},
             {"model": {}},
         )
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(live["model"]["base_url"], "http://litellm/v1")
+        self.assertEqual(live["model"]["base_url"], "http://inference-gateway/v1")
         self.assertEqual(live["model"]["api_mode"], "chat_completions")
         self.assertIn("model.base_url", proc.stdout)
 
@@ -656,7 +656,7 @@ class ConfigBackfillTest(unittest.TestCase):
 
     def test_nothing_missing_leaves_the_file_byte_identical(self):
         """No rewrite when there is nothing to add — that is what keeps the comments."""
-        live = "# the agent's own file\nmodel:\n  base_url: http://litellm/v1\n"
+        live = "# the agent's own file\nmodel:\n  base_url: http://inference-gateway/v1\n"
         proc, _, unchanged = self._fill({"model": {"base_url": "http://other/v1"}}, live)
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -664,7 +664,7 @@ class ConfigBackfillTest(unittest.TestCase):
 
     def test_a_live_file_that_is_not_a_mapping_is_skipped(self):
         """A corrupt config must not take the container down; step 2d only reports."""
-        proc, live, unchanged = self._fill({"model": {"base_url": "http://litellm/v1"}}, "- a\n- b")
+        proc, live, unchanged = self._fill({"model": {"base_url": "http://inference-gateway/v1"}}, "- a\n- b")
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(unchanged)

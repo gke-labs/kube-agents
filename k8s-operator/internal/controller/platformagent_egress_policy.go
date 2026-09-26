@@ -341,8 +341,8 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	})
 
 	// The model gateway. buildAgentConfig pins the agent's model base_url to
-	// http://litellm.<namespace>.svc.cluster.local/v1 unconditionally, so the
-	// agent cannot think for a living without this rule. The port set matches
+	// http://inference-gateway.<namespace>.svc.cluster.local/v1 unconditionally,
+	// so the agent cannot think for a living without this rule. The port set matches
 	// buildNetworkPolicy's LiteLLM rule exactly, so the two policies cannot
 	// disagree about the model gateway: 8080 is what this repository's chart
 	// and kustomize deployments actually listen on (Service 80 -> targetPort

@@ -26,7 +26,7 @@ spec:
             - containerPort: 8080
           env:
             - name: INFERENCE_URL
-              value: "http://litellm-gateway.kubeagents-system.svc.cluster.local"
+              value: "http://inference-gateway-upstream.kubeagents-system.svc.cluster.local"
             - name: CACHE_FILE
               value: "/data/replay_cache.json"
             - name: MODE_FILE

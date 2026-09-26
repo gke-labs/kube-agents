@@ -240,7 +240,7 @@ trafficSimulator:
     targetWebGo: "http://web-tier-go:8080"
     targetWebPython: "http://web-tier-python:8000"
     targetWebNodejs: "http://web-tier-nodejs:3000"
-    targetLiteLLM: "http://litellm-gateway:4000/health/readiness"
+    targetLiteLLM: "http://inference-gateway-upstream:4000/health/readiness"
     targetLangflow: "http://langflow:7860"
     targetOpenWebui: "http://open-webui:8080"
 

@@ -1,23 +1,23 @@
 # Inference Replay Proxy
 
-## This directory contains an example of deploying a Inference Replay proxy. It intercepts traffic destined for your primary LLM gateway (`litellm`), serves instant repeated responses from a local Persistent Disk (PVC), and forwards cache misses to the real LLM gateway automatically.
+## This directory contains an example of deploying a Inference Replay proxy. It intercepts traffic destined for your primary LLM gateway (`inference-gateway`), serves instant repeated responses from a local Persistent Disk (PVC), and forwards cache misses to the real LLM gateway automatically.
 
 ## Architecture Overview
 
 ```mermaid
 graph TD
-    Agent[Agent Harness] -->|Calls http://litellm| ProxySvc[Service: litellm]
+    Agent[Agent Harness] -->|Calls http://inference-gateway| ProxySvc[Service: inference-gateway]
     ProxySvc -->|Port 8080| ProxyPod[Replay Pod]
 
     subgraph Persistent Cache
         ProxyPod <-->|Read / Write KV Store| PVC[(1Gi ReadWriteOnce Disk)]
     end
 
-    ProxyPod -->|Cache Miss| RealSvc[Service: litellm-gateway]
+    ProxyPod -->|Cache Miss| RealSvc[Service: inference-gateway-upstream]
     RealSvc -->|Port 8080| RealPod[Original LiteLLM Pod]
 ```
 
-- **Zero-Configuration Interception**: We re-route the primary `litellm` service address to hit our Replay Proxy pod. Agents require zero configuration changes.
+- **Zero-Configuration Interception**: We re-route the primary `inference-gateway` service address to hit our Replay Proxy pod. Agents require zero configuration changes.
 - **Context-Aware Hashing**: Calculates a SHA-256 hash combining the exact **Prompt + Available Kubernetes Skills + Target Model**.
 - **Permanent Lazy-Caching**: Trajectories are permanently captured directly onto a Google Cloud Persistent Disk (`/data/replay_cache.json`).
 - **Runtime Togglable**: A `ConfigMap`-backed mode flag flips caching on/off without a pod restart.

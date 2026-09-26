@@ -127,7 +127,7 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "model: model-default") {
 		t.Errorf("expected config to contain model: model-default, got:\n%s", yamlContent)
 	}
-	if !strings.Contains(yamlContent, "base_url: http://litellm.test-ns.svc.cluster.local/v1") {
+	if !strings.Contains(yamlContent, "base_url: http://inference-gateway.test-ns.svc.cluster.local/v1") {
 		t.Errorf("expected config to contain correct base_url, got:\n%s", yamlContent)
 	}
 	if !strings.Contains(yamlContent, "api_key: none") {

@@ -211,7 +211,7 @@ one from the mirror through its own chart's values.
 ### LiteLLM gateway
 
 The agent's baked default model endpoint is
-`http://litellm.<namespace>.svc.cluster.local/v1`, so the chart deploys the
+`http://inference-gateway.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base`. `litellm.modelProvider`
 (gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
