@@ -473,9 +473,9 @@ func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
 }
 
 func TestRedactInput_ValuesUnderInnocentKeys(t *testing.T) {
-	in := `{"command": "kubectl --token eyJhbGciOiJSUzI1NiIsImtpZCI6In0 get pods; gcloud x --password hunter5; curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' -u admin:hunter2 -d '{\"password\":\"hunter3\", \"token\": \"hunter4\"}' -H 'Authorization: Basic dXNlcjpodW50ZXIy' https://x; export GH=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345; gcloud --access-token=ya29.a0AfH6SMBxyzxyzxyzxyzxyzxyz ls", "plain": "kubectl get pods -n kube-system", "id": 9007199254740993}`
+	in := `{"command": "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI; aws s3 ls --secret-access-key hunter6; kubectl --token eyJhbGciOiJSUzI1NiIsImtpZCI6In0 get pods; gcloud x --password hunter5; curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' -u admin:hunter2 -d '{\"password\":\"hunter3\", \"token\": \"hunter4\"}' -H 'Authorization: Basic dXNlcjpodW50ZXIy' https://x; export GH=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345; gcloud --access-token=ya29.a0AfH6SMBxyzxyzxyzxyzxyzxyz ls", "plain": "kubectl get pods -n kube-system", "id": 9007199254740993}`
 	out := string(redactInput(json.RawMessage(in)))
-	for _, leaked := range []string{"abcdefghijklmnopqrstuvwxyz0123", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "ya29.a0AfH6SMB", "hunter2", "hunter3", "hunter4", "dXNlcjpodW50ZXIy", "eyJhbGciOiJSUzI1NiIsImtpZCI6In0", "hunter5"} {
+	for _, leaked := range []string{"abcdefghijklmnopqrstuvwxyz0123", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "ya29.a0AfH6SMB", "hunter2", "hunter3", "hunter4", "dXNlcjpodW50ZXIy", "eyJhbGciOiJSUzI1NiIsImtpZCI6In0", "hunter5", "wJalrXUtnFEMI", "hunter6"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
@@ -485,6 +485,49 @@ func TestRedactInput_ValuesUnderInnocentKeys(t *testing.T) {
 	}
 	if !strings.Contains(out, `"id":9007199254740993`) {
 		t.Fatalf("a 64-bit id lost digits through the scrub: %s", out)
+	}
+}
+
+// Ordinary text and names are not credentials: the scrub leaves them, so the
+// trace carries what the worker adapter's would.
+func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
+	in := `{"command": "git commit -m 'basic refactoring'; date -u 12:30; sort -u a:b; kubectl get secret my-secret -o yaml", "secretName": "db-creds", "tokenizer": "cl100k", "max_tokens": 4096, "SECRET_KEY": "s3"}`
+	out := string(redactInput(json.RawMessage(in)))
+	for _, kept := range []string{"basic refactoring", "date -u 12:30", "sort -u a:b", "kubectl get secret my-secret -o yaml", `"secretName":"db-creds"`, `"tokenizer":"cl100k"`} {
+		if !strings.Contains(out, kept) {
+			t.Fatalf("ordinary text %q was scrubbed: %s", kept, out)
+		}
+	}
+	// The accepted price: a key that ends in a secret word is blanked even
+	// when it is a count, so SECRET_KEY-style keys are caught.
+	if !strings.Contains(out, `"max_tokens":"[redacted]"`) || strings.Contains(out, `"s3"`) {
+		t.Fatalf("component rule not applied as documented: %s", out)
+	}
+}
+
+// A source managed file that exists but cannot be read fails the scope
+// rather than starting the child without the operator's pins; nothing is
+// left behind.
+func TestChildManagedScope_FailsOnAnUnreadableSourceAndLeavesNothing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads everything")
+	}
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "config.yaml"), []byte("model: {default: x}\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	scratch := t.TempDir()
+	b := &Bridge{cfg: Config{ScratchDir: scratch, ManagedScopeDir: src}}
+	if dir, err := b.childManagedScope("task-unreadable"); err == nil {
+		t.Fatalf("unreadable source accepted: %s", dir)
+	}
+	if entries, _ := os.ReadDir(scratch); len(entries) != 0 {
+		t.Fatalf("a failed scope left files: %v", entries)
+	}
+	// Absent is different: nothing to copy, the hook alone.
+	b2 := &Bridge{cfg: Config{ScratchDir: t.TempDir(), ManagedScopeDir: filepath.Join(t.TempDir(), "absent")}}
+	if _, err := b2.childManagedScope("task-absent"); err != nil {
+		t.Fatalf("absent source refused: %v", err)
 	}
 }
 

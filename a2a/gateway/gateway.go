@@ -865,7 +865,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		// replay makes the same choice).
 		addressee = rec.AddresseeFor(taskID)
 	default:
-		ref, owned := rec.taskRef(taskID)
+		ref, owned := rec.TaskRefFor(taskID)
 		if !owned {
 			return state, nil
 		}
