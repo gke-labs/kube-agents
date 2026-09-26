@@ -390,7 +390,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         res_fail = Exception("gcloud auth print-identity-token --audiences rejected")
         res_ok = MagicMock()
         res_ok.stdout = "fallback-oidc-token\n"
-        run.side_effect = [res_fail, res_ok, MagicMock(), MagicMock()]
+        run.side_effect = [res_fail, res_ok, MagicMock(), MagicMock(), MagicMock()]
 
         with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
             ok_response = MagicMock()
@@ -431,7 +431,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     def test_direct_minty_retries_on_5xx_and_succeeds(self, urlopen, sleep, mock_get_managed, run):
         run_oidc = MagicMock()
         run_oidc.stdout = "mock-oidc-token\n"
-        run.side_effect = [run_oidc, MagicMock(), MagicMock()]
+        run.side_effect = [run_oidc, MagicMock(), MagicMock(), MagicMock()]
 
         err_500 = urllib.error.HTTPError(
             "http://token-broker",
@@ -463,7 +463,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     ):
         run_oidc = MagicMock()
         run_oidc.stdout = "mock-oidc-token\n"
-        run.side_effect = [run_oidc, MagicMock(), MagicMock()]
+        run.side_effect = [run_oidc, MagicMock(), MagicMock(), MagicMock()]
 
         err_conn = urllib.error.URLError("Connection reset by peer")
         ok_response = MagicMock()
@@ -575,6 +575,119 @@ class GitHubTokenRefreshTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as cm:
                     main()
                 self.assertEqual(1, cm.exception.code)
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("gitops_workspace.get_managed_github_repos", return_value=[])
+    def test_skips_setup_git_when_credential_helper_already_configured(
+        self, mock_get_managed, run
+    ):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if "print-identity-token" in cmd:
+                return MagicMock(stdout="fake-oidc-token\n")
+            if cmd[:2] == ["gh", "auth"] and cmd[2] == "login":
+                return MagicMock(returncode=0)
+            if cmd[:2] == ["git", "config"]:
+                return MagicMock(
+                    returncode=0,
+                    stdout="!/usr/bin/gh auth git-credential\n",
+                )
+            if cmd[:3] == ["gh", "auth", "setup-git"]:
+                self.fail("gh auth setup-git must not be run when helper is already configured")
+            return MagicMock()
+
+        run.side_effect = fake_run
+
+        with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
+            ok_response = MagicMock()
+            ok_response.status = 200
+            ok_response.read.return_value = b"ghs_test_token\n"
+            ok_response.__enter__.return_value = ok_response
+            urlopen.return_value = ok_response
+
+            with patch.dict(os.environ, {}, clear=True):
+                token = refresh_git_credentials("owner/repository")
+
+        self.assertEqual("ghs_test_token", token)
+        self.assertTrue(any(c[:2] == ["git", "config"] for c in calls))
+        self.assertFalse(any(c[:3] == ["gh", "auth", "setup-git"] for c in calls))
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("gitops_workspace.get_managed_github_repos", return_value=[])
+    def test_runs_setup_git_when_credential_helper_not_configured(
+        self, mock_get_managed, run
+    ):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if "print-identity-token" in cmd:
+                return MagicMock(stdout="fake-oidc-token\n")
+            if cmd[:2] == ["gh", "auth"] and cmd[2] == "login":
+                return MagicMock(returncode=0)
+            if cmd[:2] == ["git", "config"]:
+                return MagicMock(returncode=1, stdout="")
+            if cmd[:3] == ["gh", "auth", "setup-git"]:
+                return MagicMock(returncode=0)
+            return MagicMock()
+
+        run.side_effect = fake_run
+
+        with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
+            ok_response = MagicMock()
+            ok_response.status = 200
+            ok_response.read.return_value = b"ghs_test_token\n"
+            ok_response.__enter__.return_value = ok_response
+            urlopen.return_value = ok_response
+
+            with patch.dict(os.environ, {}, clear=True):
+                token = refresh_git_credentials("owner/repository")
+
+        self.assertEqual("ghs_test_token", token)
+        self.assertTrue(any(c[:2] == ["git", "config"] for c in calls))
+        self.assertTrue(any(c[:3] == ["gh", "auth", "setup-git"] for c in calls))
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("gitops_workspace.get_managed_github_repos", return_value=[])
+    def test_setup_git_failure_includes_stderr_in_raised_error(
+        self, mock_get_managed, run
+    ):
+        import subprocess
+
+        def fake_run(cmd, **kwargs):
+            if "print-identity-token" in cmd:
+                return MagicMock(stdout="fake-oidc-token\n")
+            if cmd[:2] == ["gh", "auth"] and cmd[2] == "login":
+                return MagicMock(returncode=0)
+            if cmd[:2] == ["git", "config"]:
+                return MagicMock(returncode=1, stdout="")
+            if cmd[:3] == ["gh", "auth", "setup-git"]:
+                raise subprocess.CalledProcessError(
+                    1,
+                    cmd,
+                    stderr="error: could not lock config file /home/.gitconfig: File exists",
+                )
+            return MagicMock()
+
+        run.side_effect = fake_run
+
+        with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
+            ok_response = MagicMock()
+            ok_response.status = 200
+            ok_response.read.return_value = b"ghs_test_token\n"
+            ok_response.__enter__.return_value = ok_response
+            urlopen.return_value = ok_response
+
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(RuntimeError) as cm:
+                    refresh_git_credentials("owner/repository")
+
+        self.assertIn(
+            "error: could not lock config file /home/.gitconfig: File exists",
+            str(cm.exception),
+        )
 
 
 class SandboxForwardTest(unittest.TestCase):
