@@ -1734,7 +1734,7 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				}
 				// The number it does name is the width a fresh render
 				// creates, not the raw budget. This agent takes the
-				// default maxSessions, so its budget (46) sits below
+				// default maxSessions, so its budget (58) sits below
 				// the floor its TASKS renders at (64), and the
 				// refusal is reached as readily by an operator
 				// upgrade whose stream is already at that floor. A

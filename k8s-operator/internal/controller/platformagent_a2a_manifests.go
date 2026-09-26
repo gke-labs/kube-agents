@@ -371,31 +371,197 @@ const (
 	// fails if this number stops matching it.
 	a2aSessionConsumersPerSession = 3
 
-	// a2aTasksReservedConsumers is the part of the budget that is nobody's
-	// session. What follows itemizes the STANDING consumers only: the
-	// gateway's `gateway-relay` durable and the Hermes bridge's
-	// `bridge-<profile>` durable (2), headroom for the audit durable the
-	// accountability rail needs (1), one session's worth of overlap while
-	// the gateway retires an incarnation and mints its replacement and the
-	// old consumers have not yet reached their 5s inactive threshold (3),
-	// and ten for the web rail's concurrent readers.
+	// The reserve, term by term. a2aTasksReservedConsumers is the part of
+	// the budget that is nobody's session pod: what sits on TASKS however
+	// many sessions run. Each row is a named constant and the total is a
+	// literal; TestReservedConsumersIsTheSumOfItsTerms holds the two
+	// together, so the table is the number and the number is the table.
 	//
-	// It is not an accounting of everything that sits on TASKS, and reading
-	// it as one is the mistake to avoid: `tasks/get` replay ephemerals are
-	// outside this number and are not counted anywhere. lib.TasksGet opens an
-	// ordered consumer and its cleanup stops the local subscription only --
-	// the consumer itself waits out its InactiveThreshold, which TasksGet
-	// sets to five seconds (lib.EphemeralConsumerInactiveThreshold). A call
-	// that finds events therefore leaves one consumer on the stream for five
-	// seconds after it returns. That makes the missing term a call RATE over
-	// a rolling five-second window rather than a concurrency, and the callers
-	// are not just the web rail: the gateway's sweep, reap and relay paths
-	// replay too. The window was five minutes -- nats.go's default, left in
-	// place -- until TasksGet set the threshold, so the rate this constant
-	// absorbs is 60x lower than the number was sized against. gke-labs#1739
-	// owns the term and the number; this constant deliberately does not move
-	// for it here.
-	a2aTasksReservedConsumers = 16
+	//	| slots | term                                                              |
+	//	| ----: | ----------------------------------------------------------------- |
+	//	|     2 | a2aTasksStandingDurables: the gateway's `gateway-relay` and the    |
+	//	|       | Hermes bridge's `bridge-<profile>`                                |
+	//	|     1 | a2aTasksAuditDurableHeadroom: the audit durable the               |
+	//	|       | accountability rail binds                                         |
+	//	|     3 | a2aTasksIncarnationOverlap: one session's named consumers a       |
+	//	|       | second time, while the gateway retires an incarnation and mints   |
+	//	|       | its replacement and the old three have not yet reached their 5s   |
+	//	|       | inactive threshold                                                |
+	//	|    10 | a2aTasksWebReaders: the web rail's concurrent readers             |
+	//	|    12 | a2aTasksReplayConsumers: tasks/get replay ephemerals, derived     |
+	//	|       | below                                                             |
+	//	|    28 | a2aTasksReservedConsumers                                         |
+	//
+	// The replay term, and the mechanism it is sized from. lib.TasksGet
+	// opens an ordered consumer on TASKS and its cleanup stops the local
+	// subscription only; the consumer waits out the inactive threshold
+	// TasksGet sets on it, lib.EphemeralConsumerInactiveThreshold (five
+	// seconds; it was nats.go's five-minute ordered default until
+	// gke-labs#1741). So a replay holds a slot for its own duration plus
+	// five seconds, and the slots held at any instant are the replays BEGUN
+	// in the last five seconds, not the replays in flight. What bounds that
+	// is how many replays each caller can begin in five seconds. The callers
+	// on main, with the structure that bounds each:
+	//
+	// The gateway, one replica. Every path but the sweep and the probe runs
+	// under the conversation's session lock (a2a/gateway sessionLocks), so
+	// one conversation has at most one of them running at a time:
+	//
+	//   - healActiveTask, once per inbound turn on a conversation with a
+	//     running task, and answerStatusByReplay, once more when that turn is
+	//     a status question: two replays back to back, per turn.
+	//   - relayTerminal's fallback, once per terminal whose render state a
+	//     restart lost, and closeDetachedBeforeDelete, once per retired pod
+	//     holding a detached task: each at most once per task.
+	//   - probeConversation, once per inject-door read carrying ?probe=1
+	//     and once more after a wait that blocked, paced by the caller; it
+	//     takes no lock.
+	//   - sweepOnce, one per terminal orphan pod per pass, once a minute, in
+	//     one goroutine, sequentially.
+	//   - buildRehydrationPrimer, one per task in the conversation's history
+	//     (capped at the gateway's taskHistoryCap), sequentially, per spawn.
+	//
+	// The Hermes bridge, one per install. Its durable delivers to one handler
+	// at a time -- nats.go v1.53.1 jetstream/pull.go calls Consume's handler
+	// from the subscription's own callback -- so these never overlap each
+	// other:
+	//
+	//   - handleMessage, once per submission for a task it is not running,
+	//     which is every new task; cancelOrphan, once per cancel for a task
+	//     it is not running.
+	//   - sweepTask and synthesizeTerminal at start, before it consumes, one
+	//     to four per in-flight key the prior incarnation left, sequentially.
+	//
+	// Two kinds of caller fall out of that list. A TRIGGER-PACED caller
+	// replays once per external event -- a turn, a terminal, a submission,
+	// a cancel, a pod delete, a read -- and its five-second count is the
+	// event rate. A LOOP-PACED caller replays back to back with nothing in
+	// between, and its five-second count is min(loop length, 5s / replay
+	// latency): the rehydration primer, the two start-and-minute sweeps, and
+	// the bridge's handler under a burst of submissions. Nothing the operator
+	// sets bounds a loop-paced caller; at the 0.1s a replay takes against an
+	// embedded server that is ~50 slots per loop, fewer on a slower bus. This
+	// term does not size for them, and the cost of that is stated rather
+	// than hidden: a replay refused at the cap fails soft on every path but
+	// two -- the primer skips the task, the sweeps retry next pass or fail
+	// the bridge's start (which restarts it) -- and the two that do not are
+	// both in the bridge's handler, which acks when it returns:
+	// handleMessage logs "events lookup failed; dropping submission", which
+	// loses the task, and cancelOrphan logs "cancel events lookup failed",
+	// which drops the cancel and leaves the orphan non-terminal for the
+	// retention window. A submission burst wide enough to reach the
+	// cap is that handler's hazard, and pacing it is a bridge change, not a
+	// number here.
+	//
+	// What this term holds is the trigger-paced callers, each counted at
+	// what can be in flight at once from the structure above, times
+	// a2aTasksReplayTailFactor for the tail: the next replay from the same
+	// source lands while the last one's five seconds are still running, so
+	// a source holds two slots, not one. A source that fires more than twice
+	// in five seconds is a burst, covered above.
+	//
+	//	| slots | source                                                            |
+	//	| ----: | ----------------------------------------------------------------- |
+	//	|     1 | a2aTasksReplayBridgeDispatch: the bridge's serialized handler     |
+	//	|     1 | a2aTasksReplayGatewaySweep: the sweep's one goroutine             |
+	//	|     4 | a2aTasksReplayAsks: an asker's two replays (a2aTasksReplayAsk)   |
+	//	|       | on each conversation whose task is running -- a chat turn's      |
+	//	|       | heal and status answer, or an inject-door read's probe before    |
+	//	|       | and after its wait -- and in the shape this operator renders     |
+	//	|       | the running conversations are the bridge's                       |
+	//	|       | a2aBridgeDefaultConcurrency runs                                  |
+	//	|     6 | in flight                                                         |
+	//	|   x 2 | a2aTasksReplayTailFactor                                          |
+	//	|    12 | a2aTasksReplayConsumers                                           |
+	//
+	// One row this table does not have, and what puts it back. gke-labs#2010,
+	// open and held at this writing, gives the bridge a pre-spawn look-ahead:
+	// lib.TaskInReplay, once per spawn, from each of the bridge's
+	// a2aBridgeDefaultConcurrency workers, concurrently. That is a
+	// trigger-paced source like the others -- 2 in flight, 4 after the tail
+	// factor -- and it was a row here, a2aTasksReplayBridgeLookAhead, before
+	// the symbol was in the tree. Sizing for a caller that cannot run is not
+	// caution, it is a refusal: those four slots took the first maxSessions
+	// the provision gate refuses on an existing 64-wide TASKS from 13 down to
+	// 11, for code no render reaches. The row comes back with the code:
+	// whoever lands #2010 restores a2aTasksReplayBridgeLookAhead =
+	// a2aBridgeDefaultConcurrency to the sum below, which takes in flight to
+	// 8, a2aTasksReplayConsumers to 16 and a2aTasksReservedConsumers to 32,
+	// and re-derives every number this block states from them.
+	// TestBridgeLookAheadIsNotInTheA2AModule reads the bridge's sources and
+	// fails on the day TaskInReplay appears in one, so the two halves cannot
+	// land in the wrong order unnoticed.
+	//
+	// The asks row is the one that rests on the shape of the install rather
+	// than on a lock, so the shape is stated. A conversation has one asker:
+	// a chat backend's, whose turn runs under the session lock and replays
+	// twice back to back, or the inject door's, whose read takes no lock and
+	// replays before and after its wait -- one asker, two replays, either
+	// way. The operator leaves the gateway's A2A_DEFAULT_ADDRESSEE at its
+	// default, "platform", so a plain conversation's task is a bridge run
+	// and a session pod is spawned only for a Delegate or a session-routed
+	// record; the conversations being asked about while their task runs are
+	// therefore the bridge's Concurrency runs. A conversation with a queued
+	// bridge task, or with a session pod, can be asked about too; that is a
+	// person or a harness at one conversation, once per ask, and the tail
+	// factor is the allowance for it. It is not a per-session term today,
+	// because maxSessions counts pods and a conversation's task is not one;
+	// put in the multiplier it would size the reserve by the wrong number.
+	// The day A2A_DEFAULT_ADDRESSEE flips to the session route (the
+	// RouteSession sentinel in a2a/gateway; gke-labs#2033 is the open design
+	// change that plans it), every conversation's task IS a pod, the asks row
+	// becomes per-session, and it moves into the multiplier beside
+	// a2aSessionConsumersPerSession.
+	//
+	// Two more things the two bridge rows rest on, both settable on the
+	// CR and neither read by this render. BRIDGE_CONCURRENCY: the sidecar is
+	// declared in spec.deployment.sidecars, so its env is the CR's, and an
+	// install that raises it (docs/designs/eval-next-transport.md commits the
+	// eval install to at least its task parallelism) scales the asks row with
+	// it while this reserve stays put -- at 6, in flight is 1+1+12 = 14 and
+	// the term would be 28, which such an install carries today only because
+	// it spawns no session pods and so spends none of its maxSessions*3.
+	// Reading the sidecar's env into the budget is the follow-up, not a
+	// number here. And one agent replica: replicas share the bridge's
+	// durable and each brings its own workers, so a second replica doubles
+	// the dispatch row.
+	//
+	// Where the floor hides all this. The budget is maxSessions*3 + 28 and a
+	// stream is created at max(64, budget), so a default install
+	// (maxSessions=10, budget 58) still renders 64. The first maxSessions
+	// whose budget clears the floor is 13 (67); it was 17 when the reserve
+	// was 16. Above it the stream is 12 wider than it would have been, and
+	// so is the web user's unreapable-durable ceiling, which is the trade
+	// the block above already states.
+	a2aTasksStandingDurables     = 2
+	a2aTasksAuditDurableHeadroom = 1
+	a2aTasksIncarnationOverlap   = a2aSessionConsumersPerSession
+	a2aTasksWebReaders           = 10
+
+	// a2aBridgeDefaultConcurrency mirrors defaultConcurrency in
+	// a2a/cmd/hermes-bridge/main.go, the number of hermes subprocesses -- and
+	// so of running conversations -- one bridge has when BRIDGE_CONCURRENCY
+	// is unset, which this operator leaves unset.
+	// The two modules cannot import each other;
+	// TestBridgeConcurrencyMatchesTheA2AModule reads that constant and fails
+	// if this one stops matching it.
+	a2aBridgeDefaultConcurrency = 2
+
+	a2aTasksReplayBridgeDispatch = 1
+	a2aTasksReplayGatewaySweep   = 1
+	// a2aTasksReplayAsk is the replays one ask makes back to back: a chat
+	// turn's healActiveTask then answerStatusByReplay, or an inject-door
+	// read's probeConversation before and after its wait.
+	a2aTasksReplayAsk  = 2
+	a2aTasksReplayAsks = a2aTasksReplayAsk * a2aBridgeDefaultConcurrency
+	// a2aTasksReplayTailFactor is the slots one trigger-paced source holds:
+	// the replay running and the one before it, still inside its five-second
+	// inactive threshold.
+	a2aTasksReplayTailFactor = 2
+	a2aTasksReplayConsumers  = a2aTasksReplayTailFactor *
+		(a2aTasksReplayBridgeDispatch + a2aTasksReplayGatewaySweep + a2aTasksReplayAsks)
+
+	a2aTasksReservedConsumers = 28
 
 	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a
 	// default install still gets. Never render below it.
@@ -678,7 +844,7 @@ func a2aSeedJetStreamGrants() []string {
 // reaped by the inactive threshold lib.TasksGet sets on it,
 // lib.EphemeralConsumerInactiveThreshold (five seconds -- nats.go's own
 // ordered default is five MINUTES, which is what the replay carried before
-// gke-labs/kube-agents#1739). TasksGet does not delete its own replay
+// gke-labs/kube-agents#1741). TasksGet does not delete its own replay
 // consumer, and that is a decision rather than an omission: under this grant
 // the delete is a refused publish on a subject with no reply, so the bridge
 // would pay an Error-level permissions violation on every task it dispatches
@@ -864,22 +1030,25 @@ func a2aAgentJetStreamGrants() []string {
 //     gateway's own log, for a refusal that is by design. Measured in
 //     TestGatewayConsumersSurviveABusRestart, which asserts that this is the
 //     only violation the restart produces.
-//   - The pre-reset ephemeral is not removed immediately; it waits out its
-//     own five-minute inactive threshold -- nats.go's ordered-consumer
-//     default (jetstream/ordered.go), which lib.TasksGet does not override --
-//     holding a TASKS consumer slot against max_consumers. Stopping an
-//     ordered iterator never deleted its consumer under the wildcard either,
-//     so the per-replay ephemeral is pre-existing -- what this adds is that
-//     the RESET path's old consumer lingers too. Measured on the rendered
-//     config: a reconnect that leaves the server running holds two slots per
-//     replay in flight, the old consumer and its replacement, until the
-//     threshold expires; a bus bounce leaves only the replacement, because
-//     these consumers are memory storage with one replica and the restarting
-//     server drops them. Those slots are the gateway's and never a session's,
-//     so whatever sizes TASKS' max_consumers has to count concurrent
-//     tasks/get replays beside the session cap. A budget that counts sessions
-//     alone runs out under replay load and refuses a legitimate session's
-//     consumer create, which reads as an undersized stream.
+//   - The pre-reset ephemeral is not removed immediately; it waits out the
+//     inactive threshold lib.TasksGet sets on it,
+//     lib.EphemeralConsumerInactiveThreshold (five seconds; nats.go's own
+//     ordered-consumer default is five minutes, which is what the replay
+//     carried before gke-labs/kube-agents#1741), holding a TASKS consumer
+//     slot against max_consumers. Stopping an ordered iterator never deleted
+//     its consumer under the wildcard either, so the per-replay ephemeral is
+//     pre-existing -- what this adds is that the RESET path's old consumer
+//     lingers too. Measured on the rendered config: a reconnect that leaves
+//     the server running holds two slots per replay in flight, the old
+//     consumer and its replacement, until the threshold expires; a bus
+//     bounce leaves only the replacement, because these consumers are memory
+//     storage with one replica and the restarting server drops them. Those
+//     slots are the gateway's and never a session's, which is why TASKS'
+//     max_consumers counts tasks/get replays beside the session cap:
+//     a2aTasksReplayConsumers, in the reserve, derives the number from the
+//     callers. A budget that counted sessions alone ran out under replay
+//     load and refused a legitimate session's consumer create, which read
+//     as an undersized stream.
 //
 // Neither is worth the grant, but the cost is stated rather than described as
 // free, which is what this comment said first.
@@ -1823,7 +1992,7 @@ fi
 if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
   echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
   echo "  spec.harness.tuning.maxSessions is ` + strconv.Itoa(resolveA2AMaxSessions(agent)) + `, each session creates ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` consumers on TASKS," >&2
-  echo "  plus ` + strconv.Itoa(a2aTasksReservedConsumers) + ` reserved for the standing durables and the web rail." >&2
+  echo "  plus ` + strconv.Itoa(a2aTasksReservedConsumers) + ` reserved for the standing durables, the web rail and tasks/get replays." >&2
   echo "Provisioning does not edit an existing stream, and this one limit could not be" >&2
   echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
   echo "  \"stream configuration update can not change MaxConsumers\"" >&2
@@ -2845,7 +3014,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 				// what the script's gate compares a live stream
 				// against; the recreate width is what a fresh render
 				// creates, which floors at the cap TASKS shipped with,
-				// so a default install needs 46 and recreates at 64.
+				// so a default install needs 58 and recreates at 64.
 				// The third — what the live stream actually holds — is
 				// on the bus, and it is the one the maxSessions that
 				// fits is derived from, so that half of the remedy
