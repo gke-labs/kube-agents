@@ -38,6 +38,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -181,16 +182,30 @@ var activityEntryBudget = 3000
 var taskIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 var (
-	redactedKeyPattern    = regexp.MustCompile(`(?i)token|secret|password|passwd|authorization|api[_-]?key|credential`)
+	// A key is secret-looking when one of the words is a whole component of
+	// it (access_token, AWS_SECRET_ACCESS_KEY, api-key), not a substring
+	// (tokenizer, secretName): the latter are names, and blanking them would
+	// put "[redacted]" where the worker adapter's trace carries the value.
+	// A count or a path that ends in the word (max_tokens, credentials_file)
+	// is blanked too; that is the accepted price of catching SECRET_KEY.
+	redactedKeyPattern    = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|authorization|api[_-]?key|credential)s?(?:$|[_.-])`)
 	redactedValuePatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}`),
 		regexp.MustCompile(`ya29\.[A-Za-z0-9._-]{20,}`),
 		regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),
 		regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
-		regexp.MustCompile(`(?i)basic\s+[A-Za-z0-9+/=]{8,}`),
-		regexp.MustCompile(`(?i)(?:^|\s)(?:-u|--user)[\s=]+\S+:\S+`),
-		regexp.MustCompile(`(?i)(token|secret|password|passwd|api[_-]?key|credential)s?["']?\s*[=:]\s*["']?[^"'\s,}]+`),
-		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z-]*(token|secret|password|passwd|api[_-]?key|credential)s?\s+\S+`),
+		// The header form, capitalised as HTTP writes it and long enough to
+		// be a credential, so "basic refactoring" in a commit message is
+		// not one.
+		regexp.MustCompile(`Basic\s+[A-Za-z0-9+/]{16,}={0,2}`),
+		// curl's -u user:password, on a curl command: "date -u 12:30" and
+		// "sort -u a:b" are not.
+		regexp.MustCompile(`(?i)\bcurl\b[^;|&\n]*\s(?:-u|--user)[\s=]+\S+:\S+`),
+		// key=value / key: value / "key": "value", where a secret word is a
+		// whole component of the key (SECRET_KEY, AWS_SECRET_ACCESS_KEY).
+		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?\s*[=:]\s*["']?[^"'\s,}]+`),
+		// --flag value, the word a component of the flag (--token, --secret-access-key).
+		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z0-9-]*(?:token|secret|password|passwd|api[_-]?key|credential)s?(?:-[a-z0-9-]+)?\s+\S+`),
 	}
 )
 
@@ -519,7 +534,7 @@ func redactValue(v any) any {
 // config.yaml with the door's hooks.outbound entry added (appended to any the
 // source already carries) and its .env verbatim. Returns the directory; the
 // caller removes it once the child has exited.
-func (b *Bridge) childManagedScope(taskID string) (string, error) {
+func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	if !taskIDPattern.MatchString(taskID) {
 		return "", fmt.Errorf("task id %q is not a path segment", taskID)
 	}
@@ -527,28 +542,48 @@ func (b *Bridge) childManagedScope(taskID string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("scratch dir: %w", err)
 	}
-	dir := filepath.Join(scratch, taskID)
+	dir = filepath.Join(scratch, taskID)
 	if rel, err := filepath.Rel(scratch, dir); err != nil || rel != taskID {
 		return "", fmt.Errorf("task id %q leaves the scratch dir", taskID)
 	}
 	if err := os.MkdirAll(dir, childScopeDirMode); err != nil {
 		return "", fmt.Errorf("child scope dir: %w", err)
 	}
+	// Nothing half-written survives a failure: the copy carries the
+	// managed .env, and a directory left behind would hold it for the
+	// pod's lifetime.
+	made := dir
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(made)
+		}
+	}()
+	// A source file that exists but cannot be read is a fault, not an
+	// absence: a child started on a hook-only scope would run without the
+	// operator's pins, silently. Only a missing file means nothing to copy.
 	cfg := map[string]any{}
 	src := b.cfg.ManagedScopeDir
 	if src != "" {
-		if raw, err := os.ReadFile(filepath.Join(src, managedConfigFile)); err == nil {
+		raw, rerr := os.ReadFile(filepath.Join(src, managedConfigFile))
+		switch {
+		case rerr == nil:
 			if err := yaml.Unmarshal(raw, &cfg); err != nil {
 				return "", fmt.Errorf("managed config %s: %w", src, err)
 			}
 			if cfg == nil {
 				cfg = map[string]any{}
 			}
+		case !errors.Is(rerr, os.ErrNotExist):
+			return "", fmt.Errorf("managed config %s: %w", src, rerr)
 		}
-		if raw, err := os.ReadFile(filepath.Join(src, managedEnvFile)); err == nil {
+		raw, rerr = os.ReadFile(filepath.Join(src, managedEnvFile))
+		switch {
+		case rerr == nil:
 			if err := os.WriteFile(filepath.Join(dir, managedEnvFile), raw, childScopeFileMode); err != nil {
 				return "", fmt.Errorf("child scope env: %w", err)
 			}
+		case !errors.Is(rerr, os.ErrNotExist):
+			return "", fmt.Errorf("managed env %s: %w", src, rerr)
 		}
 	}
 	hooks, _ := cfg[hooksKey].(map[string]any)
@@ -577,11 +612,21 @@ func (b *Bridge) childManagedScope(taskID string) (string, error) {
 
 // --- the door ---
 
-// listenActivity binds the door. Called from New so the address is known
-// before Run; Run serves it.
+// listenActivity binds the door and claims the scratch dir. Called from New
+// so the address is known before Run; Run serves it. The scratch dir is the
+// bridge's alone and starts empty: a scope a previous incarnation left
+// behind (killed mid-task, its defers never run) held a copy of the managed
+// .env, and the sweep that finalizes that incarnation's tasks does not
+// know about files.
 func (b *Bridge) listenActivity() error {
 	if b.cfg.ActivityListen == "" {
 		return nil
+	}
+	if err := os.RemoveAll(b.cfg.ScratchDir); err != nil {
+		return fmt.Errorf("scratch dir %s: %w", b.cfg.ScratchDir, err)
+	}
+	if err := os.MkdirAll(b.cfg.ScratchDir, childScopeDirMode); err != nil {
+		return fmt.Errorf("scratch dir %s: %w", b.cfg.ScratchDir, err)
 	}
 	ln, err := net.Listen("tcp", b.cfg.ActivityListen)
 	if err != nil {

@@ -111,8 +111,8 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		TaskDeadline: time.Duration(envInt(log, "BRIDGE_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds)) * time.Second,
 		KillGrace:    time.Duration(envInt(log, "BRIDGE_KILL_GRACE_SECONDS", defaultKillGraceSeconds)) * time.Second,
 		KVBucket:     envOr("BRIDGE_KV_BUCKET", defaultKVBucket),
-		// The activity door (a2a/hermes-bridge/activity.go): on by default at
-		// the address the platform profile's hooks.overlay.yaml names.
+		// The activity door (a2a/hermes-bridge/activity.go): on by default;
+		// each child is handed whatever address the door bound.
 		ActivityListen:   activityListen(envOr("BRIDGE_ACTIVITY_LISTEN", hermesbridge.DefaultActivityListen)),
 		ScratchDir:       os.Getenv("BRIDGE_SCRATCH_DIR"),
 		ProgressInterval: progressInterval(envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)),
