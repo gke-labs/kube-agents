@@ -117,6 +117,12 @@
 # repetitions measured 710-1325s). With the 2026-09-23 additions above it
 # grows the matrix to forty-five cases and 135 units, ~1047-1067 serial
 # minutes, on nights the 2026-09-22 paragraph already says can truncate.
+#
+# 2026-09-25 adds cluster-agent-unlocated-crashloop-debug (#1670): one case,
+# three units, ~36 serial minutes at its 720s hint. With the 2026-09-25
+# additions above it grows the matrix to forty-eight cases and 144 units,
+# ~1112-1132 serial minutes, on nights the 2026-09-22 paragraph already says
+# can truncate.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -284,6 +290,19 @@
 # ledger. The collector (`collect.py`) computes the check. Priced with the
 # 900s audit band.
 ./tasks/obtainability-planted-orphan-service/task.yaml
+
+# Blocker: never run (`validated: false`). Issue #953: unlocated cluster
+# crashloop debugging (omits "Find the cluster it is running on", requiring the
+# Platform Agent to discover the target cluster via fleet enumeration before
+# delegating to the cluster agent). Requires role crashloop-workload on seeded
+# cluster A of the 3-cluster standing dirty fleet (bench/tf/fleet/README.md).
+# Authored in PR #1670; its eval loop was not run locally because the contributor
+# environment is single-cluster (kyber-test) without the multi-cluster OpenTofu
+# fleet stack applied. Unvalidated live on dev cluster; awaiting maintainer
+# determination on PR #1670 review (@scromp / OWNERS approvers). Lands in the
+# nightly roster under ADDED_AFTER_THE_SPLIT to build its empirical baseline in
+# Boskos-leased pool projects.
+./tasks/cluster-agent-unlocated-crashloop-debug/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was

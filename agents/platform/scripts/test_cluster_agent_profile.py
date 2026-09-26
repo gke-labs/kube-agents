@@ -523,5 +523,335 @@ class CreateProfileTest(unittest.TestCase):
         self.assertEqual(cfg["backends"], [])
 
 
+class ResolveProfilesBaseTest(unittest.TestCase):
+    def test_resolves_when_hermes_home_is_profile_home(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform"}, clear=True):
+            self.assertEqual(cap._resolve_data_root(), Path("/opt/data"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/opt/data/profiles"))
+
+    def test_resolves_when_platform_agent_home_is_set(self):
+        with mock.patch.dict(
+            os.environ,
+            {"HERMES_HOME": "/custom/profiles/platform", "PLATFORM_AGENT_HOME": "/srv/agent"},
+            clear=True,
+        ):
+            self.assertEqual(cap._resolve_data_root(), Path("/srv/agent"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/srv/agent/profiles"))
+
+    def test_resolves_standard_root_hermes_home(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/opt/data"}, clear=True):
+            self.assertEqual(cap._resolve_data_root(), Path("/opt/data"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/opt/data/profiles"))
+
+    def test_resolves_when_data_root_parent_is_named_profiles(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/srv/profiles/data"}, clear=True):
+            self.assertEqual(cap._resolve_data_root(), Path("/srv/profiles/data"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/srv/profiles/data/profiles"))
+
+    def test_resolves_when_profile_home_contains_profiles_directory(self):
+        with tempfile.TemporaryDirectory(prefix="test-prof-") as tmpdir:
+            profile_home = Path(tmpdir) / "profiles" / "platform"
+            (profile_home / "profiles").mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}, clear=True):
+                self.assertEqual(cap._resolve_data_root(), Path(tmpdir))
+                self.assertEqual(cap._resolve_profiles_base(), Path(tmpdir) / "profiles")
+
+    def test_resolves_when_cluster_profile_home_contains_profiles_directory(self):
+        with tempfile.TemporaryDirectory(prefix="test-cluster-prof-") as tmpdir:
+            cluster_home = Path(tmpdir) / "profiles" / "cluster-prod-east"
+            (cluster_home / "profiles").mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"HERMES_HOME": str(cluster_home)}, clear=True):
+                self.assertEqual(cap._resolve_data_root(), Path(tmpdir))
+                self.assertEqual(cap._resolve_profiles_base(), Path(tmpdir) / "profiles")
+
+
+class ListProfilesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="cap-list-test-"))
+        self.patcher = mock.patch.object(cap, "PROFILES_BASE", self.tmp)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_nonexistent_directory_returns_empty(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        self.assertEqual(cap.list_profiles(), [])
+
+    def test_filters_reserved_and_files(self):
+        (self.tmp / "default").mkdir()
+        (self.tmp / "platform").mkdir()
+        (self.tmp / "not-a-dir.txt").touch()
+        (self.tmp / "cluster-beta").mkdir()
+        (self.tmp / "cluster-alpha").mkdir()
+
+        self.assertEqual(cap.list_profiles(), ["cluster-alpha", "cluster-beta"])
+
+    def test_cmd_list_prints_ready_sorted_by_default(self):
+        for name in ("cluster-zeta", "cluster-beta"):
+            p = self.tmp / name
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "profile.yaml").touch()
+            (p / "USER.md").write_text("- project: p\n- cluster: c\n- location: l\n", encoding="utf-8")
+            (p / "config.yaml").write_text(
+                "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
+                encoding="utf-8",
+            )
+        (self.tmp / "cluster-incomplete").mkdir()
+        (self.tmp / "cluster-incomplete" / "config.yaml").write_text(
+            "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
+            encoding="utf-8",
+        )
+
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            cap.cmd_list(mock.MagicMock(all=False))
+        self.assertEqual(out.getvalue(), "cluster-beta\ncluster-zeta\n")
+
+        out_all = io.StringIO()
+        with mock.patch("sys.stdout", out_all):
+            cap.cmd_list(mock.MagicMock(all=True))
+        self.assertEqual(out_all.getvalue(), "cluster-beta\ncluster-incomplete\ncluster-zeta\n")
+
+    def test_build_parser_list_all(self):
+        parser = cap.build_parser()
+        args = parser.parse_args(["list"])
+        self.assertFalse(args.all)
+        args_all = parser.parse_args(["list", "--all"])
+        self.assertTrue(args_all.all)
+
+
+class ListReadyProfilesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="cap-ready-test-"))
+        self.patcher = mock.patch.object(cap, "PROFILES_BASE", self.tmp)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _scaffold(self, name: str, user_md: bool = True, identity: bool = True, scaffolded: bool = True):
+        p = self.tmp / name
+        p.mkdir(parents=True, exist_ok=True)
+        if scaffolded:
+            (p / "profile.yaml").touch()
+        if user_md:
+            (p / "USER.md").write_text("- project: p\n- cluster: c\n- location: l\n", encoding="utf-8")
+        if identity:
+            (p / "config.yaml").write_text(
+                "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n",
+                encoding="utf-8",
+            )
+        return p
+
+    def test_ready_profiles_filters_incomplete_scaffolds(self):
+        self._scaffold("cluster-ready")
+        self._scaffold("cluster-no-user", user_md=False, identity=True)
+        self._scaffold("cluster-unregistered", scaffolded=False)
+        self._scaffold("default")
+        self._scaffold("platform")
+
+        self.assertEqual(cap.list_ready_profiles(), ["cluster-ready"])
+
+    def test_ready_profiles_does_not_probe_sandbox_or_call_kubeconfig_landed(self):
+        self._scaffold("cluster-ready")
+        with mock.patch.object(cap, "kubeconfig_landed", side_effect=AssertionError("kubeconfig_landed should not be called")):
+            self.assertEqual(cap.list_ready_profiles(), ["cluster-ready"])
+
+    def test_ready_profiles_tolerates_corrupt_config_yaml(self):
+        self._scaffold("cluster-ready")
+        p_corrupt = self._scaffold("cluster-corrupt", user_md=True, identity=False)
+        (p_corrupt / "config.yaml").write_text("invalid yaml: {{\n", encoding="utf-8")
+
+        # Ready profiles match the dispatcher capability: scaffolded and USER.md present
+        self.assertEqual(cap.list_ready_profiles(), ["cluster-corrupt", "cluster-ready"])
+
+    def test_read_cluster_identity_robustness(self):
+        # 1. Nonexistent directory
+        self.assertIsNone(cap.read_cluster_identity(self.tmp / "nonexistent"))
+
+        # 2. Scalar and list YAML
+        p1 = self.tmp / "p1"
+        p1.mkdir()
+        (p1 / "config.yaml").write_text("scalar_value\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        (p1 / "config.yaml").write_text("[item1, item2]\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        # 3. Non-dict cluster_identity
+        (p1 / "config.yaml").write_text("cluster_identity: 12345\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        # 4. Incomplete fields
+        (p1 / "config.yaml").write_text("cluster_identity:\n  project: p\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        # 5. Invalid YAML syntax
+        (p1 / "config.yaml").write_text("{{invalid-yaml\n", encoding="utf-8")
+        self.assertIsNone(cap.read_cluster_identity(p1))
+
+        # 6. Valid cluster_identity
+        (p1 / "config.yaml").write_text(
+            "cluster_identity:\n  project: p\n  cluster: c\n  location: l\n", encoding="utf-8"
+        )
+        self.assertEqual(
+            cap.read_cluster_identity(p1),
+            {"project": "p", "cluster": "c", "location": "l"},
+        )
+
+        # 7. Non-UTF-8 bytes (UnicodeDecodeError)
+        p_bin = self.tmp / "p_bin"
+        p_bin.mkdir()
+        (p_bin / "config.yaml").write_bytes(b"\xff\xfe")
+        self.assertIsNone(cap.read_cluster_identity(p_bin))
+
+        # 8. Directory config.yaml (IsADirectoryError / OSError)
+        p_dir = self.tmp / "p_dir"
+        p_dir.mkdir()
+        (p_dir / "config.yaml").mkdir()
+        self.assertIsNone(cap.read_cluster_identity(p_dir))
+
+
+
+class SandboxStubTest(unittest.TestCase):
+    def setUp(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        self.stub_path = repo_root / "deploy" / "sandbox" / "agent-pod-only-stub.py"
+        self.assertTrue(self.stub_path.is_file(), f"missing {self.stub_path}")
+        self.tmp = Path(tempfile.mkdtemp(prefix="sandbox-stub-test-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_stub_refuses_execution(self):
+        wrapper = self.tmp / "cluster_agent_profile.py"
+        wrapper.symlink_to(self.stub_path)
+
+        res = subprocess.run(
+            [sys.executable, str(wrapper), "list"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("cluster_agent_profile.py does not run in the shell sandbox", res.stderr)
+        self.assertIn("Report the request as blocked", res.stderr)
+
+
+class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
+    def setUp(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        self.skill_path = (
+            repo_root / "agents" / "platform" / "skills" / "cluster-agent-lifecycle" / "SKILL.md"
+        )
+        self.assertTrue(self.skill_path.is_file(), f"missing {self.skill_path}")
+        self.content = self.skill_path.read_text(encoding="utf-8")
+
+    def test_delegation_handles_unnamed_cluster_via_fleet_enumeration(self):
+        # The procedure must explicitly guide resolution when the cluster name is omitted (#953).
+        self.assertIn("list_cluster_profiles()", self.content)
+        self.assertIn("get_cluster_profile_name", self.content)
+        self.assertIn("cluster_agent_profile.py list", self.content)
+        # Must instruct checking before asking the user
+        self.assertIn("existence", self.content.lower())
+        # Must instruct polling to settlement and waiting before completing
+        self.assertIn("settlement", self.content.lower())
+        self.assertIn("sleep 60", self.content)
+        # Must handle ready cards without false timeouts
+        self.assertIn("Do NOT classify cards in `ready` as timed out", self.content)
+        self.assertIn("never complete while probe cards remain queued in `ready`", self.content)
+        # Must acknowledge configurable concurrency (spec.harness.tuning.maxInProgress) rather than assuming a static cap
+        self.assertIn("spec.harness.tuning.maxInProgress", self.content)
+        # Must define that blocked or failed probes do not count as a match
+        self.assertRegex(
+            self.content,
+            r"[Bb]locked.*not.*match|[Dd]o(es)?\s+(\*\*)?not(\*\*)?\s+count as a match",
+        )
+        # Must instruct asking only after searching / looking
+        self.assertRegex(
+            self.content,
+            r"[Aa]sk only after (looking|checking|searching)",
+        )
+        # Must require identifying which cluster was picked in the report
+        self.assertIn("Never resolve silently", self.content)
+        # Must guide keeping probe instructions and results concise
+        self.assertIn("concise", self.content.lower())
+        # Must forbid abandoning unsettled probes in ready
+        self.assertRegex(
+            self.content,
+            r"[Nn]ever abandon an unsettled probe queued in `ready`",
+        )
+        # Must instruct completing with the answer you have if a probe blocks or times out
+        self.assertRegex(
+            self.content,
+            r"[Cc]omplete with the answer you have",
+        )
+
+
+class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
+    def setUp(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        self.task_path = (
+            repo_root
+            / "bench"
+            / "tasks"
+            / "cluster-agent-unlocated-crashloop-debug"
+            / "task.yaml"
+        )
+        self.assertTrue(self.task_path.is_file(), f"missing {self.task_path}")
+        self.data = yaml.safe_load(self.task_path.read_text(encoding="utf-8"))
+
+    def test_no_stubbed_profile_scripts_forbids_kubectl_variations(self):
+        spec = self.data.get("verification_spec", [])
+        no_stubbed = next(
+            (c for c in spec if c.get("name") == "no-stubbed-profile-scripts"),
+            None,
+        )
+        self.assertIsNotNone(no_stubbed, "missing no-stubbed-profile-scripts check")
+        assert no_stubbed is not None
+        forbidden = no_stubbed.get("check", {}).get("forbidden_patterns", [])
+        kubectl_pats = [p for p in forbidden if "kubectl" in p]
+        self.assertEqual(len(kubectl_pats), 1, f"expected 1 kubectl pattern, got {kubectl_pats}")
+        pattern = re.compile(kubectl_pats[0])
+
+        matching_commands = [
+            "kubectl get pods",
+            "KUBECONFIG=/tmp/k kubectl -n seeded-debug get pods",
+            "for c in a b; do kubectl --context $c get pods; done",
+            "$(kubectl config current-context)",
+            "`kubectl config current-context`",
+            "timeout 60 kubectl get pods",
+            "/usr/bin/kubectl get pods",
+            "./kubectl get pods",
+            '"kubectl" get pods',
+            "'kubectl' get pods",
+            "echo test && kubectl get pods",
+            "echo test; kubectl get pods",
+            "echo test | kubectl get pods",
+        ]
+        for cmd in matching_commands:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(
+                    pattern.search(cmd),
+                    f"pattern {pattern.pattern!r} failed to match forbidden command {cmd!r}",
+                )
+
+        non_matching_commands = [
+            "python3 /opt/data/scripts/gitops_workspace.py",
+            "cat README.md",
+            "git status",
+            "echo 'kube-agents repo'",
+        ]
+        for cmd in non_matching_commands:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(
+                    pattern.search(cmd),
+                    f"pattern {pattern.pattern!r} falsely matched {cmd!r}",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,10 +19,14 @@ from datetime import datetime
 from mcp.server import MCPServer
 import sandbox_exec
 from agent_common_server import _run_env, CONFIG_PATH
-from cluster_agent_profile import RESERVED_PROFILES, profile_name, read_cluster_identity
-from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS
+from cluster_agent_profile import (
+    RESERVED_PROFILES,
+    is_ready_profile,
+    profile_name,
+    read_cluster_identity,
+)
 from gke_endpoint import dns_endpoint_args
-from profile_scaffold import is_scaffolded, profiles_base
+from profile_scaffold import profiles_base
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
@@ -400,16 +404,7 @@ def _profiles_dir() -> Path:
     return profiles_base(Path(os.environ.get("PLATFORM_AGENT_HOME") or DEFAULT_AGENT_HOME))
 
 
-def _is_ready(home: Path) -> bool:
-    """A profile the dispatcher can hand a card to and its worker can serve.
-
-    is_scaffolded, not is_dir: a plugin mount point can leave a directory under
-    profiles/ that Hermes never registered, and a card assigned to it never runs.
-    The scaffold artifacts too: create_profile registers the profile and stamps its
-    identity before it fetches the credential and writes USER.md, so a scaffold that
-    stopped in between is registered, and its worker blocks at preflight.
-    """
-    return is_scaffolded(home) and all((home / f).is_file() for f in SCAFFOLD_ARTIFACTS)
+_is_ready = is_ready_profile
 
 
 def _cluster_agent_roster() -> list[dict]:

@@ -27,11 +27,49 @@ from pathlib import Path
 
 import sandbox_exec
 from gke_endpoint import dns_endpoint_args
-from profile_scaffold import HERMES_BIN, backfill_cron_file, ensure_profile, overlay_template
+from profile_scaffold import HERMES_BIN, backfill_cron_file, ensure_profile, is_scaffolded, overlay_template
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+
+
+ENV_PLATFORM_AGENT_HOME = "PLATFORM_AGENT_HOME"
+ENV_HERMES_HOME = "HERMES_HOME"
+DEFAULT_DATA_ROOT = Path("/opt/data")
+PROFILES_DIR_NAME = "profiles"
+CLUSTER_PROFILE_PREFIX = "cluster-"
+IDENTITY_FILE = "USER.md"
+# Non-cluster profiles that live under $HERMES_HOME/profiles but are never
+# managed as Cluster Agents: the front-door router (`default`) and the Platform
+# Agent itself (`platform`). Reconciliation must never touch these.
+RESERVED_PROFILES = frozenset({"default", "platform"})
+
+
+def _resolve_data_root() -> Path:
+    """Resolve the data PVC root containing the profiles/ directory.
+
+    In a Platform Agent worker, kanban session, or gateway child, HERMES_HOME is pointed
+    at the profile home (<root>/profiles/platform) while PLATFORM_AGENT_HOME points to
+    the data PVC root (/opt/data). If PLATFORM_AGENT_HOME is unset and HERMES_HOME points
+    directly to a profile home, derive the root from HERMES_HOME.parent.parent.
+    """
+    if os.environ.get(ENV_PLATFORM_AGENT_HOME):
+        return Path(os.environ[ENV_PLATFORM_AGENT_HOME])
+    raw_home = Path(os.environ.get(ENV_HERMES_HOME, str(DEFAULT_DATA_ROOT)))
+    if (
+        raw_home.parent.name == PROFILES_DIR_NAME
+        and (raw_home.name in RESERVED_PROFILES or raw_home.name.startswith(CLUSTER_PROFILE_PREFIX))
+    ):
+        return raw_home.parent.parent
+    return raw_home
+
+
+def _resolve_profiles_base() -> Path:
+    """Resolve the directory containing all profile subdirectories."""
+    return _resolve_data_root() / PROFILES_DIR_NAME
+
+
+HERMES_HOME = _resolve_data_root()
 # Operator-rendered config overlays and profile-targeted plugin image volumes. The
 # entrypoint applies both at pod startup; a profile scaffolded here appears later, so it
 # has to pick them up itself (see create_profile steps 2c/2d).
@@ -50,16 +88,11 @@ SANDBOX_MIRROR_TIMEOUT_SECONDS = 120
 ENV_HERMES_OTEL_ENABLED = "HERMES_OTEL_ENABLED"
 ENV_OTEL_SDK_DISABLED = "OTEL_SDK_DISABLED"
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
-PROFILES_BASE = HERMES_HOME / "profiles"
+PROFILES_BASE = _resolve_profiles_base()
 
 # Files/dirs from the template to overlay onto the created profile home.
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
 MAX_NAME_LEN = 63
-
-# Non-cluster profiles that live under $HERMES_HOME/profiles but are never
-# managed as Cluster Agents: the front-door router (`default`) and the Platform
-# Agent itself (`platform`). Reconciliation must never touch these.
-RESERVED_PROFILES = frozenset({"default", "platform"})
 
 # How the scaffold checks that gcloud's kubeconfig exists on the side that will
 # read it. An absolute path because a builtin `test` would be the sandbox
@@ -139,8 +172,11 @@ def read_cluster_identity(home: Path) -> dict[str, str] | None:
 
     config_path = home / "config.yaml"
     try:
-        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except (FileNotFoundError, yaml.YAMLError):
+        raw = config_path.read_text(encoding="utf-8")
+        data = yaml.safe_load(raw) or {}
+    except (OSError, yaml.YAMLError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
         return None
     identity = data.get("cluster_identity")
     if not isinstance(identity, dict):
@@ -423,7 +459,7 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # It stays informational even so: the pin the runtime honours is KUBECONFIG
     # in the profile's .env (step 3b), not this line. Repointing an agent means
     # re-running this scaffold, not editing USER.md.
-    (home / "USER.md").write_text(
+    (home / IDENTITY_FILE).write_text(
         "# Cluster Agent Context\n\n"
         "This Cluster Agent is permanently scoped to the following GKE cluster:\n\n"
         f"- project: {project}\n"
@@ -481,14 +517,38 @@ def list_profiles() -> list[str]:
     )
 
 
+def is_ready_profile(home: Path) -> bool:
+    """A profile the dispatcher can hand a card to and its worker can serve.
+
+    is_scaffolded, not is_dir: a plugin mount point can leave a directory under
+    profiles/ that Hermes never registered, and a card assigned to it never runs.
+    The scaffold artifacts too: create_profile registers the profile and stamps its
+    identity before it fetches the credential and writes USER.md, so a scaffold that
+    stopped in between is registered, and its worker blocks at preflight.
+    """
+    return is_scaffolded(home) and (home / IDENTITY_FILE).is_file()
+
+
+def list_ready_profiles() -> list[str]:
+    """Return sorted names of active, fully scaffolded Cluster Agent profiles."""
+    if not PROFILES_BASE.is_dir():
+        return []
+    return sorted(
+        p.name
+        for p in PROFILES_BASE.iterdir()
+        if p.is_dir() and p.name not in RESERVED_PROFILES and is_ready_profile(p)
+    )
+
+
 def cmd_delete(args: argparse.Namespace) -> None:
     name = profile_name(args.project, args.cluster, args.location)
     delete_profile(name)
     print(name)
 
 
-def cmd_list(_args: argparse.Namespace) -> None:
-    for name in list_profiles():
+def cmd_list(args: argparse.Namespace) -> None:
+    profiles = list_profiles() if getattr(args, "all", False) else list_ready_profiles()
+    for name in profiles:
         print(name)
 
 
@@ -503,7 +563,7 @@ def cmd_name(args: argparse.Namespace) -> None:
     print(profile_name(args.project, args.cluster, args.location))
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage per-cluster Cluster Agent Hermes profiles.")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -518,8 +578,17 @@ def main() -> None:
         sp.add_argument("--cluster", required=True)
         sp.add_argument("--location", required=True)
 
-    sub.add_parser("list", help="List existing cluster profiles")
+    list_parser = sub.add_parser("list", help="List active, fully scaffolded cluster profiles")
+    list_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include incomplete/unscaffolded profiles (default: False, lists only ready profiles)",
+    )
+    return parser
 
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
     handlers = {"create": cmd_create, "delete": cmd_delete, "list": cmd_list, "name": cmd_name}
     handlers[args.command](args)
