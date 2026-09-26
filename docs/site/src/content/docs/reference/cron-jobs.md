@@ -67,7 +67,7 @@ Both rosters use one schema. A governance watchdog:
     "expr": "20 6 * * *",
     "display": "20 6 * * *"
   },
-  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 414 lines of it, before you run anything. Its eleven checks are section 2, lines 107-320, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 494 lines of it, before you run anything. Its sixteen checks are section 2, lines 113-393, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 opens by running the collector (`skills/fleet-audit/scripts/collect.py compliance-audit`) with --workspace set to the workspace start returned, redirecting its stdout to /opt/data/scratch/manifest_compliance-audit.json: run it before evaluating any check by hand, read the manifest the way section 2 says, and pass the same file to finish as --manifest-file. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
   "skills": [
     "fleet-audit"
   ],

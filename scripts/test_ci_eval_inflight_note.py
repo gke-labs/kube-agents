@@ -356,7 +356,7 @@ class NamesTest(unittest.TestCase):
         # and teardown; a holder that spends the grace before its run must
         # not push the waiter past it, so the grace is in the deadline.
         self.assertIn(
-            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) ))"',
+            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"',
             lifted("run_one_unit"),
         )
         self.assertEqual(grace_seconds(), 300)

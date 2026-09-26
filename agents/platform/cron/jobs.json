@@ -8,7 +8,7 @@
         "expr": "20 6 * * *",
         "display": "20 6 * * *"
       },
-      "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 414 lines of it, before you run anything. Its eleven checks are section 2, lines 107-320, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 494 lines of it, before you run anything. Its sixteen checks are section 2, lines 113-393, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 opens by running the collector (`skills/fleet-audit/scripts/collect.py compliance-audit`) with --workspace set to the workspace start returned, redirecting its stdout to /opt/data/scratch/manifest_compliance-audit.json: run it before evaluating any check by hand, read the manifest the way section 2 says, and pass the same file to finish as --manifest-file. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "risk": "low",
       "enabled": true,
@@ -22,7 +22,7 @@
         "expr": "50 6 * * *",
         "display": "50 6 * * *"
       },
-      "prompt": "Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your profile home — all 310 lines of it, before you run anything. Its eleven checks are section 3, lines 94-223, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "prompt": "Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your profile home — all 517 lines of it, before you run anything. Its twenty-three checks are section 3, lines 103-422, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 runs the collector (`skills/fleet-audit/scripts/collect.py obtainability-audit`) with --workspace set to the workspace start returned, redirecting its stdout to /opt/data/scratch/manifest_obtainability-audit.json: run it before evaluating any check by hand, read the manifest the way section 2 says, and pass the same file to finish as --manifest-file. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "risk": "low",
       "enabled": true,
@@ -78,7 +78,7 @@
         "expr": "50 8 * * *",
         "display": "50 8 * * *"
       },
-      "prompt": "Run the daily AI workload security audit. Read the SOP at 'governance/ai_security_audit_sop.md' in your profile home — all 349 lines of it, before you run anything. Its six checks are section 3, lines 153-277, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 defines which workloads count as AI workloads; on a cluster running none the six checks still ran and matched nothing, so record all six in checks_run with the collection command — never leave checks_run empty, which the validator rejects. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "prompt": "Run the daily AI workload security audit. Read the SOP at 'governance/ai_security_audit_sop.md' in your profile home — all 298 lines of it, before you run anything. Its six checks are section 3, lines 131-220, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 3 opens by running the collector (`skills/fleet-audit/scripts/collect.py ai-security-audit`) with --workspace set to the workspace start returned, redirecting its stdout to /opt/data/scratch/manifest_ai-security-audit.json: run it before evaluating any check by hand, read the manifest the way section 3 says, and pass the same file to finish as --manifest-file. Section 2 defines which workloads count as AI workloads; on a cluster running none the six checks still ran and matched nothing, so record all six in checks_run with the collector's command — never leave checks_run empty, which the validator rejects. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "risk": "low",
       "enabled": true,

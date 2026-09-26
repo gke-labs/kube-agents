@@ -69,7 +69,9 @@
 # Forty-four cases, ~1011-1031min serial. 2026-09-25 adds the two
 # obtainability probes (#1841), unhinted and probe-shaped (~200s a
 # repetition, ~10min each at three): forty-six cases, ~1031-1051min serial.
-# The
+# 2026-09-25 also added obtainability-planted-orphan-service (~45min at the
+# 900s band; tofu, so it serializes on the infra lock with the other tofu
+# cases). Forty-seven cases, ~1076-1096min serial. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=8 (6 from #1491 until
 # oss-test-infra#2707, 2026-09-25; the arithmetic that follows was done at
@@ -275,6 +277,13 @@
 # channel's roster but is still served at its location. The collector
 # (`patch_readiness.py`) computes the route check.
 ./tasks/upgrades-master-behind-offered-elsewhere/task.yaml
+
+# The obtainability stream's collector case, nightly from the start: a per-run
+# plant (`prebuilt/orphan-service`) of a ClusterIP Service whose selector
+# matches no pod, graded on §3.16 `service-selects-nothing` reaching the
+# ledger. The collector (`collect.py`) computes the check. Priced with the
+# 900s audit band.
+./tasks/obtainability-planted-orphan-service/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was

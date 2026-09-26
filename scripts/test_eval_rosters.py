@@ -99,6 +99,7 @@ ADDED_AFTER_THE_SPLIT = [
     "gitops-drift-out-of-band-triage",  # the drift half of incident-triage, PR #1827
     "cluster-agent-delegation-profile-lookup",  # #1840's delegation route, PR #1917
     "upgrades-master-behind-offered-elsewhere",  # the patch collector's §3.1 route check, with patch_readiness.py
+    "obtainability-planted-orphan-service",  # the obtainability collector's §3.16 check, with collect.py
 ]
 # Appended at the tail of the nightly file.
 ADDED_AT_THE_TAIL = [

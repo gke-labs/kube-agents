@@ -432,6 +432,15 @@ _LEDGER_FOOTER_RE = re.compile(
 _DELTA_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
+# Mirrors the output of its `all_findings_block`, which the script writes but
+# never parses, so no test on that side checks this regex against it
+# (`test_the_complete_block_regex_reads_what_audit_report_writes` does): every finding id
+# in the document plus the collector-held ids, written only when the body cut
+# findings for space. The delta block above then lists the rendered ones
+# alone, and a finding filed but cut would read as never filed.
+_ALL_FINDINGS_RE = re.compile(
+    r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
+)
 
 # Bound on issue URLs fetched from one report. An audit reply names its ledger
 # once; anything past a handful is a report to look at by hand, not a set of
@@ -728,7 +737,7 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
     """The ledger footer's ``(audit id, generated-at)``, or None when absent.
 
     The LAST match, not the first. ``render_issue_body`` assembles the body as
-    ``fixed + findings + withheld + evidence + footer``, so every byte the
+    ``fixed + findings + held + declared + withheld + evidence + footer``, so every byte the
     agent authored — finding titles and impacts through ``clip_text``, which
     redacts credentials and clips length but neither strips backticks nor
     flattens newlines, and evidence excerpts into a raw fenced block — sits
@@ -740,7 +749,7 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
     hidden ``audit-findings`` delta block is rendered after it — but nothing
     the agent writes can ever appear below it, so the final match is the one
     ``audit_report.py`` wrote. Same reason ``_finding_ids`` reads
-    ``matches[-1]``.
+    the last match.
     """
     match = None
     for match in _LEDGER_FOOTER_RE.finditer(body):
@@ -773,18 +782,30 @@ def _parse_github_time(value: Any) -> datetime | None:
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
-def _finding_ids(body: str) -> list[str] | None:
-    """This run's finding ids from the hidden delta block, or None when absent."""
-    matches = _DELTA_RE.findall(body)
-    if not matches:
+def _finding_ids(body: str) -> tuple[list[str], str] | None:
+    """This run's finding ids and the block they came from, or None when the ledger carries no block.
+
+    The complete-list block when the body has one, since only a truncated body
+    writes it and there the delta block holds the rendered subset; the delta
+    block otherwise, which then names every finding. Both by their last match,
+    for the reason ``_parse_footer`` gives, and the complete list only BELOW
+    the last delta block, where ``_render_footer`` puts it: an untruncated
+    body has no real one, so a copy an agent wrote into a finding above the
+    footer would otherwise outrank the delta block that does.
+    """
+    deltas = list(_DELTA_RE.finditer(body))
+    if not deltas:
         return None
+    last = deltas[-1]
+    complete = [m for m in _ALL_FINDINGS_RE.finditer(body) if m.start() > last.end()]
+    source = "audit-findings-all" if complete else "audit-findings"
     try:
-        ids = json.loads(matches[-1])
+        ids = json.loads((complete or deltas)[-1].group(1))
     except (ValueError, TypeError):
         return None
     if not isinstance(ids, list):
         return None
-    return [i for i in ids if isinstance(i, str)]
+    return [i for i in ids if isinstance(i, str)], source
 
 
 @VERIFIERS.register("ledger_issue_contains")
@@ -853,7 +874,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     recommendations, and the scope table.
 
     ``finding_ids`` — only the ids in the hidden ``<!-- audit-findings: … -->``
-    delta block, which ``audit_report.py`` derives as
+    delta block (or, on a body truncated for size, the
+    ``<!-- audit-findings-all: … -->`` block listing every filed and
+    collector-held finding),
+    which ``audit_report.py`` derives as
     ``<check>.<cluster>.<namespace>.<object>``. Use it whenever the phrase is a
     CLUSTER name: the body's scope table names every audited cluster on every
     run, so ``required_phrases: ["seeded-c"]`` against ``body`` would pass on a
@@ -1174,16 +1198,22 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             )
 
         if self.scope == "finding_ids":
-            ids = _finding_ids(ledger["body"])
-            if ids is None:
+            parsed = _finding_ids(ledger["body"])
+            if parsed is None:
                 return done(
                     False,
                     f"{ledger['slug']} carries no readable "
-                    "<!-- audit-findings: [...] --> delta block, so the findings "
+                    "<!-- audit-findings: [...] --> delta block (or a malformed "
+                    "audit-findings-all block below it), so the findings "
                     "this run filed cannot be read off it",
                 )
+            ids, source = parsed
             text = "\n".join(ids).lower()
-            surface = f"the {len(ids)} finding id(s) on {ledger['slug']}"
+            # Which block: a truncated body with no complete list below its
+            # delta block (over the script's cap, or a drifted format) grades
+            # the rendered subset, and the reason should say so rather than
+            # read as a finding the agent never filed.
+            surface = f"the {len(ids)} finding id(s) in {ledger['slug']}'s {source} block"
         else:
             text = ledger["body"].lower()
             surface = f"the body of {ledger['slug']}"

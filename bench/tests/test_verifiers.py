@@ -1713,6 +1713,41 @@ def test_finding_ids_scope_closes_the_scope_table_hole(token, github):
     assert strict.verify(5.0).status == "fail"  # closed
 
 
+def test_finding_ids_scope_reads_the_complete_block_on_a_truncated_body(token, github):
+    """A body cut for size lists only the rendered ids in its delta block.
+
+    The finding that sorted last was still filed; the complete-list block
+    audit_report writes on a truncated body is what names it.
+    """
+    _stash_report()
+    body = _ledger_body(finding_ids=["rbac-overgrant.seeded-a._.debug-binding"])
+    payload = json.dumps(
+        sorted(["rbac-overgrant.seeded-a._.debug-binding", "service-selects-nothing.seeded-c.ns.orders"]),
+        separators=(",", ":"),
+    )
+    body += f"<!-- audit-findings-all: {payload} -->\n"
+    github.routes[_api()] = (200, _issue(body))
+    res = _ledger_check(required_phrases=["service-selects-nothing"], scope="finding_ids").verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_finding_ids_scope_without_the_complete_block_reads_the_delta_block(token, github):
+    _stash_report()
+    github.routes[_api()] = (200, _issue(_ledger_body()))
+    res = _ledger_check(required_phrases=["service-selects-nothing"], scope="finding_ids").verify(5.0)
+    assert res.status == "fail"
+
+
+def test_finding_ids_scope_ignores_a_complete_block_above_the_delta_block(token, github):
+    """Agent-authored text sits above the footer; a forged copy there is not the script's."""
+    _stash_report()
+    forged = '<!-- audit-findings-all: ["service-selects-nothing.seeded-c.ns.orders"] -->\n'
+    body = _ledger_body(findings="### rbac-overgrant on seeded-a\n\n" + forged)
+    github.routes[_api()] = (200, _issue(body))
+    res = _ledger_check(required_phrases=["service-selects-nothing"], scope="finding_ids").verify(5.0)
+    assert res.status == "fail"
+
+
 def test_finding_ids_scope_fails_when_the_delta_block_is_absent(token, github):
     _stash_report()
     github.routes[_api()] = (200, _issue(_ledger_body(finding_ids=None)))
@@ -1908,6 +1943,21 @@ def test_the_pinned_stream_list_matches_the_audit_scripts_registry():
     assert ids == set(verifiers.LEDGER_AUDIT_IDS)
     literal = LedgerIssueContainsVerifier.model_fields["audit"].annotation
     assert set(literal.__args__) == set(verifiers.LEDGER_AUDIT_IDS)
+
+
+def test_the_complete_block_regex_reads_what_audit_report_writes():
+    """_ALL_FINDINGS_RE copies all_findings_block's format, and audit_report's
+    own tests never run this regex. Render the script's own template so a change
+    on that side fails here rather than quietly grading the rendered subset."""
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    )
+    (template,) = re.findall(r'f"(<!-- audit-findings-all: \{payload\} -->)"', script.read_text())
+    payload = json.dumps(["a.b.c.d", "e.f.g.h"], separators=(",", ":"))
+    body = _ledger_body() + template.replace("{payload}", payload) + "\n"
+    parsed = verifiers._finding_ids(body)
+    assert parsed == (["a.b.c.d", "e.f.g.h"], "audit-findings-all")
 
 
 def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():
