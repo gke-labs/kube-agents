@@ -398,6 +398,7 @@ class ChatService:
                         frozenset({InteractionStatus.WAITING_FOR_TASKS}),
                         event="interaction.completed",
                         status=InteractionStatus.COMPLETED,
+                        output=interaction.output,
                     )
                 return
             time.sleep(self._poll_interval)
@@ -424,6 +425,9 @@ class ChatService:
                 summary=task.summary,
                 error=task.error,
                 run_count=task.run_count,
+                result=task.result,
+                evidence=task.evidence,
+                artifacts=task.artifacts,
             )
             for task in result.tasks
         )

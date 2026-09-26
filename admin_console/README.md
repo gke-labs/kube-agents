@@ -213,7 +213,10 @@ as synthetic agent chat messages.
 The FastAPI interaction resource joins the root Hermes run with delegated Task
 Kanban work. A root run ending does not make the interaction terminal: the API
 waits for linked work to settle and returns explicit failure diagnostics when a
-task fails or its state cannot be read. This is the same black-box contract used
+task fails or its state cannot be read. Each task in the projection carries the
+specialist's `result` and the typed `evidence` and `artifacts` records it filed
+through the worker-only `record_evidence` and `attach_artifact` tools. This is
+the same black-box contract used
 by the Streamlit page and evaluation clients. The complete contract and
 deployment boundary are owned by the
 [admin-console design](../docs/designs/admin-console.md#portal-api-and-shared-chat-abstraction).

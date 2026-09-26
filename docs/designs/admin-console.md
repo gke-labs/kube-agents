@@ -402,8 +402,12 @@ GET /api/v1/tasks/{taskId}/events
 ```
 
 All collections are paginated and bounded. Page tokens are opaque. Task
-responses expose state, assignee, retry count, latest result, safe error, and
-child IDs; they do not expose delivery credentials, attachment filesystem
+responses expose state, assignee, retry count, the specialist's `result`, safe
+error, child IDs, and the typed records the worker filed with its
+`record_evidence` and `attach_artifact` tools — `evidence[]` (`type`, `status`,
+`details` with `apiMethod`, `region`, `nodeCount`, `request`, `analysis`,
+`executionRef`) and `artifacts[]` (`type`, `manifest`, `pairId`, `target`,
+`machineSpec`); they do not expose delivery credentials, attachment filesystem
 paths, raw prompts, or unredacted command output.
 
 The API returns root output, task results, and messages as separate fields. It

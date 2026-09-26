@@ -27,9 +27,14 @@ from admin_console.runtime_contract import (
     gateway_endpoints,
     select_canonical_platform_agent,
 )
-from admin_console.telemetry import redact_evidence
+from admin_console.telemetry import redact_evidence, redact_record
 
 _K8S_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
+#: Typed evidence and artifact records projected per task. Newest win the
+#: cut: a worker records its ranked analysis after its probes and a corrected
+#: manifest after its first attempt, so dropping the tail would drop exactly
+#: what the graders read.
+TYPED_RECORDS_LIMIT = 32
 _KANBAN_TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 GATEWAY_PYTHON = "/opt/hermes/.venv/bin/python3"
 _READ_SCRIPT = r'''
@@ -38,6 +43,10 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+
+# Kept equal to admin_console.agent_runtime.TYPED_RECORDS_LIMIT (a test holds
+# the two together): this script is its own program inside the pod.
+TYPED_RECORDS_LIMIT = 32
 
 
 def profiles():
@@ -225,6 +234,115 @@ def tasks(session_id, limit):
                 (session_id, limit + 1),
             )
         ]
+        for row in rows:
+            # tasks.result predates this reader, but a rebuilt store may lack
+            # it; the typed tables ship with the worker-side recorder patch and
+            # are absent on older images. Missing sources read as empty rather
+            # than failing the whole projection.
+            try:
+                found = connection.execute(
+                    "SELECT result FROM tasks WHERE id = ?", (row["id"],)
+                ).fetchone()
+                row["result"] = (found["result"] if found else None) or ""
+            except sqlite3.OperationalError:
+                row["result"] = ""
+            try:
+                row["evidence"] = []
+                # Newest TYPED_RECORDS_LIMIT rows, returned oldest first: the
+                # portal keeps that many, and a worker that recorded in a loop
+                # must not grow this read past the exec budget.
+                for item in reversed(
+                    list(
+                        connection.execute(
+                            """
+                            SELECT type, status, api_method, request_json,
+                                   analysis_json, execution_ref
+                            FROM task_evidence WHERE task_id = ?
+                            ORDER BY id DESC LIMIT ?
+                            """,
+                            (row["id"], TYPED_RECORDS_LIMIT),
+                        )
+                    )
+                ):
+                    request = json.loads(item["request_json"] or "{}")
+                    # The evidence contract nests provenance under `details`,
+                    # with the request's region and node count surfaced
+                    # beside it so region- and count-scoped evaluators need
+                    # not re-parse the request.
+                    row["evidence"].append(
+                        {
+                            "type": item["type"],
+                            "status": item["status"],
+                            "details": {
+                                "apiMethod": item["api_method"],
+                                "region": str(request.get("region") or "")
+                                if isinstance(request, dict)
+                                else "",
+                                "nodeCount": request.get("nodeCount")
+                                if isinstance(request, dict)
+                                else None,
+                                "request": request,
+                                "analysis": json.loads(
+                                    item["analysis_json"] or "{}"
+                                ),
+                                "executionRef": item["execution_ref"],
+                            },
+                        }
+                    )
+            except (sqlite3.OperationalError, ValueError):
+                row["evidence"] = []
+            try:
+                # target/machine_spec columns arrived after the table first
+                # shipped; a board an older image created lacks them, and
+                # losing the whole artifact list to that would grade worse
+                # than the old shape did. Fall back to the original columns.
+                try:
+                    artifact_rows = list(
+                        reversed(
+                            list(
+                                connection.execute(
+                                    """
+                                    SELECT type, manifest_json, pair_id,
+                                           target_json, machine_spec_json
+                                    FROM task_artifacts WHERE task_id = ?
+                                    ORDER BY id DESC LIMIT ?
+                                    """,
+                                    (row["id"], TYPED_RECORDS_LIMIT),
+                                )
+                            )
+                        )
+                    )
+                except sqlite3.OperationalError:
+                    artifact_rows = [
+                        dict(item)
+                        | {"target_json": "{}", "machine_spec_json": "{}"}
+                        for item in reversed(
+                            list(
+                                connection.execute(
+                                    """
+                                    SELECT type, manifest_json, pair_id
+                                    FROM task_artifacts WHERE task_id = ?
+                                    ORDER BY id DESC LIMIT ?
+                                    """,
+                                    (row["id"], TYPED_RECORDS_LIMIT),
+                                )
+                            )
+                        )
+                    ]
+                row["artifacts"] = [
+                    {
+                        "type": item["type"],
+                        "manifest": json.loads(item["manifest_json"] or "{}"),
+                        "pairId": item["pair_id"],
+                        "target": json.loads(item["target_json"] or "{}"),
+                        "machineSpec": json.loads(
+                            item["machine_spec_json"] or "{}"
+                        ),
+                    }
+                    for item in artifact_rows
+                ]
+            except (sqlite3.OperationalError, ValueError):
+                row["artifacts"] = []
     return {"tasks": rows[:limit], "truncated": len(rows) > limit}
 
 
@@ -596,6 +714,9 @@ class AgentTaskUpdate:
     latest_event: str = ""
     latest_event_at: datetime | None = None
     previous_error: str = ""
+    result: str = ""
+    evidence: tuple[dict, ...] = ()
+    artifacts: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -753,6 +874,21 @@ class CronSnapshot:
     jobs_truncated: bool
     executions_truncated: bool
     read_at: datetime
+
+
+def _typed_records(
+    value: object, limit: int = TYPED_RECORDS_LIMIT
+) -> tuple[dict, ...]:
+    """Bound and redact the typed evidence and artifact records a task may carry.
+
+    Records are scrubbed structurally rather than rendered, so the shape every
+    evaluator walks survives while secret-named keys and credential forms do
+    not — the same treatment every other projected field gets.
+    """
+    if not isinstance(value, list):
+        return ()
+    records = [redact_record(item) for item in value if isinstance(item, dict)]
+    return tuple(records[-limit:])
 
 
 def _timestamp(value: object) -> datetime:
@@ -1012,6 +1148,9 @@ class AgentRuntimeProvider:
                 latest_event=str(row.get("latest_event") or ""),
                 latest_event_at=_optional_timestamp(row.get("latest_event_at")),
                 previous_error=redact_evidence(row.get("previous_error") or ""),
+                result=redact_evidence(row.get("result") or ""),
+                evidence=_typed_records(row.get("evidence")),
+                artifacts=_typed_records(row.get("artifacts")),
             )
             for row in payload.get("tasks", [])
         )

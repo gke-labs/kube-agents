@@ -158,6 +158,34 @@ def redact_evidence(value: object) -> str:
     return rendered
 
 
+def redact_record(value: dict) -> dict:
+    """Scrub a structured record without rendering it.
+
+    The typed evidence and artifact records a worker files are walked by
+    evaluators as objects, so they get the same two treatments
+    :func:`redact_evidence` gives rendered text — keys that name a secret are
+    replaced whole, credential forms inside string leaves are replaced in
+    place — while the dict shape, and therefore every path a grader reads,
+    survives. No size cap: a record is bounded at write time by the recorder.
+    """
+
+    def scrub(item: object) -> object:
+        if isinstance(item, dict):
+            return {
+                str(key): "[REDACTED]" if _SECRET_KEY.search(str(key)) else scrub(child)
+                for key, child in item.items()
+            }
+        if isinstance(item, list):
+            return [scrub(child) for child in item]
+        if isinstance(item, str):
+            for pattern in _SECRET_PATTERNS:
+                item = pattern.sub(r"\1[REDACTED]", item)
+            return item
+        return item
+
+    return scrub(value)
+
+
 def redact_kubernetes_evidence(value: object) -> str:
     """Redact Kubernetes EnvVar values whose names identify credentials."""
     if isinstance(value, str):

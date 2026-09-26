@@ -871,6 +871,29 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_report_format.py && \
     rm -rf /tmp/kanban-result
 
+# Typed evidence and artifact records for delegated tasks (#804): a worker's
+# prose report is not evidence, so record_evidence/attach_artifact give it a
+# structured place to put what it executed and what it produced. The rows land
+# beside the task in kanban.db and the admin console's task projection carries
+# them, provenance nested under `details`. Registered behind the worker-only
+# gate, so this block must run after the kanban-worker-tools block above — the
+# applier refuses otherwise. One COPY and one RUN: the module is staged with
+# the applier and installed into /opt/hermes/tools by the RUN rather than by a
+# COPY of its own, because the layer budget at the top of this file is what a
+# second COPY would spend. See the module docstring in
+# deploy/docker/patches/kanban_evidence_tools.py.
+COPY deploy/docker/patches/kanban_evidence_tools.py \
+     deploy/docker/patches/apply_kanban_evidence_tools.py \
+     deploy/docker/patches/verify_kanban_evidence_tools.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/kanban-evidence/
+RUN cp /tmp/kanban-evidence/kanban_evidence_tools.py /opt/hermes/tools/kanban_evidence_tools.py && \
+    chmod 0644 /opt/hermes/tools/kanban_evidence_tools.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-evidence/apply_kanban_evidence_tools.py /opt/hermes && \
+    grep -q "_register_evidence_tools(registry, _check_kanban_worker_mode, tool_error)" /opt/hermes/tools/kanban_tools.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-evidence/verify_kanban_evidence_tools.py && \
+    rm -rf /tmp/kanban-evidence
+
 # Hotfix: three kanban scheduler faults, all measured on the cluster 2026-08-07,
 # all in what is now `hermes_cli/kanban_db.py` plus its `kanban_db_dispatch.py`
 # split. One patch, because three appliers rewriting the same source could not
