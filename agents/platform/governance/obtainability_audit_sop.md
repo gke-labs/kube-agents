@@ -12,8 +12,10 @@
 
 ### 0. Open the audit run
 
+Pass `--on-demand` on interactive, chat, or kanban-dispatched audit runs so `finish` is never silent even on an unchanged ledger (#1929). Scheduled cron jobs omit `--on-demand`.
+
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit obtainability-audit [--repo "<owner>/<repo>"]
+./skills/fleet-audit/scripts/audit_report.py start --audit obtainability-audit [--repo "<owner>/<repo>"] [--on-demand]
 ```
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:

@@ -926,17 +926,23 @@ and the report can never disagree. The PR counters are in the conjunction becaus
 news even on a run that found nothing new: the ids were already in the ledger, so `new` is zero,
 while a pull request now exists that did not before.
 
-`silent_ok` is the **scheduled** verdict. It answers "would a channel want this?", and it has no way
-to know a person is waiting: `finish` sees a findings document, not the provenance of the run. So
-the second half of the rule lives with the agent and cannot be moved into the harness — **an
-on-demand run is never silent.** A run a person asked for — a kanban card naming the stream, or a
-request straight from chat — reports its outcome and its ledger URL whatever `silent_ok` says, and
-every SOP's close section says so. The Platform Agent's `AGENTS.md` adds the one case the rule
-cannot reach: "run the `<x>` cron job now" is answered with `hermes cron run <job-id>`, which marks
-the job due for the next `profile-cron-tick` instead of re-enacting the audit in the session that
-fielded the request. That run takes the same execute → save → deliver → mark path as a scheduled
-one and has no way to know a person asked, so `silent_ok` judges it like any other scheduled run;
-the session that triggered it says only that the job is queued and leaves the report to the run.
+`silent_ok` is the **scheduled** verdict. It answers "would a channel want this?", and on scheduled
+cron runs it suppresses delivery when the ledger is unchanged. Following #1929, the harness accepts
+`--on-demand` on `start`/`finish` (persisted into the scratch run record) and inspects environment
+markers as local fallbacks, setting `silent_ok: False` directly when dispatched on demand. In the
+deployed shell sandbox, the SSH crossing drops ambient dispatcher environment variables when commands
+run from profile home (`deploy/sandbox/session-command.sh`), so `--on-demand` passed to `start` is
+the only signal that reaches the harness in production. (As an architectural follow-up, flipping the
+default so `finish` speaks unless `start` was explicitly told `--scheduled` in machine-authored cron
+prompts would invert the trust boundary so silence is earned rather than trusting human/agent prose).
+Along with this harness guard, **an on-demand run is never silent.** A run a person asked for — a kanban
+card naming the stream, or a request straight from chat — reports its outcome and its ledger URL, and
+every SOP's close section says so. The Platform Agent's `AGENTS.md` adds the one case the rule cannot
+reach: "run the `<x>` cron job now" is answered with `hermes cron run <job-id>`, which marks the job
+due for the next `profile-cron-tick` instead of re-enacting the audit in the session that fielded the
+request. That run takes the same execute → save → deliver → mark path as a scheduled one and has no way
+to know a person asked, so `silent_ok` judges it like any other scheduled run; the session that
+triggered it says only that the job is queued and leaves the report to the run.
 
 On a scheduled run there is no channel on the other side of that verdict today, and the mechanism
 says so: a scheduled audit is a cron run on the Platform Agent's own roster

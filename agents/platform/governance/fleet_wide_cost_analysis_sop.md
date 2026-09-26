@@ -12,7 +12,7 @@
 
 ### 0. Open the audit run
 
-Run `./skills/fleet-audit/scripts/audit_report.py start --audit fleet-wide-cost-analysis [--repo "<owner>/<repo>"]`.
+Run `./skills/fleet-audit/scripts/audit_report.py start --audit fleet-wide-cost-analysis [--repo "<owner>/<repo>"] [--on-demand]`. Pass `--on-demand` on interactive, chat, or kanban-dispatched audit runs so `finish` is never silent even on an unchanged ledger (#1929). Scheduled cron jobs omit `--on-demand`.
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
 

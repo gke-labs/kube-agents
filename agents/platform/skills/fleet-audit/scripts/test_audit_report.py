@@ -585,7 +585,13 @@ class BaseTestCase(unittest.TestCase):
         # would otherwise put the whole suite on a different code path than CI.
         # Directory mode has to be the explicit state, not the ambient one.
         env = patch.dict(
-            os.environ, {"GITOPS_BASE_BRANCH": "", "CREDENTIAL_PROXY_URL": ""}
+            os.environ,
+            {
+                "GITOPS_BASE_BRANCH": "",
+                "CREDENTIAL_PROXY_URL": "",
+                "HERMES_KANBAN_TASK": "",
+                "AUDIT_ON_DEMAND": "",
+            },
         )
         env.start()
         self.addCleanup(env.stop)
@@ -633,10 +639,10 @@ class BaseTestCase(unittest.TestCase):
         self.assertTrue(record.pop(audit_report.RUN_RECORD_STARTED_KEY))
         return record
 
-    def record_run(self, repo="acme/fleet", context=(), audit=DECLARING_AUDIT):
+    def record_run(self, repo="acme/fleet", context=(), audit=DECLARING_AUDIT, on_demand=None):
         """Leave the run record `start` would have, under the scratch directory."""
         Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
-        return audit_report.write_run_record(audit, repo, list(context))
+        return audit_report.write_run_record(audit, repo, list(context), on_demand=on_demand)
 
     def run_finish(self, doc, argv_extra=(), audit=AUDIT):
         findings_file = self.write_findings(doc)
@@ -2515,6 +2521,58 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"{audit_id} prompt says {says.group(1)!r} but the stream "
                     f"has {len(spec.checks)} checks",
                 )
+
+    def test_every_sop_documents_on_demand_in_start_command(self):
+        """Every SOP's step 0 must document --on-demand for on-demand audit runs (#1929).
+
+        Workers executing on-demand audits (such as from kanban cards or chat) follow
+        the SOP directly. If the SOP's start command omits `--on-demand`, start will
+        not record `on_demand: true` into the run record, and finish will evaluate
+        `silent_ok: true` on unchanged ledgers if the environment heuristic does not fire.
+        """
+        sop_dir = self.sop_dir()
+        pattern = re.compile(r"audit_report\.py start [^\n]*--on-demand")
+        unconditional_pattern = re.compile(
+            r"Pass `--on-demand` on interactive, chat, or kanban-dispatched audit runs so `finish` is never silent"
+        )
+        for audit_id, spec in audit_report.AUDITS.items():
+            sop = sop_dir / spec.sop
+            with self.subTest(audit=audit_id):
+                text = sop.read_text(encoding="utf-8")
+                self.assertRegex(
+                    text,
+                    pattern,
+                    f"{spec.sop} start command does not document --on-demand",
+                )
+                self.assertRegex(
+                    text,
+                    unconditional_pattern,
+                    f"{spec.sop} step 0 does not unconditionally explain --on-demand",
+                )
+
+    def test_multi_repo_sops_document_interactive_repo_prompt(self):
+        """Every SOP with managed_repos must prompt the user when repo is omitted in interactive sessions."""
+        sop_dir = self.sop_dir()
+        pattern = re.compile(r"prompt the user to choose which repository to target before proceeding")
+        for audit_id, spec in audit_report.AUDITS.items():
+            if audit_id == "gce-compute-fleet-audit":
+                continue
+            sop = sop_dir / spec.sop
+            with self.subTest(audit=audit_id):
+                text = sop.read_text(encoding="utf-8")
+                self.assertRegex(
+                    text,
+                    pattern,
+                    f"{spec.sop} does not instruct prompting the user to choose a repository",
+                )
+                # Verify --on-demand is not buried inside the multi-repo interactive bullet
+                for line in text.splitlines():
+                    if "prompt the user to choose which repository" in line:
+                        self.assertNotIn(
+                            "--on-demand",
+                            line,
+                            f"{spec.sop} buries --on-demand inside multi-repo interactive prompt",
+                        )
 
     def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
         """A fix written into one SOP has to reach all the others.
@@ -5168,6 +5226,64 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         )
         payload = json.loads(self.out)
         self.assertEqual(payload["declared_intent_repos"], ["acme/fleet", "acme/terraform-live"])
+
+    def test_start_records_on_demand_when_requested(self):
+        self.assertEqual(
+            self.run_main(["start", "--audit", DECLARING_AUDIT, "--on-demand"]),
+            0,
+        )
+        record = self.record_without_stamp(DECLARING_AUDIT)
+        self.assertTrue(record.get(audit_report.RUN_RECORD_ON_DEMAND_KEY))
+
+    def test_start_records_no_on_demand_when_requested(self):
+        self.assertEqual(
+            self.run_main(["start", "--audit", DECLARING_AUDIT, "--no-on-demand"]),
+            0,
+        )
+        record = self.record_without_stamp(DECLARING_AUDIT)
+        self.assertIn(audit_report.RUN_RECORD_ON_DEMAND_KEY, record)
+        self.assertFalse(record[audit_report.RUN_RECORD_ON_DEMAND_KEY])
+
+    def test_start_records_on_demand_from_kanban_env(self):
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123"}):
+            self.assertEqual(
+                self.run_main(["start", "--audit", DECLARING_AUDIT]),
+                0,
+            )
+        record = self.record_without_stamp(DECLARING_AUDIT)
+        self.assertTrue(record.get(audit_report.RUN_RECORD_ON_DEMAND_KEY))
+
+    def test_start_no_on_demand_overrides_kanban_env_in_record(self):
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123"}):
+            self.assertEqual(
+                self.run_main(["start", "--audit", DECLARING_AUDIT, "--no-on-demand"]),
+                0,
+            )
+        record = self.record_without_stamp(DECLARING_AUDIT)
+        self.assertIn(audit_report.RUN_RECORD_ON_DEMAND_KEY, record)
+        self.assertFalse(record[audit_report.RUN_RECORD_ON_DEMAND_KEY])
+
+    def test_start_records_negative_on_demand_from_audit_on_demand_env(self):
+        with patch.dict(os.environ, {"AUDIT_ON_DEMAND": "false"}):
+            self.assertEqual(
+                self.run_main(["start", "--audit", DECLARING_AUDIT]),
+                0,
+            )
+        record = self.record_without_stamp(DECLARING_AUDIT)
+        self.assertIsNotNone(record)
+        self.assertIn(audit_report.RUN_RECORD_ON_DEMAND_KEY, record)
+        self.assertFalse(record[audit_report.RUN_RECORD_ON_DEMAND_KEY])
+
+    def test_start_falsy_audit_on_demand_overrides_kanban_env_in_record(self):
+        with patch.dict(os.environ, {"AUDIT_ON_DEMAND": "0", "HERMES_KANBAN_TASK": "t_audit_card_123"}):
+            self.assertEqual(
+                self.run_main(["start", "--audit", DECLARING_AUDIT]),
+                0,
+            )
+        record = self.record_without_stamp(DECLARING_AUDIT)
+        self.assertIsNotNone(record)
+        self.assertIn(audit_report.RUN_RECORD_ON_DEMAND_KEY, record)
+        self.assertFalse(record[audit_report.RUN_RECORD_ON_DEMAND_KEY])
 
     def test_start_clears_yesterdays_record_before_anything_can_fail(self):
         # Every step between the top of `start` and the write can raise. A
@@ -11874,18 +11990,153 @@ class TestSilentVerdict(HarnessTestCase):
     every input; it should hold the verdict.
     """
 
-    def finish_json(self, doc, **replies):
+    def finish_json(self, doc, argv_extra=(), **replies):
         self.harness.replies = {
             "issue list": self.issue_list(),
             "--json body": json.dumps({"body": published_body(doc, generated_at=NOW)}),
             **replies,
         }
-        self.run_finish(doc)
+        self.run_finish(doc, argv_extra=argv_extra)
         return self.stdout_json()
 
     def test_an_unchanged_complete_clean_run_is_silent(self):
         doc = make_doc(findings=[])
         out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
+
+    def test_an_on_demand_unchanged_clean_run_is_never_silent(self):
+        """When an on-demand audit finds nothing new or resolved, silent_ok must be False (#1929)."""
+        doc = make_doc(findings=[])
+        out = self.finish_json(doc, argv_extra=["--on-demand"])
+        self.assertFalse(out["silent_ok"])
+
+    def test_an_on_demand_run_from_kanban_env_is_never_silent(self):
+        """A worker running under HERMES_KANBAN_TASK is on-demand and never silent (#1929)."""
+        doc = make_doc(findings=[])
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123"}):
+            out = self.finish_json(doc)
+        self.assertFalse(out["silent_ok"])
+
+    def test_an_on_demand_run_from_audit_on_demand_env_is_never_silent(self):
+        """A worker running with AUDIT_ON_DEMAND=1 is on-demand and never silent (#1929)."""
+        doc = make_doc(findings=[])
+        with patch.dict(os.environ, {"AUDIT_ON_DEMAND": "1"}):
+            out = self.finish_json(doc)
+        self.assertFalse(out["silent_ok"])
+
+    def test_an_on_demand_unchanged_updated_run_is_never_silent(self):
+        """An updated run with 0 new and 0 resolved is not silent when on demand (#1929)."""
+        finding = make_finding(fid="a")
+        doc = make_doc(findings=[finding])
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps(
+                {"body": published_body(make_doc(findings=[finding]), generated_at=NOW)}
+            ),
+        }
+        self.run_finish(doc, argv_extra=["--on-demand"])
+        out = self.stdout_json()
+        self.assertEqual(out["new"], 0)
+        self.assertEqual(out["resolved"], 0)
+        self.assertFalse(out["silent_ok"])
+
+    def test_an_on_demand_run_recorded_at_start_is_never_silent(self):
+        """Start recording on_demand into the run record keeps finish from being silent (#1929)."""
+        doc = make_doc(findings=[])
+        self.record_run(repo="acme/fleet", context=[], audit=AUDIT, on_demand=True)
+        out = self.finish_json(doc)
+        self.assertFalse(out["silent_ok"])
+
+    def test_an_explicit_no_on_demand_flag_overrides_env(self):
+        """Passing --no-on-demand explicitly forces scheduled evaluation even in kanban env (#1929)."""
+        doc = make_doc(findings=[])
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123"}):
+            out = self.finish_json(doc, argv_extra=["--no-on-demand"])
+        self.assertTrue(out["silent_ok"])
+
+    def test_an_explicit_no_on_demand_persisted_in_record_overrides_kanban_env(self):
+        """A run record recording on_demand=False keeps finish from being on-demand (#1929)."""
+        doc = make_doc(findings=[])
+        self.record_run(repo="acme/fleet", context=[], audit=AUDIT, on_demand=False)
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123"}):
+            out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
+
+    def test_audit_on_demand_normalized_truth_grammar(self):
+        """AUDIT_ON_DEMAND accepts normalized truthy strings (1, true, yes, on, t, y, enable, enabled, quotes, =1) (#1929)."""
+        doc = make_doc(findings=[])
+        for val in (
+            "1",
+            "true",
+            "True",
+            "TRUE",
+            "yes",
+            "YES",
+            "on",
+            "ON",
+            "t",
+            "T",
+            "y",
+            "Y",
+            "enable",
+            "ENABLE",
+            "enabled",
+            "ENABLED",
+            '"on"',
+            "'true'",
+            "=1",
+        ):
+            with patch.dict(os.environ, {"AUDIT_ON_DEMAND": val}):
+                out = self.finish_json(doc)
+            self.assertFalse(out["silent_ok"], f"Expected silent_ok=False for AUDIT_ON_DEMAND={val!r}")
+
+    def test_audit_on_demand_negative_overrides_kanban_env(self):
+        """AUDIT_ON_DEMAND with negative values overrides HERMES_KANBAN_TASK (#1929)."""
+        doc = make_doc(findings=[])
+        for val in (
+            "0",
+            "false",
+            "False",
+            "FALSE",
+            "no",
+            "NO",
+            "off",
+            "OFF",
+            "f",
+            "F",
+            "n",
+            "N",
+            "disable",
+            "DISABLE",
+            "disabled",
+            "DISABLED",
+            '"off"',
+            "'false'",
+            "=0",
+        ):
+            with patch.dict(os.environ, {"AUDIT_ON_DEMAND": val, "HERMES_KANBAN_TASK": "t_audit_card_123"}):
+                out = self.finish_json(doc)
+            self.assertTrue(out["silent_ok"], f"Expected silent_ok=True for AUDIT_ON_DEMAND={val!r}")
+
+    def test_audit_on_demand_unrecognized_value_warns_to_stderr(self):
+        """Unrecognized non-empty AUDIT_ON_DEMAND warns to stderr and does not force on-demand (#1929)."""
+        doc = make_doc(findings=[])
+        with patch.dict(os.environ, {"AUDIT_ON_DEMAND": "invalid_mode"}):
+            out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
+        self.assertIn("ignoring unrecognized AUDIT_ON_DEMAND='invalid_mode'", self.err)
+        self.assertIn("expected truthy", self.err)
+
+    def test_start_negative_on_demand_persisted_in_record_overrides_kanban_env_at_finish(self):
+        """Negative AUDIT_ON_DEMAND at start persists into record and overrides kanban env at finish (#1929)."""
+        with patch.dict(os.environ, {"AUDIT_ON_DEMAND": "false"}):
+            self.assertEqual(
+                self.run_main(["start", "--audit", AUDIT]),
+                0,
+            )
+        doc = make_doc(findings=[])
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_audit_card_123", "AUDIT_ON_DEMAND": ""}):
+            out = self.finish_json(doc)
         self.assertTrue(out["silent_ok"])
 
     def test_a_partial_run_is_never_silent(self):

@@ -10,8 +10,10 @@
 
 ### 0. Open the audit run
 
+Pass `--on-demand` on interactive, chat, or kanban-dispatched audit runs so `finish` is never silent even on an unchanged ledger (#1929). Scheduled cron jobs omit `--on-demand`.
+
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit [--repo "<owner>/<repo>"]
+./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit [--repo "<owner>/<repo>"] [--on-demand]
 # -> {"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/compliance-audit/org__repo",
 #     "findings_path":"/opt/data/scratch/findings_compliance-audit.json",
 #     "pending_remediation_requests":["<finding-id>", ...]}

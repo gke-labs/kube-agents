@@ -472,6 +472,30 @@ _QUEUED_INSTEAD_OF_RUN_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Marker produced when a scheduled or quiet task emits silence.
+# Matched case-insensitively and stripped of Markdown formatting noise (#1929).
+SILENT_MARKER = "[silent]"
+
+_DELEGATED_TASK_SPLIT_RE = re.compile(
+    r"(?:^|\n+)Result of delegated task\s+\S+:\s*",
+    re.IGNORECASE,
+)
+
+
+def _is_silent_report(message: str) -> bool:
+    """True if the report or any delegated task payload is solely the silence marker.
+
+    Follows the whole-message rule from deploy/docker/plugins/chat/adapter.py:
+    only a report whose entire content (or whose delegated worker task result)
+    is the silence marker alone — bare or stripped of Markdown dress — is graded
+    as silence. Mentions of [SILENT] embedded in prose or alongside other text
+    are not silence (#1929).
+    """
+    sections = _DELEGATED_TASK_SPLIT_RE.split(message)
+    if len(sections) > 1:
+        return any(_normalize(s).strip("~ \t\r\n") == SILENT_MARKER for s in sections[1:])
+    return _normalize(sections[0]).strip("~ \t\r\n") == SILENT_MARKER
+
 _NO_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
     "is unset), so this check cannot tell this run's ledger from a previous "
@@ -1014,6 +1038,12 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             if key not in seen:
                 seen.append(key)
         if not seen:
+            if _is_silent_report(snap.final_message):
+                return done(
+                    False,
+                    "the run's report was [SILENT] with no issue URL: an on-demand "
+                    "audit run is never silent and must report the ledger URL (#1929)",
+                )
             queued = _QUEUED_INSTEAD_OF_RUN_RE.search(snap.final_message)
             if queued:
                 return done(

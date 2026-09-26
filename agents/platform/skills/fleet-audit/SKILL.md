@@ -56,7 +56,7 @@ When you are delegated a task or kanban card to execute an audit stream followin
 
 - **You are the audit worker.** You have been given a dedicated worker session and turn budget for this specific audit stream.
 - **Execute the audit following its SOP (mapped in `AUDITS` at the top of `audit_report.py`, e.g. `governance/compliance_audit_sop.md` for `compliance-audit`) directly.** Use the two-command lifecycle below:
-  1. `./skills/fleet-audit/scripts/audit_report.py start --audit <stream> [--repo "<owner>/<repo>"]`
+  1. `./skills/fleet-audit/scripts/audit_report.py start --audit <stream> --on-demand [--repo "<owner>/<repo>"]`
   2. Enumerate clusters and run the checks per the SOP.
   3. `./skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
 - **Do not reach for `hermes cron run` or say "queued for the next cron tick":** This request is an explicit on-demand audit execution, not a request to trigger the scheduled cron job. Execute the SOP directly and report the ledger issue URL in your result.
@@ -140,8 +140,11 @@ Before inspecting anything, claim the workspace:
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py start \
   --audit <audit-id> \
-  [--repo "<owner>/<repo>"]
+  [--repo "<owner>/<repo>"] \
+  [--on-demand]
 ```
+
+Pass `--on-demand` whenever executing an on-demand or delegated audit run (such as from a kanban card or chat request). In the deployed sandbox, the SSH crossing drops ambient dispatcher environment variables when running commands from the profile directory, so `--on-demand` must be passed explicitly to `start`. This persists `on_demand: true` (or `false` for `--no-on-demand` or negative environment overrides) into the scratch run record so that `audit_report.py finish` never suppresses output with `[SILENT]` even if the ledger is unchanged (#1929). When running in testing or environments where CLI flags cannot be passed, `AUDIT_ON_DEMAND` provides an explicit environment override accepting truthy values (`1`, `true`, `yes`, `on`, `t`, `y`, `enable`, `enabled`) or falsy values (`0`, `false`, `no`, `off`, `f`, `n`, `disable`, `disabled`); unrecognized values emit a warning to stderr.
 
 This resolves the target repository (using `--repo` if specified, falling back to the single
 configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), mints
@@ -318,8 +321,11 @@ All three exit 2 in directory mode, where the clone already holds the file.
   --audit <audit-id> \
   --findings-file <findings_path> \
   [--repo "<owner>/<repo>"] \
+  [--on-demand | --no-on-demand] \
   [--manifest-file <path> | --no-collector-manifest "<why>"]
 ```
+
+`--on-demand` is preserved automatically from the run record if passed to `start` (as is `--no-on-demand` or negative `AUDIT_ON_DEMAND`); it may also be passed directly to `finish` to ensure `silent_ok` is false.
 
 The last pair is optional and belongs to a stream whose SOP runs a collector (the repository's
 collector-manifest design says what the manifest holds): `--manifest-file` names the manifest the
@@ -1102,9 +1108,10 @@ Two rules follow, and they are the whole rule:
 
 - On a **scheduled** run, `silent_ok: true` → the final response is exactly `[SILENT]`. Otherwise
   report, and every report carries `issue_url` in full.
-- **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
-  channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
-  kanban card or straight from chat, they are waiting on the answer and
+- **An on-demand run is never silent.** When started or finished with `--on-demand` (the only signal in
+  the deployed sandbox, as the SSH crossing drops ambient dispatcher environment markers),
+  `audit_report.py finish` sets `silent_ok: false` (#1929). If someone dispatched
+  this job, from a kanban card or straight from chat, they are waiting on the answer and
   `[SILENT]` throws it away. Report the outcome and the ledger URL whatever the flag says.
 
 A zero-finding run comes back `silent_ok: false` in each of these cases, and all of them matter:
