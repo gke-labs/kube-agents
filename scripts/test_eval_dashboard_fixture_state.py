@@ -179,10 +179,12 @@ print(json.dumps(answers[key]))
 '''
 
 
-def _pod(*, restarts, last_reason, phase="Running"):
+def _pod(*, restarts, last_reason, phase="Running", waiting_reason=None):
     status = {"restartCount": restarts, "lastState": {}}
     if last_reason:
         status["lastState"] = {"terminated": {"reason": last_reason, "exitCode": 137}}
+    if waiting_reason:
+        status["state"] = {"waiting": {"reason": waiting_reason}}
     return {"status": {"phase": phase, "containerStatuses": [status]}}
 
 
@@ -211,6 +213,7 @@ def healthy_world(*projects):
             "namespace/seeded-debug": {"metadata": {"name": "seeded-debug"}},
             "namespace/seeded-capacity": {"metadata": {"name": "seeded-capacity"}},
             "namespace/seeded-reliability": {"metadata": {"name": "seeded-reliability"}},
+            "namespace/seeded-stall": {"metadata": {"name": "seeded-stall"}},
             "deployment/payments-api": {"status": {"readyReplicas": 0}},
             "pod?app=payments-api": _pods(_pod(restarts=3, last_reason="OOMKilled")),
             "horizontalpodautoscaler/inference-server": {"status": {}},
@@ -220,6 +223,20 @@ def healthy_world(*projects):
             "poddisruptionbudget?": {"items": []},
             "clusterrolebinding/debug-binding": {"roleRef": {"name": "cluster-admin"}, "subjects": [{"kind": "ServiceAccount", "name": "default", "namespace": "seeded-security"}]},
             "node?cloud.google.com/gke-nodepool=idle-batch-pool": {"items": [{"spec": {"taints": [{"key": "seeded-role", "value": "idle-batch", "effect": "NoSchedule"}]}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
+            "deployment/inventory-api": {
+                "status": {
+                    "conditions": [
+                        {
+                            "type": "Progressing",
+                            "status": "False",
+                            "reason": "ProgressDeadlineExceeded",
+                        }
+                    ]
+                }
+            },
+            "pod?app=inventory-api": _pods(
+                _pod(restarts=0, last_reason=None, phase="Pending", waiting_reason="CreateContainerConfigError")
+            ),
         },
         "describe": {project: {"seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1"}} for project in projects},
         "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},
@@ -299,10 +316,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 7, "drifted": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 8, "drifted": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 7, "drifted": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 8, "drifted": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -356,7 +373,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 13, "drifted": 1, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 15, "drifted": 1, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):

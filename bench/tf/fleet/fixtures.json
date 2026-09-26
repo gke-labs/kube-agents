@@ -99,6 +99,40 @@
         }
       ]
     },
+    "stalled-controller": {
+      "cluster_slot": "a",
+      "namespace": "seeded-stall",
+      "probes": ["deployment/inventory-api"],
+      "fixture": "inventory-api Deployment, container reads non-existent ConfigMap inventory-flags via envFrom, stuck in CreateContainerConfigError with ProgressDeadlineExceeded",
+      "state": [
+        {
+          "subject": "configmap/inventory-flags",
+          "path": null,
+          "op": "absent",
+          "why": "the defect is the missing referent; creating the ConfigMap heals the defect and lets the Deployment progress"
+        },
+        {
+          "subject": "deployment/inventory-api",
+          "path": "status.availableReplicas",
+          "op": "absent",
+          "why": "the pods sit in CreateContainerConfigError and never become ready; an available replica means the workload somehow progressed"
+        },
+        {
+          "subject": "deployment/inventory-api",
+          "path": "status.conditions[?(@.type=='Progressing')].reason",
+          "op": "any_eq",
+          "value": "ProgressDeadlineExceeded",
+          "why": "the Deployment controller sets ProgressDeadlineExceeded when a rollout sits unable to make progress past its deadline"
+        },
+        {
+          "subject": "pod?app=inventory-api",
+          "path": "status.containerStatuses[*].state.waiting.reason",
+          "op": "any_eq",
+          "value": "CreateContainerConfigError",
+          "why": "the container cannot start because the ConfigMap does not exist; an image pull failure or capacity stall is a different defect from the one the stall-watch cron and cases diagnose"
+        }
+      ]
+    },
     "idle-nodepool": {
       "cluster_slot": "a",
       "namespace": null,

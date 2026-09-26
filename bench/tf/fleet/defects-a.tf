@@ -56,6 +56,14 @@ resource "kubernetes_namespace_v1" "seeded_capacity" {
   depends_on = [google_container_node_pool.pinned_inference_pool]
 }
 
+resource "kubernetes_namespace_v1" "seeded_stall" {
+  metadata {
+    name   = "seeded-stall"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
 # Defect (reliability): two replicas, no PodDisruptionBudget. Two, not one,
 # deliberately: the reliability SOP's no-pdb check (3.3) flags only
 # `spec.replicas >= 2` with no matching PDB and explicitly does NOT flag
@@ -324,6 +332,63 @@ resource "kubernetes_horizontal_pod_autoscaler_v2" "inference_server" {
   }
 }
 
+# Defect (cluster debugging, stall detection): a Deployment whose container
+# references a ConfigMap (inventory-flags) that does not exist through
+# envFrom. Its pods sit in CreateContainerConfigError, restartCount stays 0,
+# and the Deployment never progresses. Once progressDeadlineSeconds (120s,
+# under the verifier's 300s FLEET_STATE_WAIT_SECONDS) elapses, the Deployment
+# controller marks the Progressing condition False with reason
+# ProgressDeadlineExceeded. stall_report.py reports it as a dangling-reference.
+# Asserted by cluster-agent-stalled-controller-diagnosis.
+resource "kubernetes_deployment_v1" "inventory_api" {
+  metadata {
+    name      = "inventory-api"
+    namespace = kubernetes_namespace_v1.seeded_stall.metadata[0].name
+  }
+  spec {
+    replicas                  = 1
+    progress_deadline_seconds = 120
+    selector {
+      match_labels = { app = "inventory-api" }
+    }
+    template {
+      metadata {
+        labels = { app = "inventory-api" }
+      }
+      spec {
+        # SOP 2.7, as on checkout-gateway.
+        automount_service_account_token = false
+        # SOP 2.11, as on checkout-gateway.
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "api"
+          image = "registry.k8s.io/pause:3.9"
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+          env_from {
+            config_map_ref {
+              name = "inventory-flags"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  # The deployment never becomes Ready -- that is the defect. Without this,
+  # every apply of the stack blocks on a rollout that cannot finish and the
+  # scheduled reconcile reads as a provisioning failure.
+  wait_for_rollout = false
+}
+
 # Compliance SOP 2.6 flags any non-system namespace that has workloads and
 # zero NetworkPolicies. The planted workloads use no network at all (a pause
 # container, a memory bomb, a CPU burn), so a default-deny policy closes the
@@ -337,6 +402,7 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     reliability = kubernetes_namespace_v1.seeded_reliability.metadata[0].name
     debug       = kubernetes_namespace_v1.seeded_debug.metadata[0].name
     capacity    = kubernetes_namespace_v1.seeded_capacity.metadata[0].name
+    stall       = kubernetes_namespace_v1.seeded_stall.metadata[0].name
   }
 
   metadata {
