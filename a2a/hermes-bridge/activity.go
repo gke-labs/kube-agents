@@ -173,6 +173,13 @@ const (
 // marker. A variable only so a test can lower it.
 var activityEntryBudget = 3000
 
+// taskIDPattern is what a task id may look like before it becomes a path
+// segment under ScratchDir: the gateway mints task-<hex>, tests use words.
+// The id arrives on a bus envelope, and the lib checks it against the
+// subject token it rode in on - which cannot hold a dot, so no ".." - but
+// the sink that writes files does not lean on that.
+var taskIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
 var (
 	redactedKeyPattern    = regexp.MustCompile(`(?i)token|secret|password|passwd|authorization|api[_-]?key|credential`)
 	redactedValuePatterns = []*regexp.Regexp{
@@ -513,7 +520,17 @@ func redactValue(v any) any {
 // source already carries) and its .env verbatim. Returns the directory; the
 // caller removes it once the child has exited.
 func (b *Bridge) childManagedScope(taskID string) (string, error) {
-	dir := filepath.Join(b.cfg.ScratchDir, taskID)
+	if !taskIDPattern.MatchString(taskID) {
+		return "", fmt.Errorf("task id %q is not a path segment", taskID)
+	}
+	scratch, err := filepath.Abs(b.cfg.ScratchDir)
+	if err != nil {
+		return "", fmt.Errorf("scratch dir: %w", err)
+	}
+	dir := filepath.Join(scratch, taskID)
+	if rel, err := filepath.Rel(scratch, dir); err != nil || rel != taskID {
+		return "", fmt.Errorf("task id %q leaves the scratch dir", taskID)
+	}
 	if err := os.MkdirAll(dir, childScopeDirMode); err != nil {
 		return "", fmt.Errorf("child scope dir: %w", err)
 	}
