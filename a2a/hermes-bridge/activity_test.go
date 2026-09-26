@@ -543,3 +543,22 @@ print("done")
 		t.Fatalf("heartbeats produced a marker or entries: %+v", got)
 	}
 }
+
+// The task id becomes a directory name under ScratchDir; one that is not a
+// plain path segment is refused before anything is written.
+func TestChildManagedScope_RefusesATaskIDThatIsNotAPathSegment(t *testing.T) {
+	scratch := t.TempDir()
+	b := &Bridge{cfg: Config{ScratchDir: scratch}}
+	for _, bad := range []string{"../escape", "a/b", "..", "", "task with space", strings.Repeat("x", 129)} {
+		if dir, err := b.childManagedScope(bad); err == nil {
+			t.Fatalf("task id %q accepted: %s", bad, dir)
+		}
+	}
+	entries, _ := os.ReadDir(scratch)
+	if len(entries) != 0 {
+		t.Fatalf("a refused id left something in the scratch dir: %v", entries)
+	}
+	if dir, err := b.childManagedScope("task-ok_1"); err != nil || filepath.Dir(dir) != scratch {
+		t.Fatalf("a plain id was refused or misplaced: %s %v", dir, err)
+	}
+}
