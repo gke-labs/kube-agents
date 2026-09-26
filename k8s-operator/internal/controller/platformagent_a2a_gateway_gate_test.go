@@ -758,6 +758,125 @@ func TestADegradedPassStillMaintainsTheA2AConditions(t *testing.T) {
 	}
 }
 
+// TestTheReadyWriterReportsTheGatewayTheRenderWithheld: the render's decision
+// and the status writer's report, driven together through Reconcile, on the
+// path that ends in updateStatusReady. The readiness tests drive the writer
+// alone against a stand-in for the render (a2aStateFrom); this is the pass
+// where the two are the same code path.
+func TestTheReadyWriterReportsTheGatewayTheRenderWithheld(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	// The fake runs no workload controllers, so the phase is Provisioning
+	// on the today workloads; what matters is that it is the Ready writer's
+	// phase and not a Degraded one, and that it carries the render's
+	// decision.
+	if ready := meta.FindStatusCondition(stored.Status.Conditions, "Ready"); ready == nil || ready.Reason != "Provisioning" {
+		t.Fatalf("precondition: the pass did not end in the Ready writer: %+v", ready)
+	}
+	cond := meta.FindStatusCondition(stored.Status.Conditions, a2aGatewayConditionType)
+	if cond == nil || cond.Reason != a2aGatewayDarkReason || !strings.Contains(cond.Message, a2aDiscordBotSecretName) {
+		t.Fatalf("the render withheld the gateway and the Ready writer did not say so: %+v", cond)
+	}
+	if !busProvisioned(stored) {
+		t.Error("the completion was not recorded on the Ready path")
+	}
+
+	if err := cl.Create(ctx, discordBotSecret(agent)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d after the Secret: %v", i+1, err)
+		}
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the gateway did not render once the Secret existed: %v", err)
+	}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if cond := meta.FindStatusCondition(stored.Status.Conditions, a2aGatewayConditionType); cond != nil {
+		t.Errorf("the gateway is rendered and the CR still says it is withheld: %+v", cond)
+	}
+}
+
+// TestAFailedJobPassStillMaintainsTheA2AConditions: the other Degraded path
+// that renders first. A provisioning Job that has Failed parks the CR on
+// A2AProvisionFailed through the Degraded writer on every pass; the render's
+// gateway decision still has to reach the CR, and still has to clear when a
+// Secret arrives while the refusal stands.
+func TestAFailedJobPassStillMaintainsTheA2AConditions(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	jobs := &batchv1.JobList{}
+	if err := cl.List(ctx, jobs); err != nil || len(jobs.Items) != 1 {
+		t.Fatalf("one provision Job expected after the render (got %d, err %v)", len(jobs.Items), err)
+	}
+	failed := jobs.Items[0]
+	failed.Status.Conditions = []batchv1.JobCondition{{
+		Type: batchv1.JobFailed, Status: corev1.ConditionTrue,
+		Reason: "PodFailurePolicy", Message: "the provision script refused",
+	}}
+	if err := cl.Status().Update(ctx, &failed); err != nil {
+		t.Fatalf("mark the Job failed: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if ready := meta.FindStatusCondition(stored.Status.Conditions, "Ready"); ready == nil || ready.Reason != "A2AProvisionFailed" {
+		t.Fatalf("precondition: the install is not parked on the failed Job: %+v", ready)
+	}
+	if cond := meta.FindStatusCondition(stored.Status.Conditions, a2aGatewayConditionType); cond == nil || cond.Reason != a2aGatewayDarkReason {
+		t.Errorf("the parked pass withheld the gateway and the CR does not say so: %+v", cond)
+	}
+	if busProvisioned(stored) {
+		t.Error("BusProvisioned was written for a Job that never completed")
+	}
+
+	if err := cl.Create(ctx, discordBotSecret(agent)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d after the Secret: %v", i+1, err)
+		}
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the gateway did not render once the Secret existed: %v", err)
+	}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if ready := meta.FindStatusCondition(stored.Status.Conditions, "Ready"); ready == nil || ready.Reason != "A2AProvisionFailed" {
+		t.Fatalf("the refusal should still stand: %+v", ready)
+	}
+	if cond := meta.FindStatusCondition(stored.Status.Conditions, a2aGatewayConditionType); cond != nil {
+		t.Errorf("the gateway is running and the parked CR still says it is withheld: %+v", cond)
+	}
+}
+
 // TestARunningGatewayDoesNotReadTheSecret: the backend question costs an
 // uncached Secret read, and it is asked only on the pass that would create
 // the gateway. An install whose gateway exists pays nothing for the gate.

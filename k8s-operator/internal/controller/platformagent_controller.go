@@ -754,7 +754,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		log.Info(msg)
 		// Same as the failed-Job path: a next install can sit here for
 		// days, and its render-derived conditions have to follow the
-		// renders it keeps doing. A no-op under today.
+		// renders it keeps doing. Under today it is the pass that removes
+		// the next-mode conditions a flip left behind; on a today install
+		// that never had them it writes nothing.
 		if err := r.syncA2AConditions(ctx, instance, a2aState); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -2600,9 +2602,8 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 		// whose bus was never provisioned cannot serve an A2A request either,
 		// and until these were counted the CR read Ready over every one of
 		// those states (quota refusals, image pulls, a Job burning its
-		// backoff). The Job is read through a2aReader like every other Job
-		// read here; it is ready when its Complete condition is true, and a
-		// Failed one is already A2AProvisionFailed before this runs.
+		// backoff). NATS and the callout are read here; the Job's answer
+		// arrives in a2a from the pass's own read of it (below).
 		nats := &appsv1.StatefulSet{}
 		natsName := a2aNATSName(agent)
 		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: natsName}, nats); err != nil {
