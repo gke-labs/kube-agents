@@ -377,13 +377,18 @@ than a live write, a new domain inherits reviewability and rollback for free.
 The GKE-events path is live end to end:
 
 - **Detection** — `k8s-event-watcher` streams warning events in real time, with namespace deny/allow
-  rules and a flapping guard. The deployed watcher gates on seven reasons, which
+  rules and a flapping guard. The deployed watcher forwards eight reasons, which
   `deploy/shared/start-services.sh` passes as `--reason` and no environment variable overrides:
   `Failed`, `FailedToDrainNode`, `CrashLoopBackOff`, `BackOff`, `ImagePullBackOff`, `ErrImagePull`,
-  `OOMKilled`. The eleven-entry `defaultReasons` in the watcher's `filter.go` — which does include
-  `FailedScheduling` and `Evicted` — applies only when `--reason` is left unset, so it does not
-  describe an install. `Decide` matches the wire reason exactly and before canonicalization, so a
-  reason absent from that list produces nothing at all: no session, no card, no report.
+  `OOMKilled`, `FailedScheduling`. The same list admits two more, cluster-autoscaler's
+  `TriggeredScaleUp` and `NotTriggerScaleUp`, which the watcher records against the pod and never
+  forwards: a `FailedScheduling` is held while a scale-up for its pod is in progress, passed at any
+  count once the autoscaler has declined to help, and otherwise held until its fifth repeat, so a
+  pod waiting for a node the cluster is already adding opens no card and a pod nothing will place
+  opens one. The eleven-entry `defaultReasons` in the watcher's `filter.go` — which does include
+  `Evicted` — applies only when `--reason` is left unset, so it does not describe an install.
+  `Decide` matches the wire reason exactly and before canonicalization, so a reason absent from
+  that list produces nothing at all: no session, no card, no report.
 - **Dedup** — a 24h rolling window collapses repeats and related reasons into one incident.
 - **Session + routing** — one session per incident, SQLite-backed, posted to the right chat thread and
   recorded with the platform that thread lives on, with the triage report stored for follow-up replies.

@@ -261,6 +261,25 @@ WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-3}"
 # mirror will rarely see it apply at all. Set to 1 to disable.
 WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-3}"
 
+# The backstop for FailedScheduling when cluster-autoscaler has recorded no
+# verdict on the pod: five failed scheduling attempts, a count rather than a
+# time, since the scheduler retries on every cluster change and at least
+# every five minutes. The autoscaler's own events take precedence over it: a
+# NotTriggerScaleUp on the pod fires at any count, a TriggeredScaleUp holds at
+# any count for WATCHER_SCALEUP_HOLD, and on a cluster with an autoscaler one
+# or the other arrives seconds after the pod's first attempt. Both are in the
+# --reason list below so the watcher reads them; neither is forwarded. Set to
+# 1 to fire on the first event when no verdict is on record.
+WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-5}"
+
+# How long a TriggeredScaleUp on a pod holds its FailedScheduling events,
+# measured from the autoscaler's event to the FailedScheduling's own last
+# sighting. A ceiling on the hold, not a delay on
+# the alert: 15m is cluster-autoscaler's default node-provision timeout, and
+# a pod still pending past it is reported on the count whatever the autoscaler
+# last said. Raise it on a cluster whose node pools take longer to provision.
+WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-15m}"
+
 # The agent image's interpreter. The credential-proxy image is built on
 # agent-base by way of proxy-tools, so this is the same venv the agent runs
 # from; the two proxy scripts import nothing outside the standard library, so
@@ -494,9 +513,11 @@ start_event_watcher() {
         --daemon-url="${KV_DAEMON_URL}" \
         --token-env=SESSION_KV_API_KEY \
         --owner=platform \
-        --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled \
+        --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled,FailedScheduling,TriggeredScaleUp,NotTriggerScaleUp \
         --backoff-min-count="${WATCHER_BACKOFF_MIN_COUNT}" \
-        --imagepull-transient-min-count="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT}" || true
+        --imagepull-transient-min-count="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT}" \
+        --failedscheduling-min-count="${WATCHER_FAILEDSCHEDULING_MIN_COUNT}" \
+        --scaleup-hold="${WATCHER_SCALEUP_HOLD}" || true
       ran=$(( SECONDS - started ))
 
       # A run long enough to have synced and served is treated as a fresh
