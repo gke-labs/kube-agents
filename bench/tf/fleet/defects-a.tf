@@ -99,8 +99,9 @@ resource "kubernetes_deployment_v1" "checkout_gateway" {
           }
         }
         # Compliance SOP 2.7: a workload on the default SA with the token
-        # automounted is a finding. None of the planted workloads uses the
-        # API, so the token is refused rather than declared.
+        # automounted is a finding. None of the workloads in these namespaces uses
+        # the API (the deprecation writer, below, has its own account), so the
+        # token is refused rather than declared.
         automount_service_account_token = false
         # Compliance SOP 2.11: run as non-root with a seccomp filter. UID
         # 65534 (nobody) suits every planted command -- pause pauses, tail
@@ -462,8 +463,10 @@ resource "kubernetes_service_account_v1" "legacy_endpoints_writer" {
   automount_service_account_token = true
 }
 
-# get to decide between patch and create, patch for the routine write, create
-# to re-seed the object if someone deleted it. Nothing else, and namespaced.
+# patch, for the routine write, and nothing else; namespaced. The object is
+# Terraform-managed, so a deleted Endpoints is drift for the fleet's reconcile to
+# repair, not for the writer: its PATCH then returns 404, the run exits non-zero,
+# and the retained failed Job is what the state scan reports.
 resource "kubernetes_role_v1" "legacy_endpoints_writer" {
   metadata {
     name      = "legacy-endpoints-writer"
@@ -472,7 +475,7 @@ resource "kubernetes_role_v1" "legacy_endpoints_writer" {
   rule {
     api_groups = [""]
     resources  = ["endpoints"]
-    verbs      = ["get", "create", "patch"]
+    verbs      = ["patch"]
   }
 }
 
@@ -573,16 +576,7 @@ resource "kubernetes_config_map_v1" "legacy_endpoints_writer" {
       JSON_TYPE = "application/json"
       MERGE_PATCH_TYPE = "application/merge-patch+json"
       HTTP_OK = 200
-      HTTP_CREATED = 201
-      HTTP_NOT_FOUND = 404
       TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-      # The designed subset, re-seeded only when the object is gone. Keep it
-      # equal to kubernetes_endpoints_v1.legacy_endpoints_lane: the role
-      # asserts on the ip.
-      DESIGNED_SUBSET = {
-          "addresses": [{"ip": "192.0.2.10"}],
-          "ports": [{"name": "discard", "port": 9, "protocol": "TCP"}],
-      }
 
 
       def main():
@@ -624,31 +618,15 @@ resource "kubernetes_config_map_v1" "legacy_endpoints_writer" {
               )
               return 1
 
-          collection = "/api/v1/namespaces/" + namespace + "/endpoints"
-          path = collection + "/" + ENDPOINTS_NAME
+          path = "/api/v1/namespaces/" + namespace + "/endpoints/" + ENDPOINTS_NAME
           stamp = datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
-          status, _ = call("GET", path)
-          if status == HTTP_NOT_FOUND:
-              verb = "created"
-              body = {
-                  "apiVersion": "v1",
-                  "kind": "Endpoints",
-                  "metadata": {"name": ENDPOINTS_NAME, "annotations": {ANNOTATION: stamp}},
-                  "subsets": [DESIGNED_SUBSET],
-              }
-              status, doc = call("POST", collection, json.dumps(body).encode(), JSON_TYPE)
-          elif status == HTTP_OK:
-              verb = "patched"
-              body = {"metadata": {"annotations": {ANNOTATION: stamp}}}
-              status, doc = call("PATCH", path, json.dumps(body).encode(), MERGE_PATCH_TYPE)
-          else:
-              print("BROKEN: GET " + path + " returned " + str(status) + "; no write made")
-              return 1
-          if status not in (HTTP_OK, HTTP_CREATED):
-              print("BROKEN: write returned " + str(status) + ": " + str(doc.get("message", doc)))
+          body = {"metadata": {"annotations": {ANNOTATION: stamp}}}
+          status, doc = call("PATCH", path, json.dumps(body).encode(), MERGE_PATCH_TYPE)
+          if status != HTTP_OK:
+              print("BROKEN: PATCH " + path + " returned " + str(status) + ": " + str(doc.get("message", doc)))
               return 1
           print(
-              verb + " endpoints/" + ENDPOINTS_NAME + " in " + namespace + ": "
+              "patched endpoints/" + ENDPOINTS_NAME + " in " + namespace + ": "
               + ANNOTATION + "=" + stamp + " (server " + server + ")"
           )
           return 0
