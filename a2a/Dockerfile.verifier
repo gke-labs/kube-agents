@@ -1,0 +1,48 @@
+# The a2a capability verifier image.
+#
+# The only component that reads the `cap` bucket. A broker hands it a
+# capability reference and it answers whether a verb is permitted; it never
+# hands back the capability. See docs/architecture/09-capability-envelope.md.
+#
+# It sits on the request path — while it is down, no task starts, because a
+# broker that cannot reach it refuses rather than proceeds — so the Deployment
+# that runs it uses two replicas and a rollout that never drops below the
+# running count, the same shape and the same reason as the auth callout.
+#
+# Build from the a2a/ module root:
+#   docker build -f Dockerfile.verifier -t <registry>/a2a-verifier:<tag> .
+
+# Bases come from images.json, the repo's image inventory, spelled the way
+# k8s-operator/Dockerfile spells them so `make mirror-images` and the pinning
+# there cover this build too. Note the distroless repository: images.json pins
+# gcr.io/distroless/static, not static-debian12, which is a different
+# repository and therefore a different pin.
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.27-alpine
+ARG DISTROLESS_IMAGE=gcr.io/distroless/static
+ARG DISTROLESS_VERSION=nonroot
+
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
+# Refuse to download a toolchain the pin above does not name: without this, a
+# substituted GOLANG_IMAGE older than a2a/go.mod's `go` directive silently
+# fetches a newer one instead of failing the build (#1138).
+ENV GOTOOLCHAIN=local
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/verifier ./cmd/verifier
+
+# The binary writes nothing to disk, so a static distroless base with no shell
+# and no package manager is the whole runtime, and the Deployment can mount the
+# root filesystem read-only.
+#
+# `USER nonroot` is the image's own default and does NOT set the uid this runs
+# as in this product: distroless nonroot is uid 65532, while the Deployment
+# sets runAsNonRoot with runAsUser 1000, and the pod spec wins. It is here so
+# that running this image anywhere else — a `docker run`, another chart — still
+# does not get root by default.
+FROM ${DISTROLESS_IMAGE}:${DISTROLESS_VERSION}
+COPY --from=build /out/verifier /verifier
+USER nonroot
+ENTRYPOINT ["/verifier"]

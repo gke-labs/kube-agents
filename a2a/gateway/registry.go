@@ -12,6 +12,7 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -38,6 +39,12 @@ type ActiveTask struct {
 	// StatusMsgID is the backend message the relay edits — the rolling
 	// progress line.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
+	// Capability pins this task's root entry in the `cap` bucket: the key
+	// and the revision the mint returned. Every envelope the gateway sends
+	// toward this task carries it, and it is on the record rather than in
+	// memory so a gateway restart does not orphan a running task from its
+	// own authority.
+	Capability *capability.Ref `json:"capability,omitempty"`
 	// Detached means the user said stop but no terminal event has arrived
 	// (the executor may be dead and platform tasks have no janitor yet, W3
 	// retarget). A detached task no longer serializes the session; its events,
@@ -70,7 +77,9 @@ type SessionRecord struct {
 	Tasks []TaskRef `json:"tasks,omitempty"`
 }
 
-// TaskRef names one historical task and the addressee it ran under.
+// TaskRef names one historical task and the authority it ran under: the
+// addressee, the correlation id that threads its envelopes, and the
+// capability it was minted with. A cancel is rebuilt from these.
 type TaskRef struct {
 	ID        string `json:"id"`
 	Addressee string `json:"addressee"`
@@ -78,6 +87,12 @@ type TaskRef struct {
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.
 	CorrelationID string `json:"correlationId,omitempty"`
+	// Capability is the task's, kept past ActiveTask for the same reason
+	// CorrelationID is: a cancel for a task the record has released still
+	// carries the task's own authority rather than none. Nil on entries
+	// written before the mint existed, which render `grants: null` — the
+	// same block a pre-mint gateway sent, and no executor checks a cancel.
+	Capability *capability.Ref `json:"capability,omitempty"`
 	// Canceled records that the gateway published a cancel for this task —
 	// set only after the publish succeeded, so a true here means the cancel
 	// is on the stream. It is what lets a supervisor path reached long

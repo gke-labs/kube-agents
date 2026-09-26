@@ -25,6 +25,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nuid"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -68,6 +69,25 @@ type Config struct {
 	// large answer never trips the client-side max-message-size gate
 	// (default 256KiB).
 	ResultChunkSize int
+	// Scope is the resource path this executor operates in, and it is what
+	// the capability is checked against: not "may this capability do
+	// anything" but "may it execute here". It has to be a scope the
+	// gateway's ceiling contains, which for an unconfigured install is
+	// `namespace/<the agent's namespace>`; the bridge shares that pod, so
+	// the two agree by construction. Resolved by the caller, never
+	// defaulted here — an executor that invented its own scope would be
+	// answering the question it was asked to pose.
+	Scope capability.Scope
+	// CapabilityOptional governs exactly one thing: what a submission with
+	// no capability at all means. Zero value — the safe one — refuses it.
+	// Set, it executes and says so at WARN. That is the mixed-version
+	// window: a gateway that predates the mint in front of an executor
+	// that enforces it, and nothing else.
+	//
+	// It is NOT a switch for enforcement. A capability that is present is
+	// always checked and its refusal is always honoured; there is no
+	// configuration in which this bridge runs work a verifier refused.
+	CapabilityOptional bool
 	// NATSOptions carries credentials etc; applied to both connections.
 	NATSOptions []nats.Option
 	Logger      *slog.Logger
@@ -320,6 +340,7 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 	b.mu.Lock()
 	b.tasks[env.TaskID] = run
 	b.mu.Unlock()
+
 	b.cfg.Logger.Info("task accepted", "task", env.TaskID, "correlation", env.CorrelationID, "from", env.From.Session)
 	select {
 	case b.queue <- run:
@@ -406,6 +427,18 @@ func (b *Bridge) worker(ctx context.Context) {
 			return
 		case run = <-b.queue:
 		}
+		// Cheap skip first: a cancel that arrived while this sat in the
+		// queue already finalized it, and asking the verifier about a task
+		// nobody is going to run is a round trip for nothing.
+		run.mu.Lock()
+		pending := run.state == statePending
+		run.mu.Unlock()
+		if !pending {
+			continue
+		}
+		if !b.capabilityPermits(ctx, run) {
+			continue
+		}
 		run.mu.Lock()
 		if run.state != statePending {
 			run.mu.Unlock()
@@ -415,6 +448,48 @@ func (b *Bridge) worker(ctx context.Context) {
 		run.mu.Unlock()
 		b.runTask(ctx, run)
 	}
+}
+
+// capabilityPermits is the authorization gate, and it runs HERE — on a
+// worker, after the queue — rather than in accept, which is where the check
+// first landed. Both placements are before `working` publishes, before hermes
+// is invoked and before a model is called, so nothing about what is refused
+// changes. What changes is who waits: accept runs on the bridge's one durable
+// consumer callback, which is serial and which also carries the KindCancel
+// envelopes for tasks that are already running. Check blocks for
+// capability.DefaultTimeout when nothing answers on the verify subject, so a
+// verifier outage made every cancel queue behind 5s per pending submission —
+// a user unable to stop a running hermes subprocess because of an outage in
+// the thing that authorizes new ones. The session executor has always checked
+// in its own process for the same reason (a2a/worker-adapter/adapter.go).
+//
+// The cost of the move: a submission now occupies a queue slot while it is
+// being verified, so a verifier outage long enough to queue taskQueueCapacity
+// of them ends in bridge-queue-overflow rather than capability-refused. At
+// Concurrency workers and one DefaultTimeout each that is thousands of
+// submissions inside one outage on a single-profile bridge, which is the
+// "fault, not load" the capacity already stands for.
+//
+// Returns false when it finalized the task; the caller must not run it.
+func (b *Bridge) capabilityPermits(ctx context.Context, run *taskRun) bool {
+	reason := b.capabilityRefusal(ctx, run.origin)
+	if reason == "" {
+		return true
+	}
+	// "The verifier could not be reached" and "we stopped asking" are
+	// different facts, and Check cannot tell them apart: it turns any
+	// error out of NextMsgWithContext, context.Canceled included, into
+	// a refusal. So a submission whose check was in flight when the
+	// bridge was terminated would land as terminal `rejected` -- which
+	// no supervisor retries -- instead of the retryable shutdown every
+	// other pending task gets. The verifier guards the mirror image of
+	// this on its own side; see capability.DrainAndCancel.
+	if ctx.Err() != nil {
+		b.finalize(run, lib.StateFailed, shutdownReason, nil)
+		return false
+	}
+	b.finalize(run, lib.StateRejected, reason, nil)
+	return false
 }
 
 func (b *Bridge) runTask(ctx context.Context, run *taskRun) {

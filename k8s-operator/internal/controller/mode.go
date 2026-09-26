@@ -34,7 +34,7 @@ const (
 	ModeToday Mode = "today"
 	// ModeNext additionally renders the A2A stack, which is otherwise
 	// dark: NATS, the auth callout that authenticates every client to it,
-	// the gateway, and the provisioning Job.
+	// the gateway, the capability verifier, and the provisioning Job.
 	ModeNext Mode = "next"
 )
 

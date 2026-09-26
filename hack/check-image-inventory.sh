@@ -143,12 +143,15 @@ check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
-# The a2a images. All parameterize their builder bases: the auth callout on
-# this branch, the gateway on main in #1334.
+# The a2a images. All parameterize their builder bases: the auth callout and
+# the gateway already did, the worker arrived with #1334, and the capability
+# verifier is added here.
 check_base_image golang a2a/Dockerfile.authcallout GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.authcallout DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.gateway DISTROLESS_IMAGE DISTROLESS_VERSION
+check_base_image golang a2a/Dockerfile.verifier GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.verifier DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.worker GOLANG_IMAGE GOLANG_VERSION
 check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
 # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge) is deliberately NOT
@@ -212,6 +215,7 @@ check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
 check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
 check_go_directive a2a/Dockerfile.authcallout GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.verifier GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.hermes-bridge GOLANG_VERSION a2a/go.mod
 
@@ -243,9 +247,10 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 #    them (#1557). The constants keep Docker Hub's short spelling because that
 #    is the string the operator renders into the pod template; the comparison
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
-#    The first-party next defaults (gateway, worker, callout) fit the same
-#    description and are deliberately not here: they are not inventory
-#    entries, so there is nothing to hold them to until the stack graduates.
+#    The first-party next defaults (gateway, worker, callout, capability
+#    verifier) fit the same description and are deliberately not here: they
+#    are not inventory entries, so there is nothing to hold them to until the
+#    stack graduates.
 # ---------------------------------------------------------------------------
 check_operator_pin() {
   local name=$1 gofile=$2 constant=$3

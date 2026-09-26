@@ -75,15 +75,68 @@ func renderA2AStaticUser(id a2aIdentity, password string) string {
 	b.WriteString(a2aUserBlockIndent + `  password: "` + password + "\"\n")
 
 	// $SYS's user holds the system account's own privileges and carries no
-	// subject lists; a permissions block with empty allow lists would deny it
-	// everything.
+	// subject lists, so there is nothing for the block to contain and it is
+	// omitted. Not a narrowing either way: see renderA2APermission below for
+	// what nats-server does with an empty one.
 	if len(id.publish) > 0 || len(id.subscribe) > 0 {
 		b.WriteString(a2aUserBlockIndent + "  permissions {\n")
-		b.WriteString(renderA2ASubjectList(a2aSubjectListIndent, "publish", id.publish))
-		b.WriteString(renderA2ASubjectList(a2aSubjectListIndent, "subscribe", id.subscribe))
+		b.WriteString(renderA2APermission(a2aSubjectListIndent, "publish", id.publish, id.denyPublish))
+		b.WriteString(renderA2APermission(a2aSubjectListIndent, "subscribe", id.subscribe, id.denySubscribe))
 		b.WriteString(a2aUserBlockIndent + "  }\n")
 	}
 	b.WriteString(a2aUserBlockIndent + "}\n")
+	return b.String()
+}
+
+// renderA2APermission renders one direction's allow list and, when the
+// principal has one, the deny list subtracted from it.
+//
+// A direction with no allow entries renders nothing, and that is NOT a
+// narrowing. An earlier version of this comment claimed it was — that omitting
+// the block avoided NATS reading an empty allow as "everything" — and it had
+// the semantics backwards in a way worth spelling out, because the mistake is
+// the kind that reads as caution:
+//
+//   - No `permissions` block at all: every direction unrestricted.
+//   - `permissions` present, one direction's key omitted: THAT direction
+//     unrestricted. nats-server builds `Permissions.Publish` only when the key
+//     is there, and the publish check returns true when it is nil.
+//   - The key present with an empty allow: THAT DIRECTION UNRESTRICTED TOO.
+//     This is the one that catches people. `parsePermSubjects` starts from a
+//     nil `[]string` and appends, so `allow = []` yields nil rather than an
+//     empty slice; `setPermissions` builds the allow sublist only when the
+//     slice is non-nil; and the check passes everything when the sublist is
+//     nil. `publish { }` is the same — `parseSubjectPermission` returns nil for
+//     an empty map. Measured against nats-server v2.14.6, not inferred: an
+//     `allow = []` on either direction leaves that direction wide open, while a
+//     deny with no allow beside it IS honoured.
+//
+// So for an identity that has publish entries and a subscribe deny but no
+// subscribe allow, the permissions block IS written, the subscribe key is NOT,
+// and the deny evaporates into allow-all. Returning "" is no narrower than the
+// other two readings — all three are unrestricted — and in particular there is
+// no shape of this block that denies a direction outright. If you come here to
+// repair the hole, do not reach for an empty allow: it is the hole.
+//
+// Nothing is guessed here to repair that, because the two repairs mean opposite
+// things — deny-all, or allow-everything-but — and the render cannot know which
+// an author meant. What closes it is
+// TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow, which refuses the
+// configuration at build time instead. Every deny list in the identity table is
+// an operator-authored constant, so that test sees all of them; if a deny list
+// ever becomes CR-derived, this returns to being a live hole and the guard has
+// to move into the render.
+func renderA2APermission(indent, kind string, allow, deny []string) string {
+	if len(allow) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(indent + kind + " {\n")
+	b.WriteString(renderA2ASubjectList(indent+"  ", "allow", allow))
+	if len(deny) > 0 {
+		b.WriteString(renderA2ASubjectList(indent+"  ", "deny", deny))
+	}
+	b.WriteString(indent + "}\n")
 	return b.String()
 }
 
@@ -92,7 +145,7 @@ func renderA2ASubjectList(indent, kind string, subjects []string) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString(indent + kind + " { allow = [\n")
+	b.WriteString(indent + kind + " = [\n")
 	for i, s := range subjects {
 		comma := ","
 		if i == len(subjects)-1 {
@@ -100,7 +153,7 @@ func renderA2ASubjectList(indent, kind string, subjects []string) string {
 		}
 		b.WriteString(indent + `  "` + s + `"` + comma + "\n")
 	}
-	b.WriteString(indent + "] }\n")
+	b.WriteString(indent + "]\n")
 	return b.String()
 }
 

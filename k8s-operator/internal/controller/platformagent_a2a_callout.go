@@ -279,6 +279,78 @@ func a2aStripBusCredentialSources(volumes []corev1.Volume, agentName string) []c
 // what is bus-specific is the name set a2aBusCredentialVolumeNames builds, not
 // the removal.
 
+// a2aExecutorSidecarEnv is the environment the operator owes any executor
+// riding spec.deployment.sidecars, and the reason it owes it is that the pod
+// cannot supply either value on its own.
+//
+// POD_NAMESPACE is the scope. capabilityScope (a2a/cmd/hermes-bridge/main.go)
+// resolves the scope the executor is checked at from A2A_AUTHORITY_SCOPE, then
+// POD_NAMESPACE, then the kubelet's namespace file -- and that last rung does
+// not exist in this pod. buildPodTemplateSpec sets AutomountServiceAccountToken
+// false, so the kubelet projects no serviceaccount directory at all and the
+// read returns ENOENT. capabilityScope then does the correct thing and returns
+// an empty scope rather than guessing a namespace, an empty scope is contained
+// by nothing, and every `platform` task on a default install is refused at the
+// first turn. The downward API is the one source that cannot be wrong here.
+//
+// A2A_CAPABILITY_REQUIRED is the mixed-version switch, and it is rendered for
+// the reason the gateway's copy of it is: both halves have to read one value or
+// they drift. The gateway passes its own resolved setting to the session pods
+// it spawns (a2a/gateway/spawn.go), which covers the delegated route; the
+// bridge reads its own container's environment, so the default route needs the
+// operator to put it there. Without this an install that relaxed the gateway
+// gets a bridge that still refuses every capability-less submission -- the
+// half-armed state the single switch exists to make unreachable.
+//
+// Rendered onto every CR-authored sidecar rather than onto one matched by name.
+// Matching `hermes-bridge` would make a renamed container silently take the
+// ENOENT path again, which is the failure this repairs.
+//
+// The two are NOT merged the same way, and the difference is the point.
+//
+// A2A_CAPABILITY_REQUIRED is the override: a CR that sets it on its own sidecar
+// has re-created exactly the half-armed drift the single switch exists to make
+// unreachable, so the operator's value wins. The name is private to this
+// product, so nothing else can be reading it for its own reasons.
+//
+// POD_NAMESPACE is a default: an explicit CR value wins. It is the most
+// conventional downward-API name in Kubernetes and plenty of off-the-shelf
+// containers read it, so clobbering it on every sidecar overrides user intent
+// on a name this product does not own. An earlier version of this function did
+// exactly that and justified it as "inert in a container that does not read
+// them", which is true of the switch and false of this one. Nor is the override
+// a control: capabilityScope prefers A2A_AUTHORITY_SCOPE over POD_NAMESPACE,
+// sidecar env is unscreened by the webhook on purpose (a2a/docs/hermes-bridge.md),
+// and so whoever writes the sidecar can already name any scope they like. The
+// override bought nothing and cost a silent clobber. The bridge sets neither
+// name, so it still takes the downward API and still gets the ENOENT repair.
+func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
+	if len(containers) == 0 {
+		return containers
+	}
+	out := make([]corev1.Container, 0, len(containers))
+	for _, c := range containers {
+		// Both built per container, not hoisted. mergeEnvVars returns one of
+		// its arguments by reference when the other is empty, so a hoisted
+		// slice would leave every sidecar with no env of its own sharing one
+		// backing array and one *EnvVarSource.
+		namespaceDefault := []corev1.EnvVar{
+			{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "metadata.namespace",
+			}}},
+		}
+		switchOverride := []corev1.EnvVar{
+			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
+		}
+		// mergeEnvVars' second argument wins, so the nesting IS the
+		// precedence: the container's own env beats the namespace default,
+		// and the switch beats both.
+		c.Env = mergeEnvVars(mergeEnvVars(namespaceDefault, c.Env), switchOverride)
+		out = append(out, c)
+	}
+	return out
+}
+
 // buildA2ACalloutServiceAccount is the identity the callout runs as. It is not
 // a bus identity: the callout authenticates to NATS with a password, because it
 // cannot authenticate through itself.
@@ -498,10 +570,20 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							{Name: "A2A_AUTHMAP_NAME", Value: a2aAuthMapName(agent)},
 							{Name: "A2A_AUTHMAP_KEY", Value: a2aAuthMapKey},
 							{Name: "A2A_TOKEN_AUDIENCE", Value: a2aBusTokenAudience},
-							// The seeds. This Deployment is the only thing
-							// that mounts them, and the issuer is the key
-							// that decides what every connection on this bus
-							// may do.
+							// The seeds. This Deployment is the only
+							// thing that reads them, and the issuer is the
+							// key that decides what every connection on
+							// this bus may do.
+							//
+							// They arrive as environment variables, which
+							// is weaker than a projected file: secretKeyRef
+							// keeps the value out of the pod spec and out
+							// of `describe`, but env is inherited by every
+							// child process and lands in core dumps. A
+							// projected 0400 file is the shape this wants;
+							// changing it is a custody fix of its own and
+							// is tracked with the rotation gap, not done
+							// here.
 							{Name: "A2A_ISSUER_SEED", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 								LocalObjectReference: corev1.LocalObjectReference{Name: a2aCalloutKeysName(agent)},
 								Key:                  a2aCalloutIssuerSeedKey,

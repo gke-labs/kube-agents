@@ -231,7 +231,16 @@ func TestEveryCalloutPrincipalHasAClientThatCanPresentAToken(t *testing.T) {
 			got = append(got, id.user)
 		}
 	}
-	want := []string{"provision", "session", a2aAgentBusUser}
+	// The order is a2aIdentities' order. Each name has a workload that
+	// mounts an a2a-bus token for the ServiceAccount the entry is keyed on:
+	// the provisioning Job, through a2aBusTokenVolumeSource; a spawned
+	// session pod, through the projection the gateway builds in
+	// a2a/gateway/spawn.go; the platform agent container, which arrived when
+	// the static `worker` credential was retired; and the capability verifier
+	// Deployment, through a2aBusTokenVolumeSource again — asserted directly
+	// rather than only promised, in
+	// TestTheVerifierDeploymentPresentsTheTokenItsGrantsAreKeyedOn.
+	want := []string{"provision", "session", a2aAgentBusUser, "verifier"}
 	if !slices.Equal(got, want) {
 		t.Errorf("callout principals = %v, want %v.\nA new callout principal needs a rendered workload that mounts an a2a-bus token for its ServiceAccount (a2aBusTokenVolumeSource / a2aBusTokenVolumeMount). Without one the entry authorizes nobody and misreports who authenticates.", got, want)
 	}
@@ -516,5 +525,88 @@ func TestAnOverriddenServiceAccountThatCollidesIsRefused(t *testing.T) {
 		t.Errorf("the render failed for some other reason: %v", err)
 	} else {
 		t.Logf("refused: %v", err)
+	}
+}
+
+// TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow is the guard renderA2APermission
+// names, and it exists because a deny list has two ways to reach the server as
+// nothing at all -- neither of which fails, logs, or changes the rendered config
+// in a way a reader would notice.
+//
+//  1. STATIC principals. renderA2APermission returns "" for a direction with no
+//     allow entries, deny list and all. nats-server reads a `permissions` block
+//     with the `subscribe` key absent as subscribe-unrestricted: it builds
+//     Permissions.Subscribe only when the key is there, and the check passes on
+//     nil. So a deny written without an allow beside it does not narrow the
+//     principal to "everything but these" and does not deny it everything -- it
+//     removes the restriction entirely, in the one direction the author was
+//     trying to restrict.
+//
+//     renderA2AStaticUser has the same shape one level up: it writes no
+//     permissions block at all unless publish or subscribe is non-empty, so an
+//     identity carrying only denies authenticates unrestricted in BOTH
+//     directions. That path is the $SYS exemption working as intended and is
+//     why the check below is on the identity table rather than on the block.
+//
+//  2. CALLOUT principals. renderA2AAuthMap copies id.publish and id.subscribe
+//     into a2aAuthMapGrants, which has no deny field of any spelling. A deny on
+//     a callout identity is dropped before the JWT is minted, unconditionally,
+//     whether or not an allow sits beside it.
+//
+// Both are latent today rather than live: the three deny lists in the table
+// (gateway, bridge, web) sit on static principals with allows in the same
+// direction, which is the case that renders correctly. The point is that
+// nothing stops the next one. Every deny in this table is an operator-authored
+// constant -- capDenyPublish, capDenySubscribe, and web's literal -- so this
+// test sees all of them, which is what makes a test the right place for the
+// check. If a deny list ever becomes CR-derived, a passing test here stops
+// meaning anything and the refusal has to move into the render.
+//
+// Two of the three denies subtract nothing from their current allow lists and
+// say so in their own comments; they are kept as defence against a future
+// widening. That is exactly the situation this test protects -- a deny whose
+// value is entirely prospective is the one most likely to be moved, copied, or
+// paired with a rewritten allow list without anyone re-reading how it renders.
+func TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow(t *testing.T) {
+	agent := identityTestAgent()
+
+	// Precondition. If the table stops carrying denies -- or this stops
+	// finding them -- every assertion below passes over an empty set and the
+	// guard is gone without a failure. Three is what ships; the check is that
+	// it is not zero, so adding a fourth does not need an edit here.
+	denies := 0
+	for _, id := range a2aIdentities(agent) {
+		denies += len(id.denyPublish) + len(id.denySubscribe)
+	}
+	if denies == 0 {
+		t.Fatal("no identity in the table carries a deny list: either the denies were removed, in which " +
+			"case delete this test with them, or a2aIdentities no longer reaches them and this test " +
+			"measures nothing")
+	}
+
+	for _, id := range a2aIdentities(agent) {
+		for _, d := range []struct {
+			kind  string
+			allow []string
+			deny  []string
+		}{
+			{"publish", id.publish, id.denyPublish},
+			{"subscribe", id.subscribe, id.denySubscribe},
+		} {
+			if len(d.deny) == 0 {
+				continue
+			}
+			if id.auth == a2aAuthCallout {
+				t.Errorf("callout principal %q carries a %s deny %v: renderA2AAuthMap copies only the "+
+					"allow lists into a2aAuthMapGrants, so this never reaches the minted JWT and the "+
+					"principal is granted the allow list unsubtracted", id.user, d.kind, d.deny)
+				continue
+			}
+			if len(d.allow) == 0 {
+				t.Errorf("static principal %q carries a %s deny %v with no %s allow: renderA2APermission "+
+					"renders nothing for that direction, and nats-server reads the missing key as "+
+					"unrestricted -- this widens the principal instead of narrowing it", id.user, d.kind, d.deny, d.kind)
+			}
+		}
 	}
 }

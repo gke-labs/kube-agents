@@ -3,6 +3,7 @@ package authcallout
 import (
 	"fmt"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -102,6 +103,46 @@ func sessionGrants(pod string) Grants {
 			consumerAPI("DELETE", name),
 		)
 	}
+	// The capability path: ask, and be answered. Two subjects, and the shape
+	// of both is the mechanism rather than a convention.
+	//
+	// The ask carries the caller's own name as the subject's LAST token, and
+	// the verifier reads its caller off that token rather than off anything
+	// in the payload. That is only sound because this grant is exactly one
+	// subject: the server refuses this session on any other session's verify
+	// token, so a pod cannot ask a question in somebody else's name. A
+	// wildcard here would silently convert the verifier's identity check
+	// into a self-assertion.
+	//
+	// The answer namespace is `a2a.cap.reply.<pod>.>` rather than the
+	// session's own _INBOX for the verifier's sake, not this session's: the
+	// verifier answers wherever a caller says, and every broker is a caller,
+	// so its publish grant cannot be narrower than the whole reply space. If
+	// that space were _INBOX, the verifier would hold `_INBOX.>` and could
+	// publish into the gateway's inbox, where the gateway reads JetStream
+	// replies. See capability.ReplyPrefix.
+	//
+	// Deliberately NOT granted: `$KV.cap.hop.<pod>.*`, the write a broker
+	// would use to attenuate a capability before forwarding it. The rules
+	// for that write exist and are tested (capability.Minter.Attenuate), but
+	// nothing in the product calls them — there is no second hop, because
+	// the gateway's delegate flow mints the successor's root itself. A grant
+	// for a client that does not exist is a standing authorization, not
+	// documentation of a plan; it lands with the hop that needs it.
+	verify, err := capability.VerifySubject(pod)
+	if err != nil {
+		// Unreachable: validSessionName has already checked the pod name
+		// against the same rule. Refusing the whole grant set rather than
+		// dropping one subject is the fail-closed reading of "unreachable".
+		return Grants{}
+	}
+	reply, err := capability.ReplySubscribe(pod)
+	if err != nil {
+		return Grants{}
+	}
+	g.Publish = append(g.Publish, verify)
+	g.Subscribe = append(g.Subscribe, reply)
+
 	g.Publish = append(g.Publish, inbox)
 	return g
 }

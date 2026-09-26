@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -2171,8 +2172,22 @@ func TestInjectCancelNamesTheTaskAfterTheHealReleasedIt(t *testing.T) {
 	if cancelEnv.CorrelationID != origin.CorrelationID {
 		t.Fatalf("the cancel rides correlation %q, want the task's own %q", cancelEnv.CorrelationID, origin.CorrelationID)
 	}
-	if len(cancelEnv.Authority) == 0 {
-		t.Error("the cancel carries no authority block")
+	// Not merely "an authority block": the task's own capability. The
+	// history entry is the only place it survives once the heal released
+	// ActiveTask, and a cancel that lost it would carry `grants: null` --
+	// indistinguishable, to anything that later reads the stream, from a
+	// turn the gateway answered itself.
+	wantRef, wantPresent, err := capability.RefFromAuthority(origin.Authority)
+	if err != nil || !wantPresent {
+		t.Fatalf("the submission carries no capability to compare against: present=%v err=%v", wantPresent, err)
+	}
+	gotRef, gotPresent, err := capability.RefFromAuthority(cancelEnv.Authority)
+	if err != nil || !gotPresent {
+		t.Fatalf("the cancel carries no capability: present=%v err=%v authority=%s",
+			gotPresent, err, cancelEnv.Authority)
+	}
+	if gotRef != wantRef {
+		t.Errorf("the cancel carries capability %+v, want the task's own %+v", gotRef, wantRef)
 	}
 	// The heal ran first and said so; the cancel then went out anyway.
 	r.waitForPost(t, reply.Conversation, "produced nothing on its event stream")

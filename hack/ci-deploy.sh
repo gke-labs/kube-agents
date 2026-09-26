@@ -210,14 +210,17 @@ readonly MODE_NEXT_REPORT_LOG_LINES=30
 readonly MODE_NEXT_ENTRYPOINT_SCAN_LINES=400
 readonly MODE_NEXT_ENTRYPOINT_MATCH_LINES=40
 # The operator's override variables (a2aGatewayImage and a2aWorkerImage in
-# platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go)
-# and the repository names step 4 pushes the builds under.
+# platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go,
+# a2aVerifierImage in platformagent_a2a_verifier.go) and the repository names
+# step 4 pushes the builds under.
 readonly A2A_GATEWAY_IMAGE_ENV_VAR="A2A_GATEWAY_IMAGE"
 readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
+readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_GATEWAY_IMAGE_NAME="a2a-gateway"
 readonly A2A_CALLOUT_IMAGE_NAME="a2a-authcallout"
 readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
+readonly A2A_VERIFIER_IMAGE_NAME="a2a-verifier"
 # The bridge image goes to the CR as the sidecar's image, not to the operator:
 # no env var, and no images.json entry (hack/check-image-inventory.sh).
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -713,8 +716,9 @@ else
     A2A_GATEWAY_URI="${AR_REPO}/${A2A_GATEWAY_IMAGE_NAME}:${TAG}"
     A2A_CALLOUT_URI="${AR_REPO}/${A2A_CALLOUT_IMAGE_NAME}:${TAG}"
     A2A_WORKER_URI="${AR_REPO}/${A2A_WORKER_IMAGE_NAME}:${TAG}"
+    A2A_VERIFIER_URI="${AR_REPO}/${A2A_VERIFIER_IMAGE_NAME}:${TAG}"
     A2A_BRIDGE_URI="${AR_REPO}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
-    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
     A2A_OPERATOR_ENV_ARGS=(
       --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
       --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -722,10 +726,16 @@ else
       --set-string "operator.extraEnv[1].value=${A2A_CALLOUT_URI}"
       --set-string "operator.extraEnv[2].name=${A2A_WORKER_IMAGE_ENV_VAR}"
       --set-string "operator.extraEnv[2].value=${A2A_WORKER_URI}"
-      --set-string "operator.extraEnv[3].name=${A2A_INJECT_BACKEND_ENV_VAR}"
-      --set-string "operator.extraEnv[3].value=${A2A_INJECT_BACKEND_ON}"
+      # The verifier is on the request path: unoverridden it stays on a
+      # private dev registry a leased eval project cannot pull, the Deployment
+      # never comes up, and every executor refuses every task -- an eval that
+      # reads as a broken product rather than a missing override.
+      --set-string "operator.extraEnv[3].name=${A2A_VERIFIER_IMAGE_ENV_VAR}"
+      --set-string "operator.extraEnv[3].value=${A2A_VERIFIER_URI}"
+      --set-string "operator.extraEnv[4].name=${A2A_INJECT_BACKEND_ENV_VAR}"
+      --set-string "operator.extraEnv[4].value=${A2A_INJECT_BACKEND_ON}"
     )
-    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout and worker images and the Hermes bridge sidecar"
+    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker and verifier images and the Hermes bridge sidecar"
   fi
   gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
     --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \

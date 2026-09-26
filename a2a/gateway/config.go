@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -244,6 +245,32 @@ type Config struct {
 	// window (72h at the dev default) after the split reaches the install.
 	StrictEventsWriter bool
 
+	// AuthorityTier and AuthorityScope are what the gateway mints a task's
+	// root capability at: the ceiling for this agent, from which every hop
+	// can only narrow.
+	//
+	// They come from the environment because there is nowhere better yet.
+	// 02-agent-personas §9 puts `tier` and `scope` on the Agent CRD, and
+	// that CRD does not exist — PlatformAgent carries neither, and inventing
+	// them on it is an API change this card is not. The operator renders
+	// neither — so the defaults below are what every rendered install runs
+	// on, not a local-run convenience, and they are deliberately the
+	// narrowest thing that could be true: the ceiling an operator has not
+	// chosen must not be a generous one.
+	AuthorityTier  capability.Tier
+	AuthorityScope capability.Scope
+
+	// CapabilityOptional relaxes exactly one thing: what happens when this
+	// gateway cannot mint. Zero value — the safe one — refuses the turn.
+	// Set, a mint failure logs and the envelope goes out with `grants: null`,
+	// which is the pre-A3b shape, for an install whose bus has no `cap`
+	// bucket yet. The executor has the matching knob and the operator renders
+	// both from A2A_CAPABILITY_REQUIRED, so the two halves cannot drift.
+	//
+	// It is NOT a switch for enforcement. A capability that exists is always
+	// checked, and no configuration makes a refused verb run.
+	CapabilityOptional bool
+
 	// MaxSessions caps how many session pods run concurrently, gateway-wide
 	// (A2A_MAX_SESSIONS). "Delegate:" makes pod creation user-triggerable and
 	// threads are free, so the principal map bounds WHO can spawn and this
@@ -311,6 +338,9 @@ func FromEnv() (*Config, error) {
 
 		SessionServiceAccount: os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
 		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
+		AuthorityTier:         capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
+		AuthorityScope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
+		CapabilityOptional:    os.Getenv("A2A_CAPABILITY_REQUIRED") == "false",
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
@@ -384,6 +414,13 @@ func FromEnv() (*Config, error) {
 	// bridge-only install.
 	if cfg.SpawnSessions && cfg.SessionServiceAccount == "" {
 		return nil, fmt.Errorf("A2A_SESSION_SERVICE_ACCOUNT is required when A2A_SPAWN_SESSIONS is true; session pods authenticate to the bus as it, and there is no safe default")
+	}
+	cfg.defaultCapabilityCeiling()
+	// Validated at boot rather than at mint: a bad tier or scope would
+	// otherwise surface as every task failing to start, one refusal at a
+	// time, with the cause in the gateway's logs and not the operator's.
+	if err := cfg.validateCapabilityCeiling(); err != nil {
+		return nil, err
 	}
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs
@@ -485,4 +522,29 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// defaultCapabilityCeiling fills the tier and scope the gateway mints under.
+// Tests and embedders build Config directly, bypassing FromEnv, and the
+// ceiling is inherited by every hop of every task, so the unset value has to
+// be the narrowest thing that is certainly true rather than the widest thing
+// that would work.
+func (c *Config) defaultCapabilityCeiling() {
+	if c.AuthorityTier == "" {
+		c.AuthorityTier = capability.TierDeveloperTeam
+	}
+	if c.AuthorityScope == "" {
+		c.AuthorityScope = capability.NamespaceScope(c.Namespace)
+	}
+}
+
+// validateCapabilityCeiling runs the ceiling through the same validation a
+// minted entry gets, so a bad tier or scope is a boot failure the operator
+// sees rather than a per-task refusal in the gateway's log.
+func (c *Config) validateCapabilityCeiling() error {
+	e := capability.Entry{Tier: c.AuthorityTier, Scope: c.AuthorityScope, Delegate: "boot-check"}
+	if err := e.Validate(); err != nil {
+		return fmt.Errorf("A2A_AUTHORITY_TIER/A2A_AUTHORITY_SCOPE: %w", err)
+	}
+	return nil
 }

@@ -1,5 +1,5 @@
 {
-  "version": "0f1058bc5973562d",
+  "version": "f6dc619be8a2ab8f",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -63,6 +63,24 @@
         "subscribe": [
           "a2a.topics.>",
           "_INBOX.agent.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-verifier",
+      "user": "verifier",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.cap.reply.>",
+          "$JS.API.STREAM.INFO.KV_cap",
+          "$JS.API.DIRECT.GET.KV_cap",
+          "$JS.API.STREAM.MSG.GET.KV_cap",
+          "_INBOX.verifier.>"
+        ],
+        "subscribe": [
+          "a2a.cap.verify.*",
+          "_INBOX.verifier.>"
         ]
       }
     }

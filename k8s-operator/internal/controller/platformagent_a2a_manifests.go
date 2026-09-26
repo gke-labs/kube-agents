@@ -111,10 +111,18 @@ const (
 	a2aSessionStateBucket  = "session-state"
 	a2aKVStreamPrefix      = "KV_"
 
-	// a2aNATSConfGrantLine renders one allow-list entry at the depth of
-	// accounts.APP.users[].permissions.publish in the nats.conf template
-	// below: twelve spaces, the quoted subject, a trailing comma.
-	a2aNATSConfGrantLine = "            %q,"
+	// a2aNATSConfGrantLine renders one allow-list entry at the depth
+	// renderA2APermission puts them: the subject-list indent, two more for
+	// the bracketed list inside the direction's block, the quoted subject, a
+	// trailing comma.
+	//
+	// Derived rather than spelled, because it was spelled once and the depth
+	// moved under it. Adding deny lists wrapped every allow list in a block
+	// of its own and pushed the entries two spaces right; the literal still
+	// compiled, still looked like a grant line, and simply stopped matching
+	// the render -- which took out the one control that proves the worker's
+	// enumerated grants are narrower than the `$JS.API.>` they replaced.
+	a2aNATSConfGrantLine = a2aSubjectListIndent + "    " + "%q,"
 
 	// a2aProvisionWritablePath is the one writable path the provision
 	// container has: the emptyDir mount, the nats CLI's HOME and
@@ -139,13 +147,15 @@ const (
 	// registry; graduation moves this to the release pipeline alongside the
 	// other first-party images.
 	//
-	// The first-party A2A images — this one, the worker below and the auth
-	// callout (A2A_CALLOUT_IMAGE, platformagent_a2a_callout.go) — are not in
-	// images.json, deliberately: this repo builds them and publishes them
-	// only from that dev registry, off the release pipeline the inventory's
-	// first-party entries are copied from. That exemption is graduation debt
-	// alongside the registry move (#1557) — a mirrored or air-gapped install
-	// that flips next must override each of them via the env vars until then.
+	// The first-party A2A images — this one, the worker below, the auth
+	// callout (A2A_CALLOUT_IMAGE, platformagent_a2a_callout.go) and the
+	// capability verifier (A2A_VERIFIER_IMAGE,
+	// platformagent_a2a_verifier.go) — are not in images.json,
+	// deliberately: this repo builds them and publishes them only from that
+	// dev registry, off the release pipeline the inventory's first-party
+	// entries are copied from. That exemption is graduation debt alongside
+	// the registry move (#1557) — a mirrored or air-gapped install that
+	// flips next must override each of them via the env vars until then.
 	defaultA2AGatewayImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/gateway:latest"
 
 	// The session-pod image, on the same terms as the gateway above. The
@@ -259,6 +269,26 @@ const (
 	// on `…events` before it, and refusing those folds every recent task
 	// non-terminal. A flip that needed a new image would not get made.
 	a2aStrictEventsWriterEnvVar = "A2A_STRICT_EVENTS_WRITER"
+
+	// a2aCapabilityRequiredEnvVar is the other controller-read override, and
+	// it defaults the other way round. The capability check is armed unless
+	// an operator explicitly disarms it, because the posture it protects —
+	// an executor refusing a verb its capability does not permit — is the
+	// point of the mechanism, not a tightening of one.
+	//
+	// It exists for exactly one situation: a mixed-version install, where a
+	// gateway that mints is in front of executors that predate the check, or
+	// the reverse. Both halves read this same variable, so the two cannot
+	// drift — but they reach it by two different routes, and the claim was
+	// only half true until both were rendered. The gateway passes its own
+	// resolved setting down to the session pods it spawns, which covers the
+	// `delegate:` route. The default route's executor is the bridge sidecar,
+	// which reads its own container's environment, so the operator renders
+	// this onto every CR-authored sidecar too (a2aExecutorSidecarEnv). Without
+	// that second render an install that relaxed the gateway got a bridge
+	// still refusing every capability-less submission: the half-armed state
+	// the single switch exists to make unreachable.
+	a2aCapabilityRequiredEnvVar = "A2A_CAPABILITY_REQUIRED"
 	defaultA2AWorkerImage       = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"
 
 	// a2aConfigHashPlaceholder is the stand-in a2aConfigRolloutHash puts where
@@ -454,6 +484,18 @@ func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
 }
 
+// a2aCapabilityRequired renders "false" only for an explicit "false", so a
+// typo arms rather than disarms — the safe direction here, and the opposite of
+// a2aStrictEventsWriter's, because here the tight setting is the intended one
+// and the loose setting is the temporary concession. The two binaries that
+// read the rendered value spell the same test (`== "false"`).
+func a2aCapabilityRequired() string {
+	if os.Getenv(a2aCapabilityRequiredEnvVar) == "false" {
+		return "false"
+	}
+	return "true"
+}
+
 // a2aNATSName and a2aCredsSecretName are spelled in the API package, because
 // the validating webhook recognises the credentials Secret by name and must
 // agree with the render on what that name is.
@@ -475,6 +517,20 @@ func a2aNATSConfigSecretName(agent *agentv1alpha1.PlatformAgent) string {
 // together, and naming them apart would only make the teardown list harder to
 // read.
 func a2aInjectName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-inject" }
+
+// a2aVerifierName is the capability verifier's Deployment, ServiceAccount and
+// pod-selector name, all one string like the callout's. The verifier is the
+// only principal on the bus that may read the `cap` bucket, so the name is
+// also what the identity map keys its grants on (verifierIdentity) — a rename
+// that reaches one and not the other leaves a Deployment whose connections are
+// refused, which is the loud direction.
+func a2aVerifierName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-verifier"
+}
+
+func a2aVerifierNetpolName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-verifier-netpol"
+}
 
 // a2aCredsSecretName is the Secret holding the static users' passwords.
 func a2aCredsSecretName(agent *agentv1alpha1.PlatformAgent) string {
@@ -1172,11 +1228,12 @@ authorization {
   timeout: 2
 
   auth_callout {
-    # Public halves only. The seeds live in the callout's own Secret, mounted
-    # by the callout Deployment and nothing else. The issuer signs the user
-    # JWTs that carry the permissions this server enforces, so its holder can
-    # mint a user with any grants at all — see the callout-keys Secret for the
-    # custody note.
+    # Public halves only. The seeds live in the callout's own Secret, read by
+    # the callout Deployment and nothing else. The issuer signs the user JWTs
+    # that carry the permissions this server enforces, so its holder can mint a
+    # user with any grants at all — including publish on $KV.cap.root.> and read
+    # on $KV.cap.>, which is the whole capability store. See the callout-keys
+    # Secret for the custody note.
     issuer: ` + keys.IssuerPublic + `
     account: AUTH
 
@@ -1571,6 +1628,14 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 						"app": a2aGatewayName(agent),
 					}}},
+					// The capability verifier. It is a bus client like
+					// any other, and a fence that does not name it refuses
+					// the one peer every task's authorization depends on —
+					// which surfaces as every submission being rejected, not
+					// as a network error, because the executor fails closed.
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						"app": a2aVerifierName(agent),
+					}}},
 					// Session pods, by the spawner's labels (see
 					// a2aSessionComponent above).
 					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
@@ -1739,11 +1804,21 @@ $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOUR
 # Heartbeats (agents.hb.>) are core NATS, outside JetStream — no stream.
 
 # KV buckets: runtime-state (who is alive), session-state (the gateway's
-# registry; its user is the only writer), cap (reserved for capability
-# entries per docs/architecture/09-capability-envelope.md — arms with the
-# authority work). Capped at 256MiB each: the streams' max_bytes discipline
-# applies to KV too, or unbounded bucket growth eats the file store's
-# headroom and stalls every JetStream write.
+# registry; its user is the only writer), cap (the capability entries of
+# docs/architecture/09-capability-envelope.md; the gateway writes one per
+# task at ingress and only the verifier may read them). Capped at 256MiB
+# each: the streams' max_bytes discipline applies to KV too, or unbounded
+# bucket growth eats the file store's headroom and stalls every JetStream
+# write.
+#
+# The cap bucket has no TTL and nothing deletes from it, so it fills — at a ~180-byte
+# entry that is order 1.5M tasks. KV is discard=new, so the bucket REFUSES
+# the write rather than evicting: the gateway cannot mint, and a gateway
+# that cannot mint refuses the turn. That is the fail-closed direction, and
+# it is the reason there is no TTL here — an entry that expired under a
+# running task would refuse that task mid-flight instead. Reclaiming is a
+# "nats kv del cap" against a finished task's key; no tooling ships for it
+# and the runbook says so.
 $NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 $NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
@@ -2526,6 +2601,18 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// the retention window is an edit to a value
 							// that is already there.
 							{Name: a2aStrictEventsWriterEnvVar, Value: a2aStrictEventsWriter()},
+							// Armed, and rendered explicitly at that
+							// default for the same reason as the line above:
+							// the mixed-version concession is an edit to a
+							// value that is already visible in the live
+							// Deployment, not a variable an operator has to
+							// know exists. The gateway passes its own
+							// resolved setting down to every session pod it
+							// spawns; a2aExecutorSidecarEnv renders the same
+							// value onto the bridge sidecar, which reads its
+							// own environment rather than the gateway's. Both
+							// routes, one switch.
+							{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
 							// The namespace from the downward API, not a baked
 							// default: the boot-time owner resolution below
 							// reads the gateway's own Deployment in THIS
@@ -2617,8 +2704,9 @@ func (r *PlatformAgentReconciler) a2aSessionDNSClusterIPs(ctx context.Context, a
 	return r.ungatedDNSClusterIPs(ctx, agent)
 }
 
-// reconcileA2ANetworkFences applies the two NetworkPolicies that fence the
-// next stack: the bus's ingress policy and the session pods' egress one.
+// reconcileA2ANetworkFences applies the three NetworkPolicies that fence the
+// next stack: the bus's ingress policy, the session pods' egress one, and the
+// capability verifier's.
 //
 // Separate from the rest of reconcileA2A because a NetworkPolicy is not
 // rendering, it is a guardrail, and #1247 settled what that distinction costs:
@@ -2637,11 +2725,13 @@ func (r *PlatformAgentReconciler) a2aSessionDNSClusterIPs(ctx context.Context, a
 // bad CIDR and the confinement is gone from pods that are still running, with
 // the status naming the CIDR and saying nothing about the fence.
 func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	dnsClusterIPs := r.a2aSessionDNSClusterIPs(ctx, agent)
 	fences := []*networkingv1.NetworkPolicy{
 		buildA2ANATSNetworkPolicy(agent),
-		buildA2ASessionNetworkPolicy(agent, r.a2aSessionDNSClusterIPs(ctx, agent)),
+		buildA2ASessionNetworkPolicy(agent, dnsClusterIPs),
+		buildA2AVerifierNetworkPolicy(agent, dnsClusterIPs),
 	}
-	// The gateway fence rides here with the other two, for the reason this
+	// The gateway fence rides here with the others, for the reason this
 	// function exists: it is what withholds a task-submission endpoint from
 	// the pod network, so that the door's token is presented only from the
 	// node path its caller uses, and a refused CR must
@@ -2731,10 +2821,21 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, err
 	}
 
-	// Both fences ride reconcileA2ANetworkFences so they appear and disappear
-	// with the stack they fence — including the skew freeze, where a frozen,
-	// running bus keeps its ingress policy and the workers on it keep their
-	// egress one.
+	// The capability verifier. It binds the `cap` bucket at boot and exits
+	// if the bind fails, so on a fresh install it crash-loops until the
+	// provision Job below has created the bucket — loud, bounded by the
+	// kubelet's restart backoff, and preferable to a verifier that comes up
+	// answering nothing. Applied before the Job rather than after it because
+	// ordering inside one reconcile buys nothing here: the Job takes seconds
+	// to schedule and complete either way.
+	if err := r.reconcileA2AVerifier(ctx, agent); err != nil {
+		return state, err
+	}
+
+	// All three fences ride reconcileA2ANetworkFences so they appear and
+	// disappear with the stack they fence — including the skew freeze, where a
+	// frozen, running bus keeps its ingress policy and the workers on it keep
+	// their egress one.
 	if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 		return state, err
 	}
@@ -3282,6 +3383,14 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		// that would make every callout answer be refused.
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The capability verifier, after the gateway that submits work and
+		// before the bus it reads through. Its ServiceAccount goes with it:
+		// left behind, it is a mintable bus identity whose grants include the
+		// read on every capability in the store — the single most valuable
+		// residue this stack could leave in a namespace that is supposed to
+		// look like it has never heard of A2A.
+		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
@@ -3311,6 +3420,7 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		// removing it, and removing it would take a foreground delete and a
 		// wait this reconcile has no reason to block on.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		// ResourceQuota is not a watched kind, so the read goes through
 		// a2aReader like the Secrets. Deleting it here is safe even with

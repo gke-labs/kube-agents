@@ -17,6 +17,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -44,8 +45,8 @@ func startServer(t *testing.T) *natsserver.Server {
 	return s
 }
 
-// provision creates the TASKS stream and session-state bucket the way the W6
-// operator's provision Job does.
+// provision creates the TASKS stream and the session-state and cap buckets
+// the way the W6 operator's provision Job does.
 func provision(t *testing.T, url string) {
 	t.Helper()
 	nc, err := nats.Connect(url)
@@ -69,6 +70,11 @@ func provision(t *testing.T, url string) {
 	}
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.SessionStateBucket}); err != nil {
 		t.Fatalf("create session-state: %v", err)
+	}
+	// `nats kv add cap`, history 1: one live revision per key, which is what
+	// the chain walk's revision pinning is written against.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: capability.Bucket, History: 1}); err != nil {
+		t.Fatalf("create cap: %v", err)
 	}
 }
 
@@ -375,9 +381,7 @@ func TestNewTaskRoutesToPlatformWithMintedIdsAndAuthority(t *testing.T) {
 	if auth.Audience.Conversation != "discord:g1/thread1" || !auth.Audience.RosterComplete {
 		t.Fatalf("audience = %+v", auth.Audience)
 	}
-	if string(auth.Grants) != "null" {
-		t.Fatalf("grants must stay null, got %s", auth.Grants)
-	}
+	assertRootCapability(t, r, auth, origin.TaskID, "platform")
 
 	var m lib.Message
 	if err := json.Unmarshal(origin.Payload, &m); err != nil {
@@ -507,6 +511,23 @@ func TestMessageDuringWorkingIsSteeringOnSameTask(t *testing.T) {
 	if auth.Requester.Principal == originAuth.Requester.Principal {
 		t.Fatal("steer must be attributed to its own sender")
 	}
+	// ...and to the same capability. One task is one capability, and the
+	// reason is the reference rather than the ceiling: Ref pins a key AND a
+	// revision, the executor resolved THAT pair when the task opened, and a
+	// second mint per turn would hand it a root it never resolved. The
+	// verifier walks what the envelope names, so the steer would be checked
+	// against an entry whose arrival nothing ordered against the work already
+	// in flight.
+	//
+	// Not a ceiling difference. A steerer has no ceiling of their own here --
+	// mintCapability fills Tier and Scope from install-wide config and varies
+	// only Delegate, so a re-mint on this turn would produce the same bound
+	// with a different revision. An earlier version of this comment said the
+	// re-mint would substitute "the steerer's ceiling for the submitter's",
+	// which reads as a per-requester bound that this tree does not have.
+	if string(auth.Grants) != string(originAuth.Grants) {
+		t.Fatalf("the steer carries a different capability:\n  steer  %s\n  origin %s", auth.Grants, originAuth.Grants)
+	}
 	// The steer is acknowledged in-channel - silent absorption looked like
 	// a dropped message live.
 	waitFor(t, "steer acknowledgement", func() bool {
@@ -631,7 +652,7 @@ func TestRosterCapAndPseudonyms(t *testing.T) {
 		big[i] = fmt.Sprintf("u%d", i)
 	}
 	raw := BuildAuthority(ps, pm, "test:bnaylor", "discord", "1001", "principal-map",
-		"discord:g/x", "group", big, true)
+		"discord:g/x", "group", big, true).Render(nil)
 	var auth Authority
 	if err := json.Unmarshal(raw, &auth); err != nil {
 		t.Fatal(err)
@@ -1279,5 +1300,60 @@ func TestAddresseeForStragglerTask(t *testing.T) {
 	}
 	if got := rec.AddresseeFor("task-unknown"); got != "platform" {
 		t.Fatalf("unknown task falls back to the record's addressee, got %q", got)
+	}
+}
+
+// assertRootCapability is the DoD's first clause in unit form: grants is not
+// null, it names the key the gateway minted for this task, and the entry is
+// really there at the pinned revision with the addressee as its delegate.
+//
+// It resolves through the same Resolver the verifier runs, against the same
+// real bucket, so what is under test is the write the gateway performed and
+// not the struct it marshalled.
+func assertRootCapability(t *testing.T, r *rig, auth Authority, taskID, delegate string) {
+	t.Helper()
+	if string(auth.Grants) == "null" || len(auth.Grants) == 0 {
+		t.Fatalf("grants is null; the task carries no capability")
+	}
+	var grants AuthorityGrants
+	if err := json.Unmarshal(auth.Grants, &grants); err != nil {
+		t.Fatalf("grants: %v", err)
+	}
+	ref := grants.Capability
+	if want := "root." + taskID; ref.Key != want {
+		t.Fatalf("capability key = %q, want %q", ref.Key, want)
+	}
+	if ref.Revision == 0 {
+		t.Fatalf("capability reference is not pinned to a revision: %+v", ref)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store, err := capability.NewStore(ctx, r.client.JetStream())
+	if err != nil {
+		t.Fatalf("cap store: %v", err)
+	}
+	res := &capability.Resolver{Store: store}
+
+	entry, err := res.Resolve(ctx, delegate, ref)
+	if err != nil {
+		t.Fatalf("the delegate could not resolve its own capability: %v", err)
+	}
+	if entry.Delegate != delegate {
+		t.Fatalf("delegate = %q, want %q", entry.Delegate, delegate)
+	}
+	if entry.Tier != capability.TierDeveloperTeam {
+		t.Fatalf("tier = %q, want the narrow default", entry.Tier)
+	}
+	if entry.Scope == "" {
+		t.Fatal("scope is empty; the ceiling was never applied")
+	}
+
+	// Same reference, wrong holder. The block travels on a bus other
+	// principals read, so possession of the reference must not be the test.
+	if _, err := res.Resolve(ctx, "somebody-else", ref); err == nil {
+		t.Fatal("a principal the root does not name resolved it anyway")
+	} else if !errors.Is(err, capability.ErrRefused) {
+		t.Fatalf("wrong holder refused for the wrong reason: %v", err)
 	}
 }

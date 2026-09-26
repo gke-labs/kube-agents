@@ -1202,6 +1202,13 @@ Mutation(
     Mutation(
         "A3-second-supervisor-writer",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        # This anchor's neighbour moves. gke-labs/kube-agents#1316 re-indented
+        # it and A5 renamed the principal out from under it, and each time the
+        # mutation went STALE -- which reports as silence, indistinguishable
+        # from a mutation that has nothing to say, against the one test that
+        # pins the supervisor subject to a single writer. Re-verify this pair
+        # against the file, not against the sweep's survived count, whenever
+        # the bridge's grant list is touched.
         ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
          '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.tasks.*.*.supervisor",\n\t\t"$KV.runtime-state.>",'),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",

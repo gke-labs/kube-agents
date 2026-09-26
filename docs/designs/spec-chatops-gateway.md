@@ -625,7 +625,8 @@ not be silent about it.
   "stop" is indistinguishable from an intent. It lands on the bus as the same `kind: cancel`
   envelope the text route publishes. The body may name the task (`taskId`, the id the POST
   answered with); named, the cancel is published whether or not the record still holds the task
-  as active, from the task's history entry (its addressee and correlation id), and refused for a
+  as active, from the task's history entry (its addressee, correlation id and capability), and
+  refused for a
   task the conversation never held. The harness sends it after a read has classified the task,
   never before, and in every outcome that leaves an active task - `working` at the budget (a
   graded timeout), queued for the whole budget, never taken by any executor, and a read that

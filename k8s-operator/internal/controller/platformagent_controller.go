@@ -686,7 +686,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// The mode gate: `next` additionally renders the A2A stack -- NATS, the
-	// auth callout, the gateway, the provisioning Job; `today` keeps the
+	// auth callout, the gateway, the capability verifier, the provisioning
+	// Job; `today` keeps the
 	// dark stack dark — including tearing it
 	// back down after a flip, so `mode` absent renders exactly today's stack
 	// rather than today's stack plus leftovers. Version skew touches NEITHER

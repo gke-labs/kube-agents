@@ -2368,6 +2368,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		sidecars = stripContainerMountsNamed(sidecars, droppedSources)
 		sidecarVolumes = a2aStripBusCredentialSources(sidecarVolumes, agent.Name)
 		extraVolumes = a2aStripBusCredentialSources(extraVolumes, agent.Name)
+
+		// Last, after every strip: the executor environment the pod cannot
+		// resolve for itself. Ordering is not incidental -- the strips above
+		// remove what a sidecar must not hold, and this adds what one that
+		// executes tasks cannot run without. See a2aExecutorSidecarEnv.
+		sidecars = a2aExecutorSidecarEnv(sidecars)
 	}
 
 	homeDir := "/opt/data"

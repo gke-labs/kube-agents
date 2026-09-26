@@ -339,6 +339,27 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					// to have one, and only the second is unremarkable
 					// (lib.EnvOriginSeq).
 					{Name: lib.EnvOriginSeq, Value: originSeqValue(originSeq)},
+					// The capability contract's two halves, rendered the same
+					// way and for the same reason.
+					//
+					// Scope, because the gateway MINTS under its resolved
+					// AuthorityScope and the executor CHECKS against its own:
+					// they are compared, not merely both present, so a session
+					// pod left to default would derive `namespace/-` — the
+					// scope that contains nothing — and refuse every task with
+					// a message that reads like a capability bug rather than a
+					// missing variable. It cannot derive the real one either:
+					// no POD_NAMESPACE rides here, deliberately, because the
+					// value that has to match is the gateway's resolved
+					// setting and not whatever namespace the pod landed in.
+					//
+					// Required, because a mixed-version install needs both
+					// halves relaxed together. One switch on the gateway
+					// Deployment arms or relaxes the executor too, so there is
+					// no state where the gateway mints nothing and the
+					// executor insists on a capability.
+					{Name: "A2A_AUTHORITY_SCOPE", Value: string(s.cfg.AuthorityScope)},
+					{Name: "A2A_CAPABILITY_REQUIRED", Value: strconv.FormatBool(!s.cfg.CapabilityOptional)},
 				},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{

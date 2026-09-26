@@ -30,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
@@ -85,21 +86,28 @@ func run() int {
 
 	originSeq, originSeqStated := originSeq(log)
 	cfg := workeradapter.Config{
-		NATSURL:         natsURL,
-		NATSUser:        os.Getenv("NATS_USER"),
-		NATSPassword:    os.Getenv("NATS_PASSWORD"),
-		BusTokenFile:    busTokenFile(),
-		PodName:         os.Getenv(lib.EnvPodName),
-		TaskID:          taskID,
-		Profile:         profile,
-		Session:         os.Getenv("A2A_SESSION"),
-		OriginSeq:       originSeq,
-		OriginSeqStated: originSeqStated,
-		HarnessCommand:  harnessCommand(),
-		HarnessEnv:      harnessEnv(),
-		TaskDeadline:    envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds),
-		KillGrace:       envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds),
-		Logger:          log,
+		NATSURL:      natsURL,
+		NATSUser:     os.Getenv("NATS_USER"),
+		NATSPassword: os.Getenv("NATS_PASSWORD"),
+		BusTokenFile: busTokenFile(),
+		PodName:      os.Getenv(lib.EnvPodName),
+		TaskID:       taskID,
+		Profile:      profile,
+		Session:      os.Getenv("A2A_SESSION"),
+		Namespace:    os.Getenv("POD_NAMESPACE"),
+		Scope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
+		// Unset means required: a submission with no capability is
+		// refused. "false" is the mixed-version window only — a gateway
+		// that predates the mint. It does not switch enforcement off; a
+		// capability that is present is always checked.
+		CapabilityOptional: os.Getenv("A2A_CAPABILITY_REQUIRED") == "false",
+		OriginSeq:          originSeq,
+		OriginSeqStated:    originSeqStated,
+		HarnessCommand:     harnessCommand(),
+		HarnessEnv:         harnessEnv(),
+		TaskDeadline:       envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds),
+		KillGrace:          envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds),
+		Logger:             log,
 	}
 
 	// The harness works out of the pod's scratch emptyDir; falling back to

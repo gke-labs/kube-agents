@@ -21,9 +21,10 @@ untested. This suite reads the output side instead:
 The golden half reaches only what the golden cases render. All seven set
 `spec.mode: default`, so the `mode: next` stack is in none of them: the A2A
 gateway's strategy is asserted by `TestBuildA2AGatewayIdentityAndOwnerWiring`
-in `k8s-operator/internal/controller/`, and the A2A auth callout (two replicas,
-surge-first) is asserted by nothing here. A `mode: next` golden case would bring
-both into this sweep.
+in `k8s-operator/internal/controller/`, and the two surge-first pairs -- the
+A2A auth callout and the capability verifier, two replicas each -- are asserted
+by nothing here. A `mode: next` golden case would bring all three into this
+sweep.
 
 Every Deployment in both must be `Recreate` or resolve `maxUnavailable >= 1`,
 unless its name is in `_SURGE_FIRST_BY_DESIGN`, where the entry carries the

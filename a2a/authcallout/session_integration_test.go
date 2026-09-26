@@ -42,9 +42,9 @@ const (
 	relayDurable = "gateway-relay"
 )
 
-// sessionMap is one ordinary entry and one narrowed one. The narrowed entry
-// carries no grants at all — that is the shape the operator renders and the
-// shape ParseIdentityMap insists on.
+// sessionMap is one ordinary entry, one narrowed one, and the verifier. The
+// narrowed entry carries no grants at all — that is the shape the operator
+// renders and the shape ParseIdentityMap insists on.
 //
 // The `gateway` entry is a stage prop and does not track the rendered gateway,
 // which is worth saying because it is now the only place in the tree where a
@@ -54,6 +54,14 @@ const (
 // test harness's own setup — it creates the TASKS stream the session cases run
 // against — and the subject under test here is what the CALLOUT derives for a
 // session, not what any map says about a gateway.
+//
+// The gateway's `$KV.cap.root.*` and the verifier entry are here because the
+// adapter run next door is now a capability-bearing task end to end: a task
+// with no capability is refused before its harness starts, so a fixture that
+// could not mint one would test the refusal path and nothing else. The
+// verifier's grants are copied from the operator's render deliberately rather
+// than widened for convenience — capability_conformance_test.go asserts the
+// rendered ones, and a laxer set here would let a missing grant pass.
 const sessionMap = `{
   "version": "session-itest-1",
   "identities": [
@@ -62,7 +70,7 @@ const sessionMap = `{
       "user": "gateway",
       "account": "APP",
       "grants": {
-        "publish": ["a2a.tasks.>", "$JS.API.>", "_INBOX.gateway.>"],
+        "publish": ["a2a.tasks.>", "$KV.cap.root.*", "$JS.API.>", "_INBOX.gateway.>"],
         "subscribe": ["a2a.tasks.>", "_INBOX.gateway.>"]
       }
     },
@@ -72,6 +80,21 @@ const sessionMap = `{
       "account": "APP",
       "narrowing": "pod",
       "grants": {"publish": [], "subscribe": []}
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-verifier",
+      "user": "verifier",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.cap.reply.>",
+          "$JS.API.STREAM.INFO.KV_cap",
+          "$JS.API.DIRECT.GET.KV_cap",
+          "$JS.API.STREAM.MSG.GET.KV_cap",
+          "_INBOX.verifier.>"
+        ],
+        "subscribe": ["a2a.cap.verify.*", "_INBOX.verifier.>"]
+      }
     }
   ]
 }`
@@ -83,6 +106,8 @@ func sessionTokens() map[string]Attested {
 		tokenPodB:    {ServiceAccount: sessionSA, PodName: podB, PodUID: "uid-b"},
 		tokenNoPod:   {ServiceAccount: sessionSA},
 		tokenDotted:  {ServiceAccount: sessionSA, PodName: "chat.otter.1a2b", PodUID: "uid-d"},
+
+		tokenVerifier: {ServiceAccount: verifierSA},
 	}
 }
 

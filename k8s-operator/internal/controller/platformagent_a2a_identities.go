@@ -96,7 +96,90 @@ type a2aIdentity struct {
 
 	publish   []string
 	subscribe []string
+
+	// denyPublish and denySubscribe are subtracted from the allow lists
+	// above, and they exist for one situation: a principal whose allow list
+	// is a wildcard broad enough to cover something it must not reach.
+	//
+	// A deny is strictly worse than a narrow allow and is not a substitute
+	// for one. It is here because `gateway` holds `$JS.API.>` — the whole
+	// JetStream API, on every stream — and narrowing that is a change to how
+	// the gateway talks to JetStream, which is gke-labs#1306's work and not
+	// this card's. What this card cannot ship without is the one subtraction
+	// the capability design rests on: nobody but the verifier reads the cap
+	// bucket. So the deny is scoped to that bucket, and the wide allow it
+	// carves out of stays a recorded debt rather than becoming invisible.
+	//
+	// `worker` carries the same pair as defence in depth. #1316 enumerated
+	// that principal by stream name, so nothing in its allow list reaches the
+	// cap bucket today and the deny subtracts nothing — which is precisely
+	// why it is written down: #1306 will be asked to widen these lists, and a
+	// widening must not be able to hand the capability store out on the way
+	// past.
+	//
+	// `seed` deliberately has NO deny, and the reason is the one thing a
+	// positional deny cannot express. Its entries match on stream name at a
+	// fixed depth, so `$JS.API.STREAM.CREATE.KV_cap` is denied by the same
+	// pattern as `$JS.API.STREAM.INFO.KV_cap` — and seed is a PROVISIONER.
+	// a2aSeedJetStreamGrants grants it CREATE and INFO on every provisioned
+	// stream so the `kv info cap || kv add cap` guard in the provision script
+	// works on a fresh store; a deny there does not make that guard fail
+	// loudly, it makes each refused request wait out natscli's 5s timeout,
+	// which is the failure mode that function's own comment was written
+	// about. Nothing is given up: post-#1316 seed's allow list holds no
+	// DIRECT.GET, no STREAM.MSG.GET and no CONSUMER verb on any bucket, and
+	// its subscribe list is two exact prefixes, so it cannot read an entry
+	// with or without the deny.
+	//
+	// Rendered only for static principals. No callout principal needs one:
+	// provision's JetStream grants are enumerated the same way seed's are,
+	// the session's are derived at mint time, and the verifier is the reader.
+	denyPublish   []string
+	denySubscribe []string
 }
+
+// a2aCapBucketReadDeny is every JetStream API subject that could read, copy or
+// snapshot the cap bucket, and the subscribe on its live writes.
+//
+// Positional rather than enumerated by verb. The stream name lands at one of
+// two depths in the JetStream API — `$JS.API.DIRECT.GET.KV_cap` and
+// `$JS.API.CONSUMER.CREATE.KV_cap` put it fourth, `$JS.API.STREAM.MSG.GET.KV_cap`
+// and `$JS.API.CONSUMER.MSG.NEXT.KV_cap.<consumer>` put it fifth — so covering
+// both depths with and without a trailing token covers the API's shape instead
+// of a list of verbs somebody has to keep current. A future NATS release that
+// adds a read verb is covered the day it ships; an enumeration would not be.
+//
+// It denies the write verbs at those depths too (STREAM.DELETE, PURGE, UPDATE),
+// which is not the property under test but is free and correct: only the
+// provision Job creates this bucket, and only the gateway and the session pods
+// write entries — and both of those write by publishing to `$KV.cap.…`
+// directly, never through the stream API. That is why the Minter deliberately
+// does not bind the bucket: binding is a `$JS.API.STREAM.INFO.KV_cap` read,
+// and a writer that needed one could not be denied here.
+//
+// $KV.cap.> on the subscribe side closes the other door. Denying the API path
+// alone would still leave a broker able to subscribe to the bucket's subject
+// space and watch every capability as it is minted.
+var capDenyPublish, capDenySubscribe = a2aCapBucketReadDeny()
+
+func a2aCapBucketReadDeny() (publish, subscribe []string) {
+	stream := "KV_" + a2aCapBucket
+	return []string{
+			"$JS.API.*.*." + stream,
+			"$JS.API.*.*." + stream + ".>",
+			"$JS.API.*.*.*." + stream,
+			"$JS.API.*.*.*." + stream + ".>",
+		}, []string{
+			"$KV." + a2aCapBucket + ".>",
+		}
+}
+
+// a2aCapBucket is the KV bucket the capability chain lives in, created by the
+// provision Job and readable by exactly one principal. The a2a module spells
+// the same name in capability.Bucket; the two modules cannot import each other,
+// and the conformance tests in a2a/authcallout run this render against a real
+// server, which is what keeps them honest.
+const a2aCapBucket = "cap"
 
 // a2aNarrowingPod marks a principal whose grants derive from the attested pod
 // name. It must match the callout's NarrowingPod; the two modules cannot import
@@ -203,6 +286,7 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		sessionIdentity(agent, ns),
 		agentIdentity(agent, ns),
 		bridgeIdentity(),
+		verifierIdentity(agent, ns),
 		seedIdentity(),
 		webIdentity(),
 		sysIdentity(),
@@ -241,6 +325,20 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// name different buckets is an authorization failure at runtime with
 		// a green suite.
 		"$KV.session-state.>",
+		// The capability the gateway mints for each task. One token after
+		// `root`, which is the request id, so this is the whole minting
+		// authority in one subject.
+		//
+		// Notably absent, and load-bearing: no read of any kind on `cap`, and
+		// no publish under `cap.hop.>`. The gateway writes roots and cannot
+		// read what it wrote, cannot read anyone else's, and cannot forge a
+		// hop that claims to descend from one. The verifier is the only reader
+		// (09 §4) and only a delegate writes a hop.
+		//
+		// A KV put is a plain publish to the key's own subject — the Minter
+		// never binds the bucket, precisely so this grant does not have to
+		// include a STREAM.INFO read.
+		"$KV.cap.root.*",
 	}
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
 	publish = append(publish,
@@ -292,6 +390,18 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"$KV.session-state.>",
 			"_INBOX.gateway.>",
 		},
+		// Defence in depth rather than a live subtraction. This deny was
+		// written when the gateway held `$JS.API.>`, which reached every
+		// capability in flight; gke-labs#1666 replaced that wildcard with
+		// a2aGatewayJetStreamGrants(), so nothing above reaches the cap
+		// bucket and the pair denies nothing today. It stays because this
+		// principal is the one that MINTS — it holds `$KV.cap.root.*`, so
+		// a widening of its JetStream grants is the single most likely way
+		// for read on the store to arrive by accident. Pinned by
+		// TestGatewayHoldsNoWholesaleJetStreamAPI so that "it subtracts
+		// nothing" cannot become the argument for deleting it.
+		denyPublish:   capDenyPublish,
+		denySubscribe: capDenySubscribe,
 	}
 }
 
@@ -425,6 +535,60 @@ func sessionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 	}
 }
 
+// verifier: the only principal that reads the `cap` bucket.
+//
+// 09 §4 gives read to exactly one component and this is the entry that makes
+// that true on the server rather than in a document. Three JetStream subjects
+// and no fourth: bind the bucket, and get a message by sequence on either the
+// direct-get path or the stream path. No CONSUMER surface — a consumer on
+// KV_cap delivering into a subject this principal can subscribe to would be a
+// live feed of every capability minted, which is the one thing the whole
+// no-crypto scheme depends on nobody having.
+//
+// It answers on `a2a.cap.reply.>` rather than into callers' inboxes, and that
+// is a deliberate narrowing of THIS entry: the caller set is every broker on
+// the bus, so the grant could not be scoped to one inbox, and under _INBOX it
+// would have covered `_INBOX.gateway.>` — where the gateway reads its
+// JetStream replies. The verifier could have forged a stream acknowledgement
+// to the component that creates streams. A namespace of its own costs one
+// subscribe grant per caller and takes that away.
+//
+// CALLOUT, not static, and unlike the gateway there is no sequencing excuse
+// to make: this program is new and presents a projected token from its first
+// commit. The component that can read every capability in flight should not
+// be reachable by whoever can read a Secret.
+func verifierIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
+	return a2aIdentity{
+		user:    a2aVerifierUser,
+		account: a2aAccountApp,
+		comment: "answers whether a capability permits a verb; the only principal with read on " +
+			"the cap bucket (09 §4). No consumer surface: a consumer on KV_cap would be a " +
+			"live feed of every capability in flight.",
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(ns, a2aVerifierName(agent)),
+		publish: []string{
+			// The answer. Never into a caller's inbox; see above.
+			"a2a.cap.reply.>",
+			"$JS.API.STREAM.INFO.KV_cap",
+			"$JS.API.DIRECT.GET.KV_cap",
+			"$JS.API.STREAM.MSG.GET.KV_cap",
+			"_INBOX." + a2aVerifierUser + ".>",
+		},
+		subscribe: []string{
+			// One token: the caller, and the server is what makes
+			// that token true. This is where the verifier's answer
+			// to "who is asking" comes from.
+			"a2a.cap.verify.*",
+			"_INBOX." + a2aVerifierUser + ".>",
+		},
+	}
+}
+
+// a2aVerifierUser is the verifier's NATS user name, and therefore its inbox
+// prefix. cmd/verifier spells the same constant; they must agree or every
+// store read times out on a reply the grant does not cover.
+const a2aVerifierUser = "verifier"
+
 // agent: the platform agent container, on the blackboard and nowhere else.
 //
 // This is what the platform agent pod authenticates as since A5. It replaces
@@ -547,6 +711,29 @@ func bridgeIdentity() a2aIdentity {
 		"_INBOX."+a2aBridgeUser+".>",
 	)
 
+	// The capability path, and the reason this static principal has one.
+	//
+	// The operator renders A2A_SPAWN_SESSIONS=true and renders no
+	// A2A_DEFAULT_ADDRESSEE, so the gateway keeps its own default and every
+	// turn in a stock `mode: next` install is addressed to
+	// a2aBridgeAddressee and executed by the sidecar this principal
+	// belongs to. A session pod is reached only by an explicit `delegate:`.
+	// Without these two subjects the capability the gateway mints for those
+	// tasks is read by nobody: minted, referenced, and never checked.
+	//
+	// The ask is ONE subject and the token on the end is the addressee, not
+	// the user name. That is deliberate twice over. The verifier reads its
+	// caller off that last token and compares it to the entry's delegate,
+	// which the gateway set to the addressee; and a wildcard here would let
+	// this credential ask in a session pod's name, converting the
+	// verifier's identity check into a self-assertion — see the same
+	// argument at length in a2a/authcallout/session.go.
+	//
+	// Deliberately NOT granted, for the same reason session pods are not
+	// granted it: `$KV.cap.hop.<...>.*`. This executor never attenuates,
+	// because it never delegates onward.
+	publish = append(publish, "a2a.cap.verify."+a2aBridgeAddressee)
+
 	return a2aIdentity{
 		user:     a2aBridgeUser,
 		account:  a2aAccountApp,
@@ -565,8 +752,19 @@ func bridgeIdentity() a2aIdentity {
 		subscribe: []string{
 			"a2a.tasks." + a2aBridgeAddressee + ".*.in",
 			"$KV.runtime-state.>",
+			"a2a.cap.reply." + a2aBridgeAddressee + ".>",
 			"_INBOX." + a2aBridgeUser + ".>",
 		},
+		// Defence in depth rather than a live subtraction. This deny was
+		// written against the old `worker` credential and its `$JS.API.>`;
+		// A5 split that credential and scoped this half to
+		// a2aBridgeJetStreamGrants(), so nothing above reaches the cap
+		// bucket and the pair denies nothing today. It is here for the next
+		// widening: see a2aCapBucketReadDeny, and the deny is pinned by
+		// TestBridgeHoldsNoWholesaleJetStreamAPI so that "it subtracts
+		// nothing" cannot become the argument for deleting it.
+		denyPublish:   capDenyPublish,
+		denySubscribe: capDenySubscribe,
 	}
 }
 
@@ -629,6 +827,11 @@ func seedIdentity() a2aIdentity {
 			"a2a.topics.>",
 			"_INBOX.seed.>",
 		},
+		// No deny, unlike gateway and worker. This principal PROVISIONS the
+		// cap bucket, and a positional deny cannot tell
+		// `STREAM.CREATE.KV_cap` from `STREAM.INFO.KV_cap` -- they sit at
+		// the same depth. See the denyPublish field's comment for the full
+		// argument, and for why nothing is given up by leaving it off.
 	}
 }
 
@@ -683,6 +886,24 @@ func webIdentity() a2aIdentity {
 			"a2a.>",
 			"_INBOX.web.>",
 		},
+		// The one subtraction `a2a.>` needs, and it is not about
+		// confidentiality.
+		//
+		// A NATS subscriber may join ANY queue group on a subject it is
+		// permitted to subscribe to. `a2a.>` covers `a2a.cap.verify.*`,
+		// which is the verifier's request subject, and the verifier scales
+		// on queue group `cap-verifier` — so a holder of this password
+		// could join that group and take a share of every verify request
+		// in the install. It cannot answer them (it holds no publish under
+		// `a2a.cap.reply.>`), which is worse rather than better: the
+		// request is simply swallowed, the caller's Check times out, and a
+		// timeout is a denial by design. A browser credential would have
+		// been able to reject a proportion of every task on the bus.
+		//
+		// Denying the whole `a2a.cap.>` namespace rather than the verify
+		// subject alone also takes away the reply traffic, which this
+		// credential had no reason to see either.
+		denySubscribe: []string{"a2a.cap.>"},
 	}
 }
 

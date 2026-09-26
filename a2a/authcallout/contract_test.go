@@ -48,9 +48,10 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 	// particular list that means a workload either lost its grants or
 	// silently gained some.
 	//
-	// Three names: the provisioning Job, the session pod, and the platform
-	// agent container, which arrived when the static `worker` credential was
-	// retired.
+	// Four names: the provisioning Job, the session pod, the platform agent
+	// container (which arrived when the static `worker` credential was
+	// retired), and the capability verifier Deployment. Each has a rendered
+	// workload that mounts an a2a-bus token.
 	//
 	// The Hermes bridge sidecar is deliberately NOT here and cannot be. The
 	// callout keys on the username TokenReview returns, which names a
@@ -59,7 +60,11 @@ func TestTheOperatorsRenderedMapParses(t *testing.T) {
 	// the union of the two grant sets — `worker` reborn under a new name. The
 	// bridge stays a static principal for that reason, and the static-residue
 	// check below is what holds it there.
-	want := map[string]bool{"provision": true, "session": true, "agent": true}
+	//
+	// `verifier` is the one entry here whose grants include a read that no
+	// other principal on the bus holds, so its arrival or departure from this
+	// list is worth a deliberate edit rather than a fixture regeneration.
+	want := map[string]bool{"provision": true, "session": true, "agent": true, "verifier": true}
 	for _, id := range m.Identities {
 		if !want[id.User] {
 			t.Errorf("the operator renders a principal this package did not expect: %q", id.User)

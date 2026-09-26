@@ -307,3 +307,72 @@ func TestMintedSessionNamesAreOneSubjectTokenAndALegalPodName(t *testing.T) {
 		t.Errorf("only %d distinct names from 800 mints; the suffix is not varying", len(seen))
 	}
 }
+
+// The capability contract's two halves reach the session pod, and they carry
+// the gateway's OWN resolved values rather than defaults the pod would pick.
+//
+// This is the pairing test for the mint. The gateway mints under
+// cfg.AuthorityScope and the executor checks against A2A_AUTHORITY_SCOPE, and
+// the verifier compares them — so an unrendered scope is not a missing nicety,
+// it is every task refused. It would also be refused *quietly*: the executor's
+// fallback is capability.NamespaceScope(""), which is `namespace/-`, and that
+// placeholder mismatches any real namespace the gateway minted under — the
+// refusal comes from the two scopes differing, not from the placeholder being
+// empty of everything, so the failure arrives as a scope refusal and reads
+// like a capability bug.
+func TestSpawnRendersTheCapabilityContractFromTheGatewaysOwnConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		optional     bool
+		wantRequired string
+	}{
+		{"armed", false, "true"},
+		{"relaxed for a mixed-version install", true, "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := k8sfake.NewSimpleClientset()
+			cfg := &Config{
+				Namespace: "test-ns", WorkerImage: "img",
+				SessionServiceAccount: "agent-a2a-session",
+				TaskDeadline:          15 * time.Minute,
+				CapabilityOptional:    tc.optional,
+			}
+			// The same call the gateway makes at construction, before it
+			// builds a spawner: the scope the pod is told has to be the
+			// one the minter will actually use.
+			cfg.defaultCapabilityCeiling()
+			s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+
+			rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1",
+				BusSession: "chat-otter-abcd", Addressee: "chat-otter-abcd"}
+			if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
+				t.Fatal(err)
+			}
+			pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-abcd", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			env := map[string]string{}
+			for _, e := range pod.Spec.Containers[0].Env {
+				env[e.Name] = e.Value
+			}
+			if got, want := env["A2A_AUTHORITY_SCOPE"], string(cfg.AuthorityScope); got != want {
+				t.Errorf("A2A_AUTHORITY_SCOPE = %q, want %q — the scope the gateway mints under.\n"+
+					"An executor checking against a different scope refuses every task it is given.", got, want)
+			}
+			if env["A2A_AUTHORITY_SCOPE"] == "namespace/-" {
+				t.Error("the session pod is told the empty scope; the gateway's own namespace never reached its config")
+			}
+			if got := env["A2A_CAPABILITY_REQUIRED"]; got != tc.wantRequired {
+				t.Errorf("A2A_CAPABILITY_REQUIRED = %q, want %q — one switch arms or relaxes both halves", got, tc.wantRequired)
+			}
+			// The pod is told nothing it could derive a DIFFERENT scope
+			// from. A POD_NAMESPACE here would give the adapter a second
+			// source that agrees today and drifts the first time the
+			// gateway is given an explicit ceiling.
+			if _, ok := env["POD_NAMESPACE"]; ok {
+				t.Error("the session pod carries POD_NAMESPACE; that is a second source for a value the gateway already resolved")
+			}
+		})
+	}
+}

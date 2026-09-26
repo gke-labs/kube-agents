@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -32,7 +34,7 @@ var testPort atomic.Int64
 
 func init() { testPort.Store(26222) }
 
-func startServer(t *testing.T) string {
+func startServerOpt(t *testing.T, withVerifier bool) string {
 	t.Helper()
 	opts := &server.Options{
 		Host:      "127.0.0.1",
@@ -72,7 +74,85 @@ func startServer(t *testing.T) string {
 	}); err != nil {
 		t.Fatalf("provision TASKS: %v", err)
 	}
+	// `nats kv add cap`, history 1, the way the operator's provision Job
+	// makes it. Every test in this package now runs against a real
+	// capability: the executor's check is on by default here because it is
+	// on by default in the pod, and a suite that switched it off would
+	// prove the harness works and nothing about the control.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: capability.Bucket, History: 1}); err != nil {
+		t.Fatalf("provision cap: %v", err)
+	}
+	if withVerifier {
+		startVerifier(t, url)
+	}
 	return url
+}
+
+// startServer is the harness every test uses: a bus with the streams and
+// buckets the operator provisions, and the verifier running.
+func startServer(t *testing.T) string { return startServerOpt(t, true) }
+
+// startServerNoVerifier is the outage: everything provisioned, nothing
+// answering on the verify subject.
+func startServerNoVerifier(t *testing.T) string { return startServerOpt(t, false) }
+
+// startVerifier runs the real verifier service against the test server: the
+// same Service the verifier Deployment runs, resolving out of the same bucket.
+// Not a stub — a stub would answer "allowed" for chains that do not exist.
+func startVerifier(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url, nats.Name("cap-verifier-test"))
+	if err != nil {
+		t.Fatalf("verifier connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("verifier jetstream: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	store, err := capability.NewStore(ctx, js)
+	if err != nil {
+		t.Fatalf("verifier store: %v", err)
+	}
+	svc := &capability.Service{Resolver: &capability.Resolver{Store: store}, Log: slog.Default()}
+	sub, err := svc.Subscribe(ctx, nc)
+	if err != nil {
+		t.Fatalf("verifier subscribe: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+}
+
+// mintFor writes the root capability the gateway would have minted for this
+// task, naming the addressee as its delegate, and returns the reference.
+func mintFor(t *testing.T, c *lib.Client, taskID, addressee string) capability.Ref {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ref, err := capability.NewMinter(c.JetStream()).Mint(ctx, taskID, capability.Entry{
+		Tier:     capability.TierDeveloperTeam,
+		Scope:    capability.NamespaceScope(""),
+		Delegate: addressee,
+	})
+	if err != nil {
+		t.Fatalf("mint %s for %s: %v", taskID, addressee, err)
+	}
+	return ref
+}
+
+// authorityFor renders the authority block the gateway puts on a submission.
+// Only `grants` matters to the executor; the advisory halves are omitted
+// because nothing in this package reads them.
+func authorityFor(t *testing.T, ref capability.Ref) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"grants": map[string]any{"capability": ref},
+	})
+	if err != nil {
+		t.Fatalf("authority: %v", err)
+	}
+	return raw
 }
 
 func testClient(t *testing.T, url string) *lib.Client {
@@ -111,9 +191,17 @@ func stub(t *testing.T, body string) []string {
 
 var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
 
-// submit publishes a task submission the way the gateway does and returns
-// the origin envelope.
+// submit publishes a task submission the way the gateway does — including the
+// capability it minted for this task — and returns the origin envelope.
 func submit(t *testing.T, c *lib.Client, addressee, taskID, text string) *lib.Envelope {
+	t.Helper()
+	return submitWithAuthority(t, c, addressee, taskID, text,
+		authorityFor(t, mintFor(t, c, taskID, addressee)))
+}
+
+// submitWithAuthority is submit with the authority block chosen by the
+// caller, which is how the attacker tests forge one.
+func submitWithAuthority(t *testing.T, c *lib.Client, addressee, taskID, text string, authority json.RawMessage) *lib.Envelope {
 	t.Helper()
 	parts := []lib.Part{{Kind: "text", Text: text}}
 	if text == "" {
@@ -126,8 +214,12 @@ func submit(t *testing.T, c *lib.Client, addressee, taskID, text string) *lib.En
 	if err != nil {
 		t.Fatalf("marshal message: %v", err)
 	}
+	opts := []lib.EnvelopeOption{lib.WithTo(lib.Party{Session: addressee})}
+	if len(authority) > 0 {
+		opts = append(opts, lib.WithAuthority(authority))
+	}
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, "ctx-"+taskID, "corr-"+taskID,
-		payload, lib.WithTo(lib.Party{Session: addressee}))
+		payload, opts...)
 	if err != nil {
 		t.Fatalf("submission envelope: %v", err)
 	}

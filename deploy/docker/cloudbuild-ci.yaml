@@ -1,5 +1,5 @@
 # CI-only build of the four first-party images in a single Cloud Build, plus,
-# when hack/ci-deploy.sh runs under EVAL_MODE_NEXT=1, the three A2A images of
+# when hack/ci-deploy.sh runs under EVAL_MODE_NEXT=1, the four A2A images of
 # the next stack and the Hermes bridge sidecar (the `a2a` and `a2a-bridge`
 # steps at the end, no-ops otherwise).
 #
@@ -165,9 +165,9 @@ steps:
       - "k8s-operator/Dockerfile"
       - "k8s-operator"
 
-  # The next stack's three first-party images (a2a/Dockerfile.gateway,
-  # .authcallout, .worker), built only when hack/ci-deploy.sh runs under
-  # EVAL_MODE_NEXT=1 and passes their URIs. With the substitutions at their
+  # The next stack's four first-party images (a2a/Dockerfile.gateway,
+  # .authcallout, .worker, .verifier), built only when hack/ci-deploy.sh runs
+  # under EVAL_MODE_NEXT=1 and passes their URIs. With the substitutions at their
   # empty defaults the step prints one line and exits, and the `images:` list
   # below stays the four it was: that list cannot be conditional and an empty
   # entry fails the build, which is why this step pushes from inside itself.
@@ -178,6 +178,12 @@ steps:
   # module download layer, which the daemon serves to the second and third.
   # Nothing here depends on the platform image, so the step starts at once,
   # like sandbox and operator; the bridge, which does, is the step after.
+  #
+  # The verifier belongs in this set and not in the "override it later" pile:
+  # it sits on the request path, and an executor that cannot reach it refuses
+  # rather than proceeds. Left on its private default an eval cluster cannot
+  # pull it, so every task in the run is refused and the eval reads as a
+  # product failure.
   - id: a2a
     name: "gcr.io/cloud-builders/docker"
     entrypoint: "bash"
@@ -199,6 +205,7 @@ steps:
         build_and_push gateway "$_A2A_GATEWAY_URI"
         build_and_push authcallout "$_A2A_CALLOUT_URI"
         build_and_push worker "$_A2A_WORKER_URI"
+        build_and_push verifier "$_A2A_VERIFIER_URI"
 
   # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge), under the same
   # flag and the same no-op rule. It is FROM the platform-agent image of THIS
@@ -268,8 +275,10 @@ substitutions:
   _KUBE_AGENTS_VERSION: "dev"
   _REQUIRE_CACHE: "false"
   # Empty means the a2a and a2a-bridge steps are no-ops; hack/ci-deploy.sh
-  # sets all four together under EVAL_MODE_NEXT=1.
+  # sets all five together under EVAL_MODE_NEXT=1. The a2a step gates on
+  # _A2A_GATEWAY_URI alone, so they are set as a set or not at all.
   _A2A_GATEWAY_URI: ""
   _A2A_CALLOUT_URI: ""
   _A2A_WORKER_URI: ""
+  _A2A_VERIFIER_URI: ""
   _A2A_BRIDGE_URI: ""

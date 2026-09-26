@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nuid"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -28,6 +30,18 @@ var testPort atomic.Int32
 func init() { testPort.Store(24222) }
 
 func startServer(t *testing.T) (*natsserver.Server, string) {
+	t.Helper()
+	return startServerOpt(t, true)
+}
+
+// startServerNoVerifier is the outage: everything provisioned, nothing
+// answering on the verify subject.
+func startServerNoVerifier(t *testing.T) (*natsserver.Server, string) {
+	t.Helper()
+	return startServerOpt(t, false)
+}
+
+func startServerOpt(t *testing.T, withVerifier bool) (*natsserver.Server, string) {
 	t.Helper()
 	opts := &natsserver.Options{
 		Host:      "127.0.0.1",
@@ -69,7 +83,82 @@ func startServer(t *testing.T) (*natsserver.Server, string) {
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "runtime-state"}); err != nil {
 		t.Fatalf("create runtime-state: %v", err)
 	}
+	// `nats kv add cap`, history 1, the way the operator's provision Job
+	// makes it. Every lifecycle test in this file now runs through the
+	// armed capability path, because that is how the sidecar runs in a
+	// pod: submit() mints a real root naming `platform` as its delegate
+	// and a real verifier answers. A suite that set CapabilityOptional to
+	// keep the old tests passing would have proved the harness works and
+	// nothing about the control.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: capability.Bucket, History: 1,
+	}); err != nil {
+		t.Fatalf("create cap: %v", err)
+	}
+	if withVerifier {
+		startVerifier(t, url)
+	}
 	return s, url
+}
+
+// startVerifier runs the real verifier service against the test server - the
+// same Service the verifier Deployment runs, resolving out of the same bucket.
+// Not a stub: a stub would answer "allowed" for chains that do not exist.
+func startVerifier(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url, nats.Name("cap-verifier-test"))
+	if err != nil {
+		t.Fatalf("verifier connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("verifier jetstream: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	store, err := capability.NewStore(ctx, js)
+	if err != nil {
+		t.Fatalf("verifier store: %v", err)
+	}
+	svc := &capability.Service{Resolver: &capability.Resolver{Store: store}, Log: slog.Default()}
+	sub, err := svc.Subscribe(ctx, nc)
+	if err != nil {
+		t.Fatalf("verifier subscribe: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+}
+
+// mintFor writes the root capability the gateway would have minted for this
+// task, naming the bridge's addressee as its delegate, and returns the
+// reference.
+func mintFor(t *testing.T, c *lib.Client, taskID, delegate string) capability.Ref {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ref, err := capability.NewMinter(c.JetStream()).Mint(ctx, taskID, capability.Entry{
+		Tier:     capability.TierDeveloperTeam,
+		Scope:    capability.NamespaceScope(""),
+		Delegate: delegate,
+	})
+	if err != nil {
+		t.Fatalf("mint %s for %s: %v", taskID, delegate, err)
+	}
+	return ref
+}
+
+// authorityFor renders the authority block the gateway puts on a submission.
+// Only `grants` matters to the executor; the advisory halves are omitted
+// because nothing in this package reads them.
+func authorityFor(t *testing.T, ref capability.Ref) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"grants": map[string]any{"capability": ref},
+	})
+	if err != nil {
+		t.Fatalf("authority: %v", err)
+	}
+	return raw
 }
 
 func testCtx(t *testing.T) context.Context {
@@ -99,7 +188,28 @@ func startBridge(t *testing.T, url string, command []string) {
 	startBridgeN(t, url, command, 0)
 }
 
+// startBridgeCancelable hands the shutdown to the caller, for the tests whose
+// subject is what happens to a task in flight when the bridge goes away.
+// Cleanup still cancels, so cancelling twice is expected and harmless.
+func startBridgeCancelable(t *testing.T, url string, command []string) context.CancelFunc {
+	t.Helper()
+	return startBridgeCfg(t, url, command, 0, false)
+}
+
+// startBridgeOptional runs a bridge with A2A_CAPABILITY_REQUIRED=false's
+// effect: the mixed-version rollout window, and the only configuration in
+// which an uncapabled submission runs.
+func startBridgeOptional(t *testing.T, url string, command []string) {
+	t.Helper()
+	_ = startBridgeCfg(t, url, command, 0, true)
+}
+
 func startBridgeN(t *testing.T, url string, command []string, concurrency int) {
+	t.Helper()
+	_ = startBridgeCfg(t, url, command, concurrency, false)
+}
+
+func startBridgeCfg(t *testing.T, url string, command []string, concurrency int, optional bool) context.CancelFunc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	b, err := New(ctx, Config{
@@ -108,6 +218,12 @@ func startBridgeN(t *testing.T, url string, command []string, concurrency int) {
 		Concurrency:  concurrency,
 		TaskDeadline: 20 * time.Second,
 		KillGrace:    500 * time.Millisecond,
+		// The scope the capability is checked at, matching what mintFor
+		// writes. Every caller but startBridgeOptional leaves
+		// CapabilityOptional at its zero value: the lifecycle tests run
+		// with the control armed, because that is how the sidecar runs.
+		Scope:              capability.NamespaceScope(""),
+		CapabilityOptional: optional,
 	})
 	if err != nil {
 		cancel()
@@ -141,6 +257,7 @@ func startBridgeN(t *testing.T, url string, command []string, concurrency int) {
 		_, err = js.Consumer(ctx, lib.TasksStream, "bridge-platform")
 		return err == nil
 	})
+	return cancel
 }
 
 func gatewayClient(t *testing.T, url string) *lib.Client {
@@ -177,7 +294,9 @@ func submit(t *testing.T, c *lib.Client, taskID, prompt string) *lib.Envelope {
 	contextID := "ctx-" + taskID
 	corrID := "corr-" + taskID
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, contextID, corrID,
-		messagePayload(t, taskID, contextID, prompt), lib.WithTo(lib.Party{Session: "platform"}))
+		messagePayload(t, taskID, contextID, prompt),
+		lib.WithTo(lib.Party{Session: "platform"}),
+		lib.WithAuthority(authorityFor(t, mintFor(t, c, taskID, "platform"))))
 	if err != nil {
 		t.Fatalf("submission envelope: %v", err)
 	}
@@ -467,7 +586,9 @@ exit 3`))
 }
 
 // A submission with no text parts is terminal rejected - an executor
-// refusing work before starting it.
+// refusing work before starting it. It carries a real capability: without
+// one this test passes on the capability refusal instead, asserting rejected
+// for a reason that has nothing to do with the content check.
 func TestLifecycle_RejectedNoTextParts(t *testing.T) {
 	_, url := startServer(t)
 	startBridge(t, url, script(t, `echo unreachable`))
@@ -486,7 +607,8 @@ func TestLifecycle_RejectedNoTextParts(t *testing.T) {
 		t.Fatal(err)
 	}
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, contextID, "corr-"+taskID, payload,
-		lib.WithTo(lib.Party{Session: "platform"}))
+		lib.WithTo(lib.Party{Session: "platform"}),
+		lib.WithAuthority(authorityFor(t, mintFor(t, c, taskID, "platform"))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -496,6 +618,9 @@ func TestLifecycle_RejectedNoTextParts(t *testing.T) {
 	task := waitTerminal(t, c, taskID)
 	if task.State != lib.StateRejected {
 		t.Fatalf("state = %s, want rejected", task.State)
+	}
+	if text := terminalText(t, url, taskID); strings.Contains(text, "capability-refused") {
+		t.Fatalf("refused for the wrong reason, so this test proves nothing about content: %q", text)
 	}
 }
 

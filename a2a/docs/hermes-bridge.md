@@ -27,10 +27,22 @@ profile's config, memory, and skills. A separate Deployment would need that PVC 
 cross-pod, which RWO only allows with same-node scheduling games. Not worth it for a
 component we intend to delete.
 
-The `sidecars` field takes ordinary `corev1.Container` entries, so the operator renders
-the bridge without any operator code change and reconcile never fights us. The sidecar
-mounts the same data volume, runs as the pod's KSA (model auth via Workload Identity for
-free), and gets `NATS_URL` plus creds from the a2a creds Secret.
+The `sidecars` field takes ordinary `corev1.Container` entries, so most of the bridge's
+pod shape is CR-authored and reconcile leaves it alone: the sidecar mounts the same data
+volume, runs as the pod's KSA (model auth via Workload Identity for free), and gets
+`NATS_URL` plus creds from the a2a creds Secret out of its own `env`.
+
+**Two names are the exception, and they are the operator's.** Under the A2A surface the
+render writes `POD_NAMESPACE` and `A2A_CAPABILITY_REQUIRED` onto every sidecar it emits
+(`a2aExecutorSidecarEnv`), but not with the same precedence.
+`A2A_CAPABILITY_REQUIRED` goes to `mergeEnvVars` as the override, so a CR value for it is
+discarded on every reconcile: the switch is the install's, not the sidecar author's.
+`POD_NAMESPACE` goes in underneath the container's own env, as a default, so a CR that
+sets it deliberately wins. Both are inputs to the capability check below rather than
+deployment preferences - see "What scope the check runs at" for why the render has to
+supply `POD_NAMESPACE` at all, and for what a default install did before it did. This
+paragraph used to say the bridge needed no operator code at all; it needs exactly this
+much.
 
 Concurrent hermes processes under one `$HERMES_HOME` is the kanban dispatcher's existing
 posture (`deploy/docker/patches/kanban_result_required.py` documents `_default_spawn`
@@ -39,8 +51,12 @@ known-working concurrency story. Cap is 2, matching the platform profile's `conc
 
 ## What this deployment method costs
 
-Two properties of riding `spec.deployment.sidecars`, stated here because the operator
-cannot fix either one - gating a user-supplied container means overriding user intent.
+Two properties of riding `spec.deployment.sidecars`. Neither is fixed, for the same
+reason in both cases: screening a user-supplied container means overriding user intent,
+and the operator does that only where it owns the meaning of the field - the capability
+switch above, and the reserved volume names the webhook refuses. `POD_NAMESPACE` is the
+other name the render writes, but it goes in as a default a CR beats, so it overrides
+nothing.
 
 **Flipping to `mode: today` with the sidecar still set takes the agent down.** The
 operator copies `spec.deployment.sidecars` into the pod without consulting the mode, so
@@ -84,6 +100,33 @@ program and nothing else: subscribe `a2a.tasks.platform.*.in`, publish
 `a2a.tasks.platform.*.events`, `$KV.runtime-state.>` both ways for the in-flight
 registry below, and `_INBOX.bridge.>`. Nothing wider - a bridge that can publish
 submissions is a bridge that can impersonate the gateway.
+
+Two of those grants are the capability check's: publish `a2a.cap.verify.platform` and
+subscribe `a2a.cap.reply.platform.>`. Both are single subjects rather than wildcards,
+and that is load-bearing twice over. The verifier reads its caller off the last token of
+the subject it was asked on, so a principal granted `a2a.cap.verify.*` could name itself
+anything; and any principal permitted to subscribe to a request subject may join a queue
+group on it, so a wildcard in the reply space would let this user intercept other
+principals' verifications rather than merely observe them. The bridge asks as `platform`
+rather than as `bridge` because `platform` is the addressee the gateway writes into the
+capability's `delegate` - the name it is being asked about is the routing identity, not
+the connection's. `a2a/authcallout`'s conformance suite pins both halves, including that
+a forged caller name is refused by the server.
+
+**What scope the check runs at.** The bridge resolves it from `A2A_AUTHORITY_SCOPE` if
+that is set, else `POD_NAMESPACE`, else the kubelet's serviceaccount namespace file. On a
+rendered install only the middle rung ever fires: the operator sets no
+`A2A_AUTHORITY_SCOPE` on the sidecar, and the pod is built with
+`automountServiceAccountToken: false`, so there is no namespace file to read. That is why
+the render supplies `POD_NAMESPACE` from the downward API. Before it did, the third rung
+returned ENOENT, the scope resolved empty, and every `platform`-scoped task was refused on
+a default install - fail-closed, but closed on everything. The file read stays as the last
+rung for a bridge run by hand outside the operator's render, which is the only place it
+can succeed.
+
+The bridge holds no read on the `cap` bucket. It cannot resolve a capability itself, only
+ask; the verifier is the only principal on the bus that may read the store. See
+`docs/architecture/09-capability-envelope.md`.
 
 The JetStream tax is not `$JS.API.>`: it is the `$JS.API` subjects the bridge emits on
 TASKS and `KV_runtime-state` — stream info, consumer create, pull, direct get, and the
