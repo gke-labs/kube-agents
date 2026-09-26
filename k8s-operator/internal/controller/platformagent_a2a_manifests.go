@@ -307,6 +307,7 @@ const (
 	a2aBridgePasswordKey  = "bridge-password"  // #nosec G101 -- Secret key name, not a credential
 	a2aSeedPasswordKey    = "seed-password"    // #nosec G101 -- Secret key name, not a credential
 	a2aWebPasswordKey     = "web-password"     // #nosec G101 -- Secret key name, not a credential
+	a2aConsolePasswordKey = "console-password" // #nosec G101 -- Secret key name, not a credential
 	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
 
@@ -541,7 +542,7 @@ func randomA2APassword() (string, error) {
 // still has a credential.
 var a2aCredsKeys = []string{
 	a2aGatewayPasswordKey, a2aBridgePasswordKey, a2aSeedPasswordKey,
-	a2aWebPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
+	a2aWebPasswordKey, a2aConsolePasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
 }
 
 // a2aProvisionedStreams is every JetStream stream the provision Job creates, and
@@ -1197,13 +1198,14 @@ authorization {
     # task. Do not read this list as the session path.
     #
     # A name is here for one of three reasons, and each identity's own comment
-    # above says which. It can hold no projected token at all — the browser
-    # read user, the $SYS login held by a person, the seed tooling that is
-    # applied rather than run. Or it is a sidecar, which a ServiceAccount
-    # token cannot name apart from the container beside it — the bridge, whose
-    # own comment above says what a callout entry there would merge. Or it
-    # could move and has not: gateway, which is the remaining migration. The
-    # first two reasons are permanent; only the third is a migration.
+    # above says which. It can hold no projected token at all — the browser's
+    # two credentials, web and console, the $SYS login held by a person, the
+    # seed tooling that is applied rather than run. Or it is a sidecar, which
+    # a ServiceAccount token cannot name apart from the container beside it —
+    # the bridge, whose own comment above says what a callout entry there
+    # would merge. Or it could move and has not: gateway, which is the
+    # remaining migration. The first two reasons are permanent; only the
+    # third is a migration.
     auth_users: [ ` + renderA2AAuthUsers(agent) + ` ]
   }
 }

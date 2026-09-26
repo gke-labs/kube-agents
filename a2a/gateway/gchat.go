@@ -114,6 +114,8 @@ func verifiedByFor(backend string) string {
 	switch backend {
 	case gchatBackend:
 		return gchatVerifiedBy
+	case consoleBackend:
+		return consoleVerifiedBy
 	case injectBackend:
 		// Its own value, not "principal-map" and deliberately nothing a real
 		// backend stamps. The map is what resolves the author here too, but
@@ -127,12 +129,15 @@ func verifiedByFor(backend string) string {
 }
 
 // unverifiedRemedyFor names what an admin edits to admit a sender — the
-// allowlist on gchat, the door's own map on inject, the mapping table
-// everywhere else.
+// allowlist on gchat, the door's own map on inject, nothing at all on the
+// console, the mapping table everywhere else.
 func unverifiedRemedyFor(backend string) string {
 	switch backend {
 	case gchatBackend:
 		return "the allowed users list"
+	case consoleBackend:
+		// Cannot happen from a real console frame; a spoofed author id can.
+		return "nothing - only the console credential's own frames are accepted here"
 	case injectBackend:
 		return "the inject door's principal map"
 	}
@@ -766,26 +771,36 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 }
 
 // resolvePrincipal establishes the requester's principal from the backend's
-// identity mechanism. On gchat the Google-asserted email IS the principal —
-// resolution is the identity function gated by the allowlist (the mapping
-// table other backends need is exactly what this backend exists to not
-// have). Everything else goes through a principal map. Empty means drop.
+// identity mechanism. On gchat the Google-asserted email IS the principal,
+// gated by the allowlist (the mapping table other backends need is exactly
+// what that backend exists to not have). On the console the NATS grant is
+// the mechanism: only the console credential can publish on the console
+// subject, so the author is the console principal - but only on a console
+// conversation, so the string "console" arriving on any other backend is
+// just an unmapped id. The inject door has a map, but its own and prefixed
+// (resolveInjectPrincipal), never this one. Everything else goes through the
+// principal map. Empty means drop.
 func (g *Gateway) resolvePrincipal(backend, authorID string) string {
-	if backend == injectBackend {
+	switch backend {
+	case injectBackend:
 		return g.resolveInjectPrincipal(authorID)
+	case consoleBackend:
+		if authorID == consoleAuthor {
+			return consolePrincipal
+		}
+		return ""
+	case gchatBackend:
+		if g.gchatAllowAll || g.gchatAllowed[strings.ToLower(authorID)] {
+			// Returned case-preserved, deliberately: the audit join requires
+			// hashing the SAME string the shipped attribution path hashes (the
+			// delivered sender email, un-normalized). If Google ever varies the
+			// asserted email's case across events, both surfaces fork the same
+			// way — lowercasing here would fix nothing and break the join.
+			return authorID
+		}
+		return ""
 	}
-	if backend != gchatBackend {
-		return g.pm.Resolve(authorID)
-	}
-	if g.gchatAllowAll || g.gchatAllowed[strings.ToLower(authorID)] {
-		// Returned case-preserved, deliberately: the audit join requires
-		// hashing the SAME string the shipped attribution path hashes (the
-		// delivered sender email, un-normalized). If Google ever varies the
-		// asserted email's case across events, both surfaces fork the same
-		// way — lowercasing here would fix nothing and break the join.
-		return authorID
-	}
-	return ""
+	return g.pm.Resolve(authorID)
 }
 
 // resolveInjectPrincipal resolves an author the side door delivered, and it

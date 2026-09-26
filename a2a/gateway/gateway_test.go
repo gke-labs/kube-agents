@@ -630,7 +630,7 @@ func TestRosterCapAndPseudonyms(t *testing.T) {
 	for i := range big {
 		big[i] = fmt.Sprintf("u%d", i)
 	}
-	raw := BuildAuthority(ps, pm, "test:bnaylor", "discord", "1001", "principal-map",
+	raw := BuildAuthority(ps, pm.Resolve, "test:bnaylor", "discord", "1001", "principal-map",
 		"discord:g/x", "group", big, true)
 	var auth Authority
 	if err := json.Unmarshal(raw, &auth); err != nil {

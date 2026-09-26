@@ -64,6 +64,7 @@ func a2aTestCreds() *corev1.Secret {
 			"bridge-password":  []byte("pw-bridge"),
 			"seed-password":    []byte("pw-seed"),
 			"web-password":     []byte("pw-web"),
+			"console-password": []byte("pw-console"),
 			"sys-password":     []byte("pw-sys"),
 			"callout-password": []byte("pw-callout"),
 		},
@@ -239,6 +240,7 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		"session": nil,
 		"seed":    nil,
 		"web":     nil,
+		"console": nil,
 		"sys":     nil,
 	}
 
@@ -666,6 +668,88 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 	// message streams, and a KV bucket is a stream called KV_<bucket>.
 	if strings.Contains(pub, "KV_") || strings.Contains(pub, "$KV.") {
 		t.Error("web can address a KV bucket stream")
+	}
+}
+
+// The console user is the web read surface plus one narrow publish: the
+// inbound chat subject the gateway's console adapter subscribes. Pinned
+// EXACTLY for the same reason web's list is - the reach lives in request
+// bodies and wildcards, and a blocklist cannot see either.
+func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+
+	start := strings.Index(conf, "user: console")
+	if start < 0 {
+		t.Fatal("nats.conf has no console user")
+	}
+	rest := conf[start:]
+	if next := strings.Index(rest[1:], "user: "); next >= 0 {
+		rest = rest[:next+1]
+	}
+	if !strings.Contains(rest, "pw-console") {
+		t.Error("console's password does not come from the creds Secret")
+	}
+
+	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
+	sub := rest[strings.Index(rest, "subscribe"):]
+	var got, gotSub []string
+	for _, line := range strings.Split(pub, "\n") {
+		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+		if strings.HasPrefix(line, `"`) {
+			got = append(got, strings.Trim(line, `"`))
+		}
+	}
+	for _, line := range strings.Split(sub, "\n") {
+		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+		if strings.HasPrefix(line, `"`) {
+			gotSub = append(gotSub, strings.Trim(line, `"`))
+		}
+	}
+	want := []string{
+		"$JS.API.INFO",
+		"$JS.API.STREAM.INFO.TASKS",
+		"$JS.API.STREAM.INFO.DIRECTORY",
+		"$JS.API.STREAM.INFO.TOPICS-STATE",
+		"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+		"$JS.API.CONSUMER.CREATE.TASKS.>",
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+		"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+		"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+		"$JS.API.CONSUMER.INFO.TASKS.*",
+		"$JS.API.CONSUMER.INFO.DIRECTORY.*",
+		"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+		"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+		"chat.console.*.in",
+		"_INBOX.console.>",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("console publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+	wantSub := []string{"a2a.>", "chat.console.*.out", "_INBOX.console.>"}
+	if !reflect.DeepEqual(gotSub, wantSub) {
+		t.Errorf("console subscribe allow-list changed.\n got: %q\nwant: %q", gotSub, wantSub)
+	}
+	// No verb on any KV_* stream, STREAM.INFO included: its subjects_filter
+	// body lists every key. Nor the KV data plane.
+	for _, gone := range []string{"$KV.", "KV_", "$JS.ACK.", "$JS.FC.", "$JS.API.>", "a2a.tasks"} {
+		if strings.Contains(pub, gone) {
+			t.Errorf("console publish list contains %q", gone)
+		}
+	}
+
+	// The other half of the door: the gateway can hear the inbound subject
+	// and answer on the outbound one.
+	gw := conf[strings.Index(conf, "user: gateway"):]
+	gw = gw[:strings.Index(gw[1:], "user: ")+1]
+	if !strings.Contains(gw, `"chat.console.*.out"`) {
+		t.Error("gateway cannot publish console notices")
+	}
+	if !strings.Contains(gw, `"chat.console.*.in"`) {
+		t.Error("gateway cannot subscribe the console inbound subject")
 	}
 }
 
@@ -3351,7 +3435,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "_INBOX.gateway.>",
+		"agents.hb.>", "$KV.session-state.>", "chat.console.*.in", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
 	}
@@ -3360,6 +3444,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"a2a.tasks.*.*.in",
 		"a2a.tasks.*.*.supervisor",
 		"$KV.session-state.>",
+		"chat.console.*.out",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")
@@ -3861,10 +3946,13 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 	)
 	// The namespaces a grant may start in: the bus's own subjects, the
 	// core-NATS heartbeats (agents.hb.>, spec-a2a-payloads' subject table),
-	// JetStream, KV, and inboxes. A first token outside them is a grant
+	// JetStream, KV and inboxes. A first token outside them is a grant
 	// nothing here can read, and a wildcard there (">", "*.API.>", "*.>")
 	// covers all five at once, which no literal spelling check would see.
-	namespaces := []string{"a2a", "agents", "$JS", "$KV", "_INBOX"}
+	// The console door is admitted as two exact subjects rather than a sixth
+	// namespace -- see grantNamespaceAllowed for why, and for how this
+	// divides with TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader,
+	// which decides which principal may hold the door.
 	ownInbox := inboxPrefix + user + ".>"
 	reached := map[string]map[string]bool{}
 
@@ -3882,8 +3970,8 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 			// wholesale grant appears only where the table records it.
 			// Whether a wildcard further in covers a subject the row does
 			// not record is asked by subject matching in the caller.
-			if first, _, _ := strings.Cut(g, "."); !slices.Contains(namespaces, first) {
-				t.Errorf("%s %s holds %q, whose first token %q is none of %v", user, section, g, first, namespaces)
+			if !grantNamespaceAllowed(g) {
+				t.Errorf("%s %s holds %q, which names no namespace the bus reads and is neither console door subject (%s, %s)", user, section, g, consoleInbound, consoleOutbound)
 				continue
 			}
 			if g == bareJetStreamAPI {
@@ -4002,6 +4090,11 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 
 	kvSessionState := a2aKVStreamPrefix + "session-state"
 	kvRuntimeState := a2aKVStreamPrefix + a2aRuntimeStateBucket
+	// console holds web's four streams and verbs and nothing on any KV_*
+	// stream: STREAM.INFO's subjects_filter body would list every key.
+	consoleStreams := a2aSameVerbsOn(
+		[]string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream},
+		"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT")
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{
@@ -4036,6 +4129,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			streams: a2aSameVerbsOn(
 				[]string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream},
 				"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT"),
+			accountLevel: []string{"$JS.API.INFO"},
+		},
+		"console": {
+			streams:      consoleStreams,
 			accountLevel: []string{"$JS.API.INFO"},
 		},
 		"provision": {
@@ -4227,6 +4324,194 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// subjectPatternsOverlap reports whether some concrete subject matches both
+// NATS subject patterns a and b. It walks the two token by token: "*" on
+// either side matches any single token, ">" on either side matches the
+// remainder (one or more tokens, whatever the other side holds there), and
+// two literals overlap only when they are equal. Unlike subjectMatches, both
+// sides may carry wildcards, so a literal grant (chat.console.abc.in), a
+// partial wildcard (chat.*.*.in) and a tail wildcard (chat.>) all register
+// against the pattern chat.console.*.in.
+func subjectPatternsOverlap(a, b string) bool {
+	at := strings.Split(a, ".")
+	bt := strings.Split(b, ".")
+	for i := 0; i < len(at) && i < len(bt); i++ {
+		if at[i] == ">" || bt[i] == ">" {
+			return true
+		}
+		if at[i] != "*" && bt[i] != "*" && at[i] != bt[i] {
+			return false
+		}
+	}
+	return len(at) == len(bt)
+}
+
+func TestSubjectPatternsOverlap(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"chat.console.abc.in", "chat.console.*.in", true},
+		{"chat.>", "chat.console.*.in", true},
+		{"chat.console.*.out", "chat.console.*.in", false},
+		{"a2a.>", "chat.console.*.in", false},
+		{"chat.*.*.in", "chat.console.*.in", true},
+		{">", "chat.console.*.in", true},
+		{"chat.console.*.in", "chat.console.>", true},
+		{"chat.console.in", "chat.console.*.in", false},
+		{"chat.console.*.in.x", "chat.console.*.in", false},
+		{"chat.console", "chat.console.>", false},
+		{"*.*.*.*", "chat.console.*.in", true},
+	}
+	for _, c := range cases {
+		if got := subjectPatternsOverlap(c.a, c.b); got != c.want {
+			t.Errorf("subjectPatternsOverlap(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+		if got := subjectPatternsOverlap(c.b, c.a); got != c.want {
+			t.Errorf("subjectPatternsOverlap(%q, %q) = %v, want %v (not symmetric)", c.b, c.a, got, c.want)
+		}
+	}
+}
+
+// The console chat door, in the one spelling every check here shares. Two
+// exact subjects, not a namespace: these are the only chat.* grants the
+// render produces, so admitting the "chat" namespace wholesale in rule 2
+// would be wider than the thing being held.
+const (
+	consoleInbound  = "chat.console.*.in"
+	consoleOutbound = "chat.console.*.out"
+)
+
+// grantNamespaceAllowed is rule 2's spelling check. A grant's first token
+// must name one of the bus's own namespaces, or the grant must BE one of the
+// two console door subjects.
+//
+// The door is deliberately not a namespace here. Admitting "chat" would stop
+// refusing chat.gchat.>, chat.console.*.status or chat.console.*.in.x by
+// spelling on every principal, and consoleDoorViolations cannot pick them up
+// because none of them overlaps either door pattern (the overlap table below
+// pins chat.console.*.in.x as a non-overlap). The two checks divide the work:
+// this one refuses everything in chat.* that is not the door, and the door
+// test decides which principal may hold the door itself.
+func grantNamespaceAllowed(g string) bool {
+	if g == consoleInbound || g == consoleOutbound {
+		return true
+	}
+	first, _, _ := strings.Cut(g, ".")
+	return slices.Contains([]string{"a2a", "agents", "$JS", "$KV", "_INBOX"}, first)
+}
+
+// TestGrantNamespaceCheckRefusesChatBeyondTheDoor pins rule 2's half of the
+// split. The door test cannot cover these: none of them overlaps either door
+// pattern, so consoleDoorViolations returns nothing for any of them and a
+// grant like chat.gchat.> would otherwise pass the whole suite on any list
+// with no exact pin (web subscribe, seed subscribe, provision's two lists).
+func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
+	for _, tc := range []struct {
+		grant   string
+		allowed bool
+	}{
+		{consoleInbound, true},
+		{consoleOutbound, true},
+		{"a2a.task.>", true},
+		{"agents.hb.>", true},
+		{"$JS.API.STREAM.INFO.a2a", true},
+		{"$KV.sessions.>", true},
+		{"_INBOX.>", true},
+		// chat.* that is not the door, in every shape the render could
+		// grow one: a sibling backend, a sibling verb, a suffix under a
+		// door subject, and the namespace wildcard.
+		{"chat.gchat.>", false},
+		{"chat.discord.*.in", false},
+		{"chat.console.*.status", false},
+		{"chat.console.*.in.x", false},
+		{"chat.console.>", false},
+		{"chat.>", false},
+		{"chat", false},
+		// And the wildcards that cover every namespace at once.
+		{">", false},
+		{"*.API.>", false},
+		{"*.>", false},
+	} {
+		if got := grantNamespaceAllowed(tc.grant); got != tc.allowed {
+			t.Errorf("grantNamespaceAllowed(%q) = %v, want %v", tc.grant, got, tc.allowed)
+		}
+	}
+}
+
+// consoleDoorViolations returns one line per grant, across ids, that
+// overlaps a console door subject pattern on a principal other than that
+// side's one intended holder: publish on chat.console.*.in is console's
+// alone, subscribe there is gateway's alone, and the reverse for
+// chat.console.*.out.
+func consoleDoorViolations(ids []a2aIdentity) []string {
+	rules := []struct {
+		verb, pattern, owner string
+		grants               func(a2aIdentity) []string
+	}{
+		{"publish", consoleInbound, "console", func(id a2aIdentity) []string { return id.publish }},
+		{"publish", consoleOutbound, "gateway", func(id a2aIdentity) []string { return id.publish }},
+		{"subscribe", consoleInbound, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", consoleOutbound, "console", func(id a2aIdentity) []string { return id.subscribe }},
+	}
+	var out []string
+	for _, id := range ids {
+		for _, r := range rules {
+			if id.user == r.owner {
+				continue
+			}
+			for _, g := range r.grants(id) {
+				if subjectPatternsOverlap(g, r.pattern) {
+					out = append(out, fmt.Sprintf("%s %s %q overlaps %s; only %s may %s it", id.user, r.verb, g, r.pattern, r.owner, r.verb))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader is the property the
+// console identity's security claim rests on (consoleIdentity's own comment):
+// the gateway takes a frame on chat.console.*.in as coming from nats:console
+// with no mapping table in between, because only console can publish there --
+// and console takes a notice on chat.console.*.out as coming from the
+// gateway for the same reason. Rule 2 above refuses everything in chat.*
+// that is not one of the two door subjects; what it cannot do is say which
+// principal may hold the door, since the door subjects are spelled the same
+// on whoever carries them. That is this test's job, and it holds them to one
+// intended writer and one intended reader: every principal's publish and
+// subscribe lists are checked for pattern overlap (subjectPatternsOverlap,
+// wildcards on either side) against chat.console.*.in and
+// chat.console.*.out. A literal chat.console.abc.in, a chat.*.*.in, or a
+// chat.> on any other principal -- bridge, seed, the callout-issued agent or
+// provision, even a widened web -- trips here; the mutation half below
+// proves the check would.
+func TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
+	ids := a2aIdentities(a2aTestAgent())
+	for _, v := range consoleDoorViolations(ids) {
+		t.Error(v)
+	}
+
+	// Mutation: one non-console principal gains a literal-token grant on
+	// the inbound subject. The same check over the modified set must report
+	// it, or the check above proves nothing.
+	mutated := slices.Clone(ids)
+	found := false
+	for i := range mutated {
+		if mutated[i].user == a2aBridgeUser {
+			mutated[i].publish = append(slices.Clone(mutated[i].publish), "chat.console.abc.in")
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no %s identity to mutate", a2aBridgeUser)
+	}
+	v := consoleDoorViolations(mutated)
+	if len(v) != 1 || !strings.Contains(v[0], a2aBridgeUser+" publish \"chat.console.abc.in\"") {
+		t.Errorf("a literal chat.console.abc.in publish grant on %s was not reported exactly once; got %q", a2aBridgeUser, v)
 	}
 }
 
