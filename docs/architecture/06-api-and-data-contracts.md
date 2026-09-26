@@ -221,15 +221,20 @@ dispatches directly to the named agent — constant-time, no inference. On Googl
 carries a numeric `commandId`; on Slack it is a registered `/command`. Both map to the handle table
 above; the gateway normalizes them to a single dispatch path.
 
-**Resolution order:** (1) slash command → (2) explicit `@handle` → (3) NL inference (fallback; low
-confidence → clarify, not guess). Modes 1–2 spend no inference; mode 3 spends one router call.
+**Resolution order:** (1) slash command → (2) explicit `@handle` → (3) the conversation's session agent
+(fallback for a thread nothing has bound; unsure → clarify, not guess). The gateway spends no inference
+in any mode; mode 3's inference is the session agent's, which the gateway hands the turn to. A `/session`
+command that opts a conversation onto the session route is a slash command that names a route rather
+than a handle; it is planned, not built.
 
 **Attribution (extends §8).** Every chat turn's audit record adds the **resolved agent** (`tier`,
-`scope`) and the **routing mode** (`slash` | `handle` | `inference`) alongside the requester +
-trace/session IDs. Thread affinity (sticky routing) is keyed on the session store's `thread_id`
+`scope`) and the **routing mode** (`slash` | `handle` | `session`) alongside the requester +
+trace/session IDs; for mode 3 the gateway records the session, and the target of any delegation the
+session makes is on the child task's envelope, with the same requester. Thread affinity (sticky routing) is keyed on the session store's `thread_id`
 (§6). Routing is **never** an authz signal ([03](03-security-model.md) §4a): the gateway checks the
-target agent's `AllowedUsers` before dispatch, and the NL router (model output) is never trusted for
-authorization.
+target agent's `AllowedUsers` before dispatch, and when a session delegates, the target's `AllowedUsers`
+is checked against the turn's requester where the child task is minted; the session agent's routing
+choice (model output) is never trusted for authorization.
 
 **Allowlist source & enforcement.** The gateway resolves the **target** agent's trusted-human allowlist
 by reading that `(tier, scope)` **`Agent` CR's** `integration.{googleChat,slack}.allowedUsers` (§1.1) —

@@ -218,11 +218,11 @@ kube-agents provides a single chat **gateway** — the **`@kage`** bot — as th
 supports **three ways to address an agent**, in strict precedence (deterministic first, inference
 last):
 
-| #   | Mode                            | Example                                                          | How the target is resolved                                           | Inference? |
-| --- | ------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------- | ---------- |
-| 1   | **Deterministic slash command** | `@kage /devteam-charlie why is checkout erroring?`               | Slash command → the handle it names; constant-time dispatch          | No         |
-| 2   | **Direct mention (handle)**     | `@cluster-bravo drain node-7`                                    | The `@<tier>-<scope>` handle → its `(tier, scope)` — an alias lookup | No         |
-| 3   | **Natural-language routing**    | `@kage why is my app crashing on the bravo cluster, charlie ns?` | The gateway's NL router infers tier + scope from the text and routes | Yes        |
+| #   | Mode                            | Example                                                          | How the target is resolved                                                     | Inference?                            |
+| --- | ------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------- |
+| 1   | **Deterministic slash command** | `@kage /devteam-charlie why is checkout erroring?`               | Slash command → the handle it names; constant-time dispatch                    | No                                    |
+| 2   | **Direct mention (handle)**     | `@cluster-bravo drain node-7`                                    | The `@<tier>-<scope>` handle → its `(tier, scope)` — an alias lookup           | No                                    |
+| 3   | **Natural-language routing**    | `@kage why is my app crashing on the bravo cluster, charlie ns?` | The conversation's session agent reads the text and resolves the target itself | Yes (in the session, not the gateway) |
 
 **Handles are derived, not a registry.** An agent's handle is its `<tier>-<scope>` name (§6.1) —
 `@platform-<project>`, `@cluster-admin-<cluster>` (short alias `@cluster-<cluster>`), and
@@ -234,8 +234,12 @@ cardinality on (§8), so there is no separate routing table to drift
 **Precedence: deterministic over inference.** A slash command (1) or an explicit handle (2) always
 wins and spends **no** inference — the same "prefer deterministic over probabilistic" principle the
 workflow model applies to push-over-poll ([04](04-workflow-model.md) §4). Natural-language routing
-(3) is the convenience fallback for humans who don't know the exact handle; when the router's
-confidence is low it **asks a clarifying question rather than guessing**. Once a thread is routed,
+(3) is the convenience fallback for humans who don't know the exact handle; it is performed by the
+conversation's session agent, not by a model call in the gateway (the gateway holds no model,
+[`spec-chatops-gateway.md`](../designs/spec-chatops-gateway.md), "Sessions by default"), and when the
+agent is unsure it **asks a clarifying question rather than guessing**. When the session delegates on
+the human's behalf, the child task carries that human as requester and the target's allowlist is
+enforced on it where the child is minted, so the worst-case bound below holds for a delegation too. Once a thread is routed,
 follow-ups **stick to the same agent** (thread affinity via the session store,
 [06](06-api-and-data-contracts.md) §6) unless re-addressed.
 
@@ -249,11 +253,12 @@ to the addressed agent; agents still never call each other synchronously.
 
 **Routing is not an authorization signal.** Which agent a message reaches is a _convenience_, never
 a privilege grant. The gateway enforces the target agent's trusted-human allowlist (`AllowedUsers`)
-**before** dispatch ([03](03-security-model.md) §4a), and the NL router's output — like all model
-output — is never trusted as an authz signal ([03](03-security-model.md) §1). So a mis-route can
+**before** dispatch ([03](03-security-model.md) §4a), and the session agent's routing choice — like all
+model output — is never trusted as an authz signal ([03](03-security-model.md) §1). So a mis-route can
 only ever land on an agent the human is _already_ allowed to reach, still bounded by that agent's
 read-only, tier-scoped ceiling. Every turn is audited with the requester, the resolved agent, and
-the routing mode ([06](06-api-and-data-contracts.md) §2b, §8).
+the routing mode ([06](06-api-and-data-contracts.md) §2b, §8); for a session-routed turn the gateway
+records the mode and the session, and the target of any delegation is on the child task's envelope.
 
 ---
 
@@ -497,5 +502,5 @@ A harness confirms this doc's design with:
 - **Chat entrypoints & routing:** each persona exposes its own authenticated entrypoint (one per
   audience); the ChatOps gateway resolves a slash command or `@<tier>-<scope>` handle to the matching
   `(tier, scope)` agent **deterministically** (no inference), and enforces that agent's `AllowedUsers`
-  before dispatch (§2.4). NL routing falls back to inference and, on low confidence, asks rather than
-  guesses.
+  before dispatch (§2.4). Unaddressed text falls back to the conversation's session agent, which asks
+  when unsure rather than guessing.
