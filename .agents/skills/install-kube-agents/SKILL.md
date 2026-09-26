@@ -5,7 +5,9 @@ description: Install, set up, or deploy kube-agents (the Kubernetes Agentic Harn
 
 # `install-kube-agents` Skill
 
-This skill provides step-by-step instructions for AI Agents to non-interactively provision Google Cloud GKE infrastructure and deploy the `kube-agents` Platform Agent.
+Install `kube-agents` for an operator: detect their environment and interview them for the choices
+that shape the install, preview it with `--dry-run`, and apply only after they confirm. Follow
+[Install workflow](#install-workflow).
 
 ## What `install.sh` actually does
 
@@ -15,6 +17,8 @@ hand-authored configuration), collects anything still missing, generates
 `lifecycle.sh apply` — the Terraform root in
 [`terraform/examples/full-install/`](../../../terraform/examples/full-install/README.md) owns every
 GCP resource and installs the Helm chart (`charts/kube-agents`) that owns every Kubernetes one.
+The chart installs the operator and the `PlatformAgent` into the `kubeagents-system` namespace
+(`DEFAULT_NAMESPACE`; `--agent-namespace` overrides it).
 Terraform state goes to a GCS bucket (`<project>-kube-agents-tfstate`, versioned, prefix
 `kube-agents/<cluster>`), so `uninstall.sh` and `upgrade.sh` can find the install from a fresh
 clone. The installer sources
@@ -34,9 +38,120 @@ it, the managed-OTel scope on a cluster it created — and the GitHub App PEM im
 the Minty CLI so the key never enters Terraform state. Re-running the installer (or its `--menu`
 Day-2 panel's Save & Apply) reconciles every change through one `terraform apply`.
 
-## Quick Execution for AI Agents
+## Install workflow
 
-For production installations, AI Agents and automated pipelines must target an official release version. When recommending commands to users or executing deployments, AI Agents must resolve the latest stable release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (e.g. `0.4.0`) and provide executable commands with that exact release version substituted, rather than leaving an unrendered `<RELEASE_VERSION>` placeholder:
+Run the three stages in order. Stages 1 and 2 create and change nothing in the project or cluster;
+nothing is applied until the operator confirms in stage 3. Pass `--non-interactive` to every
+`install.sh` call: a tool call has no terminal for the installer's `/dev/tty` prompts, so the
+interview happens in chat instead.
+
+After every `install.sh` call, read the exit code before `/tmp/kube-agents-install-report.json`.
+Several exits (the service-account ownership check, input validation, a missing tool under
+`--dry-run`, the GitHub App PEM import) write no report and leave an earlier run's in place.
+
+Resolve the latest stable release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases)
+(e.g. `0.4.0`) first, and substitute it for `<RELEASE_VERSION>` in every command you run or hand
+over; never leave the placeholder unrendered.
+
+### Stage 1: Detect and interview
+
+Read the environment; change nothing:
+
+```bash
+gcloud config get-value project
+gcloud config get-value compute/region
+gcloud auth application-default print-access-token >/dev/null && echo "ADC: ok"
+gcloud container clusters list --project <PROJECT_ID>
+gcloud storage ls gs://<PROJECT_ID>-kube-agents-tfstate/kube-agents/
+```
+
+No `ADC: ok` means no Application Default Credentials; stage 3 cannot run without them (stage 2
+says why), so have the operator run `gcloud auth application-default login` now.
+
+A prefix in that bucket means an install already exists in the project, and so does an
+`install.env` where the installer looks for one: `$KUBE_AGENTS_INSTALL_ENV`, beside `install.sh`,
+the current directory, or `$HOME/kube-agents/` (where the `curl | bash` form clones). Ask whether
+the operator wants [`upgrade-kube-agents`](../upgrade-kube-agents/SKILL.md) instead. A re-run reads
+that `install.env`; [`scripts/installer/README.md`](../../../scripts/installer/README.md) owns the
+precedence between it, flags and defaults.
+
+Propose the detected value or the default for each decision below, and have the operator confirm or
+change it. Never ask for a secret in chat: the installer reads each one from the environment it runs
+in, where the operator sets it.
+
+1. **Project and region** — `--gcp-project-id`, `--gcp-region`. Defaults: the active `gcloud`
+   project, and its `compute/region` or, when that is unset, `DEFAULT_REGION`.
+2. **Cluster** — create one (`--gke-cluster-name`, default `DEFAULT_CLUSTER_NAME`; Autopilot unless
+   `--gke-cluster-mode=standard` or a zonal region) or install onto one from the list. An existing
+   cluster can need changes; stage 2 lists them.
+3. **Model provider** — `--model-provider`. `vertex_ai` authenticates through Workload Identity and
+   needs no API key; `gemini`, `anthropic` and `openai` read `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`
+   or `OPENAI_API_KEY`, and `gemini` also finds a key stored in Secret Manager. The default is
+   `DEFAULT_MODEL_PROVIDER`; pass the flag for any other choice.
+4. **How the operator reaches the agent** — a terminal when no chat flag is passed (see
+   [Handing over a chat-less install](#handing-over-a-chat-less-install)), `--enable-google-chat`,
+   or `--enable-slack` (tokens in `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`).
+   `--enable-hermes-dashboard=true` adds the Hermes Web UI, which a port-forward cannot reach under
+   gVisor; the
+   [PlatformAgent reference](../../../docs/site/src/content/docs/operator/platformagent-crd.md)
+   gives its access path. GitOps pull requests add `--gitops-org`, `--gitops-repo` and
+   `--github-app-id`; see
+   [GitOps Repository & GitHub Token Minter Configuration](#gitops-repository--github-token-minter-configuration).
+
+Leave `--permission-set` at `read-only` unless the operator asks for `custom`. The flags in
+[Adopting a cluster the operator already owns](#adopting-a-cluster-the-operator-already-owns) are
+the operator's decision, never a default you fill in.
+
+### Stage 2: Dry run
+
+Run the installer with the agreed flags and `--dry-run`. It validates the Terraform configuration
+and, when Application Default Credentials exist, runs `terraform plan` against local state; it
+creates nothing, the state bucket included:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --dry-run \
+  --non-interactive \
+  --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
+  --model-provider="gemini" \
+  --permission-set="read-only"
+```
+
+A dry run regenerates `terraform.tfvars`, so back up a real deployment's copy first. It writes no
+`install.env`: a dry run provisions nothing, so it has no install to record, and an existing one is
+never rewritten. It also installs no missing tool — a machine without any installer prerequisite
+(`terraform`, `helm`, `gh`, `gke-gcloud-auth-plugin` and the rest) fails it with
+`Dry-run validation will not install missing tools`, naming the tool; install it and re-run.
+
+Go through the output with the operator:
+
+- `DRY_RUN_SUCCESS` in `/tmp/kube-agents-install-report.json` does not clear an existing cluster.
+  The dry run exits before the consent gates, so it never reports `REFUSED_*`.
+- On an existing cluster, the `Existing Cluster Mutations (Adoption)` summary and any
+  `Dry-run: skipping terraform plan because ...` warning are the questions to put to the operator,
+  as [Adopting a cluster the operator already owns](#adopting-a-cluster-the-operator-already-owns)
+  sets out.
+- `No Application Default Credentials; skipping the resource preview` means no plan ran, and on an
+  existing cluster the NetworkPolicy and node-pool checks were skipped too, so their warnings are
+  missing. Have the operator run `gcloud auth application-default login` and repeat stage 2. Do not
+  go to stage 3 without ADC: the apply's Terraform needs it, the installer's own auth check does not
+  test it, and on an existing cluster the Workload Identity, CMEK and NetworkPolicy changes run
+  before Terraform starts — the install fails after making them.
+- `No ... API key was provided` is a warning, not a failure: the install would finish with an agent
+  that cannot call its model. Resolve the key before stage 3.
+
+When the operator would rather run the apply themselves, use [`--generate-only`](#generate-only-mode)
+instead: it runs the consent gates and reports `REFUSED_*` itself.
+
+### Stage 3: Confirm and apply
+
+When the operator chooses an adoption flag in stage 2, re-run stage 2 with it: the flag changes both
+the adoption summary and whether `terraform plan` runs at all, so the first preview no longer shows
+what will run. Summarize the project, the cluster (new or existing, and each change the run makes to
+an existing one), the namespace, the model provider and how the operator reaches the agent. Wait
+for an explicit go-ahead. Then run the last stage 2 command without `--dry-run`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
@@ -48,7 +163,23 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --permission-set="read-only"
 ```
 
-If deploying from local sources instead of piping the script via curl, AI Agents should unpack the official release bundle (recommended):
+- Non-zero exit: the install did not finish. Relay the error the installer printed. A `REFUSED_*`
+  status leaves the cluster unchanged — relay the options and stop.
+- `SUCCESS`, or `SUCCESS_PENDING_ROLLOUT` (applied, but a deployment had not reported ready; relay
+  the `kubectl rollout status` command the installer printed): relay how to reach the agent — the
+  terminal commands in [Handing over a chat-less install](#handing-over-a-chat-less-install), which
+  also fetch credentials, or the chat platform the operator enabled — then confirm the pods with
+  `kubectl get pods -n kubeagents-system`. Relay `network_policy_enforcement` when it is not
+  `enforced` ([Machine-Readable Results](#machine-readable-results)).
+
+The `kubectl` commands in this skill assume the default namespace; under `--agent-namespace`,
+substitute its value.
+
+### Local sources and pre-confirmed runs
+
+The same invocation runs from the official release bundle (recommended) or a checkout pinned to the
+release tag; add `--dry-run` for stage 2 exactly as above. Run an apply without stages 1 and 2 only
+when the operator has already confirmed these exact flags, or in CI.
 
 ```bash
 curl -fsSL https://github.com/gke-labs/kube-agents/releases/download/<RELEASE_VERSION>/kube-agents-<RELEASE_VERSION>.tar.gz | tar -xz
@@ -61,7 +192,7 @@ cd kube-agents-<RELEASE_VERSION>
   --permission-set="read-only"
 ```
 
-Alternatively, if a Git checkout is specifically required, clone pinned to the target release tag:
+If a Git checkout is required, clone pinned to the release tag:
 
 ```bash
 git clone --branch <RELEASE_VERSION> https://github.com/gke-labs/kube-agents.git
@@ -97,21 +228,6 @@ In `--generate-only` mode, the installer:
 4. Exits 0 with status `GENERATE_ONLY_SUCCESS` in `/tmp/kube-agents-install-report.json`, or exits 1 with the `REFUSED_*` / `FAILED_PREFLIGHT_*` status from step 2.
 
 The interactive wizard also offers the same choice by answering `g` at the final confirmation step.
-
-## Dry-Run Inspection
-
-To validate prerequisites and preview the install without creating GCP resources, AI Agents must use `--dry-run` with the official release installer (substituting `<RELEASE_VERSION>` with the resolved release version):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
-  --dry-run \
-  --non-interactive \
-  --gcp-project-id="YOUR_GCP_PROJECT_ID"
-```
-
-A dry run regenerates `terraform.tfvars`, so back that up first if a real deployment's copy is
-already there. It writes no `install.env`: a dry run provisions nothing, so it has no install to
-record, and an existing one is never rewritten.
 
 ## Adopting a cluster the operator already owns
 
@@ -236,12 +352,14 @@ The GitHub App and its permissions, the private key, the Cloud KMS signing key a
 
 One input decides whether the minter can work at all, so it is worth stating where the command is: `--gitops-org` must be a GitHub **organization**. Minty resolves App installations at `/orgs/{org}/installation`, which returns 404 for a personal account, and `install.sh` refuses one rather than deploying a minter that can never mint a token.
 
+The commands below are stage 2 dry runs showing the GitOps flags. Replace the placeholders and example values with the operator's values from stage 1, review the output as stage 2 describes, and apply through stage 3 once the operator confirms — Path 1 creates a Cloud KMS key ring and key, which cannot be deleted.
+
 ### Deployment Path 1: Automated Import via `install.sh`
 
 In this path, `install.sh` automatically creates the Cloud KMS keyring/key (if missing) and imports the GitHub App private key using the Minty CLI before Terraform applies:
 
 ```bash
-./install.sh --non-interactive \
+./install.sh --dry-run --non-interactive \
   --gcp-project-id="YOUR_GCP_PROJECT_ID" \
   --gke-cluster-name="platform-agent-host" \
   --gcp-region="us-central1" \
@@ -252,14 +370,14 @@ In this path, `install.sh` automatically creates the Cloud KMS keyring/key (if m
   --github-pem-path="/path/to/app-private-key.pem"
 ```
 
-Delete the `.pem` once the run succeeds. Cloud KMS keys cannot be destroyed, and a later run or upgrade finds the `ENABLED` version and skips the import.
+Delete the `.pem` once the stage 3 apply succeeds. Cloud KMS keys cannot be destroyed, and a later run or upgrade finds the `ENABLED` version and skips the import.
 
 ### Deployment Path 2: Pre-Provisioned / Ahead-Of-Time (AOT) Key
 
 For CI/CD pipelines and anywhere runners must not handle raw private keys, the key is imported ahead of time — the procedure, and the keyring and key names `install.sh` expects, are in [Token minter](https://gke-labs.github.io/kube-agents/deploy/token-minter/). Once the key holds an `ENABLED` version, invoke `install.sh` without `--github-pem-path`:
 
 ```bash
-./install.sh --non-interactive \
+./install.sh --dry-run --non-interactive \
   --gcp-project-id="YOUR_GCP_PROJECT_ID" \
   --gke-cluster-name="platform-agent-host" \
   --gcp-region="us-central1" \
