@@ -121,6 +121,6 @@ verification_spec:
       required_phrases: ["authorized-networks"]
   # No deterministic mutation safeguard, documented: the planted state is a
   # GKE label and a GKE control-plane facet, not a cluster object, so there
-  # is no resource for resource_property to assert on, and tool_called is
-  # blind to a delegated worker's calls. The fleet's scheduled reconcile owns
-  # the fixture's integrity.
+  # is no resource for resource_property to assert on, and tool_called, even
+  # under scope: workers, counts a worker's call as intent, not effect. The
+  # fleet's scheduled reconcile owns the fixture's integrity.

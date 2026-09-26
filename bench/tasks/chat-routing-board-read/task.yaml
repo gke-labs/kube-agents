@@ -29,7 +29,7 @@
 # Unlike every delegation case, the calls under test are the responding
 # agent's own — the trajectory tool_called reads is the front door's, and
 # kanban_list / kanban_create are front-door calls — so this sits entirely
-# inside tool_called's router-only limit (verifiers.py) instead of working
+# inside tool_called's default router scope (verifiers.py) instead of working
 # around it.
 #
 # One standing text disagreed with that premise, and the measured run

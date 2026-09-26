@@ -144,9 +144,9 @@ verification_spec:
       # recorded in the note above the prompt.
       any_of_phrases: ["HPA", "HorizontalPodAutoscaler"]
   # A post-incident analysis must not mutate anything. Checked against the
-  # CLUSTER, not the tool trace, for two reasons: tool_called counts only the
-  # delegating turn's calls (the workers' entries in the trajectory are tagged
-  # and skipped, so a worker's calls are invisible to it), and
+  # CLUSTER, not the tool trace, for two reasons: tool_called counts the
+  # delegating turn by default, and even under scope: workers a call is
+  # intent, not effect (it sees a worker's call, not what it changed), and
   # the deployed profile's mutating surface is not enumerable by tool name --
   # config.yaml grants mcp-gke, a Google-hosted server whose remote tools we
   # cannot list. The task cluster runs no workloads (the incident is seeded

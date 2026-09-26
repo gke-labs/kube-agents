@@ -157,9 +157,9 @@ verification_spec:
       forbidden_phrases: ["CVE-"]
   # No deterministic mutation safeguard, documented: the planted defect is
   # the control-plane version, not a cluster object.
-  # tool_called is structurally blind to worker mutations (it counts only the
-  # delegating turn's calls; the workers' entries in the trajectory are
-  # tagged and skipped), so the honest safeguard is
+  # tool_called is structurally blind to worker mutations (it counts the
+  # delegating turn by default, and even under scope: workers a call is
+  # intent, not effect), so the honest safeguard is
   # cluster state -- and this scenario's planted defect is not a Kubernetes
   # object, so there is no resource to assert on. The fleet's scheduled
   # reconcile owns the defect's integrity; a mutation here surfaces there.
