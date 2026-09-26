@@ -6,6 +6,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -247,10 +248,15 @@ const (
 // released the conversation on some turn is immaterial to that caller: it
 // keys every case and repetition to a fresh conversation.
 //
+// taskID names the task whose stream to read; "" reads the record's active
+// task. A caller that names one reads that task whether or not the record
+// still holds it as active -- the relay clears the active task when it
+// posts the terminal, and a finished run's trace is read after that.
+//
 // Called off the adapter's own request goroutine, never from a gateway
 // worker; it costs one KV read and one replay of the task's stream, so a
 // caller bounds ctx.
-type ConversationProbe func(ctx context.Context, conversation string) (ConversationState, error)
+type ConversationProbe func(ctx context.Context, conversation, taskID string) (ConversationState, error)
 
 // ProbeSink is the optional extension an Adapter implements to receive the
 // gateway's ConversationProbe. The gateway type asserts for it in New, the
@@ -273,9 +279,11 @@ type ConversationState struct {
 	// Grace is the gateway's FirstEventGrace: the window inside which an
 	// active task with nothing on its stream is legitimately pre-first-event.
 	Grace time.Duration
-	// Active is whether the record holds an active task; the four fields
-	// after it describe that task. Detached is one the gateway has already
-	// published a cancel for.
+	// TaskID is the task this read describes: the one the caller named,
+	// else the record's active task. Active is whether the record holds
+	// that task as its active one; the three fields after it describe the
+	// active task and are zero for a named task the record has released.
+	// Detached is one the gateway has already published a cancel for.
 	Active      bool
 	TaskID      string
 	SubmittedAt time.Time
@@ -305,4 +313,16 @@ type ConversationState struct {
 	TerminalSource TerminalSource
 	Result         string
 	Reason         string
+	// Activity is the task's tool-call trace as the stream holds it: the
+	// data part of every part of the activity artifact, in stream order,
+	// each one the executor's own JSON record of one tool invocation. Set
+	// whenever the task's stream was read, final or not, and non-nil then
+	// even with no calls -- nil means the stream was not read (no active
+	// task, or the read failed), and a caller telling "this executor
+	// called nothing" from "nobody looked" needs the two kept apart. The
+	// relay deliberately never posts it; this is the only way a caller
+	// sees it. Progress is the last text part of the progress artifact,
+	// which is the line the relay's rolling edit shows.
+	Activity []json.RawMessage
+	Progress string
 }

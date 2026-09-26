@@ -584,7 +584,10 @@ not be silent about it.
   come back the way the relay posts them - the placeholder, the rolling progress line's edits,
   the deliverable, the terminal - because what a verifier grades has to be what a customer would
   have read. With `probe=1` the same read is also the **read route**: a pure read of the
-  conversation's session record and of the active task's stream, which mutates nothing - no
+  conversation's session record and of the active task's stream (or, with `task=`, of the named
+  task's stream whether or not the record still holds it as active - the relay clears the active
+  task when it posts the terminal, and that is how a harness reads a finished run's trace after
+  the release), which mutates nothing - no
   heal, no lock, no post, no publish, no write. It returns the record's active task with its
   `submittedAt`, age and `detached` flag, the latest executor state the stream shows (none,
   `submitted`, `working`, or a terminal, with `final`), whether `working` was ever on the stream
@@ -594,7 +597,11 @@ not be silent about it.
   fold of it: whose word the terminal is (`terminalSource`, the executor's for a terminal on the
   task's events subject and the supervisor's for one on its supervisor subject - distinct from
   the gateway's own source, which says it could not publish the task at all), the result
-  artifact's text and the terminal's status message; plus the conversation's last post, the
+  artifact's text and the terminal's status message; whenever the stream was read, final or
+  not, the task's tool-call trace (`activity`, the data parts of the activity artifact in
+  stream order, present as `[]` when the executor called nothing and absent when no stream was
+  read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
+  and the progress artifact's latest line (`progress`); plus the conversation's last post, the
   gateway's configured first-event grace, and the armed backend with `injectOnly`. The gateway
   classifies nothing on it; the harness does. It is a pure read because the never-started heal
   is a write under the per-conversation lock inside the keyed queue, and a read that performed

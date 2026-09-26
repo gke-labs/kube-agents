@@ -178,6 +178,12 @@ const (
 	// holds. It applies to what the GATEWAY posts, never to the prompt: the
 	// inbound text goes to the bus, not into this transcript.
 	injectMaxEntryBytes = 64 * 1024
+	// injectMaxActivityEntries bounds the trace a probe carries: the read
+	// route runs before and after every wait on the harness's hot loop, and
+	// a long run's trace would otherwise ride every poll whole. The newest
+	// entries are kept, since a caller reading a live run wants what it is
+	// doing now; ActivityDropped says how many older ones the cap cut.
+	injectMaxActivityEntries = 1000
 
 	// injectMaxEntries bounds one conversation's retained transcript and
 	// injectMaxConversations how many conversations are retained at once.
@@ -392,6 +398,9 @@ type conversationResponse struct {
 // probeReport is ConversationState on the wire, plus the door's own two
 // additions: the conversation's last post, which the gateway's record does
 // not hold and this transcript does, and an error for "could not look".
+// Beside the record and the terminal it carries the two artifacts the relay
+// keeps off the chat: the tool-call trace (activity) and the progress line,
+// as the stream holds them at the read.
 //
 // Nothing here is a verdict. A caller decides "nobody took this task" from
 // active, executorState "" and ageSeconds past graceSeconds; "queued and
@@ -423,6 +432,27 @@ type probeReport struct {
 	TerminalSource string `json:"terminalSource,omitempty"`
 	Result         string `json:"result,omitempty"`
 	Reason         string `json:"reason,omitempty"`
+	// Activity is the task's tool-call trace as its stream holds it, final
+	// or not: the data part of every part of the activity artifact, in
+	// stream order, each the executor's own JSON record of one invocation
+	// (tool, input, callId, status, durationMs, at). The relay never posts
+	// it, so this is the one place a caller sees what a run called. The
+	// key is present -- as [] when the executor called nothing -- whenever
+	// the task's stream was read, and absent when it was not (no active
+	// task, or the read failed) and on a door older than the field. A
+	// pointer to a slice rather than a slice because that is the only
+	// encoding in which those two are different things on the wire in a
+	// way every consumer keeps: a plain slice without omitempty writes
+	// null for "not read", and null and absent both decode to a nil slice
+	// in Go and to None under a Python .get, which would leave a harness
+	// unable to tell "this door cannot show calls" from "nobody called".
+	Activity *[]json.RawMessage `json:"activity,omitempty"`
+	// ActivityDropped is how many of the oldest entries injectMaxActivityEntries
+	// cut from Activity; zero, and absent, when the whole trace fits.
+	ActivityDropped int `json:"activityDropped,omitempty"`
+	// Progress is the last text part of the progress artifact -- the line
+	// the relay's rolling edit shows -- at the instant of the read.
+	Progress string `json:"progress,omitempty"`
 	// LastPost is the newest post entry on this conversation, if any: the
 	// last thing the relay said, for a caller deciding what a stalled task
 	// was doing.
@@ -1681,8 +1711,14 @@ func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectC
 // task's stream, read with nothing changed (ConversationProbe). It is how a
 // caller learns, without sending a message that would itself become a turn,
 // whether any executor has touched its task, whether the task has sat queued
-// (submitted) or run (working), and how old it is against the gateway's
-// grace -- and classifies for itself. The probe runs before the wait, so a
+// (submitted) or run (working), how old it is against the gateway's grace,
+// and what the run has called so far (the activity artifact, which the relay
+// never posts) -- and classifies for itself. With task=, the probe reads that
+// task's stream whether or not the record still holds it as active: the
+// relay clears the active task when it posts the terminal, so this is how a
+// caller reads a finished run's trace after the relay has released it;
+// without task= the probe reads the record's active task, and a released
+// conversation reads as no stream at all. The probe runs before the wait, so a
 // caller that reads a terminal on the stream does not wait on the relay for
 // it, and again after any wait that blocked, so the probe in the reply
 // describes the same instant as the entries beside it: a caller classifying
@@ -1746,7 +1782,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 	}
 	var probed *probeReport
 	if probeAsked != 0 {
-		probed = a.runProbe(r.Context(), key)
+		probed = a.runProbe(r.Context(), key, taskID)
 		probed.LastPost = a.lastPost(key)
 		if probed.Final {
 			// A terminal on the stream is the answer; nothing the relay
@@ -1764,7 +1800,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 			if probeAsked != 0 && waited {
 				// Time moved on under the wait; the probe has to describe
 				// where the stream is now, beside the entries that are.
-				probed = a.runProbe(r.Context(), key)
+				probed = a.runProbe(r.Context(), key, taskID)
 				probed.LastPost = a.lastPost(key)
 			}
 			writeJSON(w, http.StatusOK, conversationResponse{
@@ -1790,17 +1826,18 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// runProbe asks the gateway about a conversation and puts the answer on the
-// wire. Never a failure status: the transcript half of the reply is good
-// whatever the probe found, and a caller reads "could not look" out of the
-// report's error rather than out of a 5xx it would retry the whole poll for.
-func (a *InjectAdapter) runProbe(ctx context.Context, key string) *probeReport {
+// runProbe asks the gateway about a conversation -- the task taskID names,
+// or its active task when taskID is "" -- and puts the answer on the wire.
+// Never a failure status: the transcript half of the reply is good whatever
+// the probe found, and a caller reads "could not look" out of the report's
+// error rather than out of a 5xx it would retry the whole poll for.
+func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probeReport {
 	if a.probe == nil {
 		return &probeReport{Error: "the gateway offered this door no probe"}
 	}
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	state, err := a.probe(ctx, key)
+	state, err := a.probe(ctx, key, taskID)
 	report := &probeReport{
 		Backend:        state.Backend,
 		InjectOnly:     state.InjectOnly,
@@ -1817,6 +1854,17 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key string) *probeReport {
 		TerminalSource: string(state.TerminalSource),
 		Result:         truncateRunes(state.Result, injectMaxEntryBytes),
 		Reason:         truncateRunes(state.Reason, injectMaxEntryBytes),
+		Progress:       truncateRunes(state.Progress, injectMaxEntryBytes),
+	}
+	// Non-nil is the fact that the stream was read (ConversationState.
+	// Activity), and the pointer carries that fact onto the wire.
+	if state.Activity != nil {
+		trace := state.Activity
+		if len(trace) > injectMaxActivityEntries {
+			report.ActivityDropped = len(trace) - injectMaxActivityEntries
+			trace = trace[len(trace)-injectMaxActivityEntries:]
+		}
+		report.Activity = &trace
 	}
 	if !state.SubmittedAt.IsZero() {
 		report.SubmittedAt = state.SubmittedAt.UTC().Format(time.RFC3339Nano)
