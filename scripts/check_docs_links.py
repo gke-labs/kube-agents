@@ -84,10 +84,17 @@ CODE_GLOBS = ("*.py", "*.go", "*.sh", "*Dockerfile*", "*.yaml", "*.yml", "*.tf",
 # The docs site's dependency tree carries its own Markdown and scripts.
 VENDORED_DIR = "node_modules"
 
-# [text](target) but not ![image](target) handled separately; both are checked.
-# A title after the target, in each spelling CommonMark admits.
+# `[text](target)` and `![alt](target)` alike; both are checked. A title after
+# the target, in each spelling CommonMark admits. An image wrapped in a link,
+# `[![alt](image)](target)`, has its own pattern: LINK_RE reads the image,
+# whose `]` ends the outer text, and resumes after the image's `)`, so the
+# outer target went unread, which the reachability rule turned into a false
+# report for a document the badge form alone links.
 LINK_TITLE_RE = r"""(?:"[^"]*"|'[^']*'|\([^)]*\))"""
-LINK_RE = re.compile(rf"!?\[[^\]]*\]\(\s*([^)\s]+)(?:\s+{LINK_TITLE_RE})?\s*\)")
+LINK_DESTINATION_RE = rf"\(\s*(?P<target>[^)\s]+)(?:\s+{LINK_TITLE_RE})?\s*\)"
+IMAGE_RE = rf"!\[[^\]]*\]\(\s*[^)\s]+(?:\s+{LINK_TITLE_RE})?\s*\)"
+LINK_RE = re.compile(rf"!?\[[^\]]*\]{LINK_DESTINATION_RE}")
+LINKED_IMAGE_RE = re.compile(rf"\[{IMAGE_RE}\]{LINK_DESTINATION_RE}")
 # The other ways a document links another, read for the same two rules. An
 # HTML or JSX `href` attribute: `<LinkCard href="/kube-agents/..."/>` is how
 # the site's hub pages link their sections, and `<a href>` reads the same; an
@@ -460,8 +467,7 @@ def strip_specimens(lines: list[tuple[int, str]], comments: tuple[tuple[str, str
 
 def line_links(line: str) -> Iterator[str]:
     """Every link target written on one line, in each form a document links another."""
-    yield from LINK_RE.findall(line)
-    for pattern in (HREF_RE, AUTOLINK_RE):
+    for pattern in (LINK_RE, LINKED_IMAGE_RE, HREF_RE, AUTOLINK_RE):
         for match in pattern.finditer(line):
             yield match.group("target")
     definition = REFERENCE_DEFINITION_RE.match(line)
