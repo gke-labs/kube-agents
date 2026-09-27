@@ -162,13 +162,19 @@ OTHER_FORMS_LINES = (
 # lines (holding a Markdown link, an `href` and a broken link), and an MDX
 # comment around a `<LinkCard>` in a site hub page: each hides its target from
 # every reader, so the target is reported, and the broken link inside one is
-# not a broken link. The live link on the line a comment closes on, and the
-# one after a `<!--` quoted in inline code (a specimen, not an opener), still
-# reach their targets.
+# not a broken link. The live links still reach their targets: the one on the
+# line a comment closes on; the one after a `<!--` quoted in inline code (a
+# specimen, not an opener), whether the span closes on its line or wraps onto
+# the next; the one after a comment that holds a backtick (the comment opened
+# first, so the backtick is the comment's, not a span's); and the one inside
+# an MDX comment's delimiters in a `.md` file, where they are text.
 COMMENTED_OUT = "docs/commented-out.md"
 COMMENTED_OUT_SPAN = "docs/commented-out-span.md"
 LIVE_BESIDE_COMMENT = "docs/live-beside-comment.md"
 LIVE_AFTER_SPECIMEN = "docs/live-after-specimen.md"
+LIVE_AFTER_WRAPPED_SPECIMEN = "docs/live-after-wrapped-specimen.md"
+LIVE_AFTER_BACKTICK_IN_COMMENT = "docs/live-after-backtick-in-comment.md"
+LIVE_IN_MDX_DELIMITERS = "docs/live-in-mdx-delimiters.md"
 SITE_COMMENTED_CARD = SITE + "install/commented-card.md"
 COMMENTS = "comments.md"  # a root file, reached by shape
 COMMENTS_LINES = (
@@ -181,6 +187,10 @@ COMMENTS_LINES = (
     "-->",
     "a quoted `<!--` is a specimen, so the next line is live:",
     f"[live]({LIVE_AFTER_SPECIMEN})",
+    "a span that wraps `<!-- across",
+    f"the line break` is a specimen too, so [live]({LIVE_AFTER_WRAPPED_SPECIMEN}) reaches,",
+    f"<!-- a `x --> b `y` after a backtick in a comment [live]({LIVE_AFTER_BACKTICK_IN_COMMENT}) reaches,",
+    f"{{/* and in a .md file [live]({LIVE_IN_MDX_DELIMITERS}) reaches */}}",
 )
 SITE_INDEX_COMMENTED_CARD_LINES = (
     "import { LinkCard } from '@astrojs/starlight/components';",
@@ -360,6 +370,7 @@ class SyntheticRepoTest(unittest.TestCase):
         _write(self.root, cdl.SITE_CONFIG, "\n".join(SITE_CONFIG_LINES) + "\n")
         self._track(
             COMMENTS, COMMENTED_OUT, COMMENTED_OUT_SPAN, LIVE_BESIDE_COMMENT, LIVE_AFTER_SPECIMEN,
+            LIVE_AFTER_WRAPPED_SPECIMEN, LIVE_AFTER_BACKTICK_IN_COMMENT, LIVE_IN_MDX_DELIMITERS,
             SITE_INDEX, SITE_CARDED, SITE_COMMENTED_CARD,
         )
         _write(self.root, COMMENTS, "\n".join(COMMENTS_LINES) + "\n")

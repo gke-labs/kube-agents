@@ -123,8 +123,9 @@ REPO_BLOB_URL_PREFIXES = (
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 # Inline code spans, for the same reason a fenced block is skipped: what is
-# inside one is a specimen, not a link. Backtick runs of any length, matched
-# shortest-first and longest-delimiter-first so ``a `b` c`` closes correctly.
+# inside one is a specimen, not a link. Backtick runs of any length, closed by
+# a run of exactly the same length, so ``a `b` c`` closes correctly, and a run
+# whose closer never comes is text.
 #
 # This is not hypothetical tidiness. Seven documents quote the fleet-audit
 # finding-id pattern `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$`, and the `](`
@@ -132,20 +133,31 @@ FENCE_RE = re.compile(r"^\s*(```|~~~)")
 # which is not a file. The checker reported seven broken links in seven
 # correct documents.
 #
-# Deliberately line-scoped: a span left unclosed on its line stays visible to
-# LINK_RE, which is the safe direction to be wrong in, and line numbers in the
-# report keep meaning what they say.
-INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)")
+# A span may wrap onto the next line but not across a blank line, as a
+# Markdown renderer reads one, so the lines outside fences are read a
+# paragraph at a time. Reading a span one line at a time was wrong in the
+# unsafe direction once comments were stripped too: a `<!--` quoted in a span
+# that wraps stayed visible and opened a comment that swallowed the rest of
+# the document, links included.
+BACKTICK_RUN_RE = re.compile(r"`+")
 
 # HTML and MDX comments, for the same reason again: a link an author commented
 # out instead of deleting renders nowhere, so it reaches no document -- the
 # rule the sidebar read applies to a JavaScript comment, one file over -- and
-# it is not a broken link either. A comment may span lines; the lines inside
-# one are dropped and the report's line numbers keep meaning what they say.
-# Removed after fences and inline code, because several design documents
-# quote the opener in a span (`<!--`) to explain a marker, and read raw it
-# would open a comment that swallows the rest of the document.
-COMMENT_DELIMITERS = (("<!--", "-->"), ("{/*", "*/}"))
+# it is not a broken link either. A comment may span lines and paragraphs; the
+# lines inside one are dropped and the report's line numbers keep meaning what
+# they say. An MDX comment is one only in an `.mdx` file; in a `.md` file the
+# same characters render as text. Spans and comments are read in one pass,
+# left to right, and whichever opens first wins, as a renderer decides it: a
+# `<!--` quoted inside a span is a specimen, and a backtick inside a comment
+# is part of the comment.
+HTML_COMMENT = ("<!--", "-->")
+MDX_COMMENT = ("{/*", "*/}")
+MDX_SUFFIX = ".mdx"
+# What a span or a comment leaves behind: a space, not "", so what stood
+# either side of it cannot be glued into a link that was never written, plus
+# every line break it covered, so line numbers hold.
+SPECIMEN_REPLACEMENT = " "
 
 # A design or architecture document named from code. The match ends at `.md`,
 # so a trailing `)`, `.`, `,`, `:12`, `#anchor`, a closing backtick or a
@@ -314,31 +326,77 @@ def strip_code_fences(text: str) -> list[tuple[int, str]]:
     return kept
 
 
-def strip_comments(lines: Iterator[tuple[int, str]]) -> Iterator[tuple[int, str]]:
-    """The lines with every HTML and MDX comment removed, across line breaks."""
-    closer: str | None = None
+def paragraphs(lines: list[tuple[int, str]]) -> Iterator[tuple[list[int], str]]:
+    """Group the lines into paragraphs: runs of adjacent non-blank lines, joined by newlines.
+
+    A blank line, or a line a fence removed, ends one; a blank line is a
+    paragraph of its own so that a comment still runs across it.
+    """
+    numbers: list[int] = []
+    body: list[str] = []
     for lineno, line in lines:
+        if numbers and (line.strip() == "" or body[-1].strip() == "" or lineno != numbers[-1] + 1):
+            yield numbers, "\n".join(body)
+            numbers, body = [], []
+        numbers.append(lineno)
+        body.append(line)
+    if numbers:
+        yield numbers, "\n".join(body)
+
+
+def blanked(text: str) -> str:
+    """The replacement for a dropped span or comment: a space and the line breaks it covered."""
+    return SPECIMEN_REPLACEMENT + "\n" * text.count("\n")
+
+
+def closing_run(text: str, run: str, start: int) -> int:
+    """Where a backtick run of exactly `run`'s length closes the span, or -1."""
+    position = text.find(run, start)
+    while position >= 0:
+        before = text[position - 1] if position else ""
+        after = text[position + len(run) : position + len(run) + 1]
+        if before != "`" and after != "`":
+            return position
+        position = text.find(run, position + len(run))
+    return -1
+
+
+def strip_specimens(lines: list[tuple[int, str]], comments: tuple[tuple[str, str], ...]) -> Iterator[tuple[int, str]]:
+    """The lines with every inline code span and every comment removed."""
+    closer: str | None = None
+    for numbers, text in paragraphs(lines):
         kept: list[str] = []
-        rest = line
-        while True:
+        at = 0
+        while at < len(text):
             if closer is not None:
-                end = rest.find(closer)
+                end = text.find(closer, at)
                 if end < 0:
-                    rest = ""
+                    kept.append(blanked(text[at:]))
                     break
-                rest = rest[end + len(closer) :]
+                kept.append(blanked(text[at : end + len(closer)]))
+                at = end + len(closer)
                 closer = None
-            starts = [(rest.find(opener), opener, close) for opener, close in COMMENT_DELIMITERS]
-            starts = [found for found in starts if found[0] >= 0]
-            if not starts:
-                kept.append(rest)
+                continue
+            run = BACKTICK_RUN_RE.search(text, at)
+            openers = [(text.find(opener, at), opener, close) for opener, close in comments]
+            first_opener = min((found for found in openers if found[0] >= 0), default=None)
+            if run is None and first_opener is None:
+                kept.append(text[at:])
                 break
-            start, opener, closer = min(starts)
-            # A space, as for an inline span: what stood either side of the
-            # comment must not be glued into a link that was never written.
-            kept.append(rest[:start] + " ")
-            rest = rest[start + len(opener) :]
-        yield lineno, "".join(kept)
+            if run is not None and (first_opener is None or run.start() < first_opener[0]):
+                kept.append(text[at : run.start()])
+                end = closing_run(text, run.group(), run.end())
+                if end < 0:
+                    kept.append(run.group())
+                    at = run.end()
+                else:
+                    kept.append(blanked(text[run.start() : end + len(run.group())]))
+                    at = end + len(run.group())
+                continue
+            start, opener, closer = first_opener
+            kept.append(text[at:start] + SPECIMEN_REPLACEMENT)
+            at = start + len(opener)
+        yield from zip(numbers, "".join(kept).split("\n"))
 
 
 def line_links(line: str) -> Iterator[str]:
@@ -354,10 +412,8 @@ def line_links(line: str) -> Iterator[str]:
 
 def markdown_links(path: Path) -> Iterator[tuple[int, str]]:
     """Yield (line number, link target) for every navigable link in a document."""
-    # A space, not "", so stripping a span cannot glue a stray `[text]`
-    # onto a following `(target)` and invent a link that was never written.
-    lines = ((n, INLINE_CODE_RE.sub(" ", line)) for n, line in strip_code_fences(path.read_text(encoding="utf-8")))
-    for lineno, line in strip_comments(lines):
+    comments = (HTML_COMMENT, MDX_COMMENT) if path.suffix == MDX_SUFFIX else (HTML_COMMENT,)
+    for lineno, line in strip_specimens(strip_code_fences(path.read_text(encoding="utf-8")), comments):
         for raw in line_links(line):
             target = raw.strip()
             if target:
