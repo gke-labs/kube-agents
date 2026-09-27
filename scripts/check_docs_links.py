@@ -162,11 +162,15 @@ BLOCK_OPENER_RE = re.compile(rf"^ {{0,3}}(?:[-*+](?:\s|$)|\d{{1,9}}[.)](?:\s|$)|
 # `<!--` quoted inside a span is a specimen, and a backtick inside a comment
 # is part of the comment. An opener with no closer is text, as an unclosed
 # backtick run is, and where the closer may be depends on where the opener
-# stands, as a renderer decides it: an opener at the start of its line (up to
-# three spaces in, CommonMark's HTML block) may close in any later paragraph;
-# one in the middle of a prose line is inline HTML, which cannot cross a
-# blank line, so it is a comment only when its closer is in the same
-# paragraph. Otherwise a bare `<!--` in prose, or one whose closer an edit
+# stands, as a renderer decides it: an opener that is the first thing on its
+# line (CommonMark's HTML block) may close in any later paragraph; one in the
+# middle of a prose line is inline HTML, which cannot cross a blank line, so
+# it is a comment only when its closer is in the same paragraph. The block
+# form is believed at any indent: CommonMark allows three spaces, measured
+# from the enclosing list item, and the checker does not track list items, so
+# an opener alone on its line four spaces in under a numbered or nested item
+# is the block it renders as, not inline HTML that keeps the links it hides.
+# Otherwise a bare `<!--` in prose, or one whose closer an edit
 # lost, blanked the rest of the document up to the next comment, which most
 # documents hold (a prettier-ignore, a generated-region marker), and the
 # broken-link check went green over links it never read. (CommonMark reads an
@@ -176,7 +180,6 @@ BLOCK_OPENER_RE = re.compile(rf"^ {{0,3}}(?:[-*+](?:\s|$)|\d{{1,9}}[.)](?:\s|$)|
 HTML_COMMENT = ("<!--", "-->")
 MDX_COMMENT = ("{/*", "*/}")
 MDX_SUFFIX = ".mdx"
-HTML_BLOCK_INDENT = 3
 # What a span or a comment leaves behind: a space, not "", so what stood
 # either side of it cannot be glued into a link that was never written, plus
 # every line break it covered, so line numbers hold.
@@ -395,9 +398,8 @@ def closing_run(text: str, run: str, start: int) -> int:
 
 
 def at_line_start(text: str, position: int) -> bool:
-    """Whether only block indentation stands between the line's start and `position`."""
-    prefix = text[text.rfind("\n", 0, position) + 1 : position]
-    return prefix.strip(" ") == "" and len(prefix) <= HTML_BLOCK_INDENT
+    """Whether only indentation stands between the line's start and `position`."""
+    return text[text.rfind("\n", 0, position) + 1 : position].strip(" ") == ""
 
 
 def strip_specimens(lines: list[tuple[int, str]], comments: tuple[tuple[str, str], ...]) -> Iterator[tuple[int, str]]:
