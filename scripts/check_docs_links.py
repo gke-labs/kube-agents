@@ -235,14 +235,11 @@ GLOB_DOUBLE_STAR_RE = r"(?:(?!\.)[^/]*/)*(?!\.)[^/]*"
 # start.
 UNLINKED_ALLOWLIST = frozenset(
     {
-        "a2a/docs/hermes-bridge.md",
         "a2a/persona/platform/skills/a2a-topics/SKILL.md",
         "agents/chat/AGENTS.md",
         "agents/platform/docs/autoops-architecture.md",
-        "docs/designs/capability-delivery-vehicle.md",
         "docs/designs/design_537148738.md",
         "docs/designs/e2e-testing-harness.md",
-        "docs/designs/eval-next-transport.md",
         "docs/designs/fleet-anomaly-detection-checks.md",
         "docs/designs/semver-deployment-versioning.md",
         "docs/designs/upgrade-readiness-checks.md",
