@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import shutil
 import subprocess
 import unittest
@@ -292,11 +293,19 @@ class SyntheticRepoTest(unittest.TestCase):
         self.assertEqual(self._unlinked(), [])
 
     def test_reach_follows_links_from_a_root_and_stops_at_dead_ends(self) -> None:
+        """PRESENT, which README.md links, links CHAINED and the allowlisted DEAD_END.
+
+        DEAD_END is reached, so its entry is reported as stale; reach through it
+        counts for nothing, so DEAD_END_ONLY, which it alone links, is reported
+        as unreached. Both halves fail if the dead-end clauses in
+        ``reached_files()`` go: DEAD_END_ONLY then vanishes from the report.
+        """
         self._track(
             CHAINED, DEAD_END, DEAD_END_ONLY, CYCLE_A, CYCLE_B,
             links={CYCLE_A: (CYCLE_B,), CYCLE_B: (CYCLE_A,), DEAD_END: (DEAD_END_ONLY,)},
         )
-        _write(self.root, PRESENT, f"# present\n[chained]({Path(CHAINED).name})\n")
+        dead_end = os.path.relpath(DEAD_END, Path(PRESENT).parent)
+        _write(self.root, PRESENT, f"# present\n[chained]({Path(CHAINED).name})\n[dead end]({dead_end})\n")
         with mock.patch.object(cdl, "UNLINKED_ALLOWLIST", frozenset({DEAD_END})):
             self.assertEqual(
                 self._unlinked(),
@@ -304,6 +313,7 @@ class SyntheticRepoTest(unittest.TestCase):
                     f"{CYCLE_A}: {cdl.UNLINKED_MESSAGE}",
                     f"{CYCLE_B}: {cdl.UNLINKED_MESSAGE}",
                     f"{DEAD_END_ONLY}: {cdl.UNLINKED_MESSAGE}",
+                    f"{DEAD_END}: {cdl.ALLOWLIST_LINKED_MESSAGE}",
                 ],
             )
 
