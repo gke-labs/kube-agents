@@ -150,7 +150,13 @@ BACKTICK_RUN_RE = re.compile(r"`+")
 # same characters render as text. Spans and comments are read in one pass,
 # left to right, and whichever opens first wins, as a renderer decides it: a
 # `<!--` quoted inside a span is a specimen, and a backtick inside a comment
-# is part of the comment.
+# is part of the comment. An opener with no closer anywhere after it is text,
+# as an unclosed backtick run is: otherwise a bare `<!--` in prose, or one
+# whose closer an edit lost, blanked the rest of the document and the
+# broken-link check went green over links it never read. (CommonMark reads an
+# unclosed opener at the start of a line as an HTML block that runs to the
+# end of the document; the checker does not, because that is the quiet
+# failure, and a link the renderer would hide is reported rather than missed.)
 HTML_COMMENT = ("<!--", "-->")
 MDX_COMMENT = ("{/*", "*/}")
 MDX_SUFFIX = ".mdx"
@@ -362,9 +368,15 @@ def closing_run(text: str, run: str, start: int) -> int:
 
 
 def strip_specimens(lines: list[tuple[int, str]], comments: tuple[tuple[str, str], ...]) -> Iterator[tuple[int, str]]:
-    """The lines with every inline code span and every comment removed."""
+    """The lines with every inline code span and every comment removed.
+
+    A comment opener whose closer appears nowhere after it, in this paragraph
+    or a later one, is text; the paragraphs are held as a list so the
+    remainder of the document can be searched before the opener is believed.
+    """
     closer: str | None = None
-    for numbers, text in paragraphs(lines):
+    grouped = list(paragraphs(lines))
+    for index, (numbers, text) in enumerate(grouped):
         kept: list[str] = []
         at = 0
         while at < len(text):
@@ -393,9 +405,15 @@ def strip_specimens(lines: list[tuple[int, str]], comments: tuple[tuple[str, str
                     kept.append(blanked(text[run.start() : end + len(run.group())]))
                     at = end + len(run.group())
                 continue
-            start, opener, closer = first_opener
+            start, opener, close = first_opener
+            after = start + len(opener)
+            if close not in text[after:] and not any(close in later for _, later in grouped[index + 1 :]):
+                kept.append(text[at:after])  # an opener nothing closes is text
+                at = after
+                continue
+            closer = close
             kept.append(text[at:start] + SPECIMEN_REPLACEMENT)
-            at = start + len(opener)
+            at = after
         yield from zip(numbers, "".join(kept).split("\n"))
 
 
