@@ -192,33 +192,70 @@ COMMENTS_LINES = (
     f"<!-- a `x --> b `y` after a backtick in a comment [live]({LIVE_AFTER_BACKTICK_IN_COMMENT}) reaches,",
     f"{{/* and in a .md file [live]({LIVE_IN_MDX_DELIMITERS}) reaches */}}",
 )
-# A comment opener nothing ever closes. A closed comment may span a blank
-# line; an opener with no closer anywhere after it is text, as an unclosed
-# backtick run is, so the links after it are live and the broken one among
-# them is reported. Without that rule the opener swallowed the rest of the
-# document, and a green broken-link check said nothing about the links it
-# never read. The `.mdx` file checks the MDX opener the same way.
+# A comment opener in the middle of a prose line that nothing in its
+# paragraph closes. A comment that opens at the start of a line may span a
+# blank line to its closer; one that opens mid-line is inline, so it closes
+# in its own paragraph or it is text, as an unclosed backtick run is, and the
+# links after it are live and the broken one among them is reported. The
+# closed comments come after the stray opener on purpose: without the
+# position rule a later closer anywhere in the document was enough to believe
+# the opener, it swallowed every paragraph up to that closer, and a green
+# broken-link check said nothing about the links it never read. The `.mdx`
+# file checks the MDX opener the same way.
 STRAY_OPENER = "stray-opener.md"  # a root file, reached by shape
 STRAY_OPENER_MDX = "stray-opener.mdx"
 HIDDEN_ACROSS_BLANK = "docs/hidden-across-blank.md"
+HIDDEN_IN_PARAGRAPH = "docs/hidden-in-paragraph.md"
 LIVE_AFTER_STRAY_OPENER = "docs/live-after-stray-opener.md"
 LIVE_AFTER_STRAY_MDX_OPENER = "docs/live-after-stray-mdx-opener.md"
+STRAY_OPENER_GONE_LINE = "and [gone](nowhere.md) is a broken link, while one that <!-- closes in"
 STRAY_OPENER_LINES = (
     "# stray opener",
+    "an HTML comment opens with <!-- and this one never closes, so",
+    "",
+    f"the next paragraph is live: [live]({LIVE_AFTER_STRAY_OPENER}) reaches",
+    STRAY_OPENER_GONE_LINE,
+    f"its own paragraph [hidden]({HIDDEN_IN_PARAGRAPH}) --> hides its link.",
+    "",
     "<!--",
     f"[hidden]({HIDDEN_ACROSS_BLANK})",
     "",
     "-->",
-    "an HTML comment opens with <!-- and this one never closes, so",
-    "",
-    f"the next paragraph is live: [live]({LIVE_AFTER_STRAY_OPENER}) reaches",
-    "and [gone](nowhere.md) is a broken link.",
 )
 STRAY_OPENER_MDX_LINES = (
     "# stray opener",
     "an MDX comment opens with {/* and this one never closes, so",
     "",
     f"[live]({LIVE_AFTER_STRAY_MDX_OPENER}) reaches.",
+    "",
+    "{/* a comment closed on its own line, later in the file */}",
+)
+# A backtick left unpaired in a list item, a table row or a heading. A renderer
+# parses each of those inline on its own, so the backtick is text and the next
+# block's links are live; read as one paragraph, it paired with the next
+# backtick in the document and hid every link between them, the broken one
+# included. The last item keeps the case the paragraph read exists for: a span
+# that wraps onto a plain continuation line is still one span.
+BLOCK_BOUNDARIES = "block-boundaries.md"  # a root file, reached by shape
+LIVE_IN_NEXT_ITEM = "docs/live-in-next-item.md"
+LIVE_IN_NEXT_ROW = "docs/live-in-next-row.md"
+LIVE_UNDER_HEADING = "docs/live-under-heading.md"
+LIVE_AFTER_ITEM_WRAP = "docs/live-after-item-wrap.md"
+BLOCK_BOUNDARIES_GONE_LINE = f"| [live]({LIVE_IN_NEXT_ROW}) and [gone](nowhere.md) | `y` |"
+BLOCK_BOUNDARIES_LINES = (
+    "# block boundaries",
+    "",
+    "- a literal ` in item one",
+    f"- see [live]({LIVE_IN_NEXT_ITEM}) and `code`",
+    "",
+    "| a lone ` in a cell | x |",
+    BLOCK_BOUNDARIES_GONE_LINE,
+    "",
+    "## a heading with a ` marker",
+    f"prose under it links [live]({LIVE_UNDER_HEADING}) and `code`",
+    "",
+    "- an item whose span wraps `[specimen](specimen.md)",
+    f"  onto its continuation line` and then [live]({LIVE_AFTER_ITEM_WRAP}) reaches",
 )
 SITE_INDEX_COMMENTED_CARD_LINES = (
     "import { LinkCard } from '@astrojs/starlight/components';",
@@ -415,17 +452,32 @@ class SyntheticRepoTest(unittest.TestCase):
 
     def test_an_opener_nothing_closes_is_text_and_hides_no_later_link(self) -> None:
         self._track(
-            STRAY_OPENER, STRAY_OPENER_MDX, HIDDEN_ACROSS_BLANK, LIVE_AFTER_STRAY_OPENER, LIVE_AFTER_STRAY_MDX_OPENER,
+            STRAY_OPENER, STRAY_OPENER_MDX, HIDDEN_ACROSS_BLANK, HIDDEN_IN_PARAGRAPH,
+            LIVE_AFTER_STRAY_OPENER, LIVE_AFTER_STRAY_MDX_OPENER,
         )
         _write(self.root, STRAY_OPENER, "\n".join(STRAY_OPENER_LINES) + "\n")
         _write(self.root, STRAY_OPENER_MDX, "\n".join(STRAY_OPENER_MDX_LINES) + "\n")
-        self.assertEqual(self._unlinked(), [f"{HIDDEN_ACROSS_BLANK}: {cdl.UNLINKED_MESSAGE}"])
+        self.assertEqual(
+            self._unlinked(),
+            [f"{HIDDEN_ACROSS_BLANK}: {cdl.UNLINKED_MESSAGE}", f"{HIDDEN_IN_PARAGRAPH}: {cdl.UNLINKED_MESSAGE}"],
+        )
         tracked = cdl.tracked_paths()
+        gone_line = STRAY_OPENER_LINES.index(STRAY_OPENER_GONE_LINE) + 1
         self.assertEqual(
             cdl.check_file(self.root / STRAY_OPENER, tracked),
-            [f"{STRAY_OPENER}:{len(STRAY_OPENER_LINES)}: broken link -> nowhere.md"],
+            [f"{STRAY_OPENER}:{gone_line}: broken link -> nowhere.md"],
         )
         self.assertEqual(cdl.check_file(self.root / STRAY_OPENER_MDX, tracked), [])
+
+    def test_a_backtick_does_not_pair_across_a_block_boundary(self) -> None:
+        self._track(BLOCK_BOUNDARIES, LIVE_IN_NEXT_ITEM, LIVE_IN_NEXT_ROW, LIVE_UNDER_HEADING, LIVE_AFTER_ITEM_WRAP)
+        _write(self.root, BLOCK_BOUNDARIES, "\n".join(BLOCK_BOUNDARIES_LINES) + "\n")
+        self.assertEqual(self._unlinked(), [])
+        gone_line = BLOCK_BOUNDARIES_LINES.index(BLOCK_BOUNDARIES_GONE_LINE) + 1
+        self.assertEqual(
+            cdl.check_file(self.root / BLOCK_BOUNDARIES, cdl.tracked_paths()),
+            [f"{BLOCK_BOUNDARIES}:{gone_line}: broken link -> nowhere.md"],
+        )
 
     def test_without_a_site_config_only_the_convention_pages_are_exempt(self) -> None:
         self._track(SITE_404, SITE_AUTOGENERATED)

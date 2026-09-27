@@ -67,6 +67,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Iterator
+from itertools import islice
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -133,13 +134,22 @@ FENCE_RE = re.compile(r"^\s*(```|~~~)")
 # which is not a file. The checker reported seven broken links in seven
 # correct documents.
 #
-# A span may wrap onto the next line but not across a blank line, as a
-# Markdown renderer reads one, so the lines outside fences are read a
-# paragraph at a time. Reading a span one line at a time was wrong in the
-# unsafe direction once comments were stripped too: a `<!--` quoted in a span
-# that wraps stayed visible and opened a comment that swallowed the rest of
-# the document, links included.
+# A span may wrap onto the next line but not across a blank line or into a
+# new block, as a Markdown renderer reads one, so the lines outside fences are
+# read a paragraph at a time, and a paragraph ends where a heading, a list
+# item, a table row, a blockquote or a thematic break begins, and again after
+# a heading, a table row or a thematic break, which are one line long: a
+# renderer parses each of those inline on its own, so a lone backtick in one
+# list item never pairs with one in the next and hides the link between
+# them, while a span that wraps onto a plain continuation line is still one
+# span. Reading a span one line at a time was wrong in the unsafe direction
+# once comments were stripped too: a `<!--` quoted in a span that wraps
+# stayed visible and opened a comment that swallowed the rest of the
+# document, links included.
 BACKTICK_RUN_RE = re.compile(r"`+")
+ONE_LINE_BLOCK = r"#{1,6}(?:\s|$)|\||(?P<rule>[-*_])(?:\s*(?P=rule)){2,}\s*$"
+ONE_LINE_BLOCK_RE = re.compile(rf"^ {{0,3}}(?:{ONE_LINE_BLOCK})")
+BLOCK_OPENER_RE = re.compile(rf"^ {{0,3}}(?:[-*+](?:\s|$)|\d{{1,9}}[.)](?:\s|$)|>|{ONE_LINE_BLOCK})")
 
 # HTML and MDX comments, for the same reason again: a link an author commented
 # out instead of deleting renders nowhere, so it reaches no document -- the
@@ -150,9 +160,15 @@ BACKTICK_RUN_RE = re.compile(r"`+")
 # same characters render as text. Spans and comments are read in one pass,
 # left to right, and whichever opens first wins, as a renderer decides it: a
 # `<!--` quoted inside a span is a specimen, and a backtick inside a comment
-# is part of the comment. An opener with no closer anywhere after it is text,
-# as an unclosed backtick run is: otherwise a bare `<!--` in prose, or one
-# whose closer an edit lost, blanked the rest of the document and the
+# is part of the comment. An opener with no closer is text, as an unclosed
+# backtick run is, and where the closer may be depends on where the opener
+# stands, as a renderer decides it: an opener at the start of its line (up to
+# three spaces in, CommonMark's HTML block) may close in any later paragraph;
+# one in the middle of a prose line is inline HTML, which cannot cross a
+# blank line, so it is a comment only when its closer is in the same
+# paragraph. Otherwise a bare `<!--` in prose, or one whose closer an edit
+# lost, blanked the rest of the document up to the next comment, which most
+# documents hold (a prettier-ignore, a generated-region marker), and the
 # broken-link check went green over links it never read. (CommonMark reads an
 # unclosed opener at the start of a line as an HTML block that runs to the
 # end of the document; the checker does not, because that is the quiet
@@ -160,6 +176,7 @@ BACKTICK_RUN_RE = re.compile(r"`+")
 HTML_COMMENT = ("<!--", "-->")
 MDX_COMMENT = ("{/*", "*/}")
 MDX_SUFFIX = ".mdx"
+HTML_BLOCK_INDENT = 3
 # What a span or a comment leaves behind: a space, not "", so what stood
 # either side of it cannot be glued into a link that was never written, plus
 # every line break it covered, so line numbers hold.
@@ -335,13 +352,23 @@ def strip_code_fences(text: str) -> list[tuple[int, str]]:
 def paragraphs(lines: list[tuple[int, str]]) -> Iterator[tuple[list[int], str]]:
     """Group the lines into paragraphs: runs of adjacent non-blank lines, joined by newlines.
 
-    A blank line, or a line a fence removed, ends one; a blank line is a
-    paragraph of its own so that a comment still runs across it.
+    A blank line, a line a fence removed, a line that opens a new block (a
+    heading, a list item, a table row, a blockquote, a thematic break) or the
+    line after a one-line block (a heading, a table row, a thematic break)
+    ends one; a blank line is a paragraph of its own so that a comment still
+    runs across it.
     """
     numbers: list[int] = []
     body: list[str] = []
     for lineno, line in lines:
-        if numbers and (line.strip() == "" or body[-1].strip() == "" or lineno != numbers[-1] + 1):
+        ends = numbers and (
+            line.strip() == ""
+            or body[-1].strip() == ""
+            or lineno != numbers[-1] + 1
+            or BLOCK_OPENER_RE.match(line)
+            or ONE_LINE_BLOCK_RE.match(body[-1])
+        )
+        if ends:
             yield numbers, "\n".join(body)
             numbers, body = [], []
         numbers.append(lineno)
@@ -367,12 +394,20 @@ def closing_run(text: str, run: str, start: int) -> int:
     return -1
 
 
+def at_line_start(text: str, position: int) -> bool:
+    """Whether only block indentation stands between the line's start and `position`."""
+    prefix = text[text.rfind("\n", 0, position) + 1 : position]
+    return prefix.strip(" ") == "" and len(prefix) <= HTML_BLOCK_INDENT
+
+
 def strip_specimens(lines: list[tuple[int, str]], comments: tuple[tuple[str, str], ...]) -> Iterator[tuple[int, str]]:
     """The lines with every inline code span and every comment removed.
 
-    A comment opener whose closer appears nowhere after it, in this paragraph
-    or a later one, is text; the paragraphs are held as a list so the
-    remainder of the document can be searched before the opener is believed.
+    A comment opener is believed only where its closer can be: in this
+    paragraph or a later one for an opener at the start of its line, in this
+    paragraph alone for one in the middle of a line. An opener nothing there
+    closes is text. The paragraphs are held as a list so the remainder of the
+    document can be searched before a line-start opener is believed.
     """
     closer: str | None = None
     grouped = list(paragraphs(lines))
@@ -407,7 +442,11 @@ def strip_specimens(lines: list[tuple[int, str]], comments: tuple[tuple[str, str
                 continue
             start, opener, close = first_opener
             after = start + len(opener)
-            if close not in text[after:] and not any(close in later for _, later in grouped[index + 1 :]):
+            closed_here = close in text[after:]
+            closed_later = at_line_start(text, start) and any(
+                close in later for _, later in islice(grouped, index + 1, None)
+            )
+            if not closed_here and not closed_later:
                 kept.append(text[at:after])  # an opener nothing closes is text
                 at = after
                 continue
