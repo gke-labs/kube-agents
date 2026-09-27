@@ -84,17 +84,19 @@ CODE_GLOBS = ("*.py", "*.go", "*.sh", "*Dockerfile*", "*.yaml", "*.yml", "*.tf",
 VENDORED_DIR = "node_modules"
 
 # [text](target) but not ![image](target) handled separately; both are checked.
-LINK_RE = re.compile(r"!?\[[^\]]*\]\(\s*([^)\s]+)(?:\s+\"[^\"]*\")?\s*\)")
+# A title after the target, in each spelling CommonMark admits.
+LINK_TITLE_RE = r"""(?:"[^"]*"|'[^']*'|\([^)]*\))"""
+LINK_RE = re.compile(rf"!?\[[^\]]*\]\(\s*([^)\s]+)(?:\s+{LINK_TITLE_RE})?\s*\)")
 # The other ways a document links another, read for the same two rules. An
 # HTML or JSX `href` attribute: `<LinkCard href="/kube-agents/..."/>` is how
 # the site's hub pages link their sections, and `<a href>` reads the same; an
 # `href={expression}` names no file and is skipped. A reference-style
-# definition, `[label]: target`, alone on its line with at most a quoted title
+# definition, `[label]: target`, alone on its line with at most a title
 # after it, so a footnote (`[^1]: prose`) and a paragraph that happens to open
 # with a bracketed word are not read as one. An autolink, `<https://...>`,
 # which reaches a document only when it is a repository blob URL.
 HREF_RE = re.compile(r"""\bhref=(?P<quote>["'])(?P<target>[^\n]*?)(?P=quote)""")
-REFERENCE_DEFINITION_RE = re.compile(r"""^\s{0,3}\[(?!\^)[^\]]+\]:\s*<?(?P<target>[^\s<>]+)>?(?:\s+"[^"]*")?\s*\Z""")
+REFERENCE_DEFINITION_RE = re.compile(rf"""^\s{{0,3}}\[(?!\^)[^\]]+\]:\s*<?(?P<target>[^\s<>]+)>?(?:\s+{LINK_TITLE_RE})?\s*\Z""")
 AUTOLINK_RE = re.compile(r"<(?P<target>https?://[^\s<>]+)>")
 
 SKIP_PREFIXES = (

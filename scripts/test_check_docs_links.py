@@ -135,6 +135,9 @@ SITE_LISTED_LINES = ("# listed", f"[routed]({cdl.SITE_ROUTE_PREFIX}reference/rou
 # nor reads as a broken one.
 SITE_CARDED = SITE + "install/carded.md"
 REF_DEFINED_ONLY = "docs/ref-defined.md"
+REF_SINGLE_QUOTED_TITLE = "docs/ref-single-quoted.md"  # a definition with a 'title'
+REF_PARENTHESISED_TITLE = "docs/ref-parenthesised.md"  # a definition with a (title)
+LINK_PARENTHESISED_TITLE = "docs/link-parenthesised.md"  # an inline link with a (title)
 AUTOLINKED_ONLY = "docs/autolinked.md"
 OTHER_FORMS = "other-forms.md"
 SITE_INDEX_CARD_LINES = (
@@ -148,6 +151,9 @@ SITE_INDEX_CARD_LINES = (
 OTHER_FORMS_LINES = (
     "# other forms",
     f"[defined]: {REF_DEFINED_ONLY}",
+    f"[single]: {REF_SINGLE_QUOTED_TITLE} 'The spec'",
+    f"[paren]: {REF_PARENTHESISED_TITLE} (The spec)",
+    f"[titled]({LINK_PARENTHESISED_TITLE} (The spec))",
     f"<{cdl.REPO_BLOB_URL_PREFIXES[0]}{AUTOLINKED_ONLY}>",
     "[^1]: footnote",
     '`<a href="specimen.md">`',
@@ -341,7 +347,10 @@ class SyntheticRepoTest(unittest.TestCase):
 
     def test_reach_follows_an_href_a_reference_definition_and_an_autolink(self) -> None:
         _write(self.root, cdl.SITE_CONFIG, "\n".join(SITE_CONFIG_LINES) + "\n")
-        self._track(SITE_INDEX, SITE_CARDED, REF_DEFINED_ONLY, AUTOLINKED_ONLY, OTHER_FORMS)
+        self._track(
+            SITE_INDEX, SITE_CARDED, REF_DEFINED_ONLY, REF_SINGLE_QUOTED_TITLE, REF_PARENTHESISED_TITLE,
+            LINK_PARENTHESISED_TITLE, AUTOLINKED_ONLY, OTHER_FORMS,
+        )
         _write(self.root, SITE_INDEX, "\n".join(SITE_INDEX_CARD_LINES) + "\n")
         _write(self.root, OTHER_FORMS, "\n".join(OTHER_FORMS_LINES) + "\n")
         self.assertEqual(self._unlinked(), [])
