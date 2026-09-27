@@ -169,15 +169,21 @@ BLOCK_OPENER_RE = re.compile(rf"^ {{0,3}}(?:[-*+](?:\s|$)|\d{{1,9}}[.)](?:\s|$)|
 # `<!--` quoted inside a span is a specimen, and a backtick inside a comment
 # is part of the comment. An opener with no closer is text, as an unclosed
 # backtick run is, and where the closer may be depends on where the opener
-# stands, as a renderer decides it: an opener that is the first thing on its
+# stands, as a renderer decides it: an opener that is the first content of its
 # line (CommonMark's HTML block) may close in any later paragraph; one in the
 # middle of a prose line is inline HTML, which cannot cross a blank line, so
 # it is a comment only when its closer is in the same paragraph. The block
-# form is believed at any indent: CommonMark allows three spaces, measured
-# from the enclosing list item, and the checker does not track list items, so
-# an opener alone on its line four spaces in under a numbered or nested item
-# is the block it renders as, not inline HTML that keeps the links it hides.
-# Otherwise a bare `<!--` in prose, or one whose closer an edit
+# form is believed at any indent, in spaces or tabs, and behind the markers
+# that open a container block, a blockquote's `>` and a list item's bullet or
+# number: CommonMark allows three spaces measured from the enclosing item, the
+# item's or quote's content is a block sequence of its own, and the checker
+# tracks neither, so an opener alone on its line four spaces in under a
+# numbered item, or opening an item or a quote, is the block it renders as,
+# not inline HTML that keeps the links it hides. An HTML block runs to the end
+# of the line its closer is on, so what follows the closer there is raw HTML
+# and not a link, while inline HTML ends at its closer and the rest of its
+# line is prose; an MDX comment is an expression, which ends at its closer
+# either way. Otherwise a bare `<!--` in prose, or one whose closer an edit
 # lost, blanked the rest of the document up to the next comment, which most
 # documents hold (a prettier-ignore, a generated-region marker), and the
 # broken-link check went green over links it never read. (CommonMark reads an
@@ -187,6 +193,10 @@ BLOCK_OPENER_RE = re.compile(rf"^ {{0,3}}(?:[-*+](?:\s|$)|\d{{1,9}}[.)](?:\s|$)|
 HTML_COMMENT = ("<!--", "-->")
 MDX_COMMENT = ("{/*", "*/}")
 MDX_SUFFIX = ".mdx"
+# What may stand before an opener on its line for it to open a block rather
+# than inline HTML: indentation, any number of blockquote markers, one list
+# marker with the whitespace that makes it one.
+BLOCK_PREFIX_RE = re.compile(r"^[ \t]*(?:>[ \t]*)*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?$")
 # What a span or a comment leaves behind: a space, not "", so what stood
 # either side of it cannot be glued into a link that was never written, plus
 # every line break it covered, so line numbers hold.
@@ -404,21 +414,31 @@ def closing_run(text: str, run: str, start: int) -> int:
     return -1
 
 
-def at_line_start(text: str, position: int) -> bool:
-    """Whether only indentation stands between the line's start and `position`."""
-    return text[text.rfind("\n", 0, position) + 1 : position].strip(" ") == ""
+def opens_a_block(text: str, position: int) -> bool:
+    """Whether only indentation and container markers stand between the line's start and `position`."""
+    return BLOCK_PREFIX_RE.match(text[text.rfind("\n", 0, position) + 1 : position]) is not None
+
+
+def comment_end(text: str, position: int, to_line_end: bool) -> int:
+    """Where the comment whose closer ends at `position` ends: there, or at the end of that line."""
+    if not to_line_end:
+        return position
+    newline = text.find("\n", position)
+    return len(text) if newline < 0 else newline
 
 
 def strip_specimens(lines: list[tuple[int, str]], comments: tuple[tuple[str, str], ...]) -> Iterator[tuple[int, str]]:
     """The lines with every inline code span and every comment removed.
 
     A comment opener is believed only where its closer can be: in this
-    paragraph or a later one for an opener at the start of its line, in this
+    paragraph or a later one for an opener that opens a block, in this
     paragraph alone for one in the middle of a line. An opener nothing there
-    closes is text. The paragraphs are held as a list so the remainder of the
-    document can be searched before a line-start opener is believed.
+    closes is text. An HTML comment that opens a block takes the rest of its
+    closer's line with it. The paragraphs are held as a list so the remainder
+    of the document can be searched before a block opener is believed.
     """
     closer: str | None = None
+    to_line_end = False
     grouped = list(paragraphs(lines))
     for index, (numbers, text) in enumerate(grouped):
         kept: list[str] = []
@@ -429,8 +449,9 @@ def strip_specimens(lines: list[tuple[int, str]], comments: tuple[tuple[str, str
                 if end < 0:
                     kept.append(blanked(text[at:]))
                     break
-                kept.append(blanked(text[at : end + len(closer)]))
-                at = end + len(closer)
+                stop = comment_end(text, end + len(closer), to_line_end)
+                kept.append(blanked(text[at:stop]))
+                at = stop
                 closer = None
                 continue
             run = BACKTICK_RUN_RE.search(text, at)
@@ -451,15 +472,15 @@ def strip_specimens(lines: list[tuple[int, str]], comments: tuple[tuple[str, str
                 continue
             start, opener, close = first_opener
             after = start + len(opener)
+            block = opens_a_block(text, start)
             closed_here = close in text[after:]
-            closed_later = at_line_start(text, start) and any(
-                close in later for _, later in islice(grouped, index + 1, None)
-            )
+            closed_later = block and any(close in later for _, later in islice(grouped, index + 1, None))
             if not closed_here and not closed_later:
                 kept.append(text[at:after])  # an opener nothing closes is text
                 at = after
                 continue
             closer = close
+            to_line_end = block and (opener, close) == HTML_COMMENT
             kept.append(text[at:start] + SPECIMEN_REPLACEMENT)
             at = after
         yield from zip(numbers, "".join(kept).split("\n"))

@@ -160,18 +160,23 @@ OTHER_FORMS_LINES = (
     "[^1]: footnote",
     '`<a href="specimen.md">`',
 )
-# Links written inside a comment. An HTML comment on one line, one spanning
-# lines (holding a Markdown link, an `href` and a broken link), and an MDX
-# comment around a `<LinkCard>` in a site hub page: each hides its target from
-# every reader, so the target is reported, and the broken link inside one is
-# not a broken link. The live links still reach their targets: the one on the
-# line a comment closes on; the one after a `<!--` quoted in inline code (a
+# Links written inside a comment. An HTML comment in the middle of a line, one
+# that opens its line and closes on it, one spanning lines (holding a Markdown
+# link, an `href` and a broken link), and an MDX comment around a `<LinkCard>`
+# in a site hub page: each hides its target from every reader, so the target
+# is reported, and the broken link inside one is not a broken link. A comment
+# that opens its line is an HTML block, which runs to the end of the line its
+# closer is on, so a link after the closer on that line is raw HTML too: it
+# reaches nothing, and a broken one there is not reported. The live links
+# still reach their targets: the one after a mid-line comment's closer (inline
+# HTML ends at its closer); the one after a `<!--` quoted in inline code (a
 # specimen, not an opener), whether the span closes on its line or wraps onto
 # the next; the one after a comment that holds a backtick (the comment opened
 # first, so the backtick is the comment's, not a span's); and the one inside
 # an MDX comment's delimiters in a `.md` file, where they are text.
 COMMENTED_OUT = "docs/commented-out.md"
 COMMENTED_OUT_SPAN = "docs/commented-out-span.md"
+HIDDEN_ON_CLOSING_LINE = "docs/hidden-on-closing-line.md"
 LIVE_BESIDE_COMMENT = "docs/live-beside-comment.md"
 LIVE_AFTER_SPECIMEN = "docs/live-after-specimen.md"
 LIVE_AFTER_WRAPPED_SPECIMEN = "docs/live-after-wrapped-specimen.md"
@@ -181,7 +186,8 @@ SITE_COMMENTED_CARD = SITE + "install/commented-card.md"
 COMMENTS = "comments.md"  # a root file, reached by shape
 COMMENTS_LINES = (
     "# comments",
-    f"<!-- [hidden]({COMMENTED_OUT}) --> [live]({LIVE_BESIDE_COMMENT})",
+    f"prose <!-- [hidden]({COMMENTED_OUT}) --> [live]({LIVE_BESIDE_COMMENT})",
+    f"<!-- [hidden]({COMMENTED_OUT}) --> [hidden]({HIDDEN_ON_CLOSING_LINE}) [gone](nowhere.md)",
     "<!--",
     f"[hidden]({COMMENTED_OUT_SPAN})",
     f'<a href="{COMMENTED_OUT_SPAN}">',
@@ -191,7 +197,7 @@ COMMENTS_LINES = (
     f"[live]({LIVE_AFTER_SPECIMEN})",
     "a span that wraps `<!-- across",
     f"the line break` is a specimen too, so [live]({LIVE_AFTER_WRAPPED_SPECIMEN}) reaches,",
-    f"<!-- a `x --> b `y` after a backtick in a comment [live]({LIVE_AFTER_BACKTICK_IN_COMMENT}) reaches,",
+    f"prose <!-- a `x --> b `y` after a backtick in a comment [live]({LIVE_AFTER_BACKTICK_IN_COMMENT}) reaches,",
     f"{{/* and in a .md file [live]({LIVE_IN_MDX_DELIMITERS}) reaches */}}",
 )
 # A comment opener in the middle of a prose line that nothing in its
@@ -281,6 +287,44 @@ INDENTED_OPENER_LINES = (
     "    -->",
     "",
     f"   and [live]({LIVE_AFTER_INDENTED_COMMENT}) after it reaches.",
+)
+# A comment opener that is the first content of its line behind what
+# CommonMark lets stand before a block: a tab of indentation, a list marker, a
+# blockquote marker. Each opens an HTML block, as the space-indented opener
+# above does, so the comment runs across blank lines to its closer and the
+# links inside render nowhere, and a closer on the opener's own line still
+# takes the rest of that line with it. Read as inline HTML, the opener whose
+# closer sat past a blank line was text and its links were live.
+BLOCK_OPENERS = "block-openers.md"  # a root file, reached by shape
+HIDDEN_UNDER_TAB = "docs/hidden-under-tab.md"
+HIDDEN_IN_ITEM = "docs/hidden-in-item.md"
+HIDDEN_IN_QUOTE = "docs/hidden-in-quote.md"
+HIDDEN_ON_ITEM_LINE = "docs/hidden-on-item-line.md"
+LIVE_AFTER_BLOCK_OPENERS = "docs/live-after-block-openers.md"
+BLOCK_OPENERS_LINES = (
+    "# block openers",
+    "",
+    "1. an item whose continuation is indented with a tab:",
+    "",
+    "\t<!--",
+    "",
+    f"\t[hidden]({HIDDEN_UNDER_TAB})",
+    "",
+    "\t-->",
+    "",
+    "- <!--",
+    f"  [hidden]({HIDDEN_IN_ITEM})",
+    "",
+    "  -->",
+    "",
+    "> <!--",
+    f"> [hidden]({HIDDEN_IN_QUOTE}) [gone](nowhere.md)",
+    ">",
+    "> -->",
+    "",
+    f"2. <!-- a note --> [hidden]({HIDDEN_ON_ITEM_LINE}) [gone](nowhere.md) is raw HTML to the end of the line",
+    "",
+    f"- and [live]({LIVE_AFTER_BLOCK_OPENERS}) in the next item reaches.",
 )
 # An image wrapped in a link, the badge form. The image is read as one link
 # and the outer target as another, so the document only the outer target
@@ -490,9 +534,9 @@ class SyntheticRepoTest(unittest.TestCase):
     def test_a_link_inside_a_comment_reaches_nothing_and_breaks_nothing(self) -> None:
         _write(self.root, cdl.SITE_CONFIG, "\n".join(SITE_CONFIG_LINES) + "\n")
         self._track(
-            COMMENTS, COMMENTED_OUT, COMMENTED_OUT_SPAN, LIVE_BESIDE_COMMENT, LIVE_AFTER_SPECIMEN,
-            LIVE_AFTER_WRAPPED_SPECIMEN, LIVE_AFTER_BACKTICK_IN_COMMENT, LIVE_IN_MDX_DELIMITERS,
-            SITE_INDEX, SITE_CARDED, SITE_COMMENTED_CARD,
+            COMMENTS, COMMENTED_OUT, COMMENTED_OUT_SPAN, HIDDEN_ON_CLOSING_LINE, LIVE_BESIDE_COMMENT,
+            LIVE_AFTER_SPECIMEN, LIVE_AFTER_WRAPPED_SPECIMEN, LIVE_AFTER_BACKTICK_IN_COMMENT,
+            LIVE_IN_MDX_DELIMITERS, SITE_INDEX, SITE_CARDED, SITE_COMMENTED_CARD,
         )
         _write(self.root, COMMENTS, "\n".join(COMMENTS_LINES) + "\n")
         _write(self.root, SITE_INDEX, "\n".join(SITE_INDEX_COMMENTED_CARD_LINES) + "\n")
@@ -501,6 +545,7 @@ class SyntheticRepoTest(unittest.TestCase):
             [
                 f"{COMMENTED_OUT_SPAN}: {cdl.UNLINKED_MESSAGE}",
                 f"{COMMENTED_OUT}: {cdl.UNLINKED_MESSAGE}",
+                f"{HIDDEN_ON_CLOSING_LINE}: {cdl.UNLINKED_MESSAGE}",
                 f"{SITE_COMMENTED_CARD}: {cdl.UNLINKED_MESSAGE}",
             ],
         )
@@ -540,6 +585,23 @@ class SyntheticRepoTest(unittest.TestCase):
         _write(self.root, INDENTED_OPENER, "\n".join(INDENTED_OPENER_LINES) + "\n")
         self.assertEqual(self._unlinked(), [f"{HIDDEN_UNDER_ITEM}: {cdl.UNLINKED_MESSAGE}"])
         self.assertEqual(cdl.check_file(self.root / INDENTED_OPENER, cdl.tracked_paths()), [])
+
+    def test_an_opener_behind_a_tab_a_list_marker_or_a_quote_marker_is_a_block_comment(self) -> None:
+        self._track(
+            BLOCK_OPENERS, HIDDEN_UNDER_TAB, HIDDEN_IN_ITEM, HIDDEN_IN_QUOTE, HIDDEN_ON_ITEM_LINE,
+            LIVE_AFTER_BLOCK_OPENERS,
+        )
+        _write(self.root, BLOCK_OPENERS, "\n".join(BLOCK_OPENERS_LINES) + "\n")
+        self.assertEqual(
+            self._unlinked(),
+            [
+                f"{HIDDEN_IN_ITEM}: {cdl.UNLINKED_MESSAGE}",
+                f"{HIDDEN_IN_QUOTE}: {cdl.UNLINKED_MESSAGE}",
+                f"{HIDDEN_ON_ITEM_LINE}: {cdl.UNLINKED_MESSAGE}",
+                f"{HIDDEN_UNDER_TAB}: {cdl.UNLINKED_MESSAGE}",
+            ],
+        )
+        self.assertEqual(cdl.check_file(self.root / BLOCK_OPENERS, cdl.tracked_paths()), [])
 
     def test_a_linked_image_reaches_its_target_and_its_outer_target_is_checked(self) -> None:
         self._track(LINKED_IMAGE, LINKED_IMAGE_ONLY)
