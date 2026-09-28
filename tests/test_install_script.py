@@ -7480,14 +7480,13 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             out = proc.stdout + proc.stderr
-            # The value carries a backslash-escaped space, so the token is
-            # "anything but an unescaped space" up to the trailing " in ".
-            printed = re.search(r"Set (SCOPE_PROJECTS=(?:\\.|\S)+) in ", out)
-            self.assertIsNotNone(printed, out)
-            self.assertEqual(printed.group(1), "SCOPE_PROJECTS=payments-prod\\ payments-staging")
+            # The value carries a backslash-escaped space, so the remedy is one
+            # assignment, pinned verbatim as printed.
+            remedy = "SCOPE_PROJECTS=payments-prod\\ payments-staging"
+            self.assertIn(f"Set {remedy} in ", out)
             # And the assignment as printed round-trips through a sourcing shell.
             check = subprocess.run(
-                ["bash", "-c", f'set -eu; {printed.group(1)}; printf "%s" "$SCOPE_PROJECTS"'],
+                ["bash", "-c", f'set -eu; {remedy}; printf "%s" "$SCOPE_PROJECTS"'],
                 capture_output=True, text=True,
             )
             self.assertEqual(check.stdout, "payments-prod payments-staging")

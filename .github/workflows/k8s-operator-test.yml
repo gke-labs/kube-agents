@@ -33,7 +33,6 @@ on:
     branches: [main]
     paths:
       - "k8s-operator/**"
-      - "agents/platform/scripts/**"
       - ".github/workflows/k8s-operator-test.yml"
   workflow_dispatch:
 
@@ -66,7 +65,6 @@ jobs:
           filters: |
             operator:
               - "k8s-operator/**"
-              - "agents/platform/scripts/**"
               - ".github/workflows/k8s-operator-test.yml"
 
       - name: Set up Go
@@ -129,22 +127,6 @@ jobs:
         with:
           path: k8s-operator/bin/k8s
           key: envtest-${{ runner.os }}-${{ steps.envtest.outputs.k8s-version }}
-
-      # `make -C k8s-operator test` depends on test-python, which discovers the
-      # tests under agents/platform/scripts as well as the operator's own. Those
-      # modules import fastapi, mcp and the rest at module scope, so without this
-      # the discovery reports an ImportError rather than running them. Read from
-      # requirements-test.txt for the same reason python-tests.yml does: so the
-      # two jobs and `make test-python-deps` cannot drift apart.
-      #
-      # This became load-bearing when test-python moved from a hand-maintained
-      # list of four files to discovery -- the list never named the modules that
-      # need these packages, which is precisely why it was stale.
-      - name: Install the third-party imports the Python tests need
-        if: steps.filter.outputs.operator == 'true'
-        run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install -r requirements-test.txt
 
       # The deployment targets apply the committed manifests rather than
       # regenerating them, so nothing at deploy time would notice config/
