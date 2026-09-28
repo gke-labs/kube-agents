@@ -52,15 +52,21 @@ CLUSTER_KEY_PREFIX = "bootstrap-inventory-cluster-"
 # agents/platform/scripts/cluster_agent_profile.py: RESERVED_PROFILES.
 RESERVED_PROFILES = ("default", "platform")
 
+# profile_scaffold.PROFILE_MARKER and cluster_agent_reconcile.SCAFFOLD_ARTIFACTS:
+# a profile missing either is one the gate leaves out of Step 2, as
+# platform_control's list_cluster_profiles does.
+READY_FILES = ("profile.yaml", "USER.md")
+
 # Runs inside the agent container. Positional arguments: data root, board
-# file, sentinel, scan marker, key prefix, then the reserved profile names.
+# file, sentinel, scan marker, key prefix, the comma-joined ready files, then
+# the reserved profile names.
 _IN_POD_SCRIPT = r"""
 import json, os, sqlite3, sys
 
-ROOT, BOARD, SENTINEL, MARKER, PREFIX = sys.argv[1:6]
-RESERVED = set(sys.argv[6:])
+ROOT, BOARD, SENTINEL, MARKER, PREFIX, READY = sys.argv[1:7]
+RESERVED = set(sys.argv[7:])
 SQLITE_BUSY_TIMEOUT = 10
-out = {"sweep": None, "roster": [], "unidentified": [], "children": [], "error": None}
+out = {"sweep": None, "roster": [], "unidentified": [], "not_ready": [], "children": [], "error": None}
 
 
 def fail(message):
@@ -90,6 +96,9 @@ names = sorted(
     if n not in RESERVED and os.path.isdir(os.path.join(profiles, n))
 )
 for name in names:
+    if not all(os.path.isfile(os.path.join(profiles, name, f)) for f in READY.split(",")):
+        out["not_ready"].append(name)
+        continue
     try:
         with open(os.path.join(profiles, name, "config.yaml")) as fh:
             ident = (yaml.safe_load(fh) or {}).get("cluster_identity") or {}
@@ -130,7 +139,15 @@ def command() -> str:
     """The ``sh -c`` line that reads the sweep, its children and the roster."""
     args = " ".join(
         shlex.quote(a)
-        for a in [DATA_ROOT, BOARD_FILE, FANOUT_PRESENT, SCAN_MARKER, CLUSTER_KEY_PREFIX, *RESERVED_PROFILES]
+        for a in [
+            DATA_ROOT,
+            BOARD_FILE,
+            FANOUT_PRESENT,
+            SCAN_MARKER,
+            CLUSTER_KEY_PREFIX,
+            ",".join(READY_FILES),
+            *RESERVED_PROFILES,
+        ]
     )
     return (
         f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '

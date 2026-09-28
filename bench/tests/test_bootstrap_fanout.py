@@ -24,6 +24,7 @@ one of the two.
 
 from __future__ import annotations
 
+import ast
 import copy
 import json
 import sqlite3
@@ -44,6 +45,7 @@ from kube_agents_bench.verifiers import BootstrapFanoutVerifier
 BOARDS = json.loads(
     (Path(__file__).parent / "fixtures" / "bootstrap_fanout" / "boards.json").read_text()
 )
+REPO = Path(__file__).resolve().parents[2]
 
 # The board tables as the install's hermes creates them, cut to the columns
 # the read touches plus the NOT NULL ones.
@@ -74,6 +76,8 @@ def _write_root(
         if identity is not None:
             config["cluster_identity"] = identity
         (home / "config.yaml").write_text(yaml.safe_dump(config))
+        for ready in discovery.READY_FILES:
+            (home / ready).write_text("")
     if board is None:
         return root
     (root / discovery.SCAN_MARKER).write_text(f"task_id={board['sweep']}\nfiled_at=1790608075\n")
@@ -100,6 +104,7 @@ def _run_script(root: Path) -> str:
             discovery.FANOUT_PRESENT,
             discovery.SCAN_MARKER,
             discovery.CLUSTER_KEY_PREFIX,
+            ",".join(discovery.READY_FILES),
             *discovery.RESERVED_PROFILES,
         ],
         capture_output=True,
@@ -168,6 +173,44 @@ def test_a_malformed_profile_is_unidentified_not_a_failed_read(tmp_path: Path, c
     assert why == ""
     assert name in payload["unidentified"]
     assert len(payload["roster"]) == 3
+
+
+@pytest.mark.parametrize("absent", discovery.READY_FILES)
+def test_a_profile_whose_scaffold_did_not_finish_is_not_on_the_roster(tmp_path: Path, absent: str) -> None:
+    root = _write_root(tmp_path, _board("branch"))
+    name = "cluster-example-project-support-eval-cluster-us-central1-a"
+    (root / "profiles" / name / absent).unlink()
+    payload, why = discovery.read_fanout(lambda s, t: _run_script(root), 5.0)
+    assert why == ""
+    assert payload["not_ready"] == [name]
+    assert name not in [r["profile"] for r in payload["roster"]]
+    assert len(payload["roster"]) == 3
+
+
+def _module_constant(path: Path, name: str) -> Any:
+    tree = ast.parse(path.read_text())
+    value = next(
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == name for t in node.targets)
+    )
+    if isinstance(value, ast.Call) and getattr(value.func, "id", None) == "frozenset":
+        value = value.args[0]
+    return ast.literal_eval(value)
+
+
+def test_the_mirrored_names_match_the_agent_scripts() -> None:
+    gate = REPO / "agents" / "chat" / "scripts" / "bootstrap_scan_gate.py"
+    scripts = REPO / "agents" / "platform" / "scripts"
+    assert _module_constant(gate, "SCAN_FILED_MARKER") == discovery.SCAN_MARKER
+    assert _module_constant(gate, "CLUSTER_IDEMPOTENCY_KEY_PREFIX") == discovery.CLUSTER_KEY_PREFIX
+    assert set(_module_constant(scripts / "cluster_agent_profile.py", "RESERVED_PROFILES")) == set(
+        discovery.RESERVED_PROFILES
+    )
+    assert discovery.READY_FILES == (
+        _module_constant(scripts / "profile_scaffold.py", "PROFILE_MARKER"),
+        *_module_constant(scripts / "cluster_agent_reconcile.py", "SCAFFOLD_ARTIFACTS"),
+    )
 
 
 def test_a_failed_exec_is_a_failed_read() -> None:
@@ -243,7 +286,7 @@ def test_no_cluster_agent_is_an_error(pod) -> None:
     pod(_board("main"), roster={})
     result = _verify("one_card_per_cluster_agent")
     assert result.status == "error"
-    assert "no Cluster Agent profile" in result.reason
+    assert "no ready Cluster Agent profile" in result.reason
 
 
 def test_no_sweep_marker_is_an_error(pod) -> None:

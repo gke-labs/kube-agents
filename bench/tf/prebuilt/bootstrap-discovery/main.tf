@@ -15,10 +15,10 @@
 # The scenario driver for bench/tasks/bootstrap-discovery-fanout: re-arm the
 # onboarding discovery gate on the install under test, wait for the
 # `bootstrap-inventory-scan` cron job to file a fresh sweep card, and return
-# once the sweep's worker has ended its first run -- by then it has filed
-# whatever Cluster Agent cards it is going to file, which is what the case
-# grades. It does not wait for those cards to finish: the destroy archives
-# them, and archiving a running card ends its worker.
+# once the sweep's worker has filed cards and ended a run -- by then it has
+# filed whatever Cluster Agent cards it is going to file, which is what the
+# case grades. It does not wait for those cards to finish: the destroy
+# archives them, and archiving a running card ends its worker.
 #
 # Re-arming is the runbook in agents/chat/defaults/plugins/bootstrap_onboarding/
 # README.md §5 plus one step: the board deduplicates kanban_create on
@@ -51,6 +51,11 @@ locals {
   run_wait  = 900
   poll      = 15
   inventory = "${local.home}/INVENTORY.raw.md ${local.home}/INVENTORY.md"
+  # The gate as the cron job launches it, and the longest one run of it can
+  # take: bootstrap_scan_gate.py's RECONCILE_TIMEOUT_SECONDS (240) plus one
+  # cron tick.
+  gate_script = "bootstrap_scan_gate.py"
+  gate_wait   = 300
 }
 
 resource "null_resource" "sweep" {
@@ -86,8 +91,15 @@ resource "null_resource" "sweep" {
           echo "Plant failed (exit $status); archiving the bootstrap-inventory cards it left open." >&2
           # The gate files only while this marker is absent, and a sweep filed
           # after this exit would run with nothing to archive it, so the
-          # marker goes back before the cards are listed.
+          # marker goes back before the cards are listed. A gate run that read
+          # the marker before it went back files once its reconcile ends, so
+          # the listing also waits for any gate run to exit.
           agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$${old_id:-none}" >&2
+          waited=0
+          until [ "$(gate_running)" = idle ] || [ "$waited" -ge ${local.gate_wait} ]; do
+            sleep 5
+            waited=$((waited + 5))
+          done
           for id in $(open_cards); do
             agent ${local.hermes} kanban archive "$id" >&2
           done
@@ -127,6 +139,24 @@ resource "null_resource" "sweep" {
       c = sqlite3.connect("file:${local.home}/kanban.db?mode=ro", uri=True)
       rows = c.execute("SELECT id FROM tasks WHERE idempotency_key LIKE ? AND status != 'archived' ORDER BY created_at DESC", (sys.argv[1],))
       print(" ".join(r[0] for r in rows))
+      PY
+      }
+      # Anything but `idle`, a failed exec included, reads as running.
+      gate_running() {
+        agent_py "${local.gate_script}" <<'PY' || true
+      import os, sys
+      me = os.getpid()
+      for pid in filter(str.isdigit, os.listdir("/proc")):
+          try:
+              with open("/proc/%s/cmdline" % pid, "rb") as fh:
+                  argv = fh.read().decode(errors="replace").split("\0")
+          except OSError:
+              continue
+          if int(pid) != me and any(os.path.basename(a) == sys.argv[1] for a in argv[1:]):
+              print("running")
+              break
+      else:
+          print("idle")
       PY
       }
       sweep_id() {
@@ -191,36 +221,40 @@ resource "null_resource" "sweep" {
       done
       echo "The gate filed sweep card $sweep after $${elapsed}s."
 
-      # ---- 4. Wait for the sweep worker's first run to end -----------------
-      # A run ends when the worker blocks to wait for its children or
-      # completes, and either happens after the fan-out. Counting ended runs
-      # rather than reading the card's status cannot miss a block the
-      # dispatcher lifts between two polls.
+      # ---- 4. Wait for the sweep worker to file its cards -----------------
+      # The worker blocks to wait for its children or completes once it has
+      # filed them, and either ends its run. A run can also end before the
+      # worker files anything -- a rate-limit block, retries exhausted, a
+      # crashed worker reclaimed and re-dispatched -- so an ended run counts
+      # only once the sweep has filed a card. Counting ended runs rather
+      # than reading the card's status cannot miss a block the dispatcher
+      # lifts between two polls.
       run_state() {
         agent_py "$sweep" <<'PY'
       import sqlite3, sys
       c = sqlite3.connect("file:${local.home}/kanban.db?mode=ro", uri=True)
       runs = c.execute("SELECT count(*), count(ended_at) FROM task_runs WHERE task_id = ?", (sys.argv[1],)).fetchone()
-      print(runs[0], runs[1])
+      filed = c.execute("SELECT count(*) FROM kanban_worker_children WHERE creator_id = ?", (sys.argv[1],)).fetchone()
+      print(runs[0], runs[1], filed[0])
       PY
       }
       elapsed=0
-      read -r started ended <<<"$(run_state)"
-      until [ "$${ended:-0}" -ge 1 ]; do
+      read -r started ended filed <<<"$(run_state)"
+      until [ "$${ended:-0}" -ge 1 ] && [ "$${filed:-0}" -ge 1 ]; do
         if [ "$elapsed" -ge ${local.run_wait} ]; then
           if [ "$${started:-0}" -eq 0 ]; then
             echo "ERROR: no worker picked up sweep card $sweep within $${elapsed}s, so there is no fan-out to grade." >&2
             agent ${local.hermes} kanban show "$sweep" >&2 || true
             exit 1
           fi
-          echo "Sweep card $sweep is still in its first run after $${elapsed}s; handing over to the verifier."
+          echo "Sweep card $sweep has $${ended:-0} ended run(s) and $${filed:-0} filed card(s) after $${elapsed}s; handing over to the verifier."
           exit 0
         fi
         sleep ${local.poll}
         elapsed=$((elapsed + ${local.poll}))
-        read -r started ended <<<"$(run_state)"
+        read -r started ended filed <<<"$(run_state)"
       done
-      echo "Sweep card $sweep ended its first run after $${elapsed}s."
+      echo "Sweep card $sweep filed $filed card(s) and ended a run after $${elapsed}s."
     EOT
   }
 

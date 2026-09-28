@@ -711,15 +711,18 @@ class BootstrapFanoutVerifier(BaseVerifier):
 
     ``require``:
 
-    - ``one_card_per_cluster_agent``: every Cluster Agent with a cluster
-      identity got exactly one ``bootstrap-inventory-cluster-*`` card, assigned
-      to it and keyed by its cluster, and no such card went anywhere else.
+    - ``one_card_per_cluster_agent``: every Cluster Agent that is registered,
+      finished scaffolding and has a cluster identity got exactly one
+      ``bootstrap-inventory-cluster-*`` card, assigned to it and keyed by its
+      cluster, and no such card went anywhere else.
     - ``no_card_waits_on_the_sweep``: no ``bootstrap-inventory-cluster-*``
       card names the sweep as a parent. A child waiting on the card that waits
       on it never runs until the sweep has given up on it.
 
-    Fails closed: an unreadable pod, no sweep marker, a sweep card the board
-    does not know, or an empty roster is ``status="error"``.
+    Fails closed: an unreadable pod, no sweep marker, or a sweep card the board
+    does not know is ``status="error"``, and so is an empty roster for
+    ``one_card_per_cluster_agent``. ``no_card_waits_on_the_sweep`` passes on an
+    empty roster: no cluster card exists to wait on the sweep.
     """
 
     type: Literal["bootstrap_fanout"]
@@ -748,10 +751,12 @@ class BootstrapFanoutVerifier(BaseVerifier):
         roster = payload.get("roster") or []
         if not roster:
             unidentified = payload.get("unidentified") or []
+            not_ready = payload.get("not_ready") or []
             return (
                 "error",
-                f"{where}: no Cluster Agent profile with a cluster identity"
-                + (f" (profiles without one: {unidentified})" if unidentified else ""),
+                f"{where}: no ready Cluster Agent profile with a cluster identity"
+                + (f" (profiles without one: {unidentified})" if unidentified else "")
+                + (f" (profiles whose scaffold did not finish: {not_ready})" if not_ready else ""),
                 payload,
             )
         expected = {(r["profile"], r["key"]) for r in roster}
