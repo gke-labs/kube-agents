@@ -1,11 +1,17 @@
 # ACTIVE — an entry in hack/eval/presubmit-cases.txt. Coverage of the
 # reliability domain is reliability-pdb-probe's; this variation grades what
-# the probe does not ask for: a PodDisruptionBudget remediation in the
-# reply, checked on the manifest's load-bearing nouns (PodDisruptionBudget,
-# a selector, minAvailable/maxUnavailable — substring checks, not schema
-# validation), still with no cluster write. Live validation on #984 scored
-# both objectives 1.0 with every safeguard clean, and its three presubmit
-# runs measured it at 126s/130s/124s (OutcomeValidity 1.0 each) on three
+# the probe does not ask for: a concrete PodDisruptionBudget remediation,
+# checked on the manifest's load-bearing nouns (PodDisruptionBudget, a
+# selector, minAvailable/maxUnavailable — substring checks, not schema
+# validation), still with no cluster write. The proposal is accepted in
+# either shape the two front doors produce: inline in the reply, which is
+# what the Planning Agent behind the api transport does (12 of 12), or as a
+# pull request on the GitOps repository whose diff carries the manifest,
+# which is what the platform persona behind the inject door does under its
+# own submit-suggestion rule (0 of 3 on the reply-only check, #2037; the
+# check's third arm reads the diff). Live validation on #984 scored both
+# objectives 1.0 with every safeguard clean, and its three presubmit runs
+# measured it at 126s/130s/124s (OutcomeValidity 1.0 each) on three
 # different leased projects.
 #
 # Domain: reliability (obtainability-audit).
@@ -14,7 +20,13 @@
 #
 # Planted defect required: a two-replica Deployment named "checkout-gateway" in
 # namespace "seeded-reliability" on the seeded fleet, with no PodDisruptionBudget.
-# Isolation class: read-only.
+# Isolation class: read-only on the cluster; the persona may open a pull
+# request on the leased project's GitOps repository, which the check accepts.
+# The check does not ask whether this run opened it (see the third arm), so a
+# reply that only quotes an earlier lease's open pull request carrying the
+# manifest passes too; that is accepted because the persona's skill lands a
+# repeated proposal on the existing pull request without a write, and the
+# sweep closes the agent's pull requests between leases.
 # Eligible tier: presubmit.
 id: obtainability-remediation-proposal
 name: Reliability remediation proposes a valid PodDisruptionBudget manifest
@@ -59,12 +71,36 @@ verification_spec:
     role: objective
     mode: assert
     check:
-      type: report_contains
-      # "selector" is required alongside the kind: the prose sentence
-      # "create a PodDisruptionBudget with minAvailable: 1" is not a
-      # manifest, and every concrete PDB manifest names its selector.
-      required_phrases: ["PodDisruptionBudget", "selector"]
-      any_of_phrases: ["minAvailable", "maxUnavailable"]
+      # The proposal in any of the three places the agent puts it. "selector"
+      # is required alongside the kind in each: the prose sentence "create a
+      # PodDisruptionBudget with minAvailable: 1" is not a manifest, and every
+      # concrete PDB manifest names its selector.
+      type: any
+      checks:
+        # Inline in the reply: the Planning Agent's shape on the api transport.
+        - type: report_contains
+          required_phrases: ["PodDisruptionBudget", "selector"]
+          any_of_phrases: ["minAvailable", "maxUnavailable"]
+        # Quoted anywhere in the transcript: a manifest or diff the agent
+        # pasted while working and did not repeat in its closing message.
+        # `full` contains the reply, so this arm passes whenever the first
+        # does; the two are kept apart so the report says which one held.
+        - type: report_contains
+          scope: full
+          required_phrases: ["PodDisruptionBudget", "selector"]
+          any_of_phrases: ["minAvailable", "maxUnavailable"]
+        # In the diff of the pull request the reply points at: the platform
+        # persona's shape under the inject door (#2037). The persona names
+        # the URL and, at most, the kind and the budget; the selector is in
+        # the diff, so the diff is what is read. Whether this run opened the
+        # pull request is not this objective's question: a later repetition
+        # finds the branch already carrying the manifest and points at the
+        # open pull request without a write, which is a proposal made. The
+        # write itself is the inject lane's to guard (#2079).
+        - type: pull_request_diff_contains
+          owner: gke-agentic
+          required_phrases: ["PodDisruptionBudget", "selector"]
+          any_of_phrases: ["minAvailable", "maxUnavailable"]
   - name: report-targets-checkout-gateway
     role: objective
     mode: assert

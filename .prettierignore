@@ -33,6 +33,12 @@ agents/*/skills/gke-*/**
 # invocation from rewriting them by accident.
 bench/tests/fixtures/runs/**/*.json
 
+# Recorded GitHub API responses (pull requests, file listings, refs) from a
+# pool project's GitOps repository, trimmed to the fields the verifiers read
+# and kept in the shape GitHub served them. Same reasoning and the same CI
+# filter as the run records above.
+bench/tests/fixtures/github/*.json
+
 # The fleet-upgrade-verification skill's removal table: one removed apiVersion
 # per line, which is the form a reviewer diffs against the upstream migration
 # guide. Prettier would spread each entry over six lines. CI's prettier job

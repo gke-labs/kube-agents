@@ -267,6 +267,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
+    # The diff of the pull request the reply points at, with report_contains'
+    # phrase semantics; forbidden_phrases alone cannot say a proposal was
+    # made, and the verifier refuses that shape at load.
+    "pull_request_diff_contains": ("required_phrases", "any_of_phrases"),
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns"),
     "worker_agents": ("required_agents",),

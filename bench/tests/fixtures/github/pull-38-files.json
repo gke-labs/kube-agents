@@ -1,0 +1,18 @@
+[
+  {
+    "filename": "checkout-gateway-pdb.yaml",
+    "status": "added",
+    "additions": 10,
+    "deletions": 0,
+    "changes": 10,
+    "patch": "@@ -0,0 +1,10 @@\n+apiVersion: policy/v1\n+kind: PodDisruptionBudget\n+metadata:\n+  name: checkout-gateway-pdb\n+  namespace: seeded-reliability\n+spec:\n+  minAvailable: 1\n+  selector:\n+    matchLabels:\n+      app: checkout-gateway"
+  },
+  {
+    "filename": "manifests/seeded-a/checkout-gateway-pdb.yaml",
+    "status": "added",
+    "additions": 10,
+    "deletions": 0,
+    "changes": 10,
+    "patch": "@@ -0,0 +1,10 @@\n+apiVersion: policy/v1\n+kind: PodDisruptionBudget\n+metadata:\n+  name: checkout-gateway-pdb\n+  namespace: seeded-reliability\n+spec:\n+  minAvailable: 1\n+  selector:\n+    matchLabels:\n+      app: checkout-gateway"
+  }
+]

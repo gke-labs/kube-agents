@@ -14,18 +14,20 @@
 
 """Leaf verifiers this repository adds to devops-bench's own.
 
-Four of them answer the half of a task's exact checks that cluster state
+Most of them answer the half of a task's exact checks that cluster state
 cannot: did the *report* name the thing we planted, did the agent *call* the
-tools it claims to have used, does the *ledger issue the run published* carry
-the finding — for the fleet audits, whose SOPs deliberately keep the chat reply
-to one line — and is the *pull request* the reply links one this run opened
-rather than an earlier one. All four read the per-run stash in
-:mod:`kube_agents_bench.transcript`, and all four fail closed: an empty
-stash is ``status="error"`` — the check could not be evaluated — never a pass
-or a fail, so ``VerificationCoverage`` drops below 1.0 and the gate catches
-it.
+tools it claims to have used (and, through the workers' logs and tags, what
+the delegated *workers* ran and as whom), does the *ledger issue the run
+published* carry the finding — for the fleet audits, whose SOPs deliberately
+keep the chat reply to one line — is the *pull request* the reply links one
+this run opened rather than an earlier one, and does the *diff* of the pull
+request the reply points at carry the proposal the case asked for. They read
+the per-run stash in :mod:`kube_agents_bench.transcript`, and they fail
+closed: an empty stash is ``status="error"`` — the check could not be
+evaluated — never a pass or a fail, so ``VerificationCoverage`` drops below
+1.0 and the gate catches it.
 
-The fifth, ``fleet_resource_property``, does read cluster state, and exists
+The exception, ``fleet_resource_property``, does read cluster state, and exists
 because upstream's ``resource_property`` reads the WRONG cluster and cannot
 tell a missing fixture from a missing cluster. See
 :class:`FleetResourcePropertyVerifier`.
@@ -58,6 +60,7 @@ from devops_bench.verification.base import (
     single_call_timeout,
 )
 from devops_bench.verification.verifiers import ResourcePropertyVerifier
+from pydantic import Field, field_validator, model_validator
 
 from kube_agents_bench import transcript
 from kube_agents_bench.fleet import (
@@ -70,6 +73,7 @@ from kube_agents_bench.fleet import (
 __all__ = [
     "FleetResourcePropertyVerifier",
     "LedgerIssueContainsVerifier",
+    "PullRequestDiffContainsVerifier",
     "PullRequestOpenedVerifier",
     "ReportContainsVerifier",
     "ToolCalledVerifier",
@@ -1624,6 +1628,261 @@ class PullRequestOpenedVerifier(BaseVerifier):
         return done(
             False,
             "none of the pull request URLs the report names is one this run opened: "
+            + "; ".join(rejected),
+        )
+
+
+# ------------------------------------------------- pull request diff
+
+# Page size and bound for the pull request's file listing. A remediation
+# touches a handful of files; GitHub serves up to 3000 across pages, and a
+# diff past this bound is graded on the pages read and says so.
+_PR_FILES_PAGE_SIZE = 100
+_PR_FILES_MAX_PAGES = 3
+
+_NO_DIFF_PHRASES_REASON = (
+    "pull_request_diff_contains asserts nothing: set required_phrases or "
+    "any_of_phrases (forbidden_phrases alone cannot say a proposal was made)"
+)
+_NO_DIFF_TOKEN_REASON = (
+    "no GitHub read credential in the environment: set one of "
+    f"{', '.join(LEDGER_TOKEN_ENV_VARS)} to a token with pull_requests: read on "
+    "the eval GitOps repository, or this check cannot be evaluated"
+)
+# What a unified diff marks an added line with, and the header line that
+# shares the prefix and is not one.
+_DIFF_ADDED_PREFIX = "+"
+_DIFF_FILE_HEADER_PREFIX = "+++"
+
+
+@VERIFIERS.register("pull_request_diff_contains")
+class PullRequestDiffContainsVerifier(BaseVerifier):
+    """Phrase checks against the diff of the pull request the reply points at.
+
+    WHY THIS EXISTS. A proposal case asks for a concrete manifest and grades
+    the reply for its load-bearing nouns. The Planning Agent, which today's
+    api transport reaches, inlines the manifest; the platform persona, which
+    the inject door reaches directly, follows its own rule and opens a pull
+    request instead, naming the URL and nothing of the manifest (#2037:
+    ``obtainability-remediation-proposal`` 12 of 12 on one, 0 of 3 on the
+    other, for the same proposal). The proposal is in the diff, so this check
+    reads it there: the same phrase semantics as ``report_contains``, over
+    the ``patch`` of every file the pull request changes, plus the file
+    names.
+
+    WHAT IT ASSERTS, AND WHAT IT DOES NOT. The reply names a github.com pull
+    request URL under ``owner``; GitHub resolves it as a pull request that is
+    open or merged; and the concatenated patches carry every phrase in
+    ``required_phrases``, at least one of ``any_of_phrases``, and none of
+    ``forbidden_phrases``, after the normalisation ``report_contains``
+    applies. It does NOT ask whether this run opened or pushed to the pull
+    request: that is ``pull_request_opened``'s question, and a case that
+    needs both declares both. Here a repetition that recomputed the same
+    manifest, found the branch already carrying it and pointed at the open
+    pull request (the skill's "already exists" path, which the measurement
+    run's third repetition took: it refused "nothing to commit" and named the
+    pull request its predecessor had pushed to) has proposed a concrete
+    manifest, and the proposal is what the objective grades. The cost of that
+    choice is stated rather than hidden: a reply that only quotes an earlier
+    lease's open pull request carrying the manifest passes this arm too, the
+    leftover grading #1755 describes. It is accepted here because requiring a
+    push would fail the correct third repetition, because the sweep closes the
+    agent's pull requests between leases so such a leftover is the exception,
+    and because a case that must prove the write declares
+    ``pull_request_opened`` beside this. What the run wrote to GitHub is not
+    this objective's question; the inject lane guards that with a safeguard
+    of its own (#2079). A pull request closed without being merged is
+    rejected: the skill's "already exists" matches open ones only, so a
+    closed one named in a reply is a leftover quoted, not a proposal made.
+    Only ADDED lines of each patch are matched, plus the file names: a pull
+    request that deletes a budget, or edits a line beside one, carries the
+    nouns in its context and removed lines and proposes nothing.
+
+    WHICH ENDPOINT. ``/pulls/{n}`` for the state, then ``/pulls/{n}/files``
+    for the patches; both want ``pull_requests: read``, which
+    ``hack/ci-eval-pr.sh`` asks for at mint. A 401, a 403, an unexpected
+    status or an unreachable API is a candidate that could not be evaluated,
+    and ends the check as ``status="error"`` only when no other candidate
+    passes; a 404 is a pull request that is not there, rejected. A file whose
+    ``patch`` GitHub omits (binary, or too large) is noted; the phrases are
+    matched over what was served.
+    """
+
+    type: Literal["pull_request_diff_contains"]
+    # The organisation the pull request must sit under, "" for any; the same
+    # pin `pull_request_opened` carries.
+    owner: str = ""
+    required_phrases: list[str] = Field(default_factory=list)
+    any_of_phrases: list[str] = Field(default_factory=list)
+    forbidden_phrases: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _asserts_something(self) -> PullRequestDiffContainsVerifier:
+        if not self.required_phrases and not self.any_of_phrases:
+            raise ValueError(_NO_DIFF_PHRASES_REASON)
+        return self
+
+    def _diff(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[str | None, str | None, list[str]]:
+        """``(diff text, None, notes)`` when read, ``(None, reason, notes)``
+        when the candidate could not be evaluated, ``(None, None, notes)``
+        when it is not a gradable pull request (absent, an issue, closed
+        unmerged); the notes say why."""
+        base = f"https://api.github.com/repos/{owner}/{repo}"
+        slug = f"{owner}/{repo}#{number}"
+        status, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
+        if status == 401:
+            return None, (
+                f"GitHub answered 401 for {slug}: the token in {LEDGER_TOKEN_ENV_VARS[0]} is "
+                "not valid — an installation token expires an hour after it is minted — so "
+                "this check could not be evaluated"
+            ), []
+        if status == 403:
+            return None, (
+                f"GitHub denied {slug}; the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                "`pull_requests: read` to read the diff, so this check could not be evaluated"
+            ), []
+        if status == 404:
+            return None, None, [f"{slug}: no such pull request (404)"]
+        if status != 200 or not isinstance(payload, dict) or "head" not in payload:
+            return None, (
+                f"unexpected GitHub response {status} for {slug}; this check could not be "
+                "evaluated"
+            ), []
+        if str(payload.get("state") or "").lower() == "closed" and not payload.get("merged_at"):
+            return None, None, [f"{slug}: closed without being merged"]
+        chunks: list[str] = []
+        notes: list[str] = []
+        for page in range(1, _PR_FILES_MAX_PAGES + 1):
+            status, files = _http_get_json(
+                f"{base}/pulls/{number}/files?per_page={_PR_FILES_PAGE_SIZE}&page={page}",
+                token,
+                budget,
+            )
+            if status != 200 or not isinstance(files, list):
+                return None, (
+                    f"unexpected GitHub response {status} for {slug}'s file listing; this "
+                    "check could not be evaluated"
+                ), notes
+            for entry in files:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("filename") or "")
+                patch = entry.get("patch")
+                if not isinstance(patch, str):
+                    notes.append(f"{name}: no patch served (binary or too large)")
+                    patch = ""
+                added = [
+                    line[len(_DIFF_ADDED_PREFIX) :]
+                    for line in patch.splitlines()
+                    if line.startswith(_DIFF_ADDED_PREFIX)
+                    and not line.startswith(_DIFF_FILE_HEADER_PREFIX)
+                ]
+                chunks.append("\n".join([name, *added]))
+            if len(files) < _PR_FILES_PAGE_SIZE:
+                break
+        else:
+            notes.append(
+                f"{slug} changes at least {_PR_FILES_PAGE_SIZE * _PR_FILES_MAX_PAGES} files; "
+                "graded on the first pages"
+            )
+        return "\n".join(chunks), None, notes
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+
+        def done(
+            success: bool,
+            reason: str,
+            *,
+            status: str | None = None,
+            raw: dict | None = None,
+        ) -> VerificationResult:
+            return VerificationResult(
+                success=success,
+                status=status,
+                elapsed_time=time.monotonic() - start,
+                reason=reason,
+                raw=raw,
+            )
+
+        snap = transcript.get()
+        if snap is None:
+            return done(False, _NO_TRANSCRIPT_REASON, status="error")
+        seen: list[tuple[str, str, int]] = []
+        for owner, repo, number in _PULL_URL_RE.findall(snap.final_message):
+            key = (owner, repo, int(number))
+            if key not in seen:
+                seen.append(key)
+        # Before the token: a reply that names no pull request is a plain
+        # fail, and a hand-driven run whose reply inlined the manifest
+        # should not error here for want of a credential it never needed.
+        if not seen:
+            return done(False, _NO_PR_URL_REASON)
+        if len(seen) > _MAX_PR_CANDIDATES:
+            return done(
+                False,
+                f"the run's report names {len(seen)} distinct pull request URLs; a "
+                f"proposal points at one, so more than {_MAX_PR_CANDIDATES} is not a set of "
+                "candidates worth resolving",
+            )
+        token = next(
+            (v for v in (os.environ.get(n) for n in LEDGER_TOKEN_ENV_VARS) if v), None
+        )
+        if not token:
+            return done(False, _NO_DIFF_TOKEN_REASON, status="error")
+
+        budget = single_call_timeout(timeout_sec)
+        any_of = [_normalize(p) for p in self.any_of_phrases]
+        rejected: list[str] = []
+        unresolved: list[str] = []
+        for owner, repo, number in seen:
+            slug = f"{owner}/{repo}#{number}"
+            if self.owner and owner.lower() != self.owner.lower():
+                rejected.append(f"{slug}: not under {self.owner}")
+                continue
+            try:
+                diff, unevaluable, notes = self._diff(owner, repo, number, token, budget)
+            except OSError as exc:
+                unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                continue
+            if diff is None:
+                (unresolved if unevaluable else rejected).extend([unevaluable] if unevaluable else notes)
+                continue
+            haystack = _normalize(diff)
+            missing = [p for p in self.required_phrases if _normalize(p) not in haystack]
+            present_forbidden = [p for p in self.forbidden_phrases if _normalize(p) in haystack]
+            any_ok = not any_of or any(p in haystack for p in any_of)
+            if missing or present_forbidden or not any_ok:
+                parts = []
+                if missing:
+                    parts.append(f"required phrases absent from its diff: {missing}")
+                if not any_ok:
+                    parts.append(f"none of the alternative phrasings in its diff: {self.any_of_phrases}")
+                if present_forbidden:
+                    parts.append(f"forbidden phrases in its diff: {present_forbidden}")
+                rejected.append(f"{slug}: " + "; ".join(parts))
+                continue
+            return done(
+                True,
+                f"{slug}'s diff adds all {len(self.required_phrases)} required phrase(s)"
+                + (f", one of {self.any_of_phrases}" if any_of else "")
+                + f", none of {len(self.forbidden_phrases)} forbidden"
+                + (f" ({'; '.join(notes)})" if notes else ""),
+                raw={"pull_request": slug, "notes": notes},
+            )
+
+        if unresolved:
+            return done(
+                False,
+                "no pull request URL in the report could be read: " + "; ".join(unresolved)
+                + (f"; also rejected: {'; '.join(rejected)}" if rejected else ""),
+                status="error",
+            )
+        return done(
+            False,
+            "none of the pull request URLs the report names carries the proposal in its diff: "
             + "; ".join(rejected),
         )
 
