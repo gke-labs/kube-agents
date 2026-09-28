@@ -15,10 +15,10 @@
 # The scenario driver for bench/tasks/bootstrap-discovery-fanout: re-arm the
 # onboarding discovery gate on the install under test, wait for the
 # `bootstrap-inventory-scan` cron job to file a fresh sweep card, and return
-# once the sweep's worker has filed cards and ended a run -- by then it has
-# filed whatever Cluster Agent cards it is going to file, which is what the
-# case grades. It does not wait for those cards to finish: the destroy
-# archives them, and archiving a running card ends its worker.
+# once the sweep's worker has filed cards and ended the run that filed them --
+# by then it has filed whatever Cluster Agent cards it is going to file, which
+# is what the case grades. It does not wait for those cards to finish: the
+# destroy archives them, and archiving a running card ends its worker.
 #
 # Re-arming is the runbook in agents/chat/defaults/plugins/bootstrap_onboarding/
 # README.md §5 plus one step: the board deduplicates kanban_create on
@@ -141,9 +141,22 @@ resource "null_resource" "sweep" {
       print(" ".join(r[0] for r in rows))
       PY
       }
-      # Anything but `idle`, a failed exec included, reads as running.
+      # Anything but `idle`, a failed exec included, reads as running. Every
+      # pod is checked because above one replica only the leader runs cron.
       gate_running() {
-        agent_py "${local.gate_script}" <<'PY' || true
+        selector="$(kubectl get deployment -n "${var.agent_namespace}" "${var.agent_deployment}" \
+          -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}' || true)"
+        pods=""
+        if [ -n "$selector" ]; then
+          pods="$(kubectl get pods -n "${var.agent_namespace}" -l "$${selector%,}" -o name || true)"
+        fi
+        if [ -z "$pods" ]; then
+          echo running
+          return
+        fi
+        for pod in $pods; do
+          state="$(kubectl exec -i -n "${var.agent_namespace}" "$pod" -c "${var.agent_container}" -- \
+            ${local.python} - "${local.gate_script}" <<'PY' || true
       import os, sys
       me = os.getpid()
       for pid in filter(str.isdigit, os.listdir("/proc")):
@@ -158,6 +171,13 @@ resource "null_resource" "sweep" {
       else:
           print("idle")
       PY
+      )"
+          if [ "$state" != idle ]; then
+            echo running
+            return
+          fi
+        done
+        echo idle
       }
       sweep_id() {
         agent sh -c 'sed -n "s/^task_id=//p" ${local.home}/.bootstrap_scan_filed 2>/dev/null; true' || true
@@ -225,22 +245,27 @@ resource "null_resource" "sweep" {
       # The worker blocks to wait for its children or completes once it has
       # filed them, and either ends its run. A run can also end before the
       # worker files anything -- a rate-limit block, retries exhausted, a
-      # crashed worker reclaimed and re-dispatched -- so an ended run counts
-      # only once the sweep has filed a card. Counting ended runs rather
-      # than reading the card's status cannot miss a block the dispatcher
-      # lifts between two polls.
+      # crashed worker reclaimed and re-dispatched -- so only a run that ended
+      # after the sweep's newest card was filed counts. Counting ended runs
+      # rather than reading the card's status cannot miss a block the
+      # dispatcher lifts between two polls. The board creates
+      # kanban_worker_children when a worker first files a card.
       run_state() {
         agent_py "$sweep" <<'PY'
       import sqlite3, sys
       c = sqlite3.connect("file:${local.home}/kanban.db?mode=ro", uri=True)
       runs = c.execute("SELECT count(*), count(ended_at) FROM task_runs WHERE task_id = ?", (sys.argv[1],)).fetchone()
-      filed = c.execute("SELECT count(*) FROM kanban_worker_children WHERE creator_id = ?", (sys.argv[1],)).fetchone()
-      print(runs[0], runs[1], filed[0])
+      filed, newest, after = 0, None, 0
+      if c.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kanban_worker_children'").fetchone():
+          filed, newest = c.execute("SELECT count(*), max(created_at) FROM kanban_worker_children WHERE creator_id = ?", (sys.argv[1],)).fetchone()
+      if newest is not None:
+          after = c.execute("SELECT count(*) FROM task_runs WHERE task_id = ? AND ended_at >= ?", (sys.argv[1], newest)).fetchone()[0]
+      print(runs[0], runs[1], filed, after)
       PY
       }
       elapsed=0
-      read -r started ended filed <<<"$(run_state)"
-      until [ "$${ended:-0}" -ge 1 ] && [ "$${filed:-0}" -ge 1 ]; do
+      read -r started ended filed after <<<"$(run_state)"
+      until [ "$${after:-0}" -ge 1 ]; do
         if [ "$elapsed" -ge ${local.run_wait} ]; then
           if [ "$${started:-0}" -eq 0 ]; then
             echo "ERROR: no worker picked up sweep card $sweep within $${elapsed}s, so there is no fan-out to grade." >&2
@@ -252,7 +277,7 @@ resource "null_resource" "sweep" {
         fi
         sleep ${local.poll}
         elapsed=$((elapsed + ${local.poll}))
-        read -r started ended filed <<<"$(run_state)"
+        read -r started ended filed after <<<"$(run_state)"
       done
       echo "Sweep card $sweep filed $filed card(s) and ended a run after $${elapsed}s."
     EOT

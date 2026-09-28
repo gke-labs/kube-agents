@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -211,6 +212,13 @@ def test_the_mirrored_names_match_the_agent_scripts() -> None:
         _module_constant(scripts / "profile_scaffold.py", "PROFILE_MARKER"),
         *_module_constant(scripts / "cluster_agent_reconcile.py", "SCAFFOLD_ARTIFACTS"),
     )
+
+
+def test_the_stack_waits_out_the_longest_gate_run() -> None:
+    gate = REPO / "agents" / "chat" / "scripts" / "bootstrap_scan_gate.py"
+    stack = (REPO / "bench" / "tf" / "prebuilt" / "bootstrap-discovery" / "main.tf").read_text()
+    gate_wait = int(re.search(r"^\s*gate_wait\s*=\s*(\d+)\s*$", stack, re.M).group(1))
+    assert gate_wait == _module_constant(gate, "RECONCILE_TIMEOUT_SECONDS") + 60  # one cron tick
 
 
 def test_a_failed_exec_is_a_failed_read() -> None:

@@ -9,9 +9,8 @@
 # stack and the verifier.
 #
 # bench/tf/prebuilt/bootstrap-discovery re-arms the gate, waits for the cron
-# job to file a new sweep card, and returns once that card's worker has ended
-# its first run -- the point by which it has filed every card it is going to
-# file. The objective then compares the cards it filed against the Cluster
+# job to file a new sweep card, and returns once that card's worker has filed
+# its cards and ended the run that filed them. The objective then compares the cards it filed against the Cluster
 # Agent roster, read straight from the profiles on the agent's disk rather
 # than through the gate, so a build whose gate hands the worker no roster
 # fails here instead of erroring. The stack's header says why re-arming
