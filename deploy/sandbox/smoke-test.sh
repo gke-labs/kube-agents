@@ -192,6 +192,46 @@ check "hermes can write its kubeconfig directory" "700 hermes" \
   "$("${HERMES_SSH[@]}" 'stat -c "%a %U" /home/hermes/.kubeconfigs' 2>&1)"
 check "the agent cannot write a kubeconfig for hermes to use" "Permission denied" \
   "$("${SSH[@]}" 'touch /home/hermes/.kubeconfigs/planted.yaml' 2>&1)"
+# The same property one level up: not what a hermes session *sources*, but what
+# an agent-pod caller runs over it. Two scripts are forwarded in as hermes --
+# `forge.py` for every forge verb (agents/platform/scripts/forge.py, `_forward`)
+# and `resolver.py` for the issues sweep's poll (github-issue-resolver,
+# `_forward_to_sandbox`) -- and the copy of each under /opt/data is the model's
+# own; section 4b plants an edit in one on purpose. So the forwarded path is a
+# root-owned staging directory instead. Both are checked: resolver.py's hop was
+# left under /opt/data when forge.py's was moved, which is what a per-script
+# check would not have let happen.
+for forwarded in forge.py resolver.py; do
+  check "the forwarded $forwarded is root-owned and writable by nobody else" "755 root root" \
+    "$("${SSH[@]}" "stat -c '%a %U %G' /opt/vcs/libexec/platform/$forwarded" 2>&1)"
+  check "the model cannot rewrite the $forwarded hermes runs" "Permission denied" \
+    "$("${SSH[@]}" "echo '# planted' >> /opt/vcs/libexec/platform/$forwarded" 2>&1)"
+done
+check "nor take the directory out from under it" "Permission denied" \
+  "$("${SSH[@]}" 'mv /opt/vcs/libexec/platform /opt/vcs/libexec/platform.bak' 2>&1)"
+# And they run from there, which is the other half: every module either imports
+# is staged beside it, so nothing has to be found under /opt/data. `--help` is
+# enough to prove that -- argparse only prints usage once the module-level
+# imports have all resolved.
+check "hermes can run the forwarded forge.py" "usage:" \
+  "$("${HERMES_SSH[@]}" 'python3 /opt/vcs/libexec/platform/forge.py --help' 2>&1)"
+check "hermes can run the forwarded resolver.py" "usage:" \
+  "$("${HERMES_SSH[@]}" 'python3 /opt/vcs/libexec/platform/resolver.py --help' 2>&1)"
+# And that the closure really is closed: nothing either one loaded came off the
+# agent-owned directories their own sys.path appends put behind the staging
+# directory. This is the build guard's check, re-run against the running image,
+# because the thing it protects is a runtime property.
+check "nothing hermes imports resolves outside the staging directory" "clean" \
+  "$("${HERMES_SSH[@]}" 'cd /opt/vcs/libexec/platform && python3 -c "
+import sys
+sys.path.insert(0, \"/opt/vcs/libexec/platform\")
+import forge, resolver
+bad = [m.__name__ for m in list(sys.modules.values())
+       if getattr(m, \"__file__\", None)
+       and (m.__file__.startswith(\"/opt/data\") or m.__file__.startswith(\"/opt/defaults\"))]
+print(\" \".join(bad) or \"clean\")
+"' 2>&1)"
+
 # Generated on the host so the private half never has to be copied back out of
 # the container: the model only needs the public half to authorise it.
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/rogue" -C sandbox-smoke-rogue
@@ -309,6 +349,18 @@ check "and the reference forms in the skills resolve to the same file" "ok" \
 "${SSH[@]}" 'echo "# planted" >> /opt/data/scripts/forge.py' >/dev/null 2>&1
 check "the model can edit what it runs" "planted" \
   "$("${SSH[@]}" 'tail -1 /opt/data/scripts/forge.py' 2>&1)"
+# The other end of the boundary section 3b set up: this is the copy the *model*
+# runs, and the edit is allowed to stand. What an agent-pod caller runs is the
+# root-owned one, and it is untouched by this.
+check_absent "the edit does not reach the copy hermes runs" "planted" \
+  "$("${SSH[@]}" 'tail -1 /opt/vcs/libexec/platform/forge.py' 2>&1)"
+# And the same for the issues sweep's entry point, which reaches /opt/data on
+# every tick of an install with the sandbox on.
+"${SSH[@]}" 'echo "# planted" >> /opt/data/skills/github-issue-resolver/scripts/resolver.py' >/dev/null 2>&1
+check "the model can edit its own copy of the resolver" "planted" \
+  "$("${SSH[@]}" 'tail -1 /opt/data/skills/github-issue-resolver/scripts/resolver.py' 2>&1)"
+check_absent "the edit does not reach the resolver hermes runs" "planted" \
+  "$("${SSH[@]}" 'tail -1 /opt/vcs/libexec/platform/resolver.py' 2>&1)"
 
 echo
 echo "== 4c. the working directory Hermes cds into =="

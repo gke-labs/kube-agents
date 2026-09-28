@@ -27,9 +27,9 @@ object on stdout.
 - **Changing a repository.** Use **submit-suggestion** (a pull request against
   the GitOps repo) or **fleet-audit** (fixes for its own findings). This skill
   opens read-only workspaces and the broker refuses to commit from one.
-- **Reading a file the GitOps workflow already handed you.** `fleet-audit` and
-  `submit-suggestion` give you a workspace or a handle of their own; use theirs
-  rather than opening a second view of the same repository.
+- **Reading a file the GitOps workflow already handed you.** `fleet-audit` gives
+  you a leased clone and `submit-suggestion` `prepare` gives you the copy it
+  cloned; read theirs rather than opening a second view of the same repository.
 
 ## Two shapes, and which to pick
 

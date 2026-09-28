@@ -1,0 +1,19 @@
+{
+  "payload": {
+    "name": "status:in-progress",
+    "color": "fbca04",
+    "description": "Being worked by the agent"
+  },
+  "responses": [
+    {
+      "__status__": 404,
+      "__detail__": "gh: Not Found (HTTP 404)"
+    },
+    {
+      "id": 11112301,
+      "name": "status:in-progress",
+      "color": "fbca04",
+      "description": "Being worked by the agent"
+    }
+  ]
+}

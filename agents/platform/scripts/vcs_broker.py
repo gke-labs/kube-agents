@@ -63,6 +63,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -87,6 +88,14 @@ LOGGER = logging.getLogger("credential-proxy.vcs")
 # under everything else.
 DEFAULT_MAX_CLONE_BYTES = 256 << 20  # 256 MiB
 DEFAULT_MAX_BUNDLE_BYTES = 64 << 20  # 64 MiB
+
+# How many open proposals the `advance` check reads off a branch. One would
+# settle whether any is open; the rest are read because the second half of the
+# check asks whose they are, and a forge that lets two proposals share a source
+# branch would otherwise have the answer decided by whichever came back first.
+# Not a page to walk: a branch with more than this many open proposals on it is
+# not a case this refusal is trying to be exact about.
+OPEN_PROPOSALS_ON_A_BRANCH = 10
 
 # The ref an incoming bundle is fetched into. Under `refs/vcs/` rather than
 # `refs/heads/` so nothing here can be confused with a branch, and so a publish
@@ -135,6 +144,29 @@ def _remove_tree(path: Path) -> None:
         pass
 
 
+_AUTOMATION_MARKING = re.compile(r"\[[^\]]*\]$")
+
+
+def _login_key(login: str) -> str:
+    """One spelling for two sources that mark an automation differently.
+
+    A provider's translation strips the marking a forge puts on an automation's
+    login before it emits an author; a transport's `whoami` reports whatever the
+    credential store holds, marking and all. Compared raw, an install is a
+    stranger to its own proposals.
+
+    The marking is therefore not available to tell the two apart, and this
+    folds `kube-agents[bot]` onto a human account spelled `kube-agents`: the
+    `advance` ownership check above would read that person's open proposal as
+    this install's. Getting it back needs the author's bot flag carried through
+    `proposal-list`, which no forge in the protocol emits today. The failure is
+    permissive and it takes a human registering the install's own App name on
+    the same forge, so it is recorded rather than guarded -- guessing from the
+    spelling is how the comparison broke in the first place.
+    """
+    return _AUTOMATION_MARKING.sub("", (login or "").strip()).casefold()
+
+
 class Binding:
     """One request's forge, repository, transport and git runner.
 
@@ -176,11 +208,14 @@ class Binding:
             self.forge.credential.ensure(self.repo)
             self._ready = True
 
-    def api(self, method: str, path: str, **kwargs: Any) -> Any:
+    def transport(self) -> Transport:
         if self._built is None:
             self._built = self._transport()
+        return self._built
+
+    def api(self, method: str, path: str, **kwargs: Any) -> Any:
         self.ensure()
-        return self._built.api(method, path, **kwargs)
+        return self.transport().api(method, path, **kwargs)
 
     def stamp(self, result: dict[str, Any]) -> dict[str, Any]:
         result.update({"forge": self.forge.name, "repo": self.repo})
@@ -420,7 +455,10 @@ class VcsBroker:
 
         The branch must not be the target either. That closes the same door for
         a copy cloned from a branch that is not the default, where the broker
-        has nothing to check against but what the caller declared.
+        has nothing to check against but what the caller declared. `advance`
+        waives the declared half of that pair and nothing else -- it is how a
+        caller says the branch it cloned is a proposal branch it is here to add
+        to, which is the one case where writing to it is the whole point.
 
         The bundle must carry exactly the branch it claims. A bundle holding a
         second ref would publish something the caller did not declare, and a
@@ -447,7 +485,15 @@ class VcsBroker:
         cloned_from = payload.get("clonedFrom")
         if cloned_from is not None:
             cloned_from = validate_branch(cloned_from, "clonedFrom")
-        if cloned_from and branch == cloned_from:
+        # The one legitimate reason to write to the branch this copy was cloned
+        # from: the copy was taken *of* a proposal branch in order to add to it.
+        # A caller revising an open proposal has to clone the branch the
+        # proposal is on -- there is nowhere else its revisions are -- and every
+        # other check still applies to it, the default-branch refusal below
+        # included. The field is the caller saying which of the two situations
+        # this is, and a caller that omits it gets the refusal.
+        advance = bool(payload.get("advance"))
+        if cloned_from and branch == cloned_from and not advance:
             # The client says so itself: this is the branch the copy was
             # cloned from, whatever `target` names. A client that lies here
             # gains nothing it could not get by omitting the field, so this
@@ -539,6 +585,42 @@ class VcsBroker:
                     status=409,
                     code="PROTECTED_BRANCH",
                 )
+            if advance:
+                # The waived refusal, checked against the forge rather than
+                # taken on the caller's word alone. `advance` says one thing --
+                # this copy was cloned *of* a proposal branch in order to add
+                # to it -- and an open proposal whose source is this branch is
+                # that thing, read off the forge.
+                #
+                # A bar, not a proof, and worth being exact about which. The
+                # same caller can open that proposal first: `proposal-create`
+                # is on the same route table, gated on the same managed list a
+                # caller already passed to reach `publish`. So the sequence
+                # this stops -- clone `release-1.2`, commit, `publish --target
+                # main --advance`, the live incident the refusal was added for
+                # -- is not made impossible; it is made to cost a pull request
+                # under the install's own name, open on the forge for anyone
+                # to see, and it stops being something a worker does by
+                # mistake because the refusal text named a flag. Without the
+                # check the field was simply that flag.
+                #
+                # "Under the install's own name" is a claim about the author,
+                # so the author is what is compared -- otherwise the ordinary
+                # `release-1.2` back-merge, open on the forge under somebody
+                # else's name, clears the bar and the cost is zero. It is
+                # compared only where both halves can be read: a credential
+                # that cannot introspect itself leaves the weaker bar, which is
+                # why this is still a bar and not a proof.
+                #
+                # The refusals that do not come from the request -- the
+                # remote's default branch, the protected names, the base
+                # override, `run/**` -- stand regardless, which is the part
+                # that is a proof.
+                #
+                # After the default-branch check, not before it. That refusal is
+                # the one the broker establishes for itself, and it must stay
+                # the answer a caller gets for trying `advance` on `main`.
+                self._require_open_proposal(bound, branch)
             # The target first, so the ancestry checks below have something to
             # be about.
             git(root, "fetch", "--quiet", "--no-tags", "origin", target)
@@ -685,6 +767,108 @@ class VcsBroker:
 
     # ---- collaboration verbs -------------------------------------------
 
+    def _require_open_proposal(self, bound: Binding, branch: str) -> None:
+        """Refuse unless `branch` already carries an open proposal.
+
+        One extra read on the `advance` path only, which is the second and
+        later rounds of a proposal the caller already opened -- not the first
+        publish of anything. What it establishes is that such a proposal is
+        open on the forge and that this install is the one who opened it, the
+        second only where the credential can say who it is and the forge names
+        the proposal's author. It does not establish that the install opened it
+        *before* this request: the same caller can call `proposal-create` one
+        verb earlier. See the comment at the call site for what that does and
+        does not buy.
+
+        A forge that does not serve `proposal-list` is left alone. `publish`
+        holds no forge otherwise -- it is git against a URL, which is what makes
+        the seam a seam -- and a forge with no proposals has no branch this
+        could be the second round of, so there is nothing for the check to
+        establish. The refusals that do not come from the request, the
+        default-branch one above chief among them, still stand there.
+        """
+        if "proposal-list" not in getattr(bound.forge, "verbs", ()):
+            return
+        answer = bound.forge.proposal_list(
+            bound.api,
+            bound.repo,
+            {"state": "open", "source": branch, "limit": OPEN_PROPOSALS_ON_A_BRANCH},
+        )
+        proposals = answer.get("proposals") or []
+        if not proposals:
+            raise WorkspaceError(
+                f"`advance` says {branch} is a proposal branch this copy was "
+                "cloned in order to add to, but no open proposal on this "
+                "repository has it as its source. Publish a branch of your own "
+                "and open a proposal onto it.",
+                status=409,
+                code="CLONED_BRANCH",
+            )
+        # Whose proposal it is, when both halves of the question can be
+        # answered. A long-lived branch carrying somebody else's open proposal
+        # -- the `release-1.2` back-merge every GitOps repository has one of --
+        # otherwise satisfies the bar with nothing under this install's name at
+        # all, which is the incident with an extra step rather than a cost.
+        try:
+            viewer = self._viewer(bound)
+        except WorkspaceError as failed:
+            # A lookup that did not happen is not a credential that cannot
+            # say, and settling for the weaker bar on it would drop the
+            # ownership half of this check on exactly the branch it was added
+            # for. Refused with the transport's own code rather than
+            # `CLONED_BRANCH`: what is known is that the question could not be
+            # asked, and reporting that as "the proposal is somebody else's"
+            # would be a guess that sends the caller to rename a branch over
+            # what a retry fixes.
+            raise WorkspaceError(
+                f"`advance` says {branch} is a proposal branch this copy was "
+                "cloned in order to add to, and an open proposal on it exists, "
+                "but asking the forge who this credential is failed, so whether "
+                "that proposal is this install's could not be established: "
+                f"{failed}. Retry; the branch has not been moved.",
+                status=502,
+                code="FORGE_CALL_FAILED",
+            ) from failed
+        authors = {str(item.get("author") or "") for item in proposals}
+        authors.discard("")
+        keys = {_login_key(author) for author in authors}
+        if viewer and authors and _login_key(viewer) not in keys:
+            # Named as the forge spells them, not as they were compared: the
+            # normalisation is this broker's business, and a refusal that
+            # reports a login nobody can search for is a worse refusal.
+            named = ", ".join(sorted(authors))
+            raise WorkspaceError(
+                f"`advance` says {branch} is a proposal branch this copy was "
+                f"cloned in order to add to, but the open proposal on it is "
+                f"{named}'s, not this install's ({viewer}). Adding to it moves "
+                "a branch whose proposal this install does not own. Publish a "
+                "branch of your own and open a proposal onto it.",
+                status=409,
+                code="CLONED_BRANCH",
+            )
+
+    def _viewer(self, bound: Binding) -> str:
+        """The login this credential authenticates as, or "" when it cannot say.
+
+        Empty is a real answer and not a failure: `whoami` is documented to
+        return it for a credential that cannot introspect itself, and a forge
+        that declares no transport this broker builds -- the directory-backed
+        one the tests run against -- has nowhere to ask. The caller treats "" as
+        "do not compare", which leaves the weaker bar in place rather than
+        refusing every `advance` on such an install.
+
+        Which is why only the second of those is caught here. A forge with no
+        transport cannot answer the question at all, and never will; a
+        transport whose call failed would have answered, and its silence is an
+        outage wearing the same clothes. Turning that into "" is how the weaker
+        bar arrives on an install that was meant to have the stronger one, so
+        it is left to the caller to refuse.
+        """
+        try:
+            return bound.transport().whoami()
+        except ForgeUnsupported:
+            return ""
+
     def _forge_verb(self, verb: str, payload: dict[str, Any]) -> dict[str, Any]:
         bound = self._bind(payload)
         method = getattr(bound.forge, verb.replace("-", "_"))
@@ -714,6 +898,66 @@ class VcsBroker:
     def issue_comment(self, payload):
         return self._forge_verb("issue-comment", payload)
 
+    def proposal_update(self, payload):
+        return self._forge_verb("proposal-update", payload)
+
+    def proposal_close(self, payload):
+        return self._forge_verb("proposal-close", payload)
+
+    def proposal_commits(self, payload):
+        return self._forge_verb("proposal-commits", payload)
+
+    def proposal_acknowledge(self, payload):
+        return self._forge_verb("proposal-acknowledge", payload)
+
+    def issue_update(self, payload):
+        return self._forge_verb("issue-update", payload)
+
+    def issue_close(self, payload):
+        return self._forge_verb("issue-close", payload)
+
+    def label_ensure(self, payload):
+        return self._forge_verb("label-ensure", payload)
+
+    def identity(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Who this credential is on this forge, and whether a login may write.
+
+        A broker verb rather than a forge verb because half of it is a property
+        of the transport -- how the call is authenticated -- and not of the
+        API: a CLI reads its login out of the credential store, an HTTP client
+        asks the current-user route. The other half, `canWrite`, is the forge's
+        normalised answer to a question every forge spells differently. Both
+        exist so the agent-side policy that separates the agent's own
+        proposals and comments from a stranger's stays above the provider.
+
+        `login` in the payload asks about that login; absent, about the
+        credential itself. `bot` beside it says the login is an automation's,
+        as the forge reported it on the comment being asked about: the
+        translation strips the App marking off every author it emits, so the
+        caller hands the fact back rather than a spelling it does not know.
+        """
+        bound = self._bind(payload)
+        bound.ensure()
+        transport = bound.transport()
+        viewer = transport.whoami()
+        login = payload.get("login")
+        if login is not None and not isinstance(login, str):
+            raise WorkspaceError("login must be a string")
+        bot = payload.get("bot", False)
+        if not isinstance(bot, bool):
+            raise WorkspaceError("bot must be true or false")
+        # `canWrite` is answered for a login the caller named, never for the
+        # credential itself: on the shipped forge an App's own bot login is
+        # not a collaborator, so the permission endpoint answers 404 for it
+        # and would report the account that just pushed as unable to write. The
+        # callers that ask this ask about comment authors; the credential's own
+        # standing is what `publish` proves by doing it.
+        subject = (login or "").strip()
+        can_write = (
+            bound.forge.can_write(bound.api, bound.repo, subject, bot=bot) if subject else None
+        )
+        return bound.stamp({"identity": {"login": viewer, "subject": subject, "canWrite": can_write}})
+
 
 # The verbs that leave a mark on the forge, named here so the HTTP layer can
 # refuse an unmanaged repository before one of them runs. The classification
@@ -741,8 +985,14 @@ WRITE_VERBS = frozenset(
         "publish",
         "proposal-create",
         "proposal-comment",
+        "proposal-update",
+        "proposal-close",
+        "proposal-acknowledge",
         "issue-create",
         "issue-comment",
+        "issue-update",
+        "issue-close",
+        "label-ensure",
     }
 )
 
@@ -766,6 +1016,14 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "issue-list": broker.issue_list,
         "issue-view": broker.issue_view,
         "issue-comment": broker.issue_comment,
+        "proposal-update": broker.proposal_update,
+        "proposal-close": broker.proposal_close,
+        "proposal-commits": broker.proposal_commits,
+        "proposal-acknowledge": broker.proposal_acknowledge,
+        "issue-update": broker.issue_update,
+        "issue-close": broker.issue_close,
+        "label-ensure": broker.label_ensure,
+        "identity": broker.identity,
     }
 
 

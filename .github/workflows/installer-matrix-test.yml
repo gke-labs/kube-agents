@@ -73,7 +73,24 @@ jobs:
             container\ clusters\ describe*)
               if [ "${STUB_LIVE_AUTOPILOT:-}" = "true" ]; then echo "True"; exit 0; fi
               echo "ERROR: (gcloud.container.clusters.describe) NOT_FOUND: Not found." >&2; exit 1 ;;
-            container\ clusters\ get-credentials*) ;;
+            # Real get-credentials leaves a kubeconfig context behind, and the
+            # generator gates both its Secret recovery and its live Hindsight
+            # probe on the current context naming this cluster. A no-op stub
+            # leaves none, so the probe can never ask, and an adoption run
+            # refuses rather than guess the memory store away -- correct
+            # behaviour against a stub that was lying about the fetch.
+            # STUB_NO_CREDENTIALS=true is the other real outcome, the operator
+            # having no access to the cluster; it clears the record so a later
+            # step cannot inherit a context this run never obtained.
+            container\ clusters\ get-credentials*)
+              case "$*" in *--help*) exit 0 ;; esac
+              if [ "${STUB_NO_CREDENTIALS:-}" = "true" ]; then
+                rm -f "$RUNNER_TEMP/kube-agents-stub-context"
+                echo "ERROR: (gcloud.container.clusters.get-credentials) ResponseError: code=403, message=Required \"container.clusters.get\" permission." >&2
+                exit 1
+              fi
+              printf 'gke_ci-test-project_us-central1_ci-test-cluster\n' \
+                > "$RUNNER_TEMP/kube-agents-stub-context" ;;
             # The minter gate's key-version probe: no ENABLED version.
             kms\ keys\ versions\ list*) exit 0 ;;
             storage\ cat*) exit 1 ;;
@@ -81,7 +98,22 @@ jobs:
           esac
           EOF
           chmod +x "$RUNNER_TEMP/kube-agents-test-bin/gcloud"
-          for tool in kubectl gh helm gke-gcloud-auth-plugin; do
+          # Silent success is how the installer reads "nothing there", and that
+          # is what every dry run here wants from kubectl but one call: the
+          # current context, which exists only once something fetched
+          # credentials. Answering it unset unconditionally would make the
+          # generator's Hindsight probe permanently unable to ask.
+          cat > "$RUNNER_TEMP/kube-agents-test-bin/kubectl" <<'EOF'
+          #!/usr/bin/env bash
+          if [ "$*" = "config current-context" ]; then
+            # What real kubectl does with no context: nothing on stdout, exit 1.
+            [ -f "$RUNNER_TEMP/kube-agents-stub-context" ] || exit 1
+            cat "$RUNNER_TEMP/kube-agents-stub-context"
+          fi
+          exit 0
+          EOF
+          chmod +x "$RUNNER_TEMP/kube-agents-test-bin/kubectl"
+          for tool in gh helm gke-gcloud-auth-plugin; do
             printf '#!/usr/bin/env bash\nexit 0\n' > "$RUNNER_TEMP/kube-agents-test-bin/$tool"
             chmod +x "$RUNNER_TEMP/kube-agents-test-bin/$tool"
           done
@@ -110,9 +142,43 @@ jobs:
         run: |
           PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./uninstall.sh --dry-run -y --gcp-project-id="ci-test-project" --gke-cluster-name="ci-test-cluster" --gcp-region="us-central1"
 
+      # upgrade.sh upgrades an install, and a preview that cannot name one is
+      # worth nothing: with no install.env anywhere the run now stops on the
+      # same refusal a real upgrade gives, so this step has to bring the
+      # configuration an installed cluster would have. It comes from
+      # KUBE_AGENTS_INSTALL_ENV in $RUNNER_TEMP rather than a file in the
+      # checkout, because the assertion below requires that no dry run leaves
+      # an install.env there.
       - name: Validate Dry-Run Upgrade (Non-Interactive)
         run: |
-          PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./upgrade.sh --dry-run -y --upgrade-mode=full --gcp-project-id="ci-test-project" --image-tag="$GITHUB_SHA"
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/upgrade-install.env" <<'EOF'
+          PROJECT_ID="ci-test-project"
+          CLUSTER_NAME="ci-test-cluster"
+          REGION="us-central1"
+          EOF
+          KUBE_AGENTS_INSTALL_ENV="$RUNNER_TEMP/upgrade-install.env" \
+            PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" \
+            ./upgrade.sh --dry-run -y --upgrade-mode=full --gcp-project-id="ci-test-project" --image-tag="$GITHUB_SHA"
+
+          # Negative control: the same preview with nothing to read must refuse
+          # rather than report. This run is from a checkout, which looks only at
+          # KUBE_AGENTS_INSTALL_ENV, the checkout and the working directory --
+          # $HOME/kube-agents is consulted only by a run from outside one. HOME
+          # is moved anyway so the control does not rest on that.
+          refusal_log="$RUNNER_TEMP/upgrade-refusal.log"
+          set +e
+          env HOME="$RUNNER_TEMP/empty-home" PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" \
+            ./upgrade.sh --dry-run -y --upgrade-mode=full --gcp-project-id="ci-test-project" --image-tag="$GITHUB_SHA" \
+            > "$refusal_log" 2>&1
+          refusal_status=$?
+          set -e
+          if [ "$refusal_status" -eq 0 ]; then
+            echo "a preview with no install.env reported a plan instead of refusing:" >&2
+            cat "$refusal_log" >&2
+            exit 1
+          fi
+          grep -q "Refusing to upgrade without the installation's configuration" "$refusal_log"
 
       # The gcloud stub answers NOT_FOUND, so every dry run here takes the
       # fresh-create path — the one case where --gke-cluster-mode has a say. That
@@ -149,6 +215,43 @@ jobs:
           if ! grep -qE "^cluster_mode[[:space:]]+= \"autopilot\"\$" "$tfvars"; then
             echo "the live Autopilot cluster did not overrule --gke-cluster-mode=standard:" >&2
             grep -iE "cluster_mode" "$tfvars" >&2
+            exit 1
+          fi
+
+          # The same adoption, with no access to the cluster. MEMORY is the one
+          # key whose absence costs data rather than re-creatable
+          # infrastructure, so a run that cannot ask whether the Hindsight store
+          # is deployed must stop: continuing would generate
+          # memory_provider = "multiuser_memory" and the apply would delete the
+          # hindsight-postgresql StatefulSet and its database.
+          refusal_log="$RUNNER_TEMP/install-memory-refusal.log"
+          set +e
+          STUB_NO_CREDENTIALS=true STUB_LIVE_AUTOPILOT=true \
+            PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" \
+            ./install.sh --dry-run -y --gcp-project-id="ci-test-project" \
+            --gke-cluster-name="ci-test-cluster" --gcp-region="us-central1" \
+            --gke-cluster-mode="standard" --image-tag="$GITHUB_SHA" \
+            > "$refusal_log" 2>&1
+          refusal_status=$?
+          set -e
+          if [ "$refusal_status" -eq 0 ]; then
+            echo "an adoption run that could not ask the cluster generated tfvars anyway:" >&2
+            cat "$refusal_log" >&2
+            exit 1
+          fi
+          grep -q "Cannot tell whether this cluster runs the Hindsight memory store" "$refusal_log"
+
+          # And the way out the refusal names has to work, or it is a dead end:
+          # stating the answer gets the same unreachable run through, and the
+          # answer reaches the tfvars rather than the default.
+          MEMORY=off STUB_NO_CREDENTIALS=true STUB_LIVE_AUTOPILOT=true \
+            PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" \
+            ./install.sh --dry-run -y --gcp-project-id="ci-test-project" \
+            --gke-cluster-name="ci-test-cluster" --gcp-region="us-central1" \
+            --gke-cluster-mode="standard" --image-tag="$GITHUB_SHA"
+          if ! grep -qE "^memory_provider[[:space:]]+= \"none\"\$" "$tfvars"; then
+            echo "MEMORY=off did not reach terraform.tfvars:" >&2
+            grep memory_provider "$tfvars" >&2
             exit 1
           fi
 

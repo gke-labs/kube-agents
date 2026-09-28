@@ -153,7 +153,7 @@ class ApplierTest(unittest.TestCase):
             spec.loader.exec_module(module)
             storm = Exception('{"details": [{"retryDelay": "54s"}]}')
             kwargs = dict(retry_count=1, max_retries=3, is_zai_coding_overload=False,
-                          base_url="http://litellm", model="gemini")
+                          base_url="http://inference-gateway", model="gemini")
             self.assertEqual(
                 module.compute_error_backoff(None, storm, is_rate_limited=True, **kwargs), 54.0
             )

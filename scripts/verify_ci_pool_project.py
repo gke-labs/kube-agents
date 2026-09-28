@@ -1495,7 +1495,7 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
         return CheckResult(name, False, f"{_FLEET_CATALOG} declares no fixture roles")
 
     # kubectl is absent from check_toolchain() because every other check here is
-    # gcloud or gh. Without it every probe fails, all seven roles report as
+    # gcloud or gh. Without it every probe fails, all eight roles report as
     # unplanted, and the run states a confident and wrong verdict about a fleet
     # it never looked at.
     rc, _, _ = run_cmd(["kubectl", "version", "--client=true"])

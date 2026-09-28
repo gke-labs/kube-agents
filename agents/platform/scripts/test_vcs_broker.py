@@ -26,6 +26,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -134,6 +135,84 @@ class LocalForge(providers.Forge):
 
     def clone_url(self, repo: str) -> str:
         return str(self.root / repo)
+
+
+class ProposingLocalForge(LocalForge):
+    """`LocalForge` plus the one collaboration verb the `advance` check asks.
+
+    A directory has no proposals, so the plain `LocalForge` above is the forge
+    that cannot be asked. This one answers, out of a set the test sets, and it
+    is what proves the check is a lookup rather than a reading of the request.
+    """
+
+    verbs = ("proposal-list",)
+
+    def __init__(self, root, minted=None, open_sources=(), author=""):
+        super().__init__(root, minted)
+        self.open_sources = set(open_sources)
+        self.author = author
+        self.listed: list[dict] = []
+
+    def proposal_list(self, api, repo, payload):
+        self.listed.append(dict(payload))
+        source = payload.get("source")
+        found = (
+            [{"id": 1, "source": source, "author": self.author}]
+            if source in self.open_sources
+            else []
+        )
+        return {"proposals": found, "truncated": False}
+
+
+class SelfAware:
+    """A transport that can say who the credential is. `LocalForge` declares none.
+
+    The directory-backed forge the rest of these tests run against builds no
+    transport at all, which is the "cannot say" arm of the author comparison.
+    This is the other arm.
+    """
+
+    def __init__(self, login: str) -> None:
+        self.login = login
+
+    def whoami(self) -> str:
+        return self.login
+
+    def api(self, *_args, **_kwargs):
+        raise AssertionError("the author check makes no API call of its own")
+
+
+class LookupFailed:
+    """A transport whose `whoami` call did not happen. Not the same as "".
+
+    `<cli> auth status` exits non-zero on a timeout and when the
+    token-validation call it makes of its own accord is throttled, and it
+    prints no login line in either case -- so the difference between this and
+    a credential that answered and named nobody is the exit code, and nothing
+    else.
+    """
+
+    def whoami(self) -> str:
+        raise WorkspaceError(
+            "`gh auth status` exited 124 without saying who the credential is",
+            status=502,
+            code="FORGE_CALL_FAILED",
+        )
+
+
+class Nameless:
+    """A transport that answered and named nobody. The documented "" case.
+
+    Exit zero and no login line: a credential a forge accepts and cannot
+    introspect. It is the arm `_viewer`'s docstring leads with, and it reaches
+    the comparison from the other side of the `except` from `LookupFailed`.
+    """
+
+    def whoami(self) -> str:
+        return ""
+
+    def api(self, *_args, **_kwargs):
+        raise AssertionError("the author check makes no API call of its own")
 
 
 class Recorder:
@@ -953,6 +1032,254 @@ class RepositoryVerbTest(unittest.TestCase):
         )
         self.assertEqual(self.remote_tip("topic"), first)
 
+    def test_advance_is_how_a_proposal_branch_gets_a_second_publish(self):
+        # The refusal above is about a copy that wandered onto the branch it
+        # came down on. A copy taken *of* a proposal branch in order to add to
+        # it is the other situation, and it is the whole of how an open
+        # proposal gets revised: there is nowhere else its revisions live.
+        git(self.seed, "checkout", "--quiet", "-b", "topic")
+        git(self.seed, "push", "--quiet", "origin", "topic")
+        git(self.seed, "checkout", "--quiet", "main")
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "topic")
+        second = self.commit_in(work, "b.txt", "b\n", "another round")
+        self.broker.publish(
+            {
+                "repository": "local.test/acme/infra",
+                "branch": "topic",
+                "target": "main",
+                "clonedFrom": "topic",
+                "advance": True,
+                "baseRevision": answer["revision"],
+                "bundleBase64": self.bundle_of(work, "topic", answer["revision"]),
+            }
+        )
+        self.assertEqual(self.remote_tip("topic"), second)
+
+    def test_advance_is_refused_on_a_branch_carrying_no_open_proposal(self):
+        """The waiver is for a proposal branch, and the forge is asked whether it is one.
+
+        Without this, `advance` is a field that turns the refusal off: a worker
+        that clones `release-1.2`, commits, and publishes `--target main
+        --advance` fast-forwards a long-lived shared branch -- the live incident
+        the refusal was added for -- and the client's own refusal text names the
+        flag to any worker that meets one. What the check buys is exactly that
+        much: the same caller could open the proposal first with
+        `proposal-create`, so this is a bar (a visible pull request under the
+        install's name) rather than a proof, and the default- and
+        protected-branch refusals above it are the ones that do not depend on
+        the request.
+        """
+        forge = ProposingLocalForge(self.forges, self.refreshed, open_sources=())
+        self.broker.registry.hosts["local.test"] = forge
+        git(self.seed, "checkout", "--quiet", "-b", "release-1.2")
+        git(self.seed, "push", "--quiet", "origin", "release-1.2")
+        git(self.seed, "checkout", "--quiet", "main")
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "release-1.2")
+        self.commit_in(work, "b.txt", "b\n", "straight onto the release branch")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "release-1.2",
+                    "target": "main",
+                    "clonedFrom": "release-1.2",
+                    "advance": True,
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "release-1.2", answer["revision"]),
+                }
+            )
+        self.assertEqual(caught.exception.fields.get("code"), "CLONED_BRANCH")
+        self.assertEqual(forge.listed[0]["source"], "release-1.2")
+        self.assertEqual(self.remote_tip("release-1.2"), self.origin_head)
+
+    def test_advance_is_honoured_when_the_forge_finds_the_proposal(self):
+        forge = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={"topic"}
+        )
+        self.broker.registry.hosts["local.test"] = forge
+        git(self.seed, "checkout", "--quiet", "-b", "topic")
+        git(self.seed, "push", "--quiet", "origin", "topic")
+        git(self.seed, "checkout", "--quiet", "main")
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "topic")
+        second = self.commit_in(work, "b.txt", "b\n", "another round")
+        self.broker.publish(
+            {
+                "repository": "local.test/acme/infra",
+                "branch": "topic",
+                "target": "main",
+                "clonedFrom": "topic",
+                "advance": True,
+                "baseRevision": answer["revision"],
+                "bundleBase64": self.bundle_of(work, "topic", answer["revision"]),
+            }
+        )
+        self.assertEqual(self.remote_tip("topic"), second)
+
+    def _advance_onto(self, forge, branch="release-1.2"):
+        """Clone, commit on `branch`, and publish it with `advance` set."""
+        self.broker.registry.hosts["local.test"] = forge
+        git(self.seed, "checkout", "--quiet", "-b", branch)
+        git(self.seed, "push", "--quiet", "origin", branch)
+        git(self.seed, "checkout", "--quiet", "main")
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", branch)
+        made = self.commit_in(work, "b.txt", "b\n", "onto the shared branch")
+        self.broker.publish(
+            {
+                "repository": "local.test/acme/infra",
+                "branch": branch,
+                "target": "main",
+                "clonedFrom": branch,
+                "advance": True,
+                "baseRevision": answer["revision"],
+                "bundleBase64": self.bundle_of(work, branch, answer["revision"]),
+            }
+        )
+        return made
+
+    def test_advance_is_refused_when_the_open_proposal_is_somebody_elses(self):
+        """The bar is a pull request under the install's own name, so the name is read.
+
+        `release-1.2 -> main` with a human's open back-merge proposal on it is
+        the ordinary shape of a GitOps repository, and a bar that asks only
+        whether *some* proposal is open is cleared by it -- leaving the live
+        incident the refusal was added for reachable with nothing under this
+        install's name at all.
+        """
+        forge = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
+        )
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        with self.assertRaises(WorkspaceError) as caught:
+            self._advance_onto(forge)
+        self.assertEqual(caught.exception.fields.get("code"), "CLONED_BRANCH")
+        self.assertIn("a-colleague", str(caught.exception))
+        self.assertIn("kube-agents[bot]", str(caught.exception))
+        self.assertEqual(self.remote_tip("release-1.2"), self.origin_head)
+
+    def test_advance_is_honoured_when_the_open_proposal_is_the_installs_own(self):
+        """And the marking a forge puts on an automation's login is not a difference.
+
+        The provider strips `[bot]` off every author it emits; the credential
+        store keeps it. Compared raw, the install is a stranger to the proposal
+        it opened itself an hour ago.
+        """
+        forge = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={"release-1.2"}, author="Kube-Agents"
+        )
+        self.broker._transport = lambda _forge: SelfAware("kube-agents[bot]")
+        made = self._advance_onto(forge)
+        self.assertEqual(self.remote_tip("release-1.2"), made)
+
+    def test_advance_keeps_the_weaker_bar_when_the_credential_cannot_say_who_it_is(self):
+        """A forge this broker builds no transport for still gets the check it can have.
+
+        `whoami` is documented to answer "" for a credential that cannot
+        introspect itself, and `LocalForge` declares no transport at all.
+        Refusing there would turn the author comparison into an outage for
+        every install whose forge cannot answer the question.
+        """
+        forge = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
+        )
+        made = self._advance_onto(forge)
+        self.assertEqual(self.remote_tip("release-1.2"), made)
+
+    def test_advance_keeps_the_weaker_bar_when_the_credential_answers_with_no_login(self):
+        """The other half of the same sentence, and the one that has a transport.
+
+        The test above reaches "" through `ForgeUnsupported` -- a forge with
+        nowhere to ask. This one has somewhere: the call succeeds and names
+        nobody, which is what `whoami` is documented to do for a credential
+        that cannot introspect itself. Both must leave the comparison
+        unmade; only one of them was covered.
+        """
+        forge = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
+        )
+        self.broker._transport = lambda _forge: Nameless()
+        made = self._advance_onto(forge)
+        self.assertEqual(self.remote_tip("release-1.2"), made)
+
+    def test_advance_is_refused_when_who_the_credential_is_cannot_be_learned(self):
+        """A lookup that failed is not a credential that cannot say.
+
+        The weaker bar belongs to a forge with no way to answer the question.
+        Taken for a forge that has one and whose answer did not arrive, it
+        drops the ownership half of the check on exactly the case it was added
+        for -- a stranger's open proposal on a long-lived branch -- and a
+        timeout on one `auth status` is the whole of what it takes to get
+        there.
+        """
+        forge = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
+        )
+        self.broker._transport = lambda _forge: LookupFailed()
+        with self.assertRaises(WorkspaceError) as caught:
+            self._advance_onto(forge)
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_CALL_FAILED")
+        self.assertIn("who this credential is", str(caught.exception))
+        self.assertEqual(self.remote_tip("release-1.2"), self.origin_head)
+
+    def test_advance_does_not_reach_the_default_branch(self):
+        # Everything else still applies to it. The default-branch refusal is
+        # the one that does not come from the request, so it is the one worth
+        # proving the opt-in cannot talk its way past.
+        work, answer = self.clone_locally()
+        self.commit_in(work, "c.txt", "c\n", "onto main")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "main",
+                    "target": "release",
+                    "clonedFrom": "main",
+                    "advance": True,
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "main", answer["revision"]),
+                }
+            )
+        self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+
+    def test_advance_does_not_reach_a_default_branch_of_another_name(self):
+        """The refusal above would hold with no remote lookup at all.
+
+        `main` is in the static set, so that test passes whether or not the
+        broker ever asks the remote what its default is -- and the whole point
+        of asking is the repository whose trunk is called something else. Here
+        it is `trunk`, which is in no set: only `_default_branch_of_remote` can
+        refuse it, and if that lookup were dropped the publish would land on
+        the branch every change is supposed to be proposed against.
+        """
+        git(self.seed, "checkout", "--quiet", "-b", "trunk")
+        git(self.seed, "push", "--quiet", "origin", "trunk")
+        git(self.origin, "symbolic-ref", "HEAD", "refs/heads/trunk")
+        # A real target, so that a broker which stopped asking the remote fails
+        # this on the branch it moved rather than on a fetch of a branch that
+        # was never there.
+        git(self.seed, "push", "--quiet", "origin", "trunk:release")
+
+        work, answer = self.clone_locally()
+        self.assertEqual(answer["branch"], "trunk")
+        self.commit_in(work, "c.txt", "c\n", "onto trunk")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": "local.test/acme/infra",
+                    "branch": "trunk",
+                    "target": "release",
+                    "clonedFrom": "trunk",
+                    "advance": True,
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": self.bundle_of(work, "trunk", answer["revision"]),
+                }
+            )
+        self.assertEqual(caught.exception.fields.get("code"), "PROTECTED_BRANCH")
+        self.assertEqual(self.remote_tip("trunk"), answer["revision"])
+
     def test_scratch_names_come_from_a_counter_not_from_the_caller(self):
         first = self.broker._scratch("clone")
         second = self.broker._scratch("clone")
@@ -1066,6 +1393,72 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual(answer["forge"], "github")
         self.assertEqual(answer["repo"], "acme/infra")
 
+    def test_a_proposal_says_where_its_source_branch_lives_and_what_is_on_it(self):
+        # `source` is a branch name and nothing else. A proposal opened from a
+        # fork carries the bare name, so a caller deciding "is this mine" on
+        # the name alone accepts any fork's branch spelled the same way -- and
+        # the caller that does this then amends by pushing that name to *this*
+        # repository, creating a branch somebody else chose the name of.
+        broker, _ = self.broker(
+            {
+                "number": 7,
+                "state": "open",
+                "head": {
+                    "ref": "platform-agent/bump",
+                    "sha": "c0ffee1",
+                    "repo": {"full_name": "acme/infra"},
+                },
+                "base": {"ref": "main"},
+                "labels": [{"name": "agent:ignore"}, {"name": "kind/bug"}],
+            }
+        )
+        proposal = broker.proposal_view({"repository": "acme/infra", "number": 7})[
+            "proposal"
+        ]
+        self.assertEqual(proposal["source"], "platform-agent/bump")
+        self.assertEqual(proposal["sourceRepo"], "acme/infra")
+        self.assertEqual(proposal["sourceRevision"], "c0ffee1")
+        self.assertEqual(proposal["labels"], ["agent:ignore", "kind/bug"])
+
+    def test_a_deleted_fork_leaves_the_source_repository_unnamed(self):
+        # Not this repository, and not the fork either -- the forge has stopped
+        # saying. Answering `""` is what lets a caller fail closed; answering
+        # the repository being read would be a claim the forge did not make.
+        broker, _ = self.broker(
+            {
+                "number": 8,
+                "state": "open",
+                "head": {"ref": "platform-agent/bump", "sha": "c0ffee1", "repo": None},
+                "base": {"ref": "main"},
+            }
+        )
+        proposal = broker.proposal_view({"repository": "acme/infra", "number": 8})[
+            "proposal"
+        ]
+        self.assertEqual(proposal["sourceRepo"], "")
+        self.assertEqual(proposal["source"], "platform-agent/bump")
+
+    def test_a_comment_carries_an_identity_unique_across_endpoints(self):
+        # The numeric id is unique only within the endpoint that issued it, so
+        # a conversation comment and a review comment on one proposal can share
+        # it. A caller keying "already answered" on the number alone would let
+        # an answer to either suppress the other.
+        broker, _ = self.broker(
+            {"number": 7, "state": "open"},
+            [{"id": 111, "user": {"login": "alice"}, "body": "please rebase"}],
+            [{"id": 111, "user": {"login": "bob"}, "body": "nit", "path": "a.py"}],
+            [],
+        )
+        comments = broker.proposal_view(
+            {"repository": "acme/infra", "number": 7, "comments": True}
+        )["comments"]
+        refs = {comment["ref"] for comment in comments}
+        self.assertEqual(refs, {"issue-111", "review_comment-111"})
+        # And the pair it is built from is still there, because that pair is
+        # what `proposal-acknowledge` takes back.
+        for comment in comments:
+            self.assertEqual(comment["ref"], f"{comment['kind']}-{comment['id']}")
+
     def test_closed_and_merged_are_different_outcomes(self):
         # GitHub encodes the difference in a nullable date field; nowhere else
         # does, and a caller should not have to know that.
@@ -1152,18 +1545,283 @@ class CollaborationTest(unittest.TestCase):
         self.assertIn("pull request", str(caught.exception))
         self.assertIn("proposal view", str(caught.exception))
 
-    def test_comments_come_from_the_conversation_not_the_diff(self):
-        # `pulls/{n}/comments` is line notes; a caller asking to read the
-        # discussion means `issues/{n}/comments`.
+    def test_a_proposals_comments_come_from_all_three_places_tagged_by_kind(self):
+        # GitHub splits one conversation across the conversation tab, inline
+        # review comments and review summaries; a caller reading fewer than
+        # three ignores requests at random. Each carries where it came from,
+        # and an empty-bodied review (an approval) is not an utterance.
         broker, recorder = self.broker(
             {"number": 9, "state": "open"},
-            [{"user": {"login": "someone"}, "body": "looks good"}],
+            [{"id": 1, "user": {"login": "someone"}, "body": "looks good", "created_at": "2026-01-01T00:00:02Z"}],
+            [{"id": 2, "user": {"login": "someone"}, "body": "off by one", "created_at": "2026-01-01T00:00:01Z", "path": "a.yaml", "line": 3}],
+            [{"id": 3, "user": {"login": "someone"}, "body": "", "state": "APPROVED", "submitted_at": "2026-01-01T00:00:03Z"},
+             {"id": 4, "user": {"login": "someone"}, "body": "summary", "submitted_at": "2026-01-01T00:00:00Z"}],
         )
         answer = broker.proposal_view(
             {"repository": "acme/infra", "number": 9, "comments": True}
         )
-        self.assertEqual(answer["comments"][0]["body"], "looks good")
-        self.assertIn("repos/acme/infra/issues/9/comments", recorder.path)
+        self.assertEqual(
+            [(c["kind"], c["body"]) for c in answer["comments"]],
+            [("review", "summary"), ("review_comment", "off by one"), ("issue", "looks good")],
+        )
+        self.assertEqual(answer["comments"][1]["path"], "a.yaml")
+        paths = [call[4] for call in recorder.calls[1:]]
+        self.assertTrue(any("issues/9/comments" in p for p in paths))
+        self.assertTrue(any("pulls/9/comments" in p for p in paths))
+        self.assertTrue(any("pulls/9/reviews" in p for p in paths))
+
+    def test_proposal_update_applies_labels_then_patches(self):
+        broker, recorder = self.broker([{"name": "a"}], None, {"number": 9, "state": "open"})
+        answer = broker.proposal_update(
+            {"repository": "acme/infra", "number": 9, "title": "new", "labelsAdd": ["a"], "labelsRemove": ["b"]}
+        )
+        self.assertEqual(answer["proposal"]["number"], 9)
+        # Labels land first so the PATCH's answer is the proposal as it now stands.
+        methods = [call[3] for call in recorder.calls]
+        self.assertEqual(methods, ["POST", "DELETE", "PATCH"])
+        self.assertEqual(recorder.calls[1][4], "repos/acme/infra/issues/9/labels/b")
+        self.assertEqual(recorder.calls[2][4], "repos/acme/infra/pulls/9")
+        self.assertEqual(json.loads(recorder.stdin[2])["title"], "new")
+
+    def test_a_removal_of_a_label_already_off_does_not_lose_the_rest_of_the_update(self):
+        """The 404 is the state the caller asked for, so the PATCH still runs.
+
+        The resolver finishes an issue with one call --
+        `{labelsAdd: [status:<terminal>], labelsRemove: [status:in-progress]}`
+        -- and the stale sweep may have taken the claim label off first. Letting
+        GitHub's 404 out would abort the update before the PATCH, leaving that
+        issue with no terminal label. Any other refusal is not the asked-for
+        state and is still an error.
+        """
+        gone = subprocess.CompletedProcess(["gh"], 1, "", "gh: Not Found (HTTP 404)")
+        broker, recorder = self.broker([{"name": "a"}], gone, {"number": 9, "state": "open"})
+        answer = broker.proposal_update(
+            {"repository": "acme/infra", "number": 9, "title": "new", "labelsAdd": ["a"], "labelsRemove": ["b"]}
+        )
+        self.assertEqual([call[3] for call in recorder.calls], ["POST", "DELETE", "PATCH"])
+        self.assertEqual(answer["proposal"]["number"], 9)
+
+        denied = subprocess.CompletedProcess(["gh"], 1, "", "gh: Forbidden (HTTP 403)")
+        broker, recorder = self.broker([{"name": "a"}], denied, {"number": 9, "state": "open"})
+        with self.assertRaises(WorkspaceError):
+            broker.proposal_update(
+                {"repository": "acme/infra", "number": 9, "title": "new", "labelsAdd": ["a"], "labelsRemove": ["b"]}
+            )
+        self.assertEqual([call[3] for call in recorder.calls], ["POST", "DELETE"])
+
+    def test_issue_close_carries_a_neutral_reason(self):
+        broker, recorder = self.broker({"number": 5, "state": "closed"})
+        broker.issue_close({"repository": "acme/infra", "number": 5, "reason": "not-planned"})
+        self.assertEqual(recorder.calls[-1][3], "PATCH")
+        self.assertEqual(recorder.body, {"state": "closed", "state_reason": "not_planned"})
+        with self.assertRaises(WorkspaceError):
+            broker.issue_close({"repository": "acme/infra", "number": 5, "reason": "wontfix"})
+
+    def test_proposal_commits_is_a_listing_of_commits(self):
+        broker, _ = self.broker([{"sha": "a" * 40, "commit": {"message": "m", "committer": {"date": "2026-01-01T00:00:00Z"}}}])
+        answer = broker.proposal_commits({"repository": "acme/infra", "number": 9})
+        self.assertEqual(answer["count"], 1)
+        self.assertEqual(answer["commits"][0]["sha"], "a" * 40)
+        self.assertEqual(answer["commits"][0]["committed"], "2026-01-01T00:00:00Z")
+
+    def test_acknowledge_reacts_on_comments_and_declines_reviews(self):
+        broker, recorder = self.broker({"id": 1, "content": "eyes"})
+        answer = broker.proposal_acknowledge(
+            {"repository": "acme/infra", "number": 9, "comment": {"id": 44, "kind": "review_comment"}}
+        )
+        self.assertTrue(answer["acknowledged"])
+        self.assertEqual(recorder.calls[-1][4], "repos/acme/infra/pulls/comments/44/reactions")
+        answer = broker.proposal_acknowledge(
+            {"repository": "acme/infra", "number": 9, "comment": {"id": 45, "kind": "review"}}
+        )
+        self.assertFalse(answer["acknowledged"])
+        self.assertEqual(len(recorder.calls), 1)
+
+    def test_label_ensure_creates_on_404_and_updates_otherwise(self):
+        missing = subprocess.CompletedProcess(["gh"], 1, "", "gh: Not Found (HTTP 404)")
+        broker, recorder = self.broker(missing, {"name": "x", "color": "fbca04"})
+        answer = broker.label_ensure({"repository": "acme/infra", "name": "x", "color": "#fbca04"})
+        self.assertEqual([c[3] for c in recorder.calls], ["GET", "POST"])
+        self.assertEqual(answer["label"]["name"], "x")
+        self.assertEqual(recorder.body["color"], "fbca04")
+        broker, recorder = self.broker({"name": "x"}, {"name": "x", "color": "000000"})
+        broker.label_ensure({"repository": "acme/infra", "name": "x", "color": "000000"})
+        self.assertEqual([c[3] for c in recorder.calls], ["GET", "PATCH"])
+
+    def test_identity_reads_the_login_from_the_cli_and_the_permission_from_the_api(self):
+        status = subprocess.CompletedProcess(
+            ["gh"], 0, "", "github.com\n  ✓ Logged in to github.com account kube-agents[bot] (keyring)\n"
+        )
+        broker, recorder = self.broker(status, {"permission": "write"})
+        answer = broker.identity({"repository": "acme/infra"})
+        self.assertEqual(answer["identity"]["login"], "kube-agents[bot]")
+        # The credential's own standing is not asked of the permission endpoint
+        # (an App is not a collaborator there): unknown, and one call made.
+        self.assertIsNone(answer["identity"]["canWrite"])
+        self.assertEqual(recorder.calls[0][1:3], ["auth", "status"])
+        self.assertEqual(len(recorder.calls), 1)
+        broker, recorder = self.broker(status, {"permission": "write"})
+        answer = broker.identity({"repository": "acme/infra", "login": "kube-agents[bot]"})
+        self.assertTrue(answer["identity"]["canWrite"])
+        self.assertIn("collaborators/kube-agents%5Bbot%5D/permission", recorder.calls[1][4])
+        # A login nobody knows is a definitive no; a broker fault is unknown.
+        gone = subprocess.CompletedProcess(["gh"], 1, "", "gh: Not Found (HTTP 404)")
+        broker, _ = self.broker(status, gone)
+        self.assertFalse(broker.identity({"repository": "acme/infra", "login": "stranger"})["identity"]["canWrite"])
+        broken = subprocess.CompletedProcess(["gh"], 1, "", "connect: timeout")
+        broker, _ = self.broker(status, broken)
+        self.assertIsNone(broker.identity({"repository": "acme/infra", "login": "stranger"})["identity"]["canWrite"])
+
+    def test_a_login_lookup_that_failed_is_not_an_empty_login(self):
+        """The two are one string apart in the output and worlds apart in meaning.
+
+        Empty is an answer -- an installation token cannot always introspect
+        itself -- and every caller reads it as "do not compare". A call that
+        timed out or was throttled prints no login either, so reading the
+        output without the exit code turns an outage into that answer, and the
+        comparisons it governs quietly stop happening.
+        """
+        timed_out = subprocess.CompletedProcess(["gh"], 124, "", "")
+        broker, recorder = self.broker(timed_out)
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.identity({"repository": "acme/infra"})
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_CALL_FAILED")
+        self.assertEqual(recorder.calls[0][1:3], ["auth", "status"])
+        silent = subprocess.CompletedProcess(
+            ["gh"], 0, "", "github.com\n  - Active account: true\n"
+        )
+        broker, _ = self.broker(silent)
+        self.assertEqual(broker.identity({"repository": "acme/infra"})["identity"]["login"], "")
+
+    def test_a_credential_the_forge_rejected_is_not_a_call_that_failed(self):
+        """The other non-zero exit of `auth status`, and it is not transient.
+
+        A revoked or expired token exits 1 with the CLI saying so in prose --
+        there is no `(HTTP 401)` to parse, because the CLI phrases that answer
+        itself. Read as `FORGE_CALL_FAILED` it comes back as "the forge did not
+        answer ... one retry is reasonable", and `identity` is the first call an
+        install makes: `github_scan_gate.sweep_pull_requests` asks
+        `viewer_login` of every managed repository before it asks anything
+        else, so a dead credential reported that way names a forge outage on
+        every repository, every tick, and the 401 a later verb would have
+        produced is never reached.
+        """
+        for output in (
+            "github.com\n  X github.com: authentication failed\n"
+            "  - The github.com token in GH_TOKEN is invalid.\n",
+            "gh: Bad credentials\n",
+        ):
+            with self.subTest(output=output.splitlines()[-1]):
+                revoked = subprocess.CompletedProcess(["gh"], 1, "", output)
+                broker, _ = self.broker(revoked)
+                with self.assertRaises(WorkspaceError) as caught:
+                    broker.identity({"repository": "acme/infra"})
+                self.assertEqual(
+                    caught.exception.fields.get("code"), "FORGE_UNAUTHENTICATED"
+                )
+        # And a throttle of the validation call `auth status` makes of its own
+        # accord still says what it is: the status the CLI printed wins over the
+        # default the absence of one stands for.
+        throttled = subprocess.CompletedProcess(
+            ["gh"], 1, "", "gh: API rate limit exceeded (HTTP 429)\n"
+        )
+        broker, _ = self.broker(throttled)
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.identity({"repository": "acme/infra"})
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_RATE_LIMITED")
+
+    def test_identity_asks_about_the_app_account_when_the_login_is_a_bots(self):
+        """`bot` puts the suffix back that the translation took off.
+
+        Asked about the bare `renovate`, the permission endpoint answers for
+        the *user* of that name -- "is not a user" (404), or a stranger's
+        permission -- and never for the App `renovate[bot]` that wrote the
+        comment. Seen against the real API: `github-actions[bot]` answers
+        `none`; `github-actions` answers 404.
+        """
+        status = subprocess.CompletedProcess(
+            ["gh"], 0, "", "github.com\n  ✓ Logged in to github.com account kube-agents[bot] (keyring)\n"
+        )
+        broker, recorder = self.broker(status, {"permission": "none"})
+        answer = broker.identity({"repository": "acme/infra", "login": "renovate", "bot": True})
+        self.assertFalse(answer["identity"]["canWrite"])
+        self.assertIn("collaborators/renovate%5Bbot%5D/permission", recorder.calls[1][4])
+        # Not doubled when the caller already had the suffix.
+        broker, recorder = self.broker(status, {"permission": "none"})
+        broker.identity({"repository": "acme/infra", "login": "renovate[bot]", "bot": True})
+        self.assertIn("collaborators/renovate%5Bbot%5D/permission", recorder.calls[1][4])
+        # And without the flag, the user is the one asked about.
+        broker, recorder = self.broker(status, {"permission": "write"})
+        broker.identity({"repository": "acme/infra", "login": "renovate"})
+        self.assertIn("collaborators/renovate/permission", recorder.calls[1][4])
+        broker, _ = self.broker(status)
+        with self.assertRaises(WorkspaceError):
+            broker.identity({"repository": "acme/infra", "login": "renovate", "bot": "yes"})
+
+    def test_a_listing_asks_for_the_page_it_was_given(self):
+        """The two listings a caller reads to the end take a page; the first is implicit."""
+        broker, recorder = self.broker([])
+        broker.proposal_commits({"repository": "acme/infra", "number": 9})
+        self.assertNotIn("&page=", recorder.path)
+        broker, recorder = self.broker([])
+        broker.proposal_commits({"repository": "acme/infra", "number": 9, "page": 3})
+        self.assertIn("&page=3", recorder.path)
+        self.assertIn("per_page=", recorder.path)
+        broker, recorder = self.broker([])
+        broker.proposal_list({"repository": "acme/infra", "page": 2})
+        self.assertIn("&page=2", recorder.path)
+        broker, recorder = self.broker([])
+        with self.assertRaises(WorkspaceError):
+            broker.proposal_list({"repository": "acme/infra", "page": 0})
+        self.assertEqual(recorder.calls, [])
+
+    def test_proposal_list_asks_for_one_branch_rather_than_filtering_a_page(self):
+        broker, recorder = self.broker([])
+        broker.proposal_list({"repository": "acme/infra", "source": "platform-agent/fix"})
+        asked = recorder.calls[-1][4]
+        self.assertIn("repos/acme/infra/pulls", asked)
+        # Owner-qualified, so a fork carrying the same branch name cannot
+        # answer for this repository's proposal.
+        self.assertIn("head=acme%3Aplatform-agent%2Ffix", asked)
+
+    def test_issue_list_with_a_query_goes_through_search(self):
+        broker, recorder = self.broker({"items": [{"number": 1, "title": "t", "state": "open", "user": {"login": "u"}}]})
+        answer = broker.issue_list({"repository": "acme/infra", "query": "drift", "labels": ["kind/bug"]})
+        self.assertEqual(recorder.calls[-1][4].split("?")[0], "search/issues")
+        self.assertIn("repo%3Aacme%2Finfra", recorder.calls[-1][4])
+        self.assertIn("is%3Aissue", recorder.calls[-1][4])
+        self.assertEqual(answer["count"], 1)
+
+    def test_issue_list_excludes_labels_at_the_forge_not_on_the_page(self):
+        # No query text, only an exclusion: it still has to leave the plain
+        # listing endpoint, because that endpoint can say which labels an issue
+        # must carry but not which it must not. A poller watching a queue for
+        # unclaimed work asks exactly this and nothing else.
+        broker, recorder = self.broker({"items": []})
+        broker.issue_list(
+            {
+                "repository": "acme/infra",
+                "labels": ["kind/bug"],
+                "excludeLabels": ["status:in-progress", "agent:ignore"],
+            }
+        )
+        asked = urllib.parse.unquote_plus(recorder.calls[-1][4])
+        self.assertTrue(asked.startswith("search/issues"))
+        self.assertIn('label:"kind/bug"', asked)
+        self.assertIn('-label:"status:in-progress"', asked)
+        self.assertIn('-label:"agent:ignore"', asked)
+
+    def test_the_search_path_orders_its_page_the_way_the_listing_does(self):
+        # Left alone this endpoint answers in relevance order, which is not an
+        # order a caller can predict and not the one the plain listing uses --
+        # so the same verb would hand back differently ordered pages depending
+        # on whether a filter was present, and `truncated` would mean a
+        # different thing in each.
+        broker, recorder = self.broker({"items": []})
+        broker.issue_list({"repository": "acme/infra", "query": "drift"})
+        asked = recorder.calls[-1][4]
+        self.assertIn("sort=created", asked)
+        self.assertIn("order=desc", asked)
 
     def test_a_diff_is_asked_for_by_media_type_and_returned_raw(self):
         broker, recorder = self.broker({"number": 9}, "diff --git a/x b/x\n")
@@ -1221,6 +1879,19 @@ class CollaborationTest(unittest.TestCase):
             ("gh: API rate limit exceeded (HTTP 403)", 429, "FORGE_RATE_LIMITED"),
             ("gh: secondary rate limit (HTTP 429)", 429, "FORGE_RATE_LIMITED"),
             ("gh: Not Found (HTTP 404)", 404, "FORGE_NOT_FOUND"),
+            # 422 is the other status GitHub spends twice. `search/issues`
+            # answers it, not 404, for a repository that is gone or that this
+            # credential cannot see -- so the filtered half of `issue_list`
+            # has to report the same fault as the unfiltered half, or an
+            # operator is told to fix a field that does not exist.
+            (
+                "gh: The listed users and repositories cannot be searched "
+                "either because the resources do not exist or you do not have "
+                "permission to view them. (HTTP 422)",
+                404,
+                "FORGE_NOT_FOUND",
+            ),
+            ("gh: Validation Failed (HTTP 422)", 422, "FORGE_REJECTED"),
             ("gh: Conflict (HTTP 409)", 409, "FORGE_CONFLICT"),
             ("gh: Server Error (HTTP 500)", 503, "FORGE_UNAVAILABLE"),
             ("gh: Bad Gateway (HTTP 502)", 503, "FORGE_UNAVAILABLE"),
@@ -1250,11 +1921,14 @@ class CollaborationTest(unittest.TestCase):
         broker.proposal_comment({"repository": "acme/infra", "number": 1, "body": "hi"})
         self.assertEqual(self.minted, [("github", "acme/infra")] * 3)
 
-    def test_a_verb_that_calls_twice_refreshes_once(self):
-        broker, _ = self.broker({"number": 9}, [])
+    def test_a_verb_that_calls_several_times_refreshes_once(self):
+        # A proposal's comments are three endpoints; the credential is made
+        # current once for the request, not once per call.
+        broker, recorder = self.broker({"number": 9}, [], [], [])
         broker.proposal_view(
             {"repository": "acme/infra", "number": 9, "comments": True}
         )
+        self.assertEqual(len(recorder.calls), 4)
         self.assertEqual(self.minted, [("github", "acme/infra")])
 
     def test_an_unserved_forge_refuses_the_collaboration_verbs_by_name(self):

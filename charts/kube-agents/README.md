@@ -211,7 +211,7 @@ one from the mirror through its own chart's values.
 ### LiteLLM gateway
 
 The agent's baked default model endpoint is
-`http://litellm.<namespace>.svc.cluster.local/v1`, so the chart deploys the
+`http://inference-gateway.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base`. `litellm.modelProvider`
 (gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
@@ -282,6 +282,25 @@ resolves to that GSA:
 `model_provider = "vertex_ai"` — the second `kube-agents-iam` module
 instantiation creates the identity and roles, and the chart values above carry
 the annotated KSA.
+
+#### Upgrade notes: inference-gateway Service rename
+
+The agent-facing K8s Service was renamed from `litellm` to `inference-gateway` (and `litellm-gateway` to `inference-gateway-upstream` for the upstream gateway). The operator now renders `base_url: http://inference-gateway.<namespace>.svc.cluster.local/v1` into the managed agent config on every reconcile; the managed scope is overlaid on load, so agents cannot retain the old name via a local override.
+
+**Default installs (`litellm.enabled=true`):** Helm deletes the old `litellm` Service and creates `inference-gateway` in the same upgrade. The operator re-renders the agent ConfigMap once the new pod rolls out. There is a brief window between Helm's delete of `litellm` and the completion of the operator reconcile and agent rolling-restart during which agent pods still resolve `litellm` (now gone) and model calls fail. To eliminate this window, annotate the live `litellm` Service before upgrading so Helm retains it alongside the new `inference-gateway`:
+
+```bash
+kubectl annotate svc litellm helm.sh/resource-policy=keep -n <namespace>
+helm upgrade ...
+```
+
+Old agent pods continue routing through `Service/litellm` until the operator updates the ConfigMap and the rolling restart completes. Once all pods have migrated to `inference-gateway`, remove the retained Service:
+
+```bash
+kubectl delete svc litellm -n <namespace>
+```
+
+**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on.
 
 #### Upgrade notes: static to dynamic NetworkPolicy
 

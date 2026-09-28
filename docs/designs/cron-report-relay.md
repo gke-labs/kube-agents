@@ -660,8 +660,9 @@ privilege the pod does not already hold.
   one read, which is how an issue a person closed by hand is noticed and
   replaced rather than edited while closed), and closed with a comment once
   every leg has recovered. The call is
-  `forge.run_gh` through the sandbox and the credential proxy, the same route
-  `github-repo-watcher` takes; the minted token already holds `issues: write`.
+  `forge.call` — a version-control verb, over the sandbox hop into the
+  credential broker — the same route `github-repo-watcher` takes; the minted
+  token already holds `issues: write`.
   The issue resolver's search excludes the label, so the agent never triages its
   own ledger. With no repository to use, the job falls back to the log line
   alone. Two installs that manage one repository would share one issue; the

@@ -16,9 +16,9 @@ need no privilege the pod does not already hold:
 * a **GitHub ledger issue** in the install's configured repository, one per
   install, labelled ``agent:delivery-watch``. It is opened when any job crosses
   the failure threshold, edited when the picture changes, and closed with a
-  comment when every leg has recovered. The forge call goes the same route the
-  GitHub watcher's does (``forge.run_gh`` through the sandbox and the
-  credential proxy);
+  comment when every leg has recovered. The forge calls go the same route the
+  pull-request watcher's do — ``forge.call``, a version-control verb answered
+  by the credential broker from inside the shell sandbox;
 * an **``ALERT chat_delivery_watch`` line appended to
   ``<agent home>/logs/chat_delivery_watch.log``**. The gateway pod's fluent-bit
   sidecar tails ``logs/*.log`` and ships it to the container's stdout and so
@@ -162,10 +162,8 @@ LABEL_COLOR = "D73A4A"
 LABEL_DESCRIPTION = "Scheduled-report delivery to chat is failing; maintained by chat_delivery_watch.py"
 TITLE_PREFIX = "Scheduled-report delivery is failing: "
 BODY_MARKER = "<!-- chat-delivery-watch -->"
-GH_LIST_LIMIT = "20"
+LEDGER_LIST_LIMIT = 20
 CLOSE_REASON = "completed"
-# `gh issue create` prints the new issue's URL; the number is its last segment.
-ISSUE_URL_RE = re.compile(r"/issues/(\d+)\s*$")
 EMPTY_CELL = "—"
 EMPTY_FIELD = "-"
 
@@ -407,36 +405,52 @@ def advance(entry: dict, job: dict, *, silent: bool, has_output: bool = True) ->
 
 
 class LedgerError(RuntimeError):
-    """A GitHub step failed in a way that must not be read as 'nothing to do'."""
+    """A forge step failed in a way that must not be read as 'nothing to do'."""
 
 
-def gh(argv: list[str], repo: str, *, stdin: str | None = None, check: bool = True):
-    result = forge.run_gh(argv, repo, stdin=stdin)
-    if check and result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip().splitlines()
-        raise LedgerError(f"gh {' '.join(argv[:2])} exited {result.returncode}: {detail[-1] if detail else ''}")
-    return result
+def verb(name: str, payload: dict, repo: str) -> dict:
+    """One version-control verb, with any refusal raised as `LedgerError`.
+
+    The reason code is kept in the message rather than flattened away. This job
+    reports its own faults on the log channel and nowhere else, so that string
+    is the only thing anyone ever sees about a ledger that stopped being
+    maintained -- and "FORGE_FORBIDDEN" and "FORGE_RATE_LIMITED" send whoever
+    reads it to different places.
+    """
+    try:
+        return forge.call(name, payload, repo)
+    except forge.ForgeError as refusal:
+        raise LedgerError(
+            f"{name} on {repo} refused: {refusal.reason}"
+            + (f": {refusal.value}" if refusal.value else "")
+        ) from refusal
 
 
 def ensure_label(repo: str) -> None:
-    gh(
-        ["label", "create", LABEL, "-R", repo, "--color", LABEL_COLOR, "--description", LABEL_DESCRIPTION, "--force"],
-        repo,
-        check=False,
-    )
+    """Make the ledger label exist, and shrug if it cannot.
+
+    Best-effort, as it was: the issue is worth opening without its label, and a
+    repository whose labels this credential may not touch is not a reason to
+    stop reporting a delivery outage.
+    """
+    try:
+        verb("label-ensure", {"name": LABEL, "color": LABEL_COLOR, "description": LABEL_DESCRIPTION}, repo)
+    except LedgerError:
+        pass
 
 
 def find_ledger_issue(repo: str) -> int | None:
     """The open ledger issue, if any: highest-numbered open issue carrying the marker."""
-    result = gh(
-        ["issue", "list", "-R", repo, "--label", LABEL, "--state", "open", "--json", "number,body", "--limit", GH_LIST_LIMIT],
+    answer = verb(
+        "issue-list",
+        {"labels": [LABEL], "state": "open", "limit": LEDGER_LIST_LIMIT},
         repo,
     )
-    try:
-        issues = json.loads(result.stdout or "[]")
-    except ValueError as exc:
-        raise LedgerError(f"gh issue list returned unparseable JSON: {exc}") from exc
-    numbers = [int(i["number"]) for i in issues if isinstance(i, dict) and BODY_MARKER in str(i.get("body") or "")]
+    numbers = [
+        int(issue["number"])
+        for issue in answer.get("issues") or []
+        if isinstance(issue, dict) and BODY_MARKER in str(issue.get("body") or "")
+    ]
     return max(numbers) if numbers else None
 
 
@@ -493,6 +507,26 @@ def render_issue(degraded: list[tuple[str, dict]], now: str, threshold_value: in
     return title, body
 
 
+def close_with_note(repo: str, number: int, note: str) -> None:
+    """Close the ledger issue and say why, in that order.
+
+    Two calls where `gh issue close --comment` was one, so the order is now a
+    decision rather than a given. Closing first is the one that cannot go
+    wrong twice: if the comment then fails, the issue is shut and the ledger is
+    cleared -- an outcome missing its explanation. Commenting first and failing
+    to close leaves an open issue carrying "everything recovered", which reads
+    as a live outage that is over, and the next tick comments again, and the one
+    after that.
+    """
+    verb("issue-close", {"number": number, "reason": CLOSE_REASON}, repo)
+    try:
+        verb("issue-comment", {"number": number, "body": note}, repo)
+    except LedgerError:
+        # The close landed, so the ledger is right. A missing note is worth
+        # less than the retry loop that insisting on it would create.
+        pass
+
+
 def fingerprint(title: str, body: str) -> str:
     digest = hashlib.sha256()
     digest.update(title.encode("utf-8"))
@@ -512,10 +546,10 @@ def reconcile_issue(repo: str, degraded: list[tuple[str, dict]], state: dict, no
     if ledger.get("issue_number") is not None and ledger.get("repo") and ledger.get("repo") != repo:
         # The ledger repository changed under an open issue: close it there so
         # it is not left open forever, and start afresh in the new one.
-        gh(
-            ["issue", "close", str(ledger["issue_number"]), "-R", ledger["repo"], "--reason", CLOSE_REASON, "--comment",
-             f"The delivery ledger moved to {repo} as of {now}; closing this copy."],
+        close_with_note(
             ledger["repo"],
+            int(ledger["issue_number"]),
+            f"The delivery ledger moved to {repo} as of {now}; closing this copy.",
         )
         state["ledger"] = ledger = {"repo": None, "issue_number": None, "fingerprint": None}
     if degraded:
@@ -526,15 +560,16 @@ def reconcile_issue(repo: str, degraded: list[tuple[str, dict]], state: dict, no
         digest = fingerprint(title, body)
         if number is None:
             ensure_label(repo)
-            result = gh(
-                ["issue", "create", "-R", repo, "--title", title, "--body-file", forge.BODY_STDIN, "--label", LABEL],
-                repo,
-                stdin=body,
+            answer = verb(
+                "issue-create", {"title": title, "body": body, "labels": [LABEL]}, repo
             )
-            match = ISSUE_URL_RE.search(result.stdout or "")
-            number = int(match.group(1)) if match else None
+            # The verb answers with the issue it made, so the number is read
+            # rather than recovered from a printed URL. That mattered: a create
+            # whose URL did not parse lost the number, and the recovery for it
+            # is the extra listing in the recovery branch below.
+            number = int((answer.get("issue") or {}).get("number") or 0) or None
         elif digest != ledger.get("fingerprint") or number != ledger.get("issue_number"):
-            gh(["issue", "edit", str(number), "-R", repo, "--title", title, "--body-file", forge.BODY_STDIN], repo, stdin=body)
+            verb("issue-update", {"number": number, "title": title, "body": body}, repo)
         state["ledger"] = {"repo": repo, "issue_number": number, "fingerprint": digest}
         return f"{repo}#{number}" if number else repo
     number = ledger.get("issue_number") if ledger.get("repo") == repo else None
@@ -543,12 +578,8 @@ def reconcile_issue(repo: str, degraded: list[tuple[str, dict]], state: dict, no
         # state file); a tick that just saw a recovery looks the issue up once.
         number = find_ledger_issue(repo)
     if number is not None:
-        # One call, so a close that fails cannot leave a comment behind to be
-        # repeated on every later tick.
-        gh(
-            ["issue", "close", str(number), "-R", repo, "--reason", CLOSE_REASON, "--comment",
-             f"Every scheduled report reached chat again as of {now}; closing."],
-            repo,
+        close_with_note(
+            repo, number, f"Every scheduled report reached chat again as of {now}; closing."
         )
         state["ledger"] = {"repo": None, "issue_number": None, "fingerprint": None}
         return LEDGER_CLOSED

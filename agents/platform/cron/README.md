@@ -415,12 +415,35 @@ on purpose, not shipped new, and is never reinstalled.
 Three rules on the site page came from measured failures, recorded here so the
 rule outlives the memory of why:
 
-- **On-demand runs are marked due, never re-enacted in the requesting session.**
+- **On-demand runs are marked due, not re-enacted in the requesting session; one delegated stream is the exception.**
   On 2026-08-03 a session asked to run several audits at once crammed them into
   one turn budget and produced five hand-typed empty findings documents and a
   fleet-wide all-clear, having issued no `kubectl` at all. That is why the
   Platform Agent marks the job due for the next tick instead of running the SOP
-  itself.
+  itself. The one run that does happen in a session (#1876, #1887): a card that
+  delegates exactly one stream per its SOP is run by that worker through
+  `audit_report.py start … finish` (`skills/fleet-audit/SKILL.md`, "Running a
+  stream on demand"); several streams still queue.
+  Such a run holds no per-job lock, so `start` keeps its own guard: an
+  in-flight note per stream on the sandbox pod's own volume, at
+  `/opt/data/scratch/inflight_<audit>.json` in that pod (the script runs in
+  the sandbox shell, whose `/opt/data` is its own PVC, not the gateway volume
+  this README otherwise calls "the volume"), holding the stream id and a start
+  time, honoured for two hours and removed by a `finish` that published or
+  died (exit 0 or 1); `finish --dry-run` and a `finish` that exited 2 keep it,
+  so a note beside a rejected document is a live run, not a stale one. The note spans one
+  `start`-`finish` pair, so a multi-repository loop reclaims it at each
+  repository. A run that died without `finish` costs the
+  stream at most the ticks inside those two hours. For the operator only:
+  when you know from outside the run that it is over (its card is closed, its
+  pod is gone), deleting that note releases the stream at once. The `.lock`
+  file beside the note is created once, mode 0644 whatever the creating
+  shell's umask, and never removed; a `START REFUSED` that says the guard
+  could not be taken names the error, and a lock that uid 1000 cannot open
+  is the first thing to check. The CLI has no
+  override flag on purpose; the one it had was taken by refused workers over
+  their own live runs (#1876), and a worker's shell is the same shell you
+  would use, so the release lives here and not where a worker reads.
 - **Overlap is held per job, not per profile.** Holding the profile lock across
   execution — the upstream default — meant a fleet audit blocked every dispatch
   for its whole run; three `github-issue-resolver` firings were measured 418s,

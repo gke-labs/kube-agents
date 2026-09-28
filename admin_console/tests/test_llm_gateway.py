@@ -211,7 +211,7 @@ class LlmGatewayServiceTest(unittest.TestCase):
         result = service.verify()
 
         script = kube.calls[2][0][-1]
-        self.assertIn("http://litellm:80/v1/chat/completions", script)
+        self.assertIn("http://inference-gateway:80/v1/chat/completions", script)
         self.assertIn("platform-agent-pod", kube.calls[2][0])
         self.assertIn("runtime-from-pod", kube.calls[2][0])
         self.assertEqual(result["evidence"]["returncode"], 1)

@@ -63,8 +63,8 @@ func TestHarnessEnvDefaultsToTheInstallLiteLLM(t *testing.T) {
 			base = value
 		}
 	}
-	if base != "http://litellm" {
-		t.Errorf("ANTHROPIC_BASE_URL = %q, want the in-namespace LiteLLM", base)
+	if base != "http://inference-gateway" {
+		t.Errorf("ANTHROPIC_BASE_URL = %q, want the in-namespace inference gateway", base)
 	}
 }
 

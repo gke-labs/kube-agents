@@ -27,7 +27,7 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 - [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) — Gemini-only default. Uses `GEMINI_API_KEY`.
 - [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription) — proxies to a personal ChatGPT subscription via OAuth device flow. Useful for demos where you don't want a per-token cost.
 
-To switch providers, edit the LiteLLM `config.yaml` (mounted from a `ConfigMap`) and set the corresponding API key secret. The Platform Agent config doesn't change — it always talks to a Service named `litellm`.
+To switch providers, edit the LiteLLM `config.yaml` (mounted from a `ConfigMap`) and set the corresponding API key secret. The Platform Agent config doesn't change — it always talks to a Service named `inference-gateway`.
 
 ### Setting the default model
 
@@ -196,7 +196,7 @@ Deploy it with `make -C k8s-operator deploy-inference-replay` — it is a develo
 
 ## What the agent doesn't care about
 
-The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the LLM provider. Provider selection is entirely at the LiteLLM / vLLM layer — the agent always talks to the `litellm` Service, and the install decides what that Service resolves to. When the replay proxy is deployed, the `litellm` Service is repointed at the replay proxy and the original LiteLLM pods are re-exposed through a new `litellm-gateway` Service that the proxy forwards cache misses to. That means:
+The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the LLM provider. Provider selection is entirely at the LiteLLM / vLLM layer — the agent always talks to the `inference-gateway` Service, and the install decides what that Service resolves to. When the replay proxy is deployed, the `inference-gateway` Service is repointed at the replay proxy and the original gateway pods are re-exposed through a new `inference-gateway-upstream` Service that the proxy forwards cache misses to. That means:
 
 - Swapping Gemini for Anthropic is a LiteLLM `ConfigMap` change.
 - So is [prompt caching](#prompt-caching) — the breakpoints are injected gateway-side, because only the gateway knows which model they are for.
