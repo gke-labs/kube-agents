@@ -612,7 +612,9 @@ func (b *Bridge) cancelInStream(ctx context.Context, run *taskRun) (bool, error)
 // server reaps the consumer on, so the slot and the consumer live the same
 // span and the slots in hand are the consumers the look-ahead is holding;
 // if it did not (the run was finalized during the wait, the subject was
-// empty, the read failed before its consumer), the slot comes back at once,
+// empty, the read failed before its consumer existed; a read that failed
+// after creating it, a timeout mid-iteration say, reports it opened), the
+// slot comes back at once,
 // since holding it would delay the next replay for a consumer that never
 // existed. Releasing at acquisition instead would have let a replay slower
 // than the threshold hold a third consumer per worker. A canceled context is

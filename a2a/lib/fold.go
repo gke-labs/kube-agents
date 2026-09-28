@@ -298,9 +298,11 @@ func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task,
 // read is asked (is there a cancel here?) with "no".
 //
 // The second result reports whether the read opened an ordered consumer,
-// which it does exactly when the subject held a message: a caller pacing
-// consumer slots learns whether one is now live for the inactive threshold
-// or whether the read cost nothing past the horizon get.
+// which it does when the subject held a message and the create succeeded,
+// and it reports it on an error as well as on success: a caller pacing
+// consumer slots learns whether one is now live for the inactive threshold,
+// whatever the read did after creating it, or whether the read cost nothing
+// past the horizon get.
 func (c *Client) TaskInReplay(ctx context.Context, addressee, taskID string) (events []*Envelope, opened bool, err error) {
 	events, _, opened, err = c.replay(ctx, []string{TaskInSubject(addressee, taskID)}, taskID)
 	return events, opened, err
@@ -360,9 +362,12 @@ func IsFinalStatus(env *Envelope) bool {
 // replay reads subjects from sequence 1 up to a horizon snapshotted at the
 // call, on an ephemeral ordered consumer, and returns the envelopes with the
 // subject each arrived on, in step. found is false when no subject holds a
-// message in the retention window; the caller decides what that means. The
-// subjects share the TASKS stream sequence, so the ordered consumer supplies
-// their total order and the caller needs no merge.
+// message in the retention window; the caller decides what that means. On an
+// error, found says whether the ordered consumer was created before it: true
+// from the moment it exists, since it then outlives the error by its
+// inactive threshold, false when the error came before. The subjects share
+// the TASKS stream sequence, so the ordered consumer supplies their total
+// order and the caller needs no merge.
 func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (events []*Envelope, eventSubjects []string, found bool, err error) {
 	_, js := c.conn()
 	stream, err := js.Stream(ctx, TasksStream)
@@ -398,9 +403,13 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("ordered consumer for %s: %w", taskID, err)
 	}
+	// From here the consumer exists and outlives an error by its inactive
+	// threshold, so every return below reports found: a caller pacing
+	// consumer slots on it must hold the slot whether or not the read then
+	// succeeded.
 	it, err := cons.Messages()
 	if err != nil {
-		return nil, nil, false, fmt.Errorf("replay messages for %s: %w", taskID, err)
+		return nil, nil, true, fmt.Errorf("replay messages for %s: %w", taskID, err)
 	}
 	defer it.Stop()
 	// it.Next does not observe ctx on its own; stopping the iterator is what
@@ -414,13 +423,13 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 		msg, err := it.Next()
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, nil, false, fmt.Errorf("replay for %s: %w", taskID, ctx.Err())
+				return nil, nil, true, fmt.Errorf("replay for %s: %w", taskID, ctx.Err())
 			}
-			return nil, nil, false, fmt.Errorf("replay next for %s: %w", taskID, err)
+			return nil, nil, true, fmt.Errorf("replay next for %s: %w", taskID, err)
 		}
 		meta, err := msg.Metadata()
 		if err != nil {
-			return nil, nil, false, fmt.Errorf("replay metadata for %s: %w", taskID, err)
+			return nil, nil, true, fmt.Errorf("replay metadata for %s: %w", taskID, err)
 		}
 		subject := msg.Subject()
 		env, err := ParseEnvelope(msg.Data())
