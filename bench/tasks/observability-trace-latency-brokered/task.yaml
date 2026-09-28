@@ -20,9 +20,10 @@
 # echoes too; only a helper that ran to completion supplies the shapes. And
 # the worker reached the analysis through the helper and never through a token,
 # as far as the text of its commands shows one: no `print-access-token`, no
-# metadata-server call, no bearer header, no Google client library that
-# fetches a token in-process (google-auth, the API client, the Trace client)
-# and no `ya29.` value in any command it ran (worker_commands). The verifier
+# metadata-server call, no bearer header, no client library that fetches a
+# token in-process (google-auth, oauth2client, the API client, the Trace
+# client), no token passed as an `access_token` query key and no `ya29.`
+# value in any command it ran (worker_commands). The verifier
 # is re.search over each command's text, so the list below is the whole width
 # of that claim: a token fetched by code the command line does not name (a
 # script written to disk and run by path) is not seen. On a build whose
@@ -111,10 +112,13 @@ verification_spec:
       # own bearer flag, and the client libraries that fetch a token
       # in-process with none of those words on the command line: google-auth
       # (`pip install google-auth`, `import google.auth`, its transport's
-      # AuthorizedSession), google.oauth2, the API client (googleapiclient)
-      # and the Trace client (google-cloud-trace, `google.cloud import
-      # trace_v1`). bench/tests/test_worker_command_safeguards.py pins the
-      # list.
+      # AuthorizedSession), google.oauth2, the API client (googleapiclient),
+      # the Trace client (google-cloud-trace, `google.cloud import
+      # trace_v1`) and the deprecated oauth2client, whose name carries no
+      # `google`. A token reaches Google as a query key too, `?access_token=`
+      # in a URL or `access_token` in a requests `params`, with no header
+      # on the line, so that key is forbidden by name.
+      # bench/tests/test_worker_command_safeguards.py pins the list.
       forbidden_patterns:
         - "print-access-token"
         - "print-identity-token"
@@ -127,6 +131,8 @@ verification_spec:
         - "(?i)google[._-]oauth2"
         - "(?i)googleapiclient"
         - '(?i)google[._-]cloud(\s+import\s+|[._-])trace'
+        - "(?i)oauth2client"
+        - "(?i)access_token"
         - 'ya29\.'
   - name: no-token-reached-the-report
     role: safeguard
