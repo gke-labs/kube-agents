@@ -1,12 +1,20 @@
 # Reproducing the upgrade failure catalogue: how each scenario is planted, broken, verified, detected and fixed
 
 This is the test plan for [`upgrade-failure-catalogue.md`](upgrade-failure-catalogue.md). The
-catalogue says what breaks and which signal shows it; this document says, for each of its twenty
-entries, how to create the failure in a test environment, how to make the upgrade break it, how to
-prove the break happened, and the concrete check and fix on each side of the upgrade. Where the
-seeded fleet already plants the scenario, or an open pull request does, the entry says so; where
-it cannot live in the fleet, the entry names the out-of-tree cluster or the simulation that stands
-in; and where nothing can create it on demand, the entry says what to observe and when.
+catalogue says what breaks and which signal shows it; this document says, for each of its entries,
+how to create the failure in a test environment, how to make the upgrade break it, how to prove
+the break happened, and the concrete check and fix on each side of the upgrade. Where the seeded
+fleet already plants the scenario, the entry says so; where a role is proposed but not planted on
+`main`, the entry says that and [`bench/tasks/DRAFTS.md`](../../bench/tasks/DRAFTS.md) is where
+proposals are tracked; where it cannot live in the fleet, the entry names the out-of-tree cluster
+or the simulation that stands in; and where nothing can create it on demand, the entry says what
+to observe and when.
+
+Out-of-tree hosts. The clusters the entries call `gemma-gpu` and `gemma-gpu-upgraded`, and the
+scripts `setup.sh`, `break-upgrade.sh`, `detect.sh` and `watch-break.py` with their manifests,
+live in a separate repository, <https://github.com/haoxuw/gke-fleet-iac>, under
+`clusters/gemma-gpu/`, and run in a Google Cloud project of your own; nothing in them touches the
+seeded fleet.
 
 ## For a reader who does not run Kubernetes
 
@@ -25,88 +33,58 @@ purpose at all, only watched for.
 Each line gives the scenario, where it can be created, and what exists for it today.
 
 1. [A PodDisruptionBudget forbids the eviction](#1-a-poddisruptionbudget-forbids-the-eviction):
-   seeded fleet, in an open pull request. Fleet main: no drain-blocking budget. an open pull request
-   adds readiness-drain-blocked on seeded-b. gemma-gpu measured the stall twice to the minute; its
-   audit rows re-read 2026-09-28. Read today by --readiness.
+   seeded fleet, a role to plant (not on main today). Fleet main: no drain-blocking budget.
 2. [No spare capacity for the displaced pods](#2-no-spare-capacity-for-the-displaced-pods): an
-   out-of-tree cluster. No fleet role on main. an open pull request adds readiness-surge-blocked:
-   no_surge_pool on seeded-b, the maxUnavailable 1 half; main's pinned-inference-pool is the ceiling
-   half. Out-of-tree: gemma-gpu scripts, once.
+   out-of-tree cluster. No fleet role on main.
 3. [Every replica in one zone or on one node](#3-every-replica-in-one-zone-or-on-one-node): seeded
-   fleet, in an open pull request. Fleet role in an open pull request (zonal-skew-scheduling;
-   no bench case, not in nightly-cases.txt); nothing on main (checkout-gateway has a hostname
-   spread); no out-of-tree script; 3.7/3.8 read templates, none reads placement.
-4. [Data on the node is gone](#4-data-on-the-node-is-gone): seeded fleet, a new role to plant.
-   Nothing planted: no fleet role on main or in an open pull request, no out-of-tree script.
-   Incidental only: gemma-gpu's vLLM keeps its weights cache in an emptyDir (model-cache, 40Gi);
-   both measured upgrades refilled it.
+   fleet, a role to plant (not on main today). Fleet role in open a proposed change
+   (zonal-skew-scheduling.
+4. [Data on the node is gone](#4-data-on-the-node-is-gone): seeded fleet, a role to plant (not on
+   main today). Nothing planted: no fleet role on main or in a proposed change, no out-of-tree
+   script.
 5. [Maintenance window too short, or an exclusion ends
    mid-roll](#5-maintenance-window-too-short-or-an-exclusion-ends-mid-roll): an out-of-tree cluster.
    Covering exclusion: fleet role on main (seeded-b hold-the-minor-lag, case
-   upgrades-fleet-readiness-exclusion) and gemma-gpu setup.sh. Window-too-short and
-   exclusion-ends-mid-change: nothing; no script, no case, no check.
+   upgrades-fleet-readiness-exclusion) and gemma-gpu setup.sh.
 6. [A served API version is removed](#6-a-served-api-version-is-removed): an out-of-tree cluster.
-   Out-of-tree only: gemma-gpu scripts; break measured once (gemma-gpu-upgraded, 2026-09-24);
-   gemma-gpu still on 1.31 with the live caller. Fleet: deprecated-api-caller merged on seeded-a
-   (Endpoints). No bench case yet.
+   Out-of-tree only: gemma-gpu scripts.
 7. [A fail-closed webhook whose backend is not
-   up](#7-a-fail-closed-webhook-whose-backend-is-not-up): seeded fleet, in an open pull request.
-   Fleet role readiness-failclosed-webhook (seeded-b) in an open pull request, applied nowhere
-   2026-09-28; no eval case reads it; no out-of-tree script; gemma-gpu plants no webhook; readiness
-   mode reads PDBs, exclusions, skew
+   up](#7-a-fail-closed-webhook-whose-backend-is-not-up): seeded fleet, a role to plant (not on main
+   today). Fleet role readiness-failclosed-webhook (seeded-b) in open a proposed change, applied
+   nowhere 2026-09-28.
 8. [A default changes in the new minor](#8-a-default-changes-in-the-new-minor): an out-of-tree
-   cluster. Nothing exists: no fleet role on main or in an open pull request; gemma-gpu plants a removed API and a
-   drain block, not a flipped default. gemma-gpu-upgraded (cp 1.32.13, default-pool 1.31.14,
-   measured) is a ready host.
+   cluster. Nothing exists: no fleet role on main or in a proposed change.
 9. [A feature is deprecated but still served](#9-a-feature-is-deprecated-but-still-served): seeded
    fleet, planted today. Fleet role deprecated-api-caller on main, applied and yielding in the dev
-   copy (seeded-a v1.35.8, 144 stamps in 24 h, no Failed job); no eval case reads it yet.
-   externalIPs: nothing; throwaway-only on GKE. IPVS: none.
+   copy (seeded-a v1.35.8, 144 stamps in 24 h, no Failed job).
 10. [Add-on and client skew](#10-add-on-and-client-skew): an out-of-tree cluster. Nothing plants it:
-    no fleet role or open pull request (seeded-b's pool is pinned to its master; main.tf says why); gemma-gpu
-    starts pool and master equal. Pool skew: upgrade_readiness.py evaluate_skew; add-on/client unread
+    no fleet role or proposed change (seeded-b's pool is pinned to its master.
 11. [The control plane is unreachable for minutes on a zonal
     cluster](#11-the-control-plane-is-unreachable-for-minutes-on-a-zonal-cluster): an out-of-tree
-    cluster. No fleet role, no open pull request, nothing reads location type. All fleet slots and gemma-gpu
-    are zonal; break-upgrade.sh + watch-break.py ran one master upgrade on 2026-09-24, no gap seen at
-    60 s.
+    cluster. No fleet role, no proposed change, nothing reads location type.
 12. [A node label or taint is removed](#12-a-node-label-or-taint-is-removed): simulation only.
-    Nothing in tree. No fleet role; an open pull request's readiness-pinned-workload pins
-    pinned-batch-runner to a tainted pool, not a vanishing label. gemma-gpu's scripts do not plant
-    it; gemma-gpu-upgraded's default pool serves.
+    Nothing in tree.
 13. [The container runtime changes](#13-the-container-runtime-changes): an out-of-tree cluster.
-    Nothing exists: no fleet role on main or an open pull request; gemma-gpu's 1.31 to 1.32 path keeps
-    containerd 1.7; the one nearby reader, security-patch orchestrator 3.9 stale-image-type, passes
-    COS_CONTAINERD and stays silent.
+    Nothing exists: no fleet role on main or in an proposed change.
 14. [cgroup v2 under a runtime that cannot read
     it](#14-cgroup-v2-under-a-runtime-that-cannot-read-it): an out-of-tree cluster. Nothing exists:
-    no fleet role, open pull request or gemma-gpu script. Every gemma-gpu and gemma-gpu-upgraded pool reads
-    EFFECTIVE_CGROUP_MODE_V2 today; no kube-agents script reads effectiveCgroupMode or images.
+    no fleet role, proposed change or gemma-gpu script.
 15. [The OOM killer starts killing the whole
     container](#15-the-oom-killer-starts-killing-the-whole-container): simulation only. Nothing
-    exists: no fleet role (seeded-a/c 1.35.8, seeded-b 1.34.11, all past the 1.33 migration), no open pull request, no gemma-gpu script; the four gemma pools read V2,
-    opt-out unset (2026-09-28).
+    exists: no fleet role (seeded-a/c 1.35.8, seeded-b 1.34.11, all past the 1.33 migration), no
+    proposed change but the catalogue's (a proposed change), no gemma-gpu script.
 16. [The network dataplane changes](#16-the-network-dataplane-changes): simulation only. Nothing
-    planted: fleet Terraform sets no datapath, DNS or policy fields; gemma-gpu, gemma-gpu-upgraded
-    and seeded-a/b/c read legacy, kube-dns, addon disabled (2026-09-28); gemma-gpu has 1 unenforced
-    policy; no open pull request.
+    planted: fleet Terraform sets no datapath, DNS or policy fields.
 17. [A node networking agent fails on the new
     image](#17-a-node-networking-agent-fails-on-the-new-image): simulation only. Nothing exists
-    today: no fleet role on main or an open pull request; gemma-gpu scripts cover entries 1, 2 and 6 only;
-    the catalogue reads 'Read today: nothing', no Recommender insight. Scenario 12 plans the same
-    event.
+    today: no fleet role on main or in an proposed change.
 18. [GPU driver mismatch](#18-gpu-driver-mismatch): an out-of-tree cluster. Nothing plants it.
-    Fleet: GPU excluded. gemma-gpu (setup.sh) has one L4 pool on gpu-driver-version=latest, no
-    mismatch. Repo: prose only (gke-upgrades SKILL.md 148-153, troubleshooting.md section 9,
-    checklists.md 27).
 19. [In-tree volumes lose their CSI path](#19-in-tree-volumes-lose-their-csi-path): an out-of-tree
-    cluster. Nothing exists: no fleet role on main or an open pull request, no out-of-tree script (gemma-gpu
-    plants API removal and drain, not storage), no kube-agents reader; the catalogue says 'Read
-    today: nothing'. This recipe is first.
-20. [Images on a retired registry](#20-images-on-a-retired-registry): seeded fleet, a new role to
-    plant. Nothing: no fleet role on main or in the open pull requests, no out-of-tree script. gemma-gpu
-    pulls from us-docker.pkg.dev and docker.io; its only egress control is a pod NetworkPolicy, which
-    kubelet pulls bypass.
+    cluster. Nothing exists: no fleet role on main or in an proposed change, no out-of-tree script
+    (gemma-gpu plants API removal and drain, not storage), no kube-agents reader.
+20. [Images on a retired registry](#20-images-on-a-retired-registry): seeded fleet, a role to plant
+    (not on main today). Nothing: no fleet role on main or in the listed proposed change, no
+    out-of-tree script.
 
 ## The scenarios
 
@@ -118,13 +96,13 @@ change. Then cost and time, what exists today, and caveats.
 
 ### 1. A PodDisruptionBudget forbids the eviction
 
-Home: seeded fleet, in an open pull request. Plant: an open pull request adds
+Home: seeded fleet, a role to plant (not on main today). Plant: a proposed fleet role adds
 readiness-drain-blocked on seeded-b: PDB pinned-batch-runner, maxUnavailable 0, one pause replica
 on no-surge-pool. Break: never in the fleet (read-only, pool pinned to the master); use a
 disposable cluster or gemma-gpu.
 
 - Plant:
-  - Fleet (an open pull request, bench/tf/fleet/defects-b.tf): kubernetes_pod_disruption_budget_v1
+  - Fleet (a proposed change, bench/tf/fleet/defects-b.tf): kubernetes_pod_disruption_budget_v1
     "drain_blocked" on seeded-b, ns seeded-upgrade, name pinned-batch-runner, max_unavailable = "0",
     selector app=pinned-batch-runner; fixtures.json role readiness-drain-blocked.
   - Its target (same file): kubernetes_deployment_v1 "pinned_batch_runner", replicas = 1, image
@@ -142,7 +120,7 @@ disposable cluster or gemma-gpu.
 - Break:
   - Disposable: gcloud container clusters upgrade pdb-drain --master --cluster-version $NEW --zone Z
     --quiet (~10 min, break-upgrade.sh step 1), then the same command with --node-pool no-surge
-    --async instead of --master. gemma-gpu: ./break-upgrade.sh.
+    --async instead of --master. Gemma-gpu: ./break-upgrade.sh.
   - Measured twice on gemma-gpu: T+0 UPGRADE_NODES starts; T+1.5 min node Ready,SchedulingDisabled,
     pod Running and serving; GKE retries the eviction every 2 s (1,710 refusals in run 2); T+60 pod
     deleted; node back ~T+63; DONE T+64 to T+66, workload not back.
@@ -170,7 +148,7 @@ disposable cluster or gemma-gpu.
     blocked when maxUnavailable is 0/0% or minAvailable >= the owner's replicas; decide on spec.
   - Read today: fleet_upgrade_report.py --readiness --kubeconfig-dir <dir> (rule 1 of 3, SOP §3.4)
     grades it blocked, naming ns/name, field and workloads; obtainability 3.4 blocking-pdb files it
-    critical; an open pull request adds upgrade SOP 3.11 upgrade-blocked.
+    critical; a proposed fleet role adds upgrade SOP 3.11 upgrade-blocked.
   - gcloud recommender insights list --project P --location Z --insight-type
     google.container.DiagnosisInsight --filter insightSubtype=PDB_UNPERMISSIVE;
     content.podDisruptionInsight[].pdbInfo names the budget; daily; gemma-gpu flagged within a day;
@@ -205,18 +183,21 @@ disposable cluster or gemma-gpu.
 
 - Cost and time: Disposable e2-small: ~10 min create, ~10 min control-plane step, ~65 min stall +
   rebuild, cents/hour; gemma-gpu copy: L4 + EXTENDED fee, 23-24 min outage.
-- Exists today: Fleet main: no drain-blocking budget. an open pull request adds
-  readiness-drain-blocked on seeded-b. gemma-gpu measured the stall twice to the minute; its audit
+- Exists today: Fleet main: no drain-blocking budget. A proposed fleet role adds
+  readiness-drain-blocked on seeded-b. Gemma-gpu measured the stall twice to the minute; its audit
   rows re-read 2026-09-28. Read today by --readiness.
 - Caveats:
   - seeded-a's inference-server PDB (maxUnavailable 1) also sits at disruptionsAllowed 0 because its
     surplus replicas are Pending; the readiness rule decides on spec, so it is not graded blocked
     (defects-a.tf says so).
+  - Catalogue says blue-green honours the budget up to seven days; the strategies doc says drains
+    respect a PDB up to 1 hour in both strategies, 7 days is the soak ceiling, and
+    wait-for-drain-duration only delays the drain.
 
 ### 2. No spare capacity for the displaced pods
 
 Home: an out-of-tree cluster. The break is a node-pool upgrade, forbidden in the read-only fleet, so
-plant and break run in a user project. The fleet holds before-signals: an open pull request's
+plant and break run in a user project. The fleet holds before-signals: a proposed change's
 no-surge-pool (maxSurge 0 / maxUnavailable 1) on seeded-b, main's pinned-inference-pool
 (autoscaler 1/1).
 
@@ -229,7 +210,7 @@ no-surge-pool (maxSurge 0 / maxUnavailable 1) on seeded-b, main's pinned-inferen
     currentMasterVersion, from get-server-config channels[].validVersions>.
   - Read free CPU first: kubectl describe node <n> | grep -A5 'Allocated resources' (e2-small
     allocates 940m; DaemonSets take ~250m per bench/tf/fleet/defects-a.tf). Request more than half
-    of what is free, e.g. cpu 500m: one pod fits a node, two do not.
+    of what is free, e.g. Cpu 500m: one pod fits a node, two do not.
   - Fill both nodes: a Deployment, replicas 2, nodeSelector pool=no-headroom, toleration
     pool=no-headroom:NoSchedule, one pause container with that request. No PDB: a budget is entry 1.
     Autoscaler max equal to node count is the ceiling signal.
@@ -301,7 +282,7 @@ no-surge-pool (maxSurge 0 / maxUnavailable 1) on seeded-b, main's pinned-inferen
 
 - Cost and time: CPU: two e2-small under an hour, cents; a node rebuild took 3 min (run 1), the
   Pending gap per node. GPU: gemma-gpu's L4 round the clock; 23-24 min outage.
-- Exists today: No fleet role on main. an open pull request adds readiness-surge-blocked:
+- Exists today: No fleet role on main. A proposed fleet role adds readiness-surge-blocked:
   no_surge_pool on seeded-b, the maxUnavailable 1 half; main's pinned-inference-pool is the ceiling
   half. Out-of-tree: gemma-gpu scripts, once.
 - Caveats:
@@ -314,13 +295,13 @@ no-surge-pool (maxSurge 0 / maxUnavailable 1) on seeded-b, main's pinned-inferen
 
 ### 3. Every replica in one zone or on one node
 
-Home: seeded fleet, in an open pull request. an open pull request (zonal-skew-scheduling, seeded-d)
-plants this shape: zone-pinned-api, two replicas, a ScheduleAnyway zonal spread and a required
-single-zone nodeAffinity. The fleet is read-only, so the break step runs on a throwaway pool in
-the gemma-gpu project.
+Home: seeded fleet, a role to plant (not on main today). a proposed change (zonal-skew-scheduling,
+seeded-d) plants this shape: zone-pinned-api, two replicas, a ScheduleAnyway zonal spread and a
+required single-zone nodeAffinity. The fleet is read-only, so the break step runs on a throwaway
+pool in the gemma-gpu project.
 
 - Plant:
-  - Fleet (an open pull request, defects-d.tf): Deployment zone-pinned-api, ns seeded-topology,
+  - Fleet (a proposed change, defects-d.tf): Deployment zone-pinned-api, ns seeded-topology,
     replicas 2, zonal topology_spread_constraint ScheduleAnyway, required node_affinity
     topology.kubernetes.io/zone In [var.zone], PDB maxUnavailable 1, requests 10m/16Mi.
   - Fleet shape: seeded-d is one e2-small per zone (node_locations=[var.second_zone], node_count 1
@@ -375,7 +356,7 @@ the gemma-gpu project.
     Available reason (MinimumReplicasUnavailable) also reads so at 1 of 2, and
     status.availableReplicas is omitted at 0, so neither proves zero alone. Unread by the watcher.
   - FailedScheduling appears only when no other node satisfies the pod (a maxSurge 0 pool, or a pin
-    to the cordoned node's zone); with the default surge node, no event. kubectl get events -A
+    to the cordoned node's zone); with the default surge node, no event. Kubectl get events -A
     --field-selector reason=FailedScheduling; not on the deployed list
   - The eviction audit query in verify, run over the drain, is the durable record of two evictions
     with no budget refusal between them; the GKE operation reads DONE either way, so operation
@@ -400,8 +381,8 @@ the gemma-gpu project.
 
 - Cost and time: Out-of-tree: one e2-medium for a few hours (cents), one pool upgrade; create plus
   one-node surge upgrade typically within 30 min. Fleet: nothing beyond seeded-d
-- Exists today: Fleet role in an open pull request (zonal-skew-scheduling; no bench case, not
-  in nightly-cases.txt); nothing on main (checkout-gateway has a hostname spread); no out-of-tree
+- Exists today: Fleet role in open a proposed change (zonal-skew-scheduling; no bench case, not in
+  nightly-cases.txt); nothing on main (checkout-gateway has a hostname spread); no out-of-tree
   script; 3.7/3.8 read templates, none reads placement.
 - Caveats:
   - Fleet copy: with the one-zone pin and maxUnavailable 1, a drain's second eviction waits for a
@@ -413,10 +394,10 @@ the gemma-gpu project.
 
 ### 4. Data on the node is gone
 
-Home: seeded fleet, a new role to plant. emptyDir half as a new seeded-a role, the before-check's
-fixture; the fleet is read-only, so its break is GKE's auto-upgrade when REGULAR rolls, observed.
-Local SSD and hostPath out-of-tree: Local SSD needs n1-standard-1 (no e2), hostPath trips
-compliance 2.3.
+Home: seeded fleet, a role to plant (not on main today). emptyDir half as a new seeded-a role, the
+before-check's fixture; the fleet is read-only, so its break is GKE's auto-upgrade when REGULAR
+rolls, observed. Local SSD and hostPath out-of-tree: Local SSD needs n1-standard-1 (no e2),
+hostPath trips compliance 2.3.
 
 - Plant:
   - Fleet role node-local-state on seeded-a, new ns seeded-node-state (kubernetes_namespace_v1; add
@@ -429,7 +410,7 @@ compliance 2.3.
     ["deployment/session-cache"]; state, a why each: pod?app=session-cache
     status.conditions[?(@.type=='Ready')].status any_eq "True", spec.volumes[*].name any_eq "cache";
     spec.replicas eq 1.
-  - Out-of-tree (any cluster, e.g. gemma-gpu): gcloud container node-pools create ssd-pool --cluster
+  - Out-of-tree (any cluster, e.g. Gemma-gpu): gcloud container node-pools create ssd-pool --cluster
     C --location Z --machine-type n1-standard-1 --num-nodes 1 --ephemeral-storage-local-ssd count=1.
     GKE: n1-standard-1 or larger; emptyDir then lives on the SSD.
   - On it, apply a one-replica Deployment app=node-state as root: nodeSelector
@@ -439,7 +420,7 @@ compliance 2.3.
   - Out-of-tree: gcloud container clusters upgrade C --node-pool=ssd-pool --location=Z
     --cluster-version=<currentMasterVersion>: the same-version call GKE documents to recreate nodes.
     No PDB, no stall: minutes (gemma: force-kill 16:02:00, node back 16:05:11).
-  - Fleet: no on-demand break; the fleet is read-only and no case may upgrade it. seeded-a is on
+  - Fleet: no on-demand break; the fleet is read-only and no case may upgrade it. Seeded-a is on
     REGULAR with a 03:00 UTC window: when REGULAR rolls a version, GKE rebuilds default-pool's two
     nodes one at a time (maxSurge 1), as on 2026-09-07. Observe only.
   - Repair-shaped alternative, no UPGRADE_NODES operation: gcloud compute instance-groups managed
@@ -450,7 +431,7 @@ compliance 2.3.
     it with kubectl get pod -l app=session-cache -o jsonpath='{.items[0].metadata.uid}
     {.items[0].spec.nodeName}' and that node's .status.nodeInfo.bootID.
   - Out-of-tree control: kubectl delete pod -l app=node-state, wait Ready, cat both markers:
-    /node/marker (hostPath) unchanged, /cache/marker (emptyDir) new. hostPath data survives a pod
+    /node/marker (hostPath) unchanged, /cache/marker (emptyDir) new. HostPath data survives a pod
     restart, so what the rebuild removes is node data, not pod data.
   - After: gcloud container operations list --location Z --filter='operationType=UPGRADE_NODES AND
     targetLink~ssd-pool' --format='value(status,startTime,endTime)' is DONE; node name (surge) or
@@ -476,7 +457,7 @@ compliance 2.3.
     the marker dated after the operation. On a real application the same read is its data directory.
     Unread.
   - The catalogue's after-signal is the app's own errors: kubectl logs deploy/X --since-time=<op
-    startTime> for read errors, empty queues, cache misses. gemma-gpu's replacement refilled its
+    startTime> for read errors, empty queues, cache misses. Gemma-gpu's replacement refilled its
     emptyDir model cache: container 19:22:33Z, Ready 19:28:52Z. Unread.
 - Fix before:
   - State on a PVC (standard-rwo, pd.csi.storage.gke.io): GKE unmounts, not erases, persistent disks
@@ -485,7 +466,7 @@ compliance 2.3.
   - Keep emptyDir and Local SSD for what the app rebuilds; annotate
     cluster-autoscaler.kubernetes.io/safe-to-evict: "true", which the autoscaler and the jq above
     read as rebuildable; a startupProbe gates readiness on it.
-  - Data that cannot move before the window: copy it out first (kubectl exec ... tar cf - /cache |
+  - Data that cannot move before the window: copy it out first (kubectl exec ... Tar cf - /cache |
     gcloud storage cp - gs://...) and rehearse the restore. A PDB delays the drain by at most an
     hour; it saves nothing.
 - Fix after:
@@ -498,7 +479,7 @@ compliance 2.3.
 
 - Cost and time: Fleet: one 10m/16Mi busybox pod on seeded-a, no added spend; break on GKE's
   schedule. Out-of-tree: an n1-standard-1 plus a 375 GiB Local SSD, about an hour.
-- Exists today: Nothing planted: no fleet role on main or in an open pull request, no out-of-tree
+- Exists today: Nothing planted: no fleet role on main or in a proposed change, no out-of-tree
   script. Incidental only: gemma-gpu's vLLM keeps its weights cache in an emptyDir (model-cache,
   40Gi); both measured upgrades refilled it.
 - Caveats:
@@ -506,7 +487,7 @@ compliance 2.3.
     recreate nodes; it is a real UPGRADE_NODES roll under the pool's surge settings. MIG recreate is
     a repair, not an upgrade.
   - No read can tell rebuildable scratch from state; the check needs the safe-to-evict annotation or
-    a human. hostPath stays out of the fleet (needs root, compliance 2.3 flags it) and the fleet
+    a human. HostPath stays out of the fleet (needs root, compliance 2.3 flags it) and the fleet
     break is observe-only.
 
 ### 5. Maintenance window too short, or an exclusion ends mid-roll
@@ -604,7 +585,7 @@ demand: put the pool on gemma-gpu (setup.sh window 03:00-07:00Z); the pause is o
     gemma-gpu); real pools drain in minutes, so 'too short' there means hundreds of nodes, which no
     test cluster should carry.
   - Whether a paused automatic upgrade keeps its operation RUNNING between windows was not measured;
-    the docs say only that the surge upgrade 'is paused'. verify 1 accepts either; the pool's two
+    the docs say only that the surge upgrade 'is paused'. Verify 1 accepts either; the pool's two
     versions are the firm signal.
 
 ### 6. A served API version is removed
@@ -657,7 +638,7 @@ break it; the merged deprecated-api-caller stands in for the pre-upgrade audit s
 - Detect before:
   - gcloud logging read '<cluster filter> AND labels."k8s.io/removed-release"="1.32"' --freshness
     30d; assert empty before targeting 1.32; entries name the caller (callerSuppliedUserAgent).
-    logging read is allowlisted, but nothing runs this filter: unread.
+    Logging read is allowlisted, but nothing runs this filter: unread.
   - gcloud recommender insights list --location us-central1-a --insight-type
     google.container.DiagnosisInsight --filter 'insightSubtype:DEPRECATION_K8S_1_32_API AND
     targetResources:<name>'; assert empty. Human-only: not allowlisted. Still absent 2026-09-28.
@@ -686,7 +667,7 @@ break it; the merged deprecated-api-caller stands in for the pre-upgrade audit s
     Clear it after 30 silent days.
 - Fix after:
   - Object intact through v1: same sed | kubectl apply, then kubectl -n kubeagents-system create job
-    --from=cronjob/legacy-flowcontrol-tuner tuner-fixed; its log: ok ... patched FlowSchema
+    --from=cronjob/legacy-flowcontrol-tuner tuner-fixed; its log: ok ... Patched FlowSchema
     legacy-batch-lane (HTTP 200).
   - Helm: helm mapkubeapis rewrites the release record (Secret or ConfigMap driver) so helm upgrade
     stops refusing. A CRD whose status.storedVersions lists a dropped version: migrate its objects,
@@ -707,18 +688,18 @@ break it; the merged deprecated-api-caller stands in for the pre-upgrade audit s
 
 ### 7. A fail-closed webhook whose backend is not up
 
-Home: seeded fleet, in an open pull request. an open pull request (bench/tf/fleet/defects-b.tf)
-plants seeded-fail-closed-gate on seeded-b, confined to fleet-labelled ConfigMap CREATE in
-seeded-upgrade: detectable, never breakable; applied to no project seen 2026-09-28. The break runs
-on a disposable own cluster.
+Home: seeded fleet, a role to plant (not on main today). a proposed change
+(bench/tf/fleet/defects-b.tf) plants seeded-fail-closed-gate on seeded-b, confined to
+fleet-labelled ConfigMap CREATE in seeded-upgrade: detectable, never breakable; applied to no
+project seen 2026-09-28. The break runs on a disposable own cluster.
 
 - Plant:
-  - Fleet (an open pull request defects-b.tf, tofu apply per project): VWC seeded-fail-closed-gate
-    on seeded-b: hook gate.seeded.invalid, failurePolicy Fail, timeoutSeconds 30 (API max), service
+  - Fleet (a proposed change defects-b.tf, tofu apply per project): VWC seeded-fail-closed-gate on
+    seeded-b: hook gate.seeded.invalid, failurePolicy Fail, timeoutSeconds 30 (API max), service
     seeded-upgrade/nonexistent-admission-gate; rule core v1 configmaps CREATE only.
   - Fleet scope: namespaceSelector kubernetes.io/metadata.name=seeded-upgrade plus objectSelector
     managed-by=kube-agents-seeded-fleet, so nothing real is ever rejected; the cluster-wide
-    dimension is deliberately left to a unit test (see bench-fleet-catalog.md).
+    dimension is deliberately left to a unit test.
   - Own project, P=<proj> Z=us-central1-a: gcloud container clusters create wh-test --zone $Z
     --project $P --release-channel regular --num-nodes 1 --machine-type e2-small. The default pool
     gets GKE's defaults maxSurge 1, maxUnavailable 0.
@@ -732,7 +713,7 @@ on a disposable own cluster.
   - Rule: apiGroups [""], apiVersions [v1], operations [CREATE], resources [pods], scope Namespaced;
     service {webhook-test, dead-gate, /validate}; no caBundle; no namespaceSelector, so kube-system
     matches. Plant check: kubectl run p --image=pause --dry-run=server
-  - Fleet: observe only. printf 'kind: ConfigMap\napiVersion: v1\nmetadata: {name: p, namespace:
+  - Fleet: observe only. Printf 'kind: ConfigMap\napiVersion: v1\nmetadata: {name: p, namespace:
     seeded-upgrade, labels: {managed-by: kube-agents-seeded-fleet}}\n' | kubectl --context
     gke_${P}_${Z}_seeded-b apply --dry-run=server -f - (persists nothing)
   - Own cluster: gcloud container clusters upgrade wh-test --node-pool default-pool --zone $Z
@@ -740,11 +721,11 @@ on a disposable own cluster.
     finishes), then delete; all pod CREATEs meanwhile rejected, kube-system too
 - Verify:
   - Fleet, derived from apiserver source (fixture applied nowhere): Error from server
-    (InternalError): ... failed calling webhook "gate.seeded.invalid": failed to call webhook: Post
+    (InternalError): ... Failed calling webhook "gate.seeded.invalid": failed to call webhook: Post
     "https://nonexistent-admission-gate.seeded-upgrade.svc:443/validate?timeout=30s"
   - kubectl get events -A --field-selector reason=FailedCreate -o
     custom-columns=NS:.involvedObject.namespace,OBJ:.involvedObject.name,MSG:.message -> Error
-    creating: Internal error occurred: failed calling webhook "gate.dead.invalid": ... no endpoints
+    creating: Internal error occurred: failed calling webhook "gate.dead.invalid": ... No endpoints
     available
   - kubectl get ds -n kube-system -o
     custom-columns=NAME:.metadata.name,DESIRED:.status.desiredNumberScheduled,READY:.status.numberReady
@@ -795,7 +776,7 @@ on a disposable own cluster.
 
 - Cost and time: Fleet: free. Own cluster ~$0.12/h ($0.10 fee unless the free zonal one, plus
   e2-small): create ~8 min, master ~9 (measured), plant 5, pool ~10 unmeasured
-- Exists today: Fleet role readiness-failclosed-webhook (seeded-b) in an open pull request,
+- Exists today: Fleet role readiness-failclosed-webhook (seeded-b) in open a proposed change,
   applied nowhere 2026-09-28; no eval case reads it; no out-of-tree script; gemma-gpu plants no
   webhook; readiness mode reads PDBs, exclusions, skew
 - Caveats:
@@ -894,12 +875,12 @@ Deployment on seeded-a's 1.35 nodes would sit permanently broken, so none is pro
 
 - Cost and time: One e2-small zonal EXTENDED cluster, hours, plus the extended-support fee
   (1.32/1.33 past standard support); create ~10 min, control plane ~9, pool minutes.
-- Exists today: Nothing exists: no fleet role on main or in an open pull request; gemma-gpu plants a removed API and
-  a drain block, not a flipped default. gemma-gpu-upgraded (cp 1.32.13, default-pool 1.31.14,
-  measured) is a ready host.
+- Exists today: Nothing exists: no fleet role on main or in a proposed change; gemma-gpu plants a
+  removed API and a drain block, not a flipped default. Gemma-gpu-upgraded (cp 1.32.13, default-pool
+  1.31.14, measured) is a ready host.
 - Caveats:
   - The break lands on 1.33 nodes: kube_features.go sets GitRepoVolumeDriver Default false at 1.33
-    (kubernetes/kubernetes#129923), LockToDefault at 1.36 (kubernetes/kubernetes#136400), the catalogue's '1.36'. The kubelet event text is
+    (#129923), LockToDefault at 1.36 (#136400), the catalogue's '1.36'. The kubelet event text is
     from source, unmeasured on GKE.
   - 1.31 to 1.33 are EXTENDED-only (1.32.13-gke.2504000, 1.33.13-gke.1721000 today); once 1.32
     leaves, no offered minor admits the volume and the 'before' is gone. The PSP to PSA example
@@ -909,7 +890,7 @@ Deployment on seeded-a's 1.35 nodes would sit permanently broken, so none is pro
 
 Home: seeded fleet, planted today. The deprecated-api-caller role on main (seeded-a, ns
 seeded-deprecation) is the fixture: a writer of Endpoints v1, deprecated in 1.33, still served.
-externalIPs cannot join the fleet: GKE admission denies the field by default. IPVS: not settable
+ExternalIPs cannot join the fleet: GKE admission denies the field by default. IPVS: not settable
 on GKE.
 
 - Plant:
@@ -918,14 +899,14 @@ on GKE.
     legacy-endpoints-lane (192.0.2.10:9) under a headless, selector-less Service.
   - SA legacy-endpoints-writer, Role verbs [patch] on endpoints only, egress-only NetworkPolicy to
     the API server on 443. Apply per project: cd bench/tf/fleet && tofu apply
-    -var="project_id=<project>". writer.py refuses masters below 1.33 (BROKEN, exit 1).
+    -var="project_id=<project>". Writer.py refuses masters below 1.33 (BROKEN, exit 1).
   - externalIPs, throwaway cluster only: GKE's DenyServiceExternalIPs admission (default since 1.21)
     rejects it ('Use of external IPs is denied by admission control', seen on gemma-gpu-upgraded
     1.32). Create with --enable-service-externalips, apply the Service.
   - Out-of-tree: any 1.33+ cluster takes the Endpoints trio by kubectl apply as-is. The fleet stays
     externalIPs-denied: enabling it (service_external_ips_config { enabled = true } on
     google_container_cluster) reopens CVE-2020-8554 and undoes a GKE default.
-  - kube-proxy IPVS (1.35): not plantable on GKE. kube-proxy is a static pod per node whose args set
+  - kube-proxy IPVS (1.35): not plantable on GKE. Kube-proxy is a static pod per node whose args set
     no --proxy-mode (seeded-a: --kubeconfig, --cluster-cidr, sync periods) and there is no
     kube-proxy ConfigMap ('configmaps "kube-proxy" not found'). Nothing to see.
 - Break:
@@ -974,7 +955,7 @@ on GKE.
     asks for. Unread; the skill keeps no such record today.
 - Fix before:
   - Endpoints: move each caller to discovery.k8s.io/v1 EndpointSlice (the Warning names it), e.g.
-    kubectl get endpointslices instead of endpoints. The fleet's writer stays: it is the fixture,
+    Kubectl get endpointslices instead of endpoints. The fleet's writer stays: it is the fixture,
     not a caller to fix.
   - externalIPs on GKE: a type: LoadBalancer Service (GKE assigns the IP) or a Gateway with
     spec.addresses; keep DenyServiceExternalIPs on (the default; org policy
@@ -992,7 +973,7 @@ on GKE.
 - Cost and time: Fleet: no added cost, already applied per project; verify is five minutes of reads.
   1.36 edge: a throwaway e2-small cluster; a zonal master upgrade took 9 min.
 - Exists today: Fleet role deprecated-api-caller on main, applied and yielding in the dev copy
-  (seeded-a v1.35.8, 144 stamps in 24 h, no Failed job); no eval case reads it yet. externalIPs:
+  (seeded-a v1.35.8, 144 stamps in 24 h, no Failed job); no eval case reads it yet. ExternalIPs:
   nothing; throwaway-only on GKE. IPVS: none.
 - Caveats:
   - The label alone proves nothing: kube-system principals (endpoint-controller,
@@ -1019,18 +1000,19 @@ master's pin on purpose (main.tf). A derived default-2 pool there would only rea
     --add-maintenance-exclusion-scope no_minor_or_node_upgrades --add-maintenance-exclusion-end
     2026-10-21T00:00:00Z (start optional; GKE refuses an end past EOL 2026-10-22)
   - Add-on: helm repo add jetstack https://charts.jetstack.io; helm install cert-manager
-    jetstack/cert-manager -n cert-manager --create-namespace --version <a release two minors below the target's support matrix> --set
-    crds.enabled=true (chart default false). Matrix (cert-manager.io/docs/releases): 1.29 to 1.33
+    jetstack/cert-manager -n cert-manager --create-namespace --version <a release two minors below
+    the target's support matrix> --set crds.enabled=true (chart default false). Matrix
+    (cert-manager.io/docs/releases): 1.29 to 1.33
   - Client: curl -fLo kubectl-old https://dl.k8s.io/release/v1.30.0/bin/$(uname -s | tr A-Z
     a-z)/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/kubectl; chmod +x kubectl-old: one
     minor behind 1.31, no warning yet. Baseline: the version commands under verify
 - Break:
   - Step 1: gcloud container clusters upgrade skew-lab --master --cluster-version
     1.32.13-gke.2504000 $L --quiet (a 1.32 in validVersions). Manual upgrades bypass exclusions (GKE
-    docs); the pool stays on 1.31, 1 behind. gemma-gpu measured ~9 min a minor.
-  - Step 2: the same upgrade to 1.33.13-gke.1721000 (GKE allows one control-plane minor per upgrade).
-    Pool now 2 behind, GKE's documented ceiling; cert-manager 1.18 is still inside its matrix (to
-    1.33); kubectl-old is 3 behind.
+    docs); the pool stays on 1.31, 1 behind. Gemma-gpu measured ~9 min a minor.
+  - Step 2: the same upgrade to 1.33.13-gke.1721000 (GKE allows one control-plane minor per
+    upgrade). Pool now 2 behind, GKE's documented ceiling; cert-manager 1.18 is still inside its
+    matrix (to 1.33); kubectl-old is 3 behind.
   - Step 3: the same upgrade to 1.34.11-gke.1056000, leaving the pool 3 behind. GKE documents the
     two-minor policy, not the enforcement: record gcloud's answer (refusal, a running operation, or
     a forced pool upgrade). If it runs, cert-manager 1.18 is off its matrix.
@@ -1063,7 +1045,7 @@ master's pin on purpose (main.tf). A derived default-2 pool there would only rea
   - Read today (re-run the report, or --rollout-in-progress): grade_member grades the lowest pool
     with the master, so status stays 'lagging' and progress reads 'started', not 'completed'; the
     describe command under verify shows the gap
-  - Unread: crash loops. kubectl get pods -A with containerStatuses[].restartCount rising in
+  - Unread: crash loops. Kubectl get pods -A with containerStatuses[].restartCount rising in
     cert-manager, events with reason BackOff, logs. The before/after CrashLoopBackOff and Pending
     compare (upgrade-readiness-checks.md) is specified, not shipped
   - Human-read (off the allowlist): gcloud recommender insights list --project $P --location $Z
@@ -1077,9 +1059,9 @@ master's pin on purpose (main.tf). A derived default-2 pool there would only rea
   - Exclusion: gcloud container clusters update skew-lab $L --remove-maintenance-exclusion
     hold-nodes; auto-upgrade then keeps the pool in the window. A human does it; SKILL.md says do
     not propose deleting an exclusion
-  - Add-on: helm upgrade cert-manager jetstack/cert-manager -n cert-manager --version <the release whose matrix includes the target> before
-    the master moves (only release spanning 1.31 to 1.35; 1.20 needs 1.32+; EOL 2026-07-08). Client:
-    kubectl within one minor
+  - Add-on: helm upgrade cert-manager jetstack/cert-manager -n cert-manager --version <the release
+    whose matrix includes the target> before the master moves (only release spanning 1.31 to 1.35;
+    1.20 needs 1.32+; EOL 2026-07-08). Client: kubectl within one minor
 - Fix after:
   - Pool: the same node-pool upgrade to currentMasterVersion closes the gap in one step (GKE lets
     nodes skip minors, e.g. 1.32 to 1.34); then remove the exclusion so it does not recur
@@ -1089,9 +1071,9 @@ master's pin on purpose (main.tf). A derived default-2 pool there would only rea
 
 - Cost and time: One e2-small plus the EXTENDED fee; ~15 min setup, ~9 min per master minor x3, up
   to a day for the insight; finish before 1.31's EOL 2026-10-22; delete after
-- Exists today: Nothing plants it: no fleet role or open pull request (seeded-b's pool is pinned to its
-  master; main.tf says why); gemma-gpu starts pool and master equal. Pool skew: upgrade_readiness.py
-  evaluate_skew; add-on/client unread
+- Exists today: Nothing plants it: no fleet role or proposed change (seeded-b's pool is pinned to
+  its master; main.tf says why); gemma-gpu starts pool and master equal. Pool skew:
+  upgrade_readiness.py evaluate_skew; add-on/client unread
 - Caveats:
   - GKE states the two-minor policy, never a refusal: its troubleshooting page treats nodes 'outside
     this supported window' as a state you fix by moving the pool; step 3 is the measurement. After
@@ -1112,10 +1094,10 @@ upgrade. The fleet is zonal: 'before' holds on any slot; its 03:00 UTC window is
     role: it sits on all three slots, a background row, not a defect.
   - Out-of-tree: `gcloud container get-server-config --location us-central1-a --project $P
 --format=json`; NEXT = REGULAR `defaultVersion`; VER = newest REGULAR `validVersions` entry one
-    minor below it (setup.sh line 22's python, K8S_MINOR = that minor).
+    minor below it (setup.sh's python, K8S_MINOR = that minor).
   - `gcloud container clusters create zonal-cp-test --zone us-central1-a --project $P
 --release-channel regular --cluster-version "$VER" --num-nodes 1 --machine-type e2-small
---disk-size 32 --quiet` (setup.sh line 24's shape; `--zone` makes it zonal).
+--disk-size 32 --quiet` (setup.sh's shape; `--zone` makes it zonal).
   - A caller with no retry, started first: `CTX=gke_${P}_us-central1-a_zonal-cp-test; while :; do
     printf '%s ' $(date -u +%T); kubectl --context $CTX --request-timeout=5s get --raw /readyz
     > /dev/null 2>&1 && echo up || echo DOWN; sleep 2; done | tee probe.log`
@@ -1124,8 +1106,8 @@ upgrade. The fleet is zonal: 'before' holds on any slot; its 03:00 UTC window is
     in-cluster CronJob is no use as caller: its controller is down too.
 - Break:
   - `gcloud container clusters upgrade zonal-cp-test --master --cluster-version "$NEXT" --zone
-us-central1-a --project $P --quiet` (synchronous; break-upgrade.sh line 16). GKE moves a control
-    plane one minor at a time, which is why VER sits one minor under NEXT.
+us-central1-a --project $P --quiet` (synchronous; break-upgrade.sh). GKE moves a control plane
+    one minor at a time, which is why VER sits one minor under NEXT.
   - Measured once (gemma-gpu-upgraded, 2026-09-24, 1.31 to 1.32; README): CronJob's last 1.31
     success 18:00:01, server on 1.32.13 by 18:01:10, operation DONE 18:04:34, about nine minutes in
     all; the 60 s probe never failed. GKE documents only 'a few minutes'.
@@ -1172,8 +1154,8 @@ resource.labels.cluster_name="C"' --project P --freshness 2d`; one brackets them
 container clusters create ... --region us-central1` or Terraform `location = "<region>"`). Not
     the fleet: zonal on purpose.
   - Bounded, timed calls in callers that cannot wait: `kubectl --request-timeout=15s` under a
-    process timeout (watch-break.py lines 17-24); an upgrade script blocks on `gcloud container
-operations wait <OP> --zone L`.
+    process timeout (watch-break.py); an upgrade script blocks on `gcloud container operations wait
+<OP> --zone L`.
   - Window when callers are idle: `gcloud container clusters update C --location L
 --maintenance-window-start 2000-01-01T03:00:00Z --maintenance-window-end 2000-01-01T07:00:00Z
 --maintenance-window-recurrence FREQ=DAILY`.
@@ -1187,7 +1169,7 @@ argocd.argoproj.io/refresh=hard --overwrite`. Re-run a job the gap skipped: `kub
 
 - Cost and time: Out-of-tree: one e2-small zonal cluster (GKE fee + one node); create not measured;
   a master minor step ~9 min (README's 1.31->1.32 run). Fleet: free.
-- Exists today: No fleet role, no open pull request, nothing reads location type. All fleet slots and
+- Exists today: No fleet role, no proposed change, nothing reads location type. All fleet slots and
   gemma-gpu are zonal; break-upgrade.sh + watch-break.py ran one master upgrade on 2026-09-24, no
   gap seen at 60 s.
 - Caveats:
@@ -1206,7 +1188,7 @@ simulated: a kubectl-set node label the pool upgrade's node rebuild discards (GK
 
 - Plant:
   - Subject: P=haoxuw-gke-dev Z=us-central1-a C=gemma-gpu-upgraded; K="kubectl --context
-    gke_${P}_${Z}_${C}". default-pool: one e2-small on 1.31.14 under a 1.32.13 master, maxSurge 1,
+    gke_${P}_${Z}_${C}". Default-pool: one e2-small on 1.31.14 under a 1.32.13 master, maxSurge 1,
     config.labels empty, no PDB. Any 1-node CPU pool below its master does.
   - Out-of-band label (never in the pool's config.labels): N=$($K get nodes -l
     cloud.google.com/gke-nodepool=default-pool -o jsonpath='{.items[0].metadata.name}'); $K label
@@ -1284,15 +1266,15 @@ simulated: a kubectl-set node label the pool upgrade's node rebuild discards (GK
 
 - Cost and time: gemma-gpu-upgraded exists: plant ~3 min, verify ~2 min; the e2-small pool upgrade
   is unmeasured (the GPU node was rebuilt ~4 min after its drain ended); cents.
-- Exists today: Nothing in tree. No fleet role; an open pull request's readiness-pinned-workload
-  pins pinned-batch-runner to a tainted pool, not a vanishing label. gemma-gpu's scripts do not
-  plant it; gemma-gpu-upgraded's default pool serves.
+- Exists today: Nothing in tree. No fleet role; a proposed change's readiness-pinned-workload pins
+  pinned-batch-runner to a tainted pool, not a vanishing label. Gemma-gpu's scripts do not plant it;
+  gemma-gpu-upgraded's default pool serves.
 - Caveats:
   - Catalogue trigger unverified and not creatable: 1.35.8 nodes carry all five beta labels (kubelet
     stopped setting os/arch near 1.19; the node controller mirrors them); 1.36/1.37 unread. Recipe
     drops a hand-set label.
   - Taints: removing one blocks nothing; only a taint a new image adds would, and none is known. No
-    PDB, so the break kills the pod once and rehearses entry 12 alone, not entry 1. kube-dns's two
+    PDB, so the break kills the pod once and rehearses entry 12 alone, not entry 1. Kube-dns's two
     Pending pods pre-exist.
 
 ### 13. The container runtime changes
@@ -1312,7 +1294,7 @@ already run containerd 2; a role there could only hold the wreckage, not the bef
     untars crictl-v1.22.0-linux-amd64.tar.gz (v1alpha2-only) to an emptyDir; busybox loops `crictl
 -r unix:///run/containerd/containerd.sock version || exit 1`.
   - DaemonSet schema1-image, same ns: gcr.io/google-containers/startup-script:v1, command `sleep
-2147483647`. gcr.io served it as manifest.v1+prettyjws, schemaVersion 1, on 2026-09-28 (curl);
+2147483647`. Gcr.io served it as manifest.v1+prettyjws, schemaVersion 1, on 2026-09-28 (curl);
     GKE's containerd-2 page names it. Pulls on 1.7, not on 2.0.
   - Not planted: containerd 1.x config overrides. GKE's path is `--containerd-config-from-file`
     (registryHosts, privateRegistryAccessConfig, writableCgroups) and it rewrites config.toml on
@@ -1379,8 +1361,8 @@ get converter"`. Read on request; nothing ties them to the node.
 
 - Cost and time: One e2-small zonal EXTENDED cluster (extended-support fee applies); ~15 min to
   build, 5-10 min to break, under an hour total; a day or more only for the insight
-- Exists today: Nothing exists: no fleet role on main or an open pull request; gemma-gpu's 1.31 to 1.32
-  path keeps containerd 1.7; the one nearby reader, security-patch orchestrator 3.9
+- Exists today: Nothing exists: no fleet role on main or in an proposed change; gemma-gpu's 1.31 to
+  1.32 path keeps containerd 1.7; the one nearby reader, security-patch orchestrator 3.9
   stale-image-type, passes COS_CONTAINERD and stays silent.
 - Caveats:
   - Timings and the create-time version pair are untested by a run of this recipe; if create rejects
@@ -1397,18 +1379,18 @@ CGROUP_MODE_V1 pool on seeded-b at 1.34 would die when 1.35 removes v1, so no st
 Use a fresh 1.32 EXTENDED e2-small cluster in haoxuw-gke-dev; gemma-gpu's pools already read V2.
 
 - Plant:
-  - P=haoxuw-gke-dev Z=us-central1-a C=cgroup-test. gcloud container clusters create $C --project $P
+  - P=haoxuw-gke-dev Z=us-central1-a C=cgroup-test. Gcloud container clusters create $C --project $P
     --zone $Z --release-channel extended --cluster-version 1.32.13-gke.2504000 --num-nodes 1
     --machine-type e2-small --quiet. Not gemma-gpu: its 1.31 fixture.
   - printf 'linuxConfig:\n cgroupMode: CGROUP_MODE_V1\n' > cgroup-v1.yaml; gcloud container
     node-pools create legacy-jvm-pool --cluster $C --zone $Z --project $P --machine-type e2-small
     --num-nodes 1 --system-config-from-file cgroup-v1.yaml --quiet
   - Fill.java: add new byte[1<<23] to an ArrayList until OutOfMemoryError, print
-    "max="+Runtime.getRuntime().maxMemory(), Thread.sleep(Long.MAX_VALUE). kubectl create ns
+    "max="+Runtime.getRuntime().maxMemory(), Thread.sleep(Long.MAX_VALUE). Kubectl create ns
     cgroup-test; kubectl -n cgroup-test create configmap fill-src --from-file=Fill.java
   - Deployment legacy-jvm: image eclipse-temurin:11.0.15_10-jdk (below the page's 11.0.16 floor),
     command [java, /src/Fill.java], fill-src at /src, limits.memory 256Mi, nodeSelector
-    cloud.google.com/gke-nodepool: legacy-jvm-pool. fixed-jvm: same, 11.0.16_8-jdk.
+    cloud.google.com/gke-nodepool: legacy-jvm-pool. Fixed-jvm: same, 11.0.16_8-jdk.
   - gcloud container node-pools describe legacy-jvm-pool --cluster $C --zone $Z --project $P
     --format='value(config.effectiveCgroupMode,config.linuxNodeConfig.cgroupMode)' ->
     EFFECTIVE_CGROUP_MODE_V1 CGROUP_MODE_V1; both pods Running, each log max= near 126 MiB.
@@ -1439,18 +1421,18 @@ Use a fresh 1.32 EXTENDED e2-small cluster in haoxuw-gke-dev; gemma-gpu's pools 
 - Detect before:
   - gcloud container node-pools list --cluster <c> --zone <z>
     --format='table(name,config.effectiveCgroupMode)'; flag EFFECTIVE_CGROUP_MODE_V1 for a 1.33+
-    target (1.35+ if pinned). container.viewer covers it; fleet_upgrade_report.py reads
+    target (1.35+ if pinned). Container.viewer covers it; fleet_upgrade_report.py reads
     version/status. Unread.
   - V1-node images: kubectl get pods -A --field-selector spec.nodeName=<node> -o
     jsonpath='{.items[_].spec.containers[_].image}' vs the cgroup page floors (JDK 8u372, 11.0.16,
-    15; Node.js 20.3.0; automaxprocs 1.5.1). audit_report.py reads no images. Unread.
+    15; Node.js 20.3.0; automaxprocs 1.5.1). Audit_report.py reads no images. Unread.
   - Dry run on any V2 pool (human only): kubectl exec <pod of the same image and limit> -- java
     -XX:+PrintFlagsFinal -version | grep MaxHeapSize. Measured at 256m: 11.0.15 reports 2078277632
     (a quarter of the host), 11.0.16 132120576. Unread.
 - Detect after:
   - kubectl get pods -A -o
     custom-columns='N:.spec.nodeName,P:.metadata.name,L:.status.containerStatuses[*].lastState.terminated.reason'
-    | grep OOMKilled; hits on a pool just gone V2, same imageID. gke-workload-troubleshooting reads
+    | grep OOMKilled; hits on a pool just gone V2, same imageID. Gke-workload-troubleshooting reads
     exit 137, not the flip. Unread.
   - Flip: gcloud container operations list --zone <z> --filter='operationType=UPGRADE_NODES'
     --format='table(targetLink,status,startTime,endTime)' with the describe: V1 before, V2 after,
@@ -1478,8 +1460,8 @@ Use a fresh 1.32 EXTENDED e2-small cluster in haoxuw-gke-dev; gemma-gpu's pools 
 
 - Cost and time: Two e2-small nodes plus EXTENDED fee. Cluster+pool ~10 min, pods ~2 min; mode-flip
   sim 5-10 min; real walk 3 x ~10 min plus two pool upgrades; kill in <1 min.
-- Exists today: Nothing exists: no fleet role, open pull request or gemma-gpu script. Every gemma-gpu and
-  gemma-gpu-upgraded pool reads EFFECTIVE_CGROUP_MODE_V2 today; no kube-agents script reads
+- Exists today: Nothing exists: no fleet role, proposed change or gemma-gpu script. Every gemma-gpu
+  and gemma-gpu-upgraded pool reads EFFECTIVE_CGROUP_MODE_V2 today; no kube-agents script reads
   effectiveCgroupMode or images.
 - Caveats:
   - GKE's page says explicit v1 is a temporary opt-out at 1.33+ and that 1.35 removes v1, but not
@@ -1496,7 +1478,7 @@ older, so cgroup v1 under a kubelet >= 1.28 cannot be built. Simulation: a cheap
 gemma-gpu-upgraded (1.32.13, dev project) with the singleProcessOomKill opt-out on, then off.
 
 - Plant:
-  - P=haoxuw-gke-dev; Z=us-central1-a; F="--cluster gemma-gpu-upgraded --zone $Z --project $P". echo
+  - P=haoxuw-gke-dev; Z=us-central1-a; F="--cluster gemma-gpu-upgraded --zone $Z --project $P". Echo
     '{kubeletConfig: {singleProcessOomKill: true}}' >sp.yaml; gcloud container node-pools create
     oomg-pool $F --num-nodes 1 --system-config-from-file sp.yaml
   - gcloud container node-pools describe oomg-pool $F
@@ -1558,7 +1540,7 @@ gemma-gpu-upgraded (1.32.13, dev project) with the singleProcessOomKill opt-out 
     {.metadata.creationTimestamp}') and the pool's cgroup mode or opt-out changed since. Unread.
   - OOMKilling events for every process of one container; or kubectl debug node/<node>
     --profile=sysadmin --image=busybox:1.36 -- chroot /host dmesg | grep oom.group -> 'Tasks in ...
-    are going to be killed due to memory.oom.group set' (mm/memcontrol.c). Unread.
+    Are going to be killed due to memory.oom.group set' (mm/memcontrol.c). Unread.
 - Fix before:
   - Opt out a pool at 1.32.4-gke.1132000/1.33.0-gke.1748000+ (nodes recreated): echo
     '{kubeletConfig: {singleProcessOomKill: true}}' >sp.yaml; gcloud container node-pools update
@@ -1580,8 +1562,8 @@ gemma-gpu-upgraded (1.32.13, dev project) with the singleProcessOomKill opt-out 
 - Cost and time: One e2-medium on gemma-gpu-upgraded (about USD 0.03/h plus disk); pool create and
   config flip a few minutes each, untimed; break visible in a minute; no GPU.
 - Exists today: Nothing exists: no fleet role (seeded-a/c 1.35.8, seeded-b 1.34.11, all past the
-  1.33 migration), no open pull request, no gemma-gpu script; the
-  four gemma pools read V2, opt-out unset (2026-09-28).
+  1.33 migration), no proposed change but the catalogue's (a proposed change), no gemma-gpu script;
+  the four gemma pools read V2, opt-out unset (2026-09-28).
 - Caveats:
   - Simulated trigger: an opt-out flip on a v2 pool reproduces memory.oom.group 0 to 1, not a
     cgroup-mode migration or a 1.27 to 1.28 upgrade; mechanics verified in Docker and by reads on
@@ -1640,14 +1622,14 @@ kube-system get deploy kube-dns` READY vs desired (gemma-gpu: 1/2 today).
 - Detect before:
   - `gcloud container clusters describe <c> --zone <z>
 --format='value(networkConfig.datapathProvider,networkConfig.dnsConfig.clusterDns,networkPolicy.enabled,addonsConfig.networkPolicyConfig.disabled)'`;
-    empty = legacy, kube-dns. fleet_drift.py reads 1, 3, 4.
+    empty = legacy, kube-dns. Fleet_drift.py reads 1, 3, 4.
   - Count vs enforcer: `kubectl get networkpolicy -A --no-headers | wc -l` with the read above;
     count above 0 and neither ADVANCED_DATAPATH nor networkPolicy.enabled=true means nothing
     enforces them (gemma-gpu: 1 policy, legacy). SOP 2.6 counts; join unread.
   - Known issues for the target:
     docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues (today: Calico
     pod-scheduling regression 1.32 to 1.35, a 1.35 Dataplane V2 entry), read by a human at run time
-    (upgrade-readiness-checks.md:178). Unread.
+    (upgrade-readiness-checks.md). Unread.
 - Detect after:
   - Re-run the probe matrix after the pool step and diff against baseline.txt; assertion: no row
     changed. Unread by any component; the readiness mode of fleet-upgrade-verification runs no
@@ -1656,7 +1638,7 @@ kube-system get deploy kube-dns` READY vs desired (gemma-gpu: 1/2 today).
     or 988 or the probe as jsonPayload.src.pod_name; jsonPayload.policies names the dropping policy.
     Unread: no component reads policy-action logs.
   - DNS timeouts: probe `nslookup -timeout=2` failing; on kube-dns clusters `kubectl -n kube-system
-get deploy kube-dns` READY below desired. kube-dns keeps running after a Cloud DNS switch, so
+get deploy kube-dns` READY below desired. Kube-dns keeps running after a Cloud DNS switch, so
     there resolv.conf and the probe row are the signal. Unread.
 - Fix before:
   - Rehearse: build the copy with production's datapathProvider and clusterDns at the target
@@ -1679,11 +1661,8 @@ clusters upgrade <c> --node-pool default-pool --cluster-version <prev> --zone <z
   e2-small), deleted after the session; 15 to 25 min per cluster per round.
 - Exists today: Nothing planted: fleet Terraform sets no datapath, DNS or policy fields; gemma-gpu,
   gemma-gpu-upgraded and seeded-a/b/c read legacy, kube-dns, addon disabled (2026-09-28); gemma-gpu
-  has 1 unenforced policy; no open pull request.
+  has 1 unenforced policy; no proposed change.
 - Caveats:
-  - Catalogue's 'Read today: nothing' is off: fleet_drift.py reads datapathProvider,
-    networkPolicy.enabled and the addon flag as drift facets. seeded-a/b/c read legacy plus
-    disabled, so their default-deny enforces nothing.
   - A DNS row DENY before any upgrade is the manifest, not the dataplane: vllm-policy names
     10.96.0.10/32 or a non-private VIP; read `kubectl -n kube-system get svc kube-dns -o
 jsonpath='{.spec.clusterIP}'`, fix the peer.
@@ -1720,7 +1699,7 @@ gemma-gpu-upgraded: a stand-in per-node agent whose kubectl-set label a rebuild 
     pool's upgrade strategy, regardless of maintenance policy.
   - Documented surge order (maxSurge 1 / maxUnavailable 0): new node provisioned and Ready without
     the kubectl label; old node cordoned, drained (DaemonSet pods not evicted), deleted;
-    UPGRADE_NODES DONE. sim-node-agent DESIRED holds, then drops by one.
+    UPGRADE_NODES DONE. Sim-node-agent DESIRED holds, then drops by one.
 - Verify:
   - $K get ds -n sim-netagent sim-node-agent -o
     jsonpath='{.status.desiredNumberScheduled}/{.status.numberReady}' reads one below the node
@@ -1775,14 +1754,14 @@ gemma-gpu-upgraded: a stand-in per-node agent whose kubectl-set label a rebuild 
 
 - Cost and time: Plant ~10 min; one e2-small, cents per hour; a one-node rebuild is minutes (no
   canary figure; gemma-gpu's in-place rebuild took 3 min, 16:02:00 to 16:05:11).
-- Exists today: Nothing exists today: no fleet role on main or an open pull request; gemma-gpu scripts
-  cover entries 1, 2 and 6 only; the catalogue reads 'Read today: nothing', no Recommender insight.
-  Scenario 12 plans the same event.
+- Exists today: Nothing exists today: no fleet role on main or in an proposed change; gemma-gpu
+  scripts cover entries 1, 2 and 6 only; the catalogue reads 'Read today: nothing', no Recommender
+  insight. Scenario 12 plans the same event.
 - Caveats:
   - Simulation covers the selector mechanism only: netd, kube-proxy and Service VIPs stay healthy;
     the routing outage itself is observe-only, in a real event. Same trigger as scenario 12,
     different agent and signals.
-  - GKE removes kubectl-applied node labels on any rebuild (documented). node-pools rollback covers
+  - GKE removes kubectl-applied node labels on any rebuild (documented). Node-pools rollback covers
     canceled, failed or incomplete upgrades only; once DONE the only path is a downgrade to a
     version the channel still offers.
 
@@ -1790,7 +1769,7 @@ gemma-gpu-upgraded: a stand-in per-node agent whose kubectl-set label a rebuild 
 
 Home: an out-of-tree cluster. Needs an L4 pool, which the seeded fleet cannot hold. Lives beside
 gemma-gpu in gke-fleet-iac (haoxuw-gke-dev, us-central1-a): a copy of the cluster, a second L4
-pool on gpu-driver-version=default, a CUDA-13 probe pod. setup.sh plants only a latest pool.
+pool on gpu-driver-version=default, a CUDA-13 probe pod. Setup.sh plants only a latest pool.
 
 - Plant:
   - Baseline measured 2026-09-28 on gemma-gpu: gpu-pool 1.31.14-gke.2704000,
@@ -1868,20 +1847,20 @@ pool on gpu-driver-version=default, a CUDA-13 probe pod. setup.sh plants only a 
     nodes must be rebuilt (not on GKE's documented recreation list: watch operations list and node
     AGE). Pods recover on restart.
   - If even latest is below the floor (not on 1.31-1.33): move to a GKE version whose table row
-    lists the branch, or rebuild on a lower CUDA. gpu-driver-version=disabled +
+    lists the branch, or rebuild on a lower CUDA. Gpu-driver-version=disabled +
     daemonset-preloaded.yaml gives the same COS driver.
 
 - Cost and time: One extra g2-standard-4+L4 per test hour, plus the copy cluster; us-central1-a L4
   stock is thin (stockout 2026-09-24). Break at first schedule; rebuild ~3 min.
-- Exists today: Nothing plants it. Fleet: GPU excluded. gemma-gpu (setup.sh) has one L4 pool on
-  gpu-driver-version=latest, no mismatch. Repo: prose only (gke-upgrades SKILL.md 148-153,
-  troubleshooting.md section 9, checklists.md 27).
+- Exists today: Nothing plants it. Fleet: GPU excluded. Gemma-gpu (setup.sh) has one L4 pool on
+  gpu-driver-version=latest, no mismatch. Repo: prose only (gke-upgrades SKILL.md,
+  troubleshooting.md section 9, checklists.md).
 - Caveats:
   - The simulation shows the pairing (default pin + CUDA-13 image), not an upgrade lowering a
     driver; GKE's table keeps R535 default and R580 highest across 1.31-1.33, so no reachable
     upgrade produces that transition.
   - R535 on a default pool and the crash text come from the GKE table, NVIDIA notes and torch
-    source, not observed here. pytorch/pytorch is ubuntu:24.04-based, no cuda-compat libs, so no
+    source, not observed here. Pytorch/pytorch is ubuntu:24.04-based, no cuda-compat libs, so no
     forward-compat path masks the floor.
 
 ### 19. In-tree volumes lose their CSI path
@@ -1919,16 +1898,16 @@ cluster runs CSI migration; the staged event is the add-on toggle. A seeded-a ro
     to wait on the pod that cannot unmount, up to GKE's documented hour.
 - Verify:
   - kubectl -n intree get pod -l app=intree-pd: new pod ContainerCreating (phase Pending); old pod
-    expected Terminating (kubelet TearDownAt needs the node plugin). describe new pod Events:
-    FailedAttachVolume 'Multi-Attach error ... already used by pod(s) <old>'.
+    expected Terminating (kubelet TearDownAt needs the node plugin). Describe new pod Events:
+    FailedAttachVolume 'Multi-Attach error ... Already used by pod(s) <old>'.
   - Other texts (k8s 1.35 src, unobserved): first-ever attach (fleet shape) -> 'timed out waiting
     for external-attacher of pd.csi.storage.gke.io CSI driver to attach volume'; same-node relaunch
     -> FailedMount 'not found in the list of registered CSI drivers'.
   - kubectl get volumeattachment: cordon path keeps the old row (ATTACHED true, NODE old), adds
-    none; fleet shape: one row ATTACHED false, never flips. gcloud compute disks describe
+    none; fleet shape: one row ATTACHED false, never flips. Gcloud compute disks describe
     intree-pd-1 --zone $Z --format='value(users)' names the old node till its VM goes.
   - kubectl -n kube-system get ds pdcsi-node -> NotFound; kubectl get csidriver
-    pd.csi.storage.gke.io (record if it survives); add-on read (detect_before 1) -> not True. gcloud
+    pd.csi.storage.gke.io (record if it survives); add-on read (detect_before 1) -> not True. Gcloud
     container operations list --zone $Z --filter='targetLink~intree-pd' -> DONE.
 - Detect before:
   - gcloud container clusters describe $C --zone $Z
@@ -1944,14 +1923,14 @@ cluster runs CSI migration; the staged event is the add-on toggle. A seeded-a ro
     ships standard = kubernetes.io/gce-pd beside standard-rwo (default).
 - Detect after:
   - kubectl get events -A --field-selector reason=FailedAttachVolume (then FailedMount); kubectl get
-    pods -A --field-selector=status.phase=Pending; assert none. gcloud logging read
+    pods -A --field-selector=status.phase=Pending; assert none. Gcloud logging read
     'logName="projects/$P/logs/events" AND jsonPayload.reason="FailedAttachVolume"'
   - kubectl -n kube-system get ds pdcsi-node -> NotFound while kubectl get pv -o json | jq
     '[.items[]|select(.spec.gcePersistentDisk!=null or
     .spec.csi.driver=="pd.csi.storage.gke.io")]|length' > 0 is this entry. A VolumeAttachment count
     misses the cordon stall.
   - Re-run the add-on read after every control-plane operation: the flag survives upgrades, so
-    not-True plus any PD-backed PV means every re-attach fails from now on. api_deprecation_scan.py
+    not-True plus any PD-backed PV means every re-attach fails from now on. Api_deprecation_scan.py
     cannot see it: removed_apis.json keys on apiVersion/kind, not PV fields.
 - Fix before:
   - gcloud container clusters update $C --zone $Z --update-addons=GcePersistentDiskCsiDriver=ENABLED
@@ -1973,9 +1952,9 @@ cluster runs CSI migration; the staged event is the add-on toggle. A seeded-a ro
 
 - Cost and time: One zonal cluster, 2 x e2-small + 10 GB pd-standard: cents/hour. Plant: cluster
   create + 5 manifests. Break: add-on op, cordon, delete; first event in ~2 min.
-- Exists today: Nothing exists: no fleet role on main or an open pull request, no out-of-tree script
-  (gemma-gpu plants API removal and drain, not storage), no kube-agents reader; the catalogue says
-  'Read today: nothing'. This recipe is first.
+- Exists today: Nothing exists: no fleet role on main or in an proposed change, no out-of-tree
+  script (gemma-gpu plants API removal and drain, not storage), no kube-agents reader; the catalogue
+  says 'Read today: nothing'. This recipe is first.
 - Caveats:
   - Event texts, the Terminating old pod and the drain wait come from k8s 1.35 source and GKE docs,
     not observation; whether the CSIDriver object and -rwo classes survive the disable is unknown.
@@ -1986,9 +1965,9 @@ cluster runs CSI migration; the staged event is the add-on toggle. A seeded-a ro
 
 ### 20. Images on a retired registry
 
-Home: seeded fleet, a new role to plant. A before-signal role fits the read-only fleet: a pause
-Deployment on seeded-a referencing k8s.gcr.io, which runs only via the redirect (302 to
-registry.k8s.io, 307 to *-docker.pkg.dev, checked 2026-09-28). The break needs a retirable
+Home: seeded fleet, a role to plant (not on main today). A before-signal role fits the read-only
+fleet: a pause Deployment on seeded-a referencing k8s.gcr.io, which runs only via the redirect
+(302 to registry.k8s.io, 307 to *-docker.pkg.dev, checked 2026-09-28). The break needs a retirable
 registry: out of tree.
 
 - Plant:
@@ -2024,13 +2003,13 @@ registry: out of tree.
     shows ErrImagePull then ImagePullBackOff, and NODE is the node created after the operation's
     startTime.
   - kubectl get events --field-selector involvedObject.name=<pod>,reason=Failed -o
-    custom-columns=MSG:.message reads 'Failed to pull image ... failed to resolve reference', then
+    custom-columns=MSG:.message reads 'Failed to pull image ... Failed to resolve reference', then
     'not found' for (a) or '403 Forbidden' for (b) (GKE image-pull troubleshooting page).
   - Control: with the registry retired and before the cordon, kubectl delete pod -l app=legacy-pause
-    once; the replacement on the old node logs Pulled 'Container image ... already present on
+    once; the replacement on the old node logs Pulled 'Container image ... Already present on
     machine' and runs. The cache, not the reference, is what changed.
   - kubectl get node <old> -o jsonpath='{.status.images[*].names}' lists the reference (50 newest
-    only); the new node's does not. gcloud container operations list
+    only); the new node's does not. Gcloud container operations list
     --filter='operationType=UPGRADE_NODES' --format='table(status,error.message)': DONE, no error.
 - Detect before:
   - Cluster: kubectl get pods -A -o jsonpath='{range .items[_]}{range
@@ -2074,8 +2053,8 @@ registry: out of tree.
 
 - Cost and time: Fleet role: one pause pod on the standing fleet, no new cost, about an hour to
   write and apply. Out of tree: e2-small zonal cluster, node SA, AR repo, ~40 min.
-- Exists today: Nothing: no fleet role on main or in the open pull requests, no out-of-tree script.
-  gemma-gpu pulls from us-docker.pkg.dev and docker.io; its only egress control is a pod
+- Exists today: Nothing: no fleet role on main or in the listed proposed change, no out-of-tree
+  script. Gemma-gpu pulls from us-docker.pkg.dev and docker.io; its only egress control is a pod
   NetworkPolicy, which kubelet pulls bypass.
 - Caveats:
   - Pod NetworkPolicy and FQDNNetworkPolicy do not govern kubelet pulls (node network); the VPC
