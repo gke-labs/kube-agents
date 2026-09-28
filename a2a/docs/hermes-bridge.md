@@ -282,9 +282,11 @@ managed `config.yaml` with a `hooks.outbound` entry added (URL the door actually
 `secret_env: A2A_ACTIVITY_SECRET`, appended to any entry the operator's own managed config
 carries) and the managed `.env` verbatim, and names it in the child's `HERMES_MANAGED_DIR`
 (the source is `$HERMES_MANAGED_DIR` as the sidecar sees it, else `/etc/hermes` when it
-exists; `BRIDGE_SCRATCH_DIR` is where the copies live: the bridge's alone, cleared when it starts,
-each copy removed when its child exits, and none written at all when the source exists but
-cannot be read, since a child on a hook-only scope would run without the operator's pins). The
+exists; `BRIDGE_SCRATCH_DIR` is where the copies live: made if absent, each copy removed when
+its child exits, the ones a previous incarnation left (its direct subdirectories named like a
+task id, nothing else in it and never the directory itself) removed when the bridge starts, and
+none written at all when the source exists but cannot be read, since a child on a hook-only
+scope would run without the operator's pins). The
 hook therefore exists only in processes the bridge spawned: a kanban worker or cron tick
 under the same profile never POSTs anywhere, a pod with no bridge has nothing to POST at,
 and nothing about the profile's shipped config or the image changes for it.
@@ -332,9 +334,11 @@ part; the relay drops the artifact on purpose (debug and audit views never rende
 chat), and the inject door's probe is where a reader sees it.
 
 The heartbeat is a `progress` text part every `BRIDGE_PROGRESS_INTERVAL_SECONDS` (default
-60; 0 turns it off): `running 1m30s, 3 tool call(s), last mcp__gke__list_clusters`. The relay renders
-progress as one edited rolling line, so this is one chat edit per minute, and it is what
-tells a stuck task from a slow one from outside the pod.
+60; 0 turns it off, and a count a duration cannot hold is refused with a log line and the
+default): `running 1m30s, 3 tool call(s), last mcp__gke__list_clusters`. With the door closed
+the count has nothing to move it, so the line says so instead: `running 1m30s, tool trace off`.
+The relay renders progress as one edited rolling line, so this is one chat edit per minute,
+and it is what tells a stuck task from a slow one from outside the pod.
 
 Trust boundary, stated: everything in the pod is reachable from the persona's own terminal
 tool, its environment included. The trace is "as reported by the executor's process", the

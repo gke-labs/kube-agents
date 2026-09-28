@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -115,7 +116,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		// each child is handed whatever address the door bound.
 		ActivityListen:   activityListen(envOr("BRIDGE_ACTIVITY_LISTEN", hermesbridge.DefaultActivityListen)),
 		ScratchDir:       os.Getenv("BRIDGE_SCRATCH_DIR"),
-		ProgressInterval: progressInterval(envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)),
+		ProgressInterval: progressInterval(log, envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)),
 		Logger:           log,
 	}
 	if bin := os.Getenv("HERMES_BIN"); bin != "" {
@@ -142,11 +143,22 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	return nil
 }
 
+// maxDurationSeconds is the largest count of seconds a time.Duration holds;
+// past it the multiplication wraps negative, which the Config reads as off.
+const maxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
+
 // progressInterval maps the environment's seconds to the Config's duration:
-// 0 is off there (the Config's off is negative; its zero is the default).
-func progressInterval(seconds int) time.Duration {
+// 0 is off there (the Config's off is negative; its zero is the default). A
+// count the duration cannot hold is refused the way envInt refuses a
+// non-integer, loudly and with the default in its place, rather than
+// wrapping into a silent off.
+func progressInterval(log *slog.Logger, seconds int) time.Duration {
 	if seconds <= 0 {
 		return -1
+	}
+	if int64(seconds) > maxDurationSeconds {
+		log.Error("progress interval out of range; using default", "key", "BRIDGE_PROGRESS_INTERVAL_SECONDS", "value", seconds, "default", defaultProgressIntervalSeconds)
+		return time.Duration(defaultProgressIntervalSeconds) * time.Second
 	}
 	return time.Duration(seconds) * time.Second
 }

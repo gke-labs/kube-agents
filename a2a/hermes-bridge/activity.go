@@ -395,11 +395,18 @@ func (a *activityState) interrupted() []ActivityEntry {
 }
 
 // progressLine is the heartbeat text: what a reader of the rolling line, or
-// of a stalled task's probe, needs to tell slow from stuck.
+// of a stalled task's probe, needs to tell slow from stuck. The count only
+// moves on a delivery through the door, so with the door closed the line
+// says the trace is off rather than reporting zero calls from a persona
+// that may be making them.
 func (a *activityState) progressLine(now time.Time) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	line := fmt.Sprintf("running %s, %d tool call(s)", now.Sub(a.startedAt).Round(time.Second), a.calls)
+	elapsed := now.Sub(a.startedAt).Round(time.Second)
+	if a.key == "" {
+		return fmt.Sprintf("running %s, tool trace off", elapsed)
+	}
+	line := fmt.Sprintf("running %s, %d tool call(s)", elapsed, a.calls)
 	if a.lastTool != "" {
 		line += ", last " + a.lastTool
 	}
@@ -613,19 +620,22 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 // --- the door ---
 
 // listenActivity binds the door and claims the scratch dir. Called from New
-// so the address is known before Run; Run serves it. The scratch dir is the
-// bridge's alone and starts empty: a scope a previous incarnation left
-// behind (killed mid-task, its defers never run) held a copy of the managed
-// .env, and the sweep that finalizes that incarnation's tasks does not
-// know about files.
+// so the address is known before Run; Run serves it. The scratch dir is
+// made if absent and swept, never replaced: a scope a previous incarnation
+// left behind (killed mid-task, its defers never run) held a copy of the
+// managed .env, and the sweep that finalizes that incarnation's tasks does
+// not know about files. Only that incarnation's leftovers go with it, the
+// direct subdirectories named like a task id; the directory itself and
+// anything else in it are left alone, since BRIDGE_SCRATCH_DIR is whatever
+// the manifest says and may name a mount the bridge does not own.
 func (b *Bridge) listenActivity() error {
 	if b.cfg.ActivityListen == "" {
 		return nil
 	}
-	if err := os.RemoveAll(b.cfg.ScratchDir); err != nil {
+	if err := os.MkdirAll(b.cfg.ScratchDir, childScopeDirMode); err != nil {
 		return fmt.Errorf("scratch dir %s: %w", b.cfg.ScratchDir, err)
 	}
-	if err := os.MkdirAll(b.cfg.ScratchDir, childScopeDirMode); err != nil {
+	if err := sweepTaskScopes(b.cfg.ScratchDir); err != nil {
 		return fmt.Errorf("scratch dir %s: %w", b.cfg.ScratchDir, err)
 	}
 	ln, err := net.Listen("tcp", b.cfg.ActivityListen)
@@ -640,6 +650,26 @@ func (b *Bridge) listenActivity() error {
 		ReadHeaderTimeout: activityReadHeaderTimeout,
 		ReadTimeout:       activityReadTimeout,
 		WriteTimeout:      activityWriteTimeout,
+	}
+	return nil
+}
+
+// sweepTaskScopes removes the direct children of dir that are directories
+// named like a task id, which is the only shape childManagedScope writes.
+// A file, or a directory whose name is not a task id, is not the bridge's
+// and stays.
+func sweepTaskScopes(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !taskIDPattern.MatchString(e.Name()) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			return err
+		}
 	}
 	return nil
 }

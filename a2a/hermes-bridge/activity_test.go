@@ -254,6 +254,29 @@ print("slow answer")
 	}
 }
 
+// With the door closed no delivery can move the count, so the heartbeat says
+// the trace is off rather than reporting zero calls; with it open the count
+// is there from the first line.
+func TestActivity_HeartbeatWithTheDoorClosedSaysTheTraceIsOff(t *testing.T) {
+	now := time.Now()
+	closed, err := newActivityState(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.startedAt = now.Add(-5 * time.Minute)
+	if got := closed.progressLine(now); got != "running 5m0s, tool trace off" {
+		t.Fatalf("door-closed heartbeat = %q", got)
+	}
+	open, err := newActivityState(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open.startedAt = now.Add(-5 * time.Minute)
+	if got := open.progressLine(now); got != "running 5m0s, 0 tool call(s)" {
+		t.Fatalf("door-open heartbeat = %q", got)
+	}
+}
+
 func TestActivity_DoorClosedLeavesTheChildWithoutAKey(t *testing.T) {
 	_, url := startServer(t)
 	startBridgeCfg(t, url, hermesStub(t, `
@@ -604,5 +627,55 @@ func TestChildManagedScope_RefusesATaskIDThatIsNotAPathSegment(t *testing.T) {
 	}
 	if dir, err := b.childManagedScope("task-ok_1"); err != nil || filepath.Dir(dir) != scratch {
 		t.Fatalf("a plain id was refused or misplaced: %s %v", dir, err)
+	}
+}
+
+// The start-time sweep takes a previous incarnation's task scopes and
+// nothing else: BRIDGE_SCRATCH_DIR may name a mount the bridge shares, so
+// the directory itself, a file in it, and a subdirectory not named like a
+// task id all survive a restart.
+func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
+	scratch := t.TempDir()
+	leftover := filepath.Join(scratch, "task-0123abcd")
+	if err := os.MkdirAll(leftover, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(leftover, ".env"), []byte("SECRET=x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	foreignFile := filepath.Join(scratch, "notes")
+	if err := os.WriteFile(foreignFile, []byte("not the bridge's\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	foreignDir := filepath.Join(scratch, "lost+found")
+	if err := os.MkdirAll(filepath.Join(foreignDir, "inner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &Bridge{cfg: Config{ScratchDir: scratch, ActivityListen: "127.0.0.1:0"}}
+	if err := b.listenActivity(); err != nil {
+		t.Fatalf("listenActivity: %v", err)
+	}
+	t.Cleanup(func() { _ = b.activityLn.Close() })
+
+	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
+		t.Fatalf("a previous incarnation's scope survived the start: stat err = %v", err)
+	}
+	for _, kept := range []string{scratch, foreignFile, filepath.Join(foreignDir, "inner")} {
+		if _, err := os.Stat(kept); err != nil {
+			t.Fatalf("the sweep took %s, which is not a task scope: %v", kept, err)
+		}
+	}
+	// A directory still has to be a directory to go: a file named like a
+	// task id is not a scope the bridge wrote.
+	fileNamedLikeATask := filepath.Join(scratch, "task-file")
+	if err := os.WriteFile(fileNamedLikeATask, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sweepTaskScopes(scratch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(fileNamedLikeATask); err != nil {
+		t.Fatalf("the sweep took a file: %v", err)
 	}
 }
