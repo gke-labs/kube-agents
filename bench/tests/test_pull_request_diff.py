@@ -219,6 +219,47 @@ def test_removed_and_context_lines_do_not_count(token, github):
     assert check().verify(5.0).status == "fail"
 
 
+def test_a_form_feed_or_a_bare_cr_inside_a_line_does_not_move_the_sign(token, github):
+    """GitHub passes a file's bytes through its patch. A form feed inside a
+    removed line must not manufacture added ones (str.splitlines would), and
+    one added line of a CR-only file is still one added line."""
+    stash()
+    github.routes[f"{API}/pulls/39"] = (200, fixture("pull-39.json"))
+    files = f"{API}/pulls/39/files?per_page=100&page=1"
+    added = fixture("pull-39-files.json")[0]["patch"]
+    removed = added.replace("\n+", "\n-").replace("@@ -0,0 +1,10 @@", "@@ -1,10 +0,0 @@")
+    # Every line of the removed manifest after the first, folded into the
+    # first behind a form feed and a "+": one removed line to a diff, ten
+    # added lines to str.splitlines.
+    smuggled = removed.replace("\n-", "\x0c+").replace("\x0c+", "\n-", 1)
+    assert smuggled.count("\n") == 1
+    github.routes[files] = (200, [{"filename": "seeded-reliability/checkout-gateway-pdb.yaml", "patch": smuggled}])
+    assert check().verify(5.0).status == "fail"
+    cr_only = "@@ -0,0 +1 @@\n+" + "\r".join(line[1:] for line in added.splitlines() if line.startswith("+"))
+    github.routes[files] = (200, [{"filename": "seeded-reliability/checkout-gateway-pdb.yaml", "patch": cr_only}])
+    assert check().verify(5.0).status == "pass"
+
+
+def test_underscored_identifiers_are_not_the_camel_case_nouns(token, github):
+    """In a diff "_" separates identifiers. A snake_case comment or file name
+    names the concepts without proposing a manifest, so the underscore is
+    kept on both sides rather than stripped as Markdown emphasis."""
+    stash()
+    github.routes[f"{API}/pulls/39"] = (200, fixture("pull-39.json"))
+    github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (
+        200,
+        [
+            {
+                "filename": "notes/pod_disruption_budget_selector_min_available.md",
+                "patch": "@@ -0,0 +1 @@\n+# pod_disruption_budget: pick a selector, min_available 1",
+            }
+        ],
+    )
+    assert check().verify(5.0).status == "fail"
+    # A phrase written with the underscore matches the identifier as written.
+    assert check(required_phrases=["pod_disruption_budget"], any_of_phrases=["min_available"]).verify(5.0).status == "pass"
+
+
 def test_a_listing_of_full_pages_is_graded_on_what_was_read_and_says_so(token, github):
     stash()
     github.routes[f"{API}/pulls/39"] = (200, fixture("pull-39.json"))
@@ -310,7 +351,8 @@ def test_a_human_on_an_agent_named_branch_is_not_the_agents_proposal(token, gith
 
 def test_a_blank_phrase_is_refused_at_load():
     """Blank after the matcher's own normalisation: `**` and `` ` `` strip to
-    nothing there and would match every diff."""
+    nothing there and would match every diff; `_` does not, since the diff
+    normaliser keeps it."""
     for kw in (
         {"required_phrases": [""]},
         {"required_phrases": ["x", " "]},
@@ -318,10 +360,12 @@ def test_a_blank_phrase_is_refused_at_load():
         {"required_phrases": ["x"], "forbidden_phrases": [""]},
         {"required_phrases": ["**"]},
         {"any_of_phrases": ["`", "x"]},
-        {"required_phrases": ["_ _"]},
     ):
         with pytest.raises(ValidationError, match="blank phrase"):
             PullRequestDiffContainsVerifier(type="pull_request_diff_contains", **kw)
+    # The underscore is not noise in a diff, so a phrase of underscores is a
+    # phrase here (and blank for report_contains, whose table drops it).
+    assert PullRequestDiffContainsVerifier(type="pull_request_diff_contains", required_phrases=["_ _"]).required_phrases == ["_ _"]
 
 
 def test_a_removed_files_name_does_not_count(token, github):

@@ -113,7 +113,12 @@ def _normalize(text: str) -> str:
     ``" ".join(str.split())`` would drop it and hand back the false positive
     the space was added to prevent.
     """
-    stripped = text.translate(_MARKDOWN_NOISE)
+    return _normalize_with(text, _MARKDOWN_NOISE)
+
+
+def _normalize_with(text: str, noise: dict[int, str | None]) -> str:
+    """``_normalize`` over a caller's noise table; see ``_normalize_diff``."""
+    stripped = text.translate(noise)
     collapsed = " ".join(stripped.split())
     if stripped[:1].isspace():
         collapsed = " " + collapsed
@@ -1658,6 +1663,15 @@ _NO_DIFF_TOKEN_REASON = (
 _DIFF_ADDED_PREFIX = "+"
 # The `status` GitHub gives a file the pull request deletes.
 _DIFF_REMOVED_STATUS = "removed"
+# A unified diff is newline-delimited. str.splitlines would also break on a
+# form feed, a bare CR, NEL or U+2028 inside a file's content, which GitHub
+# passes through its patch verbatim, and would then read a removed line's
+# tail as an added line, or one added CR-only line as many unprefixed ones.
+_DIFF_LINE_SEPARATOR = "\n"
+# report_contains' noise table without the underscore. In a chat reply "_"
+# is Markdown emphasis; in a diff it separates identifiers, and dropping it
+# would read pod_disruption_budget and min_available as the manifest's nouns.
+_DIFF_NOISE = str.maketrans({"*": None, "`": None, "’": "'"})
 # Where a run that knows the repository it writes to (owner/name) says so;
 # hack/ci-eval-pr.sh exports it from the project mapping on every lane
 # (tests/test_ci_eval_gitops_repo_export.py pins the name to this constant).
@@ -1672,6 +1686,14 @@ _GITOPS_REPO_ENV_VAR = "BENCH_GITOPS_REPO"
 # and a human with push access naming a branch under the prefix is not one.
 _AGENT_BRANCH_PREFIX = "platform-agent/"
 _APP_USER_TYPE = "Bot"
+
+
+def _normalize_diff(text: str) -> str:
+    """``_normalize`` for a diff and the phrases matched against it: the
+    underscore stays (``_DIFF_NOISE`` says why); everything else is the same,
+    so a phrase written for ``report_contains`` matches here as it does there
+    unless it leans on an underscore being dropped."""
+    return _normalize_with(text, _DIFF_NOISE)
 
 
 @VERIFIERS.register("pull_request_diff_contains")
@@ -1696,7 +1718,10 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
     request whose head is an agent branch in the repository itself; and the
     added lines of its patches carry every phrase in ``required_phrases``, at
     least one of ``any_of_phrases``, and none of ``forbidden_phrases``, after
-    the normalisation ``report_contains`` applies. Open, not merged: the
+    the normalisation ``report_contains`` applies with one difference: the
+    underscore is kept on both sides, since in a diff it separates
+    identifiers rather than marking emphasis, so a snake_case comment or file
+    name is not the camelCase manifest. Open, not merged: the
     skill's "already exists" path lands on open pull requests only, so a
     merged one named in a reply is quoted, not proposed, and a merged
     manifest anywhere in the organisation is not a standing pass. It does NOT
@@ -1748,7 +1773,7 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
         # refuses the shape for a task file, and this refuses it for an
         # inline spec or a hand-built verifier.
         phrases = (*self.required_phrases, *self.any_of_phrases, *self.forbidden_phrases)
-        if any(not _normalize(p).strip() for p in phrases):
+        if any(not _normalize_diff(p).strip() for p in phrases):
             raise ValueError(_BLANK_DIFF_PHRASE_REASON)
         return self
 
@@ -1823,7 +1848,7 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                     patch = ""
                 added = [
                     line[len(_DIFF_ADDED_PREFIX) :]
-                    for line in patch.splitlines()
+                    for line in patch.split(_DIFF_LINE_SEPARATOR)
                     if line.startswith(_DIFF_ADDED_PREFIX)
                 ]
                 # A removed file's name is not something the pull request
@@ -1884,7 +1909,7 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
             return done(False, _NO_DIFF_TOKEN_REASON, status="error")
 
         budget = single_call_timeout(timeout_sec)
-        any_of = [_normalize(p) for p in self.any_of_phrases]
+        any_of = [_normalize_diff(p) for p in self.any_of_phrases]
         bound_repo = os.environ.get(_GITOPS_REPO_ENV_VAR, "").strip()
         rejected: list[str] = []
         unresolved: list[str] = []
@@ -1910,9 +1935,9 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                 else:
                     rejected.extend(notes)
                 continue
-            haystack = _normalize(diff)
-            missing = [p for p in self.required_phrases if _normalize(p) not in haystack]
-            present_forbidden = [p for p in self.forbidden_phrases if _normalize(p) in haystack]
+            haystack = _normalize_diff(diff)
+            missing = [p for p in self.required_phrases if _normalize_diff(p) not in haystack]
+            present_forbidden = [p for p in self.forbidden_phrases if _normalize_diff(p) in haystack]
             any_ok = not any_of or any(p in haystack for p in any_of)
             if missing or present_forbidden or not any_ok:
                 parts = []
