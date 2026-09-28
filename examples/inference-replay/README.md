@@ -80,11 +80,11 @@ cd examples/inference-replay
 kubectl apply -f pvc.yaml
 # 2. Create the mode ConfigMap (defaults to 'off' — pure pass-through)
 kubectl apply -f configmap.yaml
-# 3. Expose the original LiteLLM pods under the new name 'litellm-gateway'
+# 3. Expose the original gateway pods under the new name 'inference-gateway-upstream'
 kubectl apply -f service-gateway.yaml
 # 4. Deploy the Standalone Replay Proxy pod
 kubectl apply -f deployment.yaml
-# 5. Intercept primary 'litellm' traffic to route to the Proxy
+# 5. Intercept primary 'inference-gateway' traffic to route to the Proxy
 kubectl apply -f service.yaml
 ```
 

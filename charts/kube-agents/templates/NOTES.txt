@@ -3,7 +3,7 @@
 
 WARNING: this release is not in the kubeagents-system namespace, but the
 agent's baked default model endpoint is
-http://litellm.kubeagents-system.svc.cluster.local/v1 — the agent will NOT
+http://inference-gateway.kubeagents-system.svc.cluster.local/v1 — the agent will NOT
 reach the LiteLLM gateway installed here ({{ .Release.Namespace }}). Install
 into kubeagents-system, or override the agent's model endpoint.
 {{- end }}
