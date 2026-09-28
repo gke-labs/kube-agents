@@ -15,7 +15,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 - `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`). This file states each rule and links there; the split keeps `AGENTS.md` inside the budget `scripts/check_context_budget.py` enforces.
 - `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles, persona, gateway and auth-callout.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
-- `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top. `drift-pubsub` is not yet part of that composition.
+- `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
 - `docs/`: Documentation.
   - `site/`: The published documentation site (Astro + Starlight) — the canonical home for
