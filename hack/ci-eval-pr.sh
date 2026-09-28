@@ -35,6 +35,12 @@ readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
 readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
+# A fifth, applied on the same lane (#2079): the safeguards every case the
+# lane runs carries beside its own -- today the one that fails a repetition
+# on a GitHub write the case did not request. Appended to a copy of each
+# task file before devops-bench reads it (bench/kube_agents_bench/lane.py);
+# the files under bench/tasks/ and the api lane are untouched.
+readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE="eval/inject-lane-safeguards.yaml"
 
 # What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
 # when the run could not be evaluated: an admitted case lost every repetition
@@ -842,7 +848,11 @@ EVAL_HEARTBEAT_PID=$!
 disown "${EVAL_HEARTBEAT_PID}" 2>/dev/null || true
 
 START_TIME=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
+# Wall clock beside the elapsed counter: the leftovers report after the
+# fan-out asks GitHub what was written since this run began, and GitHub's
+# stamps are wall clock.
+EVAL_RUN_STARTED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+echo "=== [${EVAL_RUN_STARTED_AT}] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 
 # 2. Cluster Auth
 profile_begin "cluster-auth: gcloud get-credentials"
@@ -1614,13 +1624,15 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 6. Task Matrix Execution Loop
-# The matrix is data, not code: four files under hack/eval/, read here at
+# The matrix is data, not code: five files under hack/eval/, read here at
 # startup (#1546, 2026-09-15). presubmit-cases.txt is what every pull request
 # runs (TASKS), nightly-cases.txt is what EVAL_TIER=nightly appends
 # (NIGHTLY_TASKS), blocking-roster.txt, read further down, is what can red
-# a pull request on a graded failure (BOOTSTRAP_ADMITTED), and
+# a pull request on a graded failure (BOOTSTRAP_ADMITTED),
 # inject-lane-exclusions.txt, read after the tier switch, is what the inject
-# lane leaves out of both (#2039). The split exists
+# lane leaves out of both (#2039), and inject-lane-safeguards.yaml, read
+# after that, is what every case on that lane carries beside its own checks
+# (#2079). The split exists
 # so OWNERS can tell them apart: hack/OWNERS puts the two presubmit files
 # under the eval-crew alias and lets the nightly file and this script fall
 # through to the root approvers. Each file's header says what belongs in it;
@@ -1802,6 +1814,65 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LAN
   fi
   echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${#TASKS[@]} task(s) remain in the matrix"
 fi
+
+# ─── The inject lane's safeguards (#2079) ────────────────────────────────────
+# The cluster safeguards a case carries say nothing about GitHub, and through
+# the inject door the platform persona opens a pull request where the chat
+# path inlined a manifest (#2037): the first matrix run through the door left
+# pull requests on the pool repository that no case had asked for.
+# hack/eval/inject-lane-safeguards.yaml holds the entries every case on the
+# lane carries beside its own -- one, a none-wrapped `github_writes` -- and
+# this step appends them to a COPY of each task file under a scratch
+# directory, `<dir>/<case>/task.yaml`, which run_one_unit hands to
+# devops-bench in place of the file under bench/tasks/ (unit_task_path). The
+# case id devops-bench records is the directory name, so it is unchanged;
+# `bench-gate case` still reads the file under bench/tasks/, and the appended
+# entry reaches it through the record's report, which is what rung 1 grades.
+# The check reads the repository from BENCH_GITOPS_REPO, exported here from
+# the same project mapping the deploy and the ledger reset read
+# (eval_gitops_repo; EVAL_GITOPS_REPO is a local deploy's own answer), and
+# refuses to start the lane without one: a lane whose safeguard cannot name
+# its repository would grade every repetition as an errored check. Applied on
+# the inject lane only; on the api lane the copy is never made and the file
+# is never read, so that lane's matrix and task files stay byte for byte what
+# they were. bench/kube_agents_bench/lane.py refuses a lane entry whose name
+# a case already declares -- devops-bench would refuse the duplicate as a
+# parse error on every repetition of that case, after the lease -- and
+# scripts/test_eval_rosters.py pins the file's shape and that no case on the
+# lane requests a GitHub write, which the check cannot attribute between
+# concurrent cases (the four that do are in the exclusion list above).
+INJECT_LANE_TASKS_DIR=""
+if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
+  INJECT_LANE_REPO="${EVAL_LEDGER_REPO:-}"
+  if [ -z "${INJECT_LANE_REPO}" ] && [ -n "${EVAL_GITOPS_REPO:-}" ] && [ "${EVAL_GITOPS_REPO}" != "none" ]; then
+    INJECT_LANE_REPO="${EVAL_GITOPS_REPO}"
+  fi
+  if [ -z "${INJECT_LANE_REPO}" ]; then
+    echo "ERROR: AGENT_TRANSPORT=${AGENT_TRANSPORT} but no GitOps repository is known for PROJECT_ID=${PROJECT_ID:-unset} (gitops_repo_for_project in hack/ci-deploy.sh, or EVAL_GITOPS_REPO on a local run); the lane's GitHub-write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot name the repository it reads, so the lane does not start." >&2
+    exit 1
+  fi
+  export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"
+  INJECT_LANE_TASKS_DIR="$(mktemp -d)"
+  if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.lane \
+      --safeguards "${SCRIPT_DIR}/${EVAL_INJECT_LANE_SAFEGUARDS_FILE}" \
+      --out-dir "${INJECT_LANE_TASKS_DIR}" "${TASKS[@]}"); then
+    echo "ERROR: could not append the inject lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) to the matrix; the lane would run without its GitHub-write safeguard, so it does not start." >&2
+    exit 1
+  fi
+  echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: every task in the matrix carries the lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}"
+fi
+
+# The task file a unit hands devops-bench: the lane's copy when the step
+# above made one for this case, the file under bench/tasks/ otherwise. Its
+# own function so the fan-out's tests can run it; `${INJECT_LANE_TASKS_DIR:-}`
+# because those tests lift run_one_unit without this section.
+unit_task_path() { # <task-path> <task-name>
+  if [ -n "${INJECT_LANE_TASKS_DIR:-}" ] && [ -f "${INJECT_LANE_TASKS_DIR}/$2/task.yaml" ]; then
+    echo "${INJECT_LANE_TASKS_DIR}/$2/task.yaml"
+  else
+    echo "$1"
+  fi
+}
 
 # Floor for VerificationCorrectness on a repetition of a task that declares a
 # verification_spec. 1.0 while every declared objective is meant to hold
@@ -2615,9 +2686,10 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # leaks to a sibling lane; see unit_delegation_timeout.
   AGENT_DELEGATION_TIMEOUT="$(unit_delegation_timeout "${name}")"
   export AGENT_DELEGATION_TIMEOUT
-  local start end dir
+  local start end dir run_task
+  run_task="$(unit_task_path "${task}" "${name}")"
   start="$(_now_ms)"
-  (cd "${BENCH_DIR}" && uv run devops-bench "${task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
+  (cd "${BENCH_DIR}" && uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
   # `|| true`: a run that never printed a `results:` line must still write
   # its state files and reach the artifact copy -- it is exactly the crashed
@@ -2681,6 +2753,39 @@ done <<EOF_UNIT_QUEUE
 ${UNIT_QUEUE}
 EOF_UNIT_QUEUE
 wait
+
+# ─── What the run left on GitHub (#2079) ─────────────────────────────────────
+# On the inject lane, once every unit is done: every pull request and branch
+# under the agent's prefix written to the leased project's repository since
+# this run began, in the job log by number and branch, so a red safeguard has
+# its subject named beside it and a run's leftovers are on record even when
+# no repetition graded them (a unit that died before verification). It closes
+# nothing: this job holds no credential that closes a pull request, by design
+# -- a presubmit runs the pull request's own code, and the one
+# `pull_requests: write` outside a run is the periodic sweep that executes
+# `main` alone (hack/ci_sweep_agent_pulls.py; docs/ci-pool-projects.md 5.3
+# and 5.5), which closes these and deletes their branches within its
+# ten-minute interval once the lease is released. A fresh read token first:
+# the one minted at preflight is hours old by now. Never fatal, and after
+# the fan-out rather than in the EXIT trap: a deadline-cut run loses this
+# line and keeps the per-repetition reasons, which is the right trade.
+report_github_leftovers() {
+  if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] || [ -z "${BENCH_GITOPS_REPO:-}" ]; then
+    return 0
+  fi
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] GitHub writes this run left on ${BENCH_GITOPS_REPO} since ${EVAL_RUN_STARTED_AT} <<<"
+  if ! mint_ledger_token "leftovers"; then
+    echo "WARNING: GitHub leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the periodic sweep still closes it once the lease is released."
+    return 0
+  fi
+  if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.github_writes \
+      --repo "${BENCH_GITOPS_REPO}" --since "${EVAL_RUN_STARTED_AT}"); then
+    echo "WARNING: GitHub leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the periodic sweep still closes what this run left once the lease is released."
+    return 0
+  fi
+  echo "GitHub leftovers: this job closes none of them (no pull_requests: write in a presubmit, docs/ci-pool-projects.md 5.3); the periodic sweep ci-kube-agents-pull-sweep closes them and deletes their branches once the lease is released."
+}
+report_github_leftovers
 
 # ─── Per-case verdicts, in the order TASKS declares ───────────────────────────
 # Most cases were graded inside the fan-out by the unit that finished them

@@ -1,8 +1,10 @@
-# The inject lane's exclusions: presubmit cases that do not run when the
+# The inject lane's exclusions: registered cases that do not run when the
 # matrix goes through the A2A gateway's inject door (the harness's
 # AGENT_TRANSPORT=inject, which hack/ci-eval-pr.sh exports under
 # EVAL_MODE_NEXT=1), because the case's premise needs the chat front door
-# and the door addresses `platform` directly.
+# and the door addresses `platform` directly, or because the case requests
+# a GitHub write and the lane's own safeguard (inject-lane-safeguards.yaml)
+# cannot yet tell that write from a concurrent sibling's.
 #
 # One case id per line; `#` starts a comment, blank lines are skipped. The
 # reason is the comment block directly above the id, and it names the issue
@@ -34,3 +36,22 @@
 # Returns to the lane when the door routes through the chat profile, or
 # when the case is rewritten for a transport-neutral premise.
 agent-kanban-smoke
+
+# The four cases that request a GitHub write (a pull_request_opened
+# objective), nightly-only today. The lane's github_writes safeguard dates
+# writes and cannot tell this case's pull request from a concurrent
+# sibling's, so a case that writes by design would trip every repetition
+# running beside it on an inject nightly. Each returns to the lane when the
+# safeguard can attribute a write to a repetition (#2079).
+
+# #2079: requests a pull request; see the block above.
+cluster-agent-crashloop-fix-request
+
+# #2079: requests a pull request; see the block above.
+pdb-remediation-pr
+
+# #2079: requests a pull request; see the block above.
+rca-remediation-pr
+
+# #2079: requests a pull request; see the block above.
+vcs-review-feedback-read-back

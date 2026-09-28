@@ -1,0 +1,77 @@
+[
+  {
+    "url": "https://api.github.com/repos/gke-agentic/kube-agents-evals-21-infra/pulls/39",
+    "html_url": "https://github.com/gke-agentic/kube-agents-evals-21-infra/pull/39",
+    "number": 39,
+    "state": "open",
+    "title": "feat: Add PodDisruptionBudget for checkout-gateway",
+    "user": {
+      "login": "kube-agents-evals-token-minter[bot]",
+      "type": "Bot"
+    },
+    "created_at": "2026-09-25T17:32:18Z",
+    "updated_at": "2026-09-25T17:32:18Z",
+    "closed_at": null,
+    "merged_at": null,
+    "head": {
+      "ref": "platform-agent/checkout-gateway-pdb-new",
+      "sha": "f6314dad3b1c6e60a5b495350e163fa1badce473",
+      "repo": {
+        "full_name": "gke-agentic/kube-agents-evals-21-infra"
+      }
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  {
+    "url": "https://api.github.com/repos/gke-agentic/kube-agents-evals-21-infra/pulls/38",
+    "html_url": "https://github.com/gke-agentic/kube-agents-evals-21-infra/pull/38",
+    "number": 38,
+    "state": "open",
+    "title": "feat(fleet): add PDB for checkout-gateway",
+    "user": {
+      "login": "kube-agents-evals-token-minter[bot]",
+      "type": "Bot"
+    },
+    "created_at": "2026-09-25T00:39:54Z",
+    "updated_at": "2026-09-25T17:42:49Z",
+    "closed_at": null,
+    "merged_at": null,
+    "head": {
+      "ref": "platform-agent/checkout-gateway-pdb",
+      "sha": "0d7264e14d68865f5bcde8983e44ad0ecd42a979",
+      "repo": {
+        "full_name": "gke-agentic/kube-agents-evals-21-infra"
+      }
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  {
+    "url": "https://api.github.com/repos/gke-agentic/kube-agents-evals-21-infra/pulls/37",
+    "html_url": "https://github.com/gke-agentic/kube-agents-evals-21-infra/pull/37",
+    "number": 37,
+    "state": "open",
+    "title": "Fix payments-api OOMKilled crashloop",
+    "user": {
+      "login": "kube-agents-evals-token-minter[bot]",
+      "type": "Bot"
+    },
+    "created_at": "2026-09-24T00:52:09Z",
+    "updated_at": "2026-09-24T00:52:09Z",
+    "closed_at": null,
+    "merged_at": null,
+    "head": {
+      "ref": "platform-agent/fix-payments-api",
+      "sha": "1837f9422e1edde1b2575927d82d0ce131279254",
+      "repo": {
+        "full_name": "gke-agentic/kube-agents-evals-21-infra"
+      }
+    },
+    "base": {
+      "ref": "main"
+    }
+  }
+]

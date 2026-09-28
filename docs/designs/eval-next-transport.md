@@ -386,8 +386,8 @@ tracked as its own issue.
 
 **What the lane grades (decided 2026-09-28 on gke-labs/kube-agents#2037).** Through the inject
 door the eval addresses the platform persona directly, with the `platform_toolsets.cli` bundle:
-`terminal`, `read_file`, `patch`, `execute_code`, `delegate_task` and every MCP tool the install
-carries. That is a different agent from the one today's evals reach. The api transport posts to
+`terminal`, `read_file`, `patch`, `process_manage`, `execute_code`, `delegate_task` and every
+MCP tool the install carries. That is a different agent from the one today's evals reach. The api transport posts to
 the API server, which runs the default profile, the Planning Agent: its model-facing tools are the
 kanban set, it delegates fleet work to the platform persona over a card, and it relays the
 worker's report. Same prompt, two agents reading it: `obtainability-remediation-proposal` is 12
@@ -561,10 +561,15 @@ three are set on the operator, because its defaults point at a registry the pool
 pull from. Under the same flag
 `hack/ci-eval-pr.sh` runs the matrix through the door: it exports `AGENT_TRANSPORT=inject` and
 `AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door, and
-changes nothing else about the run except the matrix itself, from which the inject lane's
-exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather than
-on this flag) then leaves out the cases whose premise needs the chat front door. With the flag
-unset both scripts are byte for byte what they were, and the presubmit's own tests hold that.
+changes nothing else about the run except what hangs off that transport switch: the inject
+lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather
+than on this flag) leaves out the cases whose premise needs the chat front door and the four
+that request a GitHub write; the lane's safeguards (`hack/eval/inject-lane-safeguards.yaml`) are
+appended to a scratch copy of every remaining task file, which the unit hands devops-bench,
+over the leased project's GitOps repository exported as `BENCH_GITOPS_REPO` (the lane refuses
+to start without one); and after the fan-out the script lists in the job log what the run left
+on that repository, closing nothing. With the flag unset both scripts are byte for byte what
+they were, and the presubmit's own tests hold that.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.

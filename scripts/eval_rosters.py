@@ -39,6 +39,11 @@ BLOCKING_ROSTER_FILE = EVAL_DIR / "blocking-roster.txt"
 # under AGENT_TRANSPORT=inject, each with its reason as the comment block
 # directly above it.
 INJECT_LANE_EXCLUSIONS_FILE = EVAL_DIR / "inject-lane-exclusions.txt"
+# The inject lane's safeguards (#2079): the verification_spec entries the
+# script appends to every case it runs on that lane. YAML, so this
+# stdlib-only module names the path and bench/kube_agents_bench/lane.py
+# reads it; scripts/test_eval_rosters.py pins its shape.
+INJECT_LANE_SAFEGUARDS_FILE = EVAL_DIR / "inject-lane-safeguards.yaml"
 # An issue reference a reason must carry, so every exclusion names what
 # decides when it goes.
 ISSUE_REFERENCE_RE = re.compile(r"#\d+")

@@ -10,7 +10,8 @@ only with an `approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNE
 [`hack/OWNERS`](../hack/OWNERS) scopes `blocking-roster.txt` and
 `hack/eval/presubmit-cases.txt` — what blocks and what runs on every pull request — to that
 alias with `no_parent_owners`, so a root approver does not count for either. Nothing else
-carries the rule: `hack/eval/nightly-cases.txt`, `hack/eval/inject-lane-exclusions.txt`, a new
+carries the rule: `hack/eval/nightly-cases.txt`, `hack/eval/inject-lane-exclusions.txt`,
+`hack/eval/inject-lane-safeguards.yaml`, a new
 case directory under `bench/tasks/` and the script itself need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the script's step-0 revalidation treats `docs/` as
@@ -216,7 +217,8 @@ Admitted on the record since the split:
 ## How far the roster's promise reaches
 
 The scope of "a held-out case cannot red a pull request" is rungs 4 and 6 only. Rungs 1–3
-— a forbidden cluster mutation, an erroring check, a record that is not a real run — stay
+— a forbidden cluster mutation (or, on the inject lane, an unrequested GitHub write), an
+erroring check, a record that is not a real run — stay
 blocking for every case by design, admitted or not: `grade_case` evaluates them before it
 reads admission. Those classes signal a broken case or install, not flake, and the fix is
 on that side rather than on the roster.
@@ -263,8 +265,24 @@ block above it, naming the issue that decides when it goes, and `scripts/test_ev
 holds every entry to that, the way the validator's `FIXTURE_NOT_READY` holds a case with no
 fixture to an issue. An entry is not a demotion: the case stays in `presubmit-cases.txt` and on
 the blocking roster, runs on every pull request over the api transport, and can still red one.
-The file needs the normal approvers, not the eval-crew rule, for the same reason
+The list also holds the four nightly cases that request a pull request, for the safeguards
+list's reason below: they stay in `nightly-cases.txt` and run every night over the api
+transport. The file needs the normal approvers, not the eval-crew rule, for the same reason
 `nightly-cases.txt` does — it changes what one lane runs, not what can red a pull request.
+
+A safeguard the lane needs and no case declares is the lane's safeguards list,
+`hack/eval/inject-lane-safeguards.yaml`. The door addresses the platform persona, whose own rule
+for a change is a pull request, and a case's cluster safeguards see nothing of GitHub; the file
+holds one entry, a none-wrapped `github_writes` at catastrophic severity, which
+`hack/ci-eval-pr.sh` appends on that lane to a copy of every task file in the matrix before
+devops-bench reads it, so a repetition that wrote a pull request or branch the case did not
+request is a tripped catastrophic safeguard at rung 1, as a cluster mutation is. The task files
+under `bench/tasks/` and the api lane are untouched, and `scripts/test_eval_rosters.py` pins the
+file's shape, that no case reuses an entry's name, and that no case the lane runs on either tier
+requests a GitHub write — the check dates writes and cannot attribute a concurrent sibling's
+pull request, which is why the four cases that request one are on the exclusion list, and why
+a seat on the lane for any of them first needs that attribution. The same approvers as the
+exclusion list, for the same reason.
 
 ## Demoting a flaky case
 

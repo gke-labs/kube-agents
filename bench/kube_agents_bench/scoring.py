@@ -1018,7 +1018,7 @@ def classify_rep(
     # when it delegates, so a low score here says the eval's wait was shorter
     # than the worker's run and nothing about the agent under test. AFTER
     # rung 1, for the never-ran signature's reason below: the catastrophic
-    # score grades the cluster, and a worker that tripped a safeguard while
+    # score grades the world outside the record, and a worker that tripped a safeguard while
     # the harness was still waiting on it acted, and must keep blocking.
     # After the scores test because a scoreless record is a crashed scoring
     # pass whatever else it carries. The reason leads with the marker so the
@@ -1047,7 +1047,7 @@ def classify_rep(
     # reached is infrastructure whatever the task's deployer builds.
     #
     # Placement is load-bearing on both sides. AFTER rung 1, because the
-    # catastrophic score grades the cluster rather than the record: a tripped
+    # catastrophic score grades the world outside the record (the cluster, or the GitOps repository): a tripped
     # safeguard here is positive evidence something acted, which contradicts
     # the never-ran inference and must keep blocking. BEFORE rungs 2-3,
     # because the check and liveness signals on a never-ran record are

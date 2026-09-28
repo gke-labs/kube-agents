@@ -168,7 +168,7 @@ deployment's ready replicas land in a range). A fourth, `fleet_resource_property
 this repository's `resource_property` against the seeded-fleet cluster that carries a
 fixture role, named by `fixture_role:` rather than by cluster.
 
-Six read what the run produced, from this repository
+Seven read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns` are
@@ -177,7 +177,11 @@ which no substring can express), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
-repetition's), and `worker_commands` (regular expressions over the terminal commands
+repetition's), `github_writes` (every pull request or branch under the agent's
+prefix written to the case's GitOps repository since the repetition started; it
+passes on a write, so a case wraps it in `none` to say the agent wrote nothing
+it was not asked for, and the inject lane appends exactly that entry to every
+case it runs), and `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
 purges it), and `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
