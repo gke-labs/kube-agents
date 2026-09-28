@@ -294,6 +294,9 @@ REQUIRED_APIS = {
     "aiplatform.googleapis.com",
     "logging.googleapis.com",
     "monitoring.googleapis.com",
+    # The observability nightly case reads the install's traces through the
+    # broker's relay; the composition enables this for the same reason.
+    "cloudtrace.googleapis.com",
     "iam.googleapis.com",
     "cloudkms.googleapis.com",
 }

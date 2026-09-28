@@ -8,6 +8,10 @@ locals {
     "cloudresourcemanager.googleapis.com",
     "monitoring.googleapis.com",
     "logging.googleapis.com",
+    # The observability skill's trace helpers read Cloud Trace through the
+    # credential broker's relay on the Trace role granted below; the API has
+    # to be on for the grant to buy anything.
+    "cloudtrace.googleapis.com",
     # Unconditional: the cluster is created with the Backup for GKE agent
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.

@@ -24,10 +24,10 @@
 #
 # Planted defect required: none — the case reads the install's own traces in
 # the eval project. The install must be exporting traces (the operator's
-# telemetry discovery to GKE Managed OTel, the default) and the Cloud Trace
-# API must be enabled there; a project with no traces in the window reports
-# "No traces found" and fails the report check, which is a fixture gap, not
-# a red.
+# telemetry discovery to GKE Managed OTel, the default); the composition
+# enables the Cloud Trace API and grants the read role. A project with no
+# traces in the window reports "No traces found" and fails the report check,
+# which is a fixture gap, not a red.
 # Isolation class: read-only (nothing created or applied).
 # Tier: nightly (new case; presubmit admission is earned on record).
 id: observability-trace-latency-brokered
