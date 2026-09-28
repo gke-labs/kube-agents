@@ -101,9 +101,10 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #     published to point the operator at) and section 2b refuses it on a Prow
 #     run that is neither a pull request's nor one of the next-lane jobs
 #     named below (a mis-set variable on the nightly or a postsubmit would
-#     otherwise append next-mode samples to main's baseline record), and
-#     refuses a fan-out the bridge cannot be given as its concurrency, before
-#     anything is built;
+#     otherwise run that job in next mode, recording and publishing nothing,
+#     so main's window and dashboard would silently miss it), and refuses a
+#     fan-out the bridge cannot be given as its concurrency, before anything
+#     is built;
 #   - step 4 also builds the A2A gateway, auth callout and worker images from
 #     a2a/Dockerfile.* (the operator's defaults for them name a private dev
 #     registry, #1557, which a leased project cannot pull from) and the Hermes
@@ -491,14 +492,16 @@ else
 fi
 
 # The mode flip exists for the next lane's runs: a pull request's, or one of
-# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic on main). bench-gate
-# keeps main's baseline honest by refusing to append a sample when PULL_NUMBER
-# or RC_COMMIT_SHA is set (bench/baselines/README.md), and hack/ci-eval-pr.sh
-# keeps a flagged run out of the recorder on the flag alone; what neither
-# covers is the flag mis-set on a job that is not the lane's -- the nightly,
-# a postsubmit -- whose today-mode identity can write the store. Keyed on the
-# job's name rather than on PULL_NUMBER, so the periodic is admitted by being
-# named and every other Prow run without a pull request is still refused.
+# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic on main). A flagged
+# run appends nothing to main's baseline and publishes no dashboard
+# (hack/ci-eval-pr.sh keeps it out of both on the flag alone; bench-gate
+# separately refuses a pull request's sample, bench/baselines/README.md), so
+# what the flag mis-set on a job that is not the lane's -- the nightly, a
+# postsubmit -- would do is run that job in next mode and leave main's window
+# and dashboard silently missing it, its verdict measuring the wrong stack.
+# Keyed on the job's name rather than on PULL_NUMBER, so the periodic is
+# admitted by being named and every other Prow run without a pull request is
+# still refused.
 if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
   # One whole-string comparison per listed name, not a pattern over the
   # joined list: a substring match on the space-padded list would also admit
@@ -515,7 +518,8 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${P
     echo "ERROR: EVAL_MODE_NEXT=1 is set on a Prow run with no PULL_NUMBER (JOB_NAME=${JOB_NAME:-})." >&2
     echo "       The flag is for a pull request's presubmit or a next-lane job named in" >&2
     echo "       EVAL_MODE_NEXT_JOB_NAMES (${EVAL_MODE_NEXT_JOB_NAMES}); any other periodic or" >&2
-    echo "       postsubmit under it would record next-mode samples into main's baseline." >&2
+    echo "       postsubmit under it would run in next mode and record nothing to main's" >&2
+    echo "       baseline or dashboard, leaving that run silently missing from both." >&2
     exit 1
   fi
 fi

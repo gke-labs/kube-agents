@@ -532,6 +532,11 @@ class FlagSetIsNextTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1 if refused else 0, result.stderr)
                 if refused:
                     self.assertIn(f"no PULL_NUMBER (JOB_NAME={job})", result.stderr)
+                    # The consequence the error names is the one the tree has:
+                    # a flagged run records nothing, so the refused job would
+                    # go missing from main's record, not move it.
+                    self.assertIn("record nothing to main's", result.stderr)
+                    self.assertNotIn("would record next-mode samples", result.stderr)
                     self.assertEqual(result.stdout, "")
                 elif flag == "1" and prow == "true" and not pull:
                     self.assertIn(f"EVAL_MODE_NEXT=1: accepted on {job}", result.stdout)
