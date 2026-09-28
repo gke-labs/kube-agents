@@ -114,10 +114,15 @@ def tofu_runner(argv, cwd=None, timeout=None, **_):
     """subprocess.run for tofu, with a graceful stop.
 
     A killed tofu leaves the state locked and the next run failing on the lock,
-    so on SIGTERM or the ceiling it gets SIGINT and a grace period first.
+    so on a termination signal or the ceiling it gets SIGINT and a grace period
+    first. Its own session, so a terminal's Ctrl-C reaches this process alone
+    and tofu sees one interrupt, the forwarded one: a second interrupt makes
+    tofu exit at once, mid-operation.
     """
     env = dict(os.environ, **TOFU_ENV)
-    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(
+        argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True
+    )
     try:
         out, err = proc.communicate(timeout=timeout)
     except (subprocess.TimeoutExpired, boskos_pool.Terminated):
@@ -281,16 +286,17 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
 
     A name outside the pool mapping is failed before Boskos is asked: Boskos
     answers 404 for a leased project and for one it has never heard of alike,
-    so a typo would otherwise read as busy on every run.
+    so a typo would otherwise read as busy on every run. Without a lease the
+    mapping is not consulted; that is the dev-project path.
     """
     known = pool_projects() if known is None else known
     outcomes = {}
     for project in projects:
-        if project not in known:
-            outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
-            continue
         if not lease:
             outcomes[project] = reconcile_project(project, runner=runner, dry_run=dry_run)
+            continue
+        if project not in known:
+            outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
             continue
         if boskos_pool.acquire(server, owner, HOLD_STATE, name=project) is None:
             outcomes[project] = (OUTCOME_BUSY, REASON_BUSY)

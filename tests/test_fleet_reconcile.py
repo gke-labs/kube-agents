@@ -318,13 +318,17 @@ class LeaseTest(unittest.TestCase):
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_FAILED)
         self.assertIn("release failed", outcomes[P7][1])
 
-    def test_no_lease_asks_boskos_nothing(self):
+    def test_no_lease_asks_boskos_nothing_and_takes_a_project_outside_the_pool(self):
+        # The dev-project path: no Boskos, and no mapping check, since the
+        # check exists only to stop a typo reading as busy at Boskos.
         def no_boskos(request, timeout=None):
             raise AssertionError("Boskos was called: %s" % request.full_url)
 
+        dev = "my-dev-project"
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", no_boskos):
-            outcomes = reconcile.reconcile_named([P7], BOSKOS, OWNER, lease=False, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN)
+            outcomes = reconcile.reconcile_named([P7, dev], BOSKOS, OWNER, lease=False, runner=_Tofu({P7: UPDATE_ONLY, dev: UPDATE_ONLY}), known=KNOWN)
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(outcomes[dev][0], reconcile.OUTCOME_APPLIED)
 
     def test_the_pool_walk_applies_every_free_project_once_and_releases_each(self):
         boskos = _Boskos(free=[P7, P8])
@@ -462,6 +466,12 @@ class TofuRunnerTest(unittest.TestCase):
     def test_a_finished_child_is_returned_with_its_output(self):
         result = reconcile.tofu_runner([sys.executable, "-c", "print('hi')"], timeout=10)
         self.assertEqual((result.returncode, result.stdout.strip()), (0, "hi"))
+
+    def test_the_child_runs_in_its_own_session(self):
+        # A terminal's Ctrl-C goes to the foreground process group; tofu in
+        # its own session sees only the one interrupt this process forwards.
+        result = reconcile.tofu_runner([sys.executable, "-c", "import os; print(os.getsid(0))"], timeout=10)
+        self.assertNotEqual(int(result.stdout.strip()), os.getsid(0))
 
 
 if __name__ == "__main__":
