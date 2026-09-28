@@ -77,7 +77,7 @@ Cluster Agent is named, stored, or driven:
 - PRUNE works per stamped identity, not per resolved project: `_cluster_exists`
   (`cluster_agent_reconcile.py:135-163`) runs `describe --project=<identity.project>`, so a profile
   for a cluster in another project is verified against the right project today.
-- `create_profile()` fetches credentials with `--project=<P>` (`cluster_agent_profile.py:235-243`).
+- `create_profile()` fetches credentials with `--project=<P>` (`cluster_agent_profile.py:366-369`).
 - The credential broker passes `--project` through as a value-taking flag
   (`_GCLOUD_FLAGS_WITH_VALUE` in `agents/platform/scripts/command_policy.py`), takes the project from the kubeconfig context
   name (`credential_proxy.py:1168-1190`), and re-issues `get-credentials` with the target's project

@@ -13,6 +13,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
   `/api/v1` interaction contract. It waits for aggregate terminal state before
   producing assertions.
 - `kube_agents_bench/verifiers.py` — the leaf verifiers this repository adds to devops-bench's own, published through the `devops_bench.verifiers` entry-point group.
+- `kube_agents_bench/discovery.py` — reads the onboarding discovery sweep off the agent pod for the `bootstrap_fanout` verifier: the sweep's board rows and the Cluster Agent profiles beside them, in one `kubectl exec`.
 - `kube_agents_bench/fleet.py` — resolves a seeded-fleet fixture ROLE to the kubeconfig that reaches it. Fails loudly rather than falling back to the ambient config; see [tf/fleet/README.md](tf/fleet/README.md).
 - `kube_agents_bench/cases.py`, `scoring.py`, `baselines.py`, `gate.py` — the presubmit's verdict, described under [The gate](#the-gate) below. Nothing devops-bench calls; these read the records it writes.
 - `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with. The rest are the Phase 2 domain scenarios; [`tasks/DRAFTS.md`](tasks/DRAFTS.md) is their status page.

@@ -76,7 +76,9 @@
 # 900s band; tofu, so it serializes on the infra lock with the other tofu
 # cases). Forty-nine cases, ~1176-1196min serial. 2026-09-28 adds
 # bootstrap-discovery-fanout (~30min at its 600s hint; tofu, so it too
-# serializes on the infra lock): fifty cases, ~1206-1226min serial. The
+# serializes on the infra lock): fifty-two cases across the two files,
+# counted from the lists, since the running totals above had fallen two
+# behind. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
 # herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=8 (6 from #1491 until
 # oss-test-infra#2707, 2026-09-25; the arithmetic that follows was done at

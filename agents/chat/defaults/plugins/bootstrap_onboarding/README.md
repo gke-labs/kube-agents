@@ -264,8 +264,9 @@ reset produces silence. Check with `grep bootstrap /opt/data/cron/jobs.json` ins
 re-add them or skip the gate entirely and file the sweep card yourself. Filing directly skips the
 gate's reconcile, and the card body forbids the worker from reconciling the roster itself, so run
 the reconcile first or the sweep fans out to a stale roster. Run these inside the agent
-container, the first two with the Hermes interpreter: the card body lists the Cluster Agents read
-from the profiles there, and reading them needs `yaml`, which the container's `python3` does not have:
+container, the first two with the Hermes interpreter named in full: the card body lists the Cluster
+Agents read from the profiles there, reading them needs `yaml`, and a login shell resolves `python3`
+to `/usr/bin/python3`, which does not have it:
 
 ```bash
 /opt/hermes/.venv/bin/python /opt/data/scripts/cluster_agent_reconcile.py
