@@ -316,6 +316,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "forbidden_phrases",
         "any_of_phrases",
         "forbidden_patterns",
+        "required_patterns",
     ),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     # No field, deliberately: the freshness binding is the assertion and every
