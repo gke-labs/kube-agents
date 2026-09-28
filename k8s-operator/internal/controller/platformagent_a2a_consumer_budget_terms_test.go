@@ -226,10 +226,10 @@ const a2aBridgeLookAheadCall = "InReplay"
 // this is what holds those two facts together.
 //
 // The bridge's worker calls lib.TaskInReplay at most once per dequeue (it
-// answers from the in subject's newest message by direct get first) and at
-// most Concurrency times in any five-second window (it paces the rest), and
-// the reserve counts that ceiling: a2aTasksReplayBridgeLookAhead, one slot
-// per worker and its tail.
+// answers from the in subject's newest message by direct get first) and
+// holds at most Concurrency of those replays in hand at once (it paces the
+// rest), and the reserve counts that ceiling: a2aTasksReplayBridgeLookAhead,
+// one slot per worker and its tail.
 // Before the call existed the term was out, because four slots reserved
 // against code no render could reach moved the provision gate's first refused
 // maxSessions on an existing 64-wide TASKS from 13 to 11 for nothing, and a

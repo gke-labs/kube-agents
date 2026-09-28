@@ -458,11 +458,7 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 // second parse here cannot fail on anything the fold accepted.
 func finalSubject(events []*Envelope, subjects []string) string {
 	for i, env := range events {
-		if env.Kind != KindStatusUpdate {
-			continue
-		}
-		var s StatusUpdate
-		if err := json.Unmarshal(env.Payload, &s); err == nil && s.Final {
+		if IsFinalStatus(env) {
 			return subjects[i]
 		}
 	}

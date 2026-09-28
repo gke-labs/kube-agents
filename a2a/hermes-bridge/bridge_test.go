@@ -899,11 +899,14 @@ echo never`, markers)), fanOut)
 
 // A backlog whose newest in message answers nothing, here a write no envelope
 // parser accepts behind each cancel, reaches the fallback replay on every
-// task, and the replay is paced: at most Concurrency of them begin in any
-// five-second window, so the look-ahead holds at most twice that many
-// consumer slots however long the backlog is. Every task is still refused
-// without a spawn; it just takes the windows it takes. Unpaced, twelve such
-// tasks opened twelve ephemerals inside a tenth of a second.
+// task, and the replay is paced: at most Concurrency of them are in hand at
+// once, each held until its ephemeral is reaped, so the look-ahead holds at
+// most that many consumer slots however long the backlog is (the reserve's
+// row, with its tail factor, is twice that, and is what this test holds the
+// sampled peak to, since the server's reaping lags the clock by a little).
+// Every task is still refused without a spawn; it just takes the windows it
+// takes. Unpaced, twelve such tasks opened twelve ephemerals inside a tenth
+// of a second.
 //
 // The durable's delivery of the cancels is held until the workers have
 // refused everything, as in the fresh-bind test: delivered, a cancel
@@ -989,6 +992,111 @@ echo never`, markers)), workers, func(b *Bridge) {
 		if n := len(replayEvents(t, url, o.TaskID)); n != 2 {
 			t.Fatalf("%s has %d events, want submitted and the terminal", o.TaskID, n)
 		}
+	}
+}
+
+// A run the durable's cancel has already finalized on handleCancel's queued
+// path, which on a live bridge is where a task's own cancel usually lands
+// while the worker's direct get is out, gets no fallback replay: no slot
+// taken, no wait, no consumer. The order is pinned in three steps: the
+// durable's cancels are held until every worker is inside the look-ahead
+// with a pending run, then released so the queued path ends every run, and
+// only then are the workers let through, so the real read runs on
+// finalized runs only. (Left to timing, a cancel that lands before the
+// dequeue is caught by the worker's own pending check and the look-ahead is
+// never entered, which is correct and not what this test is about.)
+func TestLookAhead_FinalizedRunSkipsTheFallbackReplay(t *testing.T) {
+	_, url := startServer(t)
+	c := gatewayClient(t, url)
+	js := testJetStream(t, url)
+	markers := t.TempDir()
+	const workers = 4
+
+	var origins []*lib.Envelope
+	for i := 0; i < workers; i++ {
+		origins = append(origins, submit(t, c, fmt.Sprintf("task-dead-%02d", i), "the stale prompt"))
+	}
+	for _, o := range origins {
+		publishCancel(t, c, o)
+		if _, err := js.Publish(testCtx(t), lib.TaskInSubject("platform", o.TaskID), []byte("not an envelope")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type answer struct {
+		canceled bool
+		err      error
+		took     time.Duration
+	}
+	answers := make(chan answer, workers)
+	var entered atomic.Int32
+	gate := make(chan struct{})
+	var opened atomic.Bool
+	openGate := func() {
+		if opened.CompareAndSwap(false, true) {
+			close(gate)
+		}
+	}
+	release := make(chan struct{})
+	var released atomic.Bool
+	releaseCancels := func() {
+		if released.CompareAndSwap(false, true) {
+			close(release)
+		}
+	}
+	startBridgeWith(t, url, script(t, fmt.Sprintf(`touch %s/$1
+echo never`, markers)), workers, func(b *Bridge) {
+		real, realDeliver := b.lookAhead, b.deliver
+		b.lookAhead = func(ctx context.Context, run *taskRun) (bool, error) {
+			entered.Add(1)
+			<-gate
+			start := time.Now()
+			canceled, err := real(ctx, run)
+			answers <- answer{canceled: canceled, err: err, took: time.Since(start)}
+			return canceled, err
+		}
+		b.deliver = func(ctx context.Context, env *lib.Envelope) {
+			if env.Kind == lib.KindCancel {
+				<-release
+			}
+			realDeliver(ctx, env)
+		}
+	})
+	t.Cleanup(openGate)
+	t.Cleanup(releaseCancels)
+
+	// Every worker holds a pending run inside the look-ahead; now the
+	// durable's cancels end every run under them.
+	waitFor(t, 20*time.Second, "every worker to be inside the look-ahead", func() bool {
+		return entered.Load() == workers
+	})
+	releaseCancels()
+	waitFor(t, 20*time.Second, "the queued cancel path to finalize every task", func() bool {
+		for _, o := range origins {
+			if !lib.IsFinalStatus(lastOnSubject(t, js, lib.TaskEventsSubject("platform", o.TaskID))) {
+				return false
+			}
+		}
+		return true
+	})
+	openGate()
+	for i := 0; i < workers; i++ {
+		select {
+		case got := <-answers:
+			if got.err != nil || got.canceled {
+				t.Fatalf("look-ahead on a finalized run answered (canceled=%v, err=%v), want (false, nil)", got.canceled, got.err)
+			}
+			if got.took >= lib.EphemeralConsumerInactiveThreshold {
+				t.Fatalf("look-ahead on a finalized run took %s: it waited on a replay slot", got.took)
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatal("a held worker never returned from the look-ahead")
+		}
+	}
+	if n := streamConsumers(t, js); n != 1 {
+		t.Fatalf("TASKS holds %d consumers, want the durable alone: a finalized run was replayed", n)
+	}
+	if entries, err := os.ReadDir(markers); err != nil || len(entries) != 0 {
+		t.Fatalf("%d stale prompts spawned (%v)", len(entries), err)
 	}
 }
 

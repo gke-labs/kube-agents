@@ -226,10 +226,12 @@ nothing followed it; only a subject whose newest message is something else, a fo
 behind a cancel, is replayed in full (`lib.TaskInReplay`, the one-subject form of the read
 `tasks/get` does on the event subjects, on the same five-second ephemeral). That is what
 keeps a bind over a backlog of abandoned submissions from opening a consumer per task at bus
-speed, and the replay that remains is paced: at most `BRIDGE_CONCURRENCY` of them begin in any
-five-second window, the ephemeral's lifetime, so the look-ahead never holds more than twice that
-many consumer slots whatever the backlog's shape. `working` is published only after that read,
-so a cancelled run never shows it. It is
+speed, and the replay that remains is paced: at most `BRIDGE_CONCURRENCY` of them are in hand
+at once, each held until its ephemeral's five-second threshold has run after it returned, so the
+look-ahead never holds more than that many consumer slots whatever the backlog's shape (the
+operator's reserve counts twice that, its tail factor), and a run the durable's cancel has
+already ended takes no slot at all. `working` is published only after that read, so a cancelled
+run never shows it. It is
 a read, not a consume: the durable still delivers the cancel to the handler afterwards, and
 it does nothing - the run is normally gone from the bridge's table by then, so the cancel
 takes the orphan path, which reads the newest event the same consumer-free way, finds the

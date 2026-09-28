@@ -166,11 +166,12 @@ type Bridge struct {
 	deliver func(ctx context.Context, env *lib.Envelope)
 
 	// replaySlots paces the look-ahead's fallback replay: one slot per
-	// worker, held for the ephemeral's inactive threshold, so at most
-	// Concurrency of those replays begin in any five-second window and the
-	// look-ahead never holds more than twice that many consumer slots,
-	// whatever shape the backlog has. The operator's TASKS reserve counts
-	// exactly that (a2aTasksReplayBridgeLookAhead).
+	// worker, held from the replay's start until the ephemeral's inactive
+	// threshold after it returns, so the slots in hand are the consumers the
+	// look-ahead is holding, Concurrency at most plus whatever the server
+	// has not yet reaped, whatever shape the backlog has. The operator's
+	// TASKS reserve counts twice that (a2aTasksReplayBridgeLookAhead and
+	// its tail factor).
 	replaySlots chan struct{}
 }
 
@@ -534,7 +535,9 @@ func (r *taskRun) pending() bool {
 // than at bus speed: the look-ahead's consumer cost has the ceiling the
 // operator's reserve gives it, whatever the backlog looks like. The wait
 // for a slot is bounded by the threshold itself and is not charged to
-// either read's own bound.
+// either read's own bound, and it is not spent on a run the durable's
+// cancel has already ended on handleCancel's queued path, which on a live
+// bridge is where that cancel usually lands while the direct get is out.
 //
 // Newer than the submission means after it in stream order. The submission
 // is normally in the replay, since the durable delivered it moments ago;
@@ -555,8 +558,18 @@ func (b *Bridge) cancelInStream(ctx context.Context, run *taskRun) (bool, error)
 	case last != nil && last.EnvelopeID == run.origin.EnvelopeID:
 		return false, nil
 	}
-	if err := b.takeReplaySlot(ctx); err != nil {
+	// A finalized run has nothing to look ahead for; the worker's re-check
+	// reads the same state after this returns.
+	if !run.pending() {
+		return false, nil
+	}
+	release, err := b.takeReplaySlot(ctx)
+	if err != nil {
 		return false, err
+	}
+	defer release()
+	if !run.pending() {
+		return false, nil
 	}
 	replayCtx, cancelReplay := context.WithTimeout(ctx, lookAheadTimeout)
 	defer cancelReplay()
@@ -580,18 +593,22 @@ func (b *Bridge) cancelInStream(ctx context.Context, run *taskRun) (bool, error)
 }
 
 // takeReplaySlot admits one fallback replay, waiting when Concurrency of them
-// began inside the last threshold window. The slot comes back when that
-// window has passed, which is when the replay's ephemeral is reaped, so the
-// slots in hand are the consumers the look-ahead can be holding. A canceled
-// context is the only other way out of the wait.
-func (b *Bridge) takeReplaySlot(ctx context.Context) error {
+// are in hand. The caller invokes release when the replay has returned, and
+// from that instant the slot is held for the ephemeral's inactive threshold,
+// which is the clock the server reaps the consumer on: the slot and the
+// consumer it stands for live the same span, so the slots in hand are the
+// consumers the look-ahead is holding. Releasing early, at acquisition, would
+// have let a replay slower than the threshold hold a third consumer per
+// worker. A canceled context is the only other way out of the wait.
+func (b *Bridge) takeReplaySlot(ctx context.Context) (release func(), err error) {
 	select {
 	case b.replaySlots <- struct{}{}:
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
-	time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, func() { <-b.replaySlots })
-	return nil
+	return func() {
+		time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, func() { <-b.replaySlots })
+	}, nil
 }
 
 func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
