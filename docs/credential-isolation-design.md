@@ -637,6 +637,15 @@ clone**, so the two defaults multiply out to about 2 GiB retained across eight
 open workspaces, by design. Size the node's ephemeral storage against the
 product, not against either number.
 
+The cap counts a list the runtime keeps in memory, so a worker that dies without
+closing its workspace would otherwise hold a slot until the pod restarts. Two
+things bound that. A workspace no verb has named for
+`CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS` (30 minutes by default) is reclaimed by
+the next `open`, and every tree a previous process left under the root is removed
+when the runtime starts. A refusal at the cap logs each holder's handle prefix,
+repository, caller label (the card or session id the client sends), age and idle
+time, so a full store is diagnosable from the runtime's log.
+
 The ceiling is also measured after the clone finishes, so it bounds what is
 _retained_ and not the peak: a repository far over the limit still lands on the
 disk before it is removed, and the only thing bounding that is the runtime's

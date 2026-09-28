@@ -1045,6 +1045,25 @@ class WorkspaceReadVerbsTest(unittest.TestCase):
             {"repo": "acme/infra", "branch": "fix/x", "depth": 1}, self.calls[1][1]
         )
 
+    def test_an_open_labels_itself_with_the_card_or_session_it_runs_under(self):
+        self._workspace({})
+        card = {"HERMES_KANBAN_TASK": "t_f660e9c5", "HERMES_SESSION_ID": "20260925_001944_b09c64"}
+        with patch.dict(os.environ, card):
+            credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
+            self.assertEqual({"repo": "acme/infra", "caller": "t_f660e9c5"}, self.calls[-1][1])
+            # The card outranks the session; without a card the session is the label.
+            del os.environ["HERMES_KANBAN_TASK"]
+            credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
+            self.assertEqual("20260925_001944_b09c64", self.calls[-1][1]["caller"])
+            # An explicit label wins over both.
+            credential_proxy_client.Workspace.open(self.endpoint, "acme/infra", caller="explicit-1")
+            self.assertEqual("explicit-1", self.calls[-1][1]["caller"])
+        # A value the broker would refuse is dropped, not sent: the label is
+        # for the log and must never be what fails an open.
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "not a token", "HERMES_SESSION_ID": ""}):
+            credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
+            self.assertEqual({"repo": "acme/infra"}, self.calls[-1][1])
+
     def test_a_batch_read_hands_back_what_it_did_not_read(self):
         workspace = self._workspace(
             {
