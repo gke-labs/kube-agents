@@ -1743,9 +1743,12 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
     is accepted here because requiring a push would fail the correct third
     repetition, because the sweep closes the agent's pull requests between
     leases when it reaches them, and because a case that must prove the write
-    declares ``pull_request_opened`` beside this. What the run wrote to GitHub is not
-    this objective's question; the inject lane guards that with a safeguard
-    of its own (#2079). Only ADDED lines of each patch are matched, plus the file names: a pull
+    declares ``pull_request_opened`` beside this. Open-only is safe against
+    that sweep: ``hack/ci_sweep_agent_pulls.py`` acquires only projects Boskos
+    reports free (``BOSKOS_FREE_STATE``), so a leased run's pull request stays
+    open until this check reads it. What the run wrote to GitHub is not this
+    objective's question; ``pull_request_opened`` asks it. Only ADDED lines
+    of each patch are matched, plus the file names: a pull
     request that deletes a budget, or edits a line beside one, carries the
     nouns in its context and removed lines and proposes nothing.
 
