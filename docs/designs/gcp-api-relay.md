@@ -17,7 +17,8 @@ a Google token. What it gains is exactly the reads the table names, on the ident
 already has, with the same caller authentication, refusal shape and audit line as `/v1/exec`.
 
 The first table entries are the Monitoring `timeSeries` and `metricDescriptors` reads and the
-Managed Prometheus query endpoints. A collector's one-function change is to obtain its
+Managed Prometheus query endpoints; the Cloud Trace `traces` list and single-trace get followed,
+for the observability skill's trace helpers. A collector's one-function change is to obtain its
 `requests`-shaped session from the broker client (`credential_proxy_client.ApiSession`)
 instead of from `google.auth`.
 
@@ -187,9 +188,10 @@ ApiRoute("monitoring.googleapis.com", API_READ_METHOD,
 ```
 
 `API_READ_ROUTES` in that file is the table and the only place it is written down; today it
-holds the Monitoring `timeSeries` and `metricDescriptors` lists and the Managed Prometheus
-`query`, `query_range`, `series` and `labels` reads, each with a comment saying which
-consumer needs it. `REFUSED_HOSTS` beside it names the hosts whose responses are credentials
+holds the Monitoring `timeSeries` and `metricDescriptors` lists, the Managed Prometheus
+`query`, `query_range`, `series` and `labels` reads, and the Cloud Trace `traces` list and
+`traces/<id>` get (the id held to 32 lower-case hex characters), each with a comment saying
+which consumer needs it. `REFUSED_HOSTS` beside it names the hosts whose responses are credentials
 or that turn a read into a write elsewhere — the token, STS, OAuth, IAM, Secret Manager, KMS
 and metadata endpoints — and is checked before the table and never overridable by it; the
 validator refuses a table that names one. `PROJECT` is Google's project-id grammar, and
