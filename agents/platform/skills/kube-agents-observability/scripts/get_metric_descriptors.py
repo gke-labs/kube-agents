@@ -12,7 +12,6 @@ import google_api
 
 METRIC_DESCRIPTORS_URL = "https://monitoring.googleapis.com/v3/projects/{project}/metricDescriptors"
 METRIC_NAME_SUBSTRING = "litellm"
-JSON_INDENT = 2
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -41,7 +40,7 @@ def main(argv=None, session=None) -> int:
         for m in descriptors.get("metricDescriptors", [])
         if m.get("type") and METRIC_NAME_SUBSTRING in m.get("type")
     ]
-    print(json.dumps(matching, indent=JSON_INDENT))
+    print(json.dumps(matching, indent=google_api.JSON_INDENT))
     return 0
 
 

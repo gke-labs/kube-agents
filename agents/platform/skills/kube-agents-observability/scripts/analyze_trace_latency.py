@@ -9,22 +9,21 @@ from __future__ import annotations
 
 import argparse
 import sys
-import urllib.parse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import google_api
 
-TRACE_LIST_URL = "https://cloudtrace.googleapis.com/v1/projects/{project}/traces"
-TRACE_GET_URL = "https://cloudtrace.googleapis.com/v1/projects/{project}/traces/{trace_id}"
-TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-DEFAULT_HOURS = 24
 DEFAULT_LIMIT = 5
 # How many of a trace's slowest spans the breakdown lists.
 TOP_SPANS = 10
 # fromisoformat reads at most microseconds; Cloud Trace writes nanoseconds.
 FRACTION_DIGITS = 6
+# The breakdown's columns: the rule above each trace, the span name, the
+# duration in seconds and its share of the trace.
 RULE_WIDTH = 70
 SPAN_NAME_WIDTH = 50
+DURATION_FORMAT = "6.3f"
+PERCENT_FORMAT = "4.1f"
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -33,8 +32,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--project-id", required=True, help="Google Cloud Project ID")
     parser.add_argument(
-        "--hours", type=int, default=DEFAULT_HOURS,
-        help=f"Analyze traces within the last N hours (default: {DEFAULT_HOURS})",
+        "--hours", type=int, default=google_api.DEFAULT_WINDOW_HOURS,
+        help=f"Analyze traces within the last N hours (default: {google_api.DEFAULT_WINDOW_HOURS})",
     )
     parser.add_argument(
         "--limit", type=int, default=DEFAULT_LIMIT,
@@ -71,26 +70,6 @@ def parse_timestamp(ts_str):
             return datetime.now(timezone.utc)
 
 
-def list_traces(session, project_id: str, hours: int, limit: int) -> dict:
-    end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(hours=hours)
-    params = {
-        "startTime": start_time.strftime(TIMESTAMP_FORMAT),
-        "endTime": end_time.strftime(TIMESTAMP_FORMAT),
-        "pageSize": limit,
-    }
-    url = TRACE_LIST_URL.format(project=urllib.parse.quote(project_id, safe=""))
-    return google_api.get_json(session, url, params=params)
-
-
-def get_trace(session, project_id: str, trace_id: str) -> dict:
-    url = TRACE_GET_URL.format(
-        project=urllib.parse.quote(project_id, safe=""),
-        trace_id=urllib.parse.quote(trace_id, safe=""),
-    )
-    return google_api.get_json(session, url)
-
-
 def print_breakdown(trace_id: str, spans: list) -> None:
     print("=" * RULE_WIDTH)
     print(f"Trace ID: {trace_id}")
@@ -115,7 +94,7 @@ def print_breakdown(trace_id: str, spans: list) -> None:
     span_durations.sort(key=lambda x: x[1], reverse=True)
     for name, dur in span_durations[:TOP_SPANS]:
         pct = (dur / total_duration) * 100 if total_duration > 0 else 0
-        print(f"  - {name:{SPAN_NAME_WIDTH}} : {dur:6.3f}s ({pct:4.1f}%)")
+        print(f"  - {name:{SPAN_NAME_WIDTH}} : {dur:{DURATION_FORMAT}}s ({pct:{PERCENT_FORMAT}}%)")
     if len(span_durations) > TOP_SPANS:
         print(f"  ... and {len(span_durations) - TOP_SPANS} more spans.")
 
@@ -125,7 +104,7 @@ def main(argv=None, session=None) -> int:
     print(f"Retrieving the last {args.limit} traces...")
     try:
         session = session or google_api.open_session()
-        listing = list_traces(session, args.project_id, args.hours, args.limit)
+        listing = google_api.list_traces(session, args.project_id, args.hours, args.limit)
     except google_api.RelayError as exc:
         print(f"Error listing traces: {exc}", file=sys.stderr)
         return google_api.EXIT_READ_FAILED
@@ -138,7 +117,7 @@ def main(argv=None, session=None) -> int:
         if not trace_id:
             continue
         try:
-            detail = get_trace(session, args.project_id, trace_id)
+            detail = google_api.get_trace(session, args.project_id, trace_id)
         except google_api.RelayError as exc:
             print(f"Error reading trace {trace_id}: {exc}", file=sys.stderr)
             continue

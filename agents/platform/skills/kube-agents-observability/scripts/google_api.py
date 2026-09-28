@@ -14,6 +14,8 @@ Google token exists in this process, so none can be printed or pasted.
 from __future__ import annotations
 
 import sys
+import urllib.parse
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # The shared client, in the pod (`/opt/defaults/scripts`, the operator's copy;
@@ -43,6 +45,20 @@ ERROR_BODY_PREVIEW_CHARS = 500
 
 # What a helper exits with when the read did not happen.
 EXIT_READ_FAILED = 1
+
+# The Cloud Trace v1 reads the relay carries (api_policy.API_READ_ROUTES),
+# written once here: analyze_trace_latency.py and fetch_traces.py both list,
+# and only the first then reads each trace.
+TRACE_LIST_URL = "https://cloudtrace.googleapis.com/v1/projects/{project}/traces"
+TRACE_GET_URL = "https://cloudtrace.googleapis.com/v1/projects/{project}/traces/{trace_id}"
+
+# How the helpers spell a window boundary to Google, and the window they
+# read by default.
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+DEFAULT_WINDOW_HOURS = 24
+
+# How every helper prints its JSON.
+JSON_INDENT = 2
 
 
 class RelayError(Exception):
@@ -92,3 +108,27 @@ def get_json(session, url: str, *, params=None) -> dict:
         return response.json()
     except ValueError as exc:
         raise RelayError(f"{url}: the response was not JSON: {exc}") from exc
+
+
+def window(hours: int) -> tuple[str, str]:
+    """The last `hours` as (start, end), spelt the way the APIs' filters take them."""
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(hours=hours)
+    return start_time.strftime(TIMESTAMP_FORMAT), end_time.strftime(TIMESTAMP_FORMAT)
+
+
+def list_traces(session, project_id: str, hours: int, page_size: int) -> dict:
+    """The traces in the last `hours`, at most `page_size` of them."""
+    start_str, end_str = window(hours)
+    params = {"startTime": start_str, "endTime": end_str, "pageSize": page_size}
+    url = TRACE_LIST_URL.format(project=urllib.parse.quote(project_id, safe=""))
+    return get_json(session, url, params=params)
+
+
+def get_trace(session, project_id: str, trace_id: str) -> dict:
+    """One trace with its spans."""
+    url = TRACE_GET_URL.format(
+        project=urllib.parse.quote(project_id, safe=""),
+        trace_id=urllib.parse.quote(trace_id, safe=""),
+    )
+    return get_json(session, url)
