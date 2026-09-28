@@ -25,14 +25,15 @@
 # number of `pull_request_opened` leaves the case declares, so a case that
 # asks for a pull request is graded on anything beyond it.
 #
-# What the lane cannot do yet, and the roster test enforces. The check dates
-# writes, it cannot sign them: a pull request a concurrent sibling case opened
-# in the same repository inside this repetition's window is indistinguishable
-# from this repetition's. No case on the lane requests a GitHub write today
-# (both remediation writers are nightly-only), so every write in a window is
-# unrequested; a presubmit seat for a case that requests one first needs an
-# attribution the check can read (#2079 tracks it), and
-# scripts/test_eval_rosters.py fails the seat until then.
+# How a sibling's write is told apart. The check dates writes, it cannot sign
+# them, and the fan-out runs cases side by side against one repository. So
+# hack/ci-eval-pr.sh exports the cases that request a pull request
+# (BENCH_REQUESTING_CASES, from the same leaf count as the allowance above)
+# and each unit records when it ran (BENCH_FANOUT_STATE_DIR); a write that
+# falls inside a requesting case's unit is that case's to grade, and a
+# sibling repetition attributes it rather than failing on it. A write made
+# while no requesting case was running is unrequested wherever it landed.
+# scripts/test_eval_rosters.py pins the set of requesting cases.
 #
 # WHO APPROVES. The normal approvers, as for inject-lane-exclusions.txt: this
 # file changes what the inject lane grades, not what can red a pull request

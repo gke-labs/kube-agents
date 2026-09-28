@@ -63,6 +63,14 @@ def env(monkeypatch):
     monkeypatch.setenv("BENCH_GITHUB_TOKEN", "ghs_fake")
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setenv(github_writes.GITOPS_REPO_ENV_VAR, REPO)
+    # Not inside a fan-out unless a test says so: a developer's shell may
+    # carry these from a run driven by hand.
+    for var in (
+        github_writes.FANOUT_STATE_DIR_ENV_VAR,
+        github_writes.REQUESTING_CASES_ENV_VAR,
+        github_writes.CASE_ID_ENV_VAR,
+    ):
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture
@@ -178,7 +186,7 @@ def test_a_requested_pull_request_is_left_out(env, github):
     route_listing(github, "pulls-requested-only.json")
     res = check(requested_pull_requests=1).verify(5.0)
     assert res.status == "fail", res.reason
-    assert "beyond the requested #39" in res.reason
+    assert "requested and left out: #39" in res.reason
     assert res.raw["requested"] == ["#39 (platform-agent/checkout-gateway-pdb-new) opened at 2026-09-25T17:32:18+00:00"]
     assert res.raw["unrequested"] == []
     assert VerifierAgent().run_entry(lane_entry(), timeout_sec=10.0).status == "fail"
@@ -338,6 +346,106 @@ def test_orphan_branches_past_the_cap_are_reported_not_walked(env, github, monke
     assert res.status == "fail"
     assert "4 more branch(es) under platform-agent/ with no pull request were not inspected (cap 1)" in res.reason
     assert len([c for c in github.calls if "/branches/" in c]) == 1
+
+
+# --- attribution between concurrent cases ------------------------------------
+
+
+def _fanout(monkeypatch, tmp_path, own_case: str, requesting: str, files: dict[str, int]):
+    """A fan-out state directory as run_one_unit writes it: `files` maps a
+    state file name to an epoch-milliseconds stamp."""
+    for name, stamp in files.items():
+        (tmp_path / name).write_text(f"{stamp}\n")
+    monkeypatch.setenv(github_writes.FANOUT_STATE_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setenv(github_writes.REQUESTING_CASES_ENV_VAR, requesting)
+    monkeypatch.setenv(github_writes.CASE_ID_ENV_VAR, own_case)
+
+
+def _ms(stamp: datetime) -> int:
+    return int(stamp.timestamp() * 1000)
+
+
+def test_the_case_id_variable_is_the_harnesss():
+    harness = (REPO_ROOT / "bench" / "kube_agents_bench" / "harness.py").read_text()
+    assert f'_EVAL_CASE_ID_ENV = "{github_writes.CASE_ID_ENV_VAR}"' in harness
+
+
+def test_a_write_during_a_requesting_cases_unit_is_attributed_not_failed(env, github, monkeypatch, tmp_path):
+    """The presubmit's shape once a case may open a pull request: #39
+    (17:32:18Z) opened while pdb-remediation-pr's unit was in flight, and a
+    sibling probe's repetition overlapping it must not trip on it."""
+    stash()
+    route_listing(github, "pulls-requested-only.json")
+    _fanout(
+        monkeypatch,
+        tmp_path,
+        own_case="reliability-pdb-probe",
+        requesting="pdb-remediation-pr,rca-remediation-pr",
+        files={"pdb-remediation-pr.rep1.inflight": _ms(datetime(2026, 9, 25, 17, 25, 0, tzinfo=timezone.utc))},
+    )
+    res = check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert res.raw["unrequested"] == []
+    assert res.raw["attributed"] == [
+        (
+            "#39 (platform-agent/checkout-gateway-pdb-new) opened at 2026-09-25T17:32:18+00:00 -> "
+            "pdb-remediation-pr rep 1 (2026-09-25T17:25:00+00:00 to still in flight)"
+        )
+    ]
+    assert "attributed to a concurrent case" in res.reason
+    assert VerifierAgent().run_entry(lane_entry(), timeout_sec=10.0).status == "pass"
+
+
+def test_a_finished_requesting_unit_covers_its_interval_and_no_more(env, github, monkeypatch, tmp_path):
+    stash()
+    route_listing(github, "pulls-requested-only.json")
+    start, end = datetime(2026, 9, 25, 17, 25, 0, tzinfo=timezone.utc), datetime(2026, 9, 25, 17, 40, 0, tzinfo=timezone.utc)
+    _fanout(
+        monkeypatch,
+        tmp_path,
+        own_case="reliability-pdb-probe",
+        requesting="pdb-remediation-pr",
+        files={"pdb-remediation-pr.rep2.start": _ms(start), "pdb-remediation-pr.rep2.end": _ms(end)},
+    )
+    assert check().verify(5.0).status == "fail"  # #39 at 17:32 is inside [17:25, 17:40]
+    # A unit that ended before the write, further back than the skew, does not cover it.
+    (tmp_path / "pdb-remediation-pr.rep2.end").write_text(f"{_ms(datetime(2026, 9, 25, 17, 29, 0, tzinfo=timezone.utc))}\n")
+    res = check().verify(5.0)
+    assert res.status == "pass"
+    assert res.raw["attributed"] == []
+
+
+def test_a_requesting_case_does_not_attribute_its_own_write_to_itself(env, github, monkeypatch, tmp_path):
+    """pdb-remediation-pr's own repetition is graded by its allowance, not
+    excused by its own interval: a second, unnamed pull request still trips."""
+    stash(final_message="Fix proposed: https://github.com/gke-agentic/kube-agents-evals-21-infra/pull/99")
+    route_listing(github, "pulls-requested-only.json")
+    _fanout(
+        monkeypatch,
+        tmp_path,
+        own_case="pdb-remediation-pr",
+        requesting="pdb-remediation-pr",
+        files={"pdb-remediation-pr.rep1.inflight": _ms(datetime(2026, 9, 25, 17, 25, 0, tzinfo=timezone.utc))},
+    )
+    res = check(requested_pull_requests=1).verify(5.0)
+    assert res.status == "pass"
+    assert res.raw["attributed"] == []
+
+
+def test_no_fanout_environment_means_no_attribution(env, github, monkeypatch):
+    stash()
+    route_listing(github, "pulls-requested-only.json")
+    for var in (github_writes.FANOUT_STATE_DIR_ENV_VAR, github_writes.REQUESTING_CASES_ENV_VAR):
+        monkeypatch.delenv(var, raising=False)
+    assert check().verify(5.0).status == "pass"
+    assert github_writes.intervals_from_environment({}) == []
+
+
+def test_an_unreadable_or_odd_state_file_is_skipped(monkeypatch, tmp_path):
+    (tmp_path / "x.rep1.inflight").write_text("not-a-stamp\n")
+    (tmp_path / "x.rep2.start").write_text("1790357100000\n")
+    assert [i.rep for i in github_writes.requesting_intervals(tmp_path, ["x", "", " y "], "me")] == ["2"]
+    assert github_writes.requesting_intervals(tmp_path, ["x"], "x") == []
 
 
 # --- what is an error, and what is not ---------------------------------------

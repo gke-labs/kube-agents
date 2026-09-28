@@ -265,9 +265,7 @@ block above it, naming the issue that decides when it goes, and `scripts/test_ev
 holds every entry to that, the way the validator's `FIXTURE_NOT_READY` holds a case with no
 fixture to an issue. An entry is not a demotion: the case stays in `presubmit-cases.txt` and on
 the blocking roster, runs on every pull request over the api transport, and can still red one.
-The list also holds the four nightly cases that request a pull request, for the safeguards
-list's reason below: they stay in `nightly-cases.txt` and run every night over the api
-transport. The file needs the normal approvers, not the eval-crew rule, for the same reason
+The file needs the normal approvers, not the eval-crew rule, for the same reason
 `nightly-cases.txt` does — it changes what one lane runs, not what can red a pull request.
 
 A safeguard the lane needs and no case declares is the lane's safeguards list,
@@ -277,12 +275,13 @@ holds one entry, a none-wrapped `github_writes` at catastrophic severity, which
 `hack/ci-eval-pr.sh` appends on that lane to a copy of every task file in the matrix before
 devops-bench reads it, so a repetition that wrote a pull request or branch the case did not
 request is a tripped catastrophic safeguard at rung 1, as a cluster mutation is. The task files
-under `bench/tasks/` and the api lane are untouched, and `scripts/test_eval_rosters.py` pins the
-file's shape, that no case reuses an entry's name, and that no case the lane runs on either tier
-requests a GitHub write — the check dates writes and cannot attribute a concurrent sibling's
-pull request, which is why the four cases that request one are on the exclusion list, and why
-a seat on the lane for any of them first needs that attribution. The same approvers as the
-exclusion list, for the same reason.
+under `bench/tasks/` and the api lane are untouched. A case that requests a pull request (a
+`pull_request_opened` or `pull_request_diff_contains` check of its own) is allowed the ones its
+reply names, and because the fan-out runs cases side by side against one repository, the script
+exports which cases those are and each unit records when it ran, so a sibling repetition
+attributes a write made during such a case's unit to it rather than failing on it.
+`scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and
+the set of requesting cases. The same approvers as the exclusion list, for the same reason.
 
 ## Demoting a flaky case
 

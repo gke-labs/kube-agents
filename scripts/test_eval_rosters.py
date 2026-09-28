@@ -278,13 +278,6 @@ class SplitLostNothingTest(unittest.TestCase):
 # are pinned.
 INJECT_LANE_EXCLUDED = [
     "agent-kanban-smoke",  # #2039: grades kanban_create by the front door; the inject door addresses platform directly
-    # #2079 (2026-09-28): the four cases that request a pull request, which
-    # the lane's github_writes safeguard cannot attribute between concurrent
-    # cases; all four are nightly-only, so the presubmit lane is unchanged.
-    "cluster-agent-crashloop-fix-request",
-    "pdb-remediation-pr",
-    "rca-remediation-pr",
-    "vcs-review-feedback-read-back",
 ]
 
 
@@ -336,16 +329,12 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                 self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
 
     def test_an_exclusion_is_not_a_demotion(self):
-        # The api lane's rosters are untouched by an entry here: a presubmit
-        # case still runs on every pull request and can still red one, and a
-        # nightly case still runs every night.
+        # The api lane's roster is untouched by an entry here: the excluded
+        # case still runs on every pull request and can still red one.
         for case in INJECT_LANE_EXCLUDED:
             with self.subTest(case=case):
-                if case in eval_rosters.presubmit_cases():
-                    self.assertIn(case, eval_rosters.blocking_roster())
-                else:
-                    self.assertIn(case, eval_rosters.nightly_cases())
-        self.assertIn("agent-kanban-smoke", eval_rosters.presubmit_cases())
+                self.assertIn(case, eval_rosters.presubmit_cases())
+                self.assertIn(case, eval_rosters.blocking_roster())
 
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the
@@ -355,9 +344,18 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 INJECT_LANE_SAFEGUARDS = [
     "no-github-writes-the-case-did-not-request",  # #2079: a none-wrapped github_writes, catastrophic
 ]
-# The check type that requests a GitHub write, which no case on the lane may
-# declare until the safeguard can attribute a write to a repetition.
-REQUESTING_CHECK_TYPE = "pull_request_opened"
+# The registered cases whose checks request a pull request, at the
+# safeguard's introduction: what hack/ci-eval-pr.sh exports as
+# BENCH_REQUESTING_CASES on the lane, so a sibling repetition attributes a
+# write made during one of their units to it. A new requesting case edits
+# this set in the same pull request; the check types that count are
+# lane.REQUESTING_CHECK_TYPES.
+INJECT_LANE_REQUESTING = [
+    "cluster-agent-crashloop-fix-request",
+    "pdb-remediation-pr",
+    "rca-remediation-pr",
+    "vcs-review-feedback-read-back",
+]
 LANE_SAFEGUARD_LEAF_TYPE = "github_writes"
 
 
@@ -429,17 +427,27 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
                 declared = {str(e.get("name")) for e in self.task_spec(case) if isinstance(e, dict)}
                 self.assertFalse(declared & names, f"{case} declares a lane safeguard's name")
 
-    def test_no_case_on_the_lane_requests_a_github_write(self):
-        """Attribution is the gap: a `github_writes` check dates writes and a
-        concurrent sibling's pull request would trip it. The four cases that
-        declare `pull_request_opened` are in the exclusion list with that
-        reason, so this holds on both tiers; a new requesting case, or one
-        taken off the list, fails here until the lane can attribute a write
-        to a repetition (#2079)."""
+    def test_the_requesting_cases_are_the_pinned_set(self):
+        """A `github_writes` check dates writes, and the fan-out runs cases
+        side by side against one repository, so a case that requests a pull
+        request has to be known to its siblings: the script exports the set
+        the lane module computes from the specs, and a sibling attributes a
+        write made during such a case's unit to it. The set is pinned here so
+        a new requesting case is a reviewed edit, and derived from the same
+        module the script runs so the two cannot disagree."""
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench import lane
+
+        requesting = [c for c in self.lane_cases() if lane.requested_pull_requests(self.task_spec(c)) > 0]
+        self.assertEqual(sorted(requesting), INJECT_LANE_REQUESTING)
+        # The plain leaf walk here agrees with the module's on every lane case.
         for case in self.lane_cases():
             with self.subTest(case=case):
                 types = [t for e in self.task_spec(case) if isinstance(e, dict) for t in _leaf_types(e.get("check"))]
-                self.assertNotIn(REQUESTING_CHECK_TYPE, types, f"{case} requests a GitHub write on the inject lane")
+                self.assertEqual(
+                    sum(1 for t in types if t in lane.REQUESTING_CHECK_TYPES),
+                    lane.requested_pull_requests(self.task_spec(case)),
+                )
 
     def test_the_lane_still_runs_a_case_that_requests_nothing(self):
         # The safeguard changes what a case is graded on, not whether it

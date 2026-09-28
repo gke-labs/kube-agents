@@ -49,9 +49,10 @@ import argparse
 import os
 import sys
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 __all__ = [
@@ -60,10 +61,14 @@ __all__ = [
     "GitHubClient",
     "GitHubUnreadable",
     "GitHubWrite",
+    "UnitInterval",
     "WritesReport",
+    "attribute",
     "find_writes",
+    "intervals_from_environment",
     "main",
     "parse_github_time",
+    "requesting_intervals",
 ]
 
 #: Where the run learns the case's GitOps repository, ``owner/name``.
@@ -114,6 +119,29 @@ STATUS_OK = 200
 #: check's budget through devops-bench's ``single_call_timeout``).
 EXIT_UNREADABLE = 1
 DEFAULT_CALL_TIMEOUT_SECONDS = 30.0
+
+#: Attribution between concurrent cases. The fan-out in ``hack/ci-eval-pr.sh``
+#: runs units of different cases side by side against one repository, so a
+#: write inside this repetition's window may be a sibling's. The script
+#: exports the directory its units record themselves in
+#: (``BENCH_FANOUT_STATE_DIR``: ``<case>.rep<n>.inflight`` holding the unit's
+#: start in epoch milliseconds while it runs, ``<case>.rep<n>.start`` and
+#: ``.end`` once it is done) and the cases whose checks request a pull
+#: request (``BENCH_REQUESTING_CASES``, comma-separated, computed by
+#: ``lane.py`` from their specs). A write that falls inside a requesting
+#: case's interval is that case's to grade -- its own safeguard allows only
+#: the pull requests its reply names -- and is attributed rather than held
+#: against this repetition. ``EVAL_CASE_ID`` is this unit's own case, which
+#: the harness already reads under the same name (``harness.py``); a test
+#: pins the two.
+CASE_ID_ENV_VAR = "EVAL_CASE_ID"
+FANOUT_STATE_DIR_ENV_VAR = "BENCH_FANOUT_STATE_DIR"
+REQUESTING_CASES_ENV_VAR = "BENCH_REQUESTING_CASES"
+INFLIGHT_SUFFIX = ".inflight"
+START_SUFFIX = ".start"
+END_SUFFIX = ".end"
+REP_INFIX = ".rep"
+MS_PER_SECOND = 1000.0
 
 Transport = Callable[[str, str, float], tuple[int, Any]]
 
@@ -399,6 +427,95 @@ def find_writes(
             f"with no pull request were not inspected (cap {BRANCH_INSPECTION_CAP})"
         )
     return report
+
+
+@dataclass(frozen=True)
+class UnitInterval:
+    """When one unit of a requesting case ran: ``end`` is None while it is
+    still in flight."""
+
+    case: str
+    rep: str
+    start: datetime
+    end: datetime | None
+
+    def covers(self, when: datetime, skew: timedelta) -> bool:
+        if when < self.start - skew:
+            return False
+        return self.end is None or when <= self.end + skew
+
+    def describe(self) -> str:
+        until = self.end.isoformat() if self.end else "still in flight"
+        return f"{self.case} rep {self.rep} ({self.start.isoformat()} to {until})"
+
+
+def _stamp_file(path: Path) -> datetime | None:
+    """An epoch-milliseconds stamp the fan-out wrote, or None."""
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        return datetime.fromtimestamp(int(text) / MS_PER_SECOND, tz=timezone.utc)
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+def requesting_intervals(
+    state_dir: Path, requesting_cases: Iterable[str], own_case: str
+) -> list[UnitInterval]:
+    """Every unit of every requesting case other than ``own_case`` the
+    fan-out has recorded in ``state_dir``: in flight (an ``.inflight`` stamp
+    and no ``.end``) or finished (``.start`` and ``.end``)."""
+    found: list[UnitInterval] = []
+    for case in requesting_cases:
+        case = case.strip()
+        if not case or case == own_case:
+            continue
+        seen: set[str] = set()
+        for marker in list(state_dir.glob(f"{case}{REP_INFIX}*{INFLIGHT_SUFFIX}")) + list(
+            state_dir.glob(f"{case}{REP_INFIX}*{START_SUFFIX}")
+        ):
+            rep = marker.name[len(case) + len(REP_INFIX) : -len(marker.suffix)]
+            if rep in seen:
+                continue
+            seen.add(rep)
+            # Built by name, not with_suffix(): a stem like `x.rep1` has
+            # `.rep1` as its suffix, which with_suffix would replace.
+            stem = f"{case}{REP_INFIX}{rep}"
+            start = _stamp_file(state_dir / (stem + START_SUFFIX)) or _stamp_file(
+                state_dir / (stem + INFLIGHT_SUFFIX)
+            )
+            if start is None:
+                continue
+            found.append(
+                UnitInterval(case=case, rep=rep, start=start, end=_stamp_file(state_dir / (stem + END_SUFFIX)))
+            )
+    return found
+
+
+def attribute(
+    writes: list[GitHubWrite], intervals: list[UnitInterval], skew: timedelta
+) -> tuple[list[GitHubWrite], list[tuple[GitHubWrite, UnitInterval]]]:
+    """Split ``writes`` into this repetition's and those a requesting case's
+    unit was running for."""
+    own: list[GitHubWrite] = []
+    theirs: list[tuple[GitHubWrite, UnitInterval]] = []
+    for write in writes:
+        owner = next((i for i in intervals if i.covers(write.when, skew)), None)
+        if owner is None:
+            own.append(write)
+        else:
+            theirs.append((write, owner))
+    return own, theirs
+
+
+def intervals_from_environment(environ: Mapping[str, str]) -> list[UnitInterval]:
+    """The requesting cases' intervals the fan-out exported, or none outside it."""
+    state_dir = environ.get(FANOUT_STATE_DIR_ENV_VAR, "").strip()
+    requesting = environ.get(REQUESTING_CASES_ENV_VAR, "").strip()
+    if not state_dir or not requesting:
+        return []
+    return requesting_intervals(
+        Path(state_dir), requesting.split(","), environ.get(CASE_ID_ENV_VAR, "").strip()
+    )
 
 
 def _parse_since(text: str) -> datetime:

@@ -92,6 +92,7 @@ def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file:
             prelude,
             step,
             'echo "REPO=${BENCH_GITOPS_REPO-<unset>}"',
+            'echo "REQUESTING=${BENCH_REQUESTING_CASES-<unset>}"',
             'echo "DIR=${INJECT_LANE_TASKS_DIR-<unset>}"',
             'for t in "${TASKS[@]}"; do n="$(basename "$(dirname "${t}")")"; echo "PATH ${n} $(unit_task_path "${t}" "${n}")"; done',
         ]
@@ -99,7 +100,7 @@ def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file:
     # "Not set by the test" has to mean unset, not whatever the shell running
     # the tests exports: the transport switch and the two repository
     # variables, which a developer who drove the lane by hand has in theirs.
-    clean = {k: v for k, v in os.environ.items() if k not in ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO")}
+    clean = {k: v for k, v in os.environ.items() if k not in ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO", "BENCH_REQUESTING_CASES")}
     return subprocess.run(["bash", "-c", body], capture_output=True, text=True, check=False, env={**clean, **(env or {})})
 
 
@@ -125,6 +126,7 @@ class ApiLaneUntouchedTest(unittest.TestCase):
                 result = run_step(env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(value(result, "REPO"), "<unset>")
+                self.assertEqual(value(result, "REQUESTING"), "<unset>")
                 self.assertEqual(value(result, "DIR"), "")
                 for line in tagged(result, "PATH"):
                     name, path = line.split(" ", 1)
@@ -155,6 +157,17 @@ class InjectLaneTest(unittest.TestCase):
                 self.assertEqual(spec_names(pathlib.Path(path)), original + [LANE_ENTRY])
         self.assertIn("every task in the matrix carries the lane's safeguards", result.stdout)
         self.assertIn("BENCH_GITOPS_REPO=gke-agentic/kube-agents-evals-21-infra", result.stdout)
+        # No presubmit case requests a pull request, so the export is empty
+        # and the log says so.
+        self.assertEqual(value(result, "REQUESTING"), "")
+        self.assertIn("cases that request a pull request: none", result.stdout)
+
+    def test_the_requesting_cases_are_exported_for_attribution(self):
+        tasks = presubmit_tasks() + ["./tasks/pdb-remediation-pr/task.yaml", "./tasks/rca-remediation-pr/task.yaml"]
+        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}, tasks=tasks)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(value(result, "REQUESTING"), "pdb-remediation-pr,rca-remediation-pr")
+        self.assertIn("cases that request a pull request: pdb-remediation-pr,rca-remediation-pr", result.stdout)
 
     def test_the_task_files_under_bench_tasks_are_not_written(self):
         before = {p: p.read_bytes() for p in (BENCH_DIR / "tasks").glob("*/task.yaml")}
@@ -222,6 +235,13 @@ class WiringTest(unittest.TestCase):
         unit = re.search(r"^run_one_unit\(\) \{.*?^\}$", src, re.DOTALL | re.MULTILINE).group(0)
         self.assertIn('run_task="$(unit_task_path "${task}" "${name}")"', unit)
         self.assertIn('uv run devops-bench "${run_task}"', unit)
+        # The unit records its interval for the safeguard's attribution: the
+        # in-flight stamp before the bench, the start/end pair after it, the
+        # stamp removed once the pair is written, and the directory exported.
+        inflight = 'printf \'%s\\n\' "${start}" > "${STATE_DIR}/${name}.rep${rep}.inflight"'
+        self.assertIn('export BENCH_FANOUT_STATE_DIR="${STATE_DIR}"', unit)
+        self.assertLess(unit.index(inflight), unit.index("uv run devops-bench"))
+        self.assertLess(unit.index('.rep${rep}.end"'), unit.index('rm -f "${STATE_DIR}/${name}.rep${rep}.inflight"'))
         # Grading still reads the file under bench/tasks/: the scorer's
         # CaseSpec comes from there, and the lane entry reaches it through
         # the record's report.

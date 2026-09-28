@@ -1838,9 +1838,9 @@ fi
 # they were. bench/kube_agents_bench/lane.py refuses a lane entry whose name
 # a case already declares -- devops-bench would refuse the duplicate as a
 # parse error on every repetition of that case, after the lease -- and
-# scripts/test_eval_rosters.py pins the file's shape and that no case on the
-# lane requests a GitHub write, which the check cannot attribute between
-# concurrent cases (the four that do are in the exclusion list above).
+# scripts/test_eval_rosters.py pins the file's shape and the set of cases
+# that request a pull request, whose writes a sibling repetition attributes
+# to them (BENCH_REQUESTING_CASES, below) rather than failing on.
 INJECT_LANE_TASKS_DIR=""
 if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
   INJECT_LANE_REPO="${EVAL_LEDGER_REPO:-}"
@@ -1853,13 +1853,22 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
   fi
   export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"
   INJECT_LANE_TASKS_DIR="$(mktemp -d)"
-  if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.lane \
+  # One `<case> <copy> <requested>` line per task: the copy's path, and how
+  # many pull requests the case's own checks request. The cases with a
+  # non-zero count are exported for the safeguard's attribution: the fan-out
+  # runs cases side by side against one repository, and a write made while a
+  # requesting case's unit was in flight (run_one_unit records the interval
+  # in STATE_DIR) is that case's to grade -- its own safeguard allows only the
+  # pull requests its reply names -- not a sibling repetition's.
+  if ! INJECT_LANE_COPIES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.lane \
       --safeguards "${SCRIPT_DIR}/${EVAL_INJECT_LANE_SAFEGUARDS_FILE}" \
-      --out-dir "${INJECT_LANE_TASKS_DIR}" "${TASKS[@]}"); then
+      --out-dir "${INJECT_LANE_TASKS_DIR}" "${TASKS[@]}")"; then
     echo "ERROR: could not append the inject lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) to the matrix; the lane would run without its GitHub-write safeguard, so it does not start." >&2
     exit 1
   fi
-  echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: every task in the matrix carries the lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}"
+  INJECT_LANE_REQUESTING="$(printf '%s\n' "${INJECT_LANE_COPIES}" | awk '$3 > 0 { printf "%s%s", sep, $1; sep = "," }')"
+  export BENCH_REQUESTING_CASES="${INJECT_LANE_REQUESTING}"
+  echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: every task in the matrix carries the lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}; cases that request a pull request: ${INJECT_LANE_REQUESTING:-none}"
 fi
 
 # The task file a unit hands devops-bench: the lane's copy when the step
@@ -2688,7 +2697,14 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   export AGENT_DELEGATION_TIMEOUT
   local start end dir run_task
   run_task="$(unit_task_path "${task}" "${name}")"
+  # Where this unit records itself, for the inject lane's GitHub-write
+  # safeguard: a sibling repetition attributes a write made while a
+  # requesting case's unit was in flight to that case (the `.inflight` stamp
+  # below, the `.start`/`.end` pair once done). Inert on the api lane, where
+  # nothing reads it.
+  export BENCH_FANOUT_STATE_DIR="${STATE_DIR}"
   start="$(_now_ms)"
+  printf '%s\n' "${start}" > "${STATE_DIR}/${name}.rep${rep}.inflight"
   (cd "${BENCH_DIR}" && uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
   # `|| true`: a run that never printed a `results:` line must still write
@@ -2705,6 +2721,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   printf '%s\n' "${start}" > "${STATE_DIR}/${name}.rep${rep}.start"
   printf '%s\n' "${end}" > "${STATE_DIR}/${name}.rep${rep}.end"
   printf '%s\n' "${dir}" > "${STATE_DIR}/${name}.rep${rep}.dir"
+  # The pair above now carries the interval; the in-flight stamp goes.
+  rm -f "${STATE_DIR}/${name}.rep${rep}.inflight"
   local finished_reps=0 state
   for state in "${STATE_DIR}/${name}".rep*.end; do
     [ -e "${state}" ] && finished_reps=$((finished_reps + 1))

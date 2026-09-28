@@ -85,14 +85,15 @@ def test_a_case_that_requests_a_pull_request_gets_that_allowance(tmp_path):
     assert lane.REQUESTED_FIELD not in lane._leaves(load(again)["verification_spec"][-1]["check"])[0]
 
 
-def test_requested_counts_nested_leaves():
+def test_requested_counts_nested_leaves_of_both_requesting_types():
     spec = [
         {"name": "a", "check": {"type": "any", "checks": [{"type": "pull_request_opened"}, {"type": "report_contains"}]}},
-        {"name": "b", "check": {"type": "pull_request_opened"}},
+        {"name": "b", "check": {"type": "pull_request_diff_contains"}},
         {"name": "c", "check": {"type": "report_contains"}},
     ]
     assert lane.requested_pull_requests(spec) == 2
     assert lane.requested_pull_requests(None) == 0
+    assert lane.REQUESTING_CHECK_TYPES == {"pull_request_opened", "pull_request_diff_contains"}
 
 
 def test_a_name_collision_is_refused_before_anything_is_written(tmp_path):
@@ -153,9 +154,10 @@ def test_the_cli_prints_case_and_path_per_task_and_fails_loudly(tmp_path, capsys
     )
     out = capsys.readouterr().out.splitlines()
     assert rc == 0
+    # The third field is what the script turns into BENCH_REQUESTING_CASES.
     assert out == [
-        f"{READ_ONLY_CASE} {tmp_path / READ_ONLY_CASE / 'task.yaml'}",
-        f"{REQUESTING_CASE} {tmp_path / REQUESTING_CASE / 'task.yaml'}",
+        f"{READ_ONLY_CASE} {tmp_path / READ_ONLY_CASE / 'task.yaml'} 0",
+        f"{REQUESTING_CASE} {tmp_path / REQUESTING_CASE / 'task.yaml'} 1",
     ]
     rc = lane.main(["--safeguards", str(tmp_path / "missing.yaml"), "--out-dir", str(tmp_path), str(TASKS / READ_ONLY_CASE / "task.yaml")])
     assert rc == 1

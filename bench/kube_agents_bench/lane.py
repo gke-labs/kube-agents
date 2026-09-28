@@ -37,11 +37,14 @@ Two things a copy does that a plain append would not. An entry whose name a
 case already declares would be refused by devops-bench as a duplicate -- a
 parse error that reds every repetition of that case at rung 2, after the
 cluster lease -- so the collision is refused here, before it. And a case that requests a pull
-request (a ``pull_request_opened`` leaf in its own spec) has that many
-requested writes: every ``github_writes`` leaf appended to it gets
-``requested_pull_requests`` set to that count, so the lane's safeguard leaves
-the case's own pull request out and fails the repetition on anything beyond
-it.
+request (a leaf of a type in :data:`REQUESTING_CHECK_TYPES` in its own spec)
+has that many requested writes: every ``github_writes`` leaf appended to it
+gets ``requested_pull_requests`` set to that count, so the lane's safeguard
+leaves the case's own pull request out and fails the repetition on anything
+beyond it. The command line also reports that count per case, which the
+script exports as ``BENCH_REQUESTING_CASES`` so a sibling repetition can
+attribute a write made during such a case's unit to it
+(:mod:`kube_agents_bench.github_writes`, attribution).
 """
 
 from __future__ import annotations
@@ -66,9 +69,11 @@ __all__ = [
 SAFEGUARDS_KEY = "safeguards"
 #: The keys a check subtree nests children under, as ``cases.py`` walks them.
 CHECK_CHILD_KEYS = ("checks", "check")
-#: The check type that requests a pull request, and the check type whose
-#: allowance the lane sets from it.
-REQUESTING_CHECK_TYPE = "pull_request_opened"
+#: The check types that request a pull request -- ``pull_request_opened``
+#: (the remediation cases) and ``pull_request_diff_contains`` (a proposal
+#: graded on the diff the reply points at, #2079 item 2) -- and the check
+#: type whose allowance the lane sets from them.
+REQUESTING_CHECK_TYPES = frozenset({"pull_request_opened", "pull_request_diff_contains"})
 WRITES_CHECK_TYPE = "github_writes"
 REQUESTED_FIELD = "requested_pull_requests"
 #: What a task file names its checks under, and the file the copy is written as.
@@ -132,8 +137,8 @@ def load_lane_safeguards(path: str | Path) -> list[dict[str, Any]]:
 
 
 def requested_pull_requests(spec: Any) -> int:
-    """How many pull requests a task's own checks request: its
-    ``pull_request_opened`` leaves, wherever they nest."""
+    """How many pull requests a task's own checks request: its leaves of a
+    type in :data:`REQUESTING_CHECK_TYPES`, wherever they nest."""
     if not isinstance(spec, list):
         return 0
     return sum(
@@ -141,7 +146,7 @@ def requested_pull_requests(spec: Any) -> int:
         for entry in spec
         if isinstance(entry, dict)
         for leaf in _leaves(entry.get("check"))
-        if leaf.get("type") == REQUESTING_CHECK_TYPE
+        if leaf.get("type") in REQUESTING_CHECK_TYPES
     )
 
 
@@ -198,8 +203,11 @@ def append_lane_safeguards(
 def main(argv: list[str] | None = None) -> int:
     """Materialise every task given with the lane's safeguards appended.
 
-    Prints ``<case> <path>`` per task; exits non-zero, naming the file and
-    the fault, when the lane file or a task refuses the append.
+    Prints ``<case> <path> <requested>`` per task -- the copy's path and how
+    many pull requests the case's own checks request, which the script turns
+    into ``BENCH_REQUESTING_CASES`` for the safeguard's attribution; exits
+    non-zero, naming the file and the fault, when the lane file or a task
+    refuses the append.
     """
     parser = argparse.ArgumentParser(description=main.__doc__.splitlines()[0])
     parser.add_argument("--safeguards", required=True, help="the lane safeguards YAML file")
@@ -210,7 +218,8 @@ def main(argv: list[str] | None = None) -> int:
         safeguards = load_lane_safeguards(args.safeguards)
         for task in args.tasks:
             written = append_lane_safeguards(task, safeguards, args.out_dir)
-            print(f"{written.parent.name} {written}")
+            requested = requested_pull_requests(_load_task(Path(task)).get(SPEC_KEY))
+            print(f"{written.parent.name} {written} {requested}")
     except LaneSafeguardsError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

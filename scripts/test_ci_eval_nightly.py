@@ -342,13 +342,7 @@ class InjectLaneExclusionTest(unittest.TestCase):
         self.assertTrue(excluded, "the exclusions file parsed to no entries")
         self.assertEqual(lines_tagged(result, "TASK"), [e for e in presubmit_entries() if e not in excluded])
         for name in eval_rosters.inject_lane_exclusions():
-            line = f"AGENT_TRANSPORT=inject: {name} leaves the matrix"
-            if name in eval_rosters.presubmit_cases():
-                self.assertIn(line, result.stdout)
-            else:
-                # A nightly-only exclusion is not in this tier's matrix, so
-                # there is nothing to drop and nothing to say.
-                self.assertNotIn(line, result.stdout)
+            self.assertIn(f"AGENT_TRANSPORT=inject: {name} leaves the matrix", result.stdout)
         # The roster FILE is untouched (an exclusion is not a demotion), but
         # the export leaves the dropped names out: a roster name the suite
         # never grades would trip bench-gate's misspelled-roster banner on
