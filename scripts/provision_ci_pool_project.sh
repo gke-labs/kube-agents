@@ -38,6 +38,13 @@ PEM_FILE=""
 SKIP_FLEET="false"
 SKIP_HOST_CLUSTER="false"
 ALLOW_UNMAPPED="false"
+# The first commit a GitOps repository needs before anything can open a branch
+# in it; the reasoning sits with the same three values in
+# scripts/verify_ci_pool_project.py, which prints this call as the repair and
+# whose tests pin the two copies equal.
+readonly GITOPS_SEED_FILE="README.md"
+readonly GITOPS_SEED_MESSAGE="Initial commit"
+readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
 
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.
@@ -361,6 +368,21 @@ echo -e "\n==> [Step 1.4] Checking GitOps Repository & App Installation..."
 if ! gh repo view "${GITOPS_REPO}" >/dev/null 2>&1; then
   echo "Creating private GitOps repository ${GITOPS_REPO}..."
   gh repo create "${GITOPS_REPO}" --private --description="GitOps eval repository for ${PROJECT_ID}"
+fi
+
+# `defaultBranchRef` is null until the repository has a commit; the five
+# projects onboarded in late September sat like that for days, failing every
+# remediation repetition that leased them. A read that fails is not "empty":
+# seeding on it would write blind, so it stops the step instead.
+if ! GITOPS_DEFAULT_BRANCH="$(gh repo view "${GITOPS_REPO}" --json defaultBranchRef --jq '.defaultBranchRef.name')"; then
+  echo "ERROR: could not read the default branch of ${GITOPS_REPO}; not seeding it blind." >&2
+  exit 1
+fi
+if [ -z "${GITOPS_DEFAULT_BRANCH}" ]; then
+  echo "Seeding ${GITOPS_REPO} with its first commit (the repository has no branches)..."
+  gh api -X PUT "repos/${GITOPS_REPO}/contents/${GITOPS_SEED_FILE}" \
+    -f message="${GITOPS_SEED_MESSAGE}" \
+    -f content="$(printf '%s\n' "${GITOPS_SEED_CONTENT}" | base64 | tr -d '\n')" >/dev/null
 fi
 
 INST_JSON="$(gh api /orgs/gke-agentic/installations --jq ".installations[] | select(.app_id==${APP_ID})" 2>/dev/null || echo "")"

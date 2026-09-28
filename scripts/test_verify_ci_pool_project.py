@@ -4,6 +4,7 @@
 import base64
 import json
 import os
+import pathlib
 import re
 import subprocess
 import time
@@ -1290,19 +1291,51 @@ class GithubAppInstallationTest(unittest.TestCase):
     def test_repo_in_installation_passes(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra"})),
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra", "defaultBranchRef": {"name": "main"}})),
                 _ok(json.dumps({"id": 99, "repository_selection": "selected"})),
                 _ok("gke-agentic/kube-agents-evals-3-infra\ngke-agentic/kube-agents-evals-infra"),
             ]
             result = checker.check_github_repo_and_app("kube-agents-evals-3", self._APP_ID)
         self.assertTrue(result.passed, result.details)
 
+    def test_an_empty_repository_fails_and_names_the_seed_command(self):
+        # The five projects onboarded in late September: the repository existed,
+        # was private, and had no commits, so the broker could not resolve a base
+        # branch and every remediation repetition on them failed. `gh repo view`
+        # reports that as a null defaultBranchRef.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-35-infra", "defaultBranchRef": None})),
+                _ok(json.dumps({"id": 99, "repository_selection": "selected"})),
+                _ok("gke-agentic/kube-agents-evals-35-infra"),
+            ]
+            result = checker.check_github_repo_and_app("kube-agents-evals-35", self._APP_ID)
+        self.assertFalse(result.passed)
+        empty = [d for d in result.details if "has no commits" in d]
+        self.assertEqual(1, len(empty), result.details)
+        self.assertIn("gh api -X PUT repos/gke-agentic/kube-agents-evals-35-infra/contents/README.md", empty[0])
+        self.assertIn("Initial commit", empty[0])
+        # The call asked for the field, so a null is an answer and not a missing key.
+        self.assertIn("defaultBranchRef", " ".join(run.call_args_list[0].args[0]))
+
+    def test_the_seed_the_verifier_prints_is_the_one_provisioning_makes(self):
+        # One commit, defined twice: the provisioning script makes it, the
+        # verifier prints it as the repair. They drift apart unless pinned.
+        script = (pathlib.Path(__file__).resolve().parent / "provision_ci_pool_project.sh").read_text()
+        for name, value in (
+            ("GITOPS_SEED_FILE", checker.GITOPS_SEED_FILE),
+            ("GITOPS_SEED_MESSAGE", checker.GITOPS_SEED_MESSAGE),
+            ("GITOPS_SEED_CONTENT", checker.GITOPS_SEED_CONTENT),
+        ):
+            self.assertIn(f'{name}="{value}"', script, name)
+        self.assertIn('contents/${GITOPS_SEED_FILE}', script)
+
     def test_repo_absent_from_installation_fails(self):
         # The regression this check exists for: the installation is healthy and
         # repository_selection is 'selected', but this project's repo is not in it.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra"})),
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra", "defaultBranchRef": {"name": "main"}})),
                 _ok(json.dumps({"id": 99, "repository_selection": "selected"})),
                 _ok("gke-agentic/kube-agents-evals-infra\ngke-agentic/kube-agents-evals-2-infra"),
             ]
@@ -1315,7 +1348,7 @@ class GithubAppInstallationTest(unittest.TestCase):
         # really is "the App is not installed" and must keep failing.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra"})),
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra", "defaultBranchRef": {"name": "main"}})),
                 _ok(""),
             ]
             result = checker.check_github_repo_and_app("kube-agents-evals-3", self._APP_ID)
@@ -1328,7 +1361,7 @@ class GithubAppInstallationTest(unittest.TestCase):
         # installed" names a correctly configured org as the defect.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-6-infra"})),
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-6-infra", "defaultBranchRef": {"name": "main"}})),
                 (1, "", "gh: Not Found (HTTP 404)"),
             ]
             result = checker.check_github_repo_and_app("kube-agents-evals-6", self._APP_ID)
@@ -1345,7 +1378,7 @@ class GithubAppInstallationTest(unittest.TestCase):
         # about an org nothing had been read from.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-6-infra"})),
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-6-infra", "defaultBranchRef": {"name": "main"}})),
                 (124, "", "timed out after 120s: gh api /orgs/gke-agentic/installations"),
             ]
             result = checker.check_github_repo_and_app("kube-agents-evals-6", self._APP_ID)
@@ -1356,7 +1389,7 @@ class GithubAppInstallationTest(unittest.TestCase):
     def test_confirmation_flag_clears_the_warning_but_says_it_was_attested(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra"})),
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra", "defaultBranchRef": {"name": "main"}})),
                 _ok(json.dumps({"id": 99, "repository_selection": "selected"})),
                 (1, "", "gh: HTTP 403"),
             ]
@@ -1386,7 +1419,7 @@ class GithubAppInstallationTest(unittest.TestCase):
         # must not turn that into a pass -- machine evidence beats attestation.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra"})),
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra", "defaultBranchRef": {"name": "main"}})),
                 _ok(json.dumps({"id": 99, "repository_selection": "selected"})),
                 _ok("gke-agentic/some-other-repo"),
             ]
@@ -1402,7 +1435,7 @@ class GithubAppInstallationTest(unittest.TestCase):
         # be a false negative, so it warns instead.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra"})),
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra", "defaultBranchRef": {"name": "main"}})),
                 _ok(json.dumps({"id": 99, "repository_selection": "selected"})),
                 (1, "", "gh: HTTP 403"),
             ]
@@ -1426,7 +1459,7 @@ class GithubAppInstallationTest(unittest.TestCase):
     def test_repository_selection_all_fails(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra"})),
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra", "defaultBranchRef": {"name": "main"}})),
                 _ok(json.dumps({"id": 99, "repository_selection": "all"})),
                 _ok("gke-agentic/kube-agents-evals-3-infra"),
             ]
@@ -1437,7 +1470,7 @@ class GithubAppInstallationTest(unittest.TestCase):
     def test_no_installation_fails(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra"})),
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra", "defaultBranchRef": {"name": "main"}})),
                 _ok(""),
             ]
             result = checker.check_github_repo_and_app("kube-agents-evals-3", self._APP_ID)
@@ -1450,7 +1483,7 @@ class GithubAppInstallationTest(unittest.TestCase):
         two = json.dumps({"id": 99, "repository_selection": "selected"}) + "\n" + json.dumps({"id": 100})
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra"})),
+                _ok(json.dumps({"isPrivate": True, "name": "kube-agents-evals-3-infra", "defaultBranchRef": {"name": "main"}})),
                 _ok(two),
                 _ok("gke-agentic/kube-agents-evals-3-infra"),
             ]

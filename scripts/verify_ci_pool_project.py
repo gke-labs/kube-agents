@@ -111,6 +111,17 @@ VALID_CMEK_STATES = {"ENCRYPTED", "ALL_OBJECTS_ENCRYPTION_ENABLED"}
 
 DEFAULT_GITHUB_APP_ID = 4675512
 
+# The first commit a GitOps repository needs before the broker can open a
+# remediation branch in it: an empty repository has no default branch to
+# resolve a base from (gitops_workspace.GitOpsRepoEmpty). The pool's early
+# projects got this commit from the agent itself, which then held a local
+# clone with the write credential; writes now go through the broker,
+# fast-forward only, so nothing downstream can make it. Provisioning does,
+# and this check fails a project whose repository still has none.
+GITOPS_SEED_FILE = "README.md"
+GITOPS_SEED_MESSAGE = "Initial commit"
+GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
+
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
 # RSA_SIGN_PKCS1_2048_SHA256 and import_only, and the KSA that impersonates the
 # minter GSA is kubeagents-github-minter in the kubeagents-system namespace.
@@ -1768,6 +1779,15 @@ def _fleet_presence_result(
     return CheckResult(name, False, "Seeded fleet incomplete", details=[counts, *notes])
 
 
+def gitops_seed_command(repo_slug: str) -> str:
+    """The one `gh api` call that gives an empty GitOps repository its first commit."""
+    return (
+        f"gh api -X PUT repos/{repo_slug}/contents/{GITOPS_SEED_FILE} "
+        f"-f message='{GITOPS_SEED_MESSAGE}' "
+        f"-f content=\"$(printf '%s\\n' '{GITOPS_SEED_CONTENT}' | base64 | tr -d '\\n')\""
+    )
+
+
 def check_github_repo_and_app(
     project_id: str, app_id: int, repo_membership_confirmed: bool = False
 ) -> CheckResult:
@@ -1788,15 +1808,27 @@ def check_github_repo_and_app(
     # treating the second as unverified would make this check unable to report
     # the first -- and a GitOps repository that was never created is exactly the
     # onboarding gap it exists to catch. The message names both readings instead.
-    rc, out, err = run_cmd(["gh", "repo", "view", repo_slug, "--json", "isPrivate,name"])
+    rc, out, err = run_cmd(
+        ["gh", "repo", "view", repo_slug, "--json", "isPrivate,name,defaultBranchRef"]
+    )
     if rc != 0:
         passed = False
         details.append(f"Repository {repo_slug} not found or inaccessible: {err.strip()}")
     else:
         try:
-            if not _load_json(out).get("isPrivate"):
+            repo_info = _load_json(out)
+            if not repo_info.get("isPrivate"):
                 passed = False
                 details.append(f"Repository {repo_slug} is not private")
+            # `defaultBranchRef` is null until the repository has a commit. The
+            # broker resolves its base branch from it, so an empty repository
+            # fails every remediation repetition on the project.
+            if repo_info.get("defaultBranchRef") is None:
+                passed = False
+                details.append(
+                    f"Repository {repo_slug} has no commits on any branch, so the broker "
+                    f"cannot open a remediation branch in it. Seed it: {gitops_seed_command(repo_slug)}"
+                )
         except Exception as exc:
             passed = False
             details.append(f"Failed parsing gh repo view: {exc}")
