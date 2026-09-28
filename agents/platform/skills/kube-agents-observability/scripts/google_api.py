@@ -27,10 +27,16 @@ sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import credential_proxy_client  # noqa: E402
 
-# How long one relayed read may take end to end. Below the broker's own
-# API_RELAY_DEADLINE_S, so a slow upstream is reported by the helper's message
-# rather than by a broker 504.
-RELAY_TIMEOUT_SECONDS = 60
+# The longest silence a helper waits through on one relayed read: `requests`
+# applies it to the connect and then to each wait for bytes, not to the whole
+# read. The broker buffers the upstream's body before it writes a status
+# line, and answers 504 (UPSTREAM_TIMEOUT) when the upstream passes its own
+# API_RELAY_DEADLINE_S, 120 s in credential_proxy.py. This value sits above
+# that deadline so a slow Monitoring or Trace page is reported as the
+# broker's 504 naming the upstream, and the helper's own timeout means the
+# broker itself went quiet past the deadline it enforces. The test beside the
+# helpers holds the ordering against the broker's constant.
+RELAY_TIMEOUT_SECONDS = 150
 
 # The keys of the broker's refusal body (`/v1/gcp` answers 403 the way
 # `/v1/exec` does, naming the api_policy rule) and of a Google API error body.
@@ -113,12 +119,34 @@ def describe_failure(url: str, response) -> str:
     return f"HTTP {response.status_code} from {url}: {text[:ERROR_BODY_PREVIEW_CHARS]}"
 
 
+def timeout_exceptions() -> tuple[type[BaseException], ...]:
+    """What a timed-out read raises: the stdlib's, and `requests`' where the session is one.
+
+    `requests.exceptions.Timeout` is an `OSError` (`RequestException` subclasses
+    `IOError`), so without this it reads as the broker being unreachable, and
+    a broker that was reached and is waiting on Google is reported as down.
+    `requests` is imported here and not at module scope, as the client does:
+    it is in the sandbox image and a test's injected session need not be one.
+    """
+    try:
+        import requests
+    except ImportError:
+        return (TimeoutError,)
+    return (TimeoutError, requests.exceptions.Timeout)
+
+
 def get_json(session, url: str, *, params=None) -> dict:
     """One relayed GET, decoded; raises RelayError with the reason on anything else."""
     try:
         response = session.get(url, params=params, timeout=RELAY_TIMEOUT_SECONDS)
     except credential_proxy_client.TokenUnavailable as exc:
         raise RelayError(f"no caller token for the credential broker: {exc}") from exc
+    except timeout_exceptions() as exc:
+        raise RelayError(
+            f"the credential broker did not answer within {RELAY_TIMEOUT_SECONDS}s for {url}, "
+            f"past its own deadline for the upstream, so the broker or the path to it stalled "
+            f"rather than Google: {exc}"
+        ) from exc
     except OSError as exc:
         raise RelayError(f"could not reach the credential broker for {url}: {exc}") from exc
     if not HTTP_OK_FIRST <= response.status_code <= HTTP_OK_LAST:
