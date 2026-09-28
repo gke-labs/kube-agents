@@ -54,11 +54,14 @@ fixtures:
 
 verification_spec:
   # The positive half: a Cluster Agent profile worked the case, and the platform
-  # worker enumerated managed profiles via list_cluster_profiles. Because target
-  # cluster resolution does not create throwaway probe cards, worker_agents
-  # confirms that the crashloop investigation itself was delegated to the Cluster Agent.
-  # Terminal profile scripts are forbidden in the sandbox by no-stubbed-profile-scripts,
-  # while expected_output requires delegating the investigation to the Cluster Agent.
+  # worker enumerated managed profiles via list_cluster_profiles. Without worker_agents,
+  # a platform worker that searches every cluster itself passes the forbidden-script
+  # check while delegating nothing. Profile names are `cluster-<project>-<cluster>-<location>`;
+  # any of them counts because the fleet carries more than one cluster the search may reach.
+  # worker_agents verifies that a Cluster Agent profile worked cards in the run; delegation
+  # of the actual diagnosis (rather than inline diagnosis with fanned-out probe cards) is
+  # evaluated by expected_output alongside root-cause analysis.
+  # Terminal profile scripts are forbidden in the sandbox by no-stubbed-profile-scripts.
   - name: a-cluster-agent-did-the-work
     role: objective
     check:

@@ -871,8 +871,8 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
         self.assertIn("rca-names-the-oom", check_names)
         self.assertIn("the-crashloop-was-diagnosed-not-fixed", check_names)
         # Ineffective in-pod platform_control safeguard was removed;
-        # delegation is enforced by a-cluster-agent-did-the-work (worker_agents)
-        # and expected_output
+        # delegation is checked by a-cluster-agent-did-the-work (worker_agents)
+        # and evaluated by expected_output
         self.assertNotIn("no-inline-platform-mcp-diagnostics", check_names)
 
 
