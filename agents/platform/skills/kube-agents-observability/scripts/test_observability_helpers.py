@@ -628,7 +628,11 @@ class NoTokenInAnyHelperTest(unittest.TestCase):
             source = (HERE / name).read_text(encoding="utf-8")
             with self.subTest(helper=name):
                 self.assertIn("google_api.open_session()", source)
-                self.assertIn("google_api.", source)
+                # Every read goes through one of the module's readers.
+                self.assertTrue(
+                    any(f"google_api.{reader}(" in source for reader in ("get_json", "get_paginated", "list_traces")),
+                    f"{name} reads through none of google_api's readers",
+                )
                 # The Trace and Monitoring endpoints and the window arithmetic
                 # are written once, in google_api.py or in the one helper that
                 # reads that endpoint; no helper re-declares a Trace URL.
