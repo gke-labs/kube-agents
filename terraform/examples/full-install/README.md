@@ -632,29 +632,44 @@ Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 fully-qualified path the drift detector's `--subscription` flag takes.
 
 The subscription is the input to the drift detector of
-[`docs/designs/drift-detection.md`](../../../docs/designs/drift-detection.md),
-which does not exist yet: no code in this repository detects drift, so nothing
-consumes it. Turned on ahead of the detector, the sink publishes every mutating
+[`docs/designs/drift-detection.md`](../../../docs/designs/drift-detection.md).
+Its consumer,
+[`k8s-operator/cmd/drift-detector`](../../../k8s-operator/cmd/drift-detector/README.md),
+ships in the platform-agent images and starts inside the gateway pod when the
+`PlatformAgent` sets `spec.harness.driftDetector.enabled`. This composition
+does not set that field: the flag provisions the ingress, and enabling the
+detector is one leaf in `extra_helm_values`
+(`platformAgent = { harness = { driftDetector = { enabled = true } } }`). With
+the flag on, the composition does write the subscription's name into that
+block (`platformAgent.harness.driftDetector.subscription`), so a renamed
+`drift_pubsub_subscription` is the one the detector pulls from; the detector's
+compiled-in default is the module's default name, which is why an install that
+leaves the name alone would work without that wire and one that renames it
+would not. Turned on without the detector, the sink publishes every mutating
 call on every GKE cluster in the project (about 60k messages a day after the
 module's lease filter, per its README) into a subscription that retains them
-for 31 days and never expires: Pub/Sub storage cost and a backlog, not a
-running feature. `lifecycle.sh apply` adopts a topic, subscription or sink of
-those names left behind by an earlier install before applying, the way it
-adopts the stockout trio, so a re-install does not 409 on them. That adoption
-is by name and cannot tell a leftover from another install's live trio, so a
-second install in the same project that turns the flag on sets its own three
-names first ([Remote state](#remote-state)).
+for 31 days and never expires: Pub/Sub storage cost and a backlog until the
+detector is enabled. The reverse, the detector enabled on an install whose
+flag is off, is what the CRD field's description warns about: the process
+retries a pull that cannot succeed for the life of the pod, and the pod stays
+Ready. `lifecycle.sh apply` adopts a topic, subscription or sink of those
+names left behind by an earlier install before applying, the way it adopts
+the stockout trio, so a re-install does not 409 on them. That adoption is by
+name and cannot tell a leftover from another install's live trio, so a second
+install in the same project that turns the flag on sets its own three names
+first ([Remote state](#remote-state)).
 
 The variable is for a hand-driven apply. The installer front doors
 (`install.sh`, `upgrade.sh`) have no `install.env` key for it and regenerate
 `terraform.tfvars` without it on every run, so on a front-door install a
-`true` written into that file lasts until the next `upgrade.sh`, whose apply
-then plans the sink, topic and subscription (with up to 31 days of retained
-messages) for removal under `-auto-approve`; no guard refuses that the way
-`guard_pubsub_subscription` refuses a Chat rename. Through the front doors,
-set it as a `TF_VAR_enable_drift_pubsub=true` line in `install.env`, the same
-channel `agent_ksa_name` uses: every front door sources that file with
-`set -a`, and Terraform reads `TF_VAR_*` where the generated file is silent.
+`true` written into that file lasts until the next front-door run, whose
+apply then plans the sink, topic and subscription (with up to 31 days of
+retained messages) for removal under `-auto-approve`; no guard refuses that
+the way `guard_pubsub_subscription` refuses a Chat rename. Through the front
+doors, set it as a `TF_VAR_enable_drift_pubsub=true` line in `install.env`,
+the same channel `agent_ksa_name` uses: every front door sources that file
+with `set -a`, and Terraform reads `TF_VAR_*` where the generated file is
+silent.
 
 **Manual steps that no IaC can perform** — canonical walkthrough:
 [INSTALL.md § Enable Google Chat & Slack Integrations](../../../INSTALL.md#step-5-enable-google-chat--slack-integrations-manual-required-steps):

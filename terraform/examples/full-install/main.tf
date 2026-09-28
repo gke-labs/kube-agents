@@ -350,10 +350,12 @@ module "chat_pubsub" {
 # are composition variables, as the stockout trio's are, because lifecycle.sh
 # adopts them by name and a second install in the project has to be able to
 # name its own; the module's defaults decide the rest (retention, backoff, and
-# the cluster scope, every GKE cluster in the project). The detector that
-# consumes the subscription, k8s-operator/cmd/drift-detector, is not yet built
-# into any image or launched by any install (docs/designs/drift-detection.md),
-# so nothing reads it.
+# the cluster scope, every GKE cluster in the project). The consumer,
+# k8s-operator/cmd/drift-detector, ships in the images and starts in the
+# gateway pod when the PlatformAgent sets spec.harness.driftDetector.enabled;
+# this flag provisions its input and passes the subscription's name into that
+# block (the harness values below), and leaves enabling the detector to
+# extra_helm_values (docs/designs/drift-detection.md).
 module "drift_pubsub" {
   source = "../../modules/drift-pubsub"
   count  = var.enable_drift_pubsub ? 1 : 0
