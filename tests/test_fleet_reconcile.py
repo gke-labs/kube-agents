@@ -178,11 +178,11 @@ class PlanInspectionTest(unittest.TestCase):
         self.assertNotIn("apply", tofu.verbs())
 
     def test_a_show_that_is_json_but_not_an_object_is_that_projects_failure(self):
-        for body in ("[]", "null", '{"resource_changes": [null]}', '{"resource_changes": {"a": {}}}'):
+        for body in ("[]", "null", '{"resource_changes": [null]}', '{"resource_changes": {"a": {}}}', '{"resource_changes": [{"address": "a", "change": "x"}]}', '{"resource_changes": [{"address": "a", "change": {"actions": [null]}}]}'):
             tofu = _Tofu({P7: body})
             outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
             self.assertEqual(outcome, reconcile.OUTCOME_FAILED, body)
-            self.assertIn("not a JSON object", detail)
+            self.assertTrue(detail.startswith("tofu show wrote"), detail)
 
     def test_a_plan_with_nothing_to_do_applies_nothing(self):
         tofu = _Tofu({}, plan_exit={P7: reconcile.PLAN_NO_CHANGES})
@@ -460,25 +460,60 @@ class TofuRunnerTest(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 3.0, "the grace was waited out before the kill")
         self.assertLess(elapsed, 8)
 
+    def _stubborn_child(self, tmp):
+        """A child that records its pid, ignores SIGINT and sleeps."""
+        pidfile = os.path.join(tmp, "pid")
+        script = "import os, signal, time; open(%r, 'w').write(str(os.getpid())); signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(30)" % pidfile
+        return script, pidfile
+
+    def _assert_dead(self, pidfile):
+        pid = int(open(pidfile).read())
+        with self.assertRaises(ProcessLookupError, msg="the child is still running detached"):
+            os.kill(pid, 0)
+
     def test_a_second_termination_during_the_grace_kills_the_child(self):
         # A second Ctrl-C must not leave tofu running detached while the
-        # project goes back to the pool.
-        script = "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(30)"
-        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
-        first = threading.Timer(1.5, os.kill, args=(os.getpid(), signal.SIGINT))
-        second = threading.Timer(2.5, os.kill, args=(os.getpid(), signal.SIGINT))
-        started = time.monotonic()
-        try:
-            first.start()
-            second.start()
-            with mock.patch.object(reconcile, "INTERRUPT_GRACE_SECONDS", 20):
-                with self.assertRaises(boskos_pool.Terminated):
-                    reconcile.tofu_runner([sys.executable, "-c", script], timeout=30)
-        finally:
-            first.cancel()
-            second.cancel()
-            signal.signal(signal.SIGINT, previous)
-        self.assertLess(time.monotonic() - started, 8, "killed on the second signal, not after the 20 s grace")
+        # project goes back to the pool: the child is dead when the runner
+        # raises, and not before the second signal.
+        with tempfile.TemporaryDirectory() as tmp:
+            script, pidfile = self._stubborn_child(tmp)
+            previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+            first = threading.Timer(1.5, os.kill, args=(os.getpid(), signal.SIGINT))
+            second = threading.Timer(2.5, os.kill, args=(os.getpid(), signal.SIGINT))
+            started = time.monotonic()
+            try:
+                first.start()
+                second.start()
+                with mock.patch.object(reconcile, "INTERRUPT_GRACE_SECONDS", 20):
+                    with self.assertRaises(boskos_pool.Terminated):
+                        reconcile.tofu_runner([sys.executable, "-c", script], timeout=30)
+            finally:
+                first.cancel()
+                second.cancel()
+                signal.signal(signal.SIGINT, previous)
+            elapsed = time.monotonic() - started
+            self.assertGreaterEqual(elapsed, 2.5, "the first signal alone does not end it")
+            self.assertLess(elapsed, 8, "killed on the second signal, not after the 20 s grace")
+            self._assert_dead(pidfile)
+
+    def test_a_termination_during_the_ceilings_grace_is_what_propagates(self):
+        # The ceiling fires first, then Prow's SIGINT lands during the grace:
+        # the run must stop, not report the project as timed out and walk on.
+        with tempfile.TemporaryDirectory() as tmp:
+            script, pidfile = self._stubborn_child(tmp)
+            previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+            later = threading.Timer(2.5, os.kill, args=(os.getpid(), signal.SIGINT))
+            started = time.monotonic()
+            try:
+                later.start()
+                with mock.patch.object(reconcile, "INTERRUPT_GRACE_SECONDS", 20):
+                    with self.assertRaises(boskos_pool.Terminated):
+                        reconcile.tofu_runner([sys.executable, "-c", script], timeout=1.0)
+            finally:
+                later.cancel()
+                signal.signal(signal.SIGINT, previous)
+            self.assertLess(time.monotonic() - started, 8)
+            self._assert_dead(pidfile)
 
     def test_a_termination_signal_reaches_the_child_before_it_propagates(self):
         # Prow's entrypoint sends SIGINT to this process; with the script's

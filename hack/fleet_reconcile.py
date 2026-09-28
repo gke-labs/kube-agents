@@ -125,17 +125,22 @@ def tofu_runner(argv, cwd=None, timeout=None, **_):
     )
     try:
         out, err = proc.communicate(timeout=timeout)
-    except (subprocess.TimeoutExpired, boskos_pool.Terminated):
+    except (subprocess.TimeoutExpired, boskos_pool.Terminated) as first:
         proc.send_signal(signal.SIGINT)
         try:
             proc.communicate(timeout=INTERRUPT_GRACE_SECONDS)
-        except (subprocess.TimeoutExpired, boskos_pool.Terminated):
-            # The grace ran out, or a second signal cut it short: either way
-            # tofu is killed before the project is released, never left
-            # running detached under a project handed back to the pool.
+        except (subprocess.TimeoutExpired, boskos_pool.Terminated) as second:
+            # The grace ran out, or a signal cut it short: either way tofu is
+            # killed before the project is released, never left running
+            # detached under a project handed back to the pool. A termination
+            # that lands during the ceiling's grace is the one that propagates:
+            # a bare raise here would re-raise the ceiling and the run would
+            # carry on into the next project under Prow's kill timer.
             proc.kill()
             proc.communicate()
-        raise
+            if isinstance(second, boskos_pool.Terminated):
+                raise second
+        raise first
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
@@ -162,9 +167,11 @@ def plan_changes(show_json):
         raise ReconcileError("tofu show wrote a plan that is not a JSON object")
     changes = []
     for change in document.get("resource_changes") or []:
-        if not isinstance(change, dict):
+        if not isinstance(change, dict) or not isinstance(change.get("change") or {}, dict):
             raise ReconcileError("tofu show wrote a resource change that is not a JSON object")
         actions = list((change.get("change") or {}).get("actions") or [])
+        if not all(isinstance(action, str) for action in actions):
+            raise ReconcileError("tofu show wrote a resource change whose actions are not strings")
         if actions and actions not in IGNORED_ACTIONS:
             changes.append((actions, change.get("address") or "?"))
     return changes

@@ -450,9 +450,11 @@ if ! gcloud storage buckets describe "gs://${STATE_BUCKET}" >/dev/null 2>&1; the
   gcloud storage buckets update "gs://${STATE_BUCKET}" --versioning
 fi
 # The reconciler reads and writes the fleet's state here, beside the host
-# cluster's, which carries the install's secrets and is not its to read: list
-# on the bucket (`tofu init` lists it, which a grant conditioned on the object
-# name does not cover) and objectAdmin under the seeded-fleet/ prefix only.
+# cluster's, which carries the install's secrets: list on the bucket (`tofu
+# init` lists it, which a grant conditioned on the object name does not cover)
+# and objectAdmin under the seeded-fleet/ prefix only. The prefix keeps tofu's
+# reads off the other state; the identity's project IAM admin above could
+# widen it, so the fence is that only main-only jobs run as this account.
 gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
   --member="${FLEET_RECONCILER_SA}" \
   --role=roles/storage.legacyBucketReader \

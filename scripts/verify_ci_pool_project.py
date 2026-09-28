@@ -310,8 +310,11 @@ PROW_RUNNER_ROLES = {
 # two Prow periodics on main; docs/ci-pool-projects.md section 6.2). It
 # re-applies bench/tf/fleet under a Boskos lease, so it holds what that apply
 # needs on the project, list on the state bucket and objectAdmin under its
-# seeded-fleet/ prefix, nothing else -- the host cluster's state shares that
-# bucket and carries the install's secrets, so the reconciler must not read it; the
+# seeded-fleet/ prefix, nothing else. The prefix keeps tofu's own reads off the
+# host cluster's state, which shares the bucket and carries the install's
+# secrets; it is not a fence against the identity, which holds project IAM
+# admin (the stack declares project bindings) and could widen its own grant.
+# What bounds the identity is that only main-only jobs run as it; the
 # presubmit's runner is never granted the job. Kept equal to the grant loop in
 # scripts/provision_ci_pool_project.sh and the repair block in
 # docs/ci-pool-projects.md by scripts/test_verify_ci_pool_project.py.
