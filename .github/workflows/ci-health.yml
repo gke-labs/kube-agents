@@ -206,15 +206,16 @@ env:
   # projects scanned at once, the ceiling per project for the runner and the
   # state check together (a healthy project takes ~20 s; the ceiling is for
   # a hung API server), and the ceiling for the whole scan. The scan ceiling
-  # must cover every wave of the mapped pool at the per-project ceiling
-  # (ceil(35 / 7) = 5 waves, 1500 s, plus a margin; a test pins it against
-  # hack/ci-deploy.sh's mapping), or a pool-wide stall kills the step and
-  # publishes nothing instead of "not checked" entries.
+  # must cover every wave of the mapped pool at the per-project ceiling plus
+  # the 60 s token mint that precedes it (ceil(35 / 7) = 5 waves of 360 s,
+  # 1800 s, plus a margin; a test pins it against hack/ci-deploy.sh's
+  # mapping), or a pool-wide stall kills the step and publishes nothing
+  # instead of "not checked" entries.
   FIXTURE_STATE_WORKERS: "7"
   FIXTURE_STATE_PROJECT_TIMEOUT_S: "300"
-  FIXTURE_STATE_TIMEOUT_S: "1620"
+  FIXTURE_STATE_TIMEOUT_S: "1920"
   # The pool-state scan's knobs (scripts/eval_dashboard/pool_state.py), the
-  # same arithmetic as the fleet scan's.
+  # same arithmetic without the mint (5 waves of 300 s, plus a margin).
   POOL_STATE_WORKERS: "7"
   POOL_STATE_PROJECT_TIMEOUT_S: "300"
   POOL_STATE_TIMEOUT_S: "1620"
@@ -752,7 +753,7 @@ jobs:
       # the publisher itself. It publishes even when the fleet scan above
       # failed the step, and vice versa, since each has its own document.
       - name: Fetch the previous pool-state scan
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           gsutil -q cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state-prior.json || echo "no previous pool-state.json; first scan"
 
@@ -762,7 +763,7 @@ jobs:
       # repository bug (no project mapping, no verifier) or the ceiling
       # exits non-zero here.
       - name: Scan every pool project's shape
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           timeout "$POOL_STATE_TIMEOUT_S" python3 scripts/eval_dashboard/pool_state.py \
             --out work/pool-state.json \
@@ -771,7 +772,7 @@ jobs:
             --project-timeout "$POOL_STATE_PROJECT_TIMEOUT_S"
 
       - name: Upload pool-state.json next to fixture-state.json
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           test -s work/pool-state.json || { echo "::error::the pool-state scan wrote no document"; exit 1; }
           gsutil -q -h "Cache-Control: no-cache" cp work/pool-state.json "$DASHBOARD_BUCKET/pool-state.json"

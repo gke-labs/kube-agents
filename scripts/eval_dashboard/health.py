@@ -1922,6 +1922,16 @@ def _scan_hold(scan_result: dict, incident: dict | None, label: str) -> str | No
     )
     if unread:
         return f"the {label} scan could not read {_project_list(unread)}"
+    # Readable is not clean: the repeat rule that re-fires a persisting drift
+    # reads the previous document, so an unread scan or a lost prior in
+    # between lets the same drift arrive as "new" and not fire. The exit asks
+    # the scan itself.
+    current = scan_result.get("current") or {}
+    still = sorted(
+        project for project in incident.get("projects") or [] if roles & set(current.get(project) or [])
+    )
+    if still:
+        return f"the {label} scan still shows the drift on {_project_list(still)}"
     return None
 
 

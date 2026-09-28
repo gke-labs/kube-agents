@@ -73,7 +73,10 @@ for check in checks:
                             "details": record.get("details", []), "warnings": record.get("warnings", []), "unread": record.get("unread", []), "findings": record.get("findings", [])}
 with open(flag("--report"), "w") as fh:
     json.dump(doc, fh)
-sys.exit(entry.get("exit", 0))
+code = max((record.get("exit", 0) for record in entry.values() if isinstance(record, dict)), default=0)
+with open(os.environ["STUB_LOG"], "a") as fh:
+    fh.write("exit %s %d\n" % (project, code))
+sys.exit(code)
 '''
 
 
@@ -110,7 +113,10 @@ class ScanHarness(unittest.TestCase):
         )
 
     def calls(self):
-        return [line.split() for line in self.log.read_text().splitlines()]
+        return [line.split() for line in self.log.read_text().splitlines() if not line.startswith("exit ")]
+
+    def exits(self):
+        return [(parts[1], int(parts[2])) for parts in (line.split() for line in self.log.read_text().splitlines()) if parts[0] == "exit"]
 
 
 class TheChecksItAsksFor(unittest.TestCase):
@@ -150,6 +156,14 @@ class OneProject(ScanHarness):
         self.assertEqual(doc["summary"]["findings"], 1)
         self.assertEqual(doc["summary"]["drifted_projects"], 1)
 
+    def test_the_stub_exits_the_way_the_verifier_does(self):
+        # The fixtures' exit codes sit on the check records; the stub must
+        # exit with them or the tests below never see a non-zero verifier.
+        self.scan({PROJECT: report(iam=drifted())})
+        self.assertIn(("kube-agents-evals-2", 1), self.exits())
+        self.scan({OTHER: report(iam=unchecked())}, projects=(OTHER,))
+        self.assertIn(("kube-agents-evals-3", 2), self.exits())
+
     def test_the_verifiers_exit_code_is_not_the_verdict(self):
         # Exit 1 on a finding, 2 on an unread item: the report says which check,
         # and the scan reads that, not the code.
@@ -169,6 +183,16 @@ class OneProject(ScanHarness):
         self.assertEqual(doc["projects"][PROJECT]["checks"]["iam"], {"state": "healthy", "detail": ["Could not read the project IAM policy"], "unread": ["Could not read the project IAM policy"]})
         self.assertEqual(pool_state.read_map(doc)[PROJECT], sorted(set(CHECKS) - {"iam"}))
         self.assertEqual(pool_state.checked_projects(doc), 1)
+
+    def test_a_drifted_check_with_a_refused_read_is_not_read_in_full(self):
+        # A missing binding read off one policy beside a 429 on another: the
+        # finding is real, and the refused read may hide the incident's.
+        record = dict(drifted(), warnings=["Could not read the project IAM policy: 429"], unread=["Could not read the project IAM policy: 429"])
+        doc = self.scan({PROJECT: report(iam=record)})
+        self.assertEqual(doc["projects"][PROJECT]["checks"]["iam"]["state"], "drifted")
+        self.assertEqual(doc["projects"][PROJECT]["checks"]["iam"]["unread"], ["Could not read the project IAM policy: 429"])
+        self.assertEqual(pool_state.read_map(doc)[PROJECT], sorted(set(CHECKS) - {"iam"}))
+        self.assertIn(FINDING, doc["projects"][PROJECT]["findings"])
 
     def test_advice_on_a_read_that_happened_still_counts_as_read_in_full(self):
         # The minter check warns about a second ENABLED key version on a
@@ -296,7 +320,9 @@ class Workflow(unittest.TestCase):
         self.assertIn('--project-timeout "$POOL_STATE_PROJECT_TIMEOUT_S"', run)
         self.assertIn('timeout "$POOL_STATE_TIMEOUT_S"', run)
         for step in (steps[scan], steps[scan - 1], steps[scan + 1]):
-            self.assertEqual(step.get("if"), "always()", f"{step.get('name')} must run whether or not the fleet scan's step failed")
+            # Not `always()`: that would also run the pool scan after an auth
+            # or setup failure, and after a cancel or the job's own timeout.
+            self.assertEqual(step.get("if"), "${{ !cancelled() }}", f"{step.get('name')} must run whether or not the fleet scan's step failed, and not after a cancel")
         upload = next(step for step in steps if "cp work/pool-state.json" in step.get("run", ""))
         self.assertIn('"$DASHBOARD_BUCKET/pool-state.json"', upload["run"])
         self.assertIn("Fetch the previous pool-state scan", names)
@@ -312,9 +338,12 @@ class Workflow(unittest.TestCase):
         env = self.doc["env"]
         mapped = len(pool_state.pool_projects(pool_state.CI_DEPLOY_SCRIPT.read_text()))
         self.assertGreaterEqual(mapped, 35)
+        # The fleet scan mints a token (up to IMPERSONATE_TIMEOUT_S) before
+        # its per-project deadline starts; the pool scan has no such step.
+        mint = {"FIXTURE_STATE": pool_state.fixture_state.IMPERSONATE_TIMEOUT_S, "POOL_STATE": 0}
         for prefix in ("FIXTURE_STATE", "POOL_STATE"):
             waves = math.ceil(mapped / int(env[f"{prefix}_WORKERS"]))
-            self.assertGreater(int(env[f"{prefix}_TIMEOUT_S"]), waves * int(env[f"{prefix}_PROJECT_TIMEOUT_S"]), prefix)
+            self.assertGreater(int(env[f"{prefix}_TIMEOUT_S"]), waves * (int(env[f"{prefix}_PROJECT_TIMEOUT_S"]) + mint[prefix]), prefix)
         both = int(env["FIXTURE_STATE_TIMEOUT_S"]) + int(env["POOL_STATE_TIMEOUT_S"])
         self.assertGreater(self.jobs["fixture-state-scan"]["timeout-minutes"] * 60, both + 600, "setup and the uploads need their ten minutes")
         self.assertGreaterEqual(self.jobs["fixture-state-scan"]["timeout-minutes"] * 60, int(env["FIXTURE_STATE_TIMEOUT_S"]) + int(env["POOL_STATE_TIMEOUT_S"]))

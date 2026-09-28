@@ -2227,9 +2227,14 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "fixture_drift", health.iso(T0)))
         cleared = self.judge(scan(at=later - timedelta(minutes=5)), prev=held, now=later)
         self.assertEqual((cleared["state"], cleared["condition"], cleared["recovering"]), ("GREEN", None, False), "no three-green-runs bar: the scan is the recovery")
-        # One project still drifted, not repeated: the condition is over.
+        # One of the incident's projects still drifted: not enough to enter,
+        # but the scan still shows the drift, so it is not the recovery either.
         one = self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, at=later - timedelta(minutes=5)), prev=held, now=later)
-        self.assertEqual(one["state"], "GREEN")
+        self.assertEqual((one["state"], one["condition"]), ("DEGRADED", "fixture_drift"))
+        self.assertIn(f"fixture drift held: the fixture-state scan still shows the drift on {project(1)}; a scan that reads those projects clean ends it", one["evidence"])
+        # A project outside the incident drifting once does not hold it.
+        elsewhere = self.judge(scan(drifted={project(9): [DRIFT_ROLE]}, at=later - timedelta(minutes=5)), prev=held, now=later)
+        self.assertEqual(elsewhere["state"], "GREEN")
 
     def test_a_scan_that_could_not_see_the_incident_holds_it(self):
         firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
@@ -2397,6 +2402,19 @@ class PoolDrift(unittest.TestCase):
                 still = self.judge(doc, prev=prev, now=later)
                 self.assertEqual((still["state"], still["condition"], still["incident"]), ("DEGRADED", "pool_drift", prev["incident"]))
                 self.assertIn(f"pool drift held: {why}; a scan that reads those projects clean ends it", still["evidence"])
+
+    def test_a_scan_that_still_shows_the_drift_holds_it_even_when_the_repeat_rule_misses(self):
+        # An unread scan or a lost prior in between makes the same drift
+        # arrive as "new" on one project, which does not fire; the exit must
+        # ask the scan whether the finding is still there, not only whether
+        # the check was readable.
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        persisting = pool_scan(at=later - timedelta(minutes=5), drifted={project(2): [FINDING]}, previous={})
+        held = self.judge(persisting, prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
+        self.assertIn(f"pool drift held: the pool-state scan still shows the drift on {project(2)}; a scan that reads those projects clean ends it", held["evidence"])
 
     def test_a_fixture_incident_recorded_before_reads_existed_still_exits_on_its_roles(self):
         # The live health.json at merge time may hold a fixture_drift incident

@@ -89,9 +89,10 @@ CHECK_IDS = (
 # on which of them decided.
 DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c != CHECK_TOKEN_MINTER_KMS)
 # The checks that need `gh`: check_toolchain asks for it only when one of
-# these is selected, so the pool-state scan, whose identity has no GitHub
-# credential, is not stopped at the door for a tool no selected check uses.
-GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_LEDGER_READ_CREDENTIAL, CHECK_TOKEN_MINTER})
+# these is selected, so a run without it -- the pool-state scan, or a hand
+# run of the minter or ledger checks, which read GitHub over urllib and KMS
+# over gcloud -- is not stopped at the door for a tool no selected check uses.
+GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP})
 # What the hourly pool-state scan runs: every read-only check on the project.
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
 # two GitHub checks (each needs a credential the health bot must not hold),
@@ -964,8 +965,10 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
             True,
             f"Project number: {project_number}; enabled APIs not checked",
             warnings=[
-                f"Could not list the enabled services on {project_id}, so the {len(REQUIRED_APIS)} required "
-                f"API(s) were not checked: {reason}"
+                Unread(
+                    f"Could not list the enabled services on {project_id}, so the {len(REQUIRED_APIS)} required "
+                    f"API(s) were not checked: {reason}"
+                )
             ],
         )
 
@@ -3053,9 +3056,15 @@ def report_document(project_id: str, checks: List[CheckResult], now: Optional[da
         check_id = check.check_id or check.name
         status = report_status(check)
         findings = [finding.as_dict() for finding in check.findings]
-        if status == REPORT_STATUS_FAIL and not findings:
-            observed = "; ".join([check.message, *check.details]).strip("; ")
-            findings = [Finding(f"{check_id}/{REPORT_FINDING_FAILED}", observed).as_dict()]
+        if status == REPORT_STATUS_FAIL:
+            # A failing detail no finding names -- a GSA absent, a listing
+            # that failed, a policy that would not parse -- is still a unit the
+            # scan must see, beside whatever findings the check did name.
+            named = {finding.observed for finding in check.findings}
+            unnamed = [line for line in check.details if line not in named]
+            if not findings or unnamed:
+                observed = "; ".join([check.message, *unnamed]).strip("; ") if unnamed or not findings else check.message
+                findings.append(Finding(f"{check_id}/{REPORT_FINDING_FAILED}", observed).as_dict())
         out[check_id] = {
             "name": check.name,
             "status": status,

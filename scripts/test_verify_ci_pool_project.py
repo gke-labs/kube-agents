@@ -148,6 +148,18 @@ class DenialClassifierTest(unittest.TestCase):
             with self.subTest(err=err[:60]):
                 self.assertIsNone(checker._unread_reason(err), err)
 
+    def test_a_refused_services_list_is_an_unread_not_a_pass_in_full(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(json.dumps({"projectNumber": "123456"})),
+                _fail("ERROR: (gcloud.services.list) RESOURCE_EXHAUSTED: Quota exceeded"),
+            ]
+            _, result = checker.check_project_and_apis("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIsInstance(result.warnings[0], checker.Unread)
+        self.assertEqual(checker.report_document("kube-agents-evals-3", [result])["checks"][result.name]["unread"], list(result.warnings))
+
     def test_a_refused_read_is_recorded_as_unread(self):
         details, warnings = [], []
         checker._record_unreadable("ERROR: PERMISSION_DENIED: denied", "missing", "not checked", details, warnings)
@@ -3373,7 +3385,7 @@ class ChecksSelectionTest(unittest.TestCase):
     def _mocks(self):
         return {
             name: mock.patch.object(checker, name, return_value=checker.CheckResult(name, True))
-            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_ledger_read_credential")
+            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_ledger_read_credential", "check_warm_cache_readers")
         }
 
     def test_parse_checks_orders_and_refuses_unknown_ids(self):
@@ -3435,7 +3447,9 @@ class ChecksSelectionTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd", side_effect=[(0, "me@example.com\n", ""), (127, "", "no gh")]):
             self.assertEqual(len(checker.check_toolchain(needs_gh=True)), 1)
         self.assertFalse(checker.GITHUB_CHECKS.intersection(checker.POOL_STATE_CHECKS))
-        self.assertIn(checker.CHECK_TOKEN_MINTER, checker.GITHUB_CHECKS)
+        # Only the repo-and-app check shells out to gh; the minter and ledger
+        # checks read GitHub over urllib and KMS over gcloud.
+        self.assertEqual(checker.GITHUB_CHECKS, {checker.CHECK_GITHUB_REPO_AND_APP})
 
 
 class ReportDocumentTest(unittest.TestCase):
@@ -3469,6 +3483,13 @@ class ReportDocumentTest(unittest.TestCase):
         self.assertEqual(second["checks"]["iam"]["warnings"], ["Could not read the project IAM policy: 403"])
         self.assertEqual(doc["checks"]["iam"]["findings"], [{"id": "iam/platform-gsa/missing/roles/x", "observed": "x missing", "repair": "gcloud ... x"}])
         self.assertEqual(doc["checks"]["codebase_mapping"]["findings"], [{"id": "codebase_mapping/failed", "observed": "No mapping; add the row", "repair": ""}])
+        # A failing detail beside a named finding is still a unit: the GSA
+        # gone and every role it should hold missing arrive together.
+        both = self._tagged("iam", checker.CheckResult("IAM", False, "IAM requirements missing", details=["Missing GSA kubeagents-platform-gsa", "x missing"], findings=[checker.Finding("iam/platform-gsa/missing/roles/x", "x missing", "gcloud ... x")]))
+        ids = [f["id"] for f in checker.report_document("kube-agents-evals-3", [both])["checks"]["iam"]["findings"]]
+        self.assertEqual(ids, ["iam/platform-gsa/missing/roles/x", "iam/failed"])
+        self.assertEqual(checker.report_document("kube-agents-evals-3", [both])["checks"]["iam"]["findings"][1]["observed"], "IAM requirements missing; Missing GSA kubeagents-platform-gsa")
+        self.assertEqual([f["id"] for f in checker.report_document("kube-agents-evals-3", [failed])["checks"]["iam"]["findings"]], ["iam/platform-gsa/missing/roles/x"], "a check whose details are all named adds nothing")
         self.assertEqual(doc["checks"]["gke_and_state"]["name"], "GKE")
 
     def test_verify_project_writes_the_report_beside_the_console(self):
