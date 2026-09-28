@@ -540,10 +540,13 @@ class FlagSetIsNextTest(unittest.TestCase):
 
     def test_the_lane_allow_list_matches_whole_job_names(self) -> None:
         """A prefix, a suffix or a substring of a listed name is not the job:
-        `ci-kube-agents-eval-next-2` or `kube-agents-eval-next` must refuse."""
+        `ci-kube-agents-eval-next-2` or `kube-agents-eval-next` must refuse.
+        So must a value spelling two adjacent entries with the space between
+        them, which a pattern over the joined list would have admitted."""
         guard = prow_guard()
         listed = _NEXT_LANE_JOB_NAMES[1]
-        for job in (listed + "-2", listed[3:], listed[:-1], listed.upper(), f"{listed} "):
+        spanning = " ".join(_NEXT_LANE_JOB_NAMES)
+        for job in (listed + "-2", listed[3:], listed[:-1], listed.upper(), f"{listed} ", spanning, f" {spanning} "):
             with self.subTest(job=job):
                 env = f'export EVAL_MODE_NEXT="1" IS_PROW_RUN="true" PULL_NUMBER="" JOB_NAME="{job}"\n'
                 self.assertEqual(run_bash(env + constants_block() + "\n" + guard).returncode, 1, job)

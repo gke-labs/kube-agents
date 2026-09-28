@@ -500,18 +500,24 @@ fi
 # job's name rather than on PULL_NUMBER, so the periodic is admitted by being
 # named and every other Prow run without a pull request is still refused.
 if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
-  case " ${EVAL_MODE_NEXT_JOB_NAMES} " in
-  *" ${JOB_NAME:-} "*)
+  # One whole-string comparison per listed name, not a pattern over the
+  # joined list: a substring match on the space-padded list would also admit
+  # a JOB_NAME that spells two adjacent entries with a space between them.
+  MODE_NEXT_JOB_ADMITTED="false"
+  for mode_next_job in ${EVAL_MODE_NEXT_JOB_NAMES}; do
+    if [ "${mode_next_job}" = "${JOB_NAME:-}" ]; then
+      MODE_NEXT_JOB_ADMITTED="true"
+    fi
+  done
+  if [ "${MODE_NEXT_JOB_ADMITTED}" = "true" ]; then
     echo "EVAL_MODE_NEXT=1: accepted on ${JOB_NAME} (a next-lane job with no PULL_NUMBER; the baseline store is read, never written)"
-    ;;
-  *)
+  else
     echo "ERROR: EVAL_MODE_NEXT=1 is set on a Prow run with no PULL_NUMBER (JOB_NAME=${JOB_NAME:-})." >&2
     echo "       The flag is for a pull request's presubmit or a next-lane job named in" >&2
     echo "       EVAL_MODE_NEXT_JOB_NAMES (${EVAL_MODE_NEXT_JOB_NAMES}); any other periodic or" >&2
     echo "       postsubmit under it would record next-mode samples into main's baseline." >&2
     exit 1
-    ;;
-  esac
+  fi
 fi
 
 # The bridge sidecar's concurrency is the matrix's fan-out, read from the same
