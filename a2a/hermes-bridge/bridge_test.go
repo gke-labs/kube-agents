@@ -667,20 +667,37 @@ func TestLookAhead_ReadFailureSpawns(t *testing.T) {
 }
 
 // Shutdown arriving while a worker is inside its look-ahead is not a read
-// failure to spawn past: the run stays pending for shutdownTasks, whose
-// terminal names bridge-shutdown, and the stub never runs.
+// failure to spawn past: the worker leaves the run pending for shutdownTasks,
+// whose terminal names bridge-shutdown, and the stub never runs.
+//
+// shutdownTasks is held out of the race until the worker has answered. It
+// finalizes the same run with the same terminal, so a worker that spawned
+// into the dead context and lost the run's mutex to it would leave the same
+// record; holding b.mu, which shutdownTasks takes before it touches any run,
+// makes the moment after the read the worker's alone, and what the run and
+// the stream show then is the worker's branch and nothing else's.
 func TestLookAhead_ShutdownMidReadLeavesTheRunToShutdownTasks(t *testing.T) {
 	_, url := startServer(t)
 	c := gatewayClient(t, url)
 	marker := filepath.Join(t.TempDir(), "spawned")
 	gate := make(chan struct{})
-	var real func(context.Context, *taskRun) (bool, error)
+	type answer struct {
+		run     *taskRun
+		err     error
+		dead    bool // ctx.Err() != nil as the read returned
+		pending bool // the run's state as the read returned
+	}
+	answers := make(chan answer, 1)
+	var b *Bridge
 	shutdown := startBridgeWith(t, url, script(t, fmt.Sprintf(`touch %s
-echo never`, marker)), 0, func(b *Bridge) {
-		real = b.lookAhead
-		b.lookAhead = func(ctx context.Context, run *taskRun) (bool, error) {
+echo never`, marker)), 0, func(br *Bridge) {
+		b = br
+		real := br.lookAhead
+		br.lookAhead = func(ctx context.Context, run *taskRun) (bool, error) {
 			<-gate
-			return real(ctx, run)
+			canceled, err := real(ctx, run)
+			answers <- answer{run: run, err: err, dead: ctx.Err() != nil, pending: run.pending()}
+			return canceled, err
 		}
 	})
 
@@ -689,8 +706,43 @@ echo never`, marker)), 0, func(b *Bridge) {
 		task, err := c.TasksGet(testCtx(t), "platform", origin.TaskID)
 		return err == nil && task.State == lib.StateSubmitted
 	})
+
+	// Hold shutdownTasks; it takes b.mu before it reads the run table.
+	b.mu.Lock()
+	held := true
+	release := func() {
+		if held {
+			held = false
+			b.mu.Unlock()
+		}
+	}
+	t.Cleanup(release)
 	shutdown()
 	close(gate)
+
+	var got answer
+	select {
+	case got = <-answers:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the look-ahead did not return after shutdown")
+	}
+	if !got.dead || got.err == nil {
+		t.Fatalf("look-ahead returned err=%v with ctx dead=%v; the read did not fail on the dead context, so this test is not on the branch it covers", got.err, got.dead)
+	}
+	if !got.pending {
+		t.Fatal("the run was not pending when the read returned; something other than the worker moved it while shutdownTasks was held")
+	}
+	// A worker that treated the dead context as a read failure would now
+	// flip the run to running and publish working on that context; give it
+	// long enough to have done so, then read what it left.
+	time.Sleep(500 * time.Millisecond)
+	if !got.run.pending() {
+		t.Fatal("the worker moved the run past pending after shutdown: it spawned into the dead context instead of leaving the run to shutdownTasks")
+	}
+	if task := fold(t, c, origin.TaskID); task.Final || task.State != lib.StateSubmitted {
+		t.Fatalf("state = %s (final=%v) with shutdownTasks held: the worker published after shutdown", task.State, task.Final)
+	}
+	release()
 
 	task := waitTerminal(t, c, origin.TaskID)
 	if task.State != lib.StateFailed {

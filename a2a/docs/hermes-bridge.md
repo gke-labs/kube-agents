@@ -247,8 +247,8 @@ and a submission past it is finalized `failed` with `reason: bridge-queue-overfl
 infrastructure in the harness's classification. Size the parallelism against both: concurrency
 at or above the parallelism, and the number of submissions a run can have outstanding at once,
 the units in flight plus anything abandoned and not yet cancelled, well under the queue
-capacity. Nothing in this repository declares that sidecar yet; the declaration that will carry
-the value is the CI flag's stage-1 work in the design above.
+capacity. `hack/ci-deploy.sh` declares that sidecar under `EVAL_MODE_NEXT=1` and sets
+`BRIDGE_CONCURRENCY` to the run's `EVAL_TASK_PARALLELISM`.
 
 ## Supervision
 
