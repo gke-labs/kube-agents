@@ -190,6 +190,15 @@ class WhatNeverFailsTheBot(ScanHarness):
         self.assertEqual(entry["error"], pool_state.REASON_VERIFIER_TIMEOUT.format(seconds=1))
         self.assertTrue(all(verdict["state"] == "not_checked" for verdict in entry["checks"].values()))
 
+    def test_a_report_left_by_an_earlier_run_is_not_read_as_this_runs(self):
+        # The same --workdir twice: a healthy first run, then a verifier that
+        # dies before writing. The old file must not become this run's verdict.
+        first = self.scan({PROJECT: report()})
+        self.assertEqual(first["projects"][PROJECT]["checks"]["iam"]["state"], "healthy")
+        second = self.scan({PROJECT: "crash"})
+        self.assertEqual(second["projects"][PROJECT]["checks"]["iam"]["state"], "not_checked")
+        self.assertIn("exited 64 without a report", second["projects"][PROJECT]["error"])
+
     def test_a_verifier_that_dies_without_a_report_is_not_checked_with_its_words(self):
         doc = self.scan({PROJECT: "crash"})
         self.assertEqual(doc["projects"][PROJECT]["error"], "scripts/verify_ci_pool_project.py exited 64 without a report: usage: something is wrong")

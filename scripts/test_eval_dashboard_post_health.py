@@ -1863,6 +1863,24 @@ class PoolDrift(RunHarness):
         short = post_health.gate_issue.render_pool_drift_title(pool_drift(), "Mon 9:00 AM ET")
         self.assertEqual(short, f"Pool drift: {FINDING} on 3 pool projects since Mon 9:00 AM ET")
 
+    def test_the_bots_own_issue_is_re_found_when_its_title_is_a_count(self):
+        # Four or more ids push the title to its count form, which names no
+        # finding; the body's marker is how the bot re-finds it after a GREEN.
+        many = [f"iam/pool-state-reader/missing/{role}" for role in ("roles/iam.securityReviewer", "roles/container.clusterViewer", "roles/artifactregistry.reader", "roles/cloudkms.viewer", "roles/storage.bucketViewer")]
+        own = {"number": 1295, "html_url": "https://github.com/gke-labs/kube-agents/issues/1295", "title": "Pool drift: 5 findings on 3 pool projects since Mon 9:00 AM ET", "body": post_health.gate_issue.POOL_DRIFT_MARKER + "\n**Findings**\n" + "\n".join(f"- `{f}`" for f in many)}
+        gh = FakeGh(open_issues=[own])
+        self.tick(pool_drift(findings=tuple(many)), T14, environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [], "adopted, not re-filed")
+        self.assertEqual(self.recorded()["issue"]["number"], 1295)
+        # The same body without the marker is somebody else's quote of the
+        # evidence, and is not adopted.
+        quoted = FakeGh(open_issues=[dict(own, number=1296, body=own["body"].replace(post_health.gate_issue.POOL_DRIFT_MARKER, ""))])
+        self.setUp()
+        self.tick(pool_drift(findings=tuple(many)), T14, environ=self.environ(), gh=quoted)
+        self.assertEqual([call[:2] for call in quoted.writes()], [("POST", "repos/gke-labs/kube-agents/issues")])
+        _, _, body = quoted.calls[-1]
+        self.assertTrue(body["body"].startswith(post_health.gate_issue.POOL_DRIFT_MARKER), "the bot's own body carries the marker")
+
     def test_the_recovery_says_the_pool_had_drifted_and_comments(self):
         self.tick(pool_drift(), T14, environ=self.environ())
         green = health("GREEN")
@@ -1905,6 +1923,30 @@ class PoolDrift(RunHarness):
         self.assertEqual(self.opener.texts[-1], "⚪ *Pool-state scan reads the pool again* — the 10:00 AM ET scan checked 30 of 30 pool projects.")
         self.assertFalse(self.recorded()["pool_state_unknown"])
         self.assertEqual(self.gh.writes(), [], "nothing is filed for a blind scan")
+
+    def test_a_tick_that_read_no_scan_does_not_announce_the_pool_read_again(self):
+        blind = health("GREEN")
+        blind["pool_state"] = pool_block(checked=0, unknown=True, reason=POOL_BLIND_REASON)
+        self.tick(blind, T14, environ=self.environ())
+        self.assertEqual(len(self.opener.texts), 1)
+        # A failed fetch: no block at all.
+        nothing = health("GREEN")
+        self.tick(nothing, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "no read is not a read")
+        self.assertTrue(self.recorded()["pool_state_unknown"], "the bit is kept, not flipped")
+        # The blind document gone stale: still no read.
+        stale = health("GREEN")
+        stale["pool_state"] = pool_block(checked=0, unknown=True, stale=True, reason=POOL_BLIND_REASON)
+        self.tick(stale, T14 + timedelta(hours=4))
+        self.assertEqual(len(self.opener.texts), 1)
+        self.assertTrue(self.recorded()["pool_state_unknown"])
+        # And a real read again is said once.
+        seeing = health("GREEN")
+        seeing["pool_state"] = pool_block(scanned="2026-09-14T18:00:00+00:00")
+        self.tick(seeing, T14 + timedelta(hours=5))
+        self.assertEqual(len(self.opener.texts), 2)
+        self.assertIn("reads the pool again", self.opener.texts[-1])
+        self.assertFalse(self.recorded()["pool_state_unknown"])
 
 
 class DeadlineKillMessages(RunHarness):

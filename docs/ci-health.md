@@ -646,9 +646,9 @@ prior scan's `scanned_at` and its `{project: [finding ids]}` map.
 `eval-dashboard-publisher@kube-agents-prow`, which needs `roles/iam.securityReviewer`,
 `roles/container.clusterViewer`, `roles/artifactregistry.reader`, `roles/cloudkms.viewer`
 and `roles/storage.bucketViewer` on each project (`POOL_STATE_READER_ROLES` in the
-verifier; together they cover every read the checks make on the project, and none
-writes; the warm-cache repository's policy in the Prow project stays unread, so the
-two `iam/warm-cache-reader/*` findings never come from the scan). `bench/tf/fleet`
+verifier; together they cover every read the scan's checks make, and none writes;
+the one read outside the project, the warm-cache repository's policy in the Prow
+project, is the verifier's `warm_cache` check, which the scan does not run). `bench/tf/fleet`
 grants them (`pool_state_readers`), so a project gets them from its fleet apply and
 the verifier fails one that lacks them (`--report` carries the binding). Projects
 applied before that default are one loop, run once by a project owner:

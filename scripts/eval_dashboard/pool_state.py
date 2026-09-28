@@ -214,6 +214,9 @@ def scan_project(
     project_dir = workdir / project
     project_dir.mkdir(parents=True, exist_ok=True)
     report = project_dir / REPORT_FILE
+    # A --workdir reused across runs keeps the last report; a verifier that
+    # dies before writing must read as unread, not as last run's verdict.
+    report.unlink(missing_ok=True)
     rc, _, err = _run(
         [
             sys.executable, str(verifier_script),

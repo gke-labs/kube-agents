@@ -401,7 +401,8 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
         kinds.append(KIND_STALE)
     if fixture_unknown(health) != bool((prev or {}).get("fixture_unknown")):
         kinds.append(KIND_FIXTURE_SCAN)
-    if pool_state_unknown(health) != bool((prev or {}).get("pool_state_unknown")):
+    pool_unknown = pool_state_unknown(health)
+    if pool_unknown is not None and pool_unknown != bool((prev or {}).get("pool_state_unknown")):
         kinds.append(KIND_POOL_SCAN)
 
     # The slow note goes out when the note appears, not when it clears: the
@@ -594,10 +595,15 @@ def pool_state_of(health: dict) -> dict:
     return block if isinstance(block, dict) else {}
 
 
-def pool_state_unknown(health: dict) -> bool:
+def pool_state_unknown(health: dict) -> bool | None:
     """The latest pool-state scan could check no project (the bot's project
-    roles are missing everywhere): blind, which is not a drift."""
-    return bool(pool_state_of(health).get("unknown"))
+    roles are missing everywhere): blind, which is not a drift. None when
+    this tick read no scan -- no block, or a stale one -- so a failed fetch
+    or a stopped scan job is not announced as the pool being read again."""
+    block = pool_state_of(health)
+    if not block or block.get("stale"):
+        return None
+    return bool(block.get("unknown"))
 
 
 def plural(count: int, one: str, many: str | None = None) -> str:
@@ -1328,7 +1334,9 @@ def run(
         "issues": carried if source.get("state") not in (None, GREEN) else [],
         "stale": bool(health.get("stale")) if told_stale else bool(before.get("stale")),
         "fixture_unknown": fixture_unknown(health) if told_fixture else bool(before.get("fixture_unknown")),
-        "pool_state_unknown": pool_state_unknown(health) if told_pool_scan else bool(before.get("pool_state_unknown")),
+        "pool_state_unknown": (
+            pool_state_unknown(health) if told_pool_scan and pool_state_unknown(health) is not None else bool(before.get("pool_state_unknown"))
+        ),
         "slow": bool(health.get("slow")) if told_slow else bool(before.get("slow")),
         # No artifact is not a reading: clearing the verdict on a blind tick
         # re-posts the same breach once the fetch recovers.

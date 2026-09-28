@@ -178,7 +178,11 @@ Filed automatically by the smoke health bot; the fleet owner should re-apply the
 POOL_DRIFT_TITLE = "Pool drift: {findings} on {projects} pool {noun} since {since}"
 # Four finding ids pass GitHub's title limit; the count stands in.
 POOL_DRIFT_TITLE_MANY = "Pool drift: {count} findings on {projects} pool {noun} since {since}"
+# The bot's own pool-drift issue carries this so it can re-find it when the
+# title has fallen back to a count and names no finding id.
+POOL_DRIFT_MARKER = "<!-- kube-agents-bot:pool-drift -->"
 POOL_DRIFT_BODY = """\
+{marker}
 The hourly pool-state scan (`scripts/eval_dashboard/pool_state.py`, which runs `scripts/verify_ci_pool_project.py`'s read-only checks against every pool project) found the pool projects below no longer shaped the way the verifier requires, on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a drift (decision 2026-09-14: evals v1 detects, does not act), so a run that leases one of these projects fails on the missing grant, API, key or cluster -- a 403 or a missing resource in the agent's transcript -- and that red is the pool's, not the pull request's. A retest is worth it only after the repair below.
 
 **Findings**
@@ -385,6 +389,7 @@ def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> st
                 per_project.extend(f"      {line}" for line in str(repair).splitlines())
                 per_project.append("      ```")
     return POOL_DRIFT_BODY.format(
+        marker=POOL_DRIFT_MARKER,
         findings="\n".join(f"- `{finding}`" for finding in findings) or "- (none recorded)",
         projects="\n".join(per_project) or "- (none recorded)",
         since=since_text,
@@ -399,15 +404,22 @@ class Tracker:
     def __init__(self, gh):
         self.gh = gh
 
-    def existing(self, names: list[str], title_only: bool = False) -> dict | None:
+    def existing(self, names: list[str], title_only: bool = False, marker: str | None = None) -> dict | None:
         """An open `presubmit-gate` issue whose title or body names every
         one of `names` (the failing cases, or the lost nodes) -- a human got
-        there first. `title_only` for names too common in bot-filed bodies."""
+        there first. `title_only` for names too common in bot-filed bodies;
+        `marker` for the bot's own issue of one kind, matched on its body
+        whatever its title says."""
         issues = self.gh.call("GET", self.gh.path(OPEN_ISSUES_PATH), paginate=True)
         for issue in issues or []:
             if not isinstance(issue, dict) or issue.get("pull_request"):
                 continue
-            text = issue.get("title", "") if title_only else f"{issue.get('title', '')}\n{issue.get('body', '')}"
+            body = issue.get("body") or ""
+            if marker is not None:
+                if marker in body and names_all(body, names):
+                    return as_issue(issue)
+                continue
+            text = issue.get("title", "") if title_only else f"{issue.get('title', '')}\n{body}"
             if names_all(text, names):
                 return as_issue(issue)
         return None
@@ -492,8 +504,11 @@ class Tracker:
         # every finding line whether or not it fires.
         findings = sorted((health.get("incident") or {}).get("roles") or [])
         found = self.existing(findings, title_only=True) if findings else None
+        if not found and findings:
+            # The bot's own, when its title fell back to a count.
+            found = self.existing(findings, marker=POOL_DRIFT_MARKER)
         if found:
-            log(f"tracking issue: adopting open #{found['number']} (its title names every finding)")
+            log(f"tracking issue: adopting open #{found['number']} (it names every finding)")
             return dict(found, condition=CONDITION_POOL_DRIFT)
         payload = {
             "title": render_pool_drift_title(health, since_text),

@@ -107,7 +107,26 @@ class DenialClassifierTest(unittest.TestCase):
         "tokens: ('invalid_grant: Bad Request', {'error': 'invalid_grant', "
         "'error_description': 'Bad Request'})",
         "ERROR: (gcloud.container.clusters.list) Reauthentication required.",
+        # A retry-later status, in the shapes gcloud prints one.
+        "ERROR: (gcloud.projects.get-iam-policy) HttpError accessing <https://cloudresourcemanager.googleapis.com/v1/projects/p:getIamPolicy?alt=json>: response: <{'status': '429'}>, content <{\"error\": {\"code\": 429, \"message\": \"Quota exceeded\"}}>",
+        "ERROR: (gcloud.container.clusters.list) ResponseError: code=503, message=The service is currently unavailable.",
+        "ERROR: (gcloud.artifacts.repositories.describe) INTERNAL: Internal error encountered.",
+        # A transport failure: gcloud never got an answer.
+        "ERROR: gcloud crashed (ConnectionError): HTTPSConnectionPool(host='cloudresourcemanager.googleapis.com', port=443): Max retries exceeded with url: /v1/projects/p (Caused by NewConnectionError('Temporary failure in name resolution'))",
+        "ERROR: gcloud crashed (SSLError): [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed",
+        "ERROR: gcloud crashed (ReadTimeout): HTTPSConnectionPool(host='container.googleapis.com', port=443): Read timed out.",
     )
+    # A status code inside a resource name is not a status.
+    NUMBERED_ABSENCES = (
+        "ERROR: (gcloud.storage.buckets.describe) gs://kube-agents-evals-500-tf-state not found: 404.",
+        "ERROR: (gcloud.projects.describe) NOT_FOUND: Project 'kube-agents-evals-429' not found or deleted.",
+        "ERROR: (gcloud.kms.keys.describe) NOT_FOUND: CryptoKey projects/kube-agents-evals-503/locations/us-central1/keyRings/r/cryptoKeys/k not found.",
+    )
+
+    def test_a_status_code_in_a_resource_name_is_still_an_absence(self):
+        for err in self.NUMBERED_ABSENCES:
+            with self.subTest(err=err[:60]):
+                self.assertIsNone(checker._unread_reason(err), err)
 
     def test_refusals_are_recognised(self):
         for err in self.REFUSALS:
@@ -2395,29 +2414,41 @@ class IamGrantsTest(unittest.TestCase):
 
     def test_both_build_identities_granted_passes(self):
         with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._both_build_identities())]
+            result = checker.check_warm_cache_readers("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(result.message, "Cloud Build and Compute SAs hold reader on the warm cache repository")
+        self.assertTrue(result.read)
+
+    def test_the_warm_cache_read_is_its_own_check_and_not_the_scans(self):
+        # The IAM check as the bot must read in full: the one read outside the
+        # project lives here, outside POOL_STATE_CHECKS, so a healthy `iam`
+        # carries no warning and rule 6's exit can see a repair.
+        self.assertIn(checker.CHECK_WARM_CACHE, checker.CHECK_IDS)
+        self.assertNotIn(checker.CHECK_WARM_CACHE, checker.POOL_STATE_CHECKS)
+        self.assertIn(checker.CHECK_WARM_CACHE, checker.DEFAULT_CHECKS)
+        with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
+        self.assertEqual(result.warnings, [])
+        self.assertEqual(run.call_count, 4, "four reads, all on the project")
 
     def test_missing_legacy_cloudbuild_reader_fails(self):
         # This is exactly the drift found on kube-agents-evals-2.
         project_number = "123456"
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(self._wi_policy("kube-agents-evals-2")),
-                _ok(self._litellm_wi_policy("kube-agents-evals-2")),
-                _ok(self._project_policy("kube-agents-evals-2")),
                 _ok(self._reader_policy([f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"])),
-                _ok(self._fleet_reader_policy()),
             ]
-            result = checker.check_iam_and_service_accounts("kube-agents-evals-2", project_number)
+            result = checker.check_warm_cache_readers("kube-agents-evals-2", project_number)
         self.assertFalse(result.passed)
+        self.assertEqual([f.id for f in result.findings], ["warm_cache/reader/cloudbuild"])
         # The whole member the checker builds, not the domain it ends in. A
         # detail naming any cloudbuild SA -- another project's, or a
         # remediation hint quoting the domain -- satisfied the old spelling
@@ -2433,7 +2464,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(json.dumps({"bindings": []})),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2450,7 +2480,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(json.dumps({"bindings": []})),
                 _ok(self._project_policy()),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2467,7 +2496,6 @@ class IamGrantsTest(unittest.TestCase):
                 _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown "
                       "service account."),
                 _ok(self._project_policy()),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2486,7 +2514,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(litellm_roles=set())),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2505,7 +2532,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(
                     litellm_roles=checker.LITELLM_GSA_ROLES | {"roles/container.viewer"})),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2524,7 +2550,6 @@ class IamGrantsTest(unittest.TestCase):
                 _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) PERMISSION_DENIED: Permission "
                       "iam.serviceAccounts.getIamPolicy is required to perform this operation"),
                 _ok(self._project_policy("kube-agents-evals-6")),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
@@ -2538,14 +2563,6 @@ class IamGrantsTest(unittest.TestCase):
                       "iam.serviceAccounts.getIamPolicy is required to perform this operation"),
                 _ok(self._litellm_wi_policy("kube-agents-evals-6")),
                 _ok(self._project_policy("kube-agents-evals-6")),
-                _ok(
-                    self._reader_policy(
-                        [
-                            "serviceAccount:123456@cloudbuild.gserviceaccount.com",
-                            "serviceAccount:123456-compute@developer.gserviceaccount.com",
-                        ]
-                    )
-                ),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
@@ -2564,7 +2581,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-6")),
                 _fail("ERROR: (gcloud.projects.get-iam-policy) PERMISSION_DENIED: Permission "
                       "'resourcemanager.projects.getIamPolicy' denied on resource"),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
@@ -2573,36 +2589,23 @@ class IamGrantsTest(unittest.TestCase):
         self.assertTrue(
             any("were not checked" in w for w in result.warnings), result.warnings)
         self.assertEqual(
-            "the Workload Identity binding, the cross-project AR reader grants, "
-            "the fleet reader's token-creator binding verified; "
+            "the Workload Identity binding, the fleet reader's token-creator binding verified; "
             "the runners' and platform GSA project roles not checked",
             result.message,
         )
 
-    def test_denied_cross_project_prow_policy_is_unverified(self):
-        # kube-agents-prow is somebody else's project. Nobody outside Prow can
-        # read its Artifact Registry policy, and that says nothing about the
-        # pool project being onboarded.
+        # The one read outside the project, denied: unread, not missing,
+        # and now a check of its own rather than a warning on the IAM check.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
-                _ok(self._wi_policy("kube-agents-evals-6")),
-                _ok(self._litellm_wi_policy("kube-agents-evals-6")),
-                _ok(self._project_policy("kube-agents-evals-6")),
                 _fail("ERROR: PERMISSION_DENIED: Permission 'artifactregistry.repositories.getIamPolicy' "
                       "denied on resource"),
-                _ok(self._fleet_reader_policy()),
             ]
-            result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
+            result = checker.check_warm_cache_readers("kube-agents-evals-6", "123456")
         self.assertTrue(result.passed, result.details)
-        # Both halves, as check_artifact_registry does it. An operator reading
-        # only the skipped half cannot tell whether the other one passed or was
-        # skipped too, and goes and re-checks something this run already did.
-        self.assertEqual(
-            "the Workload Identity binding, the runners' and platform GSA project roles, "
-            "the fleet reader's token-creator binding verified; "
-            "the cross-project AR reader grants not checked",
-            result.message,
-        )
+        self.assertFalse(result.read)
+        self.assertEqual(result.message, "Not checked: the warm cache repository's policy could not be read")
+        self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED)
 
     def test_gsa_policy_failing_for_another_reason_still_fails(self):
         with mock.patch.object(checker, "run_cmd") as run:
@@ -2614,7 +2617,6 @@ class IamGrantsTest(unittest.TestCase):
                       "service account."),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy("kube-agents-evals-3")),
-                _ok(self._reader_policy(["serviceAccount:123456@cloudbuild.gserviceaccount.com"])),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2630,7 +2632,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-6")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-6")),
                 _ok(self._project_policy("kube-agents-evals-6", prow_roles=without_container_admin)),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
@@ -2646,7 +2647,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-10")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-10")),
                 _ok(self._project_policy("kube-agents-evals-10", nightly_roles=set())),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-10", "123456")
@@ -2675,7 +2675,6 @@ class IamGrantsTest(unittest.TestCase):
                         conditional_roles={"roles/container.admin"},
                     )
                 ),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
@@ -2690,7 +2689,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(prow_roles=checker.PROW_RUNNER_ROLES | {"roles/artifactregistry.writer"})),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2703,7 +2701,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(
                     platform_roles=checker.PLATFORM_GSA_ROLES - {"roles/container.viewer"})),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2720,7 +2717,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(
                     platform_roles=checker.PLATFORM_GSA_ROLES | {"roles/container.admin"})),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2736,7 +2732,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(
                     extra_bindings=[{"role": "roles/storage.objectViewer", "members": ["allUsers"]}])),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2755,7 +2750,6 @@ class IamGrantsTest(unittest.TestCase):
                     "members": ["allAuthenticatedUsers"],
                     "condition": {"title": "t", "expression": "request.time < timestamp('2030-01-01T00:00:00Z')"},
                 }])),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2768,15 +2762,13 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
         self.assertEqual(
             "Workload Identity, both runners' and platform GSA project roles, "
-            "cross-project AR reader grants, and the fleet reader's token-creator "
-            "binding verified",
+            "and the fleet reader's token-creator binding verified",
             result.message,
         )
 
@@ -2789,7 +2781,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy(members=[])),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2811,7 +2802,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy(members=others)),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2831,7 +2821,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy(members=runners)),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2852,7 +2841,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
-                _ok(self._both_build_identities()),
                 _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown "
                       "service account."),
             ]
@@ -2869,7 +2857,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
-                _ok(self._both_build_identities()),
                 _ok("Updates are available for some Google Cloud CLI components."),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2884,7 +2871,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
-                _ok(self._both_build_identities()),
                 _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) PERMISSION_DENIED: "
                       "Permission iam.serviceAccounts.getIamPolicy is required"),
             ]
@@ -2895,8 +2881,7 @@ class IamGrantsTest(unittest.TestCase):
             result.warnings,
         )
         self.assertEqual(
-            "the Workload Identity binding, the runners' and platform GSA project roles, "
-            "the cross-project AR reader grants verified; "
+            "the Workload Identity binding, the runners' and platform GSA project roles verified; "
             "the fleet reader's token-creator binding not checked",
             result.message,
         )
@@ -3350,7 +3335,8 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
         skipped = [c for c in results if c.message.startswith("Skipped")]
-        self.assertEqual(len(skipped), 2)
+        # IAM, Artifact Registry and the warm-cache readers all need the number.
+        self.assertEqual(len(skipped), 3)
         self.assertTrue(all(not c.passed for c in skipped))
 
     def test_denied_project_read_does_not_fail_the_checks_that_needed_it(self):
@@ -3392,6 +3378,27 @@ class ChecksSelectionTest(unittest.TestCase):
         self.assertIn("nope", str(raised.exception))
         with self.assertRaises(ValueError):
             checker.parse_checks(" , ")
+        # The KMS half is inside the full minter check; naming both would drop
+        # the KMS record from the report without a word.
+        with self.assertRaises(ValueError) as pair:
+            checker.parse_checks("token_minter,token_minter_kms")
+        self.assertIn("covers", str(pair.exception))
+        self.assertEqual(checker.parse_checks("token_minter_kms"), ["token_minter_kms"])
+
+    def test_the_default_set_has_one_definition(self):
+        # run_checks and verify_project used to each compute "every check", and
+        # differed by the KMS half, so a --report's key set depended on whether
+        # the toolchain check passed.
+        self.assertEqual(set(checker.DEFAULT_CHECKS), set(checker.CHECK_IDS) - {checker.CHECK_TOKEN_MINTER_KMS})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.json"
+            with mock.patch.object(checker, "check_toolchain", return_value=["gcloud has no active credential"]), mock.patch("builtins.print"):
+                checker.verify_project("kube-agents-evals-3", report_path=path)
+            blocked = set(json.loads(path.read_text())["checks"])
+        with mock.patch.object(checker, "check_toolchain", return_value=[]), mock.patch.object(checker, "run_checks", return_value=[]) as run, mock.patch("builtins.print"):
+            checker.verify_project("kube-agents-evals-3")
+        self.assertEqual(blocked, set(checker.DEFAULT_CHECKS))
+        self.assertIsNone(run.call_args.args[-1], "run_checks resolves the same default itself")
 
     def test_only_the_selected_checks_run_and_the_default_is_every_check_once(self):
         mocks = self._mocks()
@@ -3495,7 +3502,6 @@ class FindingsCarryRepairsTest(IamGrantsTest):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(project_policy),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             return checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")

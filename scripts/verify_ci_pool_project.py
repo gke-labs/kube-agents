@@ -54,6 +54,11 @@ CHECK_CODEBASE_MAPPING = "codebase_mapping"
 CHECK_PROJECT_AND_APIS = "project_and_apis"
 CHECK_IAM = "iam"
 CHECK_ARTIFACT_REGISTRY = "artifact_registry"
+# The one read outside the project: this project's build identities' reader
+# grant on the warm cache repository in WARM_CACHE_REPOSITORY_PROJECT. Its own
+# check so that a caller holding nothing there -- every caller but the Prow
+# runner -- gets an unread check rather than an IAM check with a warning.
+CHECK_WARM_CACHE = "warm_cache"
 CHECK_GKE_AND_STATE = "gke_and_state"
 CHECK_SEEDED_FLEET = "seeded_fleet_fixtures"
 CHECK_GITHUB_REPO_AND_APP = "github_repo_and_app"
@@ -70,6 +75,7 @@ CHECK_IDS = (
     CHECK_PROJECT_AND_APIS,
     CHECK_IAM,
     CHECK_ARTIFACT_REGISTRY,
+    CHECK_WARM_CACHE,
     CHECK_GKE_AND_STATE,
     CHECK_SEEDED_FLEET,
     CHECK_GITHUB_REPO_AND_APP,
@@ -77,14 +83,20 @@ CHECK_IDS = (
     CHECK_TOKEN_MINTER,
     CHECK_TOKEN_MINTER_KMS,
 )
+# What a run without --checks does: every check but the KMS half of the
+# minter check, which CHECK_TOKEN_MINTER covers. The one definition, read by
+# run_checks and verify_project alike, so a --report's key set does not depend
+# on which of them decided.
+DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c != CHECK_TOKEN_MINTER_KMS)
 # The checks that need `gh`: check_toolchain asks for it only when one of
 # these is selected, so the pool-state scan, whose identity has no GitHub
 # credential, is not stopped at the door for a tool no selected check uses.
 GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_LEDGER_READ_CREDENTIAL, CHECK_TOKEN_MINTER})
-# What the hourly pool-state scan runs: every read-only GCP check. Not the
-# fleet fixtures (the seeded-fleet scan already runs those), not the two
-# GitHub checks (each needs a credential the health bot must not hold), not
-# the mapping (that is about the checkout, not the project).
+# What the hourly pool-state scan runs: every read-only check on the project.
+# Not the fleet fixtures (the seeded-fleet scan already runs those), not the
+# two GitHub checks (each needs a credential the health bot must not hold),
+# not the mapping (that is about the checkout, not the project), and not the
+# warm-cache check, whose read is in another project the bot holds nothing on.
 POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_TOKEN_MINTER_KMS)
 # --report's document (docs/ci-health.md, "The pool-state scan").
 REPORT_SCHEMA_VERSION = 1
@@ -331,12 +343,11 @@ CI_HEALTH_BOT_MEMBER = "serviceAccount:eval-dashboard-publisher@kube-agents-prow
 
 # The bot's project-level read for its hourly pool-state scan
 # (scripts/eval_dashboard/pool_state.py, which runs POOL_STATE_CHECKS as the
-# bot). Together they cover every read those checks make on the project and
-# none writes; securityReviewer alone lacks projects.get and the three
-# describes (role definitions read 2026-09-25). The one cross-project read,
-# the warm-cache repository's policy in WARM_CACHE_REPOSITORY_PROJECT, stays
-# unread in the scan. Granted by bench/tf/fleet (`pool_state_readers`), kept
-# equal by test, checked below.
+# bot). Together they cover every read those checks make, and none writes;
+# securityReviewer alone lacks projects.get and the three describes (role
+# definitions read 2026-09-25). The one cross-project read is CHECK_WARM_CACHE,
+# which the scan does not run. Granted by bench/tf/fleet
+# (`pool_state_readers`), kept equal by test, checked below.
 POOL_STATE_READER_ROLES = {
     "roles/iam.securityReviewer",
     "roles/container.clusterViewer",
@@ -560,8 +571,14 @@ _UNREAD_PATTERNS = (
     re.compile(r"reauthentication (?:required|failed)", re.I),
     # A retry-later reply, or gcloud's busy credential store, is not absence;
     # the scan runs six projects at once, and one wave of 429s would read as
-    # three drifted.
-    re.compile(r"RESOURCE_EXHAUSTED|\b429\b|\bUNAVAILABLE\b|\b503\b|\b500\b|\bINTERNAL\b|database is locked"),
+    # three drifted. The status codes are tied to how gcloud prints one, so
+    # a resource named kube-agents-evals-500 does not match.
+    re.compile(r"RESOURCE_EXHAUSTED|\bUNAVAILABLE\b|\bINTERNAL\b|database is locked"),
+    re.compile(r"(?:HTTPError|HTTP Error|HTTP|code|status)['\"]?\s*[=:]?\s*['\"]?\(?(?:429|500|502|503|504)\b", re.I),
+    # A transport failure on the runner -- gcloud never got an answer -- is
+    # not absence either; without this a DNS or TLS blip on one wave became
+    # three `*/failed` findings and a pool-drift issue.
+    re.compile(r"gcloud crashed|ConnectionError|NewConnectionError|SSLError|ReadTimeout|Connection reset|Temporary failure in name resolution|Name or service not known", re.I),
 )
 
 # gh prints `gh: Not Found (HTTP 404)` both for a resource that is absent and
@@ -965,14 +982,13 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, both runners' and the platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
+    """Verify Workload Identity, both runners' and the platform GSA's project roles, and the fleet reader's token-creator binding."""
     details = []
     warnings: List[str] = []
     findings: List[Finding] = []
     passed = True
     wi_checked = False
     roles_checked = False
-    prow_checked = False
     fleet_reader_checked = False
 
     gsa_email = f"kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
@@ -1228,60 +1244,6 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             passed = False
             details.append(f"Failed parsing the IAM policy for {project_id}: {exc}")
 
-    # The warm cache image hack/ci-deploy.sh defaults CACHE_IMAGE to lives in the
-    # `us` multi-region repository of kube-agents-prow, not in us-central1.
-    rc, out, err = run_cmd([
-        "gcloud", "artifacts", "repositories", "get-iam-policy",
-        "kube-agents",
-        "--project=kube-agents-prow",
-        "--location=us",
-        "--format=json",
-    ])
-    if rc != 0:
-        # A cross-project read. The pool project can be perfectly configured
-        # while the caller simply holds nothing on kube-agents-prow, which is
-        # the common case for anyone who is not the Prow service account.
-        if not _record_unreadable(
-            err,
-            f"Failed reading IAM policy for kube-agents-prow repository: {err.strip()}",
-            "Could not read the IAM policy on kube-agents-prow's kube-agents repository, so this "
-            "project's Cloud Build and Compute SAs were not checked for reader on the warm cache image",
-            details,
-            warnings,
-        ):
-            passed = False
-    else:
-        prow_checked = True
-        try:
-            policy = _load_json(out)
-            cb_sa = f"serviceAccount:{project_number}@cloudbuild.gserviceaccount.com"
-            compute_sa = f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"
-            readers = set()
-            for b in policy.get("bindings", []):
-                if b.get("role") == "roles/artifactregistry.reader":
-                    readers.update(b.get("members", []))
-            warm_cache_grant = (
-                f"gcloud artifacts repositories add-iam-policy-binding kube-agents --project={WARM_CACHE_REPOSITORY_PROJECT} "
-                f'--location={WARM_CACHE_REPOSITORY_LOCATION} --member="{{member}}" --role=roles/artifactregistry.reader'
-            )
-            if cb_sa not in readers:
-                passed = False
-                _drift(
-                    details, findings, "iam/warm-cache-reader/cloudbuild",
-                    f"Cloud Build SA ({cb_sa}) missing roles/artifactregistry.reader on kube-agents-prow",
-                    warm_cache_grant.format(member=cb_sa),
-                )
-            if compute_sa not in readers:
-                passed = False
-                _drift(
-                    details, findings, "iam/warm-cache-reader/compute",
-                    f"Compute SA ({compute_sa}) missing roles/artifactregistry.reader on kube-agents-prow",
-                    warm_cache_grant.format(member=compute_sa),
-                )
-        except Exception as exc:
-            passed = False
-            details.append(f"Failed parsing kube-agents-prow AR policy: {exc}")
-
     # The runner's permission to borrow the seeded fleet's read-only account.
     # Without it hack/fleet-kubeconfigs.sh cannot mint a token for
     # seeded-fleet-reader, writes nothing, and every run that leases the
@@ -1336,7 +1298,6 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         [
             ("the Workload Identity binding", wi_checked),
             ("the runners' and platform GSA project roles", roles_checked),
-            ("the cross-project AR reader grants", prow_checked),
             ("the fleet reader's token-creator binding", fleet_reader_checked),
         ]
     )
@@ -1347,8 +1308,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     else:
         message = (
             "Workload Identity, both runners' and platform GSA project roles, "
-            "cross-project AR reader grants, and the fleet reader's token-creator "
-            "binding verified"
+            "and the fleet reader's token-creator binding verified"
         )
 
     return CheckResult(
@@ -1358,7 +1318,85 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         details=details,
         warnings=warnings,
         findings=findings,
-        read=wi_checked or roles_checked or prow_checked or fleet_reader_checked,
+        read=wi_checked or roles_checked or fleet_reader_checked,
+    )
+
+
+def check_warm_cache_readers(project_id: str, project_number: str) -> CheckResult:
+    """Verify this project's Cloud Build and Compute SAs hold reader on the warm cache repository in WARM_CACHE_REPOSITORY_PROJECT."""
+    details: List[str] = []
+    warnings: List[str] = []
+    findings: List[Finding] = []
+    passed = True
+    prow_checked = False
+    # The warm cache image hack/ci-deploy.sh defaults CACHE_IMAGE to lives in the
+    # `us` multi-region repository of kube-agents-prow, not in us-central1.
+    rc, out, err = run_cmd([
+        "gcloud", "artifacts", "repositories", "get-iam-policy",
+        "kube-agents",
+        f"--project={WARM_CACHE_REPOSITORY_PROJECT}",
+        f"--location={WARM_CACHE_REPOSITORY_LOCATION}",
+        "--format=json",
+    ])
+    if rc != 0:
+        # A cross-project read. The pool project can be perfectly configured
+        # while the caller simply holds nothing on kube-agents-prow, which is
+        # the common case for anyone who is not the Prow service account.
+        if not _record_unreadable(
+            err,
+            f"Failed reading IAM policy for kube-agents-prow repository: {err.strip()}",
+            "Could not read the IAM policy on kube-agents-prow's kube-agents repository, so this "
+            "project's Cloud Build and Compute SAs were not checked for reader on the warm cache image",
+            details,
+            warnings,
+        ):
+            passed = False
+    else:
+        prow_checked = True
+        try:
+            policy = _load_json(out)
+            cb_sa = f"serviceAccount:{project_number}@cloudbuild.gserviceaccount.com"
+            compute_sa = f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"
+            readers = set()
+            for b in policy.get("bindings", []):
+                if b.get("role") == "roles/artifactregistry.reader":
+                    readers.update(b.get("members", []))
+            warm_cache_grant = (
+                f"gcloud artifacts repositories add-iam-policy-binding kube-agents --project={WARM_CACHE_REPOSITORY_PROJECT} "
+                f'--location={WARM_CACHE_REPOSITORY_LOCATION} --member="{{member}}" --role=roles/artifactregistry.reader'
+            )
+            if cb_sa not in readers:
+                passed = False
+                _drift(
+                    details, findings, "warm_cache/reader/cloudbuild",
+                    f"Cloud Build SA ({cb_sa}) missing roles/artifactregistry.reader on kube-agents-prow",
+                    warm_cache_grant.format(member=cb_sa),
+                )
+            if compute_sa not in readers:
+                passed = False
+                _drift(
+                    details, findings, "warm_cache/reader/compute",
+                    f"Compute SA ({compute_sa}) missing roles/artifactregistry.reader on kube-agents-prow",
+                    warm_cache_grant.format(member=compute_sa),
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing kube-agents-prow AR policy: {exc}")
+
+    if not passed:
+        message = "Warm cache reader grants missing"
+    elif not prow_checked:
+        message = "Not checked: the warm cache repository's policy could not be read"
+    else:
+        message = "Cloud Build and Compute SAs hold reader on the warm cache repository"
+    return CheckResult(
+        "Warm Cache Readers",
+        passed,
+        message,
+        details=details,
+        warnings=warnings,
+        findings=findings,
+        read=prow_checked,
     )
 
 
@@ -2911,12 +2949,11 @@ def run_checks(
     repo_membership_confirmed: bool = False,
     checks: Optional[List[str]] = None,
 ) -> List[CheckResult]:
-    """Run the checks named in `checks` (every one by default, CHECK_TOKEN_MINTER_KMS
-    excepted, since CHECK_TOKEN_MINTER covers it) and return the results in
-    CHECK_IDS order, each tagged with its id. Prints nothing, so tests can
-    assert on objects.
+    """Run the checks named in `checks` (DEFAULT_CHECKS by default) and return
+    the results in CHECK_IDS order, each tagged with its id. Prints nothing,
+    so tests can assert on objects.
     """
-    wanted = list(checks) if checks is not None else [c for c in CHECK_IDS if c != CHECK_TOKEN_MINTER_KMS]
+    wanted = list(checks) if checks is not None else list(DEFAULT_CHECKS)
     results: List[CheckResult] = []
 
     def add(check_id: str, result: CheckResult) -> None:
@@ -2927,7 +2964,7 @@ def run_checks(
     if CHECK_CODEBASE_MAPPING in wanted:
         add(CHECK_CODEBASE_MAPPING, check_codebase_mapping(project_id))
 
-    needs_project_number = {CHECK_IAM, CHECK_ARTIFACT_REGISTRY}.intersection(wanted)
+    needs_project_number = {CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_WARM_CACHE}.intersection(wanted)
     if CHECK_PROJECT_AND_APIS in wanted or needs_project_number:
         project_number, proj_check = check_project_and_apis(project_id)
         add(CHECK_PROJECT_AND_APIS, proj_check)
@@ -2936,11 +2973,13 @@ def run_checks(
                 add(CHECK_IAM, check_iam_and_service_accounts(project_id, project_number))
             if CHECK_ARTIFACT_REGISTRY in wanted:
                 add(CHECK_ARTIFACT_REGISTRY, check_artifact_registry(project_id, project_number, location))
+            if CHECK_WARM_CACHE in wanted:
+                add(CHECK_WARM_CACHE, check_warm_cache_readers(project_id, project_number))
         elif proj_check.passed:
             # The project number is missing because reading the project was refused,
             # not because the project is wrong. Failing the two checks that need it
             # would put the conflation straight back, one level up.
-            for check_id, skipped in ((CHECK_IAM, "Service Accounts & IAM Grants"), (CHECK_ARTIFACT_REGISTRY, "Artifact Registry Repository")):
+            for check_id, skipped in ((CHECK_IAM, "Service Accounts & IAM Grants"), (CHECK_ARTIFACT_REGISTRY, "Artifact Registry Repository"), (CHECK_WARM_CACHE, "Warm Cache Readers")):
                 add(check_id, CheckResult(
                     skipped,
                     True,
@@ -2951,6 +2990,7 @@ def run_checks(
         else:
             add(CHECK_IAM, CheckResult("Service Accounts & IAM Grants", False, "Skipped: could not determine project number"))
             add(CHECK_ARTIFACT_REGISTRY, CheckResult("Artifact Registry Repository", False, "Skipped: could not determine project number"))
+            add(CHECK_WARM_CACHE, CheckResult("Warm Cache Readers", False, "Skipped: could not determine project number"))
 
     if CHECK_GKE_AND_STATE in wanted:
         add(CHECK_GKE_AND_STATE, check_gke_and_state(project_id))
@@ -2978,6 +3018,8 @@ def parse_checks(spec: Optional[str]) -> Optional[List[str]]:
         raise ValueError(f"unknown check(s) {', '.join(unknown)}; the checks are {', '.join(CHECK_IDS)}")
     if not asked:
         raise ValueError(f"--checks names no check; the checks are {', '.join(CHECK_IDS)}")
+    if CHECK_TOKEN_MINTER in asked and CHECK_TOKEN_MINTER_KMS in asked:
+        raise ValueError(f"{CHECK_TOKEN_MINTER} covers {CHECK_TOKEN_MINTER_KMS}; name one of them")
     return [check_id for check_id in CHECK_IDS if check_id in asked]
 
 
@@ -3133,7 +3175,7 @@ def verify_project(
     checks: Optional[List[str]] = None,
     report_path: Optional[Path] = None,
 ) -> int:
-    selected = checks if checks is not None else list(CHECK_IDS)
+    selected = checks if checks is not None else list(DEFAULT_CHECKS)
     blockers = check_toolchain(needs_gh=bool(GITHUB_CHECKS.intersection(selected)))
     if blockers:
         print("\n" + "=" * 80)
