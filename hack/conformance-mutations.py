@@ -930,6 +930,58 @@ Mutation(
         "global, unscoped, never-expiring autonomy switch actually gets offered "
         "to a customer -- as a helpful comment next to a boolean",
     ),
+    # The three rows below, and the site row after them, are the other three
+    # surfaces of the same test. Until #1752 the chart row above was the only
+    # attack on it: the CRD halves and the site half were named by nothing.
+    Mutation(
+        "D2-read-only-leaves-the-env-denylist",
+        "k8s-operator/api/v1alpha1/common_types.go",
+        ('\t"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": {},\n', ""),
+        "test_D2_the_read_only_posture_is_not_a_customer_facing_knob",
+        "drop the read-only switch from SensitiveEnvVars while tidying the map. "
+        "The webhook stops refusing it and mergeCredentialProxyEnv stops "
+        "dropping it, so a spec.deployment.env entry naming it is admitted and "
+        "reaches the broker: the switch, offered through the CRD one list over "
+        "from where the scan was looking",
+    ),
+    Mutation(
+        "D2-read-only-documented-in-a-crd-field",
+        "k8s-operator/api/v1alpha1/common_types.go",
+        ("type SecuritySpec struct {\n",
+         "type SecuritySpec struct {\n"
+         "\t// EnforceReadOnly renders CREDENTIAL_PROXY_ENFORCE_READ_ONLY on the broker.\n"
+         "\t// Set false to recover from a bad allowlist without an image build.\n"
+         "\t// +optional\n"
+         "\tEnforceReadOnly *bool `json:\"enforceReadOnly,omitempty\"`\n"),
+        "test_D2_the_read_only_posture_is_not_a_customer_facing_knob",
+        "offer the switch as a CRD field with a helpful description -- the "
+        "shape D2-workflow-mode takes, on the switch that already exists",
+    ),
+    Mutation(
+        "D2-read-only-offered-on-the-crd-root",
+        "k8s-operator/api/v1alpha1/platformagent_types.go",
+        ('type PlatformAgentSpec struct {\n\tAgentSpec `json:",inline"`\n',
+         'type PlatformAgentSpec struct {\n\tAgentSpec `json:",inline"`\n\n'
+         "\t// EnforceReadOnly sets CREDENTIAL_PROXY_ENFORCE_READ_ONLY on the broker.\n"
+         "\t// +optional\n"
+         "\tEnforceReadOnly *bool `json:\"enforceReadOnly,omitempty\"`\n"),
+        "test_D2_the_read_only_posture_is_not_a_customer_facing_knob",
+        "the same field on the CRD's root type rather than on an embedded spec "
+        "-- the file no registry entry named before #1752, so stubbing it to a "
+        "bare package clause left the suite green",
+    ),
+    Mutation(
+        "D2-read-only-documented-on-the-site",
+        "docs/site/src/content/docs/reference/security-and-iam.md",
+        ("## Configuring read-only (auditing) mode\n",
+         "## Configuring read-only (auditing) mode\n\n"
+         "To lift the credential proxy's gate for every command, set "
+         "`CREDENTIAL_PROXY_ENFORCE_READ_ONLY=false` on the broker.\n"),
+        "test_D2_the_read_only_posture_is_not_a_customer_facing_knob",
+        "write the outage stopgap up on the security page as the way to turn "
+        "the posture off. Documented is offered; this half of the test ran "
+        "behind an `if docs.is_dir():` with no else and was attacked by nothing",
+    ),
     Mutation(
         "D5-cross-reference-renamed",
         "tests/conformance/test_C_enforcement.py",

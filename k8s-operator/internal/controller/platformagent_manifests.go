@@ -191,6 +191,11 @@ const (
 	// VolumesDropped condition names them. See hostPathVolumes.
 	hostPathExtraVolumesField   = "spec.deployment.extraVolumes"
 	hostPathSidecarVolumesField = "spec.deployment.sidecarVolumes"
+
+	// inferenceGatewayServiceName is the K8s Service name agents resolve to reach
+	// the inference gateway. Decoupled from the backing implementation (LiteLLM,
+	// vLLM, a custom proxy) so swapping the backend does not touch agent configs.
+	inferenceGatewayServiceName = "inference-gateway"
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -1714,7 +1719,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	cfg.Model.Provider = "custom"
 	cfg.Model.Default = agentModelName
 	cfg.Model.Model = agentModelName
-	cfg.Model.BaseURL = fmt.Sprintf("http://litellm.%s.svc.cluster.local/v1", agent.Namespace)
+	cfg.Model.BaseURL = fmt.Sprintf("http://%s.%s.svc.cluster.local/v1", inferenceGatewayServiceName, agent.Namespace)
 	cfg.Model.APIKey = "none"
 	// What `provider: custom` against a non-OpenAI base_url already resolves to
 	// (_resolve_plain_custom_api_mode in hermes_cli/runtime_provider.py), so this

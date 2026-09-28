@@ -81,7 +81,7 @@ Open-source inference server for local model serving. Alternative to LiteLLM whe
 
 ### Minty (GitHub Token Minter)
 
-In-cluster broker that mints short-lived GitHub App installation tokens via GCP KMS. Deployed as the `github-token-minter` workload (upstream [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter)) and queried by `github_token_refresh.py`. Lets `submit-suggestion` open PRs without a long-lived credential.
+In-cluster broker that mints short-lived GitHub App installation tokens via GCP KMS. Deployed as the `github-token-minter` workload (upstream [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter)) and queried by `github_token_refresh.py` on the credential side of the boundary. Lets `submit-suggestion` open PRs without a long-lived credential — and without the token ever entering the container the agent's shell runs in.
 
 ### Credential proxy
 

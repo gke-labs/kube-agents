@@ -404,7 +404,7 @@ def test_a_cluster_scoped_object_that_was_confirmed_and_is_gone_is_a_fail(
     """The `resource_name` branch with NO namespace to lean on.
 
     Every other fail in this file is anchored by a namespace, so the
-    cluster-scoped shape -- which four of the seven roles use -- needs its own
+    cluster-scoped shape -- which four of the eight roles use -- needs its own
     proof that a confirmed subject going missing is still charged to the run.
     """
     provisioned("rbac-overgrant")
@@ -1594,7 +1594,7 @@ def _provision(shell, tmp_path, **env) -> Path:
             "seeded-a\tus-central1-a\nseeded-b\tus-central1-a\nseeded-c\tus-central1-a\n"
         ),
         "STUB_NAMESPACES": (
-            "seeded-debug seeded-reliability seeded-security seeded-capacity"
+            "seeded-debug seeded-reliability seeded-security seeded-capacity seeded-deprecation"
         ),
         # Most tests are about discovery and presence, not the credential, so
         # they run the way a laptop does; the credential tests override this.
@@ -1852,7 +1852,7 @@ def test_a_cluster_scoped_fixture_that_was_never_planted_is_caught_too(
 ):
     """The same gate for the roles that have no namespace to gate on.
 
-    Four of the seven roles are cluster-scoped, and a namespace-only presence
+    Four of the eight roles are cluster-scoped, and a namespace-only presence
     check is a NO-OP for every one of them: their kubeconfigs were written
     unconditionally, so `compliance-rbac-overgrant` read a live-but-empty
     cluster and reported a catastrophic fail. Each cluster-scoped role is

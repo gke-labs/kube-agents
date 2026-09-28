@@ -14,10 +14,13 @@ included. The supported rollback is the Helm-only pair below. The full mode is t
 revert, and it needs a plan read first.
 
 Because the script that runs is `N-1`'s, its timeouts and Helm flags are `N-1`'s too, and this
-page says where the published releases differ. The `curl | bash` one-liner is the exception: it
-runs the published script and fetches only `N-1`'s chart, CRDs and installer library, so a
-rollback done that way has the current script's behaviour against `N-1`'s chart. This page
-describes the checkout.
+page says where the published releases differ. A copy of the script that carries no baked version
+— one taken from `main` rather than from release `N-1` — is the exception: it fetches only `N-1`'s
+chart, CRDs and installer library, so a rollback done that way has the current script's behaviour
+against `N-1`'s chart. This page describes the checkout.
+
+The forward move, the three upgrade modes, and how a run resolves the version it targets are in
+[Upgrade](/kube-agents/install/upgrade/); this page covers going backwards only.
 
 ## Before you start
 
@@ -140,12 +143,13 @@ kubectl describe pod -n kubeagents-system -l app=platform-agent-gateway
 ## What they leave as it is
 
 Terraform state and every GCP resource. The Helm-only modes write nothing to state, so it keeps
-recording `N` as the installed tag. `./upgrade.sh --plan` with no `--image-tag` plans at the tag
-state records, so the re-tag is not in its report; run from the `N-1` checkout it still lists
-every composition difference between `N-1` and `N`, which is the next section's subject. The state
-and the cluster disagree on the tag until the next `--upgrade-mode=full`, which re-applies
-whatever tag it is given. The `terraform.tfvars` in the `N-1` checkout is regenerated on every run
-and is not a record of anything.
+recording `N` as the installed tag. What `./upgrade.sh --plan` then reports depends on the copy it
+runs from: the `N-1` checkout's script carries `N-1` as its baked version, so it plans at `N-1` and
+the report holds the re-tag along with every composition difference between `N-1` and `N`, which is
+the next section's subject. A copy carrying no baked version plans at the tag state records
+instead, and the re-tag is not in that report. The state and the cluster disagree on the tag until
+the next `--upgrade-mode=full`, which re-applies whatever tag it is given. The `terraform.tfvars`
+in the `N-1` checkout is regenerated on every run and is not a record of anything.
 
 Secrets. The script never rewrites a Secret value that exists. A key that `N-1`'s script knows and
 finds missing is generated and added, which is what a forward upgrade does too.
@@ -237,17 +241,26 @@ that set `NAMESPACE` in `install.env` uses that one. `platform-agent` is the cha
 
 ## When a rollback is refused
 
-The first two refusals happen before anything on the cluster moves. The other two land in the
-operator step after `N-1`'s CRDs are applied; Helm checks before it renders or applies anything,
-so the release itself keeps its last revision.
+The first two refusals happen before anything on the cluster moves, and the third before any of
+`N-1` is applied. The last two land in the operator step after `N-1`'s CRDs are applied; Helm
+checks before it renders or applies anything, so the release itself keeps its last revision.
 
 - **The sources do not match the tag.** The checkout's `HEAD` is not the tag's commit, the tree
   has uncommitted changes, or the bundle's baked version is not the `--image-tag` given. Start
   again from a clean checkout or bundle of `N-1`.
-- **No install configuration.** Neither `install.env` beside the script, nor
-  `KUBE_AGENTS_INSTALL_ENV`, nor a legacy `k8s-operator/scripts/vars.sh` was found. Supply the
-  install's own file; a fresh one written from memory re-renders the `PlatformAgent` with whatever
-  it forgets.
+- **No install configuration.** No `install.env` was found in `KUBE_AGENTS_INSTALL_ENV`, the
+  checkout the script runs from, the working directory, or (when run from outside a checkout)
+  `$HOME/kube-agents` — or `KUBE_AGENTS_INSTALL_ENV` names a file that is not there, which is
+  reported by that path rather than searched past. Supply the install's own file; a fresh one
+  written from memory re-renders the `PlatformAgent` with whatever it forgets.
+- **The memory store cannot be checked and the configuration does not name one.** A rollback runs
+  `upgrade.sh`, and its `terraform.tfvars` is regenerated in every mode, so an `install.env` with
+  no `MEMORY` line makes the run ask the cluster whether it is running Hindsight rather than
+  default to a value that would plan the store away. If the cluster cannot be asked, the run stops.
+  This lands after `kubectl` has been pointed at the cluster and, on a real run, after the Secret
+  backfills, but before `N-1`'s CRDs are applied. Record `MEMORY=hindsight|file|off` in
+  `install.env`, or restore access to the cluster and re-run. See
+  [Upgrade](/kube-agents/install/upgrade/#when-an-upgrade-is-refused).
 - **`N-1`'s chart carries a values schema and `N` added a chart value.** Every release after
   `0.5.0` ships a `values.schema.json` that closes each level of the chart's values, and the
   re-tag reuses the values the release recorded, so a key `N`'s install set that `N-1`'s chart

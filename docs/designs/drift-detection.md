@@ -44,7 +44,7 @@ The subscriber is `k8s-operator/cmd/drift-detector`, a Go sibling of the event w
 
 Detection can be **event-driven** (a resource informer or an audit-log subscription fires the moment a change lands) or a **periodic sweep**. Together, `managedFields` says _what fields a non-GitOps actor owns_ and audit logs say _who changed them and when_, giving a complete, attributed diff.
 
-**Where the desired value comes from: Git.** `managedFields` says which fields a non-GitOps manager owns; it does not keep the value those fields held before the change, and neither does the live object. To show a diff or propose a revert, the agent reads the desired manifest out of the GitOps repository — the same clone `submit-suggestion` leases to write the PR, so this is an existing path and not a new dependency.
+**Where the desired value comes from: Git.** `managedFields` says which fields a non-GitOps manager owns; it does not keep the value those fields held before the change, and neither does the live object. To show a diff or propose a revert, the agent reads the desired manifest out of the GitOps repository — the same copy `submit-suggestion` takes to write the PR, so this is an existing path and not a new dependency.
 
 The MVP takes **no dependency on any GitOps tool**. This baseline works on every cluster and covers resources no tool manages. Argo/Flux is an optional enrichment we add later (see _Future enhancements_), never a prerequisite. **No GitOps tool is not the same as no Git:** Argo and Flux are what we do without; the repository is still the source of desired state. Two cases fall outside that:
 

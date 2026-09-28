@@ -85,6 +85,29 @@ else
   return 1 2>/dev/null || exit 1
 fi
 
+# gke_dns_endpoint_flag: whether a given cluster is reached over its IP or its
+# DNS control-plane endpoint. Three levels up like the defaults above, and
+# resolved the same way, since this script runs only inside the repository.
+#
+# This is the composition's one dependency on scripts/installer/. The helper is
+# deliberately free of that directory's state file and print helpers so it can
+# be sourced from anywhere — hack/ci-env.sh and scripts/release/common.sh
+# already do — and teardown has to reach a cluster over the same endpoint the
+# install used. A local copy of the predicate would be the alternative, and it
+# would drift.
+#
+# Absent, a stub keeps the pre-helper command rather than stopping the run: the
+# defaults above decide what gets applied, while this only picks an endpoint to
+# dial, and a teardown is the worst place to refuse over the difference.
+GKE_DNS_ENDPOINT_HELPER="../../../scripts/installer/gke_dns_endpoint.sh"
+if [[ -r "$GKE_DNS_ENDPOINT_HELPER" ]]; then
+  # shellcheck source=../../../scripts/installer/gke_dns_endpoint.sh
+  . "$GKE_DNS_ENDPOINT_HELPER"
+else
+  warn "cannot find the control-plane endpoint helper at ${GKE_DNS_ENDPOINT_HELPER}; reaching clusters over their IP endpoint."
+  gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=""; }
+fi
+
 # Remote state, opt-in. The composition ships no backend block — a hand-driven
 # example works fine on local state — but an installer-driven one cannot:
 # install.sh may run from a disposable clone, and uninstall.sh and upgrade.sh
@@ -790,8 +813,20 @@ delete_agent_cr() {
   location=$(tfvar location)
   project=$(tfvar project_id)
 
+  # Through the helper, so teardown reaches the cluster over the endpoint the
+  # install used. Without the flag a cluster whose IP endpoint this host cannot
+  # route to gets that IP written into the kubeconfig, and the guard below does
+  # not catch it: get-credentials is a describe plus a file write, neither of
+  # which touches the control plane, so it exits 0. The kubectl after it then
+  # reads an unreachable cluster as a namespace holding no PlatformAgent, and
+  # teardown reports success having left the finalizer's cluster-scoped RBAC
+  # behind — the objects nothing else garbage-collects.
+  GKE_DNS_ENDPOINT_FLAG=""
+  gke_dns_endpoint_flag "$cluster" "$location" "$project" || true
+  # Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
+  # shellcheck disable=SC2086
   if ! gcloud container clusters get-credentials "$cluster" --location "$location" \
-        --project "$project" >/dev/null 2>&1; then
+        --project "$project" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1; then
     log "cluster unreachable; nothing to delete in-cluster"
     return 0
   fi

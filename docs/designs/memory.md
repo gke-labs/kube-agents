@@ -468,8 +468,8 @@ It adds exactly two workloads to `kubeagents-system`.
   models are baked into the image, so the pod needs **no Hugging Face egress** —
   and both flags must stay set, or the libraries reach out on every cold start and
   hang where there is no route out of the cluster.
-- Extraction and consolidation call an LLM. That goes through the **same LiteLLM
-  gateway the agents use** (`HINDSIGHT_API_LLM_BASE_URL=http://litellm/v1`,
+- Extraction and consolidation call an LLM. That goes through the **same inference
+  gateway the agents use** (`HINDSIGHT_API_LLM_BASE_URL=http://inference-gateway/v1`,
   model `model-default`), so routing and cost attribution stay in one place. The
   API key is the literal string `none`, matching how the agents authenticate;
   it is a placeholder the client library insists on, not a credential.

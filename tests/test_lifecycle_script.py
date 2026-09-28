@@ -12,6 +12,7 @@ Tests safety guards in lifecycle.sh before terraform apply:
 
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -600,6 +601,150 @@ resource "google_service_account" "agent" {
         )
         self.assertEqual(proc.returncode, 1)
         self.assertIn("has no ENABLED version.", proc.stderr)
+
+
+class DeleteAgentCrEndpointTest(unittest.TestCase):
+    """delete_agent_cr has to reach the cluster over the endpoint that answers.
+
+    Its own guard cannot catch a wrong one. `get-credentials` is a describe plus
+    a file write, neither of which touches the control plane, so it exits 0
+    having written a kubeconfig naming an unroutable IP. The kubectl after it
+    then reports an unreachable cluster and a namespace holding no
+    PlatformAgent identically, and teardown returns success over the
+    cluster-scoped RBAC the finalizer would have removed.
+    """
+
+    def _run_delete(self, dns_endpoint="gke-abc.us-central1.gke.goog",
+                    allow_external="True", supports_flag=True):
+        """Run delete_agent_cr against stubbed gcloud, kubectl and terraform.
+
+        Returns (completed process, recorded get-credentials invocation).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            record = pathlib.Path(tmp) / "fetch.args"
+            help_text = "--dns-endpoint" if supports_flag else "--internal-ip"
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(f"""#!/usr/bin/env bash
+case "$*" in
+  *"get-credentials --help"*) printf -- '{help_text}\\n'; exit 0 ;;
+  *"clusters describe"*) printf '{dns_endpoint}\\t{allow_external}\\n'; exit 0 ;;
+  *get-credentials*) printf '%s\\n' "$*" >> '{record}'; exit 0 ;;
+esac
+exit 0
+""")
+            gcloud.chmod(0o755)
+
+            # No PlatformAgent in the namespace: the function logs and returns,
+            # which is all these assertions need. What is under test is the
+            # command that ran before it, not the deletion itself.
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text("#!/usr/bin/env bash\nexit 0\n")
+            kubectl.chmod(0o755)
+
+            terraform = bin_dir / "terraform"
+            terraform.write_text("""#!/usr/bin/env bash
+if [[ "${1:-}" == "console" ]]; then
+    read -r expr
+    case "$expr" in
+        *cluster_name*) echo '"test-cluster"' ;;
+        *project_id*)   echo '"test-project"' ;;
+        *location*)     echo '"us-central1"' ;;
+        *namespace*)    echo '"kubeagents-system"' ;;
+        *)              echo 'null' ;;
+    esac
+fi
+exit 0
+""")
+            terraform.chmod(0o755)
+
+            script = f'KUBE_AGENTS_SOURCE_ONLY=true source "{_LIFECYCLE_SH}"\ndelete_agent_cr\n'
+            proc = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT / "terraform" / "examples" / "full-install"),
+            )
+            return proc, (record.read_text() if record.exists() else "")
+
+    def test_it_uses_the_dns_endpoint_when_one_accepts_external_traffic(self):
+        proc, args = self._run_delete()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("--dns-endpoint", args)
+
+    def test_it_leaves_an_ordinary_cluster_on_its_ip_endpoint(self):
+        # gcloud rejects the flag on a cluster with no externally reachable DNS
+        # endpoint, so passing it blind would break the teardowns that work.
+        for dns_endpoint, allow_external, supports_flag, why in (
+            ("gke-abc.us-central1.gke.goog", "False", True, "external traffic is off"),
+            ("", "True", True, "no DNS endpoint is published"),
+            ("gke-abc.us-central1.gke.goog", "True", False, "this gcloud has no such flag"),
+        ):
+            with self.subTest(why=why):
+                proc, args = self._run_delete(dns_endpoint, allow_external, supports_flag)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("--dns-endpoint", args)
+                self.assertIn("get-credentials test-cluster", args)
+
+
+class MissingEndpointHelperTest(unittest.TestCase):
+    """The fallback for a checkout with no scripts/installer/gke_dns_endpoint.sh.
+
+    Nothing else reaches it. Every other test sources the checkout's own
+    lifecycle.sh, and the script cd's to its own directory before resolving the
+    helper three levels up, so the file is always there and the arm below never
+    runs. It matters because it runs under `set -euo pipefail` at load time: a
+    slip in its syntax, or a rename of `warn`, fails the whole teardown on
+    exactly the incomplete checkout the arm exists to keep working.
+    """
+
+    def _source_without_helper(self, probe):
+        """Source a copy of lifecycle.sh from a tree that has no helper."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            composition = root / "terraform" / "examples" / "full-install"
+            composition.mkdir(parents=True)
+            copied = composition / "lifecycle.sh"
+            shutil.copy(_LIFECYCLE_SH, copied)
+            # Three levels up, where the script looks. Copied because their
+            # absence is a hard failure by design; this is about the helper.
+            shutil.copy(_REPO_ROOT / "install.defaults.env", root / "install.defaults.env")
+            # scripts/installer/gke_dns_endpoint.sh is deliberately not created.
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            script = f'KUBE_AGENTS_SOURCE_ONLY=true source "{copied}"\n{probe}'
+            return subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(composition),
+            )
+
+    def test_a_checkout_without_the_helper_still_loads(self):
+        # The arm runs at load time under `set -euo pipefail`. Broken, it takes
+        # the teardown with it -- and only on the tree it was written for.
+        proc = self._source_without_helper('echo "kind=$(type -t gke_dns_endpoint_flag)"')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("kind=function", proc.stdout, proc.stderr)
+
+    def test_the_stub_leaves_the_flag_empty_so_teardown_dials_the_ip_endpoint(self):
+        # delete_agent_cr splices the flag unquoted, so the stub's one job is to
+        # leave nothing behind to splice.
+        proc = self._source_without_helper(
+            'GKE_DNS_ENDPOINT_FLAG=--stale\n'
+            'gke_dns_endpoint_flag some-cluster us-central1 some-project\n'
+            'echo "flag=[${GKE_DNS_ENDPOINT_FLAG}]"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("flag=[]", proc.stdout, proc.stderr)
+
+    def test_it_warns_rather_than_falling_back_in_silence(self):
+        proc = self._source_without_helper("true")
+        self.assertIn("gke_dns_endpoint.sh", proc.stderr)
+        self.assertIn("IP endpoint", proc.stderr)
 
 
 if __name__ == "__main__":
