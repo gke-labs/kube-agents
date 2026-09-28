@@ -116,11 +116,14 @@ try:
     if row is None:
         fail("the sweep card %s named by %s is not on the board" % (sweep_id, MARKER))
     out["sweep"] = {"id": row[0], "status": row[1]}
-    rows = conn.execute(
-        "SELECT t.id, t.assignee, t.idempotency_key, t.status FROM kanban_worker_children w "
-        "JOIN tasks t ON t.id = w.child_id WHERE w.creator_id = ? ORDER BY w.created_at, t.id",
-        (sweep_id,),
-    ).fetchall()
+    # The board creates kanban_worker_children when a worker first files a card.
+    rows = []
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kanban_worker_children'").fetchone():
+        rows = conn.execute(
+            "SELECT t.id, t.assignee, t.idempotency_key, t.status FROM kanban_worker_children w "
+            "JOIN tasks t ON t.id = w.child_id WHERE w.creator_id = ? ORDER BY w.created_at, t.id",
+            (sweep_id,),
+        ).fetchall()
     for tid, assignee, key, status in rows:
         parents = [p for (p,) in conn.execute("SELECT parent_id FROM task_links WHERE child_id = ?", (tid,))]
         out["children"].append(

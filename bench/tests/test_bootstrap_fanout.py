@@ -68,6 +68,7 @@ def _write_root(
     root: Path,
     board: dict[str, Any] | None,
     roster: dict[str, dict[str, str] | None] | None = None,
+    schema: tuple[str, ...] = _SCHEMA,
 ) -> Path:
     roster = BOARDS["roster"] if roster is None else roster
     for name, identity in {**roster, "platform": None}.items():
@@ -83,14 +84,15 @@ def _write_root(
         return root
     (root / discovery.SCAN_MARKER).write_text(f"task_id={board['sweep']}\nfiled_at=1790608075\n")
     with sqlite3.connect(root / "kanban.db") as conn:
-        for ddl in _SCHEMA:
+        for ddl in schema:
             conn.execute(ddl)
         conn.executemany(
             "INSERT INTO tasks VALUES (:id, :title, :assignee, :status, :created_by, :created_at, :idempotency_key)",
             board["tasks"],
         )
         conn.executemany("INSERT INTO task_links VALUES (?, ?)", board["task_links"])
-        conn.executemany("INSERT INTO kanban_worker_children VALUES (?, ?, ?)", board["kanban_worker_children"])
+        if board["kanban_worker_children"]:
+            conn.executemany("INSERT INTO kanban_worker_children VALUES (?, ?, ?)", board["kanban_worker_children"])
     return root
 
 
@@ -120,8 +122,12 @@ def _run_script(root: Path) -> str:
 def pod(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Point the verifier's shell at a data root under ``tmp_path``."""
 
-    def build(board: dict[str, Any] | None, roster: dict[str, dict[str, str] | None] | None = None) -> Path:
-        root = _write_root(tmp_path, board, roster)
+    def build(
+        board: dict[str, Any] | None,
+        roster: dict[str, dict[str, str] | None] | None = None,
+        schema: tuple[str, ...] = _SCHEMA,
+    ) -> Path:
+        root = _write_root(tmp_path, board, roster, schema)
 
         def shell(script: str, timeout: float) -> str:
             assert discovery.FANOUT_PRESENT in script
@@ -221,6 +227,18 @@ def test_the_stack_waits_out_the_longest_gate_run() -> None:
     assert gate_wait == _module_constant(gate, "RECONCILE_TIMEOUT_SECONDS") + 60  # one cron tick
 
 
+def test_the_stack_spells_the_mirrored_names_as_their_sources_do() -> None:
+    gate = REPO / "agents" / "chat" / "scripts" / "bootstrap_scan_gate.py"
+    guardrail = REPO / "deploy" / "docker" / "patches" / "kanban_guardrail_exit.py"
+    stack = (REPO / "bench" / "tf" / "prebuilt" / "bootstrap-discovery" / "main.tf").read_text()
+
+    def local(name: str) -> str:
+        return re.search(rf'^\s*{name}\s*=\s*"([^"]*)"\s*$', stack, re.M).group(1)
+
+    assert local("cluster_key_like") == _module_constant(gate, "CLUSTER_IDEMPOTENCY_KEY_PREFIX") + "%"
+    assert local("rate_limit_block") == _module_constant(guardrail, "RATE_LIMIT_REASON_PREFIX")
+
+
 def test_a_failed_exec_is_a_failed_read() -> None:
     payload, why = discovery.read_fanout(lambda s, t: "", 5.0)
     assert payload is None
@@ -248,6 +266,16 @@ def test_the_main_sweep_filed_none_and_fails(pod) -> None:
     result = _verify("one_card_per_cluster_agent")
     assert result.status == "fail"
     assert "filed 0 cluster card(s) for 4 Cluster Agent(s)" in result.reason
+
+
+def test_a_board_where_no_worker_has_filed_yet_fails_rather_than_errors(pod) -> None:
+    board = _board("main")
+    board["kanban_worker_children"] = []
+    pod(board, schema=tuple(ddl for ddl in _SCHEMA if "kanban_worker_children" not in ddl))
+    result = _verify("one_card_per_cluster_agent")
+    assert result.status == "fail", result.reason
+    assert "filed 0 cluster card(s) for 4 Cluster Agent(s)" in result.reason
+    assert _verify("no_card_waits_on_the_sweep").status == "pass"
 
 
 def test_a_missing_card_is_named(pod) -> None:

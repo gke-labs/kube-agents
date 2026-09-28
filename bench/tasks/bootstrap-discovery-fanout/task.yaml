@@ -10,11 +10,11 @@
 #
 # bench/tf/prebuilt/bootstrap-discovery re-arms the gate, waits for the cron
 # job to file a new sweep card, and returns once that card's worker has filed
-# its cards and ended the run that filed them. The objective then compares the cards it filed against the Cluster
-# Agent roster, read straight from the profiles on the agent's disk rather
-# than through the gate, so a build whose gate hands the worker no roster
-# fails here instead of erroring. The stack's header says why re-arming
-# archives the previous sweep's cards first.
+# its cards and then ended its run itself. The objective then compares the
+# cards it filed against the Cluster Agent roster, read straight from the
+# profiles on the agent's disk rather than through the gate, so a build whose
+# gate hands the worker no roster fails here instead of erroring. The stack's
+# header says why re-arming archives the previous sweep's cards first.
 #
 # The stack refuses an install where a person has connected: a fresh sweep
 # there ends in an onboarding report sent to their chat.
