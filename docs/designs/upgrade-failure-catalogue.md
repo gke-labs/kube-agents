@@ -26,49 +26,50 @@ each item can be followed to its detail.
 
 While the computers are being rebuilt:
 
-1. A safety rule says "never stop this piece". The rebuild waits an hour, then stops it anyway,
-   and the application goes down.
-2. There is no free computer to move a piece to, so it waits, offline, until its old computer is
-   back.
+1. A safety rule says "never stop this piece". The rebuild waits, an hour on the usual settings
+   and up to a week on the slower kind, then stops it anyway, and the application goes down.
+2. Only if the computers were told they may go away before a replacement exists, which is not
+   how GKE is set up unless someone asks for it: then there is no free computer to move a piece
+   to, and it waits, offline, until its old computer is back.
 3. All copies of a piece live on the same computer or in the same building, so one rebuild takes
    them all down at once.
-4. A piece takes minutes to warm up after a restart but reports itself ready at once, so users
-   reach it while it is still loading.
-5. A piece kept data on the computer's own disk, and the rebuild wipes that disk.
-6. The allowed maintenance hours are too short for the number of computers, so the fleet sits
+4. A piece kept data on the computer's own disk, and the rebuild wipes that disk.
+5. The allowed maintenance hours are too short for the number of computers, so the fleet sits
    half-upgraded for days.
 
 Once the newer control program is in charge:
 
-7. Tools still speak an old dialect the new control program dropped, and fail with "I do not
+6. Tools still speak an old dialect the new control program dropped, and fail with "I do not
    understand that request". The application itself keeps running; the tools that manage it do
-   not.
-8. A gatekeeper that inspects every change is offline, and it was set to "block everything if I
+   not. GKE holds the automatic upgrade back while it sees such tools; an upgrade started by hand,
+   or the forced one when a version reaches the end of its support, does not wait.
+7. A gatekeeper that inspects every change is offline, and it was set to "block everything if I
    cannot answer", so nothing new can start, including the pieces the rebuild is trying to move.
-9. A rule that used to be off is now on by default, and it rejects or removes pieces that were
+8. A rule that used to be off is now on by default, and it rejects or removes pieces that were
    fine yesterday.
-10. A feature is marked "going away later". Nothing breaks yet, but it will if nobody moves off
-    it in time.
-11. Add-ons and tools are too old for the new control program and stop working.
-12. On a single-location cluster the control program is unreachable for a few minutes during its
+9. A feature is marked "going away later". Nothing breaks yet, but it will if nobody moves off
+   it in time.
+10. Add-ons and tools are too old for the new control program and stop working.
+11. On a single-location cluster the control program is unreachable for a few minutes during its
     swap, and automation that does not retry fails.
 
 On the freshly rebuilt computers:
 
-13. A label that pieces used to choose their computer is gone, so they can never be placed.
-14. The engine that runs the pieces changed, and tools that talked to the old engine break.
-15. The new computers account for memory differently, and older programs misjudge how much they
+12. A label that pieces used to choose their computer is gone, so they can never be placed.
+13. The engine that runs the pieces changed edition, and tools that talked to the old edition,
+    or images built for it, stop working.
+14. The new computers account for memory differently, and older programs misjudge how much they
     may use and are killed for using too much.
-16. When one part of a piece runs out of memory, the system now kills the whole piece instead of
+15. When one part of a piece runs out of memory, the system now kills the whole piece instead of
     that one part.
-17. Network rules or name lookup behave differently, and some connections drop.
-18. The networking helper on each computer fails on the new build, and traffic stops reaching
+16. Network rules or name lookup behave differently, and some connections drop.
+17. The networking helper on each computer fails on the new build, and traffic stops reaching
     the application.
-19. The graphics-card driver on the new computers does not match what the application was built
+18. The graphics-card driver on the new computers does not match what the application was built
     for.
-20. Older storage attachments rely on a helper that is switched off, and the disks cannot be
+19. Older storage attachments rely on a helper that is switched off, and the disks cannot be
     attached.
-21. The new computers must download their software images from a source that has since closed,
+20. The new computers must download their software images from a source that has since closed,
     and cannot.
 
 The rest of this document says, for each of these, how to see it coming, how to recognise it
@@ -91,63 +92,64 @@ evidence; an entry with no public incident and no planted fixture says so there.
 During the drain and reschedule:
 
 1. [A PodDisruptionBudget forbids the eviction](#1-a-poddisruptionbudget-forbids-the-eviction):
-   the drain stalls an hour, then GKE force-deletes the pod anyway. `k8s`
-2. [No spare capacity for the displaced pods](#2-no-spare-capacity-for-the-displaced-pods): pods
-   sit Pending until the old node returns. `GKE, k8s`
+   the drain stalls, an hour on a surge upgrade or up to seven days on blue-green, then GKE
+   force-deletes the pod anyway. `k8s, GKE`
+2. [No spare capacity for the displaced pods](#2-no-spare-capacity-for-the-displaced-pods): on a
+   pool configured to allow unavailability, pods sit Pending until the old node returns. `GKE, k8s`
 3. [Every replica in one zone or on one node](#3-every-replica-in-one-zone-or-on-one-node): a
    redundant-looking application loses all replicas at once. `k8s`
-4. [Slow cold start](#4-slow-cold-start): the pod is back but cannot serve, and a loose readiness
-   probe lets traffic in. `k8s, image`
-5. [Data on the node is gone](#5-data-on-the-node-is-gone): Local SSD and `emptyDir` do not
+4. [Data on the node is gone](#4-data-on-the-node-is-gone): Local SSD and `emptyDir` do not
    survive the rebuild. `k8s`
-6. [Maintenance window too short, or an exclusion ends mid-roll](#6-maintenance-window-too-short-or-an-exclusion-ends-mid-roll):
+5. [Maintenance window too short, or an exclusion ends mid-roll](#5-maintenance-window-too-short-or-an-exclusion-ends-mid-roll):
    the pool runs two versions for days. `GKE`
 
 Once the control plane moves:
 
-7. [A served API version is removed](#7-a-served-api-version-is-removed): Helm, operators and CI
+6. [A served API version is removed](#6-a-served-api-version-is-removed): Helm, operators and CI
    fail with `no matches for kind`. `GKE, logs, metrics, git, k8s`
-8. [A fail-closed webhook whose backend is not up](#8-a-fail-closed-webhook-whose-backend-is-not-up):
+7. [A fail-closed webhook whose backend is not up](#7-a-fail-closed-webhook-whose-backend-is-not-up):
    nothing can be created or rescheduled where it matches. `k8s`
-9. [A default changes in the new minor](#9-a-default-changes-in-the-new-minor): pods rejected or
+8. [A default changes in the new minor](#8-a-default-changes-in-the-new-minor): pods rejected or
    evicted by a rule that did not exist before. `notes, k8s`
-10. [A feature is deprecated but still served](#10-a-feature-is-deprecated-but-still-served):
-    nothing breaks yet; the count is what to track. `logs, k8s`
-11. [Add-on and client skew](#11-add-on-and-client-skew): operators and tools that do not support
+9. [A feature is deprecated but still served](#9-a-feature-is-deprecated-but-still-served):
+   nothing breaks yet; the count is what to track. `logs, k8s`
+10. [Add-on and client skew](#10-add-on-and-client-skew): operators and tools that do not support
     the new server. `k8s, GKE, notes`
-12. [The control plane is unreachable for minutes on a zonal cluster](#12-the-control-plane-is-unreachable-for-minutes-on-a-zonal-cluster):
+11. [The control plane is unreachable for minutes on a zonal cluster](#11-the-control-plane-is-unreachable-for-minutes-on-a-zonal-cluster):
     clients without retry fail during the control-plane step. `GKE`
 
 On the new node image:
 
-13. [A node label or taint is removed](#13-a-node-label-or-taint-is-removed): pods selecting on
+12. [A node label or taint is removed](#12-a-node-label-or-taint-is-removed): pods selecting on
     it never schedule. `k8s, notes`
-14. [The container runtime changes](#14-the-container-runtime-changes): anything using the Docker
-    socket breaks. `k8s, GKE`
-15. [cgroup v2 under a runtime that cannot read it](#15-cgroup-v2-under-a-runtime-that-cannot-read-it):
+13. [The container runtime changes](#13-the-container-runtime-changes): agents and images built
+    for the old containerd stop working. `k8s, GKE`
+14. [cgroup v2 under a runtime that cannot read it](#14-cgroup-v2-under-a-runtime-that-cannot-read-it):
     old Java and .NET size their heaps from the host and are OOM-killed. `GKE, node, image`
-16. [The OOM killer starts killing the whole container](#16-the-oom-killer-starts-killing-the-whole-container):
+15. [The OOM killer starts killing the whole container](#15-the-oom-killer-starts-killing-the-whole-container):
     multi-process containers that used to lose one worker now die outright. `GKE, node, image`
-17. [The network dataplane changes](#17-the-network-dataplane-changes): policy, DNS or specific
+16. [The network dataplane changes](#16-the-network-dataplane-changes): policy, DNS or specific
     flows behave differently. `GKE, k8s, notes`
-18. [A node networking agent fails on the new image](#18-a-node-networking-agent-fails-on-the-new-image):
+17. [A node networking agent fails on the new image](#17-a-node-networking-agent-fails-on-the-new-image):
     Service routing stops on rebuilt nodes, or cluster-wide. `notes, k8s`
-19. [GPU driver mismatch](#19-gpu-driver-mismatch): CUDA containers cannot open the device. `notes, image`
-20. [In-tree volumes lose their CSI path](#20-in-tree-volumes-lose-their-csi-path): old
+18. [GPU driver mismatch](#18-gpu-driver-mismatch): CUDA containers cannot open the device. `notes, image`
+19. [In-tree volumes lose their CSI path](#19-in-tree-volumes-lose-their-csi-path): old
     PersistentVolumes stop attaching. `GKE, k8s`
-21. [Images on a retired registry](#21-images-on-a-retired-registry): new nodes cannot pull what
+20. [Images on a retired registry](#20-images-on-a-retired-registry): new nodes cannot pull what
     old nodes had cached. `k8s, git, GKE`
 
 ## Where each failure lands in the upgrade
 
 The list groups failures by moment. The diagram puts them in order, with one fact the list cannot
 show: which failures hold GKE's drain, and for how long. A refused eviction holds it, for at most
-one hour per node before GKE force-evicts, and three entries reach that: a budget with no allowance
+one hour per node on a surge upgrade and up to seven days on a blue-green one before GKE
+force-evicts, and three entries reach that: a budget with no allowance
 left (1), and the two cases where replacements never become Ready, because there was nowhere to
-schedule them (2) or a fail-closed webhook rejected them (8); a budget counts those replacements
+schedule them (2, on a pool configured to allow unavailability) or a fail-closed webhook rejected
+them (7); a budget counts those replacements
 unavailable, and once its allowance is used up it refuses the next eviction. A webhook that matches
 the eviction call itself, or `kube-system`, blocks the drain with no budget involved. A maintenance
-window that closes mid-roll (6) pauses the operation between nodes, and the diagram leaves that
+window that closes mid-roll (5) pauses the operation between nodes, and the diagram leaves that
 case out. Every other failure lets the upgrade finish, and the break lands afterwards on an
 upgraded cluster, which is why the post-upgrade signals are worth reading even when the operation
 reports success.
@@ -161,16 +163,14 @@ flowchart TD
     Defaults -- yes --> Adm["Rejections at admission,<br/>evictions nobody asked for"]
     Defaults -- no --> Pool[Node pool upgrade:<br/>drain each node, rebuild it]
     Pool --> PDB{Does the budget<br/>allow the eviction?}
-    PDB -- no --> Stall["Drain stalls up to an hour per node,<br/>then force-delete: an outage"]
+    PDB -- no --> Stall["Drain stalls: an hour per node on surge,<br/>up to seven days on blue-green,<br/>then force-delete: an outage"]
     PDB -- yes --> Room{Is there somewhere<br/>to reschedule?}
     Room -- "no: fail-closed webhook" --> Deadlock["Webhook deadlock: blocks the drain itself<br/>when it matches evictions or kube-system,<br/>else via a budget with no allowance left"]
-    Room -- "no: no surge, no headroom" --> Pending["Pods Pending until the old node returns<br/>(stalls the drain, up to an hour,<br/>once a budget's allowance is used up)"]
+    Room -- "no: maxUnavailable set, no headroom" --> Pending["Pods Pending until the old node returns<br/>(stalls the drain, for the same window,<br/>once a budget's allowance is used up)"]
     Room -- yes --> Image[The new node image boots]
     Image -- "CNI, kube-proxy or<br/>kernel regression" --> Net[Node NotReady or<br/>Service routing broken]
     Image -- "runtime, cgroup, label,<br/>driver or registry change" --> Crash["CrashLoop, OOMKilled,<br/>group OOM kill, unschedulable,<br/>ImagePullBackOff"]
-    Image -- boots clean --> Ready{Does the readiness probe<br/>wait for the application?}
-    Ready -- no --> Cold[Traffic during<br/>cold start: 5xx]
-    Ready -- yes --> OK([Application restored])
+    Image -- boots clean --> OK([Application restored])
 ```
 
 ## The scenarios
@@ -189,8 +189,10 @@ which audit or skill reads what; the "read today" lines here are the delta again
 ### 1. A PodDisruptionBudget forbids the eviction
 
 A node drain evicts pods through the eviction API, and a budget whose `disruptionsAllowed` is 0
-refuses every eviction. GKE respects the budget for up to one hour per node, then force-evicts,
-so the application goes down after an hour of stall instead of after a clean handover.
+refuses every eviction. How long GKE waits depends on the pool's upgrade strategy: a surge upgrade
+respects the budget for up to one hour per node, and a blue-green upgrade can be configured to
+respect it for up to seven days; at the end of that window GKE force-evicts, so the application
+goes down after the stall instead of after a clean handover.
 
 - Before: a budget whose `disruptionsAllowed` is 0 for a reason that will not clear, which is
   `maxUnavailable` 0, `minAvailable` equal to the replica count, or a single-replica workload
@@ -198,31 +200,41 @@ so the application goes down after an hour of stall instead of after a clean han
 - Where to look: the Kubernetes API: each budget's `spec` and `status`, and the owner's `.spec.replicas` behind it.
 - After: the node sits `SchedulingDisabled` with the pod still on it, `Cannot evict pod` events,
   the `UPGRADE_NODES` operation running far longer than one node should take, then the pod deleted.
-- Mitigate before: give the budget room: `maxUnavailable` at least 1 or `minAvailable` below the replica count, and a second replica so the budget can be honoured; for a true singleton, accept the outage inside a maintenance window; blue-green with a longer soak postpones it, since the blue pool's deletion phase ignores budgets, but never avoids it.
+- Mitigate before: give the budget room: `maxUnavailable` at least 1 or `minAvailable` below the replica count, and a second replica so the budget can be honoured; for a true singleton, accept the outage inside a maintenance window; a blue-green upgrade configured to honour budgets for up to seven days moves the outage to a time of your choosing, but does not avoid it.
 - Mitigate after: fix the budget and the stalled drain resumes at once; never delete the budget without replacing it, since that trades a stall for an unprotected workload.
 - Read today: the readiness mode of `fleet-upgrade-verification` grades it `blocked`.
 - GKE recommender: `PDB_UNPERMISSIVE` flags a budget that allows zero evictions; `DEPLOYMENT_MISSING_PDB` and `PDB_UNPROTECTED_STATEFULSET` flag the opposite gap. All from the [disruption-readiness insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/workload-disruption-readiness), reassessed daily.
-- Why it is on the list: the one-hour grace and the forced eviction are in GKE's
+- Why it is on the list: the one-hour grace on surge upgrades, the up-to-seven-day budget window
+  on blue-green upgrades, and the forced eviction that ends both are in GKE's
   [node upgrade strategies](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies).
   The seeded fleet plants no drain-blocking budget.
 
 ### 2. No spare capacity for the displaced pods
 
-Draining a node only works if the pods it carries can start somewhere else. With no surge node,
-no headroom, an autoscaler at its ceiling or exhausted accelerator quota, they wait for the node
-that was just taken away, and a single-replica application has a guaranteed outage.
+This entry needs a pool whose upgrade settings let a node go away before its replacement exists:
+`maxUnavailable` above 0, which GKE sets only on request. On GKE's default surge settings,
+`maxSurge` 1 and `maxUnavailable` 0, the replacement node is created first, and if it cannot be
+(quota, a stockout) the upgrade stops there with the old node still serving. On a pool that allows
+unavailability, draining a node only works if the pods it carries can start somewhere else. With no
+headroom, an autoscaler at its ceiling or exhausted accelerator quota, they wait for the node that
+was just taken away, and a single-replica application has a guaranteed outage.
 
-- Before: the pool's `maxSurge` is 0, requests already close to allocatable minus one node, the
-  autoscaler at its maximum, or accelerator quota exhausted.
+- Before: a pool whose `upgradeSettings` set `maxUnavailable` above 0 (with or without
+  `maxSurge` 0), and then requests already close to allocatable minus one node, the autoscaler at
+  its maximum, or accelerator quota exhausted.
 - Where to look: the GKE API for the pool's `upgradeSettings`, autoscaler limits, and Compute Engine for accelerator quota; the Kubernetes API for the sum of requests against allocatable.
 - After: Pending pods with `Insufficient cpu` or `Insufficient nvidia.com/gpu`, autoscaler events
   citing quota.
-- Mitigate before: `maxSurge` at least 1, one node of headroom in the pool, an autoscaler ceiling and accelerator quota that allow it; for accelerator pools surge is the strategy that fits a small quota, since `maxSurge` 1 needs one extra node's quota while blue-green needs a whole second pool's.
+- Mitigate before: leave the pool on GKE's default surge settings, or return it to them: `maxSurge` at least 1 and `maxUnavailable` 0, with one node of headroom, an autoscaler ceiling and accelerator quota that allow the extra node; for accelerator pools surge is the strategy that fits a small quota, since `maxSurge` 1 needs one extra node's quota while blue-green needs a whole second pool's.
 - Mitigate after: add a node or raise the ceiling and the Pending pods schedule.
 - Read today: the stockout-prevention audit flags regional GPU, TPU and CPU quota near exhaustion and pools near `autoscaling.maxNodeCount`; `maxSurge` and headroom against allocatable are unread.
 - GKE recommender: partial: `CLUSTER_UNDERPROVISIONED` from the [utilisation insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-cluster-utilization); nothing reads `maxSurge` or quota. The Network Analyzer's separate `google.networkanalyzer.container.ipAddressInsight` covers pod IP exhaustion.
-- Why it is on the list: it follows from how a drain works, not from an incident; no public story
-  verified and no fixture. Accelerator pools are the common case because their quota is small.
+- Why it is on the list: it follows from how a drain works on a pool configured to allow
+  unavailability, not from an incident, and it does not arise on GKE's default settings. Measured
+  on a test cluster whose GPU pool had `maxSurge` 0 and `maxUnavailable` 1: the only L4 node was
+  destroyed, the zone had no L4 to replace it for eight minutes, and GKE reported the operation
+  done while the pool was in error. No public story verified and no fixture. Accelerator pools
+  are the common case because their quota is small.
 
 ### 3. Every replica in one zone or on one node
 
@@ -240,25 +252,7 @@ node, or a zone whose nodes roll together, the upgrade takes every replica at on
 - Why it is on the list: a consequence of scheduling, not an incident; no fixture on the seeded
   fleet and no public story verified.
 
-### 4. Slow cold start
-
-After the rebuild the pod restarts from nothing. If the readiness probe passes before the
-application can serve, or there is no probe, the load balancer sends traffic to a pod that is
-still loading.
-
-- Before: a missing startup or readiness probe, a probe that passes before the application can
-  serve, or a model or image cache on an `emptyDir` that a rebuild empties.
-- Where to look: the Kubernetes API for probe specs and `emptyDir` volumes; the image, or the pod's own history of time from start to Ready, for how long the application really takes.
-- After: Ready flapping, 5xx from the load balancer immediately after the node returns.
-- Mitigate before: a `startupProbe` that covers the real load time, a readiness probe that checks serving rather than process liveness, `minReadySeconds`, and a cache that survives a rebuild (a PersistentVolume, or an image that carries the data).
-- Mitigate after: nothing shortens the load; the readiness probe is what keeps traffic away until it finishes.
-- Read today: the obtainability audit flags a missing readiness probe; a probe that passes too
-  early is unread.
-- GKE recommender: `PDB_STATEFULSET_WITHOUT_PROBES`, for StatefulSets only and for the missing-probe case only.
-- Why it is on the list: no public incident verified. A model server that reloads its weights for
-  minutes after every recreate is the common shape.
-
-### 5. Data on the node is gone
+### 4. Data on the node is gone
 
 A rebuilt node is a new machine. Local SSD and `emptyDir` contents do not come back.
 
@@ -274,7 +268,7 @@ A rebuilt node is a new machine. Local SSD and `emptyDir` contents do not come b
   [incidents section](upgrade-readiness-checks.md#upgrades-that-went-wrong-in-public); no public
   incident verified.
 
-### 6. Maintenance window too short, or an exclusion ends mid-roll
+### 5. Maintenance window too short, or an exclusion ends mid-roll
 
 A surge upgrade pauses when the maintenance window closes and resumes at the next one, so a large
 pool can run two versions for days. An exclusion whose scope covers the needed upgrade holds
@@ -293,12 +287,15 @@ back the automatic one, while a manual upgrade still runs, and one that ends ins
 - GKE recommender: `CLUSTER_MAINTENANCE_WINDOW_AND_EXCLUSIONS` recommends configuring a window and `CLUSTER_RELEASE_CHANNEL_UNSPECIFIED` a channel; neither checks a window's length against the pool.
 - Why it is on the list: a common support case; no single public story verified.
 
-### 7. A served API version is removed
+### 6. A served API version is removed
 
 Kubernetes stops serving deprecated API versions on a schedule. Objects already stored survive,
 because the server keeps serving them through the versions that remain, but every client still
 asking for the removed version fails. The last minor that removed a served version is 1.32, which
-dropped `flowcontrol.apiserver.k8s.io/v1beta3`.
+dropped `flowcontrol.apiserver.k8s.io/v1beta3`. On GKE the automatic control-plane upgrade does
+not take this step while GKE observes calls to an API the next minor removes; the entry stays
+because two paths bypass that hold, an operator upgrading by hand past the insight and the forced
+upgrade when a minor reaches the end of its support, and both happen.
 
 - Before: GKE's deprecation insight for the target minor (`google.container.DiagnosisInsight`,
   subtypes `DEPRECATION_K8S_*` for API and feature removals and `DEPRECATION_CONTAINERD_*` for the
@@ -327,7 +324,7 @@ dropped `flowcontrol.apiserver.k8s.io/v1beta3`.
   The permanent stand-in the fleet plants instead writes `Endpoints`, deprecated in 1.33: each
   write is stamped `k8s.io/deprecated=true`, with no removal label and no Recommender insight.
 
-### 8. A fail-closed webhook whose backend is not up
+### 7. A fail-closed webhook whose backend is not up
 
 An admission webhook with `failurePolicy: Fail` rejects every matching request when its backend
 does not answer. During a node upgrade the backend itself gets drained, and while it is down
@@ -345,7 +342,7 @@ case `kube-system`.
 - Why it is on the list: Jetstack's Open Policy Agent webhook outage in the incidents; no fixture
   on the seeded fleet.
 
-### 9. A default changes in the new minor
+### 8. A default changes in the new minor
 
 Each minor turns some behaviour on by default. A pod admitted yesterday can be rejected today
 without anyone changing it.
@@ -361,7 +358,7 @@ without anyone changing it.
 - Why it is on the list: the PodSecurityPolicy removal in 1.25; the `gitRepo` volume the kubelet
   refuses from [1.36](https://kubernetes.io/blog/2026/04/22/kubernetes-v1-36-release/).
 
-### 10. A feature is deprecated but still served
+### 9. A feature is deprecated but still served
 
 A deprecation breaks nothing on the day it lands; the removal does, minors later. Tracking the
 count across runs is what turns a future removal from a surprise into a plan.
@@ -379,7 +376,7 @@ count across runs is what turns a future removal from a surprise into a plan.
   [1.36 externalIPs notice](https://kubernetes.io/blog/2026/05/14/kubernetes-v1-36-deprecation-and-removal-of-service-externalips/)
   is the current example of a deprecation with a removal date attached.
 
-### 11. Add-on and client skew
+### 10. Add-on and client skew
 
 Operators, `kubectl`, `client-go` builds, service meshes and GPU operators each support a range of
 server versions. A control plane that moves past that range breaks them, and a node pool too far
@@ -397,7 +394,7 @@ behind the control plane breaks the kubelet's own contract.
 - Why it is on the list: the Calico teardown race on GKE 1.22 in the incidents, an add-on known
   issue.
 
-### 12. The control plane is unreachable for minutes on a zonal cluster
+### 11. The control plane is unreachable for minutes on a zonal cluster
 
 A zonal cluster has one control-plane replica, and it is replaced during the upgrade. Anything
 that talks to the API without retrying fails for those minutes.
@@ -413,7 +410,7 @@ that talks to the API without retrying fails for those minutes.
   [cluster availability types](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters)
   document the behaviour; no public incident verified and no fixture.
 
-### 13. A node label or taint is removed
+### 12. A node label or taint is removed
 
 A pod whose `nodeSelector` names a label the new kubelet or node image no longer sets can never
 schedule again.
@@ -427,23 +424,28 @@ schedule again.
 - Read today: nothing.
 - GKE recommender: none.
 - Why it is on the list: no GKE label removal verified. The public case, Reddit's 1.24 outage, was
-  a kubeadm label read by a CNI selector rather than a pod selector, and is entry 18's evidence.
+  a kubeadm label read by a CNI selector rather than a pod selector, and is entry 17's evidence.
 
-### 14. The container runtime changes
+### 13. The container runtime changes
 
-GKE moved from Docker to containerd between 1.19 and 1.24. Anything that mounted the Docker socket
-or shelled out to `docker` lost it.
+Every supported GKE version runs containerd, so the Docker-socket break of the 1.19 to 1.24
+migration is history. What still changes with the node image is containerd itself: the major
+version and the CRI surface it serves. Images in the Docker v1 schema stop pulling, clients pinned
+to the `v1alpha2` CRI API stop working, and containerd 2.x drops configuration and plugins that 1.x
+tolerated, which is the runtime change a node pool upgrade can carry.
 
-- Before: DaemonSets and pods mounting `docker.sock`; images built around Docker-only tooling.
-- Where to look: the Kubernetes API for volume mounts of `docker.sock`; the GKE API for the pool's node image type.
-- After: crash loops in logging and security agents.
-- Mitigate before: replace agents that mount the Docker socket with CRI-based ones.
-- Mitigate after: the same replacement, under pressure.
-- Read today: the security-patch orchestrator flags a pool whose `config.imageType` is a pre-containerd `COS` or `UBUNTU` variant and names the `_CONTAINERD` move; `docker.sock` mounts and Docker-only images are unread.
-- GKE recommender: `DEPRECATION_K8S_1_24_DOCKERSHIM`, `DEPRECATION_CONTAINERD_V1_SCHEMA_IMAGES` and `DEPRECATION_CONTAINERD_V1ALPHA2_CRI_API`, for the migrations that have happened.
-- Why it is on the list: the Docker to containerd migration on GKE 1.19 to 1.24.
+- Before: node agents that talk to the CRI socket directly (monitoring, security and logging
+  agents pinned to the `v1alpha2` API), images in the Docker v1 schema, and DaemonSets that read or
+  ship containerd configuration in the 1.x layout.
+- Where to look: the GKE API for the pool's node image type and the containerd the target version ships; the Kubernetes API for DaemonSets mounting the containerd socket or its configuration directory; the GKE recommender for the two containerd insights.
+- After: crash loops in node agents; `ImagePullBackOff` on images the new runtime refuses.
+- Mitigate before: move agents to the CRI `v1` API, rebuild v1-schema images, drop containerd 1.x configuration overrides.
+- Mitigate after: the same changes, under pressure; a completed node pool can be downgraded in place while GKE still offers the previous version.
+- Read today: the security-patch orchestrator flags a pool whose `config.imageType` the location no longer offers or that names a pre-containerd variant; CRI clients, image schemas and containerd configuration are unread.
+- GKE recommender: `DEPRECATION_CONTAINERD_V1_SCHEMA_IMAGES` and `DEPRECATION_CONTAINERD_V1ALPHA2_CRI_API`, the two transitions GKE has flagged on real clusters; `DEPRECATION_K8S_1_24_DOCKERSHIM` is the historical one.
+- Why it is on the list: containerd 1.x is supported through Kubernetes 1.35 and 2.x follows it, and GKE's two containerd insights exist because both breaks happened on real clusters.
 
-### 15. cgroup v2 under a runtime that cannot read it
+### 14. cgroup v2 under a runtime that cannot read it
 
 Older Java, .NET and Go runtimes read their memory limit from cgroup v1 paths. On a cgroup v2 node
 they see the host's memory instead, size their heaps from it, and are OOM-killed at the container
@@ -464,7 +466,7 @@ so for such a pool the flip does arrive with the minor.
 - Why it is on the list: the Kubernetes cgroup v2 documentation names the runtime versions; no
   public incident verified.
 
-### 16. The OOM killer starts killing the whole container
+### 15. The OOM killer starts killing the whole container
 
 From Kubernetes 1.28 the kubelet sets `memory.oom.group` on every container on a cgroup v2 node,
 so an out-of-memory event kills the whole container instead of the one process that overran. A
@@ -492,7 +494,7 @@ misreads its limit.
   [EKS 1.32 to 1.34 regression](https://2i2c.org/blog/kubernetes-cgroup-changes/), where a node
   image change turned cgroup v2 on under a kubelet already past 1.28, the incident.
 
-### 17. The network dataplane changes
+### 16. The network dataplane changes
 
 A new version can change how NetworkPolicy is enforced, which DNS serves the cluster, or how a
 specific flow is handled.
@@ -507,7 +509,7 @@ specific flow is handled.
 - Why it is on the list: no public incident verified; the per-version known-issue notes are the
   signal.
 
-### 18. A node networking agent fails on the new image
+### 17. A node networking agent fails on the new image
 
 The CNI, `kube-proxy` and node-local DNS run on every node and depend on the node's labels,
 kernel and packages. A change under them stops Service routing on the rebuilt nodes, and if the
@@ -526,7 +528,7 @@ CNI's own control components are hit, cluster-wide within minutes.
   label went away; the Datadog and Heroku outages in the incidents are the same shape, triggered by
   an OS update rather than an upgrade.
 
-### 19. GPU driver mismatch
+### 18. GPU driver mismatch
 
 The node image ships a GPU driver; the containers ship a CUDA version. When the new image's driver
 is older than what the CUDA build requires, the device cannot be opened.
@@ -540,7 +542,7 @@ is older than what the CUDA build requires, the device cannot be opened.
 - GKE recommender: none.
 - Why it is on the list: frequent on accelerator pools; no public incident verified.
 
-### 20. In-tree volumes lose their CSI path
+### 19. In-tree volumes lose their CSI path
 
 PersistentVolumes written against the in-tree `gce-pd` plugin attach only through CSI migration to
 the PD CSI driver, which GKE switched on at 1.22. The minor upgrade that meets this entry is the
@@ -563,7 +565,7 @@ is the same.
   [PD CSI driver page](https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/gce-pd-csi-driver);
   no public incident verified and no fixture.
 
-### 21. Images on a retired registry
+### 20. Images on a retired registry
 
 Old nodes had the image cached; a rebuilt node has to pull it. If the registry hostname has
 stopped publishing, or an egress allowlist admits only the old hostname, only the new nodes fail.
@@ -585,14 +587,14 @@ stopped publishing, or an egress allowlist admits only the old hostname, only th
 
 The order is by how often each failure appears in the public record and how cheap its signal is to
 read. GKE's recommender comes first, because one call per location returns the deprecation
-insights (7) together with the budget (1), webhook (8), skew (11), runtime (14) and window (6)
+insights (6) together with the budget (1), webhook (7), skew (10), runtime (13) and window (5)
 insights; the readiness requirements'
 [deprecation-insights section](upgrade-readiness-checks.md#gke-deprecation-insights) says what else
-the pause the deprecation family puts on automatic upgrades explains. Fail-closed webhooks (8) and the unread half of capacity headroom (2), surge settings and headroom
+the pause the deprecation family puts on automatic upgrades explains. Fail-closed webhooks (7) and the unread half of capacity headroom (2), surge settings and headroom
 against allocatable, come next, because both turn a routine drain into an outage and both are a few
-list calls. Replica placement (3) is already read. The node-image entries (13 to 21) follow, which
+list calls. Replica placement (3) is already read. The node-image entries (12 to 20) follow, which
 need the target version to be known before they mean anything. Post-upgrade detection is one mechanism for every
-entry: watch the operation, then compare Pending and crash-looping pod counts, readiness flapping
-and a live service probe against the same measurements taken before the upgrade started, as the
+entry: watch the operation, then compare Pending and crash-looping pod counts and a live service
+probe against the same measurements taken before the upgrade started, as the
 readiness requirements' [rollout section](upgrade-readiness-checks.md#rollout-and-verification)
 specifies.
