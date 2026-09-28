@@ -538,13 +538,15 @@ def parse_reason(text: str) -> str:
 def _readable_count(value: Any) -> int | None:
     """A count as the door or the executor spells it, or ``None`` when it
     cannot be read: not a number, not finite (``json.loads`` admits ``NaN``,
-    ``Infinity`` and ``1e999``), or not positive. A float is read by its
-    floor. ``None`` rather than zero, because zero is the value that vouches
-    for the trace and an unreadable count is a loss, not an absence.
+    ``Infinity`` and ``1e999``), or below one. A float is read by its floor,
+    and the bound is checked before the floor so that a fraction in (0, 1)
+    does not floor to zero. ``None`` rather than zero, because zero is the
+    value that vouches for the trace and an unreadable count is a loss, not
+    an absence.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not math.isfinite(value) or value <= 0:
+    if not math.isfinite(value) or value < 1:
         return None
     return int(value)
 

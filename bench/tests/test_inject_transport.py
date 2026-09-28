@@ -2337,6 +2337,8 @@ def test_the_probe_reads_the_trace_off_the_body() -> None:
     [
         ("3", 3, 0),
         ("2.9", 2, 0),
+        ("1.0", 1, 0),
+        ("0.5", 0, 1),
         ("NaN", 0, 1),
         ("Infinity", 0, 1),
         ("-Infinity", 0, 1),
