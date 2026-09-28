@@ -15,10 +15,14 @@
 # The scenario driver for bench/tasks/bootstrap-discovery-fanout: re-arm the
 # onboarding discovery gate on the install under test, wait for the
 # `bootstrap-inventory-scan` cron job to file a fresh sweep card, and return
-# once the sweep's worker has filed cards and then ended its run itself --
-# by then it has filed whatever Cluster Agent cards it is going to file, which
-# is what the case grades. It does not wait for those cards to finish: the
-# destroy archives them, and archiving a running card ends its worker.
+# once the sweep's worker has filed cards and then ended its run itself, or
+# has completed without filing any -- by then it has filed whatever Cluster
+# Agent cards it is going to file, which is what the case grades. Short of
+# that, it hands whatever the worker filed to the verifier at `run_wait`. It
+# does not wait for the Cluster Agent cards itself: the worker's SOP polls
+# them to the end inside its run, but a worker can end its run while they
+# are still running (#1981). The destroy archives them, and archiving a
+# running card ends its worker.
 #
 # Re-arming is the runbook in agents/chat/defaults/plugins/bootstrap_onboarding/
 # README.md §5 plus one step: the board deduplicates kanban_create on
@@ -147,7 +151,8 @@ resource "null_resource" "sweep" {
       PY
       }
       # Anything but `idle`, a failed exec included, reads as running. Every
-      # pod is checked because above one replica only the leader runs cron.
+      # Running pod is checked because above one replica only the leader runs
+      # cron; an evicted pod stays listed, and its exec always fails.
       gate_running() {
         selector="$(kubectl get deployment -n "${var.agent_namespace}" "${var.agent_deployment}" \
           -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}' || true)"
@@ -248,16 +253,19 @@ resource "null_resource" "sweep" {
       echo "The gate filed sweep card $sweep after $${elapsed}s."
 
       # ---- 4. Wait for the sweep worker to file its cards -----------------
-      # The worker blocks to wait for its Cluster Agent cards or completes
-      # once it has filed them, and either ends its run. A run can also end
-      # before the worker has filed them all -- the guardrail's rate-limit
-      # block, retries exhausted (timed_out), a crashed worker reclaimed --
-      # and the retry's re-creates add no newer card. So only a run the worker
-      # ended itself, completed or blocked other than by that guardrail, at
-      # or after the newest Cluster Agent card counts. The prioritize card is
-      # left out: the worker can file it after its run completes. Counting
-      # ended runs rather than reading the card's status cannot miss a block
-      # the dispatcher lifts between two polls. The board creates
+      # The SOP has the worker poll its Cluster Agent cards inside its run and
+      # complete after filing the prioritize card; workers also complete
+      # before those cards finish, or block to wait on them. Each ends the
+      # run. A run can also end before the worker has filed them all -- the
+      # guardrail's rate-limit block, retries exhausted (timed_out), a crashed
+      # worker reclaimed -- and the retry's re-creates add no newer card. So
+      # only a run the worker ended itself, completed or blocked other than by
+      # that guardrail, at or after the newest Cluster Agent card counts. With
+      # no Cluster Agent card filed, only a completed run counts: a worker that
+      # blocked can still file them once the block is lifted. The prioritize
+      # card is left out: the worker can file it after its run completes.
+      # Counting ended runs rather than reading the card's status cannot miss
+      # a block the dispatcher lifts between two polls. The board creates
       # kanban_worker_children when a worker first files a card.
       run_state() {
         agent_py "$sweep" "${local.cluster_key_like}" "${local.rate_limit_block}" <<'PY'
@@ -273,6 +281,8 @@ resource "null_resource" "sweep" {
       if newest is not None:
           ended = c.execute("SELECT outcome, coalesce(summary, '') FROM task_runs WHERE task_id = ? AND ended_at >= ?", (sweep, newest))
           after = sum(o == "completed" or (o == "blocked" and not s.startswith(rate_limit)) for o, s in ended)
+      else:
+          after = c.execute("SELECT count(*) FROM task_runs WHERE task_id = ? AND outcome = 'completed'", (sweep,)).fetchone()[0]
       print(runs[0], runs[1], filed, after)
       PY
       }

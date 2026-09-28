@@ -355,6 +355,23 @@ class RunStateQueryTest(unittest.TestCase):
         runs = [(100, 210, "reclaimed", None), (220, 400, "completed", "done")]
         self.assertEqual(self._query(runs, [120, 200, 300, 350]), "2 2 4 1")
 
+    def test_a_run_that_completed_without_filing_a_cluster_card_counts(self):
+        # A build whose worker files only the prioritize card, then completes.
+        runs = [(100, 160, "completed", "done")]
+        self.assertEqual(self._query(runs, [], prioritize_at=150), "1 1 0 1")
+        self.assertEqual(self._query(runs, None), "1 1 0 1")
+
+    def test_with_no_cluster_card_only_a_completed_run_counts(self):
+        prefix = _INTERPOLATIONS["local.rate_limit_block"]
+        for outcome, summary in (
+            ("blocked", "Waiting for the roster"),
+            ("blocked", prefix + " (failure_reason=rate_limit): 429"),
+            ("reclaimed", "worker process gone"),
+            ("timed_out", None),
+        ):
+            with self.subTest(outcome=outcome, summary=summary):
+                self.assertEqual(self._query([(100, 210, outcome, summary)], [], prioritize_at=150), "1 1 0 0")
+
 
 if __name__ == "__main__":
     unittest.main()
