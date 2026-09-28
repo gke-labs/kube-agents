@@ -240,6 +240,12 @@ class RequiredApisTest(unittest.TestCase):
         # bench/tf/fleet declares google_compute_disk directly.
         self.assertIn("compute.googleapis.com", checker.REQUIRED_APIS)
 
+    def test_cloudtrace_api_is_required(self):
+        # The observability nightly case reads traces through the broker's
+        # relay on roles/cloudtrace.user; a project with the role and the API
+        # off fails it with SERVICE_DISABLED, which this check exists to catch.
+        self.assertIn("cloudtrace.googleapis.com", checker.REQUIRED_APIS)
+
     def test_all_apis_enabled_passes(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
@@ -3714,6 +3720,32 @@ class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
         self.assertIn(f"--role={checker.FLEET_RECONCILER_BUCKET_LIST_ROLE} --condition=None", page)
         self.assertIn(f"--role={checker.FLEET_RECONCILER_BUCKET_ROLE} \\\n    --condition=", page)
         self.assertIn(f"/objects/{checker.FLEET_RECONCILER_STATE_PREFIX}", page)
+
+
+class RequiredApisMatchEnableSitesTest(unittest.TestCase):
+    """REQUIRED_APIS must equal what the two enabling sites enable.
+
+    The APIs are written here, in the provisioning script's `gcloud services
+    enable` block, and in the copy of that block on the pool page, and none
+    reads another. The page says the block and this set must agree, and
+    nothing else holds them to it: an API dropped from the script leaves a
+    project the verifier fails on first run, and one dropped from this set
+    leaves a project the verifier passes with the API off, which for
+    cloudtrace.googleapis.com is a nightly case failing on SERVICE_DISABLED.
+    """
+
+    def _enable_block(self, text, what):
+        blocks = re.findall(r"^gcloud services enable \\\n(.*?)^\s*--project=", text, re.S | re.M)
+        self.assertEqual(len(blocks), 1, f"expected exactly one `gcloud services enable` block in {what}")
+        return set(re.findall(r"[\w-]+\.googleapis\.com", blocks[0]))
+
+    def test_matches_the_block_the_provisioning_script_runs(self):
+        script = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text()
+        self.assertEqual(self._enable_block(script, "provision_ci_pool_project.sh"), checker.REQUIRED_APIS)
+
+    def test_matches_the_block_on_the_prerequisites_page(self):
+        page = (checker._ROOT / "docs" / "ci-pool-projects.md").read_text()
+        self.assertEqual(self._enable_block(page, "docs/ci-pool-projects.md"), checker.REQUIRED_APIS)
 
 
 class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):
