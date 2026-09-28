@@ -304,7 +304,9 @@ func TestBridgeLookAheadIsInTheA2AModule(t *testing.T) {
 		}
 	}
 
-	// The guard itself.
+	// The guard itself. The call sites are logged on the way through, so a
+	// run's record names where the look-ahead lives on the day it moves.
+	t.Logf("bridge look-ahead reads: %s", strings.Join(lookAheadCalls, "; "))
 	if len(lookAheadCalls) == 0 {
 		t.Errorf("no bridge source calls a *%s read: the bridge no longer replays per spawn, so a2aTasksReplayBridgeLookAhead reserves slots for code no render reaches. Remove it from the a2aTasksReplayConsumers sum, which takes replays in flight to 6, a2aTasksReplayConsumers to 12 and a2aTasksReservedConsumers to 28, and re-derive the two tables above the constants and the numbers the tests here pin.",
 			a2aBridgeLookAheadCall)

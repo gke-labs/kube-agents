@@ -563,7 +563,7 @@ const (
 	a2aTasksReplayAsk  = 2
 	a2aTasksReplayAsks = a2aTasksReplayAsk * a2aBridgeDefaultConcurrency
 	// a2aTasksReplayBridgeLookAhead is the bridge's pre-spawn look-ahead:
-	// lib.TaskInReplay once per spawn, from each worker.
+	// lib.TaskInReplay at most once per spawn, from each worker.
 	a2aTasksReplayBridgeLookAhead = a2aBridgeDefaultConcurrency
 	// a2aTasksReplayTailFactor is the slots one trigger-paced source holds:
 	// the replay running and the one before it, still inside its five-second
