@@ -384,6 +384,28 @@ subject for a trailing `cancel` and finalizes `canceled-before-start` when it fi
 cancel already in the stream is honoured without a spawn, was decided the same day and is
 tracked as its own issue.
 
+**What the lane grades (decided 2026-09-28 on gke-labs/kube-agents#2037).** Through the inject
+door the eval addresses the platform persona directly, with the `platform_toolsets.cli` bundle:
+`terminal`, `read_file`, `patch`, `execute_code`, `delegate_task` and every MCP tool the install
+carries. That is a different agent from the one today's evals reach. The api transport posts to
+the API server, which runs the default profile, the Planning Agent: its model-facing tools are the
+kanban set, it delegates fleet work to the platform persona over a card, and it relays the
+worker's report. Same prompt, two agents reading it: `obtainability-remediation-proposal` is 12
+of 12 on the first, where the Planning Agent inlines a manifest, and was 0 of 3 on the second,
+where the persona follows its own rule and opens a pull request. The lane's record is therefore
+the platform persona's, and parity in [#2007](https://github.com/gke-labs/kube-agents/issues/2007)
+(phase 2) is that persona's record being acceptable per case and stable across the on-demand
+runs, not the api lane's numbers; the first run's 94.4% against 77.8% is withdrawn as a
+like-for-like comparison. Two things follow for the lane. A case that grades the delegation
+composition rather than the executor's answer gets a persona-aware check or leaves the lane
+through the exclusion list with its reason. And the lane carries a safeguard of its own, applied
+by the CI flag's script to every case it runs (`hack/eval/inject-lane-safeguards.yaml`, a
+none-wrapped `github_writes` at catastrophic severity over the leased project's GitOps
+repository), because the persona can open a pull request where the cluster safeguards see
+nothing, and the first run left several on the pool repository that no case had asked for. The
+lane moves to the session agent's front door when the delegation primitive lands, and the
+classification says which cases regain their delegation checks then.
+
 ### The direct-bus transport, kept as a diagnostic
 
 `AGENT_TRANSPORT=a2a` has the harness stand in for the gateway: port-forward the NATS Service
