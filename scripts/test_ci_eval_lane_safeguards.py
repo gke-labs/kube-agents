@@ -165,17 +165,18 @@ class InjectLaneTest(unittest.TestCase):
                 self.assertEqual(spec_names(pathlib.Path(path)), original + [LANE_ENTRY])
         self.assertIn("every task in the matrix carries the lane's safeguards", result.stdout)
         self.assertIn("BENCH_GITOPS_REPO=gke-agentic/kube-agents-evals-21-infra", result.stdout)
-        # No presubmit case requests a pull request, so the second phase is
-        # empty and the log says so.
-        self.assertEqual(value(result, "REQUESTING"), "")
-        self.assertIn("cases that request a pull request, run after every other unit: none", result.stdout)
+        # One presubmit case is in the file's `requesting:` list (the persona
+        # answers it with a pull request before its own check says so), so
+        # the second phase holds it and the log says so.
+        self.assertEqual(value(result, "REQUESTING"), "obtainability-remediation-proposal")
+        self.assertIn("run after every other unit: obtainability-remediation-proposal", result.stdout)
 
     def test_the_requesting_cases_are_named_for_the_second_phase(self):
         tasks = presubmit_tasks() + ["./tasks/pdb-remediation-pr/task.yaml", "./tasks/rca-remediation-pr/task.yaml"]
         result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}, tasks=tasks)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(value(result, "REQUESTING"), "pdb-remediation-pr,rca-remediation-pr")
-        self.assertIn("run after every other unit: pdb-remediation-pr,rca-remediation-pr", result.stdout)
+        self.assertEqual(value(result, "REQUESTING"), "obtainability-remediation-proposal,pdb-remediation-pr,rca-remediation-pr")
+        self.assertIn("run after every other unit: obtainability-remediation-proposal,pdb-remediation-pr,rca-remediation-pr", result.stdout)
 
     def test_the_task_files_under_bench_tasks_are_not_written(self):
         before = {p: p.read_bytes() for p in (BENCH_DIR / "tasks").glob("*/task.yaml")}

@@ -566,7 +566,9 @@ the prefix with no pull request whose tip was committed in that window (the refs
 request grades it with `pull_request_opened` and its reply names the URL; up to
 `requested_pull_requests` of the writes that reply names are the requested ones and are left out.
 The inject lane appends the entry above to every case it runs and sets that field to the number of
-`pull_request_opened` and `pull_request_diff_contains` leaves the case declares (`hack/eval/inject-lane-safeguards.yaml`,
+`pull_request_opened` and `pull_request_diff_contains` leaves the case declares, or to the count the
+file's `requesting:` list gives a case the persona answers with a pull request before its own checks
+say so, whichever is larger (`hack/eval/inject-lane-safeguards.yaml`,
 `bench/kube_agents_bench/lane.py`).
 
 Two things to know. Writes are dated, not signed, and the presubmit's fan-out runs cases side by

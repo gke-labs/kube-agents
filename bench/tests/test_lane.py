@@ -32,6 +32,9 @@ TASKS = REPO_ROOT / "bench" / "tasks"
 # requests one (its objective is a pull_request_opened check).
 READ_ONLY_CASE = "obtainability-remediation-proposal"
 REQUESTING_CASE = "pdb-remediation-pr"
+# A presubmit case neither in the file's `requesting:` list nor requesting
+# through its own checks.
+UNLISTED_CASE = "reliability-pdb-probe"
 
 
 def load(path: Path) -> dict:
@@ -173,11 +176,48 @@ def test_the_cli_prints_case_and_path_per_task_and_fails_loudly(tmp_path, capsys
     assert rc == 0
     # The count first, the case second, the path last (it may hold spaces):
     # the script reads the first two fields to build the fan-out's second
-    # phase.
+    # phase. The read-only case counts one through the file's `requesting:`
+    # list, the remediation case through its own check.
     assert out == [
-        f"0 {READ_ONLY_CASE} {tmp_path / READ_ONLY_CASE / 'task.yaml'}",
+        f"1 {READ_ONLY_CASE} {tmp_path / READ_ONLY_CASE / 'task.yaml'}",
         f"1 {REQUESTING_CASE} {tmp_path / REQUESTING_CASE / 'task.yaml'}",
     ]
+    rc = lane.main(["--safeguards", str(LANE_FILE), "--out-dir", str(tmp_path), str(TASKS / UNLISTED_CASE / "task.yaml")])
+    assert rc == 0
+    assert capsys.readouterr().out.splitlines() == [f"0 {UNLISTED_CASE} {tmp_path / UNLISTED_CASE / 'task.yaml'}"]
+
+
+def test_the_requesting_list_is_read_and_gives_its_case_an_allowance(tmp_path):
+    listed = lane.load_lane_requesting(LANE_FILE)
+    assert listed == {READ_ONLY_CASE: 1}
+    safeguards = lane.load_lane_safeguards(LANE_FILE)
+    copy, requested = lane.copy_task(TASKS / READ_ONLY_CASE / "task.yaml", safeguards, tmp_path, listed[READ_ONLY_CASE])
+    assert requested == 1
+    assert lane._leaves(load(copy)["verification_spec"][-1]["check"])[0][lane.REQUESTED_FIELD] == 1
+    # The larger of the two counts wins; a case with its own check and no
+    # entry keeps its own.
+    _, requested = lane.copy_task(TASKS / REQUESTING_CASE / "task.yaml", safeguards, tmp_path / "b", 0)
+    assert requested == 1
+    _, requested = lane.copy_task(TASKS / REQUESTING_CASE / "task.yaml", safeguards, tmp_path / "c", 3)
+    assert requested == 3
+
+
+@pytest.mark.parametrize(
+    "text, needle",
+    [
+        ("safeguards: []\nrequesting: [a]\n", "must map case ids to counts"),
+        ("safeguards: []\nrequesting: {a: 0}\n", "count of at least 1"),
+        ("safeguards: []\nrequesting: {a: true}\n", "count of at least 1"),
+        ("safeguards: []\nrequesting: {a: one}\n", "count of at least 1"),
+    ],
+)
+def test_a_malformed_requesting_list_is_refused(tmp_path, text, needle):
+    path = tmp_path / "lane.yaml"
+    path.write_text(text)
+    with pytest.raises(lane.LaneSafeguardsError, match=needle):
+        lane.load_lane_requesting(path)
+    path.write_text("safeguards: []\n")
+    assert lane.load_lane_requesting(path) == {}
 
 
 def test_the_cli_line_survives_a_path_with_a_space(tmp_path, capsys):

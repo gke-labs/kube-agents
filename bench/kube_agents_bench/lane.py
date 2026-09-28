@@ -62,13 +62,18 @@ __all__ = [
     "LaneSafeguardsError",
     "append_lane_safeguards",
     "check_repository",
+    "copy_task",
+    "load_lane_requesting",
     "load_lane_safeguards",
     "main",
     "requested_pull_requests",
 ]
 
-#: The one top-level key of a lane safeguards file.
+#: The top-level keys of a lane safeguards file: the entries every case
+#: carries, and the cases the lane treats as requesting a pull request
+#: beyond what their own checks say, each with the count it is allowed.
 SAFEGUARDS_KEY = "safeguards"
+REQUESTING_KEY = "requesting"
 #: The keys a check subtree nests children under, as ``cases.py`` walks them.
 CHECK_CHILD_KEYS = ("checks", "check")
 #: The check types that request a pull request -- ``pull_request_opened``
@@ -163,6 +168,37 @@ def check_repository(safeguards: list[dict[str, Any]], repo: str) -> None:
                 )
 
 
+def load_lane_requesting(path: str | Path) -> dict[str, int]:
+    """The file's ``requesting:`` mapping, case id to the count of pull
+    requests the lane allows it, or an empty mapping when the key is absent.
+
+    For a case whose prompt the persona answers with a pull request before
+    its checks say so: it runs in the second phase and is allowed that many,
+    where its own spec would count zero. An entry is a placeholder for the
+    case's own check and goes when that check lands.
+    """
+    file = Path(path)
+    if not file.is_file():
+        raise LaneSafeguardsError(f"{file}: no such lane safeguards file")
+    try:
+        doc = yaml.safe_load(file.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise LaneSafeguardsError(f"{file}: not parseable as YAML: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise LaneSafeguardsError(f"{file}: expected a mapping at the top level")
+    listed = doc.get(REQUESTING_KEY) or {}
+    if not isinstance(listed, dict):
+        raise LaneSafeguardsError(f"{file}: `{REQUESTING_KEY}:` must map case ids to counts")
+    out: dict[str, int] = {}
+    for case, count in listed.items():
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            raise LaneSafeguardsError(
+                f"{file}: `{REQUESTING_KEY}:` {case!r} must map to a count of at least 1, got {count!r}"
+            )
+        out[str(case)] = count
+    return out
+
+
 def requested_pull_requests(spec: Any) -> int:
     """How many pull requests a task's own checks request: its leaves of a
     type in :data:`REQUESTING_CHECK_TYPES`, wherever they nest."""
@@ -192,8 +228,21 @@ def _load_task(task_yaml: Path) -> dict[str, Any]:
 def append_lane_safeguards(
     task_yaml: str | Path, safeguards: list[dict[str, Any]], out_dir: str | Path
 ) -> Path:
+    """Write ``<out_dir>/<case>/task.yaml`` with the lane's entries appended
+    and return its path; :func:`copy_task` with no listed allowance."""
+    return copy_task(task_yaml, safeguards, out_dir)[0]
+
+
+def copy_task(
+    task_yaml: str | Path,
+    safeguards: list[dict[str, Any]],
+    out_dir: str | Path,
+    listed_allowance: int = 0,
+) -> tuple[Path, int]:
     """Write ``<out_dir>/<case>/task.yaml``: the task with the lane's entries
-    appended, and return its path.
+    appended. Returns the copy's path and how many pull requests the case
+    requests: the larger of what its own checks say and ``listed_allowance``,
+    the count the lane file's ``requesting:`` gives it.
 
     The case is the task file's directory name, which is what devops-bench
     records as ``folder`` and the scorer joins on, so the copy keeps it.
@@ -205,7 +254,7 @@ def append_lane_safeguards(
     spec = doc.get(SPEC_KEY)
     existing = list(spec) if isinstance(spec, list) else []
     taken = {str(e.get("name")) for e in existing if isinstance(e, dict) and e.get("name")}
-    requested = requested_pull_requests(existing)
+    requested = max(requested_pull_requests(existing), listed_allowance)
     appended = []
     for entry in safeguards:
         if entry["name"] in taken:
@@ -224,7 +273,7 @@ def append_lane_safeguards(
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / TASK_FILE
     target.write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8")
-    return target
+    return target, requested
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -251,9 +300,10 @@ def main(argv: list[str] | None = None) -> int:
         safeguards = load_lane_safeguards(args.safeguards)
         if args.gitops_repo:
             check_repository(safeguards, args.gitops_repo)
+        listed = load_lane_requesting(args.safeguards)
         for task in args.tasks:
-            written = append_lane_safeguards(task, safeguards, args.out_dir)
-            requested = requested_pull_requests(_load_task(Path(task)).get(SPEC_KEY))
+            case = Path(task).parent.name
+            written, requested = copy_task(task, safeguards, args.out_dir, listed.get(case, 0))
             # The count first and the path last: the path may hold spaces
             # (a TMPDIR with one), and the consumer splits on whitespace.
             print(f"{requested} {written.parent.name} {written}")

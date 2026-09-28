@@ -351,6 +351,10 @@ INJECT_LANE_SAFEGUARDS = [
 # types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
     "cluster-agent-crashloop-fix-request",
+    # Listed in the safeguards file's `requesting:` rather than by its own
+    # checks: the persona answers its prompt with a pull request before its
+    # persona-aware check lands (#2079 item 2), which removes the entry.
+    "obtainability-remediation-proposal",
     "pdb-remediation-pr",
     "rca-remediation-pr",
     "vcs-review-feedback-read-back",
@@ -438,7 +442,14 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
         sys.path.insert(0, str(REPO_ROOT / "bench"))
         from kube_agents_bench import lane
 
-        requesting = [c for c in self.lane_cases() if lane.requested_pull_requests(self.task_spec(c)) > 0]
+        listed = lane.load_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE)
+        requesting = [c for c in self.lane_cases() if lane.requested_pull_requests(self.task_spec(c)) > 0 or c in listed]
+        # A listed case is registered and on the lane, and its own checks do
+        # not yet say it requests one: once they do, the entry is a leftover.
+        for case in listed:
+            with self.subTest(listed=case):
+                self.assertIn(case, self.lane_cases())
+                self.assertEqual(lane.requested_pull_requests(self.task_spec(case)), 0, f"{case}'s own checks request a pull request now; drop it from `requesting:`")
         self.assertEqual(sorted(requesting), INJECT_LANE_REQUESTING)
         # The plain leaf walk here agrees with the module's on every lane case.
         for case in self.lane_cases():

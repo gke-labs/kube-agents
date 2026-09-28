@@ -276,7 +276,7 @@ def test_a_comment_label_or_close_that_moved_updated_at_is_not_a_write(env, gith
     )
     res = check().verify(5.0)
     assert res.status == "fail", res.reason
-    assert "#39 was updated at 2026-09-25T17:55:00+00:00 without a push" in res.reason
+    assert "#39 was updated at 2026-09-25T17:55:00+00:00 but its head commit predates the window" in res.reason
     # A head GitHub will not date (no such page) is not counted either.
     github.routes[f"{API}/pulls/39/commits?per_page=100&page=1"] = (404, {})
     assert check().verify(5.0).status == "fail"

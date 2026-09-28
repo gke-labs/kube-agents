@@ -378,8 +378,11 @@ def find_writes(
     created in the window (``opened``) or, failing that, had its head
     commit pushed in it (``updated``: a later repetition pushes onto the
     branch the first one used, and the skill edits the pull request already
-    open there; an ``updated_at`` moved by a comment, a label or a close is
-    noted and not counted). A branch
+    open there; an ``updated_at`` moved with a head commit older than the
+    window is noted and not counted, which reads a comment, a label or a
+    close correctly and a push of an older commit the same way -- the refs
+    API carries no push time, so the head's committer date is what there
+    is). A branch
     counts when it carries the prefix, heads no pull request at all, and its
     tip was committed in the window (``tip committed``). Raises
     :class:`GitHubUnreadable` when the pull-request listing cannot be read;
@@ -403,8 +406,9 @@ def find_writes(
             pushed = client.head_commit_date(repo, number)
             if pushed is None or pushed < since:
                 report.notes.append(
-                    f"#{number} was updated at {updated.isoformat()} without a push "
-                    "(a comment, a label or a close), which is not the agent's write"
+                    f"#{number} was updated at {updated.isoformat()} but its head commit "
+                    "predates the window, so it is read as a comment, a label or a close "
+                    "rather than a push (a push of an older commit reads the same way)"
                 )
                 continue
             when, how = pushed, HOW_UPDATED
