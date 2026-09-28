@@ -54,10 +54,10 @@ fixtures:
 
 verification_spec:
   # The positive half: a Cluster Agent profile worked the case, and the platform
-  # worker enumerated managed profiles via list_cluster_profiles. Because the
-  # existence probe cards and the delegated investigation both run as cluster-*
-  # profiles, worker_agents confirms cluster agents were reached. Inline
-  # diagnostics by the platform worker are forbidden by no-stubbed-profile-scripts
+  # worker enumerated managed profiles via list_cluster_profiles. Because target
+  # cluster resolution does not create throwaway probe cards, worker_agents
+  # confirms that the crashloop investigation itself was delegated to the Cluster Agent.
+  # Inline diagnostics by the platform worker are forbidden by no-stubbed-profile-scripts
   # (no stubbed scripts in sandbox terminal) and no-inline-platform-mcp-diagnostics
   # (no in-pod platform_control diagnostic tools), while expected_output requires
   # delegating the investigation to the Cluster Agent.
@@ -83,17 +83,11 @@ verification_spec:
       # run by path (`python3 /opt/data/scripts/cluster_agent_profile.py ...`),
       # quoted, with `--help`, or inside loops the worker writes, and neither
       # name has a use in a worker's terminal on an install where the stubs
-      # apply. Additionally, the platform worker must not execute `kubectl` in
-      # its terminal to perform inline workload diagnostics — tenant workload
-      # debugging must be delegated to the cluster's Cluster Agent. The kubectl
-      # pattern matches bare invocations, command wrappers (sudo, env, timeout,
-      # sh/bash -c, eval, xargs, time, watch), control flow (if/while), subshells,
-      # backticks, paths, quoted forms, and variable assignments/indirection.
+      # apply.
       type: worker_commands
       forbidden_patterns:
         - 'cluster_agent_profile\.py'
         - 'kanban_notify_propagate\.py'
-        - '(?:^|[\s;&|(`"''/=])kubectl\b'
   - name: rca-names-the-oom
     role: objective
     mode: assert

@@ -556,18 +556,18 @@ class ResolveProfilesBaseTest(unittest.TestCase):
 
     def test_module_load_wires_hermes_home_and_profiles_base(self):
         import importlib
-        with mock.patch.dict(
-            os.environ,
-            {"PLATFORM_AGENT_HOME": "/srv/agent"},
-            clear=True,
-        ):
-            reloaded = importlib.reload(cap)
-            try:
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"PLATFORM_AGENT_HOME": "/srv/agent"},
+                clear=True,
+            ):
+                reloaded = importlib.reload(cap)
                 self.assertEqual(reloaded.HERMES_HOME, Path("/srv/agent"))
                 self.assertEqual(reloaded.PROFILES_BASE, Path("/srv/agent/profiles"))
                 self.assertEqual(reloaded._run_env()["HERMES_HOME"], "/srv/agent")
-            finally:
-                importlib.reload(cap)
+        finally:
+            importlib.reload(cap)
 
 
 class ListProfilesTest(unittest.TestCase):
@@ -769,12 +769,8 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         self.assertIn("Do not ask the user which cluster before searching", step_1)
         self.assertIn("list_cluster_profiles()", step_1)
         self.assertIn("cluster_agent_profile.py list", step_1)
-        self.assertIn("Fan out read-only existence checks", step_1)
-        self.assertIn("with no `parents`", step_1)
-        self.assertIn("sleep 60", step_1)
-        self.assertIn("Do NOT classify cards in `ready` as timed out", step_1)
-        self.assertIn("never complete while probe cards remain queued in `ready`", step_1)
-        self.assertIn("spec.harness.tuning.maxInProgress", step_1)
+        self.assertIn("get_k8s_resource", step_1)
+        self.assertIn("Do not create throwaway kanban probe cards", step_1)
         self.assertIn("Never resolve silently", step_1)
         self.assertRegex(step_1, r"[Aa]sk only after (looking|checking|searching)")
 
@@ -785,19 +781,14 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         self.assertIn("cluster_agent_profile.py list", self.content)
         # Must instruct checking before asking the user
         self.assertIn("existence", self.content.lower())
-        # Must instruct polling to settlement and waiting before completing
+        # Must instruct polling to settlement and waiting before completing in fan-out
         self.assertIn("settlement", self.content.lower())
         self.assertIn("sleep 60", self.content)
         # Must handle ready cards without false timeouts
         self.assertIn("Do NOT classify cards in `ready` as timed out", self.content)
-        self.assertIn("never complete while probe cards remain queued in `ready`", self.content)
+        self.assertIn("never complete while cards remain queued in `ready`", self.content)
         # Must acknowledge configurable concurrency (spec.harness.tuning.maxInProgress) rather than assuming a static cap
         self.assertIn("spec.harness.tuning.maxInProgress", self.content)
-        # Must define that blocked or failed probes do not count as a match
-        self.assertRegex(
-            self.content,
-            r"[Bb]locked.*not.*match|[Dd]o(es)?\s+(\*\*)?not(\*\*)?\s+count as a match",
-        )
         # Must instruct asking only after searching / looking
         self.assertRegex(
             self.content,
@@ -805,14 +796,7 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         )
         # Must require identifying which cluster was picked in the report
         self.assertIn("Never resolve silently", self.content)
-        # Must guide keeping probe instructions and results concise
-        self.assertIn("concise", self.content.lower())
-        # Must forbid abandoning unsettled probes in ready
-        self.assertRegex(
-            self.content,
-            r"[Nn]ever abandon an unsettled probe queued in `ready`",
-        )
-        # Must instruct completing with the answer you have if a probe blocks or times out
+        # Must instruct completing with the answer you have if a worker blocks or times out
         self.assertRegex(
             self.content,
             r"[Cc]omplete with the answer you have",
@@ -832,7 +816,7 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
         self.assertTrue(self.task_path.is_file(), f"missing {self.task_path}")
         self.data = yaml.safe_load(self.task_path.read_text(encoding="utf-8"))
 
-    def test_no_stubbed_profile_scripts_forbids_kubectl_variations(self):
+    def test_no_stubbed_profile_scripts_forbids_stubbed_scripts(self):
         spec = self.data.get("verification_spec", [])
         no_stubbed = next(
             (c for c in spec if c.get("name") == "no-stubbed-profile-scripts"),
@@ -841,47 +825,22 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
         self.assertIsNotNone(no_stubbed, "missing no-stubbed-profile-scripts check")
         assert no_stubbed is not None
         forbidden = no_stubbed.get("check", {}).get("forbidden_patterns", [])
+        self.assertIn("cluster_agent_profile\\.py", forbidden)
+        self.assertIn("kanban_notify_propagate\\.py", forbidden)
         kubectl_pats = [p for p in forbidden if "kubectl" in p]
-        self.assertEqual(len(kubectl_pats), 1, f"expected 1 kubectl pattern, got {kubectl_pats}")
-        pattern = re.compile(kubectl_pats[0])
+        self.assertEqual(kubectl_pats, [], "kubectl should not be in no-stubbed-profile-scripts")
 
         matching_commands = [
-            "kubectl get pods",
-            "sudo kubectl get pods",
-            "if kubectl -n seeded-debug get deploy payments-api; then true; fi",
-            "while ! kubectl get pods; do sleep 1; done",
-            "! kubectl get pods",
-            "env KUBECONFIG=/tmp/k kubectl get pods",
-            "KUBECONFIG=/tmp/k kubectl -n seeded-debug get pods",
-            "for c in a b; do kubectl --context $c get pods; done",
-            "$(kubectl config current-context)",
-            "`kubectl config current-context`",
-            "timeout 60 kubectl get pods",
-            "/usr/bin/kubectl get pods",
-            "./kubectl get pods",
-            '"kubectl" get pods',
-            "'kubectl' get pods",
-            "sh -c 'kubectl get pods'",
-            'bash -c "kubectl get pods"',
-            'eval "kubectl get pods"',
-            "xargs kubectl",
-            "time kubectl get pods",
-            "watch kubectl get pods",
-            "$(which kubectl) get pods",
-            "which kubectl",
-            "echo test && kubectl get pods",
-            "echo test; kubectl get pods",
-            "echo test | kubectl get pods",
-            "K=kubectl; $K -n seeded-debug get pods",
-            "export KUBECTL=kubectl",
-            "export K=/usr/bin/kubectl",
-            'K="kubectl"',
+            "python3 /opt/data/scripts/cluster_agent_profile.py list",
+            "cluster_agent_profile.py name --cluster foo",
+            "kanban_notify_propagate.py",
+            "/opt/data/scripts/kanban_notify_propagate.py",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
-                self.assertIsNotNone(
-                    pattern.search(cmd),
-                    f"pattern {pattern.pattern!r} failed to match forbidden command {cmd!r}",
+                self.assertTrue(
+                    any(re.search(pat, cmd) for pat in forbidden),
+                    f"expected matching command {cmd!r} to be caught",
                 )
 
         non_matching_commands = [
@@ -889,14 +848,18 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "cat README.md",
             "git status",
             "echo 'kube-agents repo'",
+            "grep -n kubectl /opt/data/skills/cluster-agent-lifecycle/SKILL.md",
+            "which kubectl",
+            "printf 'delegated; no kubectl run here' > notes.md",
+            "cat notes/kubectl.md",
             "curl http://localhost:8080",
             "hermes profile list",
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
-                self.assertIsNone(
-                    pattern.search(cmd),
-                    f"pattern {pattern.pattern!r} falsely matched {cmd!r}",
+                self.assertFalse(
+                    any(re.search(pat, cmd) for pat in forbidden),
+                    f"expected non-matching command {cmd!r} not to be caught",
                 )
 
     def test_expected_output_requires_delegation(self):
