@@ -4599,6 +4599,31 @@ class TestDryRun(BaseTestCase):
         )
         self.assertIn("is now clean", self.out)
 
+    def test_dry_run_on_demand_logs_silence_suppression(self):
+        self.patch_attr("run_cmd", Recorder())
+        self.assertEqual(
+            self.run_finish(
+                make_doc(findings=[]),
+                argv_extra=("--dry-run", "--on-demand"),
+            ),
+            0,
+        )
+        self.assertIn(
+            "DRY RUN: on-demand run: would suppress silence (silent_ok: False).",
+            self.err,
+        )
+
+    def test_dry_run_without_on_demand_does_not_log_silence_suppression(self):
+        self.patch_attr("run_cmd", Recorder())
+        self.assertEqual(
+            self.run_finish(
+                make_doc(findings=[]),
+                argv_extra=("--dry-run",),
+            ),
+            0,
+        )
+        self.assertNotIn("would suppress silence", self.err)
+
     def test_dry_run_renders_every_pr_body_it_would_open(self):
         # The pull request is the artifact a person is asked to merge. Printing
         # the ledger alone left the reviewable half visible only in production.

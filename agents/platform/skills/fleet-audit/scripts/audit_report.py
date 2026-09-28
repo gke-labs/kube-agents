@@ -10372,10 +10372,13 @@ def _handle_finish_dry_run(
     repo: str | None = None,
     manifest: dict | None = None,
     waiver: str = "",
+    on_demand: bool = False,
 ) -> None:
     findings = list(data["findings"])
 
     log("DRY RUN: validated findings; nothing will be committed, pushed, or published.")
+    if on_demand:
+        log("DRY RUN: on-demand run: would suppress silence (silent_ok: False).")
     root = dry_run_repo_root(audit_id, repo=repo)
     log(f"DRY RUN: resolving remediation paths under {root}.")
 
@@ -11060,7 +11063,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
     if args.dry_run:
         _handle_finish_dry_run(
-            audit_id, data, now, repo=opt_repo, manifest=manifest, waiver=waiver
+            audit_id,
+            data,
+            now,
+            repo=opt_repo,
+            manifest=manifest,
+            waiver=waiver,
+            on_demand=on_demand,
         )
         return
 
