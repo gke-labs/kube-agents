@@ -2861,15 +2861,15 @@ report_github_leftovers() {
   fi
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] GitHub writes this run left on ${BENCH_GITOPS_REPO} since ${EVAL_RUN_STARTED_AT} <<<"
   if ! mint_ledger_token "leftovers"; then
-    echo "WARNING: GitHub leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the periodic sweep still closes it once the lease is released."
+    echo "WARNING: GitHub leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the periodic sweep ci-kube-agents-pull-sweep (every ten minutes, on projects Boskos reports free) still closes it once the lease is released."
     return 0
   fi
   if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.github_writes \
       --repo "${BENCH_GITOPS_REPO}" --since "${EVAL_RUN_STARTED_AT}"); then
-    echo "WARNING: GitHub leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the periodic sweep still closes what this run left once the lease is released."
+    echo "WARNING: GitHub leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the periodic sweep ci-kube-agents-pull-sweep (every ten minutes, on projects Boskos reports free) still closes what this run left once the lease is released."
     return 0
   fi
-  echo "GitHub leftovers: this job closes none of them (no pull_requests: write in a presubmit, docs/ci-pool-projects.md 5.3); the periodic sweep ci-kube-agents-pull-sweep closes them and deletes their branches once the lease is released."
+  echo "GitHub leftovers: this job closes none of them (no pull_requests: write in a presubmit, docs/ci-pool-projects.md 5.3); the periodic sweep ci-kube-agents-pull-sweep (every ten minutes, on projects Boskos reports free) closes them and deletes their branches once the lease is released. The safeguard verdict above was read during each repetition and does not depend on this listing."
 }
 report_github_leftovers
 
