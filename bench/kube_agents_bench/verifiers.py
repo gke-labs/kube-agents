@@ -1678,12 +1678,15 @@ _DIFF_NOISE = str.maketrans({"*": None, "`": None, "’": "'"})
 # Set, it binds the candidate pull request to that repository; unset, the
 # `owner` pin is the only repository bind.
 _GITOPS_REPO_ENV_VAR = "BENCH_GITOPS_REPO"
-# The ownership test the pool sweep applies (is_agent_pull_request in
-# hack/ci_sweep_agent_pulls.py, from forge.py): the head branch carries the
-# agent's prefix (AGENT_BRANCH_PREFIX in agents/platform/scripts/forge.py,
-# pinned by a test), the head is in the repository itself, and the author is
-# a GitHub App -- `user.type` is what the API says without knowing which App,
-# and a human with push access naming a branch under the prefix is not one.
+# Two of the pool sweep's three ownership checks (is_agent_pull_request in
+# hack/ci_sweep_agent_pulls.py, from forge.py), and a weaker third: the head
+# branch carries the agent's prefix (AGENT_BRANCH_PREFIX in
+# agents/platform/scripts/forge.py, pinned by a test), the head is in the
+# repository itself, and the author is a GitHub App. The sweep's third is the
+# agent's own login, which it learns from the minter App it holds the key
+# for; this check's credential is the ledger App's, which does not know that
+# login, so `user.type` is what it can ask. A human with push access naming
+# a branch under the prefix is excluded; another App pushing to one is not.
 _AGENT_BRANCH_PREFIX = "platform-agent/"
 _APP_USER_TYPE = "Bot"
 

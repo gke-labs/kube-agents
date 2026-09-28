@@ -161,8 +161,8 @@ def test_the_cases_entry_is_red_on_the_reply_alone_and_green_through_the_diff(to
 
 def test_an_inline_manifest_still_passes_the_entry_without_a_credential(github, monkeypatch):
     """The api lane's shape: the Planning Agent inlines the manifest and names
-    no pull request, so the first arm passes and the third never asks for a
-    token."""
+    no pull request, so the inline arm passes and the diff arm never asks for
+    a token."""
     monkeypatch.delenv("BENCH_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     stash("apiVersion: policy/v1\nkind: PodDisruptionBudget\nspec:\n  minAvailable: 1\n  selector:\n    matchLabels:\n      app: checkout-gateway\n")

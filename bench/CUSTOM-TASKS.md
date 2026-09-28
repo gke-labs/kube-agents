@@ -570,14 +570,16 @@ What it deliberately does not ask is whether this run opened the pull request. T
 `pull_request_opened`'s question, and a remediation case that needs both declares both. Here a
 repetition that recomputed the same manifest, found the branch already carrying it and pointed at
 the open pull request has proposed a concrete manifest, which is what the objective grades. The
-cost is stated rather than hidden: a reply that only quotes an earlier lease's open pull request carrying the manifest passes too, the leftover grading described under `pull_request_opened` above; it is accepted because requiring a push would fail that correct repetition, the sweep closes the agent's pull requests between leases, and a case that must prove the write declares `pull_request_opened` beside this. The write itself is not this objective's question but the inject lane's, which guards it with a
-safeguard of its own. Three binds
+cost is stated rather than hidden: a reply that only quotes an earlier lease's open pull request carrying the manifest passes too, the leftover grading described under `pull_request_opened` above; it is accepted because requiring a push would fail that correct repetition, the sweep closes the agent's pull requests between leases, and a case that must prove the write declares `pull_request_opened` beside this. The write itself is not this objective's question; `pull_request_opened` asks it. Three binds
 keep that cost to exactly that shape: the pull request must be open (the skill's "already exists"
 path matches open ones only, so a merged or closed one in a reply is a leftover quoted, not a
 proposal made, and a merged manifest anywhere in the organisation is not a standing pass); its
 head must be an agent branch (`platform-agent/*`) in the repository itself and its author a
-GitHub App, the three checks the pool sweep's `is_agent_pull_request` applies, so a human's pull
-request under the prefix is not the agent's; and when the run sets `BENCH_GITOPS_REPO`, the
+GitHub App, two of the three checks the pool sweep's `is_agent_pull_request` applies and a weaker
+form of the third (the sweep matches the agent's own login, which it learns from the minter App it
+holds the key for; the check's credential is the ledger App's and does not know that login, so it
+asks the API's `user.type`), so a human's pull request under the prefix is not the agent's while
+another App's on such a branch would pass; and when the run sets `BENCH_GITOPS_REPO`, the
 repository it was told the agent writes to (`hack/ci-eval-pr.sh` exports it from the project
 mapping on every lane, honouring a local run's `EVAL_GITOPS_REPO`, `none` included, as the deploy
 does), the pull request must be in
