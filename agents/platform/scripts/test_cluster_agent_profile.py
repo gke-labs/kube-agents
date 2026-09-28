@@ -564,6 +564,24 @@ class ResolveProfilesBaseTest(unittest.TestCase):
                 self.assertEqual(cap._resolve_data_root(), Path(tmpdir))
                 self.assertEqual(cap._resolve_profiles_base(), Path(tmpdir) / "profiles")
 
+    def test_module_load_wires_hermes_home_and_profiles_base_from_profile_home(self):
+        import importlib
+        with tempfile.TemporaryDirectory(prefix="test-reload-") as tmpdir:
+            profile_home = Path(tmpdir) / "profiles" / "platform"
+            profile_home.mkdir(parents=True)
+            with mock.patch.dict(
+                os.environ,
+                {"HERMES_HOME": str(profile_home)},
+                clear=True,
+            ):
+                reloaded = importlib.reload(cap)
+                try:
+                    self.assertEqual(reloaded.HERMES_HOME, Path(tmpdir))
+                    self.assertEqual(reloaded.PROFILES_BASE, Path(tmpdir) / "profiles")
+                    self.assertEqual(reloaded._run_env()["HERMES_HOME"], str(tmpdir))
+                finally:
+                    importlib.reload(cap)
+
 
 class ListProfilesTest(unittest.TestCase):
     def setUp(self):
@@ -851,6 +869,56 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
                     pattern.search(cmd),
                     f"pattern {pattern.pattern!r} falsely matched {cmd!r}",
                 )
+
+    def test_expected_output_requires_delegation(self):
+        expected_output = self.data.get("expected_output", "")
+        self.assertIn(
+            "delegating the investigation to the Cluster Agent",
+            expected_output,
+            "expected_output must require delegating the investigation to the Cluster Agent",
+        )
+
+    def test_no_inline_platform_mcp_diagnostics_forbids_gke_and_platform_tools(self):
+        spec = self.data.get("verification_spec", [])
+        no_inline = next(
+            (c for c in spec if c.get("name") == "no-inline-platform-mcp-diagnostics"),
+            None,
+        )
+        self.assertIsNotNone(no_inline, "missing no-inline-platform-mcp-diagnostics check")
+        assert no_inline is not None
+        checks = no_inline.get("check", {}).get("checks", [])
+        self.assertTrue(checks, "no-inline-platform-mcp-diagnostics has no inner checks")
+        tool_names = checks[0].get("tool_names", [])
+
+        # Must forbid in-pod platform_control diagnostic tools
+        for tool in (
+            "mcp__platform_control__audit_log_searcher",
+            "mcp_platform_control_audit_log_searcher",
+            "mcp__platform_control__get_cc_pod_diagnostics",
+            "mcp_platform_control_get_cc_pod_diagnostics",
+            "mcp__platform_control__list_cc_pods",
+            "mcp_platform_control_list_cc_pods",
+            "mcp__platform_control__list_cc_healthchecks",
+            "mcp_platform_control_list_cc_healthchecks",
+            "mcp__platform_control__get_cc_operator_status",
+            "mcp_platform_control_get_cc_operator_status",
+        ):
+            self.assertIn(tool, tool_names)
+
+        # Must forbid remote GKE MCP diagnostic tools
+        for tool in (
+            "mcp__gke__get_k8s_resource",
+            "mcp_gke_get_k8s_resource",
+            "mcp__gke__describe_k8s_resource",
+            "mcp_gke_describe_k8s_resource",
+            "mcp__gke__list_k8s_events",
+            "mcp_gke_list_k8s_events",
+            "mcp__gke__get_k8s_logs",
+            "mcp_gke_get_k8s_logs",
+            "mcp__gke__get_k8s_rollout_status",
+            "mcp_gke_get_k8s_rollout_status",
+        ):
+            self.assertIn(tool, tool_names)
 
 
 if __name__ == "__main__":
