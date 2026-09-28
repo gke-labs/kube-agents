@@ -235,7 +235,7 @@ exists a pull request that touches that path should say what it ran by hand.
 
 ## The inject lane
 
-When the presubmit matrix runs through the A2A gateway's inject door — the harness's
+When a run's matrix goes through the A2A gateway's inject door — the harness's
 `AGENT_TRANSPORT=inject`, which `hack/ci-eval-pr.sh` exports under `EVAL_MODE_NEXT=1`
 ([`docs/designs/eval-next-transport.md`](designs/eval-next-transport.md), "The CI flag") — the
 roster above is still the roster:

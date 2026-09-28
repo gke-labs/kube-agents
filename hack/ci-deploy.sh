@@ -90,17 +90,20 @@ readonly SANDBOX_SSH_KEY_TYPE="ed25519"
 readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 
 # EVAL_MODE_NEXT=1 flips the eval install to `spec.mode: next` once the
-# today-mode install has passed step 6, so the presubmit matrix can be run
-# against the next stack on demand (#1686, measuring #1661). Unset, or set to
+# today-mode install has passed step 6, so the matrix can be run against the
+# next stack: the presubmit's on demand, or the next lane's periodic on main
+# (#1686, measuring #1661). Unset, or set to
 # anything but "1", is today: every line the flag guards is skipped and the
 # script behaves exactly as it did before the flag existed.
 #
 # What the flag has to do, and where:
 #   - section 2a refuses it on the release-candidate path (no A2A images are
 #     published to point the operator at) and section 2b refuses it on a Prow
-#     run that is not a pull request's (a periodic under it would append
-#     next-mode samples to main's baseline record), and refuses a fan-out the
-#     bridge cannot be given as its concurrency, before anything is built;
+#     run that is neither a pull request's nor one of the next-lane jobs
+#     named below (a mis-set variable on the nightly or a postsubmit would
+#     otherwise append next-mode samples to main's baseline record), and
+#     refuses a fan-out the bridge cannot be given as its concurrency, before
+#     anything is built;
 #   - step 4 also builds the A2A gateway, auth callout and worker images from
 #     a2a/Dockerfile.* (the operator's defaults for them name a private dev
 #     registry, #1557, which a leased project cannot pull from) and the Hermes
@@ -125,6 +128,18 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 # password key in platformagent_a2a_manifests.go). The CR name is the chart's
 # platformAgent.name default, which this deploy does not override.
 readonly PLATFORM_AGENT_CR_NAME="platform-agent"
+# The next lane's Prow jobs: its on-demand presubmit and its periodic on
+# main. Section 2b admits the flag on a run whose JOB_NAME is one of these
+# (space-separated, matched whole) or that carries a PULL_NUMBER -- the
+# presubmit is admitted by the second on a pull request and by the first on a
+# Tide batch, the periodic only by the first -- and refuses it on any other
+# Prow run, so the flag
+# leaking into the nightly's or a postsubmit's environment still stops the
+# deploy at second zero. The names are the jobs' own in oss-test-infra
+# (prow/prowjobs/gke-labs/kube-agents/); a rename there is a one-line edit here.
+# hack/ci-eval-pr.sh keeps such a run out of the baseline recorder on the flag
+# alone, so admitting a job here never lets it write main's window.
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly AGENT_CONTAINER_NAME="platform-agent"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
@@ -475,16 +490,28 @@ else
   IS_PROW_RUN="false"
 fi
 
-# The mode flip exists for a pull request's run. bench-gate keeps main's
-# baseline honest by refusing to append a sample when PULL_NUMBER or
-# RC_COMMIT_SHA is set (bench/baselines/README.md); a periodic or postsubmit
-# carrying EVAL_MODE_NEXT=1 would set neither and append next-mode samples to
-# the window every pull request is judged against. Refuse that here.
+# The mode flip exists for the next lane's runs: a pull request's, or one of
+# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic on main). bench-gate
+# keeps main's baseline honest by refusing to append a sample when PULL_NUMBER
+# or RC_COMMIT_SHA is set (bench/baselines/README.md), and hack/ci-eval-pr.sh
+# keeps a flagged run out of the recorder on the flag alone; what neither
+# covers is the flag mis-set on a job that is not the lane's -- the nightly,
+# a postsubmit -- whose today-mode identity can write the store. Keyed on the
+# job's name rather than on PULL_NUMBER, so the periodic is admitted by being
+# named and every other Prow run without a pull request is still refused.
 if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
-  echo "ERROR: EVAL_MODE_NEXT=1 is set on a Prow run with no PULL_NUMBER (JOB_NAME=${JOB_NAME:-})." >&2
-  echo "       The flag is for a pull request's presubmit; a periodic or postsubmit under it" >&2
-  echo "       would record next-mode samples into main's baseline." >&2
-  exit 1
+  case " ${EVAL_MODE_NEXT_JOB_NAMES} " in
+  *" ${JOB_NAME:-} "*)
+    echo "EVAL_MODE_NEXT=1: accepted on ${JOB_NAME} (a next-lane job with no PULL_NUMBER; the baseline store is read, never written)"
+    ;;
+  *)
+    echo "ERROR: EVAL_MODE_NEXT=1 is set on a Prow run with no PULL_NUMBER (JOB_NAME=${JOB_NAME:-})." >&2
+    echo "       The flag is for a pull request's presubmit or a next-lane job named in" >&2
+    echo "       EVAL_MODE_NEXT_JOB_NAMES (${EVAL_MODE_NEXT_JOB_NAMES}); any other periodic or" >&2
+    echo "       postsubmit under it would record next-mode samples into main's baseline." >&2
+    exit 1
+    ;;
+  esac
 fi
 
 # The bridge sidecar's concurrency is the matrix's fan-out, read from the same

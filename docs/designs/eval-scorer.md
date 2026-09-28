@@ -835,7 +835,9 @@ is on `main` and carries no `PULL_NUMBER`, so both conditions above pass it thro
 is the third condition, enforced in the same two places, and it exists because `VersionKey` carries
 no field naming the build a sample came from: once written, a candidate's record and `main`'s are
 indistinguishable, and the candidate is then measured for non-inferiority against a window it just
-moved. `bench/baselines/README.md` is canonical for the rule; this paragraph records why the
+moved. A next-mode run (`EVAL_MODE_NEXT=1`) is the fourth condition and the second member of the
+class, for the same reason, enforced in `hack/ci-eval-pr.sh` alone until the key carries a mode
+field. `bench/baselines/README.md` is canonical for the rule; this paragraph records why the
 read-only class exists.
 
 Two independent reasons, and the weaker one is the one usually cited. The narrow reason is

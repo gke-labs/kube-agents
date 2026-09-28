@@ -551,11 +551,16 @@ gateway or provisioning pods, images in a private registry, and whatever the fir
 the door find), and a default-on flip would red every pull request for reasons none of them
 caused. And the record that earns `next` a place in what every pull request measures is built by
 running it: a scheduled lane on `main` under the flag, with a record of its own, not the
-presubmit. That lane is not built yet, and the flag does not admit it as it stands: section 2b of
-the deploy refuses `EVAL_MODE_NEXT=1` on a Prow run with no pull request, because `bench-gate`
-would append that run's samples to `main`'s baseline, the window every pull request is judged
-against. The lane's change is what gives such a run a store of its own and lifts that refusal for
-it; until then the flag runs on a pull request's presubmit, on demand.
+presubmit. The flag admits that lane by name and nothing else without a pull request: section 2b
+of the deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME`
+is one of the next lane's jobs (`EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh`, the on-demand
+presubmit and the periodic on main), and refuses it on any other Prow run, so the flag mis-set
+on the nightly or a postsubmit still stops the deploy before anything is built. The record of its
+own does not exist yet: the baseline key has no mode field, so a next-mode sample appended to the
+store would be today's once written, and the dashboard has no next lane to file a run under. Until
+both exist, `hack/ci-eval-pr.sh` keeps every flagged run out of the baseline recorder and the
+dashboard publisher on the flag alone, whatever its job type; the periodic reads the store, when
+one is armed, and writes nothing shared.
 
 ## Open questions
 

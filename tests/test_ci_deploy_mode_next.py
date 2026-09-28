@@ -11,8 +11,9 @@ the flag set names the four next-stack images and fills the operator.extraEnv
 values the release expands (the three image overrides and the inject door's
 flag), the Cloud Build's `a2a` and `a2a-bridge` steps run with `docker` stubbed
 build and push those four in order with the bridge FROM this build's platform
-image, the three guards (release-candidate path, Prow run with no pull request,
-the concurrency's grammar) run against the values they refuse and admit, the
+image, the three guards (release-candidate path, Prow run with no pull request
+that is not a next-lane job, the concurrency's grammar) run against the values
+they refuse and admit, the
 sidecar patch rendered from a fixture Deployment carries what the bridge doc
 lists and what the agent container had, and the release-candidate refusal sits
 at the top of the branch the script says it guards.
@@ -63,6 +64,12 @@ _A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "hermes-bridge")
 _A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
+# The next lane's two Prow jobs (oss-test-infra), the only runs section 2b
+# admits the flag on without a pull request; the nightly and a made-up job
+# stand for every other Prow run.
+_NEXT_LANE_JOB_NAMES = ("pull-kube-agents-smoke-test-next", "ci-kube-agents-eval-next")
+_NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly"
+_OTHER_JOB_NAME = "ci-x"
 
 _BUILD_SECTION = (r"^# ─── 4\. Build Container Images.*?", r"^# ─── 5\. Chart Deployment")
 _MODE_SECTION = (r"^# ─── 6b\. EVAL_MODE_NEXT.*?", r"^# ─── 7\. Agent API Connectivity")
@@ -196,6 +203,21 @@ def lifted_block(start: str, stop: str, what: str) -> str:
                     return "\n".join(lines[index : end + 1])
             break
     raise AssertionError(f"{what} not found in {_CI_DEPLOY}")
+
+
+def prow_guard() -> str:
+    """Section 2b's refusal: from its `if` to the block's own unindented `fi`
+    (lifted_block's substring stop would end it at the first line containing
+    the two letters)."""
+    start = 'if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then'
+    lines = text(_CI_DEPLOY).splitlines()
+    for index, line in enumerate(lines):
+        if line == start:
+            for end in range(index, len(lines)):
+                if lines[end] == "fi":
+                    return "\n".join(lines[index : end + 1])
+            break
+    raise AssertionError(f"the section 2b refusal not found in {_CI_DEPLOY}")
 
 
 def flag_line(mode_next: str | None) -> str:
@@ -484,23 +506,47 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(run_bash(f"export EVAL_MODE_NEXT=1\n{guard}").returncode, 1)
         self.assertEqual(run_bash(guard).returncode, 0)
 
-    def test_a_prow_run_without_a_pull_request_refuses_the_flag(self) -> None:
-        guard = lifted_block(
-            'if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then',
-            "fi",
-            "the section 2b refusal",
-        )
+    def test_a_prow_run_without_a_pull_request_refuses_the_flag_unless_the_job_is_the_lanes(self) -> None:
+        """Section 2b admits the flag on a pull request's run and on the jobs
+        EVAL_MODE_NEXT_JOB_NAMES lists (the next lane's periodic has no
+        PULL_NUMBER); every other Prow run under it is still refused, with the
+        error naming the job, and the flag unset changes nothing."""
+        guard = prow_guard()
+        lane_jobs = constants()["EVAL_MODE_NEXT_JOB_NAMES"].split()
+        self.assertEqual(lane_jobs, list(_NEXT_LANE_JOB_NAMES), "the allow-list is the next lane's two jobs")
         cases = {
-            # (flag, IS_PROW_RUN, PULL_NUMBER) -> refused
-            ("1", "true", ""): True,
-            ("1", "true", "1686"): False,
-            ("1", "false", ""): False,
-            ("", "true", ""): False,
+            # (flag, IS_PROW_RUN, PULL_NUMBER, JOB_NAME) -> refused
+            ("1", "true", "", _OTHER_JOB_NAME): True,
+            ("1", "true", "", _NIGHTLY_JOB_NAME): True,
+            ("1", "true", "1686", _OTHER_JOB_NAME): False,
+            ("1", "true", "1686", _NEXT_LANE_JOB_NAMES[0]): False,
+            ("1", "false", "", ""): False,
+            ("", "true", "", _OTHER_JOB_NAME): False,
+            ("", "true", "", _NEXT_LANE_JOB_NAMES[1]): False,
+            **{("1", "true", "", job): False for job in lane_jobs},
         }
-        for (flag, prow, pull), refused in cases.items():
-            with self.subTest(flag=flag, prow=prow, pull=pull):
-                env = f'export EVAL_MODE_NEXT="{flag}" IS_PROW_RUN="{prow}" PULL_NUMBER="{pull}" JOB_NAME="ci-x"\n'
-                self.assertEqual(run_bash(env + guard).returncode, 1 if refused else 0)
+        for (flag, prow, pull, job), refused in cases.items():
+            with self.subTest(flag=flag, prow=prow, pull=pull, job=job):
+                env = f'export EVAL_MODE_NEXT="{flag}" IS_PROW_RUN="{prow}" PULL_NUMBER="{pull}" JOB_NAME="{job}"\n'
+                result = run_bash(env + constants_block() + "\n" + guard)
+                self.assertEqual(result.returncode, 1 if refused else 0, result.stderr)
+                if refused:
+                    self.assertIn(f"no PULL_NUMBER (JOB_NAME={job})", result.stderr)
+                    self.assertEqual(result.stdout, "")
+                elif flag == "1" and prow == "true" and not pull:
+                    self.assertIn(f"EVAL_MODE_NEXT=1: accepted on {job}", result.stdout)
+                else:
+                    self.assertEqual(result.stdout, "", "the flag unset, a pull request's run, or a laptop logs nothing here")
+
+    def test_the_lane_allow_list_matches_whole_job_names(self) -> None:
+        """A prefix, a suffix or a substring of a listed name is not the job:
+        `ci-kube-agents-eval-next-2` or `kube-agents-eval-next` must refuse."""
+        guard = prow_guard()
+        listed = _NEXT_LANE_JOB_NAMES[1]
+        for job in (listed + "-2", listed[3:], listed[:-1], listed.upper(), f"{listed} "):
+            with self.subTest(job=job):
+                env = f'export EVAL_MODE_NEXT="1" IS_PROW_RUN="true" PULL_NUMBER="" JOB_NAME="{job}"\n'
+                self.assertEqual(run_bash(env + constants_block() + "\n" + guard).returncode, 1, job)
 
     def test_the_concurrency_guard_speaks_the_bridges_grammar(self) -> None:
         """What passes here is written into BRIDGE_CONCURRENCY verbatim and
