@@ -91,7 +91,16 @@ def read_entries(project_id: str, hours: int) -> list:
         raise RuntimeError(
             f"gcloud logging read did not return JSON: {exc}; stderr: {completed.stderr.strip()}"
         ) from exc
-    return entries if isinstance(entries, list) else []
+    # `--format=json` answers a list, `[]` included. Any other shape is a read
+    # this helper cannot count, not an empty window, and the count of nothing
+    # is indistinguishable from a quiet day, so it fails the same way a cut or
+    # non-JSON body does.
+    if not isinstance(entries, list):
+        raise RuntimeError(
+            f"gcloud logging read did not return a JSON list but a "
+            f"{type(entries).__name__}; stderr: {completed.stderr.strip()}"
+        )
+    return entries
 
 
 def entry_text(entry: dict) -> str:
