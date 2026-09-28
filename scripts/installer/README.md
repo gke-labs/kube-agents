@@ -376,7 +376,7 @@ done
 
 The grants left in the unreachable project are orphaned, not revoked. A `custom` permission set
 made of custom IAM roles cannot declare a scope: a custom IAM role is never carried into scoped
-projects (only the six predefined read roles in `scope.tf`'s allowlist are, those of them the host
+projects (only the predefined read roles in `scope.tf`'s allowlist are, those of them the host
 project holds), and the plan is refused until `PLATFORM_AGENT_CUSTOM_ROLES` carries
 `roles/container.clusterViewer` or `roles/container.viewer`.
 
