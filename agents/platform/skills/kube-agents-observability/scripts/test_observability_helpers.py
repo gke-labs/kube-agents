@@ -18,6 +18,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -111,6 +112,15 @@ class PagedHttp(FakeHttp):
             raise AssertionError(f"unexpected relayed GET {url}")
         answer = self.answers[url].pop(0)
         return answer if isinstance(answer, FakeResponse) else FakeResponse(200, answer)
+
+
+def requests_or_skip(case: unittest.TestCase):
+    """`requests`, or a skip: requirements-test.txt does not name it, the sandbox image has it."""
+    try:
+        import requests
+    except ImportError:
+        case.skipTest("requests is not installed here")
+    return requests
 
 
 def run(main, argv, **kwargs):
@@ -544,6 +554,56 @@ class GoogleApiTest(BrokerSessionCase):
         with self.assertRaises(google_api.RelayError):
             google_api.get_json(session, f"https://cloudtrace.googleapis.com/v1/projects/{PROJECT}/traces")
 
+    def test_a_timed_out_read_is_the_broker_not_answering_not_the_broker_unreachable(self):
+        # A slow upstream is the broker's 504 (below); a timeout here means the
+        # broker itself went quiet, and the message must not say it was never
+        # reached, which is the reading that makes a worker improvise a path.
+        class Silent:
+            def get(self, url, **kwargs):
+                raise TimeoutError("timed out")
+
+        session = credential_proxy_client.ApiSession(http=Silent())
+        with self.assertRaises(google_api.RelayError) as raised:
+            google_api.get_json(session, google_api.TRACE_LIST_URL.format(project=PROJECT))
+        self.assertIn(f"did not answer within {google_api.RELAY_TIMEOUT_SECONDS}s", str(raised.exception))
+        self.assertNotIn("could not reach", str(raised.exception))
+
+    def test_a_requests_read_timeout_is_reported_as_a_timeout(self):
+        # requests' Timeout is an OSError; the plain OSError branch would call
+        # it "could not reach the credential broker".
+        requests = requests_or_skip(self)
+
+        class Slow:
+            def get(self, url, **kwargs):
+                raise requests.exceptions.ReadTimeout("HTTPConnectionPool: Read timed out. (read timeout=150)")
+
+        session = credential_proxy_client.ApiSession(http=Slow())
+        with self.assertRaises(google_api.RelayError) as raised:
+            google_api.get_json(session, google_api.TRACE_LIST_URL.format(project=PROJECT))
+        self.assertIn("did not answer within", str(raised.exception))
+        self.assertNotIn("could not reach", str(raised.exception))
+
+    def test_a_slow_upstream_arrives_as_the_brokers_504_naming_the_upstream(self):
+        # The body the broker's _handle_api_relay writes when the upstream
+        # passes API_RELAY_DEADLINE_S; the helper prints it, code included.
+        upstream_timeout = {"error": "the upstream did not answer within the relay deadline", "code": "UPSTREAM_TIMEOUT"}
+        session = self.session({RELAYED_TRACES: FakeResponse(504, upstream_timeout)})
+        with self.assertRaises(google_api.RelayError) as raised:
+            google_api.get_json(session, google_api.TRACE_LIST_URL.format(project=PROJECT))
+        self.assertIn("HTTP 504", str(raised.exception))
+        self.assertIn("UPSTREAM_TIMEOUT", str(raised.exception))
+        self.assertNotIn("could not reach", str(raised.exception))
+
+    def test_the_helper_waits_longer_than_the_brokers_relay_deadline(self):
+        # Read from the broker's source rather than imported: the helper's
+        # timeout must outlast the deadline the broker enforces on the
+        # upstream, or a page the broker is still assembling is reported
+        # as the broker not answering.
+        broker = (Path(credential_proxy_client.__file__).with_name("credential_proxy.py")).read_text(encoding="utf-8")
+        match = re.search(r"^API_RELAY_DEADLINE_S = (\d+)$", broker, re.MULTILINE)
+        self.assertIsNotNone(match, "the broker's API_RELAY_DEADLINE_S was not found")
+        self.assertGreater(google_api.RELAY_TIMEOUT_SECONDS, int(match.group(1)))
+
     def test_get_paginated_refuses_a_limit_below_one_without_reading(self):
         # A default page trimmed by items[:0] would read as an empty list.
         session = self.session({RELAYED_TRACES: TRACE_LIST})
@@ -628,6 +688,18 @@ class GetChatUsersTest(unittest.TestCase):
             code, out, err = run(get_chat_users.main, ["--project-id", PROJECT])
         self.assertEqual(0, code, err)
         self.assertEqual(["ann@example.com", "zoe@example.com"], list(json.loads(out)["active_chat_users"]))
+
+    def test_a_json_body_that_is_not_a_list_is_a_failed_read_not_an_empty_count(self):
+        # `--format=json` answers a list; an object, a string or a number is a
+        # read this helper cannot count, and reporting it as no users exits 0
+        # with the same output as a quiet day.
+        for body in ('{"entries": []}', '"[]"', "42"):
+            with self.subTest(body=body):
+                with patch.object(get_chat_users.subprocess, "run", return_value=self.completed(stdout=body)):
+                    code, out, err = run(get_chat_users.main, ["--project-id", PROJECT])
+                self.assertEqual(get_chat_users.EXIT_READ_FAILED, code)
+                self.assertEqual("", out)
+                self.assertIn("did not return a JSON list", err)
 
     def test_an_empty_read_is_an_empty_count(self):
         with patch.object(get_chat_users.subprocess, "run", return_value=self.completed(stdout="[]")):
