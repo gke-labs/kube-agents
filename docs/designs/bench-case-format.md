@@ -185,9 +185,10 @@ workers' trajectory entries).
 
 One reads the install under test, from the same file: `bootstrap_fanout` compares the
 cards the onboarding discovery sweep filed, read from the agent pod's board, against the
-Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (one
-card per ready profile with a cluster identity, keyed and assigned to it) or `no_card_waits_on_the_sweep` (no cluster
-card has the sweep as a parent).
+Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
+one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
+card for anything else) or `no_card_waits_on_the_sweep` (no cluster card has the sweep as a
+parent).
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated

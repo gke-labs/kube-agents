@@ -719,10 +719,11 @@ class BootstrapFanoutVerifier(BaseVerifier):
       card names the sweep as a parent. A child waiting on the card that waits
       on it never runs until the sweep has given up on it.
 
-    Fails closed: an unreadable pod, no sweep marker, or a sweep card the board
-    does not know is ``status="error"``, and so is an empty roster for
-    ``one_card_per_cluster_agent``. ``no_card_waits_on_the_sweep`` passes on an
-    empty roster: no cluster card exists to wait on the sweep.
+    Fails closed: an unreadable pod, no sweep marker, a board that cannot be
+    queried, or a sweep card the board does not know is ``status="error"``,
+    and so is an empty roster for ``one_card_per_cluster_agent``.
+    ``no_card_waits_on_the_sweep`` passes on an empty roster: no cluster card
+    exists to wait on the sweep.
     """
 
     type: Literal["bootstrap_fanout"]
