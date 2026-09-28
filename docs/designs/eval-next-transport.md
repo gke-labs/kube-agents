@@ -144,8 +144,9 @@ the presubmit exports nothing new until it chooses to. The exchange:
    reading the conversation, so it treats that edit as the terminal: infrastructure, the
    gateway failed to publish, and no cancel, because nothing was ever on a subject.
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
-   `final_message`); map `activity` artifacts into the trajectory and the `progress` artifact's
-   last line into the record's `metadata` when the executor publishes them. Token counts are not
+   `final_message`); map `activity` artifacts into the trajectory when the executor publishes them
+   (the `progress` artifact's last line goes to the harness result's `metadata`, which devops-bench
+   does not write to the record, so it reaches the log and nothing graded). Token counts are not
    on the bus, and the scorer's liveness rule
    fails a record whose token total is null, so the inject record is written the way the
    diagnostic transport below writes its own: every lifecycle event of the task, `submitted`,

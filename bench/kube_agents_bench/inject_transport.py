@@ -233,7 +233,12 @@ ACTIVITY_STATUS_TRUNCATED = "truncated"
 # verifier cannot unwrap the tools it invoked, and a ``tool_called`` naming
 # one of them would fail on this transport where the api path passes. The
 # marker counts these, and the scorer reads the count as a loss (below).
+# The stand-in is recognised by its whole shape -- exactly these three
+# keys with the flag true -- not by the flag alone, because the input is
+# the persona's own arguments and a tool whose schema carries a boolean
+# ``truncated`` would otherwise set the record aside on the run that used it.
 ACTIVITY_INPUT_TRUNCATED_KEY = "truncated"
+ACTIVITY_INPUT_TRUNCATED_KEYS = frozenset({ACTIVITY_INPUT_TRUNCATED_KEY, "bytes", "head"})
 # The marker's argument names: the two it always carries, and two counts
 # present only when non-zero -- parts that could not be mapped, and calls
 # whose input the executor replaced with its truncation stand-in. The last
@@ -727,7 +732,10 @@ class Fold:
             raw_input = part.get(ACTIVITY_INPUT_KEY)
             if isinstance(raw_input, dict):
                 args = raw_input
-                if args.get(ACTIVITY_INPUT_TRUNCATED_KEY) is True:
+                if (
+                    set(args) == ACTIVITY_INPUT_TRUNCATED_KEYS
+                    and args.get(ACTIVITY_INPUT_TRUNCATED_KEY) is True
+                ):
                     input_truncated += 1
             elif raw_input is None:
                 args = {}

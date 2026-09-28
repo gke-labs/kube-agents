@@ -1363,7 +1363,10 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
             "malformed_entries": fold.malformed,
             # The marker's arguments (calls written, calls dropped), or None
             # on a door that carried no trace; the progress artifact's last
-            # line, or None when none was carried.
+            # line, or None when none was carried. Like the rest of this
+            # block they reach the harness log and not the record --
+            # devops-bench drops ``metadata`` -- so the record's evidence is
+            # the ``a2a.activity`` entry in the trajectory.
             "activity": fold.activity_summary,
             "progress": fold.progress or None,
             "tokens_note": _INJECT_TOKENS_NOTE,

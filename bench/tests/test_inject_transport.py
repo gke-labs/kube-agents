@@ -2255,14 +2255,26 @@ def test_a_call_whose_input_the_executor_truncated_is_counted_on_the_marker() ->
     from kube_agents_bench.verifiers import _wrapped_tool_names
 
     capped = {"truncated": True, "bytes": 5000, "head": '{"calls": [{"name": "mcp__gke__'}
+    # A tool whose own arguments carry a boolean ``truncated`` is not the
+    # stand-in: the input is the persona's, intact, and counting it would set
+    # the record aside on the run that used that tool.
+    honest = {"truncated": True, "query": "logs", "limit": 50}
     fold = inject.Fold("task-1")
     fold.note_activity(
-        [CALL_CREATE, {"tool": "tool_call", "input": capped, "status": "completed"}], 0, 0
+        [
+            CALL_CREATE,
+            {"tool": "tool_call", "input": capped, "status": "completed"},
+            {"tool": "search_logs", "input": honest, "status": "completed"},
+            {"tool": "tool_call", "input": {**capped, "truncated": False}, "status": "completed"},
+        ],
+        0,
+        0,
     )
     marker, *calls = trace_block(fold.trajectory)
-    assert marker["args"] == {"calls": 2, "dropped": 0, "input_truncated": 1}
+    assert marker["args"] == {"calls": 4, "dropped": 0, "input_truncated": 1}
     assert calls[1] == {"name": "tool_call", "args": capped, "result": None, "status": "completed"}
     assert _wrapped_tool_names(calls[1]) == set()
+    assert calls[2]["args"] == honest
 
 
 def test_the_latest_read_s_trace_replaces_the_one_before() -> None:
