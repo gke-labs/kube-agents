@@ -416,8 +416,10 @@ test-python: ## Run every Python unit-test directory in PYTHON_TEST_DIRS, the op
 #
 # COVERAGE_STRICT=1 makes the target fail at the end when any directory failed,
 # which is what lets one run serve as both the verdict and the meter. CI's
-# required job sets it, so a pull request pays for the 5638 tests once instead
-# of running them again unmeasured in a second job. The default stays 0 because
+# required job sets it, so the verdict and the number come from one execution
+# rather than a measured run beside an unmeasured one on the same interpreter;
+# the one other run of the sweep in CI is on the agent image's Python, which is
+# a different question, not a second meter. The default stays 0 because
 # a local run against a tree with known-red directories should still print a
 # total. The failing list travels through a file because each recipe line is its
 # own shell: the sweep leaves `$$failed` set in the shell that called it, and
