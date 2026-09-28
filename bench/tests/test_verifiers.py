@@ -1050,6 +1050,63 @@ def test_a_pass_with_no_any_of_does_not_claim_an_any_of_clause():
     assert "alternative phrasing" not in res.reason
 
 
+TRACE_ID_PATTERN = r"\b[0-9a-f]{32}\b"
+SHARE_PATTERN = r"\d+(\.\d+)?\s*%"
+# A report whose helper exited 1, written with the prompt's own vocabulary:
+# every substring the trace case once required is in it, and no trace id.
+FAILURE_REPORT_IN_THE_PROMPTS_WORDS = (
+    "I could not obtain any trace ID, duration or slowest-span % share "
+    "because the analyzer failed."
+)
+BREAKDOWN_REPORT = (
+    "| **Trace ID** | total | slowest span |\n"
+    "| `0384e171d360c91c96df3124562dcc59` | `2.590s` | `api.model-default` `2.590s` (`100.0%`) |"
+)
+
+
+def test_a_required_pattern_demands_the_shape_and_names_it_when_absent():
+    # The substring checks this replaces (`trace id`, `%`) are the prompt's
+    # words, so a report of failure carries them; a 32-hex id it cannot.
+    v = ReportContainsVerifier(
+        type="report_contains", required_patterns=[TRACE_ID_PATTERN, SHARE_PATTERN]
+    )
+    transcript.set(BREAKDOWN_REPORT, [])
+    res = v.verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "all 2 required pattern(s)" in res.reason
+    transcript.set(FAILURE_REPORT_IN_THE_PROMPTS_WORDS, [])
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    # The reason lists the absent patterns as Python reprs.
+    assert "required patterns absent from the report" in res.reason
+    assert repr(TRACE_ID_PATTERN) in res.reason
+
+
+def test_a_required_pattern_runs_on_the_lowercased_emphasis_free_text():
+    # Same normalization as the phrases: bold and code markers are dropped and
+    # the text is lowercased before the regex runs, so a pattern spells the
+    # label in lower case and no Markdown around the value can hide it.
+    v = ReportContainsVerifier(
+        type="report_contains", required_patterns=[r"trace id: [0-9a-f]{32}"]
+    )
+    transcript.set("**Trace ID:** `0384e171d360c91c96df3124562dcc59`", [])
+    assert v.verify(5.0).status == "pass"
+    transcript.set("**Trace ID:** unavailable", [])
+    assert v.verify(5.0).status == "fail"
+
+
+def test_a_required_pattern_that_does_not_compile_is_refused_at_construction():
+    # The same refusal forbidden_patterns has: re.compile raises at load.
+    with pytest.raises(Exception):
+        ReportContainsVerifier(type="report_contains", required_patterns=["("])
+
+
+def test_a_pass_with_no_required_pattern_does_not_claim_a_pattern_clause():
+    v = ReportContainsVerifier(type="report_contains", required_phrases=["HPA"])
+    transcript.set("the HPA hit max replicas", [])
+    assert "required pattern" not in v.verify(5.0).reason
+
+
 def test_scope_final_ignores_a_quoted_phrase_in_the_accumulated_output():
     # The accumulated output quotes the planted log line; the actual answer
     # names something else. Default scope must not pass on the quotation.

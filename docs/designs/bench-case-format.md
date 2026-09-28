@@ -171,9 +171,11 @@ fixture role, named by `fixture_role:` rather than by cluster.
 Seven read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
-`report_contains` (phrases in the agent's answer; its `forbidden_patterns` are
-regular expressions, for a banned word whose negated uses are legitimate and
-which no substring can express), `tool_called` (calls in the
+`report_contains` (phrases in the agent's answer; its `forbidden_patterns` and
+`required_patterns` are regular expressions, for what no substring can express: a
+banned word whose negated uses are legitimate, or a value only the work produces,
+such as a 32-hex trace id, where the words around it are the prompt's own and a
+report of failure would echo them), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
