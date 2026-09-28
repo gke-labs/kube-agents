@@ -1,0 +1,29 @@
+# Which clusters the agent manages, answered from its own inventory rather
+# than by inspecting clusters. On kind the inventory is empty, so the agent
+# scavenges the answer from the PlatformAgent CR with kubectl: red until the
+# inventory can hold a cluster that gcloud cannot list.
+id: fleet-managed-clusters
+name: List the clusters the agent manages
+prompt: >-
+  Which clusters do you manage?
+expected_output: >-
+  The clusters in the agent's inventory, by name.
+infrastructure:
+  deployer: noop
+validated: false
+domain: chat-and-routing
+owner: maintainers
+verification_spec:
+  - name: names-a-managed-cluster
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # seeded-a on the eval install; on kind, the kind cluster.
+      any_of_phrases: ["seeded-a", "{{CLUSTER_NAME}}"]
+  - name: answered-from-the-inventory
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns: ['\bkubectl\b', '\bgcloud\b']

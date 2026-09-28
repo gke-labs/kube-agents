@@ -445,3 +445,6 @@
 # until their first observed runs.
 ./tasks/obtainability-design-quota-vs-capacity/task.yaml
 ./tasks/obtainability-window-planning-probe/task.yaml
+
+# Which clusters the agent manages, from its inventory. Runs on kind too.
+./tasks/fleet-managed-clusters/task.yaml
