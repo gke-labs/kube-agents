@@ -25,14 +25,16 @@ terraform {
   required_providers {
     google = {
       source  = "hashicorp/google"
-      # Upper bounds because the scheduled reconcile re-resolves providers on
-      # every run (the lock file is not committed): a new major must be adopted
-      # by a person, not applied unattended across the pool.
-      version = ">= 5.0.0, < 9.0.0"
+      # One major each, because the scheduled reconcile re-resolves providers
+      # on every run (the lock file is not committed): the next major must be
+      # adopted by a person, not applied unattended across the pool. These are
+      # the majors the fleet is applied with today (8.4.0 and 3.2.1 resolved
+      # on 2026-09-28).
+      version = "~> 8.0"
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
-      version = ">= 2.30.0, < 4.0.0"
+      version = "~> 3.0"
     }
   }
 }

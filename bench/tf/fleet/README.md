@@ -44,8 +44,8 @@ Local validation without credentials: `tofu init -backend=false && tofu validate
 Drift is corrected by re-applying this stack on a schedule: `hack/fleet_reconcile.py`,
 from two Prow periodics that run `main` only and hold each project through Boskos for
 its one apply — hourly for the projects the CI health bot's scan reports drifted, weekly
-for all of them (`docs/ci-pool-projects.md` §6.2). It refuses a plan that destroys or
-replaces anything; that apply is a person's. Detecting the drift is a separate job, and
+for all of them (`docs/ci-pool-projects.md` §6.2). It applies only creates and in-place updates and
+refuses anything else; that apply is a person's. Detecting the drift is a separate job, and
 it is `hack/fleet-fixture-state.py`'s: the pool verifier runs it against one project
 when asked, and the CI health bot's hourly scan runs it against every pool project and
 reports a repeated drift the way it reports a lost build node

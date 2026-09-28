@@ -17,10 +17,11 @@ credential that can rewrite the fleet is never mounted there.
 Each project is acquired from Boskos out of `free` into `reconciling` for the
 minutes the apply takes and released back, so a project a run holds is never
 applied under it and a run arriving mid-apply waits at its own acquire. The
-plan is inspected before it is applied: a plan that destroys or replaces
-anything is refused and named, because nothing this stack declares should
-ever need destroying on a re-apply, and a plan that does is a code change
-or an incident a person should look at first.
+plan is inspected before it is applied: only creates and in-place updates
+are applied, and a plan with anything else (a destroy, a replace, a forget)
+is refused and named, because nothing this stack declares should ever need
+that on a re-apply, and a plan that does is a code change or an incident a
+person should look at first.
 """
 
 import argparse
@@ -52,13 +53,15 @@ TOFU_ENV = {"TF_IN_AUTOMATION": "1", "TF_INPUT": "0"}
 # `plan -detailed-exitcode`: 0 nothing to do, 2 changes planned, 1 an error.
 PLAN_NO_CHANGES = 0
 PLAN_HAS_CHANGES = 2
-# The actions `tofu show -json` reports per resource. A replace is a delete
-# paired with a create, in either order; any delete is refused.
+# The actions `tofu show -json` reports per resource. Only a create and an
+# in-place update are applied; a delete, a replace (delete paired with a
+# create, either order), a forget, or any action a later tofu adds is refused.
 ACTION_NOOP = "no-op"
 ACTION_READ = "read"
 ACTION_CREATE = "create"
 ACTION_UPDATE = "update"
-REFUSED_ACTION = "delete"
+IGNORED_ACTIONS = ([ACTION_NOOP], [ACTION_READ])
+APPLIED_ACTIONS = ([ACTION_CREATE], [ACTION_UPDATE])
 
 # Boskos: this script's hold state and owner. A project is held for one apply.
 HOLD_STATE = "reconciling"
@@ -94,6 +97,10 @@ OUTCOME_PLANNED = "planned"
 # declares and stays that way. Busy is not one; the next run gets it.
 FAILING_OUTCOMES = frozenset({OUTCOME_REFUSED, OUTCOME_FAILED})
 OUTPUT_TAIL_CHARS = 600
+REASON_UNMAPPED = "not a mapped pool project (gitops_repo_for_project in hack/ci-deploy.sh)"
+# Boskos's 404 does not say which; a mapped project lands here between its
+# mapping row and its Boskos registration, and reads busy until registered.
+REASON_BUSY = "not free in Boskos, or not registered there yet"
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -143,24 +150,26 @@ def plan_changes(show_json):
         document = json.loads(show_json)
     except ValueError as exc:
         raise ReconcileError("tofu show wrote a plan that is not JSON: %s" % exc)
+    if not isinstance(document, dict):
+        raise ReconcileError("tofu show wrote a plan that is not a JSON object")
     changes = []
     for change in document.get("resource_changes") or []:
         actions = list((change.get("change") or {}).get("actions") or [])
-        if actions and actions != [ACTION_NOOP] and actions != [ACTION_READ]:
+        if actions and actions not in IGNORED_ACTIONS:
             changes.append((actions, change.get("address") or "?"))
     return changes
 
 
 def refused_changes(changes):
-    """The changes a re-apply must not make: every delete, alone or in a replace."""
-    return ["%s %s" % ("+".join(actions), address) for actions, address in changes if REFUSED_ACTION in actions]
+    """The changes a re-apply must not make: everything but a create or an in-place update."""
+    return ["%s %s" % ("+".join(actions), address) for actions, address in changes if actions not in APPLIED_ACTIONS]
 
 
 def describe(changes):
     add = sum(1 for actions, _ in changes if actions == [ACTION_CREATE])
     change = sum(1 for actions, _ in changes if actions == [ACTION_UPDATE])
-    destroy = sum(1 for actions, _ in changes if REFUSED_ACTION in actions)
-    return "%d to add, %d to change, %d to destroy or replace" % (add, change, destroy)
+    refused = sum(1 for actions, _ in changes if actions not in APPLIED_ACTIONS)
+    return "%d to add, %d to change, %d refused" % (add, change, refused)
 
 
 def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJECT_TIMEOUT_SECONDS):
@@ -201,7 +210,7 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
             summary = describe(changes)
             refused = refused_changes(changes)
             if refused:
-                return OUTCOME_REFUSED, "%s; would destroy or replace: %s" % (summary, ", ".join(refused))
+                return OUTCOME_REFUSED, "%s; not a create or an in-place update: %s" % (summary, ", ".join(refused))
             if dry_run:
                 return OUTCOME_PLANNED, "%s: %s" % (summary, ", ".join("%s %s" % ("+".join(a), addr) for a, addr in changes))
             _tofu(["apply", "-input=false", "-no-color", "-auto-approve", plan_path], runner, deadline)
@@ -235,13 +244,18 @@ def drifted_projects(document):
     return sorted(fixture_state.drift_map(document))
 
 
-def pool_size(ci_deploy_script=fixture_state.CI_DEPLOY_SCRIPT):
-    """How many projects the pool maps, the bound on a walk of it."""
+def pool_projects(ci_deploy_script=fixture_state.CI_DEPLOY_SCRIPT):
+    """The projects the pool maps, the only names this script will ask Boskos for."""
     text = pathlib.Path(ci_deploy_script).read_text()
     match = fixture_state.MAPPING_RE.search(text)
     if not match:
         raise ReconcileError("no gitops_repo_for_project() in %s" % ci_deploy_script)
-    return len(fixture_state.MAPPING_ROW_RE.findall(match.group(1)))
+    return set(fixture_state.MAPPING_ROW_RE.findall(match.group(1)))
+
+
+def pool_size(ci_deploy_script=fixture_state.CI_DEPLOY_SCRIPT):
+    """How many projects the pool maps, the bound on a walk of it."""
+    return len(pool_projects(ci_deploy_script))
 
 
 def report(outcomes):
@@ -262,15 +276,24 @@ def report(outcomes):
     return failing
 
 
-def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry_run=False):
-    """Each named project, held through Boskos unless `lease` is off."""
+def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry_run=False, known=None):
+    """Each named project, held through Boskos unless `lease` is off.
+
+    A name outside the pool mapping is failed before Boskos is asked: Boskos
+    answers 404 for a leased project and for one it has never heard of alike,
+    so a typo would otherwise read as busy on every run.
+    """
+    known = pool_projects() if known is None else known
     outcomes = {}
     for project in projects:
+        if project not in known:
+            outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
+            continue
         if not lease:
             outcomes[project] = reconcile_project(project, runner=runner, dry_run=dry_run)
             continue
         if boskos_pool.acquire(server, owner, HOLD_STATE, name=project) is None:
-            outcomes[project] = (OUTCOME_BUSY, "not free in Boskos; the next run gets it")
+            outcomes[project] = (OUTCOME_BUSY, REASON_BUSY)
             continue
         release_failures = {}
         outcomes[project] = boskos_pool.hold(

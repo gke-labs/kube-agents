@@ -18,7 +18,11 @@ import io
 import json
 import pathlib
 import subprocess
+import os
+import signal
 import sys
+import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -50,6 +54,8 @@ UPDATE_ONLY = _plan((["update"], "google_container_cluster.seeded_b"))
 CREATE_AND_UPDATE = _plan((["create"], "google_compute_disk.orphan"), (["update"], "google_container_cluster.seeded_b"), (["no-op"], "google_service_account.fleet_reader"))
 REPLACE = _plan((["delete", "create"], "google_container_node_pool.seeded_a_idle"), (["update"], "google_container_cluster.seeded_b"))
 DELETE = _plan((["delete"], "google_compute_disk.orphan"))
+FORGET = _plan((["forget"], "google_compute_disk.orphan"), (["update"], "google_container_cluster.seeded_b"))
+KNOWN = {P7, P8}
 
 
 class _Tofu:
@@ -136,8 +142,9 @@ class PlanInspectionTest(unittest.TestCase):
         tofu = _Tofu({P7: UPDATE_ONLY})
         outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
         self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
-        self.assertEqual(detail, "0 to add, 1 to change, 0 to destroy or replace")
+        self.assertEqual(detail, "0 to add, 1 to change, 0 refused")
         self.assertEqual(tofu.verbs(), ["init", "plan", "show", "apply"])
+        self.assertEqual(tofu.calls[3][-1], tofu.calls[2][-1], "apply takes the plan file show inspected")
         self.assertIn("-var=project_id=%s" % P7, tofu.calls[1])
         self.assertIn("-backend-config=bucket=%s-tf-state" % P7, tofu.calls[0])
         self.assertIn("-backend-config=prefix=seeded-fleet", tofu.calls[0])
@@ -146,7 +153,7 @@ class PlanInspectionTest(unittest.TestCase):
         # The orphan disk a cleanup deleted comes back; that is the point.
         tofu = _Tofu({P7: CREATE_AND_UPDATE})
         outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
-        self.assertEqual((outcome, detail), (reconcile.OUTCOME_APPLIED, "1 to add, 1 to change, 0 to destroy or replace"))
+        self.assertEqual((outcome, detail), (reconcile.OUTCOME_APPLIED, "1 to add, 1 to change, 0 refused"))
 
     def test_a_replace_is_refused_and_named_before_anything_is_applied(self):
         tofu = _Tofu({P7: REPLACE})
@@ -160,6 +167,22 @@ class PlanInspectionTest(unittest.TestCase):
         outcome, _ = reconcile.reconcile_project(P7, runner=tofu)
         self.assertEqual(outcome, reconcile.OUTCOME_REFUSED)
         self.assertNotIn("apply", tofu.verbs())
+
+    def test_an_action_that_is_not_a_create_or_update_is_refused(self):
+        # `forget` drops a resource from state; a later tofu may add others.
+        tofu = _Tofu({P7: FORGET})
+        outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
+        self.assertEqual(outcome, reconcile.OUTCOME_REFUSED)
+        self.assertIn("forget google_compute_disk.orphan", detail)
+        self.assertIn("1 refused", detail)
+        self.assertNotIn("apply", tofu.verbs())
+
+    def test_a_show_that_is_json_but_not_an_object_is_that_projects_failure(self):
+        for body in ("[]", "null"):
+            tofu = _Tofu({P7: body})
+            outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
+            self.assertEqual(outcome, reconcile.OUTCOME_FAILED, body)
+            self.assertIn("not a JSON object", detail)
 
     def test_a_plan_with_nothing_to_do_applies_nothing(self):
         tofu = _Tofu({}, plan_exit={P7: reconcile.PLAN_NO_CHANGES})
@@ -240,7 +263,7 @@ class LeaseTest(unittest.TestCase):
         boskos = _Boskos(free=[P7, P8])
         tofu = _Tofu({P7: UPDATE_ONLY})
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
-            outcomes = reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=tofu)
+            outcomes = reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=tofu, known=KNOWN)
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
         self.assertEqual((boskos.acquired, boskos.released), ([P7], [P7]))
         self.assertEqual(boskos.free, [P8], "the project not named was never touched")
@@ -249,19 +272,35 @@ class LeaseTest(unittest.TestCase):
         boskos = _Boskos(free=[P8])
         tofu = _Tofu({})
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
-            outcomes = reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=tofu)
-        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_BUSY)
+            outcomes = reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=tofu, known=KNOWN)
+        self.assertEqual(outcomes[P7], (reconcile.OUTCOME_BUSY, reconcile.REASON_BUSY))
+        self.assertIn("not registered", reconcile.REASON_BUSY, "Boskos's 404 does not say which, so the line names both")
         self.assertEqual(tofu.calls, [])
         self.assertNotIn(reconcile.OUTCOME_BUSY, reconcile.FAILING_OUTCOMES)
+
+    def test_a_name_outside_the_pool_mapping_fails_before_boskos_is_asked(self):
+        def no_boskos(request, timeout=None):
+            raise AssertionError("Boskos was called: %s" % request.full_url)
+
+        tofu = _Tofu({})
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", no_boskos):
+            outcomes = reconcile.reconcile_named(["kube-agents-evals-99"], BOSKOS, OWNER, runner=tofu, known=KNOWN)
+        self.assertEqual(outcomes["kube-agents-evals-99"], (reconcile.OUTCOME_FAILED, reconcile.REASON_UNMAPPED))
+        self.assertEqual(tofu.calls, [])
+
+    def test_the_default_mapping_is_the_one_in_ci_deploy(self):
+        self.assertIn("kube-agents-evals-3", reconcile.pool_projects())
+        self.assertEqual(len(reconcile.pool_projects()), reconcile.pool_size())
 
     def test_a_refused_project_is_released(self):
         boskos = _Boskos(free=[P7])
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
-            outcomes = reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: REPLACE}))
+            outcomes = reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: REPLACE}), known=KNOWN)
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_REFUSED)
         self.assertEqual(boskos.released, [P7])
 
-    def test_a_termination_mid_apply_releases_the_held_project(self):
+    def test_a_termination_during_a_hold_releases_the_project(self):
+        # The hold's finally, not the runner: the runner raises on its first call.
         boskos = _Boskos(free=[P7])
 
         def terminated(argv, **_):
@@ -269,13 +308,13 @@ class LeaseTest(unittest.TestCase):
 
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
             with self.assertRaises(boskos_pool.Terminated):
-                reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=terminated)
+                reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=terminated, known=KNOWN)
         self.assertEqual(boskos.released, [P7])
 
     def test_a_release_that_fails_is_that_projects_failure(self):
         boskos = _Boskos(free=[P7], release_errors={P7: _http_error(500, BOSKOS)})
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
-            outcomes = reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}))
+            outcomes = reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN)
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_FAILED)
         self.assertIn("release failed", outcomes[P7][1])
 
@@ -284,7 +323,7 @@ class LeaseTest(unittest.TestCase):
             raise AssertionError("Boskos was called: %s" % request.full_url)
 
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", no_boskos):
-            outcomes = reconcile.reconcile_named([P7], BOSKOS, OWNER, lease=False, runner=_Tofu({P7: UPDATE_ONLY}))
+            outcomes = reconcile.reconcile_named([P7], BOSKOS, OWNER, lease=False, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN)
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
 
     def test_the_pool_walk_applies_every_free_project_once_and_releases_each(self):
@@ -298,38 +337,44 @@ class LeaseTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
-    def test_a_refusal_exits_one_and_names_the_project(self):
-        boskos = _Boskos(free=[P7])
+    def _main(self, argv, boskos, tofu, scan=None):
+        """main() with the process-wide signal handlers patched, so the test
+        runner keeps its own SIGINT/SIGTERM behaviour after this class."""
         stderr = io.StringIO()
+        load = mock.patch.object(reconcile, "load_fixture_state", lambda source, runner=None: scan) if scan is not None else mock.patch.object(reconcile, "load_fixture_state", reconcile.load_fixture_state)
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
-            reconcile, "tofu_runner", _Tofu({P7: REPLACE})
-        ), mock.patch("sys.stderr", stderr), mock.patch("sys.stdout", io.StringIO()):
-            rc = reconcile.main(["--project", P7, "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+            reconcile, "tofu_runner", tofu
+        ), mock.patch.object(reconcile.signal, "signal") as installed, mock.patch("sys.stdout", io.StringIO()), mock.patch(
+            "sys.stderr", stderr
+        ), load:
+            rc = reconcile.main(argv + ["--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+        self.assertEqual(sorted(c.args[0] for c in installed.call_args_list), sorted(reconcile.TERMINATION_SIGNALS))
+        for c in installed.call_args_list:
+            self.assertIs(c.args[1], boskos_pool.terminate)
+        return rc, stderr.getvalue()
+
+    def test_a_refusal_exits_one_and_names_the_project(self):
+        rc, stderr = self._main(["--project", P7], _Boskos(free=[P7]), _Tofu({P7: REPLACE}))
         self.assertEqual(rc, reconcile.EXIT_FAILED)
-        self.assertIn(P7, stderr.getvalue())
+        self.assertIn(P7, stderr)
 
     def test_drifted_reads_the_scan_resets_strands_and_applies_the_projects_listed(self):
         boskos = _Boskos(free=[P7, P8])
-        tofu = _Tofu({P8: UPDATE_ONLY})
         scan = {"projects": {P8: {"roles": {"idle-pool": {"state": "drifted", "detail": []}}}, P7: {"roles": {"idle-pool": {"state": "healthy", "detail": []}}}}}
-        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
-            reconcile, "tofu_runner", tofu
-        ), mock.patch.object(reconcile, "load_fixture_state", lambda source, runner=None: scan), mock.patch(
-            "sys.stdout", io.StringIO()
-        ):
-            rc = reconcile.main(["--drifted", "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+        rc, _ = self._main(["--drifted"], boskos, _Tofu({P8: UPDATE_ONLY}), scan=scan)
         self.assertEqual(rc, reconcile.EXIT_OK)
         self.assertEqual(boskos.acquired, [P8])
         self.assertEqual(boskos.resets[0]["state"], reconcile.HOLD_STATE)
         self.assertEqual(boskos.resets[0]["expire"], reconcile.STRANDED_AFTER)
 
     def test_a_busy_pool_exits_zero(self):
-        boskos = _Boskos(free=[])
-        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
-            reconcile, "tofu_runner", _Tofu({})
-        ), mock.patch("sys.stdout", io.StringIO()):
-            rc = reconcile.main(["--project", P7, "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+        rc, _ = self._main(["--project", P7], _Boskos(free=[]), _Tofu({}))
         self.assertEqual(rc, reconcile.EXIT_OK)
+
+    def test_an_unmapped_project_exits_one(self):
+        rc, stderr = self._main(["--project", "kube-agents-evals-99"], _Boskos(free=[]), _Tofu({}))
+        self.assertEqual(rc, reconcile.EXIT_FAILED)
+        self.assertIn("kube-agents-evals-99", stderr)
 
     def test_no_lease_without_a_project_is_refused_by_the_parser(self):
         with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()):
@@ -391,6 +436,28 @@ class TofuRunnerTest(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired):
                 reconcile.tofu_runner([sys.executable, "-c", script], timeout=0.3)
         self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_termination_signal_reaches_the_child_before_it_propagates(self):
+        # Prow's entrypoint sends SIGINT to this process; with the script's
+        # handler installed that is a Terminated, and the child must get its
+        # own SIGINT (and the chance to unlock state) before it propagates.
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "interrupted")
+            script = (
+                "import signal, sys, time\n"
+                "signal.signal(signal.SIGINT, lambda *_: (open(%r, 'w').close(), sys.exit(3)))\n"
+                "time.sleep(30)\n" % marker
+            )
+            previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+            timer = threading.Timer(0.5, os.kill, args=(os.getpid(), signal.SIGINT))
+            try:
+                timer.start()
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.tofu_runner([sys.executable, "-c", script], timeout=30)
+            finally:
+                timer.cancel()
+                signal.signal(signal.SIGINT, previous)
+            self.assertTrue(os.path.exists(marker), "the child never saw SIGINT")
 
     def test_a_finished_child_is_returned_with_its_output(self):
         result = reconcile.tofu_runner([sys.executable, "-c", "print('hi')"], timeout=10)
