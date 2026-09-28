@@ -12,7 +12,11 @@ another document:
     pulls from). The detector's compiled-in default is the module's default
     name, so an install that renames the subscription and does not carry the
     rename into the CR has a detector that pulls a subscription that does not
-    exist, exits on every start and leaves the pod Ready.
+    exist. Nothing fails closed on that: the detector never exits, it retries
+    the pull for the life of the pod, the entrypoint's short-exit ALERT cannot
+    fire, and the pod stays Ready (the package comment on
+    k8s-operator/cmd/drift-detector/main.go says so), which is what makes the
+    failure silent.
   - the chart block is written only when the module exists. The chart renders
     a `driftDetector` block into the CR as soon as one field is set, and the
     CR template says an install that never asked for drift detection should
