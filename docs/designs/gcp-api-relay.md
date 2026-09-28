@@ -194,8 +194,9 @@ holds the Monitoring `timeSeries` and `metricDescriptors` lists, the Managed Pro
 which consumer needs it. `REFUSED_HOSTS` beside it names the hosts whose responses are credentials
 or that turn a read into a write elsewhere — the token, STS, OAuth, IAM, Secret Manager, KMS
 and metadata endpoints — and is checked before the table and never overridable by it; the
-validator refuses a table that names one. `PROJECT` is Google's project-id grammar, and
-`HOST_SHAPE` the host grammar the table and the handler share.
+validator refuses a table that names one. `PROJECT` is Google's project-id grammar or a project
+number (a decimal int64), since an install's `projectId` may be either, and `HOST_SHAPE` the host
+grammar the table and the handler share.
 
 `evaluate` answers in this order, and the order is the security argument:
 
@@ -210,8 +211,8 @@ validator refuses a table that names one. `PROJECT` is Google's project-id gramm
 
 Every regex is anchored and matched with `fullmatch` — `$` alone also matches before a
 trailing newline — so `timeSeries` admits nothing under `timeSeries/` and a project segment
-cannot carry a slash. The project id is constrained to Google's grammar so a path cannot
-smuggle a second segment through it. The table does not constrain **which** project: the
+cannot carry a slash. The project segment is constrained to Google's id grammar or a project
+number so a path cannot smuggle a second segment through it. The table does not constrain **which** project: the
 `gcloud` allowlist takes the same position and its comment says why — deciding scope from
 caller text puts a parser where the boundary belongs. IAM bounds the project set; the table
 bounds the operation.
