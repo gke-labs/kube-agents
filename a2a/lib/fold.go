@@ -327,10 +327,14 @@ func (c *Client) LastEnvelope(ctx context.Context, subject string) (*Envelope, e
 		c.log.Error("a2a newest-message read skipping unparseable envelope", "subject", subject, "err", err)
 		return nil, nil
 	}
-	if aerr := CheckSubjectAgreement(subject, env, c.opts.agreement); aerr != nil && !IsAdvisoryDisagreement(aerr) {
+	if aerr := CheckSubjectAgreement(subject, env, c.opts.agreement); aerr != nil {
 		c.protocolViolations.Add(1)
-		c.log.Error("a2a newest-message read skipping envelope that disagrees with its subject", "subject", subject, "err", aerr)
-		return nil, nil
+		if !IsAdvisoryDisagreement(aerr) {
+			c.log.Error("a2a newest-message read skipping envelope that disagrees with its subject", "subject", subject, "err", aerr)
+			return nil, nil
+		}
+		// The advisory writer check, as in the replay: counted, returned.
+		c.log.Warn("a2a newest-message read returning envelope whose writer disagrees with its subject (advisory)", "subject", subject, "err", aerr)
 	}
 	return env, nil
 }

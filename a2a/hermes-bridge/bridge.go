@@ -539,6 +539,18 @@ func (r *taskRun) pending() bool {
 // cancel has already ended on handleCancel's queued path, which on a live
 // bridge is where that cancel usually lands while the direct get is out.
 //
+// The negative answer rests on the submission's envelope id being on the
+// subject once. The server dedups a re-publish of the same id inside the
+// stream's duplicates window, and the durable drops one on delivery; a copy
+// stored after that window would sit newest, hide a cancel between the two
+// copies from the direct get, and give that task the record the bridge
+// gave every cancelled task before the look-ahead: a spawn the durable's
+// cancel kills inside the kill grace, canceled-by-request. That takes a
+// writer with rights on the task's in subject re-sending an identical
+// envelope minutes later, which no publisher in the tree does and which
+// could as well submit a fresh task; it is named here rather than paid for
+// with a replay on every spawn.
+//
 // Newer than the submission means after it in stream order. The submission
 // is normally in the replay, since the durable delivered it moments ago;
 // when it is not - the per-subject cap evicted it - everything left is

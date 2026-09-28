@@ -1043,8 +1043,10 @@ func TestLookAhead_FinalizedRunSkipsTheFallbackReplay(t *testing.T) {
 			close(release)
 		}
 	}
+	var bridge *Bridge
 	startBridgeWith(t, url, script(t, fmt.Sprintf(`touch %s/$1
 echo never`, markers)), workers, func(b *Bridge) {
+		bridge = b
 		real, realDeliver := b.lookAhead, b.deliver
 		b.lookAhead = func(ctx context.Context, run *taskRun) (bool, error) {
 			entered.Add(1)
@@ -1094,6 +1096,12 @@ echo never`, markers)), workers, func(b *Bridge) {
 	}
 	if n := streamConsumers(t, js); n != 1 {
 		t.Fatalf("TASKS holds %d consumers, want the durable alone: a finalized run was replayed", n)
+	}
+	// No slot was taken either: a slot stands for a consumer for the whole
+	// threshold, so one taken here would hold the next real replay for a
+	// consumer that never existed.
+	if n := len(bridge.replaySlots); n != 0 {
+		t.Fatalf("%d replay slots in hand after look-aheads on finalized runs, want none", n)
 	}
 	if entries, err := os.ReadDir(markers); err != nil || len(entries) != 0 {
 		t.Fatalf("%d stale prompts spawned (%v)", len(entries), err)
