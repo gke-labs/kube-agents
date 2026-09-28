@@ -3,6 +3,7 @@ package hermesbridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -778,6 +779,124 @@ echo never`, marker)), 0, func(br *Bridge) {
 	}
 }
 
+// testJetStream is a JetStream handle of the test's own, for reads that must
+// open no consumer.
+func testJetStream(t *testing.T, url string) jetstream.JetStream {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return js
+}
+
+// lastOnSubject is the newest envelope on a subject by direct get, nil when
+// the subject holds nothing. It opens no consumer, so a test counting the
+// stream's consumers can poll with it.
+func lastOnSubject(t *testing.T, js jetstream.JetStream, subject string) *lib.Envelope {
+	t.Helper()
+	stream, err := js.Stream(testCtx(t), lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := stream.GetLastMsgForSubject(testCtx(t), subject)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrMsgNotFound) {
+			return nil
+		}
+		t.Fatal(err)
+	}
+	env, err := lib.ParseEnvelope(msg.Data)
+	if err != nil {
+		t.Fatalf("unparseable message on %s: %v", subject, err)
+	}
+	return env
+}
+
+// streamConsumers is how many consumers TASKS holds right now.
+func streamConsumers(t *testing.T, js jetstream.JetStream) int {
+	t.Helper()
+	stream, err := js.Stream(testCtx(t), lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := stream.Info(testCtx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.State.Consumers
+}
+
+// A bind that finds a backlog of abandoned submissions, each with its cancel
+// behind it in the harness's order (a fan-out of submissions, then their
+// cancels), refuses every one without a spawn and without a consumer slot:
+// the look-ahead answers from the in subject's newest message, and the
+// durable's later cancels find the terminal from the events subject's the
+// same way. Before that, each pair cost two five-second ephemerals at bus
+// speed, and on a 64-consumer TASKS a backlog of thirty pairs failed the
+// look-ahead and spawned the stale prompts the read exists to refuse.
+func TestLookAhead_StaleBurstOnBindSpawnsNothingAndHoldsNoConsumer(t *testing.T) {
+	_, url := startServer(t)
+	c := gatewayClient(t, url)
+	js := testJetStream(t, url)
+	markers := t.TempDir()
+	const pairs, fanOut = 40, 4
+
+	var origins []*lib.Envelope
+	for i := 0; i < pairs; i += fanOut {
+		var batch []*lib.Envelope
+		for j := 0; j < fanOut; j++ {
+			batch = append(batch, submit(t, c, fmt.Sprintf("task-stale-%02d", i+j), "the stale prompt"))
+		}
+		for _, o := range batch {
+			publishCancel(t, c, o)
+		}
+		origins = append(origins, batch...)
+	}
+	startBridgeN(t, url, script(t, fmt.Sprintf(`touch %s/$1
+echo never`, markers)), fanOut)
+
+	// Every task final, read from its events subject's newest message so
+	// the polling here opens none of the consumers counted below.
+	waitFor(t, 60*time.Second, "every stale submission to be refused", func() bool {
+		for _, o := range origins {
+			if !lib.IsFinalStatus(lastOnSubject(t, js, lib.TaskEventsSubject("platform", o.TaskID))) {
+				return false
+			}
+		}
+		return true
+	})
+	for _, o := range origins {
+		env := lastOnSubject(t, js, lib.TaskEventsSubject("platform", o.TaskID))
+		var s lib.StatusUpdate
+		if err := json.Unmarshal(env.Payload, &s); err != nil {
+			t.Fatal(err)
+		}
+		if s.Status.State != lib.StateCanceled || s.Status.Message == nil ||
+			!strings.Contains(s.Status.Message.Parts[0].Text, "canceled-before-start") {
+			t.Fatalf("%s ended %s (%v), want canceled-before-start", o.TaskID, s.Status.State, s.Status.Message)
+		}
+	}
+	waitFor(t, 20*time.Second, "durable to consume every submission and cancel", func() bool {
+		info := bridgeDurableInfo(t, url)
+		return info.NumPending == 0 && info.NumAckPending == 0 && info.Delivered.Consumer >= 2*pairs
+	})
+	if entries, err := os.ReadDir(markers); err != nil || len(entries) != 0 {
+		t.Fatalf("%d stale prompts spawned (%v)", len(entries), err)
+	}
+	// No ephemeral outlived the refusals: the durable is the stream's only
+	// consumer. A replay per look-ahead or per orphan cancel would still be
+	// here, inside its five-second inactive threshold.
+	if n := streamConsumers(t, js); n != 1 {
+		t.Fatalf("TASKS holds %d consumers after the bind, want the durable alone: the refusals opened replays", n)
+	}
+}
+
 // cancelInStream's rule: a cancel counts when it is on the task's in
 // subject after the submission; a cancel before the submission, or a
 // follow-up, does not; an empty subject is "no" rather than an error.
@@ -843,6 +962,34 @@ func TestCancelInStream_Cases(t *testing.T) {
 		{"nothing on the subject", func() *taskRun {
 			return runFor(unpublished("la-empty"))
 		}, false},
+		// The newest message is a follow-up, so the answer comes from the
+		// full replay, which finds the cancel between.
+		{"cancel behind the submission, follow-up behind the cancel", func() *taskRun {
+			o := submit(t, c, "la-cancel-then-steer", "p")
+			publishCancel(t, c, o)
+			steer, err := lib.NewFollowUpEnvelope(o, gatewayParty,
+				messagePayload(t, o.TaskID, o.ContextID, "more"), lib.WithTo(lib.Party{Session: "platform"}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", o.TaskID), steer); err != nil {
+				t.Fatal(err)
+			}
+			return runFor(o)
+		}, true},
+		{"follow-up behind the submission, cancel behind the follow-up", func() *taskRun {
+			o := submit(t, c, "la-steer-then-cancel", "p")
+			steer, err := lib.NewFollowUpEnvelope(o, gatewayParty,
+				messagePayload(t, o.TaskID, o.ContextID, "more"), lib.WithTo(lib.Party{Session: "platform"}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", o.TaskID), steer); err != nil {
+				t.Fatal(err)
+			}
+			publishCancel(t, c, o)
+			return runFor(o)
+		}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

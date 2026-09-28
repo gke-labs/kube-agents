@@ -428,7 +428,8 @@ const (
 	//
 	//   - handleMessage, once per submission for a task it is not running,
 	//     which is every new task; cancelOrphan, once per cancel for a task
-	//     it is not running.
+	//     it is not running whose newest event is not already final (a
+	//     final one is answered by direct get, no consumer).
 	//   - sweepTask and synthesizeTerminal at start, before it consumes, one
 	//     to four per in-flight key the prior incarnation left, sequentially.
 	//
@@ -470,17 +471,21 @@ const (
 	//	|       | and after its wait -- and in the shape this operator renders     |
 	//	|       | the running conversations are the bridge's                       |
 	//	|       | a2aBridgeDefaultConcurrency runs                                  |
-	//	|     2 | a2aTasksReplayBridgeLookAhead: the pre-spawn look-ahead, one      |
-	//	|       | lib.TaskInReplay per spawn from each of the bridge's              |
+	//	|     2 | a2aTasksReplayBridgeLookAhead: the pre-spawn look-ahead, at      |
+	//	|       | most one lib.TaskInReplay per spawn from each of the bridge's     |
 	//	|       | a2aBridgeDefaultConcurrency workers, concurrently                 |
 	//	|     8 | in flight                                                         |
 	//	|   x 2 | a2aTasksReplayTailFactor                                          |
 	//	|    16 | a2aTasksReplayConsumers                                           |
 	//
 	// The look-ahead row is the bridge's second replay per task:
-	// lib.TaskInReplay, once per spawn, from each of the bridge's
+	// lib.TaskInReplay, at most once per spawn, from each of the bridge's
 	// a2aBridgeDefaultConcurrency workers, concurrently -- a trigger-paced
-	// source like the others, 2 in flight and 4 after the tail factor. The
+	// source like the others, 2 in flight and 4 after the tail factor. At
+	// most, because the worker answers from the in subject's newest message
+	// by direct get first and replays only when that message is neither the
+	// submission nor a cancel, so a bind over a backlog of abandoned
+	// submissions holds no slot per task; the row is the ceiling. The
 	// row was out of this table while the call was still gke-labs#2010's
 	// proposal, because sizing for a caller no render could reach took the
 	// provision gate's first refused maxSessions on an existing 64-wide

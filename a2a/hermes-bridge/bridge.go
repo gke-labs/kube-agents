@@ -375,6 +375,14 @@ func (b *Bridge) handleCancel(ctx context.Context, env *lib.Envelope) {
 // has no key for it), synthesize terminal canceled under CAS. Terminal or
 // absent tasks get a warning and nothing else.
 func (b *Bridge) cancelOrphan(ctx context.Context, env *lib.Envelope) {
+	// The usual orphan cancel is the durable delivering, behind a
+	// submission the look-ahead already refused, the very cancel it read:
+	// the task is final, and its newest event says so with no consumer. The
+	// fold below, and the ephemeral it costs, are for everything else.
+	if b.lastEventIsFinal(ctx, env.TaskID) {
+		b.cfg.Logger.Warn("cancel for a task with a terminal event; ignoring", "task", env.TaskID)
+		return
+	}
 	task, err := b.c.TasksGet(ctx, b.cfg.Profile, env.TaskID)
 	switch {
 	case isTaskNotFound(err):
@@ -389,6 +397,25 @@ func (b *Bridge) cancelOrphan(ctx context.Context, env *lib.Envelope) {
 			b.cfg.Logger.Error("orphan cancel synthesis failed", "task", env.TaskID, "err", err)
 		}
 	}
+}
+
+// lastEventIsFinal reads the newest message on each of the task's replay
+// subjects and reports whether one is a final status-update. A read that
+// fails, or finds nothing final, answers false and leaves the question to
+// the fold: this is a shortcut past the fold's consumer, not the decision.
+func (b *Bridge) lastEventIsFinal(ctx context.Context, taskID string) bool {
+	for _, subject := range lib.TaskReplaySubjects(b.cfg.Profile, taskID) {
+		env, err := b.c.LastEnvelope(ctx, subject)
+		if err != nil {
+			b.cfg.Logger.Warn("newest event read failed; folding instead",
+				"task", taskID, "subject", subject, "err", err)
+			return false
+		}
+		if lib.IsFinalStatus(env) {
+			return true
+		}
+	}
+	return false
 }
 
 // refuseSteer answers a mid-run follow-up honestly: hermes chat -q is
@@ -479,8 +506,19 @@ func (r *taskRun) pending() bool {
 // of a submission nobody took, or any cancel inside the retention window - is
 // dispatched only after accept returns, by which time an idle worker has the
 // run. Reading the subject closes that gap. It is a read, not a consume: the
-// durable still delivers the cancel to handle afterwards, where it finds a
-// finalized run and does nothing.
+// durable still delivers the cancel to handle afterwards. By then finalize
+// has normally removed the run from the table, so that cancel takes the
+// orphan path, which finds the terminal and does nothing; one that lands
+// before the removal finds a finalized run and does nothing either.
+//
+// The subject's newest message answers almost every bind with one direct
+// get and no consumer: a cancel there is newer than the submission, and the
+// submission there means nothing followed it. Only a subject whose newest
+// message is something else, a follow-up behind a cancel say, is replayed in
+// full, on the five-second ephemeral the replay costs. That keeps a bind
+// that finds a backlog of abandoned submissions from turning each into a
+// consumer slot at bus speed, which on a 64-consumer TASKS would have failed
+// the look-ahead and spawned the stale prompts the read exists to refuse.
 //
 // Newer than the submission means after it in stream order. The submission
 // is normally in the replay, since the durable delivered it moments ago;
@@ -491,6 +529,16 @@ func (r *taskRun) pending() bool {
 func (b *Bridge) cancelInStream(ctx context.Context, run *taskRun) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, lookAheadTimeout)
 	defer cancel()
+	last, err := b.c.LastEnvelope(ctx, lib.TaskInSubject(b.cfg.Profile, run.origin.TaskID))
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case last != nil && last.Kind == lib.KindCancel:
+		return true, nil
+	case last != nil && last.EnvelopeID == run.origin.EnvelopeID:
+		return false, nil
+	}
 	envs, err := b.c.TaskInReplay(ctx, b.cfg.Profile, run.origin.TaskID)
 	if err != nil {
 		return false, err

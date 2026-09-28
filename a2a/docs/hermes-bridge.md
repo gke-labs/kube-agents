@@ -217,14 +217,19 @@ delivers serially and acks after the handler, so a cancel already on the task's 
 subject when the bridge binds - the eval harness abandoning a submission nobody took, or any
 cancel inside the stream's retention window - is dispatched only after the submission's
 accept returns, and by then an idle worker, which a freshly bound bridge has, holds the run.
-Between dequeue and spawn the worker therefore replays the task's `…in` subject
-(`lib.TaskInReplay`, the one-subject form of the read `tasks/get` does on the event
-subjects) and, on a `cancel` newer than the submission it holds, finalizes
-`canceled-before-start` and spawns nothing. `working` is published only after that read, so
-a cancelled run never shows it. It is a read, not a consume: the durable still delivers the
-cancel to the handler afterwards, and it does nothing - the run is normally gone from the
-bridge's table by then, so the cancel takes the orphan path, finds the terminal on the stream
-and is acked with a warning like any other in-traffic for a finished task; in the window
+Between dequeue and spawn the worker therefore reads the task's `…in` subject for a `cancel`
+newer than the submission it holds and, finding one, finalizes `canceled-before-start` and
+spawns nothing. The read is the subject's newest message by direct get (`lib.LastEnvelope`,
+no consumer): a `cancel` there is newer than the submission, and the submission there means
+nothing followed it; only a subject whose newest message is something else, a follow-up
+behind a cancel, is replayed in full (`lib.TaskInReplay`, the one-subject form of the read
+`tasks/get` does on the event subjects, on the same five-second ephemeral). That is what
+keeps a bind over a backlog of abandoned submissions from opening a consumer per task at bus
+speed. `working` is published only after that read, so a cancelled run never shows it. It is
+a read, not a consume: the durable still delivers the cancel to the handler afterwards, and
+it does nothing - the run is normally gone from the bridge's table by then, so the cancel
+takes the orphan path, which reads the newest event the same consumer-free way, finds the
+terminal and acks with a warning like any other in-traffic for a finished task; in the window
 before finalize drops the run it finds it final and returns, finalize being idempotent. A read
 that fails, a bus error or its 10s bound, is logged and the run spawns
 anyway; the cancel still arrives on the durable and kills it, the bound the bridge always

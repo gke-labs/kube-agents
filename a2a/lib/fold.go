@@ -301,6 +301,53 @@ func (c *Client) TaskInReplay(ctx context.Context, addressee, taskID string) ([]
 	return events, err
 }
 
+// LastEnvelope reads the newest message on one subject with a direct get and
+// returns it parsed and screened the way the replay screens: nil, with no
+// error, when the subject holds nothing in the retention window or when its
+// newest message is one the replay would have dropped (unparseable, or in
+// disagreement with its subject). It opens no consumer, which is the point: a
+// caller whose question the newest message answers does not pay the replay's
+// five-second ephemeral for it. An error is the read failing, not the subject
+// being empty.
+func (c *Client) LastEnvelope(ctx context.Context, subject string) (*Envelope, error) {
+	_, js := c.conn()
+	stream, err := js.Stream(ctx, TasksStream)
+	if err != nil {
+		return nil, fmt.Errorf("stream %s: %w", TasksStream, err)
+	}
+	msg, err := stream.GetLastMsgForSubject(ctx, subject)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrMsgNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("newest message on %s: %w", subject, err)
+	}
+	env, err := ParseEnvelope(msg.Data)
+	if err != nil {
+		c.log.Error("a2a newest-message read skipping unparseable envelope", "subject", subject, "err", err)
+		return nil, nil
+	}
+	if aerr := CheckSubjectAgreement(subject, env, c.opts.agreement); aerr != nil && !IsAdvisoryDisagreement(aerr) {
+		c.protocolViolations.Add(1)
+		c.log.Error("a2a newest-message read skipping envelope that disagrees with its subject", "subject", subject, "err", aerr)
+		return nil, nil
+	}
+	return env, nil
+}
+
+// IsFinalStatus reports whether env is a status-update carrying final=true,
+// the event that makes a fold final. A nil or malformed envelope is not one.
+func IsFinalStatus(env *Envelope) bool {
+	if env == nil || env.Kind != KindStatusUpdate {
+		return false
+	}
+	var s StatusUpdate
+	if err := json.Unmarshal(env.Payload, &s); err != nil {
+		return false
+	}
+	return s.Final
+}
+
 // replay reads subjects from sequence 1 up to a horizon snapshotted at the
 // call, on an ephemeral ordered consumer, and returns the envelopes with the
 // subject each arrived on, in step. found is false when no subject holds a
