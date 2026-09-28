@@ -12533,6 +12533,53 @@ class TestSilentVerdict(HarnessTestCase):
                     ),
                 )
 
+    def test_write_run_record_stages_and_replaces_atomically(self):
+        """write_run_record writes via temp file and replaces atomically (#1929)."""
+        replaces = []
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            replaces.append((str(src), str(dst)))
+            return real_replace(src, dst)
+
+        with patch("os.replace", side_effect=spy_replace):
+            path = audit_report.write_run_record(AUDIT, "acme/fleet", [], on_demand=True)
+        self.assertEqual(len(replaces), 1)
+        src, dst = replaces[0]
+        self.assertTrue(src.endswith(".tmp"))
+        self.assertEqual(dst, path)
+        self.assertTrue(Path(path).is_file())
+        self.assertFalse(Path(src).is_file())
+
+    def test_finish_warns_when_run_record_is_truncated(self):
+        """Truncated or corrupted run record warns to stderr and falls through (#1929)."""
+        run_record = Path(audit_report.run_record_path_for(AUDIT))
+        run_record.parent.mkdir(parents=True, exist_ok=True)
+        run_record.write_text("", encoding="utf-8")
+        doc = make_doc(findings=[])
+        out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
+        self.assertIn("WARNING: unreadable or corrupt run record", self.err)
+
+    def test_finish_on_demand_flag_overrides_truncated_run_record(self):
+        """Passing --on-demand to finish forces silent_ok: False even if run record is truncated (#1929)."""
+        run_record = Path(audit_report.run_record_path_for(AUDIT))
+        run_record.parent.mkdir(parents=True, exist_ok=True)
+        run_record.write_text("", encoding="utf-8")
+        doc = make_doc(findings=[])
+        out = self.finish_json(doc, argv_extra=["--on-demand"])
+        self.assertFalse(out["silent_ok"])
+
+    def test_finish_warns_when_run_record_missing_during_active_inflight_run(self):
+        """Active inflight run missing its run record warns to stderr (#1929)."""
+        inflight = Path(audit_report.inflight_path_for(AUDIT))
+        inflight.parent.mkdir(parents=True, exist_ok=True)
+        inflight.write_text(json.dumps({"audit": AUDIT, "started_at": time.time()}), encoding="utf-8")
+        doc = make_doc(findings=[])
+        out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
+        self.assertIn("WARNING: run record missing", self.err)
+
 
 class TestDispatchAndHandover(unittest.TestCase):
     """The ledger URL has to survive the hop from worker to requester.

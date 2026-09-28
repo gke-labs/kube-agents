@@ -58,7 +58,8 @@ When you are delegated a task or kanban card to execute an audit stream followin
 - **Execute the audit following its SOP (mapped in `AUDITS` at the top of `audit_report.py`, e.g. `governance/compliance_audit_sop.md` for `compliance-audit`) directly.** Use the two-command lifecycle below:
   1. `./skills/fleet-audit/scripts/audit_report.py start --audit <stream> --on-demand [--repo "<owner>/<repo>"]`
   2. Enumerate clusters and run the checks per the SOP.
-  3. `./skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
+  3. `./skills/fleet-audit/scripts/audit_report.py finish --audit <stream> --on-demand ...`
+  (Pass `--on-demand` on both `start` and `finish` for dual carrier redundancy so `silent_ok` is guaranteed false even if the scratch run record is unreadable or lost.)
 - **Do not reach for `hermes cron run` or say "queued for the next cron tick":** This request is an explicit on-demand audit execution, not a request to trigger the scheduled cron job. Execute the SOP directly and report the ledger issue URL in your result.
 - **`start` refuses while a run of that stream is in flight, a scheduled tick's or another session's:**
   it exits 2 with a `START REFUSED` line that names the run (not a `FINDINGS REJECTED` line; there is

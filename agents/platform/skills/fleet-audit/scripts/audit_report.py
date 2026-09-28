@@ -9356,10 +9356,20 @@ def write_run_record(
     if on_demand is not None:
         record_dict[RUN_RECORD_ON_DEMAND_KEY] = bool(on_demand)
     path = run_record_path_for(audit_id)
-    Path(path).write_text(
-        json.dumps(record_dict),
-        encoding="utf-8",
-    )
+    staged = Path(f"{path}.tmp")
+    try:
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text(
+            json.dumps(record_dict),
+            encoding="utf-8",
+        )
+        os.replace(staged, path)
+    except OSError:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -10995,6 +11005,18 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # when `--repo` was given.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
     record = read_run_record(audit_id, repo=repo_hint)
+    if getattr(args, "on_demand", None) is None:
+        rec_path = Path(run_record_path_for(audit_id))
+        if rec_path.is_file() and record is None:
+            log(
+                f"WARNING: unreadable or corrupt run record at {rec_path}; "
+                "on-demand state falls through to environment"
+            )
+        elif not rec_path.is_file() and Path(inflight_path_for(audit_id)).is_file():
+            log(
+                f"WARNING: run record missing at {rec_path} for active run; "
+                "on-demand state falls through to environment"
+            )
     on_demand = is_on_demand(args, record)
     # The harness's search first, then the withhold against the record. The
     # order matters: a posture a declaration covers moves to `declared[]`,
