@@ -59,7 +59,7 @@ from devops_bench.verification.base import (
 )
 from devops_bench.verification.verifiers import ResourcePropertyVerifier
 
-from kube_agents_bench import transcript
+from kube_agents_bench import discovery, transcript
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -68,6 +68,7 @@ from kube_agents_bench.fleet import (
 )
 
 __all__ = [
+    "BootstrapFanoutVerifier",
     "FleetResourcePropertyVerifier",
     "LedgerIssueContainsVerifier",
     "PullRequestOpenedVerifier",
@@ -689,6 +690,87 @@ class WorkerAgentsVerifier(BaseVerifier):
             elapsed_time=time.monotonic() - start,
             reason=f"all {len(self.required_agents)} required profile pattern(s) matched; workers ran as {agents}",
         )
+
+
+_FANOUT_READ_TIMEOUT_SEC = 60.0
+
+
+def _agent_shell(script: str, timeout: float) -> str:
+    # Lazy: the harness pulls in the agent transport, which a spec load does not need.
+    from kube_agents_bench.harness import _agent_shell as shell
+
+    return shell(script, timeout)
+
+
+@VERIFIERS.register("bootstrap_fanout")
+class BootstrapFanoutVerifier(BaseVerifier):
+    """Checks the cards the onboarding discovery sweep's worker filed.
+
+    The sweep card is filed by a cron job rather than by the conversation, so
+    neither the transcript nor the harness's delegation capture sees it; this
+    reads the card, its worker's children and the Cluster Agent roster off the
+    agent's disk (:mod:`kube_agents_bench.discovery`).
+
+    ``require``:
+
+    - ``one_card_per_cluster_agent``: every Cluster Agent with a cluster
+      identity got exactly one ``bootstrap-inventory-cluster-*`` card, assigned
+      to it and keyed by its cluster, and no such card went anywhere else.
+    - ``no_card_waits_on_the_sweep``: no ``bootstrap-inventory-cluster-*``
+      card names the sweep as a parent. A child waiting on the card that waits
+      on it never runs until the sweep has given up on it.
+
+    Fails closed: an unreadable pod, no sweep marker, a sweep card the board
+    does not know, or an empty roster is ``status="error"``.
+    """
+
+    type: Literal["bootstrap_fanout"]
+    require: Literal["one_card_per_cluster_agent", "no_card_waits_on_the_sweep"]
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        read_timeout = min(single_call_timeout(timeout_sec), _FANOUT_READ_TIMEOUT_SEC)
+        return self._poll_to_result(lambda: self._check(read_timeout), timeout_sec)
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        payload, why = discovery.read_fanout(_agent_shell, read_timeout)
+        if payload is None:
+            return "error", why, None
+        sweep = payload.get("sweep") or {}
+        cards = [
+            c for c in payload.get("children") or []
+            if str(c.get("key") or "").startswith(discovery.CLUSTER_KEY_PREFIX)
+        ]
+        where = f"sweep {sweep.get('id')} ({sweep.get('status')})"
+        if self.require == "no_card_waits_on_the_sweep":
+            waiting = [c["id"] for c in cards if sweep.get("id") in (c.get("parents") or [])]
+            if waiting:
+                return "fail", f"{where}: cluster card(s) {waiting} name the sweep as a parent", payload
+            return "pass", f"{where}: none of {len(cards)} cluster card(s) waits on the sweep", payload
+
+        roster = payload.get("roster") or []
+        if not roster:
+            unidentified = payload.get("unidentified") or []
+            return (
+                "error",
+                f"{where}: no Cluster Agent profile with a cluster identity"
+                + (f" (profiles without one: {unidentified})" if unidentified else ""),
+                payload,
+            )
+        expected = {(r["profile"], r["key"]) for r in roster}
+        filed = [(c.get("assignee"), c.get("key")) for c in cards]
+        missing = sorted(expected - set(filed))
+        duplicated = sorted({f for f in filed if filed.count(f) > 1})
+        stray = sorted(set(filed) - expected)
+        if missing or duplicated or stray:
+            parts = [f"{where} filed {len(cards)} cluster card(s) for {len(roster)} Cluster Agent(s)"]
+            if missing:
+                parts.append(f"no card for {[p for p, _ in missing]}")
+            if duplicated:
+                parts.append(f"more than one card for {[p for p, _ in duplicated]}")
+            if stray:
+                parts.append(f"card(s) matching no Cluster Agent: {stray}")
+            return "fail", "; ".join(parts), payload
+        return "pass", f"{where}: one card for each of {len(roster)} Cluster Agent(s)", payload
 
 
 def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:

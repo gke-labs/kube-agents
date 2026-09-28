@@ -270,6 +270,8 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns"),
     "worker_agents": ("required_agents",),
+    # This repository, agent-disk-reading: the discovery sweep a cron job filed.
+    "bootstrap_fanout": ("require",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

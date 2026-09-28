@@ -1,0 +1,97 @@
+# Domain: fleet audits. Journey: a fresh install runs its onboarding discovery
+# sweep, and the sweep hands one survey card to each Cluster Agent instead of
+# auditing every cluster from the Platform Agent's own seat.
+#
+# The sweep is not started by a conversation. The `bootstrap-inventory-scan`
+# cron job on the Planning Agent's profile files it once per install, and the
+# Platform Agent's worker fans it out. Nothing a chat prompt says reaches that
+# path, so the prompt below only reads the board; the grade comes from the
+# stack and the verifier.
+#
+# bench/tf/prebuilt/bootstrap-discovery re-arms the gate, waits for the cron
+# job to file a new sweep card, and returns once that card's worker has ended
+# its first run -- the point by which it has filed every card it is going to
+# file. The objective then compares the cards it filed against the Cluster
+# Agent roster, read straight from the profiles on the agent's disk rather
+# than through the gate, so a build whose gate hands the worker no roster
+# fails here instead of erroring. The stack's header says why re-arming
+# archives the previous sweep's cards first.
+#
+# The stack refuses an install where a person has connected: a fresh sweep
+# there ends in an onboarding report sent to their chat.
+#
+# Isolation class: read-only on the cluster; it re-files the onboarding sweep
+# on the install under test, and the destroy archives every card the sweep
+# filed. Eligible tier: nightly -- the fan-out's cards take dispatcher slots
+# that other cases' cards running at the same time would use.
+---
+id: bootstrap-discovery-fanout
+name: The onboarding discovery sweep files one survey card per Cluster Agent
+
+# No seeded-fleet dependency: the roster is whatever Cluster Agents the install
+# under test has, and the verifier reads it from there.
+fixtures: []
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/bootstrap-discovery"
+  teardown: true
+  # host_cluster_* arrive from the environment (TF_VAR_host_cluster_name /
+  # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh), because they
+  # name the install the runner deployed and no task may choose a different
+  # one. The stack defaults everything else.
+
+validated: false
+
+# Slug per docs/designs/domains.yaml: the sweep is the fleet-wide audit that
+# delegates to workers, run once at onboarding rather than on a schedule.
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# A board read that leaves the sweep alone. The session this prompt reaches is
+# the Platform Agent's API session, not the worker running the sweep, and it
+# must not start, retry or complete any of the sweep's cards: the verifier
+# reads which cards the worker filed, and a card this session filed or moved
+# would be graded as the worker's. The status filter on kanban_list is the
+# one autoops-warning-event-triage measured: a bare call pages oldest-first
+# and misses the newest card.
+prompt: |
+  The onboarding discovery sweep for this install was filed a few minutes ago
+  as a kanban card with idempotency key 'bootstrap-inventory-scan'.
+
+  1. Find it. Call kanban_list separately for status 'running', 'blocked',
+     'todo' and 'done'. Do not call kanban_list without a status filter -- it
+     returns the oldest tasks first and stops at a page.
+  2. Report its id and status, and for each card it filed, that card's id,
+     assignee and status.
+
+  Only read the board. Do not start, retry, unblock, archive, complete or
+  create any card, and make no changes to the cluster.
+expected_output: |
+  critical requirements:
+  - The reply names the discovery sweep card and lists the cards it filed with
+    their assignees and statuses, read off the kanban board.
+  - No card is created, moved or archived, and nothing is changed on the
+    cluster.
+
+verification_spec:
+  # Both entries read the board and the profiles on the agent's disk
+  # (kube_agents_bench/discovery.py), not the transcript.
+
+  - name: one-card-per-cluster-agent
+    role: objective
+    check:
+      type: bootstrap_fanout
+      require: one_card_per_cluster_agent
+
+  # A cluster card that waits on the sweep cannot start until the sweep is
+  # done, and the sweep's report is built from the cluster cards' results.
+  - name: no-cluster-card-waits-on-the-sweep
+    role: safeguard
+    severity: recoverable
+    check:
+      type: bootstrap_fanout
+      require: no_card_waits_on_the_sweep
