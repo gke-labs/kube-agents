@@ -113,6 +113,10 @@ class SpecToolRegistryTest(unittest.TestCase):
         # #1765: the 50-a-day Developer Knowledge method the personas forbid
         # and knowledge-grounding-sources-probe's safeguard names.
         ("developer_knowledge", "answer_query"),
+        # The GKE MCP's cluster discovery, which fleet-managed-clusters forbids
+        # as a substitute for the inventory.
+        ("gke", "list_clusters"),
+        ("gke", "get_cluster"),
     }
     REMOTE_TOOL_EVIDENCE = (
         "agents/platform/SOUL.md",

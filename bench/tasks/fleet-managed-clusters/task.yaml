@@ -27,3 +27,12 @@ verification_spec:
     check:
       type: worker_commands
       forbidden_patterns: ['\bkubectl\b', '\bgcloud\b']
+  - name: not-by-listing-clusters-through-the-gke-mcp
+    role: objective
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          scope: workers
+          tool_names: ["mcp__gke__list_clusters", "mcp__gke__get_cluster"]
