@@ -1,96 +1,126 @@
+#!/usr/bin/env python3
+"""Count the users who reached the agent over chat, from Cloud Logging.
+
+Logging's `entries:list` is a POST the credential broker's relay does not
+carry, so this helper reads through `gcloud logging read` instead: in the
+sandbox `gcloud` is the broker's shim and that command is on its read
+allowlist, so the read runs on the broker's identity and no token is fetched
+here. `--freshness` is passed because gcloud's default is one day, which would
+silently truncate a wider window.
+"""
+
+from __future__ import annotations
+
 import argparse
 import json
 import re
 import subprocess
-import urllib.error
-import urllib.request
+import sys
 from datetime import datetime, timedelta, timezone
 
-# Parse arguments
-parser = argparse.ArgumentParser(description="List users and message counts who interacted with the system via chat in the last 24 hours")
-parser.add_argument("--project-id", required=True, help="Google Cloud Project ID")
-parser.add_argument("--hours", type=int, default=24, help="Time window in hours (default: 24)")
-args = parser.parse_args()
+GCLOUD = "gcloud"
+LOG_FILTER = 'resource.type="k8s_container" "Logging incoming GChat event"'
+LOG_LIMIT = 1000
+LOG_FORMAT = "json"
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+DEFAULT_HOURS = 24
+# `logging read` returns within a minute or two; the shim's own connect
+# timeout is separate.
+GCLOUD_TIMEOUT_SECONDS = 300
+EXIT_READ_FAILED = 1
+JSON_INDENT = 2
+EMAIL_PATTERN = re.compile(r"User=([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})")
 
-project_id = args.project_id
-hours = args.hours
 
-# Calculate time range
-start_time = datetime.now(timezone.utc) - timedelta(hours=hours)
-start_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="List users and message counts who interacted with the system via chat in the last 24 hours"
+    )
+    parser.add_argument("--project-id", required=True, help="Google Cloud Project ID")
+    parser.add_argument(
+        "--hours", type=int, default=DEFAULT_HOURS, help=f"Time window in hours (default: {DEFAULT_HOURS})"
+    )
+    return parser.parse_args(argv)
 
-# Retrieve access token
-try:
-    token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
-except FileNotFoundError:
-    print("Error: The 'gcloud' command-line tool was not found on your system. Please install the Google Cloud SDK.")
-    exit(1)
-except subprocess.CalledProcessError as e:
-    print(f"Error retrieving active access token: {e}")
-    exit(1)
 
-# Cloud Logging API endpoint
-url = "https://logging.googleapis.com/v2/entries:list"
+def logging_read_argv(project_id: str, hours: int) -> list[str]:
+    """The brokered read: every flag here is on the shim's allowlist."""
+    return [
+        GCLOUD,
+        "logging",
+        "read",
+        LOG_FILTER,
+        f"--project={project_id}",
+        f"--limit={LOG_LIMIT}",
+        f"--format={LOG_FORMAT}",
+        f"--freshness={hours}h",
+    ]
 
-# Request payload
-filter_query = f'resource.type="k8s_container" "Logging incoming GChat event" timestamp >= "{start_str}"'
-payload = {
-    "resourceNames": [f"projects/{project_id}"],
-    "filter": filter_query,
-    "orderBy": "timestamp desc",
-    "pageSize": 1000
-}
 
-req = urllib.request.Request(
-    url,
-    data=json.dumps(payload).encode('utf-8'),
-    headers={
-        'Authorization': f'Bearer {token}',
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-    },
-    method='POST'
-)
+def read_entries(project_id: str, hours: int) -> list:
+    argv = logging_read_argv(project_id, hours)
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=GCLOUD_TIMEOUT_SECONDS, check=False
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{GCLOUD} was not found on PATH: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"gcloud logging read did not finish in {GCLOUD_TIMEOUT_SECONDS}s") from exc
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"gcloud logging read exited {completed.returncode}: {completed.stderr.strip()}"
+        )
+    try:
+        entries = json.loads(completed.stdout or "[]")
+    except ValueError as exc:
+        raise RuntimeError(f"gcloud logging read did not return JSON: {exc}") from exc
+    return entries if isinstance(entries, list) else []
 
-try:
-    # Set a 10s timeout to prevent hanging indefinitely
-    with urllib.request.urlopen(req, timeout=10) as response:
-        result = json.loads(response.read().decode('utf-8'))
-except urllib.error.HTTPError as e:
-    print(f"HTTP Error {e.code} querying Cloud Logging: {e.read().decode('utf-8')}")
-    exit(1)
-except urllib.error.URLError as e:
-    print(f"Failed to connect to Cloud Logging API: {e.reason}")
-    exit(1)
 
-# Parse emails and count messages from the log payloads
-email_pattern = re.compile(r'User=([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})')
-user_counts = {}
-
-for entry in result.get('entries', []):
-    text = entry.get('textPayload', '')
-    json_payload = entry.get('jsonPayload')
+def entry_text(entry: dict) -> str:
+    text = entry.get("textPayload", "")
+    json_payload = entry.get("jsonPayload")
     if not text and json_payload:
         if isinstance(json_payload, dict):
-            text = json_payload.get('log', '')
-            if not text:
-                text = json.dumps(json_payload)
+            text = json_payload.get("log", "") or json.dumps(json_payload)
         else:
             text = str(json_payload)
-            
-    if not isinstance(text, str):
-        text = str(text)
-    match = email_pattern.search(text)
-    if match:
-        email = match.group(1)
-        user_counts[email] = user_counts.get(email, 0) + 1
+    return text if isinstance(text, str) else str(text)
 
 
-# Sort user counts by email address
-sorted_user_counts = {k: user_counts[k] for k in sorted(user_counts.keys())}
+def count_users(entries: list) -> dict[str, int]:
+    user_counts: dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        match = EMAIL_PATTERN.search(entry_text(entry))
+        if match:
+            email = match.group(1)
+            user_counts[email] = user_counts.get(email, 0) + 1
+    return {k: user_counts[k] for k in sorted(user_counts)}
 
-print(json.dumps({
-    "active_chat_users": sorted_user_counts,
-    "time_window_hours": hours,
-    "query_start_time": start_str
-}, indent=2))
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    start_str = (datetime.now(timezone.utc) - timedelta(hours=args.hours)).strftime(TIMESTAMP_FORMAT)
+    try:
+        entries = read_entries(args.project_id, args.hours)
+    except RuntimeError as exc:
+        print(f"Error querying Cloud Logging: {exc}", file=sys.stderr)
+        return EXIT_READ_FAILED
+    print(
+        json.dumps(
+            {
+                "active_chat_users": count_users(entries),
+                "time_window_hours": args.hours,
+                "query_start_time": start_str,
+            },
+            indent=JSON_INDENT,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
