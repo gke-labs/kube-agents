@@ -2338,6 +2338,9 @@ def test_the_probe_reads_the_trace_off_the_body() -> None:
         ("3", 3, 0),
         ("2.9", 2, 0),
         ("1.0", 1, 0),
+        # A JSON integer past float range: an int to json.loads, and a count
+        # that must read without asking a float function about it.
+        ("1" + "0" * 400, 10**400, 0),
         ("0.5", 0, 1),
         ("NaN", 0, 1),
         ("Infinity", 0, 1),
@@ -2395,12 +2398,16 @@ def test_a_wait_that_ends_on_a_read_without_a_trace_marks_the_trace_stale(
     writes no such flag."""
     task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
     monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+    monkeypatch.setattr(inject, "FINISHED_SETTLE_SECONDS", 0.05)
 
     def scripted(bodies: list[dict[str, Any]]):
-        replies = iter(bodies)
+        replies = list(bodies)
 
         def _poll(task_id: str, after: int, budget: float, *, probe: bool = True) -> dict[str, Any]:
-            return next(replies)
+            # The last body answers every later read (the settle's unprobed
+            # polls after a stream terminal), with nothing new on it.
+            body = replies.pop(0) if len(replies) > 1 else replies[0]
+            return body if probe else {**body, "entries": [], "probe": None}
 
         return _poll
 
@@ -2442,6 +2449,36 @@ def test_a_wait_that_ends_on_a_read_without_a_trace_marks_the_trace_stale(
     marker = marker_of(exchange.fold.trajectory)
     assert marker is not None and marker["args"] == {"calls": 2, "dropped": 0}
     assert not scoring._inject_blind(exchange.fold.trajectory)
+
+    # A read whose probe shows the task final on the STREAM, ahead of the
+    # relay, ends the wait through the settle, whose polls are unprobed; a
+    # probe of that shape with no activity key leaves the earlier trace
+    # stale too, and one that carries the trace does not.
+    stream_final_blind = {
+        "entries": [],
+        "lastSeq": 3,
+        "probe": {
+            "active": True,
+            "taskId": "task-1",
+            "final": True,
+            "executorState": "completed",
+            "terminalSource": inject.TERMINAL_SOURCE_EXECUTOR,
+            "result": "done on the stream",
+        },
+    }
+    monkeypatch.setattr(task, "_poll", scripted([running, stream_final_blind]))
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.outcome == inject.OUTCOME_STREAM_TERMINAL
+    assert exchange.fold.deliverable == "done on the stream"
+    assert marker_of(exchange.fold.trajectory)["args"] == {"calls": 1, "dropped": 0, "stale": 1}
+    stream_final_sighted = {
+        **stream_final_blind,
+        "probe": {**stream_final_blind["probe"], "activity": [CALL_CREATE, CALL_FAILED]},
+    }
+    monkeypatch.setattr(task, "_poll", scripted([running, stream_final_sighted]))
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.outcome == inject.OUTCOME_STREAM_TERMINAL
+    assert marker_of(exchange.fold.trajectory)["args"] == {"calls": 2, "dropped": 0}
 
     # The deadline read follows the same rule, whether it finds the terminal
     # in its entries or classifies a graded timeout from the polls before

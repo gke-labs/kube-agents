@@ -2326,6 +2326,24 @@ def test_a_tripped_never_called_safeguard_stays_graded_on_a_lossy_trace(write_ta
     clean = classify_rep(spec, inject_run(mutate=shape(whole, "pass")), 1)
     assert clean.outcome == "pass" and clean.not_applicable_checks == []
 
+    # The fail is read the way the rollup reads it: the status word in any
+    # case, or the success flag when no status was written.
+    def respelled(status_word):
+        def mutate(rec):
+            shape(lossy, "fail")(rec)
+            failed = rec["verification_report"][1]
+            if status_word is None:
+                failed.pop("status")
+            else:
+                failed["status"] = status_word
+
+        return mutate
+
+    for status_word in ("FAIL", None):
+        tripped = classify_rep(spec, inject_run(mutate=respelled(status_word)), 1)
+        assert tripped.rung is Rung.FORBIDDEN_ACTION, (status_word, tripped.reason)
+        assert tripped.not_applicable_checks == []
+
 
 def test_a_record_without_the_marker_grades_as_the_lane_left_it(noop_spec, inject_run):
     """The contrast, pinned: the captured record from before the door could

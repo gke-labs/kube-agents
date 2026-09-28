@@ -546,7 +546,11 @@ def _readable_count(value: Any) -> int | None:
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not math.isfinite(value) or value < 1:
+    # Only a float can be non-finite; asking ``math.isfinite`` about an int
+    # past float range raises, and a JSON integer literal can be that big.
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value < 1:
         return None
     return int(value)
 
@@ -1485,6 +1489,12 @@ class InjectTask:
                 adopted = self._note(fold, task_id, answered)
                 if answered.could_look and answered.concerns(task_id) and not fold.final:
                     if answered.final:
+                        if not adopted:
+                            # The stream's terminal arrived in this read
+                            # and its probe carried no trace to adopt; the
+                            # settle that follows polls unprobed, so no
+                            # later read refreshes it either.
+                            fold.note_trace_stale()
                         return self._finish(fold, task_id, after, answered)
                     if answered.executor_state == "" and answered.past_grace:
                         return self._never_started(fold, task_id, answered)

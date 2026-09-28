@@ -693,6 +693,16 @@ def _inject_record(trajectory: list[Any]) -> bool:
     )
 
 
+def _entry_failed(entry: dict[str, Any]) -> bool:
+    """Whether a report entry records a fail, read the way ``_rollup`` reads
+    it: the status word in any case, or, when no status was written, the
+    ``success`` flag."""
+    status = str(entry.get("status") or "").lower()
+    if status:
+        return status == CHECK_STATUS_FAIL
+    return not entry.get("success")
+
+
 def _inject_trace_shown(trajectory: list[Any]) -> bool:
     """Whether the record carries the activity marker at all: the door showed
     the trace, complete or not."""
@@ -886,8 +896,7 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
             set_aside -= {
                 str(e.get("name"))
                 for e in record.verification_report
-                if str(e.get("name")) in spec.negated_trace_blind_checks
-                and e.get("status") == CHECK_STATUS_FAIL
+                if str(e.get("name")) in spec.negated_trace_blind_checks and _entry_failed(e)
             }
     blind = [
         str(e.get("name")) for e in record.verification_report if str(e.get("name")) in set_aside
