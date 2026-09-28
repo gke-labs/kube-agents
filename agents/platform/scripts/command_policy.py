@@ -76,9 +76,10 @@ _ALLOWED = Decision(allowed=True, rule_id="", message="")
 # sanctioned route often exists but differs per flag: `get-credentials` then
 # `--context` is the answer to a refused `--server`, and no fixed sentence
 # could name every such route.
-# The two unreadable-command refusals carry neither notice, on purpose:
-# re-running with a spelling this module can read is the legitimate outcome
-# there, and calling that a boundary would stop retries the policy permits.
+# The two unreadable-command refusals and the asset-search type refusal carry
+# neither notice, on purpose: re-running with a spelling this module accepts is
+# the legitimate outcome there, and calling that a boundary would stop retries
+# the policy permits.
 _ACTION_BOUNDARY_NOTICE = (
     "This is a permission boundary, not an error to work around: if this "
     "command would change cluster or cloud state, that change is refused "

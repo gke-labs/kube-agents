@@ -1893,13 +1893,15 @@ class RefusalsSayTheBoundaryIsFinal(unittest.TestCase):
                 self.assertIn(self.FLAG_PHRASE, decision.message)
                 self.assertNotIn(self.ACTION_PHRASE, decision.message)
 
-    def test_unreadable_refusals_do_not_claim_a_boundary(self):
-        # Re-running with a spelling the parser can read is the legitimate
-        # retry for these two, so calling them a boundary would stop retries
-        # the policy permits.
+    def test_refusals_a_respelling_answers_do_not_claim_a_boundary(self):
+        # Re-running with a spelling the policy accepts is the legitimate
+        # retry for these, so calling them a boundary would stop retries the
+        # policy permits: a readable flag for the first two, the one allowed
+        # asset type for the third.
         for argv in (
             ["kubectl", "--unknown-flag", "get", "pods"],
             ["gcloud", "--unknown-flag", "container", "clusters", "list"],
+            ["gcloud", "asset", "search-all-resources", "--scope=projects/p"],
         ):
             with self.subTest(argv=argv):
                 decision = evaluate(argv)
