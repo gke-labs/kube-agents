@@ -2539,16 +2539,29 @@ class TestAuditCatalogue(unittest.TestCase):
             sop = sop_dir / spec.sop
             with self.subTest(audit=audit_id):
                 text = sop.read_text(encoding="utf-8")
+                step_0_match = re.search(r"### 0\.[^\n]*\n(.*?)(?=\n### 1\.|\Z)", text, re.DOTALL)
+                self.assertIsNotNone(step_0_match, f"{spec.sop} does not contain Step 0")
+                assert step_0_match is not None
+                step_0 = step_0_match.group(1)
+
                 self.assertRegex(
-                    text,
+                    step_0,
                     pattern,
-                    f"{spec.sop} start command does not document --on-demand",
+                    f"{spec.sop} start command in step 0 does not document --on-demand",
                 )
-                self.assertRegex(
-                    text,
-                    unconditional_pattern,
+                uncond_match = unconditional_pattern.search(step_0)
+                self.assertIsNotNone(
+                    uncond_match,
                     f"{spec.sop} step 0 does not unconditionally explain --on-demand",
                 )
+                assert uncond_match is not None
+                multi_repo_idx = step_0.find("If multiple repositories")
+                if multi_repo_idx != -1:
+                    self.assertLess(
+                        uncond_match.start(),
+                        multi_repo_idx,
+                        f"{spec.sop} explains --on-demand inside or after the multi-repo block rather than at the top of step 0",
+                    )
 
     def test_multi_repo_sops_document_interactive_repo_prompt(self):
         """Every SOP with managed_repos must prompt the user when repo is omitted in interactive sessions."""
@@ -2573,6 +2586,18 @@ class TestAuditCatalogue(unittest.TestCase):
                             line,
                             f"{spec.sop} buries --on-demand inside multi-repo interactive prompt",
                         )
+                step_0_match = re.search(r"### 0\.[^\n]*\n(.*?)(?=\n### 1\.|\Z)", text, re.DOTALL)
+                self.assertIsNotNone(step_0_match, f"{spec.sop} does not contain Step 0")
+                assert step_0_match is not None
+                step_0 = step_0_match.group(1)
+                multi_repo_idx = step_0.find("If multiple repositories")
+                self.assertNotEqual(multi_repo_idx, -1, f"{spec.sop} missing multi-repo section")
+                multi_repo_block = step_0[multi_repo_idx:]
+                self.assertNotIn(
+                    "--on-demand",
+                    multi_repo_block,
+                    f"{spec.sop} buries --on-demand inside the multi-repo block",
+                )
 
     def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
         """A fix written into one SOP has to reach all the others.
@@ -5284,6 +5309,40 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         self.assertIsNotNone(record)
         self.assertIn(audit_report.RUN_RECORD_ON_DEMAND_KEY, record)
         self.assertFalse(record[audit_report.RUN_RECORD_ON_DEMAND_KEY])
+
+    def test_read_run_record_ignores_non_boolean_on_demand(self):
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        path = audit_report.run_record_path_for(DECLARING_AUDIT)
+        for malformed in ("false", "true", "0", "1", 1, 0, ["on_demand"], {"on": "demand"}):
+            with self.subTest(malformed=malformed):
+                record_data = {
+                    "audit": DECLARING_AUDIT,
+                    "repo": "acme/fleet",
+                    "context_repos": [],
+                    audit_report.RUN_RECORD_STARTED_KEY: "2026-09-24T12:00:00Z",
+                    audit_report.RUN_RECORD_ON_DEMAND_KEY: malformed,
+                }
+                Path(path).write_text(json.dumps(record_data), encoding="utf-8")
+                record = audit_report.read_run_record(DECLARING_AUDIT)
+                self.assertIsNotNone(record)
+                assert record is not None
+                self.assertNotIn(audit_report.RUN_RECORD_ON_DEMAND_KEY, record)
+
+        for valid_bool in (True, False):
+            with self.subTest(valid_bool=valid_bool):
+                record_data = {
+                    "audit": DECLARING_AUDIT,
+                    "repo": "acme/fleet",
+                    "context_repos": [],
+                    audit_report.RUN_RECORD_STARTED_KEY: "2026-09-24T12:00:00Z",
+                    audit_report.RUN_RECORD_ON_DEMAND_KEY: valid_bool,
+                }
+                Path(path).write_text(json.dumps(record_data), encoding="utf-8")
+                record = audit_report.read_run_record(DECLARING_AUDIT)
+                self.assertIsNotNone(record)
+                assert record is not None
+                self.assertIn(audit_report.RUN_RECORD_ON_DEMAND_KEY, record)
+                self.assertIs(record[audit_report.RUN_RECORD_ON_DEMAND_KEY], valid_bool)
 
     def test_start_clears_yesterdays_record_before_anything_can_fail(self):
         # Every step between the top of `start` and the write can raise. A

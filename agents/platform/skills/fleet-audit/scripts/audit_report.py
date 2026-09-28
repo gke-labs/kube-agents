@@ -9242,8 +9242,8 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
             else []
         ),
     }
-    if RUN_RECORD_ON_DEMAND_KEY in data:
-        record[RUN_RECORD_ON_DEMAND_KEY] = bool(data[RUN_RECORD_ON_DEMAND_KEY])
+    if isinstance(data.get(RUN_RECORD_ON_DEMAND_KEY), bool):
+        record[RUN_RECORD_ON_DEMAND_KEY] = data[RUN_RECORD_ON_DEMAND_KEY]
     return record
 
 
