@@ -579,13 +579,14 @@ func (b *Bridge) cancelInStream(ctx context.Context, run *taskRun) (bool, error)
 	if err != nil {
 		return false, err
 	}
-	defer release()
 	if !run.pending() {
+		release(false)
 		return false, nil
 	}
 	replayCtx, cancelReplay := context.WithTimeout(ctx, lookAheadTimeout)
 	defer cancelReplay()
-	envs, err := b.c.TaskInReplay(replayCtx, b.cfg.Profile, run.origin.TaskID)
+	envs, opened, err := b.c.TaskInReplay(replayCtx, b.cfg.Profile, run.origin.TaskID)
+	release(opened)
 	if err != nil {
 		return false, err
 	}
@@ -605,20 +606,28 @@ func (b *Bridge) cancelInStream(ctx context.Context, run *taskRun) (bool, error)
 }
 
 // takeReplaySlot admits one fallback replay, waiting when Concurrency of them
-// are in hand. The caller invokes release when the replay has returned, and
-// from that instant the slot is held for the ephemeral's inactive threshold,
-// which is the clock the server reaps the consumer on: the slot and the
-// consumer it stands for live the same span, so the slots in hand are the
-// consumers the look-ahead is holding. Releasing early, at acquisition, would
-// have let a replay slower than the threshold hold a third consumer per
-// worker. A canceled context is the only other way out of the wait.
-func (b *Bridge) takeReplaySlot(ctx context.Context) (release func(), err error) {
+// are in hand. The caller invokes release when the replay has returned,
+// saying whether it opened a consumer: if it did, the slot is held from that
+// instant for the ephemeral's inactive threshold, which is the clock the
+// server reaps the consumer on, so the slot and the consumer live the same
+// span and the slots in hand are the consumers the look-ahead is holding;
+// if it did not (the run was finalized during the wait, the subject was
+// empty, the read failed before its consumer), the slot comes back at once,
+// since holding it would delay the next replay for a consumer that never
+// existed. Releasing at acquisition instead would have let a replay slower
+// than the threshold hold a third consumer per worker. A canceled context is
+// the only other way out of the wait.
+func (b *Bridge) takeReplaySlot(ctx context.Context) (release func(opened bool), err error) {
 	select {
 	case b.replaySlots <- struct{}{}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	return func() {
+	return func(opened bool) {
+		if !opened {
+			<-b.replaySlots
+			return
+		}
 		time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, func() { <-b.replaySlots })
 	}, nil
 }

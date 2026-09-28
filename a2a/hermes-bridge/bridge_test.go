@@ -1137,19 +1137,25 @@ func TestCancelInStream_Cases(t *testing.T) {
 		return env
 	}
 
+	// holds says whether the case leaves a replay slot in hand afterwards:
+	// only a fallback replay that opened a consumer does. The direct-get
+	// answers take no slot, and a fallback over an empty subject gives its
+	// slot straight back. The delta is read case by case, within the
+	// threshold a held slot lasts.
 	cases := []struct {
-		name string
-		run  func() *taskRun
-		want bool
+		name  string
+		run   func() *taskRun
+		want  bool
+		holds bool
 	}{
 		{"submission alone", func() *taskRun {
 			return runFor(submit(t, c, "la-alone", "p"))
-		}, false},
+		}, false, false},
 		{"cancel after the submission", func() *taskRun {
 			o := submit(t, c, "la-after", "p")
 			publishCancel(t, c, o)
 			return runFor(o)
-		}, true},
+		}, true, false},
 		{"cancel before the submission is not newer", func() *taskRun {
 			o := unpublished("la-before")
 			publishCancel(t, c, o)
@@ -1157,7 +1163,7 @@ func TestCancelInStream_Cases(t *testing.T) {
 				t.Fatal(err)
 			}
 			return runFor(o)
-		}, false},
+		}, false, false},
 		// The newest message is a follow-up, so the answer comes from the
 		// full replay, whose cursor starts after the submission: the cancel
 		// before it is not newer, as in the direct-get case above.
@@ -1176,7 +1182,7 @@ func TestCancelInStream_Cases(t *testing.T) {
 				t.Fatal(err)
 			}
 			return runFor(o)
-		}, false},
+		}, false, true},
 		{"follow-up after the submission is not a cancel", func() *taskRun {
 			o := submit(t, c, "la-steer", "p")
 			steer, err := lib.NewFollowUpEnvelope(o, gatewayParty,
@@ -1188,10 +1194,10 @@ func TestCancelInStream_Cases(t *testing.T) {
 				t.Fatal(err)
 			}
 			return runFor(o)
-		}, false},
+		}, false, true},
 		{"nothing on the subject", func() *taskRun {
 			return runFor(unpublished("la-empty"))
-		}, false},
+		}, false, false},
 		// The newest message is a follow-up, so the answer comes from the
 		// full replay, which finds the cancel between.
 		{"cancel behind the submission, follow-up behind the cancel", func() *taskRun {
@@ -1206,7 +1212,7 @@ func TestCancelInStream_Cases(t *testing.T) {
 				t.Fatal(err)
 			}
 			return runFor(o)
-		}, true},
+		}, true, true},
 		{"follow-up behind the submission, cancel behind the follow-up", func() *taskRun {
 			o := submit(t, c, "la-steer-then-cancel", "p")
 			steer, err := lib.NewFollowUpEnvelope(o, gatewayParty,
@@ -1219,16 +1225,21 @@ func TestCancelInStream_Cases(t *testing.T) {
 			}
 			publishCancel(t, c, o)
 			return runFor(o)
-		}, true},
+		}, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			before := len(b.replaySlots)
 			got, err := b.cancelInStream(ctx, tc.run())
 			if err != nil {
 				t.Fatalf("cancelInStream: %v", err)
 			}
 			if got != tc.want {
 				t.Fatalf("cancelInStream = %v, want %v", got, tc.want)
+			}
+			held := len(b.replaySlots) - before
+			if want := map[bool]int{true: 1, false: 0}[tc.holds]; held != want {
+				t.Fatalf("replay slots held by this case = %d, want %d", held, want)
 			}
 		})
 	}

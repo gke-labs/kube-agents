@@ -296,9 +296,14 @@ func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task,
 // error, not TaskNotFound: a task with no events is a task nobody can answer
 // for, but a submission subject with nothing on it answers the question this
 // read is asked (is there a cancel here?) with "no".
-func (c *Client) TaskInReplay(ctx context.Context, addressee, taskID string) ([]*Envelope, error) {
-	events, _, _, err := c.replay(ctx, []string{TaskInSubject(addressee, taskID)}, taskID)
-	return events, err
+//
+// The second result reports whether the read opened an ordered consumer,
+// which it does exactly when the subject held a message: a caller pacing
+// consumer slots learns whether one is now live for the inactive threshold
+// or whether the read cost nothing past the horizon get.
+func (c *Client) TaskInReplay(ctx context.Context, addressee, taskID string) (events []*Envelope, opened bool, err error) {
+	events, _, opened, err = c.replay(ctx, []string{TaskInSubject(addressee, taskID)}, taskID)
+	return events, opened, err
 }
 
 // LastEnvelope reads the newest message on one subject with a direct get and
