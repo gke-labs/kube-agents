@@ -331,9 +331,11 @@ a project the current scope resolves, `retiring` for one the scope has dropped a
 §7 is still removing. `unmanaged` is a separate list, per profile rather than per project, of
 profiles on the PVC whose project the scope never produced.
 
-Today the roster is the set of profiles under `$HERMES_HOME/profiles/` that carry a cluster
-identity, read by the bootstrap gate (`agents/chat/scripts/bootstrap_scan_gate.py`) through
-`cluster_agent_profile.list_profiles()` and `read_cluster_identity()` (`_cluster_agent_calls()`).
+Today the roster is the set of profiles under `$HERMES_HOME/profiles/` that finished
+scaffolding and carry a cluster identity, read by the bootstrap gate
+(`agents/chat/scripts/bootstrap_scan_gate.py`) through `cluster_agent_profile.list_profiles()`,
+`profile_scaffold.is_scaffolded()`, `cluster_agent_reconcile.SCAFFOLD_ARTIFACTS` and
+`read_cluster_identity()` (`_cluster_agent_calls()`).
 The gate keeps reading that; the snapshot sits beside it as `$HERMES_HOME/fleet_scope.json` and,
 when the scope holds more than one project, the gate's instructions to the sweep worker name any
 project whose outcome is not `ok`, so a partial roster is reported as partial rather than audited

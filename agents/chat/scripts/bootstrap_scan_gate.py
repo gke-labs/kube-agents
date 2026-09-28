@@ -168,8 +168,9 @@ def _cluster_agent_calls() -> list[str]:
     ``/opt/data/profiles`` is a mirror that leaves out every ``config.yaml``
     (so no ``cluster_identity``) and keeps profiles the reconcile has pruned.
     This process runs in the agent pod next to the real profiles, and only
-    after ``ensure_cluster_agents`` returns True, so the list is the roster the
-    reconcile left, or once it has given up, whatever roster exists.
+    after ``ensure_cluster_agents`` returns True, so the list is the ready part
+    of the roster the reconcile left, or once it has given up, of whatever
+    roster exists.
 
     ``cluster_agent_profile`` resolves the profiles under this process's
     ``HERMES_HOME``, the same root the markers and the reconcile use, so it
@@ -188,8 +189,8 @@ def _cluster_agent_calls() -> list[str]:
     like that is what keeps the reconcile failing until it gives up and files
     the sweep, so it must not take the other profiles with it.
 
-    Failing to list the profiles returns an empty list, which files the solo
-    sweep. Raising would fail the run before the card is filed, on every tick
+    Failing to list the profiles, or to import the readiness rule, returns an
+    empty list, which files the solo sweep. Raising would fail the run before the card is filed, on every tick
     for as long as the failure lasts; like the give-up in
     ``ensure_cluster_agents``, this gate prefers a degraded report to none.
     """
