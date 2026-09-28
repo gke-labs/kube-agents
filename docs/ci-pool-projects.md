@@ -29,12 +29,13 @@ gcloud services enable \
   aiplatform.googleapis.com \
   logging.googleapis.com \
   monitoring.googleapis.com \
+  cloudtrace.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   --project="${PROJECT_ID}"
 ```
 
-`cloudkms.googleapis.com` is for the GitHub token minter's signing key (section 5); the `ci-pool-minter` composition enables it too, so it is listed here only so a project provisioned by hand does not miss it. `compute.googleapis.com` is for the seeded fleet (section 6), which declares the orphan `google_compute_disk` the cost audit looks for and so depends on Compute directly rather than only transitively through GKE.
+`cloudkms.googleapis.com` is for the GitHub token minter's signing key (section 5); the `ci-pool-minter` composition enables it too, so it is listed here only so a project provisioned by hand does not miss it. `cloudtrace.googleapis.com` is for the observability nightly case, which reads the install's own traces through the credential broker; the full-install composition enables it too. `compute.googleapis.com` is for the seeded fleet (section 6), which declares the orphan `google_compute_disk` the cost audit looks for and so depends on Compute directly rather than only transitively through GKE.
 
 This list and `REQUIRED_APIS` in `scripts/verify_ci_pool_project.py` must agree — the verifier fails a project for an API this block does not mention, and passes one that is missing an API only this block names.
 
@@ -155,6 +156,8 @@ Every registered project was provisioned before the script ran this step. Measur
   Section 7 fails a project missing any of the project roles; the two bucket grants are not checked, and the reconcile's first run there reports either as an `init` failure. The presubmit's runner is not granted the job: a presubmit runs the pull request's code.
 
 - **The platform agent's project roles, checked in both directions.** The agent under test authenticates as `kubeagents-platform-gsa@${PROJECT_ID}`, so this is the one set on this page where an _extra_ role fails the project as well as a missing one. The read-only roles come from `local.read_only_roles` in [`terraform/examples/full-install`](../terraform/examples/full-install/README.md), which is what the install passes to the IAM module — the module's own `project_roles` default is never read on that path. The verifier hardcodes the list as `PLATFORM_GSA_ROLES` so it can run without a Terraform toolchain, and a unit test asserts both the composition and the module default match it, so narrowing either fails in CI rather than failing every project weeks later.
+
+  A project provisioned before `roles/cloudtrace.user` joined the set (#2053; every project onboarded up to 2026-09-28) lacks it, and until it is granted the verifier fails the project on the missing role and the `observability-trace-latency-brokered` nightly case fails on it with `PERMISSION_DENIED` from Cloud Trace. A composition re-apply is not the path on a registered project (section 3); the repair is one project-level binding of that role to `kubeagents-platform-gsa@${PROJECT_ID}.iam.gserviceaccount.com`, in the same idempotent form as the runner block above with that member and role, plus `gcloud services enable cloudtrace.googleapis.com --project="${PROJECT_ID}"` for the API it reads through.
 
   Boskos leases at random, so a project that differs grades differently from the rest of the pool — a case can pass on the grant rather than on the agent, and only on the runs that happen to lease that project. Note that re-running the install does **not** strip roles it no longer grants; correcting an over-privileged project is the hand-swap in [Security and IAM](site/src/content/docs/reference/security-and-iam.md).
 

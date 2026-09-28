@@ -281,6 +281,7 @@ gcloud services enable \
   aiplatform.googleapis.com \
   logging.googleapis.com \
   monitoring.googleapis.com \
+  cloudtrace.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   --project="${PROJECT_ID}"
