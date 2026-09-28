@@ -30,6 +30,11 @@ DEFAULT_HOURS = 24
 # `logging read` returns within a minute or two; the shim's own connect
 # timeout is separate.
 GCLOUD_TIMEOUT_SECONDS = 300
+# The broker caps a relayed command's stdout; past the cap the shim writes the
+# cut body, prints this line on stderr and exits as the command did. The cut
+# body is not the read, so the line is a failure here whatever the exit code.
+# Same words as credential_proxy_client.py prints; the test holds them equal.
+SHIM_TRUNCATION_NOTE = "credential proxy output truncated"
 EXIT_READ_FAILED = 1
 JSON_INDENT = 2
 EMAIL_PATTERN = re.compile(r"User=([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})")
@@ -74,10 +79,18 @@ def read_entries(project_id: str, hours: int) -> list:
         raise RuntimeError(
             f"gcloud logging read exited {completed.returncode}: {completed.stderr.strip()}"
         )
+    if SHIM_TRUNCATION_NOTE in completed.stderr:
+        raise RuntimeError(
+            f"gcloud logging read returned more than the credential broker relays for one "
+            f"command ({SHIM_TRUNCATION_NOTE}); the {LOG_LIMIT} newest entries do not fit, "
+            f"so narrow the window with --hours"
+        )
     try:
         entries = json.loads(completed.stdout or "[]")
     except ValueError as exc:
-        raise RuntimeError(f"gcloud logging read did not return JSON: {exc}") from exc
+        raise RuntimeError(
+            f"gcloud logging read did not return JSON: {exc}; stderr: {completed.stderr.strip()}"
+        ) from exc
     return entries if isinstance(entries, list) else []
 
 

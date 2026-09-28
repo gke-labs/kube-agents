@@ -209,6 +209,17 @@ class AnalyzeTraceLatencyTest(BrokerSessionCase):
         self.assertEqual(0, code, err)
         self.assertEqual([RELAYED_TRACES, f"{RELAYED_TRACES}/{TRACE_A}"], [c["url"] for c in self.http.calls])
 
+    def test_fifty_empty_pages_with_a_token_are_a_failed_read_not_an_empty_window(self):
+        # The cap fires with nothing in hand: the helper must not say "No
+        # traces found" about a list it never saw the end of.
+        session = self.paged_session({RELAYED_TRACES: [{"nextPageToken": "again"}] * (google_api.MAX_LIST_PAGES + 5)})
+        code, out, err = run(analyze_trace_latency.main, ["--project-id", PROJECT, "--limit", "3"], session=session)
+        self.assertEqual(google_api.EXIT_READ_FAILED, code)
+        self.assertNotIn("No traces found", out)
+        self.assertIn(f"stopped after {google_api.MAX_LIST_PAGES} pages", err)
+        self.assertIn("nothing in hand", err)
+        self.assertEqual(google_api.MAX_LIST_PAGES, len(self.http.calls))
+
     def test_an_empty_window_is_reported_and_exits_zero(self):
         session = self.session({RELAYED_TRACES: {}})
         code, out, err = run(analyze_trace_latency.main, ["--project-id", PROJECT], session=session)
@@ -316,10 +327,25 @@ class FetchTracesTest(BrokerSessionCase):
         self.assertEqual(fetch_traces.PAGE_SIZE, len(json.loads(out)["traces"]))
         self.assertEqual(2, len(self.http.calls))
 
-    def test_a_list_that_never_runs_dry_stops_at_the_page_cap(self):
+    def test_a_list_that_never_runs_dry_stops_at_the_page_cap_and_says_so(self):
         session = self.paged_session({RELAYED_TRACES: [{"nextPageToken": "again"}] * (google_api.MAX_LIST_PAGES + 5)})
         code, out, err = run(fetch_traces.main, ["--project-id", PROJECT], session=session)
+        self.assertEqual(google_api.EXIT_READ_FAILED, code)
+        self.assertEqual("", out)
+        self.assertIn(f"stopped after {google_api.MAX_LIST_PAGES} pages", err)
+        self.assertEqual(google_api.MAX_LIST_PAGES, len(self.http.calls))
+
+    def test_a_partial_list_at_the_page_cap_is_printed_with_a_note_on_stderr(self):
+        # One trace on the first page, then empty token-bearing pages up to the
+        # cap: what was read is printed, and stderr says it is not the whole list.
+        pages = [{"traces": [{"traceId": TRACE_A}], "nextPageToken": "p2"}]
+        pages += [{"nextPageToken": "again"}] * (google_api.MAX_LIST_PAGES + 5)
+        session = self.paged_session({RELAYED_TRACES: pages})
+        code, out, err = run(fetch_traces.main, ["--project-id", PROJECT], session=session)
         self.assertEqual(0, code, err)
+        self.assertEqual([{"traceId": TRACE_A}], json.loads(out)["traces"])
+        self.assertIn(f"warning: {google_api.TRACE_LIST_URL.format(project=PROJECT)}: stopped after {google_api.MAX_LIST_PAGES} pages", err)
+        self.assertIn("1 item(s) returned are not the whole list", err)
         self.assertEqual(google_api.MAX_LIST_PAGES, len(self.http.calls))
 
     def test_a_refusal_exits_one_with_the_reason(self):
@@ -538,6 +564,31 @@ class GetChatUsersTest(unittest.TestCase):
         self.assertEqual(get_chat_users.EXIT_READ_FAILED, code)
         self.assertIn("security policy", err)
         self.assertEqual("", out)
+
+    def test_a_truncated_read_is_a_failure_that_names_the_cap_not_a_json_error(self):
+        # The shim writes the cut body, notes the truncation on stderr and exits
+        # as gcloud did (0); the cut JSON must not be reported as malformed.
+        cut = json.dumps(self.ENTRIES)[:-40]
+        truncated = self.completed(returncode=0, stdout=cut, stderr="credential proxy output truncated\n")
+        with patch.object(get_chat_users.subprocess, "run", return_value=truncated):
+            code, out, err = run(get_chat_users.main, ["--project-id", PROJECT])
+        self.assertEqual(get_chat_users.EXIT_READ_FAILED, code)
+        self.assertEqual("", out)
+        self.assertIn("credential proxy output truncated", err)
+        self.assertIn("--hours", err)
+        self.assertNotIn("did not return JSON", err)
+
+    def test_the_truncation_note_is_the_line_the_shim_prints(self):
+        shim = Path(credential_proxy_client.__file__).read_text(encoding="utf-8")
+        self.assertIn(f'"{get_chat_users.SHIM_TRUNCATION_NOTE}"', shim)
+
+    def test_malformed_json_on_exit_zero_reports_stderr_with_the_parse_error(self):
+        broken = self.completed(returncode=0, stdout="[{", stderr="WARNING: something gcloud said")
+        with patch.object(get_chat_users.subprocess, "run", return_value=broken):
+            code, out, err = run(get_chat_users.main, ["--project-id", PROJECT])
+        self.assertEqual(get_chat_users.EXIT_READ_FAILED, code)
+        self.assertIn("did not return JSON", err)
+        self.assertIn("something gcloud said", err)
 
     def test_users_are_sorted_by_email_and_unmarked_entries_are_not_counted(self):
         entries = [
