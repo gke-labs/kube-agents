@@ -505,7 +505,9 @@ specific flow is handled.
 - After: connection resets, policy drops in flow logs, DNS timeouts.
 - Mitigate before: rehearse the target version on a staging cluster with the same dataplane, and keep NetworkPolicy explicit rather than relying on defaults.
 - Mitigate after: a completed node pool can be downgraded in place to the previous version while GKE still offers it; the control plane cannot go back.
-- Read today: nothing.
+- Read today: the fleet-consistency drift audit reads each cluster's `datapathProvider` and its
+  network-policy settings across the cohort, so a member whose dataplane differs from its peers
+  is reported; how a policy behaves, and the DNS provider, are unread.
 - GKE recommender: none. The Network Analyzer's separate connectivity insight covers control-plane and node reachability, not policy behaviour.
 - Why it is on the list: no public incident verified; the per-version known-issue notes are the
   signal.
