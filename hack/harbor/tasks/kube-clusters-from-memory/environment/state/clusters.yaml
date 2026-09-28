@@ -1,0 +1,12 @@
+# Synchronized by the fleet inventory job. Do not edit by hand.
+synced_at: 2026-09-28T17:40:00Z
+clusters:
+  - name: kube-agents
+    platform: kind
+    location: local
+  - name: payments-prod
+    platform: gke
+    location: us-central1
+  - name: orbital-7
+    platform: gke
+    location: europe-west4

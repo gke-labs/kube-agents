@@ -1,0 +1,16 @@
+schema_version = "1.4"
+
+[metadata]
+author_name = "kube-agents"
+difficulty = "easy"
+category = "kubernetes"
+tags = ["kube-agents"]
+
+[verifier]
+timeout_sec = 120.0
+
+[agent]
+timeout_sec = 600.0
+
+[environment]
+build_timeout_sec = 600.0

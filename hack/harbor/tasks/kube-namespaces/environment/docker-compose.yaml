@@ -1,0 +1,6 @@
+services:
+  main:
+    networks: [default, kind]
+networks:
+  kind:
+    external: true

@@ -1,0 +1,2 @@
+jobs/
+tasks/*/environment/kubeconfig
