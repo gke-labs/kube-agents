@@ -589,21 +589,37 @@ resource "helm_release" "kube_agents" {
       annotations = module.gke_cluster.network_policy_enforced ? {} : {
         "kubeagents.x-k8s.io/network-policy-enforcement" = "absent-accepted"
       }
-      harness = {
-        clusterName = module.gke_cluster.cluster_name
-        location    = module.gke_cluster.cluster_location
-        projectId   = var.project_id
-        # null leaves a field out of the CR so the CRD default applies — the
-        # chart's compactFields drops nulls and empty strings.
-        hermes = {
-          dashboardEnabled = var.hermes_dashboard_enabled
-        }
-        memory = {
-          enabled            = var.memory_enabled
-          provider           = var.memory_provider
-          userProfileEnabled = var.user_profile_enabled
-        }
-      }
+      harness = merge(
+        {
+          clusterName = module.gke_cluster.cluster_name
+          location    = module.gke_cluster.cluster_location
+          projectId   = var.project_id
+          # null leaves a field out of the CR so the CRD default applies — the
+          # chart's compactFields drops nulls and empty strings.
+          hermes = {
+            dashboardEnabled = var.hermes_dashboard_enabled
+          }
+          memory = {
+            enabled            = var.memory_enabled
+            provider           = var.memory_provider
+            userProfileEnabled = var.user_profile_enabled
+          }
+        },
+        # The subscription the drift detector pulls from, so a renamed
+        # drift_pubsub_subscription is the one it reads: the detector's own
+        # default is the module's default name and nothing else would carry a
+        # rename to it. Only when the module exists -- the chart renders a
+        # driftDetector block into the CR as soon as one field is set, and an
+        # install that never asked for drift detection should not carry one
+        # (the chart's platform-agent-cr.yaml says why). Whether the detector
+        # starts is spec.harness.driftDetector.enabled, which this composition
+        # does not set; extra_helm_values reaches it.
+        var.enable_drift_pubsub ? {
+          driftDetector = {
+            subscription = module.drift_pubsub[0].subscription_name
+          }
+        } : {}
+      )
       deployment = {
         image = {
           tag = var.image_tag
