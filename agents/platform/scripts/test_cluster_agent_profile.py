@@ -524,11 +524,6 @@ class CreateProfileTest(unittest.TestCase):
 
 
 class ResolveProfilesBaseTest(unittest.TestCase):
-    def test_resolves_when_hermes_home_is_profile_home(self):
-        with mock.patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform"}, clear=True):
-            self.assertEqual(cap._resolve_data_root(), Path("/opt/data"))
-            self.assertEqual(cap._resolve_profiles_base(), Path("/opt/data/profiles"))
-
     def test_resolves_when_platform_agent_home_is_set(self):
         with mock.patch.dict(
             os.environ,
@@ -543,44 +538,36 @@ class ResolveProfilesBaseTest(unittest.TestCase):
             self.assertEqual(cap._resolve_data_root(), Path("/opt/data"))
             self.assertEqual(cap._resolve_profiles_base(), Path("/opt/data/profiles"))
 
-    def test_resolves_when_data_root_parent_is_named_profiles(self):
-        with mock.patch.dict(os.environ, {"HERMES_HOME": "/srv/profiles/data"}, clear=True):
-            self.assertEqual(cap._resolve_data_root(), Path("/srv/profiles/data"))
-            self.assertEqual(cap._resolve_profiles_base(), Path("/srv/profiles/data/profiles"))
+    def test_resolves_default_when_no_env_set(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(cap._resolve_data_root(), Path("/opt/data"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/opt/data/profiles"))
 
-    def test_resolves_when_profile_home_contains_profiles_directory(self):
-        with tempfile.TemporaryDirectory(prefix="test-prof-") as tmpdir:
-            profile_home = Path(tmpdir) / "profiles" / "platform"
-            (profile_home / "profiles").mkdir(parents=True)
-            with mock.patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}, clear=True):
-                self.assertEqual(cap._resolve_data_root(), Path(tmpdir))
-                self.assertEqual(cap._resolve_profiles_base(), Path(tmpdir) / "profiles")
+    def test_resolves_when_data_root_spelled_like_profile_home_without_misfiring(self):
+        # A data root such as /mnt/profiles/platform must NOT misfire to /mnt
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/mnt/profiles/platform"}, clear=True):
+            self.assertEqual(cap._resolve_data_root(), Path("/mnt/profiles/platform"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/mnt/profiles/platform/profiles"))
 
-    def test_resolves_when_cluster_profile_home_contains_profiles_directory(self):
-        with tempfile.TemporaryDirectory(prefix="test-cluster-prof-") as tmpdir:
-            cluster_home = Path(tmpdir) / "profiles" / "cluster-prod-east"
-            (cluster_home / "profiles").mkdir(parents=True)
-            with mock.patch.dict(os.environ, {"HERMES_HOME": str(cluster_home)}, clear=True):
-                self.assertEqual(cap._resolve_data_root(), Path(tmpdir))
-                self.assertEqual(cap._resolve_profiles_base(), Path(tmpdir) / "profiles")
+    def test_resolves_when_cluster_shared_root_without_misfiring(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/srv/profiles/cluster-shared"}, clear=True):
+            self.assertEqual(cap._resolve_data_root(), Path("/srv/profiles/cluster-shared"))
+            self.assertEqual(cap._resolve_profiles_base(), Path("/srv/profiles/cluster-shared/profiles"))
 
-    def test_module_load_wires_hermes_home_and_profiles_base_from_profile_home(self):
+    def test_module_load_wires_hermes_home_and_profiles_base(self):
         import importlib
-        with tempfile.TemporaryDirectory(prefix="test-reload-") as tmpdir:
-            profile_home = Path(tmpdir) / "profiles" / "platform"
-            profile_home.mkdir(parents=True)
-            with mock.patch.dict(
-                os.environ,
-                {"HERMES_HOME": str(profile_home)},
-                clear=True,
-            ):
-                reloaded = importlib.reload(cap)
-                try:
-                    self.assertEqual(reloaded.HERMES_HOME, Path(tmpdir))
-                    self.assertEqual(reloaded.PROFILES_BASE, Path(tmpdir) / "profiles")
-                    self.assertEqual(reloaded._run_env()["HERMES_HOME"], str(tmpdir))
-                finally:
-                    importlib.reload(cap)
+        with mock.patch.dict(
+            os.environ,
+            {"PLATFORM_AGENT_HOME": "/srv/agent"},
+            clear=True,
+        ):
+            reloaded = importlib.reload(cap)
+            try:
+                self.assertEqual(reloaded.HERMES_HOME, Path("/srv/agent"))
+                self.assertEqual(reloaded.PROFILES_BASE, Path("/srv/agent/profiles"))
+                self.assertEqual(reloaded._run_env()["HERMES_HOME"], "/srv/agent")
+            finally:
+                importlib.reload(cap)
 
 
 class ListProfilesTest(unittest.TestCase):
@@ -849,6 +836,10 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "echo test && kubectl get pods",
             "echo test; kubectl get pods",
             "echo test | kubectl get pods",
+            "K=kubectl; $K -n seeded-debug get pods",
+            "export KUBECTL=kubectl",
+            "export K=/usr/bin/kubectl",
+            'K="kubectl"',
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -862,6 +853,11 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "cat README.md",
             "git status",
             "echo 'kube-agents repo'",
+            "grep -n kubectl /opt/data/skills/cluster-agent-lifecycle/SKILL.md",
+            "which kubectl",
+            "printf 'delegated; no kubectl run here' > notes.md",
+            "cat notes/kubectl.md",
+            "cat /opt/data/skills/gke-basics/references/cli-reference.md | grep -i kubectl",
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
@@ -878,7 +874,7 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "expected_output must require delegating the investigation to the Cluster Agent",
         )
 
-    def test_no_inline_platform_mcp_diagnostics_forbids_gke_and_platform_tools(self):
+    def test_no_inline_platform_mcp_diagnostics_forbids_platform_control_tools(self):
         spec = self.data.get("verification_spec", [])
         no_inline = next(
             (c for c in spec if c.get("name") == "no-inline-platform-mcp-diagnostics"),
@@ -905,7 +901,7 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
         ):
             self.assertIn(tool, tool_names)
 
-        # Must forbid remote GKE MCP diagnostic tools
+        # Must NOT forbid remote GKE MCP diagnostic tools (which belong to the Cluster Agent)
         for tool in (
             "mcp__gke__get_k8s_resource",
             "mcp_gke_get_k8s_resource",
@@ -918,7 +914,7 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "mcp__gke__get_k8s_rollout_status",
             "mcp_gke_get_k8s_rollout_status",
         ):
-            self.assertIn(tool, tool_names)
+            self.assertNotIn(tool, tool_names)
 
 
 if __name__ == "__main__":

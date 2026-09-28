@@ -48,20 +48,15 @@ RESERVED_PROFILES = frozenset({"default", "platform"})
 def _resolve_data_root() -> Path:
     """Resolve the data PVC root containing the profiles/ directory.
 
-    In a Platform Agent worker, kanban session, or gateway child, HERMES_HOME is pointed
-    at the profile home (<root>/profiles/platform) while PLATFORM_AGENT_HOME points to
-    the data PVC root (/opt/data). If PLATFORM_AGENT_HOME is unset and HERMES_HOME points
-    directly to a profile home, derive the root from HERMES_HOME.parent.parent.
+    Prefers PLATFORM_AGENT_HOME (which points to the data PVC root across all
+    shipped runtimes: operator pod env, sandbox sshd setenv, docker-entrypoint),
+    falling back to HERMES_HOME or DEFAULT_DATA_ROOT.
     """
-    if os.environ.get(ENV_PLATFORM_AGENT_HOME):
-        return Path(os.environ[ENV_PLATFORM_AGENT_HOME])
-    raw_home = Path(os.environ.get(ENV_HERMES_HOME, str(DEFAULT_DATA_ROOT)))
-    if (
-        raw_home.parent.name == PROFILES_DIR_NAME
-        and (raw_home.name in RESERVED_PROFILES or raw_home.name.startswith(CLUSTER_PROFILE_PREFIX))
-    ):
-        return raw_home.parent.parent
-    return raw_home
+    return Path(
+        os.environ.get(ENV_PLATFORM_AGENT_HOME)
+        or os.environ.get(ENV_HERMES_HOME)
+        or str(DEFAULT_DATA_ROOT)
+    )
 
 
 def _resolve_profiles_base() -> Path:
