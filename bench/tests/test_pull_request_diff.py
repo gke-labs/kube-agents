@@ -212,10 +212,6 @@ def test_removed_and_context_lines_do_not_count(token, github):
         [{"filename": "seeded-reliability/checkout-gateway-pdb.yaml", "patch": context}],
     )
     assert check().verify(5.0).status == "fail"
-    # The `+++ b/file` header shares the prefix and is not an added line.
-    header_only = "+++ b/PodDisruptionBudget-selector-minAvailable.yaml\n-x"
-    github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (200, [{"filename": "x.yaml", "patch": header_only}])
-    assert check().verify(5.0).status == "fail"
 
 
 def test_a_listing_of_full_pages_is_graded_on_what_was_read_and_says_so(token, github):
@@ -249,13 +245,54 @@ def test_a_pull_request_closed_without_merging_is_a_fail(token, github):
     assert "closed without being merged" in res.reason
 
 
-def test_a_merged_pull_request_still_carries_its_diff(token, github):
+def test_a_merged_pull_request_is_a_quote_not_a_proposal(token, github):
+    """The skill's "already exists" lands on open pull requests only, so a
+    merged one in a reply was not this proposal's vehicle; accepting it
+    would make any merged manifest in the organisation a standing pass."""
     stash()
     pull = fixture("pull-39.json")
     pull.update(state="closed", merged_at="2026-09-26T00:00:00Z")
     github.routes[f"{API}/pulls/39"] = (200, pull)
     github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (200, fixture("pull-39-files.json"))
+    res = check().verify(5.0)
+    assert res.status == "fail"
+    assert "#39: merged, so a reply naming it quotes a pull request" in res.reason
+    assert not [c for c in github.calls if "/files" in c]
+
+
+def test_a_pull_request_outside_the_runs_repository_is_rejected_when_the_run_names_one(token, github, monkeypatch):
+    """A run in one pool project naming another project's pull request: bound
+    to the repository the run writes to when the script exports it."""
+    stash()
+    route_pull(github, 39)
+    monkeypatch.setenv("BENCH_GITOPS_REPO", "gke-agentic/kube-agents-evals-22-infra")
+    res = check().verify(5.0)
+    assert res.status == "fail"
+    assert "not in gke-agentic/kube-agents-evals-22-infra, the repository this run writes to" in res.reason
+    assert github.calls == []
+    monkeypatch.setenv("BENCH_GITOPS_REPO", "GKE-Agentic/kube-agents-evals-21-infra")
     assert check().verify(5.0).status == "pass"
+    monkeypatch.delenv("BENCH_GITOPS_REPO")
+    assert check().verify(5.0).status == "pass"
+
+
+def test_a_human_pull_request_or_a_fork_is_not_the_agents_proposal(token, github):
+    stash()
+    pull = fixture("pull-39.json")
+    pull["head"]["ref"] = "fix/checkout-gateway-pdb"
+    github.routes[f"{API}/pulls/39"] = (200, pull)
+    res = check().verify(5.0)
+    assert res.status == "fail"
+    assert "is not an agent branch (platform-agent/* in the repository itself)" in res.reason
+    pull = fixture("pull-39.json")
+    pull["head"]["repo"] = {"full_name": "someone/kube-agents-evals-21-infra"}
+    github.routes[f"{API}/pulls/39"] = (200, pull)
+    assert check().verify(5.0).status == "fail"
+
+
+def test_the_branch_prefix_is_forge_pys():
+    forge = (REPO_ROOT / "agents" / "platform" / "scripts" / "forge.py").read_text()
+    assert f'AGENT_BRANCH_PREFIX = "{verifiers._AGENT_BRANCH_PREFIX}"' in forge
 
 
 def test_a_reply_naming_no_pull_request_fails_before_any_credential_is_needed(github, monkeypatch):

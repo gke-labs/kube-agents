@@ -60,7 +60,6 @@ from devops_bench.verification.base import (
     single_call_timeout,
 )
 from devops_bench.verification.verifiers import ResourcePropertyVerifier
-from pydantic import Field, field_validator, model_validator
 
 from kube_agents_bench import transcript
 from kube_agents_bench.fleet import (
@@ -1649,10 +1648,21 @@ _NO_DIFF_TOKEN_REASON = (
     f"{', '.join(LEDGER_TOKEN_ENV_VARS)} to a token with pull_requests: read on "
     "the eval GitOps repository, or this check cannot be evaluated"
 )
-# What a unified diff marks an added line with, and the header line that
-# shares the prefix and is not one.
+# What a unified diff marks an added line with. GitHub's `patch` field is
+# hunk text alone, from the `@@` header on, so there is no `+++ b/file` line
+# to tell apart.
 _DIFF_ADDED_PREFIX = "+"
-_DIFF_FILE_HEADER_PREFIX = "+++"
+# Where the run learns the repository it writes to (owner/name), when it is
+# told: hack/ci-eval-pr.sh exports it on the inject lane from the project
+# mapping. Set, it binds the candidate pull request to that repository; unset,
+# the `owner` pin is the only repository bind.
+_GITOPS_REPO_ENV_VAR = "BENCH_GITOPS_REPO"
+# The prefix every branch the agent pushes carries: AGENT_BRANCH_PREFIX in
+# agents/platform/scripts/forge.py, pinned by a test. With the head in the
+# repository itself it is the agent's own pull request, as the pool sweep
+# decides ownership; a human's pull request in the same repository is not a
+# proposal the agent made.
+_AGENT_BRANCH_PREFIX = "platform-agent/"
 
 
 @VERIFIERS.register("pull_request_diff_contains")
@@ -1671,13 +1681,19 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
     names.
 
     WHAT IT ASSERTS, AND WHAT IT DOES NOT. The reply names a github.com pull
-    request URL under ``owner``; GitHub resolves it as a pull request that is
-    open or merged; and the concatenated patches carry every phrase in
-    ``required_phrases``, at least one of ``any_of_phrases``, and none of
-    ``forbidden_phrases``, after the normalisation ``report_contains``
-    applies. It does NOT ask whether this run opened or pushed to the pull
-    request: that is ``pull_request_opened``'s question, and a case that
-    needs both declares both. Here a repetition that recomputed the same
+    request URL under ``owner`` and, when the run was told the repository it
+    writes to (``BENCH_GITOPS_REPO``, which the inject lane exports from the
+    project mapping), in that repository; GitHub resolves it as an OPEN pull
+    request whose head is an agent branch in the repository itself; and the
+    added lines of its patches carry every phrase in ``required_phrases``, at
+    least one of ``any_of_phrases``, and none of ``forbidden_phrases``, after
+    the normalisation ``report_contains`` applies. Open, not merged: the
+    skill's "already exists" path lands on open pull requests only, so a
+    merged one named in a reply is quoted, not proposed, and a merged
+    manifest anywhere in the organisation is not a standing pass. It does NOT
+    ask whether this run opened or pushed to the pull request: that is
+    ``pull_request_opened``'s question, and a case that needs both declares
+    both. Here a repetition that recomputed the same
     manifest, found the branch already carrying it and pointed at the open
     pull request (the skill's "already exists" path, which the measurement
     run's third repetition took: it refused "nothing to commit" and named the
@@ -1685,16 +1701,14 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
     manifest, and the proposal is what the objective grades. The cost of that
     choice is stated rather than hidden: a reply that only quotes an earlier
     lease's open pull request carrying the manifest passes this arm too, the
-    leftover grading #1755 describes. It is accepted here because requiring a
-    push would fail the correct third repetition, because the sweep closes the
-    agent's pull requests between leases so such a leftover is the exception,
-    and because a case that must prove the write declares
-    ``pull_request_opened`` beside this. What the run wrote to GitHub is not
+    leftover grading #1755 describes, and the same-repository, agent-branch,
+    open-only binds above are what keep that cost to exactly that shape. It
+    is accepted here because requiring a push would fail the correct third
+    repetition, because the sweep closes the agent's pull requests between
+    leases when it reaches them, and because a case that must prove the write
+    declares ``pull_request_opened`` beside this. What the run wrote to GitHub is not
     this objective's question; the inject lane guards that with a safeguard
-    of its own (#2079). A pull request closed without being merged is
-    rejected: the skill's "already exists" matches open ones only, so a
-    closed one named in a reply is a leftover quoted, not a proposal made.
-    Only ADDED lines of each patch are matched, plus the file names: a pull
+    of its own (#2079). Only ADDED lines of each patch are matched, plus the file names: a pull
     request that deletes a budget, or edits a line beside one, carries the
     nouns in its context and removed lines and proposes nothing.
 
@@ -1750,8 +1764,20 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                 f"unexpected GitHub response {status} for {slug}; this check could not be "
                 "evaluated"
             ), []
-        if str(payload.get("state") or "").lower() == "closed" and not payload.get("merged_at"):
-            return None, None, [f"{slug}: closed without being merged"]
+        if str(payload.get("state") or "").lower() != "open":
+            return None, None, [
+                f"{slug}: {'merged' if payload.get('merged_at') else 'closed without being merged'}, "
+                "so a reply naming it quotes a pull request rather than proposing one"
+            ]
+        head = payload.get("head") or {}
+        head_ref = str(head.get("ref") or "")
+        head_repo = str((head.get("repo") or {}).get("full_name") or "")
+        if not head_ref.startswith(_AGENT_BRANCH_PREFIX) or head_repo.lower() != f"{owner}/{repo}".lower():
+            return None, None, [
+                f"{slug}: its head {head_repo}:{head_ref} is not an agent branch "
+                f"({_AGENT_BRANCH_PREFIX}* in the repository itself), so it is not a pull "
+                "request the agent opened"
+            ]
         chunks: list[str] = []
         notes: list[str] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
@@ -1777,7 +1803,6 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                     line[len(_DIFF_ADDED_PREFIX) :]
                     for line in patch.splitlines()
                     if line.startswith(_DIFF_ADDED_PREFIX)
-                    and not line.startswith(_DIFF_FILE_HEADER_PREFIX)
                 ]
                 chunks.append("\n".join([name, *added]))
             if len(files) < _PR_FILES_PAGE_SIZE:
@@ -1835,12 +1860,19 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
 
         budget = single_call_timeout(timeout_sec)
         any_of = [_normalize(p) for p in self.any_of_phrases]
+        bound_repo = os.environ.get(_GITOPS_REPO_ENV_VAR, "").strip()
         rejected: list[str] = []
         unresolved: list[str] = []
         for owner, repo, number in seen:
             slug = f"{owner}/{repo}#{number}"
             if self.owner and owner.lower() != self.owner.lower():
                 rejected.append(f"{slug}: not under {self.owner}")
+                continue
+            if bound_repo and f"{owner}/{repo}".lower() != bound_repo.lower():
+                rejected.append(
+                    f"{slug}: not in {bound_repo}, the repository this run writes to "
+                    f"({_GITOPS_REPO_ENV_VAR})"
+                )
                 continue
             try:
                 diff, unevaluable, notes = self._diff(owner, repo, number, token, budget)
