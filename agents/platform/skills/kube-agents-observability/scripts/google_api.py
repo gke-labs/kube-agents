@@ -73,6 +73,11 @@ PAGE_TOKEN_PARAM = "pageToken"
 NEXT_PAGE_TOKEN_KEY = "nextPageToken"
 MAX_LIST_PAGES = 50
 PAGE_CAP_NOTE = "stopped after {pages} pages with more to read"
+# The smallest limit a list read takes. Cloud Trace reads a pageSize of 0 or
+# less as "choose a default" and answers a full page, which a stop rule of
+# `len(items) >= limit` would then trim to nothing, so the analyzer would say
+# "No traces found" over a project that just answered with traces.
+MIN_LIMIT = 1
 
 
 class RelayError(Exception):
@@ -135,11 +140,15 @@ def get_paginated(session, url: str, *, params: dict, items_key: str, limit: int
     """The `items_key` entries of a paged list read, across pages.
 
     Follows `nextPageToken` until the list runs dry or `limit` items are in
-    hand (when given), and returns at most `limit` items. A list still holding
+    hand (when given), and returns at most `limit` items; a `limit` below
+    MIN_LIMIT is a ValueError, since Google reads such a page size as a
+    default page and the trim would discard it. A list still holding
     a token after MAX_LIST_PAGES pages raises RelayError when nothing was
     read, so the caller cannot report an empty window it never saw the end
     of, and otherwise returns what was read with a note on stderr.
     """
+    if limit is not None and limit < MIN_LIMIT:
+        raise ValueError(f"limit must be at least {MIN_LIMIT} or None, got {limit}")
     items: list = []
     token = None
     for _ in range(MAX_LIST_PAGES):

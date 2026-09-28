@@ -26,6 +26,19 @@ DURATION_FORMAT = "6.3f"
 PERCENT_FORMAT = "4.1f"
 
 
+def positive_limit(value: str) -> int:
+    """The --limit type: an int of at least google_api.MIN_LIMIT.
+
+    Cloud Trace reads a pageSize of 0 or less as "choose a default" and
+    answers a full page, which the stop rule would trim to nothing and the
+    helper would report as an empty window; so the parser refuses it.
+    """
+    number = int(value)
+    if number < google_api.MIN_LIMIT:
+        raise argparse.ArgumentTypeError(f"must be at least {google_api.MIN_LIMIT}, got {value}")
+    return number
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Analyze trace latencies to locate bottlenecks (e.g. slow tool or model calls)"
@@ -36,8 +49,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         help=f"Analyze traces within the last N hours (default: {google_api.DEFAULT_WINDOW_HOURS})",
     )
     parser.add_argument(
-        "--limit", type=int, default=DEFAULT_LIMIT,
-        help=f"Number of traces to fetch and analyze (default: {DEFAULT_LIMIT})",
+        "--limit", type=positive_limit, default=DEFAULT_LIMIT,
+        help=f"Number of traces to fetch and analyze, at least {google_api.MIN_LIMIT} (default: {DEFAULT_LIMIT})",
     )
     return parser.parse_args(argv)
 

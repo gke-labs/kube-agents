@@ -40,6 +40,8 @@ import get_metric_descriptors
 HERE = Path(__file__).resolve().parent
 ENDPOINT = "http://127.0.0.1:8765"
 PROJECT = "kagents-dev"
+# What argparse exits with on a refused argument.
+ARGPARSE_USAGE_EXIT = 2
 TRACE_A = "0006344377aac15d1baede1a41e88a2c"
 TRACE_B = "ffffffffffffffffffffffffffffffff"
 RELAYED_TRACES = f"{ENDPOINT}/v1/gcp/cloudtrace.googleapis.com/v1/projects/{PROJECT}/traces"
@@ -227,6 +229,22 @@ class AnalyzeTraceLatencyTest(BrokerSessionCase):
         self.assertIn("No traces found in the specified window.", out)
         self.assertEqual(1, len(self.http.calls))
         self.assertEqual(analyze_trace_latency.DEFAULT_LIMIT, self.http.calls[0]["params"]["pageSize"])
+
+    def test_a_limit_below_one_is_refused_before_any_read(self):
+        # pageSize=0 makes Cloud Trace answer a default page, which the stop
+        # rule would trim to nothing and the helper report as an empty window.
+        for limit in ("0", "-1"):
+            with self.subTest(limit=limit):
+                session = self.session({RELAYED_TRACES: TRACE_LIST})
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as raised:
+                    analyze_trace_latency.main(["--project-id", PROJECT, "--limit", limit], session=session)
+                self.assertEqual(ARGPARSE_USAGE_EXIT, raised.exception.code)
+                self.assertIn(f"must be at least {google_api.MIN_LIMIT}", err.getvalue())
+                self.assertEqual([], self.http.calls)
+
+    def test_a_limit_of_one_is_the_smallest_the_parser_takes(self):
+        self.assertEqual(1, analyze_trace_latency.parse_args(["--project-id", PROJECT, "--limit", "1"]).limit)
 
     def test_a_broker_refusal_names_the_rule_and_exits_one(self):
         session = self.session({RELAYED_TRACES: FakeResponse(403, BROKER_REFUSAL)})
@@ -525,6 +543,16 @@ class GoogleApiTest(BrokerSessionCase):
         session = self.session({RELAYED_TRACES: FakeResponse(200, "<html>")})
         with self.assertRaises(google_api.RelayError):
             google_api.get_json(session, f"https://cloudtrace.googleapis.com/v1/projects/{PROJECT}/traces")
+
+    def test_get_paginated_refuses_a_limit_below_one_without_reading(self):
+        # A default page trimmed by items[:0] would read as an empty list.
+        session = self.session({RELAYED_TRACES: TRACE_LIST})
+        url = google_api.TRACE_LIST_URL.format(project=PROJECT)
+        for limit in (0, -1):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                google_api.get_paginated(session, url, params={}, items_key="traces", limit=limit)
+        self.assertEqual([], self.http.calls)
+        self.assertEqual(2, len(google_api.get_paginated(session, url, params={}, items_key="traces", limit=None)))
 
 
 class GetChatUsersTest(unittest.TestCase):
