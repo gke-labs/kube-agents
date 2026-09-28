@@ -65,10 +65,14 @@ JSON_INDENT = 2
 # time bucket holds nothing (observed on a live install), so a reader that
 # stops at the first page reports "no traces" over a project full of them;
 # Monitoring's descriptor list is too large to relay in one page. The cap
-# bounds a list that never runs dry.
+# bounds a list that never runs dry, and reaching it is reported, never
+# passed off as the end of the list: with nothing in hand the read fails
+# (an empty answer would read as an empty window), with something in hand the
+# helper's stdout is complete for what it says and stderr says it is partial.
 PAGE_TOKEN_PARAM = "pageToken"
 NEXT_PAGE_TOKEN_KEY = "nextPageToken"
 MAX_LIST_PAGES = 50
+PAGE_CAP_NOTE = "stopped after {pages} pages with more to read"
 
 
 class RelayError(Exception):
@@ -130,9 +134,11 @@ def window(hours: int) -> tuple[str, str]:
 def get_paginated(session, url: str, *, params: dict, items_key: str, limit: int | None = None) -> list:
     """The `items_key` entries of a paged list read, across pages.
 
-    Follows `nextPageToken` until the list runs dry, `limit` items are in hand
-    (when given) or MAX_LIST_PAGES pages have been read, and returns at most
-    `limit` items.
+    Follows `nextPageToken` until the list runs dry or `limit` items are in
+    hand (when given), and returns at most `limit` items. A list still holding
+    a token after MAX_LIST_PAGES pages raises RelayError when nothing was
+    read, so the caller cannot report an empty window it never saw the end
+    of, and otherwise returns what was read with a note on stderr.
     """
     items: list = []
     token = None
@@ -145,6 +151,11 @@ def get_paginated(session, url: str, *, params: dict, items_key: str, limit: int
         token = page.get(NEXT_PAGE_TOKEN_KEY)
         if not token or (limit is not None and len(items) >= limit):
             break
+    else:
+        note = PAGE_CAP_NOTE.format(pages=MAX_LIST_PAGES)
+        if not items:
+            raise RelayError(f"{url}: {note} and nothing in hand; the window may not be empty")
+        print(f"warning: {url}: {note}; the {len(items)} item(s) returned are not the whole list", file=sys.stderr)
     return items if limit is None else items[:limit]
 
 
