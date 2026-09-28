@@ -314,14 +314,13 @@ gate, an `authority` block that names a real principal, and the reply rendered i
 `resource_property` and `fleet_resource_property` read the cluster and never touched the
 transport. `tool_called` reads the trajectory, which on this path carries tool-call data only
 when the executor publishes `activity` artifacts and the door's probe carries them: the relay
-never posts `activity` to a conversation, so the harness reads the trace off the read route
-instead (`activity` on the probe body, `[]` for a run that called nothing, absent on a door that
-cannot show it), maps each entry to a trajectory item in the api path's shape, and writes one
-`a2a.activity` marker whenever the key was present at all. Both executors publish them: the
-worker adapter from the harness's `tool_use` blocks, the Hermes bridge from hermes's outbound
-webhooks (`a2a/docs/hermes-bridge.md`), each with a `progress` heartbeat beside the result. A
-door or an executor built without that publishes no trace, and the record then carries no marker.
-`worker_commands` reads
+never posts `activity` to a conversation, so the harness reads the trace off the read route when
+the probe body carries an `activity` key (`[]` for a run that called nothing), maps each entry to
+a trajectory item in the api path's shape, and writes one `a2a.activity` marker whenever the key
+was present at all; a probe without the key leaves the record with no marker and no calls. Which
+executor publishes `activity`, and whether the door carries it, is each component's own to state
+(the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the
+harness asks neither and grades on what the probe carried. `worker_commands` reads
 the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
 signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
