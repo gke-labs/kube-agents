@@ -239,21 +239,34 @@ ACTIVITY_STATUS_TRUNCATED = "truncated"
 # ``truncated`` would otherwise set the record aside on the run that used it.
 ACTIVITY_INPUT_TRUNCATED_KEY = "truncated"
 ACTIVITY_INPUT_TRUNCATED_KEYS = frozenset({ACTIVITY_INPUT_TRUNCATED_KEY, "bytes", "head"})
-# The marker's argument names: the two it always carries, and two counts
-# present only when non-zero -- parts that could not be mapped, and calls
-# whose input the executor replaced with its truncation stand-in. The last
-# three are the LOSS arguments: each says the trajectory does not carry
-# every call the persona made, so a ``tool_called`` graded over it could
-# miss a call that happened. The scorer treats a marker with any of them
-# non-zero as no marker for that purpose -- the check is set aside as not
-# applicable rather than graded over a trace that lost calls -- and
-# duplicates the three names (``scoring.INJECT_ACTIVITY_LOSS_ARGS``);
-# ``test_scoring.py`` asserts the two agree.
+# The marker's argument names: the two it always carries, and three
+# present only when non-zero -- parts or counts that could not be read,
+# calls whose input the executor replaced with its truncation stand-in, and
+# a trace that is stale: the read that ended the wait (the relay's terminal
+# in its entries) carried no trace the fold could adopt, because its probe
+# errored or omitted the key, so the trace is the previous read's and a
+# call made in the window between could be missing. The last four are the
+# LOSS arguments: each says the trajectory may not carry every call the
+# persona made, so a ``tool_called`` graded over it could miss a call that
+# happened. The scorer treats a marker with any of them non-zero as no
+# marker for that purpose -- the check is set aside as not applicable
+# rather than graded over a trace that lost calls -- and duplicates the
+# names (``scoring.INJECT_ACTIVITY_LOSS_ARGS``); ``test_scoring.py``
+# asserts the two agree. A count the body carries but this side cannot
+# read (a string, an object, NaN, a negative) is itself a loss and lands on
+# ``malformed`` rather than reading as zero, since zero is the value that
+# vouches for the trace.
 ACTIVITY_CALLS_ARG = "calls"
 ACTIVITY_DROPPED_ARG = "dropped"
 ACTIVITY_MALFORMED_ARG = "malformed"
 ACTIVITY_INPUT_TRUNCATED_ARG = "input_truncated"
-ACTIVITY_LOSS_ARGS = (ACTIVITY_DROPPED_ARG, ACTIVITY_MALFORMED_ARG, ACTIVITY_INPUT_TRUNCATED_ARG)
+ACTIVITY_STALE_ARG = "stale"
+ACTIVITY_LOSS_ARGS = (
+    ACTIVITY_DROPPED_ARG,
+    ACTIVITY_MALFORMED_ARG,
+    ACTIVITY_INPUT_TRUNCATED_ARG,
+    ACTIVITY_STALE_ARG,
+)
 
 STATE_SUBMITTED = "submitted"
 STATE_WORKING = "working"
@@ -522,6 +535,20 @@ def parse_reason(text: str) -> str:
     return rest.split(" ", 1)[0] if rest else ""
 
 
+def _readable_count(value: Any) -> int | None:
+    """A count as the door or the executor spells it, or ``None`` when it
+    cannot be read: not a number, not finite (``json.loads`` admits ``NaN``,
+    ``Infinity`` and ``1e999``), or not positive. A float is read by its
+    floor. ``None`` rather than zero, because zero is the value that vouches
+    for the trace and an unreadable count is a loss, not an absence.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return int(value)
+
+
 def budget_floor(grace_seconds: float) -> float:
     """The smallest budget that can be classified: the grace plus the margin."""
     return grace_seconds + GRACE_MARGIN_SECONDS
@@ -631,6 +658,9 @@ class Fold:
     activity: list[dict[str, Any]] | None = None
     activity_dropped: int = 0
     activity_malformed: int = 0
+    # Whether the read that ended the wait carried no trace the fold could
+    # adopt, so ``activity`` is an earlier read's (:meth:`note_trace_stale`).
+    activity_stale: bool = False
     progress: str = ""
     terminal: str = ""
     terminal_source: str = ""
@@ -677,6 +707,21 @@ class Fold:
         self.activity = list(parts)
         self.activity_dropped = dropped
         self.activity_malformed = malformed
+        self.activity_stale = False
+
+    def note_trace_stale(self) -> None:
+        """The read that ended the wait carried no trace this fold could adopt.
+
+        The relay's terminal and the probe travel in the same reply, and the
+        transcript half is good whatever the probe found, so a wait can end
+        on a read whose probe errored or omitted the key. The trace then
+        stands as of the previous probed read, up to a poll's wait earlier,
+        and a call made in between is not in it; the marker says so
+        (:data:`ACTIVITY_STALE_ARG`) rather than vouching for the trace.
+        Nothing to say when no read ever carried a trace.
+        """
+        if self.activity is not None:
+            self.activity_stale = True
 
     def activity_entries(self) -> list[dict[str, Any]]:
         """The activity block: the marker, then one entry per call.
@@ -722,8 +767,14 @@ class Fold:
         input_truncated = 0
         for part in self.activity:
             if part.get(ACTIVITY_STATUS_KEY) == ACTIVITY_STATUS_TRUNCATED:
-                count = part.get(ACTIVITY_DROPPED_KEY)
-                dropped += count if isinstance(count, int) and count > 0 else 0
+                # The stand-in exists only because calls were dropped; a
+                # count this side cannot read is still a loss, on
+                # ``malformed`` rather than read as zero.
+                count = _readable_count(part.get(ACTIVITY_DROPPED_KEY))
+                if count is None:
+                    malformed += 1
+                else:
+                    dropped += count
                 continue
             tool = part.get(ACTIVITY_TOOL_KEY)
             if not isinstance(tool, str) or not tool:
@@ -758,6 +809,8 @@ class Fold:
             marker_args[ACTIVITY_MALFORMED_ARG] = malformed
         if input_truncated:
             marker_args[ACTIVITY_INPUT_TRUNCATED_ARG] = input_truncated
+        if self.activity_stale:
+            marker_args[ACTIVITY_STALE_ARG] = 1
         return calls, marker_args
 
     @property
@@ -1010,21 +1063,27 @@ class Probe:
             value = raw.get(name)
             return float(value) if isinstance(value, (int, float)) else 0.0
 
-        def _count(name: str) -> int:
-            # A count the body spelled as NaN, Infinity or 1e999 (all of
-            # which ``json.loads`` admits) reads as zero rather than raising
-            # ``int()``'s ValueError out of the poll loop, which would leave
-            # the task running with nothing to cancel it.
-            value = _num(name)
-            return int(value) if math.isfinite(value) and value > 0 else 0
-
         last_post = raw.get("lastPost")
         raw_activity = raw.get(PROBE_ACTIVITY_KEY)
         activity: list[dict[str, Any]] | None = None
         malformed = 0
+        dropped = 0
         if isinstance(raw_activity, list):
             activity = [part for part in raw_activity if isinstance(part, dict)]
             malformed = len(raw_activity) - len(activity)
+            # The door omits the count when nothing was cut. A count it
+            # sent that cannot be read (a string, an object, NaN, Infinity,
+            # 1e999 -- ``json.loads`` admits the last three -- or a
+            # negative) is a loss the marker has to show, so it lands on
+            # ``malformed`` rather than raising ``int()``'s ValueError out
+            # of the poll loop (leaving the task running with nothing to
+            # cancel it) or reading as the zero that vouches for the trace.
+            if PROBE_ACTIVITY_DROPPED_KEY in raw:
+                readable = _readable_count(raw.get(PROBE_ACTIVITY_DROPPED_KEY))
+                if readable is None:
+                    malformed += 1
+                else:
+                    dropped = readable
         return cls(
             backend=str(raw.get("backend") or ""),
             inject_only=bool(raw.get("injectOnly")),
@@ -1041,7 +1100,7 @@ class Probe:
             result=str(raw.get("result") or ""),
             reason=str(raw.get("reason") or ""),
             activity=activity,
-            activity_dropped=_count(PROBE_ACTIVITY_DROPPED_KEY),
+            activity_dropped=dropped,
             activity_malformed=malformed,
             progress=str(raw.get(PROBE_PROGRESS_KEY) or ""),
             last_post=str(last_post.get("text") or "") if isinstance(last_post, dict) else "",
@@ -1418,14 +1477,20 @@ class InjectTask:
             body = self._poll(task_id, after, remaining)
             after, fresh = self._absorb(fold, body, after)
             answered = Probe.from_body(body)
+            adopted = False
             if answered is not None:
                 probe = answered
-                self._note(fold, task_id, answered)
+                adopted = self._note(fold, task_id, answered)
                 if answered.could_look and answered.concerns(task_id) and not fold.final:
                     if answered.final:
                         return self._finish(fold, task_id, after, answered)
                     if answered.executor_state == "" and answered.past_grace:
                         return self._never_started(fold, task_id, answered)
+            if fold.final and not adopted:
+                # The relay's terminal arrived in this read and its probe
+                # carried no trace to adopt: whatever trace the fold holds
+                # is an earlier read's, and the marker must say so.
+                fold.note_trace_stale()
             if not fresh and not fold.final:
                 time.sleep(POLL_PAUSE_SECONDS)
 
@@ -1444,7 +1509,7 @@ class InjectTask:
         fold.mark_terminal(STATE_FAILED, TERMINAL_SOURCE_NEVER_STARTED, "")
         return Exchange(fold, OUTCOME_NEVER_STARTED, self.conversation, task_id, probe)
 
-    def _note(self, fold: Fold, task_id: str, probe: Probe) -> None:
+    def _note(self, fold: Fold, task_id: str, probe: Probe) -> bool:
         """Record what a read showed of this task's lifecycle and its trace.
 
         The trace is taken from any read the door answered about THIS task
@@ -1454,12 +1519,18 @@ class InjectTask:
         and the last one -- the read that showed the terminal, after the
         relay released the task -- is the complete one. The lifecycle is
         taken only while the task is active and not final, as before.
+
+        Returns whether this read's trace was adopted, so a caller whose
+        wait ends on this read can tell a trace of this instant from an
+        earlier read's (:meth:`Fold.note_trace_stale`).
         """
+        adopted = False
         if probe.grace_seconds > 0:
             self.first_event_grace = probe.grace_seconds
         if probe.could_look and probe.task_id == task_id:
             if probe.activity is not None:
                 fold.note_activity(probe.activity, probe.activity_dropped, probe.activity_malformed)
+                adopted = True
             if probe.progress:
                 fold.progress = probe.progress
         if probe.could_look and probe.concerns(task_id) and not probe.final and not fold.final:
@@ -1471,6 +1542,7 @@ class InjectTask:
                 # the state the stream shows now (a repeat is dropped).
                 fold.note_executor_state(STATE_WORKING)
             fold.note_executor_state(probe.executor_state)
+        return adopted
 
     def _absorb(self, fold: Fold, body: dict[str, Any], after: int) -> tuple[int, bool]:
         """Fold one ``GET`` reply; return the next ``after`` and whether it had entries."""
@@ -1515,7 +1587,8 @@ class InjectTask:
         body = self._poll(task_id, after, 0)
         after, _ = self._absorb(fold, body, after)
         probe = Probe.from_body(body) or Probe(error="no probe in the reply")
-        self._note(fold, task_id, probe)
+        if not self._note(fold, task_id, probe) and fold.final:
+            fold.note_trace_stale()
         _log.info(
             "inject: deadline read on %s for %s: %s", self.conversation, task_id, probe.describe()
         )

@@ -165,11 +165,15 @@ probe carried the task's tool-call trace at all (the relay never posts `activity
 conversation, so the probe is where the harness reads them), so that half of the rule retires on
 the door's capability to show calls rather than on a call having happened: a `tool_called` check
 on a persona that made no call fails there as it would on the api transport. A marker whose
-`dropped`, `malformed` or `input_truncated` argument is non-zero says the trajectory does not
-carry every call the persona made (the door's cap or the executor's budget dropped some, a part
-could not be mapped, or a wrapper's input was truncated and its nested names with it), and such a
+`dropped`, `malformed`, `input_truncated` or `stale` argument is non-zero says the trajectory may
+not carry every call the persona made (the door's cap or the executor's budget dropped some, a
+part or a count could not be read, a wrapper's input was truncated and its nested names with it,
+or the read that ended the wait carried no trace and the fold holds an earlier read's), and such a
 record is treated as blind like one with no marker (`_inject_trace_vouched()`), since grading over
-it could fail a call that happened or pass a safeguard over one. The worker
+it could fail a call that happened or pass a safeguard over one. One exception runs the other way:
+a `none`-wrapped check ("this tool was never called", `CaseSpec.negated_trace_blind_checks`) that
+_failed_ on a record carrying the marker stays graded whatever the loss, because the trace shows
+the forbidden call and a loss cannot unmake it; rung 1 blocks on it as on the api transport. The worker
 half is keyed on the transport alone (`_inject_record()`) and stays until a later change rebuilds
 the delegation wait for this path and takes those entries out of `worker_blind_checks`. A record
 from a door that cannot show the trace carries no marker and is graded as before. A case whose

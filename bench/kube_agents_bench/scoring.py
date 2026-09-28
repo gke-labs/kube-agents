@@ -217,7 +217,7 @@ INJECT_TASK_EVENT = "inject.task"
 INJECT_POST_EVENT = "inject.post"
 INJECT_EDIT_EVENT = "inject.edit"
 INJECT_ACTIVITY_EVENT = "a2a.activity"
-INJECT_ACTIVITY_LOSS_ARGS = ("dropped", "malformed", "input_truncated")
+INJECT_ACTIVITY_LOSS_ARGS = ("dropped", "malformed", "input_truncated", "stale")
 INJECT_ENVELOPE_EVENTS = frozenset(
     {
         INJECT_TASK_EVENT,
@@ -693,6 +693,15 @@ def _inject_record(trajectory: list[Any]) -> bool:
     )
 
 
+def _inject_trace_shown(trajectory: list[Any]) -> bool:
+    """Whether the record carries the activity marker at all: the door showed
+    the trace, complete or not."""
+    return any(
+        isinstance(entry, dict) and entry.get("name") == INJECT_ACTIVITY_EVENT
+        for entry in trajectory
+    )
+
+
 def _inject_trace_vouched(trajectory: list[Any]) -> bool:
     """Whether the record's activity marker vouches for the delegating turn's
     calls: present, and reporting no loss.
@@ -851,7 +860,12 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     and grades in full on one carrying the activity marker; a check that
     reads the delegated workers (:attr:`CaseSpec.worker_blind_checks`) is
     set aside on every inject record (:func:`_inject_record`), marker or
-    not, since the trace carries no card ids and no worker's entries.
+    not, since the trace carries no card ids and no worker's entries. One
+    exception inside the first family: a ``none``-wrapped check
+    (:attr:`CaseSpec.negated_trace_blind_checks`) that FAILED on a record
+    whose door showed the trace stays graded even when the marker reports a
+    loss, because the trace shows the forbidden call and a loss cannot
+    unmake it; rung 1 blocks on it as on the api transport.
 
     None on the api transport, on a record with no blind entry in its report
     (the set is matched by name, so a task with no such check or a report
@@ -863,6 +877,18 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     set_aside = set(spec.worker_blind_checks)
     if _inject_blind(record.trajectory):
         set_aside |= spec.trace_blind_checks
+        if _inject_trace_shown(record.trajectory):
+            # The door showed the trace and the marker reports a loss. A
+            # loss makes a "never called" check's PASS uncertain -- the
+            # forbidden call may be among what was lost -- and never its
+            # FAIL: the trace shows the call. A failed one is the positive
+            # evidence rung 1 exists to block on, and stays graded.
+            set_aside -= {
+                str(e.get("name"))
+                for e in record.verification_report
+                if str(e.get("name")) in spec.negated_trace_blind_checks
+                and e.get("status") == CHECK_STATUS_FAIL
+            }
     blind = [
         str(e.get("name")) for e in record.verification_report if str(e.get("name")) in set_aside
     ]

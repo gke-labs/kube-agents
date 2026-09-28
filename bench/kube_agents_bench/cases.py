@@ -79,6 +79,9 @@ TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TY
 # (``verifiers.ToolCalledVerifier``: ``router`` is the default).
 _TOOL_CALLED_SCOPE_KEY = "scope"
 _TOOL_CALLED_ROUTER_SCOPE = "router"
+# The compound type that negates its children ("none of these tools was
+# called"), which is how a safeguard against a forbidden call is written.
+_NEGATED_COMPOUND_TYPE = "none"
 
 # The keys a check subtree nests children under: compound nodes carry
 # ``checks``; a single wrapped child would be ``check``.
@@ -143,6 +146,14 @@ class CaseSpec:
     whose door showed no tool-call trace (no ``a2a.activity`` marker), and
     graded in full on one that did."""
 
+    negated_trace_blind_checks: frozenset[str] = frozenset()
+    """The entries in ``trace_blind_checks`` whose check is a ``none``
+    compound: "this tool was never called". A failed one is positive
+    evidence -- the trace shows the forbidden call -- so on a record whose
+    door showed the trace the scorer keeps it graded even when the marker
+    reports a loss; a loss makes such a check's pass uncertain, never its
+    fail."""
+
     worker_blind_checks: frozenset[str] = frozenset()
     """The entries in ``transport_blind_checks`` with any leaf that reads the
     delegated workers -- ``worker_commands``, ``worker_agents``, or a
@@ -178,22 +189,27 @@ def _reads_the_workers(leaf: dict[str, Any]) -> bool:
     return kind in TRACE_GRADABLE_CHECK_TYPES and scope not in (None, _TOOL_CALLED_ROUTER_SCOPE)
 
 
-def _transport_blind_checks(spec: Any) -> tuple[frozenset[str], frozenset[str]]:
+def _transport_blind_checks(
+    spec: Any,
+) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
     """The names of the spec's entries whose every leaf is transport-blind,
-    split into the trace-gradable ones and the worker-reading ones.
+    split into the trace-gradable ones, the ``none``-compound subset of
+    those, and the worker-reading ones.
 
     An entry without a ``name`` cannot be matched to its report line and is
     left out: the scorer then grades it as it always has, which fails closed
     rather than silently.
     """
     trace: set[str] = set()
+    negated: set[str] = set()
     workers: set[str] = set()
     if not isinstance(spec, list):
-        return frozenset(), frozenset()
+        return frozenset(), frozenset(), frozenset()
     for entry in spec:
         if not isinstance(entry, dict) or entry.get("name") is None:
             continue
-        leaves = _leaves(entry.get("check"))
+        check = entry.get("check")
+        leaves = _leaves(check)
         if not leaves or not all(
             str(leaf.get("type") or "") in TRANSPORT_BLIND_CHECK_TYPES for leaf in leaves
         ):
@@ -201,9 +217,11 @@ def _transport_blind_checks(spec: Any) -> tuple[frozenset[str], frozenset[str]]:
         name = str(entry["name"])
         if any(_reads_the_workers(leaf) for leaf in leaves):
             workers.add(name)
-        else:
-            trace.add(name)
-    return frozenset(trace), frozenset(workers)
+            continue
+        trace.add(name)
+        if isinstance(check, dict) and check.get("type") == _NEGATED_COMPOUND_TYPE:
+            negated.add(name)
+    return frozenset(trace), frozenset(negated), frozenset(workers)
 
 
 def _coerce_bool(value: Any, *, field: str, path: Path) -> bool:
@@ -294,7 +312,7 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     name_raw = doc.get("name")
     name = str(name_raw).strip() if name_raw is not None else case_id
 
-    trace_blind, worker_blind = _transport_blind_checks(spec)
+    trace_blind, negated_trace_blind, worker_blind = _transport_blind_checks(spec)
 
     return CaseSpec(
         case_id=case_id,
@@ -306,5 +324,6 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
         path=path,
         transport_blind_checks=trace_blind | worker_blind,
         trace_blind_checks=trace_blind,
+        negated_trace_blind_checks=negated_trace_blind,
         worker_blind_checks=worker_blind,
     )

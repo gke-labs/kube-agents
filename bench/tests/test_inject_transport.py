@@ -2332,21 +2332,122 @@ def test_the_probe_reads_the_trace_off_the_body() -> None:
     assert "tool call" not in absent.describe()
 
 
-@pytest.mark.parametrize("spelled", ["NaN", "Infinity", "-Infinity", "1e999", "-4", "2.9"])
-def test_a_dropped_count_that_is_not_a_finite_count_reads_as_zero_or_its_floor(
-    spelled: str,
+@pytest.mark.parametrize(
+    ("spelled", "dropped", "malformed"),
+    [
+        ("3", 3, 0),
+        ("2.9", 2, 0),
+        ("NaN", 0, 1),
+        ("Infinity", 0, 1),
+        ("-Infinity", 0, 1),
+        ("1e999", 0, 1),
+        ("-4", 0, 1),
+        ("0", 0, 1),
+        ('"12"', 0, 1),
+        ('{"n": 1}', 0, 1),
+        ("true", 0, 1),
+    ],
+)
+def test_a_dropped_count_the_parser_cannot_read_is_a_loss_not_a_zero(
+    spelled: str, dropped: int, malformed: int
 ) -> None:
     """``json.loads`` admits NaN, Infinity and 1e999; ``int()`` of any of
     them raises, and a raise here would leave the poll loop with the task
-    still running and nothing to cancel it. The count reads as zero (or its
-    integer floor for an ordinary positive number) and the poll goes on."""
+    still running and nothing to cancel it. But zero is the value that
+    vouches for the trace, and a count the door sent that this side cannot
+    read is a loss the door reported, so it lands on ``malformed`` (the
+    door omits the key when nothing was cut, so a sent zero is unreadable
+    too). An ordinary count reads whole, a float by its floor. The same
+    rule reads the bridge's ``truncated`` stand-in."""
     body = json.loads(
         '{"probe": {"active": false, "taskId": "task-1", "activity": [], '
         f'"activityDropped": {spelled}}}}}'
     )
     probe = inject.Probe.from_body(body)
     assert probe is not None and probe.activity == []
-    assert probe.activity_dropped == (2 if spelled == "2.9" else 0)
+    assert (probe.activity_dropped, probe.activity_malformed) == (dropped, malformed)
+    fold = inject.Fold("task-1")
+    fold.note_activity(
+        [{"status": "truncated", "dropped": json.loads(spelled), "at": "..."}, CALL_CREATE], 0, 0
+    )
+    marker_args = marker_of(fold.trajectory)["args"]
+    assert marker_args["dropped"] == dropped
+    assert marker_args.get("malformed", 0) == malformed
+    # No marker vouches for a trace with an unreadable count behind it.
+    assert bool(dropped or malformed)
+    # A stand-in with no count at all is a loss of unknown size.
+    bare = inject.Fold("task-1")
+    bare.note_activity([{"status": "truncated"}], 0, 0)
+    assert marker_of(bare.trajectory)["args"] == {"calls": 0, "dropped": 0, "malformed": 1}
+
+
+def test_a_wait_that_ends_on_a_read_without_a_trace_marks_the_trace_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The relay's terminal and the probe travel in one reply, and the
+    transcript half is good whatever the probe found. When the wait ends on
+    a read whose probe errored, the trace is the previous read's -- up to a
+    poll's wait older -- and a call made in between is not in it; the
+    marker says ``stale`` rather than vouching, and the scorer reads that
+    as a loss. A wait that ends on a read whose probe carried the trace
+    writes no such flag."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+
+    def scripted(bodies: list[dict[str, Any]]):
+        replies = iter(bodies)
+
+        def _poll(task_id: str, after: int, budget: float, *, probe: bool = True) -> dict[str, Any]:
+            return next(replies)
+
+        return _poll
+
+    running = {
+        "entries": running_transcript("task-1"),
+        "lastSeq": 3,
+        "probe": {"active": True, "taskId": "task-1", "executorState": "working", "activity": [CALL_CREATE]},
+    }
+    finished_entries = [
+        entry(4, inject.ENTRY_POST, text="done", messageId=RESULT_ID),
+        entry(5, inject.ENTRY_TERMINAL, taskId="task-1", state="completed",
+              source=inject.TERMINAL_SOURCE_EXECUTOR),
+    ]
+    blind_finish = {
+        "entries": finished_entries,
+        "lastSeq": 5,
+        "probe": {"active": False, "taskId": "task-1", "error": "kv read failed"},
+    }
+    monkeypatch.setattr(task, "_poll", scripted([running, blind_finish]))
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.outcome == inject.OUTCOME_TERMINAL
+    marker = marker_of(exchange.fold.trajectory)
+    assert marker is not None and marker["args"] == {"calls": 1, "dropped": 0, "stale": 1}
+    assert scoring._inject_blind(exchange.fold.trajectory)
+
+    sighted_finish = {
+        "entries": finished_entries,
+        "lastSeq": 5,
+        "probe": {
+            "active": False,
+            "taskId": "task-1",
+            "final": True,
+            "executorState": "completed",
+            "activity": [CALL_CREATE, CALL_FAILED],
+        },
+    }
+    monkeypatch.setattr(task, "_poll", scripted([running, sighted_finish]))
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    marker = marker_of(exchange.fold.trajectory)
+    assert marker is not None and marker["args"] == {"calls": 2, "dropped": 0}
+    assert not scoring._inject_blind(exchange.fold.trajectory)
+
+    # The deadline read follows the same rule.
+    monkeypatch.setattr(task, "_poll", scripted([blind_finish]))
+    fold = inject.Fold("task-1")
+    fold.note_activity([CALL_CREATE], 0, 0)
+    exchange = task._classify(fold, "task-1", 3)
+    assert exchange.outcome == inject.OUTCOME_TERMINAL
+    assert marker_of(exchange.fold.trajectory)["args"] == {"calls": 1, "dropped": 0, "stale": 1}
 
 
 def test_the_trace_is_taken_only_from_a_read_about_this_task() -> None:

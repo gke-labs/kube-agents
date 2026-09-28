@@ -242,6 +242,9 @@ def test_the_blind_set_splits_by_what_the_doors_trace_can_serve(write_task):
     )
     spec = load_case(path)
     assert spec.trace_blind_checks == {"router", "router-explicit", "never-filed"}
+    # The none-wrapped one is the "never called" shape whose FAIL is positive
+    # evidence and stays graded on a lossy trace.
+    assert spec.negated_trace_blind_checks == {"never-filed"}
     assert spec.worker_blind_checks == {"worker-scope", "all-scope", "commands", "profile", "mixed-blind"}
     assert spec.transport_blind_checks == spec.trace_blind_checks | spec.worker_blind_checks
     assert "mixed-applicable" not in spec.transport_blind_checks
