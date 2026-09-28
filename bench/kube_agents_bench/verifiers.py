@@ -772,18 +772,8 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
     return match.group("audit").strip(), stamp
 
 
-def _parse_github_time(value: Any) -> datetime | None:
-    """A GitHub API timestamp (``2026-09-17T03:12:16Z``) as an aware datetime, or None."""
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        stamp = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+# One parser for GitHub's stamps, shared with the client that lists writes.
+_parse_github_time = github_writes.parse_github_time
 
 
 def _finding_ids(body: str) -> tuple[list[str], str] | None:
@@ -1673,8 +1663,9 @@ class GitHubWritesVerifier(BaseVerifier):
     with ``pull_request_opened``, and its reply names the URL. Up to
     ``requested_pull_requests`` of the writes whose number that reply names
     are the requested ones and are left out; the lane sets the field to the
-    number of ``pull_request_opened`` leaves the case declares. Anything
-    else is a write the case did not ask for.
+    number of ``pull_request_opened`` and ``pull_request_diff_contains``
+    leaves the case declares. Anything else is a write the case did not
+    ask for.
 
     HOW A CASE THAT WRITES BY DESIGN IS KEPT AWAY. Writes are dated, not
     signed, and the fan-out runs cases side by side against one repository,
@@ -1683,8 +1674,12 @@ class GitHubWritesVerifier(BaseVerifier):
     unit queue): a repetition of a case that requests nothing never shares
     the repository with one that writes by design, and a write inside its
     window is its own or a concurrent sibling's mistake, either of which is
-    the red this check exists for. Requesting cases share the second phase
-    with each other only, each graded on the pull requests its reply names.
+    the red this check exists for. The second phase runs one unit at a time,
+    each after a settle as long as ``max_clock_skew_sec`` (the script's
+    ``EVAL_GITHUB_WRITE_SETTLE_SECONDS``, pinned equal by a test), so two
+    requesting cases never see each other's by-design pull requests and no
+    window reaches back into the unit before; each is graded on the pull
+    requests its own reply names.
     A pull request that was only commented on, labelled or closed in the
     window is not a write: :func:`kube_agents_bench.github_writes.find_writes`
     reads the head commit before it counts an ``updated_at`` that moved.

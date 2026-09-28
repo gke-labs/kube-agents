@@ -381,7 +381,7 @@ def find_writes(
     open there; an ``updated_at`` moved by a comment, a label or a close is
     noted and not counted). A branch
     counts when it carries the prefix, heads no pull request at all, and its
-    tip was committed in the window (``pushed``). Raises
+    tip was committed in the window (``tip committed``). Raises
     :class:`GitHubUnreadable` when the pull-request listing cannot be read;
     a branch listing the credential cannot make is a note, not an error.
     """
@@ -455,15 +455,20 @@ def find_writes(
 
 
 def _parse_since(text: str) -> datetime:
-    """An ISO-8601 instant or a Unix epoch, as an aware UTC datetime."""
+    """An ISO-8601 instant or a Unix epoch, as an aware UTC datetime.
+
+    ISO-8601 first: an all-digit form such as ``2026`` or ``20260925`` is a
+    date to ``fromisoformat`` and would otherwise read as seconds since 1970.
+    """
+    stamp = parse_github_time(text)
+    if stamp is not None:
+        return stamp
     try:
         return datetime.fromtimestamp(float(text), tz=timezone.utc)
     except (ValueError, OverflowError, OSError):
-        pass
-    stamp = parse_github_time(text)
-    if stamp is None:
-        raise argparse.ArgumentTypeError(f"{text!r} is neither an ISO-8601 instant nor an epoch")
-    return stamp
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is neither an ISO-8601 instant nor an epoch"
+        ) from None
 
 
 def main(argv: list[str] | None = None) -> int:

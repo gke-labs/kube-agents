@@ -230,9 +230,10 @@ def append_lane_safeguards(
 def main(argv: list[str] | None = None) -> int:
     """Materialise every task given with the lane's safeguards appended.
 
-    Prints ``<case> <path> <requested>`` per task -- the copy's path and how
-    many pull requests the case's own checks request, which the script uses
-    to run those cases in the fan-out's second phase; exits
+    Prints ``<requested> <case> <path>`` per task -- how many pull requests
+    the case's own checks request, which the script uses to run those cases
+    in the fan-out's second phase, then the copy's path, last because it may
+    hold spaces; exits
     non-zero, naming the file and the fault, when the lane file or a task
     refuses the append.
     """
@@ -253,7 +254,9 @@ def main(argv: list[str] | None = None) -> int:
         for task in args.tasks:
             written = append_lane_safeguards(task, safeguards, args.out_dir)
             requested = requested_pull_requests(_load_task(Path(task)).get(SPEC_KEY))
-            print(f"{written.parent.name} {written} {requested}")
+            # The count first and the path last: the path may hold spaces
+            # (a TMPDIR with one), and the consumer splits on whitespace.
+            print(f"{requested} {written.parent.name} {written}")
     except LaneSafeguardsError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

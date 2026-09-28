@@ -74,7 +74,7 @@ def presubmit_tasks() -> list[str]:
     return [f"./tasks/{c}/task.yaml" for c in eval_rosters.presubmit_cases() if c not in excluded]
 
 
-def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file: pathlib.Path = LANE_FILE, prelude: str = "") -> subprocess.CompletedProcess:
+def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file: pathlib.Path = LANE_FILE) -> subprocess.CompletedProcess:
     tasks = presubmit_tasks() if tasks is None else tasks
     tasks_array = "TASKS=(" + " ".join(f'"{t}"' for t in tasks) + ")"
     step = safeguards_step().replace(
@@ -89,7 +89,6 @@ def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file:
             UV_STUB,
             constants(),
             tasks_array,
-            prelude,
             step,
             'echo "REPO=${BENCH_GITOPS_REPO-<unset>}"',
             'echo "REQUESTING=${INJECT_LANE_REQUESTING-<unset>}"',
@@ -198,11 +197,15 @@ class InjectLaneTest(unittest.TestCase):
         self.assertIn("BENCH_GITOPS_REPO=someone/throwaway-infra is not a repository they can grade", result.stderr)
         self.assertNotIn("REPO=", result.stdout)
 
-    def test_the_mapping_wins_over_a_local_override(self):
+    def test_a_local_override_wins_over_the_mapping_as_it_does_at_deploy(self):
+        """hack/ci-deploy.sh points the agent at EVAL_GITOPS_REPO when it is
+        set, so that is the repository the safeguard has to read; Prow
+        refuses the override at deploy time, so in CI this is the mapping."""
         result = run_step(
-            {"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra", "EVAL_GITOPS_REPO": "someone/throwaway-infra"}
+            {"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra", "EVAL_GITOPS_REPO": "gke-agentic/throwaway-infra"}
         )
-        self.assertEqual(value(result, "REPO"), "gke-agentic/kube-agents-evals-21-infra")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(value(result, "REPO"), "gke-agentic/throwaway-infra")
 
     def test_no_repository_stops_the_lane_before_anything_runs(self):
         for env in ({"AGENT_TRANSPORT": "inject"}, {"AGENT_TRANSPORT": "inject", "EVAL_GITOPS_REPO": "none"}):
@@ -243,14 +246,18 @@ class TwoPhaseFanOutTest(unittest.TestCase):
     """The cases that request a pull request launch only after every other
     unit has finished; with none named, one phase runs as before."""
 
+    # The two pacing constants are `readonly` at the top of the script and are
+    # not lifted; the test sets them so the stub units run in seconds.
     STUBS = textwrap.dedent(
         """\
         EVAL_REPETITIONS=2
         EVAL_TASK_PARALLELISM=4
-        TASKS=("./tasks/a/task.yaml" "./tasks/b/task.yaml" "./tasks/w/task.yaml")
-        TASK_NAMES=(a b w)
-        TASK_REUSE=("" "" "")
-        TASK_HAS_STACK=("" "" "")
+        EVAL_UNIT_LAUNCH_STAGGER_SECONDS=0
+        EVAL_GITHUB_WRITE_SETTLE_SECONDS=1
+        TASKS=("./tasks/a/task.yaml" "./tasks/b/task.yaml" "./tasks/w/task.yaml" "./tasks/v/task.yaml")
+        TASK_NAMES=(a b w v)
+        TASK_REUSE=("" "" "" "")
+        TASK_HAS_STACK=("" "" "" "")
         unit_cost_hint() { echo 200; }
         profile_begin() { :; }
         run_one_unit() { echo "START $2 rep $3"; sleep 1; echo "END $2 rep $3"; }
@@ -271,22 +278,40 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.splitlines()
 
-    def test_requesting_units_launch_after_every_other_unit_has_ended(self):
-        lines = self.run_fanout("w")
-        self.assertIn("TOTAL=6", lines)
-        first_w = next(i for i, line in enumerate(lines) if line.startswith("START w"))
-        others_ended = [i for i, line in enumerate(lines) if line.startswith("END ") and not line.startswith("END w")]
+    def test_requesting_units_launch_after_every_other_unit_has_ended_and_one_at_a_time(self):
+        lines = self.run_fanout("w,v")
+        self.assertIn("TOTAL=8", lines)
+        writers = [i for i, line in enumerate(lines) if line.startswith(("START w", "START v", "END w", "END v"))]
+        first_writer = min(writers)
+        others_ended = [i for i, line in enumerate(lines) if line.startswith("END ") and not line.startswith(("END w", "END v"))]
         self.assertEqual(len(others_ended), 4)
-        self.assertLess(max(others_ended), first_w)
-        self.assertTrue(any("every other unit is done; launching the 2 unit(s)" in line for line in lines))
-        # Both repetitions of the writer ran, in the second phase.
-        self.assertEqual(sum(1 for line in lines if line.startswith("END w")), 2)
+        self.assertLess(max(others_ended), first_writer)
+        self.assertTrue(any("every other unit is done; launching the 4 unit(s)" in line and "one at a time, each after a 1s settle" in line for line in lines))
+        # The second phase is serial: every writer unit ends before the next
+        # starts, whichever case it belongs to.
+        writer_lines = [lines[i] for i in writers]
+        self.assertEqual(len(writer_lines), 8)
+        for start, end in zip(writer_lines[0::2], writer_lines[1::2]):
+            self.assertTrue(start.startswith("START ") and end.startswith("END "), writer_lines)
+            self.assertEqual(start.split(" ", 1)[1], end.split(" ", 1)[1], writer_lines)
 
     def test_with_no_requesting_case_there_is_one_phase(self):
         lines = self.run_fanout("")
-        self.assertIn("TOTAL=6", lines)
+        self.assertIn("TOTAL=8", lines)
         self.assertFalse(any("every other unit is done" in line for line in lines))
-        self.assertEqual(sum(1 for line in lines if line.startswith("END ")), 6)
+        self.assertEqual(sum(1 for line in lines if line.startswith("END ")), 8)
+
+    def test_the_settle_equals_the_safeguards_clock_skew_default(self):
+        """The settle exists so a write in the last seconds of the unit before
+        is outside the next window, whose lower edge is the check's default
+        skew; the two numbers have to agree."""
+        script = SCRIPT.read_text(encoding="utf-8")
+        settle = re.search(r"^readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=(\d+)$", script, re.MULTILINE).group(1)
+        verifiers = (REPO_ROOT / "bench" / "kube_agents_bench" / "verifiers.py").read_text(encoding="utf-8")
+        body = verifiers[verifiers.index("class GitHubWritesVerifier") :]
+        default = re.search(r"max_clock_skew_sec: float = Field\(default=(\d+)\.0", body).group(1)
+        self.assertEqual(settle, default)
+        self.assertIsNotNone(re.search(r"^readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=\d+$", script, re.MULTILINE))
 
 
 class WiringTest(unittest.TestCase):
@@ -319,7 +344,7 @@ class WiringTest(unittest.TestCase):
         self.assertIn("closes none of them", report)
         call = src.index("\nreport_github_leftovers\n")
         # After both phases of the fan-out have been waited for.
-        self.assertLess(src.index('launch_units "${UNIT_QUEUE_WRITERS}"\n  wait\nfi\n'), call)
+        self.assertLess(src.index('launch_units "${UNIT_QUEUE_WRITERS}" 1 "${EVAL_GITHUB_WRITE_SETTLE_SECONDS}"\n  wait\nfi\n'), call)
         self.assertLess(call, src.index("# ─── Per-case verdicts"))
         self.assertLess(src.index("EVAL_RUN_STARTED_AT=\"$(date"), src.index("# 2. Cluster Auth"))
 

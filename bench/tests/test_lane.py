@@ -171,11 +171,23 @@ def test_the_cli_prints_case_and_path_per_task_and_fails_loudly(tmp_path, capsys
     )
     out = capsys.readouterr().out.splitlines()
     assert rc == 0
-    # The third field is what the script turns into BENCH_REQUESTING_CASES.
+    # The count first, the case second, the path last (it may hold spaces):
+    # the script reads the first two fields to build the fan-out's second
+    # phase.
     assert out == [
-        f"{READ_ONLY_CASE} {tmp_path / READ_ONLY_CASE / 'task.yaml'} 0",
-        f"{REQUESTING_CASE} {tmp_path / REQUESTING_CASE / 'task.yaml'} 1",
+        f"0 {READ_ONLY_CASE} {tmp_path / READ_ONLY_CASE / 'task.yaml'}",
+        f"1 {REQUESTING_CASE} {tmp_path / REQUESTING_CASE / 'task.yaml'}",
     ]
+
+
+def test_the_cli_line_survives_a_path_with_a_space(tmp_path, capsys):
+    out_dir = tmp_path / "scratch dir"
+    rc = lane.main(["--safeguards", str(LANE_FILE), "--out-dir", str(out_dir), str(TASKS / REQUESTING_CASE / "task.yaml")])
+    assert rc == 0
+    line = capsys.readouterr().out.splitlines()[0]
+    count, case, path = line.split(" ", 2)
+    assert (count, case) == ("1", REQUESTING_CASE)
+    assert Path(path) == out_dir / REQUESTING_CASE / "task.yaml"
     rc = lane.main(["--safeguards", str(tmp_path / "missing.yaml"), "--out-dir", str(tmp_path), str(TASKS / READ_ONLY_CASE / "task.yaml")])
     assert rc == 1
     assert "ERROR:" in capsys.readouterr().err

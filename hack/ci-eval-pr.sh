@@ -41,6 +41,17 @@ readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
 # task file before devops-bench reads it (bench/kube_agents_bench/lane.py);
 # the files under bench/tasks/ and the api lane are untouched.
 readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE="eval/inject-lane-safeguards.yaml"
+# The fan-out's launch pacing. Every unit is launched this many seconds after
+# the one before, so N units do not open their first model call in the same
+# second (burst 429s at the model quota). A unit of a case that requests a
+# pull request -- the inject lane's second phase -- waits the settle instead:
+# the lane's GitHub-write safeguard opens its window max_clock_skew_sec
+# before the repetition starts (GitHubWritesVerifier in
+# bench/kube_agents_bench/verifiers.py, whose default this equals; a test
+# pins the two), so a write in the last seconds of the unit before must be
+# older than that before the next window can open.
+readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=5
+readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=120
 
 # What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
 # when the run could not be evaluated: an admitted case lost every repetition
@@ -1844,8 +1855,12 @@ fi
 INJECT_LANE_TASKS_DIR=""
 INJECT_LANE_REQUESTING=""
 if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
+  # The deploy's precedence (hack/ci-deploy.sh, section 2b): a developer's
+  # EVAL_GITOPS_REPO is where the agent was told to write, so it is what the
+  # safeguard reads; the project mapping otherwise. Prow refuses the
+  # override at deploy time, so in CI this is the mapping.
   INJECT_LANE_REPO="${EVAL_LEDGER_REPO:-}"
-  if [ -z "${INJECT_LANE_REPO}" ] && [ -n "${EVAL_GITOPS_REPO:-}" ] && [ "${EVAL_GITOPS_REPO}" != "none" ]; then
+  if [ -n "${EVAL_GITOPS_REPO:-}" ] && [ "${EVAL_GITOPS_REPO}" != "none" ]; then
     INJECT_LANE_REPO="${EVAL_GITOPS_REPO}"
   fi
   if [ -z "${INJECT_LANE_REPO}" ]; then
@@ -1871,7 +1886,9 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
     echo "ERROR: could not append the inject lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) to the matrix, or BENCH_GITOPS_REPO=${INJECT_LANE_REPO} is not a repository they can grade (above); the lane would run without a working GitHub-write safeguard, so it does not start." >&2
     exit 1
   fi
-  INJECT_LANE_REQUESTING="$(printf '%s\n' "${INJECT_LANE_COPIES}" | awk '$3 > 0 { printf "%s%s", sep, $1; sep = "," }')"
+  # `<requested> <case> <path>`: the count first and the path last, so a
+  # path with a space (a TMPDIR with one) cannot shift the fields read here.
+  INJECT_LANE_REQUESTING="$(printf '%s\n' "${INJECT_LANE_COPIES}" | awk '$1 > 0 { printf "%s%s", sep, $2; sep = "," }')"
   echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: every task in the matrix carries the lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}; cases that request a pull request, run after every other unit: ${INJECT_LANE_REQUESTING:-none}"
 fi
 
@@ -2748,9 +2765,17 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # repetition of a case that requests nothing never shares the repository with
 # one that writes by design, so a write inside its window is its own or a
 # concurrent sibling's mistake, either of which is the red the safeguard
-# exists for. Requesting cases share the second phase with each other only,
-# each graded on the pull requests its reply names. The cost is one drain of
-# the lanes at the phase boundary; the order inside each phase is unchanged.
+# exists for. The second phase runs one unit at a time, and every unit in it
+# waits EVAL_GITHUB_WRITE_SETTLE_SECONDS before it starts: two requesting
+# cases side by side would red each other's by-design pull requests (each
+# excuses only the ones its own reply names), and the safeguard's window
+# opens that many seconds before the repetition's start, so a write in the
+# last seconds of the unit before -- the same case's previous repetition, or
+# the first phase's last unit -- must be older than that before the next
+# window can open. The cost is one drain of the lanes at the phase boundary
+# and the settle plus the serial run of the requesting units (none on the
+# presubmit tier until a case requests one); the order inside each phase is
+# unchanged.
 unit_phase() { # <task-name> -> 1 for a case that requests a pull request, 0 otherwise
   case ",${INJECT_LANE_REQUESTING:-}," in
     *",$1,"*) echo 1 ;;
@@ -2782,31 +2807,34 @@ UNIT_QUEUE_WRITERS="$(
 UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c . || true)"
 WRITER_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_WRITERS}" | grep -c . || true)"
 
-# One phase's units, launched in queue order at the parallelism cap. The
-# caller `wait`s between phases; UNIT_SEQ carries across them.
-launch_units() { # <queue: "REP COST IDX" lines>
+# One phase's units, launched in queue order at the given parallelism, each
+# after the given pause. The caller `wait`s between phases; UNIT_SEQ carries
+# across them.
+launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before each launch>
+  local queue="$1" parallelism="$2" pause="$3"
   while read -r REP _COST IDX; do
     [ -n "${IDX:-}" ] || continue
-    while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${EVAL_TASK_PARALLELISM}" ]; do
+    while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${parallelism}" ]; do
       sleep 3
     done
+    # Staggered, so N units do not open their first model call in the same
+    # second -- burst 429s at the model quota are the fan-out's failure mode;
+    # in the second phase the pause is the write-settle instead.
+    sleep "${pause}"
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
     run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" &
-    # Staggered, so N units do not open their first model call in the same
-    # second -- burst 429s at the model quota are the fan-out's failure mode.
-    sleep 5
   done <<EOF_UNIT_QUEUE
-$1
+${queue}
 EOF_UNIT_QUEUE
 }
 
 profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
-launch_units "${UNIT_QUEUE}"
+launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING})"
-  launch_units "${UNIT_QUEUE_WRITERS}"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING}), one at a time, each after a ${EVAL_GITHUB_WRITE_SETTLE_SECONDS}s settle"
+  launch_units "${UNIT_QUEUE_WRITERS}" 1 "${EVAL_GITHUB_WRITE_SETTLE_SECONDS}"
   wait
 fi
 

@@ -22,8 +22,9 @@
 # registered case. A `github_writes` leaf PASSES when it finds a write, so it
 # sits under `none`, the same shape as a cluster safeguard that says "this
 # never appeared"; the lane sets its `requested_pull_requests` per case to the
-# number of `pull_request_opened` leaves the case declares, so a case that
-# asks for a pull request is graded on anything beyond it.
+# number of `pull_request_opened` and `pull_request_diff_contains` leaves the
+# case declares (REQUESTING_CHECK_TYPES in bench/kube_agents_bench/lane.py),
+# so a case that asks for a pull request is graded on anything beyond it.
 #
 # How a case that writes by design is kept away from the others. The check
 # dates writes, it cannot sign them, and the fan-out runs cases side by side
@@ -32,10 +33,12 @@
 # phase, after every other unit has finished: a repetition of a case that
 # requests nothing never shares the repository with one that writes by
 # design, and a write inside its window is its own or a concurrent sibling's
-# mistake, either of which is the red the safeguard exists for. Requesting
-# cases share the second phase with each other only, and each is graded on
-# the pull requests its reply names. scripts/test_eval_rosters.py pins the
-# set of requesting cases.
+# mistake, either of which is the red the safeguard exists for. The second
+# phase runs one unit at a time, each after a settle as long as the check's
+# clock-skew tolerance, so two requesting cases never see each other's
+# by-design pull requests and no window reaches back into the unit before;
+# each is graded on the pull requests its own reply names.
+# scripts/test_eval_rosters.py pins the set of requesting cases.
 #
 # WHO APPROVES. The normal approvers, as for inject-lane-exclusions.txt: this
 # file changes what the inject lane grades, not what can red a pull request

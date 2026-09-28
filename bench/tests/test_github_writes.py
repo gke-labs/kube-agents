@@ -477,6 +477,17 @@ def test_the_report_lists_the_runs_writes(env, github, capsys):
     assert "note: branches under platform-agent/ were not observed" in out
 
 
+def test_since_reads_iso_8601_before_an_epoch():
+    """`20260925` is a date to fromisoformat and must not be read as seconds
+    since 1970; a bare epoch still is one, and nonsense is refused."""
+    assert github_writes._parse_since("2026-09-25T17:20:00Z") == RUN_START
+    assert github_writes._parse_since("20260925") == datetime(2026, 9, 25, tzinfo=timezone.utc)
+    assert github_writes._parse_since(str(int(RUN_START.timestamp()))) == RUN_START
+    for bad in ("inf", "not-a-time", "1e400"):
+        with pytest.raises(github_writes.argparse.ArgumentTypeError):
+            github_writes._parse_since(bad)
+
+
 def test_the_report_accepts_an_epoch_and_exits_non_zero_when_it_cannot_read(env, github, capsys, monkeypatch):
     route_listing(github, "pulls-empty.json")
     assert github_writes.main(["--repo", REPO, "--since", str(int(RUN_START.timestamp()))]) == 0
