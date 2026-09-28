@@ -660,6 +660,12 @@ def _unread_reason(err: str) -> Optional[str]:
     return None
 
 
+class Unread(str):
+    """A warning that a read did not happen -- refused, timed out, credential
+    gone -- as opposed to advice about a read that did. --report writes these
+    under `unread`, which is what the pool-state scan's "read in full" asks."""
+
+
 def _record_unreadable(
     err: str,
     absent: str,
@@ -680,7 +686,7 @@ def _record_unreadable(
     if reason is None:
         details.append(absent)
         return False
-    warnings.append(f"{unchecked}: {reason}")
+    warnings.append(Unread(f"{unchecked}: {reason}"))
     return True
 
 
@@ -1555,11 +1561,11 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
                 f"{policy_errors[0]}"
             )
         else:
-            warnings.append(
+            warnings.append(Unread(
                 f"Could not read any IAM policy on {project_id}, so image push rights and "
                 f"{HOST_CLUSTER}'s node pull rights were not checked: "
                 f"{policy_denials[0] if policy_denials else 'no policy readable'}"
-            )
+            ))
     else:
         # A grant found in either policy settles the question; its absence is
         # settled only when BOTH were read. One policy refused and the other
@@ -1575,11 +1581,11 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
         push_ok = bool(build_sas & writers)
         push_checked = push_ok or not policy_denials
         if not push_ok and policy_denials and not policy_errors:
-            warnings.append(
+            warnings.append(Unread(
                 f"No role granting image push to {project_id} was found for the Cloud Build or Compute "
                 f"SA, but one of the two IAM policies could not be read, so push rights were not "
                 f"checked: {policy_denials[0]}"
-            )
+            ))
         elif not push_ok:
             passed = False
             detail = (
@@ -1599,20 +1605,20 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
             # Reporting this as a failure would be the same conflation
             # check_toolchain exists to remove, so it goes to the operator as an
             # item to look at and the run exits 2.
-            warnings.append(
+            warnings.append(Unread(
                 f"Could not determine which account {HOST_CLUSTER}'s nodes run as ({node_err}), "
                 "so their pull rights on the kube-agents repository were not checked"
-            )
+            ))
         else:
             starved = [m for m in node_members if m not in pullers]
             if starved and policy_denials and not policy_errors:
                 # Same asymmetry as push above: a pull grant this run was
                 # refused sight of reads exactly like one that is not there.
-                warnings.append(
+                warnings.append(Unread(
                     f"No role granting image pull on {project_id} was found for {HOST_CLUSTER}'s node "
                     f"account(s) {', '.join(sorted(starved))}, but one of the two IAM policies could not "
                     f"be read, so node pull rights were not checked: {policy_denials[0]}"
-                )
+                ))
             elif starved:
                 passed = False
                 detail = (
@@ -2845,11 +2851,11 @@ def check_token_minter(
     if pinned_version is None:
         if enabled_versions:
             probe_version = sorted(enabled_versions, key=lambda v: int(v) if v.isdigit() else 0)[-1]
-        warnings.append(
+        warnings.append(Unread(
             f"Could not read githubMinter.kms.keyVersion from the chart ({pin_detail}), so the version this "
             f"project's minter will sign with is unconfirmed; probed version {probe_version or 'none'} instead. "
             "Confirm the chart's pin names an ENABLED version before registering."
-        )
+        ))
     elif not version_states:
         pass  # The versions list already failed; a second message restates it.
     elif pinned_version not in version_states:
@@ -3056,6 +3062,7 @@ def report_document(project_id: str, checks: List[CheckResult], now: Optional[da
             "message": check.message,
             "details": list(check.details),
             "warnings": list(check.warnings),
+            "unread": [w for w in check.warnings if isinstance(w, Unread)],
             "findings": findings,
         }
     return {

@@ -148,6 +148,12 @@ class DenialClassifierTest(unittest.TestCase):
             with self.subTest(err=err[:60]):
                 self.assertIsNone(checker._unread_reason(err), err)
 
+    def test_a_refused_read_is_recorded_as_unread(self):
+        details, warnings = [], []
+        checker._record_unreadable("ERROR: PERMISSION_DENIED: denied", "missing", "not checked", details, warnings)
+        self.assertEqual(details, [])
+        self.assertIsInstance(warnings[0], checker.Unread)
+
     def test_a_timeout_does_not_report_the_resource_as_missing(self):
         # A 120s stall on a bucket that exists used to append "Missing Terraform
         # state bucket" and exit 1. A read that did not happen is not evidence.
@@ -3453,6 +3459,14 @@ class ReportDocumentTest(unittest.TestCase):
         statuses = {check_id: record["status"] for check_id, record in doc["checks"].items()}
         self.assertEqual(statuses, {"gke_and_state": "pass", "artifact_registry": "pass", "project_and_apis": "unchecked", "token_minter_kms": "unchecked", "iam": "fail", "codebase_mapping": "fail"})
         self.assertEqual(doc["checks"]["artifact_registry"]["warnings"], ["Could not read the policy"])
+        # Only a refused read is `unread`; advice on a read that happened is not.
+        self.assertEqual(doc["checks"]["artifact_registry"]["unread"], [])
+        advised = self._tagged("token_minter_kms", checker.CheckResult("Minter", True, "Minter provisioned", warnings=["KMS key k has 2 ENABLED versions; disable the others"], read=True))
+        refused = self._tagged("iam", checker.CheckResult("IAM", True, "the binding verified; the roles not checked", warnings=[checker.Unread("Could not read the project IAM policy: 403")], read=True))
+        second = checker.report_document("kube-agents-evals-3", [advised, refused])
+        self.assertEqual(second["checks"]["token_minter_kms"]["unread"], [])
+        self.assertEqual(second["checks"]["iam"]["unread"], ["Could not read the project IAM policy: 403"])
+        self.assertEqual(second["checks"]["iam"]["warnings"], ["Could not read the project IAM policy: 403"])
         self.assertEqual(doc["checks"]["iam"]["findings"], [{"id": "iam/platform-gsa/missing/roles/x", "observed": "x missing", "repair": "gcloud ... x"}])
         self.assertEqual(doc["checks"]["codebase_mapping"]["findings"], [{"id": "codebase_mapping/failed", "observed": "No mapping; add the row", "repair": ""}])
         self.assertEqual(doc["checks"]["gke_and_state"]["name"], "GKE")

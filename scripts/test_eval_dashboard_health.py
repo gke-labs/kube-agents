@@ -2298,7 +2298,7 @@ def pool_scan(drifted=None, previous=None, at=None, projects=30, checked=None, u
             if not readable or check in unread.get(name, []):
                 checks[check] = {"state": "not_checked", "detail": [POOL_BLIND_REASON]}
             elif check in partial.get(name, []):
-                checks[check] = {"state": "healthy", "detail": ["Could not read the project IAM policy"]}
+                checks[check] = {"state": "healthy", "detail": ["Could not read the project IAM policy"], "unread": ["Could not read the project IAM policy"]}
             elif any(FINDING_CHECK[f] == check for f in findings):
                 checks[check] = {"state": "drifted", "detail": [FINDING_DETAIL.format(project=name)]}
             else:

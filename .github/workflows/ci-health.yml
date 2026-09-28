@@ -205,17 +205,19 @@ env:
   # The seeded-fleet scan's knobs (scripts/eval_dashboard/fixture_state.py):
   # projects scanned at once, the ceiling per project for the runner and the
   # state check together (a healthy project takes ~20 s; the ceiling is for
-  # a hung API server), and the ceiling for the whole scan.
-  FIXTURE_STATE_WORKERS: "6"
+  # a hung API server), and the ceiling for the whole scan. The scan ceiling
+  # must cover every wave of the mapped pool at the per-project ceiling
+  # (ceil(35 / 7) = 5 waves, 1500 s, plus a margin; a test pins it against
+  # hack/ci-deploy.sh's mapping), or a pool-wide stall kills the step and
+  # publishes nothing instead of "not checked" entries.
+  FIXTURE_STATE_WORKERS: "7"
   FIXTURE_STATE_PROJECT_TIMEOUT_S: "300"
-  FIXTURE_STATE_TIMEOUT_S: "1500"
-  # The pool-state scan's knobs (scripts/eval_dashboard/pool_state.py). The
-  # scan ceiling is five waves of six projects at the per-project ceiling,
-  # as the fleet scan's is: a stall publishes "not checked" entries instead
-  # of killing the step.
-  POOL_STATE_WORKERS: "6"
+  FIXTURE_STATE_TIMEOUT_S: "1620"
+  # The pool-state scan's knobs (scripts/eval_dashboard/pool_state.py), the
+  # same arithmetic as the fleet scan's.
+  POOL_STATE_WORKERS: "7"
   POOL_STATE_PROJECT_TIMEOUT_S: "300"
-  POOL_STATE_TIMEOUT_S: "1500"
+  POOL_STATE_TIMEOUT_S: "1620"
 
 jobs:
   refresh-and-adjudicate:
@@ -669,7 +671,7 @@ jobs:
     if: github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main' && (github.event.schedule == '0 * * * *' || (github.event_name == 'workflow_dispatch' && inputs.fixture_state_scan))
     runs-on: ubuntu-latest
     # FIXTURE_STATE_TIMEOUT_S plus POOL_STATE_TIMEOUT_S plus setup and the uploads.
-    timeout-minutes: 60
+    timeout-minutes: 70
     # The publisher's grant on the bucket is all this job writes with; it
     # holds no GitHub write at all.
     permissions:

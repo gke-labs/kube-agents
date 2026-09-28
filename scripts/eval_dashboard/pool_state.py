@@ -102,6 +102,10 @@ KEY_CHECKS = "checks"
 KEY_FINDINGS = "findings"
 KEY_CHECK = "check"
 KEY_REPAIR = "repair"
+# A healthy check's refused reads, from the verifier's `unread`: advice on a
+# read that happened stays in `detail` and does not stop the check counting
+# as read in full.
+KEY_UNREAD = "unread"
 
 # Reasons written when a whole project could not be checked.
 REASON_NO_BINARY = "{binary} is not on PATH, so nothing was checked"
@@ -179,6 +183,8 @@ def from_report(report: dict, checks: tuple[str, ...] | list[str]) -> tuple[dict
         else:
             detail = [str(line) for line in record.get("warnings") or []]
         checks_out[check] = {KEY_STATE: state, KEY_DETAIL: detail}
+        if state == CHECK_HEALTHY:
+            checks_out[check][KEY_UNREAD] = [str(line) for line in record.get(KEY_UNREAD) or []]
         if state == CHECK_DRIFTED:
             for finding in record.get("findings") or []:
                 if not isinstance(finding, dict) or not finding.get("id"):
@@ -264,8 +270,9 @@ def drift_map(document: dict | None) -> dict[str, list[str]]:
 
 def _read_checks(entry: dict, whole: bool) -> list[str]:
     """The checks the scan read on one project. `whole`: read in full only.
-    A check is a bundle of reads and passes with a warning when some were
-    refused; a finding in the refused read was not seen."""
+    A check is a bundle of reads and passes when some were refused, listing
+    them under `unread`; a finding in a refused read was not seen. Advice on
+    a read that happened is `detail` and does not count against it."""
     checks = entry.get(KEY_CHECKS)
     if not isinstance(checks, dict):
         return []
@@ -274,7 +281,7 @@ def _read_checks(entry: dict, whole: bool) -> list[str]:
         if not isinstance(verdict, dict):
             continue
         state = verdict.get(KEY_STATE)
-        if state == CHECK_DRIFTED or (state == CHECK_HEALTHY and (not whole or not verdict.get(KEY_DETAIL))):
+        if state == CHECK_DRIFTED or (state == CHECK_HEALTHY and (not whole or not verdict.get(KEY_UNREAD))):
             out.append(check)
     return sorted(out)
 

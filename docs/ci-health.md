@@ -612,7 +612,7 @@ instead. The recovery comments on it as on any other.
 
 **What never fails the bot.** A missing `kubectl` or `gcloud`, a project the
 publisher cannot read, a missing grant, a runner or a state check that hangs
-past its ceiling (300 s per project, 1500 s for the scan): each is "not
+past its ceiling (300 s per project, 1620 s for the scan): each is "not
 checked" with its reason, the scan exits 0 and publishes, and the tick reads
 it as such. Only a repository bug — no mapping in `hack/ci-deploy.sh`, no
 catalog — reds the scan job. `fixture_state.py --projects <id> --no-impersonate`
@@ -681,12 +681,13 @@ and `Tracking #NNN`; one digest line on the latest scan; a `presubmit-gate` issu
 for whoever holds the pool with, per project, what was observed and the exact
 command that repairs it. An open issue whose title names every finding is adopted
 instead (title only: every bot-filed body quotes the evidence, which carries the
-scan's finding lines).
+scan's finding lines), as is the bot's own issue when its title fell back to a
+count, matched on the finding ids its hidden marker carries.
 
 **What never fails the bot.** A missing `gcloud`, a project the bot cannot read, a
 verifier past the per-project ceiling (300 s): "not checked" with the reason, exit
 0, published. Only a repository bug (no mapping, no verifier) reds the step. The
-scan's own ceiling (1500 s, five waves of six projects at the per-project ceiling)
+scan's own ceiling (1620 s: five waves of seven projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
 is a backstop: past it the step is killed and publishes nothing, and the tick
 reports the last document as stale. `pool_state.py --projects <id>` runs the same scan from a
 laptop as whoever is logged in.

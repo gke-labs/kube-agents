@@ -70,7 +70,7 @@ doc = {"schema_version": 1, "project": project, "generated_at": "2026-09-27T20:0
 for check in checks:
     record = entry.get(check) or {"status": "pass"}
     doc["checks"][check] = {"name": check, "status": record.get("status", "pass"), "message": record.get("message", ""),
-                            "details": record.get("details", []), "warnings": record.get("warnings", []), "findings": record.get("findings", [])}
+                            "details": record.get("details", []), "warnings": record.get("warnings", []), "unread": record.get("unread", []), "findings": record.get("findings", [])}
 with open(flag("--report"), "w") as fh:
     json.dump(doc, fh)
 sys.exit(entry.get("exit", 0))
@@ -164,11 +164,19 @@ class OneProject(ScanHarness):
         # A pass with a warning read some of the item: the project was seen
         # (not a blind scan), but a finding in the refused read was not, so the
         # exit may not take the check as proof the finding is gone.
-        partial = {"status": "pass", "message": "the Workload Identity binding verified; the project roles not checked", "warnings": ["Could not read the project IAM policy"], "exit": 2}
+        partial = {"status": "pass", "message": "the Workload Identity binding verified; the project roles not checked", "warnings": ["Could not read the project IAM policy"], "unread": ["Could not read the project IAM policy"], "exit": 2}
         doc = self.scan({PROJECT: report(iam=partial)})
-        self.assertEqual(doc["projects"][PROJECT]["checks"]["iam"], {"state": "healthy", "detail": ["Could not read the project IAM policy"]})
+        self.assertEqual(doc["projects"][PROJECT]["checks"]["iam"], {"state": "healthy", "detail": ["Could not read the project IAM policy"], "unread": ["Could not read the project IAM policy"]})
         self.assertEqual(pool_state.read_map(doc)[PROJECT], sorted(set(CHECKS) - {"iam"}))
         self.assertEqual(pool_state.checked_projects(doc), 1)
+
+    def test_advice_on_a_read_that_happened_still_counts_as_read_in_full(self):
+        # The minter check warns about a second ENABLED key version on a
+        # project it read whole; the exit may still take it as proof.
+        advised = {"status": "pass", "message": "Minter provisioned", "warnings": ["KMS key k has 2 ENABLED versions; disable the others"], "unread": [], "exit": 0}
+        doc = self.scan({PROJECT: report(token_minter_kms=advised)})
+        self.assertEqual(doc["projects"][PROJECT]["checks"]["token_minter_kms"], {"state": "healthy", "detail": ["KMS key k has 2 ENABLED versions; disable the others"], "unread": []})
+        self.assertEqual(pool_state.read_map(doc)[PROJECT], sorted(CHECKS))
 
     def test_a_project_the_bot_cannot_read_at_all_is_unread(self):
         doc = self.scan({PROJECT: report(**{check: unchecked() for check in CHECKS})})
@@ -294,6 +302,21 @@ class Workflow(unittest.TestCase):
         self.assertIn("Fetch the previous pool-state scan", names)
         env = self.doc["env"]
         self.assertTrue(int(env["POOL_STATE_TIMEOUT_S"]) > int(env["POOL_STATE_PROJECT_TIMEOUT_S"]) > 0)
+
+    def test_each_scans_ceiling_covers_every_wave_of_the_mapped_pool(self):
+        # A pool-wide API stall puts every project at the per-project ceiling;
+        # the scan ceiling must outlast ceil(projects / workers) such waves or
+        # the step is killed and publishes nothing. The job's clock covers both.
+        import math
+
+        env = self.doc["env"]
+        mapped = len(pool_state.pool_projects(pool_state.CI_DEPLOY_SCRIPT.read_text()))
+        self.assertGreaterEqual(mapped, 35)
+        for prefix in ("FIXTURE_STATE", "POOL_STATE"):
+            waves = math.ceil(mapped / int(env[f"{prefix}_WORKERS"]))
+            self.assertGreater(int(env[f"{prefix}_TIMEOUT_S"]), waves * int(env[f"{prefix}_PROJECT_TIMEOUT_S"]), prefix)
+        both = int(env["FIXTURE_STATE_TIMEOUT_S"]) + int(env["POOL_STATE_TIMEOUT_S"])
+        self.assertGreater(self.jobs["fixture-state-scan"]["timeout-minutes"] * 60, both + 600, "setup and the uploads need their ten minutes")
         self.assertGreaterEqual(self.jobs["fixture-state-scan"]["timeout-minutes"] * 60, int(env["FIXTURE_STATE_TIMEOUT_S"]) + int(env["POOL_STATE_TIMEOUT_S"]))
 
     def test_the_tick_reads_the_published_scan(self):

@@ -1867,19 +1867,27 @@ class PoolDrift(RunHarness):
         # Four or more ids push the title to its count form, which names no
         # finding; the body's marker is how the bot re-finds it after a GREEN.
         many = [f"iam/pool-state-reader/missing/{role}" for role in ("roles/iam.securityReviewer", "roles/container.clusterViewer", "roles/artifactregistry.reader", "roles/cloudkms.viewer", "roles/storage.bucketViewer")]
-        own = {"number": 1295, "html_url": "https://github.com/gke-labs/kube-agents/issues/1295", "title": "Pool drift: 5 findings on 3 pool projects since Mon 9:00 AM ET", "body": post_health.gate_issue.POOL_DRIFT_MARKER + "\n**Findings**\n" + "\n".join(f"- `{f}`" for f in many)}
+        marker = post_health.gate_issue.POOL_DRIFT_MARKER.format(findings=",".join(many))
+        own = {"number": 1295, "html_url": "https://github.com/gke-labs/kube-agents/issues/1295", "title": "Pool drift: 5 findings on 3 pool projects since Mon 9:00 AM ET", "body": marker + "\n**Findings**\n" + "\n".join(f"- `{f}`" for f in many)}
         gh = FakeGh(open_issues=[own])
         self.tick(pool_drift(findings=tuple(many)), T14, environ=self.environ(), gh=gh)
         self.assertEqual(gh.writes(), [], "adopted, not re-filed")
         self.assertEqual(self.recorded()["issue"]["number"], 1295)
         # The same body without the marker is somebody else's quote of the
         # evidence, and is not adopted.
-        quoted = FakeGh(open_issues=[dict(own, number=1296, body=own["body"].replace(post_health.gate_issue.POOL_DRIFT_MARKER, ""))])
+        quoted = FakeGh(open_issues=[dict(own, number=1296, body=own["body"].replace(marker, ""))])
         self.setUp()
         self.tick(pool_drift(findings=tuple(many)), T14, environ=self.environ(), gh=quoted)
         self.assertEqual([call[:2] for call in quoted.writes()], [("POST", "repos/gke-labs/kube-agents/issues")])
         _, _, body = quoted.calls[-1]
-        self.assertTrue(body["body"].startswith(post_health.gate_issue.POOL_DRIFT_MARKER), "the bot's own body carries the marker")
+        self.assertTrue(body["body"].startswith(marker), "the bot's own body carries the marker with the ids that fired")
+        # An old issue of the bot's whose marker names A, and whose evidence
+        # quotes B (seen once, never fired), is not the tracker for B.
+        old = dict(own, number=1297, body=post_health.gate_issue.POOL_DRIFT_MARKER.format(findings=many[0]) + "\n**Evidence:**\n- " + f"{many[1]} found on 1 pool project(s) (kube-agents-evals-9); not yet repeated or widespread")
+        stale = FakeGh(open_issues=[old])
+        self.setUp()
+        self.tick(pool_drift(findings=(many[1],)), T14, environ=self.environ(), gh=stale)
+        self.assertEqual([call[:2] for call in stale.writes()], [("POST", "repos/gke-labs/kube-agents/issues")])
 
     def test_the_recovery_says_the_pool_had_drifted_and_comments(self):
         self.tick(pool_drift(), T14, environ=self.environ())
