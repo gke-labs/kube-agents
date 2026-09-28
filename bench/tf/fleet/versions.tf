@@ -25,11 +25,14 @@ terraform {
   required_providers {
     google = {
       source  = "hashicorp/google"
-      version = ">= 5.0.0"
+      # Upper bounds because the scheduled reconcile re-resolves providers on
+      # every run (the lock file is not committed): a new major must be adopted
+      # by a person, not applied unattended across the pool.
+      version = ">= 5.0.0, < 9.0.0"
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
-      version = ">= 2.30.0"
+      version = ">= 2.30.0, < 4.0.0"
     }
   }
 }

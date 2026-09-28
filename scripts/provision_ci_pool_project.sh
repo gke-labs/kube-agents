@@ -34,6 +34,10 @@ LEDGER_INSTALLATION_ID="157029058"
 # a Prow periodic on main). Step 4 grants it signer on this project's copy of
 # the App key, which is the whole reach it has here.
 PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+# The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, two
+# Prow periodics on main). The IAM step before 1.3 grants it what re-applying
+# bench/tf/fleet needs on the project; step 2 grants it the state bucket.
+FLEET_RECONCILER_SA="serviceAccount:seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
 PEM_FILE=""
 SKIP_FLEET="false"
 SKIP_HOST_CLUSTER="false"
@@ -315,6 +319,23 @@ for role in \
   done
 done
 
+# compute.viewer: the GKE provider lists each node pool's instance group
+# managers on refresh, which no other role here carries (seen live 2026-09-28).
+echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
+for role in \
+  roles/compute.storageAdmin \
+  roles/compute.viewer \
+  roles/container.admin \
+  roles/iam.serviceAccountAdmin \
+  roles/iam.serviceAccountUser \
+  roles/resourcemanager.projectIamAdmin \
+  roles/serviceusage.serviceUsageConsumer; do
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="${FLEET_RECONCILER_SA}" \
+    --role="${role}" \
+    --quiet >/dev/null
+done
+
 # ─── Artifact Registry Creation & Cleanup Policy ──────────────────────────────
 echo -e "\n==> [Step 1.3] Creating Regional Docker Artifact Registry & Cleanup Policy..."
 if ! gcloud artifacts repositories describe kube-agents --location="${REGION}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
@@ -428,6 +449,14 @@ if ! gcloud storage buckets describe "gs://${STATE_BUCKET}" >/dev/null 2>&1; the
     --uniform-bucket-level-access
   gcloud storage buckets update "gs://${STATE_BUCKET}" --versioning
 fi
+# The reconciler reads and writes the fleet's state here, beside the host
+# cluster's. Whole-bucket objectAdmin rather than a grant conditioned on the
+# seeded-fleet/ prefix: `tofu init` lists the bucket, which such a condition
+# does not cover.
+gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
+  --member="${FLEET_RECONCILER_SA}" \
+  --role=roles/storage.objectAdmin \
+  --quiet >/dev/null
 
 if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then
   echo -e "\n==> [Step 2.1] Provisioning Host GKE Cluster (${HOST_CLUSTER_NAME}) with remote state..."

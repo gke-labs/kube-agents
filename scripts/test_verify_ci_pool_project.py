@@ -2351,10 +2351,12 @@ class IamGrantsTest(unittest.TestCase):
         nightly_roles=None,
         platform_roles=None,
         litellm_roles=None,
+        reconciler_roles=None,
         conditional_roles=(),
         extra_bindings=(),
     ):
-        """The project's own policy: all four identities holding exactly what they should."""
+        """The project's own policy: all five identities holding exactly what they should."""
+        reconciler = checker.FLEET_RECONCILER_ROLES if reconciler_roles is None else reconciler_roles
         prow = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
         nightly = checker.PROW_RUNNER_ROLES if nightly_roles is None else nightly_roles
         platform = checker.PLATFORM_GSA_ROLES if platform_roles is None else platform_roles
@@ -2368,6 +2370,7 @@ class IamGrantsTest(unittest.TestCase):
         ]
         bindings += [{"role": r, "members": [platform_member]} for r in sorted(platform)]
         bindings += [{"role": r, "members": [litellm_member]} for r in sorted(litellm)]
+        bindings += [{"role": r, "members": [checker.FLEET_RECONCILER_MEMBER]} for r in sorted(reconciler)]
         bindings += [
             {
                 "role": r,
@@ -2378,6 +2381,21 @@ class IamGrantsTest(unittest.TestCase):
         ]
         bindings += list(extra_bindings)
         return json.dumps({"bindings": bindings})
+
+    def test_a_missing_reconciler_role_fails_and_is_named(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(reconciler_roles=checker.FLEET_RECONCILER_ROLES - {"roles/container.admin"})),
+                _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        named = [d for d in result.details if "seeded-fleet reconciler" in d]
+        self.assertEqual(len(named), 1, result.details)
+        self.assertIn("roles/container.admin", named[0])
 
     def _both_build_identities(self):
         return self._reader_policy(
@@ -2987,6 +3005,33 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
         documented = self._loop_roles(page, "docs/ci-pool-projects.md")
         self.assertEqual(documented, checker.PROW_RUNNER_ROLES)
         self.assertEqual(self._loop_members(page, "docs/ci-pool-projects.md"), set(self._MEMBER_VARS))
+
+
+class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
+    """FLEET_RECONCILER_ROLES and its member must equal the provisioning loop and the runbook's repair block.
+
+    Same silent drift as the runners': a role dropped from the script leaves a
+    project the verifier passes and the weekly reconcile fails in.
+    """
+
+    _VAR = "FLEET_RECONCILER_SA"
+
+    def _loop_roles(self, text, what):
+        loops = [m for m in re.finditer(r"for role in(.*?);\s*do(.*?)done", text, re.S) if self._VAR in m.group(2)]
+        self.assertEqual(len(loops), 1, f"expected exactly one reconciler grant loop in {what}")
+        return set(re.findall(r"roles/[\w.]+", loops[0].group(1)))
+
+    def test_matches_the_loop_the_provisioning_script_runs(self):
+        script = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text()
+        self.assertEqual(self._loop_roles(script, "provision_ci_pool_project.sh"), checker.FLEET_RECONCILER_ROLES)
+        assigned = re.search(rf'^{self._VAR}="([^"]+)"$', script, re.MULTILINE).group(1)
+        self.assertEqual(assigned, checker.FLEET_RECONCILER_MEMBER)
+        self.assertIn(f'--member="${{{self._VAR}}}" \\\n  --role={checker.FLEET_RECONCILER_BUCKET_ROLE}', script)
+
+    def test_matches_the_repair_block_on_the_prerequisites_page(self):
+        page = (checker._ROOT / "docs" / "ci-pool-projects.md").read_text()
+        self.assertEqual(self._loop_roles(page, "docs/ci-pool-projects.md"), checker.FLEET_RECONCILER_ROLES)
+        self.assertIn(f"--role={checker.FLEET_RECONCILER_BUCKET_ROLE}", page)
 
 
 class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):

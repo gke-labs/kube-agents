@@ -571,7 +571,7 @@ crashloop fixture lagged the node repair by about 40 minutes on one project (it
 needs its first restart before OOMKilled evidence exists), and one hourly scan
 can land inside that window. Three projects at once is the fleet-wide shape
 (#1278 was all 30) and waits for nothing. It is DEGRADED, ranked below every
-run-based condition (nothing in the presubmit runs this check and nothing acts on a
+run-based condition (nothing in the presubmit runs this check or acts on a
 drift, so a drifted fixture reds only the cases that depend on it, on the runs that
 lease those projects; the run-based conditions see that red as it happens, and
 this one names the cause and its owner), and it ends the hour a scan that could
@@ -605,6 +605,12 @@ line "Filed automatically by the smoke health bot; the fleet owner should
 re-apply the stack in the projects named; the bot will not close it." An open
 `presubmit-gate` issue that already names every drifted role is adopted
 instead. The recovery comments on it as on any other.
+The hourly `ci-kube-agents-fleet-reconcile` periodic re-applies the stack in
+the projects the scan names (`docs/ci-pool-projects.md` §6.2), and the
+recovery comment follows the first scan after that apply, one to two hours
+after the report. No recovery by then is a drift the re-apply did not fix, a
+plan it refused, an apply that failed, or a project leased each time the
+hourly ran; the periodic's own log says which.
 
 **What never fails the bot.** A missing `kubectl` or `gcloud`, a project the
 publisher cannot read, a missing grant, a runner or a state check that hangs

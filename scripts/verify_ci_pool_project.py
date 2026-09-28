@@ -306,6 +306,28 @@ PROW_RUNNER_ROLES = {
     "roles/viewer",
 }
 
+# The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py,
+# two Prow periodics on main; docs/ci-pool-projects.md section 6.2). It
+# re-applies bench/tf/fleet under a Boskos lease, so it holds what that apply
+# needs on the project and objectAdmin on the state bucket, nothing else; the
+# presubmit's runner is never granted the job. Kept equal to the grant loop in
+# scripts/provision_ci_pool_project.sh and the repair block in
+# docs/ci-pool-projects.md by scripts/test_verify_ci_pool_project.py.
+FLEET_RECONCILER_MEMBER = "serviceAccount:seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
+FLEET_RECONCILER_ROLES = {
+    "roles/compute.storageAdmin",
+    "roles/compute.viewer",
+    "roles/container.admin",
+    "roles/iam.serviceAccountAdmin",
+    "roles/iam.serviceAccountUser",
+    "roles/resourcemanager.projectIamAdmin",
+    "roles/serviceusage.serviceUsageConsumer",
+}
+# On gs://<project>-tf-state, where the fleet's state lives. Named for the
+# repair text; the bucket's policy is not read here, so the reconcile's own
+# first run is what reports it missing.
+FLEET_RECONCILER_BUCKET_ROLE = "roles/storage.objectAdmin"
+
 # The agent's own identity, checked in both directions -- a missing role fails
 # and so does an extra one, unlike the Prow runner above. That account is
 # infrastructure and a superset is harmless; this one is the subject under test,
@@ -828,7 +850,7 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, both runners' and the platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
+    """Verify Workload Identity, the runners', the reconciler's and the platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
     details = []
     warnings: List[str] = []
     passed = True
@@ -932,6 +954,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             platform_member = PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             litellm_member = LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             runner_held = {member: set() for _, _, member in RUNNERS}
+            reconciler_held = set()
             platform_held = set()
             litellm_held = set()
             public_held = set()
@@ -958,6 +981,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     platform_held.add(b.get("role"))
                 if litellm_member in members:
                     litellm_held.add(b.get("role"))
+                if FLEET_RECONCILER_MEMBER in members:
+                    reconciler_held.add(b.get("role"))
 
             for label, job, member in RUNNERS:
                 missing = PROW_RUNNER_ROLES - runner_held[member]
@@ -969,6 +994,17 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                         f"{job[0].upper()}{job[1:]} authenticates as this account after leasing the "
                         "project, so it will fail on the first gcloud call rather than at registration"
                     )
+
+            reconciler_missing = FLEET_RECONCILER_ROLES - reconciler_held
+            if reconciler_missing:
+                passed = False
+                details.append(
+                    f"The seeded-fleet reconciler ({FLEET_RECONCILER_MEMBER.split(':', 1)[1]}) is missing "
+                    f"{len(reconciler_missing)} role(s) on {project_id}: {', '.join(sorted(reconciler_missing))}. "
+                    "Its scheduled re-apply of bench/tf/fleet fails here, so the fixtures drift unrepaired; "
+                    f"the grant loop is in docs/ci-pool-projects.md section 3, with {FLEET_RECONCILER_BUCKET_ROLE} "
+                    "on the state bucket, which this check does not read"
+                )
 
             platform_missing = PLATFORM_GSA_ROLES - platform_held
             platform_extra = platform_held - PLATFORM_GSA_ROLES
