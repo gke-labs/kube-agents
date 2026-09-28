@@ -353,7 +353,7 @@ inject transport ends as infrastructure. That is the correct reading of that ins
 why a task nobody took is infrastructure rather than a failed case. The bridge accepts a task by
 publishing `submitted` and queues it behind `BRIDGE_CONCURRENCY` workers, default 2, and
 publishes `working` only when a worker spawns the subprocess; the presubmit fans units out at
-`EVAL_TASK_PARALLELISM`, default 4, the nightly at 6. At those defaults two of every four
+`EVAL_TASK_PARALLELISM`, default 4, the nightly at 8. At those defaults two of every four
 concurrent units wait in the bridge's queue carrying an executor event and no subprocess, for as
 long as the two ahead of them run. The eval install's sidecar therefore sets
 `BRIDGE_CONCURRENCY` to at least `EVAL_TASK_PARALLELISM`, declared with the sidecar on the CR,
