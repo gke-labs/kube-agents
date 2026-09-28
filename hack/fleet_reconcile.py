@@ -129,7 +129,10 @@ def tofu_runner(argv, cwd=None, timeout=None, **_):
         proc.send_signal(signal.SIGINT)
         try:
             proc.communicate(timeout=INTERRUPT_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, boskos_pool.Terminated):
+            # The grace ran out, or a second signal cut it short: either way
+            # tofu is killed before the project is released, never left
+            # running detached under a project handed back to the pool.
             proc.kill()
             proc.communicate()
         raise
@@ -159,6 +162,8 @@ def plan_changes(show_json):
         raise ReconcileError("tofu show wrote a plan that is not a JSON object")
     changes = []
     for change in document.get("resource_changes") or []:
+        if not isinstance(change, dict):
+            raise ReconcileError("tofu show wrote a resource change that is not a JSON object")
         actions = list((change.get("change") or {}).get("actions") or [])
         if actions and actions not in IGNORED_ACTIONS:
             changes.append((actions, change.get("address") or "?"))
@@ -316,11 +321,18 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
     return outcomes
 
 
-def reconcile_pool(server, owner, size, runner=tofu_runner, dry_run=False):
-    """Every project Boskos hands out as free, once each."""
+def reconcile_pool(server, owner, size, runner=tofu_runner, dry_run=False, known=None):
+    """Every project Boskos hands out as free, once each. A hand-out outside
+    the pool mapping is released untouched and reported, as the sweep does:
+    a project registered in Boskos before its mapping row, or left registered
+    after it, is not one to apply the fleet in."""
+    known = pool_projects() if known is None else known
     outcomes = {}
 
     def visit(project):
+        if project not in known:
+            outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
+            return
         outcomes[project] = reconcile_project(project, runner=runner, dry_run=dry_run)
 
     _, release_failures = boskos_pool.walk(server, owner, HOLD_STATE, size, visit, heartbeat=True)
@@ -372,8 +384,9 @@ def main(argv=None):
                     projects, args.boskos_server, args.boskos_owner, runner=tofu_runner, dry_run=args.dry_run
                 )
             else:
+                known = pool_projects()
                 outcomes = reconcile_pool(
-                    args.boskos_server, args.boskos_owner, pool_size(), runner=tofu_runner, dry_run=args.dry_run
+                    args.boskos_server, args.boskos_owner, len(known), runner=tofu_runner, dry_run=args.dry_run, known=known
                 )
         failing = report(outcomes)
         if failing:

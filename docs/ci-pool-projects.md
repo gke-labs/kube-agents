@@ -123,7 +123,7 @@ KUBE_AGENTS_STATE_PREFIX="full-install/platform-agent-host" \
 
   `scripts/provision_ci_pool_project.sh` makes these grants for any project it onboards; the block above is for repairing one provisioned before it did — before #966 for the Prow runner's, before #1491 for the nightly's, which is every project onboarded up to 2026-09-16. Every command in it is idempotent, so running it against a project that already holds part of the set changes only what is missing. The list is what `kube-agents-evals` holds, kept as measured rather than trimmed so a new project matches one a presubmit has passed on. It is not minimal — `container.admin` subsumes `container.developer`, `viewer` subsumes `logging.viewer` and `cloudbuild.builds.viewer`. No Artifact Registry role is in it: `hack/ci-deploy.sh` builds and pushes through `gcloud builds submit`, so Cloud Build holds the registry credentials and neither runner touches the registry itself.
 
-- **The seeded-fleet reconciler's access to the project.** `hack/fleet_reconcile.py` (section 6.2) re-applies the fleet stack here as `seeded-fleet-reconciler@kube-agents-prow` (`FLEET_RECONCILER_SA` in the provisioning script, `FLEET_RECONCILER_MEMBER` in the verifier): the roles the apply needs on the project, and `roles/storage.objectAdmin` on the state bucket. `scripts/provision_ci_pool_project.sh` grants them to a new project; for one registered before it did, by hand:
+- **The seeded-fleet reconciler's access to the project.** `hack/fleet_reconcile.py` (section 6.2) re-applies the fleet stack here as `seeded-fleet-reconciler@kube-agents-prow` (`FLEET_RECONCILER_SA` in the provisioning script, `FLEET_RECONCILER_MEMBER` in the verifier): the roles the apply needs on the project, list on the state bucket, and object admin under its `seeded-fleet/` prefix only, since the host cluster's state shares the bucket and carries the install's secrets. `scripts/provision_ci_pool_project.sh` grants them to a new project; for one registered before it did, by hand:
 
   ```bash
   FLEET_RECONCILER_SA="$(sed -n 's/^FLEET_RECONCILER_SA="\(.*\)"$/\1/p' scripts/provision_ci_pool_project.sh)"
@@ -134,10 +134,14 @@ KUBE_AGENTS_STATE_PREFIX="full-install/platform-agent-host" \
       --member="${FLEET_RECONCILER_SA}" --role="${role}" --quiet >/dev/null
   done
   gcloud storage buckets add-iam-policy-binding "gs://${PROJECT_ID}-tf-state" \
-    --member="${FLEET_RECONCILER_SA}" --role=roles/storage.objectAdmin --quiet >/dev/null
+    --member="${FLEET_RECONCILER_SA}" --role=roles/storage.legacyBucketReader --quiet >/dev/null
+  gcloud storage buckets add-iam-policy-binding "gs://${PROJECT_ID}-tf-state" \
+    --member="${FLEET_RECONCILER_SA}" --role=roles/storage.objectAdmin \
+    --condition="expression=resource.name.startsWith(\"projects/_/buckets/${PROJECT_ID}-tf-state/objects/seeded-fleet/\"),title=seeded-fleet-state,description=the seeded fleet state prefix only" \
+    --quiet >/dev/null
   ```
 
-  Section 7 fails a project missing any of the project roles; the bucket grant is not checked, and the reconcile's first run there reports it as an `init` failure. The presubmit's runner is not granted the job: a presubmit runs the pull request's code.
+  Section 7 fails a project missing any of the project roles; the two bucket grants are not checked, and the reconcile's first run there reports either as an `init` failure. The presubmit's runner is not granted the job: a presubmit runs the pull request's code.
 
 - **The platform agent's project roles, checked in both directions.** The agent under test authenticates as `kubeagents-platform-gsa@${PROJECT_ID}`, so this is the one set on this page where an _extra_ role fails the project as well as a missing one. The read-only roles come from `local.read_only_roles` in [`terraform/examples/full-install`](../terraform/examples/full-install/README.md), which is what the install passes to the IAM module — the module's own `project_roles` default is never read on that path. The verifier hardcodes the list as `PLATFORM_GSA_ROLES` so it can run without a Terraform toolchain, and a unit test asserts both the composition and the module default match it, so narrowing either fails in CI rather than failing every project weeks later.
 

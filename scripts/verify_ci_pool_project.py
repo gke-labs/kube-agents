@@ -309,7 +309,9 @@ PROW_RUNNER_ROLES = {
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py,
 # two Prow periodics on main; docs/ci-pool-projects.md section 6.2). It
 # re-applies bench/tf/fleet under a Boskos lease, so it holds what that apply
-# needs on the project and objectAdmin on the state bucket, nothing else; the
+# needs on the project, list on the state bucket and objectAdmin under its
+# seeded-fleet/ prefix, nothing else -- the host cluster's state shares that
+# bucket and carries the install's secrets, so the reconciler must not read it; the
 # presubmit's runner is never granted the job. Kept equal to the grant loop in
 # scripts/provision_ci_pool_project.sh and the repair block in
 # docs/ci-pool-projects.md by scripts/test_verify_ci_pool_project.py.
@@ -323,10 +325,14 @@ FLEET_RECONCILER_ROLES = {
     "roles/resourcemanager.projectIamAdmin",
     "roles/serviceusage.serviceUsageConsumer",
 }
-# On gs://<project>-tf-state, where the fleet's state lives. Named for the
-# repair text; the bucket's policy is not read here, so the reconcile's own
-# first run is what reports it missing.
+# On gs://<project>-tf-state, where the fleet's state lives beside the host
+# cluster's: list on the bucket (`tofu init` lists it, which a grant conditioned
+# on the object name does not cover) and objectAdmin conditioned to the fleet's
+# prefix. Named for the repair text; the bucket's policy is not read here, so
+# the reconcile's own first run is what reports either missing.
+FLEET_RECONCILER_BUCKET_LIST_ROLE = "roles/storage.legacyBucketReader"
 FLEET_RECONCILER_BUCKET_ROLE = "roles/storage.objectAdmin"
+FLEET_RECONCILER_STATE_PREFIX = "seeded-fleet/"
 
 # The agent's own identity, checked in both directions -- a missing role fails
 # and so does an extra one, unlike the Prow runner above. That account is
@@ -942,6 +948,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             err,
             f"Failed reading the IAM policy for {project_id}: {err.strip()[:160]}",
             f"Could not read the project IAM policy on {project_id}, so both runners' twelve roles, "
+            "the seeded-fleet reconciler's roles, "
             "the platform agent GSA's read-only set and any public binding were not checked",
             details,
             warnings,
@@ -1002,8 +1009,9 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     f"The seeded-fleet reconciler ({FLEET_RECONCILER_MEMBER.split(':', 1)[1]}) is missing "
                     f"{len(reconciler_missing)} role(s) on {project_id}: {', '.join(sorted(reconciler_missing))}. "
                     "Its scheduled re-apply of bench/tf/fleet fails here, so the fixtures drift unrepaired; "
-                    f"the grant loop is in docs/ci-pool-projects.md section 3, with {FLEET_RECONCILER_BUCKET_ROLE} "
-                    "on the state bucket, which this check does not read"
+                    f"the grant loop is in docs/ci-pool-projects.md section 3, with {FLEET_RECONCILER_BUCKET_LIST_ROLE} "
+                    f"on the state bucket and {FLEET_RECONCILER_BUCKET_ROLE} under its {FLEET_RECONCILER_STATE_PREFIX} "
+                    "prefix, which this check does not read"
                 )
 
             platform_missing = PLATFORM_GSA_ROLES - platform_held

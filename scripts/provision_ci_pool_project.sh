@@ -450,12 +450,17 @@ if ! gcloud storage buckets describe "gs://${STATE_BUCKET}" >/dev/null 2>&1; the
   gcloud storage buckets update "gs://${STATE_BUCKET}" --versioning
 fi
 # The reconciler reads and writes the fleet's state here, beside the host
-# cluster's. Whole-bucket objectAdmin rather than a grant conditioned on the
-# seeded-fleet/ prefix: `tofu init` lists the bucket, which such a condition
-# does not cover.
+# cluster's, which carries the install's secrets and is not its to read: list
+# on the bucket (`tofu init` lists it, which a grant conditioned on the object
+# name does not cover) and objectAdmin under the seeded-fleet/ prefix only.
+gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
+  --member="${FLEET_RECONCILER_SA}" \
+  --role=roles/storage.legacyBucketReader \
+  --quiet >/dev/null
 gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
   --member="${FLEET_RECONCILER_SA}" \
   --role=roles/storage.objectAdmin \
+  --condition="expression=resource.name.startsWith(\"projects/_/buckets/${STATE_BUCKET}/objects/seeded-fleet/\"),title=seeded-fleet-state,description=the seeded fleet state prefix only" \
   --quiet >/dev/null
 
 if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then

@@ -178,7 +178,7 @@ class PlanInspectionTest(unittest.TestCase):
         self.assertNotIn("apply", tofu.verbs())
 
     def test_a_show_that_is_json_but_not_an_object_is_that_projects_failure(self):
-        for body in ("[]", "null"):
+        for body in ("[]", "null", '{"resource_changes": [null]}', '{"resource_changes": {"a": {}}}'):
             tofu = _Tofu({P7: body})
             outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
             self.assertEqual(outcome, reconcile.OUTCOME_FAILED, body)
@@ -334,10 +334,22 @@ class LeaseTest(unittest.TestCase):
         boskos = _Boskos(free=[P7, P8])
         tofu = _Tofu({P7: UPDATE_ONLY, P8: CREATE_AND_UPDATE})
         with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
-            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, 2, runner=tofu)
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, 2, runner=tofu, known=KNOWN)
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_APPLIED, P8: reconcile.OUTCOME_APPLIED})
         self.assertEqual(sorted(boskos.released), [P7, P8])
         self.assertEqual(tofu.verbs().count("apply"), 2)
+
+    def test_the_pool_walk_leaves_a_hand_out_outside_the_mapping_untouched(self):
+        # Registered in Boskos but not mapped: released, reported, no tofu.
+        stray = "kube-agents-evals-99"
+        boskos = _Boskos(free=[stray, P7])
+        tofu = _Tofu({P7: UPDATE_ONLY})
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, 2, runner=tofu, known=KNOWN)
+        self.assertEqual(outcomes[stray], (reconcile.OUTCOME_FAILED, reconcile.REASON_UNMAPPED))
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertEqual(sorted(boskos.released), [P7, stray])
+        self.assertNotIn(stray, " ".join(" ".join(c) for c in tofu.calls))
 
 
 class MainTest(unittest.TestCase):
@@ -428,18 +440,45 @@ class TofuRunnerTest(unittest.TestCase):
     """The real runner: the ceiling interrupts tofu rather than leaving it, and a tofu that ignores the interrupt is killed."""
 
     def test_the_ceiling_interrupts_the_child_and_raises(self):
+        # The child installs the default handler itself, so the test does
+        # not depend on the disposition it inherited from the runner.
+        script = "import signal, time; signal.signal(signal.SIGINT, signal.default_int_handler); time.sleep(30)"
         started = time.monotonic()
         with self.assertRaises(subprocess.TimeoutExpired):
-            reconcile.tofu_runner([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.3)
-        self.assertLess(time.monotonic() - started, 5)
+            reconcile.tofu_runner([sys.executable, "-c", script], timeout=1.0)
+        self.assertLess(time.monotonic() - started, 6)
 
     def test_a_child_that_ignores_the_interrupt_is_killed_after_the_grace(self):
+        # Two seconds to install SIG_IGN before the ceiling, and a grace the
+        # elapsed time must exceed: the kill arm, not the interrupt arm.
         script = "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(30)"
         started = time.monotonic()
-        with mock.patch.object(reconcile, "INTERRUPT_GRACE_SECONDS", 0.3):
+        with mock.patch.object(reconcile, "INTERRUPT_GRACE_SECONDS", 1.0):
             with self.assertRaises(subprocess.TimeoutExpired):
-                reconcile.tofu_runner([sys.executable, "-c", script], timeout=0.3)
-        self.assertLess(time.monotonic() - started, 5)
+                reconcile.tofu_runner([sys.executable, "-c", script], timeout=2.0)
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 3.0, "the grace was waited out before the kill")
+        self.assertLess(elapsed, 8)
+
+    def test_a_second_termination_during_the_grace_kills_the_child(self):
+        # A second Ctrl-C must not leave tofu running detached while the
+        # project goes back to the pool.
+        script = "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(30)"
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        first = threading.Timer(1.5, os.kill, args=(os.getpid(), signal.SIGINT))
+        second = threading.Timer(2.5, os.kill, args=(os.getpid(), signal.SIGINT))
+        started = time.monotonic()
+        try:
+            first.start()
+            second.start()
+            with mock.patch.object(reconcile, "INTERRUPT_GRACE_SECONDS", 20):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.tofu_runner([sys.executable, "-c", script], timeout=30)
+        finally:
+            first.cancel()
+            second.cancel()
+            signal.signal(signal.SIGINT, previous)
+        self.assertLess(time.monotonic() - started, 8, "killed on the second signal, not after the 20 s grace")
 
     def test_a_termination_signal_reaches_the_child_before_it_propagates(self):
         # Prow's entrypoint sends SIGINT to this process; with the script's
