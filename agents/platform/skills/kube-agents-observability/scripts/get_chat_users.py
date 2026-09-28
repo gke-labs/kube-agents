@@ -85,8 +85,11 @@ def read_entries(project_id: str, hours: int) -> list:
             f"command ({SHIM_TRUNCATION_NOTE}); the {LOG_LIMIT} newest entries do not fit, "
             f"so narrow the window with --hours"
         )
+    # `--format=json` answers an empty window with the literal `[]`, so an
+    # empty body is one that went missing between gcloud and here, and it
+    # fails below as the non-JSON it is rather than being read as no users.
     try:
-        entries = json.loads(completed.stdout or "[]")
+        entries = json.loads(completed.stdout)
     except ValueError as exc:
         raise RuntimeError(
             f"gcloud logging read did not return JSON: {exc}; stderr: {completed.stderr.strip()}"

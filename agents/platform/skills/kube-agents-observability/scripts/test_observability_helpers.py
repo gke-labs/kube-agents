@@ -707,6 +707,18 @@ class GetChatUsersTest(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual({}, json.loads(out)["active_chat_users"])
 
+    def test_an_empty_body_on_exit_zero_is_a_failed_read_not_an_empty_count(self):
+        # gcloud's `--format=json` prints the literal `[]` for a window with
+        # no entries, so nothing on stdout is a body that went missing, and
+        # counting it as no users prints a quiet day's output with exit 0.
+        empty = self.completed(returncode=0, stdout="", stderr="WARNING: something gcloud said")
+        with patch.object(get_chat_users.subprocess, "run", return_value=empty):
+            code, out, err = run(get_chat_users.main, ["--project-id", PROJECT])
+        self.assertEqual(get_chat_users.EXIT_READ_FAILED, code)
+        self.assertEqual("", out)
+        self.assertIn("did not return JSON", err)
+        self.assertIn("something gcloud said", err)
+
 
 class NoTokenInAnyHelperTest(unittest.TestCase):
     """The property the port exists for, held on the source: nothing here fetches or holds a token."""
