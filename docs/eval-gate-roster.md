@@ -252,8 +252,8 @@ only objectives are of that kind is reported `NOT_GRADED_ON_TRANSPORT` rather th
 evaluated, outside the pass rate, never weather
 ([`docs/designs/eval-scorer.md`](designs/eval-scorer.md), "The inject lane sets aside what its
 transport cannot show"). No roster edit is involved. The router-scope `tool_called` half of the
-rule retires on a record whose door showed the trace (the transport's `a2a.activity` marker),
-whether or not the run made a call; the worker half stays until a later change rebuilds the
+rule retires on a record whose door showed the whole trace (the transport's `a2a.activity` marker,
+reporting no loss), whether or not the run made a call; the worker half stays until a later change rebuilds the
 delegation wait for this path and takes those entries out of `worker_blind_checks`.
 
 A premise the transport removes is the lane's exclusion list,

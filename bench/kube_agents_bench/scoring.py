@@ -193,25 +193,31 @@ A2A_STATE_WORKING = "working"
 #: marker: the transport writes it whenever the door's probe carried the
 #: task's tool-call trace at all (``activity`` on the probe body, even
 #: ``[]``), with ``args.calls`` and ``args.dropped``, and behind it one
-#: entry per call in the api transport's shape. A trajectory that carries
-#: the task marker, no activity marker, and nothing outside the envelope is
-#: a run on the inject transport whose door could not show tool calls.
-#: That, and only that, is the condition under which a router-scope
-#: ``tool_called`` is reported as not applicable (:func:`_inject_lane_view`):
-#: a record carrying the activity marker grades it in full, whether the
+#: entry per call in the api transport's shape. A router-scope
+#: ``tool_called`` is set aside as not applicable (:func:`_inject_lane_view`)
+#: on an inject record that cannot vouch for the delegating turn's calls
+#: (:func:`_inject_blind`): one with no activity marker (the door could
+#: not show tool calls), or one whose marker reports a LOSS -- calls the
+#: door's cap or the executor's budget dropped, parts that could not be
+#: mapped, or a call whose input the executor truncated (which for hermes's
+#: ``tool_call`` wrapper takes the nested tool names with it). A record
+#: whose marker reports no loss grades the check in full, whether the
 #: persona made a call or not, because the rule retires on the door's
 #: capability rather than on that run's luck -- a check that reads a call
-#: the persona never made fails there as it would on the api transport. (A
-#: tool entry with no marker, which no shipped transport writes, retires it
-#: too, as before.) A check that reads the delegated workers is set aside
-#: on every inject record, marker or not: the trace carries no card ids
-#: and no worker's entries (``cases.py``, ``worker_blind_checks``).
-#: Duplicated rather than imported, like the status entry;
+#: the persona never made fails there as it would on the api transport,
+#: while a check graded over a trace that lost calls could fail a call
+#: that happened, and a ``none``-wrapped safeguard could pass over one. A
+#: check that reads the delegated workers is set aside on every inject
+#: record, marker or not: the trace carries no card ids and no worker's
+#: entries (``cases.py``, ``worker_blind_checks``). The names are
+#: duplicated rather than imported, like the status entry, and so are the
+#: marker's three loss arguments (``inject_transport.ACTIVITY_LOSS_ARGS``);
 #: ``test_scoring.py`` asserts each agrees with the transport's.
 INJECT_TASK_EVENT = "inject.task"
 INJECT_POST_EVENT = "inject.post"
 INJECT_EDIT_EVENT = "inject.edit"
 INJECT_ACTIVITY_EVENT = "a2a.activity"
+INJECT_ACTIVITY_LOSS_ARGS = ("dropped", "malformed", "input_truncated")
 INJECT_ENVELOPE_EVENTS = frozenset(
     {
         INJECT_TASK_EVENT,
@@ -687,27 +693,51 @@ def _inject_record(trajectory: list[Any]) -> bool:
     )
 
 
-def _inject_blind(trajectory: list[Any]) -> bool:
-    """Whether the trajectory is the inject transport's envelope from a door
-    that could not show tool calls.
+def _inject_trace_vouched(trajectory: list[Any]) -> bool:
+    """Whether the record's activity marker vouches for the delegating turn's
+    calls: present, and reporting no loss.
 
-    True when it carries the transport's task marker, no activity marker,
-    and every entry is one of the envelope names: a run on the inject
-    transport whose door carried no tool-call trace. False for an
-    api-transport record (no task marker), for an empty trajectory (the
-    never-ran shapes keep their own classification), for an inject record
-    carrying the activity marker (the door showed the trace, with or without
-    a call in it, and every check grades as on the api transport), and for
-    one that carries a tool entry by any other route.
+    The transport writes the marker whenever the door carried the trace, and
+    puts on it what the trace does not carry -- calls the door's cap or the
+    executor's budget dropped, parts it could not map, calls whose input the
+    executor truncated (:data:`INJECT_ACTIVITY_LOSS_ARGS`). A marker with any
+    of those non-zero says a call may have happened that the trajectory does
+    not show, and a check graded over it could fail a call that was made or
+    pass a safeguard over one; such a record is treated as blind, like one
+    with no marker. A marker whose args are not a mapping vouches for
+    nothing.
     """
-    if not trajectory:
+    for entry in trajectory:
+        if not isinstance(entry, dict) or entry.get("name") != INJECT_ACTIVITY_EVENT:
+            continue
+        args = entry.get("args")
+        if not isinstance(args, dict):
+            return False
+        return all(not args.get(loss) for loss in INJECT_ACTIVITY_LOSS_ARGS)
+    return False
+
+
+def _inject_blind(trajectory: list[Any]) -> bool:
+    """Whether the trajectory is the inject transport's and cannot vouch for
+    the delegating turn's tool calls.
+
+    True for an inject record (the transport's task marker is present) with
+    no activity marker and nothing outside the envelope -- the door could
+    not show tool calls -- or with a marker that reports a loss
+    (:func:`_inject_trace_vouched`). False for an api-transport record (no
+    task marker), for an empty trajectory (the never-ran shapes keep their
+    own classification), for an inject record whose marker reports no
+    loss, on which every check grades as on the api transport with or
+    without a call behind the marker, and for one that carries a tool entry
+    with no marker at all (no shipped transport writes that; it grades as
+    it did before the marker existed).
+    """
+    if not _inject_record(trajectory):
         return False
     names = [entry.get("name") if isinstance(entry, dict) else None for entry in trajectory]
-    return (
-        INJECT_TASK_EVENT in names
-        and INJECT_ACTIVITY_EVENT not in names
-        and all(name in INJECT_ENVELOPE_EVENTS for name in names)
-    )
+    if INJECT_ACTIVITY_EVENT not in names:
+        return all(name in INJECT_ENVELOPE_EVENTS for name in names)
+    return not _inject_trace_vouched(trajectory)
 
 
 @dataclass(frozen=True)

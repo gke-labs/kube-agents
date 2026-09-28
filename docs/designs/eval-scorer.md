@@ -139,8 +139,9 @@ door showed no trace: the first matrix run through the door (#2007, 2026-09-25) 
 `agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
 re-reads such a record before the rungs. The condition is the record's, not the environment's: the
 trajectory carries the transport's task marker (`_inject_record()` in `scoring.py`), and for the
-router-scope `tool_called` also no `a2a.activity` marker and nothing outside the envelope
-(`_inject_blind()`); `test_scoring.py` holds the literals equal to the transport's. When it holds,
+router-scope `tool_called` also either no `a2a.activity` marker and nothing outside the envelope,
+or a marker that reports a loss (`_inject_blind()`); `test_scoring.py` holds the literals equal to
+the transport's. When it holds,
 every report entry the task declares whose check is made of `tool_called`, `worker_commands` or
 `worker_agents` leaves and nothing else (`CaseSpec.transport_blind_checks`, by entry name, split
 into `trace_blind_checks` and `worker_blind_checks` by which condition applies; a compound mixing
@@ -158,12 +159,17 @@ least one such is **not graded on transport** (the `Rung` member and the build-l
 record is a crashed scoring pass on any transport and is not re-read; a record on the api
 transport never carries the marker, and `test_scoring.py` grades every captured api record, under
 every mutation the suite uses, identically with the rule present and removed; and an inject record
-that carries the transport's `a2a.activity` marker grades its router-scope `tool_called` checks in
-full, with or without a call behind the marker. The transport writes that marker whenever the
-door's probe carried the task's tool-call trace at all (the relay never posts `activity` artifacts
-to a conversation, so the probe is where the harness reads them), so that half of the rule retires
-on the door's capability to show calls rather than on a call having happened: a `tool_called`
-check on a persona that made no call fails there as it would on the api transport. The worker
+whose `a2a.activity` marker reports no loss grades its router-scope `tool_called` checks in full,
+with or without a call behind the marker. The transport writes that marker whenever the door's
+probe carried the task's tool-call trace at all (the relay never posts `activity` artifacts to a
+conversation, so the probe is where the harness reads them), so that half of the rule retires on
+the door's capability to show calls rather than on a call having happened: a `tool_called` check
+on a persona that made no call fails there as it would on the api transport. A marker whose
+`dropped`, `malformed` or `input_truncated` argument is non-zero says the trajectory does not
+carry every call the persona made (the door's cap or the executor's budget dropped some, a part
+could not be mapped, or a wrapper's input was truncated and its nested names with it), and such a
+record is treated as blind like one with no marker (`_inject_trace_vouched()`), since grading over
+it could fail a call that happened or pass a safeguard over one. The worker
 half is keyed on the transport alone (`_inject_record()`) and stays until a later change rebuilds
 the delegation wait for this path and takes those entries out of `worker_blind_checks`. A record
 from a door that cannot show the trace carries no marker and is graded as before. A case whose

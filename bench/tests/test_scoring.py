@@ -1767,6 +1767,7 @@ def test_the_scorer_and_the_inject_transport_agree_on_the_envelope():
 
     assert INJECT_TASK_EVENT == inject_transport.EVENT_ENTRY_TASK
     assert scoring.INJECT_ACTIVITY_EVENT == inject_transport.EVENT_ENTRY_ACTIVITY
+    assert scoring.INJECT_ACTIVITY_LOSS_ARGS == inject_transport.ACTIVITY_LOSS_ARGS
     assert INJECT_ENVELOPE_EVENTS == {
         inject_transport.EVENT_ENTRY_TASK,
         inject_transport.EVENT_ENTRY_POST,
@@ -2129,6 +2130,39 @@ def test_the_activity_marker_retires_the_lane_rule_on_the_doors_capability(
         assert NOT_APPLICABLE_PHRASE not in rep.reason
         verdict = grade_case(noop_spec, [inject_run(mutate=mutate) for _ in range(3)], admitted=True)
         assert verdict.rung is Rung.COLLAPSE and verdict.blocking
+
+
+@pytest.mark.parametrize(
+    "loss",
+    [{"dropped": 3}, {"malformed": 1}, {"input_truncated": 1}, {"dropped": 1, "input_truncated": 2}],
+)
+def test_a_marker_that_reports_a_loss_does_not_retire_the_rule(noop_spec, inject_run, loss):
+    """A marker with a non-zero loss argument says the trajectory does not
+    carry every call the persona made: the door's cap or the executor's
+    budget dropped some, a part could not be mapped, or a wrapper's input
+    was truncated and its nested names with it. Grading a ``tool_called``
+    over that could fail a call that happened, or pass a ``none``-wrapped
+    safeguard over one, so the record is treated as blind, exactly like one
+    with no marker -- even when the trace it does carry holds calls."""
+
+    def lossy_marker(rec):
+        rec["trajectory"].append({**ACTIVITY_MARKER, "args": {"calls": 1, "dropped": 0, **loss}})
+        rec["trajectory"].append(
+            {"name": "kanban_list", "args": {}, "result": None, "status": "completed"}
+        )
+
+    record = load_run(inject_run(mutate=lossy_marker))
+    assert record is not None
+    assert scoring._inject_blind(record.trajectory)
+    rep = classify_rep(noop_spec, inject_run(mutate=lossy_marker), 1)
+    assert rep.outcome == "pass" and rep.correctness == 1.0
+    assert rep.not_applicable_checks == [BLIND_CHECK]
+    # And a marker whose args are not a mapping vouches for nothing.
+    def broken_marker(rec):
+        rec["trajectory"].append({**ACTIVITY_MARKER, "args": None})
+
+    broken = load_run(inject_run(mutate=broken_marker))
+    assert broken is not None and scoring._inject_blind(broken.trajectory)
 
 
 def test_a_worker_check_stays_set_aside_when_the_door_shows_the_trace(write_task, inject_run):

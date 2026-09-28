@@ -52,6 +52,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import math
 import time
 import urllib.error
 import urllib.parse
@@ -230,16 +231,24 @@ ACTIVITY_STATUS_TRUNCATED = "truncated"
 # an entry is still a call to its tool, and is written as one; but a
 # ``tool_call`` wrapper over the cap has lost its ``input.calls[]``, so the
 # verifier cannot unwrap the tools it invoked, and a ``tool_called`` naming
-# one of them fails on this transport where the api path passes. The
-# marker counts these so that failure is not read as the persona's.
+# one of them would fail on this transport where the api path passes. The
+# marker counts these, and the scorer reads the count as a loss (below).
 ACTIVITY_INPUT_TRUNCATED_KEY = "truncated"
 # The marker's argument names: the two it always carries, and two counts
 # present only when non-zero -- parts that could not be mapped, and calls
-# whose input the executor replaced with its truncation stand-in.
+# whose input the executor replaced with its truncation stand-in. The last
+# three are the LOSS arguments: each says the trajectory does not carry
+# every call the persona made, so a ``tool_called`` graded over it could
+# miss a call that happened. The scorer treats a marker with any of them
+# non-zero as no marker for that purpose -- the check is set aside as not
+# applicable rather than graded over a trace that lost calls -- and
+# duplicates the three names (``scoring.INJECT_ACTIVITY_LOSS_ARGS``);
+# ``test_scoring.py`` asserts the two agree.
 ACTIVITY_CALLS_ARG = "calls"
 ACTIVITY_DROPPED_ARG = "dropped"
 ACTIVITY_MALFORMED_ARG = "malformed"
 ACTIVITY_INPUT_TRUNCATED_ARG = "input_truncated"
+ACTIVITY_LOSS_ARGS = (ACTIVITY_DROPPED_ARG, ACTIVITY_MALFORMED_ARG, ACTIVITY_INPUT_TRUNCATED_ARG)
 
 STATE_SUBMITTED = "submitted"
 STATE_WORKING = "working"
@@ -993,6 +1002,14 @@ class Probe:
             value = raw.get(name)
             return float(value) if isinstance(value, (int, float)) else 0.0
 
+        def _count(name: str) -> int:
+            # A count the body spelled as NaN, Infinity or 1e999 (all of
+            # which ``json.loads`` admits) reads as zero rather than raising
+            # ``int()``'s ValueError out of the poll loop, which would leave
+            # the task running with nothing to cancel it.
+            value = _num(name)
+            return int(value) if math.isfinite(value) and value > 0 else 0
+
         last_post = raw.get("lastPost")
         raw_activity = raw.get(PROBE_ACTIVITY_KEY)
         activity: list[dict[str, Any]] | None = None
@@ -1016,7 +1033,7 @@ class Probe:
             result=str(raw.get("result") or ""),
             reason=str(raw.get("reason") or ""),
             activity=activity,
-            activity_dropped=int(_num(PROBE_ACTIVITY_DROPPED_KEY)),
+            activity_dropped=_count(PROBE_ACTIVITY_DROPPED_KEY),
             activity_malformed=malformed,
             progress=str(raw.get(PROBE_PROGRESS_KEY) or ""),
             last_post=str(last_post.get("text") or "") if isinstance(last_post, dict) else "",

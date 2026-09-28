@@ -327,10 +327,12 @@ this path it has data only once the case runner's delegation wait is rebuilt for
 signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
 as a failure meanwhile: on this transport's record the scorer sets every `worker_commands` and
 `worker_agents` entry aside as not applicable, and every `tool_called` entry too when the record
-carries no `a2a.activity` marker, and grades the checks that remain; a case with no other
-objective is not graded on the lane rather than collapsed. The marker retires the set-aside for a
-`tool_called` in its default `router` scope — it states the door's capability to show calls,
-whether or not the run made one — and nothing else: a `tool_called` in the `workers` or `all`
+carries no `a2a.activity` marker or a marker that reports a loss (calls the door's cap or the
+executor's budget dropped, or an input truncated with its nested names), and grades the checks
+that remain; a case with no other objective is not graded on the lane rather than collapsed. A
+marker reporting no loss retires the set-aside for a `tool_called` in its default `router` scope
+— it states the door's capability to show calls, whether or not the run made one — and nothing
+else: a `tool_called` in the `workers` or `all`
 scope reads the workers' tagged entries, which the trace does not carry, and stays set aside with
 the worker checks
 ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport

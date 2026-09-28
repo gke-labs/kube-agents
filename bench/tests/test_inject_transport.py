@@ -2320,6 +2320,23 @@ def test_the_probe_reads_the_trace_off_the_body() -> None:
     assert "tool call" not in absent.describe()
 
 
+@pytest.mark.parametrize("spelled", ["NaN", "Infinity", "-Infinity", "1e999", "-4", "2.9"])
+def test_a_dropped_count_that_is_not_a_finite_count_reads_as_zero_or_its_floor(
+    spelled: str,
+) -> None:
+    """``json.loads`` admits NaN, Infinity and 1e999; ``int()`` of any of
+    them raises, and a raise here would leave the poll loop with the task
+    still running and nothing to cancel it. The count reads as zero (or its
+    integer floor for an ordinary positive number) and the poll goes on."""
+    body = json.loads(
+        '{"probe": {"active": false, "taskId": "task-1", "activity": [], '
+        f'"activityDropped": {spelled}}}}}'
+    )
+    probe = inject.Probe.from_body(body)
+    assert probe is not None and probe.activity == []
+    assert probe.activity_dropped == (2 if spelled == "2.9" else 0)
+
+
 def test_the_trace_is_taken_only_from_a_read_about_this_task() -> None:
     """A probe describing another task -- the record's active task on a
     read that named none, or a later turn's -- lends this fold nothing."""
