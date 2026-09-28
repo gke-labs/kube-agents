@@ -38,6 +38,7 @@ DESIGN_ALLOWLIST = [
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/cloudtrace.user",
     "roles/iam.securityReviewer",
 ]
 # Kept in the host project on purpose (§6): actAs, the MCP server's check, quota.
