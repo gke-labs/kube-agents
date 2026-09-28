@@ -86,16 +86,14 @@ verification_spec:
       # apply. Additionally, the platform worker must not execute `kubectl` in
       # its terminal to perform inline workload diagnostics — tenant workload
       # debugging must be delegated to the cluster's Cluster Agent. The kubectl
-      # pattern matches bare invocations, env assignments (KUBECONFIG=... kubectl),
-      # loops (do kubectl), subshells ($(kubectl)), backticks (`kubectl`),
-      # wrappers (timeout 60 kubectl), paths (/usr/bin/kubectl), quoted forms, and
-      # variable assignments/indirection (K=kubectl; $K ...), while anchoring to
-      # command/assignment positions to permit harmless documentation or grep reads.
+      # pattern matches bare invocations, command wrappers (sudo, env, timeout,
+      # sh/bash -c, eval, xargs, time, watch), control flow (if/while), subshells,
+      # backticks, paths, quoted forms, and variable assignments/indirection.
       type: worker_commands
       forbidden_patterns:
         - 'cluster_agent_profile\.py'
         - 'kanban_notify_propagate\.py'
-        - '(?:(?:^|[;&|(`]|\$\()\s*(?:(?:\S+=\S+|timeout(?:\s+\S+)+|do|then|exec)\s+)*(?:\S*/)?["'']?kubectl["'']?\b|(?:^|[;&|(`\s]|\$\()(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=(?:\S*/)?["'']?kubectl["'']?\b)'
+        - '(?:^|[\s;&|(`"''/=])kubectl\b'
   - name: rca-names-the-oom
     role: objective
     mode: assert

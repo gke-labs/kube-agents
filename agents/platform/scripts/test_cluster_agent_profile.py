@@ -755,6 +755,29 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         self.assertTrue(self.skill_path.is_file(), f"missing {self.skill_path}")
         self.content = self.skill_path.read_text(encoding="utf-8")
 
+    def test_delegation_step_1_mandates_fleet_enumeration_before_asking(self):
+        # Must isolate Step 1 of delegation to ensure the unlocated branch is
+        # strictly present in the delegation procedure, rather than relying
+        # only on whole-document presence assertions.
+        step_1_start = self.content.find("1. **Resolve the cluster's profile name**")
+        self.assertNotEqual(step_1_start, -1, "missing Step 1 in SKILL.md")
+        step_2_start = self.content.find("2. **Create the card**", step_1_start)
+        self.assertNotEqual(step_2_start, -1, "missing Step 2 in SKILL.md")
+        step_1 = self.content[step_1_start:step_2_start]
+
+        self.assertIn("If the request does NOT name a cluster", step_1)
+        self.assertIn("Do not ask the user which cluster before searching", step_1)
+        self.assertIn("list_cluster_profiles()", step_1)
+        self.assertIn("cluster_agent_profile.py list", step_1)
+        self.assertIn("Fan out read-only existence checks", step_1)
+        self.assertIn("with no `parents`", step_1)
+        self.assertIn("sleep 60", step_1)
+        self.assertIn("Do NOT classify cards in `ready` as timed out", step_1)
+        self.assertIn("never complete while probe cards remain queued in `ready`", step_1)
+        self.assertIn("spec.harness.tuning.maxInProgress", step_1)
+        self.assertIn("Never resolve silently", step_1)
+        self.assertRegex(step_1, r"[Aa]sk only after (looking|checking|searching)")
+
     def test_delegation_handles_unnamed_cluster_via_fleet_enumeration(self):
         # The procedure must explicitly guide resolution when the cluster name is omitted (#953).
         self.assertIn("list_cluster_profiles()", self.content)
@@ -824,6 +847,11 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
 
         matching_commands = [
             "kubectl get pods",
+            "sudo kubectl get pods",
+            "if kubectl -n seeded-debug get deploy payments-api; then true; fi",
+            "while ! kubectl get pods; do sleep 1; done",
+            "! kubectl get pods",
+            "env KUBECONFIG=/tmp/k kubectl get pods",
             "KUBECONFIG=/tmp/k kubectl -n seeded-debug get pods",
             "for c in a b; do kubectl --context $c get pods; done",
             "$(kubectl config current-context)",
@@ -833,6 +861,14 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "./kubectl get pods",
             '"kubectl" get pods',
             "'kubectl' get pods",
+            "sh -c 'kubectl get pods'",
+            'bash -c "kubectl get pods"',
+            'eval "kubectl get pods"',
+            "xargs kubectl",
+            "time kubectl get pods",
+            "watch kubectl get pods",
+            "$(which kubectl) get pods",
+            "which kubectl",
             "echo test && kubectl get pods",
             "echo test; kubectl get pods",
             "echo test | kubectl get pods",
@@ -853,11 +889,8 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "cat README.md",
             "git status",
             "echo 'kube-agents repo'",
-            "grep -n kubectl /opt/data/skills/cluster-agent-lifecycle/SKILL.md",
-            "which kubectl",
-            "printf 'delegated; no kubectl run here' > notes.md",
-            "cat notes/kubectl.md",
-            "cat /opt/data/skills/gke-basics/references/cli-reference.md | grep -i kubectl",
+            "curl http://localhost:8080",
+            "hermes profile list",
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
