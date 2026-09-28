@@ -164,6 +164,14 @@ type Bridge struct {
 	// subject, handle by default; a field so a test can hold one delivery
 	// back and pin which path wrote a record.
 	deliver func(ctx context.Context, env *lib.Envelope)
+
+	// replaySlots paces the look-ahead's fallback replay: one slot per
+	// worker, held for the ephemeral's inactive threshold, so at most
+	// Concurrency of those replays begin in any five-second window and the
+	// look-ahead never holds more than twice that many consumer slots,
+	// whatever shape the backlog has. The operator's TASKS reserve counts
+	// exactly that (a2aTasksReplayBridgeLookAhead).
+	replaySlots chan struct{}
 }
 
 // New connects and sweeps but does not consume yet; Run does.
@@ -176,8 +184,9 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 			AgentType: "hermes-bridge",
 			Profile:   cfg.Profile,
 		},
-		tasks: make(map[string]*taskRun),
-		queue: make(chan *taskRun, taskQueueCapacity),
+		tasks:       make(map[string]*taskRun),
+		queue:       make(chan *taskRun, taskQueueCapacity),
+		replaySlots: make(chan struct{}, cfg.Concurrency),
 	}
 	b.lookAhead = b.cancelInStream
 	b.deliver = b.handle
@@ -519,6 +528,13 @@ func (r *taskRun) pending() bool {
 // that finds a backlog of abandoned submissions from turning each into a
 // consumer slot at bus speed, which on a 64-consumer TASKS would have failed
 // the look-ahead and spawned the stale prompts the read exists to refuse.
+// The replay that remains is paced through replaySlots, so a backlog of the
+// shape that needs it, a follow-up behind a cancel or a newest message the
+// screen drops, is refused at Concurrency tasks per threshold window rather
+// than at bus speed: the look-ahead's consumer cost has the ceiling the
+// operator's reserve gives it, whatever the backlog looks like. The wait
+// for a slot is bounded by the threshold itself and is not charged to
+// either read's own bound.
 //
 // Newer than the submission means after it in stream order. The submission
 // is normally in the replay, since the durable delivered it moments ago;
@@ -527,9 +543,9 @@ func (r *taskRun) pending() bool {
 // replay already drops an envelope whose `to` disagrees with the subject's
 // addressee, the same screen the durable applies before handle sees one.
 func (b *Bridge) cancelInStream(ctx context.Context, run *taskRun) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, lookAheadTimeout)
-	defer cancel()
-	last, err := b.c.LastEnvelope(ctx, lib.TaskInSubject(b.cfg.Profile, run.origin.TaskID))
+	getCtx, cancelGet := context.WithTimeout(ctx, lookAheadTimeout)
+	last, err := b.c.LastEnvelope(getCtx, lib.TaskInSubject(b.cfg.Profile, run.origin.TaskID))
+	cancelGet()
 	if err != nil {
 		return false, err
 	}
@@ -539,7 +555,12 @@ func (b *Bridge) cancelInStream(ctx context.Context, run *taskRun) (bool, error)
 	case last != nil && last.EnvelopeID == run.origin.EnvelopeID:
 		return false, nil
 	}
-	envs, err := b.c.TaskInReplay(ctx, b.cfg.Profile, run.origin.TaskID)
+	if err := b.takeReplaySlot(ctx); err != nil {
+		return false, err
+	}
+	replayCtx, cancelReplay := context.WithTimeout(ctx, lookAheadTimeout)
+	defer cancelReplay()
+	envs, err := b.c.TaskInReplay(replayCtx, b.cfg.Profile, run.origin.TaskID)
 	if err != nil {
 		return false, err
 	}
@@ -556,6 +577,21 @@ func (b *Bridge) cancelInStream(ctx context.Context, run *taskRun) (bool, error)
 		}
 	}
 	return false, nil
+}
+
+// takeReplaySlot admits one fallback replay, waiting when Concurrency of them
+// began inside the last threshold window. The slot comes back when that
+// window has passed, which is when the replay's ephemeral is reaped, so the
+// slots in hand are the consumers the look-ahead can be holding. A canceled
+// context is the only other way out of the wait.
+func (b *Bridge) takeReplaySlot(ctx context.Context) error {
+	select {
+	case b.replaySlots <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, func() { <-b.replaySlots })
+	return nil
 }
 
 func (b *Bridge) runTask(ctx context.Context, run *taskRun) {

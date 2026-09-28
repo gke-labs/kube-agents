@@ -484,8 +484,11 @@ const (
 	// source like the others, 2 in flight and 4 after the tail factor. At
 	// most, because the worker answers from the in subject's newest message
 	// by direct get first and replays only when that message is neither the
-	// submission nor a cancel, so a bind over a backlog of abandoned
-	// submissions holds no slot per task; the row is the ceiling. The
+	// submission nor a cancel, and the replay that remains is paced by the
+	// bridge itself (replaySlots in a2a/hermes-bridge/bridge.go: at most
+	// Concurrency fallback replays begin in any five-second window), so the
+	// row is a bound the bridge enforces whatever shape a backlog has, not
+	// a rate it usually stays under. The
 	// row was out of this table while the call was still gke-labs#2010's
 	// proposal, because sizing for a caller no render could reach took the
 	// provision gate's first refused maxSessions on an existing 64-wide
@@ -563,7 +566,8 @@ const (
 	a2aTasksReplayAsk  = 2
 	a2aTasksReplayAsks = a2aTasksReplayAsk * a2aBridgeDefaultConcurrency
 	// a2aTasksReplayBridgeLookAhead is the bridge's pre-spawn look-ahead:
-	// lib.TaskInReplay at most once per spawn, from each worker.
+	// lib.TaskInReplay at most once per dequeue from each worker, and at most
+	// Concurrency of them in any five-second window, which the bridge paces.
 	a2aTasksReplayBridgeLookAhead = a2aBridgeDefaultConcurrency
 	// a2aTasksReplayTailFactor is the slots one trigger-paced source holds:
 	// the replay running and the one before it, still inside its five-second

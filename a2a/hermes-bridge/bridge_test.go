@@ -897,6 +897,101 @@ echo never`, markers)), fanOut)
 	}
 }
 
+// A backlog whose newest in message answers nothing, here a write no envelope
+// parser accepts behind each cancel, reaches the fallback replay on every
+// task, and the replay is paced: at most Concurrency of them begin in any
+// five-second window, so the look-ahead holds at most twice that many
+// consumer slots however long the backlog is. Every task is still refused
+// without a spawn; it just takes the windows it takes. Unpaced, twelve such
+// tasks opened twelve ephemerals inside a tenth of a second.
+//
+// The durable's delivery of the cancels is held until the workers have
+// refused everything, as in the fresh-bind test: delivered, a cancel
+// finalizes the pending run on handleCancel's queued path before the
+// worker's read returns, and nothing would reach the replay this test is
+// about. The submissions go on the stream first, so the durable accepts all
+// of them before it meets the first held cancel.
+func TestLookAhead_FallbackReplayIsPacedToTheReserve(t *testing.T) {
+	_, url := startServer(t)
+	c := gatewayClient(t, url)
+	js := testJetStream(t, url)
+	markers := t.TempDir()
+	const tasks, workers = 12, 4
+	const slotCeiling = 2 * workers // in flight and the tail, the reserve's row
+
+	var origins []*lib.Envelope
+	for i := 0; i < tasks; i++ {
+		origins = append(origins, submit(t, c, fmt.Sprintf("task-fallback-%02d", i), "the stale prompt"))
+	}
+	for _, o := range origins {
+		publishCancel(t, c, o)
+		if _, err := js.Publish(testCtx(t), lib.TaskInSubject("platform", o.TaskID), []byte("not an envelope")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	release := make(chan struct{})
+	var released atomic.Bool
+	releaseCancels := func() {
+		if released.CompareAndSwap(false, true) {
+			close(release)
+		}
+	}
+	t.Cleanup(releaseCancels)
+	startBridgeWith(t, url, script(t, fmt.Sprintf(`touch %s/$1
+echo never`, markers)), workers, func(b *Bridge) {
+		realDeliver := b.deliver
+		b.deliver = func(ctx context.Context, env *lib.Envelope) {
+			if env.Kind == lib.KindCancel {
+				<-release
+			}
+			realDeliver(ctx, env)
+		}
+	})
+
+	// Sample the consumer count while the backlog drains; the durable is
+	// one, and every fallback replay is one more for five seconds.
+	peak := 0
+	waitFor(t, 60*time.Second, "every task to be refused through the paced replay", func() bool {
+		if n := streamConsumers(t, js); n > peak {
+			peak = n
+		}
+		for _, o := range origins {
+			if !lib.IsFinalStatus(lastOnSubject(t, js, lib.TaskEventsSubject("platform", o.TaskID))) {
+				return false
+			}
+		}
+		return true
+	})
+	for _, o := range origins {
+		var s lib.StatusUpdate
+		if err := json.Unmarshal(lastOnSubject(t, js, lib.TaskEventsSubject("platform", o.TaskID)).Payload, &s); err != nil {
+			t.Fatal(err)
+		}
+		if s.Status.State != lib.StateCanceled || s.Status.Message == nil ||
+			!strings.Contains(s.Status.Message.Parts[0].Text, "canceled-before-start") {
+			t.Fatalf("%s ended %s (%v), want canceled-before-start", o.TaskID, s.Status.State, s.Status.Message)
+		}
+	}
+	if entries, err := os.ReadDir(markers); err != nil || len(entries) != 0 {
+		t.Fatalf("%d stale prompts spawned (%v)", len(entries), err)
+	}
+	if peak > 1+slotCeiling {
+		t.Fatalf("TASKS peaked at %d consumers, want at most the durable plus %d: the fallback replay is not paced to the reserve", peak, slotCeiling)
+	}
+	// Now the durable reads the cancels: each finds a final task from its
+	// newest event and adds nothing.
+	releaseCancels()
+	waitFor(t, 20*time.Second, "durable to consume the held cancels", func() bool {
+		info := bridgeDurableInfo(t, url)
+		return info.NumPending == 0 && info.NumAckPending == 0
+	})
+	for _, o := range origins {
+		if n := len(replayEvents(t, url, o.TaskID)); n != 2 {
+			t.Fatalf("%s has %d events, want submitted and the terminal", o.TaskID, n)
+		}
+	}
+}
+
 // cancelInStream's rule: a cancel counts when it is on the task's in
 // subject after the submission; a cancel before the submission, or a
 // follow-up, does not; an empty subject is "no" rather than an error.
@@ -904,7 +999,7 @@ func TestCancelInStream_Cases(t *testing.T) {
 	_, url := startServer(t)
 	c := gatewayClient(t, url)
 	ctx, cancel := context.WithCancel(context.Background())
-	b, err := New(ctx, Config{NATSURL: url, Command: []string{"true"}})
+	b, err := New(ctx, Config{NATSURL: url, Command: []string{"true"}, Concurrency: 8})
 	if err != nil {
 		t.Fatal(err)
 	}
