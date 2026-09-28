@@ -376,13 +376,15 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(len(set(keys)), 2)
 
     def test_step_2_leaves_out_what_is_not_a_cluster_agent(self):
-        # `default` and `platform` share the directory; stamped here so that only the
-        # reserved-name rule can be what drops them. An unstamped profile has no
-        # cluster to key its card by, and the reconcile skips it for the same reason.
+        # `default` and `platform` share the directory; stamped and scaffolded here so
+        # that only the reserved-name rule can be what drops them. An unstamped profile
+        # has no cluster to key its card by, and the reconcile skips it for the same reason.
         for reserved, cluster in (("default", "a"), ("platform", "b")):
             home = self.d / "profiles" / reserved
             home.mkdir(parents=True)
             cluster_agent_profile._inject_cluster_identity(home, "p", cluster, "l")
+            for marker in (profile_scaffold.PROFILE_MARKER, *SCAFFOLD_ARTIFACTS):
+                (home / marker).write_text("")
         unstamped = self.d / "profiles" / "cluster-p-unstamped-l"
         unstamped.mkdir()
         for marker in (profile_scaffold.PROFILE_MARKER, *SCAFFOLD_ARTIFACTS):
