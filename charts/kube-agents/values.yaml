@@ -615,9 +615,11 @@ platformAgent:
       userProfileEnabled: null # CRD default: false
     # Out-of-band change detection. The drift-detector reads GKE
     # admin-activity audit records from a Pub/Sub subscription and reports the
-    # ones a person made outside git, so it needs that subscription to exist:
-    # apply terraform/modules/drift-pubsub against this project before
-    # enabling it. Left off, the whole block is omitted and the detector is
+    # ones a person made outside git, so it needs that subscription to exist.
+    # terraform/examples/full-install creates it with enable_drift_pubsub =
+    # true, which defaults to false; an install that renders this chart without
+    # the composition applies terraform/modules/drift-pubsub against this
+    # project itself. Left off, the whole block is omitted and the detector is
     # shipped in the image without being started.
     driftDetector:
       enabled: null # CRD default: false
