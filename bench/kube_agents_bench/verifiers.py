@@ -1643,6 +1643,10 @@ _NO_DIFF_PHRASES_REASON = (
     "pull_request_diff_contains asserts nothing: set required_phrases or "
     "any_of_phrases (forbidden_phrases alone cannot say a proposal was made)"
 )
+_BLANK_DIFF_PHRASE_REASON = (
+    "pull_request_diff_contains has a blank phrase: an empty string is in every diff, "
+    "so it asserts nothing"
+)
 _NO_DIFF_TOKEN_REASON = (
     "no GitHub read credential in the environment: set one of "
     f"{', '.join(LEDGER_TOKEN_ENV_VARS)} to a token with pull_requests: read on "
@@ -1652,17 +1656,19 @@ _NO_DIFF_TOKEN_REASON = (
 # hunk text alone, from the `@@` header on, so there is no `+++ b/file` line
 # to tell apart.
 _DIFF_ADDED_PREFIX = "+"
-# Where the run learns the repository it writes to (owner/name), when it is
-# told: hack/ci-eval-pr.sh exports it on the inject lane from the project
-# mapping. Set, it binds the candidate pull request to that repository; unset,
-# the `owner` pin is the only repository bind.
+# Where a run that knows the repository it writes to (owner/name) says so;
+# the inject lane's own GitHub-write safeguard (#2079) is what exports it.
+# Set, it binds the candidate pull request to that repository; unset, the
+# `owner` pin is the only repository bind.
 _GITOPS_REPO_ENV_VAR = "BENCH_GITOPS_REPO"
-# The prefix every branch the agent pushes carries: AGENT_BRANCH_PREFIX in
-# agents/platform/scripts/forge.py, pinned by a test. With the head in the
-# repository itself it is the agent's own pull request, as the pool sweep
-# decides ownership; a human's pull request in the same repository is not a
-# proposal the agent made.
+# The ownership test the pool sweep applies (is_agent_pull_request in
+# hack/ci_sweep_agent_pulls.py, from forge.py): the head branch carries the
+# agent's prefix (AGENT_BRANCH_PREFIX in agents/platform/scripts/forge.py,
+# pinned by a test), the head is in the repository itself, and the author is
+# a GitHub App -- `user.type` is what the API says without knowing which App,
+# and a human with push access naming a branch under the prefix is not one.
 _AGENT_BRANCH_PREFIX = "platform-agent/"
+_APP_USER_TYPE = "Bot"
 
 
 @VERIFIERS.register("pull_request_diff_contains")
@@ -1734,6 +1740,13 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
     def _asserts_something(self) -> PullRequestDiffContainsVerifier:
         if not self.required_phrases and not self.any_of_phrases:
             raise ValueError(_NO_DIFF_PHRASES_REASON)
+        # A blank phrase is in every text there has ever been, so a list of
+        # blanks asserts nothing while looking populated; the case linter
+        # refuses the shape for a task file, and this refuses it for an
+        # inline spec or a hand-built verifier.
+        phrases = (*self.required_phrases, *self.any_of_phrases, *self.forbidden_phrases)
+        if any(not p.strip() for p in phrases):
+            raise ValueError(_BLANK_DIFF_PHRASE_REASON)
         return self
 
     def _diff(
@@ -1772,11 +1785,17 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
         head = payload.get("head") or {}
         head_ref = str(head.get("ref") or "")
         head_repo = str((head.get("repo") or {}).get("full_name") or "")
+        author = payload.get("user") or {}
         if not head_ref.startswith(_AGENT_BRANCH_PREFIX) or head_repo.lower() != f"{owner}/{repo}".lower():
             return None, None, [
                 f"{slug}: its head {head_repo}:{head_ref} is not an agent branch "
                 f"({_AGENT_BRANCH_PREFIX}* in the repository itself), so it is not a pull "
                 "request the agent opened"
+            ]
+        if str(author.get("type") or "") != _APP_USER_TYPE:
+            return None, None, [
+                f"{slug}: opened by {author.get('login') or 'an unknown user'}, not by a GitHub "
+                "App, so it is not a pull request the agent opened"
             ]
         chunks: list[str] = []
         notes: list[str] = []
@@ -1880,7 +1899,10 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                 unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
                 continue
             if diff is None:
-                (unresolved if unevaluable else rejected).extend([unevaluable] if unevaluable else notes)
+                if unevaluable:
+                    unresolved.append("; ".join([unevaluable, *notes]))
+                else:
+                    rejected.extend(notes)
                 continue
             haystack = _normalize(diff)
             missing = [p for p in self.required_phrases if _normalize(p) not in haystack]
@@ -1894,6 +1916,10 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                     parts.append(f"none of the alternative phrasings in its diff: {self.any_of_phrases}")
                 if present_forbidden:
                     parts.append(f"forbidden phrases in its diff: {present_forbidden}")
+                # The notes ride along: a manifest in a file whose patch
+                # GitHub withheld reads as absent, and the note is the only
+                # thing that says the diff was never read.
+                parts.extend(notes)
                 rejected.append(f"{slug}: " + "; ".join(parts))
                 continue
             return done(

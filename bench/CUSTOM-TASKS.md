@@ -574,9 +574,11 @@ cost is stated rather than hidden: a reply that only quotes an earlier lease's o
 keep that cost to exactly that shape: the pull request must be open (the skill's "already exists"
 path matches open ones only, so a merged or closed one in a reply is a leftover quoted, not a
 proposal made, and a merged manifest anywhere in the organisation is not a standing pass); its
-head must be an agent branch (`platform-agent/*`) in the repository itself, as the pool sweep
-decides ownership; and when the run exports `BENCH_GITOPS_REPO`, which the inject lane does from
-the project mapping, the pull request must be in that repository. It reads
+head must be an agent branch (`platform-agent/*`) in the repository itself and its author a
+GitHub App, the three checks the pool sweep's `is_agent_pull_request` applies, so a human's pull
+request under the prefix is not the agent's; and when the run sets `BENCH_GITOPS_REPO` (the
+inject lane's own GitHub-write safeguard is what exports it) the pull request must be in that
+repository. It reads
 `BENCH_GITHUB_TOKEN` as the two checks above do, needs `pull_requests: read` on both endpoints,
 and errors only on a fault of ours (a 401, a denial, an unexpected status, an API it could not
 reach) and only when no other URL in the reply passes; a reply naming no pull request fails before

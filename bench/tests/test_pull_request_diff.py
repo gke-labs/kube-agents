@@ -290,6 +290,46 @@ def test_a_human_pull_request_or_a_fork_is_not_the_agents_proposal(token, github
     assert check().verify(5.0).status == "fail"
 
 
+def test_a_human_on_an_agent_named_branch_is_not_the_agents_proposal(token, github):
+    """The sweep's third ownership check: anyone with push access can name a
+    branch under the prefix, so the author has to be a GitHub App."""
+    stash()
+    pull = fixture("pull-39.json")
+    pull["user"] = {"login": "someone", "type": "User"}
+    github.routes[f"{API}/pulls/39"] = (200, pull)
+    res = check().verify(5.0)
+    assert res.status == "fail"
+    assert "opened by someone, not by a GitHub App" in res.reason
+    assert not [c for c in github.calls if "/files" in c]
+
+
+def test_a_blank_phrase_is_refused_at_load():
+    for kw in ({"required_phrases": [""]}, {"required_phrases": ["x", " "]}, {"any_of_phrases": [""]}, {"required_phrases": ["x"], "forbidden_phrases": [""]}):
+        with pytest.raises(ValidationError, match="blank phrase"):
+            PullRequestDiffContainsVerifier(type="pull_request_diff_contains", **kw)
+
+
+def test_a_withheld_patch_is_named_on_the_fail_path_too(token, github):
+    stash()
+    github.routes[f"{API}/pulls/39"] = (200, fixture("pull-39.json"))
+    github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (
+        200,
+        [{"filename": "seeded-reliability/checkout-gateway-pdb.yaml", "status": "added"}],
+    )
+    res = check().verify(5.0)
+    assert res.status == "fail"
+    assert "required phrases absent from its diff" in res.reason
+    assert "checkout-gateway-pdb.yaml: no patch served (binary or too large)" in res.reason
+    # And on the error path, when a later page fails after a note was taken.
+    page = fixture("pull-39-files.json") * 100
+    page[0] = {"filename": "big.yaml", "status": "added"}
+    github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (200, page)
+    github.routes[f"{API}/pulls/39/files?per_page=100&page=2"] = (500, {})
+    res = check().verify(5.0)
+    assert res.status == "error"
+    assert "big.yaml: no patch served" in res.reason
+
+
 def test_the_branch_prefix_is_forge_pys():
     forge = (REPO_ROOT / "agents" / "platform" / "scripts" / "forge.py").read_text()
     assert f'AGENT_BRANCH_PREFIX = "{verifiers._AGENT_BRANCH_PREFIX}"' in forge
