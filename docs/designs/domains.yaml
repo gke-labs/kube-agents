@@ -110,8 +110,8 @@ allowlist:
   # cited (12/12 on the four graded nights 2026-09-16 to 09-20) was graded
   # by report_contains, which #1780 (merged 2026-09-21) replaced with
   # pull_request_opened, and no graded run of the case under the new check
-  # existed. Since 2026-09-28 pdb-remediation-pr is seated held out in
-  # hack/eval/presubmit-cases.txt (#2016 step 2, the documented exception to
+  # existed. pdb-remediation-pr is seated held out (seat opened 2026-09-28)
+  # in hack/eval/presubmit-cases.txt (#2016 step 2, the documented exception to
   # the blocking-only rule): it runs on every pull request, cannot red one
   # on a graded failure, and covers nothing here. Delete this entry in the
   # pull request that adds its roster line (#2016 step 4, after three clean

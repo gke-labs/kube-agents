@@ -1971,7 +1971,7 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # of the thirteen-case matrix measure it, and until they have, this is the
 # projection. No Prow deadline change.
 #
-# 2026-09-28, the same day: pdb-remediation-pr is seated held out beside it
+# pdb-remediation-pr, seat opened 2026-09-28, is seated held out beside it
 # (#2016 step 2): FOURTEEN tasks, 42 units, against the same 360m deadline.
 # What arrived is three units of ~15-25min each (420-1153s on the four
 # graded nights of 09-16 to 09-20, 980-1929s in its 2026-09-14 presubmit
@@ -2256,7 +2256,7 @@ unit_cost_hint() {
     # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
     # before that, priced at the 700 it carried there.
     rca-remediation-pr) echo 700 ;;
-    # Presubmit since 2026-09-28, held out (#2016 step 2); nightly 2026-09-15
+    # Presubmit held out, seat opened 2026-09-28 (#2016 step 2); nightly 2026-09-15
     # to then. The 2026-09-22 promotion (#1023) was withdrawn before merge:
     # its record was graded by the check #1780 replaced. Measured 980-1929s
     # across build 2099539376672346112's three repetitions (267-559s in

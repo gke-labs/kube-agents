@@ -57,8 +57,8 @@
 # Neither of the remediation domain's two writers holds a ROSTER seat --
 # rca-remediation-pr was demoted 2026-09-02 (#1189), and the 2026-09-22
 # promotion of pdb-remediation-pr was withdrawn before merge because its
-# record was graded by the check #1780 replaced; it is seated held out
-# below since 2026-09-28 (#2016) -- so remediation sits on the
+# record was graded by the check #1780 replaced; its held-out seat
+# below opened 2026-09-28 (#2016) -- so remediation sits on the
 # docs/designs/domains.yaml allowlist beside fleet-audits until a roster
 # line lands. The 2026-08-26
 # smoke run (build 2092638061140643840, kube-agents-evals-3) measured what
@@ -180,23 +180,34 @@
 # fleet-audits stays on the docs/designs/domains.yaml allowlist until then.
 ./tasks/compliance-rbac-overgrant/task.yaml
 
-# The remediation domain's second writer, #2016 step 2, seated 2026-09-28.
-# Never a roster seat: nightly from 2026-09-15 (#1079); its 2026-09-22
-# promotion was withdrawn before merge because the record it cited (12/12
-# on the four graded nights 09-16 to 09-20) was graded by report_contains,
-# which #1780 replaced with pull_request_opened, and under that check it
-# has gone 0/3 on every graded night since, none of the misses the case's
-# own: 2026-09-24 (build 2103273400171499520) on #1968, #2011 and the
-# delegation-ceiling residual in that order, the nights after on "no pull
-# request URL", the #2011 credential-proxy workspace leak, whose fix #2069
-# merged 2026-09-28. One nightly data point a night would take weeks to
-# show the fix landing; this seat shows it at ~40 runs a day. The second
-# presubmit case that writes to GitHub: submit-suggestion's pull request on
-# the leased *-infra repository, graded by pull_request_opened. 420-1929s a
-# repetition measured; hinted at 1250 in unit_cost_hint, unchanged. Roster
-# line when #2016 step 3 holds -- three clean days at >= 90% of graded
-# repetitions, no all-reps collapse; remediation stays on the
-# docs/designs/domains.yaml allowlist until then.
+# The remediation domain's second writer, #2016 step 2, seat opened
+# 2026-09-28. Never a roster seat: nightly from 2026-09-15 (#1079); its
+# 2026-09-22 promotion was withdrawn before merge because the record it
+# cited (12/12 on the four graded nights 09-16 to 09-20) was graded by
+# report_contains, which #1780 replaced with pull_request_opened, and under
+# that check it has passed nothing on any graded night since, none of the
+# misses the case's own: 2026-09-24 (build 2103273400171499520) 0/2 graded
+# plus one infra repetition, on #1968, #2011 and the delegation-ceiling
+# residual in that order; the nights after (09-25 to 09-27) 0/3 each on
+# "no pull request URL", the #2011 credential-proxy workspace leak, whose
+# fix #2069 merged 2026-09-28, except one 09-25 repetition that linked a
+# 09-17 leftover, evals-6-infra#38. One nightly data point a night would
+# take weeks to show the fix landing; this seat shows it at ~40 runs a day.
+# The second presubmit case that writes to GitHub: submit-suggestion's pull
+# request on the leased *-infra repository, graded by pull_request_opened.
+# 420-1929s a repetition measured; hinted at 1250 in unit_cost_hint,
+# unchanged. Roster line when #2016 step 3 holds -- three clean days at
+# >= 90% of graded repetitions, no all-reps collapse, infra classes the
+# harness excludes not counted. One graded miss shape is the case's own and
+# counts: a job's three repetitions share the leased repository and the
+# pool sweep (hack/ci_sweep_agent_pulls.py, #1832) runs between leases, not
+# between them, so repetitions 2 and 3 meet repetition 1's open pull
+# request; one that pushes its own commit onto it passes (#1832 grades the
+# head commit), one that only links its sibling's pull request fails. Read
+# a 50-67% day as that before reading it as regression; step 3 decides
+# whether to count it, grade repetition 1 only, or sweep between
+# repetitions. remediation stays on the docs/designs/domains.yaml
+# allowlist until then.
 ./tasks/pdb-remediation-pr/task.yaml
 
 # Moved out to nightly-cases.txt, for the record:

@@ -129,7 +129,7 @@ with a filed issue naming the exit condition:
   ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2). Nightly since
   2026-09-22, and with pdb-remediation-pr's seat withdrawn (below) the remediation domain had
   no presubmit case, so `remediation` joined `fleet-audits` on the allowlist; pdb-remediation-pr
-  is back in the presubmit held out since 2026-09-28 (below), which changes nothing here until
+  is back in the presubmit held out (seat opened 2026-09-28, below), which changes nothing here until
   its roster line. Enters when #1189's re-admission bar holds.
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
@@ -150,28 +150,45 @@ promotion cited, and the promotion was withdrawn before it merged: every repetit
 record was graded by `report_contains`, which
 [#1780](https://github.com/gke-labs/kube-agents/pull/1780) (merged 2026-09-21) replaced with
 `pull_request_opened`, a check that rejects a pull request last written before the run
-started; nothing sweeps the `*-infra` repositories between runs
+started; until the pool sweep (`hack/ci_sweep_agent_pulls.py`,
+[#1832](https://github.com/gke-labs/kube-agents/pull/1832), merged 2026-09-25) nothing closed
+the `*-infra` leftovers between runs
 ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2), so a correct but
-byte-identical resubmission grades as a miss, the shape rca-remediation-pr showed on #1780's
-own head (0/3 on a leftover); and no graded run under the new check existed (the 09-22 nightly
+byte-identical resubmission graded as a miss, the shape rca-remediation-pr showed on #1780's
+own head (0/3 on a leftover), and the sweep runs between leases, not between one job's three
+repetitions; and no graded run under the new check existed (the 09-22 nightly
 died at the Prow deadline before grading). A seat on that record would have armed rung 4 on
-a grader the record never saw. The record under `pull_request_opened` since: 0/3 on every
-graded night, none of the misses the case's own. On 2026-09-24 (build 2103273400171499520) the
-three repetitions failed on the context-less `kubectl` after `get-credentials`
-([#1968](https://github.com/gke-labs/kube-agents/issues/1968), fix #1977, merged), the
-credential-proxy workspace leak
+a grader the record never saw. The record under `pull_request_opened` since: no pass on any
+graded night, none of the misses the case's own. On 2026-09-24 (build 2103273400171499520) it
+was 0/2 graded plus one infra repetition: the three failed on the context-less `kubectl` after
+`get-credentials` ([#1968](https://github.com/gke-labs/kube-agents/issues/1968), fix #1977,
+merged), the credential-proxy workspace leak
 ([#2011](https://github.com/gke-labs/kube-agents/issues/2011)) and the delegation-ceiling
-residual, in that order; the nights after failed on "no pull request URL", the #2011 shape,
-whose fix [#2069](https://github.com/gke-labs/kube-agents/pull/2069) merged 2026-09-28. Since
-2026-09-28 it is seated held out in `presubmit-cases.txt`
+residual, in that order, the last an infra class the harness excludes; the nights after (09-25
+to 09-27, 0/3 each) failed on "no pull request URL", the #2011 shape, whose fix
+[#2069](https://github.com/gke-labs/kube-agents/pull/2069) merged 2026-09-28, except one 09-25
+repetition that linked a 2026-09-17 leftover, `kube-agents-evals-6-infra#38`, the shape the
+sweep closes between leases. Its held-out seat in `presubmit-cases.txt` opened 2026-09-28
 ([#2016](https://github.com/gke-labs/kube-agents/issues/2016) step 2), the second held-out seat:
 it runs on every pull request, cannot red one on rungs 4 or 6, reds one on rungs 1–3 like every
 case, and builds the record step 3 reads at presubmit volume instead of one night at a time.
 The Cases page reads it as held out, undated: it was never on the roster. Enters the roster
 when #2016 step 3 holds: three clean days at ≥ 90 % of graded repetitions under
 `pull_request_opened` with no all-reps collapse, infra classes the harness excludes not
-counted; that edit (step 4, an eval-crew approval) takes `remediation` off the
-`docs/designs/domains.yaml` allowlist. Until then the domain sits there beside fleet-audits.
+counted. One miss shape the seat will show is graded and counts against the case: a job's three
+repetitions share the leased repository, the sweep closes leftovers between leases and not
+between them, and submit-suggestion derives its branch from the change, so repetitions 2 and 3
+meet repetition 1's open pull request. A repetition that pushes its own commit onto that pull
+request passes (#1832 grades the head commit, which must be no older than the repetition's
+start); one that only links the sibling's pull request fails, and that miss is the case's own,
+not infra. On the old record's two best nights three of six repetitions linked a pull request
+they did not open (09-20: `evals-23-infra` #34 twice, then leftover #4; 09-19: `evals-6-infra`
+#43, #46, then leftover #12), so a reading in the 50–67 % band is the isolation design
+([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 3, closed undecided) before
+it is agent regression; step 3 either counts it, grades repetition 1 only, or sweeps between
+repetitions, and says which. The roster edit (step 4, an eval-crew approval) takes
+`remediation` off the `docs/designs/domains.yaml` allowlist. Until then the domain sits there
+beside fleet-audits.
 
 Every case that is not in the presubmit runs in the nightly, since 2026-09-15 including
 the nine that used to wait commented out in the script (the reasons each cannot take a

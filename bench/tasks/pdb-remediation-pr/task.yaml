@@ -1,8 +1,8 @@
 # PRESUBMIT-ACTIVE, HELD OUT — an entry in hack/eval/presubmit-cases.txt
-# without a blocking-roster.txt line since 2026-09-28 (#2016 step 2), the
+# without a blocking-roster.txt line, seat opened 2026-09-28 (#2016 step 2), the
 # documented exception to the blocking-only rule: it runs on every pull
 # request, cannot red one on rungs 4 or 6, and reds one on rungs 1-3 like
-# every case. Nightly 2026-09-15 to 2026-09-28 (#1079), never a roster seat.
+# every case. Nightly 2026-09-15 until the seat (#1079), never a roster seat.
 # WHY THE EXCEPTION. The remediation domain has no probe and no roster case
 # (rca-remediation-pr is held out in the nightly on #1189), so it sits on the
 # domains.yaml allowlist, and the record a roster line needs is one this
@@ -10,19 +10,30 @@
 # nights 2026-09-16 to 09-20 (420-1153s a repetition) was graded by
 # report_contains, which #1780 (merged 2026-09-21) replaced with
 # pull_request_opened, so the 2026-09-22 promotion on that record (#1023)
-# was withdrawn before merge. Under pull_request_opened it went 0/3 on every
-# graded night, none of the misses the case's own: 2026-09-24 (build
-# 2103273400171499520) on #1968 (context-less kubectl, fix #1977), #2011
-# (the credential-proxy workspace leak) and the delegation-ceiling residual
-# in that order, the nights after on "no pull request URL", the #2011
-# shape; #2069 fixed it, merged 2026-09-28. One nightly data point a night
+# was withdrawn before merge. Under pull_request_opened it has passed
+# nothing on any graded night, none of the misses the case's own:
+# 2026-09-24 (build 2103273400171499520) 0/2 graded plus one infra
+# repetition, on #1968 (context-less kubectl, fix #1977), #2011 (the
+# credential-proxy workspace leak) and the delegation-ceiling residual in
+# that order; the nights after (09-25 to 09-27) 0/3 each on "no pull
+# request URL", the #2011 shape, except one 09-25 repetition that linked a
+# 09-17 leftover, evals-6-infra#38; #2069 fixed the leak, merged
+# 2026-09-28. One nightly data point a night
 # would take weeks to show that fix landing; a held-out seat shows it at
 # ~40 runs a day.
 # WHAT IT NEEDS. #2016 step 3: three clean days at >= 90 % of graded
 # repetitions under pull_request_opened, no all-reps collapse, infra classes
-# the harness excludes not counted; then step 4 adds the roster line and
-# takes remediation off the allowlist (docs/eval-gate-roster.md has the
-# entry). Measured before the 2026-09-15 move: 7/9 across three presubmit
+# the harness excludes not counted. One graded miss shape is this case's
+# own and counts: the job's three repetitions share the leased repository
+# and the pool sweep (#1832) runs between leases, not between them, so
+# repetitions 2 and 3 meet repetition 1's open pull request; a repetition
+# that pushes its own commit onto it passes (#1832 grades the head
+# commit), one that only links its sibling's pull request fails. Read a
+# 50-67% day as that before reading it as regression; step 3 decides
+# whether to count it, grade repetition 1 only, or sweep between
+# repetitions. Then step 4 adds the roster line and takes remediation off
+# the allowlist (docs/eval-gate-roster.md has the entry). Measured before
+# the 2026-09-15 move: 7/9 across three presubmit
 # builds; misses are #1097 and #1590, 980-1929s a repetition on 2026-09-14;
 # unit_cost_hint 1250, unchanged by the seat.
 # The paragraph below is the original activation note, kept for the
@@ -64,8 +75,8 @@
 # too, between leases (the accounting is in rca-remediation-pr's header). This case doubles
 # the within-job accumulation,
 # accepted on the same terms: the *-infra repos are throwaway fixtures nobody
-# reads. Eligible tier: presubmit; nightly 2026-09-15 to 2026-09-28,
-# presubmit held out since (#2016).
+# reads. Eligible tier: presubmit; nightly 2026-09-15 until the seat,
+# which opened 2026-09-28, presubmit held out since (#2016).
 #
 # Expected cost bracket: unmeasured. Bounded below by
 # obtainability-remediation-proposal (124-130s measured — same fixture,

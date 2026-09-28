@@ -1276,9 +1276,10 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # #1171) compliance-rbac-overgrant canary took fleet-audits' coverage with it
         # to the nightly (#1876), and remediation's coverage left with it:
         # rca-remediation-pr is held out and pdb-remediation-pr's promotion
-        # was withdrawn until it has a record under its #1780 grader. Since
-        # 2026-09-28 the canary (#2013) and pdb-remediation-pr (#2016) are
-        # seated held out in the presubmit file; only a roster line counts.
+        # was withdrawn until it has a record under its #1780 grader. The
+        # canary (#2013, seated 2026-09-29) and pdb-remediation-pr (#2016, seat
+        # opened 2026-09-28) are held out in the presubmit file; only a roster
+        # line counts.
         self.assertEqual(cov["uncovered"], ["fleet-audits", "remediation"])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 

@@ -205,11 +205,17 @@
 #      every one of those repetitions was graded by report_contains, which
 #      #1780 (merged 2026-09-21) replaced with pull_request_opened -- a check
 #      that rejects a pull request last written before the run started,
-#      while nothing sweeps the *-infra repositories between runs (#1755
-#      item 2), so a correct but byte-identical resubmission grades as a
-#      miss. Under the new check it went 0/3 on every graded night here,
-#      none of the misses the case's own (#2016 has the evidence), and on
-#      2026-09-28 it moved to the presubmit file held out (#2016 step 2):
+#      and until the pool sweep (hack/ci_sweep_agent_pulls.py, #1832, merged
+#      2026-09-25) nothing closed the *-infra leftovers between runs (#1755
+#      item 2), so a correct but byte-identical resubmission graded as a
+#      miss; the sweep runs between leases, not between one job's three
+#      repetitions, so a repetition that only links its sibling's open pull
+#      request still grades as a miss, the case's own. Under the new check
+#      it passed nothing on any graded night here (0/2 graded plus one
+#      infra repetition on 09-24, 0/3 each night after; one 09-25
+#      repetition linked a 09-17 leftover, evals-6-infra#38), none of the
+#      misses the case's own (#2016 has the evidence), and its held-out
+#      seat in the presubmit file opened 2026-09-28 (#2016 step 2):
 #      that file carries the record, and this file never lists a presubmit
 #      case twice. With rca-remediation-pr below still nightly, the
 #      remediation domain has no roster case and sits on the
