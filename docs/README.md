@@ -155,6 +155,7 @@ identifier appears, add its source here.
 | Kubernetes service-account names | `scripts/installer/common.sh` |
 | GCP service-account names an install creates, release namespace, GKE CMEK key ring and key | `install.defaults.env` |
 | Defaults an install gets for saying nothing (region, cluster, permission set, registry prefix) | `install.defaults.env` |
+| Content-workspace ceilings and reclaim (`CREDENTIAL_PROXY_MAX_WORKSPACES`, `CREDENTIAL_PROXY_MAX_CLONE_BYTES`, `CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS`) | `DEFAULT_*` and `_limit` in `agents/platform/scripts/content_workspace.py` |
 | Go toolchain version | `k8s-operator/go.mod` (and `a2a/go.mod`, kept in step) for building the operator; `scripts/installer/min_versions.sh` (`MIN_GO_VERSION`) for the host that imports the GitHub App key, which builds the Minty CLI and not the operator |
 | The drift audit subscription's name | `subscription_name` in `terraform/modules/drift-pubsub/variables.tf`, mirrored by `defaultSubscriptionName` in `k8s-operator/cmd/drift-detector/main.go` |
 | The drift batch join budget and the ack deadline it must fit inside | `defaultBatchJoinBudget`, `batchJoinBudgetCeiling` and `maxBudgetShareOfAckDeadline` in `k8s-operator/cmd/drift-detector/subscriber.go`; `ack_deadline_seconds` in `terraform/modules/drift-pubsub/variables.tf`. The detector reads the deadline at startup and warns when the budget takes more than half of it, but does not adopt it, so a doc stating one states both |

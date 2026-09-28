@@ -5948,6 +5948,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 payload.get("base") or None,
                 payload.get("branch") or None,
                 payload.get("depth"),
+                # Passed as sent: the store treats None and "" as no label
+                # and refuses anything else it cannot read, so a falsy
+                # non-string is a 400 rather than a silently blank label.
+                caller=payload.get("caller"),
             )
             return {
                 "handle": workspace.handle,
