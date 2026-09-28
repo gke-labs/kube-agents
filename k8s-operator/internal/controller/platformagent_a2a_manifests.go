@@ -515,15 +515,19 @@ const (
 	// becomes per-session, and it moves into the multiplier beside
 	// a2aSessionConsumersPerSession.
 	//
-	// Two more things the two bridge rows rest on, both settable on the
+	// Two more things the three bridge rows rest on, both settable on the
 	// CR and neither read by this render. BRIDGE_CONCURRENCY: the sidecar is
 	// declared in spec.deployment.sidecars, so its env is the CR's, and an
-	// install that raises it (docs/designs/eval-next-transport.md commits the
-	// eval install to at least its task parallelism) scales the asks and
-	// look-ahead rows with it while this reserve stays put -- at 6, in flight
-	// is 1+1+12+6 = 20 and the term would be 40, which such an install
-	// carries today only because
-	// it spawns no session pods and so spends none of its maxSessions*3.
+	// install that raises it (hack/ci-deploy.sh sets the eval install's to
+	// its task parallelism: 4 on the presubmit, 8 on the nightly) scales the
+	// asks and look-ahead rows with it while this reserve stays put. At 4,
+	// in flight is 1+1+8+4 = 14 and the term would be 28, and 16+28 = 44
+	// sits inside a 64-wide stream; at 8 it is 1+1+16+8 = 26, the term 52,
+	// and 16+52 = 68 is past the 64 the default render creates. Such an
+	// install runs today because its trigger-paced sources never all fire
+	// inside one five-second window and it spawns no session pods, so it
+	// spends none of its maxSessions*3 -- an observation about load, not a
+	// guarantee this reserve gives it.
 	// Reading the sidecar's env into the budget is the follow-up, not a
 	// number here. And one agent replica: replicas share the bridge's
 	// durable and each brings its own workers, so a second replica doubles
@@ -810,12 +814,14 @@ func a2aSeedJetStreamGrants() []string {
 // against a real server running this render
 // (TestBridgeJetStreamGrantOnARealServer). Per stream:
 //
-//   - TASKS: STREAM.INFO (js.Stream in lib.TasksGet and the sweep),
-//     CONSUMER.CREATE (the durable through CreateOrUpdateConsumer, and
-//     the replay's ordered consumer; nats.go puts the filter subject in the API
-//     subject, so the grant ends in `>`), CONSUMER.MSG.NEXT (every pull), and
-//     DIRECT.GET (GetLastMsgForSubject: the replay horizon and the sweep's CAS
-//     baseline). Acks are $JS.ACK.TASKS.>, granted beside this list.
+//   - TASKS: STREAM.INFO (js.Stream in lib.TasksGet, lib.TaskInReplay,
+//     lib.LastEnvelope and the sweep), CONSUMER.CREATE (the durable through
+//     CreateOrUpdateConsumer, and the replay's ordered consumer; nats.go puts
+//     the filter subject in the API subject, so the grant ends in `>`),
+//     CONSUMER.MSG.NEXT (every pull), and DIRECT.GET (GetLastMsgForSubject:
+//     the replay horizon, the sweep's CAS baseline, the worker's look-ahead
+//     reading the in subject's newest message, and the orphan cancel reading
+//     the newest event). Acks are $JS.ACK.TASKS.>, granted beside this list.
 //   - KV_runtime-state, the in-flight registry: STREAM.INFO
 //     (js.KeyValue binds a bucket by reading its stream), and CONSUMER.CREATE
 //     with CONSUMER.DELETE (kv.Keys is a push ordered consumer that nats.go

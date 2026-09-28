@@ -225,8 +225,10 @@ const a2aBridgeLookAheadCall = "InReplay"
 // The reserve has a look-ahead term because the bridge has a look-ahead, and
 // this is what holds those two facts together.
 //
-// The bridge's worker calls lib.TaskInReplay once per spawn, and the reserve
-// counts it: a2aTasksReplayBridgeLookAhead, one slot per worker and its tail.
+// The bridge's worker calls lib.TaskInReplay at most once per spawn (it
+// answers from the in subject's newest message by direct get first), and the
+// reserve counts the ceiling: a2aTasksReplayBridgeLookAhead, one slot per
+// worker and its tail.
 // Before the call existed the term was out, because four slots reserved
 // against code no render could reach moved the provision gate's first refused
 // maxSessions on an existing 64-wide TASKS from 13 to 11 for nothing, and a

@@ -947,6 +947,25 @@ func TestCancelInStream_Cases(t *testing.T) {
 			}
 			return runFor(o)
 		}, false},
+		// The newest message is a follow-up, so the answer comes from the
+		// full replay, whose cursor starts after the submission: the cancel
+		// before it is not newer, as in the direct-get case above.
+		{"cancel before the submission, follow-up behind it, is still not newer", func() *taskRun {
+			o := unpublished("la-before-steer")
+			publishCancel(t, c, o)
+			if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", o.TaskID), o); err != nil {
+				t.Fatal(err)
+			}
+			steer, err := lib.NewFollowUpEnvelope(o, gatewayParty,
+				messagePayload(t, o.TaskID, o.ContextID, "more"), lib.WithTo(lib.Party{Session: "platform"}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", o.TaskID), steer); err != nil {
+				t.Fatal(err)
+			}
+			return runFor(o)
+		}, false},
 		{"follow-up after the submission is not a cancel", func() *taskRun {
 			o := submit(t, c, "la-steer", "p")
 			steer, err := lib.NewFollowUpEnvelope(o, gatewayParty,

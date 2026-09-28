@@ -96,9 +96,10 @@ is granted.
 
 Note which delete is in that list and which is not: `$JS.API.CONSUMER.DELETE` is granted
 for `KV_runtime-state`, for the watcher, and withheld for TASKS. The bridge calls
-`lib.TasksGet` on every task it dispatches and `lib.TaskInReplay` on every task a worker is
-about to spawn (the cancel look-ahead below), and a call that finds messages creates an ordered
-consumer on TASKS; nothing deletes it. It is reaped by the five-second inactive threshold
+`lib.TasksGet` on every task it dispatches and `lib.TaskInReplay` on a task a worker is about
+to spawn whose `…in` subject's newest message is neither the submission nor a cancel (the
+cancel look-ahead below; the newest-message read itself is a direct get and opens nothing),
+and a call that finds messages creates an ordered consumer on TASKS; nothing deletes it. It is reaped by the five-second inactive threshold
 both reads set on it, which is why the replay costs a consumer slot for the calls of the last
 five seconds rather than for the last five minutes of them (gke-labs/kube-agents#1739) without
 the bridge needing a destructive verb on TASKS. The slot outlives the call it served: the
