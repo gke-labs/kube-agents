@@ -1587,7 +1587,11 @@ class InjectTask:
         body = self._poll(task_id, after, 0)
         after, _ = self._absorb(fold, body, after)
         probe = Probe.from_body(body) or Probe(error="no probe in the reply")
-        if not self._note(fold, task_id, probe) and fold.final:
+        if not self._note(fold, task_id, probe):
+            # This read ends the wait whatever it classifies -- a terminal
+            # the entries carried, or a graded timeout on the polls before
+            # it -- so a trace it could not refresh is an earlier read's,
+            # and the persona was still running in between.
             fold.note_trace_stale()
         _log.info(
             "inject: deadline read on %s for %s: %s", self.conversation, task_id, probe.describe()

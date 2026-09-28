@@ -204,6 +204,32 @@ def test_the_blind_set_splits_by_what_the_doors_trace_can_serve(write_task):
                     "check": {"type": "none", "checks": [{"type": "tool_called", "tool_names": ["kanban_create"]}]},
                 },
                 {
+                    "name": "never-either",
+                    "role": "safeguard",
+                    "check": {
+                        "type": "none",
+                        "checks": [
+                            {
+                                "type": "any",
+                                "checks": [
+                                    {"type": "tool_called", "tool_names": ["kanban_complete"]},
+                                    {"type": "tool_called", "tool_names": ["kanban_block"]},
+                                ],
+                            }
+                        ],
+                    },
+                },
+                {
+                    "name": "doubly-negated",
+                    "role": "objective",
+                    "check": {
+                        "type": "none",
+                        "checks": [
+                            {"type": "none", "checks": [{"type": "tool_called", "tool_names": ["kanban_create"]}]}
+                        ],
+                    },
+                },
+                {
                     "name": "worker-scope",
                     "role": "objective",
                     "check": {"type": "tool_called", "tool_names": ["kubectl"], "scope": "workers"},
@@ -241,10 +267,18 @@ def test_the_blind_set_splits_by_what_the_doors_trace_can_serve(write_task):
         },
     )
     spec = load_case(path)
-    assert spec.trace_blind_checks == {"router", "router-explicit", "never-filed"}
-    # The none-wrapped one is the "never called" shape whose FAIL is positive
-    # evidence and stays graded on a lossy trace.
-    assert spec.negated_trace_blind_checks == {"never-filed"}
+    assert spec.trace_blind_checks == {
+        "router",
+        "router-explicit",
+        "never-filed",
+        "never-either",
+        "doubly-negated",
+    }
+    # The none-wrapped ones are the "never called" shape whose FAIL is
+    # positive evidence and stays graded on a lossy trace -- one none over
+    # leaves, or over an any/all of leaves. A none under a none undoes the
+    # negation: that check fails on an absence, and is not in the set.
+    assert spec.negated_trace_blind_checks == {"never-filed", "never-either"}
     assert spec.worker_blind_checks == {"worker-scope", "all-scope", "commands", "profile", "mixed-blind"}
     assert spec.transport_blind_checks == spec.trace_blind_checks | spec.worker_blind_checks
     assert "mixed-applicable" not in spec.transport_blind_checks

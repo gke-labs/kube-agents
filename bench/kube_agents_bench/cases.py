@@ -147,12 +147,14 @@ class CaseSpec:
     graded in full on one that did."""
 
     negated_trace_blind_checks: frozenset[str] = frozenset()
-    """The entries in ``trace_blind_checks`` whose check is a ``none``
-    compound: "this tool was never called". A failed one is positive
-    evidence -- the trace shows the forbidden call -- so on a record whose
-    door showed the trace the scorer keeps it graded even when the marker
-    reports a loss; a loss makes such a check's pass uncertain, never its
-    fail."""
+    """The entries in ``trace_blind_checks`` whose every leaf sits under an
+    odd number of ``none`` compounds: "this tool was never called". A
+    failed one is positive evidence -- the trace shows the forbidden call
+    -- so on a record whose door showed the trace the scorer keeps it
+    graded even when the marker reports a loss; a loss makes such a check's
+    pass uncertain, never its fail. A ``none`` under a ``none`` undoes the
+    negation and is not in the set: that check fails on an absence, which
+    a lossy trace cannot vouch for."""
 
     worker_blind_checks: frozenset[str] = frozenset()
     """The entries in ``transport_blind_checks`` with any leaf that reads the
@@ -189,6 +191,28 @@ def _reads_the_workers(leaf: dict[str, Any]) -> bool:
     return kind in TRACE_GRADABLE_CHECK_TYPES and scope not in (None, _TOOL_CALLED_ROUTER_SCOPE)
 
 
+def _negates_every_leaf(node: Any, *, negations: int = 0) -> bool:
+    """Whether every leaf of a check subtree sits under an odd number of
+    ``none`` compounds, so the check as a whole FAILS only when a named
+    call is present in the trajectory.
+
+    One ``none`` over leaves, or over ``any``/``all`` of leaves, negates
+    them; a ``none`` under a ``none`` undoes it, and that check's fail means
+    a call is absent, which a lossy trace cannot vouch for. A subtree with
+    no leaf negates nothing.
+    """
+    if isinstance(node, dict):
+        children = [node.get(key) for key in _CHECK_CHILD_KEYS if node.get(key) is not None]
+        if not children:
+            return negations % 2 == 1
+        if node.get("type") == _NEGATED_COMPOUND_TYPE:
+            negations += 1
+        return all(_negates_every_leaf(child, negations=negations) for child in children)
+    if isinstance(node, list):
+        return bool(node) and all(_negates_every_leaf(item, negations=negations) for item in node)
+    return False
+
+
 def _transport_blind_checks(
     spec: Any,
 ) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
@@ -219,7 +243,7 @@ def _transport_blind_checks(
             workers.add(name)
             continue
         trace.add(name)
-        if isinstance(check, dict) and check.get("type") == _NEGATED_COMPOUND_TYPE:
+        if _negates_every_leaf(check):
             negated.add(name)
     return frozenset(trace), frozenset(negated), frozenset(workers)
 

@@ -2441,13 +2441,31 @@ def test_a_wait_that_ends_on_a_read_without_a_trace_marks_the_trace_stale(
     assert marker is not None and marker["args"] == {"calls": 2, "dropped": 0}
     assert not scoring._inject_blind(exchange.fold.trajectory)
 
-    # The deadline read follows the same rule.
+    # The deadline read follows the same rule, whether it finds the terminal
+    # in its entries or classifies a graded timeout from the polls before
+    # it: either way it ends the wait, and the persona was still running.
     monkeypatch.setattr(task, "_poll", scripted([blind_finish]))
     fold = inject.Fold("task-1")
     fold.note_activity([CALL_CREATE], 0, 0)
     exchange = task._classify(fold, "task-1", 3)
     assert exchange.outcome == inject.OUTCOME_TERMINAL
     assert marker_of(exchange.fold.trajectory)["args"] == {"calls": 1, "dropped": 0, "stale": 1}
+    blind_deadline = {
+        "entries": [],
+        "lastSeq": 3,
+        "probe": {"active": True, "taskId": "task-1", "error": "kv read failed"},
+    }
+    monkeypatch.setattr(task, "_poll", scripted([blind_deadline]))
+    timed_out = inject.Fold("task-1")
+    # A real fold carries the transport's task marker from the transcript,
+    # which is what makes the record the inject transport's to the scorer.
+    timed_out.apply(entry(1, inject.ENTRY_TASK, taskId="task-1"))
+    timed_out.note_executor_state(inject.STATE_WORKING)
+    timed_out.note_activity([CALL_CREATE], 0, 0)
+    exchange = task._classify(timed_out, "task-1", 3)
+    assert exchange.outcome == inject.OUTCOME_DEADLINE
+    assert marker_of(exchange.fold.trajectory)["args"] == {"calls": 1, "dropped": 0, "stale": 1}
+    assert scoring._inject_blind(exchange.fold.trajectory)
 
 
 def test_the_trace_is_taken_only_from_a_read_about_this_task() -> None:
