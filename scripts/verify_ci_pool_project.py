@@ -3056,15 +3056,13 @@ def report_document(project_id: str, checks: List[CheckResult], now: Optional[da
         check_id = check.check_id or check.name
         status = report_status(check)
         findings = [finding.as_dict() for finding in check.findings]
-        if status == REPORT_STATUS_FAIL:
-            # A failing detail no finding names -- a GSA absent, a listing
-            # that failed, a policy that would not parse -- is still a unit the
-            # scan must see, beside whatever findings the check did name.
-            named = {finding.observed for finding in check.findings}
-            unnamed = [line for line in check.details if line not in named]
-            if not findings or unnamed:
-                observed = "; ".join([check.message, *unnamed]).strip("; ") if unnamed or not findings else check.message
-                findings.append(Finding(f"{check_id}/{REPORT_FINDING_FAILED}", observed).as_dict())
+        if status == REPORT_STATUS_FAIL and not findings:
+            # A failing check that named no finding still reports one. A
+            # failing detail beside named findings is not matched against
+            # them: the checks write aggregate details and per-item findings,
+            # so a text match would file a `failed` beside every real drift.
+            observed = "; ".join([check.message, *check.details]).strip("; ")
+            findings = [Finding(f"{check_id}/{REPORT_FINDING_FAILED}", observed).as_dict()]
         out[check_id] = {
             "name": check.name,
             "status": status,
@@ -3212,9 +3210,15 @@ def verify_project(
             report_path.write_text(json.dumps(report_document(project_id, results), indent=2) + "\n", encoding="utf-8")
         return EXIT_UNVERIFIED
     results = run_checks(project_id, app_id, location, repo_membership_confirmed, checks)
+    status = report(project_id, results)
     if report_path is not None:
-        report_path.write_text(json.dumps(report_document(project_id, results), indent=2) + "\n", encoding="utf-8")
-    return report(project_id, results)
+        # After the console verdict: an unwritable path must not throw a
+        # completed run away or turn its exit code into "do not register".
+        try:
+            report_path.write_text(json.dumps(report_document(project_id, results), indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"\n[?] --report {report_path} could not be written ({exc}); the verdict above stands", file=sys.stderr)
+    return status
 
 
 def main() -> int:

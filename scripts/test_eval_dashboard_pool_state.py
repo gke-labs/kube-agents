@@ -288,7 +288,8 @@ class EntryPoint(ScanHarness):
     def test_main_writes_the_document_and_exits_zero_on_findings(self):
         self.world.write_text(json.dumps({PROJECT: report(iam=drifted())}), encoding="utf-8")
         out = self.root / "pool-state.json"
-        with unittest.mock.patch.dict(os.environ, {"STUB_WORLD": str(self.world), "STUB_LOG": str(self.log)}):
+        with unittest.mock.patch.dict(os.environ, {"STUB_WORLD": str(self.world), "STUB_LOG": str(self.log)}), \
+             unittest.mock.patch.object(pool_state, "missing_binaries", return_value=[]):
             rc, err = self._run("--out", str(out), "--projects", PROJECT, "--verifier", str(self.stub), "--now", NOW.isoformat(), "--workdir", str(self.workdir))
         self.assertEqual(rc, pool_state.EXIT_OK, err)
         doc = json.loads(out.read_text(encoding="utf-8"))
@@ -319,10 +320,12 @@ class Workflow(unittest.TestCase):
         self.assertIn('--workers "$POOL_STATE_WORKERS"', run)
         self.assertIn('--project-timeout "$POOL_STATE_PROJECT_TIMEOUT_S"', run)
         self.assertIn('timeout "$POOL_STATE_TIMEOUT_S"', run)
+        self.assertEqual(steps[fleet].get("id"), "fleet_scan")
         for step in (steps[scan], steps[scan - 1], steps[scan + 1]):
-            # Not `always()`: that would also run the pool scan after an auth
-            # or setup failure, and after a cancel or the job's own timeout.
-            self.assertEqual(step.get("if"), "${{ !cancelled() }}", f"{step.get('name')} must run whether or not the fleet scan's step failed, and not after a cancel")
+            # The one failure the pool steps run through is the fleet scan's;
+            # `always()` or `!cancelled()` would also run them after an auth
+            # or setup failure, with no credential and no work directory.
+            self.assertEqual(step.get("if"), "${{ success() || steps.fleet_scan.outcome == 'failure' }}", f"{step.get('name')} must run whether or not the fleet scan's step failed, and after nothing else's")
         upload = next(step for step in steps if "cp work/pool-state.json" in step.get("run", ""))
         self.assertIn('"$DASHBOARD_BUCKET/pool-state.json"', upload["run"])
         self.assertIn("Fetch the previous pool-state scan", names)

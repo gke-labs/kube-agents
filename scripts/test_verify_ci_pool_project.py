@@ -2,6 +2,7 @@
 """Unit tests for verify_ci_pool_project.py."""
 
 import base64
+import io
 import json
 import os
 import pathlib
@@ -3425,8 +3426,10 @@ class ChecksSelectionTest(unittest.TestCase):
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)) as ar, \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)) as minter, \
              mocks["check_codebase_mapping"] as mapping, mocks["check_gke_and_state"] as gke, mocks["check_seeded_fleet_fixtures"] as fleet, \
-             mocks["check_github_repo_and_app"] as app, mocks["check_ledger_read_credential"] as ledger:
+             mocks["check_github_repo_and_app"] as app, mocks["check_ledger_read_credential"] as ledger, \
+             mocks["check_warm_cache_readers"] as warm, mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS))
+            self.assertEqual(warm.call_count, 0, "the warm-cache check is not in the scan's set")
             self.assertEqual([r.check_id for r in results], list(checker.POOL_STATE_CHECKS))
             for never in (mapping, fleet, app, ledger):
                 never.assert_not_called()
@@ -3483,14 +3486,25 @@ class ReportDocumentTest(unittest.TestCase):
         self.assertEqual(second["checks"]["iam"]["warnings"], ["Could not read the project IAM policy: 403"])
         self.assertEqual(doc["checks"]["iam"]["findings"], [{"id": "iam/platform-gsa/missing/roles/x", "observed": "x missing", "repair": "gcloud ... x"}])
         self.assertEqual(doc["checks"]["codebase_mapping"]["findings"], [{"id": "codebase_mapping/failed", "observed": "No mapping; add the row", "repair": ""}])
-        # A failing detail beside a named finding is still a unit: the GSA
-        # gone and every role it should hold missing arrive together.
-        both = self._tagged("iam", checker.CheckResult("IAM", False, "IAM requirements missing", details=["Missing GSA kubeagents-platform-gsa", "x missing"], findings=[checker.Finding("iam/platform-gsa/missing/roles/x", "x missing", "gcloud ... x")]))
-        ids = [f["id"] for f in checker.report_document("kube-agents-evals-3", [both])["checks"]["iam"]["findings"]]
-        self.assertEqual(ids, ["iam/platform-gsa/missing/roles/x", "iam/failed"])
-        self.assertEqual(checker.report_document("kube-agents-evals-3", [both])["checks"]["iam"]["findings"][1]["observed"], "IAM requirements missing; Missing GSA kubeagents-platform-gsa")
-        self.assertEqual([f["id"] for f in checker.report_document("kube-agents-evals-3", [failed])["checks"]["iam"]["findings"]], ["iam/platform-gsa/missing/roles/x"], "a check whose details are all named adds nothing")
+        # A failing check that named findings gets no `failed` beside them,
+        # whatever its details say: the checks write aggregate details and
+        # per-item findings, and the two never match by text.
+        aggregate = self._tagged("iam", checker.CheckResult("IAM", False, "IAM requirements missing", details=["The CI health bot is missing 2 role(s) on p: a, b"], findings=[checker.Finding("iam/pool-state-reader/missing/a", "missing a", "g a"), checker.Finding("iam/pool-state-reader/missing/b", "missing b", "g b")]))
+        ids = [f["id"] for f in checker.report_document("kube-agents-evals-3", [aggregate])["checks"]["iam"]["findings"]]
+        self.assertEqual(ids, ["iam/pool-state-reader/missing/a", "iam/pool-state-reader/missing/b"])
         self.assertEqual(doc["checks"]["gke_and_state"]["name"], "GKE")
+
+    def test_an_unwritable_report_path_keeps_the_console_verdict_and_exit_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "no-such-dir" / "report.json"
+            err = io.StringIO()
+            with mock.patch.object(checker, "check_toolchain", return_value=[]), \
+                 mock.patch.object(checker, "run_checks", return_value=[self._tagged("gke_and_state", checker.CheckResult("GKE", True, "All present"))]), \
+                 mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", err):
+                status = checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_GKE_AND_STATE], report_path=path)
+            self.assertEqual(status, checker.EXIT_OK)
+            self.assertIn("could not be written", err.getvalue())
+            self.assertFalse(path.exists())
 
     def test_verify_project_writes_the_report_beside_the_console(self):
         with tempfile.TemporaryDirectory() as tmp:
