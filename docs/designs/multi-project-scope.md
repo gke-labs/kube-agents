@@ -402,7 +402,9 @@ project was named or reached through a container. The allowlist is `container.cl
 (`cloudtrace.user` is the one that is not purely a read: Google's Trace User role carries create,
 delete and update on analysis-report tasks and trace scopes beside `traces.get` and `traces.list`,
 and no predefined Trace role grants the two reads alone; the broker's `GET`-only relay and its
-`gcloud` allowlist are what keep those permissions out of the agent's reach),
+`gcloud` allowlist keep them out of the sandbox's path through the broker, and a token minted on the
+annotated ServiceAccount itself, which the gateway Pod and an `AgentPlugin` can do, carries them with
+every other role on the identity),
 in `terraform/examples/full-install/main.tf`, which the module default (`variable "project_roles"`
 in `terraform/modules/kube-agents-iam/variables.tf`) mirrors. The intersection matters on the
 `custom` permission set, where the operator names `project_roles` outright: a list that carries
