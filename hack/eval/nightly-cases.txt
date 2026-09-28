@@ -199,26 +199,14 @@
 #   -- pdb-remediation-pr: 7/9 across the same builds; the two misses are
 #      #1097 (delegation slot) and #1590 (submit-suggestion in the sandbox).
 #      980-1929s a repetition on 2026-09-14; priced at 1250s in
-#      unit_cost_hint. Here it went 12/12 on the four graded nights
-#      2026-09-16 to 09-20 (420-1153s a repetition), and the 2026-09-22
-#      promotion that cited that record (#1023) was withdrawn before merge:
-#      every one of those repetitions was graded by report_contains, which
-#      #1780 (merged 2026-09-21) replaced with pull_request_opened -- a check
-#      that rejects a pull request last written before the run started,
-#      and until the pool sweep (hack/ci_sweep_agent_pulls.py, #1832, merged
-#      2026-09-25) nothing closed the *-infra leftovers between runs (#1755
-#      item 2), so a correct but byte-identical resubmission graded as a
-#      miss; the sweep runs between leases, not between one job's three
-#      repetitions, so a repetition that only links its sibling's open pull
-#      request still grades as a miss, the case's own. Under the new check
-#      it passed nothing on any graded night here (0/2 graded plus one
-#      infra repetition on 09-24, 0/3 each night after; one 09-25
-#      repetition linked a 09-17 leftover, evals-6-infra#38), none of the
-#      misses the case's own (#2016 has the evidence), and its held-out
-#      seat in the presubmit file opened 2026-09-28 (#2016 step 2):
-#      that file carries the record, and this file never lists a presubmit
-#      case twice. With rca-remediation-pr below still nightly, the
-#      remediation domain has no roster case and sits on the
+#      unit_cost_hint. Listed here from 2026-09-15 until 2026-09-28, when
+#      its held-out seat in presubmit-cases.txt opened (#2016 step 2). That
+#      file carries its record under both checks (12/12 under
+#      report_contains on the four graded nights 2026-09-16 to 09-20;
+#      nothing on any graded night under pull_request_opened, #1780) and the
+#      miss shape the seat counts as the case's own; this file never lists a
+#      presubmit case twice. With rca-remediation-pr below still nightly,
+#      the remediation domain has no roster case and sits on the
 #      docs/designs/domains.yaml allowlist until #2016 step 4.
 ./tasks/chat-routing-board-read/task.yaml
 
