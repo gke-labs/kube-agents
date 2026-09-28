@@ -622,7 +622,6 @@ func TestLookAhead_AbsentCancelSpawnsAndWorkingFollowsTheRead(t *testing.T) {
 			close(gate)
 		}
 	}
-	t.Cleanup(openGate)
 	var real func(context.Context, *taskRun) (bool, error)
 	startBridgeWith(t, url, script(t, `echo "answer for $1"`), 0, func(b *Bridge) {
 		real = b.lookAhead
@@ -631,6 +630,10 @@ func TestLookAhead_AbsentCancelSpawnsAndWorkingFollowsTheRead(t *testing.T) {
 			return real(ctx, run)
 		}
 	})
+	// Registered after startBridgeWith, so it runs before the bridge's own
+	// cleanup (t.Cleanup is last-added, first-called): the gate has to be
+	// open before that cleanup waits on Run's wg.Wait.
+	t.Cleanup(openGate)
 
 	origin := submit(t, c, "task-clean", "a live prompt")
 	waitFor(t, 10*time.Second, "submitted", func() bool {
@@ -697,7 +700,6 @@ func TestLookAhead_ShutdownMidReadLeavesTheRunToShutdownTasks(t *testing.T) {
 			close(gate)
 		}
 	}
-	t.Cleanup(openGate)
 	type answer struct {
 		run     *taskRun
 		err     error
@@ -717,6 +719,9 @@ echo never`, marker)), 0, func(br *Bridge) {
 			return canceled, err
 		}
 	})
+	// After startBridgeWith for the reason the absent-cancel test gives:
+	// the gate opens before the bridge's cleanup waits on its workers.
+	t.Cleanup(openGate)
 
 	origin := submit(t, c, "task-shutdown-midread", "a prompt")
 	waitFor(t, 10*time.Second, "submitted", func() bool {
