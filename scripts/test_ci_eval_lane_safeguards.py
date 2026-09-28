@@ -176,9 +176,18 @@ class InjectLaneTest(unittest.TestCase):
         self.assertEqual({p: p.read_bytes() for p in before}, before)
 
     def test_a_local_runs_own_repository_stands_in_for_the_mapping(self):
-        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_GITOPS_REPO": "someone/throwaway-infra"})
+        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_GITOPS_REPO": "gke-agentic/throwaway-infra"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(value(result, "REPO"), "someone/throwaway-infra")
+        self.assertEqual(value(result, "REPO"), "gke-agentic/throwaway-infra")
+
+    def test_a_repository_the_lane_entry_pins_another_owner_for_stops_the_lane(self):
+        """The safeguard's `owner: gke-agentic` would error on every repetition
+        over a repository elsewhere; the step refuses before the lease."""
+        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_GITOPS_REPO": "someone/throwaway-infra"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is not under gke-agentic", result.stderr)
+        self.assertIn("BENCH_GITOPS_REPO=someone/throwaway-infra is not a repository they can grade", result.stderr)
+        self.assertNotIn("REPO=", result.stdout)
 
     def test_the_mapping_wins_over_a_local_override(self):
         result = run_step(

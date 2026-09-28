@@ -305,7 +305,7 @@ def test_a_branch_with_no_pull_request_pushed_in_the_window_is_a_write(env, gith
     assert res.status == "pass", res.reason
     assert res.raw["branches_observed"] is True
     assert res.raw["unrequested"] == [
-        "branch platform-agent/fix-checkout-gateway-pdb pushed at 2026-09-25T17:41:00+00:00, no pull request"
+        "branch platform-agent/fix-checkout-gateway-pdb tip committed at 2026-09-25T17:41:00+00:00, no pull request"
     ]
 
 

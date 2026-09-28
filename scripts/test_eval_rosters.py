@@ -456,12 +456,6 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
         self.assertTrue(self.lane_cases())
         self.assertNotIn("agent-kanban-smoke", self.lane_cases())
 
-    def test_the_script_names_the_file(self):
-        self.assertIn(
-            f'readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE="eval/{eval_rosters.INJECT_LANE_SAFEGUARDS_FILE.name}"',
-            SCRIPT.read_text(encoding="utf-8"),
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

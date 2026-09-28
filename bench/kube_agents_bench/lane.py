@@ -60,6 +60,7 @@ import yaml
 __all__ = [
     "LaneSafeguardsError",
     "append_lane_safeguards",
+    "check_repository",
     "load_lane_safeguards",
     "main",
     "requested_pull_requests",
@@ -134,6 +135,28 @@ def load_lane_safeguards(path: str | Path) -> list[dict[str, Any]]:
             raise LaneSafeguardsError(f"{where}: duplicate entry name {name!r}")
         names.add(name)
     return entries
+
+
+def check_repository(safeguards: list[dict[str, Any]], repo: str) -> None:
+    """Refuse a repository the lane's own entries would refuse at grading.
+
+    A ``github_writes`` leaf that pins ``owner`` errors on every repetition
+    when ``BENCH_GITOPS_REPO`` sits elsewhere, and a lane that starts on such
+    a repository spends a lease to grade nothing. Known before the fan-out
+    from the file and the value, so it is refused here.
+    """
+    if "/" not in repo or not repo.split("/", 1)[1]:
+        raise LaneSafeguardsError(f"{repo!r} is not an owner/name repository")
+    owner = repo.split("/", 1)[0]
+    for entry in safeguards:
+        for leaf in _leaves(entry.get("check")):
+            pinned = str(leaf.get("owner") or "") if leaf.get("type") == WRITES_CHECK_TYPE else ""
+            if pinned and pinned.lower() != owner.lower():
+                raise LaneSafeguardsError(
+                    f"{repo} is not under {pinned}, the organisation the lane entry "
+                    f"{entry['name']!r} pins; every repetition would grade an errored "
+                    "safeguard, so the lane does not start on it"
+                )
 
 
 def requested_pull_requests(spec: Any) -> int:
@@ -212,10 +235,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=main.__doc__.splitlines()[0])
     parser.add_argument("--safeguards", required=True, help="the lane safeguards YAML file")
     parser.add_argument("--out-dir", required=True, help="where <case>/task.yaml copies go")
+    parser.add_argument(
+        "--gitops-repo",
+        default="",
+        help="the owner/name the safeguards will read; refused when a lane entry pins another owner",
+    )
     parser.add_argument("tasks", nargs="+", help="task.yaml paths to copy")
     args = parser.parse_args(argv)
     try:
         safeguards = load_lane_safeguards(args.safeguards)
+        if args.gitops_repo:
+            check_repository(safeguards, args.gitops_repo)
         for task in args.tasks:
             written = append_lane_safeguards(task, safeguards, args.out_dir)
             requested = requested_pull_requests(_load_task(Path(task)).get(SPEC_KEY))

@@ -1860,10 +1860,14 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
   # requesting case's unit was in flight (run_one_unit records the interval
   # in STATE_DIR) is that case's to grade -- its own safeguard allows only the
   # pull requests its reply names -- not a sibling repetition's.
+  # --gitops-repo: a repository the lane's entries pin another organisation
+  # for (a local EVAL_GITOPS_REPO outside the pool's) is refused here, before
+  # the lease, rather than erroring the safeguard on every repetition.
   if ! INJECT_LANE_COPIES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.lane \
       --safeguards "${SCRIPT_DIR}/${EVAL_INJECT_LANE_SAFEGUARDS_FILE}" \
+      --gitops-repo "${INJECT_LANE_REPO}" \
       --out-dir "${INJECT_LANE_TASKS_DIR}" "${TASKS[@]}")"; then
-    echo "ERROR: could not append the inject lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) to the matrix; the lane would run without its GitHub-write safeguard, so it does not start." >&2
+    echo "ERROR: could not append the inject lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) to the matrix, or BENCH_GITOPS_REPO=${INJECT_LANE_REPO} is not a repository they can grade (above); the lane would run without a working GitHub-write safeguard, so it does not start." >&2
     exit 1
   fi
   INJECT_LANE_REQUESTING="$(printf '%s\n' "${INJECT_LANE_COPIES}" | awk '$3 > 0 { printf "%s%s", sep, $1; sep = "," }')"

@@ -1665,7 +1665,8 @@ class GitHubWritesVerifier(BaseVerifier):
     ``TranscriptSnapshot.started_at`` less ``max_clock_skew_sec``: every pull
     request under ``branch_prefix`` whose head is in the repository itself and
     that was opened or updated in the window, and every such branch heading no
-    pull request whose tip was pushed in it. The repository comes from the
+    pull request whose tip was committed in it (the refs API carries no push
+    time, so that is what is measured). The repository comes from the
     environment and not from the reply, since the reply of a run that wrote
     where it should not have may say nothing about it.
 

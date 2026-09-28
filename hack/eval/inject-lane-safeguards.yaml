@@ -4,7 +4,7 @@
 # copy of each task file before devops-bench reads it
 # (bench/kube_agents_bench/lane.py). The task files under bench/tasks/ are
 # untouched and the api lane is byte for byte what it was: on any other
-# transport this file is read for its shape and applied to nothing.
+# transport the script does not read this file at all.
 #
 # Why a lane-level list. Through the inject door the eval addresses the
 # platform persona directly, whose own rule for a change is submit-suggestion,

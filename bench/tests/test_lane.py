@@ -114,6 +114,22 @@ def test_a_name_collision_is_refused_before_anything_is_written(tmp_path):
     assert not (tmp_path / "out").exists()
 
 
+def test_a_repository_outside_the_pinned_owner_is_refused_before_the_lease(tmp_path, capsys):
+    safeguards = lane.load_lane_safeguards(LANE_FILE)
+    lane.check_repository(safeguards, "gke-agentic/kube-agents-evals-21-infra")
+    lane.check_repository(safeguards, "GKE-Agentic/x")  # GitHub owners are case-insensitive
+    with pytest.raises(lane.LaneSafeguardsError, match="is not under gke-agentic"):
+        lane.check_repository(safeguards, "someone/throwaway-infra")
+    with pytest.raises(lane.LaneSafeguardsError, match="not an owner/name"):
+        lane.check_repository(safeguards, "no-slash")
+    # An entry that pins nothing accepts any repository.
+    lane.check_repository([{"name": "n", "check": {"type": "none", "checks": [{"type": "github_writes"}]}}], "someone/x")
+    rc = lane.main(["--safeguards", str(LANE_FILE), "--gitops-repo", "someone/x", "--out-dir", str(tmp_path), str(TASKS / READ_ONLY_CASE / "task.yaml")])
+    assert rc == 1
+    assert "is not under gke-agentic" in capsys.readouterr().err
+    assert not (tmp_path / READ_ONLY_CASE).exists()
+
+
 def test_a_task_with_no_spec_gains_one(tmp_path):
     task_dir = tmp_path / "tasks" / "bare"
     task_dir.mkdir(parents=True)

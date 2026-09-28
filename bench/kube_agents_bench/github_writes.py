@@ -104,7 +104,10 @@ REFS_HEADS_PREFIX = "refs/heads/"
 
 HOW_OPENED = "opened"
 HOW_UPDATED = "updated"
-HOW_PUSHED = "pushed"
+#: A pull-request-less branch is dated by its tip's committer date: the refs
+#: API carries no push time, so a branch pushed from a commit made before
+#: the window is not seen, and the label says what was measured.
+HOW_TIP_COMMITTED = "tip committed"
 KIND_PULL_REQUEST = "pull_request"
 KIND_BRANCH = "branch"
 
@@ -154,7 +157,8 @@ class GitHubUnreadable(Exception):
 @dataclass(frozen=True)
 class GitHubWrite:
     """One write the run made: a pull request opened or updated in the
-    window, or a pull-request-less branch whose tip was pushed in it."""
+    window, or a pull-request-less branch whose tip was committed in it (the
+    refs API carries no push time)."""
 
     kind: str
     branch: str
@@ -419,7 +423,7 @@ def find_writes(
             continue
         if tip >= since:
             report.writes.append(
-                GitHubWrite(kind=KIND_BRANCH, branch=branch, when=tip, how=HOW_PUSHED)
+                GitHubWrite(kind=KIND_BRANCH, branch=branch, when=tip, how=HOW_TIP_COMMITTED)
             )
     if len(orphans) > BRANCH_INSPECTION_CAP:
         report.notes.append(
