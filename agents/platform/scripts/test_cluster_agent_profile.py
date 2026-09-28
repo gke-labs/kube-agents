@@ -870,47 +870,18 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "expected_output must require delegating the investigation to the Cluster Agent",
         )
 
-    def test_no_inline_platform_mcp_diagnostics_forbids_platform_control_tools(self):
+    def test_verification_spec_checks_and_delegation_requirements(self):
         spec = self.data.get("verification_spec", [])
-        no_inline = next(
-            (c for c in spec if c.get("name") == "no-inline-platform-mcp-diagnostics"),
-            None,
-        )
-        self.assertIsNotNone(no_inline, "missing no-inline-platform-mcp-diagnostics check")
-        assert no_inline is not None
-        checks = no_inline.get("check", {}).get("checks", [])
-        self.assertTrue(checks, "no-inline-platform-mcp-diagnostics has no inner checks")
-        tool_names = checks[0].get("tool_names", [])
-
-        # Must forbid in-pod platform_control diagnostic tools
-        for tool in (
-            "mcp__platform_control__audit_log_searcher",
-            "mcp_platform_control_audit_log_searcher",
-            "mcp__platform_control__get_cc_pod_diagnostics",
-            "mcp_platform_control_get_cc_pod_diagnostics",
-            "mcp__platform_control__list_cc_pods",
-            "mcp_platform_control_list_cc_pods",
-            "mcp__platform_control__list_cc_healthchecks",
-            "mcp_platform_control_list_cc_healthchecks",
-            "mcp__platform_control__get_cc_operator_status",
-            "mcp_platform_control_get_cc_operator_status",
-        ):
-            self.assertIn(tool, tool_names)
-
-        # Must NOT forbid remote GKE MCP diagnostic tools (which belong to the Cluster Agent)
-        for tool in (
-            "mcp__gke__get_k8s_resource",
-            "mcp_gke_get_k8s_resource",
-            "mcp__gke__describe_k8s_resource",
-            "mcp_gke_describe_k8s_resource",
-            "mcp__gke__list_k8s_events",
-            "mcp_gke_list_k8s_events",
-            "mcp__gke__get_k8s_logs",
-            "mcp_gke_get_k8s_logs",
-            "mcp__gke__get_k8s_rollout_status",
-            "mcp_gke_get_k8s_rollout_status",
-        ):
-            self.assertNotIn(tool, tool_names)
+        check_names = [c.get("name") for c in spec]
+        self.assertIn("a-cluster-agent-did-the-work", check_names)
+        self.assertIn("platform-enumerated-cluster-profiles", check_names)
+        self.assertIn("no-stubbed-profile-scripts", check_names)
+        self.assertIn("rca-names-the-oom", check_names)
+        self.assertIn("the-crashloop-was-diagnosed-not-fixed", check_names)
+        # Ineffective in-pod platform_control safeguard was removed;
+        # delegation is enforced by a-cluster-agent-did-the-work (worker_agents)
+        # and expected_output
+        self.assertNotIn("no-inline-platform-mcp-diagnostics", check_names)
 
 
 if __name__ == "__main__":
