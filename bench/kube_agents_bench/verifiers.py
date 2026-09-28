@@ -1656,6 +1656,8 @@ _NO_DIFF_TOKEN_REASON = (
 # hunk text alone, from the `@@` header on, so there is no `+++ b/file` line
 # to tell apart.
 _DIFF_ADDED_PREFIX = "+"
+# The `status` GitHub gives a file the pull request deletes.
+_DIFF_REMOVED_STATUS = "removed"
 # Where a run that knows the repository it writes to (owner/name) says so;
 # the inject lane's own GitHub-write safeguard (#2079) is what exports it.
 # Set, it binds the candidate pull request to that repository; unset, the
@@ -1745,7 +1747,7 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
         # refuses the shape for a task file, and this refuses it for an
         # inline spec or a hand-built verifier.
         phrases = (*self.required_phrases, *self.any_of_phrases, *self.forbidden_phrases)
-        if any(not p.strip() for p in phrases):
+        if any(not _normalize(p).strip() for p in phrases):
             raise ValueError(_BLANK_DIFF_PHRASE_REASON)
         return self
 
@@ -1823,7 +1825,10 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                     for line in patch.splitlines()
                     if line.startswith(_DIFF_ADDED_PREFIX)
                 ]
-                chunks.append("\n".join([name, *added]))
+                # A removed file's name is not something the pull request
+                # adds; only the names of files it adds or changes count.
+                named = [] if str(entry.get("status") or "") == _DIFF_REMOVED_STATUS else [name]
+                chunks.append("\n".join([*named, *added]))
             if len(files) < _PR_FILES_PAGE_SIZE:
                 break
         else:

@@ -543,8 +543,10 @@ reaches directly, opens a pull request under its own `submit-suggestion` rule an
 and its reply carries the URL and, at most, the kind and the budget. The same proposal graded
 12 of 12 on one front door and 0 of 3 on the other. `pull_request_diff_contains` reads the
 proposal where the persona put it: the phrases of `report_contains`, matched the same way, over
-the added lines of every file the pull request changes plus the file names. A case writes the three
-places as one `any`:
+the added lines of every file the pull request changes plus the names of the files it adds or
+changes. A case writes the two places as one `any`; a third arm over the whole transcript
+(`scope: full`) is left out on purpose, since it would pass on an interim message that names the
+nouns while planning, the progress-prose false pass that scope is documented to produce above:
 
 ```yaml
 - name: report-proposes-pdb-manifest
@@ -554,10 +556,6 @@ places as one `any`:
     type: any
     checks:
       - type: report_contains
-        required_phrases: ["PodDisruptionBudget", "selector"]
-        any_of_phrases: ["minAvailable", "maxUnavailable"]
-      - type: report_contains
-        scope: full
         required_phrases: ["PodDisruptionBudget", "selector"]
         any_of_phrases: ["minAvailable", "maxUnavailable"]
       - type: pull_request_diff_contains
@@ -570,15 +568,15 @@ What it deliberately does not ask is whether this run opened the pull request. T
 `pull_request_opened`'s question, and a remediation case that needs both declares both. Here a
 repetition that recomputed the same manifest, found the branch already carrying it and pointed at
 the open pull request has proposed a concrete manifest, which is what the objective grades. The
-cost is stated rather than hidden: a reply that only quotes an earlier lease's open pull request carrying the manifest passes too, the leftover grading #1755 describes; it is accepted because requiring a push would fail that correct repetition, the sweep closes the agent's pull requests between leases, and a case that must prove the write declares `pull_request_opened` beside this. The write itself is not this objective's question; the inject lane guards it (#2079). Three binds
+cost is stated rather than hidden: a reply that only quotes an earlier lease's open pull request carrying the manifest passes too, the leftover grading described under `pull_request_opened` above; it is accepted because requiring a push would fail that correct repetition, the sweep closes the agent's pull requests between leases, and a case that must prove the write declares `pull_request_opened` beside this. The write itself is not this objective's question but the inject lane's, which guards it with a
+safeguard of its own. Three binds
 keep that cost to exactly that shape: the pull request must be open (the skill's "already exists"
 path matches open ones only, so a merged or closed one in a reply is a leftover quoted, not a
 proposal made, and a merged manifest anywhere in the organisation is not a standing pass); its
 head must be an agent branch (`platform-agent/*`) in the repository itself and its author a
 GitHub App, the three checks the pool sweep's `is_agent_pull_request` applies, so a human's pull
-request under the prefix is not the agent's; and when the run sets `BENCH_GITOPS_REPO` (the
-inject lane's own GitHub-write safeguard is what exports it) the pull request must be in that
-repository. It reads
+request under the prefix is not the agent's; and when the run sets `BENCH_GITOPS_REPO`, the
+repository it was told the agent writes to, the pull request must be in that repository. It reads
 `BENCH_GITHUB_TOKEN` as the two checks above do, needs `pull_requests: read` on both endpoints,
 and errors only on a fault of ours (a 401, a denial, an unexpected status, an API it could not
 reach) and only when no other URL in the reply passes; a reply naming no pull request fails before

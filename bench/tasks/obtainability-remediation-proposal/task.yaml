@@ -71,22 +71,18 @@ verification_spec:
     role: objective
     mode: assert
     check:
-      # The proposal in any of the three places the agent puts it. "selector"
+      # The proposal in either of the two places the agent puts it. "selector"
       # is required alongside the kind in each: the prose sentence "create a
       # PodDisruptionBudget with minAvailable: 1" is not a manifest, and every
-      # concrete PDB manifest names its selector.
+      # concrete PDB manifest names its selector. Not a third arm over the
+      # whole transcript (`scope: full`): on the inject transport it reads
+      # the same text as the reply, and on the api transport it would pass
+      # on an interim message that names the nouns while planning, which is
+      # the progress-prose false pass that scope is documented to produce.
       type: any
       checks:
         # Inline in the reply: the Planning Agent's shape on the api transport.
         - type: report_contains
-          required_phrases: ["PodDisruptionBudget", "selector"]
-          any_of_phrases: ["minAvailable", "maxUnavailable"]
-        # Quoted anywhere in the transcript: a manifest or diff the agent
-        # pasted while working and did not repeat in its closing message.
-        # `full` contains the reply, so this arm passes whenever the first
-        # does; the two are kept apart so the report says which one held.
-        - type: report_contains
-          scope: full
           required_phrases: ["PodDisruptionBudget", "selector"]
           any_of_phrases: ["minAvailable", "maxUnavailable"]
         # In the diff of the pull request the reply points at: the platform

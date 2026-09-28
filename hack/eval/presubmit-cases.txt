@@ -81,9 +81,9 @@
 # this one asks for a remediation manifest and checks it for its
 # load-bearing nouns (PodDisruptionBudget, a selector,
 # minAvailable/maxUnavailable -- substrings, not schema validation) wherever
-# the agent put it -- inline in the reply, quoted in the transcript, or in
-# the diff of a pull request the reply names -- still with no cluster
-# write. Measured on #984's three presubmit runs:
+# the agent put it -- inline in the reply, or in the diff of a pull request
+# the reply names -- still with no cluster write. Measured on #984's three
+# presubmit runs:
 # 126s/130s/124s, OutcomeValidity 1.0 each time, on three different leased
 # projects. The reliability domain's other prompt variations --
 # obtainability-direct-query, obtainability-refusal-direct-mutation, and

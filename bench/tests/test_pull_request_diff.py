@@ -167,13 +167,18 @@ def test_an_inline_manifest_still_passes_the_entry_without_a_credential(github, 
     assert github.calls == []
 
 
-def test_a_manifest_quoted_earlier_in_the_transcript_passes_the_second_arm(github):
+def test_progress_prose_that_names_the_nouns_is_not_a_proposal(github, monkeypatch):
+    """The entry has no `scope: full` arm on purpose: an interim message that
+    plans "a PodDisruptionBudget whose selector matches, minAvailable: 1"
+    followed by a closing reply with none of it must not pass."""
+    monkeypatch.delenv("BENCH_GITHUB_TOKEN", raising=False)
     stash(
-        final_message="Done; see the manifest above.",
-        output="kind: PodDisruptionBudget ... selector: ... minAvailable: 1\n\nDone; see the manifest above.",
+        final_message="Done; I opened nothing and inlined nothing.",
+        output="I will check for a PodDisruptionBudget whose selector matches and propose minAvailable: 1.\n\nDone; I opened nothing and inlined nothing.",
     )
-    assert VerifierAgent().run_entry(case_entry(), timeout_sec=10.0).status == "pass"
+    assert VerifierAgent().run_entry(case_entry(), timeout_sec=10.0).status == "fail"
     assert github.calls == []
+    assert [c.type for c in case_entry().check.checks] == ["report_contains", "pull_request_diff_contains"]
 
 
 # --- what is rejected, and what is an error -----------------------------------
@@ -304,9 +309,45 @@ def test_a_human_on_an_agent_named_branch_is_not_the_agents_proposal(token, gith
 
 
 def test_a_blank_phrase_is_refused_at_load():
-    for kw in ({"required_phrases": [""]}, {"required_phrases": ["x", " "]}, {"any_of_phrases": [""]}, {"required_phrases": ["x"], "forbidden_phrases": [""]}):
+    """Blank after the matcher's own normalisation: `**` and `` ` `` strip to
+    nothing there and would match every diff."""
+    for kw in (
+        {"required_phrases": [""]},
+        {"required_phrases": ["x", " "]},
+        {"any_of_phrases": [""]},
+        {"required_phrases": ["x"], "forbidden_phrases": [""]},
+        {"required_phrases": ["**"]},
+        {"any_of_phrases": ["`", "x"]},
+        {"required_phrases": ["_ _"]},
+    ):
         with pytest.raises(ValidationError, match="blank phrase"):
             PullRequestDiffContainsVerifier(type="pull_request_diff_contains", **kw)
+
+
+def test_a_removed_files_name_does_not_count(token, github):
+    """A pull request that deletes `checkout-gateway-PodDisruptionBudget.yaml`
+    while adding `selector:` and `minAvailable` elsewhere is not a proposal:
+    only the names of files it adds or changes join the haystack."""
+    stash()
+    github.routes[f"{API}/pulls/39"] = (200, fixture("pull-39.json"))
+    github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (
+        200,
+        [
+            {"filename": "seeded-reliability/checkout-gateway-PodDisruptionBudget.yaml", "status": "removed", "patch": "@@ -1,3 +0,0 @@\n-a\n-b\n-c"},
+            {"filename": "seeded-reliability/deploy.yaml", "status": "modified", "patch": "@@ -1 +1,2 @@\n+  selector:\n+  # minAvailable"},
+        ],
+    )
+    res = check().verify(5.0)
+    assert res.status == "fail"
+    assert "required phrases absent from its diff: ['PodDisruptionBudget']" in res.reason
+    # Renamed to the noun, and added: the name counts.
+    github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (
+        200,
+        [
+            {"filename": "seeded-reliability/checkout-gateway-PodDisruptionBudget.yaml", "status": "added", "patch": "@@ -0,0 +1,2 @@\n+  selector:\n+  minAvailable: 1"},
+        ],
+    )
+    assert check().verify(5.0).status == "pass"
 
 
 def test_a_withheld_patch_is_named_on_the_fail_path_too(token, github):
