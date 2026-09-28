@@ -46,17 +46,35 @@ Anything after the frontmatter is procedural instruction: workflows, SOPs, examp
 Two ways a skill enters the model's context:
 
 1. **On-demand.** The agent notices from the user's prompt (or a cron job's prompt) that a particular skill's `description` matches. It loads the skill body and follows the procedure.
-2. **Explicit reference from a cron job.** `cron/jobs.json` entries can name skills in the `"skills"` field. Each fleet audit, for example, always loads `fleet-audit`:
+2. **Explicit reference from a cron job.** `cron/jobs.json` entries can name skills in the `"skills"` field. Each fleet audit always loads `fleet-audit`; the `"skills"` line of the `compliance-audit` entry below is that reference.
 
-   ```json
-   {
-     "id": "compliance-audit",
-     "prompt": "Run the daily fleet security and RBAC posture audit. ...",
-     "skills": ["fleet-audit"]
-   }
-   ```
+<!-- BEGIN GENERATED: cron-job-example -->
+<!-- Regenerate with: make docs-generate -- do not edit by hand. -->
+<!-- prettier-ignore-start -->
 
-   This route is only open to jobs that run a model. A `no_agent` job such as `github-repo-watcher` runs a script instead of a turn, so `skills` has nothing to load into; when its script files a kanban card, the card body names the skill and the worker loads it on demand.
+```json
+{
+  "id": "compliance-audit",
+  "name": "Security & RBAC Posture Audit",
+  "schedule": {
+    "kind": "cron",
+    "expr": "20 6 * * *",
+    "display": "20 6 * * *"
+  },
+  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 494 lines of it, before you run anything. Its sixteen checks are section 2, lines 113-393, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 opens by running the collector (`skills/fleet-audit/scripts/collect.py compliance-audit`) with --workspace set to the workspace start returned, redirecting its stdout to /opt/data/scratch/manifest_compliance-audit.json: run it before evaluating any check by hand, read the manifest the way section 2 says, and pass the same file to finish as --manifest-file. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+  "skills": [
+    "fleet-audit"
+  ],
+  "risk": "low",
+  "enabled": true,
+  "deliver": "chat"
+}
+```
+
+<!-- prettier-ignore-end -->
+<!-- END GENERATED: cron-job-example -->
+
+This route is only open to jobs that run a model. A `no_agent` job such as `github-repo-watcher` runs a script instead of a turn, so `skills` has nothing to load into; when its script files a kanban card, the card body names the skill and the worker loads it on demand.
 
 ## Skill structure conventions
 

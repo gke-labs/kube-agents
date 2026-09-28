@@ -23,226 +23,48 @@ append to a trace file OUTSIDE the repository, so the checkout cannot erase the
 evidence of what ran before it.
 """
 
-import os
 import pathlib
-import shutil
 import subprocess
 import tempfile
 import textwrap
 import unittest
 
-from tests.testing.common import create_mock_git_repo
+from tests.testing.rc_eval_driver import (
+    DEPLOY_RC_MARKER as _DEPLOY_RC_MARKER,
+    EXPECTED_DECK_URL as _EXPECTED_DECK_URL,
+    EXPECTED_RC_EVAL_TIER as _EXPECTED_RC_EVAL_TIER,
+    RC_TAG as _RC_TAG,
+    RcEvalDriverFixture,
+)
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_EVAL_RC = _REPO_ROOT / "hack" / "ci-eval-rc.sh"
 
-_RC_TAG = "rc_2609021231_fdba3a7"
-_JOB_NAME = "ci-kube-agents-eval-rc"
-_BUILD_ID = "2095176282760286208"
-_EXPECTED_DECK_URL = (
-    f"https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{_JOB_NAME}/{_BUILD_ID}"
-)
-
-# A stub ci-deploy.sh has to carry this for the driver's predates-the-RC-path
-# guard to let it through; the real marker is the variable ci-deploy.sh reads.
-_DEPLOY_RC_MARKER = "RC_COMMIT_SHA"
-
-# The tier switch's variable. The driver exports it and greps the candidate for
-# it; nothing on main reads it yet.
-_EVAL_TIER_MARKER = "EVAL_TIER"
-
-
-def _stub(trace: pathlib.Path, name: str, body: str = "", exit_code: int = 0) -> str:
-    """A sibling script that records that it ran, with what, and in what order."""
-    return textwrap.dedent(
-        f"""\
-        #!/usr/bin/env bash
-        set -euo pipefail
-        {{
-          echo "STEP {name}"
-          echo "  RC_COMMIT_SHA=${{RC_COMMIT_SHA:-unset}}"
-          echo "  TIER=${{EVAL_TIER:-unset}}"
-          echo "  HEAD=$(git rev-parse HEAD)"
-        }} >> "{trace}"
-        {body}
-        exit {exit_code}
-        """
-    )
-
 
 class RcEvalDriverTestCase(unittest.TestCase):
-    """Runs the real hack/ci-eval-rc.sh against a stubbed candidate tree."""
+    """Runs the real hack/ci-eval-rc.sh against a stubbed candidate tree.
+
+    The fixture itself lives in tests/testing/rc_eval_driver.py, because
+    tests/integration/test_seam_rc_eval_verdict.py needs the same driver run to
+    produce a real summary artifact for the verdict poller to read, and
+    inheriting it from here would have re-run every case below inside that tier.
+    """
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self._tmp.cleanup)
-        self.base = pathlib.Path(self._tmp.name)
-        # Both live outside the repository: a checkout must not be able to
-        # delete the record of what happened before it.
-        self.trace = self.base / "trace.txt"
-        self.trace.write_text("", encoding="utf-8")
-        self.artifacts = self.base / "artifacts"
-        self.artifacts.mkdir()
+        self.driver = RcEvalDriverFixture()
+        self.addCleanup(self.driver.cleanup)
+        self.base = self.driver.base
+        self.trace = self.driver.trace
+        self.artifacts = self.driver.artifacts
 
-    def build_repo(
-        self,
-        *,
-        driver_at_candidate: bool = True,
-        deploy_supports_rc: bool = True,
-        eval_supports_tier: bool = True,
-        eval_exit_code: int = 0,
-        eval_body: str = "",
-        deploy_exit_code: int = 0,
-        truncate_driver_from_deploy: bool = False,
-    ) -> tuple[pathlib.Path, str]:
-        """A repository with a candidate commit and a later HEAD to start from.
-
-        Returns the repository root and the candidate's SHA. `hack/` is
-        populated at the candidate commit, because the candidate's tree is what
-        runs after the checkout — that is the whole point of doing one.
-        """
-        # A str, not the Path: create_mock_git_repo treats anything with a
-        # `.name` as a TemporaryDirectory, and Path.name is its basename.
-        _, repo, git = create_mock_git_repo(str(self.base))
-        root = pathlib.Path(repo)
-        hack = root / "hack"
-        hack.mkdir()
-
-        shutil.copy(_CI_EVAL_RC, hack / "ci-eval-rc.sh")
-
-        # resolve-rc-target.sh's real contract: the SHA on stdout, everything
-        # else on stderr, the tag written through RC_TARGET_OUTPUT. The SHA it
-        # must print is not known until the commit exists, so it is patched in
-        # below once the tree has been committed.
-        (hack / "resolve-rc-target.sh").write_text(
-            textwrap.dedent(
-                f"""\
-                #!/usr/bin/env bash
-                set -euo pipefail
-                echo "STEP resolve" >> "{self.trace}"
-                echo "resolving" >&2
-                if [ -n "${{RC_TARGET_OUTPUT:-}}" ]; then
-                  echo "rc_tag={_RC_TAG}" >> "${{RC_TARGET_OUTPUT}}"
-                  echo "rc_commit_sha=__CANDIDATE_SHA__" >> "${{RC_TARGET_OUTPUT}}"
-                fi
-                echo "__CANDIDATE_SHA__"
-                """
-            ),
-            encoding="utf-8",
-        )
-
-        # The guard greps the candidate's ci-deploy.sh for the marker, so a
-        # stub standing in for a candidate that predates the path must not
-        # mention it ANYWHERE — including in the trace lines _stub emits,
-        # which is why that variant is written out longhand.
-        if deploy_supports_rc:
-            deploy_body = f'echo "  marker {_DEPLOY_RC_MARKER}" >> "{self.trace}"'
-            if truncate_driver_from_deploy:
-                # Truncate the driver IN PLACE, which is the mechanism the
-                # wrapper exists for and the one a checkout does not perform:
-                # git replaces a file by rename, leaving the running shell's
-                # descriptor on the intact original inode, so no checkout can
-                # reproduce this. `: >` keeps the inode and drops it to zero
-                # bytes, so a shell still reading from disk hits EOF at its
-                # offset and the remaining steps silently vanish.
-                #
-                # The path resolves to the same inode the driver is running
-                # from only because the candidate's copy of it is byte-identical
-                # to HEAD's, so the checkout left the file alone.
-                deploy_body += f'\n: > "{hack / "ci-eval-rc.sh"}"'
-            deploy_stub = _stub(
-                self.trace, "deploy", body=deploy_body, exit_code=deploy_exit_code
-            )
-        else:
-            deploy_stub = textwrap.dedent(
-                f"""\
-                #!/usr/bin/env bash
-                set -euo pipefail
-                echo "STEP deploy" >> "{self.trace}"
-                echo "  building from source" >> "{self.trace}"
-                """
-            )
-        (hack / "ci-deploy.sh").write_text(deploy_stub, encoding="utf-8")
-
-        # The tier note keys off the string EVAL_TIER appearing in the
-        # candidate's ci-eval-pr.sh, so the stub for a candidate that predates
-        # the tier must not mention it anywhere — including in its trace lines.
-        if eval_supports_tier:
-            eval_stub = _stub(
-                self.trace, "eval", body=eval_body, exit_code=eval_exit_code
-            )
-        else:
-            eval_stub = textwrap.dedent(
-                f"""\
-                #!/usr/bin/env bash
-                set -euo pipefail
-                echo "STEP eval" >> "{self.trace}"
-                exit {eval_exit_code}
-                """
-            )
-        (hack / "ci-eval-pr.sh").write_text(eval_stub, encoding="utf-8")
-
-        for script in hack.iterdir():
-            script.chmod(0o755)
-
-        if not driver_at_candidate:
-            (hack / "ci-eval-rc.sh").unlink()
-
-        git("add", "-A")
-        git("commit", "-m", "feat: the release candidate")
-        candidate = git("rev-parse", "HEAD").stdout.strip()
-
-        # The resolver can only name the candidate once it exists, and the
-        # patched copy must be the one at HEAD rather than at the candidate:
-        # the driver runs the resolver BEFORE the checkout.
-        resolver = hack / "resolve-rc-target.sh"
-        resolver.write_text(
-            resolver.read_text(encoding="utf-8").replace(
-                "__CANDIDATE_SHA__", candidate
-            ),
-            encoding="utf-8",
-        )
-        # HEAD moves past the candidate so the checkout is a real move, and
-        # the driver is restored here whether or not the candidate carries it.
-        shutil.copy(_CI_EVAL_RC, hack / "ci-eval-rc.sh")
-        (hack / "ci-eval-rc.sh").chmod(0o755)
-        resolver.chmod(0o755)
-        (root / "later.txt").write_text("a commit after the candidate\n")
-        git("add", "-A")
-        git("commit", "-m", "chore: main has moved on")
-
-        return root, candidate
+    def build_repo(self, **kwargs) -> tuple[pathlib.Path, str]:
+        return self.driver.build_repo(**kwargs)
 
     def run_driver(self, root: pathlib.Path, **env) -> subprocess.CompletedProcess:
-        environ = {
-            **os.environ,
-            "RC_EVAL_ENABLED": "1",
-            "ARTIFACTS": str(self.artifacts),
-            "JOB_NAME": _JOB_NAME,
-            "BUILD_ID": _BUILD_ID,
-        }
-        environ.pop("PULL_NUMBER", None)
-        environ.pop("RC_TAG", None)
-        for key, value in env.items():
-            if value is None:
-                environ.pop(key, None)
-            else:
-                environ[key] = value
-        return subprocess.run(
-            ["bash", str(root / "hack" / "ci-eval-rc.sh")],
-            cwd=root,
-            env=environ,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
+        return self.driver.run_driver(root, **env)
 
     def steps(self) -> list[str]:
-        return [
-            line.split(" ", 1)[1]
-            for line in self.trace.read_text(encoding="utf-8").splitlines()
-            if line.startswith("STEP ")
-        ]
+        return self.driver.steps()
 
     # ─── Dormancy and the trust boundary ────────────────────────────────────
 
@@ -285,10 +107,12 @@ class RcEvalDriverTestCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         trace = self.trace.read_text(encoding="utf-8")
         self.assertEqual(trace.count(f"RC_COMMIT_SHA={candidate}"), 2, trace)
-        # `nightly`, not a value of this lane's own: #1175's switch exits 1 on
-        # anything it does not know, so inventing `rc` here would break the day
-        # the two land together.
-        self.assertEqual(trace.count("TIER=nightly"), 2, trace)
+        # One of #1175's two values and not a name of this lane's own: its
+        # switch exits 1 on anything it does not know, and it exits 1 after the
+        # pool lease rather than before it.
+        self.assertEqual(
+            trace.count(f"TIER={_EXPECTED_RC_EVAL_TIER}"), 2, trace
+        )
 
     def test_survives_a_candidate_whose_tree_lacks_the_driver(self):
         """The checkout deletes the running script; the run must finish anyway.
@@ -332,17 +156,20 @@ class RcEvalDriverTestCase(unittest.TestCase):
             self.steps(), ["resolve"], "the refusal must land before deploying"
         )
 
-    def test_notes_but_allows_a_candidate_without_the_tier_switch(self):
-        """A smaller matrix than intended is a note; it is not a wrong verdict.
+    def test_grades_a_candidate_that_predates_the_tier_switch_without_a_note(self):
+        """The two agree on the matrix, so there is nothing left to warn about.
 
-        This is the ordinary case, not a legacy one: the tier switch is not on
-        main, so every candidate reaches here until it lands.
+        A candidate cut before #1175 has no switch to read and falls back to
+        the presubmit matrix, which is what RC_EVAL_TIER exports anyway. The
+        driver used to print a note here saying the run measured something
+        narrower than the lane intended; that stopped being true when the lane
+        settled on the presubmit matrix, and a note nobody can act on is how
+        the comment this change removed survived nineteen days.
         """
         root, _ = self.build_repo(eval_supports_tier=False)
         result = self.run_driver(root)
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("carries no EVAL_TIER switch", result.stdout)
-        self.assertIn("presubmit matrix", result.stdout)
+        self.assertNotIn("carries no EVAL_TIER switch", result.stdout)
         self.assertEqual(self.steps(), ["resolve", "deploy", "eval"])
 
     def test_finishes_the_run_after_its_own_file_is_emptied_mid_step(self):
@@ -376,33 +203,38 @@ class RcEvalDriverTestCase(unittest.TestCase):
         deploy = (_REPO_ROOT / "hack" / "ci-deploy.sh").read_text(encoding="utf-8")
         self.assertIn(_DEPLOY_RC_MARKER, deploy)
 
-    def test_the_tier_marker_is_a_string_the_real_ci_eval_pr_reads(self):
-        """The driver's export and the candidate's switch must be one string.
+    def test_the_exported_tier_is_the_presubmit_matrix(self):
+        """The lane grades the merge-blocking matrix, not the full catalog.
 
-        The half that can be checked today is the driver's: it greps the
-        candidate for the same name it exports, so a rename on one side alone
-        makes the grep vacuous. The candidate's half waits on #1175, which is
-        what adds the switch to hack/ci-eval-pr.sh.
+        Step 5 of staging-promotion-pipeline.yml withdraws the nomination if no
+        verdict has arrived in 330 minutes, and it cannot wait longer: a
+        GitHub-hosted job is killed at 360. The nightly tier does not finish in
+        that window — ci-kube-agents-eval-nightly grades the same 126 units and
+        took 357 and 401 minutes on the two runs that finished in the week to
+        2026-09-23. The presubmit matrix does: the same fan-out took 83, 110 and
+        143 minutes on the three runs that reached a verdict on 2026-09-24.
 
-        A skip rather than @unittest.expectedFailure, deliberately. An
-        expected failure that starts passing is an unexpectedSuccess, which
-        unittest counts as a failure and exits 1 — so #1175 landing would have
-        reddened main's Python suite, with the failure naming this file rather
-        than the change that caused it.
+        This pins the value rather than only checking the evaluator accepts it,
+        because `nightly` is also accepted. It was `nightly` from #1230 until
+        the wall-clock measurements on #1842, and the comment that made that
+        look harmless said #1175's switch was not on main — 29 minutes after it
+        was. A silent flip back reds here rather than on the next deploy that
+        does not happen.
         """
         driver = _CI_EVAL_RC.read_text(encoding="utf-8")
         self.assertIn(
-            _EVAL_TIER_MARKER,
+            f'readonly RC_EVAL_TIER="{_EXPECTED_RC_EVAL_TIER}"',
             driver,
-            "the driver must export the marker it greps the candidate for",
+            "widening the tier needs the verdict to arrive somewhere that is "
+            "not a GitHub-hosted job holding a connection open for it",
         )
         evaluator = (_REPO_ROOT / "hack" / "ci-eval-pr.sh").read_text(encoding="utf-8")
-        if _EVAL_TIER_MARKER not in evaluator:
-            self.skipTest(
-                f"{_EVAL_TIER_MARKER} is not on main yet (#1175), so the "
-                "driver's export is inert and its note fires on every "
-                "candidate — the case above covers that state"
-            )
+        self.assertIn(
+            f"  {_EXPECTED_RC_EVAL_TIER})",
+            evaluator,
+            "ci-eval-pr.sh's tier case must accept what the driver exports, or "
+            "the run exits 1 after taking a pool project",
+        )
 
     # ─── Reporting ──────────────────────────────────────────────────────────
 
@@ -426,14 +258,43 @@ class RcEvalDriverTestCase(unittest.TestCase):
         self.assertIn("never evaluated", summary)
 
     def test_a_red_verdict_is_reported_not_swallowed(self):
-        """Non-gating is the job config's `|| true`, not a hidden exit 0 here."""
-        root, _ = self.build_repo(eval_exit_code=1)
+        """A red eval has to be red here, because the promotion reads it.
+
+        Both halves matter and they are read by different audiences. The
+        non-zero status is what makes the Prow job red for a human looking at
+        Deck; the RED row in the summary is what step 5 of staging-promotion-pipeline.yml
+        polls for, and what holds the candidate back from staging.
+        """
+        root, _ = self.build_repo(eval_exit_code=1, eval_writes_verdict=True)
         result = self.run_driver(root)
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("RED", result.stdout)
         summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
         self.assertIn("| Verdict | RED |", summary)
-        self.assertIn("does not hold a release", summary)
+        self.assertIn("RED holds", summary)
+
+    def test_an_eval_that_graded_nothing_is_not_a_red_candidate(self):
+        """A preflight refusal must not retire the candidate it never measured.
+
+        hack/ci-eval-pr.sh exits 1 for a red catalog and also for the guards it
+        runs before the first case — a ledger token that would not mint, a
+        runner image short of `uv`, an EVAL_REPETITIONS that is not a positive
+        integer. Reading both as RED matters here in a way it does not in the
+        presubmit: RED is settled, so step 5b leaves the evalcand_ tag in place
+        and resolve_promotion_candidate.sh skips that commit for good. A broken
+        runner would retire a candidate nobody measured.
+
+        bench-gate's --markdown-out is the separator. The roll-up writes it, so
+        its absence after a non-zero exit means no case was graded.
+        """
+        root, _ = self.build_repo(eval_exit_code=1, eval_writes_verdict=False)
+        result = self.run_driver(root)
+        self.assertEqual(result.returncode, 1, "the eval's own status still survives")
+        self.assertEqual(self.steps(), ["resolve", "deploy", "eval"])
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Verdict | NOT RUN |", summary)
+        self.assertNotIn("| Verdict | RED |", summary)
+        self.assertIn("before grading a case", summary)
 
     def test_a_not_evaluated_eval_is_not_run_rather_than_red(self):
         """ci-eval-pr.sh exits 2 when `bench-gate suite` could not evaluate the
@@ -540,6 +401,32 @@ class RcEvalDriverTestCase(unittest.TestCase):
         self.assertIn("| Verdict | RED |", summary)
         self.assertIn("did not reach its verdict step", summary)
         self.assertNotIn("Per-case detail is in", summary)
+
+    def test_a_preflight_refusal_exiting_2_is_not_described_as_weather(self):
+        """The two NOT RUN paths must not both claim the same run.
+
+        A preflight refusal exits whatever it exits, and 2 is a status it can
+        reach without bench-gate: argparse takes it on a bad flag, and `uv run`
+        can exit it before bench-gate loads. Such a run wrote neither verdict
+        file, so it is the roll-up-never-reached branch and its summary should
+        say the eval stopped before grading a case.
+
+        What it must not also say is that an admitted case lost every
+        repetition to infrastructure. That paragraph belonged to a condition
+        written when a 2 the JSON did not confirm was still RED, so nothing
+        NOT RUN could reach it; once a preflight refusal could, re-deriving the
+        branch from the status alone printed both explanations for one run and
+        told the reader to wait for weather that was never the problem.
+        """
+        root, _ = self.build_repo(eval_exit_code=2, eval_writes_verdict=False)
+        result = self.run_driver(root)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Verdict | NOT RUN |", summary)
+        self.assertIn("before grading a case", summary)
+        self.assertNotIn("could not certify", summary)
+        self.assertNotIn("rerun when the environment is healthy", summary)
+        self.assertNotIn("lost every", summary)
 
     def test_writes_the_target_and_summary_artifacts(self):
         root, candidate = self.build_repo()

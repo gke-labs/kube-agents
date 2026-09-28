@@ -135,7 +135,8 @@ adopts the Cloud KMS resources GCP refuses to delete, which a bare
 The composition ships no backend block, so a hand-driven apply uses local
 state in this directory. For an install whose state must outlive the checkout
 — anything driven by `install.sh`, whose companion `uninstall.sh` and
-`upgrade.sh` run from fresh clones — set `KUBE_AGENTS_STATE_BUCKET` before any
+`upgrade.sh` may run from a fresh clone, a release bundle, or the install
+checkout in `$HOME/kube-agents` — set `KUBE_AGENTS_STATE_BUCKET` before any
 `lifecycle.sh` subcommand:
 
 ```bash
@@ -468,6 +469,35 @@ nothing and leaves IAM to you (the agent fails every GCP call until an
 equivalent set exists). Deliberately no admin list is pre-staged in
 `terraform.tfvars.example` — widening access should be an explicit, reviewed
 choice.
+
+### Projects in scope (`scope`)
+
+`scope` is the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the
+install from this one value: the `kube-agents-iam` module binds its read allowlist (the read
+subset of `read_only_roles`, intersected with the roles the host project got) in every project
+`scope.projects` names, and the chart renders the same object into the CR, so the IAM and the
+declaration cannot name different projects, and the release waits for the bindings. The block is
+rendered on every apply, empty lists included: an emptied `projects` list is the declaration that
+drops projects (their read roles are revoked and their Cluster Agent profiles retire over the
+reconcile's next two clean runs), and a missing block would declare nothing. `exclude.projects`
+takes project IDs or shell-style globs, `exclude.clusters` the full `project_id`, `location`,
+`cluster_name` triple; neither changes IAM. Through the installer the value comes from
+`SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`
+([`scripts/installer/README.md`](../../../scripts/installer/README.md), which also says how to
+forget the bindings of a project that became unreachable). If the running `PlatformAgent` already
+declares `spec.scope` by hand, copy it into `scope` before the first apply of a composition that
+has the variable: that apply renders the block for the first time and replaces the live lists
+with `scope`'s, empty by default, after which the reconcile retires the dropped projects over two
+clean runs. `upgrade.sh --upgrade-mode=full` refuses that apply until `install.env` records the
+declaration; the composition run directly does not. A composition applied directly to an existing
+install also applies no CRDs: run `kubectl --context gke_<project>_<region>_<cluster> apply
+--server-side --force-conflicts -f charts/kube-agents/crds/` first, through the install's own context
+as `upgrade.sh` does, or a `spec.scope` the served schema does not know is pruned on write and, the
+release record then carrying it, never re-sent. The identity running the apply needs
+to set IAM policy in each project named. The release's dependency on the module orders creation,
+not IAM propagation: a first install's one-shot inventory sweep may name a scoped project as
+`denied`, and the hourly reconcile creates its profiles once the grant has propagated. Folders and
+organisations are not inputs yet.
 
 ### Backups
 

@@ -9058,6 +9058,50 @@ spec:
                         ClusterName is the logical name of the cluster (either
                         where the agent is running or the target cluster).
                       type: string
+                    driftDetector:
+                      description: |-
+                        DriftDetector configures out-of-band change detection — the drift-detector
+                        that reads GKE admin-activity audit records from a Pub/Sub subscription and
+                        turns the ones a person made outside git into triage cards. Off unless asked
+                        for, unlike EventWatcher above.
+                      properties:
+                        enabled:
+                          default: false
+                          description: |-
+                            Enabled controls whether the detector is started. Absent means not started,
+                            the opposite of EventWatcher, and the reason is a dependency rather than
+                            caution: the detector reads a Pub/Sub subscription that exists only where the
+                            drift-pubsub Terraform module was applied. An install without one that started
+                            the detector anyway would get a process that never exits and never reports a
+                            change — the subscription is not checked at startup, and a pull that fails
+                            because it does not exist is retried for the life of the pod. The pod stays
+                            Ready, so an install left on by accident is indistinguishable from a fleet
+                            nobody has touched.
+
+                            Setting it is necessary and not sufficient. The detector also needs
+                            spec.harness.projectId, .location and .clusterName, because it verifies the
+                            cluster name it is given against the cluster its credentials actually reach and
+                            stops on a disagreement — so a half-named harness would give a restart loop.
+                            The operator treats that combination as the detector staying off.
+                          type: boolean
+                        gitopsManagers:
+                          description: |-
+                            GitopsManagers names the managedFields managers that are the GitOps controller
+                            — `argocd-controller`, `flux`. Comma-separated and matched exactly.
+
+                            Empty is supported and degrades rather than fails. Ownership is still read and
+                            reported, but no record is ever marked as possibly reconciled, so every card
+                            asks its reader to check the live object without the hint that a controller may
+                            already have reverted the change. Naming a manager that does not write to these
+                            objects has the same effect as leaving it empty.
+                          type: string
+                        subscription:
+                          description: |-
+                            Subscription is the Pub/Sub subscription carrying the audit records. Empty
+                            takes the detector's own default, which is the name the drift-pubsub module
+                            creates; set it only for a subscription made by hand or renamed.
+                          type: string
+                      type: object
                     eventWatcher:
                       description: |-
                         EventWatcher configures cluster event ingestion — the k8s-event-watcher that
@@ -9954,7 +9998,8 @@ spec:
                     alone, keeps the last declaration's exclusions and retires nothing; an empty
                     projects list in a present block drops the projects an earlier block declared.
                     The management project is always in scope and cannot be excluded. The design is docs/designs/multi-project-scope.md;
-                    this is its phases 1 and 2: explicit projects, folders and organisations.
+                    this is its phases 1 to 3: explicit projects, folders and organisations, and the
+                    sharedVpcHosts and metricsScopes selectors, which resolve to explicit projects.
                   properties:
                     exclude:
                       description: |-
@@ -10016,11 +10061,35 @@ spec:
                         Folders lists GCP folder IDs (numeric) whose every project, at any depth,
                         contributes its GKE clusters, resolved through Cloud Asset Inventory on each
                         run. The agent's service account needs roles/cloudasset.viewer and the read
-                        roles on the folder, granted by hand until the install's Terraform gains a
-                        scope input; a folder it cannot read freezes its previous members and is
-                        reported with the reason.
+                        roles on the folder, granted by hand: the install's Terraform binds the
+                        projects `projects` names and no folder yet; a folder it cannot read
+                        freezes its previous members and is reported with the reason.
                       items:
                         pattern: ^[0-9]{1,20}$
+                        type: string
+                      maxItems: 100
+                      type: array
+                      x-kubernetes-list-type: set
+                    metricsScopes:
+                      description: |-
+                        MetricsScopes lists Cloud Monitoring Metrics Scope scoping-project IDs; every
+                        monitored project of the scope contributes its GKE clusters, resolved on each
+                        run from the Monitoring API (gcloud beta monitoring metrics-scopes describe).
+                        The API names monitored projects by number, so each is mapped to its ID with
+                        gcloud projects describe, and a monitored project the agent cannot read is
+                        reported by number under the naming call's outcome (denied for a 403).
+                        Nothing is inherited through a Metrics Scope, so the agent's service account
+                        needs the read roles in each resolved project, granted by hand until the
+                        install's Terraform resolves the selectors at plan time (the design's §10
+                        step 3); the lookup itself needs to read the scope in the scoping project:
+                        roles/monitoring.metricsScopesViewer (resourcemanager.projects.get and
+                        resourcemanager.projects.list) is the narrowest role that grants it, and the
+                        read roles the scope binds carry both between them. The Monitoring API has to
+                        be enabled in the scoping project. A lookup that fails freezes the selector's
+                        previous members and holds the scope prune, and is reported in the
+                        snapshot's containers array under metricsScopes/<scope>.
+                      items:
+                        pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]$
                         type: string
                       maxItems: 100
                       type: array
@@ -10039,10 +10108,33 @@ spec:
                       description: |-
                         Projects lists GCP project IDs whose GKE clusters get Cluster Agent
                         profiles, in addition to the management project. The agent's service
-                        account needs the read roles in each, granted by hand until the install's
-                        Terraform gains a scope input; a project it cannot list is reported with
-                        the reason (denied, api-disabled, unreachable) and its existing profiles
-                        are kept.
+                        account needs the read roles in each: the install's Terraform binds them
+                        from the same scope input that renders this block, and a CR edited by
+                        hand needs the same grants made by hand; a project it cannot list is
+                        reported with the reason (denied, api-disabled, unreachable) and its
+                        existing profiles are kept.
+                      items:
+                        pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]$
+                        type: string
+                      maxItems: 100
+                      type: array
+                      x-kubernetes-list-type: set
+                    sharedVpcHosts:
+                      description: |-
+                        SharedVpcHosts lists Shared VPC host project IDs; every service project
+                        attached to the host contributes its GKE clusters, resolved on each run from
+                        the Compute API (gcloud compute shared-vpc list-associated-resources). The
+                        host project itself is not included: name it in projects if its clusters are
+                        wanted. A project that is not a Shared VPC host resolves to no members: the
+                        API answers HTTP 400 for it, which the reconcile reads as an empty membership
+                        rather than a failed lookup, so a misdeclared host cannot hold the scope prune.
+                        Nothing is inherited through a Shared VPC, so the agent's service account
+                        needs the read roles in each resolved project, granted by hand until the
+                        install's Terraform resolves the selectors at plan time (the design's §10
+                        step 3), and compute.projects.get in the host project (roles/compute.viewer
+                        carries it). A lookup that fails freezes
+                        the selector's previous members and holds the scope prune, and is reported
+                        in the snapshot's containers array under sharedVpcHosts/<host>.
                       items:
                         pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]$
                         type: string
@@ -10319,11 +10411,9 @@ spec:
                         for egress by <name>-gateway-netpol, which the operator renders on every
                         reconcile whether this field is set or not — unless
                         spec.networkPolicy.enabled is false, which withholds the gateway policy.
-                        On a Helm install that makes this the Pod's only policy: the one shape
-                        where this field enforces for real on an enforcing CNI, denying
-                        everything off its list. A Kustomize install still carries the static
-                        platform-agent-core-egress set over the same Pod, so the union resumes
-                        there. Everywhere else, turning this on leaves the
+                        That makes this the Pod's only policy: the one shape where this field
+                        enforces for real on an enforcing CNI, denying everything off its list.
+                        Everywhere else, turning this on leaves the
                         Pod's permitted egress a strict superset of what it was. In the default
                         shape the only destination it adds is the credential broker on TCP 8765
                         — plus, when the agent is not exporting telemetry, the managed collector
@@ -10346,12 +10436,6 @@ spec:
                             FQDNNetworkPolicy annotation is set. So every HTTPS destination on
                             the public internet stays open, and with it the exfiltration half of
                             what this control is meant to be.
-
-                        A Kustomize install additionally applies platform-agent-core-egress
-                        (deploy/kustomize/platform/networkpolicy-core-egress.yaml), which selects
-                        the agent Pod by app.kubernetes.io/name and permits the same metadata
-                        path. A Helm install does not carry it, and it changes nothing either
-                        way: the gateway policy alone is enough to make the point above.
 
                         The overlap is deliberate rather than an oversight. Workload Identity
                         needs the metadata path, and <name>-gateway-netpol still permits it to

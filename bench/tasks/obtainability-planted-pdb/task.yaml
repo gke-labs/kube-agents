@@ -26,8 +26,9 @@
 # through fleet_resource_property, so they grade the seeded cluster rather
 # than platform-agent-host. That matters most here: the second safeguard is a
 # pathless `op: absent`, a LIST, which on the wrong cluster exits zero with an
-# empty result and would have read as a clean PASS forever. What is left of A5
-# is which identity those kubeconfigs carry, not which cluster they reach.
+# empty result and would have read as a clean PASS forever. A5 is a
+# precondition of the run: without the reader grant, hack/fleet-kubeconfigs.sh
+# writes no kubeconfig and the run stops.
 #
 # Executed once, 2026-08-26: the run minted a token, cloned the *-infra
 # workspace, published the obtainability ledger and passed every exact check.

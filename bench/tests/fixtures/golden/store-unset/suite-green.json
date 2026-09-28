@@ -2,6 +2,7 @@
   "green": true,
   "reasons": [],
   "notes": [],
+  "not_graded": [],
   "pass_rate": 1.0,
   "baseline_rate": null,
   "margin": 0.05,
@@ -20,6 +21,7 @@
       "notes": [],
       "passes": 0,
       "scored": 3,
+      "not_applicable": 0,
       "pass_rate": 0.0,
       "judged_means": {
         "OutcomeValidity": {
@@ -51,7 +53,8 @@
             "OutcomeScore": 0.5
           },
           "latency": 133.12637670803815,
-          "total_tokens": 275153
+          "total_tokens": 275153,
+          "not_applicable_checks": []
         },
         {
           "index": 2,
@@ -68,7 +71,8 @@
             "OutcomeScore": 0.5
           },
           "latency": 49.3587532970123,
-          "total_tokens": 135530
+          "total_tokens": 135530,
+          "not_applicable_checks": []
         },
         {
           "index": 3,
@@ -85,7 +89,8 @@
             "OutcomeScore": 0.5
           },
           "latency": 46.11065511684865,
-          "total_tokens": 135064
+          "total_tokens": 135064,
+          "not_applicable_checks": []
         }
       ],
       "admission_reason": "no screening evidence for this case yet",
@@ -115,6 +120,7 @@
       "notes": [],
       "passes": 3,
       "scored": 3,
+      "not_applicable": 0,
       "pass_rate": 1.0,
       "judged_means": {
         "OutcomeValidity": {
@@ -146,7 +152,8 @@
             "OutcomeScore": 1.0
           },
           "latency": 46.67580479523167,
-          "total_tokens": 135281
+          "total_tokens": 135281,
+          "not_applicable_checks": []
         },
         {
           "index": 2,
@@ -163,7 +170,8 @@
             "OutcomeScore": 1.0
           },
           "latency": 47.00481715425849,
-          "total_tokens": 135195
+          "total_tokens": 135195,
+          "not_applicable_checks": []
         },
         {
           "index": 3,
@@ -180,7 +188,8 @@
             "OutcomeScore": 1.0
           },
           "latency": 46.67580479523167,
-          "total_tokens": 135281
+          "total_tokens": 135281,
+          "not_applicable_checks": []
         }
       ],
       "admission_reason": "admitted by BOOTSTRAP_ADMITTED (transition bridge)",

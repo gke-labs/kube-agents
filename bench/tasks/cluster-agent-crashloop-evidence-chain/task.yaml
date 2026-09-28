@@ -4,10 +4,10 @@
 # agent actually observed, not by a plausible label.
 #
 # A1 and A4 closed on 2026-08-25 and never applied here: this case opens no
-# pull request and reads no ledger. A5's residual applies as it does to
-# every fleet case — until the fleet_reader_token_creators grant is applied
-# in the leased project, the safeguard runs under the runner's own read-write
-# identity, a privilege gap rather than a functional block. It is uncommented while still `validated: false`, as
+# pull request and reads no ledger. A5 is a precondition of the run: without
+# the fleet_reader_token_creators grant in the leased project,
+# hack/fleet-kubeconfigs.sh refuses to read the fleet and the run stops before
+# any case. It is uncommented while still `validated: false`, as
 # cluster-agent-crashloop-debug was: only a scored presubmit run closes that
 # field. The verification half has been watched both ways — on 2026-08-26
 # every safeguard here passed against real Kubernetes objects matching the

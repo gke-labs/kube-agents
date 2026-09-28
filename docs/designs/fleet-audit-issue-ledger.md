@@ -581,7 +581,7 @@ lose and anything present is debris from a run that did not finish.
 | Artifact              | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Ledger issue title    | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                                                                                                                                           |
-| Ledger issue body     | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation, PR link. Hidden `<!-- audit-findings -->` marker last, listing the ids the body rendered plus the collector-held ids ([collector design §3.3](fleet-audit-collector-manifest.md)), followed by the `<!-- audit-id-scheme -->` stamp that says which identity scheme minted them.                        |
+| Ledger issue body     | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation, PR link. Hidden `<!-- audit-findings -->` marker at the end, listing the ids the body rendered plus the collector-held ids ([collector design §3.3](fleet-audit-collector-manifest.md)), then the `<!-- audit-id-scheme -->` stamp, and on a truncated body an `audit-findings-all` block (§7.1).       |
 | Scope                 | Clusters covered with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-cluster `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. A `### Coverage` list follows for the holds the document cannot express — the collector-manifest waiver and a ledger body the run could not read ([collector design §3.3, §4](fleet-audit-collector-manifest.md)). |
 | Held by the collector | On a run that passed `--manifest-file`: previous findings the collector still flags and the document did not carry, each with the identity lines a finding has and, for the first `MAX_HELD_DETAIL_ROWS`, its check and the collector's command. Measured after the findings; degrades before it displaces one. See collector design §3.3.                                                                                                                                 |
 | Size budget           | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -610,7 +610,7 @@ headroom for the trailing marker and for anything a later section appends.
 - **Table caps.** The scope and skipped tables cap at 60 rows each, with a trailing "…and N more"
   row. Without the cap a body with _zero findings_ overflows: 1,200 clusters plus 1,200 skipped
   entries renders 148,627 characters of pure scope.
-- **Order of measurement.** Header, scope, and footer are rendered and measured first; whatever
+- **Order of measurement.** Header, scope, and footer (the complete-list block excepted, see below) are rendered and measured first; whatever
   remains of the 60,000 is the findings budget. The collector-held section, when there is one, is
   measured after the findings and before the evidence appendix, degrading to identity lines and then
   to a note rather than displacing a finding (collector design §3.3). Findings are selected **severity-first**, so
@@ -640,6 +640,17 @@ headroom for the trailing marker and for anything a later section appends.
   calling it resolved puts a fix that never happened in writing, on the one finding nobody can see
   to contradict it. One yardstick for both halves is wrong in one direction or the other whichever
   one is chosen.
+- **A truncated body also lists every finding id.** The delta marker's rendered-only list leaves no
+  machine-readable record that a cut finding was filed at all, so a grader or a script reading the
+  ledger for a finding that sorted last cannot tell "cut for space" from "never found". A body that
+  omitted findings therefore carries a second hidden block, `<!-- audit-findings-all: [...] -->`,
+  with every current id and the collector-held ids. Nothing joins against it: the delta keeps
+  reading the rendered marker, for the reason the bullet above gives, so a cut finding is announced
+  as new the first run it renders, whatever freed the room. Findings are selected once without the
+  block and, only if that cut something, again with it charged, so it never truncates a body that
+  would have fit; on a body already truncated it costs the findings its length, which grows with the id count up to the cap: about 3 of 37 rendered findings at 60 ids of 70 characters, about 8 at the cap. That is the price of the record. Above `ALL_FINDINGS_BLOCK_CAP` (12,000
+  characters) it is left out rather than truncated, since a partial complete list would be the same
+  ambiguity with a different name.
 - **The delta comment is capped and ordered by severity.** Both of its lists cap at 50 rows, and the
   `new` list is sorted severity-first before the cap applies — an alphabetical cut decides what a
   reader sees by the first letter of a finding id, which is how a critical ends up under "…and 40
@@ -1158,6 +1169,8 @@ belief is wrong, so raising the constant to 200,000 would keep them all green wh
 
 - A run of 250 findings renders a body at or under the limit.
 - The hidden delta block contains exactly the ids the body rendered — no more, no fewer.
+- A truncated body's `audit-findings-all` block lists every finding id; an untruncated body carries
+  none, and a list over `ALL_FINDINGS_BLOCK_CAP` is left out.
 - 5 critical plus 300 minor findings keeps all 5 criticals.
 - 10 findings render untruncated, with no "omitted" notice and no trimmed command.
 - The clean-run comment stays under the limit with 900 skipped clusters.

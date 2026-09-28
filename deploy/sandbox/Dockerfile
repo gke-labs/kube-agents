@@ -108,17 +108,18 @@ RUN pip install --no-cache-dir pyyaml requests
 # See docs/designs/version-control-support.md.
 #
 # The binary lives at /opt/vcs/libexec/git and is on no PATH at all. It is
-# reached by absolute path from vcs.py -- see KUBE_AGENTS_LOCAL_GIT there -- and
+# reached by absolute path from vcs_client.py -- see LOCAL_GIT there, and the
+# KUBE_AGENTS_LOCAL_GIT it reads -- and
 # by /usr/lib/git-core, which is git's compiled-in exec path rather than a PATH
 # directory. A bare `git` typed by the model still resolves to the credential
 # shim, exactly as it did before this layer existed.
 #
 # Giving the local binary the name `git` instead is the better arrangement and
-# it is deliberately not done here. Every shipped caller of bare `git` today --
-# gitops_workspace.py, submit_suggestion.py, audit_report.py -- means the shim,
-# so the rename has to travel with those callers moving onto the verbs. It goes
-# in the consumer-migration change; this one adds a binary and takes nothing
-# away. docs/designs/version-control-support.md carries the reasoning, including
+# it is still not done here. The rename has to travel with the last caller of
+# bare `git` moving onto the verbs, because until then the name has to keep
+# meaning the shim. submit_suggestion.py is off it as of this change;
+# gitops_workspace.py and fleet-audit's audit_report.py are not, so the rename
+# waits on them. docs/designs/version-control-support.md carries the reasoning, including
 # the measurement that motivates it: given the version-control skill and a shim
 # still owning the name, an agent answered 8 of 60 read probes through the shim
 # alone and issued 4 credentialed clones through it.
@@ -398,22 +399,48 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          only and deliberately so — the sidecar imports it
 #                          across the credential boundary, so it may not reach
 #                          for anything that shells out
-#   forge.py               GitHub REST client, imported by pr_conversation
+#   forge.py               the typed layer over the version-control verbs —
+#                          pull requests, comments, identity, permission —
+#                          imported by pr_conversation. Not a REST client and no
+#                          longer a GitHub one: it asks the broker for a verb and
+#                          a forge module answers it, so it imports vcs_client
+#                          rather than anything that speaks HTTP
 #   pr_triggers.py         imported by pr_conversation, imports forge
-#   github_token_refresh.py  invoked directly by submit-suggestion Step 5
+#   github_token_refresh.py  named by SOUL.md as the token refresher the agent
+#                          runs by hand (`python3 ./scripts/github_token_refresh.py
+#                          <owner>/<repo>`), and imported for its `log` by
+#                          submit_suggestion
 #   wif_credentials.py     imported by github_token_refresh, and reached only by
 #                          the branch the proxy container takes; here so that the
 #                          import at the top of that script resolves
-#   gitops_workspace.py    the leased clone every write skill uses
-#   credential_proxy_client.py  imported by submit-suggestion for the content
-#                          workspace client. The same file is also COPYed to
+#   gitops_workspace.py    what is left of it that this container reads: the
+#                          managed-repository config (`get_managed_github_repos`,
+#                          `is_valid_repo_slug`, `validate_repo_org`), which every
+#                          skill checks a `--repo` against before it acts. Its
+#                          leased clone is still used from here by the two skills
+#                          that read a whole tree — inspect-repository and
+#                          fleet-upgrade-verification's api_deprecation_scan, both
+#                          `ensure_workspace(..., lease=...)` — and by fleet-audit's
+#                          audit_report, which also proposes from it. That last one
+#                          is the consumer this migration does not move; every
+#                          other working copy that *proposes* a change is
+#                          `vcs_client`'s now
+#   credential_proxy_client.py  how anything here reaches the broker at all, and
+#                          the only way out of this container that carries a
+#                          credential. Imported by vcs_client, and through it by
+#                          every verb. The same file is also COPYed to
 #                          /usr/local/bin/credential-proxy-exec above, as the
 #                          kubectl/git/gh shim; that copy is not importable by
-#                          module name, so it is staged here as well. Content
-#                          mode is the one that works from this container at
-#                          all: no path crosses the protocol, so nothing depends
-#                          on the two ends sharing a filesystem, which they do
-#                          not.
+#                          module name, so it is staged here as well
+#   vcs_client.py          the client half of the verb surface: it composes a
+#                          request, sends it over the line above, and raises on a
+#                          refusal. `vcs.py`, `forge.py` and submit-suggestion all
+#                          go through it, and it is the only thing in this image
+#                          that composes a `/v1/vcs/<verb>` request. Other scripts
+#                          here -- github_token_refresh, gke_endpoint,
+#                          inspect-repository, fleet-audit,
+#                          fleet-upgrade-verification -- do reach the proxy
+#                          directly, for its other routes, not for a forge verb
 #   workspace_paths.py     the workspace protocol's path validator, imported by
 #                          inspect-repository to re-check every name at the point
 #                          it becomes a write. The broker's content_workspace
@@ -447,6 +474,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/wif_credentials.py \
      agents/platform/scripts/gitops_workspace.py \
      agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/workspace_paths.py \
      agents/platform/scripts/gke_endpoint.py \
      agents/platform/scripts/cluster_preflight.sh \
@@ -495,6 +523,65 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + && \
     find /opt/defaults/skills -path '*/scripts/*' -type f -exec chmod 755 {} +
 
+# The trusted principal's own copy of the forwarded scripts. Root-owned.
+#
+# The pull-request and issue crons run in the agent pod, hold the forge
+# credential, and do their forge work by sshing in as `hermes` and running a
+# script here. Two of them cross: forge.py for every forge verb
+# (agents/platform/scripts/forge.py, `_forward`) and resolver.py for the issues
+# sweep's `poll` (github-issue-resolver, `_forward_to_sandbox`). The copy under
+# /opt/data is the model's: uid 1000 owns that mount, can rewrite any file in
+# it, and the edit lives until the next restart -- section 4b of
+# deploy/sandbox/smoke-test.sh plants one on purpose. Forwarding to that copy
+# would run the model's code with the cron's credential, which is exactly the
+# rule the block above states one caller short of keeping. So the forwarded
+# path is this one instead, outside every directory the agent can write. The
+# model's own copy stays where its instructions say it is; nothing about what
+# an agent runs changes here.
+#
+# The whole import closure is staged, not just the two entry points:
+# `sys.path[0]` is the script's own directory, so a module missing here would be
+# found under /opt/data instead and the boundary would be gone with nothing to
+# show for it.
+#
+# `-P` and a `PYTHONPATH` of this directory alone did not prove that, which an
+# earlier version of this comment claimed they did. resolver.py, vcs_client.py
+# and github_token_refresh.py each append /opt/defaults/scripts and
+# /opt/data/scripts to `sys.path`, which is how a copy in the agent pod finds
+# its siblings -- so a module loading after them could come from an agent-owned
+# directory with an import-only check still passing. Two things answer that now.
+# The three of them leave the appends off when the file they are running from is
+# this copy, so the trusted process has no agent-writable directory on its path
+# at all; and the guard below imports both entry points and then reads
+# `__file__` off every module that got loaded, which is the check that was
+# meant: where the code actually came from, at build time rather than at the
+# first cron tick.
+COPY agents/platform/scripts/forge.py \
+     agents/platform/skills/github-issue-resolver/scripts/resolver.py \
+     agents/platform/scripts/gitops_workspace.py \
+     agents/platform/scripts/repo_ref.py \
+     agents/platform/scripts/sandbox_exec.py \
+     agents/platform/scripts/vcs_client.py \
+     agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/github_token_refresh.py \
+     agents/platform/scripts/wif_credentials.py \
+     /opt/vcs/libexec/platform/
+COPY deploy/sandbox/trusted-closure-guard.py /opt/vcs/libexec/trusted-closure-guard.py
+RUN set -e; \
+    chown -R root:root /opt/vcs/libexec/platform; \
+    chmod 0755 /opt/vcs/libexec/platform; \
+    find /opt/vcs/libexec/platform -type f -exec chmod 0755 {} +; \
+    loose="$(find /opt/vcs/libexec/platform \( ! -user root -o -perm /go=w \) -print)"; \
+    if [ -n "$loose" ]; then \
+        echo "the trusted copy is writable by someone other than root:" >&2; \
+        echo "$loose" >&2; \
+        exit 1; \
+    fi; \
+    PYTHONPATH=/opt/vcs/libexec/platform PYTHONDONTWRITEBYTECODE=1 \
+        python3 -P /opt/vcs/libexec/trusted-closure-guard.py; \
+    rm -f /opt/vcs/libexec/trusted-closure-guard.py; \
+    find /opt/vcs/libexec -name '__pycache__' -type d -prune -exec rm -rf {} +
+
 # The same guard the agent image runs, for the same reason and with more at
 # stake: a real gcloud or kubectl in this image is a credential path out of the
 # sandbox that no network policy would see. /opt/credential-proxy/bin is not on
@@ -504,9 +591,11 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 # `gh` keeps its shim here. Taking it away is the right end state -- a forge CLI
 # on PATH is the route out of a forge-neutral abstraction and the model takes
 # it, answering through `gh api` on a quarter of the write probes with the
-# version-control skill loaded -- but every `gh` caller in the tree still means
-# this shim, so its removal travels with them in the consumer-migration change
-# rather than landing here ahead of them.
+# version-control skill loaded -- but callers in the tree still mean this shim.
+# The consumer migration moved the pull-request and issue paths onto the
+# version-control verbs and deliberately left `fleet-audit`'s `audit_report.py`
+# on the CLI, on size grounds. The removal travels with that port, not with
+# this line.
 RUN mkdir -p /opt/credential-proxy/bin && \
     for binary in gcloud kubectl gh git; do \
         ln -s /usr/local/bin/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \

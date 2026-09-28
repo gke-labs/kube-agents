@@ -734,6 +734,37 @@ class GcloudReadOnlyTest(unittest.TestCase):
             # on `export --output-path`, or the unknown-flag refusal on `feeds create`.
             self.assertFalse(evaluate(argv).allowed, argv)
 
+    def test_scope_selector_lookups_are_allowed_and_their_writes_are_refused(self):
+        # The Cluster Agent reconcile resolves spec.scope.sharedVpcHosts and
+        # spec.scope.metricsScopes with exactly these two calls
+        # (docs/designs/multi-project-scope.md §10 step 3). Both pass --format and
+        # nothing else, and --format is already in the flag table.
+        self.assertTrue(evaluate(["gcloud", "compute", "shared-vpc", "list-associated-resources",
+                                  "host-proj", "--format=json(id,type)"]).allowed)
+        self.assertTrue(evaluate(["gcloud", "beta", "monitoring", "metrics-scopes", "describe",
+                                  "locations/global/metricsScopes/my-proj", "--format=json"]).allowed)
+        # The writes one word away attach and detach a service project, or link and
+        # unlink a monitored project. The allowlist compares the track word as typed,
+        # so the GA and alpha spellings of the Metrics Scope read are refused as well.
+        # Every argv here carries only flags the table knows, so the refusal is the
+        # allowlist's and not the unknown-flag gate's.
+        for argv in (["gcloud", "compute", "shared-vpc", "enable", "p"],
+                     ["gcloud", "compute", "shared-vpc", "associated-projects", "add", "svc", "--project=p"],
+                     ["gcloud", "compute", "shared-vpc", "associated-projects", "remove", "svc", "--project=p"],
+                     ["gcloud", "beta", "monitoring", "metrics-scopes", "create", "projects/x", "--project=p"],
+                     ["gcloud", "beta", "monitoring", "metrics-scopes", "delete", "projects/x", "--project=p"],
+                     ["gcloud", "monitoring", "metrics-scopes", "describe", "locations/global/metricsScopes/my-proj"],
+                     ["gcloud", "alpha", "monitoring", "metrics-scopes", "describe", "locations/global/metricsScopes/my-proj"]):
+            decision = evaluate(argv)
+            self.assertFalse(decision.allowed, argv)
+            self.assertEqual("gcp.read-only", decision.rule_id, argv)
+        for argv in (["gcloud", "compute", "shared-vpc", "associated-projects", "add", "svc", "--host-project=p"],
+                     ["gcloud", "compute", "shared-vpc", "associated-projects", "remove", "svc", "--host-project=p"]):
+            # The spelling gcloud requires for these writes. --host-project is not in the
+            # flag table, so the unknown-flag refusal fires before the allowlist is read;
+            # refused either way.
+            self.assertFalse(evaluate(argv).allowed, argv)
+
     def test_config_set_is_refused(self):
         # `config set` is not in GCLOUD_READ_COMMANDS, so it should be refused.
         decision = evaluate(["gcloud", "config", "set", "core.project", "my-proj"])
@@ -1337,11 +1368,52 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
               "--region=us-central1", "--max-run-duration=12h",
               "--format=json"],
              "capacity probe, Flex-Start"),
+            (["gcloud", "beta", "compute", "advice", "capacity",
+              "--provisioning-model=SPOT",
+              "--instance-selection-machine-types=a2-highgpu-8g",
+              "--target-distribution-shape=ANY", "--size=4",
+              "--region=us-central1", "--zones=us-central1-a",
+              "--format=json"],
+             "capacity probe, per-zone follow-up"),
             (["gcloud", "beta", "compute", "advice", "capacity-history",
               "--provisioning-model=SPOT", "--machine-type=a2-highgpu-8g",
               "--types=PREEMPTION,PRICE", "--region=us-central1",
               "--format=json"],
              "capacity history, single machine type"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_the_future_windows_spellings_reach_the_calendar_mode_entry(self):
+        # The spellings capacity-obtainability's Future windows section has
+        # the agent emit — the TPU probe (version + chips + workload type)
+        # and the VM-shape variant, one call per candidate region, with
+        # representative timestamp values where the skill shows
+        # placeholders computed from the clock. The verb path was allowed
+        # before any of its flags had arity entries, so every one of these
+        # spellings was refused as gcp.unreadable-command -- the entry existed
+        # and nothing could reach it.
+        for argv, desc in (
+            (["gcloud", "beta", "compute", "advice", "calendar-mode",
+              "--region=us-central1", "--tpu-version=V5E", "--chip-count=256",
+              "--workload-type=BATCH", "--duration-range=min=1d,max=1d",
+              "--start-time-range=from=2026-09-22T00:00:00Z,to=2026-09-23T12:00:00Z",
+              "--location-policy=us-central1-a=ALLOW", "--format=json"],
+             "calendar mode, TPU shape"),
+            (["gcloud", "beta", "compute", "advice", "calendar-mode",
+              "--region=us-central1", "--machine-type=a3-megagpu-8g",
+              "--vm-count=8", "--duration-range=min=1d,max=7d",
+              "--start-time-range=from=2026-09-22,to=2026-09-28",
+              "--end-time-range=from=2026-09-23,to=2026-09-29",
+              "--format=json"],
+             "calendar mode, VM shape with an end-time range"),
+            (["gcloud", "beta", "compute", "advice", "calendar-mode",
+              "--region=us-central1", "--machine-type=c3-standard-88-lssd",
+              "--vm-count=4", "--local-ssd=interface=NVME,size=375",
+              "--duration-range=min=1d,max=1d",
+              "--start-time-range=from=2026-09-22,to=2026-09-28",
+              "--format=json"],
+             "calendar mode, VM shape with local SSD"),
         ):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)

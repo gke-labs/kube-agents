@@ -101,7 +101,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
    kubectl get pods -n kubeagents-system
    ```
 
-   You should see one `PlatformAgent` resource plus pods for the operator (`kubeagents-controller-manager`), LiteLLM (`litellm`), and three for the Platform Agent itself: the gateway (`platform-agent-gateway`), the shell sandbox (`platform-agent-shell`), and the credential broker (`platform-agent-credential-proxy`). The GitHub token minter (`github-token-minter`) also appears if you enabled the GitHub integration. When all three agent pods are `Running` and Google Chat is configured, DM your Chat app and it should reply.
+   You should see one `PlatformAgent` resource plus pods for the operator (`kube-agents-controller-manager`), LiteLLM (`litellm`), and three for the Platform Agent itself: the gateway (`platform-agent-gateway`), the shell sandbox (`platform-agent-shell`), and the credential broker (`platform-agent-credential-proxy`). The GitHub token minter (`github-token-minter`) also appears if you enabled the GitHub integration. When all three agent pods are `Running` and Google Chat is configured, DM your Chat app and it should reply.
 
    The gateway logs errors while it starts up, and they do not mean the install failed. Repeated `Connection refused` from the Google Chat relay, and a one-off `slack connect timed out after 30s`, are ordering: both relays dial the credential broker before it is listening. They retry until it is, and on a fresh install the messages stopped on their own within about seven minutes. Treat them as a fault only if they are still arriving well after that, and inspect the `envoy-credential-proxy` container in the `platform-agent-credential-proxy` pod rather than the relay reporting the error.
 
@@ -143,6 +143,10 @@ Changing your mind later is the same engine: running the installer with `--menu`
 - `--memory=file|hindsight|off` — the agent's long-term memory store; `hindsight` deploys the Hindsight API and Postgres into the cluster.
 
 Run the installer with `--help` (e.g. `./install.sh --help`) for the full list.
+
+## Upgrade
+
+Run the `upgrade.sh` published for the release you are moving to; it carries that version, so the run names no tag. See [Upgrade](/kube-agents/install/upgrade/) for the modes, the previews, and what a run refuses.
 
 ## Uninstall
 

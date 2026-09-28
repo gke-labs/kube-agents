@@ -46,6 +46,76 @@ not a new cron entry. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
 and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 
+## `stall-watch` hands a stall to a Cluster Agent card
+
+`stall-watch` is a `no_agent` script: the tick prompts no model. Every thirty
+minutes it lists the project's clusters and, for every namespace of every
+running or reconciling cluster that has a Cluster Agent profile and is not a
+system namespace, runs the Cluster Agent's `stall_report.py` over a bounded list
+of controller kinds, keeping a ledger of the rows it has seen. On a new stall
+episode it files one kanban card per cluster and namespace, assigned to that
+cluster's Cluster Agent profile, telling it to run `gke-stall-detection` on the
+namespace and record the finding. That is the same card, diagnosis and chat
+thread a user's own question produces, which is the point: one detector and one
+experience whether the cron or a person noticed first. The watch follows the
+reconciler's roster: a cluster with no profile, one `RECONCILE_EXCLUDE` pruned
+or one not yet scaffolded, is neither read nor filed for, because the exclusion
+is the operator keeping a model turn off that cluster and a card would hand its
+rows to another profile; a cluster that leaves the roster has its rows cleared
+and its open card completed with a comment saying so. At most three cards open
+per tick (`MAX_CARDS_PER_TICK`, the default of the pull-request poller's
+`PR_AGENT_MAX_PER_TICK`), since each is a Cluster Agent turn and the number of
+namespaces with a new stall is chosen by whoever can create namespaces; the rest
+keep their rows and wait, oldest first sighting first, so a tenant filling three
+fresh namespaces every tick cannot keep an older stall from its card, and chat
+gets one line saying how many wait. A card the board refused leaves its
+namespace waiting the same way. A new object in
+a namespace whose card is still open is a comment on that card; when every
+object in the namespace has cleared, the card gets a closing comment and is
+completed. A `repeating-warnings` or `dangling-reference` row clears only after
+two consecutive scans without it, so a warning that recurs hourly or a referent
+listing that failed once does not close and reopen a card.
+
+The card's progress reaches chat because the script writes the card's
+`kanban_notify_subs` row itself: a cron child has no session identity for
+`kanban_create` to copy, and a card without a row is invisible to the gateway
+notifier. The row targets every shipped chat platform with a home channel in the agent home's `config.yaml` (`platforms.<p>.home_channel.chat_id`, the field the tick spawner reads, because Hermes strips every `*_HOME_CHANNEL` from a `no_agent` child's environment), with the same `notify+wake` delivery a user-filed card gets; `<PLATFORM>_HOME_CHANNEL` in the environment is read only for a platform the file does not settle, which is a run started by hand. A row the board refused is written on a later tick while the card is open. `deliver: chat` then carries three one-liners, "stall noticed in
+`<cluster>` / `<namespace>`: `<objects>`; card `<id>` opened", "stall cleared
+...; card `<id>` closed" and "stall noticed in `<n>` more namespaces; cards
+follow on later ticks", each naming at most eight objects, plus the sweep-failed
+and sweep-recovered lines every roster entry owes. A clean tick prints nothing. Anything a tick could not read (a
+cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a listing gcloud called incomplete, a sweep that hit its
+25-minute budget) keeps its rows and is recorded in the ledger, not posted, and
+an exhausted sweep resumes where it stopped.
+
+Every `gcloud`, `kubectl` and `stall_report.py` call runs in the shell sandbox
+through `sandbox_exec`, because the agent container carries no kubectl (with the
+sandbox switched off the calls run locally and fail with `No such file or
+directory: 'gcloud'`, the same failure every `sandbox_exec` caller sees in that
+state). The script itself travels on the command's stdin, read from the agent
+image's copy in `/opt/defaults/scripts` and run with `python3 -I -`: what the
+`hermes` login executes is never a file under the sandbox's agent-owned
+`/opt/data`, and isolated mode keeps that directory, which is the command's
+working directory, off the module path, so a `json.py` the model dropped there is
+not the code that runs. The per-cluster kubeconfigs stay in
+`/home/hermes/.kubeconfigs`, where `platform_mcp_server.py` keeps its own, under a
+prefix of their own. The kind list is `DEFAULT_KINDS` in the script, cut per
+cluster to what `kubectl api-resources` says it serves, and is not
+operator-configurable on this release: `STALL_WATCH_KINDS` replaces it for a run
+started by hand in the pod (`all` hands `stall_report.py` its every-kind
+default), but the operator's env allowlist does not carry it, so a value on the
+CR's `spec.deployment.env` never reaches the script. The k8s-event-watcher and
+this job split the work by signal: a Warning whose reason is on the watcher's
+list is the watcher's within seconds; a condition, a reference or an event the
+list never names is this job's within the half hour. It declares `risk: high`
+because every card it files starts a Cluster Agent turn over every namespace of
+every cluster on the Cluster Agent roster, the management cluster included
+unless `RECONCILE_EXCLUDE` names it. The card body and chat lines carry object
+names, heuristics and durations only, never a row's detail, since condition
+reasons, spec paths and event messages are text a tenant writes; the Cluster
+Agent reads that text again when it runs the skill, and its read-only skill and
+preflight bound what it does with it.
+
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
 The third shape, and the reason it is here rather than anywhere else: it is
@@ -305,7 +375,10 @@ to an install:
 
 - Run `make docs-generate` after editing either roster. The site's cron
   reference table is generated from both, and a cron expression missing from
-  `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`.
+  `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`. The
+  `compliance-audit` entry is also rendered in full as the job-schema example
+  on the watchdogs, skills and cron-jobs pages, so an edit to it changes those
+  three pages too.
 - For a dev workspace, `scripts/dev/dev_rebuild_agent.sh` rebuilds and restarts
   the agent image without a release; `./upgrade.sh --upgrade-mode=harness
 --image-tag=<ref>` is the path for an installed cluster.

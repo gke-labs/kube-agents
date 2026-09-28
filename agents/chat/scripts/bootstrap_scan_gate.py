@@ -212,7 +212,10 @@ def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
 
 
 def _unresolved_containers(data_dir: Path) -> list[tuple[str, str, int]]:
-    """Folders and organisations the last reconcile could not resolve, as (id, outcome, projects)."""
+    """Every row of the snapshot's `containers` array the last reconcile could not resolve, as (id, outcome, projects).
+
+    A row is a folder, an organisation, a Shared VPC host or a Metrics Scope; the kind is not read here.
+    """
     try:
         snapshot = json.loads((data_dir / SCOPE_SNAPSHOT_NAME).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - absent or unreadable: nothing to name
@@ -229,8 +232,8 @@ def _unresolved_containers(data_dir: Path) -> list[tuple[str, str, int]]:
 def _scope_has_other_projects(data_dir: Path) -> bool:
     """Whether the last reconcile's scope reaches beyond one project.
 
-    True when the snapshot names more than one project, or any declared folder or
-    organisation. The task body speaks of "the project" on an install with no scope,
+    True when the snapshot names more than one project, or any declared folder,
+    organisation, Shared VPC host or Metrics Scope. The task body speaks of "the project" on an install with no scope,
     exactly as it did before scopes existed, and of "the projects in scope" only then,
     so a single-project install renders the same prompt as before.
     """
@@ -246,9 +249,10 @@ def _scope_has_other_projects(data_dir: Path) -> bool:
 
 
 def _scope_gap_paragraph(data_dir: Path) -> str:
-    """The sweep's note on projects and containers the reconcile could not resolve.
+    """The sweep's note on projects, containers and selectors the reconcile could not resolve.
 
-    Rendered when a declared folder or organisation could not be resolved, or when the
+    Rendered when a declared folder, organisation, Shared VPC host or Metrics Scope could not
+    be resolved (each has a row in the snapshot's `containers` array), or when the
     snapshot names more than one project (or any container) and one project was not listed. An install with
     no scope renders the prompt it rendered before scopes existed, whatever its one
     project's outcome: that prompt already tells the worker what to do when the project
@@ -267,7 +271,7 @@ def _scope_gap_paragraph(data_dir: Path) -> str:
         container_note += (
             "The last reconcile could not resolve "
             + ", ".join(f"`{cid}` ({outcome}, {count} project(s) carried)" for cid, outcome, count in failed)
-            + ", so every project beneath it is unlisted and the container is what to name. "
+            + ", so every project it reaches is unlisted and the container or selector is what to name. "
         )
     if over_cap:
         container_note += (

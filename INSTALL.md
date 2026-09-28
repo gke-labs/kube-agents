@@ -31,8 +31,9 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
 7. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
-8. [Teardown & Cleanup](#teardown--cleanup)
-9. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+8. [Upgrading](#upgrading)
+9. [Teardown & Cleanup](#teardown--cleanup)
+10. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
 ---
 
@@ -202,6 +203,7 @@ Before beginning installation, ensure your environment meets the requirements fo
 | **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`, and by `upgrade.sh` to read the release's values and confirm the images it re-tagged.                                              | **All Methods**                                  |
 | **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation.                                                                                                                                                      | **Methods 0 & 1**                                |
 | **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                                              | **All Methods**                                  |
+| **`python3`**                   | `3.x`                                           | `python3 --version`                | The installer's state readers and its pre-apply scope check compare JSON with it.                                                                                                                                      | **Methods 0 & 1**                                |
 | **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`                  | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                                                                                                                     | **All Methods**                                  |
 | **`gcloud beta` component**     | Standard                                        | `gcloud beta --help`               | Required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`).                             | **Optional (CMEK / Backup Plan lifecycle)**      |
 | **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`               | Template substitution in development Kustomize deployment targets (`make -C k8s-operator deploy-*`).                                                                                                                   | **Method 2 only**                                |
@@ -830,6 +832,27 @@ For fast iteration on the operator itself, against a GKE cluster or the kind clu
    ```bash
    make dev-rebuild-agent ARGS="platform"
    ```
+
+## Upgrading
+
+To move a configured `kube-agents` installation to a newer release, run the `upgrade.sh` published
+for that release. It carries its own version, so the run names no image tag, and it reuses the
+install checkout — and the `install.env` in it — that `install.sh` left in `$HOME/kube-agents`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/upgrade.sh | bash -s -- \
+  --non-interactive \
+  --gcp-project-id="<PROJECT_ID>" \
+  --gke-cluster-name="<CLUSTER_NAME>" \
+  --gcp-region="<REGION>"
+```
+
+From a checkout, run `./upgrade.sh` with the same flags. An unpacked release bundle carries sources
+and no configuration, so copy the install's `install.env` into it first, or point
+`KUBE_AGENTS_INSTALL_ENV` at one. `--image-tag` overrides the version the script carries and exists
+for development and CI/CD testing; `--plan` reports what a full upgrade would change without
+changing anything. The upgrade modes, the previews, and the refusals are in
+[the Upgrade page](docs/site/src/content/docs/install/upgrade.md).
 
 ## Teardown & Cleanup
 

@@ -211,7 +211,7 @@ one from the mirror through its own chart's values.
 ### LiteLLM gateway
 
 The agent's baked default model endpoint is
-`http://litellm.<namespace>.svc.cluster.local/v1`, so the chart deploys the
+`http://inference-gateway.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base`. `litellm.modelProvider`
 (gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
@@ -282,6 +282,25 @@ resolves to that GSA:
 `model_provider = "vertex_ai"` — the second `kube-agents-iam` module
 instantiation creates the identity and roles, and the chart values above carry
 the annotated KSA.
+
+#### Upgrade notes: inference-gateway Service rename
+
+The agent-facing K8s Service was renamed from `litellm` to `inference-gateway` (and `litellm-gateway` to `inference-gateway-upstream` for the upstream gateway). The operator now renders `base_url: http://inference-gateway.<namespace>.svc.cluster.local/v1` into the managed agent config on every reconcile; the managed scope is overlaid on load, so agents cannot retain the old name via a local override.
+
+**Default installs (`litellm.enabled=true`):** Helm deletes the old `litellm` Service and creates `inference-gateway` in the same upgrade. The operator re-renders the agent ConfigMap once the new pod rolls out. There is a brief window between Helm's delete of `litellm` and the completion of the operator reconcile and agent rolling-restart during which agent pods still resolve `litellm` (now gone) and model calls fail. To eliminate this window, annotate the live `litellm` Service before upgrading so Helm retains it alongside the new `inference-gateway`:
+
+```bash
+kubectl annotate svc litellm helm.sh/resource-policy=keep -n <namespace>
+helm upgrade ...
+```
+
+Old agent pods continue routing through `Service/litellm` until the operator updates the ConfigMap and the rolling restart completes. Once all pods have migrated to `inference-gateway`, remove the retained Service:
+
+```bash
+kubectl delete svc litellm -n <namespace>
+```
+
+**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on.
 
 #### Upgrade notes: static to dynamic NetworkPolicy
 
@@ -449,10 +468,10 @@ canonical walkthroughs.
 
 ### Agent runtime knobs
 
-`platformAgent.harness.hermes`, `platformAgent.harness.memory`, and
-`platformAgent.deployment.availability` expose the remaining PlatformAgent CR
-fields, so a chart install can reach every field of the CR without editing it
-by hand. Each one defaults
+`platformAgent.harness.hermes`, `platformAgent.harness.memory`,
+`platformAgent.harness.driftDetector`, and `platformAgent.deployment.availability`
+expose the remaining PlatformAgent CR fields, so a chart install can reach every
+field of the CR without editing it by hand. Each one defaults
 to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset.
@@ -495,7 +514,7 @@ node's cache. The chart and the Terraform composition agree on `Always` for the
 mutable-tag case they were both written for; an install at a pinned release
 tag is the case that wants the override.
 
-Four knobs need context beyond the chart:
+Five knobs need context beyond the chart:
 
 - `deployment.availability.runtimeClassName` defaults to `gvisor`, because the
   agent executes model-authored commands and an unsandboxed pod shares the node
@@ -529,6 +548,12 @@ Four knobs need context beyond the chart:
 - `harness.hermes.dashboardEnabled` defaults to `null`, which leaves the field
   out of the CR so the CRD default (`true`) applies. Set it explicitly when an
   install must pin the dashboard on or off rather than float with the CRD.
+- `harness.driftDetector.enabled` needs
+  [`terraform/modules/drift-pubsub`](../../terraform/modules/drift-pubsub/)
+  applied against the project first. The chart does not check, and neither does
+  the detector: enabled without a subscription to read, it comes up and retries
+  a pull that cannot succeed for the life of the pod, never exits, and leaves
+  the pod Ready. That is why it defaults to off.
 
 ### Plugins & Runtime Tuning
 
@@ -552,6 +577,18 @@ before any GKE call. The
 `scoped_service_accounts` output when `scoped_clusters` is set. See the site's
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
+
+### Projects in scope
+
+`platformAgent.scope` is rendered as `spec.scope` on the `PlatformAgent`: the GCP projects,
+beyond the one the agent runs in, whose GKE clusters get a Cluster Agent, and the projects and
+clusters it leaves unmanaged (the
+[CRD reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/operator/platformagent-crd.md#specscope)
+documents the field). An empty scope is a present block with empty lists, and the chart renders it whenever it is given one, `{}` included, because the reconcile reads an emptied `projects` list as the declaration that drops projects. `null`, the chart's default, is not an empty scope: it is the chart being told nothing, and the composition never tells it nothing. The block is never dropped for being empty. While no earlier revision rendered the block, a `null` leaves a scope the CR already carries alone, because Helm patches a custom resource from the difference between its rendered manifests; once a revision has rendered it, a render without it removes `spec.scope` from the CR, which the reconcile reads as no declaration (the management project alone, nothing retired), so `null` clears a scope without retiring its projects and emptying `projects` is how projects are dropped. The
+`terraform/examples/full-install` composition always passes a map, so on that path a project
+leaves the scope by being removed from `projects` and applied. Once a release has rendered the block the value is the declaration: the installer refuses the next full upgrade over a `spec.scope` edited by hand until `install.env` records it or the CR is put back, and a retag, or a hand-driven composition apply whose rendered scope is unchanged, leaves the edit in place because Helm sends only the difference between its rendered manifests.
+The agent's service account needs the read roles in each project named; the composition binds
+them from the same value, and a chart installed on its own needs them granted by hand.
 
 ### ServiceAccount ownership
 

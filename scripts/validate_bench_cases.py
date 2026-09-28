@@ -181,6 +181,11 @@ FIXTURE_NOT_READY = {
         "not, so the case fails with the branch absent, which is broken rather "
         "than red"
     ),
+    "cluster-agent-stalled-controller-diagnosis": (
+        "#1873: needs the stalled-controller role, a Deployment in seeded-stall "
+        "on seeded cluster A waiting on a ConfigMap that does not exist; no "
+        "fixture role plants a stall today"
+    ),
 }
 
 # Cases that claim no domain because no row in domains.yaml describes them.
@@ -193,6 +198,20 @@ KNOWN_NO_DOMAIN = {
         "the worker took to it (the version-control verbs, never a credentialed "
         "clone or gh from the sandbox); no domains.yaml row describes "
         "repository access"
+    ),
+    "vcs-issue-resolver-triage": (
+        "the github-issue-resolver skill end to end -- poll, claim, "
+        "investigate, transition -- graded on the route the resolver took to "
+        "the forge and on the triage it produced; no domains.yaml row "
+        "describes issue triage, and incident-triage names the event-fired "
+        "autoops journey rather than this one"
+    ),
+    "vcs-review-feedback-read-back": (
+        "a second revision put on an existing proposal's branch and read back "
+        "from the forge before it is described, graded on the route the worker "
+        "took to the read-back; rca-remediation-pr owns the remediation "
+        "journey -- a proposed fix landing as a pull request -- and this case "
+        "proposes no fix"
     ),
     "gpu-stress-test-diagnosis": (
         "a chat-prompted post-incident RCA, not the event-fired autoops triage "
@@ -238,7 +257,12 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # for the same reason. See bench/kube_agents_bench/verifiers.py.
     "fleet_resource_property": ("op",),
     # This repository, run-reading.
-    "report_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
+    "report_contains": (
+        "required_phrases",
+        "forbidden_phrases",
+        "any_of_phrases",
+        "forbidden_patterns",
+    ),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.
@@ -632,7 +656,8 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                     problems.append(
                         f"names fixture role {role!r}, which is not a slug string"
                     )
-                elif role not in roles:
+                elif role not in roles and name not in FIXTURE_NOT_READY:
+                    # A case waiting on its fixture names the role its issue plants.
                     problems.append(
                         f"names fixture role {role!r}, which neither "
                         "bench/tf/fleet/fixtures.json nor "

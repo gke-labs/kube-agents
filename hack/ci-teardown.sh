@@ -2,8 +2,9 @@
 # ==============================================================================
 # Prow CI Teardown Pipeline Script
 # ==============================================================================
-# Cleans up PR-scoped Kubernetes resources from target GKE cluster.
-# Preserves static cluster & GCP IAM setup for fast re-use across PR runs.
+# Cleans up what a PR run leaves on the leased project's GKE cluster. Preserves
+# static cluster & GCP IAM setup for fast re-use across PR runs. The agent's
+# pull requests are swept elsewhere; see below.
 #
 # One `helm uninstall` (the release owns every Kubernetes object ci-deploy.sh
 # created) plus a CRD delete, since the chart leaves CRDs behind by Helm's own
@@ -13,9 +14,12 @@
 # for `helm uninstall` to act on, and Helm then refuses to adopt them on the
 # project's next lease (#1006). Step 4 names the kinds the label cannot reach.
 #
-# The CRD delete is the one conditional step: a release record that outlives
-# Step 1 needs its CRDs, or the next lease can neither uninstall nor upgrade
-# over it (#1172).
+# One step is conditional. The CRD delete runs when a release record outlives
+# Step 1, which needs its CRDs or the next lease can neither uninstall nor
+# upgrade over it (#1172). The agent's leftover pull requests are not this
+# script's to close: that takes a write credential, and a presubmit runs the
+# pull request's own code, so the sweep runs from a periodic that executes only
+# main (hack/ci_sweep_agent_pulls.py, #1755).
 # ==============================================================================
 
 set -uo pipefail

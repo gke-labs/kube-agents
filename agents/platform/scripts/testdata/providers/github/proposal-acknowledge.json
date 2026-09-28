@@ -1,0 +1,18 @@
+{
+  "payload": {
+    "number": 4321,
+    "comment": {
+      "id": 55512309,
+      "kind": "issue"
+    }
+  },
+  "responses": [
+    {
+      "id": 99912301,
+      "content": "eyes",
+      "user": {
+        "login": "kube-agents[bot]"
+      }
+    }
+  ]
+}

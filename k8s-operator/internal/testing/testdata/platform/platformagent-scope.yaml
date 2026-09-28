@@ -39,6 +39,11 @@ spec:
       - "123456789012"
     organizations:
       - "111111111111"
+    sharedVpcHosts:
+      - "vpc-host-prod"
+      - "vpc-host-dev"
+    metricsScopes:
+      - "ops-metrics"
     exclude:
       projects:
         - "*-sandbox"

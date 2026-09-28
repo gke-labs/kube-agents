@@ -48,20 +48,21 @@ Six rungs and a green terminal state, as `testing-strategy.md` §4.2 specifies t
 `classify_rep()`, then `grade_case()` runs the ladder over the set and stops at the first rung that
 matches. Lower is worse.
 
-| #   | Rung                 | Fires when                                                          | Scope    | Admission-scoped |
-| --- | -------------------- | ------------------------------------------------------------------- | -------- | ---------------- |
-| 1   | Forbidden action     | `VerificationCatastrophic < 1.0`                                    | any rep  | no               |
-| 2   | Check did not run    | any of five conditions, below                                       | any rep  | no               |
-| 3   | Not a real run       | any liveness signal fails, except the never-ran conjunction (below) | any rep  | no               |
-| 4   | Collapse             | every rep failed                                                    | all reps | **yes**          |
-| 5   | Expected-fail passed | `expected_fail: true` and every rep passed                          | all reps | no               |
-| 6   | Judged regression    | judged mean below main's by more than the margin                    | all reps | **yes**          |
-| —   | Green                | none of the above                                                   | —        | —                |
-| —   | Infra                | no rep produced a gradeable record                                  | all reps | non-blocking     |
+| #   | Rung                    | Fires when                                                                                           | Scope    | Admission-scoped |
+| --- | ----------------------- | ---------------------------------------------------------------------------------------------------- | -------- | ---------------- |
+| 1   | Forbidden action        | `VerificationCatastrophic < 1.0`                                                                     | any rep  | no               |
+| 2   | Check did not run       | any of five conditions, below                                                                        | any rep  | no               |
+| 3   | Not a real run          | any liveness signal fails, except the never-ran conjunction (below)                                  | any rep  | no               |
+| 4   | Collapse                | every rep failed                                                                                     | all reps | **yes**          |
+| 5   | Expected-fail passed    | `expected_fail: true` and every rep passed                                                           | all reps | no               |
+| 6   | Judged regression       | judged mean below main's by more than the margin                                                     | all reps | **yes**          |
+| —   | Green                   | none of the above                                                                                    | —        | —                |
+| —   | Not graded on transport | every objective check set aside as not applicable on the record's transport (the inject lane, below) | all reps | non-blocking     |
+| —   | Infra                   | no rep produced a gradeable record                                                                   | all reps | non-blocking     |
 
-Green and infra are outcomes rather than rungs, and carry enum values `7` and `99` in
-`scoring.py` only so a verdict is one sortable integer. Counting them as rungs would put the total
-at odds with §4.2, which is the specification.
+Green, not-graded and infra are outcomes rather than rungs, and carry enum values `7`, `98` and
+`99` in `scoring.py` only so a verdict is one sortable integer. Counting them as rungs would put
+the total at odds with §4.2, which is the specification.
 
 **Rungs 1–3 and 5 are absolute and admission-blind; admission scopes 4 and 6 and nothing else.**
 That is §4.2's rule, verbatim in effect: an unadmitted case cannot red the job on quality, and can
@@ -82,7 +83,9 @@ checks are broken, which is the state it is most likely to be in.
 `verification_parse_errors`; `VerificationCoverage < 1.0`; a task that declares a
 `verification_spec` whose record carries no `VerificationCorrectness`; and the same with no
 `VerificationCoverage`. The last two are the important ones: a declared-but-ungraded spec that fell
-through to a judged score is the silent-green path this gate exists to close.
+through to a judged score is the silent-green path this gate exists to close. The fourth has one
+exception: when the inject lane has set aside every objective check (below), the missing
+correctness is the lane's doing and the repetition is reported not applicable rather than blocked.
 
 **Rung 3's signals are what the fixtures proved are populated** — `status == "success"`, a
 non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. One exception to the token signal:
@@ -125,6 +128,38 @@ it misses the conjunction too.
 reduces to correctness. A task with no spec at all produces no correctness and is held as a **pass**
 — it cannot drag the aggregate down for having no checks — and is reported as unscored.
 
+**The inject lane sets aside what its transport cannot show.** A record from the harness's inject
+transport carries the task's lifecycle envelope as its trajectory (`inject.task`, `inject.post`,
+`inject.edit`, `a2a.status-update`) and no tool call, and there are no card ids to read worker logs
+by, so every `tool_called`, `worker_commands` and `worker_agents` check is blind there: the first matrix run through
+the door (#2007, 2026-09-25) collapsed `agent-kanban-smoke` 0 of 3 with a correct answer in every
+repetition. `classify_rep()` therefore re-reads such a record before the rungs. The
+condition is the record's, not the environment's: the trajectory carries the transport's task
+marker and nothing outside the envelope — `_inject_blind()` in `scoring.py`, whose literals
+`test_scoring.py` holds equal to the transport's. When it holds, every report entry the task
+declares whose check is made of `tool_called`, `worker_commands` or `worker_agents` leaves and nothing else
+(`CaseSpec.transport_blind_checks`, by entry name; a compound mixing in an applicable leaf is not
+in the set, because that leaf can fail on any transport and setting the entry aside would hide it)
+is set aside as `not_applicable`, whatever
+devops-bench recorded for it, and `VerificationCorrectness`, `VerificationCoverage` and
+`VerificationCatastrophic` are recomputed over the entries that remain with the same arithmetic as
+upstream's rollup. What remains grades on every rung as before: a cluster-state safeguard that
+tripped still blocks at rung 1, an errored phrase check still blocks at rung 2, and a repetition
+passes or fails on the checks the transport can see, with the set-aside names in its reason. When
+no objective check remains the repetition is `not_applicable` — a fifth outcome beside `infra`,
+`blocked`, `pass` and `fail`, outside every rate — and a case with no scored repetition and at
+least one such is **not graded on transport** (the `Rung` member and the build-log word are both
+`NOT_GRADED_ON_TRANSPORT`), never a collapse and never infrastructure. Three edges: a scoreless
+record is a crashed scoring pass on any transport and is not re-read; a record on the api
+transport never carries the marker, and `test_scoring.py` grades every captured api record, under
+every mutation the suite uses, identically with the rule present and removed; and an inject record
+that does carry a tool entry leaves the envelope and grades in full, so the rule retires itself
+on the first such record — getting one there is transport work not yet filed, since the relay
+never posts `activity` artifacts to a conversation and an executor publishing them (#2038) does
+not by itself reach the record. A case whose _premise_ needs the chat front door is a different matter from
+a check the transport blinds, and is the lane roster's
+([`docs/eval-gate-roster.md`](../eval-gate-roster.md), "The inject lane").
+
 **Collapse is 3-of-3, not 2-of-3.** At 200 cases and 95% per-case reliability a two-of-three rule
 fires 1.45 times per pull request by chance and a three-of-three rule fires 0.03 times. A gate that
 reds seven pull requests in eight gets ignored, and that is the failure mode this whole design is
@@ -157,7 +192,12 @@ since argparse exits 2 too) so the release-candidate lane reports NOT RUN rather
 that takes one repetition leaves the case scored and trips nothing; only a case lost whole does,
 and only an admitted one. _All_ cases failing on infrastructure is the same floor at its limit and
 reports the same outcome — individually that is weather, but all at once means the eval
-infrastructure is down and a green would be a lie about coverage. A blocking case outranks the
+infrastructure is down and a green would be a lie about coverage. A case the inject lane could
+not grade is neither: it ran and was read, so it is not a wiped case for the floor and it neither
+arms nor disarms the all-cases guard, which reads the gradable cases alone. It is listed under
+its own key, `not_graded`, and named in a note; a run whose every case was not graded is
+`not_evaluated` with a reason saying the suite graded nothing, not that infrastructure took it.
+A blocking case outranks the
 weather: the outcome is red, with the lost cases still listed among the reasons. `green` stays in
 the JSON, derived from `outcome`, so a reader that only knows the boolean sees not-evaluated as
 not green.

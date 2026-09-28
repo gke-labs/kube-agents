@@ -574,8 +574,14 @@ func buildA2ACalloutService(agent *agentv1alpha1.PlatformAgent) *corev1.Service 
 	}
 }
 
-// reconcileA2ACallout applies the callout's objects in dependency order.
-func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+// reconcileA2ACallout applies the callout's objects in dependency order and
+// returns the callout Deployment's Generation as the API server reported it
+// on this pass's apply. The gateway gate reads the callout back from the
+// informer later in the same pass, and the apply's response is the one
+// number that says whether the copy it gets is the object this pass wrote
+// or the one before it (a2aGatewayWaitsForCallout).
+func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (int64, error) {
+	callout := buildA2ACalloutDeployment(agent)
 	// Namespaced objects get an owner reference so they are reclaimed with
 	// the CR. The one cluster-scoped object cannot: a cluster-scoped object
 	// owned by a namespaced one is treated as an orphan by the garbage
@@ -593,15 +599,15 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 		buildA2ASessionServiceAccount(agent),
 		buildA2ACalloutRole(agent),
 		buildA2ACalloutRoleBinding(agent),
-		buildA2ACalloutDeployment(agent),
+		callout,
 		buildA2ACalloutService(agent),
 	}
 	for _, obj := range owned {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
-			return err
+			return 0, err
 		}
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
-			return fmt.Errorf("failed to apply A2A callout %T: %w", obj, err)
+			return 0, fmt.Errorf("failed to apply A2A callout %T: %w", obj, err)
 		}
 	}
 
@@ -612,10 +618,12 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 		buildA2ACalloutClusterRoleBinding(agent),
 	} {
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
-			return fmt.Errorf("failed to apply A2A callout %T: %w", obj, err)
+			return 0, fmt.Errorf("failed to apply A2A callout %T: %w", obj, err)
 		}
 	}
-	return nil
+	// applyManaged decodes the server's response into the object it applied,
+	// so this is the Generation the callout has after this pass's write.
+	return callout.Generation, nil
 }
 
 // buildA2ASessionServiceAccount is the identity every spawned session pod runs

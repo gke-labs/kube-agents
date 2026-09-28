@@ -99,3 +99,13 @@ output "scoped_service_accounts" {
   description = "Map from GKE resource name to the service account for that cluster. The key is what the credential broker matches on, so the two are directly comparable. The accounts hold no IAM grant as of 2026-08-12; see scoped_pool.tf."
   value       = module.kube_agents_iam.scoped_service_accounts
 }
+
+output "scope_projects" {
+  description = "The projects beyond project_id that scope.projects named and the IAM module bound scope_roles in. The host project is omitted even when named; the CR's projects list carries it as written."
+  value       = module.kube_agents_iam.scope_projects
+}
+
+output "scope_roles" {
+  description = "The roles every scope project carries: the IAM module's read allowlist intersected with the roles the host project got."
+  value       = module.kube_agents_iam.scope_roles
+}

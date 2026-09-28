@@ -1,6 +1,6 @@
 # An Opt-In Multi-Project Scope for the Platform Agent
 
-> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Steps 1 and 2's IAM bindings and installer paths, step 1's chart rendering of `spec.scope` and `platform_mcp_server.py` change, and steps 3 to 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
+> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Step 3's runtime half is implemented too: `sharedVpcHosts` and `metricsScopes` on the CR, their two lookups and allowlist entries, the naming of monitored projects by number, their rows in `containers` and the freeze through them. Step 1's IAM bindings, installer path and the chart's rendering of `spec.scope` are implemented too: the `kube-agents-iam` module's `scope` input, the composition's `scope` variable feeding the module and the chart from one value, and the installer's `SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` keys. Steps 2 and 3's IAM bindings and installer paths (for step 3, the plan-time resolution of the two selectors), step 1's `platform_mcp_server.py` change, and steps 4 and 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
 > architecture documents define it as one agent per project. This document proposes replacing that
 > single project with a declared scope, and gives the order the change has to land in. Each section
 > says what is true on `main` now and what the design changes.
@@ -83,7 +83,7 @@ Cluster Agent is named, stored, or driven:
   name (`credential_proxy.py:1168-1190`), and re-issues `get-credentials` with the target's project
   (`:2496`). It does not pin a project. Only IAM stops a cross-project call.
 - The scoped service account pool is already keyed on a per-row project. `scoped_clusters`
-  (`terraform/modules/kube-agents-iam/variables.tf:71` onward) is a list of
+  (`variable "scoped_clusters"` in `terraform/modules/kube-agents-iam/variables.tf`) is a list of
   `{project_id, location, cluster_name}` objects, with the comment that "a cluster in another
   project is a row in this list rather than a second module"; the CRD mirror is
   `spec.security.scopedServiceAccounts[]` (`k8s-operator/api/v1alpha1/common_types.go:498-540`),
@@ -122,7 +122,7 @@ spec:
 Rules:
 
 - **Empty scope means today's behaviour.** Selectors are set when at least one of `projects`,
-  `folders`, or `organizations` (and, once phase 3 lands, the two selectors defined below) is non-empty. No `spec.scope`, `spec.scope: {}`, and a scope with
+  `folders`, `organizations`, `sharedVpcHosts` or `metricsScopes` is non-empty. No `spec.scope`, `spec.scope: {}`, and a scope with
   only `exclude` populated all resolve to the management project alone, found the way `_project()`
   finds it now. Rendering is a separate question from resolution: the operator renders the scope file on every install, marked absent when the CR has no scope block and present with empty lists when the block is there and empty, so the reconcile can tell three things apart: a present block whose `projects` is empty is the declaration that drops projects and is the one case that prunes; an absent block declares nothing and marks nothing newly `retiring` (§7; a mark an earlier present block made still counts); and a scope file the pod cannot read at all reads as no declaration and as an unclean run, so nothing is marked or pruned. An install that migrates only its exclusions gets them applied like any other declaration.
 - **The management project is always in scope.** It is the project the metadata server names,
@@ -148,7 +148,7 @@ Rules:
   lets the run list, and the sorted order of the "Resolution is deterministic" rule decides how
   the snapshot is written.
 - **Two caps of 100, enforced in different places.** Each declared list (`projects`, `folders`,
-  `organizations`, both `exclude` lists, and the phase 3 selectors when they land) carries
+  `organizations`, `sharedVpcHosts`, `metricsScopes` and both `exclude` lists) carries
   `MaxItems=100` on the CRD, so an oversized declaration is refused at admission. That cap outlives the pool's move to per-project accounts (§6) for a reason of its own: a hand-written list past a hundred entries is the shape containers exist for, and the cap is where the CRD says so; an estate with more than a hundred explicit projects declares folders rather than raising anything. The reconcile lists at most a cap's worth of projects of the resolved set, the management project included, because one folder can resolve to any number. On `main` the cap is the fixed constant `RESOLVED_SET_CAP`, 100; making it a declared value, `spec.scope.maxProjects` with 100 as its default and the listing budget (§4) scaling with it rather than staying fixed, is the follow-up §10 step 2 names. The default sits below the estate that asked for this design, about 200 projects with one cluster each grouped by folder (#1354), and that install declares its folders and a higher cap rather than splitting in two; an estate that wanted two hundred explicit projects is refused at admission and declares folders instead; what bounds an install above the default is the pod, not the reconcile (§11). The set is
   filled in a fixed order so the cap binds the same way on every run: the management project, then
   explicit projects sorted by ID, then the phase 3 selectors' projects sorted by ID, then
@@ -175,7 +175,7 @@ Rules:
 - **Resolution is deterministic.** The resolved project set is sorted by ID before it is written
   anywhere (listing follows the fill order above), so two runs against an unchanged fleet produce byte-identical snapshots (§5) and an
   unchanged roster.
-- **Two later selectors, `sharedVpcHosts` and `metricsScopes`.** Teams group projects by Shared
+- **Two further selectors, `sharedVpcHosts` and `metricsScopes`.** Teams group projects by Shared
   VPC as often as by folder, and "every service project attached to host `H`" is answerable from
   the Compute API; a Monitoring Metrics Scope's monitored-project list answers the same question
   for teams that group by observability. Both come after folders because neither is a Resource
@@ -234,7 +234,9 @@ The discovery verb was absent from the broker's read allowlist until phase 2: `G
 refused fail-closed with no signal. Phase 2 added `("asset", "search-all-resources")` with the resolver that needs it, and `--scope` and `--asset-types` to `_GCLOUD_FLAGS_WITH_VALUE`: the broker refuses a
 flag it does not know the arity of before it matches the command path, so a verb whose flags are
 not listed is admitted and unreachable at once, which the set's own comment records as having
-happened to `logging read`.
+happened to `logging read`. Phase 3 added `("compute", "shared-vpc", "list-associated-resources")` and
+`("beta", "monitoring", "metrics-scopes", "describe")` for the two selectors; neither needs a flag the table
+did not already know.
 
 **Every project gets an outcome, and no outcome is silent.** For an explicit project the outcome
 comes from its `clusters list`. For a project reached through a container, Asset Inventory has
@@ -287,7 +289,7 @@ profiles, on the data PVC, in a snapshot the reconcile run rewrites every hour:
 ```json
 {
   "resolvedAt": "2026-09-03T14:11:07Z",
-  "declared": { "projects": [...], "folders": [...], "organizations": [...], "exclude": {...} },
+  "declared": { "projects": [...], "folders": [...], "organizations": [...], "sharedVpcHosts": [...], "metricsScopes": [...], "exclude": {...} },
   "resolver": "asset-inventory",
   "ignoredExcludes": [{ "project": "ops-mgmt", "pattern": "ops-*" }],
   "containers": [
@@ -314,12 +316,14 @@ profiles, on the data PVC, in a snapshot the reconcile run rewrites every hour:
 the only value phase 1 writes, `asset-inventory` once a folder or organisation is, and a fallback resolver,
 if one is ever built, names itself here. It says nothing about the other selectors: each project's
 `via` carries its source, and the phase 3 selectors record theirs there (§10). The management project's `via` is `["management"]`; an explicit project's is `["explicit"]`;
-a project a container produced names the container. `containers` lists every selector the run resolved at runtime, with its outcome and member count: the declared folders and organisations, and in phase 3 each `sharedVpcHosts/<host>` and `metricsScopes/<scope>` entry under its `via` name, so that a failed lookup of any of them is visible where the freeze rule (§4) and §7's second condition read it. `ignoredExcludes` records the first `exclude.projects` entry that matched the management project and was not applied (§3), with the project and the pattern, so an
+a project a container produced names the container. `containers` lists every selector the run resolved at runtime, with its outcome and member count: the declared folders and organisations, and each `sharedVpcHosts/<host>` and `metricsScopes/<scope>` entry under its `via` name, so that a failed lookup of any of them is visible where the freeze rule (§4) and §7's second condition read it. `ignoredExcludes` records the first `exclude.projects` entry that matched the management project and was not applied (§3), with the project and the pattern, so an
 exclusion the run declined to honour is visible in the snapshot rather than only in a log line.
 `profiles` maps every profile on the volume to its project as the run read it, or as the last run
 that could read it did: a profile whose `cluster_identity` cannot be read this run is attributed
 through this map, so a `retiring` project whose remaining profile is unreadable stays `retiring`
 rather than leaving the snapshot and reading as never in scope once the identity is readable again.
+
+A row named through a Metrics Scope also carries `number`, the project number the Monitoring API returned it under, and every later row for the project keeps it, explicit, management, container and `retiring` rows included, so a later run whose naming call is refused can still report the project under its ID (§10 step 3).
 
 A project entry carries two fields that answer different questions. `outcome` (§4) says whether
 the run could read the project this tick. `state` says what the declaration wants: `in-scope` for
@@ -364,14 +368,18 @@ follow the selector type:
 project was named or reached through a container. The allowlist is `container.clusterViewer`,
 `container.viewer`, `compute.viewer`, `monitoring.viewer`, `logging.viewer`, and
 `iam.securityReviewer`: the read roles in the list the composition binds, `local.read_only_roles`
-in `terraform/examples/full-install/main.tf`, which the module default
-(`terraform/modules/kube-agents-iam/variables.tf:59-68`) mirrors. The intersection matters on the
+in `terraform/examples/full-install/main.tf`, which the module default (`variable "project_roles"`
+in `terraform/modules/kube-agents-iam/variables.tf`) mirrors. The intersection matters on the
 `custom` permission set, where the operator names `project_roles` outright: a list that carries
 `roles/container.admin` for the host project must not carry it to another project, where
 `container.clusters.impersonate` would apply to every cluster, and a
 quota-consuming role such as `roles/serviceusage.serviceUsageConsumer` must not consume quota in
 projects the agent only reads. Widening `project_roles` widens the host project alone; widening
-what the scope carries is an edit to the allowlist, in one file, on purpose.
+what the scope carries is an edit to the allowlist, in one file, on purpose. The module refuses the
+plan when `scope.projects` is non-empty and the intersection carries neither
+`roles/container.clusterViewer` nor `roles/container.viewer`, the two allowlist roles that carry
+`container.clusters.get` as well as `container.clusters.list`: `roles/iam.securityReviewer` lists
+but cannot get, so a project bound with it alone would read `ok` and fail every profile create.
 
 The default roles outside the allowlist are outside it by design, and so is any role a later
 change adds to the default list that is not a read role. `roles/iam.serviceAccountUser` is
@@ -414,8 +422,9 @@ owns them, which is the property #588 lost when its revocation lived in a bash f
 ## 7. The onboarding lifecycle
 
 **Adding a project.** Under a declared folder or organisation: nothing to do; it is discovered at
-the next tick. As an explicit project: add it to `scope.projects` in the tfvars and run
-`upgrade.sh`, which binds the IAM and renders the CR from the same value (a hand-applied CR is
+the next tick. As an explicit project: add it to `SCOPE_PROJECTS` in `install.env` (a hand-driven
+composition edits `scope.projects` in its tfvars) and run `upgrade.sh --upgrade-mode=full`, which
+binds the IAM and renders the CR from the same value (a hand-applied CR is
 edited separately, and §11 says why that split is the weak point). The binding then exists before
 the reconcile tries the list, and the project's
 outcome goes from `denied` to `ok` at the following tick. The order matters and the snapshot shows
@@ -574,7 +583,24 @@ into a second project the tester controls.
    selectors at runtime so the snapshot names the project and its `denied` outcome rather than
    omitting it: each such project's `via` names its source (`sharedVpcHosts/<host>` or
    `metricsScopes/<scope>`), the projects fill the set after explicit projects and before containers (§3), a failed lookup freezes the selector's members and the prune exactly as a failed container lookup does (§4, §7), and the two read verbs join the broker allowlist the way §4 adds `asset`. Moved ahead of the consumers and the documents on 2026-09-21 because the first
-   enterprise request named both.
+   enterprise request named both. The runtime half shipped with three rulings. The Monitoring
+   API names monitored projects by project number, so the reconcile names each with
+   `projects describe` and reports one it cannot name by number under the naming call's outcome (`denied` for a 403), or under the ID an
+   earlier snapshot recorded for that number (the row keeps the number). A project that is not a Shared
+   VPC host resolves to no members rather than to a failed lookup, because a host whose service
+   projects were all detached is exactly that, and a failure would hold the prune for the whole
+   install over one misdeclared host. The selectors' projects read `over-cap` one by one past
+   the cap, like explicit projects, and there is no index-lag hold behind either lookup, since
+   neither has an index: a project detached or unlinked retires under §7's ordinary rule. And a
+   fourth, from review: a monitored project whose naming call failed but that a Shared VPC host, a
+   folder, an explicit entry or the management project names by ID is listed on that route, its own
+   listing decides its outcome, and every row a scope named by number keeps the number, `retiring`
+   rows included. A fifth: a monitored project whose ID the scope model cannot carry (a legacy
+   domain-scoped ID) reads `denied` by number, a stable fact reported and never a lookup failure
+   that would hold the prune; `exclude.projects` by number drops it. A sixth: a member the run
+   could not name and no run has named holds the scope prune like a frozen container, because
+   the bare number could be any project, the one the same edit dropped from `projects` included,
+   and §7's prune never runs on a guess; naming it once, or excluding the number, releases it.
 4. **Downstream consumers.** The rows §8 marks 2: the drift detector's cross-project join,
    audit-log sinks per project or an aggregated sink, and the fleet-audit SOPs and cost skills
    iterating the snapshot.

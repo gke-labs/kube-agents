@@ -94,12 +94,15 @@ test: manifests generate fmt vet test-python ## Run tests.
 	KUBEBUILDER_ASSETS="$$assets" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 .PHONY: test-python
-# Discovery, not a hand-maintained list. The list version was stale: it named
-# three files and missed test_scoped_sa_pool.py and test_session_kv_server.py,
-# so tests that existed and passed locally were never run by this target.
-test-python: ## Run Python tests.
+# Discovery, not a hand-maintained list, so a new test file beside
+# leader_elect.py runs without an edit here. Only the operator's own Python:
+# the platform scripts suite used to run from this target as well, which made
+# `make verify` run it twice, since the root Makefile's PYTHON_TEST_DIRS sweep
+# already reaches agents/*/scripts. That sweep reaches this directory too, so
+# the leader-elect test runs on every pull request through python-tests.yml
+# and not only when a change touches k8s-operator/**.
+test-python: ## Run the operator's own Python tests (internal/controller).
 	cd internal/controller && python3 -m unittest discover -s . -p 'test_*.py'
-	cd ../agents/platform/scripts && python3 -m unittest discover -s . -p 'test_*.py'
 
 ##@ Build
 

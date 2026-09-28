@@ -53,7 +53,6 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -171,11 +170,11 @@ const (
 	// are the right precedent: operator-scoped, set by whoever deploys the
 	// operator, invisible to the CR.
 	//
-	// Nothing in this repository sets it. A developer sets it by hand on the
-	// operator Deployment; a CI eval would set it through the chart's
-	// operator.extraEnv, where the A2A image overrides already go, and that
-	// wiring does not exist yet -- so `AGENT_TRANSPORT=inject` in a presubmit
-	// today would find no Service to reach.
+	// Nothing sets it by default. A developer sets it by hand on the operator
+	// Deployment; hack/ci-deploy.sh sets it through the chart's
+	// operator.extraEnv, where the A2A image overrides already go, under
+	// EVAL_MODE_NEXT=1 and only then -- so `AGENT_TRANSPORT=inject` on an
+	// install deployed without the flag finds no Service to reach.
 	//
 	// It is read the same way a2aStrictEventsWriter is: anything but an
 	// explicit "true" is off, so a typo leaves the door shut.
@@ -372,34 +371,200 @@ const (
 	// fails if this number stops matching it.
 	a2aSessionConsumersPerSession = 3
 
-	// a2aTasksReservedConsumers is the part of the budget that is nobody's
-	// session. What follows itemizes the STANDING consumers only: the
-	// gateway's `gateway-relay` durable and the Hermes bridge's
-	// `bridge-<profile>` durable (2), headroom for the audit durable the
-	// accountability rail needs (1), one session's worth of overlap while
-	// the gateway retires an incarnation and mints its replacement and the
-	// old consumers have not yet reached their 5s inactive threshold (3),
-	// and ten for the web rail's concurrent readers.
+	// The reserve, term by term. a2aTasksReservedConsumers is the part of
+	// the budget that is nobody's session pod: what sits on TASKS however
+	// many sessions run. Each row is a named constant and the total is a
+	// literal; TestReservedConsumersIsTheSumOfItsTerms holds the two
+	// together, so the table is the number and the number is the table.
 	//
-	// It is not an accounting of everything that sits on TASKS, and reading
-	// it as one is the mistake to avoid: `tasks/get` replay ephemerals are
-	// outside this number and are not counted anywhere. lib.TasksGet opens an
-	// ordered consumer and its cleanup stops the local subscription only --
-	// the consumer itself waits out its InactiveThreshold, which TasksGet
-	// sets to five seconds (lib.EphemeralConsumerInactiveThreshold). A call
-	// that finds events therefore leaves one consumer on the stream for five
-	// seconds after it returns. That makes the missing term a call RATE over
-	// a rolling five-second window rather than a concurrency, and the callers
-	// are not just the web rail: the gateway's sweep, reap and relay paths
-	// replay too, and the bridge replays twice per task -- TasksGet when it
-	// dispatches and lib.TaskInReplay (the same replay, on the task's in
-	// subject, same threshold) before it spawns. The window was five
-	// minutes -- nats.go's default, left in
-	// place -- until TasksGet set the threshold, so the rate this constant
-	// absorbs is 60x lower than the number was sized against. gke-labs#1739
-	// owns the term and the number; this constant deliberately does not move
-	// for it here.
-	a2aTasksReservedConsumers = 16
+	//	| slots | term                                                              |
+	//	| ----: | ----------------------------------------------------------------- |
+	//	|     2 | a2aTasksStandingDurables: the gateway's `gateway-relay` and the    |
+	//	|       | Hermes bridge's `bridge-<profile>`                                |
+	//	|     1 | a2aTasksAuditDurableHeadroom: the audit durable the               |
+	//	|       | accountability rail binds                                         |
+	//	|     3 | a2aTasksIncarnationOverlap: one session's named consumers a       |
+	//	|       | second time, while the gateway retires an incarnation and mints   |
+	//	|       | its replacement and the old three have not yet reached their 5s   |
+	//	|       | inactive threshold                                                |
+	//	|    10 | a2aTasksWebReaders: the web rail's concurrent readers             |
+	//	|    16 | a2aTasksReplayConsumers: tasks/get replay ephemerals, derived     |
+	//	|       | below                                                             |
+	//	|    32 | a2aTasksReservedConsumers                                         |
+	//
+	// The replay term, and the mechanism it is sized from. lib.TasksGet
+	// opens an ordered consumer on TASKS and its cleanup stops the local
+	// subscription only; the consumer waits out the inactive threshold
+	// TasksGet sets on it, lib.EphemeralConsumerInactiveThreshold (five
+	// seconds; it was nats.go's five-minute ordered default until
+	// gke-labs#1741). So a replay holds a slot for its own duration plus
+	// five seconds, and the slots held at any instant are the replays BEGUN
+	// in the last five seconds, not the replays in flight. What bounds that
+	// is how many replays each caller can begin in five seconds. The callers
+	// on main, with the structure that bounds each:
+	//
+	// The gateway, one replica. Every path but the sweep and the probe runs
+	// under the conversation's session lock (a2a/gateway sessionLocks), so
+	// one conversation has at most one of them running at a time:
+	//
+	//   - healActiveTask, once per inbound turn on a conversation with a
+	//     running task, and answerStatusByReplay, once more when that turn is
+	//     a status question: two replays back to back, per turn.
+	//   - relayTerminal's fallback, once per terminal whose render state a
+	//     restart lost, and closeDetachedBeforeDelete, once per retired pod
+	//     holding a detached task: each at most once per task.
+	//   - probeConversation, once per inject-door read carrying ?probe=1
+	//     and once more after a wait that blocked, paced by the caller; it
+	//     takes no lock.
+	//   - sweepOnce, one per terminal orphan pod per pass, once a minute, in
+	//     one goroutine, sequentially.
+	//   - buildRehydrationPrimer, one per task in the conversation's history
+	//     (capped at the gateway's taskHistoryCap), sequentially, per spawn.
+	//
+	// The Hermes bridge, one per install. Its durable delivers to one handler
+	// at a time -- nats.go v1.53.1 jetstream/pull.go calls Consume's handler
+	// from the subscription's own callback -- so these never overlap each
+	// other:
+	//
+	//   - handleMessage, once per submission for a task it is not running,
+	//     which is every new task; cancelOrphan, once per cancel for a task
+	//     it is not running.
+	//   - sweepTask and synthesizeTerminal at start, before it consumes, one
+	//     to four per in-flight key the prior incarnation left, sequentially.
+	//
+	// Two kinds of caller fall out of that list. A TRIGGER-PACED caller
+	// replays once per external event -- a turn, a terminal, a submission,
+	// a cancel, a pod delete, a read -- and its five-second count is the
+	// event rate. A LOOP-PACED caller replays back to back with nothing in
+	// between, and its five-second count is min(loop length, 5s / replay
+	// latency): the rehydration primer, the two start-and-minute sweeps, and
+	// the bridge's handler under a burst of submissions. Nothing the operator
+	// sets bounds a loop-paced caller; at the 0.1s a replay takes against an
+	// embedded server that is ~50 slots per loop, fewer on a slower bus. This
+	// term does not size for them, and the cost of that is stated rather
+	// than hidden: a replay refused at the cap fails soft on every path but
+	// two -- the primer skips the task, the sweeps retry next pass or fail
+	// the bridge's start (which restarts it) -- and the two that do not are
+	// both in the bridge's handler, which acks when it returns:
+	// handleMessage logs "events lookup failed; dropping submission", which
+	// loses the task, and cancelOrphan logs "cancel events lookup failed",
+	// which drops the cancel and leaves the orphan non-terminal for the
+	// retention window. A submission burst wide enough to reach the
+	// cap is that handler's hazard, and pacing it is a bridge change, not a
+	// number here.
+	//
+	// What this term holds is the trigger-paced callers, each counted at
+	// what can be in flight at once from the structure above, times
+	// a2aTasksReplayTailFactor for the tail: the next replay from the same
+	// source lands while the last one's five seconds are still running, so
+	// a source holds two slots, not one. A source that fires more than twice
+	// in five seconds is a burst, covered above.
+	//
+	//	| slots | source                                                            |
+	//	| ----: | ----------------------------------------------------------------- |
+	//	|     1 | a2aTasksReplayBridgeDispatch: the bridge's serialized handler     |
+	//	|     1 | a2aTasksReplayGatewaySweep: the sweep's one goroutine             |
+	//	|     4 | a2aTasksReplayAsks: an asker's two replays (a2aTasksReplayAsk)   |
+	//	|       | on each conversation whose task is running -- a chat turn's      |
+	//	|       | heal and status answer, or an inject-door read's probe before    |
+	//	|       | and after its wait -- and in the shape this operator renders     |
+	//	|       | the running conversations are the bridge's                       |
+	//	|       | a2aBridgeDefaultConcurrency runs                                  |
+	//	|     2 | a2aTasksReplayBridgeLookAhead: the pre-spawn look-ahead, one      |
+	//	|       | lib.TaskInReplay per spawn from each of the bridge's              |
+	//	|       | a2aBridgeDefaultConcurrency workers, concurrently                 |
+	//	|     8 | in flight                                                         |
+	//	|   x 2 | a2aTasksReplayTailFactor                                          |
+	//	|    16 | a2aTasksReplayConsumers                                           |
+	//
+	// The look-ahead row is the bridge's second replay per task:
+	// lib.TaskInReplay, once per spawn, from each of the bridge's
+	// a2aBridgeDefaultConcurrency workers, concurrently -- a trigger-paced
+	// source like the others, 2 in flight and 4 after the tail factor. The
+	// row was out of this table while the call was still gke-labs#2010's
+	// proposal, because sizing for a caller no render could reach took the
+	// provision gate's first refused maxSessions on an existing 64-wide
+	// TASKS from 13 down to 11 for nothing, and it came back with the call.
+	// TestBridgeLookAheadIsInTheA2AModule reads the bridge's sources and
+	// fails on the day the call leaves them, naming the arithmetic that has
+	// to move back with it.
+	//
+	// The asks row is the one that rests on the shape of the install rather
+	// than on a lock, so the shape is stated. A conversation has one asker:
+	// a chat backend's, whose turn runs under the session lock and replays
+	// twice back to back, or the inject door's, whose read takes no lock and
+	// replays before and after its wait -- one asker, two replays, either
+	// way. The operator leaves the gateway's A2A_DEFAULT_ADDRESSEE at its
+	// default, "platform", so a plain conversation's task is a bridge run
+	// and a session pod is spawned only for a Delegate or a session-routed
+	// record; the conversations being asked about while their task runs are
+	// therefore the bridge's Concurrency runs. A conversation with a queued
+	// bridge task, or with a session pod, can be asked about too; that is a
+	// person or a harness at one conversation, once per ask, and the tail
+	// factor is the allowance for it. It is not a per-session term today,
+	// because maxSessions counts pods and a conversation's task is not one;
+	// put in the multiplier it would size the reserve by the wrong number.
+	// The day A2A_DEFAULT_ADDRESSEE flips to the session route (the
+	// RouteSession sentinel in a2a/gateway; gke-labs#2033 is the open design
+	// change that plans it), every conversation's task IS a pod, the asks row
+	// becomes per-session, and it moves into the multiplier beside
+	// a2aSessionConsumersPerSession.
+	//
+	// Two more things the two bridge rows rest on, both settable on the
+	// CR and neither read by this render. BRIDGE_CONCURRENCY: the sidecar is
+	// declared in spec.deployment.sidecars, so its env is the CR's, and an
+	// install that raises it (docs/designs/eval-next-transport.md commits the
+	// eval install to at least its task parallelism) scales the asks and
+	// look-ahead rows with it while this reserve stays put -- at 6, in flight
+	// is 1+1+12+6 = 20 and the term would be 40, which such an install
+	// carries today only because
+	// it spawns no session pods and so spends none of its maxSessions*3.
+	// Reading the sidecar's env into the budget is the follow-up, not a
+	// number here. And one agent replica: replicas share the bridge's
+	// durable and each brings its own workers, so a second replica doubles
+	// the dispatch row.
+	//
+	// Where the floor hides all this. The budget is maxSessions*3 + 32 and a
+	// stream is created at max(64, budget), so a default install
+	// (maxSessions=10, budget 62) still renders 64. The first maxSessions
+	// whose budget clears the floor is 11 (65); it was 13 when the reserve
+	// was 28 and 17 when it was 16. Above it the stream is 16 wider than it
+	// would have been, and
+	// so is the web user's unreapable-durable ceiling, which is the trade
+	// the block above already states.
+	a2aTasksStandingDurables     = 2
+	a2aTasksAuditDurableHeadroom = 1
+	a2aTasksIncarnationOverlap   = a2aSessionConsumersPerSession
+	a2aTasksWebReaders           = 10
+
+	// a2aBridgeDefaultConcurrency mirrors defaultConcurrency in
+	// a2a/cmd/hermes-bridge/main.go, the number of hermes subprocesses -- and
+	// so of running conversations -- one bridge has when BRIDGE_CONCURRENCY
+	// is unset, which this operator leaves unset.
+	// The two modules cannot import each other;
+	// TestBridgeConcurrencyMatchesTheA2AModule reads that constant and fails
+	// if this one stops matching it.
+	a2aBridgeDefaultConcurrency = 2
+
+	a2aTasksReplayBridgeDispatch = 1
+	a2aTasksReplayGatewaySweep   = 1
+	// a2aTasksReplayAsk is the replays one ask makes back to back: a chat
+	// turn's healActiveTask then answerStatusByReplay, or an inject-door
+	// read's probeConversation before and after its wait.
+	a2aTasksReplayAsk  = 2
+	a2aTasksReplayAsks = a2aTasksReplayAsk * a2aBridgeDefaultConcurrency
+	// a2aTasksReplayBridgeLookAhead is the bridge's pre-spawn look-ahead:
+	// lib.TaskInReplay once per spawn, from each worker.
+	a2aTasksReplayBridgeLookAhead = a2aBridgeDefaultConcurrency
+	// a2aTasksReplayTailFactor is the slots one trigger-paced source holds:
+	// the replay running and the one before it, still inside its five-second
+	// inactive threshold.
+	a2aTasksReplayTailFactor = 2
+	a2aTasksReplayConsumers  = a2aTasksReplayTailFactor *
+		(a2aTasksReplayBridgeDispatch + a2aTasksReplayGatewaySweep + a2aTasksReplayAsks +
+			a2aTasksReplayBridgeLookAhead)
+
+	a2aTasksReservedConsumers = 32
 
 	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a
 	// default install still gets. Never render below it.
@@ -682,7 +847,7 @@ func a2aSeedJetStreamGrants() []string {
 // reaped by the inactive threshold lib.TasksGet and lib.TaskInReplay set on it,
 // lib.EphemeralConsumerInactiveThreshold (five seconds -- nats.go's own
 // ordered default is five MINUTES, which is what the replay carried before
-// gke-labs/kube-agents#1739). TasksGet does not delete its own replay
+// gke-labs/kube-agents#1741). TasksGet does not delete its own replay
 // consumer, and that is a decision rather than an omission: under this grant
 // the delete is a refused publish on a subject with no reply, so the bridge
 // would pay an Error-level permissions violation on every task it dispatches
@@ -868,22 +1033,25 @@ func a2aAgentJetStreamGrants() []string {
 //     gateway's own log, for a refusal that is by design. Measured in
 //     TestGatewayConsumersSurviveABusRestart, which asserts that this is the
 //     only violation the restart produces.
-//   - The pre-reset ephemeral is not removed immediately; it waits out its
-//     own five-minute inactive threshold -- nats.go's ordered-consumer
-//     default (jetstream/ordered.go), which lib.TasksGet does not override --
-//     holding a TASKS consumer slot against max_consumers. Stopping an
-//     ordered iterator never deleted its consumer under the wildcard either,
-//     so the per-replay ephemeral is pre-existing -- what this adds is that
-//     the RESET path's old consumer lingers too. Measured on the rendered
-//     config: a reconnect that leaves the server running holds two slots per
-//     replay in flight, the old consumer and its replacement, until the
-//     threshold expires; a bus bounce leaves only the replacement, because
-//     these consumers are memory storage with one replica and the restarting
-//     server drops them. Those slots are the gateway's and never a session's,
-//     so whatever sizes TASKS' max_consumers has to count concurrent
-//     tasks/get replays beside the session cap. A budget that counts sessions
-//     alone runs out under replay load and refuses a legitimate session's
-//     consumer create, which reads as an undersized stream.
+//   - The pre-reset ephemeral is not removed immediately; it waits out the
+//     inactive threshold lib.TasksGet sets on it,
+//     lib.EphemeralConsumerInactiveThreshold (five seconds; nats.go's own
+//     ordered-consumer default is five minutes, which is what the replay
+//     carried before gke-labs/kube-agents#1741), holding a TASKS consumer
+//     slot against max_consumers. Stopping an ordered iterator never deleted
+//     its consumer under the wildcard either, so the per-replay ephemeral is
+//     pre-existing -- what this adds is that the RESET path's old consumer
+//     lingers too. Measured on the rendered config: a reconnect that leaves
+//     the server running holds two slots per replay in flight, the old
+//     consumer and its replacement, until the threshold expires; a bus
+//     bounce leaves only the replacement, because these consumers are memory
+//     storage with one replica and the restarting server drops them. Those
+//     slots are the gateway's and never a session's, which is why TASKS'
+//     max_consumers counts tasks/get replays beside the session cap:
+//     a2aTasksReplayConsumers, in the reserve, derives the number from the
+//     callers. A budget that counted sessions alone ran out under replay
+//     load and refused a legitimate session's consumer create, which read
+//     as an undersized stream.
 //
 // Neither is worth the grant, but the cost is stated rather than described as
 // free, which is what this comment said first.
@@ -1827,7 +1995,7 @@ fi
 if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
   echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
   echo "  spec.harness.tuning.maxSessions is ` + strconv.Itoa(resolveA2AMaxSessions(agent)) + `, each session creates ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` consumers on TASKS," >&2
-  echo "  plus ` + strconv.Itoa(a2aTasksReservedConsumers) + ` reserved for the standing durables and the web rail." >&2
+  echo "  plus ` + strconv.Itoa(a2aTasksReservedConsumers) + ` reserved for the standing durables, the web rail and tasks/get replays." >&2
   echo "Provisioning does not edit an existing stream, and this one limit could not be" >&2
   echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
   echo "  \"stream configuration update can not change MaxConsumers\"" >&2
@@ -2730,7 +2898,8 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// connection, so a bus standing up without it accepts only the static
 	// users and refuses everything else — and refuses it as an Authorization
 	// Violation, which reads exactly like a credential problem.
-	if err := r.reconcileA2ACallout(ctx, agent); err != nil {
+	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent)
+	if err != nil {
 		return state, err
 	}
 
@@ -2848,7 +3017,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 				// what the script's gate compares a live stream
 				// against; the recreate width is what a fresh render
 				// creates, which floors at the cap TASKS shipped with,
-				// so a default install needs 46 and recreates at 64.
+				// so a default install needs 62 and recreates at 64.
 				// The third — what the live stream actually holds — is
 				// on the bus, and it is the one the maxSessions that
 				// fits is derived from, so that half of the remedy
@@ -2909,9 +3078,11 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// session pod's bus credential is minted by the auth callout. So this is
 	// where the deployment spec's ordering - "the operator sets
 	// BusCredentialsReady only after the callout reports serving, and nothing
-	// dispatches before that condition is true" - either holds or is a
-	// sentence. Until this gate, it was a sentence: the operator wrote the
-	// condition and nothing in the repository read it. This reads it.
+	// dispatches before that condition is true", as its rule sentence read
+	// until the 9/17 amendment restated it as one serving replica - either
+	// holds or is a sentence. Until this gate, it was a sentence: the operator
+	// wrote the condition and nothing in the repository read it. This reads
+	// the same Deployment the condition is written from.
 	//
 	// Creation only, and the distinction is the whole design. A callout that
 	// goes unready under a running install must not take the gateway with it:
@@ -2920,28 +3091,43 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// existing gateway is reconciled normally no matter what the condition
 	// says, and only the FIRST creation waits.
 	//
-	// It reads the published condition rather than recomputing readiness from
-	// the callout Deployment, so the gate and the signal an operator watches
-	// cannot disagree about what "ready" meant. The cost is that
+	// It used to read the published condition, so that the gate and the
+	// signal an operator watches could not disagree. They now can, on
+	// purpose, because they answer different questions. BusCredentialsReady
+	// asks "is the callout as a whole serving map V": every replica ready and
+	// on the current template, which is the right claim for the operator
+	// reading it and stays as strict as it is. The gate asks "can a new
+	// gateway safely connect right now", and the callout's replicas form a
+	// NATS queue group (a2a/authcallout/service.go, AuthQueueGroup), so ONE
+	// replica serving the current map already answers every authorization
+	// request a session pod will make. Importing the all-replicas rule here
+	// held a first gateway indefinitely on a callout whose second pod could
+	// not schedule -- a namespace quota with no headroom, node pressure, an
+	// image pull failing on one node -- on a bus that would have authenticated
+	// every one of its sessions.
+	//
+	// What makes the disagreement safe is the direction it can take.
+	// a2aCalloutCanServeANewGateway is a lower bound on the replicas that are
+	// both ready and on the current template, so it never reads true while
+	// the condition's False is describing a callout with no current-template
+	// pod serving; when the two differ, the condition is the stricter one,
+	// and a gateway let through has a serving replica to mint against. The
+	// gate reads the Deployment itself rather than the condition because
 	// syncBusCredentialsReady is deferred to the way out of Reconcile, so the
-	// value read here is one pass old, and the two directions differ.
-	// Stale-false costs only a delay: the gateway is held one more pass and
-	// gatewayHeld requeues. Stale-true is a wrong answer, and worth naming as
-	// one - a first creation goes through on a callout that was serving as
-	// recently as the previous pass and is not serving now. What bounds it is
-	// that one pass, the same window the condition's own doc comment already
-	// accepts ("a stale condition for a moment is cheaper than a refused
-	// connection").
+	// condition is one pass old both ways; the predicate is as current as the
+	// informer, and once the informer's copy is known to be the one this pass
+	// applied (calloutGeneration, below) its only error direction is a false
+	// negative that gatewayHeld's requeue clears.
 	dep := buildA2AGatewayDeployment(agent)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
 	}
-	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep); err != nil {
+	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep, calloutGeneration); err != nil {
 		return state, err
 	} else if hold {
 		state.gatewayHeld = true
-		logf.FromContext(ctx).Info("holding the A2A gateway until the auth callout serves",
-			"deployment", dep.Name, "condition", busCredentialsReadyCondition)
+		logf.FromContext(ctx).Info("holding the A2A gateway until one auth callout replica serves on the current spec",
+			"deployment", dep.Name, "callout", a2aCalloutName(agent))
 		// The flag-off removal below is ordered after the gateway apply so
 		// the fence outlives the listener. Held, there is no gateway pod
 		// at all (the hold is creation-only), so nothing is listening and
@@ -3081,13 +3267,86 @@ func (r *PlatformAgentReconciler) deleteOwnedA2AObject(ctx context.Context, agen
 	return client.IgnoreNotFound(r.Delete(ctx, obj))
 }
 
+// a2aCalloutCanServeANewGateway reports whether at least one replica of the
+// auth callout Deployment is both ready and on the current pod template, which
+// is what a gateway created now needs: one such replica answers every
+// authorization request through the queue group, against the map this render
+// produced.
+//
+// Deployment status does not count that intersection directly. ReadyReplicas
+// and UpdatedReplicas are independent, so "ReadyReplicas >= 1" cannot tell one
+// ready replica on the current template from two ready replicas on the previous
+// one -- and under MaxUnavailable 0 a roll wedged on a pod too old to parse the
+// rendered identity map sits at exactly Ready=2, Updated=1, Replicas=3, which
+// is the failure the map's schema annotation exists to catch. What status does
+// give is an inclusion-exclusion bound: every counted pod is in the ready set,
+// the updated set, or neither, so ready + updated - total is a lower bound on
+// |ready AND updated|. Testing that against one can never read true when no
+// current-template pod is serving. It admits the second replica Pending
+// (1 + 2 - 2 = 1) and rejects the wedged roll (2 + 1 - 3 = 0).
+//
+// The arithmetic holds for the object it is given; appliedGeneration says
+// whether that object is the right one. The caller reads dep from the informer
+// after applying the callout in the same pass, and the informer learns of the
+// apply by watch event, so the copy can still be the object BEFORE the write.
+// On a pass that changed the callout's pod template -- a bump of
+// a2aIdentityMapSchema, a new callout image, an operator upgrade -- that copy
+// carries the previous Generation with ObservedGeneration equal to it and every
+// replica ready and updated on the template the apply just replaced, so the
+// counts read serving and the ObservedGeneration guard cannot tell: both
+// numbers come from the same stale object. Requiring dep.Generation to have
+// reached the Generation the apply's response reported closes that, and a
+// caller with no apply in hand passes 0.
+//
+// The error directions are then both false negatives, each costing the held
+// pass and the requeue that gatewayHeld already pays: a terminated pod still
+// counted in Status.Replicas -- a reap window, where one ready updated replica
+// beside a dying one reads 1 + 1 - 2 = 0 -- and an informer that has not yet
+// delivered this pass's apply, which the watch event for that apply clears.
+// ObservedGeneration is required for the reason setBusCredentialsReady gives:
+// until the Deployment controller has seen the current spec, every count
+// describes the spec before it.
+func a2aCalloutCanServeANewGateway(dep *appsv1.Deployment, appliedGeneration int64) bool {
+	if dep.Generation < appliedGeneration {
+		return false
+	}
+	if dep.Status.ObservedGeneration < dep.Generation {
+		return false
+	}
+	return dep.Status.ReadyReplicas+dep.Status.UpdatedReplicas-dep.Status.Replicas >= 1
+}
+
 // a2aGatewayWaitsForCallout reports whether the gateway Deployment must be
 // withheld this pass. See the call site for why the gate is creation-only and
-// why it reads the condition rather than the Deployment.
-func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment) (bool, error) {
-	if meta.IsStatusConditionTrue(agent.Status.Conditions, busCredentialsReadyCondition) {
+// why it computes its own answer rather than reading BusCredentialsReady.
+// calloutGeneration is the callout Deployment's Generation as this pass's
+// apply of it returned.
+//
+// The callout is read from the informer, as syncBusCredentialsReady reads it,
+// not live: the steady state of every next install passes through here on
+// every pass, and a lower bound that lags the cache by a moment can only hold
+// the gateway one pass longer than the truth would -- with one exception,
+// which is why the apply's Generation comes along. A cached copy that predates
+// this pass's apply is not merely late, it describes the callout on the
+// template the apply replaced, and on that copy the counts can read serving
+// while no replica is on the current one. The predicate refuses a copy whose
+// Generation is below the applied one; in the steady state the two are equal
+// and the check costs nothing, and on the pass that changed the template it
+// holds the gateway until the informer has delivered the write, which the
+// watch event for that write triggers a pass for.
+func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment, calloutGeneration int64) (bool, error) {
+	callout := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}, callout)
+	if err == nil && a2aCalloutCanServeANewGateway(callout, calloutGeneration) {
 		return false, nil
 	}
+	if client.IgnoreNotFound(err) != nil {
+		return false, err
+	}
+	// A callout the cache does not hold yet, one it holds as of before this
+	// pass's apply, or one short of a serving replica, holds the gate the
+	// same way; all three are "not serving".
+	//
 	// Already there: reconcile it. A gateway that exists was let through by
 	// an earlier pass, and withholding its updates now would freeze its image
 	// and env at whatever a callout outage happened to interrupt.
@@ -3099,11 +3358,11 @@ func (r *PlatformAgentReconciler) a2aGatewayWaitsForCallout(ctx context.Context,
 	// decide whether the gate holds, and the two directions of cache
 	// staleness are not symmetric. A stale NotFound costs one more held pass
 	// and a requeue. A stale hit — an informer that has not yet seen it gone —
-	// answers "already there" and lets the Deployment be re-created while
-	// BusCredentialsReady is false, which is the single thing this gate
-	// exists to prevent. The cost is one API call, and only while the
-	// condition is false: the check above returns first in the steady state.
-	err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{})
+	// answers "already there" and lets the Deployment be re-created while no
+	// callout replica is serving, which is the single thing this gate exists
+	// to prevent. The cost is one API call, and only while the callout is
+	// short of serving: the check above returns first in the steady state.
+	err = r.a2aReader().Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{})
 	if err == nil {
 		return false, nil
 	}

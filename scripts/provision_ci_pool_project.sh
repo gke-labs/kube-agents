@@ -30,6 +30,10 @@ APP_ID="4675512"
 # different one here would only mis-address the warning in step 1.4.
 LEDGER_APP_ID="4739812"
 LEDGER_INSTALLATION_ID="157029058"
+# The identity the pool's pull-request sweep runs as (hack/ci_sweep_agent_pulls.py,
+# a Prow periodic on main). Step 4 grants it signer on this project's copy of
+# the App key, which is the whole reach it has here.
+PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
 PEM_FILE=""
 SKIP_FLEET="false"
 SKIP_HOST_CLUSTER="false"
@@ -188,11 +192,12 @@ if ! awk '/gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY}" 2>/d
   echo "   and add the same pair to _EXPECTED_MAPPING in tests/test_ci_gitops_repo.py." >&2
   if [ "${ALLOW_UNMAPPED}" != "true" ]; then
     echo "   Refusing to provision: an unmapped project fails every lease at" >&2
-    echo "   gitops_repo_for_project()'s refusal, and Step 5 would fail anyway." >&2
+    echo "   gitops_repo_for_project()'s refusal, Step 5's verification would fail anyway," >&2
+    echo "   and the pull-request sweep skips an unmapped project." >&2
     echo "   Land the mapping first, or re-run with --allow-unmapped." >&2
     exit 1
   fi
-  echo "   --allow-unmapped set: continuing. Step 5 will still report this as a failure."
+  echo "   --allow-unmapped set: continuing. Step 5 will still report this as a failure, and the pull-request sweep will skip this project."
 else
   echo "✓ Mapped to ${GITOPS_REPO} in hack/ci-deploy.sh"
 fi
@@ -382,7 +387,7 @@ fi
 # bench grader scores. Missing it is the evals-6 red that #994 opened for -- and
 # step 5's Ledger Read Credential check fails the project until it is done.
 echo "⚠ ${GITOPS_REPO} must also be added to GitHub App ${LEDGER_APP_ID}'s installation."
-echo "  That edit widens which repositories a minted token can read issues from:"
+echo "  That edit widens which repositories the App can read issues and pull requests in:"
 echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
 
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
@@ -555,6 +560,19 @@ elif [ "${SKIP_PEM_IMPORT:-false}" != "true" ]; then
   echo "Cloud KMS key 'github-token-minter-key' is in PENDING_IMPORT state."
   echo "You MUST run 'minty tools import-pk' to enable version 1 before setting EVAL_GITHUB_APP_ID in Prow."
 fi
+
+# The sweep signs the same App's JWT with this project's copy of the key. The
+# presubmit's runner is not granted it; it does hold project IAM admin for the
+# deploy, so this is where the line is drawn, not a fence GitHub enforces. On
+# a project already registered, run this one command by hand rather than the
+# script (docs/ci-pool-projects.md, sections 5.5 and 8).
+echo "Granting the pull-request sweeper signer rights on github-token-minter-key..."
+gcloud kms keys add-iam-policy-binding github-token-minter-key \
+  --project="${PROJECT_ID}" --location="${REGION}" \
+  --keyring="github-token-minter-keyring" \
+  --member="${PULL_SWEEP_SA}" \
+  --role=roles/cloudkms.signerVerifier \
+  --quiet >/dev/null
 
 # ─── Step 5: Automated Pre-Flight Verification ────────────────────────────────
 echo -e "\n==> [Step 5/5] Running Pre-Flight Verification..."

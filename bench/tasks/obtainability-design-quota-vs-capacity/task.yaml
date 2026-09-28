@@ -1,0 +1,87 @@
+# Registered in hack/eval/nightly-cases.txt.
+#
+# Domain: capacity (capacity-obtainability skill).
+# Journey: CUJ1's Day-0 design behavior through the kanban path — a cluster
+# design with a concrete accelerator need must check quota and live
+# obtainability separately, weigh all three provisioning paths, and hand
+# back a ComputeClass design. The live sibling is
+# bench/cuj/obtainability/test_01_cluster_design.py, which needs a full
+# install and grades the portal projection; this case grades the same
+# behavior's report through the eval harness, so a regression shows in the
+# nightly record (a nightly-only case cannot red a presubmit).
+#
+# Planted defect required: none — the case probes live GCP advice and quota
+# APIs in the eval project and grades the report's discipline, not a fixture.
+# Isolation class: read-only (design only; nothing created or applied).
+# Tier: nightly (new case; presubmit admission is earned on record).
+id: obtainability-design-quota-vs-capacity
+name: Day-0 design separates quota from live capacity and weighs all three paths
+prompt: >-
+  Design a GKE cluster for a training workload that needs 8 NVIDIA A100
+  GPUs in us-central1. Before recommending capacity, verify the regional
+  quota for the exact accelerator metric and gather live capacity
+  obtainability advice across zones and provisioning models, then recommend
+  a ComputeClass with fallbacks. This is design only: do not create a
+  cluster, apply a manifest, or open a pull request.
+expected_output: >-
+  The agent runs the capacity-obtainability diagnostics: the NVIDIA_A100_GPUS
+  regional quota read, reservations, and `gcloud beta compute advice
+  capacity` for Spot and Flex-Start across at least two zones. The report
+  states quota and live obtainability separately (including the skill's
+  verbatim sentence "Quota is separate from live capacity"), names all three
+  provisioning paths with a verdict each, never claims a guarantee, and
+  carries a cloud.google.com/v1 ComputeClass whose primary priority is the
+  requested family with fallback tiers behind it.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: capacity
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# What the deterministic checks below do NOT grade, and why: the
+# expected_output's "across at least two zones" is live capacity weather —
+# one region-level probe legitimately covers two zones when the API returns
+# them, and the per-zone follow-up only fires when it returns fewer — so
+# zone coverage is graded by the judge through expected_output, not by a
+# pattern. The live sibling (test_01) grades it deterministically from the
+# evidence records, which this harness path does not see.
+verification_spec:
+  - name: the-quota-and-advice-probes-actually-ran
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_patterns:
+        - "gcloud compute regions describe"
+        - "gcloud beta compute advice capacity(?!-)"
+  - name: report-separates-quota-from-capacity
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["Quota is separate from live capacity"]
+  - name: report-weighs-all-three-provisioning-paths
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["On-Demand", "Spot", "Flex-Start"]
+      # The skill bans the word "guarantee"; the negated uses test_01
+      # permits ("no guarantee", "not guaranteed") are honest disclaimers.
+      # A segment (sentence or Markdown line — the harness keeps newlines
+      # for patterns) that reaches "guarant" with no negation before it
+      # fails. Punctuation ends a segment only before whitespace or the
+      # end, so "99.9%" cannot split a negation from the word it negates.
+      forbidden_patterns:
+        - "(?:^|\\n|[.!?](?=\\s|$))(?:(?!\\b(?:no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|without|nothing|none|neither|nor|unable to|rather than|non(?=-?guarant))\\b)(?:[^.!?\\n]|[.!?](?!\\s|$)))*guarant|\\b(?:no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|without|nothing|none|neither|nor|unable to|rather than|non(?=-?guarant))\\b(?:(?!\\b(?:no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|without|nothing|none|neither|nor|unable to|rather than|non(?=-?guarant))\\b)(?:[^.!?\\n]|[.!?](?!\\s|$))){60,}guarant"
+  - name: report-carries-a-computeclass-design
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["ComputeClass"]
+      any_of_phrases: ["cloud.google.com/v1", "machineFamily"]

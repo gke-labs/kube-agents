@@ -7,10 +7,11 @@ skill catalogue lives in each skill's frontmatter, and the provisioning steps
 live in the scripts themselves. Maintaining those tables by hand guarantees they
 drift. This script regenerates them from the source of truth instead.
 
-There are two kinds of target. Most are a *region* spliced into a hand-written
-document (``BLOCKS``). One is a *whole file* written verbatim from its
-generator (``FILES``): ``docs/family-roster.txt`` carries no markers, has no
-hand-written part, and is replaced in full on every run.
+There are two kinds of target. Most are a *region* spliced into one or more
+hand-written documents (``BLOCKS``); a region that several pages carry is
+rendered once and spliced into each. One is a *whole file* written verbatim
+from its generator (``FILES``): ``docs/family-roster.txt`` carries no markers,
+has no hand-written part, and is replaced in full on every run.
 
 Each generated region is delimited in its target file by::
 
@@ -43,6 +44,7 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 # The family roster is derived from the same inventory globs the map checker
@@ -60,15 +62,25 @@ REPO = Path(__file__).resolve().parent.parent
 # watchdogs sit there and run with that profile's persona and toolsets. Both
 # files feed the page; a job documented from one roster alone is a job half the
 # fleet cannot find.
+PLATFORM_CRON_ROSTER = REPO / "agents/platform/cron/jobs.json"
 CRON_ROSTERS = (
     ("Planning Agent", REPO / "agents/chat/defaults/cron/jobs.json"),
-    ("Platform Agent", REPO / "agents/platform/cron/jobs.json"),
+    ("Platform Agent", PLATFORM_CRON_ROSTER),
 )
+# The one roster entry the site renders in full, as the worked example of the
+# job schema. It is generated rather than pasted because the pasted copies went
+# stale every time the prompt was reworded, and a guard that compared them to
+# the roster was the cost of keeping them by hand.
+EXAMPLE_JOB_ID = "compliance-audit"
+# The roster file's own indentation, so the example reads as the file spells it.
+EXAMPLE_INDENT = 2
 SKILLS_DIR = REPO / "agents/platform/skills"
 CLUSTER_SKILLS_DIR = REPO / "agents/cluster/skills"
 IMAGES_JSON = REPO / "images.json"
 
 CRON_PAGE = REPO / "docs/site/src/content/docs/reference/cron-jobs.md"
+WATCHDOGS_PAGE = REPO / "docs/site/src/content/docs/concepts/autonomous-watchdogs.md"
+SKILLS_CONCEPT_PAGE = REPO / "docs/site/src/content/docs/concepts/skills.md"
 SKILLS_PAGE = REPO / "docs/site/src/content/docs/skills/index.mdx"
 IMAGES_PAGE = REPO / "docs/site/src/content/docs/deploy/docker-images.md"
 ROSTER_FILE = REPO / "docs/family-roster.txt"
@@ -201,15 +213,24 @@ def md_escape(text: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def load_roster(path: Path) -> list[dict]:
+    """Return the job entries of a cron roster, whichever shape the file takes.
+
+    A roster is either a bare list of jobs or an object carrying them under
+    ``jobs``. Both generators and the tests read through this one reader so
+    the shape rule lives in one place.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data["jobs"] if isinstance(data, dict) and "jobs" in data else data
+
+
 def gen_cron_jobs() -> str:
     rows = [
         "| ID | Profile | Schedule | Cadence | Enabled | Runs |",
         "| -- | ------- | -------- | ------- | :-----: | ---- |",
     ]
     for profile, path in CRON_ROSTERS:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        jobs = data["jobs"] if isinstance(data, dict) and "jobs" in data else data
-        for job in jobs:
+        for job in load_roster(path):
             # A disabled entry on the Platform Agent's roster is a tombstone —
             # an id on its way out, shipped switched off for a release because
             # the start-up merge never prunes, then deleted and named in
@@ -248,6 +269,26 @@ def gen_cron_jobs() -> str:
                 )
             )
     return "\n".join(rows)
+
+
+def gen_cron_job_example(job_id: str = EXAMPLE_JOB_ID) -> str:
+    """Render one Platform Agent roster entry as the fenced JSON the pages show.
+
+    The entry is re-serialised rather than copied out of the file, so the
+    example carries the roster's keys in the roster's order and nothing else;
+    ``ensure_ascii=False`` keeps the prompt's em dash a dash rather than a
+    ``\\u2014`` escape. An id the roster does not carry is a hard failure: a
+    page that silently rendered nothing would read as a schema with no
+    example, which is the drift this region exists to prevent.
+    """
+    job = next((j for j in load_roster(PLATFORM_CRON_ROSTER) if j.get("id") == job_id), None)
+    if job is None:
+        raise SystemExit(
+            f"{PLATFORM_CRON_ROSTER.relative_to(REPO)}: no job with id '{job_id}'; "
+            "the cron-job-example region has nothing to render."
+        )
+    rendered = json.dumps(job, indent=EXAMPLE_INDENT, ensure_ascii=False)
+    return f"```json\n{rendered}\n```"
 
 
 def read_frontmatter(path: Path) -> dict[str, str]:
@@ -423,10 +464,17 @@ ROSTER_HEADER = """
 # on a stale roster, and `make docs-generate` writes the correct file.
 """
 
-BLOCKS = {
-    "cron-jobs": (CRON_PAGE, gen_cron_jobs),
-    "skill-catalog": (SKILLS_PAGE, gen_skill_catalog),
-    "container-images": (IMAGES_PAGE, gen_container_images),
+# Each region names every file it is spliced into. One generator, one body,
+# however many pages carry it: the job example is the same entry on three
+# pages, and rendering it once is what keeps the three from disagreeing.
+BLOCKS: dict[str, tuple[tuple[Path, ...], Callable[[], str]]] = {
+    "cron-jobs": ((CRON_PAGE,), gen_cron_jobs),
+    "cron-job-example": (
+        (WATCHDOGS_PAGE, SKILLS_CONCEPT_PAGE, CRON_PAGE),
+        gen_cron_job_example,
+    ),
+    "skill-catalog": ((SKILLS_PAGE,), gen_skill_catalog),
+    "container-images": ((IMAGES_PAGE,), gen_container_images),
 }
 
 # Generated artifacts that are a whole file rather than a region inside a
@@ -459,9 +507,16 @@ def region_markers(path: Path, block_id: str) -> tuple[str, str, str]:
     )
 
 
-def splice(path: Path, block_id: str, body: str) -> tuple[bool, str]:
-    """Return (changed, new_text) with the generated region replaced."""
-    text = path.read_text(encoding="utf-8")
+def splice(path: Path, block_id: str, body: str, text: str | None = None) -> tuple[bool, str]:
+    """Return (changed, new_text) with the generated region replaced.
+
+    ``text`` is the document to splice into when the caller already holds it;
+    a page carrying several regions is spliced cumulatively, each block into
+    the text the previous one produced, so the last result carries them all.
+    Left ``None``, the file is read from disk.
+    """
+    if text is None:
+        text = path.read_text(encoding="utf-8")
     begin, end, notice = region_markers(path, block_id)
     pattern = re.compile(
         re.escape(begin) + r".*?" + re.escape(end),
@@ -492,6 +547,35 @@ def splice(path: Path, block_id: str, body: str) -> tuple[bool, str]:
     return new_text != text, new_text
 
 
+Target = tuple[Path, str, bool, str]
+
+
+def collect_targets(blocks=BLOCKS, files=FILES) -> list[Target]:
+    """Return (path, full new contents, changed, block id) for every target.
+
+    A region's generator runs once and the one body is spliced into each of
+    the region's files, so two pages carrying the same block cannot differ.
+    A file carrying several regions is spliced cumulatively: each block goes
+    into the text the previous block left, not into a fresh read of the disk,
+    so its last target holds every block and writing the targets in order
+    cannot put a stale region back. ``changed`` is per block, so the report
+    still names which region moved.
+    """
+    targets: list[Target] = []
+    pending: dict[Path, str] = {}
+    for block_id, (paths, generator) in blocks.items():
+        body = generator()
+        for path in paths:
+            changed, new_text = splice(path, block_id, body, pending.get(path))
+            pending[path] = new_text
+            targets.append((path, new_text, changed, block_id))
+    for block_id, (path, generator) in files.items():
+        new_text = generator()
+        old_text = path.read_text(encoding="utf-8") if path.exists() else None
+        targets.append((path, new_text, new_text != old_text, block_id))
+    return targets
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -501,15 +585,7 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    # (path, full new contents, changed, block id) for both kinds of target.
-    targets: list[tuple[Path, str, bool, str]] = []
-    for block_id, (path, generator) in BLOCKS.items():
-        changed, new_text = splice(path, block_id, generator())
-        targets.append((path, new_text, changed, block_id))
-    for block_id, (path, generator) in FILES.items():
-        new_text = generator()
-        old_text = path.read_text(encoding="utf-8") if path.exists() else None
-        targets.append((path, new_text, new_text != old_text, block_id))
+    targets = collect_targets()
 
     stale: list[str] = []
     for path, new_text, changed, block_id in targets:
