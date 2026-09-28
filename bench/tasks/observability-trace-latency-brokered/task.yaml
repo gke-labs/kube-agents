@@ -95,15 +95,17 @@ verification_spec:
       # name or address (`computeMetadata` is the path every spelling
       # carries), a bearer header in either case as a curl flag or a Python
       # header (a dict literal, a key assigned by subscript or add_header,
-      # with or without an f-string prefix), curl's own bearer flag.
-      # bench/tests/test_worker_command_safeguards.py pins the list.
+      # with or without an f-string prefix, and with the quotes escaped as
+      # `\"` the way a `python3 -c "..."` line has to write them), curl's
+      # own bearer flag. bench/tests/test_worker_command_safeguards.py pins
+      # the list.
       forbidden_patterns:
         - "print-access-token"
         - "print-identity-token"
         - 'metadata\.google\.internal'
         - '169\.254\.169\.254'
         - "computeMetadata"
-        - '(?i)authorization["'']?\s*\]?\s*[:,=]\s*[a-z]{0,2}["'']?\s*bearer'
+        - '(?i)authorization\\?["'']?\s*\]?\s*[:,=]\s*[a-z]{0,2}\\?["'']?\s*bearer'
         - "--oauth2-bearer"
         - 'ya29\.'
   - name: no-token-reached-the-report
