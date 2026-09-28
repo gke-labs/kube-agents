@@ -932,9 +932,9 @@ cron runs it suppresses delivery when the ledger is unchanged. Following #1929, 
 markers as local fallbacks, setting `silent_ok: False` directly when dispatched on demand. In the
 deployed shell sandbox, the SSH crossing drops ambient dispatcher environment variables when commands
 run from profile home (`deploy/sandbox/session-command.sh`), so `--on-demand` passed to `start` is
-the only signal that reaches the harness in production. (As an architectural follow-up, flipping the
-default so `finish` speaks unless `start` was explicitly told `--scheduled` in machine-authored cron
-prompts would invert the trust boundary so silence is earned rather than trusting human/agent prose).
+the only signal that reaches the harness in production. As an architectural follow-up tracked in #2067,
+flipping the default so `finish` speaks unless `start` was explicitly told `--scheduled` in machine-authored
+cron prompts will invert the trust boundary so silence is earned rather than trusting human/agent prose.
 Along with this harness guard, **an on-demand run is never silent.** A run a person asked for — a kanban
 card naming the stream, or a request straight from chat — reports its outcome and its ledger URL, and
 every SOP's close section says so. The Platform Agent's `AGENTS.md` adds the one case the rule cannot
