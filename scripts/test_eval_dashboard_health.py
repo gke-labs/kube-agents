@@ -1087,10 +1087,10 @@ class SlowGate(unittest.TestCase):
 
     def test_the_floor_sits_one_demotion_below_the_live_presubmit(self):
         # Since 2026-09-22 the presubmit runs the blocking roster (twelve
-        # cases, #1023; thirteen with the held-out canary seated 2026-09-29, #2013)
-        # and the floor is read from the presubmit file rather
+        # cases, #1023; fourteen with the held-out canary seated 2026-09-29, #2013,
+        # and pdb-remediation-pr, #2016) and the floor is read from the presubmit file rather
         # than pinned: a full-roster run is a full run, one demotion away it
-        # still is, and two demotions away (the eleven-case run Prow cut short
+        # still is, and two demotions away (the twelve-case run Prow cut short
         # above, today) is not. A literal floor of 15 would never see a full
         # run and the rule would go silent; a literal of any size would need
         # an edit here on every admission or demotion.

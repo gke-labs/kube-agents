@@ -103,14 +103,18 @@ allowlist:
   # 2026-09-22 for the same shape of reason.
   - fleet-audits
   # remediation, since 2026-09-22 (#1023): the same decision, and neither of
-  # the domain's two writers holds a seat. rca-remediation-pr was demoted
-  # 2026-09-02 (#1189) and moved to hack/eval/nightly-cases.txt with the
-  # other held-out cases that day; the promotion of pdb-remediation-pr
+  # the domain's two writers holds a roster seat. rca-remediation-pr was
+  # demoted 2026-09-02 (#1189) and moved to hack/eval/nightly-cases.txt with
+  # the other held-out cases that day; the promotion of pdb-remediation-pr
   # proposed the same day was withdrawn before merge, because the record it
   # cited (12/12 on the four graded nights 2026-09-16 to 09-20) was graded
   # by report_contains, which #1780 (merged 2026-09-21) replaced with
   # pull_request_opened, and no graded run of the case under the new check
-  # exists yet. Delete this entry when a remediation case is admitted on a
-  # nightly record built under pull_request_opened (#1189's bar for rca,
-  # docs/eval-gate-roster.md's entry for pdb).
+  # existed. Since 2026-09-28 pdb-remediation-pr is seated held out in
+  # hack/eval/presubmit-cases.txt (#2016 step 2, the documented exception to
+  # the blocking-only rule): it runs on every pull request, cannot red one
+  # on a graded failure, and covers nothing here. Delete this entry in the
+  # pull request that adds its roster line (#2016 step 4, after three clean
+  # days under pull_request_opened), or when a remediation case is admitted
+  # on such a record otherwise (#1189's bar for rca).
   - remediation

@@ -1718,8 +1718,8 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # 2026-09-25), and that is the copy to keep current. Since 2026-09-22 (#1023) the
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
-# tracker seats it in the presubmit file held out (#2013; the presubmit
-# file's last section).
+# tracker seats it in the presubmit file held out (#2013, #2016; the
+# presubmit file's last section).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -1970,6 +1970,22 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # collector that moves check evaluation out of the worker; the first runs
 # of the thirteen-case matrix measure it, and until they have, this is the
 # projection. No Prow deadline change.
+#
+# 2026-09-28, the same day: pdb-remediation-pr is seated held out beside it
+# (#2016 step 2): FOURTEEN tasks, 42 units, against the same 360m deadline.
+# What arrived is three units of ~15-25min each (420-1153s on the four
+# graded nights of 09-16 to 09-20, 980-1929s in its 2026-09-14 presubmit
+# run; hinted at 1250, the presubmit's largest), serialized on their own
+# task lock: a ~62min chain at the hint, ~96min if every repetition runs to
+# the measured maximum, in lanes beside the canary's chain. Under the
+# cost-hinted queue it launches first in each repetition round, ahead of the
+# canary (1000) and the incident probe (700), so at the hint it finishes
+# inside the round's tail and costs displaced lane time rather than wall
+# clock; #2016 prices it the same way (three units of 15-25 min; the case
+# launches early and was never the last unit in 385 recorded runs). Only a
+# repetition at its 1929s maximum could be the last unit, by minutes. The
+# first runs of the fourteen-case matrix measure it, and until they have,
+# this is the projection. No Prow deadline change.
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
@@ -2240,12 +2256,16 @@ unit_cost_hint() {
     # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
     # before that, priced at the 700 it carried there.
     rca-remediation-pr) echo 700 ;;
-    # Nightly-only. The 2026-09-22 promotion (#1023) was withdrawn before
-    # merge: its record was graded by the check #1780 replaced. Measured
-    # 980-1929s across build 2099539376672346112's three repetitions (267-559s
-    # in August); median of the September run, kept although the four graded
-    # nights of 09-16 to 09-20 ran 420-1153s, until the nightly record under
-    # pull_request_opened says otherwise.
+    # Presubmit since 2026-09-28, held out (#2016 step 2); nightly 2026-09-15
+    # to then. The 2026-09-22 promotion (#1023) was withdrawn before merge:
+    # its record was graded by the check #1780 replaced. Measured 980-1929s
+    # across build 2099539376672346112's three repetitions (267-559s in
+    # August); median of the September run, kept although the four graded
+    # nights of 09-16 to 09-20 ran 420-1153s, until the presubmit record
+    # under pull_request_opened says otherwise. The presubmit's largest hint,
+    # so it launches first in each repetition round; its three repetitions
+    # serialize on the task lock, ~62min at the hint and ~96min at the
+    # measured maximum.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the

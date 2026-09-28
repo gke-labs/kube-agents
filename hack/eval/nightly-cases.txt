@@ -21,7 +21,7 @@
 # the presubmit runs the blocking roster and nothing else, so this file is
 # where a held-out case lives unless a coverage tracker seats it held out in
 # the presubmit file instead (the exception section at the foot of
-# presubmit-cases.txt, #2013): the seven cases the presubmit had been
+# presubmit-cases.txt: #2013, #2016): the seven cases the presubmit had been
 # running without letting them block moved here that day, each with its
 # hold-out reason as the # line above it (their own section of this file;
 # six remain there). This is
@@ -104,10 +104,11 @@
 # thirty (90), +21 units: at their hints (178s, 200s x4, 700s x2) about
 # 120 serial minutes, at their measured presubmit medians (the canary's is
 # 1002s, p90 2074s, over 903 repetitions 2026-09-04 to 09-15) nearer 150.
-# 2026-09-29: the canary returned to the presubmit file held out (#2013), so
-# this file's share is thirty-eight cases (114 units) of the fifty-one-case,
-# 153-unit matrix the additions through 2026-09-29 made it; the nightly runs
-# both files, so its matrix and its price do not change.
+# 2026-09-29: the canary returned to the presubmit file held out (#2013) and
+# pdb-remediation-pr moved there held out beside it (#2016, seat opened
+# 2026-09-28), so this file's share is thirty-seven cases (111 units) of the
+# fifty-one-case, 153-unit matrix the additions through 2026-09-29 made it; the
+# nightly runs both files, so its matrix and its price do not change.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -206,14 +207,14 @@
 #      that rejects a pull request last written before the run started,
 #      while nothing sweeps the *-infra repositories between runs (#1755
 #      item 2), so a correct but byte-identical resubmission grades as a
-#      miss -- and no graded run under the new check exists yet (the 09-22
-#      nightly died at the Prow deadline before grading). With
-#      rca-remediation-pr below also nightly, the remediation domain has no
-#      presubmit case and sits on the docs/designs/domains.yaml allowlist;
-#      the seat waits on the record this file builds under
-#      pull_request_opened.
+#      miss. Under the new check it went 0/3 on every graded night here,
+#      none of the misses the case's own (#2016 has the evidence), and on
+#      2026-09-28 it moved to the presubmit file held out (#2016 step 2):
+#      that file carries the record, and this file never lists a presubmit
+#      case twice. With rca-remediation-pr below still nightly, the
+#      remediation domain has no roster case and sits on the
+#      docs/designs/domains.yaml allowlist until #2016 step 4.
 ./tasks/chat-routing-board-read/task.yaml
-./tasks/pdb-remediation-pr/task.yaml
 
 # #1023's incident-triage probe, incident-triage-oom-event-probe, was listed
 # here from 2026-09-15 until 2026-09-22, when it moved to presubmit-cases.txt
