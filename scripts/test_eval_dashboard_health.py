@@ -2263,5 +2263,161 @@ class FixtureDrift(unittest.TestCase):
         self.assertIsNone(self.judge(firing, posted={"issue": other})["issue"])
 
 
+# --------------------------------------------------------------------------- #
+# Rule 3e: pool drift (#1967), the same rule over pool-state.json
+# --------------------------------------------------------------------------- #
+
+POOL_CHECKS = ("project_and_apis", "iam", "artifact_registry", "gke_and_state", "token_minter_kms")
+FINDING = "iam/platform-gsa/missing/roles/serviceusage.serviceUsageConsumer"
+OTHER_FINDING = "apis/cloudkms.googleapis.com"
+FINDING_CHECK = {FINDING: "iam", OTHER_FINDING: "project_and_apis"}
+FINDING_DETAIL = "The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on {project}"
+FINDING_REPAIR = 'gcloud projects add-iam-policy-binding {project} --member="serviceAccount:kubeagents-platform-gsa@{project}.iam.gserviceaccount.com" --role=roles/serviceusage.serviceUsageConsumer'
+POOL_BLIND_REASON = "Could not describe kube-agents-evals-1, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED"
+
+
+def pool_scan(drifted=None, previous=None, at=None, projects=30, checked=None, unread=None, partial=None):
+    """A pool-state.json as scripts/eval_dashboard/pool_state.py writes it:
+    `drifted` {project: [finding ids]} this scan, `previous` the same for the
+    scan before, every check healthy -- or not checked on every project
+    outside `checked`, the checks in `unread` {project: [check ids]} not
+    checked there, and those in `partial` healthy with a warning (read in part)."""
+    drifted = drifted or {}
+    unread = unread or {}
+    partial = partial or {}
+    at = at or T0 - timedelta(minutes=5)
+    entries = {}
+    for i in range(1, projects + 1):
+        name = project(i)
+        readable = checked is None or name in checked
+        findings = {}
+        for finding in drifted.get(name, []):
+            findings[finding] = {"check": FINDING_CHECK[finding], "detail": [FINDING_DETAIL.format(project=name)], "repair": FINDING_REPAIR.format(project=name)}
+        checks = {}
+        for check in POOL_CHECKS:
+            if not readable or check in unread.get(name, []):
+                checks[check] = {"state": "not_checked", "detail": [POOL_BLIND_REASON]}
+            elif check in partial.get(name, []):
+                checks[check] = {"state": "healthy", "detail": ["Could not read the project IAM policy"]}
+            elif any(FINDING_CHECK[f] == check for f in findings):
+                checks[check] = {"state": "drifted", "detail": [FINDING_DETAIL.format(project=name)]}
+            else:
+                checks[check] = {"state": "healthy", "detail": []}
+        entries[name] = {"checks": checks, "findings": findings if readable else {}}
+    return {
+        "schema_version": 1,
+        "scanned_at": health.iso(at),
+        "checks": list(POOL_CHECKS),
+        "projects": entries,
+        "previous": {"scanned_at": health.iso(at - timedelta(hours=1)), "drifted": previous or {}},
+    }
+
+
+class PoolDrift(unittest.TestCase):
+    def judge(self, scan_doc, prev=None, now=T0, doc=None, posted=None, fleet=None):
+        doc = doc or data(*(run(100 + i, 10 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)))
+        return health.adjudicate(doc, now, prev, health.Roster.fixed(ADMITTED), posted=posted, fixture_state_doc=fleet, pool_state_doc=scan_doc)
+
+    def test_no_scan_means_no_condition_and_no_block(self):
+        result = self.judge(None)
+        self.assertEqual((result["state"], result["pool_state"]), ("GREEN", None))
+        self.assertFalse(any("pool-state" in line for line in result["evidence"]))
+
+    def test_one_project_once_is_evidence_not_a_condition(self):
+        result = self.judge(pool_scan(drifted={project(1): [FINDING]}))
+        self.assertEqual(result["state"], "GREEN")
+        self.assertIn(f"{FINDING} found on 1 pool project(s) ({project(1)}) at the 23:55 UTC scan; not yet repeated or widespread", result["evidence"])
+        block = result["pool_state"]
+        self.assertEqual((block["projects"], block["checked"], block["drifted"], block["unknown"], block["stale"]), (30, 30, {project(1): [FINDING]}, False, False))
+
+    def test_the_same_finding_on_the_same_project_two_scans_running_degrades(self):
+        result = self.judge(pool_scan(drifted={project(1): [FINDING]}, previous={project(1): [FINDING]}))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
+        self.assertEqual(result["cause"], f"pool drift: {FINDING} on 1 pool project(s)")
+        incident = result["incident"]
+        self.assertEqual((incident["prs"], incident["runs"], incident["window_end"]), ([], 0, None))
+        self.assertEqual((incident["roles"], incident["projects"]), ([FINDING], [project(1)]))
+        self.assertEqual(incident["drift"], {project(1): {FINDING: [FINDING_DETAIL.format(project=project(1))]}})
+        self.assertEqual(incident["repairs"], {project(1): {FINDING: FINDING_REPAIR.format(project=project(1))}})
+        self.assertEqual(incident["reads"], {project(1): ["iam"]}, "the exit needs the finding's check read again, not the finding")
+        self.assertEqual(
+            result["advice"],
+            f"A 403 or a missing-resource red from a run that leased {project(1)} is the pool project's shape, not your change"
+            f" ({FINDING}); retest once the pool owner has run the repair the tracking issue carries.",
+        )
+
+    def test_three_projects_in_one_scan_degrade_and_two_do_not(self):
+        three = {project(i): [FINDING] for i in (1, 2, 3)}
+        result = self.judge(pool_scan(drifted=three))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
+        self.assertEqual(result["cause"], f"pool drift: {FINDING} on 3 pool project(s)")
+        self.assertEqual(self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2)}))["state"], "GREEN")
+
+    def test_ranked_below_fixture_drift_and_every_run_based_condition(self):
+        both = self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}), fleet=scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}))
+        self.assertEqual(both["condition"], "fixture_drift")
+        self.assertTrue(any(line.startswith(f"{FINDING} found on 3 pool project(s)") for line in both["evidence"]), "the pool drift stays as context")
+        lost_doc = data(*(lost(100 + i, i, T0 - timedelta(minutes=5 * i)) for i in range(3)))
+        self.assertEqual(self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}), doc=lost_doc)["condition"], "lost_pods")
+
+    def test_a_stale_or_blind_scan_is_never_a_drift(self):
+        stale = self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}, at=T0 - timedelta(hours=4)))
+        self.assertEqual((stale["state"], stale["pool_state"]["stale"]), ("GREEN", True))
+        self.assertIn(f"pool-state scan is 4h old (last {health.iso(T0 - timedelta(hours=4))}); ignored, check the scan job", stale["evidence"])
+        blind = self.judge(pool_scan(checked=set()))
+        self.assertEqual((blind["state"], blind["pool_state"]["unknown"], blind["pool_state"]["reason"]), ("GREEN", True, POOL_BLIND_REASON))
+        self.assertIn(f"pool-state scan at 23:55 UTC could check none of 30 pool projects ({POOL_BLIND_REASON})", blind["evidence"])
+
+    def test_it_ends_when_the_findings_check_reads_clean_and_holds_while_it_is_unread(self):
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        self.assertEqual(prev["condition"], "pool_drift")
+        later = T0 + timedelta(hours=1)
+        at = later - timedelta(minutes=5)
+        cleared = self.judge(pool_scan(at=at), prev=prev, now=later)
+        self.assertEqual((cleared["state"], cleared["condition"], cleared["recovering"]), ("GREEN", None, False), "the scan is the recovery")
+        # The finding's own check unread on one of the projects holds it...
+        held = self.judge(pool_scan(at=at, unread={project(2): ["iam"]}), prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
+        self.assertIn(f"pool drift held: the pool-state scan could not read {project(2)}; a scan that reads those projects clean ends it", held["evidence"])
+        # ...and another check unread there does not: the grant was read and is back.
+        other = self.judge(pool_scan(at=at, unread={project(2): ["gke_and_state"]}), prev=prev, now=later)
+        self.assertEqual((other["state"], other["condition"]), ("GREEN", None))
+        # A partial read of the finding's check -- healthy with a warning, the
+        # project policy refused -- did not see the grant either, and holds.
+        partial = self.judge(pool_scan(at=at, partial={project(2): ["iam"]}), prev=prev, now=later)
+        self.assertEqual((partial["state"], partial["condition"]), ("DEGRADED", "pool_drift"))
+        self.assertFalse(partial["pool_state"]["unknown"], "a partial read is not a blind scan")
+        for name, (doc, why) in {
+            "absent": (None, "no pool-state scan was read this tick"),
+            "stale": (pool_scan(at=later - timedelta(hours=4)), "the pool-state scan is stale"),
+            "blind": (pool_scan(at=at, checked=set()), "the pool-state scan could check no project"),
+        }.items():
+            with self.subTest(name):
+                still = self.judge(doc, prev=prev, now=later)
+                self.assertEqual((still["state"], still["condition"], still["incident"]), ("DEGRADED", "pool_drift", prev["incident"]))
+                self.assertIn(f"pool drift held: {why}; a scan that reads those projects clean ends it", still["evidence"])
+
+    def test_a_fixture_incident_recorded_before_reads_existed_still_exits_on_its_roles(self):
+        # The live health.json at merge time may hold a fixture_drift incident
+        # without `reads`; the exit then asks for the roles themselves.
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        prev = self.judge(None, fleet=firing)
+        self.assertEqual(prev["condition"], "fixture_drift")
+        del prev["incident"]["reads"]
+        later = T0 + timedelta(hours=1)
+        at = later - timedelta(minutes=5)
+        held = self.judge(None, fleet=scan(at=at, checked={project(i) for i in range(1, 31)} - {project(2)}), prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"]), ("DEGRADED", "fixture_drift"))
+        cleared = self.judge(None, fleet=scan(at=at), prev=prev, now=later)
+        self.assertEqual((cleared["state"], cleared["condition"]), ("GREEN", None))
+
+    def test_the_posters_issue_is_cited_for_the_condition_it_was_filed_for(self):
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        owner = {"number": 1500, "url": "https://github.com/gke-labs/kube-agents/issues/1500", "condition": "pool_drift"}
+        self.assertEqual(self.judge(firing, posted={"issue": owner})["tracking_issues"], ["#1500"])
+        self.assertIsNone(self.judge(firing, posted={"issue": dict(owner, condition="fixture_drift")})["issue"])
+
+
 if __name__ == "__main__":
     unittest.main()

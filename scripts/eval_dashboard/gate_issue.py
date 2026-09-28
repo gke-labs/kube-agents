@@ -35,9 +35,16 @@ can pass. So:
     and no OPEN issue labelled `presubmit-gate` has "deadline" and "smoke" in its TITLE
     -> create one for whoever owns the gate, and say "Tracking #NNN"
 
+The fifth shape (#1967): the hourly pool-state scan finds the same finding on
+the same pool project two scans running, or on three projects at once. So:
+
+    the condition becomes `pool_drift`
+    and no OPEN issue labelled `presubmit-gate` has every finding id in its TITLE
+    -> create one for the pool owner, with the repair per project
+
 The dedupe is against people: a human who filed first, with the case names
 (or the node names, or the role names) in the title or body -- or, for the
-deadline kills, those two words in the title -- wins and the bot adopts
+deadline kills and the pool findings, in the title -- wins and the bot adopts
 their issue. A recovery gets one comment ("Healthy again after Xh; bot will not
 close it"). The bot never closes an issue -- a green gate is not proof the
 fixture is fixed, only that three runs passed, and the node events are still
@@ -63,6 +70,7 @@ COMMENTS_PATH = "issues/{number}/comments"
 # (health.py owns the vocabulary).
 CONDITION_LOST_PODS = "lost_pods"
 CONDITION_FIXTURE_DRIFT = "fixture_drift"
+CONDITION_POOL_DRIFT = "pool_drift"
 CONDITION_DEADLINE_KILL = "deadline_kill"
 # The presubmit job's timeout in minutes (health.py PROW_JOB_TIMEOUT owns it).
 DEADLINE_MINUTES = 360
@@ -166,6 +174,31 @@ The seeded fleet's fixture role(s) below are present but not in the state the ca
 Incident brief: {brief}
 
 Filed automatically by the smoke health bot; the fleet owner should re-apply the stack in the projects named; the bot will not close it.
+"""
+POOL_DRIFT_TITLE = "Pool drift: {findings} on {projects} pool {noun} since {since}"
+# Four finding ids pass GitHub's title limit; the count stands in.
+POOL_DRIFT_TITLE_MANY = "Pool drift: {count} findings on {projects} pool {noun} since {since}"
+POOL_DRIFT_BODY = """\
+The hourly pool-state scan (`scripts/eval_dashboard/pool_state.py`, which runs `scripts/verify_ci_pool_project.py`'s read-only checks against every pool project) found the pool projects below no longer shaped the way the verifier requires, on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a drift (decision 2026-09-14: evals v1 detects, does not act), so a run that leases one of these projects fails on the missing grant, API, key or cluster -- a 403 or a missing resource in the agent's transcript -- and that red is the pool's, not the pull request's. A retest is worth it only after the repair below.
+
+**Findings**
+
+{findings}
+
+**Per project** (what the scan observed, and the command that repairs it; a line starting `# confirm first:` removes something and is yours to confirm)
+
+{projects}
+
+**Window:** since {since} ({since_iso}); latest scan {scanned_at}.
+**Evidence:**
+
+{evidence}
+
+**Repair:** run each project's command above, then wait for the next hourly scan or run `python3 scripts/verify_ci_pool_project.py --project-id <project>` (docs/ci-health.md, "The pool-state scan"; docs/ci-pool-projects.md section 3 for the IAM bundles).
+
+Incident brief: {brief}
+
+Filed automatically by the smoke health bot; whoever holds the pool should run the repairs in the projects named; the bot will not close it.
 """
 RECOVERY_COMMENT = "Healthy again after {lasted}; bot will not close it."
 NO_EVIDENCE = "- (none recorded)"
@@ -322,6 +355,46 @@ def render_fixture_drift_body(health: dict, since_text: str, brief_link: str) ->
     )
 
 
+def render_pool_drift_title(health: dict, since_text: str) -> str:
+    incident = health.get("incident") or {}
+    findings = list(incident.get("roles") or [])
+    projects = list(incident.get("projects") or [])
+    noun = PROJECT_NOUN[len(projects) != 1]
+    title = POOL_DRIFT_TITLE.format(findings=", ".join(findings) or "finding(s)", projects=len(projects), noun=noun, since=since_text)
+    if len(title) > TITLE_MAX_CHARS:
+        title = POOL_DRIFT_TITLE_MANY.format(count=len(findings), projects=len(projects), noun=noun, since=since_text)
+    return title
+
+
+def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> str:
+    incident = health.get("incident") or {}
+    findings = list(incident.get("roles") or [])
+    drift = incident.get("drift") or {}
+    repairs = incident.get("repairs") or {}
+    evidence = [f"- {line}" for line in health.get("evidence") or []]
+    per_project = []
+    for project in sorted(drift):
+        per_project.append(f"- `{project}`")
+        for finding, lines in sorted((drift.get(project) or {}).items()):
+            per_project.append(f"  - `{finding}`")
+            per_project.extend(f"    - {line}" for line in lines or ["(no detail recorded)"])
+            repair = (repairs.get(project) or {}).get(finding)
+            if repair:
+                per_project.append("    - repair:")
+                per_project.append("      ```")
+                per_project.extend(f"      {line}" for line in str(repair).splitlines())
+                per_project.append("      ```")
+    return POOL_DRIFT_BODY.format(
+        findings="\n".join(f"- `{finding}`" for finding in findings) or "- (none recorded)",
+        projects="\n".join(per_project) or "- (none recorded)",
+        since=since_text,
+        since_iso=health.get("since") or "?",
+        scanned_at=incident.get("window_start") or "?",
+        evidence="\n".join(evidence) or NO_EVIDENCE,
+        brief=brief_link,
+    )
+
+
 class Tracker:
     def __init__(self, gh):
         self.gh = gh
@@ -350,6 +423,8 @@ class Tracker:
             return self._ensure_lost_pods(health, since_text, window_text or since_text, brief_link)
         if condition == CONDITION_FIXTURE_DRIFT:
             return self._ensure_fixture_drift(health, since_text, brief_link)
+        if condition == CONDITION_POOL_DRIFT:
+            return self._ensure_pool_drift(health, since_text, brief_link)
         if condition == CONDITION_DEADLINE_KILL:
             return self._ensure_deadline_kill(health, since_text, window_text or since_text, brief_link)
         cases = list(health.get("failing_cases") or [])
@@ -410,6 +485,24 @@ class Tracker:
         created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), payload), CONDITION_FIXTURE_DRIFT)
         if created:
             log(f"tracking issue: filed #{created['number']} for the fleet owner")
+        return created
+
+    def _ensure_pool_drift(self, health: dict, since_text: str, brief_link: str) -> dict | None:
+        # Title only: bot-filed bodies quote the evidence, which carries
+        # every finding line whether or not it fires.
+        findings = sorted((health.get("incident") or {}).get("roles") or [])
+        found = self.existing(findings, title_only=True) if findings else None
+        if found:
+            log(f"tracking issue: adopting open #{found['number']} (its title names every finding)")
+            return dict(found, condition=CONDITION_POOL_DRIFT)
+        payload = {
+            "title": render_pool_drift_title(health, since_text),
+            "body": render_pool_drift_body(health, since_text, brief_link),
+            "labels": [LABEL],
+        }
+        created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), payload), CONDITION_POOL_DRIFT)
+        if created:
+            log(f"tracking issue: filed #{created['number']} for the pool owner")
         return created
 
     def recovered(self, issue: dict, lasted: str) -> bool:

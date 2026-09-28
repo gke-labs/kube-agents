@@ -1773,6 +1773,140 @@ class FixtureDrift(RunHarness):
         self.assertFalse(self.recorded()["fixture_unknown"])
 
 
+# --------------------------------------------------------------------------- #
+# Pool drift (#1967): the hourly pool-state scan's condition
+# --------------------------------------------------------------------------- #
+
+FINDING = "iam/platform-gsa/missing/roles/serviceusage.serviceUsageConsumer"
+FINDING_DETAIL = "The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on {project}"
+FINDING_REPAIR = 'gcloud projects add-iam-policy-binding {project} --member="serviceAccount:kubeagents-platform-gsa@{project}.iam.gserviceaccount.com" --role=roles/serviceusage.serviceUsageConsumer'
+POOL_BLIND_REASON = "Could not describe kube-agents-evals-1, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED"
+
+
+def pool_block(drifted=None, scanned=SCAN_AT, projects=30, checked=30, unknown=False, stale=False, reason=None):
+    return {"scanned_at": scanned, "projects": projects, "checked": checked, "drifted": drifted or {}, "unknown": unknown, "stale": stale, "reason": reason}
+
+
+def pool_drift(since=SCAN_AT, findings=(FINDING,), projects=DRIFT_PROJECTS, evidence=()):
+    doc = health("DEGRADED", f"pool drift: {', '.join(findings)} on {len(projects)} pool project(s)", since=since, condition="pool_drift", window=(since, None))
+    doc["incident"].update({
+        "roles": list(findings),
+        "projects": list(projects),
+        "drift": {p: {f: [FINDING_DETAIL.format(project=p)] for f in findings} for p in projects},
+        "repairs": {p: {f: FINDING_REPAIR.format(project=p) for f in findings} for p in projects},
+        "reads": {p: ["iam"] for p in projects},
+    })
+    doc["evidence"] = list(evidence)
+    doc["pool_state"] = pool_block(drifted={p: list(findings) for p in projects})
+    return doc
+
+
+class PoolDrift(RunHarness):
+    """The pool-state scan's condition (#1967): one message naming the
+    findings and the projects, the pool owner's issue once with the repair
+    command per project, a human's issue naming the findings adopted, the
+    digest's line on the latest scan, and a blind scan said once each way."""
+
+    def environ(self):
+        return {post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN, **GH_ENV}
+
+    def test_a_new_drift_condition_posts_once_and_files_the_pool_owner_issue(self):
+        rc, err = self.tick(pool_drift(evidence=[f"{FINDING} found on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan"]), T14, environ=self.environ())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(
+            self.opener.texts,
+            [
+                (
+                    f"🟡 *Smoke gate: flaky* — pool finding {FINDING} on 3 pool projects since 9:00 AM ET;"
+                    " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code. Retest once the grant is repaired."
+                    " Pool owner: the tracking issue carries the repair command per project. Tracking #1300.\n"
+                    f"{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"
+                )
+            ],
+        )
+        method, path, body = self.gh.calls[-1]
+        self.assertEqual((method, path), ("POST", "repos/gke-labs/kube-agents/issues"))
+        self.assertEqual(body["title"], f"Pool drift: {FINDING} on 3 pool projects since Mon 9:00 AM ET")
+        self.assertEqual(body["labels"], ["presubmit-gate"])
+        for expected in (
+            f"- `{FINDING}`",
+            "- `kube-agents-evals-2`",
+            f"    - {FINDING_DETAIL.format(project='kube-agents-evals-2')}",
+            f"      {FINDING_REPAIR.format(project='kube-agents-evals-2')}",
+            "whoever holds the pool should run the repairs",
+            "latest scan 2026-09-14T13:00:00+00:00",
+            "at the 13:00 UTC scan",
+        ):
+            self.assertIn(expected, body["body"])
+        self.assertEqual(self.recorded()["issue"], {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300", "condition": "pool_drift"})
+        self.tick(pool_drift(), T14 + timedelta(minutes=15), environ=self.environ())
+        self.assertEqual((len(self.opener.texts), len(self.gh.writes())), (1, 1), "the same condition next tick is silence")
+
+    def test_a_human_issue_naming_the_findings_in_its_title_is_adopted_and_a_body_match_is_not(self):
+        gh = FakeGh(open_issues=[{"number": 1290, "html_url": "https://github.com/gke-labs/kube-agents/issues/1290", "title": f"{FINDING} is missing on the pool again", "body": ""}])
+        self.tick(pool_drift(), T14, environ=self.environ(), gh=gh)
+        self.assertTrue(self.opener.texts[0].endswith(f"Tracking #1290.\n{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"))
+        self.assertEqual(gh.writes(), [])
+        self.assertEqual(self.recorded()["issue"]["condition"], "pool_drift")
+        # Every bot-filed body quotes the evidence, which names the finding
+        # whether or not it fired: an outage issue is not the pool's tracker.
+        outage = FakeGh(open_issues=[{"number": 1280, "html_url": "https://github.com/gke-labs/kube-agents/issues/1280", "title": "Smoke gate outage: 2 cases failing on every PR since Mon 8:00 AM ET", "body": f"- {FINDING} found on 1 pool project(s) (kube-agents-evals-9) at the 12:00 UTC scan; not yet repeated or widespread"}])
+        self.setUp()
+        self.tick(pool_drift(), T14, environ=self.environ(), gh=outage)
+        self.assertEqual([call[:2] for call in outage.writes()], [("POST", "repos/gke-labs/kube-agents/issues")])
+
+    def test_a_long_title_falls_back_to_the_count(self):
+        many = [f"iam/pool-state-reader/missing/{role}" for role in ("roles/iam.securityReviewer", "roles/container.clusterViewer", "roles/artifactregistry.reader", "roles/cloudkms.viewer", "roles/storage.bucketViewer")]
+        title = post_health.gate_issue.render_pool_drift_title(pool_drift(findings=tuple(many)), "Mon 9:00 AM ET")
+        self.assertEqual(title, "Pool drift: 5 findings on 3 pool projects since Mon 9:00 AM ET")
+        self.assertLessEqual(len(title), post_health.gate_issue.TITLE_MAX_CHARS)
+        short = post_health.gate_issue.render_pool_drift_title(pool_drift(), "Mon 9:00 AM ET")
+        self.assertEqual(short, f"Pool drift: {FINDING} on 3 pool projects since Mon 9:00 AM ET")
+
+    def test_the_recovery_says_the_pool_had_drifted_and_comments(self):
+        self.tick(pool_drift(), T14, environ=self.environ())
+        green = health("GREEN")
+        green["pool_state"] = pool_block()
+        self.tick(green, T14 + timedelta(hours=2), environ=self.environ())
+        self.assertEqual(self.opener.texts[-1].splitlines()[0], "🟢 *Smoke gate: healthy again* — fixed after 2h 30m (pool projects had drifted, #1300).")
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1300/comments"))
+
+    def test_the_digest_carries_one_line_on_the_latest_scan(self):
+        def line(block):
+            doc = health("GREEN")
+            if block is not None:
+                doc["pool_state"] = block
+            return [text for text in post_health.render_digest(doc, T14).splitlines() if text.startswith("🧭 *Pool projects:*")]
+
+        self.assertEqual(line(None), [])
+        self.assertEqual(line(pool_block()), ["🧭 *Pool projects:* 30 of 30 pool projects checked at 9:00 AM ET, every one shaped as the verifier requires."])
+        self.assertEqual(line(pool_block(checked=28)), ["🧭 *Pool projects:* 28 of 30 pool projects checked at 9:00 AM ET, every one shaped as the verifier requires, 2 not checked."])
+        self.assertEqual(
+            line(pool_block(drifted={"kube-agents-evals-1": [FINDING], "kube-agents-evals-4": [FINDING]})),
+            [f"🧭 *Pool projects:* 2 of 30 checked pool projects drifted at 9:00 AM ET ({FINDING}); a 403 from a run that leased one of them is the pool's, not the code."],
+        )
+        self.assertEqual(line(pool_block(checked=0, unknown=True, reason=POOL_BLIND_REASON)), [f"🧭 *Pool projects:* the 9:00 AM ET scan could check none of 30 pool projects ({POOL_BLIND_REASON})."])
+        self.assertEqual(line(pool_block(stale=True)), ["🧭 *Pool projects:* the last scan (9:00 AM ET) is stale; someone check the scan job."])
+
+    def test_a_blind_scan_is_said_once_each_way_and_is_never_a_change(self):
+        blind = health("GREEN")
+        blind["pool_state"] = pool_block(checked=0, unknown=True, reason=POOL_BLIND_REASON)
+        self.tick(blind, T14, environ=self.environ())
+        self.assertEqual(
+            self.opener.texts,
+            [f"⚪ *Pool-state scan can't read the pool* — the 9:00 AM ET scan checked none of 30 pool projects ({POOL_BLIND_REASON}). Pool drift goes unseen until that is fixed; the bot's project roles are in docs/ci-health.md."],
+        )
+        self.assertEqual((self.recorded()["state"], self.recorded()["pool_state_unknown"]), ("GREEN", True))
+        self.tick(blind, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "said once")
+        seeing = health("GREEN")
+        seeing["pool_state"] = pool_block(scanned="2026-09-14T14:00:00+00:00")
+        self.tick(seeing, T14 + timedelta(hours=1))
+        self.assertEqual(self.opener.texts[-1], "⚪ *Pool-state scan reads the pool again* — the 10:00 AM ET scan checked 30 of 30 pool projects.")
+        self.assertFalse(self.recorded()["pool_state_unknown"])
+        self.assertEqual(self.gh.writes(), [], "nothing is filed for a blind scan")
+
+
 class DeadlineKillMessages(RunHarness):
     """#1894: runs killed at the job deadline with no verdict are an OUTAGE
     with their own sentence, an issue for the gate's owner, and a recovery

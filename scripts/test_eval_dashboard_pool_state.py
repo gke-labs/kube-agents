@@ -1,0 +1,323 @@
+"""pool_state.py scans every pool project's shape and never fails the bot for
+what it finds.
+
+The scan runs the verifier per project and reads its --report; here the
+verifier is a stub that answers from a JSON "world", so each test names only
+its own defect. What is pinned:
+
+* the checks the scan asks for are the verifier's read-only set and nothing
+  that needs a GitHub credential, the fleet, or the checkout;
+* a healthy project scans as every check `healthy`, and the document carries
+  the scan time, the counts, and the previous scan's drift map;
+* a failed check is `drifted` with its findings -- stable id, what was
+  observed, the repair -- keyed by id; an unread check is `not_checked` with
+  the verifier's warning; the verifier's exit code is never the verdict;
+* a verifier that hangs, crashes without a report, or is missing, and a
+  missing gcloud, are each "not checked" with a reason, exit 0;
+* the workflow wires the scan into the hourly job and the tick reads it.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import unittest
+import unittest.mock
+from datetime import datetime, timedelta, timezone
+
+import verify_ci_pool_project as verifier
+from eval_dashboard import pool_state
+
+REPO = pathlib.Path(__file__).resolve().parents[1]
+WORKFLOW = REPO / ".github" / "workflows" / "ci-health.yml"
+
+UTC = timezone.utc
+NOW = datetime(2026, 9, 27, 20, 0, tzinfo=UTC)
+PROJECT = "kube-agents-evals-2"
+OTHER = "kube-agents-evals-3"
+CHECKS = list(pool_state.DEFAULT_CHECKS)
+FINDING = "iam/platform-gsa/missing/roles/serviceusage.serviceUsageConsumer"
+REPAIR = 'gcloud projects add-iam-policy-binding kube-agents-evals-2 --member="serviceAccount:kubeagents-platform-gsa@kube-agents-evals-2.iam.gserviceaccount.com" --role=roles/serviceusage.serviceUsageConsumer'
+
+# The verifier stub: `--report` is written from the world's entry for the
+# project -- a report document, or a behaviour ("sleep", "crash", "silent").
+_STUB_VERIFIER = r'''#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+def flag(name):
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            return args[i + 1]
+    return None
+with open(os.environ["STUB_LOG"], "a") as fh:
+    fh.write(" ".join(args) + "\n")
+world = json.load(open(os.environ["STUB_WORLD"]))
+project = flag("--project-id")
+entry = world.get(project, "silent")
+if entry == "sleep":
+    time.sleep(30)
+if entry == "crash":
+    print("usage: something is wrong", file=sys.stderr)
+    sys.exit(64)
+if entry == "silent":
+    sys.exit(1)
+checks = flag("--checks").split(",")
+doc = {"schema_version": 1, "project": project, "generated_at": "2026-09-27T20:00:00+00:00", "checks": {}}
+for check in checks:
+    record = entry.get(check) or {"status": "pass"}
+    doc["checks"][check] = {"name": check, "status": record.get("status", "pass"), "message": record.get("message", ""),
+                            "details": record.get("details", []), "warnings": record.get("warnings", []), "findings": record.get("findings", [])}
+with open(flag("--report"), "w") as fh:
+    json.dump(doc, fh)
+sys.exit(entry.get("exit", 0))
+'''
+
+
+def report(**checks):
+    """A world entry: {check_id: {status, details, warnings, findings, exit}}."""
+    return checks
+
+
+def drifted(finding=FINDING, observed="The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on kube-agents-evals-2", repair=REPAIR):
+    return {"status": "fail", "message": "IAM requirements missing", "details": [observed], "findings": [{"id": finding, "observed": observed, "repair": repair}], "exit": 1}
+
+
+def unchecked(warning="Could not describe kube-agents-evals-2: PERMISSION_DENIED"):
+    return {"status": "unchecked", "message": "Not checked", "warnings": [warning], "exit": 2}
+
+
+class ScanHarness(unittest.TestCase):
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.root, ignore_errors=True))
+        self.stub = self.root / "verifier.py"
+        self.stub.write_text(_STUB_VERIFIER, encoding="utf-8")
+        self.log = self.root / "calls.log"
+        self.log.write_text("")
+        self.world = self.root / "world.json"
+        self.workdir = self.root / "work"
+
+    def scan(self, world: dict, projects=(PROJECT,), prior=None, timeout=20.0, which=None, checks=CHECKS):
+        self.world.write_text(json.dumps(world), encoding="utf-8")
+        environ = {**os.environ, "STUB_WORLD": str(self.world), "STUB_LOG": str(self.log)}
+        return pool_state.scan(
+            list(projects), checks, self.workdir, prior=prior, now=NOW, workers=2, project_timeout=timeout,
+            which=which or (lambda name: "/usr/bin/gcloud"), verifier_script=self.stub, environ=environ,
+        )
+
+    def calls(self):
+        return [line.split() for line in self.log.read_text().splitlines()]
+
+
+class TheChecksItAsksFor(unittest.TestCase):
+    def test_the_default_set_is_the_verifiers_read_only_set(self):
+        self.assertEqual(pool_state.DEFAULT_CHECKS, tuple(verifier.POOL_STATE_CHECKS))
+        for excluded in (verifier.CHECK_SEEDED_FLEET, verifier.CHECK_CODEBASE_MAPPING, verifier.CHECK_TOKEN_MINTER, *verifier.GITHUB_CHECKS):
+            self.assertNotIn(excluded, pool_state.DEFAULT_CHECKS)
+        self.assertIn(verifier.CHECK_TOKEN_MINTER_KMS, pool_state.DEFAULT_CHECKS)
+        self.assertTrue(set(pool_state.DEFAULT_CHECKS) <= set(verifier.CHECK_IDS))
+
+
+class OneProject(ScanHarness):
+    def test_a_healthy_project_scans_as_every_check_healthy(self):
+        doc = self.scan({PROJECT: report()})
+        entry = doc["projects"][PROJECT]
+        self.assertEqual({check: verdict["state"] for check, verdict in entry["checks"].items()}, {check: "healthy" for check in CHECKS})
+        self.assertEqual(entry["findings"], {})
+        self.assertEqual(entry["summary"], {"healthy": len(CHECKS), "drifted": 0, "not_checked": 0})
+        self.assertNotIn("error", entry)
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "findings": 0, "healthy": len(CHECKS), "drifted": 0, "not_checked": 0})
+        self.assertEqual((doc["schema_version"], doc["scanned_at"], doc["checks"]), (1, pool_state.iso(NOW), CHECKS))
+        argv = self.calls()[0]
+        self.assertEqual(argv[argv.index("--project-id") + 1], PROJECT)
+        self.assertEqual(argv[argv.index("--checks") + 1], ",".join(CHECKS))
+        self.assertEqual(argv[argv.index("--location") + 1], pool_state.DEFAULT_LOCATION)
+
+    def test_a_finding_is_drifted_with_its_id_observation_and_repair(self):
+        doc = self.scan({PROJECT: report(iam=drifted())})
+        entry = doc["projects"][PROJECT]
+        self.assertEqual(entry["checks"]["iam"]["state"], "drifted")
+        self.assertEqual(entry["checks"]["iam"]["detail"], ["The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on kube-agents-evals-2"])
+        self.assertEqual(entry["findings"], {FINDING: {"check": "iam", "detail": ["The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on kube-agents-evals-2"], "repair": REPAIR}})
+        self.assertEqual(pool_state.drift_map(doc), {PROJECT: [FINDING]})
+        self.assertEqual(pool_state.read_map(doc), {PROJECT: sorted(CHECKS)})
+        self.assertEqual(pool_state.check_of(doc, PROJECT, FINDING), "iam")
+        self.assertEqual(pool_state.repair_for(doc, PROJECT, FINDING), REPAIR)
+        self.assertEqual(doc["summary"]["findings"], 1)
+        self.assertEqual(doc["summary"]["drifted_projects"], 1)
+
+    def test_the_verifiers_exit_code_is_not_the_verdict(self):
+        # Exit 1 on a finding, 2 on an unread item: the report says which check,
+        # and the scan reads that, not the code.
+        doc = self.scan({PROJECT: report(iam=drifted(), gke_and_state=unchecked("Could not list the clusters"))})
+        entry = doc["projects"][PROJECT]
+        self.assertEqual((entry["checks"]["iam"]["state"], entry["checks"]["gke_and_state"]["state"], entry["checks"]["artifact_registry"]["state"]), ("drifted", "not_checked", "healthy"))
+        self.assertEqual(entry["checks"]["gke_and_state"]["detail"], ["Could not list the clusters"])
+        self.assertNotIn("error", entry)
+        self.assertEqual(pool_state.read_map(doc)[PROJECT], sorted(set(CHECKS) - {"gke_and_state"}))
+
+    def test_a_check_read_in_part_counts_as_checked_but_not_as_read(self):
+        # A pass with a warning read some of the item: the project was seen
+        # (not a blind scan), but a finding in the refused read was not, so the
+        # exit may not take the check as proof the finding is gone.
+        partial = {"status": "pass", "message": "the Workload Identity binding verified; the project roles not checked", "warnings": ["Could not read the project IAM policy"], "exit": 2}
+        doc = self.scan({PROJECT: report(iam=partial)})
+        self.assertEqual(doc["projects"][PROJECT]["checks"]["iam"], {"state": "healthy", "detail": ["Could not read the project IAM policy"]})
+        self.assertEqual(pool_state.read_map(doc)[PROJECT], sorted(set(CHECKS) - {"iam"}))
+        self.assertEqual(pool_state.checked_projects(doc), 1)
+
+    def test_a_project_the_bot_cannot_read_at_all_is_unread(self):
+        doc = self.scan({PROJECT: report(**{check: unchecked() for check in CHECKS})})
+        self.assertEqual(pool_state.read_map(doc), {})
+        self.assertEqual(pool_state.checked_projects(doc), 0)
+        self.assertEqual(pool_state.not_checked_reason(doc), "Could not describe kube-agents-evals-2: PERMISSION_DENIED")
+        self.assertEqual(doc["summary"]["checked"], 0)
+
+    def test_a_check_the_report_omits_is_not_checked(self):
+        checks_out, findings = pool_state.from_report({"checks": {"iam": {"status": "pass"}}}, ["iam", "gke_and_state"])
+        self.assertEqual(checks_out["gke_and_state"], {"state": "not_checked", "detail": [pool_state.REASON_NO_REPORT]})
+        self.assertEqual((checks_out["iam"]["state"], findings), ("healthy", {}))
+
+
+class WhatNeverFailsTheBot(ScanHarness):
+    def test_a_verifier_that_hangs_is_not_checked_with_the_ceiling(self):
+        doc = self.scan({PROJECT: "sleep"}, timeout=1.0)
+        entry = doc["projects"][PROJECT]
+        self.assertEqual(entry["error"], pool_state.REASON_VERIFIER_TIMEOUT.format(seconds=1))
+        self.assertTrue(all(verdict["state"] == "not_checked" for verdict in entry["checks"].values()))
+
+    def test_a_verifier_that_dies_without_a_report_is_not_checked_with_its_words(self):
+        doc = self.scan({PROJECT: "crash"})
+        self.assertEqual(doc["projects"][PROJECT]["error"], "scripts/verify_ci_pool_project.py exited 64 without a report: usage: something is wrong")
+        # Exit 1 is the verifier's own "a finding" code, but with no report it
+        # is a crash (an uncaught exception exits 1), and stderr is kept.
+        quiet = self.scan({OTHER: "silent"}, projects=(OTHER,))
+        self.assertEqual(quiet["projects"][OTHER]["error"], "scripts/verify_ci_pool_project.py exited 1 without a report: no output")
+
+    def test_a_missing_gcloud_is_not_checked_everywhere_and_the_verifier_never_runs(self):
+        doc = self.scan({PROJECT: report()}, which=lambda name: None)
+        self.assertEqual(doc["projects"][PROJECT]["error"], "gcloud is not on PATH, so nothing was checked")
+        self.assertEqual(self.calls(), [])
+
+    def test_the_other_projects_go_on_when_one_fails(self):
+        doc = self.scan({PROJECT: "crash", OTHER: report()}, projects=(PROJECT, OTHER))
+        self.assertEqual((doc["projects"][PROJECT].get("error") is not None, doc["projects"][OTHER].get("error")), (True, None))
+        self.assertEqual(doc["summary"]["checked"], 1)
+
+
+class TheDocument(ScanHarness):
+    def test_the_previous_scans_drift_rides_along(self):
+        prior = self.scan({PROJECT: report(iam=drifted())})
+        doc = self.scan({PROJECT: report()}, prior=prior)
+        self.assertEqual(doc["previous"], {"scanned_at": pool_state.iso(NOW), "drifted": {PROJECT: [FINDING]}})
+        self.assertEqual(pool_state.previous_drift_map(doc), {PROJECT: [FINDING]})
+        self.assertEqual(pool_state.drift_map(doc), {})
+        none = self.scan({PROJECT: report()}, prior=None)
+        self.assertEqual(none["previous"], {"scanned_at": None, "drifted": {}})
+
+
+class EntryPoint(ScanHarness):
+    def _run(self, *args):
+        stderr = __import__("io").StringIO()
+        with unittest.mock.patch("sys.stderr", stderr):
+            rc = pool_state.main(list(args))
+        return rc, stderr.getvalue()
+
+    def test_a_checkout_without_the_mapping_is_a_repository_bug(self):
+        deploy = self.root / "ci-deploy.sh"
+        deploy.write_text("#!/bin/bash\necho no mapping here\n", encoding="utf-8")
+        rc, err = self._run("--out", str(self.root / "out.json"), "--ci-deploy-script", str(deploy), "--verifier", str(self.stub))
+        self.assertEqual(rc, pool_state.EXIT_REPOSITORY_BUG)
+        self.assertIn("gitops_repo_for_project", err)
+
+    def test_a_missing_verifier_is_a_repository_bug(self):
+        rc, err = self._run("--out", str(self.root / "out.json"), "--projects", PROJECT, "--verifier", str(self.root / "nowhere.py"))
+        self.assertEqual(rc, pool_state.EXIT_REPOSITORY_BUG)
+        self.assertIn("nowhere.py", err)
+
+    def test_an_unknown_check_is_a_repository_bug(self):
+        rc, err = self._run("--out", str(self.root / "out.json"), "--projects", PROJECT, "--verifier", str(self.stub), "--checks", "iam,no_such_check")
+        self.assertEqual(rc, pool_state.EXIT_REPOSITORY_BUG)
+        self.assertIn("no_such_check", err)
+
+    def test_main_writes_the_document_and_exits_zero_on_findings(self):
+        self.world.write_text(json.dumps({PROJECT: report(iam=drifted())}), encoding="utf-8")
+        out = self.root / "pool-state.json"
+        with unittest.mock.patch.dict(os.environ, {"STUB_WORLD": str(self.world), "STUB_LOG": str(self.log)}):
+            rc, err = self._run("--out", str(out), "--projects", PROJECT, "--verifier", str(self.stub), "--now", NOW.isoformat(), "--workdir", str(self.workdir))
+        self.assertEqual(rc, pool_state.EXIT_OK, err)
+        doc = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(pool_state.drift_map(doc), {PROJECT: [FINDING]})
+        self.assertIn("1 of 1 pool projects checked, 1 with drift (1 findings", err)
+
+
+class Workflow(unittest.TestCase):
+    """ci-health.yml wires the scan the way docs/ci-health.md says: into the
+    hourly job after the fleet scan, with its own document and knobs, and the
+    tick reads it."""
+
+    def setUp(self):
+        import yaml
+
+        self.text = WORKFLOW.read_text()
+        self.doc = yaml.safe_load(self.text)
+        self.jobs = self.doc["jobs"]
+
+    def test_the_scan_runs_in_the_hourly_job_after_the_fleet_scan(self):
+        steps = self.jobs["fixture-state-scan"]["steps"]
+        names = [step.get("name", "") for step in steps]
+        fleet = next(i for i, step in enumerate(steps) if "fixture_state.py" in step.get("run", ""))
+        scan = next(i for i, step in enumerate(steps) if "pool_state.py" in step.get("run", ""))
+        self.assertLess(fleet, scan)
+        run = steps[scan]["run"]
+        self.assertIn("--prior work/pool-state-prior.json", run)
+        self.assertIn('--workers "$POOL_STATE_WORKERS"', run)
+        self.assertIn('--project-timeout "$POOL_STATE_PROJECT_TIMEOUT_S"', run)
+        self.assertIn('timeout "$POOL_STATE_TIMEOUT_S"', run)
+        for step in (steps[scan], steps[scan - 1], steps[scan + 1]):
+            self.assertEqual(step.get("if"), "always()", f"{step.get('name')} must run whether or not the fleet scan's step failed")
+        upload = next(step for step in steps if "cp work/pool-state.json" in step.get("run", ""))
+        self.assertIn('"$DASHBOARD_BUCKET/pool-state.json"', upload["run"])
+        self.assertIn("Fetch the previous pool-state scan", names)
+        env = self.doc["env"]
+        self.assertTrue(int(env["POOL_STATE_TIMEOUT_S"]) > int(env["POOL_STATE_PROJECT_TIMEOUT_S"]) > 0)
+        self.assertGreaterEqual(self.jobs["fixture-state-scan"]["timeout-minutes"] * 60, int(env["FIXTURE_STATE_TIMEOUT_S"]) + int(env["POOL_STATE_TIMEOUT_S"]))
+
+    def test_the_tick_reads_the_published_scan(self):
+        steps = self.jobs["refresh-and-adjudicate"]["steps"]
+        fetch = next(step for step in steps if "pool-state.json" in step.get("run", "") and "health-prev.json" in step["run"])
+        self.assertIn('gsutil -q cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state.json || true', fetch["run"])
+        adjudicate = next(step for step in steps if step.get("name") == "Adjudicate")
+        self.assertIn("--pool-state work/pool-state.json", adjudicate["run"])
+
+    def test_the_upload_steps_summary_script_runs(self):
+        steps = self.jobs["fixture-state-scan"]["steps"]
+        upload = next(step for step in steps if "cp work/pool-state.json" in step.get("run", ""))
+        run = upload["run"]
+        code = run[run.index("python3 -c '") + len("python3 -c '") :]
+        code = code[: code.index("\n'")]
+        compile(code, "<upload step>", "exec")
+        with tempfile.TemporaryDirectory() as tmp:
+            work = pathlib.Path(tmp) / "work"
+            work.mkdir()
+            document = {
+                "summary": {"checked": 1, "projects": 2, "drifted_projects": 1, "findings": 1, "healthy": 4, "drifted": 1, "not_checked": 5},
+                "projects": {
+                    "p1": {"checks": {"iam": {"state": "drifted"}}, "findings": {FINDING: {"check": "iam"}}},
+                    "p2": {"checks": {"iam": {"state": "not_checked"}}, "findings": {}, "error": "cannot read the project"},
+                },
+            }
+            (work / "pool-state.json").write_text(json.dumps(document), encoding="utf-8")
+            proc = subprocess.run([sys.executable, "-c", code], cwd=tmp, capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("1 of 2 projects checked; drifted on 1 (1 findings)", proc.stdout)
+        self.assertIn(f"p1: drifted: {FINDING}", proc.stdout)
+        self.assertIn("p2: not checked: cannot read the project", proc.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

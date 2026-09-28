@@ -820,7 +820,7 @@ read is final.
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
 `slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
@@ -844,7 +844,13 @@ role out of its designed state; docs/ci-health.md, "The seeded-fleet scan")
 carries `roles`, `projects` and `drift` in its `incident` and a
 `fixture_state` block beside `metrics`; the pages show it as the generic
 degraded headline, and `fixture-state.json` beside `health.json` is the
-scan's own document, which no page reads. `slow` is `null` or, on a `GREEN` tick, the slow-gate note
+scan's own document, which no page reads. `pool_drift` (the hourly pool-state
+scan found a pool project no longer shaped as the verifier requires;
+docs/ci-health.md, "The pool-state scan") is the same shape: `roles` are the
+verifier's finding ids, `incident` also carries `repairs` (`{project: {finding:
+command}}`), and the `pool_state` block beside `fixture_state` summarises the
+scan; `pool-state.json` is its document, which no page reads. Both scan
+incidents carry `reads` (`{project: [what a later scan must read again]}`). `slow` is `null` or, on a `GREEN` tick, the slow-gate note
 (`{since, runs, min_s, median_s, max_s, baseline_days, baseline_runs,
 baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
