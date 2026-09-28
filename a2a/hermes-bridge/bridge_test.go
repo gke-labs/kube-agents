@@ -612,7 +612,17 @@ echo never`, marker)), 0, func(b *Bridge) {
 func TestLookAhead_AbsentCancelSpawnsAndWorkingFollowsTheRead(t *testing.T) {
 	_, url := startServer(t)
 	c := gatewayClient(t, url)
+	// The worker parks on the gate, so a failure before it opens must still
+	// open it, or the bridge never leaves wg.Wait and cleanup reports a
+	// shutdown failure that is this test's, not the bridge's.
 	gate := make(chan struct{})
+	var opened atomic.Bool
+	openGate := func() {
+		if opened.CompareAndSwap(false, true) {
+			close(gate)
+		}
+	}
+	t.Cleanup(openGate)
 	var real func(context.Context, *taskRun) (bool, error)
 	startBridgeWith(t, url, script(t, `echo "answer for $1"`), 0, func(b *Bridge) {
 		real = b.lookAhead
@@ -632,7 +642,7 @@ func TestLookAhead_AbsentCancelSpawnsAndWorkingFollowsTheRead(t *testing.T) {
 	if task := fold(t, c, origin.TaskID); task.State != lib.StateSubmitted {
 		t.Fatalf("state = %s while the look-ahead is outstanding, want submitted", task.State)
 	}
-	close(gate)
+	openGate()
 
 	task := waitTerminal(t, c, origin.TaskID)
 	if task.State != lib.StateCompleted {
@@ -681,6 +691,13 @@ func TestLookAhead_ShutdownMidReadLeavesTheRunToShutdownTasks(t *testing.T) {
 	c := gatewayClient(t, url)
 	marker := filepath.Join(t.TempDir(), "spawned")
 	gate := make(chan struct{})
+	var opened atomic.Bool
+	openGate := func() {
+		if opened.CompareAndSwap(false, true) {
+			close(gate)
+		}
+	}
+	t.Cleanup(openGate)
 	type answer struct {
 		run     *taskRun
 		err     error
@@ -718,7 +735,7 @@ echo never`, marker)), 0, func(br *Bridge) {
 	}
 	t.Cleanup(release)
 	shutdown()
-	close(gate)
+	openGate()
 
 	var got answer
 	select {
