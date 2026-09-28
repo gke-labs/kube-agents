@@ -49,7 +49,7 @@ route forwards every prefix to the Python runtime with no timeout.
 Three choices inside that, each with the alternative named:
 
 - **Host in the path, with a hard host allowlist**, rather than one fixed route per service.
-  A Logging entry would mean a second service, and a per-service route means a handler per service. The host
+  A Logging entry would mean a third service, and a per-service route means a handler per service. The host
   allowlist is what stops the relay being a forward proxy: a host not in the table is refused
   before the path is read.
 - **A code table, not the JSON policy ConfigMap.** The broker's `policy.json` is a regex
