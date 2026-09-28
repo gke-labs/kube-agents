@@ -722,8 +722,8 @@ class BootstrapFanoutVerifier(BaseVerifier):
     Fails closed: an unreadable pod, no sweep marker, a board that cannot be
     queried, or a sweep card the board does not know is ``status="error"``,
     and so is an empty roster for ``one_card_per_cluster_agent``.
-    ``no_card_waits_on_the_sweep`` passes on an empty roster: no cluster card
-    exists to wait on the sweep.
+    ``no_card_waits_on_the_sweep`` does not read the roster, so an empty one
+    is not an error for it.
     """
 
     type: Literal["bootstrap_fanout"]

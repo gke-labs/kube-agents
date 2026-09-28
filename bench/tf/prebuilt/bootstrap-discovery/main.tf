@@ -15,13 +15,14 @@
 # The scenario driver for bench/tasks/bootstrap-discovery-fanout: re-arm the
 # onboarding discovery gate on the install under test, wait for the
 # `bootstrap-inventory-scan` cron job to file a fresh sweep card, and return
-# once the sweep's worker has filed cards and then ended its run itself, or
-# has completed without filing any -- by then it has filed whatever Cluster
-# Agent cards it is going to file, which is what the case grades. Short of
-# that, it hands whatever the worker filed to the verifier at `run_wait`. It
-# does not wait for the Cluster Agent cards itself: the worker's SOP polls
-# them to the end inside its run, but a worker can end its run while they
-# are still running (#1981). The destroy archives them, and archiving a
+# once the sweep's worker has filed Cluster Agent cards and then ended its run
+# itself, or has completed without filing any -- by then it has filed
+# whatever Cluster Agent cards it is going to file, which is what the case
+# grades. Short of that, it hands whatever the worker filed to the verifier
+# at `run_wait`, or fails the apply if no worker has picked the sweep up by
+# then. It does not wait for the Cluster Agent cards itself: the worker's SOP
+# polls them to the end inside its run, but a worker can end its run while
+# they are still running (#1981). The destroy archives them, and archiving a
 # running card ends its worker.
 #
 # Re-arming is the runbook in agents/chat/defaults/plugins/bootstrap_onboarding/

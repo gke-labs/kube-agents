@@ -190,9 +190,10 @@ def _cluster_agent_calls() -> list[str]:
     the sweep, so it must not take the other profiles with it.
 
     Failing to list the profiles, or to import the readiness rule, returns an
-    empty list, which files the solo sweep. Raising would fail the run before the card is filed, on every tick
-    for as long as the failure lasts; like the give-up in
-    ``ensure_cluster_agents``, this gate prefers a degraded report to none.
+    empty list, which files the solo sweep. Raising would fail the run before
+    the card is filed, on every tick for as long as the failure lasts; like
+    the give-up in ``ensure_cluster_agents``, this gate prefers a degraded
+    report to none.
     """
     try:
         import cluster_agent_profile as cap  # beside this script in the pod, as for the reconcile
