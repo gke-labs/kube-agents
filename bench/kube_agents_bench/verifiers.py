@@ -87,6 +87,7 @@ _NO_WORKER_CALLS_REASON = (
     "delegated or the worker-trajectory capture did not run, so a check scoped to "
     "the workers cannot observe its subject"
 )
+_FANOUT_READ_TIMEOUT_SEC = 60.0
 
 # Emphasis and code markers, dropped before matching. The agent answers in
 # Markdown, and a phrase spanning an emphasised word cannot match the raw
@@ -690,9 +691,6 @@ class WorkerAgentsVerifier(BaseVerifier):
             elapsed_time=time.monotonic() - start,
             reason=f"all {len(self.required_agents)} required profile pattern(s) matched; workers ran as {agents}",
         )
-
-
-_FANOUT_READ_TIMEOUT_SEC = 60.0
 
 
 def _agent_shell(script: str, timeout: float) -> str:

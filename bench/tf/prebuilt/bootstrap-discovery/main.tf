@@ -73,7 +73,29 @@ resource "null_resource" "sweep" {
       # Own kubeconfig: by the time this apply runs, an earlier tofu task may
       # have pointed the ambient context at its own cluster.
       kubeconfig_dir="$(mktemp -d)"
-      trap 'rm -rf "$kubeconfig_dir"' EXIT
+
+      # Terraform taints a resource whose create-time provisioner failed and
+      # skips its destroy-time provisioners, so a failure after the re-arm
+      # cleans up here or the sweep's cards keep their dispatcher slots.
+      # errexit stays in force inside a trap, hence `set +e`.
+      rearmed=""
+      on_exit() {
+        status=$?
+        set +e
+        if [ "$status" -ne 0 ] && [ -n "$rearmed" ]; then
+          echo "Plant failed (exit $status); archiving the bootstrap-inventory cards it left open." >&2
+          # The gate files only while this marker is absent, and a sweep filed
+          # after this exit would run with nothing to archive it, so the
+          # marker goes back before the cards are listed.
+          agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$${old_id:-none}" >&2
+          for id in $(open_cards); do
+            agent ${local.hermes} kanban archive "$id" >&2
+          done
+          clear_inventory
+        fi
+        rm -rf "$kubeconfig_dir"
+      }
+      trap on_exit EXIT
       # bash skips the EXIT trap when an untrapped signal kills it, and a
       # Prow deadline arrives as SIGTERM.
       trap 'exit 143' TERM INT
@@ -110,6 +132,12 @@ resource "null_resource" "sweep" {
       sweep_id() {
         agent sh -c 'sed -n "s/^task_id=//p" ${local.home}/.bootstrap_scan_filed 2>/dev/null; true' || true
       }
+      clear_inventory() {
+        for pod in $(kubectl get pods -n "${var.agent_namespace}" -l "${var.sandbox_selector}" -o name); do
+          kubectl exec -n "${var.agent_namespace}" "$pod" -c "${var.sandbox_container}" -- rm -f ${local.inventory}
+        done
+        agent rm -f ${local.inventory}
+      }
 
       # ---- 1. Refuse an install where the sweep would reach a person -------
       # One read that has to answer `clear`, so a failed exec refuses rather
@@ -132,6 +160,8 @@ resource "null_resource" "sweep" {
       esac
 
       # ---- 2. Clear the previous sweep -------------------------------------
+      old_id="$(sweep_id)"
+      rearmed=1
       for id in $(open_cards); do
         agent ${local.hermes} kanban archive "$id"
       done
@@ -140,11 +170,8 @@ resource "null_resource" "sweep" {
         echo "ERROR: bootstrap-inventory cards still open after archiving: $leftover. The gate's create would return one of them instead of filing a sweep." >&2
         exit 1
       fi
-      for pod in $(kubectl get pods -n "${var.agent_namespace}" -l "${var.sandbox_selector}" -o name); do
-        kubectl exec -n "${var.agent_namespace}" "$pod" -c "${var.sandbox_container}" -- rm -f ${local.inventory}
-      done
-      old_id="$(sweep_id)"
-      agent rm -f "${local.home}/.bootstrap_scan_filed" "${local.home}/.bootstrap_reconcile_attempts" ${local.inventory}
+      clear_inventory
+      agent rm -f "${local.home}/.bootstrap_scan_filed" "${local.home}/.bootstrap_reconcile_attempts"
       echo "Re-armed discovery (previous sweep card: $${old_id:-none})."
 
       # ---- 3. Wait for the gate to file a new sweep ------------------------

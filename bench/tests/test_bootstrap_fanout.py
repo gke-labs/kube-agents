@@ -155,6 +155,21 @@ def test_the_read_skips_the_reserved_profiles(tmp_path: Path) -> None:
     assert "platform" not in payload["unidentified"]
 
 
+@pytest.mark.parametrize(
+    "config",
+    [yaml.safe_dump({"cluster_identity": "not-a-mapping"}).encode(), b"\xff\xfe not utf-8"],
+    ids=["identity-not-a-mapping", "undecodable"],
+)
+def test_a_malformed_profile_is_unidentified_not_a_failed_read(tmp_path: Path, config: bytes) -> None:
+    root = _write_root(tmp_path, _board("branch"))
+    name = "cluster-example-project-support-eval-cluster-us-central1-a"
+    (root / "profiles" / name / "config.yaml").write_bytes(config)
+    payload, why = discovery.read_fanout(lambda s, t: _run_script(root), 5.0)
+    assert why == ""
+    assert name in payload["unidentified"]
+    assert len(payload["roster"]) == 3
+
+
 def test_a_failed_exec_is_a_failed_read() -> None:
     payload, why = discovery.read_fanout(lambda s, t: "", 5.0)
     assert payload is None

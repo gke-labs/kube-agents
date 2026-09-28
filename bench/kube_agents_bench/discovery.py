@@ -93,9 +93,9 @@ for name in names:
     try:
         with open(os.path.join(profiles, name, "config.yaml")) as fh:
             ident = (yaml.safe_load(fh) or {}).get("cluster_identity") or {}
-    except (OSError, yaml.YAMLError, AttributeError):
+    except (OSError, ValueError, yaml.YAMLError, AttributeError):
         ident = {}
-    if not all(ident.get(k) for k in ("project", "cluster", "location")):
+    if not isinstance(ident, dict) or not all(ident.get(k) for k in ("project", "cluster", "location")):
         out["unidentified"].append(name)
         continue
     key = "%s%s-%s-%s" % (PREFIX, ident["project"], ident["cluster"], ident["location"])
