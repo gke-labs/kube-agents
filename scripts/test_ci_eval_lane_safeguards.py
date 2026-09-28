@@ -103,10 +103,14 @@ def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file:
     # The step's `mktemp -d` lands under TMPDIR, which is a directory of the
     # test's own so nothing is left behind.
     clean = {k: v for k, v in os.environ.items() if k not in ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO")}
-    with tempfile.TemporaryDirectory() as scratch:
-        return subprocess.run(
-            ["bash", "-c", body], capture_output=True, text=True, check=False, env={**clean, "TMPDIR": scratch, **(env or {})}
-        )
+    # Kept on the result, not in a `with`: the tests read the copies the step
+    # wrote, so the directory lives until the result is dropped.
+    scratch = tempfile.TemporaryDirectory()
+    result = subprocess.run(
+        ["bash", "-c", body], capture_output=True, text=True, check=False, env={**clean, "TMPDIR": scratch.name, **(env or {})}
+    )
+    result.scratch = scratch  # type: ignore[attr-defined]
+    return result
 
 
 def tagged(result: subprocess.CompletedProcess, tag: str) -> list[str]:
