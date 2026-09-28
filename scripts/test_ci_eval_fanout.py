@@ -114,6 +114,10 @@ class QueueOrderTest(unittest.TestCase):
         body = "\n".join(
             [
                 lifted("unit_cost_hint"),
+                # The queue leaves out the cases that request a pull request
+                # (the inject lane's second phase); with the list unset every
+                # task is in this queue, as on the api lane.
+                lifted("unit_phase"),
                 f"EVAL_REPETITIONS={reps}",
                 # compliance carries a 700 hint, the probe 200: order within a
                 # repetition must be cost-descending.

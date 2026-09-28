@@ -120,8 +120,9 @@ def test_a_repository_outside_the_pinned_owner_is_refused_before_the_lease(tmp_p
     lane.check_repository(safeguards, "GKE-Agentic/x")  # GitHub owners are case-insensitive
     with pytest.raises(lane.LaneSafeguardsError, match="is not under gke-agentic"):
         lane.check_repository(safeguards, "someone/throwaway-infra")
-    with pytest.raises(lane.LaneSafeguardsError, match="not an owner/name"):
-        lane.check_repository(safeguards, "no-slash")
+    for malformed in ("no-slash", "gke-agentic/x/y", "gke-agentic/x/", "gke-agentic/ x", "/x"):
+        with pytest.raises(lane.LaneSafeguardsError, match="not an owner/name"):
+            lane.check_repository(safeguards, malformed)
     # An entry that pins nothing accepts any repository.
     lane.check_repository([{"name": "n", "check": {"type": "none", "checks": [{"type": "github_writes"}]}}], "someone/x")
     rc = lane.main(["--safeguards", str(LANE_FILE), "--gitops-repo", "someone/x", "--out-dir", str(tmp_path), str(TASKS / READ_ONLY_CASE / "task.yaml")])

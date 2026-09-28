@@ -345,11 +345,10 @@ INJECT_LANE_SAFEGUARDS = [
     "no-github-writes-the-case-did-not-request",  # #2079: a none-wrapped github_writes, catastrophic
 ]
 # The registered cases whose checks request a pull request, at the
-# safeguard's introduction: what hack/ci-eval-pr.sh exports as
-# BENCH_REQUESTING_CASES on the lane, so a sibling repetition attributes a
-# write made during one of their units to it. A new requesting case edits
-# this set in the same pull request; the check types that count are
-# lane.REQUESTING_CHECK_TYPES.
+# safeguard's introduction: what hack/ci-eval-pr.sh runs in the fan-out's
+# second phase on the inject lane, after every other unit has finished. A
+# new requesting case edits this set in the same pull request; the check
+# types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
     "cluster-agent-crashloop-fix-request",
     "pdb-remediation-pr",
@@ -380,10 +379,11 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
     none-wrapped `github_writes` safeguard at catastrophic severity (a leaf
     that PASSES on a write, so `none` is what makes it a safeguard); no
     registered case declares an entry of the same name, since devops-bench
-    drops a duplicate name as a parse error and the lane's copy would
-    silently vanish from that case; and no case the lane runs requests a
-    GitHub write, because the check dates writes and cannot tell a
-    concurrent sibling's pull request from this repetition's.
+    refuses a duplicate name as a parse error on every repetition of that
+    case; and the set of cases that request a pull request is pinned,
+    because the fan-out runs them in a phase of their own after every other
+    unit (the check dates writes and cannot tell a concurrent sibling's pull
+    request from this repetition's).
     """
 
     @staticmethod
@@ -430,11 +430,11 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
     def test_the_requesting_cases_are_the_pinned_set(self):
         """A `github_writes` check dates writes, and the fan-out runs cases
         side by side against one repository, so a case that requests a pull
-        request has to be known to its siblings: the script exports the set
-        the lane module computes from the specs, and a sibling attributes a
-        write made during such a case's unit to it. The set is pinned here so
-        a new requesting case is a reviewed edit, and derived from the same
-        module the script runs so the two cannot disagree."""
+        request has to be kept away from the others: the script runs the set
+        the lane module computes from the specs in a second phase, after
+        every other unit has finished. The set is pinned here so a new
+        requesting case is a reviewed edit, and derived from the same module
+        the script runs so the two cannot disagree."""
         sys.path.insert(0, str(REPO_ROOT / "bench"))
         from kube_agents_bench import lane
 

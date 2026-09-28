@@ -278,8 +278,8 @@ request is a tripped catastrophic safeguard at rung 1, as a cluster mutation is.
 under `bench/tasks/` and the api lane are untouched. A case that requests a pull request (a
 `pull_request_opened` or `pull_request_diff_contains` check of its own) is allowed the ones its
 reply names, and because the fan-out runs cases side by side against one repository, the script
-exports which cases those are and each unit records when it ran, so a sibling repetition
-attributes a write made during such a case's unit to it rather than failing on it.
+runs those cases in a second phase after every other unit has finished, so a repetition that
+requests nothing never shares the repository with one that writes by design.
 `scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and
 the set of requesting cases. The same approvers as the exclusion list, for the same reason.
 

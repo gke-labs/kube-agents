@@ -567,9 +567,10 @@ than on this flag) leaves out the cases whose premise needs the chat front door;
 safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scratch copy of every
 remaining task file, which the unit hands devops-bench, over the leased project's GitOps
 repository exported as `BENCH_GITOPS_REPO` (the lane refuses to start without one), with the
-cases that request a pull request exported beside it so a sibling repetition attributes a write
-made during one of their units to it; and after the fan-out the script lists in the job log what
-the run left on that repository, closing nothing. With the flag unset both scripts are byte for byte what
+cases that request a pull request run in a second phase after every other unit so no repetition
+that requests nothing shares the repository with one that writes by design; and after the
+fan-out the script lists in the job log what the run left on that repository, closing nothing.
+With the flag unset both scripts are byte for byte what
 they were, and the presubmit's own tests hold that.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes

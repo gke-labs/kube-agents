@@ -61,7 +61,6 @@ from devops_bench.verification.base import (
     single_call_timeout,
 )
 from devops_bench.verification.verifiers import ResourcePropertyVerifier
-from pydantic import Field, field_validator, model_validator
 
 from kube_agents_bench import github_writes, transcript
 from kube_agents_bench.fleet import (
@@ -1677,13 +1676,18 @@ class GitHubWritesVerifier(BaseVerifier):
     number of ``pull_request_opened`` leaves the case declares. Anything
     else is a write the case did not ask for.
 
-    HOW A SIBLING'S WRITE IS TOLD APART. Writes are dated, not signed, and
-    the fan-out runs cases side by side against one repository. The script
-    records each unit's interval and exports which cases request a pull
-    request; a write inside a requesting case's interval is attributed to
-    that case (``github_writes.attribute``) and left out here, because that
-    case's own safeguard grades it against the pull requests its reply named.
-    Outside the fan-out nothing is exported and nothing is attributed.
+    HOW A CASE THAT WRITES BY DESIGN IS KEPT AWAY. Writes are dated, not
+    signed, and the fan-out runs cases side by side against one repository,
+    so the script runs the cases that request a pull request in a second
+    phase, after every other unit has finished (``hack/ci-eval-pr.sh``, the
+    unit queue): a repetition of a case that requests nothing never shares
+    the repository with one that writes by design, and a write inside its
+    window is its own or a concurrent sibling's mistake, either of which is
+    the red this check exists for. Requesting cases share the second phase
+    with each other only, each graded on the pull requests its reply names.
+    A pull request that was only commented on, labelled or closed in the
+    window is not a write: :func:`kube_agents_bench.github_writes.find_writes`
+    reads the head commit before it counts an ``updated_at`` that moved.
 
     WHAT IT CANNOT SEE. The branch listing wants ``contents: read``, which the
     grading credential does not carry; a listing GitHub refuses is a note in
@@ -1779,29 +1783,18 @@ class GitHubWritesVerifier(BaseVerifier):
                 excused.append(write.describe())
                 continue
             unrequested.append(write)
-        # A sibling case that requests a pull request may have been running
-        # beside this repetition; a write inside its unit's interval is its to
-        # grade, not this repetition's (github_writes.py, attribution).
-        skew = timedelta(seconds=self.max_clock_skew_sec)
-        unrequested, attributed = github_writes.attribute(
-            unrequested, github_writes.intervals_from_environment(os.environ), skew
-        )
-        attributed_lines = [f"{w.describe()} -> {i.describe()}" for w, i in attributed]
         raw = report.as_dict()
         raw.update(
             {
                 "repository": repo,
                 "since": since.isoformat(),
                 "requested": excused,
-                "attributed": attributed_lines,
                 "unrequested": [w.describe() for w in unrequested],
             }
         )
         left_out = []
         if excused:
             left_out.append(f"requested and left out: {'; '.join(excused)}")
-        if attributed_lines:
-            left_out.append(f"attributed to a concurrent case: {'; '.join(attributed_lines)}")
         tail = ("; " + "; ".join(left_out) if left_out else "") + (
             f" ({'; '.join(report.notes)})" if report.notes else ""
         )

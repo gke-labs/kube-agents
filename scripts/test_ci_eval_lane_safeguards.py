@@ -92,7 +92,7 @@ def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file:
             prelude,
             step,
             'echo "REPO=${BENCH_GITOPS_REPO-<unset>}"',
-            'echo "REQUESTING=${BENCH_REQUESTING_CASES-<unset>}"',
+            'echo "REQUESTING=${INJECT_LANE_REQUESTING-<unset>}"',
             'echo "DIR=${INJECT_LANE_TASKS_DIR-<unset>}"',
             'for t in "${TASKS[@]}"; do n="$(basename "$(dirname "${t}")")"; echo "PATH ${n} $(unit_task_path "${t}" "${n}")"; done',
         ]
@@ -100,8 +100,13 @@ def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file:
     # "Not set by the test" has to mean unset, not whatever the shell running
     # the tests exports: the transport switch and the two repository
     # variables, which a developer who drove the lane by hand has in theirs.
-    clean = {k: v for k, v in os.environ.items() if k not in ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO", "BENCH_REQUESTING_CASES")}
-    return subprocess.run(["bash", "-c", body], capture_output=True, text=True, check=False, env={**clean, **(env or {})})
+    # The step's `mktemp -d` lands under TMPDIR, which is a directory of the
+    # test's own so nothing is left behind.
+    clean = {k: v for k, v in os.environ.items() if k not in ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO")}
+    with tempfile.TemporaryDirectory() as scratch:
+        return subprocess.run(
+            ["bash", "-c", body], capture_output=True, text=True, check=False, env={**clean, "TMPDIR": scratch, **(env or {})}
+        )
 
 
 def tagged(result: subprocess.CompletedProcess, tag: str) -> list[str]:
@@ -126,7 +131,7 @@ class ApiLaneUntouchedTest(unittest.TestCase):
                 result = run_step(env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(value(result, "REPO"), "<unset>")
-                self.assertEqual(value(result, "REQUESTING"), "<unset>")
+                self.assertEqual(value(result, "REQUESTING"), "")
                 self.assertEqual(value(result, "DIR"), "")
                 for line in tagged(result, "PATH"):
                     name, path = line.split(" ", 1)
@@ -157,17 +162,17 @@ class InjectLaneTest(unittest.TestCase):
                 self.assertEqual(spec_names(pathlib.Path(path)), original + [LANE_ENTRY])
         self.assertIn("every task in the matrix carries the lane's safeguards", result.stdout)
         self.assertIn("BENCH_GITOPS_REPO=gke-agentic/kube-agents-evals-21-infra", result.stdout)
-        # No presubmit case requests a pull request, so the export is empty
-        # and the log says so.
+        # No presubmit case requests a pull request, so the second phase is
+        # empty and the log says so.
         self.assertEqual(value(result, "REQUESTING"), "")
-        self.assertIn("cases that request a pull request: none", result.stdout)
+        self.assertIn("cases that request a pull request, run after every other unit: none", result.stdout)
 
-    def test_the_requesting_cases_are_exported_for_attribution(self):
+    def test_the_requesting_cases_are_named_for_the_second_phase(self):
         tasks = presubmit_tasks() + ["./tasks/pdb-remediation-pr/task.yaml", "./tasks/rca-remediation-pr/task.yaml"]
         result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}, tasks=tasks)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(value(result, "REQUESTING"), "pdb-remediation-pr,rca-remediation-pr")
-        self.assertIn("cases that request a pull request: pdb-remediation-pr,rca-remediation-pr", result.stdout)
+        self.assertIn("run after every other unit: pdb-remediation-pr,rca-remediation-pr", result.stdout)
 
     def test_the_task_files_under_bench_tasks_are_not_written(self):
         before = {p: p.read_bytes() for p in (BENCH_DIR / "tasks").glob("*/task.yaml")}
@@ -230,6 +235,56 @@ class InjectLaneTest(unittest.TestCase):
                     self.assertIn("could not append the inject lane's safeguards", result.stderr)
 
 
+class TwoPhaseFanOutTest(unittest.TestCase):
+    """The cases that request a pull request launch only after every other
+    unit has finished; with none named, one phase runs as before."""
+
+    STUBS = textwrap.dedent(
+        """\
+        EVAL_REPETITIONS=2
+        EVAL_TASK_PARALLELISM=4
+        TASKS=("./tasks/a/task.yaml" "./tasks/b/task.yaml" "./tasks/w/task.yaml")
+        TASK_NAMES=(a b w)
+        TASK_REUSE=("" "" "")
+        TASK_HAS_STACK=("" "" "")
+        unit_cost_hint() { echo 200; }
+        profile_begin() { :; }
+        run_one_unit() { echo "START $2 rep $3"; sleep 1; echo "END $2 rep $3"; }
+        """
+    )
+
+    def run_fanout(self, requesting: str) -> list[str]:
+        body = "\n".join(
+            [
+                "set -euo pipefail",
+                self.STUBS,
+                f'INJECT_LANE_REQUESTING="{requesting}"',
+                lifted_block(r"^# Two phases on the inject lane.*?^fi$"),
+                'echo "TOTAL=$((UNIT_TOTAL + WRITER_TOTAL))"',
+            ]
+        )
+        result = subprocess.run(["bash", "-c", body], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.splitlines()
+
+    def test_requesting_units_launch_after_every_other_unit_has_ended(self):
+        lines = self.run_fanout("w")
+        self.assertIn("TOTAL=6", lines)
+        first_w = next(i for i, line in enumerate(lines) if line.startswith("START w"))
+        others_ended = [i for i, line in enumerate(lines) if line.startswith("END ") and not line.startswith("END w")]
+        self.assertEqual(len(others_ended), 4)
+        self.assertLess(max(others_ended), first_w)
+        self.assertTrue(any("every other unit is done; launching the 2 unit(s)" in line for line in lines))
+        # Both repetitions of the writer ran, in the second phase.
+        self.assertEqual(sum(1 for line in lines if line.startswith("END w")), 2)
+
+    def test_with_no_requesting_case_there_is_one_phase(self):
+        lines = self.run_fanout("")
+        self.assertIn("TOTAL=6", lines)
+        self.assertFalse(any("every other unit is done" in line for line in lines))
+        self.assertEqual(sum(1 for line in lines if line.startswith("END ")), 6)
+
+
 class WiringTest(unittest.TestCase):
     def test_the_step_sits_after_the_exclusions_and_before_the_task_names(self):
         src = SCRIPT.read_text(encoding="utf-8")
@@ -244,13 +299,6 @@ class WiringTest(unittest.TestCase):
         unit = re.search(r"^run_one_unit\(\) \{.*?^\}$", src, re.DOTALL | re.MULTILINE).group(0)
         self.assertIn('run_task="$(unit_task_path "${task}" "${name}")"', unit)
         self.assertIn('uv run devops-bench "${run_task}"', unit)
-        # The unit records its interval for the safeguard's attribution: the
-        # in-flight stamp before the bench, the start/end pair after it, the
-        # stamp removed once the pair is written, and the directory exported.
-        inflight = 'printf \'%s\\n\' "${start}" > "${STATE_DIR}/${name}.rep${rep}.inflight"'
-        self.assertIn('export BENCH_FANOUT_STATE_DIR="${STATE_DIR}"', unit)
-        self.assertLess(unit.index(inflight), unit.index("uv run devops-bench"))
-        self.assertLess(unit.index('.rep${rep}.end"'), unit.index('rm -f "${STATE_DIR}/${name}.rep${rep}.inflight"'))
         # Grading still reads the file under bench/tasks/: the scorer's
         # CaseSpec comes from there, and the lane entry reaches it through
         # the record's report.
@@ -266,7 +314,8 @@ class WiringTest(unittest.TestCase):
         # Named, not implied: the job closes nothing.
         self.assertIn("closes none of them", report)
         call = src.index("\nreport_github_leftovers\n")
-        self.assertLess(src.index("EOF_UNIT_QUEUE\nwait\n"), call)
+        # After both phases of the fan-out have been waited for.
+        self.assertLess(src.index('launch_units "${UNIT_QUEUE_WRITERS}"\n  wait\nfi\n'), call)
         self.assertLess(call, src.index("# ─── Per-case verdicts"))
         self.assertLess(src.index("EVAL_RUN_STARTED_AT=\"$(date"), src.index("# 2. Cluster Auth"))
 

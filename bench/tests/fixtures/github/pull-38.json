@@ -1,0 +1,27 @@
+{
+  "url": "https://api.github.com/repos/gke-agentic/kube-agents-evals-21-infra/pulls/38",
+  "html_url": "https://github.com/gke-agentic/kube-agents-evals-21-infra/pull/38",
+  "number": 38,
+  "state": "open",
+  "title": "feat(fleet): add PDB for checkout-gateway",
+  "user": {
+    "login": "kube-agents-evals-token-minter[bot]",
+    "type": "Bot"
+  },
+  "created_at": "2026-09-25T00:39:54Z",
+  "updated_at": "2026-09-25T17:42:49Z",
+  "closed_at": null,
+  "merged_at": null,
+  "changed_files": 2,
+  "commits": 2,
+  "head": {
+    "ref": "platform-agent/checkout-gateway-pdb",
+    "sha": "0d7264e14d68865f5bcde8983e44ad0ecd42a979",
+    "repo": {
+      "full_name": "gke-agentic/kube-agents-evals-21-infra"
+    }
+  },
+  "base": {
+    "ref": "main"
+  }
+}

@@ -42,15 +42,16 @@ has that many requested writes: every ``github_writes`` leaf appended to it
 gets ``requested_pull_requests`` set to that count, so the lane's safeguard
 leaves the case's own pull request out and fails the repetition on anything
 beyond it. The command line also reports that count per case, which the
-script exports as ``BENCH_REQUESTING_CASES`` so a sibling repetition can
-attribute a write made during such a case's unit to it
-(:mod:`kube_agents_bench.github_writes`, attribution).
+script uses to run the requesting cases in a second phase after every other
+unit has finished, so a repetition that requests nothing never shares the
+repository with a case that writes by design.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -80,6 +81,9 @@ REQUESTED_FIELD = "requested_pull_requests"
 #: What a task file names its checks under, and the file the copy is written as.
 SPEC_KEY = "verification_spec"
 TASK_FILE = "task.yaml"
+#: An ``owner/name`` repository and nothing looser: a trailing slash or a
+#: third segment passes an "is there a slash" test and 404s on every call.
+REPO_SLUG_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 
 
 class LaneSafeguardsError(ValueError):
@@ -145,7 +149,7 @@ def check_repository(safeguards: list[dict[str, Any]], repo: str) -> None:
     a repository spends a lease to grade nothing. Known before the fan-out
     from the file and the value, so it is refused here.
     """
-    if "/" not in repo or not repo.split("/", 1)[1]:
+    if not REPO_SLUG_RE.match(repo):
         raise LaneSafeguardsError(f"{repo!r} is not an owner/name repository")
     owner = repo.split("/", 1)[0]
     for entry in safeguards:
@@ -207,8 +211,8 @@ def append_lane_safeguards(
         if entry["name"] in taken:
             raise LaneSafeguardsError(
                 f"{source}: declares an entry named {entry['name']!r}, which is a lane "
-                "safeguard's name; devops-bench would drop the lane's copy as a duplicate, "
-                "so rename the case's entry"
+                "safeguard's name; devops-bench would refuse the duplicate as a parse error "
+                "on every repetition of this case, so rename the case's entry"
             )
         clone = copy.deepcopy(entry)
         for leaf in _leaves(clone.get("check")):
@@ -227,8 +231,8 @@ def main(argv: list[str] | None = None) -> int:
     """Materialise every task given with the lane's safeguards appended.
 
     Prints ``<case> <path> <requested>`` per task -- the copy's path and how
-    many pull requests the case's own checks request, which the script turns
-    into ``BENCH_REQUESTING_CASES`` for the safeguard's attribution; exits
+    many pull requests the case's own checks request, which the script uses
+    to run those cases in the fan-out's second phase; exits
     non-zero, naming the file and the fault, when the lane file or a task
     refuses the append.
     """
