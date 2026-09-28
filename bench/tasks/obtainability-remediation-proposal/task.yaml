@@ -9,7 +9,7 @@
 # pull request on the GitOps repository whose diff carries the manifest,
 # which is what the platform persona behind the inject door does under its
 # own submit-suggestion rule (0 of 3 on the reply-only check, #2037; the
-# check's third arm reads the diff). Live validation on #984 scored both
+# check's diff arm reads it there). Live validation on #984 scored both
 # objectives 1.0 with every safeguard clean, and its three presubmit runs
 # measured it at 126s/130s/124s (OutcomeValidity 1.0 each) on three
 # different leased projects.
@@ -22,7 +22,7 @@
 # namespace "seeded-reliability" on the seeded fleet, with no PodDisruptionBudget.
 # Isolation class: read-only on the cluster; the persona may open a pull
 # request on the leased project's GitOps repository, which the check accepts.
-# The check does not ask whether this run opened it (see the third arm), so a
+# The check does not ask whether this run opened it (see the diff arm), so a
 # reply that only quotes an earlier lease's open pull request carrying the
 # manifest passes too; that is accepted because the persona's skill lands a
 # repeated proposal on the existing pull request without a write, and the
@@ -74,7 +74,7 @@ verification_spec:
       # The proposal in either of the two places the agent puts it. "selector"
       # is required alongside the kind in each: the prose sentence "create a
       # PodDisruptionBudget with minAvailable: 1" is not a manifest, and every
-      # concrete PDB manifest names its selector. Not a third arm over the
+      # concrete PDB manifest names its selector. No arm over the
       # whole transcript (`scope: full`): on the inject transport it reads
       # the same text as the reply, and on the api transport it would pass
       # on an interim message that names the nouns while planning, which is

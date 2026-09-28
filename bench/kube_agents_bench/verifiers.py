@@ -1659,7 +1659,8 @@ _DIFF_ADDED_PREFIX = "+"
 # The `status` GitHub gives a file the pull request deletes.
 _DIFF_REMOVED_STATUS = "removed"
 # Where a run that knows the repository it writes to (owner/name) says so;
-# the inject lane's own GitHub-write safeguard (#2079) is what exports it.
+# hack/ci-eval-pr.sh exports it from the project mapping on every lane
+# (tests/test_ci_eval_gitops_repo_export.py pins the name to this constant).
 # Set, it binds the candidate pull request to that repository; unset, the
 # `owner` pin is the only repository bind.
 _GITOPS_REPO_ENV_VAR = "BENCH_GITOPS_REPO"
@@ -1690,8 +1691,8 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
 
     WHAT IT ASSERTS, AND WHAT IT DOES NOT. The reply names a github.com pull
     request URL under ``owner`` and, when the run was told the repository it
-    writes to (``BENCH_GITOPS_REPO``, which the inject lane exports from the
-    project mapping), in that repository; GitHub resolves it as an OPEN pull
+    writes to (``BENCH_GITOPS_REPO``, which ``hack/ci-eval-pr.sh`` exports from the
+    project mapping on every lane), in that repository; GitHub resolves it as an OPEN pull
     request whose head is an agent branch in the repository itself; and the
     added lines of its patches carry every phrase in ``required_phrases``, at
     least one of ``any_of_phrases``, and none of ``forbidden_phrases``, after

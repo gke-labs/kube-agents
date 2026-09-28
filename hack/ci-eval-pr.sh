@@ -1407,6 +1407,15 @@ release_inflight_note() { # <label> <audit-id>
 }
 
 EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
+# The repository this run's agent writes to, for the checks that bind a pull
+# request the reply names to it (pull_request_diff_contains in
+# bench/kube_agents_bench/verifiers.py reads this name; a test pins it).
+# The deploy's precedence: a developer's EVAL_GITOPS_REPO when set (the
+# deploy refuses it in a Prow run), else the project mapping the deploy and
+# the ledger reset use. Empty when neither names one, in which case those
+# checks bind by organisation alone, as they do on a run driven by hand
+# without it.
+export BENCH_GITOPS_REPO="${EVAL_GITOPS_REPO:-${EVAL_LEDGER_REPO}}"
 reset_audit_ledgers "lease"
 
 # For opentofu provider

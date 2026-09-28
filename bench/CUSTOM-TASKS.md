@@ -544,7 +544,7 @@ and its reply carries the URL and, at most, the kind and the budget. The same pr
 12 of 12 on one front door and 0 of 3 on the other. `pull_request_diff_contains` reads the
 proposal where the persona put it: the phrases of `report_contains`, matched the same way, over
 the added lines of every file the pull request changes plus the names of the files it adds or
-changes. A case writes the two places as one `any`; a third arm over the whole transcript
+changes. A case writes the two places as one `any`; an arm over the whole transcript
 (`scope: full`) is left out on purpose, since it would pass on an interim message that names the
 nouns while planning, the progress-prose false pass that scope is documented to produce above:
 
@@ -576,7 +576,9 @@ proposal made, and a merged manifest anywhere in the organisation is not a stand
 head must be an agent branch (`platform-agent/*`) in the repository itself and its author a
 GitHub App, the three checks the pool sweep's `is_agent_pull_request` applies, so a human's pull
 request under the prefix is not the agent's; and when the run sets `BENCH_GITOPS_REPO`, the
-repository it was told the agent writes to, the pull request must be in that repository. It reads
+repository it was told the agent writes to (`hack/ci-eval-pr.sh` exports it from the project
+mapping on every lane; a run driven by hand sets it or goes without), the pull request must be in
+that repository. It reads
 `BENCH_GITHUB_TOKEN` as the two checks above do, needs `pull_requests: read` on both endpoints,
 and errors only on a fault of ours (a 401, a denial, an unexpected status, an API it could not
 reach) and only when no other URL in the reply passes; a reply naming no pull request fails before

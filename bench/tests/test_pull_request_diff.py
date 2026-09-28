@@ -147,7 +147,7 @@ def test_an_earlier_leases_pull_request_the_run_pointed_at_passes_too(token, git
 def test_the_cases_entry_is_red_on_the_reply_alone_and_green_through_the_diff(token, github):
     """The red-then-green the case's own entry owes: the reply of repetition 1
     fails the inline arm (no selector), and the entry passes through the
-    third arm once the diff is read."""
+    diff arm once the diff is read."""
     stash()
     route_pull(github, 39)
     entry = case_entry()
