@@ -587,8 +587,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     fetch and send nothing but carries a forbidden word as its argument: a
     worker told the helper holds no token may ``grep`` for the word before
     running it, and a case that exempts a plain ``grep`` (one invocation, no
-    shell join, pipe or substitution) grades what the worker did, not what
-    it read. Write the exemption as narrowly as that; a forbidden command
+    shell join, pipe, substitution or redirection) grades what the worker did,
+    not what it read. Write the exemption as narrowly as that; a forbidden command
     behind an exempt one on the same line is a bypass the exemption must not
     admit.
 
