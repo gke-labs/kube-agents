@@ -59,14 +59,17 @@ REFUSED_HOSTS = frozenset(
     }
 )
 
-# Google's project-id grammar: 6 to 30 characters, lower-case letters, digits
-# and hyphens, starting with a letter and not ending in a hyphen. Constraining
-# the segment to this is what stops a path from smuggling a second segment --
-# or an upper-case or dotted spelling the API might normalise -- through the
-# project position. The table does not constrain *which* project; the `gcloud`
-# allowlist takes the same position and its comment says why. IAM bounds the
-# project set, this table bounds the operation.
-PROJECT = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
+# The project segment: Google's project-id grammar (6 to 30 characters,
+# lower-case letters, digits and hyphens, starting with a letter and not ending
+# in a hyphen) or a project number (a decimal int64, as Resource Manager types
+# it), since every API here takes either and an install's `projectId` may be
+# the number. Constraining the segment to these two shapes is what stops a path
+# from smuggling a second segment -- or an upper-case or dotted spelling the
+# API might normalise -- through the project position. The table does not
+# constrain *which* project; the `gcloud` allowlist takes the same position and
+# its comment says why. IAM bounds the project set, this table bounds the
+# operation.
+PROJECT = r"(?:[a-z][a-z0-9-]{4,28}[a-z0-9]|[1-9][0-9]{0,18})"
 
 # A Cloud Trace v1 trace id as the API returns it: a 128-bit value as 32
 # lower-case hex characters. Constraining the segment is what keeps the

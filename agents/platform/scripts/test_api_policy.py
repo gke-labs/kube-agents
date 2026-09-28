@@ -135,12 +135,30 @@ class PathShapeTest(unittest.TestCase):
 
     def test_the_project_grammar_is_googles(self):
         pattern = re.compile(rf"^{PROJECT}$")
-        for project in ("kagents-dev", "abcdef", "a" + "b" * 28 + "c", "p1-2-3"):
+        for project in ("kagents-dev", "abcdef", "a" + "b" * 28 + "c", "p1-2-3", "123456789012", "1", "9" * 19):
             with self.subTest(project=project):
                 self.assertIsNotNone(pattern.match(project))
-        for project in ("abcde", "1abcdef", "abcdef-", "Abcdef", "a" * 31, "ab.cdef", "ab/cdef", "ab cdef"):
+        for project in (
+            "abcde", "1abcdef", "abcdef-", "Abcdef", "a" * 31, "ab.cdef", "ab/cdef", "ab cdef",
+            # A project number is digits alone: no leading zero, nothing an
+            # int64 cannot hold, no sign, no letter after the digits.
+            "0123", "1" * 20, "-123456", "123456a", "12 3456",
+        ):
             with self.subTest(project=project):
                 self.assertIsNone(pattern.match(project))
+
+    def test_a_project_number_is_admitted_on_every_route(self):
+        # An install whose PlatformAgent projectId is the project number sends
+        # it in the project position; the relay takes it the way `gcloud` does.
+        for host, path in (
+            (MONITORING, "v3/projects/123456789012/timeSeries"),
+            (MONITORING, "v3/projects/123456789012/metricDescriptors"),
+            (MONITORING, "v1/projects/123456789012/location/global/prometheus/api/v1/query"),
+            (CLOUDTRACE, "v1/projects/123456789012/traces"),
+            (CLOUDTRACE, f"v1/projects/123456789012/traces/{A_TRACE_ID}"),
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(evaluate("GET", host, path, "").allowed, path)
 
 
 class CloudTraceRoutesTest(unittest.TestCase):
