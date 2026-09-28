@@ -20,7 +20,11 @@ gateway's inject side door, which enters ``handleInbound`` like a message from
 any other backend -- routing, the session record, ``startTask``, the bus, and
 the relay posting the reply back into the conversation. What the harness
 grades is what the conversation received, which is the point: if a customer
-would not see it, a verifier should not depend on it.
+would not see it, a verifier should not depend on it. The one thing read
+past the conversation is the task's tool-call trace, which the relay keeps
+off the chat by design and the read route's probe carries instead
+(:data:`EVENT_ENTRY_ACTIVITY`), so a ``tool_called`` check grades the same
+run on either transport.
 
 This module is the door half: the three HTTP calls (submit; the read that
 polls the transcript and, with ``probe=1``, the gateway's own record; and the
@@ -62,6 +66,7 @@ __all__ = [
     "ENTRY_POST",
     "ENTRY_TASK",
     "ENTRY_TERMINAL",
+    "EVENT_ENTRY_ACTIVITY",
     "EVENT_ENTRY_EDIT",
     "EVENT_ENTRY_POST",
     "EVENT_ENTRY_STATUS",
@@ -160,25 +165,81 @@ ENTRY_EDIT = "edit"
 ENTRY_TASK = "task"
 ENTRY_TERMINAL = "terminal"
 
-# Trajectory entry names this transport records. The inject door carries no
-# tool calls, and structurally cannot: the relay never posts `activity`
-# artifacts to a conversation (they are debug and audit views), so no
-# transport that reads a conversation sees them however the executor behaves.
-# What this one can truthfully record is the conversation itself -- what the
-# agent said -- and the task's lifecycle: every executor state the read route
-# showed (submitted, working) and the terminal, each as an entry named
-# ``a2a.status-update`` with ``args.state`` and ``args.final``, the name and
-# shape of the bus's own status-update events, so a transport that read the
-# bus directly would record the same. ``scoring.py`` reads a final one as the record's liveness signal in
-# place of a token count and duplicates the literal (importing this module
-# would drag the transport into the scorer); ``test_scoring.py`` asserts the
-# two agree, so change it in both files or in neither.
+# Trajectory entry names this transport records. The relay never posts
+# `activity` artifacts to a conversation (they are debug and audit views), so
+# the conversation itself shows no tool calls. What the fold records from it
+# is what the agent said and the task's lifecycle: every executor state the
+# read route showed (submitted, working) and the terminal, each as an entry
+# named ``a2a.status-update`` with ``args.state`` and ``args.final``, the name
+# and shape of the bus's own status-update events, so a transport that read
+# the bus directly would record the same. ``scoring.py`` reads a final one as
+# the record's liveness signal in place of a token count and duplicates the
+# literal (importing this module would drag the transport into the scorer);
+# ``test_scoring.py`` asserts the two agree, so change it in both files or in
+# neither.
 EVENT_ENTRY_POST = "inject.post"
 EVENT_ENTRY_EDIT = "inject.edit"
 EVENT_ENTRY_TASK = "inject.task"
 EVENT_ENTRY_STATUS = "a2a.status-update"
 # The ``status`` field of every trajectory entry this transport writes.
 ENTRY_STATUS_DONE = "completed"
+
+# The tool calls come from the read route instead. The executor publishes
+# the persona's tool calls as the task's ``activity`` artifact (one data
+# part per invocation: ``tool``, ``input``, ``callId``, ``status``,
+# ``errorType``, ``durationMs``, ``at``; ``docs/designs/spec-a2a-payloads.md``),
+# and the door's probe carries the trace beside the record (``activity``,
+# the parts in stream order, present as ``[]`` when the run called nothing
+# and absent on a door that cannot show it; ``activityDropped`` counting the
+# oldest entries its cap cut). The fold maps each part to a trajectory entry
+# in the api transport's shape, ``{"name": tool, "args": input, "result":
+# None, "status": ...}`` (``ToolCall.to_dict``), so ``tool_called`` grades
+# it with no change; hermes's ``tool_call`` wrapper arrives as one part
+# whose ``input.calls[]`` names the tools it invoked (while its input fits
+# the executor's cap: :data:`ACTIVITY_INPUT_TRUNCATED_KEY`), which is the
+# shape the verifier already unwraps on the api path, so it is kept as one
+# entry rather than split. Whenever the probe body carried the key at all, even
+# empty, the fold also writes one marker entry named ``a2a.activity`` with
+# ``args.calls`` (entries written) and ``args.dropped`` (calls the door or
+# the executor counted and did not carry). The marker states the DOOR's
+# capability -- this record could have shown a tool call -- apart from
+# whether the persona made one, and it is the presence of the marker, not
+# of a call, that retires the scorer's not-applicable rule for checks that
+# read tool calls (``scoring._inject_blind``); the scorer duplicates the
+# literal like the status entry's, and ``test_scoring.py`` asserts the two
+# agree.
+EVENT_ENTRY_ACTIVITY = "a2a.activity"
+# The probe body's three keys for the trace (``probeReport`` in
+# ``a2a/gateway/inject.go``).
+PROBE_ACTIVITY_KEY = "activity"
+PROBE_ACTIVITY_DROPPED_KEY = "activityDropped"
+PROBE_PROGRESS_KEY = "progress"
+# The keys of one activity part, as the executors publish them, and the two
+# status words with a meaning here: the api shape's default for a call the
+# part gives no status for (``ToolCall.status`` before a result is folded
+# in), and the bridge's one-entry stand-in for calls past its per-task
+# budget, which is a count and not a call.
+ACTIVITY_TOOL_KEY = "tool"
+ACTIVITY_INPUT_KEY = "input"
+ACTIVITY_STATUS_KEY = "status"
+ACTIVITY_DROPPED_KEY = "dropped"
+ACTIVITY_STATUS_CALLED = "called"
+ACTIVITY_STATUS_TRUNCATED = "truncated"
+# The bridge caps one call's ``input`` and replaces an input over the cap
+# wholesale with ``{"truncated": true, "bytes": N, "head": "..."}``. Such
+# an entry is still a call to its tool, and is written as one; but a
+# ``tool_call`` wrapper over the cap has lost its ``input.calls[]``, so the
+# verifier cannot unwrap the tools it invoked, and a ``tool_called`` naming
+# one of them fails on this transport where the api path passes. The
+# marker counts these so that failure is not read as the persona's.
+ACTIVITY_INPUT_TRUNCATED_KEY = "truncated"
+# The marker's argument names: the two it always carries, and two counts
+# present only when non-zero -- parts that could not be mapped, and calls
+# whose input the executor replaced with its truncation stand-in.
+ACTIVITY_CALLS_ARG = "calls"
+ACTIVITY_DROPPED_ARG = "dropped"
+ACTIVITY_MALFORMED_ARG = "malformed"
+ACTIVITY_INPUT_TRUNCATED_ARG = "input_truncated"
 
 STATE_SUBMITTED = "submitted"
 STATE_WORKING = "working"
@@ -530,13 +591,33 @@ class Fold:
     The fold also keeps the task's lifecycle as the read route showed it
     (``executor_states``), recording each new state as an ``a2a.status-update``
     trajectory entry, with the terminal as the final one.
+
+    And it keeps the task's tool-call trace as the read route last showed
+    it (``activity``): the probe carries the whole trace on every read that
+    names the task, so the latest read's copy replaces the one before rather
+    than adding to it, and the trajectory materialises it once, after the
+    lifecycle entries -- the ``a2a.activity`` marker, then one entry per
+    call in the api transport's shape (:data:`EVENT_ENTRY_ACTIVITY`). A fold
+    whose reads never carried the key writes neither.
     """
 
     task_id: str
     entries: list[dict[str, Any]] = field(default_factory=list)
     posts: list[dict[str, Any]] = field(default_factory=list)
     edited: set[str] = field(default_factory=set)
-    trajectory: list[dict[str, Any]] = field(default_factory=list)
+    # The lifecycle and conversation entries, in the order they were folded.
+    # :attr:`trajectory` is these plus the activity block.
+    events: list[dict[str, Any]] = field(default_factory=list)
+    # The trace as the last read that carried it showed it: ``None`` until a
+    # probe body carries the ``activity`` key, then that read's parts (a
+    # later read's replace them). ``activity_dropped`` is that read's
+    # ``activityDropped``; ``activity_malformed`` counts parts that were not
+    # objects and were not mapped. ``progress`` is the last progress line a
+    # read carried.
+    activity: list[dict[str, Any]] | None = None
+    activity_dropped: int = 0
+    activity_malformed: int = 0
+    progress: str = ""
     terminal: str = ""
     terminal_source: str = ""
     terminal_reason: str = ""
@@ -559,6 +640,108 @@ class Fold:
     @property
     def final(self) -> bool:
         return self.terminal != ""
+
+    @property
+    def trajectory(self) -> list[dict[str, Any]]:
+        """The record's trajectory: the lifecycle and conversation entries,
+        then the activity block when any read carried the trace."""
+        return [*self.events, *self.activity_entries()]
+
+    @property
+    def activity_shown(self) -> bool:
+        """Whether any read carried the ``activity`` key: the door can show
+        this task's tool calls, whether or not it made any."""
+        return self.activity is not None
+
+    def note_activity(self, parts: list[dict[str, Any]], dropped: int, malformed: int) -> None:
+        """Adopt the trace one read carried, replacing the one before.
+
+        The probe carries the whole trace (newest 1000 parts) on every read
+        that names the task, so each read's copy supersedes the last; the
+        final read's is the one the trajectory materialises.
+        """
+        self.activity = list(parts)
+        self.activity_dropped = dropped
+        self.activity_malformed = malformed
+
+    def activity_entries(self) -> list[dict[str, Any]]:
+        """The activity block: the marker, then one entry per call.
+
+        Each part becomes ``{"name": tool, "args": input, "result": None,
+        "status": ...}``, the api transport's ``ToolCall.to_dict`` shape,
+        with the part's own status word (``completed``, ``error``,
+        ``interrupted``) or the api shape's ``called`` when the part has
+        none. A part with no ``input`` maps to empty args; an input that is
+        not an object is kept under the key it arrived by. The bridge's
+        ``truncated`` stand-in for calls past its budget is a count and not
+        a call: its ``dropped`` joins the door's ``activityDropped`` in the
+        marker and no entry is written for it, and a part with no tool name
+        is counted as malformed rather than written as a call to nothing.
+        Empty when no read carried the key.
+        """
+        mapped = self._map_activity()
+        if mapped is None:
+            return []
+        calls, marker_args = mapped
+        marker = {
+            "name": EVENT_ENTRY_ACTIVITY,
+            "args": marker_args,
+            "result": None,
+            "status": ENTRY_STATUS_DONE,
+        }
+        return [marker, *calls]
+
+    @property
+    def activity_summary(self) -> dict[str, Any] | None:
+        """The marker's arguments -- calls written, calls dropped -- or
+        ``None`` on a fold whose reads never carried the trace."""
+        mapped = self._map_activity()
+        return None if mapped is None else mapped[1]
+
+    def _map_activity(self) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+        """The call entries and the marker's arguments, per :meth:`activity_entries`."""
+        if self.activity is None:
+            return None
+        calls: list[dict[str, Any]] = []
+        dropped = self.activity_dropped
+        malformed = self.activity_malformed
+        input_truncated = 0
+        for part in self.activity:
+            if part.get(ACTIVITY_STATUS_KEY) == ACTIVITY_STATUS_TRUNCATED:
+                count = part.get(ACTIVITY_DROPPED_KEY)
+                dropped += count if isinstance(count, int) and count > 0 else 0
+                continue
+            tool = part.get(ACTIVITY_TOOL_KEY)
+            if not isinstance(tool, str) or not tool:
+                malformed += 1
+                continue
+            raw_input = part.get(ACTIVITY_INPUT_KEY)
+            if isinstance(raw_input, dict):
+                args = raw_input
+                if args.get(ACTIVITY_INPUT_TRUNCATED_KEY) is True:
+                    input_truncated += 1
+            elif raw_input is None:
+                args = {}
+            else:
+                args = {ACTIVITY_INPUT_KEY: raw_input}
+            status = part.get(ACTIVITY_STATUS_KEY)
+            calls.append(
+                {
+                    "name": tool,
+                    "args": args,
+                    "result": None,
+                    "status": status if isinstance(status, str) and status else ACTIVITY_STATUS_CALLED,
+                }
+            )
+        marker_args: dict[str, Any] = {
+            ACTIVITY_CALLS_ARG: len(calls),
+            ACTIVITY_DROPPED_ARG: dropped,
+        }
+        if malformed:
+            marker_args[ACTIVITY_MALFORMED_ARG] = malformed
+        if input_truncated:
+            marker_args[ACTIVITY_INPUT_TRUNCATED_ARG] = input_truncated
+        return calls, marker_args
 
     @property
     def deliverable(self) -> str:
@@ -736,7 +919,7 @@ class Fold:
         self._record_status(state, final=True, text=reason)
 
     def _record_status(self, state: str, *, final: bool, text: str) -> None:
-        self.trajectory.append(
+        self.events.append(
             {
                 "name": EVENT_ENTRY_STATUS,
                 "args": {"state": state, "final": final},
@@ -746,7 +929,7 @@ class Fold:
         )
 
     def _record(self, name: str, args: dict[str, Any], result: str | None) -> None:
-        self.trajectory.append(
+        self.events.append(
             {"name": name, "args": args, "result": result, "status": ENTRY_STATUS_DONE}
         )
 
@@ -783,6 +966,19 @@ class Probe:
     terminal_source: str = ""
     result: str = ""
     reason: str = ""
+    # The task's tool-call trace as the stream holds it at this read: the
+    # activity artifact's data parts in stream order, ``[]`` when the run
+    # called nothing, ``None`` when the body had no ``activity`` key -- no
+    # stream was read, or the door predates the field -- which is the
+    # difference between "called nothing" and "cannot show". The door keeps
+    # the newest 1000 and counts the rest in ``activity_dropped``; parts
+    # that were not objects are dropped here and counted in
+    # ``activity_malformed``. ``progress`` is the progress artifact's last
+    # line, the one the relay's rolling edit shows.
+    activity: list[dict[str, Any]] | None = None
+    activity_dropped: int = 0
+    activity_malformed: int = 0
+    progress: str = ""
     last_post: str = ""
     error: str = ""
 
@@ -798,6 +994,12 @@ class Probe:
             return float(value) if isinstance(value, (int, float)) else 0.0
 
         last_post = raw.get("lastPost")
+        raw_activity = raw.get(PROBE_ACTIVITY_KEY)
+        activity: list[dict[str, Any]] | None = None
+        malformed = 0
+        if isinstance(raw_activity, list):
+            activity = [part for part in raw_activity if isinstance(part, dict)]
+            malformed = len(raw_activity) - len(activity)
         return cls(
             backend=str(raw.get("backend") or ""),
             inject_only=bool(raw.get("injectOnly")),
@@ -813,6 +1015,10 @@ class Probe:
             terminal_source=str(raw.get("terminalSource") or ""),
             result=str(raw.get("result") or ""),
             reason=str(raw.get("reason") or ""),
+            activity=activity,
+            activity_dropped=int(_num(PROBE_ACTIVITY_DROPPED_KEY)),
+            activity_malformed=malformed,
+            progress=str(raw.get(PROBE_PROGRESS_KEY) or ""),
             last_post=str(last_post.get("text") or "") if isinstance(last_post, dict) else "",
             error=str(raw.get("error") or ""),
         )
@@ -836,7 +1042,14 @@ class Probe:
         if self.error:
             return f"could not look: {self.error}"
         if not self.active:
-            return "no active task on the record"
+            text = "no active task on the record"
+            if self.task_id and self.final:
+                # A finished task read by id after the relay released it.
+                text += (
+                    f"; task {self.task_id} final ({self.executor_state or 'state unknown'}, "
+                    f"{self.terminal_source or 'source unknown'})"
+                )
+            return text + self._describe_trace()
         text = f"active task {self.task_id}, executor state {self.executor_state or 'none'}"
         if self.final:
             text += f" (final, {self.terminal_source or 'source unknown'})"
@@ -845,11 +1058,24 @@ class Probe:
         text += f", {self.age_seconds:.0f}s old against a {self.grace_seconds:.0f}s grace"
         if self.submitted_at:
             text += f", submitted at {self.submitted_at}"
+        text += self._describe_trace()
         if self.last_post:
             excerpt = self.last_post[:LAST_POST_EXCERPT_CHARS]
             if len(self.last_post) > LAST_POST_EXCERPT_CHARS:
                 excerpt += "…"
             text += f"; last post: {excerpt!r}"
+        return text
+
+    def _describe_trace(self) -> str:
+        """The trace and progress half of :meth:`describe`; empty on a door
+        that carried neither."""
+        text = ""
+        if self.activity is not None:
+            text += f"; {len(self.activity)} tool call(s) on the stream"
+            if self.activity_dropped:
+                text += f" (+{self.activity_dropped} the door did not carry)"
+        if self.progress:
+            text += f"; progress: {self.progress!r}"
         return text
 
 
@@ -1194,9 +1420,23 @@ class InjectTask:
         return Exchange(fold, OUTCOME_NEVER_STARTED, self.conversation, task_id, probe)
 
     def _note(self, fold: Fold, task_id: str, probe: Probe) -> None:
-        """Record what a read showed of this task's lifecycle."""
+        """Record what a read showed of this task's lifecycle and its trace.
+
+        The trace is taken from any read the door answered about THIS task
+        (``taskId`` on the probe is the task the read describes: the one the
+        poll named, whether or not the record still holds it as active),
+        final or not, because the probe carries the whole trace on each read
+        and the last one -- the read that showed the terminal, after the
+        relay released the task -- is the complete one. The lifecycle is
+        taken only while the task is active and not final, as before.
+        """
         if probe.grace_seconds > 0:
             self.first_event_grace = probe.grace_seconds
+        if probe.could_look and probe.task_id == task_id:
+            if probe.activity is not None:
+                fold.note_activity(probe.activity, probe.activity_dropped, probe.activity_malformed)
+            if probe.progress:
+                fold.progress = probe.progress
         if probe.could_look and probe.concerns(task_id) and not probe.final and not fold.final:
             if probe.reached_working:
                 # The read shows the latest state; ``working`` may have come

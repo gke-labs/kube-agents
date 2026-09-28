@@ -30,11 +30,15 @@ happened. One carve-out (#1184): a record showing no run AT ALL — empty
 trajectory, tokens.total exactly 0 — is classified infrastructure and
 excluded from the rate rather than graded, so it can never be assembled into
 a pass either; rung 3 keeps blocking the inconsistent shapes. A second
-carve-out (#2039) is the inject lane's: on a record that is that transport's
-envelope with no tool call, a check that reads tool calls or worker logs is
-set aside as not applicable before the rungs -- failed or errored, it is
-neither a graded failure nor a rung-2 block there -- and the rungs grade
-what remains (see ``_inject_lane_view``).
+carve-out (#2039) is the inject lane's: on that transport's record, a check
+that reads what the record cannot show is set aside as not applicable
+before the rungs -- failed or errored, it is neither a graded failure nor a
+rung-2 block there -- and the rungs grade what remains (see
+``_inject_lane_view``). A check that reads the delegated workers is set
+aside on every inject record; a router-scope ``tool_called`` only on one
+from a door that showed no tool-call trace (no ``a2a.activity`` marker),
+and it grades in full on one carrying the marker, whether or not the
+persona made a call.
 
 HOW THE JUDGE IS AND IS NOT USED. No judged score is ever compared against an
 absolute threshold, and the reason is measured rather than assumed: three
@@ -62,6 +66,7 @@ __all__ = [
     "DEFAULT_AGGREGATE_MIN_SCORED",
     "DEFAULT_JUDGED_MARGIN",
     "DEFAULT_JUDGED_METRICS",
+    "INJECT_ACTIVITY_EVENT",
     "INJECT_ENVELOPE_EVENTS",
     "INJECT_TASK_EVENT",
     "MISSING",
@@ -177,29 +182,44 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 A2A_STATUS_EVENT = "a2a.status-update"
 A2A_STATE_WORKING = "working"
 
-#: The other three trajectory entry names the inject transport writes
-#: (``inject_transport.EVENT_ENTRY_TASK`` / ``_POST`` / ``_EDIT``). Together
-#: with the status entry they are the transport's ENVELOPE: what the
-#: conversation showed, never a tool call. The task entry is the record's
-#: transport marker -- the transport records it once per task it saw, and
-#: devops-bench keeps no ``metadata`` block through which the harness's
-#: ``transport`` field could reach the record -- and a trajectory that
-#: carries the marker and nothing outside the envelope is a run on the
-#: inject transport that carries no tool calls. That, and only that, is the
-#: condition under which a check that reads tool calls or worker logs is
-#: reported as not applicable (:func:`_inject_lane_view`): the first record
-#: whose trajectory carries a tool entry leaves the envelope and every check
-#: grades as it does on the api transport, with no edit here. Getting a tool
-#: entry there is transport work that is not filed yet -- the relay never
-#: posts ``activity`` artifacts to a conversation, so an executor publishing
-#: them (#2038) does not by itself reach the record. Duplicated rather than
-#: imported, like the status entry; ``test_scoring.py`` asserts each agrees
-#: with the transport's.
+#: The other trajectory entry names the inject transport writes
+#: (``inject_transport.EVENT_ENTRY_TASK`` / ``_POST`` / ``_EDIT`` /
+#: ``_ACTIVITY``). Together with the status entry they are the transport's
+#: ENVELOPE: what the conversation and the read route showed about the
+#: task, never a tool call. The task entry is the record's transport marker
+#: -- the transport records it once per task it saw, and devops-bench keeps
+#: no ``metadata`` block through which the harness's ``transport`` field
+#: could reach the record. The activity entry is the record's CAPABILITY
+#: marker: the transport writes it whenever the door's probe carried the
+#: task's tool-call trace at all (``activity`` on the probe body, even
+#: ``[]``), with ``args.calls`` and ``args.dropped``, and behind it one
+#: entry per call in the api transport's shape. A trajectory that carries
+#: the task marker, no activity marker, and nothing outside the envelope is
+#: a run on the inject transport whose door could not show tool calls.
+#: That, and only that, is the condition under which a router-scope
+#: ``tool_called`` is reported as not applicable (:func:`_inject_lane_view`):
+#: a record carrying the activity marker grades it in full, whether the
+#: persona made a call or not, because the rule retires on the door's
+#: capability rather than on that run's luck -- a check that reads a call
+#: the persona never made fails there as it would on the api transport. (A
+#: tool entry with no marker, which no shipped transport writes, retires it
+#: too, as before.) A check that reads the delegated workers is set aside
+#: on every inject record, marker or not: the trace carries no card ids
+#: and no worker's entries (``cases.py``, ``worker_blind_checks``).
+#: Duplicated rather than imported, like the status entry;
+#: ``test_scoring.py`` asserts each agrees with the transport's.
 INJECT_TASK_EVENT = "inject.task"
 INJECT_POST_EVENT = "inject.post"
 INJECT_EDIT_EVENT = "inject.edit"
+INJECT_ACTIVITY_EVENT = "a2a.activity"
 INJECT_ENVELOPE_EVENTS = frozenset(
-    {INJECT_TASK_EVENT, INJECT_POST_EVENT, INJECT_EDIT_EVENT, A2A_STATUS_EVENT}
+    {
+        INJECT_TASK_EVENT,
+        INJECT_POST_EVENT,
+        INJECT_EDIT_EVENT,
+        INJECT_ACTIVITY_EVENT,
+        A2A_STATUS_EVENT,
+    }
 )
 
 #: The repetition outcome when the inject lane set every objective check
@@ -323,7 +343,7 @@ class Rung(IntEnum):
     GREEN = 7
     #: Not a rung. Every repetition ran and was read, and every objective
     #: check the case declares was set aside as not applicable on the record's
-    #: transport (the inject lane, whose record carries no tool calls), so
+    #: transport (the inject lane, on a door that showed no tool-call trace), so
     #: there is nothing deterministic left to grade. Never blocks: the case's
     #: premise, not the change under test, is what the lane cannot see.
     #: Distinct from INFRA so the suite counts it as evaluated.
@@ -658,21 +678,36 @@ def _provision_death(error: Any, deployer: str) -> str | None:
     return None
 
 
-def _inject_blind(trajectory: list[Any]) -> bool:
-    """Whether the trajectory is the inject transport's envelope and nothing else.
+def _inject_record(trajectory: list[Any]) -> bool:
+    """Whether the trajectory is the inject transport's: it carries the
+    transport's task marker. False for an api record and for an empty
+    trajectory (the never-ran shapes keep their own classification)."""
+    return any(
+        isinstance(entry, dict) and entry.get("name") == INJECT_TASK_EVENT for entry in trajectory
+    )
 
-    True when it carries the transport's task marker and every entry is one
-    of the envelope names: a run on the inject transport whose record holds
-    no tool call. False for an api-transport record (no marker), for an
-    empty trajectory (the never-ran shapes keep their own classification),
-    and for an inject record that does carry a tool entry -- which is what
-    the record looks like once the executor publishes activity artifacts,
-    and is the condition under which every check grades as before.
+
+def _inject_blind(trajectory: list[Any]) -> bool:
+    """Whether the trajectory is the inject transport's envelope from a door
+    that could not show tool calls.
+
+    True when it carries the transport's task marker, no activity marker,
+    and every entry is one of the envelope names: a run on the inject
+    transport whose door carried no tool-call trace. False for an
+    api-transport record (no task marker), for an empty trajectory (the
+    never-ran shapes keep their own classification), for an inject record
+    carrying the activity marker (the door showed the trace, with or without
+    a call in it, and every check grades as on the api transport), and for
+    one that carries a tool entry by any other route.
     """
     if not trajectory:
         return False
     names = [entry.get("name") if isinstance(entry, dict) else None for entry in trajectory]
-    return INJECT_TASK_EVENT in names and all(name in INJECT_ENVELOPE_EVENTS for name in names)
+    return (
+        INJECT_TASK_EVENT in names
+        and INJECT_ACTIVITY_EVENT not in names
+        and all(name in INJECT_ENVELOPE_EVENTS for name in names)
+    )
 
 
 @dataclass(frozen=True)
@@ -766,7 +801,7 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     does not apply and the record grades exactly as it always has.
 
     The rule (#2039): on a record that is the inject transport's envelope
-    with no tool call in it (:func:`_inject_blind`), every report entry the
+    from a door that showed no tool-call trace (:func:`_inject_blind`), every report entry the
     task declares with only ``tool_called``, ``worker_commands`` or ``worker_agents`` leaves
     (:attr:`CaseSpec.transport_blind_checks`) is set aside as not
     applicable -- whatever devops-bench recorded
@@ -779,23 +814,31 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     no objective check remains, the repetition is not graded rather than
     passed.
 
+    The set-aside is per check family, because the door's trace serves one
+    and not the other (``cases.py``, the two sets): a router-scope
+    ``tool_called`` (:attr:`CaseSpec.trace_blind_checks`) is set aside only
+    on an inject record whose door showed no trace (:func:`_inject_blind`),
+    and grades in full on one carrying the activity marker; a check that
+    reads the delegated workers (:attr:`CaseSpec.worker_blind_checks`) is
+    set aside on every inject record (:func:`_inject_record`), marker or
+    not, since the trace carries no card ids and no worker's entries.
+
     None on the api transport, on a record with no blind entry in its report
     (the set is matched by name, so a task with no such check or a report
-    naming none of them is untouched), and on an inject record that carries
-    a tool entry.
+    naming none of them is untouched), and on an inject record whose door
+    showed the trace when the task's only blind checks are of the first kind.
     """
-    if not spec.transport_blind_checks or not _inject_blind(record.trajectory):
+    if not spec.transport_blind_checks or not _inject_record(record.trajectory):
         return None
+    set_aside = set(spec.worker_blind_checks)
+    if _inject_blind(record.trajectory):
+        set_aside |= spec.trace_blind_checks
     blind = [
-        str(e.get("name"))
-        for e in record.verification_report
-        if str(e.get("name")) in spec.transport_blind_checks
+        str(e.get("name")) for e in record.verification_report if str(e.get("name")) in set_aside
     ]
     if not blind:
         return None
-    kept = [
-        e for e in record.verification_report if str(e.get("name")) not in spec.transport_blind_checks
-    ]
+    kept = [e for e in record.verification_report if str(e.get("name")) not in set_aside]
     signals = _rollup(kept, len(record.verification_parse_errors))
     scores = dict(record.scores)
     # Recompute only what the record carried. A scores map that exists but

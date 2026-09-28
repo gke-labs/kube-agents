@@ -144,8 +144,9 @@ the presubmit exports nothing new until it chooses to. The exchange:
    reading the conversation, so it treats that edit as the terminal: infrastructure, the
    gateway failed to publish, and no cancel, because nothing was ever on a subject.
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
-   `final_message`); map `activity` and `progress` artifacts into the trajectory when the
-   executor publishes them. Token counts are not on the bus, and the scorer's liveness rule
+   `final_message`); map `activity` artifacts into the trajectory and the `progress` artifact's
+   last line into the record's `metadata` when the executor publishes them. Token counts are not
+   on the bus, and the scorer's liveness rule
    fails a record whose token total is null, so the inject record is written the way the
    diagnostic transport below writes its own: every lifecycle event of the task, `submitted`,
    `working` and the terminal, is a trajectory entry under the status-event name, the token
@@ -311,22 +312,29 @@ gate, an `authority` block that names a real principal, and the reply rendered i
 
 **Which verifiers work.** `report_contains` reads the answer text and works unchanged.
 `resource_property` and `fleet_resource_property` read the cluster and never touched the
-transport. `tool_called` reads the trajectory, which on this path carries no tool-call data:
-the relay never posts `activity` artifacts to a conversation, so a transport that reads one
-sees none whatever the executor publishes, and recording them is transport work of its own. The
-executors differ beneath that — the Hermes bridge publishes status updates and a `result`
-artifact and no `activity` or `progress` artifacts, while the worker adapter publishes `activity`
-and `progress` beside the result — so a case that gates on `tool_called` has no data on stage 1
-until both the executor publishes activity and the transport records it. `worker_commands` reads
+transport. `tool_called` reads the trajectory, which on this path carries tool-call data only
+when the executor publishes `activity` artifacts and the door's probe carries them: the relay
+never posts `activity` to a conversation, so the harness reads the trace off the read route
+instead (`activity` on the probe body, `[]` for a run that called nothing, absent on a door that
+cannot show it), maps each entry to a trajectory item in the api path's shape, and writes one
+`a2a.activity` marker whenever the key was present at all. Both executors publish them: the
+worker adapter from the harness's `tool_use` blocks, the Hermes bridge from hermes's outbound
+webhooks (`a2a/docs/hermes-bridge.md`), each with a `progress` heartbeat beside the result. A
+door or an executor built without that publishes no trace, and the record then carries no marker.
+`worker_commands` reads
 the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
 signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
-as a failure meanwhile: on a record whose trajectory is this transport's envelope with no tool
-call in it, the scorer sets every `tool_called`, `worker_commands` and `worker_agents` entry aside as not
-applicable and grades the checks that remain; a case with no other objective is not graded on
-the lane rather than collapsed, and the rule retires itself on the first record that carries a
-tool entry ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
-cannot show") — which, as above, is transport work that is not filed. A case whose premise
+as a failure meanwhile: on this transport's record the scorer sets every `worker_commands` and
+`worker_agents` entry aside as not applicable, and every `tool_called` entry too when the record
+carries no `a2a.activity` marker, and grades the checks that remain; a case with no other
+objective is not graded on the lane rather than collapsed. The marker retires the set-aside for a
+`tool_called` in its default `router` scope — it states the door's capability to show calls,
+whether or not the run made one — and nothing else: a `tool_called` in the `workers` or `all`
+scope reads the workers' tagged entries, which the trace does not carry, and stays set aside with
+the worker checks
+([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
+cannot show"). A case whose premise
 needs the front door — `agent-kanban-smoke`, which grades
 the chat profile's `kanban_create` — is a different matter: the door addresses `platform`
 directly, so `hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the
@@ -496,7 +504,8 @@ moved with it. Today's wait cannot be re-entered as it is: it is a method of the
 that re-posts `/v1/responses`, takes card ids from `kanban_create` tool results and statuses from
 the kanban store or from `kanban_show` payloads in the trajectory, and gives up after three status
 turns that report nothing, and
-on this path the trajectory holds no tool calls, only the lifecycle entries of step 4. Stage 1
+on this path the trajectory holds no tool results (the door's trace carries calls without their
+results), so no card id can be read from it. Stage 1
 writes the wait again for the inject path: card ids and statuses read from the `result` text, the
 status question sent as a new turn on the same conversation key with its own backend message
 id, `<run>/<case>/<rep>/status-<n>`, so the dedupe does not answer it with the opening task,

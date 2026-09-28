@@ -172,7 +172,79 @@ def test_yaml_is_loaded_safely(write_task):
 
 
 def test_the_kanban_smoke_names_its_tool_called_objective(kanban_task):
-    assert load_case(kanban_task).transport_blind_checks == {"the-kanban-card-was-actually-filed"}
+    spec = load_case(kanban_task)
+    assert spec.transport_blind_checks == {"the-kanban-card-was-actually-filed"}
+    # A router-scope tool_called: gradable once the door shows the trace.
+    assert spec.trace_blind_checks == {"the-kanban-card-was-actually-filed"}
+    assert spec.worker_blind_checks == frozenset()
+
+
+def test_the_blind_set_splits_by_what_the_doors_trace_can_serve(write_task):
+    """#2038: the door's trace carries the delegating turn's calls, so a
+    router-scope ``tool_called`` grades once the record carries the
+    ``a2a.activity`` marker; it carries no card ids and no worker's entries,
+    so ``worker_commands``, ``worker_agents`` and a ``tool_called`` in the
+    ``workers`` or ``all`` scope stay blind on every inject record. A
+    compound mixing a router leaf with a worker leaf lands on the worker
+    side, since its worker leaf would still error with the trace shown."""
+    path = write_task(
+        "split",
+        {
+            "id": "split",
+            "verification_spec": [
+                {"name": "router", "role": "objective", "check": {"type": "tool_called", "tool_names": ["kanban_create"]}},
+                {
+                    "name": "router-explicit",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["kanban_create"], "scope": "router"},
+                },
+                {
+                    "name": "never-filed",
+                    "role": "safeguard",
+                    "check": {"type": "none", "checks": [{"type": "tool_called", "tool_names": ["kanban_create"]}]},
+                },
+                {
+                    "name": "worker-scope",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["kubectl"], "scope": "workers"},
+                },
+                {
+                    "name": "all-scope",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["kubectl"], "scope": "all"},
+                },
+                {"name": "commands", "role": "objective", "check": {"type": "worker_commands", "required_patterns": ["x"]}},
+                {"name": "profile", "role": "objective", "check": {"type": "worker_agents", "required_agents": ["c.*"]}},
+                {
+                    "name": "mixed-blind",
+                    "role": "objective",
+                    "check": {
+                        "type": "all",
+                        "checks": [
+                            {"type": "tool_called", "tool_names": ["kanban_create"]},
+                            {"type": "worker_commands", "required_patterns": ["x"]},
+                        ],
+                    },
+                },
+                {
+                    "name": "mixed-applicable",
+                    "role": "objective",
+                    "check": {
+                        "type": "all",
+                        "checks": [
+                            {"type": "tool_called", "tool_names": ["kanban_create"]},
+                            {"type": "report_contains", "required_phrases": ["x"]},
+                        ],
+                    },
+                },
+            ],
+        },
+    )
+    spec = load_case(path)
+    assert spec.trace_blind_checks == {"router", "router-explicit", "never-filed"}
+    assert spec.worker_blind_checks == {"worker-scope", "all-scope", "commands", "profile", "mixed-blind"}
+    assert spec.transport_blind_checks == spec.trace_blind_checks | spec.worker_blind_checks
+    assert "mixed-applicable" not in spec.transport_blind_checks
 
 
 def test_a_task_with_no_such_check_has_an_empty_set(write_task):

@@ -243,14 +243,18 @@ nothing in the two roster files changes, and every case not named in the lane's 
 (below) runs and can red the job exactly as on the api lane. Two things differ, and they are
 kept apart on purpose.
 
-A check the transport blinds is the scorer's business. The door's record carries no tool calls
-and no card ids, so `tool_called`, `worker_commands` and `worker_agents` see nothing there; `bench-gate` sets
+A check the transport blinds is the scorer's business. The door's record carries no card ids
+and no worker's entries, so `worker_commands`, `worker_agents` and a `tool_called` in the
+`workers` or `all` scope see nothing there, and a door that shows no tool-call trace leaves a
+`tool_called` in its default `router` scope nothing either; `bench-gate` sets
 those entries aside as not applicable on that transport and grades the rest, and a case whose
 only objectives are of that kind is reported `NOT_GRADED_ON_TRANSPORT` rather than collapsed —
 evaluated, outside the pass rate, never weather
 ([`docs/designs/eval-scorer.md`](designs/eval-scorer.md), "The inject lane sets aside what its
-transport cannot show"). No roster edit is involved, and the rule retires itself once the
-executor's tool calls reach the record.
+transport cannot show"). No roster edit is involved. The router-scope `tool_called` half of the
+rule retires on a record whose door showed the trace (the transport's `a2a.activity` marker),
+whether or not the run made a call; the worker half stays until a later change rebuilds the
+delegation wait for this path and takes those entries out of `worker_blind_checks`.
 
 A premise the transport removes is the lane's exclusion list,
 `hack/eval/inject-lane-exclusions.txt`. The door addresses `platform` directly, so a case that
