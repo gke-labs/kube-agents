@@ -35,6 +35,8 @@ sys.path.insert(1, str(Path(__file__).resolve().parents[2] / "platform" / "scrip
 import bootstrap_delivery  # noqa: E402
 import bootstrap_scan_gate  # noqa: E402
 import cluster_agent_profile  # noqa: E402
+import profile_scaffold  # noqa: E402
+from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS  # noqa: E402
 
 INVENTORY = "INVENTORY.md"
 DELIVERED = "INVENTORY.delivered.md"
@@ -189,13 +191,17 @@ class ScanGateTest(unittest.TestCase):
             rc = bootstrap_scan_gate.main(self.d)
         return rc, buf.getvalue().strip()
 
-    def _cluster_agent(self, project, cluster, location):
+    def _cluster_agent(self, project, cluster, location, registered=True, artifacts=SCAFFOLD_ARTIFACTS):
         # Named and stamped by the functions create_profile uses, so the fixture
         # carries the identity block the reconcile actually writes.
         name = cluster_agent_profile.profile_name(project, cluster, location)
         home = cluster_agent_profile.profile_home(name)
         home.mkdir(parents=True)
         cluster_agent_profile._inject_cluster_identity(home, project, cluster, location)
+        if registered:
+            (home / profile_scaffold.PROFILE_MARKER).write_text("")
+        for artifact in artifacts:
+            (home / artifact).write_text("")
         return name
 
     @staticmethod
@@ -377,8 +383,12 @@ class ScanGateTest(unittest.TestCase):
             home = self.d / "profiles" / reserved
             home.mkdir(parents=True)
             cluster_agent_profile._inject_cluster_identity(home, "p", cluster, "l")
-        (self.d / "profiles" / "cluster-p-unstamped-l").mkdir()
-        step2 = self._step_2(bootstrap_scan_gate._task_body())
+        unstamped = self.d / "profiles" / "cluster-p-unstamped-l"
+        unstamped.mkdir()
+        for marker in (profile_scaffold.PROFILE_MARKER, *SCAFFOLD_ARTIFACTS):
+            (unstamped / marker).write_text("")
+        with contextlib.redirect_stderr(io.StringIO()):
+            step2 = self._step_2(bootstrap_scan_gate._task_body())
         self.assertNotIn("kanban_create(", step2)
         self.assertIn("    (none)", step2)
         self.assertIn("If no calls are listed above", step2)
@@ -394,6 +404,22 @@ class ScanGateTest(unittest.TestCase):
         self.assertNotIn("parents", calls[0])
         self.assertIn("Pass no `parents`", step2)
 
+    def test_step_2_leaves_out_a_profile_whose_scaffold_did_not_finish(self):
+        # Hermes never registered the first, so a card assigned to it is never
+        # dispatched; the second stopped before USER.md, so its worker blocks at
+        # preflight. platform_control's list_cluster_profiles leaves out both.
+        ready = self._cluster_agent("proj", "prod", "us-east4")
+        unregistered = self._cluster_agent("proj", "stray", "us-east4", registered=False)
+        half_built = self._cluster_agent("proj", "half", "us-east4", artifacts=())
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            step2 = self._step_2(bootstrap_scan_gate._task_body())
+        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
+        self.assertEqual(len(calls), 1)
+        self.assertIn(f"assignee='{ready}'", calls[0])
+        self.assertIn(f"{unregistered}: scaffold not finished", stderr.getvalue())
+        self.assertIn(f"{half_built}: scaffold not finished", stderr.getvalue())
+
     def test_an_unreadable_roster_files_the_solo_sweep(self):
         # A scripts directory without cluster_agent_profile must not fail the cron
         # run. The card then reads as having no Cluster Agents, the same answer the
@@ -408,6 +434,8 @@ class ScanGateTest(unittest.TestCase):
         good = self._cluster_agent("proj", "prod", "us-east4")
         bad = cluster_agent_profile.profile_home("cluster-broken")
         bad.mkdir(parents=True)
+        for marker in (profile_scaffold.PROFILE_MARKER, *SCAFFOLD_ARTIFACTS):
+            (bad / marker).write_text("")
         (bad / "config.yaml").write_text("- a\n")
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
@@ -415,7 +443,8 @@ class ScanGateTest(unittest.TestCase):
         calls = [line for line in step2.splitlines() if "kanban_create(" in line]
         self.assertEqual(len(calls), 1)
         self.assertIn(f"assignee='{good}'", calls[0])
-        self.assertIn("cluster-broken", stderr.getvalue())
+        self.assertIn("cluster-broken: ", stderr.getvalue())
+        self.assertNotIn("cluster-broken: scaffold not finished", stderr.getvalue())
 
     def test_the_card_lists_the_roster_the_reconcile_left(self):
         """The roster is read after the gate's own reconcile, not before it.

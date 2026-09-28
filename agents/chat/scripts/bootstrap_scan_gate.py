@@ -175,6 +175,12 @@ def _cluster_agent_calls() -> list[str]:
     ``HERMES_HOME``, the same root the markers and the reconcile use, so it
     follows ``spec.harness.hermes.agentHome``.
 
+    A profile is listed only when ``platform_control``'s ``list_cluster_profiles``
+    would list it: registered with Hermes and its scaffold finished. A card
+    assigned to an unregistered directory is never dispatched and the sweep
+    waits on it forever; a profile without ``USER.md`` blocks at preflight, and
+    its cluster is better audited by the sweep itself in Step 4.
+
     A profile without a readable ``cluster_identity`` is left out, as the
     reconcile neither counts nor prunes one: there is no cluster to key its card
     by, and the card already sends every cluster the list misses to Step 4. A
@@ -189,6 +195,8 @@ def _cluster_agent_calls() -> list[str]:
     """
     try:
         import cluster_agent_profile as cap  # beside this script in the pod, as for the reconcile
+        from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS
+        from profile_scaffold import is_scaffolded
 
         names = cap.list_profiles()
     except Exception as e:  # noqa: BLE001 - never fail the cron run; see the docstring
@@ -196,12 +204,23 @@ def _cluster_agent_calls() -> list[str]:
         return []
     calls = []
     for name in names:
+        home = cap.profile_home(name)
+        missing = [f for f in SCAFFOLD_ARTIFACTS if not (home / f).is_file()]
+        if not is_scaffolded(home) or missing:
+            sys.stderr.write(
+                f"bootstrap_scan_gate: skipping Cluster Agent {name}: scaffold not finished "
+                f"(registered={is_scaffolded(home)}, missing={missing})\n"
+            )
+            continue
         try:
-            identity = cap.read_cluster_identity(cap.profile_home(name))
+            identity = cap.read_cluster_identity(home)
         except Exception as e:  # noqa: BLE001 - see the docstring
             sys.stderr.write(f"bootstrap_scan_gate: skipping Cluster Agent {name}: {e}\n")
             continue
         if identity is None:
+            sys.stderr.write(
+                f"bootstrap_scan_gate: skipping Cluster Agent {name}: no complete cluster_identity in its config\n"
+            )
             continue
         project, cluster, location = identity["project"], identity["cluster"], identity["location"]
         calls.append(
