@@ -142,9 +142,8 @@ A live-deployment test installs what it tests by running the plugins' own `insta
 first, so what it exercises is the chart in this repository rather than whatever happens
 to be deployed on the cluster; `SKIP_INSTALL=true` reuses the existing deployment.
 
-CI runs the unit tests only, one plugin at a time
-([`agentplugins-test.yml`](../.github/workflows/agentplugins-test.yml)); the rest are run
-by hand against a deployment.
+CI runs the unit tests only, through `make test-python` (`python-tests.yml`), one discovery
+pass per plugin directory; the rest are run by hand against a deployment.
 
 ## Adding a plugin
 
