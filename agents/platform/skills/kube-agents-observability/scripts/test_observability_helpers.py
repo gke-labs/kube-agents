@@ -100,6 +100,17 @@ class FakeHttp:
         return answer if isinstance(answer, FakeResponse) else FakeResponse(200, answer)
 
 
+class PagedHttp(FakeHttp):
+    """Serves each URL's answers in order, one per call, so a test can stage pages."""
+
+    def get(self, url, *, params=None, headers=None, timeout=None):
+        self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
+        if url not in self.answers or not self.answers[url]:
+            raise AssertionError(f"unexpected relayed GET {url}")
+        answer = self.answers[url].pop(0)
+        return answer if isinstance(answer, FakeResponse) else FakeResponse(200, answer)
+
+
 def run(main, argv, **kwargs):
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -124,6 +135,10 @@ class BrokerSessionCase(unittest.TestCase):
 
     def session(self, answers):
         self.http = FakeHttp(answers)
+        return credential_proxy_client.ApiSession(http=self.http)
+
+    def paged_session(self, answers):
+        self.http = PagedHttp(answers)
         return credential_proxy_client.ApiSession(http=self.http)
 
     def assert_every_call_is_a_relayed_read_the_policy_admits(self):
@@ -168,6 +183,31 @@ class AnalyzeTraceLatencyTest(BrokerSessionCase):
         self.assertTrue(lines[0].startswith("  - POST /v1/chat/completions"), lines)
         self.assertTrue(lines[-1].startswith("  - auth /v1/chat/completions"), lines)
         self.assertNotIn(f"Trace ID: {TRACE_B}", out)
+
+    def test_an_empty_first_page_with_a_token_is_followed_not_reported_as_no_traces(self):
+        # Cloud Trace answers an empty first page with a nextPageToken when the
+        # newest bucket holds nothing; the traces are on the next page.
+        session = self.paged_session({
+            RELAYED_TRACES: [{"nextPageToken": "p2"}, {"traces": [{"traceId": TRACE_A}]}],
+            f"{RELAYED_TRACES}/{TRACE_A}": [TRACE_A_DETAIL],
+        })
+        code, out, err = run(analyze_trace_latency.main, ["--project-id", PROJECT, "--limit", "1"], session=session)
+        self.assertEqual(0, code, err)
+        self.assertNotIn("No traces found", out)
+        self.assertIn(f"Trace ID: {TRACE_A}", out)
+        first, second = self.http.calls[0], self.http.calls[1]
+        self.assertNotIn("pageToken", first["params"])
+        self.assertEqual("p2", second["params"]["pageToken"])
+        self.assertEqual(first["params"]["startTime"], second["params"]["startTime"])
+
+    def test_listing_stops_once_the_limit_is_in_hand(self):
+        session = self.paged_session({
+            RELAYED_TRACES: [{"traces": [{"traceId": TRACE_A}], "nextPageToken": "more"}],
+            f"{RELAYED_TRACES}/{TRACE_A}": [TRACE_A_DETAIL],
+        })
+        code, out, err = run(analyze_trace_latency.main, ["--project-id", PROJECT, "--limit", "1"], session=session)
+        self.assertEqual(0, code, err)
+        self.assertEqual([RELAYED_TRACES, f"{RELAYED_TRACES}/{TRACE_A}"], [c["url"] for c in self.http.calls])
 
     def test_an_empty_window_is_reported_and_exits_zero(self):
         session = self.session({RELAYED_TRACES: {}})
@@ -261,11 +301,26 @@ class FetchTracesTest(BrokerSessionCase):
         self.assertEqual(fetch_traces.PAGE_SIZE, self.http.calls[0]["params"]["pageSize"])
         self.assertEqual(TRACE_LIST, json.loads(out))
 
-    def test_an_empty_window_prints_the_empty_response_not_an_error(self):
+    def test_an_empty_window_prints_an_empty_list_not_an_error(self):
         session = self.session({RELAYED_TRACES: {}})
         code, out, err = run(fetch_traces.main, ["--project-id", PROJECT], session=session)
         self.assertEqual(0, code, err)
-        self.assertEqual({}, json.loads(out))
+        self.assertEqual({"traces": []}, json.loads(out))
+
+    def test_pages_are_joined_up_to_the_page_size(self):
+        pages = [{"traces": [{"traceId": f"{i:032x}"} for i in range(6)], "nextPageToken": "p2"},
+                 {"traces": [{"traceId": f"{i:032x}"} for i in range(6, 12)], "nextPageToken": "p3"}]
+        session = self.paged_session({RELAYED_TRACES: pages})
+        code, out, err = run(fetch_traces.main, ["--project-id", PROJECT], session=session)
+        self.assertEqual(0, code, err)
+        self.assertEqual(fetch_traces.PAGE_SIZE, len(json.loads(out)["traces"]))
+        self.assertEqual(2, len(self.http.calls))
+
+    def test_a_list_that_never_runs_dry_stops_at_the_page_cap(self):
+        session = self.paged_session({RELAYED_TRACES: [{"nextPageToken": "again"}] * (google_api.MAX_LIST_PAGES + 5)})
+        code, out, err = run(fetch_traces.main, ["--project-id", PROJECT], session=session)
+        self.assertEqual(0, code, err)
+        self.assertEqual(google_api.MAX_LIST_PAGES, len(self.http.calls))
 
     def test_a_refusal_exits_one_with_the_reason(self):
         session = self.session({RELAYED_TRACES: FakeResponse(403, BROKER_REFUSAL)})
@@ -397,7 +452,21 @@ class GetMetricDescriptorsTest(BrokerSessionCase):
         self.assertEqual(0, code, err)
         self.assert_every_call_is_a_relayed_read_the_policy_admits()
         self.assertEqual(RELAYED_DESCRIPTORS, self.http.calls[0]["url"])
+        # Filtered on the server and paged: the whole descriptor list runs past
+        # the relay's response cap.
+        self.assertEqual('metric.type = has_substring("litellm")', self.http.calls[0]["params"]["filter"])
+        self.assertEqual(get_metric_descriptors.PAGE_SIZE, self.http.calls[0]["params"]["pageSize"])
         self.assertEqual(["prometheus.googleapis.com/litellm_input_tokens_metric_total/counter"], json.loads(out))
+
+    def test_descriptor_pages_are_joined(self):
+        session = self.paged_session({RELAYED_DESCRIPTORS: [
+            {"metricDescriptors": [{"type": "prometheus.googleapis.com/litellm_a/counter"}], "nextPageToken": "p2"},
+            {"metricDescriptors": [{"type": "prometheus.googleapis.com/litellm_b/counter"}]},
+        ]})
+        code, out, err = run(get_metric_descriptors.main, ["--project-id", PROJECT], session=session)
+        self.assertEqual(0, code, err)
+        self.assertEqual("p2", self.http.calls[1]["params"]["pageToken"])
+        self.assertEqual(["prometheus.googleapis.com/litellm_a/counter", "prometheus.googleapis.com/litellm_b/counter"], json.loads(out))
 
     def test_an_empty_response_reports_an_empty_list(self):
         session = self.session({RELAYED_DESCRIPTORS: {}})

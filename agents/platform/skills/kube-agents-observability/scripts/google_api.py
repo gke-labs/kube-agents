@@ -60,6 +60,16 @@ DEFAULT_WINDOW_HOURS = 24
 # How every helper prints its JSON.
 JSON_INDENT = 2
 
+# List reads page: the caller's `pageToken` and the reply's `nextPageToken`.
+# Cloud Trace's list answers an empty first page with a token when the newest
+# time bucket holds nothing (observed on a live install), so a reader that
+# stops at the first page reports "no traces" over a project full of them;
+# Monitoring's descriptor list is too large to relay in one page. The cap
+# bounds a list that never runs dry.
+PAGE_TOKEN_PARAM = "pageToken"
+NEXT_PAGE_TOKEN_KEY = "nextPageToken"
+MAX_LIST_PAGES = 50
+
 
 class RelayError(Exception):
     """A relayed read that did not return 2xx; the message is what the helper prints."""
@@ -117,12 +127,33 @@ def window(hours: int) -> tuple[str, str]:
     return start_time.strftime(TIMESTAMP_FORMAT), end_time.strftime(TIMESTAMP_FORMAT)
 
 
+def get_paginated(session, url: str, *, params: dict, items_key: str, limit: int | None = None) -> list:
+    """The `items_key` entries of a paged list read, across pages.
+
+    Follows `nextPageToken` until the list runs dry, `limit` items are in hand
+    (when given) or MAX_LIST_PAGES pages have been read, and returns at most
+    `limit` items.
+    """
+    items: list = []
+    token = None
+    for _ in range(MAX_LIST_PAGES):
+        page_params = dict(params)
+        if token:
+            page_params[PAGE_TOKEN_PARAM] = token
+        page = get_json(session, url, params=page_params)
+        items.extend(page.get(items_key) or [])
+        token = page.get(NEXT_PAGE_TOKEN_KEY)
+        if not token or (limit is not None and len(items) >= limit):
+            break
+    return items if limit is None else items[:limit]
+
+
 def list_traces(session, project_id: str, hours: int, page_size: int) -> dict:
-    """The traces in the last `hours`, at most `page_size` of them."""
+    """The traces in the last `hours`, at most `page_size` of them, as `{"traces": [...]}`."""
     start_str, end_str = window(hours)
     params = {"startTime": start_str, "endTime": end_str, "pageSize": page_size}
     url = TRACE_LIST_URL.format(project=urllib.parse.quote(project_id, safe=""))
-    return get_json(session, url, params=params)
+    return {"traces": get_paginated(session, url, params=params, items_key="traces", limit=page_size)}
 
 
 def get_trace(session, project_id: str, trace_id: str) -> dict:
