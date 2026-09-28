@@ -141,7 +141,7 @@ dbMongodb:
 
 litellmGateway:
   enabled: true
-  name: "litellm-gateway"
+  name: "inference-gateway-upstream"
   replicaCount: 1
   image:
     repository: "ghcr.io/berriai/litellm"
