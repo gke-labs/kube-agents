@@ -35,6 +35,10 @@ readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
 readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
+# The deploy's explicit opt-out for a local run (hack/ci-deploy.sh reads the
+# same word from EVAL_GITOPS_REPO): the GitHub integration is off, the agent
+# writes to no repository, and the checks that bind to one get none.
+readonly EVAL_GITOPS_REPO_OFF_SENTINEL="none"
 
 # What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
 # when the run could not be evaluated: an admitted case lost every repetition
@@ -1410,12 +1414,17 @@ EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LED
 # The repository this run's agent writes to, for the checks that bind a pull
 # request the reply names to it (pull_request_diff_contains in
 # bench/kube_agents_bench/verifiers.py reads this name; a test pins it).
-# The deploy's precedence: a developer's EVAL_GITOPS_REPO when set (the
-# deploy refuses it in a Prow run), else the project mapping the deploy and
-# the ledger reset use. Empty when neither names one, in which case those
-# checks bind by organisation alone, as they do on a run driven by hand
-# without it.
-export BENCH_GITOPS_REPO="${EVAL_GITOPS_REPO:-${EVAL_LEDGER_REPO}}"
+# The deploy's precedence, sentinel included: a developer's EVAL_GITOPS_REPO
+# when set (the deploy refuses it in a Prow run, so on every lane the eval
+# job runs this is the project mapping), its "none" as no repository at all,
+# else the mapping the deploy and the ledger reset use. Empty when none of
+# those names one, in which case those checks bind by organisation alone.
+case "${EVAL_GITOPS_REPO:-}" in
+  "") BENCH_GITOPS_REPO="${EVAL_LEDGER_REPO}" ;;
+  "${EVAL_GITOPS_REPO_OFF_SENTINEL}") BENCH_GITOPS_REPO="" ;;
+  *) BENCH_GITOPS_REPO="${EVAL_GITOPS_REPO}" ;;
+esac
+export BENCH_GITOPS_REPO
 reset_audit_ledgers "lease"
 
 # For opentofu provider

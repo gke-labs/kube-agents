@@ -579,7 +579,8 @@ head must be an agent branch (`platform-agent/*`) in the repository itself and i
 GitHub App, the three checks the pool sweep's `is_agent_pull_request` applies, so a human's pull
 request under the prefix is not the agent's; and when the run sets `BENCH_GITOPS_REPO`, the
 repository it was told the agent writes to (`hack/ci-eval-pr.sh` exports it from the project
-mapping on every lane; a run driven by hand sets it or goes without), the pull request must be in
+mapping on every lane, honouring a local run's `EVAL_GITOPS_REPO`, `none` included, as the deploy
+does), the pull request must be in
 that repository. It reads
 `BENCH_GITHUB_TOKEN` as the two checks above do, needs `pull_requests: read` on both endpoints,
 and errors only on a fault of ours (a 401, a denial, an unexpected status, an API it could not

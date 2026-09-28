@@ -63,6 +63,9 @@ def fixture(name: str):
 def token(monkeypatch):
     monkeypatch.setenv("BENCH_GITHUB_TOKEN", "ghs_fake")
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    # The repository bind is the one test's to set; an ambient value would
+    # fail every other diff test with a message that reads as a verifier bug.
+    monkeypatch.delenv("BENCH_GITOPS_REPO", raising=False)
 
 
 @pytest.fixture
