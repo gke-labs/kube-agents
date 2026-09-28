@@ -21,7 +21,9 @@ real install:
   1. Step 4 must not hand over on a run that ended before the sweep filed its
      cards, or one the worker did not end itself -- a rate-limit block, or a
      run that filed some and was reclaimed. Handing over early grades a
-     fan-out that is still being written.
+     fan-out that is still being written. With no Cluster Agent card filed,
+     only a completed run hands over: a worker that blocked can still file
+     them once the block is lifted.
   2. On failure, the exit trap must wait for every gateway pod's gate run to
      exit before it lists the cards to archive. A gate run that read the marker
      as absent files its sweep after the trap puts the marker back, and above
@@ -278,7 +280,7 @@ class RunStateQueryTest(unittest.TestCase):
     def tearDownClass(cls):
         cls._dir.cleanup()
 
-    def _query(self, runs, children, prioritize_at=None):
+    def _query(self, runs, children, prioritize_at=None, other_runs=()):
         board = pathlib.Path(self._home) / "kanban.db"
         board.unlink(missing_ok=True)
         cards = [(f"t_child{i}", _CLUSTER_KEY + str(i), at) for i, at in enumerate(children or [])]
@@ -293,7 +295,7 @@ class RunStateQueryTest(unittest.TestCase):
             )
             conn.executemany(
                 "INSERT INTO task_runs (task_id, started_at, ended_at, outcome, summary) VALUES (?, ?, ?, ?, ?)",
-                [(_SWEEP, *run) for run in runs],
+                [(_SWEEP, *run) for run in runs] + list(other_runs),
             )
             if children is not None:
                 conn.execute(
@@ -356,7 +358,7 @@ class RunStateQueryTest(unittest.TestCase):
         self.assertEqual(self._query(runs, [120, 200, 300, 350]), "2 2 4 1")
 
     def test_a_run_that_completed_without_filing_a_cluster_card_counts(self):
-        # A build whose worker files only the prioritize card, then completes.
+        # A build whose worker files only the prioritize card, or nothing, then completes.
         runs = [(100, 160, "completed", "done")]
         self.assertEqual(self._query(runs, [], prioritize_at=150), "1 1 0 1")
         self.assertEqual(self._query(runs, None), "1 1 0 1")
@@ -367,10 +369,17 @@ class RunStateQueryTest(unittest.TestCase):
             ("blocked", "Waiting for the roster"),
             ("blocked", prefix + " (failure_reason=rate_limit): 429"),
             ("reclaimed", "worker process gone"),
+            ("crashed", None),
             ("timed_out", None),
         ):
             with self.subTest(outcome=outcome, summary=summary):
                 self.assertEqual(self._query([(100, 210, outcome, summary)], [], prioritize_at=150), "1 1 0 0")
+
+    def test_a_run_on_another_card_does_not_count(self):
+        # Re-arming archives the previous sweep card, which keeps its completed run.
+        old = [("t_old_sweep", 50, 900, "completed", "done")]
+        self.assertEqual(self._query([(100, 210, "blocked", "Waiting for the roster")], [], other_runs=old), "1 1 0 0")
+        self.assertEqual(self._query([(100, 150, "completed", "done")], [120, 200], other_runs=old), "1 1 2 0")
 
 
 if __name__ == "__main__":
