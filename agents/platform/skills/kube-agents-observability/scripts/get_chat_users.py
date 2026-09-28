@@ -18,6 +18,9 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 
+# The constants below that the relay helpers share through google_api.py are
+# declared again here on purpose: this helper reads through the gcloud shim,
+# never the relay, and importing the relay module would say otherwise.
 GCLOUD = "gcloud"
 LOG_FILTER = 'resource.type="k8s_container" "Logging incoming GChat event"'
 LOG_LIMIT = 1000

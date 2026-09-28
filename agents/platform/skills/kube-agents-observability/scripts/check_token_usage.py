@@ -7,17 +7,13 @@ import argparse
 import json
 import sys
 import urllib.parse
-from datetime import datetime, timedelta, timezone
 
 import google_api
 
 TIME_SERIES_URL = "https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
-TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-WINDOW_HOURS = 24
 INPUT_TOKENS_METRIC = "prometheus.googleapis.com/litellm_input_tokens_metric_total/counter"
 OUTPUT_TOKENS_METRIC = "prometheus.googleapis.com/litellm_output_tokens_metric_total/counter"
 CACHED_INPUT_TOKENS_METRIC = "prometheus.googleapis.com/litellm_input_cached_tokens_metric_total/counter"
-JSON_INDENT = 2
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -70,9 +66,7 @@ def get_token_delta(session, project_id: str, metric_name: str, start_str: str, 
 
 def main(argv=None, session=None) -> int:
     args = parse_args(argv)
-    end_time = datetime.now(timezone.utc)
-    start_str = (end_time - timedelta(hours=WINDOW_HOURS)).strftime(TIMESTAMP_FORMAT)
-    end_str = end_time.strftime(TIMESTAMP_FORMAT)
+    start_str, end_str = google_api.window(google_api.DEFAULT_WINDOW_HOURS)
     try:
         session = session or google_api.open_session()
         usage = {
@@ -85,7 +79,7 @@ def main(argv=None, session=None) -> int:
     except google_api.RelayError as exc:
         print(f"Error querying the Monitoring API: {exc}", file=sys.stderr)
         return google_api.EXIT_READ_FAILED
-    print(json.dumps(usage, indent=JSON_INDENT))
+    print(json.dumps(usage, indent=google_api.JSON_INDENT))
     return 0
 
 

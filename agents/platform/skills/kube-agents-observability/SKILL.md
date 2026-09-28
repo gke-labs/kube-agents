@@ -11,7 +11,7 @@ Audit, verify, and troubleshoot the logging, metrics, and distributed tracing ob
 > The provided Python scripts in the `scripts/` subdirectory are parameterized reference implementations. When troubleshooting, you can run them directly, customize their parameters, or write custom just-in-time scripts/commands to query more specific metrics, endpoints, or time ranges as required by the task context.
 
 > [!IMPORTANT]
-> The helpers reach Google APIs through the credential broker and never hold a token: the Cloud Trace and Cloud Monitoring reads go through `credential_proxy_client.ApiSession` (see `scripts/google_api.py`), and the Cloud Logging read runs `gcloud logging read` through the broker's shim. Write a just-in-time script the same way. Do not fetch an access token, from `gcloud` or from the metadata server, and do not write an `Authorization` header yourself: the sandbox refuses the fetch, and a token that reaches a command line is recorded in the transcript.
+> The helpers reach Google APIs through the credential broker and never hold a token: the Cloud Trace and Cloud Monitoring reads go through `credential_proxy_client.ApiSession` (see `scripts/google_api.py`), and the Cloud Logging read runs `gcloud logging read` through the broker's shim. Write a just-in-time script the same way. Do not fetch an access token and do not write an `Authorization` header yourself: the shim refuses a `gcloud` token fetch, the metadata server answers the sandbox with an identity IAM grants nothing, and whatever either returns lands in the transcript.
 
 # Workflow
 

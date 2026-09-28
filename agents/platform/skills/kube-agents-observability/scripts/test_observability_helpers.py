@@ -508,7 +508,12 @@ class NoTokenInAnyHelperTest(unittest.TestCase):
             source = (HERE / name).read_text(encoding="utf-8")
             with self.subTest(helper=name):
                 self.assertIn("google_api.open_session()", source)
-                self.assertIn("google_api.get_json(", source)
+                self.assertIn("google_api.", source)
+                # The Trace and Monitoring endpoints and the window arithmetic
+                # are written once, in google_api.py or in the one helper that
+                # reads that endpoint; no helper re-declares a Trace URL.
+                self.assertNotIn("cloudtrace.googleapis.com", source)
+                self.assertNotIn("strftime", source)
 
     def test_the_session_is_the_broker_client(self):
         source = (HERE / "google_api.py").read_text(encoding="utf-8")
