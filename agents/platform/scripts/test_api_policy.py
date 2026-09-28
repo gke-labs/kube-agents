@@ -16,11 +16,14 @@ from api_policy import (
     API_READ_ROUTES,
     PROJECT,
     REFUSED_HOSTS,
+    TRACE_ID,
     ApiRoute,
     evaluate,
 )
 
 MONITORING = "monitoring.googleapis.com"
+CLOUDTRACE = "cloudtrace.googleapis.com"
+A_TRACE_ID = "0006344377aac15d1baede1a41e88a2c"
 
 
 class ListedRoutesTest(unittest.TestCase):
@@ -125,7 +128,10 @@ class PathShapeTest(unittest.TestCase):
     def test_the_path_refusal_names_what_the_host_does_relay(self):
         decision = evaluate("GET", MONITORING, "v3/projects/kagents-dev/alertPolicies", "")
         for route in API_READ_ROUTES:
-            self.assertIn(route.rule_id, decision.message)
+            if route.host == MONITORING:
+                self.assertIn(route.rule_id, decision.message)
+            else:
+                self.assertNotIn(route.rule_id, decision.message)
 
     def test_the_project_grammar_is_googles(self):
         pattern = re.compile(rf"^{PROJECT}$")
@@ -135,6 +141,72 @@ class PathShapeTest(unittest.TestCase):
         for project in ("abcde", "1abcdef", "abcdef-", "Abcdef", "a" * 31, "ab.cdef", "ab/cdef", "ab cdef"):
             with self.subTest(project=project):
                 self.assertIsNone(pattern.match(project))
+
+
+class CloudTraceRoutesTest(unittest.TestCase):
+    """The two Trace reads the observability helpers make, and nothing beside them."""
+
+    CASES = (
+        ("v1/projects/kagents-dev/traces", "gcp.api.cloudtrace.traces-list"),
+        (f"v1/projects/kagents-dev/traces/{A_TRACE_ID}", "gcp.api.cloudtrace.traces-get"),
+    )
+
+    def test_each_trace_route_is_allowed_with_its_rule_id(self):
+        for path, rule_id in self.CASES:
+            with self.subTest(path=path):
+                decision = evaluate("GET", CLOUDTRACE, path, "startTime=x&pageSize=5")
+                self.assertTrue(decision.allowed, decision.message)
+                self.assertEqual(rule_id, decision.rule_id)
+
+    def test_the_same_path_with_post_is_refused_on_method(self):
+        for path, _ in self.CASES:
+            with self.subTest(path=path):
+                decision = evaluate("POST", CLOUDTRACE, path, "")
+                self.assertFalse(decision.allowed)
+                self.assertEqual("gcp.api.method", decision.rule_id)
+
+    def test_sibling_child_and_malformed_trace_paths_are_refused(self):
+        for path in (
+            "v1/projects/kagents-dev/traces/",
+            f"v1/projects/kagents-dev/traces/{A_TRACE_ID}/spans",
+            f"v1/projects/kagents-dev/traces/{A_TRACE_ID}/",
+            "v1/projects/kagents-dev/traces/not-a-trace-id",
+            "v1/projects/kagents-dev/traces/" + "g" * 32,
+            "v1/projects/kagents-dev/traces/" + "a" * 31,
+            "v1/projects/kagents-dev/traces/" + "a" * 33,
+            "v1/projects/kagents-dev/traces/" + A_TRACE_ID.upper(),
+            "v1/projects/kagents-dev/traces:batchWrite",
+            "v1/projects/kagents-dev/tracesx",
+            "v1/projects/P-UPPER/traces",
+            "v1/projects/a/b/traces",
+            f"v2/projects/kagents-dev/traces/{A_TRACE_ID}",
+            "v2/projects/kagents-dev/traces",
+            "v1/projects/kagents-dev/traces\n",
+            "",
+        ):
+            with self.subTest(path=path):
+                decision = evaluate("GET", CLOUDTRACE, path, "")
+                self.assertFalse(decision.allowed)
+                self.assertEqual("gcp.api.path", decision.rule_id)
+
+    def test_the_trace_refusal_names_only_the_trace_rules(self):
+        decision = evaluate("GET", CLOUDTRACE, "v2/projects/kagents-dev/traces", "")
+        self.assertIn("gcp.api.cloudtrace.traces-list", decision.message)
+        self.assertIn("gcp.api.cloudtrace.traces-get", decision.message)
+        self.assertNotIn("gcp.api.monitoring", decision.message)
+
+    def test_a_trace_path_on_the_monitoring_host_is_refused(self):
+        decision = evaluate("GET", MONITORING, "v1/projects/kagents-dev/traces", "")
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.api.path", decision.rule_id)
+
+    def test_the_trace_id_grammar_is_32_lower_case_hex(self):
+        # `fullmatch`, as `evaluate` uses it: `$` alone would admit a trailing newline.
+        pattern = re.compile(TRACE_ID)
+        self.assertIsNotNone(pattern.fullmatch(A_TRACE_ID))
+        for trace_id in ("", "a" * 31, "a" * 33, A_TRACE_ID.upper(), "g" * 32, A_TRACE_ID + "\n"):
+            with self.subTest(trace_id=trace_id):
+                self.assertIsNone(pattern.fullmatch(trace_id))
 
 
 class TableValidatorTest(unittest.TestCase):

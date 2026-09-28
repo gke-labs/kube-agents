@@ -68,6 +68,12 @@ REFUSED_HOSTS = frozenset(
 # project set, this table bounds the operation.
 PROJECT = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
 
+# A Cloud Trace v1 trace id as the API returns it: a 128-bit value as 32
+# lower-case hex characters. Constraining the segment is what keeps the
+# `traces/<id>` route from admitting a child (`traces/<id>/spans`), a sibling
+# spelt as an id, or an id that is not one.
+TRACE_ID = r"[0-9a-f]{32}"
+
 # What a host may look like, in the table and in a request: a lower-case DNS
 # name with at least one dot. No scheme, no port, no path, no user info, no
 # percent-encoding. Exact-match at lookup. Public because the broker's handler
@@ -120,6 +126,23 @@ API_READ_ROUTES: tuple[ApiRoute, ...] = (
             r"(query|query_range|series|labels)$"
         ),
         "gcp.api.monitoring.promql-read",
+    ),
+    # The observability skill's trace helpers (analyze_trace_latency.py,
+    # fetch_traces.py): the traces in a time window, then one trace's spans.
+    # Two anchored reads on one host, so the helpers can run in the sandbox
+    # without a token of their own; the v2 write surface, `traces/<id>/...`
+    # and every other Trace path stay refused.
+    ApiRoute(
+        "cloudtrace.googleapis.com",
+        API_READ_METHOD,
+        re.compile(rf"^v1/projects/{PROJECT}/traces$"),
+        "gcp.api.cloudtrace.traces-list",
+    ),
+    ApiRoute(
+        "cloudtrace.googleapis.com",
+        API_READ_METHOD,
+        re.compile(rf"^v1/projects/{PROJECT}/traces/{TRACE_ID}$"),
+        "gcp.api.cloudtrace.traces-get",
     ),
 )
 
