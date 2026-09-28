@@ -12580,6 +12580,58 @@ class TestSilentVerdict(HarnessTestCase):
         self.assertTrue(out["silent_ok"])
         self.assertIn("WARNING: run record missing", self.err)
 
+    def test_finish_does_not_warn_when_inflight_note_is_expired(self):
+        """Expired inflight note (> 2h) does not warn about active run (#1929)."""
+        inflight = Path(audit_report.inflight_path_for(AUDIT))
+        inflight.parent.mkdir(parents=True, exist_ok=True)
+        expired_time = time.time() - audit_report.INFLIGHT_TTL_SECONDS - 60
+        inflight.write_text(json.dumps({"audit": AUDIT, "started_at": expired_time}), encoding="utf-8")
+        doc = make_doc(findings=[])
+        out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
+        self.assertNotIn("WARNING: run record missing", self.err)
+
+    def test_finish_warns_differing_repository_when_record_intact(self):
+        """Finish with differing repository logs repository mismatch, not unreadable/corrupt (#1929)."""
+        run_record = Path(audit_report.run_record_path_for(AUDIT))
+        run_record.parent.mkdir(parents=True, exist_ok=True)
+        record_content = {
+            "audit": AUDIT,
+            "repo": "acme/repo-a",
+            "context_repos": [],
+            "started_at": "2026-09-28T12:00:00Z",
+            "on_demand": True,
+        }
+        run_record.write_text(json.dumps(record_content), encoding="utf-8")
+        doc = make_doc(findings=[])
+        out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
+        self.assertIn("WARNING: run record at", self.err)
+        self.assertIn("is for repository 'acme/repo-a', not 'acme/fleet'", self.err)
+        self.assertNotIn("unreadable or corrupt run record", self.err)
+
+        self.err = ""
+        self.run_finish(doc, argv_extra=["--dry-run", "--repo", "acme/repo-b"])
+        self.assertIn("is for repository 'acme/repo-a', not 'acme/repo-b'", self.err)
+        self.assertNotIn("unreadable or corrupt run record", self.err)
+
+    def test_finish_warns_unreadable_or_corrupt_when_record_audit_mismatch(self):
+        """Finish logs unreadable or corrupt when run record audit does not match (#1929)."""
+        run_record = Path(audit_report.run_record_path_for(AUDIT))
+        run_record.parent.mkdir(parents=True, exist_ok=True)
+        record_content = {
+            "audit": "different-audit-stream",
+            "repo": "acme/fleet",
+            "context_repos": [],
+            "started_at": "2026-09-28T12:00:00Z",
+            "on_demand": True,
+        }
+        run_record.write_text(json.dumps(record_content), encoding="utf-8")
+        doc = make_doc(findings=[])
+        out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
+        self.assertIn("WARNING: unreadable or corrupt run record", self.err)
+
 
 class TestDispatchAndHandover(unittest.TestCase):
     """The ledger URL has to survive the hop from worker to requester.

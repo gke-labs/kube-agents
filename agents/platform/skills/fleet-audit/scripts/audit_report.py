@@ -11008,15 +11008,39 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     if getattr(args, "on_demand", None) is None:
         rec_path = Path(run_record_path_for(audit_id))
         if rec_path.is_file() and record is None:
-            log(
-                f"WARNING: unreadable or corrupt run record at {rec_path}; "
-                "on-demand state falls through to environment"
-            )
-        elif not rec_path.is_file() and Path(inflight_path_for(audit_id)).is_file():
-            log(
-                f"WARNING: run record missing at {rec_path} for active run; "
-                "on-demand state falls through to environment"
-            )
+            try:
+                rec_raw = json.loads(rec_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                rec_raw = None
+            if (
+                isinstance(rec_raw, dict)
+                and rec_raw.get("audit") == audit_id
+                and rec_raw.get("repo")
+            ):
+                recorded_repo = str(rec_raw.get("repo"))
+                if repo_hint and recorded_repo.strip().lower() != str(repo_hint).strip().lower():
+                    log(
+                        f"WARNING: run record at {rec_path} is for repository {recorded_repo!r}, "
+                        f"not {repo_hint!r}; on-demand state falls through to environment"
+                    )
+                else:
+                    log(
+                        f"WARNING: unreadable or corrupt run record at {rec_path}; "
+                        "on-demand state falls through to environment"
+                    )
+            else:
+                log(
+                    f"WARNING: unreadable or corrupt run record at {rec_path}; "
+                    "on-demand state falls through to environment"
+                )
+        elif not rec_path.is_file():
+            inflight_path = Path(inflight_path_for(audit_id))
+            started = _in_flight_since(inflight_path)
+            if started is not None and (time.time() - started) < INFLIGHT_TTL_SECONDS:
+                log(
+                    f"WARNING: run record missing at {rec_path} for active run; "
+                    "on-demand state falls through to environment"
+                )
     on_demand = is_on_demand(args, record)
     # The harness's search first, then the withhold against the record. The
     # order matters: a posture a declaration covers moves to `declared[]`,
