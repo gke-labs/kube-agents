@@ -780,7 +780,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// A2A provisioning still running — Jobs are not watched (see a2aReader),
 	// so completion, failure, and the TTL removing a finished Job are all
-	// invisible without a requeue.
+	// invisible without a requeue. A provision Job held for the callout
+	// (a2aProvisionState.jobHeld) is a pass with done=false, so it rides
+	// this term too.
 	//
 	// gatewayHeld shares the requeue rather than getting its own: the gateway
 	// is waiting on a callout replica that is both ready and on the current

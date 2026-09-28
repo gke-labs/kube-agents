@@ -187,9 +187,11 @@ readonly BRIDGE_QUEUE_CAPACITY=1024
 readonly BRIDGE_CONSUMING_LOG_MSG='"msg":"hermes bridge consuming"'
 readonly BRIDGE_CONSUMING_LOG_PROFILE='"profile":"platform"'
 readonly MODE_NEXT_BRIDGE_LOG_ATTEMPTS=60
-# The provisioning Job depends on NATS and on the callout, and its retries
-# back off exponentially: 19.5 minutes to complete was measured under adverse
-# conditions (#1661), a few minutes on a healthy cluster.
+# The provisioning Job depends on NATS and on the callout. The operator now
+# creates it only once a callout replica serves (#1702); before that its
+# retries backed off exponentially and 19.5 minutes to complete was measured
+# under adverse conditions (#1661). A few minutes on a healthy cluster, and the
+# budget covers the wait for the callout too.
 readonly MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS=1500
 # What the Job's status.conditions say when it is over, either way. A Job
 # that exhausts its backoff carries Failed and never Complete, so the gate
@@ -921,11 +923,9 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # measured run through the door. Not gated either: the shell StatefulSet,
 # which does not change under next.
 #
-# A namespace ResourceQuota on limits.cpu refuses every A2A pod: none of them
-# declares a CPU limit (the callout declares a memory limit only, #1661).
-# Nothing this deploy or the chart renders carries such a quota, so no
-# LimitRange is added here. An install that has one needs the operator fix,
-# or a LimitRange of its own, before the flag.
+# Every A2A pod the operator renders carries CPU and memory requests and
+# limits (#1700), so a namespace ResourceQuota on limits.cpu admits them;
+# nothing this deploy or the chart renders carries such a quota either way.
 dump_mode_next_state() {
   kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o yaml | sed -n '/^status:/,$p' || true
   kubectl get pods,jobs,networkpolicies,pvc -n "${NAMESPACE}" -l "${A2A_PART_OF_SELECTOR}" || true

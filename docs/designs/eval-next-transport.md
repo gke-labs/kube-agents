@@ -517,8 +517,9 @@ today-mode install has passed its own readiness and connectivity checks. It reco
 Deployment's generation, merge-patches the CR, and waits for the generation to move before
 asking any workload for status, because the flip is a rollout and a status read before it lands
 describes the old pods. It then gates, in order, on the NATS StatefulSet, the callout Deployment,
-the provisioning Job reaching `complete` (the Job depends on the callout and has been measured at
-19.5 minutes under adverse conditions, so its bound is generous), and the agent Deployment. Then
+the provisioning Job reaching `complete` (the Job depends on the callout; before the operator
+ordered its creation after a serving callout replica it was measured at 19.5 minutes under adverse
+conditions, so its bound is generous), and the agent Deployment. Then
 the door and the executor. The deploy arms the gateway's inject door on the operator under the
 same flag (`A2A_INJECT_BACKEND=true` through the chart's `operator.extraEnv`, beside the A2A
 image overrides) and waits for the door's Service and token Secret; it then declares the bridge
@@ -547,10 +548,9 @@ unset both scripts are byte for byte what they were, and the presubmit's own tes
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.
-The next stack still has holes independent of any case (no resource requests on the NATS,
-gateway or provisioning pods, images in a private registry, and whatever the first runs through
-the door find), and a default-on flip would red every pull request for reasons none of them
-caused. And the record that earns `next` a place in what every pull request measures is built by
+The next stack still has holes independent of any case (images in a private registry, and
+whatever the first runs through the door find), and a default-on flip would red every pull
+request for reasons none of them caused. And the record that earns `next` a place in what every pull request measures is built by
 running it: a scheduled lane on `main` under the flag, with a record of its own, not the
 presubmit. That lane is not built yet, and the flag does not admit it as it stands: section 2b of
 the deploy refuses `EVAL_MODE_NEXT=1` on a Prow run with no pull request, because `bench-gate`

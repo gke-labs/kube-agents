@@ -371,6 +371,13 @@ func TestReconcileA2AGatedByMode(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
+	// The provision Job waits on a serving callout replica, like the
+	// gateway (TestA2AProvisionJobWaitsForTheCallout); report one and pass
+	// again so the Job is there to assert on.
+	reportCalloutServing(t, ctx, cl, agent)
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 3 failed: %v", err)
+	}
 
 	sts := &appsv1.StatefulSet{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats", Namespace: "test-ns"}, sts); err != nil {
@@ -5134,5 +5141,167 @@ func TestAnExtraVolumesEntryCannotShadowTheBusToken(t *testing.T) {
 	if podVolume(buildPodTemplateSpec(today, "", "", "", "", nil, renderOptions{}), a2aBusTokenVolume) == nil {
 		t.Error("a today install lost the CR's extraVolumes entry too; the strip is not gated on the " +
 			"surface, which is one more way to tell the next stack exists")
+	}
+}
+
+// ---- resources and ordering on the next-stack pods (#1700, #1702) ---------
+
+// TestA2ANextStackPodsCarryRequestsAndLimits: every container the operator
+// renders for the next stack (NATS, gateway, provision Job, callout) carries
+// CPU and memory requests and limits, so a namespace whose ResourceQuota
+// requires limits admits the stack, and Autopilot does not size the pods for
+// it. The session pods the gateway spawns are the gateway's (a2a/gateway).
+func TestA2ANextStackPodsCarryRequestsAndLimits(t *testing.T) {
+	agent := a2aTestAgent()
+	type container struct {
+		where string
+		c     corev1.Container
+	}
+	var containers []container
+	sts := buildA2ANATSStatefulSet(agent, "conf-hash")
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		containers = append(containers, container{"nats StatefulSet", c})
+	}
+	dep := buildA2AGatewayDeployment(agent)
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		containers = append(containers, container{"gateway Deployment", c})
+	}
+	job := buildA2AProvisionJob(agent)
+	for _, c := range job.Spec.Template.Spec.Containers {
+		containers = append(containers, container{"provision Job", c})
+	}
+	// The callout too: it is the provision Job's authentication path, and a
+	// quota that refused it would leave the Job's creation held for good.
+	for _, c := range buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers {
+		containers = append(containers, container{"callout Deployment", c})
+	}
+	if len(containers) < 4 {
+		t.Fatalf("expected at least four containers across the four renders, got %d", len(containers))
+	}
+	for _, entry := range containers {
+		for _, res := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			req, ok := entry.c.Resources.Requests[res]
+			if !ok || req.IsZero() {
+				t.Errorf("%s container %q: no %s request", entry.where, entry.c.Name, res)
+			}
+			lim, ok := entry.c.Resources.Limits[res]
+			if !ok || lim.IsZero() {
+				t.Errorf("%s container %q: no %s limit; a limits-requiring quota refuses the pod", entry.where, entry.c.Name, res)
+			}
+			if ok && req.Cmp(lim) > 0 {
+				t.Errorf("%s container %q: %s request %s exceeds limit %s", entry.where, entry.c.Name, res, req.String(), lim.String())
+			}
+		}
+	}
+	// The sizes are named constants, and NATS is the one that holds state.
+	nats := sts.Spec.Template.Spec.Containers[0].Resources
+	if got := nats.Limits[corev1.ResourceMemory]; got.String() != a2aNATSMemoryLimit {
+		t.Errorf("nats memory limit = %s, want %s", got.String(), a2aNATSMemoryLimit)
+	}
+	gw := dep.Spec.Template.Spec.Containers[0].Resources
+	if got := gw.Requests[corev1.ResourceCPU]; got.String() != a2aGatewayCPURequest {
+		t.Errorf("gateway cpu request = %s, want %s", got.String(), a2aGatewayCPURequest)
+	}
+}
+
+// TestA2AProvisionJobWaitsForTheCallout: the Job is not created until one
+// callout replica is ready, so the Job never spends its backoff on the callout
+// not being there yet. The rest of the stack renders while it waits (a gate that
+// withheld the callout too would deadlock), and the creation happens on the
+// first pass after the callout serves. Creation only: a Job that exists has
+// its status read whatever the callout does (TestA2AProvisionJobConditionsDriveStatus
+// seeds one with no callout serving).
+func TestA2AProvisionJobWaitsForTheCallout(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		state, err := r.reconcileA2A(ctx, agent)
+		if err != nil {
+			t.Fatalf("reconcileA2A %d: %v", i+1, err)
+		}
+		if !state.jobHeld || state.done {
+			t.Fatalf("pass %d: state = {jobHeld:%v done:%v}, want held and not done while no callout replica serves", i+1, state.jobHeld, state.done)
+		}
+	}
+	jobs := &batchv1.JobList{}
+	if err := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("%d provision Jobs created while no callout replica serves; the Job would spend its backoff on authentication errors", len(jobs.Items))
+	}
+	// Everything the callout needs to become ready is there, or this is a
+	// deadlock rather than an ordering.
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, &appsv1.StatefulSet{}); err != nil {
+		t.Errorf("NATS did not render while the Job waits: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the callout did not render while the Job waits: %v", err)
+	}
+
+	reportCalloutServing(t, ctx, cl, agent)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A after the callout came up: %v", err)
+	}
+	if state.jobHeld {
+		t.Error("the Job is still held with a callout replica serving")
+	}
+	if err := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 1 || jobs.Items[0].Name != buildA2AProvisionJob(agent).Name {
+		t.Fatalf("after the callout serves the namespace holds %d provision Jobs, want the one the render names", len(jobs.Items))
+	}
+	if inits := jobs.Items[0].Spec.Template.Spec.InitContainers; len(inits) != 0 {
+		t.Errorf("the Job carries init containers %+v; the ordering is the operator's, not the pod's", inits)
+	}
+}
+
+// TestTheProvisionJobRunsOnAnOldTemplateReplica: the Job's question of the
+// callout is weaker than the gateway's. Mid-roll, with one replica ready on
+// the previous template and none on the current one, the gateway is held
+// (it is minted against the map version this pass rendered) and the Job is
+// not (its principal is authenticated by any replica, all of which serve the
+// current map). A Job gated on the gateway's rule would be held through every
+// callout roll and for good on a wedged one.
+func TestTheProvisionJobRunsOnAnOldTemplateReplica(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, discordBotSecret(agent)). // a backend, so the gateway reaches its callout gate rather than the backend one
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	// Two pods, one ready, none on the current template: a roll in progress
+	// or wedged at maxUnavailable 0.
+	reportCalloutStatus(t, ctx, cl, agent, 2, 1, 0)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.jobHeld {
+		t.Error("the Job is held while a callout replica is ready; the old-template replica authenticates it")
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: buildA2AProvisionJob(agent).Name, Namespace: agent.Namespace}, &batchv1.Job{}); err != nil {
+		t.Errorf("the Job was not created with a ready replica serving: %v", err)
+	}
+	if !state.gatewayHeld {
+		t.Error("the gateway was let through with no current-template replica; its gate is the stricter one on purpose")
 	}
 }

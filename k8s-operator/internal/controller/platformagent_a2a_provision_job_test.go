@@ -81,6 +81,7 @@ func TestA2AProvisionJobNameIsDeterministic(t *testing.T) {
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent) // the Job's creation waits on it
 	for i := 0; i < 3; i++ {
 		if _, err := r.reconcileA2A(ctx, agent); err != nil {
 			t.Fatalf("reconcileA2A %d: %v", i+1, err)
@@ -182,6 +183,7 @@ func TestReconcileA2ACreatesANewProvisionJobWhenThePodSpecChanges(t *testing.T) 
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent) // the Job's creation waits on it
 
 	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatalf("reconcileA2A with the default image: %v", err)
