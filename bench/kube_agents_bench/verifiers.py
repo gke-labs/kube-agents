@@ -582,6 +582,15 @@ class WorkerCommandsVerifier(BaseVerifier):
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
+    ``exempt_patterns``: a command matching one is left out before either
+    list runs, and the reason says how many were. For a command that can
+    fetch and send nothing but carries a forbidden word as its argument: a
+    worker told the helper holds no token may ``grep`` for the word before
+    running it, and a case that exempts a plain ``grep`` (one invocation, no
+    shell join, pipe or substitution) grades what the worker did, not what
+    it read. Write the exemption as narrowly as that; a forbidden command
+    behind an exempt one on the same line is a bypass the exemption must not
+    admit.
 
     Limits, stated so a case is not written against them: only terminal
     commands are visible, not MCP tool calls; only delegated workers' logs
@@ -593,8 +602,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     type: Literal["worker_commands"]
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
+    exempt_patterns: list[str] = Field(default_factory=list)
 
-    @field_validator("required_patterns", "forbidden_patterns")
+    @field_validator("required_patterns", "forbidden_patterns", "exempt_patterns")
     @classmethod
     def _patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
@@ -618,7 +628,11 @@ class WorkerCommandsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=_NO_WORKER_COMMANDS_REASON,
             )
-        commands = [row.get("command", "") for row in snap.worker_commands]
+        typed = [row.get("command", "") for row in snap.worker_commands]
+        commands = [
+            c for c in typed if not any(re.search(p, c) for p in self.exempt_patterns)
+        ]
+        exempted = f" ({len(typed) - len(commands)} exempted)" if len(commands) < len(typed) else ""
         missing = [
             p for p in self.required_patterns
             if not any(re.search(p, c) for c in commands)
@@ -631,7 +645,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             if missing:
                 parts.append(
                     f"no worker command matched required pattern(s) {missing} "
-                    f"across {len(commands)} command(s)"
+                    f"across {len(commands)} command(s){exempted}"
                 )
             if hits:
                 shown = "; ".join(
@@ -648,7 +662,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             success=True,
             elapsed_time=time.monotonic() - start,
             reason=(
-                f"{len(commands)} worker command(s): all {len(self.required_patterns)} "
+                f"{len(commands)} worker command(s){exempted}: all {len(self.required_patterns)} "
                 f"required pattern(s) matched, none of {len(self.forbidden_patterns)} forbidden"
             ),
         )

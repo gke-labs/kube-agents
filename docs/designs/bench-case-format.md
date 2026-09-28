@@ -185,7 +185,10 @@ passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
 case it runs), and `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
-purges it), and `worker_agents` (regular expressions every one of which must match the
+purges it; its `exempt_patterns` leave a command out before the required and
+forbidden lists run, for a command that can fetch and send nothing but carries a
+forbidden word as its argument, such as a plain `grep` for it), and `worker_agents`
+(regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries).
 
