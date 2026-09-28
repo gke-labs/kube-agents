@@ -530,29 +530,21 @@ class ResolveProfilesBaseTest(unittest.TestCase):
             {"HERMES_HOME": "/custom/profiles/platform", "PLATFORM_AGENT_HOME": "/srv/agent"},
             clear=True,
         ):
-            self.assertEqual(cap._resolve_data_root(), Path("/srv/agent"))
-            self.assertEqual(cap._resolve_profiles_base(), Path("/srv/agent/profiles"))
-
-    def test_resolves_standard_root_hermes_home(self):
-        with mock.patch.dict(os.environ, {"HERMES_HOME": "/opt/data"}, clear=True):
-            self.assertEqual(cap._resolve_data_root(), Path("/opt/data"))
-            self.assertEqual(cap._resolve_profiles_base(), Path("/opt/data/profiles"))
+            self.assertEqual(cap.agent_home(), "/srv/agent")
+            self.assertEqual(cap.profiles_base(Path(cap.agent_home())), Path("/srv/agent/profiles"))
 
     def test_resolves_default_when_no_env_set(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(cap._resolve_data_root(), Path("/opt/data"))
-            self.assertEqual(cap._resolve_profiles_base(), Path("/opt/data/profiles"))
+            self.assertEqual(cap.agent_home(), "/opt/data")
+            self.assertEqual(cap.profiles_base(Path(cap.agent_home())), Path("/opt/data/profiles"))
 
-    def test_resolves_when_data_root_spelled_like_profile_home_without_misfiring(self):
-        # A data root such as /mnt/profiles/platform must NOT misfire to /mnt
+    def test_ignores_hermes_home_deliberately(self):
+        # In the agent container HERMES_HOME names the profile home
+        # (<agent home>/profiles/platform) and points too deep; agent_home()
+        # deliberately ignores it.
         with mock.patch.dict(os.environ, {"HERMES_HOME": "/mnt/profiles/platform"}, clear=True):
-            self.assertEqual(cap._resolve_data_root(), Path("/mnt/profiles/platform"))
-            self.assertEqual(cap._resolve_profiles_base(), Path("/mnt/profiles/platform/profiles"))
-
-    def test_resolves_when_cluster_shared_root_without_misfiring(self):
-        with mock.patch.dict(os.environ, {"HERMES_HOME": "/srv/profiles/cluster-shared"}, clear=True):
-            self.assertEqual(cap._resolve_data_root(), Path("/srv/profiles/cluster-shared"))
-            self.assertEqual(cap._resolve_profiles_base(), Path("/srv/profiles/cluster-shared/profiles"))
+            self.assertEqual(cap.agent_home(), "/opt/data")
+            self.assertEqual(cap.profiles_base(Path(cap.agent_home())), Path("/opt/data/profiles"))
 
     def test_module_load_wires_hermes_home_and_profiles_base(self):
         import importlib

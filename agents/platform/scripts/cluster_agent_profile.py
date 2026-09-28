@@ -27,44 +27,22 @@ from pathlib import Path
 
 import sandbox_exec
 from gke_endpoint import dns_endpoint_args
-from profile_scaffold import HERMES_BIN, backfill_cron_file, ensure_profile, is_scaffolded, overlay_template
+from gitops_workspace import agent_home
+from profile_scaffold import (
+    HERMES_BIN,
+    backfill_cron_file,
+    ensure_profile,
+    is_scaffolded,
+    overlay_template,
+    profiles_base,
+)
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
-
-
-ENV_PLATFORM_AGENT_HOME = "PLATFORM_AGENT_HOME"
-ENV_HERMES_HOME = "HERMES_HOME"
-DEFAULT_DATA_ROOT = Path("/opt/data")
-PROFILES_DIR_NAME = "profiles"
-CLUSTER_PROFILE_PREFIX = "cluster-"
-IDENTITY_FILE = "USER.md"
-# Non-cluster profiles that live under $HERMES_HOME/profiles but are never
-# managed as Cluster Agents: the front-door router (`default`) and the Platform
-# Agent itself (`platform`). Reconciliation must never touch these.
-RESERVED_PROFILES = frozenset({"default", "platform"})
-
-
-def _resolve_data_root() -> Path:
-    """Resolve the data PVC root containing the profiles/ directory.
-
-    Prefers PLATFORM_AGENT_HOME (which points to the data PVC root across all
-    shipped runtimes: operator pod env, sandbox sshd setenv, docker-entrypoint),
-    falling back to HERMES_HOME or DEFAULT_DATA_ROOT.
-    """
-    return Path(
-        os.environ.get(ENV_PLATFORM_AGENT_HOME)
-        or os.environ.get(ENV_HERMES_HOME)
-        or str(DEFAULT_DATA_ROOT)
-    )
-
-
-def _resolve_profiles_base() -> Path:
-    """Resolve the directory containing all profile subdirectories."""
-    return _resolve_data_root() / PROFILES_DIR_NAME
-
-
-HERMES_HOME = _resolve_data_root()
+# Uses gitops_workspace.agent_home() which reads PLATFORM_AGENT_HOME (or /opt/data),
+# intentionally ignoring HERMES_HOME because in an agent container HERMES_HOME points
+# to the profile home (<agent home>/profiles/platform) rather than the data PVC root.
+HERMES_HOME = Path(agent_home())
 # Operator-rendered config overlays and profile-targeted plugin image volumes. The
 # entrypoint applies both at pod startup; a profile scaffolded here appears later, so it
 # has to pick them up itself (see create_profile steps 2c/2d).
@@ -83,11 +61,18 @@ SANDBOX_MIRROR_TIMEOUT_SECONDS = 120
 ENV_HERMES_OTEL_ENABLED = "HERMES_OTEL_ENABLED"
 ENV_OTEL_SDK_DISABLED = "OTEL_SDK_DISABLED"
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
-PROFILES_BASE = _resolve_profiles_base()
+PROFILES_BASE = profiles_base(HERMES_HOME)
 
 # Files/dirs from the template to overlay onto the created profile home.
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
 MAX_NAME_LEN = 63
+
+CLUSTER_PROFILE_PREFIX = "cluster-"
+IDENTITY_FILE = "USER.md"
+# Non-cluster profiles that live under $HERMES_HOME/profiles but are never
+# managed as Cluster Agents: the front-door router (`default`) and the Platform
+# Agent itself (`platform`). Reconciliation must never touch these.
+RESERVED_PROFILES = frozenset({"default", "platform"})
 
 # How the scaffold checks that gcloud's kubeconfig exists on the side that will
 # read it. An absolute path because a builtin `test` would be the sandbox
