@@ -56,6 +56,11 @@ SPAN_RE = re.compile(r"are section (\d+), lines (\d+)-(\d+)")
 # reference is the line to rewrite. Anchoring on the key keeps a stray mention
 # of an SOP in some other field from being edited.
 PROMPT_LINE_RE = re.compile(r'^\s*"prompt":\s*"')
+# What the line rule must reach: every parsed prompt that carries a pin. A
+# pinned prompt written in a shape the rule does not match (a job object on
+# one line, a space before the colon) would otherwise be neither rewritten nor
+# compared, and ``--check`` would print ``ok`` over its stale numbers.
+PROMPT_KEY_SHAPE = '"prompt": "'
 FENCE = "```"
 # How much of a refused prompt line an error quotes: enough to identify the job, not the whole prompt.
 ERROR_EXCERPT_CHARS = 120
@@ -126,17 +131,41 @@ def rewrite_roster(text: str, sop_dir: Path = SOP_DIR) -> str:
 
     The text is processed line by line and only prompt lines are touched, so
     the returned string differs from ``text`` in digits inside those lines and
-    nowhere else. The result is parsed and compared field by field against the
+    nowhere else. Two checks follow. The original is parsed and every prompt
+    that carries a pin is counted against the pinned lines the line rule
+    reached: a pinned prompt in a shape the rule does not match is refused,
+    since ``--check`` would otherwise print ``ok`` over numbers it never read.
+    Then the result is parsed and compared field by field against the
     original, prompts excepted, so a substitution that broke the JSON or
     reached another field fails here rather than at the next ``hermes cron``.
     """
     out = []
+    reached = 0
     for line in text.split("\n"):
-        out.append(rewrite_prompt_line(line, sop_dir) if PROMPT_LINE_RE.match(line) else line)
+        if PROMPT_LINE_RE.match(line):
+            reached += _pins_an_sop(line)
+            line = rewrite_prompt_line(line, sop_dir)
+        out.append(line)
     new_text = "\n".join(out)
-    if _without_prompts(json.loads(text)) != _without_prompts(json.loads(new_text)):
+    roster = json.loads(text)
+    pinned = sum(_pins_an_sop(job.get("prompt", "")) for job in roster["jobs"])
+    if reached != pinned:
+        raise ValueError(
+            f"{pinned} prompt(s) pin an SOP but {reached} open a line of their own with "
+            f"{PROMPT_KEY_SHAPE!r}; the generator rewrites only those, so it cannot vouch for the rest"
+        )
+    if _without_prompts(roster) != _without_prompts(json.loads(new_text)):
         raise ValueError("rewriting the pins changed something other than a prompt")
     return new_text
+
+
+def _pins_an_sop(prompt: str) -> bool:
+    """Whether ``prompt`` carries either pin.
+
+    The same answer for a raw roster line and for the parsed prompt, since
+    neither pattern contains a character JSON escapes.
+    """
+    return bool(TOTAL_RE.search(prompt) or SPAN_RE.search(prompt))
 
 
 def _without_prompts(roster: dict) -> list[dict]:

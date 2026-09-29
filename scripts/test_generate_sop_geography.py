@@ -5,8 +5,9 @@ prompt of a hand-maintained JSON file. These cases hold it to the properties
 that make that safe: the section is measured the way the geography test
 measures it (a ``###`` inside a fence is not a heading), a prompt that pins
 nothing is left alone, nothing outside the digits changes, an SOP the prompt
-cannot cite is refused rather than guessed at, and the committed tree is
-already current.
+cannot cite is refused rather than guessed at, a pinned prompt in a shape the
+line rule does not reach is refused rather than reported current, and the
+committed tree is already current.
 
 Run:
   python3 -m unittest discover -s scripts -p 'test_generate_sop_geography.py' -v
@@ -134,6 +135,28 @@ class RewriteTest(unittest.TestCase):
         roster = ROSTER.replace("sample_sop.md", "gone_sop.md")
         with self.assertRaisesRegex(ValueError, "gone_sop.md"):
             gen.rewrite_roster(roster, self.sop_dir)
+
+    def test_a_pinned_job_written_on_one_line_is_refused(self):
+        # Valid JSON, the same jobs, but the prompt key no longer opens its
+        # line: the line rule never reaches the pin, so the roster is refused
+        # rather than reported current.
+        roster = ROSTER.replace('"id": "sample-audit",\n      "prompt"', '"id": "sample-audit", "prompt"')
+        self.assertNotEqual(ROSTER, roster)
+        with self.assertRaisesRegex(ValueError, r"1 prompt\(s\) pin an SOP but 0 open a line"):
+            gen.rewrite_roster(roster, self.sop_dir)
+
+    def test_a_pinned_prompt_with_a_spaced_colon_is_refused(self):
+        roster = ROSTER.replace('"prompt": "Read the SOP', '"prompt" : "Read the SOP')
+        self.assertNotEqual(ROSTER, roster)
+        with self.assertRaisesRegex(ValueError, r"1 prompt\(s\) pin an SOP but 0 open a line"):
+            gen.rewrite_roster(roster, self.sop_dir)
+
+    def test_an_unpinned_prompt_in_another_shape_is_not_counted(self):
+        # The count is of pinned prompts only: a prompt with nothing to
+        # regenerate may sit wherever its author put it.
+        roster = ROSTER.replace('"id": "no-pins",\n      "prompt"', '"id": "no-pins", "prompt"')
+        self.assertNotEqual(ROSTER, roster)
+        self.assertIn("are section 2, lines 8-13", gen.rewrite_roster(roster, self.sop_dir))
 
 
 class CommittedTreeTest(unittest.TestCase):
