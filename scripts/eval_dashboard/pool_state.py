@@ -122,6 +122,7 @@ REASON_VERIFIER_TIMEOUT = "scripts/verify_ci_pool_project.py did not finish with
 REASON_NO_REPORT = "scripts/verify_ci_pool_project.py wrote no report for this check"
 REASON_CHECK_UNCHECKED = "the verifier could read nothing about this item"
 REASON_WORKDIR = "the scan could not prepare a work directory for this project: {error}"
+REASON_REPORT_UNREADABLE = "scripts/verify_ci_pool_project.py exited {rc} and its report could not be read: {error}"
 # What `--projects` admits: the mapping row's shape in hack/ci-deploy.sh, at
 # GCP's 30-character cap. An id is also a directory name under the work
 # directory, so nothing with a path in it, or too long for one, gets that far.
@@ -271,10 +272,19 @@ def scan_project(
     if rc == EXIT_TIMED_OUT:
         reason = REASON_VERIFIER_TIMEOUT.format(seconds=int(timeout))
         return _project_entry(_all_checks(checks, CHECK_NOT_CHECKED, [reason]), {}, started, reason)
-    document = load_json(report) if report.is_file() else None
-    if document is None:
+    if not report.is_file():
         # Any code: an uncaught exception exits 1, and stderr says why.
         reason = REASON_VERIFIER_FAILED.format(rc=rc, error=_error_summary(err))
+        return _project_entry(_all_checks(checks, CHECK_NOT_CHECKED, [reason]), {}, started, reason)
+    try:
+        document = json.loads(report.read_text(encoding="utf-8"))
+        if not isinstance(document, dict):
+            raise ValueError(f"the report is a JSON {type(document).__name__}, not an object")
+    except (OSError, ValueError) as exc:
+        # A report that is there but cannot be read -- a write cut short, a
+        # full disk -- is its own reason; "without a report" would name a
+        # crash that did not happen.
+        reason = REASON_REPORT_UNREADABLE.format(rc=rc, error=exc)
         return _project_entry(_all_checks(checks, CHECK_NOT_CHECKED, [reason]), {}, started, reason)
     checks_out, findings = from_report(document, checks)
     return _project_entry(checks_out, findings, started)

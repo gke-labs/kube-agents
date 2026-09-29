@@ -346,6 +346,10 @@ FIXTURE_STATE_MAX_AGE = timedelta(hours=3)
 # in the agent's transcript, not on the change; the run-based rules see that
 # red, this one names the cause and carries the repair.
 POOL_STATE_LABEL = "pool-state"
+# The verifier's synthesised finding for a check that failed with nothing more
+# specific to say: `<check>/failed` (REPORT_FINDING_FAILED in
+# scripts/verify_ci_pool_project.py; the pool-state tests pin the two equal).
+SCAN_FAILED_SUFFIX = "/failed"
 FIXTURE_STATE_LABEL = "fixture-state"
 # How many projects an evidence line names before "and N more".
 EVIDENCE_MAX_PROJECTS = 4
@@ -1895,6 +1899,21 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
     return not any(carries(run) for run in recent)
 
 
+def _units_still_shown(units: set[str], shown) -> bool:
+    """Whether any of an incident's units is still in a project's current
+    findings. The verifier's synthesised `<check>/failed` names a check that
+    failed with nothing more specific to say; it stands for the check, so it
+    is still shown while that check has any finding, named or not -- a named
+    finding joining it must not read as its recovery."""
+    shown = set(shown)
+    if units & shown:
+        return True
+    return any(
+        unit.endswith(SCAN_FAILED_SUFFIX) and any(s.startswith(unit[: -len(SCAN_FAILED_SUFFIX)] + "/") for s in shown)
+        for unit in units
+    )
+
+
 def _scan_hold(scan_result: dict, incident: dict | None, label: str) -> str | None:
     """Rule 6's exit for a scan condition: why this tick's scan cannot end
     the incident, or None when it can. Entering took a scan that saw the
@@ -1930,7 +1949,7 @@ def _scan_hold(scan_result: dict, incident: dict | None, label: str) -> str | No
     # the scan itself.
     current = scan_result.get("current") or {}
     still = sorted(
-        project for project in incident.get("projects") or [] if roles & set(current.get(project) or [])
+        project for project in incident.get("projects") or [] if _units_still_shown(roles, current.get(project) or [])
     )
     if still:
         return f"the {label} scan still shows the drift on {_project_list(still)}"

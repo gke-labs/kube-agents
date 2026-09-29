@@ -105,6 +105,10 @@ class DenialClassifierTest(unittest.TestCase):
         # A failure that said nothing (gcloud killed by a signal): no line
         # says the resource is absent.
         "",
+        # A token the API rejected: the credential lapsed mid-run, as the
+        # refresh failures above, printed as the gRPC status or as a 401.
+        "ERROR: (gcloud.iam.service-accounts.get-iam-policy) UNAUTHENTICATED: Request had invalid authentication credentials. Expected OAuth 2 access token.",
+        "ERROR: (gcloud.storage.buckets.describe) HTTPError 401: Invalid Credentials",
         # Observed 2026-08-27 from a gcloud whose refresh token had lapsed. The
         # account still printed as ACTIVE under `gcloud auth list`, which is the
         # case check_toolchain's docstring says it cannot catch.
@@ -2453,7 +2457,6 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(reconciler_roles=checker.FLEET_RECONCILER_ROLES - {"roles/container.admin"})),
-                _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -2461,6 +2464,12 @@ class IamGrantsTest(unittest.TestCase):
         named = [d for d in result.details if "seeded-fleet reconciler" in d]
         self.assertEqual(len(named), 1, result.details)
         self.assertIn("roles/container.admin", named[0])
+        # One finding per missing role, with the grant, like every other
+        # role-set here: the scan's document and issue name it and its repair.
+        self.assertEqual(
+            {f.id: f.repair for f in result.findings},
+            {"iam/fleet-reconciler/missing/roles/container.admin": checker._project_binding("kube-agents-evals-3", checker.FLEET_RECONCILER_MEMBER, "roles/container.admin")},
+        )
 
     def _both_build_identities(self):
         return self._reader_policy(

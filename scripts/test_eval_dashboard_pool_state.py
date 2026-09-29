@@ -348,6 +348,32 @@ class EntryPoint(ScanHarness):
         self.assertFalse((self.workdir.parent / "evals-2").exists(), "nothing was created beside it")
         self.assertTrue(pool_state.PROJECT_ID_RE.match("kube-agents-evals-35"))
 
+    def test_a_report_the_scan_cannot_read_says_so_rather_than_no_report(self):
+        # A verifier cut off mid-write leaves a report that is there and not
+        # JSON; the reason names that, not a crash with no report.
+        def cut_short(argv, **kwargs):
+            report = pathlib.Path(argv[argv.index("--report") + 1])
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text('{"checks": {"iam": {"status": "pa', encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, "", "iam: pass")
+        entry = pool_state.scan_project(PROJECT, ["iam"], self.root / "work", 5.0, verifier_script=self.stub, runner=cut_short)
+        self.assertTrue(entry["error"].startswith("scripts/verify_ci_pool_project.py exited 0 and its report could not be read:"), entry["error"])
+        self.assertEqual(entry["checks"]["iam"]["state"], "not_checked")
+
+        def not_an_object(argv, **kwargs):
+            report = pathlib.Path(argv[argv.index("--report") + 1])
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text("[]", encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        entry = pool_state.scan_project(PROJECT, ["iam"], self.root / "work", 5.0, verifier_script=self.stub, runner=not_an_object)
+        self.assertIn("not an object", entry["error"])
+
+    def test_the_failed_finding_suffix_is_the_verifiers(self):
+        # health.py holds a `<check>/failed` unit while its check has any
+        # finding; the suffix it looks for is the id the verifier synthesises.
+        from eval_dashboard import health
+        self.assertEqual(health.SCAN_FAILED_SUFFIX, "/" + verifier.REPORT_FINDING_FAILED)
+
     def test_a_work_directory_that_cannot_be_made_is_not_checked_not_a_dead_scan(self):
         # scan_project's contract holds for its own filesystem calls too: a
         # work directory it cannot prepare (here, its parent is a file) is

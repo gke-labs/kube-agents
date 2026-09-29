@@ -644,10 +644,13 @@ _UNREAD_PATTERNS = (
     # (upper case, so a lower-case "unknown" in a message is not one); a
     # resource named kube-agents-evals-500 does not match.
     re.compile(r"RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED|\bUNAVAILABLE\b|\bINTERNAL\b|\bABORTED\b|\bUNKNOWN\b|\bCANCELLED\b|database is locked"),
+    # A token the API rejected is a credential that expired mid-run, not an
+    # absent resource: gcloud prints the gRPC status, or the HTTP 401 below.
+    re.compile(r"\bUNAUTHENTICATED\b|Request had invalid authentication credentials"),
     # A separator between the word and the code is required (`code=`, `status:
     # '`, `HTTP `, `HTTPError (`), so a resource named http500 or code503 is
     # not a status.
-    re.compile(r"(?:HTTPError|HTTP Error|HTTP|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()(?:408|429|500|502|503|504)\b", re.I),
+    re.compile(r"(?:HTTPError|HTTP Error|HTTP|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()(?:401|408|429|500|502|503|504)\b", re.I),
     # A transport failure on the runner -- gcloud never got an answer -- is
     # not absence either; without this a DNS or TLS blip on one wave became
     # three `*/failed` findings and a pool-drift issue.
@@ -1261,6 +1264,12 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     f"on the state bucket and {FLEET_RECONCILER_BUCKET_ROLE} under its {FLEET_RECONCILER_STATE_PREFIX} "
                     "prefix, which this check does not read"
                 )
+                for role in sorted(reconciler_missing):
+                    findings.append(Finding(
+                        f"iam/fleet-reconciler/missing/{role}",
+                        f"The seeded-fleet reconciler is missing {role} on {project_id}",
+                        _project_binding(project_id, FLEET_RECONCILER_MEMBER, role),
+                    ))
 
             platform_missing = PLATFORM_GSA_ROLES - platform_held
             platform_extra = platform_held - PLATFORM_GSA_ROLES

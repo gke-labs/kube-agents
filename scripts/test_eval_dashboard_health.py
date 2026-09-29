@@ -2275,7 +2275,8 @@ class FixtureDrift(unittest.TestCase):
 POOL_CHECKS = ("project_and_apis", "iam", "artifact_registry", "gke_and_state", "token_minter_kms")
 FINDING = "iam/platform-gsa/missing/roles/serviceusage.serviceUsageConsumer"
 OTHER_FINDING = "apis/cloudkms.googleapis.com"
-FINDING_CHECK = {FINDING: "iam", OTHER_FINDING: "project_and_apis"}
+FAILED_FINDING = "iam/failed"
+FINDING_CHECK = {FINDING: "iam", OTHER_FINDING: "project_and_apis", FAILED_FINDING: "iam"}
 FINDING_DETAIL = "The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on {project}"
 FINDING_REPAIR = 'gcloud projects add-iam-policy-binding {project} --member="serviceAccount:kubeagents-platform-gsa@{project}.iam.gserviceaccount.com" --role=roles/serviceusage.serviceUsageConsumer'
 POOL_BLIND_REASON = "Could not describe kube-agents-evals-1, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED"
@@ -2415,6 +2416,23 @@ class PoolDrift(unittest.TestCase):
         held = self.judge(persisting, prev=prev, now=later)
         self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
         self.assertIn(f"pool drift held: the pool-state scan still shows the drift on {project(2)}; a scan that reads those projects clean ends it", held["evidence"])
+
+    def test_a_named_finding_joining_a_checks_failed_unit_is_not_its_recovery(self):
+        # `iam/failed` is what the verifier writes for an IAM failure with no
+        # named finding; it stands for the check. A later scan that names a
+        # finding on the same check stops synthesising it, and the check is
+        # still failing, so the incident holds; it ends when the check is clean.
+        firing = pool_scan(drifted={project(i): [FAILED_FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        self.assertEqual(prev["condition"], "pool_drift")
+        later = T0 + timedelta(hours=1)
+        at = later - timedelta(minutes=5)
+        joined = pool_scan(at=at, drifted={project(2): [FINDING]}, previous={project(i): [FAILED_FINDING] for i in (1, 2, 3)})
+        held = self.judge(joined, prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
+        self.assertTrue(any(f"still shows the drift on {project(2)}" in line for line in held["evidence"]), held["evidence"])
+        clean = pool_scan(at=at, previous={project(i): [FAILED_FINDING] for i in (1, 2, 3)})
+        self.assertEqual(self.judge(clean, prev=prev, now=later)["condition"], None)
 
     def test_a_fixture_incident_recorded_before_reads_existed_still_exits_on_its_roles(self):
         # The live health.json at merge time may hold a fixture_drift incident
