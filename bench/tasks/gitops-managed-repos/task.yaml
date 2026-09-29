@@ -1,6 +1,6 @@
-# Which GitOps repositories the agent manages, answered from its own
-# configuration: the gitops-state ConfigMap, mounted at $GITOPS_STATE_PATH.
-# Each eval project's repository is <owner>/<project>-infra (hack/ci-deploy.sh).
+# Which GitOps repositories the agent manages, read from the file mounted at
+# $GITOPS_STATE_PATH. Each eval project's repository is <owner>/<project>-infra
+# (hack/ci-deploy.sh); on kind, hack/kind-up.sh registers a fake kind-infra.
 id: gitops-managed-repos
 name: List the GitOps repositories the agent manages
 prompt: >-
@@ -19,9 +19,9 @@ verification_spec:
     check:
       type: report_contains
       any_of_phrases: ["{{PROJECT_ID}}-infra"]
-  - name: answered-from-the-configuration
+  - name: answered-from-the-mounted-file
     role: objective
     mode: assert
     check:
       type: worker_commands
-      forbidden_patterns: ['\bgh\s+(repo\s+list|search\s+repos)\b', '\bgcloud\b']
+      forbidden_patterns: ['\bkubectl\b', '\bgcloud\b', '\bgh\s+(repo\s+list|search\s+repos)\b']

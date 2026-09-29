@@ -153,6 +153,10 @@ wait_for deployment platform-agent-credential-proxy "kind.local/credential-proxy
 wait_for deployment platform-agent-gateway "kind.local/platform-agent:${AGENT_TAG}"
 wait_for statefulset platform-agent-shell "kind.local/agent-sandbox:${SANDBOX_TAG}"
 
+# A fake GitOps repository; nothing serves it yet.
+kubectl --context "${CONTEXT}" -n "${NAMESPACE}" patch configmap platform-agent-gitops-state --type merge \
+  -p '{"data":{"managed_repos":"[{\"type\":\"git\",\"url\":\"http://git-server.'"${NAMESPACE}"'.svc.cluster.local/kind-infra.git\"}]"}}' >/dev/null
+
 log "probing the agent API"
 kubectl --context "${CONTEXT}" -n "${NAMESPACE}" port-forward svc/platform-agent 28641:8642 >/dev/null 2>&1 &
 PF_PID=$!
