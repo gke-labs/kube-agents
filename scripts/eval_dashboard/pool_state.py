@@ -123,6 +123,7 @@ REASON_NO_REPORT = "scripts/verify_ci_pool_project.py wrote no report for this c
 REASON_CHECK_UNCHECKED = "the verifier could read nothing about this item"
 REASON_WORKDIR = "the scan could not prepare a work directory for this project: {error}"
 REASON_REPORT_UNREADABLE = "scripts/verify_ci_pool_project.py exited {rc} and its report could not be read: {error}"
+REASON_PROJECT_PLACEHOLDER = "<project>"
 # What `--projects` admits: the mapping row's shape in hack/ci-deploy.sh, at
 # GCP's 30-character cap. An id is also a directory name under the work
 # directory, so nothing with a path in it, or too long for one, gets that far.
@@ -348,6 +349,20 @@ def unread_units(document: dict | None) -> int:
     return count
 
 
+def failing_map(document: dict | None) -> dict[str, list[str]]:
+    """{project: [check ids in the drifted state]}, sorted: what a
+    `<check>/failed` unit stands for, whatever the check's findings are named."""
+    out: dict[str, list[str]] = {}
+    for project, entry in _entries(document):
+        checks = entry.get(KEY_CHECKS)
+        if not isinstance(checks, dict):
+            continue
+        failing = sorted(check for check, verdict in checks.items() if isinstance(verdict, dict) and verdict.get(KEY_STATE) == CHECK_DRIFTED)
+        if failing:
+            out[project] = failing
+    return out
+
+
 def read_map(document: dict | None) -> dict[str, list[str]]:
     """{project: [check ids read in full]}, sorted: what rule 6's exit may
     take as proof a finding is gone."""
@@ -405,13 +420,19 @@ def _project_reason(entry: dict) -> str | None:
 def not_checked_reason(document: dict | None) -> str | None:
     """The reason a scan saw nothing: one reason per project, then the one
     most projects share, so one project's refusal does not name a stall on
-    the other thirty-four."""
-    reasons: collections.Counter = collections.Counter()
-    for _, entry in _entries(document):
+    the other thirty-four. A reason that names its project (the verifier's
+    "Could not describe <project>...") is the same reason on every project,
+    so the vote is on the wording with the project's id taken out, and the
+    first project's own line is what comes back."""
+    votes: collections.Counter = collections.Counter()
+    first: dict[str, str] = {}
+    for project, entry in _entries(document):
         reason = _project_reason(entry)
         if reason:
-            reasons[reason] += 1
-    return reasons.most_common(1)[0][0] if reasons else None
+            wording = reason.replace(project, REASON_PROJECT_PLACEHOLDER)
+            votes[wording] += 1
+            first.setdefault(wording, reason)
+    return first[votes.most_common(1)[0][0]] if votes else None
 
 
 def summarize(projects: dict[str, dict]) -> dict:
@@ -495,6 +516,9 @@ def _project_list(text: str) -> list[str]:
     bad = [p for p in projects if not PROJECT_ID_RE.match(p)]
     if bad:
         raise argparse.ArgumentTypeError(f"not a project id: {', '.join(repr(p) for p in bad)}")
+    if not projects:
+        # An empty value (an unset shell variable) must not widen to the pool.
+        raise argparse.ArgumentTypeError(f"{text!r} names no project")
     return projects
 
 

@@ -1131,6 +1131,9 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     current = module.drift_map(state_doc)
     previous = module.previous_drift_map(state_doc)
     out["current"] = current
+    # The checks failing per project, for the exit of a `<check>/failed`
+    # unit; a fleet scan's units are its roles, so its failing set is current.
+    out["failing"] = module.failing_map(state_doc) if hasattr(module, "failing_map") else current
     out["read"] = module.read_map(state_doc)
     unit_projects: dict[str, list[str]] = {}
     for project, units in current.items():
@@ -1899,19 +1902,17 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
     return not any(carries(run) for run in recent)
 
 
-def _units_still_shown(units: set[str], shown) -> bool:
+def _units_still_shown(units: set[str], shown, failing) -> bool:
     """Whether any of an incident's units is still in a project's current
     findings. The verifier's synthesised `<check>/failed` names a check that
     failed with nothing more specific to say; it stands for the check, so it
-    is still shown while that check has any finding, named or not -- a named
+    is still shown while that check is still failing (`failing`: the
+    project's drifted checks), whatever its findings are now named -- a named
     finding joining it must not read as its recovery."""
-    shown = set(shown)
-    if units & shown:
+    if units & set(shown):
         return True
-    return any(
-        unit.endswith(SCAN_FAILED_SUFFIX) and any(s.startswith(unit[: -len(SCAN_FAILED_SUFFIX)] + "/") for s in shown)
-        for unit in units
-    )
+    failing = set(failing)
+    return any(unit.endswith(SCAN_FAILED_SUFFIX) and unit[: -len(SCAN_FAILED_SUFFIX)] in failing for unit in units)
 
 
 def _scan_hold(scan_result: dict, incident: dict | None, label: str) -> str | None:
@@ -1948,8 +1949,11 @@ def _scan_hold(scan_result: dict, incident: dict | None, label: str) -> str | No
     # between lets the same drift arrive as "new" and not fire. The exit asks
     # the scan itself.
     current = scan_result.get("current") or {}
+    failing = scan_result.get("failing") or {}
     still = sorted(
-        project for project in incident.get("projects") or [] if _units_still_shown(roles, current.get(project) or [])
+        project
+        for project in incident.get("projects") or []
+        if _units_still_shown(roles, current.get(project) or [], failing.get(project) or [])
     )
     if still:
         return f"the {label} scan still shows the drift on {_project_list(still)}"

@@ -3949,23 +3949,25 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
     asserts them and Terraform grants them, and neither reads the other."""
 
     def test_roles_match_the_local(self):
-        main = (checker._ROOT / "bench" / "tf" / "fleet" / "main.tf").read_text()
+        # Comments stripped before the list is cut out: a role commented out
+        # is a role removed, and a `]` inside a comment does not end the list.
+        main = _without_hcl_comments((checker._ROOT / "bench" / "tf" / "fleet" / "main.tf").read_text())
         block = re.search(r"pool_state_reader_roles\s*=\s*\[(.*?)\]", main, re.S)
         self.assertIsNotNone(block, "pool_state_reader_roles is gone from main.tf")
-        # Comments stripped first: a role commented out is a role removed.
-        live = _without_hcl_comments(block.group(1))
-        self.assertEqual(sorted(re.findall(r'"([^"]+)"', live)), sorted(checker.POOL_STATE_READER_ROLES))
+        self.assertEqual(sorted(re.findall(r'"([^"]+)"', block.group(1))), sorted(checker.POOL_STATE_READER_ROLES))
 
     def test_the_member_matches_the_variable_default(self):
-        variables = (checker._ROOT / "bench" / "tf" / "fleet" / "variables.tf").read_text()
+        variables = _without_hcl_comments((checker._ROOT / "bench" / "tf" / "fleet" / "variables.tf").read_text())
         block = re.search(r'variable "pool_state_readers".*?\n\}', variables, re.S)
         self.assertIsNotNone(block, "pool_state_readers is gone from variables.tf")
         default = re.search(r"default\s*=\s*\[(.*?)\]", block.group(0), re.S)
-        self.assertEqual(re.findall(r'"([^"]+)"', _without_hcl_comments(default.group(1))), [checker.CI_HEALTH_BOT_MEMBER])
+        self.assertEqual(re.findall(r'"([^"]+)"', default.group(1)), [checker.CI_HEALTH_BOT_MEMBER])
 
     def test_the_comment_strip_sees_all_three_hcl_forms(self):
-        text = 'x = [\n  "a", # "b"\n  // "c"\n  /* "d",\n  "e", */ "f",\n]'
-        self.assertEqual(re.findall(r'"([^"]+)"', _without_hcl_comments(text)), ["a", "f"])
+        text = 'x = [\n  "a", # "b" see [1]\n  // "c"\n  /* "d",\n  "e", */ "f",\n]'
+        stripped = _without_hcl_comments(text)
+        self.assertEqual(re.findall(r'"([^"]+)"', stripped), ["a", "f"])
+        self.assertEqual(re.search(r"x\s*=\s*\[(.*?)\]", stripped, re.S).group(1).count('"'), 4, "the bracket in the comment did not end the list")
 
 
 if __name__ == "__main__":

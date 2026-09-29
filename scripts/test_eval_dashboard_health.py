@@ -2276,7 +2276,9 @@ POOL_CHECKS = ("project_and_apis", "iam", "artifact_registry", "gke_and_state", 
 FINDING = "iam/platform-gsa/missing/roles/serviceusage.serviceUsageConsumer"
 OTHER_FINDING = "apis/cloudkms.googleapis.com"
 FAILED_FINDING = "iam/failed"
-FINDING_CHECK = {FINDING: "iam", OTHER_FINDING: "project_and_apis", FAILED_FINDING: "iam"}
+GKE_FAILED_FINDING = "gke_and_state/failed"
+GKE_FINDING = "gke/cluster/seeded-b"
+FINDING_CHECK = {FINDING: "iam", OTHER_FINDING: "project_and_apis", FAILED_FINDING: "iam", GKE_FAILED_FINDING: "gke_and_state", GKE_FINDING: "gke_and_state"}
 FINDING_DETAIL = "The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on {project}"
 FINDING_REPAIR = 'gcloud projects add-iam-policy-binding {project} --member="serviceAccount:kubeagents-platform-gsa@{project}.iam.gserviceaccount.com" --role=roles/serviceusage.serviceUsageConsumer'
 POOL_BLIND_REASON = "Could not describe kube-agents-evals-1, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED"
@@ -2433,6 +2435,14 @@ class PoolDrift(unittest.TestCase):
         self.assertTrue(any(f"still shows the drift on {project(2)}" in line for line in held["evidence"]), held["evidence"])
         clean = pool_scan(at=at, previous={project(i): [FAILED_FINDING] for i in (1, 2, 3)})
         self.assertEqual(self.judge(clean, prev=prev, now=later)["condition"], None)
+        # The same for a check whose findings are not prefixed with its id:
+        # `gke_and_state/failed`, then `gke/cluster/seeded-b`.
+        firing = pool_scan(drifted={project(i): [GKE_FAILED_FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        joined = pool_scan(at=at, drifted={project(2): [GKE_FINDING]}, previous={project(i): [GKE_FAILED_FINDING] for i in (1, 2, 3)})
+        held = self.judge(joined, prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
+        self.assertTrue(any(f"still shows the drift on {project(2)}" in line for line in held["evidence"]), held["evidence"])
 
     def test_a_fixture_incident_recorded_before_reads_existed_still_exits_on_its_roles(self):
         # The live health.json at merge time may hold a fixture_drift incident

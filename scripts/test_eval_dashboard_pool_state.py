@@ -348,6 +348,28 @@ class EntryPoint(ScanHarness):
         self.assertFalse((self.workdir.parent / "evals-2").exists(), "nothing was created beside it")
         self.assertTrue(pool_state.PROJECT_ID_RE.match("kube-agents-evals-35"))
 
+    def test_an_empty_projects_value_is_refused_not_widened_to_the_pool(self):
+        for empty in (",", " ", ", ,"):
+            stderr = __import__("io").StringIO()
+            with unittest.mock.patch("sys.stderr", stderr), self.assertRaises(SystemExit) as raised:
+                pool_state.main(["--out", str(self.root / "out.json"), "--projects", empty, "--verifier", str(self.stub), "--workdir", str(self.workdir)])
+            self.assertEqual(raised.exception.code, 2, repr(empty))
+            self.assertIn("names no project", stderr.getvalue())
+        self.assertFalse((self.root / "out.json").exists())
+
+    def test_the_blind_reason_is_the_one_most_projects_share_even_when_it_names_them(self):
+        # Thirty-three refusals each naming their own project against two
+        # stalls with one wording: the refusal wins the vote, the first
+        # project's own line comes back.
+        refused = {f"kube-agents-evals-{i}": {"checks": {"project_and_apis": {"state": "not_checked", "detail": [f"Could not describe kube-agents-evals-{i}, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED"]}}} for i in range(1, 34)}
+        stalled = {f"kube-agents-evals-{i}": {"checks": {}, "error": pool_state.REASON_VERIFIER_TIMEOUT.format(seconds=300)} for i in (34, 35)}
+        reason = pool_state.not_checked_reason({"projects": {**refused, **stalled}})
+        self.assertTrue(reason.startswith("Could not describe kube-agents-evals-1, so neither"), reason)
+
+    def test_the_failing_map_lists_each_projects_drifted_checks(self):
+        doc = {"projects": {"p1": {"checks": {"iam": {"state": "drifted"}, "gke_and_state": {"state": "drifted"}, "artifact_registry": {"state": "healthy"}}}, "p2": {"checks": {"iam": {"state": "not_checked"}}}}}
+        self.assertEqual(pool_state.failing_map(doc), {"p1": ["gke_and_state", "iam"]})
+
     def test_a_report_the_scan_cannot_read_says_so_rather_than_no_report(self):
         # A verifier cut off mid-write leaves a report that is there and not
         # JSON; the reason names that, not a crash with no report.
