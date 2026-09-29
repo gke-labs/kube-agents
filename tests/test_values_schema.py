@@ -120,6 +120,33 @@ def _resolve(schema: dict, path: tuple[str, ...]) -> dict | None:
     return node
 
 
+def _closes_an_object(node) -> bool:
+    """Whether some object at or below `node` refuses keys it does not declare."""
+    if isinstance(node, list):
+        return any(_closes_an_object(item) for item in node)
+    if not isinstance(node, dict):
+        return False
+    return node.get("additionalProperties", True) is False or any(_closes_an_object(child) for child in node.values())
+
+
+def _maps_keyed_into_a_closed_object(node, path: tuple[str, ...] = ()) -> list[str]:
+    """Paths of the `additionalProperties` schemas with a closed object below them."""
+    if isinstance(node, list):
+        return [
+            found
+            for index, item in enumerate(node)
+            for found in _maps_keyed_into_a_closed_object(item, path + (f"[{index}]",))
+        ]
+    if not isinstance(node, dict):
+        return []
+    found = []
+    if isinstance(node.get("additionalProperties"), dict) and _closes_an_object(node["additionalProperties"]):
+        found.append("/".join(path) or "<root>")
+    for key, child in node.items():
+        found.extend(_maps_keyed_into_a_closed_object(child, path + (key,)))
+    return found
+
+
 def _values_leaves(value, prefix: tuple[str, ...] = ()):
     """Every (path, scalar) pair in a values tree; an empty map or list is a leaf."""
     if isinstance(value, dict) and value:
@@ -258,32 +285,19 @@ class SchemaShapeTest(unittest.TestCase):
         walk(_load_schema(), ())
         self.assertEqual(open_typed, [])
 
-    def test_no_object_takes_its_keys_under_a_schema(self) -> None:
-        """No map lets the operator choose its key names.
+    def test_no_map_keys_lead_to_a_closed_object(self) -> None:
+        """No map's operator-chosen keys lead to an object that refuses unknown keys.
 
         `retag_values` in `upgrade.sh` prints the path of each recorded key the
         target schema refuses, on the promise that it prints names and never
-        values. It recurses through an `additionalProperties` schema, so under a
-        map whose keys the operator chooses, those keys would be printed, and
-        there they are data. Adding such a map means deciding what that
-        refusal prints first.
+        values. It follows a map's keys through an `additionalProperties`
+        schema, so a closed object below one would put the keys the operator
+        chose into that path, and there they are data. Adding such a map means
+        deciding what that refusal prints first. This reads one schema: a map
+        open in one release and closed in the next prints its keys on a re-tag
+        between them, which no test here sees.
         """
-        keyed_by_schema = []
-
-        def walk(node, path):
-            if isinstance(node, list):
-                for index, item in enumerate(node):
-                    walk(item, path + (f"[{index}]",))
-                return
-            if not isinstance(node, dict):
-                return
-            if isinstance(node.get("additionalProperties"), dict):
-                keyed_by_schema.append("/".join(path) or "<root>")
-            for key, child in node.items():
-                walk(child, path + (key,))
-
-        walk(_load_schema(), ())
-        self.assertEqual(keyed_by_schema, [])
+        self.assertEqual(_maps_keyed_into_a_closed_object(_load_schema()), [])
 
 
 class ValuesYamlTest(unittest.TestCase):
@@ -394,6 +408,22 @@ class ResolverTest(unittest.TestCase):
         self.assertIsNone(_resolve(schema, ("platformAgent", "annotations", "anything")))
         self.assertIsNone(_resolve(schema, ("global", "imagePullSecrets", _ITEM, "name")))
         self.assertIsNone(_resolve(schema, ("platformAgent", "harness", "tuning", "platform", "maxTurns")))
+
+    def test_a_map_is_reported_only_when_its_keys_lead_to_a_closed_object(self) -> None:
+        closed = {"type": "object", "additionalProperties": False, "properties": {"a": {"type": "string"}}}
+        schema = {
+            "properties": {
+                "labels": {"type": "object", "additionalProperties": {"type": "string"}},
+                "byTeam": {
+                    "type": "array",
+                    "items": {"anyOf": [{"additionalProperties": {"properties": {"x": closed}}}]},
+                },
+            }
+        }
+        self.assertEqual(
+            _maps_keyed_into_a_closed_object(schema),
+            ["properties/byTeam/items/anyOf/[0]"],
+        )
 
     def test_hcl_walker_skips_for_expression_arrows(self) -> None:
         paths = _composition_value_paths(
