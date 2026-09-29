@@ -27,7 +27,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 _ROOT = Path(__file__).resolve().parent.parent
 _UPSTREAM_SLUG = "gke-labs/kube-agents"
@@ -195,6 +195,16 @@ DEFAULT_TIMEOUT_SECONDS = 120
 DEADLINE_PASSED = "the run's deadline passed before this check"
 # ...and for a command refused inside a check that had started.
 DEADLINE_CUT = "the run's deadline passed"
+# ...and for a deadline that passed before the toolchain probe finished: a
+# ceiling set too low, not a credential that is gone.
+DEADLINE_PASSED_TOOLCHAIN = (
+    "the run's deadline passed before the toolchain check finished; raise --deadline-seconds "
+    "(under the pool-state scan, --project-timeout less its 30 s margin)"
+)
+# What a subset run's banner says instead of the registration verdict.
+SUBSET_NOTE = "The other checks did not run: this is not the registration verdict, which needs a run without --checks."
+# run_cmd's exit for a command it stopped: GNU timeout's, which callers read.
+TIMED_OUT_RC = 124
 # The run's deadline as a time.monotonic() value, set by verify_project from
 # --deadline-seconds and read by run_cmd and _net_timeout: every command after
 # it is cut to the time left (a subprocess returns 124 at once once none is,
@@ -593,7 +603,7 @@ def run_cmd(
     if _RUN_DEADLINE is not None:
         remaining = _RUN_DEADLINE - time.monotonic()
         if remaining <= 0:
-            return 124, "", f"timed out after 0s ({DEADLINE_CUT}): {' '.join(cmd)}"
+            return TIMED_OUT_RC, "", f"timed out after 0s ({DEADLINE_CUT}): {' '.join(cmd)}"
         if remaining < timeout:
             timeout = max(1, int(remaining))
             cut = True
@@ -603,7 +613,7 @@ def run_cmd(
         # 124 is what GNU timeout(1) reports, so a caller that only looks at the
         # code still sees a failure rather than a success.
         note = f" ({DEADLINE_CUT})" if cut else ""
-        return 124, "", f"timed out after {timeout}s{note}: {' '.join(cmd)}"
+        return TIMED_OUT_RC, "", f"timed out after {timeout}s{note}: {' '.join(cmd)}"
     except FileNotFoundError as exc:
         return 127, "", str(exc)
     return proc.returncode, proc.stdout, proc.stderr
@@ -3332,7 +3342,9 @@ class _Parser(argparse.ArgumentParser):
         self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
 
 
-def report(project_id: str, checks: List[CheckResult]) -> int:
+def report(project_id: str, checks: List[CheckResult], selected: Optional[Sequence[str]] = None) -> int:
+    """The console verdict. `selected` is the --checks selection when one was
+    given: a subset's banner names what ran and says it is not the whole."""
     print("\n" + "=" * 80)
     print(f" Pre-flight Onboarding Verification: {project_id}")
     print("=" * 80 + "\n")
@@ -3352,18 +3364,28 @@ def report(project_id: str, checks: List[CheckResult]) -> int:
             unverified += 1
             print(f"    ? {w}")
 
+    subset = sorted(selected) if selected is not None and set(selected) != set(DEFAULT_CHECKS) else None
     print("\n" + "-" * 80)
     if not all_passed:
         print(f"PRE-FLIGHT CHECK FAILED. Do NOT register {project_id} in Boskos until the above are resolved.")
         status = EXIT_FAILED
     elif unverified:
-        print(
-            f"MANUAL VERIFICATION REQUIRED. Nothing failed, but {unverified} item(s) could not be checked "
-            f"automatically. Confirm each one above before registering {project_id} in Boskos."
-        )
+        if subset:
+            print(
+                f"MANUAL VERIFICATION REQUIRED. Nothing failed among the {len(subset)} selected check(s) "
+                f"({', '.join(subset)}), but {unverified} item(s) could not be checked automatically. {SUBSET_NOTE}"
+            )
+        else:
+            print(
+                f"MANUAL VERIFICATION REQUIRED. Nothing failed, but {unverified} item(s) could not be checked "
+                f"automatically. Confirm each one above before registering {project_id} in Boskos."
+            )
         status = EXIT_UNVERIFIED
     else:
-        print(f"ALL CHECKS PASSED. Project {project_id} is provisioned as the prerequisites describe.")
+        if subset:
+            print(f"ALL {len(subset)} SELECTED CHECK(S) PASSED ({', '.join(subset)}) on {project_id}. {SUBSET_NOTE}")
+        else:
+            print(f"ALL CHECKS PASSED. Project {project_id} is provisioned as the prerequisites describe.")
         status = EXIT_OK
     print("-" * 80 + "\n")
     return status
@@ -3397,6 +3419,8 @@ def check_toolchain(needs_gh: bool = True, needs_gcloud: bool = True) -> List[st
         rc, out, err = run_cmd(["gcloud", "auth", "list", "--format=value(account)", "--filter=status:ACTIVE"])
         if rc == 127:
             blockers.append("gcloud is not on PATH; every GCP check would report its resource as absent")
+        elif rc == TIMED_OUT_RC:
+            blockers.append(f"{DEADLINE_PASSED_TOOLCHAIN} ({err.strip()})")
         elif rc != 0:
             blockers.append(f"gcloud auth list failed: {err.strip()}")
         elif not out.strip():
@@ -3446,7 +3470,7 @@ def verify_project(
             _write_report(report_path, project_id, results)
         return EXIT_UNVERIFIED
     results = run_checks(project_id, app_id, location, repo_membership_confirmed, checks, deadline)
-    status = report(project_id, results)
+    status = report(project_id, results, selected=checks)
     if report_path is not None:
         # After the console verdict: an unwritable path must not throw a
         # completed run away or turn its exit code into "do not register".

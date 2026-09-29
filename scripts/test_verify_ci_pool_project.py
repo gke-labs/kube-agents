@@ -3860,6 +3860,36 @@ class ReportDocumentTest(unittest.TestCase):
         self.assertEqual(source.count("urlopen("), 3, "the three probes, and no other urlopen")
         self.assertEqual(source.count("urlopen(request, timeout=_net_timeout(timeout))"), 3, "every urlopen goes through the deadline")
 
+    def test_a_subset_runs_banner_says_it_is_not_the_registration_verdict(self):
+        passing = [checker.CheckResult("IAM", True)]
+        out = io.StringIO()
+        with mock.patch.object(checker, "check_toolchain", return_value=[]), mock.patch.object(checker, "run_checks", return_value=passing), mock.patch("sys.stdout", out):
+            status = checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_IAM])
+        self.assertEqual(status, checker.EXIT_OK)
+        self.assertIn("ALL 1 SELECTED CHECK(S) PASSED (iam)", out.getvalue())
+        self.assertIn(checker.SUBSET_NOTE, out.getvalue())
+        self.assertNotIn("ALL CHECKS PASSED", out.getvalue())
+        unread = [checker.CheckResult("IAM", True, "Not checked", warnings=[checker.Unread("refused")], read=False)]
+        out = io.StringIO()
+        with mock.patch.object(checker, "check_toolchain", return_value=[]), mock.patch.object(checker, "run_checks", return_value=unread), mock.patch("sys.stdout", out):
+            status = checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_IAM])
+        self.assertEqual(status, checker.EXIT_UNVERIFIED)
+        self.assertIn("Nothing failed among the 1 selected check(s) (iam)", out.getvalue())
+        self.assertNotIn("before registering", out.getvalue())
+        # The default selection keeps the registration verdict.
+        out = io.StringIO()
+        with mock.patch.object(checker, "check_toolchain", return_value=[]), mock.patch.object(checker, "run_checks", return_value=passing), mock.patch("sys.stdout", out):
+            checker.verify_project("kube-agents-evals-3")
+        self.assertIn("ALL CHECKS PASSED", out.getvalue())
+
+    def test_a_deadline_that_cuts_the_toolchain_probe_names_the_deadline_not_the_credential(self):
+        cut = (checker.TIMED_OUT_RC, "", f"timed out after 1s ({checker.DEADLINE_CUT}): gcloud auth list")
+        with mock.patch.object(checker, "run_cmd", return_value=cut):
+            blockers = checker.check_toolchain(needs_gh=False)
+        self.assertEqual(len(blockers), 1)
+        self.assertTrue(blockers[0].startswith(checker.DEADLINE_PASSED_TOOLCHAIN), blockers[0])
+        self.assertNotIn("gcloud auth list failed", blockers[0])
+
     def test_the_command_line_takes_checks_and_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "report.json"
