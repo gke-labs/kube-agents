@@ -1142,6 +1142,24 @@ def test_a_dead_gateway_on_the_opening_tunnel_is_infra_not_an_answer(
     assert len(attempts) == harness._MAX_TRANSPORT_FAILURES
 
 
+def test_agent_url_skips_the_tunnel(stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch) -> None:
+    """From inside the cluster the Service is reachable directly."""
+    monkeypatch.setenv("AGENT_URL", f"http://127.0.0.1:{stub_agent.server_address[1]}/")
+    monkeypatch.setenv("AGENT_LOCAL_PORT", "1")
+
+    def _no_tunnel(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("spawned a port-forward")
+
+    monkeypatch.setattr(harness, "_ensure_port_forward", _no_tunnel)
+    monkeypatch.setattr(harness, "_reset_port_forward", _no_tunnel)
+
+    result = KubeAgentsHarness().run("prompt")
+
+    assert not result.has_errors()
+    assert stub_agent.last_request is not None
+    assert stub_agent.session_lookups
+
+
 def test_a_tunnel_that_establishes_on_retry_reaches_the_answer(
     stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
