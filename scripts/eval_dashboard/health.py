@@ -2029,6 +2029,18 @@ def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
         # Same severity. The cause follows the evidence (a second case
         # joining a break changes what the reader should be told), but a
         # condition that has stopped firing does not reset `since`.
+        # One exception: a scan condition that is being held (its scan is
+        # stale, blind, or still shows the drift) is not displaced by the
+        # other scan's condition. Displacing it would let the state leave
+        # through the other scan's exit while this drift was never read
+        # clean; the newcomer takes over once this one's hold lifts.
+        prev_condition = prev.get("condition")
+        if (
+            prev_condition in SCAN_CONDITIONS
+            and assessed["condition"] != prev_condition
+            and scan_hold_for(prev_condition, assessed, prev.get("incident")) is not None
+        ):
+            return _keep(prev_state, prev_condition, prev.get("cause") or "", [], since, recovering=False)
         return _keep(raw_state, assessed["condition"], assessed["cause"], assessed["failing_cases"], since, recovering=False)
 
     # Down. Leaving OUTAGE for a lesser live condition is immediate: the
@@ -2116,10 +2128,12 @@ def adjudicate(
     elif decided["condition"] == POOL_DRIFT and not assessed["pool_state"]["fires"]:
         evidence.append(f"pool drift held: {pool_drift_hold(assessed['pool_state'], (prev or {}).get('incident'))}; a scan that reads those projects clean ends it")
 
-    # A held state (recovering, or a worse condition not yet current) keeps
-    # the previous tick's numbers: the assessment's incident describes the
-    # raw state, not the one being reported.
-    incident = assessed["incident"] if decided["state"] == assessed["state"] else (prev or {}).get("incident")
+    # A held state (recovering, a worse condition not yet current, or a scan
+    # condition held against the other scan's) keeps the previous tick's
+    # numbers: the assessment's incident describes the raw state and
+    # condition, not the ones being reported.
+    kept_assessment = decided["state"] == assessed["state"] and decided["condition"] == assessed["condition"]
+    incident = assessed["incident"] if kept_assessment else (prev or {}).get("incident")
     if decided["condition"] == DEADLINE_KILL and decided["state"] != GREEN and isinstance(incident, dict):
         # The rule's window slides, so `window_start` is the oldest kill still
         # inside it; the outage's first kill is kept across ticks for the

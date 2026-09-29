@@ -20,10 +20,11 @@ Every read runs as that project's seeded-fleet reader
 (`seeded-fleet-reader@<project>`, bench/tf/fleet). CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT
 makes gcloud impersonate it for the cluster listing, the credentials and the
 control-plane describes; FLEET_READONLY_SA makes the runner rewrite each
-kubeconfig so kubectl's token is minted as it too. The bot therefore needs
-exactly one grant per pool project -- roles/iam.serviceAccountTokenCreator on
-that account, the grant #1238 gave the presubmit's identity -- and nothing on
-the project itself. The impersonation is pre-flighted with one token mint, so
+kubeconfig so kubectl's token is minted as it too. For this scan the bot
+therefore needs one grant per pool project -- roles/iam.serviceAccountTokenCreator
+on that account, the grant #1238 gave the presubmit's identity; the read roles
+it holds on the project itself serve the pool-state scan (pool_state.py), not
+this one. The impersonation is pre-flighted with one token mint, so
 a project missing the grant is "not checked" with gcloud's own words rather
 than a runner that could not list clusters.
 

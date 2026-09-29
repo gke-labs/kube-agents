@@ -861,6 +861,25 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertTrue(result.passed, result.details)
         self.assertTrue(any("container.clusters.get" in w for w in result.warnings), result.warnings)
 
+    def test_the_ledger_checks_did_not_read_warnings_are_unread(self):
+        # The five "Not checked" exits of the ledger check: the PEM unreadable,
+        # the mint unverified, a rate-limited 403, another HTTP status, no
+        # route to GitHub. Each is a read that did not happen.
+        import urllib.error
+        with mock.patch.object(checker, "_read_ledger_app_key", return_value=(None, "kubectl could not read the secret")):
+            pem_gone = checker.check_ledger_read_credential("kube-agents-evals-3")
+        with mock.patch.object(checker, "_read_ledger_app_key", return_value=("PEM", "")), mock.patch.object(checker, "_mint_ledger_token", return_value=(None, "unverified", "GitHub's mint response carried no token")):
+            unverified = checker.check_ledger_read_credential("kube-agents-evals-3")
+        limited = urllib.error.HTTPError("https://api.github.com/x", 403, "rate limited", {"x-ratelimit-remaining": "0"}, None)
+        other = urllib.error.HTTPError("https://api.github.com/x", 502, "bad gateway", {}, None)
+        results = [pem_gone, unverified]
+        for exc in (limited, other, OSError("no route to host")):
+            with mock.patch.object(checker, "_read_ledger_app_key", return_value=("PEM", "")), mock.patch.object(checker, "_mint_ledger_token", return_value=("tok", "ok", "")), mock.patch.object(checker.urllib.request, "urlopen", side_effect=exc):
+                results.append(checker.check_ledger_read_credential("kube-agents-evals-3"))
+        for result in results:
+            self.assertEqual(result.message, "Not checked", result.message)
+            self.assertTrue(result.warnings and all(isinstance(w, checker.Unread) for w in result.warnings), result.warnings)
+
     def test_the_fleet_checks_refused_reads_are_unread_in_the_report(self):
         # Refused, timed out or unreachable: the report must list these under
         # `unread`, as every other check's did-not-read warnings are.
@@ -897,6 +916,14 @@ class SeededFleetFixturesTest(unittest.TestCase):
             run.side_effect = [(127, "", "not found")]
             no_kubectl = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
         self.assertTrue(no_kubectl.warnings and all(isinstance(w, checker.Unread) for w in no_kubectl.warnings), no_kubectl.warnings)
+        # ...and the presence script silent on exit 0.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", "")]
+            presence_silent = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertEqual(presence_silent.message, "Not checked")
+        self.assertTrue(presence_silent.warnings and all(isinstance(w, checker.Unread) for w in presence_silent.warnings), presence_silent.warnings)
+        presence_silent.check_id = checker.CHECK_SEEDED_FLEET
+        self.assertEqual(len(checker.report_document("kube-agents-evals-5", [presence_silent])["checks"][checker.CHECK_SEEDED_FLEET]["unread"]), 1)
 
     def test_a_silent_state_script_exit_is_a_failure_like_the_presence_halfs(self):
         # The state half (hack/fleet-fixture-state.py) follows the presence
@@ -3858,6 +3885,25 @@ class ReportDocumentTest(unittest.TestCase):
             doc = json.loads(path.read_text())
             self.assertEqual(set(doc["checks"]), set(checker.POOL_STATE_CHECKS))
             self.assertTrue(all(record["status"] == "unchecked" and record["warnings"] == ["gcloud has no active credential"] for record in doc["checks"].values()))
+
+    def test_a_result_written_before_its_check_ran_carries_the_checks_console_name(self):
+        # A deadline that passed, or a blocked toolchain: the record says which
+        # check it stands for by name, as the check itself would, and its
+        # blockers are reads that did not happen.
+        self.assertEqual(set(checker.CHECK_DISPLAY_NAMES), set(checker.CHECK_IDS))
+        for check_id, name in checker.CHECK_DISPLAY_NAMES.items():
+            self.assertNotEqual(name, check_id)
+        past = time.monotonic() - 1
+        with mock.patch.object(checker, "run_cmd", side_effect=AssertionError("nothing runs")):
+            results = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_GKE_AND_STATE], deadline=past)
+        self.assertEqual(results[0].name, checker.CHECK_DISPLAY_NAMES[checker.CHECK_GKE_AND_STATE])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.json"
+            with mock.patch.object(checker, "check_toolchain", return_value=["gcloud has no active credential"]), mock.patch("sys.stdout", io.StringIO()):
+                checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_IAM], report_path=path)
+            record = json.loads(path.read_text())["checks"][checker.CHECK_IAM]
+        self.assertEqual((record["name"], record["status"]), (checker.CHECK_DISPLAY_NAMES[checker.CHECK_IAM], checker.REPORT_STATUS_UNCHECKED))
+        self.assertEqual(record["unread"], ["gcloud has no active credential"])
 
     def test_verify_project_arms_the_deadline_before_anything_runs_and_hands_it_to_the_checks(self):
         # The link between --deadline-seconds and the checks: the run deadline

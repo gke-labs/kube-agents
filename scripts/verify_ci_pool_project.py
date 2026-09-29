@@ -89,6 +89,21 @@ CHECK_IDS = (
 # run_checks and verify_project alike, so a --report's key set does not depend
 # on which of them decided.
 DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c != CHECK_TOKEN_MINTER_KMS)
+# The console name each check reports under, for a result written on its
+# behalf before it ran (a deadline that passed, a blocked toolchain).
+CHECK_DISPLAY_NAMES = {
+    CHECK_CODEBASE_MAPPING: "Codebase GitOps Mapping",
+    CHECK_PROJECT_AND_APIS: "GCP Project & APIs",
+    CHECK_IAM: "Service Accounts & IAM Grants",
+    CHECK_ARTIFACT_REGISTRY: "Artifact Registry Repository",
+    CHECK_WARM_CACHE: "Warm Cache Readers",
+    CHECK_GKE_AND_STATE: "GKE Clusters & Terraform State",
+    CHECK_SEEDED_FLEET: "Seeded Fleet Fixtures",
+    CHECK_GITHUB_REPO_AND_APP: "GitOps Repo & GitHub App Installation",
+    CHECK_LEDGER_READ_CREDENTIAL: "Ledger Read Credential",
+    CHECK_TOKEN_MINTER: "Token Minter KMS & GSA",
+    CHECK_TOKEN_MINTER_KMS: "Token Minter KMS & GSA",
+}
 # The checks that need `gh`: check_toolchain asks for it only when one of
 # these is selected, so a run without it -- the pool-state scan, or a hand
 # run of the minter or ledger checks, which read GitHub over urllib and KMS
@@ -1113,7 +1128,7 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, the runners', the reconciler's and the platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
+    """Verify Workload Identity, the runners', the reconciler's, the health bot's and the platform GSA's project roles, and the fleet reader's token-creator binding (the cross-project AR reader grants are check_warm_cache_readers)."""
     details = []
     warnings: List[str] = []
     findings: List[Finding] = []
@@ -2156,10 +2171,10 @@ def _fleet_presence_result(
             name,
             True,
             "Not checked",
-            warnings=[
+            warnings=[Unread(
                 "hack/fleet-kubeconfigs.sh printed no summary line, so nothing is known "
                 f"about the fixtures in {project_id}. Last line of its output: {last}"
-            ],
+            )],
         )
 
     written = int(match.group("written"))
@@ -2586,20 +2601,20 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
 
     pem, reason = _read_ledger_app_key()
     if pem is None:
-        return CheckResult(name, True, "Not checked", warnings=[
+        return CheckResult(name, True, "Not checked", warnings=[Unread(
             f"Not checked: {reason}, so nothing here says whether the eval runner can read "
             f"{repo_slug}'s issues -- the read that failed on kube-agents-evals-6's first lease. "
             f"The key is secret {LEDGER_KEY_SECRET} ({LEDGER_KEY_SECRET_ENTRY}) in namespace "
             f"{LEDGER_KEY_NAMESPACE} on cluster {PROW_BUILD_CLUSTER}"
-        ])
+        )])
 
     token, status, message = _mint_ledger_token(pem, timeout=timeout)
     if status == "failed":
         return CheckResult(name, False, "Ledger issues not readable", details=[message])
     if token is None:
-        return CheckResult(name, True, "Not checked", warnings=[
+        return CheckResult(name, True, "Not checked", warnings=[Unread(
             f"{message}, so the eval runner's access to {repo_slug}'s issues is unknown"
-        ])
+        )])
 
     request = urllib.request.Request(
         GITHUB_ISSUES_URL.format(repo=repo_slug),
@@ -2623,10 +2638,10 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
                 name,
                 True,
                 "Not checked",
-                warnings=[
+                warnings=[Unread(
                     f"GitHub rate-limited the read of {repo_slug}'s issues, so the eval runner's "
                     "access to them was never established. Re-run when the limit resets"
-                ],
+                )],
             )
         if exc.code == 403:
             return CheckResult(name, False, "Ledger issues not readable", details=[
@@ -2643,21 +2658,21 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
                 "of docs/ci-pool-projects.md. (The same 404 covers a repository that does not "
                 "exist; the check above settles which.)"
             ])
-        return CheckResult(name, True, "Not checked", warnings=[
+        return CheckResult(name, True, "Not checked", warnings=[Unread(
             f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of allowing or refusing the "
             f"read of {repo_slug}'s issues, so the eval runner's access is unknown. Re-run when "
             "it clears"
-        ])
+        )])
     except Exception as exc:  # timeout, DNS, blocked egress, untrusted CA
         remedy = (
             "point SSL_CERT_FILE at a CA bundle (/etc/ssl/cert.pem on macOS) and re-run"
             if "CERTIFICATE_VERIFY_FAILED" in str(exc)
             else "re-run from somewhere with egress to api.github.com"
         )
-        return CheckResult(name, True, "Not checked", warnings=[
+        return CheckResult(name, True, "Not checked", warnings=[Unread(
             f"Could not reach api.github.com to read {repo_slug}'s issues "
             f"({type(exc).__name__}: {exc}), so the eval runner's access is unknown; {remedy}"
-        ])
+        )])
 
     return CheckResult(name, True, f"App {LEDGER_APP_ID} can read {repo_slug}'s issues")
 
@@ -3171,7 +3186,7 @@ def run_checks(
         if check_id not in wanted:
             return
         if due():
-            add(check_id, CheckResult(check_id, True, "Not checked", warnings=[Unread(DEADLINE_PASSED)], read=False))
+            add(check_id, CheckResult(CHECK_DISPLAY_NAMES.get(check_id, check_id), True, "Not checked", warnings=[Unread(DEADLINE_PASSED)], read=False))
         else:
             add(check_id, thunk())
 
@@ -3468,8 +3483,12 @@ def verify_project(
         )
         if report_path is not None:
             # Nothing ran, so nothing is reported: a document with no checks
-            # is the scan's "not checked", with the blockers as the reason.
-            results = [CheckResult(check_id, True, "Not checked", warnings=blockers, read=False) for check_id in selected]
+            # is the scan's "not checked", with the blockers as the reason --
+            # reads that did not happen, so the report lists them under unread.
+            results = [
+                CheckResult(CHECK_DISPLAY_NAMES.get(check_id, check_id), True, "Not checked", warnings=[Unread(b) for b in blockers], read=False)
+                for check_id in selected
+            ]
             for result, check_id in zip(results, selected):
                 result.check_id = check_id
             _write_report(report_path, project_id, results)

@@ -2420,6 +2420,23 @@ class PoolDrift(unittest.TestCase):
         self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
         self.assertIn(f"pool drift held: the pool-state scan still shows the drift on {project(2)}; a scan that reads those projects clean ends it", held["evidence"])
 
+    def test_a_held_fixture_incident_is_not_displaced_by_pool_drift(self):
+        # The fleet scan goes stale while fixture drift is open, and the pool
+        # scan (which the workflow keeps publishing then) fires: the held
+        # incident stands until its own scan reads clean, then pool drift takes
+        # over. Otherwise the state would leave through the pool scan's exit
+        # with the fixture drift never read clean.
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        prev = self.judge(None, fleet=firing)
+        self.assertEqual(prev["condition"], "fixture_drift")
+        later = T0 + timedelta(hours=1)
+        pool = pool_scan(at=later - timedelta(minutes=5), drifted={project(i): [FINDING] for i in (4, 5, 6)})
+        held = self.judge(pool, fleet=scan(at=later - timedelta(hours=4)), prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "fixture_drift", health.iso(T0)))
+        self.assertTrue(any("fixture-state scan is stale" in line for line in held["evidence"]), held["evidence"])
+        switched = self.judge(pool, fleet=scan(at=later + timedelta(minutes=55)), prev=held, now=later + timedelta(hours=1))
+        self.assertEqual((switched["state"], switched["condition"]), ("DEGRADED", "pool_drift"))
+
     def test_a_named_finding_joining_a_checks_failed_unit_is_not_its_recovery(self):
         # `iam/failed` is what the verifier writes for an IAM failure with no
         # named finding; it stands for the check. A later scan that names a

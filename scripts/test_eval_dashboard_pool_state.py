@@ -237,7 +237,9 @@ class OneProject(ScanHarness):
         # Mixed causes: one project refused at the describe, the others at the
         # ceiling; the reason is the one most projects share, not the refusal.
         stalled = {p: "sleep" for p in ("kube-agents-evals-4", "kube-agents-evals-5", "kube-agents-evals-6")}
-        mixed = self.scan({PROJECT: report(**world), **stalled}, projects=(PROJECT, *stalled), timeout=0.5)
+        # Two seconds: the refused project's stub has to finish inside the
+        # ceiling for this to be the mixed case rather than four stalls.
+        mixed = self.scan({PROJECT: report(**world), **stalled}, projects=(PROJECT, *stalled), timeout=2.0)
         self.assertTrue(pool_state.not_checked_reason(mixed).startswith("scripts/verify_ci_pool_project.py did not finish within"), pool_state.not_checked_reason(mixed))
 
     def test_a_check_the_report_omits_is_not_checked(self):
