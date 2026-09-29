@@ -100,13 +100,9 @@ KEY_SUMMARY = fixture_state.KEY_SUMMARY
 KEY_PREVIOUS = fixture_state.KEY_PREVIOUS
 KEY_DRIFTED = fixture_state.KEY_DRIFTED
 KEY_ERROR = fixture_state.KEY_ERROR
-# What the document covers: the whole mapping (the hourly job), or the ids a
-# hand run named with --projects. The health rule reads a project absent from
-# a pool-scoped document as retired from the mapping; from a selected one, as
-# not read.
-KEY_SCOPE = "scope"
-SCOPE_POOL = "pool"
-SCOPE_SELECTED = "selected"
+KEY_SCOPE = fixture_state.KEY_SCOPE
+SCOPE_POOL = fixture_state.SCOPE_POOL
+SCOPE_SELECTED = fixture_state.SCOPE_SELECTED
 KEY_CHECKS = "checks"
 KEY_FINDINGS = "findings"
 KEY_CHECK = "check"

@@ -3615,6 +3615,18 @@ class ChecksSelectionTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd", return_value=(0, "me@example.com\n", "")) as run:
             self.assertEqual(checker.check_toolchain(needs_gh=False), [])
             self.assertEqual([c.args[0][0] for c in run.call_args_list], ["gcloud"])
+        # ...and gcloud only when a selected check reads GCP: the mapping
+        # check alone runs on a machine with neither tool.
+        with mock.patch.object(checker, "run_cmd", side_effect=AssertionError("no tool was asked for")):
+            self.assertEqual(checker.check_toolchain(needs_gh=False, needs_gcloud=False), [])
+        self.assertEqual(checker.GCP_CHECKS, frozenset(checker.CHECK_IDS) - {checker.CHECK_CODEBASE_MAPPING})
+        seen = {}
+        with mock.patch.object(checker, "check_toolchain", side_effect=lambda **kw: seen.update(kw) or ["stop here"]), mock.patch("sys.stdout", io.StringIO()):
+            checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_CODEBASE_MAPPING])
+        self.assertEqual(seen, {"needs_gh": False, "needs_gcloud": False})
+        with mock.patch.object(checker, "check_toolchain", side_effect=lambda **kw: seen.update(kw) or ["stop here"]), mock.patch("sys.stdout", io.StringIO()):
+            checker.verify_project("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS))
+        self.assertEqual(seen, {"needs_gh": False, "needs_gcloud": True})
         with mock.patch.object(checker, "run_cmd", side_effect=[(0, "me@example.com\n", ""), (127, "", "no gh")]):
             self.assertEqual(len(checker.check_toolchain(needs_gh=True)), 1)
         self.assertFalse(checker.GITHUB_CHECKS.intersection(checker.POOL_STATE_CHECKS))
@@ -3801,7 +3813,7 @@ class ReportDocumentTest(unittest.TestCase):
             with mock.patch.object(checker, "check_toolchain", return_value=["gcloud has no active credential"]) as toolchain, mock.patch("builtins.print"):
                 status = checker.verify_project("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS), report_path=path)
             self.assertEqual(status, checker.EXIT_UNVERIFIED)
-            toolchain.assert_called_once_with(needs_gh=False)
+            toolchain.assert_called_once_with(needs_gh=False, needs_gcloud=True)
             doc = json.loads(path.read_text())
             self.assertEqual(set(doc["checks"]), set(checker.POOL_STATE_CHECKS))
             self.assertTrue(all(record["status"] == "unchecked" and record["warnings"] == ["gcloud has no active credential"] for record in doc["checks"].values()))
@@ -3812,7 +3824,7 @@ class ReportDocumentTest(unittest.TestCase):
         # and a run without the flag leaves both unset.
         seen = {}
 
-        def toolchain(needs_gh):
+        def toolchain(needs_gh, needs_gcloud):
             seen["at_toolchain"] = checker._RUN_DEADLINE
             return []
 

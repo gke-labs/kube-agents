@@ -94,6 +94,9 @@ DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c != CHECK_TOKEN_MINTER_KMS)
 # run of the minter or ledger checks, which read GitHub over urllib and KMS
 # over gcloud -- is not stopped at the door for a tool no selected check uses.
 GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP})
+# The checks that read GCP, and so need a gcloud credential before they run:
+# every check but the mapping, which reads the checkout and the remote ref.
+GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING}
 # What the hourly pool-state scan runs: every read-only check on the project.
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
 # two GitHub checks (each needs a credential the health bot must not hold),
@@ -3366,12 +3369,14 @@ def report(project_id: str, checks: List[CheckResult]) -> int:
     return status
 
 
-def check_toolchain(needs_gh: bool = True) -> List[str]:
+def check_toolchain(needs_gh: bool = True, needs_gcloud: bool = True) -> List[str]:
     """Reasons the checks below cannot be trusted, before any of them run.
 
     `needs_gh` is whether a selected check reads GitHub (GITHUB_CHECKS): the
     pool-state scan's identity has no `gh` credential and asks for none of
     those checks, so demanding one would stop it at the door for nothing.
+    `needs_gcloud` is the same for GCP (GCP_CHECKS): `--checks
+    codebase_mapping` alone reads no GCP and runs without a credential.
 
     A missing binary or no credential at all would leave every check reporting
     its resource as unreadable, which is exit 2 and a screenful of warnings
@@ -3386,15 +3391,16 @@ def check_toolchain(needs_gh: bool = True) -> List[str]:
     still prints as ACTIVE and only the calls that follow fail.
     """
     blockers = []
-    # An empty active-account list is exit 0 with no output, not an error, so the
-    # logged-out case has to be read off stdout rather than the return code.
-    rc, out, err = run_cmd(["gcloud", "auth", "list", "--format=value(account)", "--filter=status:ACTIVE"])
-    if rc == 127:
-        blockers.append("gcloud is not on PATH; every GCP check would report its resource as absent")
-    elif rc != 0:
-        blockers.append(f"gcloud auth list failed: {err.strip()}")
-    elif not out.strip():
-        blockers.append("gcloud has no active credential; every GCP check would report its resource as absent")
+    if needs_gcloud:
+        # An empty active-account list is exit 0 with no output, not an error, so
+        # the logged-out case has to be read off stdout rather than the return code.
+        rc, out, err = run_cmd(["gcloud", "auth", "list", "--format=value(account)", "--filter=status:ACTIVE"])
+        if rc == 127:
+            blockers.append("gcloud is not on PATH; every GCP check would report its resource as absent")
+        elif rc != 0:
+            blockers.append(f"gcloud auth list failed: {err.strip()}")
+        elif not out.strip():
+            blockers.append("gcloud has no active credential; every GCP check would report its resource as absent")
 
     if needs_gh:
         rc, _, err = run_cmd(["gh", "auth", "status"])
@@ -3418,7 +3424,9 @@ def verify_project(
     selected = checks if checks is not None else list(DEFAULT_CHECKS)
     deadline = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
     _RUN_DEADLINE = deadline
-    blockers = check_toolchain(needs_gh=bool(GITHUB_CHECKS.intersection(selected)))
+    blockers = check_toolchain(
+        needs_gh=bool(GITHUB_CHECKS.intersection(selected)), needs_gcloud=bool(GCP_CHECKS.intersection(selected))
+    )
     if blockers:
         print("\n" + "=" * 80)
         print(f" Pre-flight Onboarding Verification: {project_id}")

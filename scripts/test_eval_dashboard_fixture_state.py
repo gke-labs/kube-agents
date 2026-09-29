@@ -454,6 +454,8 @@ class EntryPoint(ScanHarness):
         env = self.environ()
         with unittest.mock.patch.dict(os.environ, env):
             rc, err = self.run_main(["--out", str(out), "--prior", str(prior), "--projects", PROJECT, "--workdir", str(self.workdir), "--now", NOW.isoformat(), "--workers", "1"])
+            # A hand run's document says it covers named projects, not the pool.
+            self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["scope"], fixture_state.SCOPE_SELECTED)
         self.assertEqual(rc, 0, err)
         doc = json.loads(out.read_text())
         self.assertEqual(doc["schema_version"], 1)

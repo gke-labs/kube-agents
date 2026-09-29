@@ -118,6 +118,13 @@ KEY_PREVIOUS = "previous"
 KEY_DRIFTED = "drifted"
 KEY_READER = "reader"
 KEY_ERROR = "error"
+# What the document covers: the whole mapping (the hourly job), or the ids a
+# hand run named with --projects. The health rule reads a project absent from
+# a pool-scoped document as retired from the mapping; from a selected one, as
+# not read. pool_state.py writes the same key.
+KEY_SCOPE = "scope"
+SCOPE_POOL = "pool"
+SCOPE_SELECTED = "selected"
 
 # Reasons written when a whole project could not be checked.
 REASON_NO_BINARY = "{binary} is not on PATH, so nothing was checked"
@@ -457,6 +464,7 @@ def scan(
     project_timeout: float = DEFAULT_PROJECT_TIMEOUT_S,
     impersonate: bool = True,
     which=shutil.which,
+    scope: str = SCOPE_POOL,
     **project_kwargs,
 ) -> dict:
     """fixture-state.json as a dict. `prior` is the previously published
@@ -482,6 +490,7 @@ def scan(
     document = {
         "schema_version": SCHEMA_VERSION,
         KEY_SCANNED_AT: iso(now),
+        KEY_SCOPE: scope,
         KEY_DURATION: int(time.monotonic() - started),
         KEY_PROJECTS: entries,
         KEY_SUMMARY: summarize(entries),
@@ -544,6 +553,7 @@ def main(argv=None) -> int:
             workdir,
             prior=load_json(args.prior),
             now=parse_iso(args.now),
+            scope=SCOPE_SELECTED if args.projects else SCOPE_POOL,
             workers=args.workers,
             project_timeout=args.project_timeout,
             impersonate=not args.no_impersonate,

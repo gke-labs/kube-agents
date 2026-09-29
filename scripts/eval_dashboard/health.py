@@ -1910,6 +1910,11 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
     return not any(carries(run) for run in recent)
 
 
+def _failed_checks(shown) -> set[str]:
+    """The checks a project's current `<check>/failed` findings name."""
+    return {unit[: -len(SCAN_FAILED_SUFFIX)] for unit in shown if unit.endswith(SCAN_FAILED_SUFFIX)}
+
+
 def _units_still_shown(units: set[str], shown, failing) -> bool:
     """Whether any of an incident's units is still in a project's current
     findings. The verifier's synthesised `<check>/failed` names a check that
@@ -1953,10 +1958,19 @@ def _scan_hold(scan_result: dict, incident: dict | None, label: str) -> str | No
     scanned = set(scan_result.get("scanned") or [])
     named = list(incident.get("projects") or [])
     waiting = named if scan_result.get("partial") else [project for project in named if not scanned or project in scanned]
+    current = scan_result.get("current") or {}
+
+    def required(project):
+        return set(reads.get(project, roles) if reads is not None else roles)
+
+    # A check that failed with nothing named (`<check>/failed`) did not read
+    # what the incident needs read again -- a policy that would not parse, a
+    # listing that failed outside the unread grammar -- so it is not proof the
+    # named finding is gone.
     unread = sorted(
         project
         for project in waiting
-        if not set(reads.get(project, roles) if reads is not None else roles) <= set(read.get(project, []))
+        if not required(project) <= set(read.get(project, [])) or required(project) & _failed_checks(current.get(project) or [])
     )
     if unread:
         return f"the {label} scan could not read {_project_list(unread)}"
@@ -1964,7 +1978,6 @@ def _scan_hold(scan_result: dict, incident: dict | None, label: str) -> str | No
     # reads the previous document, so an unread scan or a lost prior in
     # between lets the same drift arrive as "new" and not fire. The exit asks
     # the scan itself.
-    current = scan_result.get("current") or {}
     failing = scan_result.get("failing") or {}
     still = sorted(project for project in waiting if _units_still_shown(roles, current.get(project) or [], failing.get(project) or []))
     if still:

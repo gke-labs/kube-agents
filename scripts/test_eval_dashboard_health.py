@@ -2476,6 +2476,18 @@ class PoolDrift(unittest.TestCase):
         self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
         self.assertTrue(any("could not read" in line for line in held["evidence"]), held["evidence"])
 
+    def test_a_check_that_later_fails_without_a_finding_does_not_end_a_named_incident(self):
+        # The IAM policy would not parse, or the read failed outside the
+        # unread grammar: the check is `iam/failed` with nothing named and
+        # nothing unread, which is not a read of the role the incident named.
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        failed = pool_scan(at=later - timedelta(minutes=5), drifted={project(2): [FAILED_FINDING]}, previous={project(i): [FINDING] for i in (1, 2, 3)})
+        held = self.judge(failed, prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
+        self.assertTrue(any(f"could not read {project(2)}" in line for line in held["evidence"]), held["evidence"])
+
     def test_an_incident_whose_every_project_was_retired_ends(self):
         # The pool's own document (`scope: pool`) no longer listing any of an
         # incident's projects means they left the mapping: nothing is waited
