@@ -1478,6 +1478,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     partial = _partial_summary(
         [
             ("the Workload Identity binding", wi_checked),
+            ("the LiteLLM gateway's Workload Identity binding", litellm_checked),
             ("the runners' and platform GSA project roles", roles_checked),
             ("the fleet reader's token-creator binding", fleet_reader_checked),
         ]

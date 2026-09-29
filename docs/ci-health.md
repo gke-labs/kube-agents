@@ -186,7 +186,12 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 ## Hysteresis
 
 A single bad tick does not change the state, and a single lucky green does not
-end an incident. Entering a shared-break OUTAGE or a storm or delegation-ceiling DEGRADED needs the condition to be
+end an incident. A scan condition (fixture drift, pool drift) that its own
+scan cannot yet read clean is not replaced by a scan condition either, the
+other scan's or its own on other units: the state would otherwise leave
+through a scan exit that never read the held incident's projects. It is
+displaced by a run-based condition as before, and the newcomer takes over
+once the hold lifts. Entering a shared-break OUTAGE or a storm or delegation-ceiling DEGRADED needs the condition to be
 current: one of the three newest completed runs carries it. Setup deaths,
 lost pods, deadline kills, fixture drift and pool drift have no such signature
 on a completed run; their count is the currency. Returning to GREEN needs 3
@@ -637,12 +642,14 @@ scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
 against every pool project, seven at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
-Left out: the fleet fixtures (the fleet scan reads those), the two GitHub checks
+Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the two GitHub checks
 (each needs a credential the bot must not hold), the mapping (about the checkout).
 
 **The document.** `pool-state.json` has the fleet scan's shape. Per project,
 `checks` holds one `{state, detail}` per verifier check (`healthy`, `drifted`,
-`not_checked`) and `findings` one entry per thing found wrong, keyed by the
+`not_checked`; a healthy or drifted check also carries `unread`, the reads the
+verifier could not make), and `findings` one entry per thing found wrong, keyed
+by the
 verifier's stable id (`iam/platform-gsa/missing/roles/serviceusage.serviceUsageConsumer`,
 `gke/cluster/seeded-b`, `token-minter/signer/pull-sweeper`): `{check, detail,
 repair}`, where `repair` is the command or runbook section that closes it (empty

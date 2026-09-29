@@ -2801,7 +2801,8 @@ class IamGrantsTest(unittest.TestCase):
         self.assertTrue(
             any("were not checked" in w for w in result.warnings), result.warnings)
         self.assertEqual(
-            "the Workload Identity binding, the fleet reader's token-creator binding verified; "
+            "the Workload Identity binding, the LiteLLM gateway's Workload Identity binding, "
+            "the fleet reader's token-creator binding verified; "
             "the runners' and platform GSA project roles not checked",
             result.message,
         )
@@ -3093,7 +3094,8 @@ class IamGrantsTest(unittest.TestCase):
             result.warnings,
         )
         self.assertEqual(
-            "the Workload Identity binding, the runners' and platform GSA project roles verified; "
+            "the Workload Identity binding, the LiteLLM gateway's Workload Identity binding, "
+            "the runners' and platform GSA project roles verified; "
             "the fleet reader's token-creator binding not checked",
             result.message,
         )

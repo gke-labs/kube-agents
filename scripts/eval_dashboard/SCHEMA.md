@@ -899,6 +899,11 @@ the episode ending. `metrics.pool_since` is the open episode's start, held
 across the ticks that read no artifact and so write no `pool`, and `null` once
 a tick reads one and writes none, which is the episode ending.
 
+A held scan condition (`fixture_drift` or `pool_drift` whose scan is stale,
+blind, or still shows the drift) keeps its `condition` and `incident` while the
+other scan's condition, or its own on other units, is assessed at the same
+severity; a run-based condition displaces it as before.
+
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus
 `"tick": "<ISO 8601 UTC>"`, oldest first (the reader sorts anyway and

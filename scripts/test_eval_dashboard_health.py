@@ -2437,6 +2437,30 @@ class PoolDrift(unittest.TestCase):
         switched = self.judge(pool, fleet=scan(at=later + timedelta(minutes=55)), prev=held, now=later + timedelta(hours=1))
         self.assertEqual((switched["state"], switched["condition"]), ("DEGRADED", "pool_drift"))
 
+    def test_a_run_based_condition_still_displaces_a_held_scan_condition(self):
+        # Lost pods, a storm, a break: read from the runs, ranked above the
+        # scans, and reported the tick they fire, whatever a scan's hold says.
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        prev = self.judge(None, fleet=firing)
+        assessed = {"state": "DEGRADED", "condition": health.LOST_PODS, "cause": "the build cluster lost the node under 3 runs", "failing_cases": [], "current": True, "fixture": {"known": False}, "pool_state": {"known": False}}
+        decided = health.transition(prev, assessed, T0 + timedelta(hours=1))
+        self.assertEqual((decided["state"], decided["condition"]), ("DEGRADED", health.LOST_PODS))
+
+    def test_a_held_scan_condition_is_not_replaced_by_its_own_firing_on_other_units(self):
+        # p1..p3 unread this scan while a different finding fires on p4..p6:
+        # the incident stays p1..p3's until they are read clean, then the new
+        # one takes over; otherwise a scan that never read p1..p3 could end it.
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        unread_old = pool_scan(at=later - timedelta(minutes=5), drifted={project(i): [OTHER_FINDING] for i in (4, 5, 6)}, unread={project(i): ["iam"] for i in (1, 2, 3)})
+        held = self.judge(unread_old, prev=prev, now=later)
+        self.assertEqual((held["condition"], sorted(held["incident"]["projects"]), held["incident"]["roles"]), ("pool_drift", [project(1), project(2), project(3)], [FINDING]))
+        self.assertTrue(any("could not read" in line for line in held["evidence"]), held["evidence"])
+        clean_old = pool_scan(at=later + timedelta(minutes=55), drifted={project(i): [OTHER_FINDING] for i in (4, 5, 6)}, previous={project(i): [OTHER_FINDING] for i in (4, 5, 6)})
+        switched = self.judge(clean_old, prev=held, now=later + timedelta(hours=1))
+        self.assertEqual((switched["condition"], sorted(switched["incident"]["projects"]), switched["incident"]["roles"]), ("pool_drift", [project(4), project(5), project(6)], [OTHER_FINDING]))
+
     def test_a_named_finding_joining_a_checks_failed_unit_is_not_its_recovery(self):
         # `iam/failed` is what the verifier writes for an IAM failure with no
         # named finding; it stands for the check. A later scan that names a
