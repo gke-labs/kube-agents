@@ -861,6 +861,24 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertTrue(result.passed, result.details)
         self.assertTrue(any("container.clusters.get" in w for w in result.warnings), result.warnings)
 
+    def test_the_fleet_checks_refused_reads_are_unread_in_the_report(self):
+        # Refused, timed out or unreachable: the report must list these under
+        # `unread`, as every other check's did-not-read warnings are.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles())), (1, "", "ERROR: PERMISSION_DENIED: caller lacks container.pods.list")]
+            state_refused = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(state_refused.passed, state_refused.details)
+        self.assertTrue(state_refused.warnings and all(isinstance(w, checker.Unread) for w in state_refused.warnings), state_refused.warnings)
+        stderr = "\n".join([
+            f"WARNING: no credentials for seeded cluster seeded-{slot} in kube-agents-evals-5: code=403, message=denied"
+            for slot in ("a", "b", "c")
+        ] + [self._summary(0, unresolved=self._roles())])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", stderr)]
+            unreachable = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(unreachable.passed, unreachable.details)
+        self.assertTrue(unreachable.warnings and all(isinstance(w, checker.Unread) for w in unreachable.warnings), unreachable.warnings)
+
     def test_a_silent_state_script_exit_is_a_failure_like_the_presence_halfs(self):
         # The state half (hack/fleet-fixture-state.py) follows the presence
         # half's rule: a non-zero exit with nothing on stderr is a kill or a
@@ -3889,6 +3907,21 @@ class ReportDocumentTest(unittest.TestCase):
         self.assertEqual(len(blockers), 1)
         self.assertTrue(blockers[0].startswith(checker.DEADLINE_PASSED_TOOLCHAIN), blockers[0])
         self.assertNotIn("gcloud auth list failed", blockers[0])
+        # The gh half the same way.
+        gh_cut = (checker.TIMED_OUT_RC, "", f"timed out after 0s ({checker.DEADLINE_CUT}): gh auth status")
+        with mock.patch.object(checker, "run_cmd", side_effect=[(0, "me@example.com\n", ""), gh_cut]):
+            blockers = checker.check_toolchain(needs_gh=True)
+        self.assertEqual(len(blockers), 1)
+        self.assertTrue(blockers[0].startswith(checker.DEADLINE_PASSED_TOOLCHAIN), blockers[0])
+        self.assertNotIn("not authenticated", blockers[0])
+        # A probe that ran out its own ceiling, with no deadline armed, is the
+        # stall it was, not a deadline nobody set.
+        stalled = (checker.TIMED_OUT_RC, "", "timed out after 120s: gcloud auth list --format=value(account)")
+        with mock.patch.object(checker, "run_cmd", return_value=stalled):
+            blockers = checker.check_toolchain(needs_gh=False)
+        self.assertEqual(len(blockers), 1)
+        self.assertTrue(blockers[0].startswith("gcloud auth list failed: timed out after 120s"), blockers[0])
+        self.assertNotIn("--deadline-seconds", blockers[0])
 
     def test_the_command_line_takes_checks_and_report(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4078,9 +4111,34 @@ class TokenMinterKmsHalfTest(unittest.TestCase):
 
 
 def _without_hcl_comments(text):
-    """HCL's three comment forms stripped: `#`, `//` and `/* */`. A role
+    """HCL's three comment forms stripped: `#`, `//` and `/* */`, outside
+    string literals (a `principalSet://...` member is not a comment). A role
     commented out in any of them is a role removed."""
-    return re.sub(r"(#|//)[^\n]*", "", re.sub(r"/\*.*?\*/", "", text, flags=re.S))
+    out, i, n, in_string = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            in_string = c != '"'
+            i += 1
+        elif c == '"':
+            in_string = True
+            out.append(c)
+            i += 1
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+        elif c == "#" or text.startswith("//", i):
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
 class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
@@ -4104,10 +4162,10 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
         self.assertEqual(re.findall(r'"([^"]+)"', default.group(1)), [checker.CI_HEALTH_BOT_MEMBER])
 
     def test_the_comment_strip_sees_all_three_hcl_forms(self):
-        text = 'x = [\n  "a", # "b" see [1]\n  // "c"\n  /* "d",\n  "e", */ "f",\n]'
+        text = 'x = [\n  "a", # "b" see [1]\n  // "c"\n  /* "d",\n  "e", */ "f",\n  "principalSet://iam.googleapis.com/locations/global/workforcePools/p/*", // "g"\n  "with # hash",\n]'
         stripped = _without_hcl_comments(text)
-        self.assertEqual(re.findall(r'"([^"]+)"', stripped), ["a", "f"])
-        self.assertEqual(re.search(r"x\s*=\s*\[(.*?)\]", stripped, re.S).group(1).count('"'), 4, "the bracket in the comment did not end the list")
+        self.assertEqual(re.findall(r'"([^"]+)"', stripped), ["a", "f", "principalSet://iam.googleapis.com/locations/global/workforcePools/p/*", "with # hash"])
+        self.assertEqual(re.search(r"x\s*=\s*\[(.*?)\]", stripped, re.S).group(1).count('"'), 8, "the bracket in the comment did not end the list")
 
 
 if __name__ == "__main__":

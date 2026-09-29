@@ -1023,11 +1023,11 @@ def check_codebase_mapping(project_id: str) -> CheckResult:
             "Codebase GitOps Mapping",
             True,
             f"Mapped to {expected_repo} in this checkout; could not read the mapping on {_UPSTREAM_SLUG} main",
-            warnings=[
+            warnings=[Unread(
                 f"Could not check whether {project_id} is mapped on {_UPSTREAM_SLUG} main: {detail}. "
                 "A presubmit runs main's hack/ci-deploy.sh, not this checkout's -- confirm the row is on "
-                f"main before registering {project_id}.",
-            ],
+                f"main before registering {project_id}."
+            )],
         )
     fetch_hint = f"git fetch {remote} main" if remote else "git fetch"
     return CheckResult(
@@ -2049,7 +2049,7 @@ def _fleet_state_result(
                     presence.message,
                     warnings=[
                         *presence.warnings,
-                        (
+                        Unread(
                             f"hack/fleet-fixture-state.py exited {rc} without reading the fixtures, "
                             f"so nothing is known about their state in {project_id}: {reason}"
                         ),
@@ -2095,7 +2095,7 @@ def _fleet_state_result(
             f"{unchecked} of {expected} fixture role(s) present, state not checked",
             warnings=[
                 *presence.warnings,
-                "\n      ".join(
+                Unread("\n      ".join(
                     [
                         (
                             f"{counts}. Nothing was found out of shape: the reads failed, so "
@@ -2103,7 +2103,7 @@ def _fleet_state_result(
                         ),
                         *notes,
                     ]
-                ),
+                )),
             ],
         )
     if presence.warnings:
@@ -2222,14 +2222,14 @@ def _fleet_presence_result(
             # are evidence for a single item -- this project's seeded fleet --
             # rather than three separate things to go and confirm.
             warnings=[
-                "\n      ".join(
+                Unread("\n      ".join(
                     [
                         f"{counts}. Nothing was found missing: the clusters carrying those roles could "
                         f"not be reached, so their fixtures were never checked. Confirm the seeded "
                         f"fleet in {project_id} before registering it.",
                         *notes,
                     ]
-                )
+                ))
             ],
         )
     return CheckResult(name, False, "Seeded fleet incomplete", details=[counts, *notes])
@@ -3419,7 +3419,9 @@ def check_toolchain(needs_gh: bool = True, needs_gcloud: bool = True) -> List[st
         rc, out, err = run_cmd(["gcloud", "auth", "list", "--format=value(account)", "--filter=status:ACTIVE"])
         if rc == 127:
             blockers.append("gcloud is not on PATH; every GCP check would report its resource as absent")
-        elif rc == TIMED_OUT_RC:
+        elif rc == TIMED_OUT_RC and DEADLINE_CUT in err:
+            # Cut by the run's deadline; a probe that ran out its own ceiling
+            # falls through and is named as the stall it was.
             blockers.append(f"{DEADLINE_PASSED_TOOLCHAIN} ({err.strip()})")
         elif rc != 0:
             blockers.append(f"gcloud auth list failed: {err.strip()}")
@@ -3430,6 +3432,8 @@ def check_toolchain(needs_gh: bool = True, needs_gcloud: bool = True) -> List[st
         rc, _, err = run_cmd(["gh", "auth", "status"])
         if rc == 127:
             blockers.append("gh is not on PATH; every GitHub check would report its resource as absent")
+        elif rc == TIMED_OUT_RC and DEADLINE_CUT in err:
+            blockers.append(f"{DEADLINE_PASSED_TOOLCHAIN} ({err.strip()})")
         elif rc != 0:
             blockers.append(f"gh is not authenticated: {err.strip()}")
     return blockers
