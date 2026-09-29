@@ -35,12 +35,13 @@ real install:
      closed the gate stops the apply before step 2 changes anything.
 
 The rest pin step 1's refusals, step 2 stopping when it cannot list the
-sandbox pods, step 4's handling of a board read that fails and of a sweep no
-worker picked up, and the trap and the destroy carrying on past a failed step
-and naming it. As in `test_autoops_incident_plant.py`, the provisioners are
-rendered the way Terraform renders them and run against a stub
-`kubectl`/`gcloud`/`sleep`. The reads in steps 1 and 2 also run on their own
-against a data directory, and step 4's board query against a sqlite board.
+sandbox pods or remove the INVENTORY files from one, step 4's handling of a
+board read that fails and of a sweep no worker picked up, the trap retrying a
+card listing that fails, and the trap and the destroy carrying on past a
+failed step and naming it. As in `test_autoops_incident_plant.py`, the
+provisioners are rendered the way Terraform renders them and run against a
+stub `kubectl`/`gcloud`/`sleep`. The reads in steps 1 and 2 also run on their
+own against a data directory, and step 4's board query against a sqlite board.
 """
 
 import json
@@ -163,6 +164,9 @@ elif "s/^task_id=//p" in script:
         print("t_new")
 elif "task_id=$1" in script:
     record("restore")
+    if bump("restores") < int(os.environ.get("RESTORE_FAILS", "0")):
+        sys.stderr.write("error: unable to upgrade connection: container not found\n")
+        sys.exit(1)
 elif "rm" in cmd and "/opt/data/.bootstrap_scan_filed" in cmd:
     record("rearm")
 elif "rm" in cmd and "/opt/data/INVENTORY.md" in cmd:
@@ -172,6 +176,9 @@ elif "rm" in cmd and "/opt/data/INVENTORY.md" in cmd:
         sys.exit(1)
 elif "archive" in cmd:
     record("archive")
+    if cmd[-1] in os.environ.get("ARCHIVE_FAIL", "").split():
+        sys.stderr.write("error: unable to upgrade connection: container not found\n")
+        sys.exit(1)
 elif "/proc" in stdin:
     record("gate " + target)
     if target == "pod/gw-evicted":
@@ -197,7 +204,7 @@ elif "idempotency_key LIKE" in stdin:
         sys.stderr.write("error: unable to upgrade connection: container not found\n")
         sys.exit(1)
     raced = os.environ.get("RACE") == "1" and (state / "gate_done").exists()
-    print("t_raced" if raced else "")
+    print(os.environ.get("OPEN_CARDS", "t_raced" if raced else ""))
 else:
     record()
 '''
@@ -371,7 +378,34 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("Plant failed", completed.stderr)
         self.assertEqual(self._indices(calls, "[rearm]"), [])
+        self.assertEqual(len(self._indices(calls, "[clear deployment/platform-agent-gateway]")), 2)
         self.assertIn("Cleanup incomplete: could not remove the INVENTORY files.", completed.stderr)
+
+    def test_a_failed_sandbox_rm_stops_the_apply_before_the_marker_goes(self):
+        completed, calls = self._run(INVENTORY_RM_FAIL="pod/platform-agent-shell-0")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(self._indices(calls, "[rearm]"), [])
+        self.assertEqual(len(self._indices(calls, "[clear deployment/platform-agent-gateway]")), 2)
+        self.assertIn("Cleanup incomplete: could not remove the INVENTORY files.", completed.stderr)
+
+    def test_the_trap_retries_the_marker_restore_while_the_agent_is_down(self):
+        completed, calls = self._run(GATE_FILES=0, RESTORE_FAILS=2)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(len(self._indices(calls, "[restore]")), 3)
+        self.assertEqual(calls.count("sleep 5"), 2)
+        self.assertNotIn("Cleanup incomplete", completed.stderr)
+
+    def test_the_trap_names_a_marker_restore_it_never_managed(self):
+        completed, calls = self._run(GATE_FILES=0, RESTORE_FAILS=1000, NO_PODS=1)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(calls.count("sleep 5"), 60)
+        self.assertEqual(len(self._indices(calls, "[open_cards]")), 3)
+        self.assertIn("Cleanup incomplete: could not put back the sweep marker.", completed.stderr)
+
+    def test_the_trap_names_a_card_it_could_not_archive(self):
+        completed, _ = self._run(GATE_FILES=0, RACE=1, ARCHIVE_FAIL="t_raced")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Cleanup incomplete: could not archive t_raced.", completed.stderr)
 
     # Step 2 lists the cards twice, so the trap's listings are the third on.
     def test_the_trap_retries_a_card_listing_that_fails(self):
@@ -403,6 +437,20 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 1)
         self.assertIn("Cleanup incomplete: could not remove the agent's INVENTORY files.", completed.stderr)
         self.assertEqual(len(self._indices(calls, "[clear pod/platform-agent-shell-0]")), 1)
+
+    def test_the_destroy_archives_the_rest_when_one_archive_fails(self):
+        completed, calls = self._run(script=self._destroy_script, OPEN_CARDS="t_a t_b", ARCHIVE_FAIL="t_a")
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(len([c for c in calls if c.endswith("archive t_b [archive]")]), 1, calls)
+        self.assertIn("Cleanup incomplete: could not archive t_a.", completed.stderr)
+
+    def test_the_destroy_names_a_sandbox_pod_it_could_not_clear(self):
+        completed, _ = self._run(script=self._destroy_script, INVENTORY_RM_FAIL="pod/platform-agent-shell-0")
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(
+            "Cleanup incomplete: could not remove the INVENTORY files from pod/platform-agent-shell-0.",
+            completed.stderr,
+        )
 
     def test_the_destroy_names_a_sandbox_listing_it_never_got(self):
         completed, calls = self._run(script=self._destroy_script, SANDBOX_LIST_FAIL="1")

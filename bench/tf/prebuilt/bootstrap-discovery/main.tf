@@ -115,13 +115,21 @@ resource "null_resource" "sweep" {
           # stays, as after the destroy, and its sweep is among the cards
           # archived below. A gate run that read the marker before it went
           # back files once its reconcile ends, so the listing also waits for
-          # any gate run to exit.
+          # any gate run to exit. The restore is retried under the same ceiling
+          # as that wait: an agent pod that is down fails both, and once it is
+          # back the gate files if the marker is still absent.
           failed=""
-          if [ -n "$old_id" ]; then
-            agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$old_id" >&2 ||
-              failed="$failed, put back the sweep marker"
-          fi
           waited=0
+          if [ -n "$old_id" ]; then
+            until agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$old_id" >&2; do
+              if [ "$waited" -ge ${local.gate_wait} ]; then
+                failed="$failed, put back the sweep marker"
+                break
+              fi
+              sleep 5
+              waited=$((waited + 5))
+            done
+          fi
           until [ "$(gate_running)" = idle ] || [ "$waited" -ge ${local.gate_wait} ]; do
             sleep 5
             waited=$((waited + 5))
@@ -226,9 +234,10 @@ resource "null_resource" "sweep" {
       # A failed listing or rm fails step 2, where the destroy's copy only
       # reports it: the sandbox's /opt/data outlives its pod, and a report left
       # there makes the sweep skip discovery
-      # (agents/platform/governance/inventory.md). Every step runs either way,
-      # so the trap's call clears what it can. The listing is checked on its
-      # own because a failure inside a `for` word list fails nothing.
+      # (agents/platform/governance/inventory.md). Every step runs and the
+      # status covers them all, so step 2 still stops and the trap can name
+      # what it left. The listing is checked on its own because a failure
+      # inside a `for` word list fails nothing.
       clear_inventory() {
         clear_status=0
         if sandbox_pods="$(kubectl get pods -n "${var.agent_namespace}" -l "${var.sandbox_selector}" -o name)"; then
