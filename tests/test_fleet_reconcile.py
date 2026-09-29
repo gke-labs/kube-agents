@@ -359,8 +359,10 @@ class LeaseTest(unittest.TestCase):
             raise AssertionError("Boskos was called: %s" % request.full_url)
 
         dev = "my-dev-project"
-        with mock.patch.object(boskos_pool.urllib.request, "urlopen", no_boskos):
-            outcomes = reconcile.reconcile_named([P7, dev], BOSKOS, OWNER, lease=False, runner=_Tofu({P7: UPDATE_ONLY, dev: UPDATE_ONLY}), known=KNOWN)
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", no_boskos), mock.patch.object(
+            reconcile, "pool_projects", side_effect=AssertionError("the mapping was read on the dev-project path")
+        ):
+            outcomes = reconcile.reconcile_named([P7, dev], BOSKOS, OWNER, lease=False, runner=_Tofu({P7: UPDATE_ONLY, dev: UPDATE_ONLY}))
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
         self.assertEqual(outcomes[dev][0], reconcile.OUTCOME_APPLIED)
 

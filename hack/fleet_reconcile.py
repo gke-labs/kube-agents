@@ -339,7 +339,9 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
     so a typo would otherwise read as busy on every run. Without a lease the
     mapping is not consulted; that is the dev-project path.
     """
-    known = pool_projects() if known is None else known
+    # The mapping is read only when Boskos will be asked: the dev-project
+    # path has no use for it and must not fail on it.
+    known = pool_projects() if known is None and lease else known
     outcomes = {} if outcomes is None else outcomes
     for project in projects:
         if not lease:

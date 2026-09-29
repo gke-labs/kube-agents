@@ -134,7 +134,7 @@ KUBE_AGENTS_STATE_PREFIX="full-install/platform-agent-host" \
       --member="${FLEET_RECONCILER_SA}" --role="${role}" --quiet >/dev/null
   done
   gcloud storage buckets add-iam-policy-binding "gs://${PROJECT_ID}-tf-state" \
-    --member="${FLEET_RECONCILER_SA}" --role=roles/storage.legacyBucketReader --quiet >/dev/null
+    --member="${FLEET_RECONCILER_SA}" --role=roles/storage.legacyBucketReader --condition=None --quiet >/dev/null
   gcloud storage buckets add-iam-policy-binding "gs://${PROJECT_ID}-tf-state" \
     --member="${FLEET_RECONCILER_SA}" --role=roles/storage.objectAdmin \
     --condition="expression=resource.name.startsWith(\"projects/_/buckets/${PROJECT_ID}-tf-state/objects/seeded-fleet/\"),title=seeded-fleet-state,description=the seeded fleet state prefix only" \

@@ -3026,14 +3026,14 @@ class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
         self.assertEqual(self._loop_roles(script, "provision_ci_pool_project.sh"), checker.FLEET_RECONCILER_ROLES)
         assigned = re.search(rf'^{self._VAR}="([^"]+)"$', script, re.MULTILINE).group(1)
         self.assertEqual(assigned, checker.FLEET_RECONCILER_MEMBER)
-        self.assertIn(f'--member="${{{self._VAR}}}" \\\n  --role={checker.FLEET_RECONCILER_BUCKET_LIST_ROLE}', script)
+        self.assertIn(f'--member="${{{self._VAR}}}" \\\n  --role={checker.FLEET_RECONCILER_BUCKET_LIST_ROLE} \\\n  --condition=None', script, "re-runnable once the conditioned grant exists")
         self.assertIn(f'--member="${{{self._VAR}}}" \\\n  --role={checker.FLEET_RECONCILER_BUCKET_ROLE} \\\n  --condition=', script)
         self.assertIn(f'/objects/{checker.FLEET_RECONCILER_STATE_PREFIX}', script, "objectAdmin is conditioned to the fleet's prefix")
 
     def test_matches_the_repair_block_on_the_prerequisites_page(self):
         page = (checker._ROOT / "docs" / "ci-pool-projects.md").read_text()
         self.assertEqual(self._loop_roles(page, "docs/ci-pool-projects.md"), checker.FLEET_RECONCILER_ROLES)
-        self.assertIn(f"--role={checker.FLEET_RECONCILER_BUCKET_LIST_ROLE}", page)
+        self.assertIn(f"--role={checker.FLEET_RECONCILER_BUCKET_LIST_ROLE} --condition=None", page)
         self.assertIn(f"--role={checker.FLEET_RECONCILER_BUCKET_ROLE} \\\n    --condition=", page)
         self.assertIn(f"/objects/{checker.FLEET_RECONCILER_STATE_PREFIX}", page)
 

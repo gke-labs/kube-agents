@@ -455,9 +455,13 @@ fi
 # and objectAdmin under the seeded-fleet/ prefix only. The prefix keeps tofu's
 # reads off the other state; the identity's project IAM admin above could
 # widen it, so the fence is that only main-only jobs run as this account.
+# --condition=None on the unconditioned grant: once the conditioned one below
+# exists, gcloud refuses an unconditioned add in non-interactive mode without
+# it, and this script is re-run.
 gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
   --member="${FLEET_RECONCILER_SA}" \
   --role=roles/storage.legacyBucketReader \
+  --condition=None \
   --quiet >/dev/null
 gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
   --member="${FLEET_RECONCILER_SA}" \
