@@ -150,8 +150,7 @@ recording `N` as the installed tag. What `./upgrade.sh --plan` then reports depe
 runs from: the `N-1` checkout's script carries `N-1` as its baked version, so it plans at `N-1` and
 the report holds the re-tag along with every composition difference between `N-1` and `N`, which is
 the next section's subject. A copy carrying no baked version plans at the tag state records
-instead, and the re-tag is not in that report; where that tag is `0.7.0` or earlier, the plan stops
-for the reason the introduction gives. The state and the cluster disagree on the tag until
+instead, and the re-tag is not in that report. The state and the cluster disagree on the tag until
 the next `--upgrade-mode=full`, which re-applies whatever tag it is given. The `terraform.tfvars`
 in the `N-1` checkout is regenerated on every run and is not a record of anything.
 
