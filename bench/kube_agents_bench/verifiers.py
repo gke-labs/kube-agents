@@ -1709,7 +1709,7 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
     ``obtainability-remediation-proposal`` 12 of 12 on one, 0 of 3 on the
     other, for the same proposal). The proposal is in the diff, so this check
     reads it there: the same phrase semantics as ``report_contains``, over
-    the ``patch`` of every file the pull request changes, plus the file
+    the added lines of every file the pull request changes, never the file
     names.
 
     WHAT IT ASSERTS, AND WHAT IT DOES NOT. The reply names a github.com pull
@@ -1743,8 +1743,8 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
     leases when it reaches them, and because a case that must prove the write
     declares ``pull_request_opened`` beside this. Open-only is safe against
     that sweep: ``hack/ci_sweep_agent_pulls.py`` acquires only projects Boskos
-    reports free (``BOSKOS_FREE_STATE``), so a leased run's pull request stays
-    open until this check reads it. What the run wrote to GitHub is not this
+    reports free (``FREE_STATE`` in ``hack/boskos_pool.py``), so a leased
+    run's pull request stays open until this check reads it. What the run wrote to GitHub is not this
     objective's question; ``pull_request_opened`` asks it. Only ADDED lines
     of each patch are matched, and file names are not: a pull request that
     deletes a budget, or edits a line beside one, carries the nouns in its
