@@ -151,7 +151,7 @@ KIND_POOL = "pool"  # runs are waiting to start; once per episode
 KIND_POOL_CLEAR = "pool_clear"  # ... and once when they stop
 KIND_DIGEST = "digest"  # the daily numbers
 KIND_FIXTURE_SCAN = "fixture_scan"  # the fleet scan sees nothing, or sees again
-KIND_PERIODIC = "periodic"  # a watched Prow periodic failed or stopped; once per build
+KIND_PERIODIC = "periodic"  # a watched Prow periodic failed or stopped; once per episode and verdict
 KIND_PERIODIC_CLEAR = "periodic_clear"  # ... and once when its next run passes
 
 # Where the message goes. The space is a resource name, the token a bearer
@@ -393,10 +393,10 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
         kinds.append(KIND_STALE)
     if fixture_unknown(health) != bool((prev or {}).get("fixture_unknown")):
         kinds.append(KIND_FIXTURE_SCAN)
-    # A watched periodic: once per failing build (a new build that also
-    # failed is news: the fix did not take), and once more when a job the
-    # space was told about passes again. Only a reading clears -- no reading
-    # is the bot losing sight of the job, not the job recovering.
+    # A watched periodic: once per episode and verdict (a persistently
+    # failing hourly job is one message, not one an hour), and once more when
+    # a job the space was told about passes again. Only a reading clears --
+    # no reading is the bot losing sight of the job, not the job recovering.
     if periodic_news(health, prev):
         kinds.append(KIND_PERIODIC)
     if periodic_clears(health, prev):
@@ -855,8 +855,11 @@ def render_pool_clear(health: dict) -> str:
 
 
 def periodic_key(note: dict) -> str:
-    """What one message stands for: the job's verdict on one build."""
-    return f"{note.get('verdict')}:{note.get('build')}"
+    """What one message stands for: the job's verdict this episode. A newer
+    build that fails the same way is not news (the digest carries it daily);
+    a job that failed and then stopped is two facts, so the verdict flipping
+    is."""
+    return str(note.get("verdict"))
 
 
 def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:
@@ -906,7 +909,8 @@ def periodic_digest_lines(health: dict) -> list[str]:
     lines = []
     for _, note in sorted((health.get("periodics") or {}).items()):
         if note.get("verdict") == periodics.VERDICT_STALE:
-            lines.append(f"⚪ {note['label']}: no finished run since {clock(parse_iso(note.get('finished_at')))}.")
+            last = f"no finished run since {clock(parse_iso(note.get('finished_at')))}" if note.get("finished_at") else "no finished run on record"
+            lines.append(f"⚪ {note['label']}: {last}.")
         else:
             lines.append(f"🟠 {note['label']}: build {note['build']} failed {clock(parse_iso(note.get('finished_at')))}; {note['history_url']}")
     return lines

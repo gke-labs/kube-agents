@@ -90,7 +90,6 @@ DEFAULT_FIXTURE_STATE = "gs://kube-agents-dashboards/evals/fixture-state.json"
 REPORT_FILE = "fleet-reconcile.json"
 REPORT_SCHEMA_VERSION = 1
 ARTIFACTS_ENV = "ARTIFACTS"
-EXIT_NAMES = {0: "ok", 1: "failed", 143: "terminated"}
 GCS_PREFIX = "gs://"
 GCLOUD_TIMEOUT_SECONDS = 60
 
@@ -116,6 +115,7 @@ REASON_CEILING = "did not finish within %ds; tofu was interrupted, and killed if
 
 EXIT_OK = 0
 EXIT_FAILED = 1
+EXIT_NAMES = {EXIT_OK: "ok", EXIT_FAILED: "failed", boskos_pool.TERMINATED_EXIT_CODE: "terminated"}
 
 
 class ReconcileError(Exception):
@@ -487,9 +487,14 @@ def main(argv=None):
     outcomes = {}
     started = time.time()
     error = []
-    code = _run(args, outcomes, error)
-    if args.report:
-        write_report(args.report, args, outcomes, code, error[0] if error else None, started)
+    code = None
+    try:
+        code = _run(args, outcomes, error)
+    finally:
+        # Written whatever happened above: an exception no arm of _run
+        # handles still leaves a report, with `exit` "error" and no code.
+        if args.report:
+            write_report(args.report, args, outcomes, code, error[0] if error else None, started)
     return code
 
 

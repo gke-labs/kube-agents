@@ -902,7 +902,10 @@ where `detail` names the projects the reconcile's artifact says it refused,
 failed or was interrupted in, and `since` is carried from the previous
 `health.json`. `periodics_read` names the jobs a reading arrived for this
 tick, whether or not they are noted; the poster clears a told job only on a
-reading that shows it clean (`scripts/eval_dashboard/periodics.py` owns both).
+reading that shows it clean. `periodics_since` is each open note's start, kept
+across the ticks that read nothing (which write no `periodics`) and dropped for
+a job once a tick with readings writes no note for it
+(`scripts/eval_dashboard/periodics.py` owns the notes).
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus

@@ -365,15 +365,18 @@ latest finished build failed is a `FAILED` note; one whose latest finished
 build is older than its stale window (an hour for the sweep, three for the
 hourly reconcile, eight days for the weekly) is `STALE`, whatever that build's
 verdict. The note carries the build, when it finished, `since` (kept across
-ticks through the previous `health.json`), the job's history link, where the
+ticks through the previous `health.json`, blind ticks included), the job's
+history link, where the
 recovery is written, and for the reconcile the projects it refused, failed or
 was interrupted in, with each one's reason, up to five. A job with no reading
 writes no note and ends none: that is the bot losing sight of the job, not the
 job recovering.
 
-The poster sends one message per failing build (a newer build that also failed
-is news: the fix did not take) and one when a job the space was told about
-passes again, on a reading only. The digest carries one line per open note.
+The poster sends one message per episode and verdict: a job's first failing
+build (in orange; a newer build that fails the same way is not news, and the
+digest carries it daily), a job that has stopped (in grey, whether or not its
+last build failed), and one when a job the space was told about passes again,
+on a reading only. The digest carries one line per open note.
 Nothing here files an issue: the recovery is a person's, and the message says
 where it is written (`docs/ci-pool-projects.md`, sections 3 and 6.2).
 

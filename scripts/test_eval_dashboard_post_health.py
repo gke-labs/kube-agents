@@ -1798,25 +1798,51 @@ class WatchedPeriodics(RunHarness):
         self.assertIn("- kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)", text)
         self.assertIn("Recovery: docs/ci-pool-projects.md, section 6.2.", text)
         self.assertIn(f"https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs/{self.WEEKLY}", text)
-        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED:100"})
+        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED"})
         self.assertEqual(self.recorded()["state"], "GREEN")
         self.tick(failed, T14 + timedelta(minutes=15))
         self.assertEqual(len(self.opener.texts), 1, "said once")
-        # A newer build that also failed is news; a tick with no reading is not a clear.
+        # A newer build that fails the same way is not news; the job stopping
+        # is; a tick with no reading is not a clear.
         failed["periodics"][self.WEEKLY]["build"] = "101"
         self.tick(failed, T14 + timedelta(hours=1))
+        self.assertEqual(len(self.opener.texts), 1, "one message per episode, not per build")
+        failed["periodics"][self.WEEKLY]["verdict"] = "STALE"
+        self.tick(failed, T14 + timedelta(hours=2))
         self.assertEqual(len(self.opener.texts), 2)
+        self.assertTrue(self.opener.texts[-1].startswith("⚪ *seeded-fleet reconcile (weekly) stopped*"), self.opener.texts[-1])
         blind = health("GREEN")
         blind["periodics"], blind["periodics_read"] = {}, []
-        self.tick(blind, T14 + timedelta(hours=2))
+        self.tick(blind, T14 + timedelta(hours=2, minutes=30))
         self.assertEqual(len(self.opener.texts), 2, "no reading is not a recovery")
-        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED:101"})
+        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "STALE"})
         clean = health("GREEN")
         clean["periodics"], clean["periodics_read"] = {}, [self.WEEKLY]
         self.tick(clean, T14 + timedelta(hours=3))
         self.assertEqual(self.opener.texts[-1], "✅ *seeded-fleet reconcile (weekly) passed again* — its latest run finished clean.")
         self.assertEqual(self.recorded()["periodics_told"], {})
         self.assertEqual(self.gh.writes(), [], "nothing is filed for a periodic")
+
+    def test_a_failed_send_is_retried_and_two_jobs_are_one_message(self):
+        sweep = "ci-kube-agents-pull-sweep"
+        doc = health("GREEN")
+        doc["periodics"] = {self.WEEKLY: periodic_note(), sweep: periodic_note(job=sweep, label="GitOps pull sweep", stale_after_h=1)}
+        doc["periodics_read"] = [self.WEEKLY, sweep]
+        # A recorded first tick, then the failed send: the first tick records
+        # nothing when every post fails, by design, so it is not the case here.
+        self.tick(health("GREEN"), T14 - timedelta(hours=1))
+        self.tick(doc, T14, opener=FakeOpener(statuses=[500]))
+        self.assertEqual(self.recorded()["periodics_told"], {}, "a failed send is retried next tick")
+        self.tick(doc, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "two jobs, one message")
+        self.assertIn("*GitOps pull sweep failed*", self.opener.texts[0])
+        self.assertIn("*seeded-fleet reconcile (weekly) failed*", self.opener.texts[0])
+        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED", sweep: "FAILED"})
+        # A clear for one beside news for the other: the news goes, the clear goes, separately.
+        doc["periodics"] = {sweep: periodic_note(job=sweep, label="GitOps pull sweep", verdict="STALE", stale_after_h=1)}
+        self.tick(doc, T14 + timedelta(hours=1))
+        self.assertEqual(self.recorded()["periodics_told"], {sweep: "STALE"})
+        self.assertEqual(len(self.opener.texts), 3)
 
     def test_a_stopped_job_is_said_in_grey_with_its_last_run(self):
         stopped = health("GREEN")

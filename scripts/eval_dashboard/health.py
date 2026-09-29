@@ -1987,8 +1987,15 @@ def adjudicate(
     if pool:
         evidence.append(pool_evidence(pool))
     readings = periodics_readings if isinstance(periodics_readings, dict) else {}
-    watched = periodics.assess(readings, now, (prev or {}).get("periodics") or {})
+    # An open note's start survives a blind tick through `periodics_since`,
+    # as the pool episode's does through `pool_since`: a tick with readings
+    # and no note for a job ends its episode; one with no readings keeps it.
+    before_since = (prev or {}).get("periodics_since") or {}
+    prev_notes = {job: {"since": since} for job, since in before_since.items() if isinstance(since, str)}
+    prev_notes.update((prev or {}).get("periodics") or {})
+    watched = periodics.assess(readings, now, prev_notes)
     evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
+    periodics_since = {job: note["since"] for job, note in watched.items()} if readings else dict(before_since)
     stale_after = DEFAULT_STALE_AFTER
     if isinstance(data.get("stale_after_s"), (int, float)):
         stale_after = timedelta(seconds=data["stale_after_s"])
@@ -2017,6 +2024,7 @@ def adjudicate(
         "pool": pool,
         "periodics": watched,
         "periodics_read": sorted(readings),
+        "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,
         "generated_at": iso(now),

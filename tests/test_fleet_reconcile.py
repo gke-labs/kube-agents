@@ -503,6 +503,15 @@ class MainTest(unittest.TestCase):
                 self._main(["--project", P7, "--dry-run"], _Boskos(free=[P7]), _Tofu({P7: UPDATE_ONLY}))
             self.assertFalse(explicit.exists())
 
+    def test_an_unhandled_exception_still_writes_its_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "r.json"
+            with mock.patch.object(reconcile, "reset_stranded_or_reconcile", create=True), mock.patch.object(reconcile, "_run", side_effect=KeyError("boom")), mock.patch.object(reconcile.signal, "signal"):
+                with self.assertRaises(KeyError):
+                    reconcile.main(["--project", P7, "--report", str(report), "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+            doc = json.loads(report.read_text())
+            self.assertEqual((doc["exit"], doc["exit_code"], doc["outcomes"]), ("error", None, {}))
+
     def test_a_terminated_run_still_writes_its_report(self):
         def tofu(argv, **_):
             if argv[1] == "plan":

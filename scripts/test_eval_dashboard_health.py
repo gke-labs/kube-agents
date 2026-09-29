@@ -1274,6 +1274,17 @@ class PeriodicNote(unittest.TestCase):
         blind = self.judge(None)
         self.assertEqual((blind["periodics"], blind["periodics_read"]), ({}, []))
 
+    def test_an_episodes_start_survives_a_blind_tick_and_ends_on_a_clean_reading(self):
+        failing = {self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False)}
+        first = self.judge(failing)
+        self.assertEqual(first["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        blind = self.judge(None, prev=first, now=T0 + timedelta(hours=1))
+        self.assertEqual((blind["periodics"], blind["periodics_since"]), ({}, {self.WEEKLY: health.iso(T0)}))
+        again = self.judge(failing, prev=blind, now=T0 + timedelta(hours=2))
+        self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0), "the start is not the blind tick's end")
+        clean = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 + timedelta(hours=2))}, prev=again, now=T0 + timedelta(hours=3))
+        self.assertEqual((clean["periodics"], clean["periodics_since"]), ({}, {}))
+
 
 class PoolNote(unittest.TestCase):
     def test_a_breach_quotes_the_day_it_breached_on_not_the_window(self):

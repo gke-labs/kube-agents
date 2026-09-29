@@ -115,6 +115,25 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(len(warnings), 1, "a denied pointer is said, a NotFound is not")
         self.assertIn("build pointer", warnings[0])
 
+    def test_a_finished_json_that_cannot_be_read_is_a_blind_tick_not_an_older_build(self):
+        # A 503 on the newest finished build must not walk back to last
+        # week's and report that: nothing is written, with a warning.
+        objects = archive(WEEKLY.job, {"101": (finished(NOW - timedelta(days=1)), None), "100": (finished(NOW - timedelta(days=8, hours=1)), None)})
+        denied = FakeGsutil(objects, denied={f"{periodics.LOGS_ROOT}/{WEEKLY.job}/101/{periodics.FINISHED}"})
+        warnings = []
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=denied, log=lambda *a, **k: warnings.append(a[0]))
+        self.assertEqual(readings, {})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("101/finished.json", warnings[0])
+
+    def test_an_absurd_timestamp_is_no_finish_time_not_a_crash(self):
+        objects = archive(HOURLY.job, {"5": ({"timestamp": 10**20, "passed": True, "result": "SUCCESS"}, None)})
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(HOURLY,), runner=FakeGsutil(objects))
+        self.assertIsNone(readings[HOURLY.job]["finished_at"])
+        self.assertEqual(periodics.assess(readings, NOW, {})[HOURLY.job]["verdict"], periodics.VERDICT_STALE)
+
     def test_load_readings_skips_a_file_it_cannot_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = pathlib.Path(tmp)

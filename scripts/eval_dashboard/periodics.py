@@ -48,6 +48,12 @@ DETAIL_LIMIT = 5
 RECONCILE_ARTIFACT = "fleet-reconcile.json"
 RECONCILE_NAMED_OUTCOMES = ("refused", "failed", "interrupted")
 NOT_FOUND_MARKERS = ("NotFound", "No URLs matched", "404")
+# run()'s conventions for a binary that is missing and a call that timed out,
+# and argparse's exit for a bad command line.
+MISSING_BINARY_RC = 127
+TIMED_OUT_RC = 124
+EXIT_USAGE = 2
+SECONDS_PER_HOUR = 3600
 KEY_JOB = "job"
 KEY_BUILD = "build"
 KEY_FINISHED_AT = "finished_at"
@@ -100,10 +106,10 @@ def _gsutil(args: list[str], runner=subprocess.run) -> tuple[int, str, str]:
     try:
         proc = runner(["gsutil", "-q", *args], capture_output=True, text=True, timeout=GSUTIL_TIMEOUT_S, check=False)
     except FileNotFoundError as exc:
-        return 127, "", str(exc)
+        return MISSING_BINARY_RC, "", str(exc)
     except subprocess.TimeoutExpired as exc:
         err = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        return 124, "", err
+        return TIMED_OUT_RC, "", err
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -111,10 +117,19 @@ def _not_found(err: str) -> bool:
     return any(marker in (err or "") for marker in NOT_FOUND_MARKERS)
 
 
+class Unreadable(Exception):
+    """A read that failed for a reason other than NotFound: the tick is blind
+    on this job rather than walking back to an older build and reporting it."""
+
+
 def _finished(job: str, build: str, runner) -> dict | None:
-    rc, out, _ = _gsutil(["cat", f"{LOGS_ROOT}/{job}/{build}/{FINISHED}"], runner)
+    """The build's finished.json, None when it has none (still running or
+    aborted); Unreadable when the read itself failed."""
+    rc, out, err = _gsutil(["cat", f"{LOGS_ROOT}/{job}/{build}/{FINISHED}"], runner)
     if rc != 0:
-        return None
+        if _not_found(err):
+            return None
+        raise Unreadable(f"{build}/{FINISHED}: {err.strip()}")
     try:
         doc = json.loads(out)
     except ValueError:
@@ -149,11 +164,18 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
     if not newest.isdigit():
         return None
     for build in [newest, *_earlier_builds(periodic.job, newest, runner)]:
-        finished = _finished(periodic.job, build, runner)
+        try:
+            finished = _finished(periodic.job, build, runner)
+        except Unreadable as exc:
+            log(f"warning: could not read {periodic.job}'s {exc}", file=sys.stderr)
+            return None
         if finished is None:
             continue
         timestamp = finished.get("timestamp")
-        finished_at = datetime.fromtimestamp(timestamp, tz=timezone.utc) if isinstance(timestamp, (int, float)) else None
+        try:
+            finished_at = datetime.fromtimestamp(timestamp, tz=timezone.utc) if isinstance(timestamp, (int, float)) else None
+        except (OverflowError, OSError, ValueError):
+            finished_at = None
         reading = {
             KEY_JOB: periodic.job,
             KEY_BUILD: build,
@@ -253,7 +275,7 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             KEY_BUILD: reading.get(KEY_BUILD),
             KEY_FINISHED_AT: reading.get(KEY_FINISHED_AT),
             KEY_RESULT: reading.get(KEY_RESULT),
-            "stale_after_h": int(periodic.stale_after.total_seconds() // 3600),
+            "stale_after_h": int(periodic.stale_after.total_seconds() // SECONDS_PER_HOUR),
             "dry_run": bool(artifact.get("dry_run")) if artifact else None,
             "detail": reconcile_detail(artifact) if verdict == VERDICT_FAILED else [],
             "history_url": history_url(periodic.job),
@@ -285,7 +307,7 @@ def main(argv=None, runner=subprocess.run) -> int:
         unknown = [job for job in args.job if job not in WATCHED_BY_JOB]
         if unknown:
             print(f"ERROR: not a watched periodic: {', '.join(unknown)}", file=sys.stderr)
-            return 2
+            return EXIT_USAGE
         watched = tuple(WATCHED_BY_JOB[job] for job in args.job)
     readings = fetch(args.out_dir, watched, runner=runner)
     for job in sorted(readings):
