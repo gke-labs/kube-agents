@@ -299,9 +299,13 @@ def pool_size(ci_deploy_script=fixture_state.CI_DEPLOY_SCRIPT):
     return len(pool_projects(ci_deploy_script))
 
 
+def _line(project, outcome):
+    """One project's result, printed as it happens: a run that is terminated
+    or loses Boskos mid-walk has still named every project it reached."""
+    print("%s: %s (%s)" % (project, outcome[0], outcome[1]), flush=True)
+
+
 def report(outcomes):
-    for project, (outcome, detail) in sorted(outcomes.items()):
-        print("%s: %s (%s)" % (project, outcome, detail))
     failing = sorted(p for p, (outcome, _) in outcomes.items() if outcome in FAILING_OUTCOMES)
     print(
         "reconciled %d project(s): %d applied, %d unchanged, %d planned, %d busy, %d refused or failed"
@@ -317,7 +321,7 @@ def report(outcomes):
     return failing
 
 
-def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry_run=False, known=None):
+def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry_run=False, known=None, outcomes=None):
     """Each named project, held through Boskos unless `lease` is off.
 
     A name outside the pool mapping is failed before Boskos is asked: Boskos
@@ -326,13 +330,15 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
     mapping is not consulted; that is the dev-project path.
     """
     known = pool_projects() if known is None else known
-    outcomes = {}
+    outcomes = {} if outcomes is None else outcomes
     for project in projects:
         if not lease:
             outcomes[project] = reconcile_project(project, runner=runner, dry_run=dry_run)
+            _line(project, outcomes[project])
             continue
         if project not in known:
             outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
+            _line(project, outcomes[project])
             continue
         release_failures = {}
         outcome = boskos_pool.acquire_and_hold(
@@ -346,30 +352,33 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
         )
         if outcome is boskos_pool.NOT_ACQUIRED:
             outcomes[project] = (OUTCOME_BUSY, REASON_BUSY)
-            continue
-        outcomes[project] = outcome
-        if project in release_failures:
-            outcomes[project] = (OUTCOME_FAILED, release_failures[project])
+        else:
+            outcomes[project] = outcome
+            if project in release_failures:
+                outcomes[project] = (OUTCOME_FAILED, release_failures[project])
+        _line(project, outcomes[project])
     return outcomes
 
 
-def reconcile_pool(server, owner, size, runner=tofu_runner, dry_run=False, known=None):
+def reconcile_pool(server, owner, size, runner=tofu_runner, dry_run=False, known=None, outcomes=None):
     """Every project Boskos hands out as free, once each. A hand-out outside
     the pool mapping is released untouched and reported, as the sweep does:
     a project registered in Boskos before its mapping row, or left registered
     after it, is not one to apply the fleet in."""
     known = pool_projects() if known is None else known
-    outcomes = {}
+    outcomes = {} if outcomes is None else outcomes
 
     def visit(project):
         if project not in known:
             outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
-            return
-        outcomes[project] = reconcile_project(project, runner=runner, dry_run=dry_run)
+        else:
+            outcomes[project] = reconcile_project(project, runner=runner, dry_run=dry_run)
+        _line(project, outcomes[project])
 
     _, release_failures = boskos_pool.walk(server, owner, HOLD_STATE, size, visit, heartbeat=True)
     for project, reason in release_failures.items():
         outcomes[project] = (OUTCOME_FAILED, reason)
+        _line(project, outcomes[project])
     return outcomes
 
 
@@ -397,30 +406,32 @@ def main(argv=None):
         parser.error("--no-lease needs --project")
     for sig in TERMINATION_SIGNALS:
         signal.signal(sig, boskos_pool.terminate)
+    outcomes = {}
     try:
         if args.project:
             if not args.no_lease:
                 boskos_pool.reset_stranded(args.boskos_server, HOLD_STATE, STRANDED_AFTER, "reconcile")
-            outcomes = reconcile_named(
+            reconcile_named(
                 args.project,
                 args.boskos_server,
                 args.boskos_owner,
                 lease=not args.no_lease,
                 runner=tofu_runner,
                 dry_run=args.dry_run,
+                outcomes=outcomes,
             )
         else:
             boskos_pool.reset_stranded(args.boskos_server, HOLD_STATE, STRANDED_AFTER, "reconcile")
             if args.drifted:
                 projects = drifted_projects(load_fixture_state(args.fixture_state))
                 print("%d project(s) drifted in %s" % (len(projects), args.fixture_state))
-                outcomes = reconcile_named(
-                    projects, args.boskos_server, args.boskos_owner, runner=tofu_runner, dry_run=args.dry_run
+                reconcile_named(
+                    projects, args.boskos_server, args.boskos_owner, runner=tofu_runner, dry_run=args.dry_run, outcomes=outcomes
                 )
             else:
                 known = pool_projects()
-                outcomes = reconcile_pool(
-                    args.boskos_server, args.boskos_owner, len(known), runner=tofu_runner, dry_run=args.dry_run, known=known
+                reconcile_pool(
+                    args.boskos_server, args.boskos_owner, len(known), runner=tofu_runner, dry_run=args.dry_run, known=known, outcomes=outcomes
                 )
         failing = report(outcomes)
         if failing:
@@ -428,18 +439,23 @@ def main(argv=None):
             return EXIT_FAILED
         return EXIT_OK
     except boskos_pool.Terminated as exc:
-        print("ERROR: terminated (%s); held projects were released" % exc, file=sys.stderr)
+        # Every project reached has its line above; the summary says how far
+        # the run got before the signal.
+        report(outcomes)
+        print("ERROR: terminated (%s) after %d project(s); held projects were released" % (exc, len(outcomes)), file=sys.stderr)
         return boskos_pool.TERMINATED_EXIT_CODE
     except (ReconcileError, boskos_pool.BoskosError) as exc:
+        report(outcomes)
         print("ERROR: %s" % exc, file=sys.stderr)
         return EXIT_FAILED
     except subprocess.SubprocessError as exc:
+        report(outcomes)
         print("ERROR: could not run a command (%s: %s)" % (type(exc).__name__, exc), file=sys.stderr)
         return EXIT_FAILED
     except boskos_pool.REACH_ERRORS as exc:
+        report(outcomes)
         print("ERROR: could not reach a service (%s: %s)" % (type(exc).__name__, exc), file=sys.stderr)
         return EXIT_FAILED
-
 
 if __name__ == "__main__":
     sys.exit(main())

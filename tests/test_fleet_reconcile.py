@@ -408,6 +408,32 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rc, reconcile.EXIT_FAILED)
         self.assertIn(P7, stderr)
 
+    def test_a_run_terminated_mid_walk_has_named_every_project_it_reached(self):
+        # The per-project line is printed as each finishes, and the summary
+        # is printed on the way out, so a weekly killed at its deadline still
+        # says what it applied and refused.
+        calls = []
+
+        def tofu(argv, **_):
+            calls.append(argv)
+            if "kube-agents-evals-8-tf-state" in " ".join(argv):
+                raise boskos_pool.Terminated("signal 2")
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", _Boskos(free=[P7, P8])), mock.patch.object(
+            reconcile, "tofu_runner", tofu
+        ), mock.patch.object(reconcile.signal, "signal"), mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            rc = reconcile.main(["--project", P7, "--project", P8, "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+        self.assertEqual(rc, boskos_pool.TERMINATED_EXIT_CODE)
+        self.assertIn(f"{P7}: applied", stdout.getvalue())
+        self.assertIn("reconciled 1 project(s)", stdout.getvalue())
+        self.assertIn("terminated (signal 2) after 1 project(s)", stderr.getvalue())
+
     def test_drifted_reads_the_scan_resets_strands_and_applies_the_projects_listed(self):
         boskos = _Boskos(free=[P7, P8])
         scan = {"projects": {P8: {"roles": {"idle-pool": {"state": "drifted", "detail": []}}}, P7: {"roles": {"idle-pool": {"state": "healthy", "detail": []}}}}}
@@ -483,16 +509,36 @@ class HoldTest(unittest.TestCase):
         previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
         try:
             with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
-                try:
+                with self.assertRaises(boskos_pool.Terminated):
                     reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN)
-                except boskos_pool.Terminated:
-                    pass
         finally:
             signal.signal(signal.SIGINT, previous)
-        # The property under test is the order: the project is back in the
-        # pool before the termination can be acted on. Where the termination
-        # surfaces is the unit test below.
         self.assertEqual(boskos.released, [P7], "released before the termination was delivered")
+        self.assertIs(signal.getsignal(signal.SIGINT), previous)
+
+    def test_a_termination_during_the_acquire_releases_the_project_and_then_propagates(self):
+        # Between the acquire and the armed finally: deferred, then raised
+        # before the visit, so the project is acquired, never applied, and
+        # given back.
+        class _Boskos_signalling_acquire(_Boskos):
+            def __call__(self, request, timeout=None):
+                out = super().__call__(request, timeout)
+                if "/acquirebystate?" in request.full_url:
+                    os.kill(os.getpid(), signal.SIGINT)
+                return out
+
+        boskos = _Boskos_signalling_acquire(free=[P7])
+        tofu = _Tofu({P7: UPDATE_ONLY})
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        try:
+            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=tofu, known=KNOWN)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        self.assertEqual(boskos.acquired, [P7])
+        self.assertEqual(boskos.released, [P7], "acquired, then given back")
+        self.assertEqual(tofu.calls, [], "never applied")
 
     def test_a_signal_held_back_is_raised_on_the_unblock_in_that_frame(self):
         previous = signal.signal(signal.SIGINT, boskos_pool.terminate)

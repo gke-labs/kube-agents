@@ -46,6 +46,10 @@ TERMINATED_EXIT_CODE = 143
 TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 # What acquire_and_hold returns when the acquire handed out nothing.
 NOT_ACQUIRED = object()
+# Before the deferring handler is taken down: a signal the kernel handed to
+# another thread a moment ago reaches the main thread's handler at its next
+# check, and this is what makes that check happen here, in the hold's frame.
+SIGNAL_SETTLE_SECONDS = 0.01
 
 REACH_ERRORS = (urllib.error.HTTPError, OSError, http.client.HTTPException)
 
@@ -167,6 +171,7 @@ def _hold_signals(block):
     _HOLD_DEPTH = max(0, _HOLD_DEPTH - 1)
     if _HOLD_DEPTH:
         return
+    time.sleep(SIGNAL_SETTLE_SECONDS)
     for sig, previous in _SAVED_HANDLERS.items():
         signal.signal(sig, previous)
     _SAVED_HANDLERS.clear()
