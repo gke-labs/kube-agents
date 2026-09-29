@@ -158,6 +158,10 @@ FLEET_STATE_WAIT_SECONDS = 300
 # No gcloud or gh call here should take anywhere near this long. The ceiling
 # exists so a hung call fails the run instead of hanging a CI job forever.
 DEFAULT_TIMEOUT_SECONDS = 120
+# What a check that never ran says when --deadline-seconds passed before it:
+# the pool-state scan runs the verifier under its own per-project ceiling and
+# would otherwise lose every finished check's verdict to one hung read.
+DEADLINE_PASSED = "the run's deadline passed before this check"
 
 REQUIRED_APIS = {
     # bench/tf/fleet declares google_compute_disk (the planted orphan-pd-* the
@@ -2957,10 +2961,13 @@ def run_checks(
     location: str = "us-central1",
     repo_membership_confirmed: bool = False,
     checks: Optional[List[str]] = None,
+    deadline: Optional[float] = None,
 ) -> List[CheckResult]:
     """Run the checks named in `checks` (DEFAULT_CHECKS by default) and return
     the results in CHECK_IDS order, each tagged with its id. Prints nothing,
-    so tests can assert on objects.
+    so tests can assert on objects. `deadline` is a time.monotonic() value:
+    a check not started by then is recorded as not checked (an Unread), so a
+    caller with its own ceiling keeps every verdict the run did reach.
     """
     wanted = list(checks) if checks is not None else list(DEFAULT_CHECKS)
     results: List[CheckResult] = []
@@ -2970,49 +2977,64 @@ def run_checks(
             result.check_id = check_id
             results.append(result)
 
-    if CHECK_CODEBASE_MAPPING in wanted:
-        add(CHECK_CODEBASE_MAPPING, check_codebase_mapping(project_id))
+    def due() -> bool:
+        return deadline is not None and time.monotonic() > deadline
 
-    needs_project_number = {CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_WARM_CACHE}.intersection(wanted)
-    if CHECK_PROJECT_AND_APIS in wanted or needs_project_number:
-        project_number, proj_check = check_project_and_apis(project_id)
-        add(CHECK_PROJECT_AND_APIS, proj_check)
-        if project_number:
-            if CHECK_IAM in wanted:
-                add(CHECK_IAM, check_iam_and_service_accounts(project_id, project_number))
-            if CHECK_ARTIFACT_REGISTRY in wanted:
-                add(CHECK_ARTIFACT_REGISTRY, check_artifact_registry(project_id, project_number, location))
-            if CHECK_WARM_CACHE in wanted:
-                add(CHECK_WARM_CACHE, check_warm_cache_readers(project_id, project_number))
-        elif proj_check.passed:
-            # The project number is missing because reading the project was refused,
-            # not because the project is wrong. Failing the two checks that need it
-            # would put the conflation straight back, one level up.
-            for check_id, skipped in ((CHECK_IAM, "Service Accounts & IAM Grants"), (CHECK_ARTIFACT_REGISTRY, "Artifact Registry Repository"), (CHECK_WARM_CACHE, "Warm Cache Readers")):
-                add(check_id, CheckResult(
-                    skipped,
-                    True,
-                    "Not checked",
-                    warnings=[f"Not checked: {project_id}'s project number could not be read"],
-                    read=False,
-                ))
+    def run(check_id: str, thunk) -> None:
+        if check_id not in wanted:
+            return
+        if due():
+            add(check_id, CheckResult(check_id, True, "Not checked", warnings=[Unread(DEADLINE_PASSED)], read=False))
         else:
-            add(CHECK_IAM, CheckResult("Service Accounts & IAM Grants", False, "Skipped: could not determine project number"))
-            add(CHECK_ARTIFACT_REGISTRY, CheckResult("Artifact Registry Repository", False, "Skipped: could not determine project number"))
-            add(CHECK_WARM_CACHE, CheckResult("Warm Cache Readers", False, "Skipped: could not determine project number"))
+            add(check_id, thunk())
 
-    if CHECK_GKE_AND_STATE in wanted:
-        add(CHECK_GKE_AND_STATE, check_gke_and_state(project_id))
-    if CHECK_SEEDED_FLEET in wanted:
-        add(CHECK_SEEDED_FLEET, check_seeded_fleet_fixtures(project_id))
-    if CHECK_GITHUB_REPO_AND_APP in wanted:
-        add(CHECK_GITHUB_REPO_AND_APP, check_github_repo_and_app(project_id, app_id, repo_membership_confirmed))
-    if CHECK_LEDGER_READ_CREDENTIAL in wanted:
-        add(CHECK_LEDGER_READ_CREDENTIAL, check_ledger_read_credential(project_id))
+    run(CHECK_CODEBASE_MAPPING, lambda: check_codebase_mapping(project_id))
+
+    dependents = (
+        (CHECK_IAM, "Service Accounts & IAM Grants", lambda number: check_iam_and_service_accounts(project_id, number)),
+        (CHECK_ARTIFACT_REGISTRY, "Artifact Registry Repository", lambda number: check_artifact_registry(project_id, number, location)),
+        (CHECK_WARM_CACHE, "Warm Cache Readers", lambda number: check_warm_cache_readers(project_id, number)),
+    )
+    needs_project_number = {check_id for check_id, _, _ in dependents}.intersection(wanted)
+    if CHECK_PROJECT_AND_APIS in wanted or needs_project_number:
+        if due():
+            for check_id in (CHECK_PROJECT_AND_APIS, *needs_project_number):
+                run(check_id, lambda: None)
+        else:
+            project_number, proj_check = check_project_and_apis(project_id)
+            add(CHECK_PROJECT_AND_APIS, proj_check)
+            # The reason the project read failed travels with the dependents
+            # when the project check itself was not asked for; without it a
+            # --checks subset reports a skip with no cause.
+            why = "" if CHECK_PROJECT_AND_APIS in wanted else proj_check.message
+            if project_number:
+                for check_id, _, thunk in dependents:
+                    run(check_id, lambda thunk=thunk: thunk(project_number))
+            elif proj_check.passed:
+                # The project number is missing because reading the project was refused,
+                # not because the project is wrong. Failing the two checks that need it
+                # would put the conflation straight back, one level up.
+                cause = next(iter(proj_check.warnings), "") if why else ""
+                for check_id, skipped, _ in dependents:
+                    add(check_id, CheckResult(
+                        skipped,
+                        True,
+                        "Not checked",
+                        warnings=[Unread(f"Not checked: {project_id}'s project number could not be read" + (f" ({cause})" if cause else ""))],
+                        read=False,
+                    ))
+            else:
+                for check_id, skipped, _ in dependents:
+                    add(check_id, CheckResult(skipped, False, "Skipped: could not determine project number" + (f" ({why})" if why else "")))
+
+    run(CHECK_GKE_AND_STATE, lambda: check_gke_and_state(project_id))
+    run(CHECK_SEEDED_FLEET, lambda: check_seeded_fleet_fixtures(project_id))
+    run(CHECK_GITHUB_REPO_AND_APP, lambda: check_github_repo_and_app(project_id, app_id, repo_membership_confirmed))
+    run(CHECK_LEDGER_READ_CREDENTIAL, lambda: check_ledger_read_credential(project_id))
     if CHECK_TOKEN_MINTER in wanted:
-        add(CHECK_TOKEN_MINTER, check_token_minter(project_id, app_id, location))
+        run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))
     elif CHECK_TOKEN_MINTER_KMS in wanted:
-        add(CHECK_TOKEN_MINTER_KMS, check_token_minter(project_id, app_id, location, probe_app=False))
+        run(CHECK_TOKEN_MINTER_KMS, lambda: check_token_minter(project_id, app_id, location, probe_app=False))
     return results
 
 
@@ -3188,8 +3210,10 @@ def verify_project(
     repo_membership_confirmed: bool = False,
     checks: Optional[List[str]] = None,
     report_path: Optional[Path] = None,
+    deadline_seconds: Optional[float] = None,
 ) -> int:
     selected = checks if checks is not None else list(DEFAULT_CHECKS)
+    deadline = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
     blockers = check_toolchain(needs_gh=bool(GITHUB_CHECKS.intersection(selected)))
     if blockers:
         print("\n" + "=" * 80)
@@ -3207,18 +3231,22 @@ def verify_project(
             results = [CheckResult(check_id, True, "Not checked", warnings=blockers, read=False) for check_id in selected]
             for result, check_id in zip(results, selected):
                 result.check_id = check_id
-            report_path.write_text(json.dumps(report_document(project_id, results), indent=2) + "\n", encoding="utf-8")
+            _write_report(report_path, project_id, results)
         return EXIT_UNVERIFIED
-    results = run_checks(project_id, app_id, location, repo_membership_confirmed, checks)
+    results = run_checks(project_id, app_id, location, repo_membership_confirmed, checks, deadline)
     status = report(project_id, results)
     if report_path is not None:
         # After the console verdict: an unwritable path must not throw a
         # completed run away or turn its exit code into "do not register".
-        try:
-            report_path.write_text(json.dumps(report_document(project_id, results), indent=2) + "\n", encoding="utf-8")
-        except OSError as exc:
-            print(f"\n[?] --report {report_path} could not be written ({exc}); the verdict above stands", file=sys.stderr)
+        _write_report(report_path, project_id, results)
     return status
+
+
+def _write_report(report_path: Path, project_id: str, results: List[CheckResult]) -> None:
+    try:
+        report_path.write_text(json.dumps(report_document(project_id, results), indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"\n[?] --report {report_path} could not be written ({exc}); the verdict above stands", file=sys.stderr)
 
 
 def main() -> int:
@@ -3269,13 +3297,23 @@ def main() -> int:
             "The console output is unchanged."
         ),
     )
+    parser.add_argument(
+        "--deadline-seconds",
+        type=float,
+        help=(
+            "Stop starting checks this many seconds in; a check not started by then is reported as not "
+            "checked. For a caller with its own ceiling (the pool-state scan), so one hung read does not "
+            "cost the report every verdict the run did reach."
+        ),
+    )
     args = parser.parse_args()
     try:
         checks = parse_checks(args.checks)
     except ValueError as exc:
         parser.error(str(exc))
     return verify_project(
-        args.project_id, args.app_id, args.location, args.confirmed_repo_in_app_installation, checks, args.report
+        args.project_id, args.app_id, args.location, args.confirmed_repo_in_app_installation, checks, args.report,
+        args.deadline_seconds,
     )
 
 

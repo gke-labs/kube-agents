@@ -222,6 +222,16 @@ class WhatNeverFailsTheBot(ScanHarness):
         self.assertEqual(entry["error"], pool_state.REASON_VERIFIER_TIMEOUT.format(seconds=1))
         self.assertTrue(all(verdict["state"] == "not_checked" for verdict in entry["checks"].values()))
 
+    def test_the_verifier_gets_a_deadline_inside_the_scans_ceiling(self):
+        # One hung read (the verifier's 120 s) must not cost the whole report:
+        # the verifier stops starting checks 130 s before the scan's ceiling.
+        self.assertEqual(pool_state.verifier_deadline(300), 170)
+        self.assertEqual(pool_state.verifier_deadline(20), 1)
+        self.scan({PROJECT: report()})
+        argv = self.calls()[0]
+        self.assertIn("--deadline-seconds", argv)
+        self.assertEqual(argv[argv.index("--deadline-seconds") + 1], "1")
+
     def test_a_report_left_by_an_earlier_run_is_not_read_as_this_runs(self):
         # The same --workdir twice: a healthy first run, then a verifier that
         # dies before writing. The old file must not become this run's verdict.

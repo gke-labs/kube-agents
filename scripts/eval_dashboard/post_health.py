@@ -703,7 +703,7 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
     elif condition == CONDITION_POOL_DRIFT:
         tag = issue_tag(issue)
         tracking = f" Tracking {tag}." if tag else ""
-        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Retest once the grant is repaired. {POOL_REPAIR_HINT}{tracking}"]
+        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Retest once the pool owner has run the repair the tracking issue carries. {POOL_REPAIR_HINT}{tracking}"]
     else:
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours died before any test ran, retest."]
     lines.append(incident_link(health))

@@ -349,7 +349,7 @@ python3 scripts/verify_ci_pool_project.py --project-id "${PROJECT_ID}" \
 
 It exits `0` when everything checked passed, `1` when a prerequisite failed, and **`2` when nothing failed but something could not be checked**. The third code exists because a script that prints "ALL CHECKS PASSED" over items it merely could not read gives the same false assurance that let `kube-agents-evals-3` into the pool. Treat `2` as "go and look", not as a pass.
 
-`--checks a,b` runs a subset by id (`--help` lists them); `--report <file>` also writes the results as JSON, one record per check with a stable id, what was observed and the repair for every finding. The hourly pool-state scan runs exactly that against every registered project ([`docs/ci-health.md`](ci-health.md), "The pool-state scan"), so drift after registration is found there rather than by the next lease.
+`--checks a,b` runs a subset by id (`--help` lists them); `--deadline-seconds N` stops starting checks N seconds in and reports the rest as not checked, for a caller with its own ceiling; `--report <file>` also writes the results as JSON, one record per check with a stable id, what was observed and the repair for every finding. The hourly pool-state scan runs exactly that against every registered project ([`docs/ci-health.md`](ci-health.md), "The pool-state scan"), so drift after registration is found there rather than by the next lease.
 
 A bad command line exits `64`, not `2`, so a mistyped flag cannot be mistaken for an unverified item. One case stays ambiguous and cannot be fixed inside the script: if the _path_ to the script is wrong, Python exits `2` before the file is read. A wrapper that branches on `2` should check the path exists first.
 

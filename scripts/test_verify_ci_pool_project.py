@@ -3417,7 +3417,7 @@ class ChecksSelectionTest(unittest.TestCase):
         with mock.patch.object(checker, "check_toolchain", return_value=[]), mock.patch.object(checker, "run_checks", return_value=[]) as run, mock.patch("builtins.print"):
             checker.verify_project("kube-agents-evals-3")
         self.assertEqual(blocked, set(checker.DEFAULT_CHECKS))
-        self.assertIsNone(run.call_args.args[-1], "run_checks resolves the same default itself")
+        self.assertIsNone(run.call_args.args[4], "run_checks resolves the same default itself")
 
     def test_only_the_selected_checks_run_and_the_default_is_every_check_once(self):
         mocks = self._mocks()
@@ -3494,6 +3494,56 @@ class ReportDocumentTest(unittest.TestCase):
         self.assertEqual(ids, ["iam/pool-state-reader/missing/a", "iam/pool-state-reader/missing/b"])
         self.assertEqual(doc["checks"]["gke_and_state"]["name"], "GKE")
 
+    def test_a_deadline_that_passed_leaves_the_rest_not_checked_and_keeps_what_ran(self):
+        # The pool-state scan's ceiling: checks not started by the deadline
+        # are unread with the reason, and the ones that ran keep their verdict.
+        with mock.patch.object(checker, "check_project_and_apis", return_value=("123", checker.CheckResult("p", True))), \
+             mock.patch.object(checker, "check_iam_and_service_accounts", return_value=checker.CheckResult("i", True)) as iam, \
+             mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
+            past = time.monotonic() - 1
+            results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS), deadline=past)
+        self.assertEqual([r.check_id for r in results], list(checker.POOL_STATE_CHECKS))
+        self.assertEqual(iam.call_count, 0)
+        for r in results:
+            self.assertEqual((r.message, r.read), ("Not checked", False), r.check_id)
+            self.assertIsInstance(r.warnings[0], checker.Unread)
+            self.assertIn(checker.DEADLINE_PASSED, r.warnings[0])
+            self.assertEqual(checker.report_status(r), checker.REPORT_STATUS_UNCHECKED)
+        # A deadline still ahead changes nothing.
+        with mock.patch.object(checker, "check_project_and_apis", return_value=("123", checker.CheckResult("p", True))), \
+             mock.patch.object(checker, "check_iam_and_service_accounts", return_value=checker.CheckResult("i", True)) as iam, \
+             mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)), \
+             mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
+             mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
+            results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS), deadline=time.monotonic() + 60)
+        self.assertEqual(iam.call_count, 1)
+        self.assertTrue(all(r.message != "Not checked" for r in results))
+
+    def test_a_checks_subset_carries_the_reason_the_project_read_failed(self):
+        with mock.patch.object(checker, "check_project_and_apis", return_value=(None, checker.CheckResult("p", False, "Project describe failed: NOT_FOUND"))):
+            failed = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_IAM])
+        self.assertEqual(len(failed), 1)
+        self.assertIn("Project describe failed: NOT_FOUND", failed[0].message)
+        refused = checker.CheckResult("p", True, "Not checked", warnings=[checker.Unread("Could not describe: PERMISSION_DENIED")], read=False)
+        with mock.patch.object(checker, "check_project_and_apis", return_value=(None, refused)):
+            unread = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_IAM])
+        self.assertIn("PERMISSION_DENIED", unread[0].warnings[0])
+        self.assertIsInstance(unread[0].warnings[0], checker.Unread)
+        # With the project check selected the cause is in its own record.
+        with mock.patch.object(checker, "check_project_and_apis", return_value=(None, checker.CheckResult("p", False, "Project describe failed: NOT_FOUND"))):
+            both = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_PROJECT_AND_APIS, checker.CHECK_IAM])
+        self.assertEqual(both[1].message, "Skipped: could not determine project number")
+
+    def test_a_blocked_toolchain_with_an_unwritable_report_path_still_exits_unverified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "no-such-dir" / "report.json"
+            err = io.StringIO()
+            with mock.patch.object(checker, "check_toolchain", return_value=["gcloud has no active credential"]), \
+                 mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", err):
+                status = checker.verify_project("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS), report_path=path)
+            self.assertEqual(status, checker.EXIT_UNVERIFIED)
+            self.assertIn("could not be written", err.getvalue())
+
     def test_an_unwritable_report_path_keeps_the_console_verdict_and_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "no-such-dir" / "report.json"
@@ -3514,7 +3564,7 @@ class ReportDocumentTest(unittest.TestCase):
                  mock.patch("builtins.print"):
                 status = checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_GKE_AND_STATE], report_path=path)
             self.assertEqual(status, checker.EXIT_OK)
-            self.assertEqual(run.call_args.args[-1], [checker.CHECK_GKE_AND_STATE])
+            self.assertEqual(run.call_args.args[4], [checker.CHECK_GKE_AND_STATE])
             self.assertEqual(json.loads(path.read_text())["checks"]["gke_and_state"]["status"], "pass")
 
     def test_a_blocked_toolchain_still_writes_an_unchecked_report(self):
@@ -3531,10 +3581,10 @@ class ReportDocumentTest(unittest.TestCase):
     def test_the_command_line_takes_checks_and_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "report.json"
-            with mock.patch("sys.argv", ["verify_ci_pool_project.py", "--project-id", "kube-agents-evals-3", "--checks", "iam,gke_and_state", "--report", str(path)]), \
+            with mock.patch("sys.argv", ["verify_ci_pool_project.py", "--project-id", "kube-agents-evals-3", "--checks", "iam,gke_and_state", "--report", str(path), "--deadline-seconds", "170"]), \
                  mock.patch.object(checker, "verify_project", return_value=0) as verify:
                 self.assertEqual(checker.main(), 0)
-            self.assertEqual(verify.call_args.args[4:], (["iam", "gke_and_state"], path))
+            self.assertEqual(verify.call_args.args[4:], (["iam", "gke_and_state"], path, 170.0))
         with mock.patch("sys.argv", ["verify_ci_pool_project.py", "--project-id", "p", "--checks", "nope"]), mock.patch("sys.stderr"):
             with self.assertRaises(SystemExit) as raised:
                 checker.main()
