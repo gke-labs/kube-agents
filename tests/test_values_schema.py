@@ -258,6 +258,33 @@ class SchemaShapeTest(unittest.TestCase):
         walk(_load_schema(), ())
         self.assertEqual(open_typed, [])
 
+    def test_no_object_takes_its_keys_under_a_schema(self) -> None:
+        """No map lets the operator choose its key names.
+
+        `retag_values` in `upgrade.sh` prints the path of each recorded key the
+        target schema refuses, on the promise that it prints names and never
+        values. It recurses through an `additionalProperties` schema, so under a
+        map whose keys the operator chooses, those keys would be printed, and
+        there they are data. Adding such a map means deciding what that
+        refusal prints first.
+        """
+        keyed_by_schema = []
+
+        def walk(node, path):
+            if isinstance(node, list):
+                for index, item in enumerate(node):
+                    walk(item, path + (f"[{index}]",))
+                return
+            if not isinstance(node, dict):
+                return
+            if isinstance(node.get("additionalProperties"), dict):
+                keyed_by_schema.append("/".join(path) or "<root>")
+            for key, child in node.items():
+                walk(child, path + (key,))
+
+        walk(_load_schema(), ())
+        self.assertEqual(keyed_by_schema, [])
+
 
 class ValuesYamlTest(unittest.TestCase):
     def test_every_default_resolves_and_matches_its_type(self) -> None:
