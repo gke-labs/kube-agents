@@ -855,6 +855,12 @@ every runtime write (`/sethome` with a permission error, the rest silently), and
 merging it into the file at startup left every merged key mutable, so an agent that repointed
 `model.base_url` at nothing kept that across restarts.
 
+Hermes builds the terminal for some turns, among them a scheduled run and the turn a kanban wake
+starts, from the profile's own `.env` and `config.yaml`, so the managed `terminal.*` leaves do not
+reach them on their own. The entrypoint copies them into every profile's `.env` at
+start-up and refuses to start while a profile still resolves something else — see
+[Container entrypoint](/kube-agents/deploy/docker-images/#container-entrypoint).
+
 `platforms.<platform>.home_channel` is deliberately **not** pinned, so `/sethome` can still set it
 from chat. The platform credentials and endpoints that have no `config.yaml` equivalent are pinned
 through a companion `/etc/hermes/.env`, which Hermes applies last with `override=True` and refuses to

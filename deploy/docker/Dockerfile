@@ -1638,11 +1638,19 @@ COPY agents/chat/scripts/ agents/platform/scripts/ /opt/defaults/scripts/
 #                              is already WAL, so without this the pin reaches only
 #                              databases created after it — see
 #                              tests/test_sqlite_journal_migrate.py.
+#   terminal_env_pin.py        copies the managed terminal settings into every profile's
+#                              .env and checks with Hermes that scheduled runs resolve the
+#                              ssh backend (entrypoint step 4b, fatal; cluster_agent_profile.py
+#                              for profiles scaffolded later; --build-check at the end of
+#                              this stage). The terminal scope a cron job runs under ignores
+#                              the managed config, so without it cron jobs use Hermes'
+#                              default local backend — see tests/test_terminal_env_pin.py.
 COPY deploy/shared/profile_overlay.py \
      deploy/shared/profile_plugins.py \
      deploy/shared/otel_config.py \
      deploy/shared/sandbox_mirror.py \
      deploy/shared/sqlite_journal_migrate.py \
+     deploy/shared/terminal_env_pin.py \
      /opt/defaults/scripts/
 
 # --- Platform Agent specialist profile TEMPLATE (scaffolded at startup) ---
@@ -1964,6 +1972,13 @@ RUN set -eu; \
 # holds the Workload Identity — succeeding, silently, in the container #737
 # exists to take that capability away from. Nothing else in the build or the
 # test suite would report it.
+#
+# The same RUN asks the Hermes this image ships whether terminal_env_pin.py's .env
+# copy still sends a profile's scheduled runs to the ssh sandbox, including over a
+# backend the profile's config.yaml still sets. It is in this RUN rather
+# than its own because the chain is at the layer ceiling. It fails the build when
+# the copy stops working, and only warns when Hermes resolves ssh without the copy,
+# because the copy still agrees then and a failure would block the Hermes bump.
 RUN set -eu; \
     if [ -e /opt/credential-proxy ]; then \
       echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \
@@ -1974,7 +1989,8 @@ RUN set -eu; \
         echo "cluster tooling is back in the agent image: ${binary}" >&2; \
         exit 1; \
       fi; \
-    done
+    done; \
+    /opt/hermes/.venv/bin/python3 /opt/defaults/scripts/terminal_env_pin.py --build-check
 
 USER 10000:10000
 
@@ -2142,6 +2158,7 @@ COPY --chown=root:root --chmod=0755 \
      deploy/shared/otel_config.py \
      deploy/shared/sandbox_mirror.py \
      deploy/shared/sqlite_journal_migrate.py \
+     deploy/shared/terminal_env_pin.py \
      /opt/defaults/scripts/
 
 USER 10000:10000

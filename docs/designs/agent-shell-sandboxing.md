@@ -107,7 +107,7 @@ version-control abstraction lands.
 
 | Layer                          | Where it lives                                                                                                                                                                                                                                                                        |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Terminal backend selection     | Hermes `terminal.backend` / `TERMINAL_ENV`. **Unset everywhere in this repo** → `local`                                                                                                                                                                                               |
+| Terminal backend selection     | Hermes `terminal.backend` / `TERMINAL_ENV`: `ssh`, pinned in the operator's managed scope and copied into each profile's `.env` by `deploy/shared/terminal_env_pin.py`                                                                                                                |
 | The agent's Hermes config      | [`agents/platform/config.yaml`](../../agents/platform/config.yaml)                                                                                                                                                                                                                    |
 | The pod that hosts the shell   | a `<agent>-shell` StatefulSet, one per `PlatformAgent`, reconciled by the operator — [`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go)                                                                                                |
 | The image it runs              | [`deploy/sandbox/`](../../deploy/sandbox/) — first-party, `sshd` plus the credential-proxy wrappers                                                                                                                                                                                   |
@@ -1088,6 +1088,15 @@ install changes. With it on, six keys are Hermes' and one is this design's:
 helpers which shell into the sandbox read the sandbox's layout from one place
 instead of each hard-coding it, which is the same reason `sandbox_exec.py` reads
 `ssh_host` from the managed config rather than re-deriving the Service name.
+
+Scheduled runs and kanban wake turns do not read this block. Hermes builds their terminal with
+`tools/terminal_scope.build_profile_terminal_scope`, from the profile's own `.env` and
+`config.yaml` only, so `deploy/shared/terminal_env_pin.py` copies the block's
+Hermes keys into each profile's `.env` and asks Hermes to confirm they resolve: at
+start-up (entrypoint step 4b; [Container entrypoint](/kube-agents/deploy/docker-images/#container-entrypoint)
+says which failures stop the container) and when `cluster_agent_profile.py` scaffolds a profile. The image build's
+`--build-check` fails when a Hermes bump breaks the copy, and warns once Hermes
+resolves the managed backend without it.
 
 #### Two sharp edges left
 

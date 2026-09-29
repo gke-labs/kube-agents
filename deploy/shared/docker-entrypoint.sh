@@ -1744,6 +1744,33 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     fi
 fi
 
+# 4b. Copy the managed terminal settings into every profile's .env, then check with Hermes
+# that each profile's scheduled runs resolve the ssh backend. The terminal scope a cron job
+# runs under ignores the managed config, so without the copy it falls back to Hermes'
+# default local backend; terminal_env_pin.py says why .env is the place. A key in a
+# profile's config.yaml that outranks the copy is deleted, as Hermes' own save does.
+# Cluster profiles scaffolded after start-up are pinned by cluster_agent_profile.py.
+#
+# FATAL, unlike the managed-scope assertion above: the operator configures one terminal
+# for every agent run, and a profile whose scheduled runs resolve another is misconfigured.
+# A profile whose .env took the copy but whose config.yaml Hermes cannot read or parse is
+# only reported: its scheduled runs fail until the file is fixed.
+# With HERMES_MANAGED_DIR set, the operator's marker as for the managed-scope assertion, a
+# managed config that is missing, unreadable, not ssh, or holds a value .env cannot carry
+# is fatal too; elsewhere (compose, `docker run`, the kustomize bases) it copies only a
+# terminal block it finds.
+# Primary only, under the bootstrap lock, for the same shared-PVC reason as step 4.
+# Run from the image, not the PVC copy the agent can write. The `-f` guard skips only on
+# a host: every image copies the file to this path, and the platform build check runs it
+# from here.
+TERMINAL_ENV_PIN_SCRIPT="/opt/defaults/scripts/terminal_env_pin.py"
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then
+    if ! "$INSTALL_DIR/.venv/bin/python3" "$TERMINAL_ENV_PIN_SCRIPT" --hermes-home "$TARGET_DIR" --sweep; then
+        echo "ERROR: a profile's scheduled runs would not use the managed ssh terminal, or the managed block is unusable (see the lines above); refusing to start" >&2
+        exit 1
+    fi
+fi
+
 # Everything that writes shared volume state is done; release the bootstrap lock
 # before starting anything long-lived, so a peer container is not blocked behind
 # this one for the life of the pod. Closing the fd releases it too, but do both
