@@ -379,6 +379,32 @@ class Workflow(unittest.TestCase):
         adjudicate = next(step for step in steps if step.get("name") == "Adjudicate")
         self.assertIn("--pool-state work/pool-state.json", adjudicate["run"])
 
+    def test_the_fleet_upload_steps_summary_script_runs_through_the_shell(self):
+        # The same `python3 -c '…'` shape as the pool step, and the hourly
+        # job was red on it: a quote inside the script ended the shell word.
+        steps = self.jobs["fixture-state-scan"]["steps"]
+        upload = next(step for step in steps if "cp work/fixture-state.json" in step.get("run", ""))
+        run = upload["run"]
+        start = run.index("python3 -c '")
+        end = run.index("\n'", start) + 2
+        shell_word = run[start:end].replace("python3 ", f"'{sys.executable}' ", 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            work = pathlib.Path(tmp) / "work"
+            work.mkdir()
+            document = {
+                "summary": {"checked": 1, "projects": 2, "drifted_projects": 1, "healthy": 3, "drifted": 1, "not_checked": 4},
+                "projects": {
+                    "p1": {"roles": {"crashloop-workload": {"state": "drifted"}}},
+                    "p2": {"roles": {"crashloop-workload": {"state": "not_checked"}}, "error": "cannot read the project"},
+                },
+            }
+            (work / "fixture-state.json").write_text(json.dumps(document), encoding="utf-8")
+            proc = subprocess.run(["bash", "-c", shell_word], cwd=tmp, capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("1 of 2 projects checked; drifted on", proc.stdout)
+        self.assertIn("p1: drifted: crashloop-workload", proc.stdout)
+        self.assertIn("p2: not checked: cannot read the project", proc.stdout)
+
     def test_the_upload_steps_summary_script_runs(self):
         steps = self.jobs["fixture-state-scan"]["steps"]
         upload = next(step for step in steps if "cp work/pool-state.json" in step.get("run", ""))
