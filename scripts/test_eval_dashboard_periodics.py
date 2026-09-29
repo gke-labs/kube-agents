@@ -151,6 +151,22 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("101/finished.json", warnings[0])
 
+    def test_a_present_but_unparseable_finished_json_is_a_blind_tick(self):
+        # An empty or truncated object is not "still running": walking past it
+        # would report the build before as the latest finished run.
+        root = f"{periodics.LOGS_ROOT}/{WEEKLY.job}"
+        objects = archive(WEEKLY.job, {"101": (None, None), "100": (finished(NOW - timedelta(days=1), passed=True), None)})
+        objects[f"{root}/101/{periodics.FINISHED}"] = ""
+        warnings = []
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0]))
+        self.assertEqual(readings, {})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("101/finished.json: not JSON", warnings[0])
+        objects[f"{root}/101/{periodics.FINISHED}"] = "[]"
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects), log=lambda *a, **k: None), {})
+
     def test_an_absurd_timestamp_is_no_finish_time_not_a_crash(self):
         objects = archive(HOURLY.job, {"5": ({"timestamp": 10**20, "passed": True, "result": "SUCCESS"}, None)})
         with tempfile.TemporaryDirectory() as tmp:

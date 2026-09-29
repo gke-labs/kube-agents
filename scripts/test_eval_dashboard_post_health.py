@@ -1798,7 +1798,7 @@ class WatchedPeriodics(RunHarness):
         self.assertIn("- kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)", text)
         self.assertIn("Recovery: docs/ci-pool-projects.md, section 6.2.", text)
         self.assertIn(f"https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs/{self.WEEKLY}", text)
-        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED@2026-09-14T13:40:00+00:00"})
+        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED"})
         self.assertEqual(self.recorded()["state"], "GREEN")
         self.tick(failed, T14 + timedelta(minutes=15))
         self.assertEqual(len(self.opener.texts), 1, "said once")
@@ -1815,7 +1815,7 @@ class WatchedPeriodics(RunHarness):
         blind["periodics"], blind["periodics_read"] = {}, []
         self.tick(blind, T14 + timedelta(hours=2, minutes=30))
         self.assertEqual(len(self.opener.texts), 2, "no reading is not a recovery")
-        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "STALE@2026-09-14T13:40:00+00:00"})
+        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "STALE"})
         clean = health("GREEN")
         clean["periodics"], clean["periodics_read"] = {}, [self.WEEKLY]
         self.tick(clean, T14 + timedelta(hours=3))
@@ -1841,13 +1841,12 @@ class WatchedPeriodics(RunHarness):
         # A clear for one beside news for the other: the news goes, the clear goes, separately.
         doc["periodics"] = {sweep: periodic_note(job=sweep, label="GitOps pull sweep", verdict="STALE", stale_after_h=1)}
         self.tick(doc, T14 + timedelta(hours=1))
-        self.assertEqual(list(self.recorded()["periodics_told"]), [sweep])
-        self.assertTrue(self.recorded()["periodics_told"][sweep].startswith("STALE@"))
+        self.assertEqual(self.recorded()["periodics_told"], {sweep: "STALE"})
         self.assertEqual(len(self.opener.texts), 3)
 
     def test_a_new_episode_after_a_clear_whose_send_failed_is_still_news(self):
-        # A clean reading resets `since`, so the next failure is a new key
-        # even though the told map still carries the old episode's.
+        # The poster remembers the clean reading it saw even when the clear
+        # did not go out, so the next failure is a new episode.
         first = health("GREEN")
         first["periodics"] = {self.WEEKLY: periodic_note(finished="2026-09-14T13:40:00+00:00")}
         first["periodics_read"] = [self.WEEKLY]
@@ -1856,13 +1855,28 @@ class WatchedPeriodics(RunHarness):
         clean = health("GREEN")
         clean["periodics"], clean["periodics_read"] = {}, [self.WEEKLY]
         self.tick(clean, T14 + timedelta(hours=1), opener=FakeOpener(statuses=[500]))
-        self.assertEqual(list(self.recorded()["periodics_told"]), [self.WEEKLY], "the clear that failed to send is not forgotten")
+        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED"}, "the clear that failed to send is not forgotten")
+        self.assertEqual(self.recorded()["periodics_clean_seen"], [self.WEEKLY])
         again = health("GREEN")
         again["periodics"] = {self.WEEKLY: periodic_note(build="103", finished="2026-09-14T16:40:00+00:00")}
         again["periodics_read"] = [self.WEEKLY]
         self.tick(again, T14 + timedelta(hours=3))
         self.assertEqual(len(self.opener.texts), 2, "the new episode is announced")
         self.assertIn("build 103", self.opener.texts[-1])
+        self.assertEqual(self.recorded()["periodics_clean_seen"], [])
+
+    def test_a_since_stamped_afresh_does_not_re_announce_an_open_note(self):
+        # health.json's `since` restarts when the previous health.json could
+        # not be fetched; the space was told, and hears nothing again.
+        told = health("GREEN")
+        told["periodics"] = {self.WEEKLY: periodic_note(finished="2026-09-14T13:40:00+00:00")}
+        told["periodics_read"] = [self.WEEKLY]
+        self.tick(told, T14)
+        restamped = health("GREEN")
+        restamped["periodics"] = {self.WEEKLY: dict(periodic_note(finished="2026-09-14T13:40:00+00:00"), since="2026-09-14T15:00:00+00:00")}
+        restamped["periodics_read"] = [self.WEEKLY]
+        self.tick(restamped, T14 + timedelta(hours=1))
+        self.assertEqual(len(self.opener.texts), 1, "not re-announced")
 
     def test_a_stopped_job_is_said_in_grey_with_its_last_run(self):
         stopped = health("GREEN")

@@ -134,11 +134,15 @@ def _finished(job: str, build: str, runner) -> dict | None:
         if _not_found(err):
             return None
         raise Unreadable(f"{build}/{FINISHED}: {err.strip()}")
+    # Present but not a JSON object is unreadable, not "still running": walking
+    # past it would report the build before as the latest finished run.
     try:
         doc = json.loads(out)
-    except ValueError:
-        return None
-    return doc if isinstance(doc, dict) else None
+    except ValueError as exc:
+        raise Unreadable(f"{build}/{FINISHED}: not JSON ({exc})")
+    if not isinstance(doc, dict):
+        raise Unreadable(f"{build}/{FINISHED}: a JSON {type(doc).__name__}, not an object")
+    return doc
 
 
 def _earlier_builds(job: str, newest: str, runner) -> list[str]:

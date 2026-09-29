@@ -855,19 +855,26 @@ def render_pool_clear(health: dict) -> str:
 
 
 def periodic_key(note: dict) -> str:
-    """What one message stands for: the job's verdict this episode, the
-    episode named by its start. A newer build that fails the same way is not
-    news (the digest carries it daily); a job that failed and then stopped is
-    two facts, so the verdict flipping is; and a new episode after a clean
-    reading is news even when the clear's own send failed, because a clean
-    reading resets `since`."""
-    return f"{note.get('verdict')}@{note.get('since')}"
+    """What one message stands for: the job's verdict this episode. A newer
+    build that fails the same way is not news (the digest carries it daily);
+    a job that failed and then stopped is two facts, so the verdict flipping
+    is. The episode's end is a clean reading the poster itself saw
+    (`periodics_clean_seen`), not health.json's `since`, which a tick that
+    could not fetch the previous health.json stamps afresh."""
+    return str(note.get("verdict"))
 
 
 def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:
-    """The notes not yet told at their current build, by job."""
+    """The notes not yet told this episode, by job: never told, told with
+    another verdict, or told and since read clean (the clear's send failed,
+    so the told key stayed) and failing again."""
     told = (prev or {}).get("periodics_told") or {}
-    return {job: note for job, note in (health.get("periodics") or {}).items() if told.get(job) != periodic_key(note)}
+    clean_seen = set((prev or {}).get("periodics_clean_seen") or [])
+    return {
+        job: note
+        for job, note in (health.get("periodics") or {}).items()
+        if told.get(job) != periodic_key(note) or job in clean_seen
+    }
 
 
 def periodic_clears(health: dict, prev: dict | None) -> list[str]:
@@ -1311,11 +1318,21 @@ def run(
     # message (a failed send retries next tick), and a job leaves the map only
     # on a sent clear, so "it is over" is never lost either.
     periodics_told = dict(before.get("periodics_told") or {})
-    if KIND_PERIODIC in sent:
-        periodics_told.update({job: periodic_key(note) for job, note in (health.get("periodics") or {}).items()})
+    # A told job read clean is remembered as such whether or not the clear
+    # went out: the next failure is a new episode either way. A sent clear
+    # forgets the job; a sent note forgets the clean reading.
+    clean_seen = set(before.get("periodics_clean_seen") or [])
+    cleared = periodic_clears(health, prev)
+    if KIND_PERIODIC_CLEAR in kinds and KIND_PERIODIC_CLEAR not in sent:
+        clean_seen.update(cleared)
     if KIND_PERIODIC_CLEAR in sent:
-        for job in periodic_clears(health, prev):
+        for job in cleared:
             periodics_told.pop(job, None)
+            clean_seen.discard(job)
+    if KIND_PERIODIC in sent:
+        for job, note in (health.get("periodics") or {}).items():
+            periodics_told[job] = periodic_key(note)
+            clean_seen.discard(job)
     source = health if told_state else before
     state = {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -1341,6 +1358,7 @@ def run(
         "pool_causes": pool_causes,
         "pool_drained": pool_drained,
         "periodics_told": periodics_told,
+        "periodics_clean_seen": sorted(clean_seen),
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),
         "updated_at": now.isoformat(timespec="seconds"),
