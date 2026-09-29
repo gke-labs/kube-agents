@@ -2130,9 +2130,20 @@ def _pr_payload(
 ) -> dict:
     """What either endpoint returns. The issues endpoint marks a pull request
     with a `pull_request` sub-object; the pulls endpoint returns `head`."""
-    body = {"number": 7, "created_at": created_at, "updated_at": updated_at or created_at}
+    body = {
+        "number": 7,
+        "created_at": created_at,
+        "updated_at": updated_at or created_at,
+        # The agent writes as the minter App, so its pull requests carry the
+        # App's bot login; the slug itself is not pinned anywhere (verifiers.py
+        # PR_BOT_LOGIN_SUFFIX), so any App's will do here.
+        "user": {"login": _AGENT_LOGIN},
+    }
     body["pull_request" if as_issue else "head"] = {"ref": "platform-agent/fix"}
     return body
+
+
+_AGENT_LOGIN = "pool-minter[bot]"
 
 
 _PR_HEAD_SHA = "2d206b1ead215bab99f78a9305a9f3083d75cd58"
@@ -2392,6 +2403,8 @@ def test_an_in_job_sibling_passes_with_its_own_reason(token, github, lease):
     assert "pushed no commit of its own" in res.reason
     assert res.raw["rule"] == "in-job-sibling"
     assert res.raw["leased_repository"] == f"gke-agentic/{_PR_REPO}"
+    assert f"(as {_AGENT_LOGIN};" in res.reason
+    assert res.raw["author"] == _AGENT_LOGIN
     # The file count is still read: an empty sibling is no fix either.
     assert "3 changed file(s)" in res.reason
 
@@ -2429,6 +2442,44 @@ def test_a_pull_request_in_another_repository_is_not_a_sibling(token, github, le
     res = _pr_check().verify(5.0)
     assert res.status == "fail", res.reason
     assert f"not in the leased repository gke-agentic/{_PR_REPO}" in res.reason
+
+
+def test_a_pull_request_a_person_opened_in_the_window_is_not_a_sibling(token, github, lease):
+    """review-sweepreps F1. The window is the job's and the lease keeps other
+    jobs out, not people: a human can open a pull request in the leased
+    repository during it. The agent writes as an App, so its login ends in
+    [bot]; a person's does not, and the rep fails naming who opened it."""
+    _stash_pr_report()
+    _sibling_routes(github, state={"user": {"login": "jayantid"}})
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "opened by jayantid, not a [bot] login" in res.reason
+    assert "not an in-job sibling" in res.reason
+
+
+def test_a_pull_request_with_no_author_is_not_a_sibling(token, github, lease):
+    """A payload without `user` reads as nobody, and nobody is not a bot."""
+    _stash_pr_report()
+    payload = _pr_payload(_SIBLING_OPENED)
+    del payload["user"]
+    github.routes[_pr_api()] = (200, payload)
+    _pr_head_routes(github, "2026-08-21T08:29:50Z")
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "opened by ?, not a [bot] login" in res.reason
+
+
+def test_a_person_s_pull_request_still_passes_on_its_own_head_commit(token, github, lease):
+    """The author test belongs to the sibling rule alone: a hand run against a
+    dev install pushes with a personal token, and the first rule grades the
+    push as it always has."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload() | {"user": {"login": "jayantid"}})
+    _pr_head_routes(github)
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("own-head-commit: ")
+    assert res.raw["author"] == "jayantid"
 
 
 def test_an_in_job_pull_request_closed_unmerged_still_fails(token, github, lease):

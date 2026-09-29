@@ -68,8 +68,9 @@
 # Within a job the accumulation is graded as such since #2016 step 3: the
 # skill reuses the branch, so a later rep with the same fix pushes nothing
 # and links the earlier rep's pull request; pull_request_opened passes that
-# as an in-job sibling (opened in the leased *-infra repository at or after
-# this job's lease window began, open or merged) and says so in the reason,
+# as an in-job sibling (opened by a [bot] login in the leased *-infra
+# repository at or after this job's lease window began, open or merged) and
+# says so in the reason,
 # where a rep that pushed passes as own-head-commit. A pull request from an
 # earlier lease -- before the window -- still fails, as #1832 intends.
 #

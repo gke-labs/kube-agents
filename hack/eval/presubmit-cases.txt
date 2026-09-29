@@ -205,9 +205,10 @@
 # between them, and submit-suggestion reuses the branch, so repetitions 2
 # and 3 meet repetition 1's open pull request with the fix on it and push
 # nothing; pull_request_opened passes a repetition on its own head commit
-# (own-head-commit) or on a pull request opened in the leased *-infra
-# repository at or after this job's lease window began (in-job-sibling),
-# and names which; an earlier lease's leftover still fails. remediation
+# (own-head-commit) or on a pull request a [bot] login opened in the leased
+# *-infra repository at or after this job's lease window began
+# (in-job-sibling), and names which; an earlier lease's leftover and a
+# person's pull request still fail. remediation
 # stays on the docs/designs/domains.yaml allowlist until then.
 ./tasks/pdb-remediation-pr/task.yaml
 

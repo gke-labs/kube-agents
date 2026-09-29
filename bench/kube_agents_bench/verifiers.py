@@ -406,6 +406,18 @@ LEASE_START_ENV = "EVAL_LEASE_STARTED_AT"
 PR_RULE_OWN_HEAD_COMMIT = "own-head-commit"
 PR_RULE_IN_JOB_SIBLING = "in-job-sibling"
 
+# Who may have opened an in-job sibling: a GitHub App's bot, which is the only
+# kind of login the agent writes as (the minter App, hack/ci-deploy.sh's
+# EVAL_GITHUB_APP_ID). The App's slug is deliberately not written out anywhere
+# in this repository -- hack/ci_sweep_agent_pulls.py reads it with GET /app
+# under a JWT signed by the pool project's KMS key, which the eval runners do
+# not hold -- so the check tests the kind of login, as
+# hack/ci_reset_audit_ledgers.py does for the ledger issues, not the name. That
+# keeps a human's pull request opened in the window out; a sibling case's
+# agent pull request in the same nightly lease shares the App and is not told
+# apart here (docs/eval-gate-roster.md says so).
+PR_BOT_LOGIN_SUFFIX = "[bot]"
+
 # The first line of the closing comment hack/ci_reset_audit_ledgers.py leaves
 # on a ledger it retires before a repetition (RESET_MARKER there;
 # scripts/test_ci_eval_ledger_reset.py pins the two literals equal). A closed
@@ -1298,15 +1310,20 @@ class PullRequestOpenedVerifier(BaseVerifier):
       what separates a run that pushed a fix from one that left a comment.
     * ``in-job-sibling`` -- it sits in the leased project's own repository
       (``EVAL_LEDGER_REPO``), was created at or after this job's lease window
-      began (``EVAL_LEASE_STARTED_AT``, the same skew allowed), and is open or
-      merged. The skill derives the branch from the change, so once
-      repetition 1's fix is on it, repetitions 2 and 3 of the same job push
-      nothing, ``gh pr create`` answers "already exists", and the skill hands
-      back repetition 1's URL: correct work with no commit of its own, the
-      1/3 the held-out seat's second live run read (#2016 step 3). The
+      began (``EVAL_LEASE_STARTED_AT``, the same skew allowed), was opened by
+      a ``[bot]`` login (``PR_BOT_LOGIN_SUFFIX``: an App's, as the agent
+      writes; not a person's), and is open or merged. The skill derives the
+      branch from the change, so once repetition 1's fix is on it,
+      repetitions 2 and 3 of the same job push nothing, ``gh pr create``
+      answers "already exists", and the skill hands back repetition 1's
+      URL: correct work with no commit of its own, the 1/3 the held-out
+      seat's second live run read (#2016 step 3). The
       project is leased to no one else during the window, so a pull request
-      opened inside it in that repository is this job's; one opened before
-      it is an earlier lease's leftover and fails exactly as #1832 intends.
+      an App opened inside it in that repository is this job's; one opened
+      before it is an earlier lease's leftover and fails exactly as #1832
+      intends. The window is the job's, not the case's: every PR-writing
+      case in a nightly shares it and writes as the same App, so which case
+      opened a sibling is not something this check can tell.
 
     One surviving candidate is enough — a reply may link the ticket it came
     from beside the fix — and a candidate GitHub cannot answer for ends the
@@ -1496,15 +1513,19 @@ class PullRequestOpenedVerifier(BaseVerifier):
         owner: str,
         repo: str,
         created: datetime,
+        author: str,
         lease_repo: str,
         lease_start: datetime | None,
     ) -> str | None:
         """Why a pull request is NOT an in-job sibling, or None when it is one.
 
-        Three answers, each a clause the rejection can carry: no lease window
+        Four answers, each a clause the rejection can carry: no lease window
         in the environment; a repository other than the leased one (nobody's
-        sibling, whatever its dates); created before the window began, less
-        ``max_clock_skew_sec`` -- an earlier lease's leftover. Open-or-merged
+        sibling, whatever its dates); an author that is not a ``[bot]`` login
+        (a person's pull request, whenever opened); created before the window
+        began, less ``max_clock_skew_sec`` -- an earlier lease's leftover.
+        The author is tested before the date so a person's pull request is
+        named as such whichever side of the window it sits. Open-or-merged
         is the caller's: closed unmerged is rejected before this is asked, and
         a merge postdates its creation, so "merged inside the window" is
         implied by "created inside it".
@@ -1516,6 +1537,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         if f"{owner}/{repo}".lower() != lease_repo:
             return f"not in the leased repository {lease_repo}, so not an in-job sibling"
+        if not author.endswith(PR_BOT_LOGIN_SUFFIX):
+            return (
+                f"opened by {author or '?'}, not a {PR_BOT_LOGIN_SUFFIX} login as the "
+                "agent's are, so a person's pull request and not an in-job sibling"
+            )
         early = (lease_start - created).total_seconds()
         if early > self.max_clock_skew_sec:
             return (
@@ -1622,7 +1648,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # no push of its own. Decided here, applied at the two places the
             # first rule would reject it, so a candidate that meets the first
             # rule is still recorded as own-head-commit.
-            not_sibling = self._not_in_job(owner, repo, created, lease_repo, lease_start)
+            # `user.login` is on both endpoints' payloads; an App's ends in
+            # PR_BOT_LOGIN_SUFFIX. Missing reads as nobody, which is no bot.
+            author = str((payload.get("user") or {}).get("login") or "")
+            not_sibling = self._not_in_job(
+                owner, repo, created, author, lease_repo, lease_start
+            )
             # Creation is not the only way a run owns a pull request: the
             # submit-suggestion skill derives the branch from the change, so a
             # later rep pushes onto the branch the first one used, `gh pr
@@ -1683,7 +1714,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 rule = PR_RULE_IN_JOB_SIBLING
                 reason = (
                     f"{rule}: {slug} was opened at {created.isoformat()} by an earlier "
-                    f"repetition of this job (lease window from "
+                    f"repetition of this job (as {author}; lease window from "
                     f"{lease_start.isoformat() if lease_start else '?'} in {lease_repo}), "
                     f"is {'merged at ' + merged.isoformat() if merged else 'open'}, and "
                     f"carries {files}; this repetition pushed no commit of its own (last "
@@ -1703,6 +1734,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 raw={
                     "rule": rule,
                     "pull_request": slug,
+                    "author": author or None,
                     "created_at": created.isoformat(),
                     "updated_at": updated.isoformat() if updated else None,
                     "merged_at": merged.isoformat() if merged else None,

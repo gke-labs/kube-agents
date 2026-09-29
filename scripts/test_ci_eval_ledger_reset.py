@@ -579,12 +579,15 @@ class CallSiteTest(unittest.TestCase):
         self.assertEqual(sorted(names), ["LEASED_REPO_ENV", "LEASE_START_ENV"])
         derived = src.index('EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}"')
         exported = src.index(f"\nexport {names['LEASED_REPO_ENV']}\n")
+        # The window's start is the run's own wall-clock stamp, taken once.
+        clock = src.index("EVAL_RUN_STARTED_AT=\"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\"")
         stamped = src.index(
-            f"export {names['LEASE_START_ENV']}=\"${{{names['LEASE_START_ENV']}:-$(date -u +'%Y-%m-%dT%H:%M:%SZ')}}\""
+            f"export {names['LEASE_START_ENV']}=\"${{{names['LEASE_START_ENV']}:-${{EVAL_RUN_STARTED_AT}}}}\""
         )
         matrix = src.index("# 6. Task Matrix Execution Loop")
         self.assertLess(derived, exported)
         self.assertLess(exported, matrix)
+        self.assertLess(clock, stamped)
         self.assertLess(stamped, derived)
 
     def test_the_unit_reset_is_after_its_mint_before_devops_bench_inside_the_task_lock(self):
