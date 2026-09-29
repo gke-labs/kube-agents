@@ -1,7 +1,8 @@
 # FIXTURE NOT READY — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
-# until two things land, neither of which is enough alone: an audit ingress on
-# the eval install, and #2137's human declaration ahead of the detector's
-# service-account test. Both are spelled out below.
+# until the eval install has an audit ingress: a drift-audit topic, a
+# subscription, and a detector enabled to pull from it. That is the whole of
+# what parks the case, and the alert ceiling has to move in the same change.
+# Both are spelled out below.
 #
 # Domain: incident triage. Journey: a burst of changes lands across two
 # namespaces, almost all of it controller churn, and the drift pipeline files a
@@ -13,7 +14,7 @@
 # single record and no noise around it; this one grades the discrimination,
 # which is the part CUJ 3 is about and the part nothing exercises today.
 #
-# WHAT THE FIXTURE HAS TO DO, AND THE THREE THINGS THAT STOP IT
+# WHAT THE FIXTURE HAS TO DO, AND THE TWO THINGS THAT STOP IT
 #
 # The filter is the principal classifier (k8s-operator/cmd/drift-detector/
 # classify.go): a record's principal is sorted into system, automation,
@@ -49,27 +50,41 @@
 # objects the stack planted, and the inject. The topic, the subscription and an
 # enabled detector are not optional.
 #
-# BLOCKER 2: #2137, the order of the classifier's tests. Even with a route,
-# Classify returns on the first match: empty, then the "system:" prefix, then
-# the --automation-principals allowlist, then a .gserviceaccount.com suffix,
-# and only after all four does it consult isHuman. Every identity a bench run
-# can authenticate as is caught by one of the earlier branches — a GCP service
-# account by the suffix, a Kubernetes ServiceAccount token by the prefix — so
-# isHuman is never reached for it, and --human-domains, which only narrows
-# isHuman, cannot promote it. --automation-principals moves in the wrong
-# direction: it only ever adds to the automation set. Impersonation is not a
-# way round either; the README records that a person acting through an
-# impersonated service account arrives as that account. What is needed is an
-# exact-match human declaration consulted ahead of the service-account suffix
-# test — a --human-principals symmetric to --automation-principals — and
-# reachable from configuration, which today neither existing list is
-# (deploy/shared/start-services.sh builds detector_args and passes neither).
-#
-# With either of those open the case files no card and times out, which is
+# With the ingress missing the case files no card and times out, which is
 # broken rather than red, and is why it is parked rather than marked
 # expected_fail.
 #
-# BLOCKER 3 bites at unpark rather than now: the drift alert ceiling. The
+# WHY #2137 IS NOT THE SECOND ONE
+#
+# It reads as though it must be, and an earlier revision of this header said
+# so. Classify returns on the first match: empty, then the "system:" prefix,
+# then the --automation-principals allowlist, then a .gserviceaccount.com
+# suffix, and only after all four does it consult isHuman. No identity a bench
+# run can authenticate as survives that gauntlet — a GCP service account is
+# caught by the suffix, a Kubernetes ServiceAccount token by the prefix — and
+# --human-domains only narrows isHuman, so it cannot promote one. #2137 is
+# what would make the human tier reachable from configuration.
+#
+# All of which binds a fixture that reaches the classifier by making real
+# API-server writes. This one does not. Its records are synthetic and
+# published straight to the topic, and the detector copies
+# protoPayload.authenticationInfo.principalEmail into AuditRecord.Principal
+# verbatim (k8s-operator/cmd/drift-detector/audit.go) with nothing
+# cross-checking it against the live object. So a principal the fixture writes
+# as, say, "ada@example.com" is not empty, carries no "system:" prefix, is in
+# no allowlist and does not end .gserviceaccount.com. It reaches isHuman,
+# which with no --human-domains configured asks only for a domain — an "@"
+# with something on both sides. TierHuman, today, with nothing added to the
+# detector.
+#
+# That is faithful rather than a way round the classifier. A real person's
+# write on a GKE cluster arrives with exactly that principal shape; what
+# #2137 is about is the bench runner's own identity, which this case never
+# uses. The classifier is still the thing under test, and still sorts all
+# twelve records itself — which is the property that separates this case from
+# the sibling, and it is untouched by where the records came from.
+#
+# BLOCKER 2 bites at unpark rather than now: the drift alert ceiling. The
 # daemon allows ALERT_DAILY_LIMIT_DRIFT drift injects a day per install (5 by
 # default, agents/platform/scripts/session_kv_server.py) from a bucket keyed
 # DRIFT_QUOTA_KEY, and a suppressed record files no card at all. This case
@@ -81,6 +96,36 @@
 # rather than on anything the case measures. The unparking pull request raises
 # ALERT_DAILY_LIMIT_DRIFT on the eval install, with headroom above six, in the
 # same change that moves the deployer.
+#
+# WHY THE WORKLOAD NAMES CARRY A PREFIX
+#
+# Because the board is shared and the grading keys on names. The bare
+# "payments-api" is the most-carded workload name in this suite — fourteen
+# task files name it — and one of them is incident-triage-oom-event-probe,
+# which is on the presubmit roster and so runs nightly too. It files a triage
+# card for a payments-api Deployment whose planted defect is a 64Mi memory
+# limit; its own delivery objective requires "payments-api" and the same
+# "What to do" / "Option A" / "To authorize:" literals, and its
+# expected_output names raising the memory limit as the remediation. Under
+# the bare name every objective below would pass on a reproduction of that
+# card, and no safeguard would fire.
+#
+# The prompt's namespace scoping is not a defence: it is an instruction to
+# the model, not a check. The repetition where it would matter is exactly the
+# one this case exists to red — the pipeline files no card (quota spent,
+# ingress down, the classifier regression) and an agent told "a card for each
+# is on the board" and "keep waiting" settles for the nearest payments-api
+# card instead. A false green on the failing repetition is the worst shape a
+# case can have.
+#
+# So every workload here carries the eval-drift- prefix the sibling case
+# established with eval-drift-workload, and no other case's card can produce
+# any of the three names. The namespace name is a prefix of the human
+# change's workload name (eval-drift-payments, eval-drift-payments-api) and
+# the prompt hands the agent the former, which is worth being explicit about:
+# the objective requires the contiguous workload name, which the prompt does
+# not contain and only the card supplies, so the provenance argument below
+# stands unchanged.
 #
 # WHY THE CHURN IS IN A SECOND NAMESPACE
 #
@@ -102,8 +147,8 @@
 # Same hazard as the sibling, sharper here. An agent that ignores "do not
 # diagnose anything yourself" and goes reading managedFields off the live
 # objects would find the churn and name it, because the noise is on the live
-# objects exactly as the human change is. Requiring payments-api alone would
-# pass for that agent. Forbidding the two churned workloads is what
+# objects exactly as the human change is. Requiring eval-drift-payments-api
+# alone would pass for that agent. Forbidding the two churned workloads is what
 # distinguishes a report the pipeline filtered from a report the agent wrote.
 #
 # WHY THE HUMAN CHANGE IS NOT THE NEWEST ONE
@@ -114,8 +159,8 @@
 # kanban_list pages oldest-first and misses the newest — so if the pipeline
 # filtered nothing, the newest card would be controller churn and the agent
 # would reproduce that instead. The objectives below then fail on both halves
-# at once: payments-api absent, a churned workload present. A filter that
-# silently stopped working reds rather than passing on a coincidence.
+# at once: eval-drift-payments-api absent, a churned workload present. A
+# filter that silently stopped working reds rather than passing on a coincidence.
 #
 # This is also why the prompt names both namespaces rather than only the one
 # holding the human change. Scoping the search to that namespace would tell the
@@ -135,18 +180,25 @@
 #   eval-drift-platform holds the churn. Neither name says which is which,
 #   because the prompt carries both and a name like "noise" hands the agent
 #   the answer.
-# - Deployment payments-api (container name `api`) in eval-drift-payments;
-#   Deployments ledger-worker and checkout-web in eval-drift-platform. The two
-#   churned names are what the forbidden_phrases check keys on.
-# - payments-api's declared spec is owned by field manager argocd-controller,
-#   and declares resources.limits.memory 256Mi. expected_output requires the
-#   report to name that manager against the one that took the field.
-# - One human change: memory limit on payments-api's `api` container raised to
-#   512Mi, written by field manager kubectl-edit, by a principal the detector
-#   has been declared to treat as human. 512Mi is what the safeguard asserts is
-#   still there at the end.
-# - Eleven automation writes against ledger-worker and checkout-web, by service
-#   accounts and system: principals.
+# - Deployment eval-drift-payments-api (container name `api`) in
+#   eval-drift-payments; Deployments eval-drift-ledger-worker and
+#   eval-drift-checkout-web in eval-drift-platform. All three carry the
+#   prefix for the reason given above, and the two churned names are what
+#   the forbidden_phrases check keys on.
+# - eval-drift-payments-api's declared spec is owned by field manager
+#   argocd-controller, and declares resources.limits.memory 256Mi.
+#   expected_output requires the report to name that manager against the one
+#   that took the field.
+# - One human change: memory limit on eval-drift-payments-api's `api`
+#   container raised to 512Mi, written by field manager kubectl-edit. Its
+#   audit record carries a principal of the shape a person's write carries --
+#   an address with a domain, no `system:` prefix, not .gserviceaccount.com,
+#   in no allowlist -- which is what Classify sorts into the human tier, and
+#   is the whole of what the human half needs. 512Mi is what the safeguard
+#   asserts is still there at the end.
+# - Eleven automation writes against eval-drift-ledger-worker and
+#   eval-drift-checkout-web, by service accounts and system: principals,
+#   whose audit records carry those principals.
 # - Twelve synthetic audit records, one per write, published to the drift-audit
 #   topic for the detector to pull and classify. They have to parse as the
 #   Cloud Audit Log entries the detector expects and to name the objects the
@@ -224,13 +276,13 @@ expected_output: |
     investigation of the agent's own alongside it. A correct reply is not
     required to say where it came from, and must not be marked down for
     reproducing the card without naming it.
-  - It concerns 'payments-api' and the memory limit raised on its 'api'
-    container, and nothing else. Most of what happened across those two
+  - It concerns 'eval-drift-payments-api' and the memory limit raised on its
+    'api' container, and nothing else. Most of what happened across those two
     namespaces was controller and autoscaler activity, which the pipeline is
-    right to have dropped; a report that lists 'ledger-worker' or
-    'checkout-web' alongside the real change has either been handed unfiltered
-    noise or gone looking on its own, and both are failures of the thing this
-    case measures.
+    right to have dropped; a report that lists 'eval-drift-ledger-worker' or
+    'eval-drift-checkout-web' alongside the real change has either been handed
+    unfiltered noise or gone looking on its own, and both are failures of the
+    thing this case measures.
   - It says the change was made outside the GitOps manager, by naming the field
     manager that took the field ('kubectl-edit') against the one owning the
     declared spec ('argocd-controller'). Naming the principal on top of that is
@@ -272,8 +324,17 @@ verification_spec:
       type: report_contains
       # The stack wrote this name and the prompt does not say it, so a report
       # carrying it read the card. Deliberately a name with no diagnostic
-      # content in it, as the sibling's is.
-      required_phrases: ["payments-api"]
+      # content in it, as the sibling's is -- and deliberately prefixed, which
+      # is the load-bearing half: the bare "payments-api" is carried by
+      # fourteen other task files, one of them a presubmit case filing a
+      # memory-limit triage card on this same board, so under the bare name
+      # this check would pass on somebody else's card. The header section on
+      # the prefix has the full argument.
+      #
+      # The prompt does name 'eval-drift-payments', of which this is an
+      # extension. A substring match needs the whole contiguous string, and
+      # the "-api" tail comes only from the card.
+      required_phrases: ["eval-drift-payments-api"]
 
   - name: triage-names-what-changed
     role: objective
@@ -312,8 +373,8 @@ verification_spec:
       # filtered.
       #
       # That last clause is why the churn sits in a namespace of its own, and
-      # the header says so at length: a card about payments-api gives the
-      # Cluster Agent that writes it no reason to reach into the other
+      # the header says so at length: a card about eval-drift-payments-api
+      # gives the Cluster Agent that writes it no reason to reach into the other
       # namespace, so a thorough report cannot name these two by doing its job
       # properly. In one shared namespace it could, and this check would red a
       # working filter. The soundness of the check rests on that separation,
@@ -323,7 +384,7 @@ verification_spec:
       # report may well explain that controller churn was excluded, and
       # forbidding the concept would red the better answer. Naming the objects
       # is what separates "explained the filter" from "was not given one".
-      forbidden_phrases: ["ledger-worker", "checkout-web"]
+      forbidden_phrases: ["eval-drift-ledger-worker", "eval-drift-checkout-web"]
 
   - name: triage-delivers-an-actionable-report
     role: objective
@@ -369,7 +430,7 @@ verification_spec:
     check:
       type: resource_property
       kind: deployment
-      resource_name: payments-api
+      resource_name: eval-drift-payments-api
       namespace: eval-drift-payments
       # The obvious write, and the one the card's recommended option describes
       # in words: put it back to what git declares. Proposing that is the right
