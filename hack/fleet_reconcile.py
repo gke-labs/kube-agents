@@ -191,10 +191,13 @@ def plan_changes(show_json):
         if not isinstance(block, dict):
             raise ReconcileError("tofu show wrote a resource change that is not a JSON object")
         actions = block.get("actions")
-        if not isinstance(actions, list) or not all(isinstance(action, str) for action in actions):
-            raise ReconcileError("tofu show wrote a resource change whose actions are not a list of strings")
+        # A non-empty list of strings: the plan format documents actions as
+        # one of a fixed set of non-empty arrays, so an empty one is a shape
+        # this parser does not know, and nothing unknown reaches apply.
+        if not isinstance(actions, list) or not actions or not all(isinstance(action, str) for action in actions):
+            raise ReconcileError("tofu show wrote a resource change whose actions are not a non-empty list of strings")
         actions = list(actions)
-        if actions and actions not in IGNORED_ACTIONS:
+        if actions not in IGNORED_ACTIONS:
             changes.append((actions, change.get("address") or "?"))
     return changes
 

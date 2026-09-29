@@ -197,7 +197,9 @@ class PlanInspectionTest(unittest.TestCase):
         for body in ("[]", "null", '{"resource_changes": [null]}', '{"resource_changes": {"a": {}}}', '{"resource_changes": 5}', '{"resource_changes": "abc"}', '{"resource_changes": [{"address": "a", "change": "x"}]}', '{"resource_changes": [{"address": "a", "change": {"actions": [null]}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": 5}}]}',
                      # Falsy wrong types must be refused as loudly as truthy ones.
                      '{"resource_changes": 0}', '{"resource_changes": false}', '{"resource_changes": ""}', '{"resource_changes": {}}',
-                     '{"resource_changes": [{"address": "a", "change": []}]}', '{"resource_changes": [{"address": "a", "change": 0}]}', '{"resource_changes": [{"address": "a", "change": {"actions": 0}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": {}}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": ""}}]}'):
+                     '{"resource_changes": [{"address": "a", "change": []}]}', '{"resource_changes": [{"address": "a", "change": 0}]}', '{"resource_changes": [{"address": "a", "change": {"actions": 0}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": {}}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": ""}}]}',
+                     # The one falsy list: a shape the format never emits, so refused, not skipped.
+                     '{"resource_changes": [{"address": "a", "change": {"actions": []}}]}'):
             tofu = _Tofu({P7: body})
             outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
             self.assertEqual(outcome, reconcile.OUTCOME_FAILED, body)
