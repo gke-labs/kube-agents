@@ -161,6 +161,19 @@ run_upgrade {checkout} 0.7.0 operator {drop}
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("args=--non-interactive --upgrade-mode=operator --image-tag 0.7.0\n", proc.stdout)
 
+    def test_only_the_rollback_calls_ask_for_the_drop(self):
+        lines = (line.strip() for line in _SCRIPT.read_text().splitlines())
+        calls = [line for line in lines if line.startswith("run_upgrade ")]
+        rollback = [line for line in calls if '"${ROLLBACK_CHECKOUT}"' in line]
+        forward = [line for line in calls if '"${CANDIDATE_CHECKOUT}"' in line]
+        self.assertEqual(len(rollback), 2, calls)
+        self.assertEqual(len(forward), 2, calls)
+        self.assertEqual(len(calls), 4, calls)
+        for line in rollback:
+            self.assertTrue(line.endswith(" true"), line)
+        for line in forward:
+            self.assertFalse(line.endswith(" true"), line)
+
     def test_the_roll_forward_leg_keeps_the_refusal(self):
         stub = '#!/usr/bin/env bash\n# --drop-undeclared-values\necho "args=$*"\n'
         proc = self._run("false", stub)
