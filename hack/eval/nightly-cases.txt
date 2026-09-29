@@ -93,7 +93,7 @@
 # wider, realises ~2.4x or better. Night one (2026-09-16, build
 # 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
-# so the ten additions since are priced inside its headroom. The first nights after this change measure it:
+# so the thirteen additions since are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
 # order. A deadline kill is survivable by design -- the cost-hinted queue
