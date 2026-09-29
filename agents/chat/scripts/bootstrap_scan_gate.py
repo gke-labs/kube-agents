@@ -178,10 +178,9 @@ def _cluster_agent_calls() -> list[str]:
 
     A profile is listed only when it meets ``platform_control``'s
     ``list_cluster_profiles`` rule: registered with Hermes and its scaffold
-    finished. A card
-    assigned to an unregistered directory is never dispatched and the sweep
-    waits on it forever; a profile without ``USER.md`` blocks at preflight, and
-    its cluster is better audited by the sweep itself in Step 4.
+    finished. A card assigned to an unregistered directory is never dispatched
+    and the sweep waits on it forever; a profile without ``USER.md`` blocks at
+    preflight, and its cluster is better audited by the sweep itself in Step 4.
 
     A profile without a readable ``cluster_identity`` is left out, as the
     reconcile neither counts nor prunes one: there is no cluster to key its card
@@ -189,7 +188,8 @@ def _cluster_agent_calls() -> list[str]:
     profile whose directory or config cannot be read is skipped the same way: a
     file like that is what keeps the reconcile failing until it gives up and
     files the sweep, so it must not take the other profiles with it. An entry
-    that cannot be stat'ed at all fails ``list_profiles`` itself, below.
+    whose stat fails with EACCES or EIO fails ``list_profiles`` itself, below;
+    ``list_profiles`` leaves out a dangling symlink.
 
     Failing to list the profiles, or to import the readiness rule, returns an
     empty list, which files the solo sweep. Raising would fail the run before

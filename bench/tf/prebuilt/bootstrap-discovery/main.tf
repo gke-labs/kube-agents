@@ -20,10 +20,11 @@
 # whatever Cluster Agent cards it is going to file, which is what the case
 # grades. Short of that, it hands whatever the worker filed to the verifier
 # at `run_wait`, or fails the apply if no worker has picked the sweep up by
-# then or no read of the board has succeeded. It does not wait for the Cluster Agent cards itself: the worker's SOP
-# polls them to the end inside its run, but a worker can end its run while
-# they are still running (#1981). The destroy archives them, and archiving a
-# running card ends its worker.
+# then or no read of the board has succeeded. It does not wait for the
+# Cluster Agent cards itself: the worker's SOP polls them to the end inside
+# its run, but a worker can end its run while they are still running
+# (#1981). The destroy archives them, and archiving a running card ends its
+# worker.
 #
 # Re-arming is the runbook in agents/chat/defaults/plugins/bootstrap_onboarding/
 # README.md §5 plus one step: the board deduplicates kanban_create on
@@ -253,10 +254,11 @@ resource "null_resource" "sweep" {
       esac
 
       # ---- 2. Clear the previous sweep -------------------------------------
-      # What the trap puts back: the previous sweep's id, `none` when only an
-      # inventory file kept the gate closed, or nothing when it was open. A
-      # failed read stops the apply before anything changes; taken for an
-      # open gate, it would have the trap leave this one open.
+      # What the trap puts back: the previous sweep's id; `none` when a marker
+      # without one, or only an inventory file, kept the gate closed; or
+      # nothing when it was open. A failed read stops the apply before
+      # anything changes; taken for an open gate, it would have the trap
+      # leave this one open.
       old_id="$(agent_py <<'PY'
       import os
       home = "${local.home}"
