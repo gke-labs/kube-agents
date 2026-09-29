@@ -135,7 +135,7 @@ ADDED_AFTER_THE_MOVED_BLOCK = [
 ADDED_AFTER_THE_MOVE = [
     "obtainability-design-quota-vs-capacity",  # the two obtainability-journey probes, PR #1841
     "obtainability-window-planning-probe",
-    "gitops-managed-repos",  # which GitOps repositories the agent manages
+    "list-gitops-repos",  # which GitOps repositories the agent manages
 ]
 
 # Admitted after the split, each by a pull request that cited the record

@@ -445,4 +445,4 @@
 ./tasks/obtainability-window-planning-probe/task.yaml
 
 # Which GitOps repositories the agent manages, from its configuration.
-./tasks/gitops-managed-repos/task.yaml
+./tasks/list-gitops-repos/task.yaml

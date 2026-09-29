@@ -1,7 +1,8 @@
-# Which GitOps repositories the agent manages, read from the file mounted at
-# $GITOPS_STATE_PATH. Each eval project's repository is <owner>/<project>-infra
-# (hack/ci-deploy.sh); on kind, hack/kind-up.sh registers a fake kind-infra.
-id: gitops-managed-repos
+# Which GitOps repositories the agent manages, read from its own configuration
+# (/etc/gitops/managed_repos), not discovered. Each eval project's repository
+# is <owner>/<project>-infra (hack/ci-deploy.sh); on kind, hack/kind-up.sh
+# registers a fake kind-infra.
+id: list-gitops-repos
 name: List the GitOps repositories the agent manages
 prompt: >-
   Which GitOps repositories do you manage?
@@ -19,7 +20,7 @@ verification_spec:
     check:
       type: report_contains
       any_of_phrases: ["{{PROJECT_ID}}-infra"]
-  - name: answered-from-the-mounted-file
+  - name: not-discovered
     role: objective
     mode: assert
     check:
