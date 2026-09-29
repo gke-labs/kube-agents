@@ -121,10 +121,11 @@ REASON_VERIFIER_FAILED = "scripts/verify_ci_pool_project.py exited {rc} without 
 REASON_VERIFIER_TIMEOUT = "scripts/verify_ci_pool_project.py did not finish within {seconds}s"
 REASON_NO_REPORT = "scripts/verify_ci_pool_project.py wrote no report for this check"
 REASON_CHECK_UNCHECKED = "the verifier could read nothing about this item"
-# What `--projects` admits: the mapping row's shape in hack/ci-deploy.sh. An
-# id is also a directory name under the work directory, so nothing with a
-# path in it gets that far.
-PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+REASON_WORKDIR = "the scan could not prepare a work directory for this project: {error}"
+# What `--projects` admits: the mapping row's shape in hack/ci-deploy.sh, at
+# GCP's 30-character cap. An id is also a directory name under the work
+# directory, so nothing with a path in it, or too long for one, gets that far.
+PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,29}$")
 # GNU timeout's code, as fixture_state._run reports a ceiling.
 EXIT_TIMED_OUT = 124
 # Summary keys the entry point and the workflow's upload step read back.
@@ -245,11 +246,15 @@ def scan_project(
     """
     started = time.monotonic()
     project_dir = workdir / project
-    project_dir.mkdir(parents=True, exist_ok=True)
     report = project_dir / REPORT_FILE
-    # A --workdir reused across runs keeps the last report; a verifier that
-    # dies before writing must read as unread, not as last run's verdict.
-    report.unlink(missing_ok=True)
+    try:
+        project_dir.mkdir(parents=True, exist_ok=True)
+        # A --workdir reused across runs keeps the last report; a verifier that
+        # dies before writing must read as unread, not as last run's verdict.
+        report.unlink(missing_ok=True)
+    except OSError as exc:
+        reason = REASON_WORKDIR.format(error=exc)
+        return _project_entry(_all_checks(checks, CHECK_NOT_CHECKED, [reason]), {}, started, reason)
     rc, _, err = _run(
         [
             sys.executable, str(verifier_script),

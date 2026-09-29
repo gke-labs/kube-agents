@@ -2460,6 +2460,17 @@ class IamGrantsTest(unittest.TestCase):
         self.assertEqual(result.message, "Cloud Build and Compute SAs hold reader on the warm cache repository")
         self.assertTrue(result.read)
 
+    def test_the_one_read_that_happened_keeps_the_check_read(self):
+        # Four reads, any one of which is a read: the platform GSA, project
+        # and fleet-reader policies refused, the LiteLLM GSA's read and bound.
+        denied = (1, "", "ERROR: (gcloud.iam.service-accounts.get-iam-policy) PERMISSION_DENIED: the caller does not have permission")
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [denied, _ok(self._litellm_wi_policy("kube-agents-evals-3")), denied, denied]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertTrue(result.read, "the LiteLLM policy was read")
+        self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_PASS)
+        self.assertEqual(len([w for w in result.warnings if isinstance(w, checker.Unread)]), 3)
+
     def test_an_absent_service_account_is_a_finding_with_its_repair(self):
         gone = _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown service account.")
         # A deleted account's bindings are gone from the project policy too,
@@ -3569,14 +3580,19 @@ class ReportDocumentTest(unittest.TestCase):
         self.assertEqual(iam.call_count, 1)
         self.assertTrue(all(r.message != "Not checked" for r in results))
         # The mixed case: the project read finishes after the deadline, so it
-        # keeps its verdict and every check after it is not checked.
+        # keeps its verdict and every check after it is not checked. The clock
+        # is the test's, moved by the read itself, so no wall-clock margin
+        # decides which branch runs.
+        clock = [1000.0]
+
         def slow_project_read(project_id):
-            time.sleep(0.2)
+            clock[0] += 10.0
             return "123", checker.CheckResult("p", True, "ok")
-        with mock.patch.object(checker, "check_project_and_apis", slow_project_read), \
+        with mock.patch.object(checker.time, "monotonic", lambda: clock[0]), \
+             mock.patch.object(checker, "check_project_and_apis", slow_project_read), \
              mock.patch.object(checker, "check_iam_and_service_accounts", return_value=checker.CheckResult("i", True)) as iam, \
              mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
-            results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS), deadline=time.monotonic() + 0.05)
+            results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS), deadline=clock[0] + 1.0)
         self.assertEqual([r.check_id for r in results], list(checker.POOL_STATE_CHECKS))
         self.assertEqual(iam.call_count, 0)
         by_id = {r.check_id: r for r in results}

@@ -337,7 +337,7 @@ class EntryPoint(ScanHarness):
     def test_a_project_id_with_a_path_in_it_is_refused_at_the_door(self):
         # An id is a directory name under the work directory: nothing with a
         # path in it, or outside the mapping's shape, reaches the scan.
-        for bad in ("../evals-2", "/tmp/x", "kube-agents-evals-2/..", "Evals-2", "evals 2"):
+        for bad in ("../evals-2", "/tmp/x", "kube-agents-evals-2/..", "Evals-2", "evals 2", "a" * 31):
             stderr = __import__("io").StringIO()
             with unittest.mock.patch("sys.stderr", stderr), self.assertRaises(SystemExit) as raised:
                 pool_state.main(["--out", str(self.root / "out.json"), "--projects", f"{PROJECT},{bad}", "--verifier", str(self.stub), "--workdir", str(self.workdir)])
@@ -347,6 +347,17 @@ class EntryPoint(ScanHarness):
         self.assertFalse(self.workdir.exists(), "nothing was created under the work directory")
         self.assertFalse((self.workdir.parent / "evals-2").exists(), "nothing was created beside it")
         self.assertTrue(pool_state.PROJECT_ID_RE.match("kube-agents-evals-35"))
+
+    def test_a_work_directory_that_cannot_be_made_is_not_checked_not_a_dead_scan(self):
+        # scan_project's contract holds for its own filesystem calls too: a
+        # work directory it cannot prepare (here, its parent is a file) is
+        # that project's reason, and the scan over the others goes on.
+        not_a_dir = self.root / "not-a-dir"
+        not_a_dir.write_text("", encoding="utf-8")
+        entry = pool_state.scan_project(PROJECT, ["iam", "gke_and_state"], not_a_dir, 5.0, verifier_script=self.stub)
+        self.assertTrue(entry["error"].startswith("the scan could not prepare a work directory"), entry["error"])
+        self.assertEqual({c["state"] for c in entry["checks"].values()}, {"not_checked"})
+        self.assertEqual(entry["findings"], {})
 
     def test_a_scalar_where_a_report_lists_lines_is_a_thin_verdict_not_a_dead_scan(self):
         record = {"status": "fail", "message": "IAM requirements missing", "details": 5, "warnings": True, "unread": 0, "findings": 1}

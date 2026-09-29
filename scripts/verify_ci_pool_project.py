@@ -1051,6 +1051,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     findings: List[Finding] = []
     passed = True
     wi_checked = False
+    litellm_checked = False
     roles_checked = False
     fleet_reader_checked = False
     # An account that is not there is one finding; its roles are not N more
@@ -1123,6 +1124,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             litellm_absent = True
             findings.append(Finding("iam/litellm-gsa/absent", details[-1], REPAIR_LITELLM_GSA))
     else:
+        litellm_checked = True
         try:
             policy = _load_json(out)
             expected_member = f"serviceAccount:{project_id}.svc.id.goog[kubeagents-system/kubeagents-litellm]"
@@ -1390,7 +1392,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         details=details,
         warnings=warnings,
         findings=findings,
-        read=wi_checked or roles_checked or fleet_reader_checked,
+        read=wi_checked or litellm_checked or roles_checked or fleet_reader_checked,
     )
 
 
