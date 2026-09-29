@@ -93,7 +93,10 @@
 # priced against this ceiling in hack/eval/nightly-cases.txt. Two nightly drift
 # cases at three repetitions each is six injects against a ceiling of five, so
 # the sixth repetition of the night files no card and times out on the ceiling
-# rather than on anything the case measures. The unparking pull request raises
+# rather than on anything the case measures — a timeout rather than a pass on
+# the previous repetition's card because the stack polls for a card carrying
+# its own insertId, which PLANTED STATE below requires and explains. The
+# unparking pull request raises
 # ALERT_DAILY_LIMIT_DRIFT on the eval install, with headroom above six, in the
 # same change that moves the deployer.
 #
@@ -239,6 +242,33 @@
 #   example-project/us-central1/prod-1, so they cannot be copied as they
 #   stand. And every record needs its own insertId: it is what the detector
 #   deduplicates on (audit.go) and what the ledger row carries as object_uid.
+# - The human record's insertId is minted per apply, and the stack does not
+#   return until a card carrying it is on the board. Without that poll the
+#   spec grades a board that is shared and persists between runs, against a
+#   plant that is identical every repetition — same two namespaces, same three
+#   workload names, same 512Mi. So on the repetition where the pipeline files
+#   nothing, the prompt's kanban_list still returns the PREVIOUS repetition's
+#   card as the most recent one concerning either namespace, the agent
+#   reproduces it, and every check below passes on that text, safeguard
+#   included, because this repetition's plant wrote the same value the
+#   safeguard reads. That is a green on exactly the repetition the case exists
+#   to red, and the eval-drift- prefix does not reach it: the prefix keeps
+#   other cases' cards out, not this case's own earlier ones. The insertId is
+#   the lever because _drift_task_body renders it into the card body verbatim
+#   (`insertId=<id>`, session_kv_server.py), so a bounded poll for that
+#   literal is run-scoped without needing a per-run object name — which is how
+#   the sibling stack scopes its own poll
+#   (bench/tf/prebuilt/gitops-drift/main.tf).
+# - When that poll times out the stack says which failure it was, and the
+#   ledger is where it looks. Publishing to Pub/Sub gets no reply, so unlike
+#   the sibling's direct inject there is no `suppressed` status to read — but
+#   _inject_drift writes the intercepted_events row either way, with object_uid
+#   set to the insertId and notified=0 when the ceiling refused it. A row with
+#   notified=0 is BLOCKER 2 arriving in production and wants the sibling's
+#   message: raise ALERT_DAILY_LIMIT_DRIFT, or run against a fresh install. No
+#   row at all means the record never reached the daemon, which is the ingress
+#   and not the ceiling. A stack that reports neither fails the run without
+#   saying what to fix.
 # - Pacing: the human record is published first, far enough ahead of the burst
 #   that its delivery cannot be overtaken (see above); the eleven churn
 #   records follow; and the whole burst lands early enough that the card is
@@ -458,7 +488,7 @@ verification_spec:
   # the context is whatever the previous task left behind, and the same applies
   # to {{CLUSTER_NAME}} in the prompt, which resolves to the runner's own
   # CLUSTER_NAME rather than to the host cluster. Both are reasons the move to
-  # deployer: tofu is not optional when #2137 lands and this case unparks; an
+  # deployer: tofu is not optional when this case unparks; an
   # unparking that skipped it would red the gate on a safeguard that resolved
   # nothing rather than on a mutation.
   - name: triage-did-not-revert-the-live-cluster
