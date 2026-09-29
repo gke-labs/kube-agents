@@ -6808,16 +6808,89 @@ class DomainScopedFlagsTest(unittest.TestCase):
                 "repeat --enable-drift-detector on every later install.sh run",
                 combined,
             )
+            # The remedy has to name upgrade.sh. It takes no --enable-drift-detector
+            # and regenerates terraform.tfvars from install.env alone, so an
+            # operator who reads "repeat the flag" and does exactly that keeps
+            # the ingress across install.sh re-runs and loses it on their first
+            # upgrade -- which is the run this warning exists to head off.
+            self.assertIn("upgrade.sh takes no such flag", combined)
 
-    def test_the_drift_detector_warning_needs_the_flag_to_have_been_typed(self):
-        """resolve_shared_defaults fills the PARAM, so it cannot answer this.
+    def test_the_drift_detector_warning_reaches_an_exported_value(self):
+        """The environment is a supported route, and it bypassed the guard.
 
-        Unlike PARAM_ENABLE_GKE_BACKUP_PLAN, which nothing fills, this one
-        carries DEFAULT_ENABLE_DRIFT_DETECTOR by the time bootstrap runs — so
-        reading it the way the helper reads every other value would fire the
-        destroyed-ingress warning on every install over a file predating the
-        key, which is every install there is. DRIFT_DETECTOR_FLAG_PASSED is
-        what separates a typed `false` from a defaulted one.
+        installer_common.sh documents precedence as install.defaults.env → an
+        exported environment variable → install.env → a flag, and install.env
+        only outranks the export for a key it actually assigns. So
+        `ENABLE_DRIFT_DETECTOR=true ./install.sh` over a file predating the key
+        provisions the sink, topic and subscription, and the next upgrade.sh --
+        run from a shell without that export, reading the file alone --
+        destroys them under -auto-approve. A guard keyed on "was the flag
+        typed" cannot see this run at all.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "-y",
+                "resolve_shared_defaults\n"
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"ENABLE_DRIFT_DETECTOR": "true"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("records no ENABLE_DRIFT_DETECTOR", combined)
+            self.assertIn("a later run without it writes neither", combined)
+
+    def test_turning_the_drift_detector_off_says_this_apply_destroys_them(self):
+        """The consequence is not symmetrical, and the timing inverts with it.
+
+        Turning the key on leaves the loss for a later run. Turning it off over
+        a file that records it on does the destroying in THIS apply -- the run
+        writes neither tfvars key -- and the later run re-reads the file and
+        provisions them again, empty. Told the deferred story here, the
+        operator reads "a later run destroys it" at the moment it is going.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=true\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("this apply destroys", combined)
+            self.assertNotIn("a later run without it writes neither", combined)
+
+    def test_turning_it_off_over_a_file_that_never_asked_says_nothing(self):
+        """Nothing diverges, so the destroyed-ingress line would be a lie.
+
+        A file with no ENABLE_DRIFT_DETECTOR line and a typed `=false` agree:
+        this run writes neither tfvars key and so would every later run. The
+        helper's unrecorded branch fires on any non-empty value, so the call
+        site has to withhold the value rather than let it print.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertNotIn("ENABLE_DRIFT_DETECTOR", proc.stdout + proc.stderr)
+
+    def test_an_unchosen_drift_detector_key_stays_empty_and_says_nothing(self):
+        """Empty through resolve_shared_defaults is what keeps this quiet.
+
+        warn_flag_beats_unrecorded_file_value reads an empty value as "nobody
+        chose". PARAM_ENABLE_GKE_BACKUP_PLAN relies on that and nothing fills
+        it; this key is deliberately left out of resolve_shared_defaults for
+        the same reason. Filled with DEFAULT_ENABLE_DRIFT_DETECTOR, it would
+        fire the destroyed-ingress warning on every install over a file
+        predating the key, which is every install there is.
         """
         with tempfile.TemporaryDirectory() as tmp:
             destination = pathlib.Path(tmp) / "existing.env"
@@ -6828,9 +6901,8 @@ class DomainScopedFlagsTest(unittest.TestCase):
                 f'bootstrap_install_env_file "{destination}" v1.2.3',
             )
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-            combined = proc.stdout + proc.stderr
-            self.assertIn(
-                "false",
+            self.assertEqual(
+                "",
                 subprocess.run(
                     ["bash", "-c",
                      f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}" >/dev/null 2>&1\n'
@@ -6840,9 +6912,9 @@ class DomainScopedFlagsTest(unittest.TestCase):
                     capture_output=True, text=True, cwd=str(_REPO_ROOT),
                     env=get_isolated_test_env(),
                 ).stdout,
-                "sanity: the PARAM is filled, so an empty-PARAM guard would not hold",
+                "resolve_shared_defaults must leave this one empty",
             )
-            self.assertNotIn("ENABLE_DRIFT_DETECTOR", combined)
+            self.assertNotIn("ENABLE_DRIFT_DETECTOR", proc.stdout + proc.stderr)
 
     def test_the_drift_detector_warning_reads_both_sides_as_booleans(self):
         """A recorded `True` and a flagged `true` agree, and say nothing.

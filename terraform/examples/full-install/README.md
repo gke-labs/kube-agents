@@ -725,10 +725,10 @@ README) into a subscription that retains them for 31 days and never expires:
 Pub/Sub storage cost and a backlog until the detector is enabled. The reverse
 is refused — a `helm_release` precondition fails the apply when
 `enable_drift_detector` is set without `enable_drift_pubsub`. The block
-carrying `enabled` is written only when the ingress is on, so what the
-precondition prevents is not the Ready-forever detector the CRD field's
-description warns about but something quieter: an apply that succeeds, renders
-no `driftDetector` block, provisions nothing, starts nothing, and leaves a
+carrying `enabled` is written only when the ingress is on, so the failure that
+precondition catches is quieter than the Ready-forever detector the CRD
+field's description warns about: an apply that succeeds, renders no
+`driftDetector` block, provisions nothing, starts nothing, and leaves a
 variable that did nothing as the only evidence. A second precondition refuses
 `enable_drift_detector` when `project_id` is the project number rather than
 the project ID, which the rest of the composition accepts and the operator

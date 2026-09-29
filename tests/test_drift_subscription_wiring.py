@@ -21,9 +21,13 @@ another document:
     a `driftDetector` block into the CR as soon as one field is set, and the
     CR template says an install that never asked for drift detection should
     not carry one. The same block carries `enabled` from
-    `enable_drift_detector`, and a precondition refuses the other order: the
-    consumer without the ingress is a detector that retries a pull it cannot
-    satisfy for the life of the pod, which is the silent failure above.
+    `enable_drift_detector`, and a precondition refuses the other order. What
+    that precondition prevents is quieter than the silent failure above:
+    because the block is written only when the ingress is on, an
+    `enable_drift_detector` set without `enable_drift_pubsub` renders no
+    `driftDetector` block at all, so the apply succeeds, provisions nothing,
+    starts nothing, and leaves a variable that did nothing as the only
+    evidence.
   - the composition's three defaults equal the module's, and the detector's
     `defaultSubscriptionName` equals the subscription's, so an install that
     never sets a name gets the resource the detector looks for. docs/README.md

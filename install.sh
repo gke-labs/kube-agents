@@ -399,17 +399,19 @@ PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
 # Whether a --scope-* flag was typed: the Day-2 menu reads the keys from
 # install.env alone and refuses a flag it would otherwise validate and drop.
 SCOPE_FLAG_PASSED="false"
-# The same question for --enable-drift-detector, asked for a different reason.
-# warn_flag_beats_unrecorded_file_value reads an empty PARAM as "nobody chose",
-# which is how --enable-gke-backup-plan stays quiet on a run that passed no
-# flag; resolve_shared_defaults fills this one with install.defaults.env's
-# answer, so by the time the warning runs the PARAM says "false" whether it was
-# typed or defaulted, and only this marker can still tell the two apart.
-DRIFT_DETECTOR_FLAG_PASSED="false"
 # Empty means "not chosen", like PARAM_MODEL_PROVIDER above; resolve_shared_defaults
 # fills in install.defaults.env's answer once the helpers are sourced.
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
 PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-}"
+# Not filled by resolve_shared_defaults, and PARAM_ENABLE_GKE_BACKUP_PLAN below
+# is the pattern: warn_flag_beats_unrecorded_file_value reads an empty PARAM as
+# "nobody chose", and that is the only thing that keeps the destroyed-ingress
+# warning off every install over a file predating this key. Filling it and
+# recovering the distinction with a separate "was it typed" marker reads the
+# flag alone, so an exported ENABLE_DRIFT_DETECTOR -- a documented route, above
+# install.env in precedence when the file does not name the key -- would
+# provision the ingress with no warning that the next upgrade.sh destroys it.
+# main() therefore exports this one conditionally, as it does the backup plan.
 PARAM_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 PARAM_ENABLE_GKE_BACKUP_PLAN="${ENABLE_GKE_BACKUP_PLAN:-}"
 # Set-ness, never ${VAR:-...}: `--enable-gvisor=` with no value sets this to the empty
@@ -832,7 +834,6 @@ parse_args() {
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"; shift ;;
       --enable-drift-detector|--enable-drift|--enable-drift-detector=*|--enable-drift=*)
         PARAM_ENABLE_DRIFT_DETECTOR="$(flag_bool_value "$1")"
-        DRIFT_DETECTOR_FLAG_PASSED="true"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_DRIFT_DETECTOR"; shift ;;
       # Validated for emptiness here, ahead of resolve_shared_defaults.
       # PARAM_MEMORY is seeded from MEMORY and resolved with
@@ -1598,15 +1599,32 @@ bootstrap_install_env_file() {
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
       true \
       "every later install.sh run"
-    # The typed value, not the PARAM: see DRIFT_DETECTOR_FLAG_PASSED's comment.
-    local drift_detector_typed=""
-    if [ "${DRIFT_DETECTOR_FLAG_PASSED:-false}" = "true" ]; then
-      drift_detector_typed="${PARAM_ENABLE_DRIFT_DETECTOR:-}"
+    # Direction-aware, unlike every other call here, because this key is the
+    # only one whose two directions have different consequences and different
+    # timing. Turning it ON leaves the loss for a later run; turning it OFF
+    # over a file that records it on does the destroying now, and the later run
+    # re-reads the file and puts it back. One consequence string cannot say
+    # both, and the wrong one tells the operator the destruction is deferred at
+    # the moment it is about to happen.
+    local drift_detector_chosen="${PARAM_ENABLE_DRIFT_DETECTOR:-}"
+    local drift_detector_recorded drift_detector_consequence
+    drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it writes neither and the apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there; the front door applies with -auto-approve, so nobody is shown that plan first."
+    drift_detector_recorded="$(recorded_install_env_value "$destination" ENABLE_DRIFT_DETECTOR 2>/dev/null || true)"
+    if [ -n "$drift_detector_chosen" ] && ! is_truthy "$drift_detector_chosen"; then
+      if is_truthy "${drift_detector_recorded:-false}"; then
+        drift_detector_consequence="This run writes neither drift tfvars key, so this apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there, with -auto-approve and no plan shown first; a later run without the flag re-reads the file and provisions them again, empty."
+      else
+        # Off over a file that does not ask for it on. This run writes neither
+        # key and so would every later run, so there is no reversal to
+        # announce -- and the helper's unrecorded branch would announce one.
+        drift_detector_chosen=""
+      fi
     fi
     warn_flag_beats_unrecorded_file_value "$destination" ENABLE_DRIFT_DETECTOR --enable-drift-detector \
-      "$drift_detector_typed" \
-      "This key writes both drift tfvars keys, so a later run without it writes neither and the apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there; the front door applies with -auto-approve, so nobody is shown that plan first." \
-      true
+      "$drift_detector_chosen" \
+      "$drift_detector_consequence" \
+      true \
+      "every later install.sh run -- and upgrade.sh takes no such flag, regenerating tfvars from the file alone, so the file is the only remedy that survives one"
     # The scope keys: a flag applies its declaration for this run, and the
     # next full upgrade regenerates from the file, so a project the file does
     # not name is dropped again, its bindings revoked and its profiles retired.
@@ -2052,7 +2070,10 @@ resolve_shared_defaults() {
   PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
-  PARAM_ENABLE_DRIFT_DETECTOR="${PARAM_ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}"
+  # No PARAM_ENABLE_DRIFT_DETECTOR. Empty has to survive this function and
+  # reach bootstrap_install_env_file's guard as "nobody chose"; its two
+  # readers, write_env_var below and the generator, each apply
+  # DEFAULT_ENABLE_DRIFT_DETECTOR themselves.
 }
 
 # Run a command or function in the background, animating a spinner with elapsed
@@ -5279,7 +5300,13 @@ main() {
   export REGISTRY_PREFIX="$registry_prefix"
   export ENABLE_PUBSUB_PLATFORM="$PARAM_ENABLE_PUBSUB_PLATFORM"
   export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
-  export ENABLE_DRIFT_DETECTOR="$PARAM_ENABLE_DRIFT_DETECTOR"
+  # Conditional, like ENABLE_GKE_BACKUP_PLAN above and for the same reason:
+  # resolve_shared_defaults leaves this PARAM empty when nothing chose, so an
+  # unconditional export would write an empty value over whatever install.env
+  # said. The generator's DEFAULT_ENABLE_DRIFT_DETECTOR decides when it is.
+  if [ -n "${PARAM_ENABLE_DRIFT_DETECTOR:-}" ]; then
+    export ENABLE_DRIFT_DETECTOR="$PARAM_ENABLE_DRIFT_DETECTOR"
+  fi
   # Exported only when asked for, the way it was only ever persisted when asked
   # for: an empty value here is an override the installer never took a flag
   # for, turning "leave the third-party images upstream" from a default into an
