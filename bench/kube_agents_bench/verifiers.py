@@ -1661,8 +1661,6 @@ _NO_DIFF_TOKEN_REASON = (
 # hunk text alone, from the `@@` header on, so there is no `+++ b/file` line
 # to tell apart.
 _DIFF_ADDED_PREFIX = "+"
-# The `status` GitHub gives a file the pull request deletes.
-_DIFF_REMOVED_STATUS = "removed"
 # A unified diff is newline-delimited. str.splitlines would also break on a
 # form feed, a bare CR, NEL or U+2028 inside a file's content, which GitHub
 # passes through its patch verbatim, and would then read a removed line's
@@ -1723,8 +1721,8 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
     least one of ``any_of_phrases``, and none of ``forbidden_phrases``, after
     the normalisation ``report_contains`` applies with one difference: the
     underscore is kept on both sides, since in a diff it separates
-    identifiers rather than marking emphasis, so a snake_case comment or file
-    name is not the camelCase manifest. Open, not merged: the
+    identifiers rather than marking emphasis, so a snake_case comment is not
+    the camelCase manifest. Open, not merged: the
     skill's "already exists" path lands on open pull requests only, so a
     merged one named in a reply is quoted, not proposed, and a merged
     manifest anywhere in the organisation is not a standing pass. It does NOT
@@ -1748,9 +1746,10 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
     reports free (``BOSKOS_FREE_STATE``), so a leased run's pull request stays
     open until this check reads it. What the run wrote to GitHub is not this
     objective's question; ``pull_request_opened`` asks it. Only ADDED lines
-    of each patch are matched, plus the file names: a pull
-    request that deletes a budget, or edits a line beside one, carries the
-    nouns in its context and removed lines and proposes nothing.
+    of each patch are matched, and file names are not: a pull request that
+    deletes a budget, or edits a line beside one, carries the nouns in its
+    context and removed lines and proposes nothing, and a file named for the
+    kind and its selector is a name, not a manifest.
 
     WHICH ENDPOINT. ``/pulls/{n}`` for the state, then ``/pulls/{n}/files``
     for the patches; both want ``pull_requests: read``, which
@@ -1857,10 +1856,10 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                     for line in patch.split(_DIFF_LINE_SEPARATOR)
                     if line.startswith(_DIFF_ADDED_PREFIX)
                 ]
-                # A removed file's name is not something the pull request
-                # adds; only the names of files it adds or changes count.
-                named = [] if str(entry.get("status") or "") == _DIFF_REMOVED_STATUS else [name]
-                chunks.append("\n".join([*named, *added]))
+                # Added lines only, never the file name: a path such as
+                # `PodDisruptionBudget-selector-notes.md` would otherwise
+                # supply the manifest's nouns with no manifest behind it.
+                chunks.append("\n".join(added))
             if len(files) < _PR_FILES_PAGE_SIZE:
                 break
         else:

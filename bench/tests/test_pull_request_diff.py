@@ -244,9 +244,9 @@ def test_a_form_feed_or_a_bare_cr_inside_a_line_does_not_move_the_sign(token, gi
 
 
 def test_underscored_identifiers_are_not_the_camel_case_nouns(token, github):
-    """In a diff "_" separates identifiers. A snake_case comment or file name
-    names the concepts without proposing a manifest, so the underscore is
-    kept on both sides rather than stripped as Markdown emphasis."""
+    """In a diff "_" separates identifiers. A snake_case comment names the
+    concepts without proposing a manifest, so the underscore is kept on both
+    sides rather than stripped as Markdown emphasis."""
     stash()
     github.routes[f"{API}/pulls/39"] = (200, fixture("pull-39.json"))
     github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (
@@ -371,10 +371,11 @@ def test_a_blank_phrase_is_refused_at_load():
     assert PullRequestDiffContainsVerifier(type="pull_request_diff_contains", required_phrases=["_ _"]).required_phrases == ["_ _"]
 
 
-def test_a_removed_files_name_does_not_count(token, github):
-    """A pull request that deletes `checkout-gateway-PodDisruptionBudget.yaml`
-    while adding `selector:` and `minAvailable` elsewhere is not a proposal:
-    only the names of files it adds or changes join the haystack."""
+def test_a_files_name_does_not_count(token, github):
+    """A file's name is not its content. A pull request that deletes
+    `checkout-gateway-PodDisruptionBudget.yaml` while adding `selector:` and
+    `minAvailable` elsewhere is not a proposal, and neither is one that adds a
+    file named for both nouns with no manifest in it."""
     stash()
     github.routes[f"{API}/pulls/39"] = (200, fixture("pull-39.json"))
     github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (
@@ -387,11 +388,22 @@ def test_a_removed_files_name_does_not_count(token, github):
     res = check().verify(5.0)
     assert res.status == "fail"
     assert "required phrases absent from its diff: ['PodDisruptionBudget']" in res.reason
-    # Renamed to the noun, and added: the name counts.
+    # Added, and named for both nouns, with prose and no manifest: the name
+    # supplies nothing.
     github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (
         200,
         [
-            {"filename": "seeded-reliability/checkout-gateway-PodDisruptionBudget.yaml", "status": "added", "patch": "@@ -0,0 +1,2 @@\n+  selector:\n+  minAvailable: 1"},
+            {"filename": "policies/PodDisruptionBudget-selector-notes.md", "status": "added", "patch": "@@ -0,0 +1 @@\n+minAvailable: 1 is what I would pick"},
+        ],
+    )
+    res = check().verify(5.0)
+    assert res.status == "fail"
+    assert "required phrases absent from its diff: ['PodDisruptionBudget', 'selector']" in res.reason
+    # The same file carrying the manifest passes on its content.
+    github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (
+        200,
+        [
+            {"filename": "policies/PodDisruptionBudget-selector-notes.md", "status": "added", "patch": "@@ -0,0 +1,3 @@\n+kind: PodDisruptionBudget\n+  selector:\n+  minAvailable: 1"},
         ],
     )
     assert check().verify(5.0).status == "pass"
