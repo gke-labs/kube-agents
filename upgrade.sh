@@ -628,7 +628,8 @@ harness_retag_keys() {
 # left for Helm to judge. A chart without a schema drops nothing. Names are
 # printed, never values: the recorded values carry the install's credentials.
 # A name is printed through `echo -e`, so its backslashes and unprintable
-# characters are written as escapes a terminal shows rather than acts on.
+# characters are written as escapes a terminal shows rather than acts on, a
+# backslash as `\\` so that it cannot be read as the start of one.
 # Assigns rather than prints, for the reasons recorded_plugin_image_tag_keys
 # gives. Arguments: release, namespace, schema path.
 RETAG_VALUES_JSON=""
@@ -689,7 +690,7 @@ def visible(key):
     out = []
     for char in key:
         if char == "\\":
-            out.append("\\\\")
+            out.append("\\\\\\\\")
         elif char.isprintable():
             out.append(char)
         elif ord(char) <= 0xFFFF:

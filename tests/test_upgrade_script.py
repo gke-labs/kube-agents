@@ -1111,7 +1111,7 @@ class RetagValuesTest(_StubHelm, unittest.TestCase):
         for drop in (True, False):
             with self.subTest(drop=drop):
                 proc = self._run(json.dumps({"a\x1bb\\033c\u2028d": 1}), drop=drop)
-                self.assertIn("'a\\u001bb\\033c\\u2028d'", proc.stdout)
+                self.assertIn("'a\\u001bb\\\\033c\\u2028d'", proc.stdout)
                 # The colours are ESC sequences of their own, so look for the key's.
                 for raw in ("a\x1bb", "b\x1bc", "\u2028"):
                     self.assertNotIn(raw, proc.stdout + proc.stderr)
