@@ -18,6 +18,11 @@ in `AGENTS.md`; change how they are done here.
 The rule, and the requirement to fill in the template's **Self-Review** section, are in
 `AGENTS.md` under Pull Request Hygiene.
 
+One pass is the floor, not the loop. When a branch has been through the bot more than once,
+or the diff is large, run `/full-review` (`.claude/commands/full-review.md`): it repeats the
+clean-context read and the fix until a full pass finds nothing, pushes once, and asks the bot
+after the head has settled, so the bot reads one head rather than one per fix.
+
 - **Run the pass in a context that did not write the change** — a subagent, or a new session,
   handed the diff range and nothing else. Not your plan, not your reasoning, not the summary you
   were about to write. Reviewing a diff in the conversation that produced it is the one
