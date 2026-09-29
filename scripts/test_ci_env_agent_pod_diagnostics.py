@@ -16,6 +16,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -25,12 +26,16 @@ FUNCTION = "collect_agent_pod_diagnostics"
 
 REQUEST_TIMEOUT_PREFIX = "--request-timeout="
 WATCH_FILES = ("agent-pods-watch.txt", "agent-events-watch.txt")
+# How long a loop gets to notice its kubectl or its parent is gone; generous
+# so a loaded runner does not flake, far below the stub's 60 s block.
+EXIT_DEADLINE_SECONDS = 10
 
 # A kubectl that records every call's arguments in $STUB_CALLS; answers the
 # Deployment's container-name read with $STUB_CONTAINERS; for a watch, prints
 # its arguments, records its pid in $STUB_WATCH_PIDS and then either blocks
-# (the apiserver holding the watch open) or, with STUB_WATCH_EXITS, returns
-# (the apiserver closing it); prints its arguments then STUB_LINES lines of
+# for STUB_WATCH_SECONDS (the apiserver holding the watch open, 60 unless
+# set, which is the request timeout cutting it) or, with STUB_WATCH_EXITS,
+# returns (the apiserver closing it); prints its arguments then STUB_LINES lines of
 # STUB_LINE_BYTES for anything else; or fails outright when STUB_FAIL is set.
 KUBECTL_STUB = """#!/usr/bin/env bash
 echo "$*" >> "${STUB_CALLS}"
@@ -39,7 +44,7 @@ case "$*" in
     echo "WATCH: $*"
     echo "$$" >> "${STUB_WATCH_PIDS}"
     [ -n "${STUB_WATCH_EXITS:-}" ] && exit 0
-    exec sleep 60 ;;
+    exec sleep "${STUB_WATCH_SECONDS:-60}" ;;
 esac
 if [ -n "${STUB_FAIL:-}" ]; then
   echo "error: unable to reach the cluster" >&2
@@ -61,13 +66,13 @@ def lifted(restart_seconds: str | None = None) -> str:
     """The functions, their state and the constants they read, as written in ci-env.sh."""
     src = ENV_SCRIPT.read_text(encoding="utf-8")
     constants = re.findall(r"^readonly AGENT_DIAG_[A-Z_]+=.*$", src, re.MULTILINE)
-    if len(constants) != 11:  # pragma: no cover - a rename should say so loudly
-        raise AssertionError(f"expected eleven AGENT_DIAG_ constants in {ENV_SCRIPT}, found {constants}")
+    if len(constants) != 12:  # pragma: no cover - a rename should say so loudly
+        raise AssertionError(f"expected twelve AGENT_DIAG_ constants in {ENV_SCRIPT}, found {constants}")
     if restart_seconds is not None:
         constants = [re.sub(r"(WATCH_RESTART_SECONDS=).*", rf"\g<1>{restart_seconds}", c) for c in constants]
-    state = re.findall(r'^AGENT_DIAG_WATCH_[A-Z]+=""$', src, re.MULTILINE)
-    if len(state) != 2:  # pragma: no cover
-        raise AssertionError(f"expected the watch's two state variables in {ENV_SCRIPT}, found {state}")
+    state = re.findall(r'^AGENT_DIAG_(?:WATCH_[A-Z]+|COLLECTED)=""$', src, re.MULTILINE)
+    if len(state) != 3:  # pragma: no cover
+        raise AssertionError(f"expected the three state variables in {ENV_SCRIPT}, found {state}")
     bodies = []
     for name in FUNCTIONS:
         match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
@@ -87,16 +92,21 @@ def constant(name: str) -> int:
     return int(value)
 
 
-def one_shots(calls: list[str]) -> list[str]:
-    """The snapshot's calls with their request timeout checked and stripped."""
+def strip_timeout(calls: list[str], watches: bool = False) -> list[str]:
+    """The snapshot's calls, or with `watches` the watch calls, with their
+    request timeout checked and stripped: no kubectl here is unbounded."""
     out = []
     for call in calls:
-        if "--watch" in call:
+        if ("--watch" in call) != watches:
             continue
         first, _, rest = call.partition(" ")
         assert first.startswith(REQUEST_TIMEOUT_PREFIX), call
         out.append(rest)
     return out
+
+
+def one_shots(calls: list[str]) -> list[str]:
+    return strip_timeout(calls)
 
 
 def pid_alive(pid: int) -> bool:
@@ -107,22 +117,44 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
-def run_collect(
-    watch: bool = False, restart_seconds: str | None = None, watch_for: float = 1.0, **stub_env: str
-) -> tuple[subprocess.CompletedProcess, pathlib.Path, list[str]]:
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="poddiag-"))
+def all_exit(pids: list[int]) -> bool:
+    """Whether every pid is gone within the deadline, polled: a loop takes a
+    moment to see its TERM, and a reaped child vanishes only once reaped."""
+    deadline = time.monotonic() + EXIT_DEADLINE_SECONDS
+    while time.monotonic() < deadline:
+        if not any(pid_alive(p) for p in pids):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def stub_bin(tmp: pathlib.Path) -> pathlib.Path:
     stubs = tmp / "bin"
     stubs.mkdir()
     kubectl = stubs / "kubectl"
     kubectl.write_text(KUBECTL_STUB, encoding="utf-8")
     kubectl.chmod(kubectl.stat().st_mode | stat.S_IXUSR)
+    return stubs
+
+
+def run_collect(
+    watch: bool = False,
+    restart_seconds: str | None = None,
+    watch_for: float = 1.0,
+    collect_times: int = 1,
+    **stub_env: str,
+) -> tuple[subprocess.CompletedProcess, pathlib.Path, list[str]]:
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="poddiag-"))
+    stubs = stub_bin(tmp)
     artifacts = tmp / "artifacts"
     calls = tmp / "calls"
     calls.touch()
     watch_pids = tmp / "watch-pids"
     watch_pids.touch()
-    start = f"start_agent_pod_watch\nsleep {watch_for}\n" if watch else ""
-    script = f'set -euo pipefail\n{lifted(restart_seconds)}\n{start}{FUNCTION}\necho "STATUS AFTER: $?"\n'
+    loops = tmp / "loop-pids"
+    start = f'start_agent_pod_watch\necho "$AGENT_DIAG_WATCH_PIDS" > {loops}\nsleep {watch_for}\n' if watch else ""
+    collect = f"{FUNCTION}\n" * collect_times
+    script = f'set -euo pipefail\n{lifted(restart_seconds)}\n{start}{collect}echo "STATUS AFTER: $?"\n'
     env = {k: v for k, v in os.environ.items() if k != "AGENT_CLUSTER_CONTEXT"}
     env.update(
         PATH=f"{stubs}:{os.environ['PATH']}",
@@ -134,6 +166,7 @@ def run_collect(
     )
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False, env=env)
     run_collect.watch_pids = [int(p) for p in watch_pids.read_text(encoding="utf-8").split()]
+    run_collect.loop_pids = [int(p) for p in loops.read_text(encoding="utf-8").split()] if watch else []
     return proc, artifacts, calls.read_text(encoding="utf-8").splitlines()
 
 
@@ -199,7 +232,7 @@ class AgentPodDiagnosticsTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(sum("--watch" in c for c in calls), 2, calls)
-        for c in [*one_shots(calls), *(c for c in calls if "--watch" in c)]:
+        for c in [*one_shots(calls), *strip_timeout(calls, watches=True)]:
             self.assertTrue(c.startswith("--context gke_proj_region_host "), c)
         proc, _, calls = run_collect(watch=True, AGENT_CLUSTER_CONTEXT="")
         for c in calls:
@@ -219,8 +252,47 @@ class AgentPodDiagnosticsTest(unittest.TestCase):
         self.assertIn("get events -n test-ns --watch", events)
         self.assertIn(".lastTimestamp", events)
         self.assertEqual(len(run_collect.watch_pids), 2)
-        for pid in run_collect.watch_pids:
-            self.assertFalse(pid_alive(pid), "a stopped watch must not leave its kubectl running")
+        self.assertEqual(len(run_collect.loop_pids), 2)
+        self.assertTrue(
+            all_exit(run_collect.watch_pids + run_collect.loop_pids),
+            "a stopped watch must leave neither its loop nor its kubectl running",
+        )
+
+    def test_the_loops_die_with_a_killed_eval_and_let_go_of_its_stdout(self):
+        """A SIGKILLed eval runs no trap. The loops must still end, within one
+        request timeout, and must never have held the job's stdout: Prow
+        waits on that pipe, not on the process."""
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="poddiag-kill-"))
+        loops = tmp / "loop-pids"
+        script = (
+            f"{lifted(restart_seconds='0')}\nstart_agent_pod_watch\n"
+            f'echo "$AGENT_DIAG_WATCH_PIDS" > {loops}.tmp && mv {loops}.tmp {loops}\nexec sleep 60\n'
+        )
+        env = {k: v for k, v in os.environ.items() if k != "AGENT_CLUSTER_CONTEXT"}
+        env.update(
+            PATH=f"{stub_bin(tmp)}:{os.environ['PATH']}",
+            TARGET_NAMESPACE="test-ns",
+            STUB_CALLS=str(tmp / "calls"),
+            STUB_WATCH_PIDS=str(tmp / "watch-pids"),
+            STUB_WATCH_SECONDS="1",
+        )
+        proc = subprocess.Popen(["bash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        deadline = time.monotonic() + EXIT_DEADLINE_SECONDS
+        while not loops.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        pids = [int(p) for p in loops.read_text(encoding="utf-8").split()]
+        self.assertEqual(len(pids), 2)
+        proc.kill()
+        proc.communicate(timeout=EXIT_DEADLINE_SECONDS)  # EOF, or the pipe is still held
+        self.assertTrue(all_exit(pids), "a loop outlived its SIGKILLed parent")
+
+    def test_a_second_call_does_not_repeat_the_snapshot(self):
+        """The trap and the failure dumper both call it on a red run; the
+        second call must not re-read a cluster that may be what failed."""
+        _, _, once = run_collect(STUB_CONTAINERS="platform-agent hermes-bridge")
+        proc, _, twice = run_collect(collect_times=2, STUB_CONTAINERS="platform-agent hermes-bridge")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(twice), len(once), twice)
 
     def test_a_closed_watch_is_reopened(self):
         _, artifacts, _ = run_collect(watch=True, restart_seconds="0", watch_for=1.5, STUB_WATCH_EXITS="1")

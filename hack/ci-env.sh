@@ -83,19 +83,23 @@ readonly AGENT_DIAG_EVENTS_TAIL_LINES=5000
 readonly AGENT_DIAG_AGENT_CONTAINER="platform-agent"
 readonly AGENT_DIAG_BRIDGE_CONTAINER="hermes-bridge"
 readonly AGENT_DIAG_DEPLOYMENT="deployment/platform-agent-gateway"
-# One line per pod, then one per container: restarts, the last termination
-# (reason, exit code, when), and since when it has been running. Evicted pods
-# carry their reason at pod level, so the pod line has status.reason.
 # Every one-shot read gives up after this, so an unreachable cluster costs
 # seconds per call on an exit that is often already an infrastructure failure.
 readonly AGENT_DIAG_REQUEST_TIMEOUT="30s"
 # The apiserver closes a watch after 30-60 minutes; the loop re-opens it after
 # this pause (and keeps retrying at this pace while the cluster is unreachable).
 readonly AGENT_DIAG_WATCH_RESTART_SECONDS=10
+# Each watch is also cut at this, so the loop re-checks that the eval is still
+# alive every few minutes rather than once per apiserver-closed watch (up to
+# an hour): a loop outliving a SIGKILLed eval is bounded by it.
+readonly AGENT_DIAG_WATCH_REQUEST_TIMEOUT="300s"
 # Absolute times only: a watch line is read hours after it was printed, so the
 # relative ages `-o wide` prints would say nothing.
 readonly AGENT_DIAG_WATCH_POD_COLUMNS="NAME:.metadata.name,PHASE:.status.phase,REASON:.status.reason,STARTED:.status.startTime,DELETING:.metadata.deletionTimestamp,CONTAINERS:.status.containerStatuses[*].name,RESTARTS:.status.containerStatuses[*].restartCount,LAST:.status.containerStatuses[*].lastState.terminated.reason,EXIT:.status.containerStatuses[*].lastState.terminated.exitCode,FINISHED:.status.containerStatuses[*].lastState.terminated.finishedAt"
 readonly AGENT_DIAG_WATCH_EVENT_COLUMNS="FIRST:.firstTimestamp,LAST:.lastTimestamp,EVENT:.eventTime,COUNT:.count,TYPE:.type,REASON:.reason,OBJECT:.involvedObject.kind,NAME:.involvedObject.name,MESSAGE:.message"
+# One line per pod, then one per container: restarts, the last termination
+# (reason, exit code, when), and since when it has been running. Evicted pods
+# carry their reason at pod level, so the pod line has status.reason.
 readonly AGENT_DIAG_POD_STATUS_JSONPATH='{range .items[*]}{.metadata.name}{"\tphase="}{.status.phase}{"\treason="}{.status.reason}{"\tstarted="}{.status.startTime}{"\n"}{range .status.containerStatuses[*]}{"  "}{.name}{"\trestarts="}{.restartCount}{"\tlast="}{.lastState.terminated.reason}{"\texit="}{.lastState.terminated.exitCode}{"\tfinished="}{.lastState.terminated.finishedAt}{"\trunningSince="}{.state.running.startedAt}{"\n"}{end}{end}'
 
 ensure_helm() {
@@ -182,36 +186,46 @@ collect_gateway_log() {
 _agent_pod_watch_loop() {
   local parent="$1" out="$2"
   shift 2
-  local child=""
-  trap 'kill "${child}" 2>/dev/null; exit 0' TERM
+  local child="" pause=""
+  trap 'kill ${child} ${pause} 2>/dev/null; exit 0' TERM
   while kill -0 "${parent}" 2>/dev/null; do
     "$@" >> "${out}" 2>&1 &
     child=$!
     wait "${child}" || true
-    sleep "${AGENT_DIAG_WATCH_RESTART_SECONDS}" || true
+    # Backgrounded and waited on, not run in the foreground: bash defers a
+    # trap until a foreground command returns, which held every exit for the
+    # whole pause.
+    sleep "${AGENT_DIAG_WATCH_RESTART_SECONDS}" &
+    pause=$!
+    wait "${pause}" || true
   done
 }
 
 # Starts the pod and event watches the AGENT_DIAG_ header describes, pinned to
 # AGENT_CLUSTER_CONTEXT. Call once the context is known; a second call is a
 # no-op. `disown` for the reason the Boskos heartbeat gives in ci-eval-pr.sh:
-# the fan-out sizes its lanes with `jobs -rp`. Never fails the caller.
+# the fan-out sizes its lanes with `jobs -rp`. The loops' own output goes to
+# /dev/null, for the other reason hack/boskos_heartbeat.sh gives: a process
+# still holding the job's stdout after the eval is SIGKILLed keeps the Prow
+# job open. Never fails the caller.
 AGENT_DIAG_WATCH_PIDS=""
 AGENT_DIAG_WATCH_DIR=""
 start_agent_pod_watch() {
   [ -z "${AGENT_DIAG_WATCH_PIDS}" ] || return 0
   local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
-  local kctl=(kubectl)
+  local kctl=(kubectl --request-timeout="${AGENT_DIAG_WATCH_REQUEST_TIMEOUT}")
   if [ -n "${AGENT_CLUSTER_CONTEXT:-}" ]; then
     kctl+=(--context "${AGENT_CLUSTER_CONTEXT}")
   fi
   AGENT_DIAG_WATCH_DIR=$(mktemp -d) || return 0
   _agent_pod_watch_loop "$$" "${AGENT_DIAG_WATCH_DIR}/pods" \
-    "${kctl[@]}" get pods -n "${ns}" --watch -o custom-columns="${AGENT_DIAG_WATCH_POD_COLUMNS}" &
+    "${kctl[@]}" get pods -n "${ns}" --watch -o custom-columns="${AGENT_DIAG_WATCH_POD_COLUMNS}" \
+    >/dev/null 2>&1 &
   AGENT_DIAG_WATCH_PIDS="$!"
   disown "$!" 2>/dev/null || true
   _agent_pod_watch_loop "$$" "${AGENT_DIAG_WATCH_DIR}/events" \
-    "${kctl[@]}" get events -n "${ns}" --watch -o custom-columns="${AGENT_DIAG_WATCH_EVENT_COLUMNS}" &
+    "${kctl[@]}" get events -n "${ns}" --watch -o custom-columns="${AGENT_DIAG_WATCH_EVENT_COLUMNS}" \
+    >/dev/null 2>&1 &
   AGENT_DIAG_WATCH_PIDS="${AGENT_DIAG_WATCH_PIDS} $!"
   disown "$!" 2>/dev/null || true
   return 0
@@ -241,7 +255,13 @@ _stop_agent_pod_watch() {
 # a container that never restarted writes kubectl's "not found" into its file,
 # which is the answer, not an error. The bridge files are written only when
 # the Deployment declares the sidecar, so a today-mode run gains no empty ones.
+# Runs once per process: the eval's trap takes it and the failure dumper's
+# second call returns at once, rather than repeating every read against a
+# cluster that may be what failed, inside the deadline's grace.
+AGENT_DIAG_COLLECTED=""
 collect_agent_pod_diagnostics() {
+  [ -z "${AGENT_DIAG_COLLECTED}" ] || return 0
+  AGENT_DIAG_COLLECTED=1
   local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
   local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
   local kctl=(kubectl --request-timeout="${AGENT_DIAG_REQUEST_TIMEOUT}")
