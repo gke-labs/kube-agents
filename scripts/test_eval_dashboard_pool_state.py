@@ -215,6 +215,11 @@ class OneProject(ScanHarness):
         world["project_and_apis"] = unchecked("Could not describe kube-agents-evals-2, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED")
         doc = self.scan({PROJECT: report(**world)})
         self.assertTrue(pool_state.not_checked_reason(doc).startswith("Could not describe kube-agents-evals-2, so neither"))
+        # Mixed causes: one project refused at the describe, the others at the
+        # ceiling; the reason is the one most projects share, not the refusal.
+        stalled = {p: "sleep" for p in ("kube-agents-evals-4", "kube-agents-evals-5", "kube-agents-evals-6")}
+        mixed = self.scan({PROJECT: report(**world), **stalled}, projects=(PROJECT, *stalled), timeout=0.5)
+        self.assertTrue(pool_state.not_checked_reason(mixed).startswith("scripts/verify_ci_pool_project.py did not finish within"), pool_state.not_checked_reason(mixed))
 
     def test_a_check_the_report_omits_is_not_checked(self):
         checks_out, findings = pool_state.from_report({"checks": {"iam": {"status": "pass"}}}, ["iam", "gke_and_state"])
@@ -235,6 +240,9 @@ class WhatNeverFailsTheBot(ScanHarness):
         # the scan's ceiling.
         self.assertEqual(pool_state.verifier_deadline(300), 270)
         self.assertEqual(pool_state.verifier_deadline(20), 1)
+        for bad in (float("nan"), float("inf"), -1):
+            with self.assertRaises(ValueError):
+                pool_state.verifier_deadline(bad)
         self.scan({PROJECT: report()})
         argv = self.calls()[0]
         self.assertIn("--deadline-seconds", argv)

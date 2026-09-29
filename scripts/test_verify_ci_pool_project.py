@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for verify_ci_pool_project.py."""
 
+import argparse
 import base64
 import io
 import json
@@ -3407,6 +3408,10 @@ class ChecksSelectionTest(unittest.TestCase):
             checker.parse_checks(" , ")
         # The KMS half is inside the full minter check; naming both would drop
         # the KMS record from the report without a word.
+        for bad in ("nan", "inf", "-inf", "-5", "soon"):
+            with self.assertRaises(argparse.ArgumentTypeError, msg=bad):
+                checker._finite_seconds(bad)
+        self.assertEqual(checker._finite_seconds("270"), 270.0)
         with self.assertRaises(ValueError) as pair:
             checker.parse_checks("token_minter,token_minter_kms")
         self.assertIn("covers", str(pair.exception))
@@ -3540,7 +3545,9 @@ class ReportDocumentTest(unittest.TestCase):
             checker._RUN_DEADLINE = time.monotonic() - 1
             rc, _, err = checker.run_cmd(["sleep", "30"])
             self.assertEqual(rc, 124)
-            self.assertIn(checker.DEADLINE_PASSED, err)
+            # Inside a check that had started: not "before this check".
+            self.assertIn(checker.DEADLINE_CUT, err)
+            self.assertNotIn(checker.DEADLINE_PASSED, err)
         finally:
             checker._RUN_DEADLINE = None
 

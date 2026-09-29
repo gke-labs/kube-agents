@@ -16,6 +16,7 @@ Usage:
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import subprocess
@@ -169,6 +170,8 @@ DEFAULT_TIMEOUT_SECONDS = 120
 # the pool-state scan runs the verifier under its own per-project ceiling and
 # would otherwise lose every finished check's verdict to one hung read.
 DEADLINE_PASSED = "the run's deadline passed before this check"
+# ...and for a command refused inside a check that had started.
+DEADLINE_CUT = "the run's deadline passed"
 # The run's deadline as a time.monotonic() value, set by verify_project from
 # --deadline-seconds and read by run_cmd: every command after it is cut to
 # the time left and returns 124 at once once none is, so a stall inside a
@@ -529,7 +532,7 @@ def run_cmd(
     if _RUN_DEADLINE is not None:
         remaining = _RUN_DEADLINE - time.monotonic()
         if remaining <= 0:
-            return 124, "", f"timed out after 0s: {' '.join(cmd)} ({DEADLINE_PASSED})"
+            return 124, "", f"timed out after 0s: {' '.join(cmd)} ({DEADLINE_CUT})"
         timeout = min(timeout, max(1, int(remaining)))
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
@@ -3083,6 +3086,18 @@ def run_checks(
     return sorted(results, key=lambda result: CHECK_IDS.index(result.check_id))
 
 
+def _finite_seconds(text: str) -> float:
+    """argparse type: a finite, non-negative number of seconds. `float` alone
+    admits nan and inf, which int() then raises on at the first command."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds")
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite, non-negative number of seconds")
+    return value
+
+
 def parse_checks(spec: Optional[str]) -> Optional[List[str]]:
     """`--checks a,b` as a list in CHECK_IDS order; None means every check.
     An unknown id raises ValueError naming the ones there are."""
@@ -3346,7 +3361,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--deadline-seconds",
-        type=float,
+        type=_finite_seconds,
         help=(
             "Stop starting checks this many seconds in; a check not started by then is reported as not "
             "checked. For a caller with its own ceiling (the pool-state scan), so one hung read does not "

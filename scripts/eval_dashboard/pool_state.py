@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import math
 import os
 import pathlib
 import shutil
@@ -205,6 +206,8 @@ def from_report(report: dict, checks: tuple[str, ...] | list[str]) -> tuple[dict
 
 def verifier_deadline(timeout: float) -> int:
     """Seconds into the run after which the verifier starts no more checks."""
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError(f"project timeout must be a finite, non-negative number of seconds, not {timeout!r}")
     return max(1, int(timeout) - DEADLINE_MARGIN_S)
 
 
@@ -338,23 +341,31 @@ def checked_projects(document: dict | None) -> int:
     return sum(1 for _, entry in _entries(document) if _read_checks(entry, whole=False))
 
 
+def _project_reason(entry: dict) -> str | None:
+    """One project's reason for being unchecked: the whole-project error, else
+    the project check's own line (the checks that need its number restate
+    it), else its commonest not-checked line."""
+    if entry.get(KEY_ERROR):
+        return str(entry[KEY_ERROR])
+    lines: collections.Counter = collections.Counter()
+    for check, verdict in (entry.get(KEY_CHECKS) or {}).items():
+        if isinstance(verdict, dict) and verdict.get(KEY_STATE) == CHECK_NOT_CHECKED and verdict.get(KEY_DETAIL):
+            if check == verifier.CHECK_PROJECT_AND_APIS:
+                return str(verdict[KEY_DETAIL][0])
+            lines[str(verdict[KEY_DETAIL][0])] += 1
+    return lines.most_common(1)[0][0] if lines else None
+
+
 def not_checked_reason(document: dict | None) -> str | None:
-    """The reason a check went unchecked, for a scan that saw nothing: the
-    project check's own line when it has one, since the checks that need the
-    project number restate it, else the commonest line."""
+    """The reason a scan saw nothing: one reason per project, then the one
+    most projects share, so one project's refusal does not name a stall on
+    the other thirty-four."""
     reasons: collections.Counter = collections.Counter()
-    root: collections.Counter = collections.Counter()
     for _, entry in _entries(document):
-        if entry.get(KEY_ERROR):
-            reasons[str(entry[KEY_ERROR])] += 1
-            continue
-        for check, verdict in (entry.get(KEY_CHECKS) or {}).items():
-            if isinstance(verdict, dict) and verdict.get(KEY_STATE) == CHECK_NOT_CHECKED and verdict.get(KEY_DETAIL):
-                (root if check == verifier.CHECK_PROJECT_AND_APIS else reasons)[str(verdict[KEY_DETAIL][0])] += 1
-    for counter in (root, reasons):
-        if counter:
-            return counter.most_common(1)[0][0]
-    return None
+        reason = _project_reason(entry)
+        if reason:
+            reasons[reason] += 1
+    return reasons.most_common(1)[0][0] if reasons else None
 
 
 def summarize(projects: dict[str, dict]) -> dict:
