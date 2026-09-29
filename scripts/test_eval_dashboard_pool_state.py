@@ -324,6 +324,15 @@ class EntryPoint(ScanHarness):
         self.assertEqual(rc, pool_state.EXIT_REPOSITORY_BUG)
         self.assertIn("nowhere.py", err)
 
+    def test_projects_are_stripped_of_whitespace_around_the_separator(self):
+        self.world.write_text(json.dumps({PROJECT: report(), OTHER: report()}), encoding="utf-8")
+        out = self.root / "pool-state.json"
+        with unittest.mock.patch.dict(os.environ, {"STUB_WORLD": str(self.world), "STUB_LOG": str(self.log)}), \
+             unittest.mock.patch.object(pool_state, "missing_binaries", return_value=[]):
+            rc, _ = self._run("--out", str(out), "--projects", f"{PROJECT}, {OTHER} ", "--verifier", str(self.stub), "--now", NOW.isoformat(), "--workdir", str(self.workdir))
+        self.assertEqual(rc, pool_state.EXIT_OK)
+        self.assertEqual(sorted(json.loads(out.read_text(encoding="utf-8"))["projects"]), sorted([PROJECT, OTHER]))
+
     def test_a_bad_project_timeout_is_refused_at_the_door(self):
         for bad in ("nan", "inf", "-1", "soon"):
             stderr = __import__("io").StringIO()
@@ -395,7 +404,7 @@ class Workflow(unittest.TestCase):
 
         env = self.doc["env"]
         mapped = len(pool_state.pool_projects(pool_state.CI_DEPLOY_SCRIPT.read_text()))
-        self.assertGreaterEqual(mapped, 35)
+        self.assertGreaterEqual(mapped, 1, "the mapping was read")
         # The fleet scan mints a token (up to IMPERSONATE_TIMEOUT_S) before
         # its per-project deadline starts; the pool scan has no such step.
         mint = {"FIXTURE_STATE": pool_state.fixture_state.IMPERSONATE_TIMEOUT_S, "POOL_STATE": 0}

@@ -2460,8 +2460,10 @@ class IamGrantsTest(unittest.TestCase):
 
     def test_an_absent_service_account_is_a_finding_with_its_repair(self):
         gone = _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown service account.")
+        # A deleted account's bindings are gone from the project policy too,
+        # so every role would read as missing; the policy here holds none.
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [gone, gone, _ok(self._project_policy()), gone]
+            run.side_effect = [gone, gone, _ok(self._project_policy(platform_roles=set(), litellm_roles=set())), gone]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
         found = {f.id: f.repair for f in result.findings}

@@ -480,7 +480,7 @@ def parse_args(argv):
 def main(argv=None) -> int:
     args = parse_args(argv)
     try:
-        projects = [p for p in args.projects.split(",") if p] if args.projects else pool_projects(args.ci_deploy_script.read_text(encoding="utf-8"))
+        projects = [p.strip() for p in args.projects.split(",") if p.strip()] if args.projects else pool_projects(args.ci_deploy_script.read_text(encoding="utf-8"))
         checks = verifier.parse_checks(args.checks) or list(DEFAULT_CHECKS)
     except (OSError, ValueError) as exc:
         log(f"ERROR: {exc}")
