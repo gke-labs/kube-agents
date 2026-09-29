@@ -3396,7 +3396,15 @@ def _kill_process_group(process: subprocess.Popen) -> None:
         # -- so an emptied group is left alone.
         return
     signal_group(signal.SIGKILL)
-    wait_for_group_to_empty(KILL_SETTLE_SECONDS)
+    if not wait_for_group_to_empty(KILL_SETTLE_SECONDS):
+        # The one case the bound exists for, and the only place it is known:
+        # the slot is released with something still in the group, and an
+        # operator later asking what outlived the command starts here.
+        LOGGER.warning(
+            "process group %d still occupied %ss after SIGKILL; giving up the wait",
+            process.pid,
+            KILL_SETTLE_SECONDS,
+        )
 
 
 def _bounded_text(raw: bytes, limit: int) -> tuple[str, bool]:

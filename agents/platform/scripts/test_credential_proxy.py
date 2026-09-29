@@ -3062,17 +3062,23 @@ class CommandExecutorTest(unittest.TestCase):
 
         self.assertTrue(result.timed_out)
         grace_ms = credential_proxy.KILL_GRACE_SECONDS * 1000
+        settle_ms = credential_proxy.KILL_SETTLE_SECONDS * 1000
         self.assertGreaterEqual(result.duration_ms, 1000 + grace_ms - 100)
-        self.assertLess(result.duration_ms, 9000)
+        # The wait after SIGKILL returns as soon as the group is gone -- a
+        # few milliseconds here, one poll interval at most -- not when its
+        # bound runs out. Half the bound is the line between the two.
+        self.assertLess(result.duration_ms, 1000 + grace_ms + settle_ms // 2)
 
     def test_a_descendant_that_ignores_sigterm_is_killed_with_the_group(self):
         # The leader (bash) dies on SIGTERM; the shell it started ignores it,
         # and so does that shell's sleep. The second signal has to reach the
         # group whether or not the leader is still there, or the survivors
         # keep the pipes and run on outside the slot they were counted under.
-        # The liveness read is immediate on purpose: it relies on the kill
-        # waiting for the group to empty after SIGKILL, and polling here would
-        # pass while that wait regressed to a fire-and-return.
+        # The liveness read is immediate: the kill returns only once the group
+        # is empty, after SIGKILL as after SIGTERM. This read alone does not
+        # pin that wait -- the survivors hold the stub's pipes, so the drain
+        # after the kill cannot return until they have exited either way --
+        # and test_the_wait_after_sigkill_is_bounded is what does.
         pid_file = Path(self.temp_dir.name) / "stubborn.pid"
         executor = self.fake_kubectl(
             self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
@@ -3109,12 +3115,21 @@ class CommandExecutorTest(unittest.TestCase):
             self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
             body="trap '' TERM; sleep 10 & wait $!",
         )
-        with mock.patch("credential_proxy.os.killpg", always_occupied):
+        with (
+            mock.patch("credential_proxy.os.killpg", always_occupied),
+            self.assertLogs("credential-proxy", level="WARNING") as logs,
+        ):
             result = executor.execute(["kubectl", "get", "pods"])
 
         self.assertTrue(result.timed_out)
         self.assertEqual(
             [credential_proxy.signal.SIGTERM, credential_proxy.signal.SIGKILL], sent
+        )
+        # A bound that ran out is the one case an operator may later ask
+        # about, so it leaves a line.
+        self.assertTrue(
+            any("still occupied" in line and "after SIGKILL" in line for line in logs.output),
+            logs.output,
         )
         floor_ms = (
             1000
@@ -3179,8 +3194,9 @@ class CommandExecutorTest(unittest.TestCase):
 
         Read right after `execute()` returns, with no retry: `_kill_process_group`
         returns only once the group is empty, after SIGTERM and after SIGKILL
-        alike, or once its bound for that has run out, and these tests are what
-        holds it to the first half of that.
+        alike, or once its bound for that has run out. The reads check that the
+        kill reached what the command started; the wait itself is pinned by
+        `test_the_wait_after_sigkill_is_bounded`.
         """
         try:
             with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
