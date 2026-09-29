@@ -524,10 +524,10 @@ class HoldTest(unittest.TestCase):
             with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", stdout):
                 with self.assertRaises(boskos_pool.Terminated):
                     reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN, outcomes=outcomes)
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back after the release")
         finally:
             signal.signal(signal.SIGINT, previous)
         self.assertEqual(boskos.released, [P7], "released before the termination was delivered")
-        self.assertIs(signal.getsignal(signal.SIGINT), previous)
         # The apply that happened is on record and on stdout before the raise.
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
         self.assertIn(f"{P7}: applied", stdout.getvalue())
@@ -570,7 +570,29 @@ class HoldTest(unittest.TestCase):
             self.assertEqual(boskos_pool._DEFERRED, [])
         finally:
             boskos_pool._DEFERRED.clear()
-            boskos_pool._SAVED_HANDLERS.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            signal.signal(signal.SIGINT, previous)
+
+    def test_a_raised_termination_holds_later_ones_until_the_next_unblock(self):
+        # The gap between a termination being raised and the code unwinding
+        # from it reaching its next deferred region: a second signal there is
+        # held, and raised at that region's unblock.
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        try:
+            with self.assertRaises(boskos_pool.Terminated):
+                boskos_pool.terminate(signal.SIGINT, None)
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool._defer, "later signals are held")
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.05)
+            self.assertEqual(boskos_pool._DEFERRED, [signal.SIGINT])
+            boskos_pool._hold_signals(True)
+            self.assertEqual(boskos_pool._HOLD_DEPTH, 1)
+            with self.assertRaises(boskos_pool.Terminated):
+                boskos_pool._hold_signals(False)
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back")
+            self.assertEqual(boskos_pool._HOLD_DEPTH, 0)
+        finally:
+            boskos_pool._DEFERRED.clear()
             boskos_pool._HOLD_DEPTH = 0
             signal.signal(signal.SIGINT, previous)
 
@@ -731,6 +753,65 @@ class TofuRunnerTest(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 6, "the child was interrupted and killed, not left for 30 s")
             self.assertEqual(len(handles), 1)
             self.assertIsNotNone(handles[0].poll(), "the child is still running, detached from the runner")
+
+    def _signal_before_the_first_deferral(self, handles, fired):
+        """boskos_pool._hold_signals with a SIGINT sent to this process on the
+        first block after the child exists: the gap between the runner
+        catching a termination or the ceiling and its first deferred region."""
+        original = boskos_pool._hold_signals
+
+        def hooked(block):
+            if block and handles and not fired:
+                fired.append(True)
+                os.kill(os.getpid(), signal.SIGINT)
+            return original(block)
+
+        return hooked
+
+    def _run_with_a_signal_in_the_gap(self, timeout, first_signal_after=None):
+        real_popen = subprocess.Popen
+        handles, fired = [], []
+
+        def popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            handles.append(proc)
+            return proc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script, pidfile = self._stubborn_child(tmp)
+            previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+            timer = threading.Timer(first_signal_after, os.kill, args=(os.getpid(), signal.SIGINT)) if first_signal_after else None
+            started = time.monotonic()
+            try:
+                if timer:
+                    timer.start()
+                with mock.patch.object(reconcile.subprocess, "Popen", popen), mock.patch.object(
+                    boskos_pool, "_hold_signals", self._signal_before_the_first_deferral(handles, fired)
+                ), mock.patch.object(reconcile, "INTERRUPT_GRACE_SECONDS", 20):
+                    with self.assertRaises(boskos_pool.Terminated):
+                        reconcile.tofu_runner([sys.executable, "-c", script], timeout=timeout)
+            finally:
+                if timer:
+                    timer.cancel()
+                boskos_pool._DEFERRED.clear()
+                boskos_pool._HOLD_DEPTH = 0
+                signal.signal(signal.SIGINT, previous)
+            self.assertEqual(fired, [True], "the gap was reached")
+            self.assertLess(time.monotonic() - started, 8, "no grace wait, no 30 s child")
+            self._assert_dead(pidfile)
+
+    def test_a_second_termination_before_the_forward_is_deferred_and_kills_the_child(self):
+        # The first signal is raised out of communicate; the second lands
+        # before the forward's deferral begins. It is held and read at the
+        # forward as a stop-now: the child is killed, nothing escapes with it
+        # running.
+        self._run_with_a_signal_in_the_gap(timeout=30, first_signal_after=1.0)
+
+    def test_a_termination_after_the_ceiling_before_the_forward_still_kills_the_child(self):
+        # The ceiling is caught, and a signal lands before the forward's
+        # deferral begins: it escapes the except body, and the child is killed
+        # on the way out rather than left applying under a released project.
+        self._run_with_a_signal_in_the_gap(timeout=1.0)
 
     def test_a_second_termination_while_the_first_is_being_forwarded_kills_the_child(self):
         # A signal in the window between catching the first termination and

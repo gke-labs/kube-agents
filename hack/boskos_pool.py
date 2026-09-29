@@ -63,6 +63,11 @@ class Terminated(Exception):
 
 
 def terminate(signum, frame):
+    # Later terminations are held back until the next unblock at depth 0
+    # (_hold_signals), which raises the first of them: the code unwinding from
+    # this raise reaches its next deferred region without a second raise
+    # landing between the catch and the region's start.
+    _defer_terminations()
     raise Terminated("signal %d" % signum)
 
 
@@ -151,7 +156,6 @@ def _heartbeat(server, owner, hold_state, name, stop):
 # with Python-level handlers rather than a signal mask because the mask does
 # not stop a process-directed signal reaching another thread.
 _DEFERRED = []
-_SAVED_HANDLERS = {}
 _HOLD_DEPTH = 0
 
 
@@ -159,22 +163,29 @@ def _defer(signum, frame):
     _DEFERRED.append(signum)
 
 
+def _defer_terminations():
+    for sig in TERMINATION_SIGNALS:
+        if signal.getsignal(sig) is terminate:
+            signal.signal(sig, _defer)
+
+
 def _hold_signals(block):
     global _HOLD_DEPTH
     if block:
+        if _HOLD_DEPTH == 0:
+            # Swapped before counted: a termination raised out of the swap
+            # leaves the depth at 0, and the next unblock restores the
+            # handlers it did swap.
+            _defer_terminations()
         _HOLD_DEPTH += 1
-        if _HOLD_DEPTH == 1:
-            for sig in TERMINATION_SIGNALS:
-                if signal.getsignal(sig) is terminate:
-                    _SAVED_HANDLERS[sig] = signal.signal(sig, _defer)
         return
     _HOLD_DEPTH = max(0, _HOLD_DEPTH - 1)
     if _HOLD_DEPTH:
         return
     time.sleep(SIGNAL_SETTLE_SECONDS)
-    for sig, previous in _SAVED_HANDLERS.items():
-        signal.signal(sig, previous)
-    _SAVED_HANDLERS.clear()
+    for sig in TERMINATION_SIGNALS:
+        if signal.getsignal(sig) is _defer:
+            signal.signal(sig, terminate)
     if _DEFERRED:
         signum = _DEFERRED[0]
         _DEFERRED.clear()

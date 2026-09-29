@@ -140,9 +140,11 @@ def tofu_runner(argv, cwd=None, timeout=None, **_):
     except (subprocess.TimeoutExpired, boskos_pool.Terminated) as first:
         if proc is None:
             raise
-        # The forward and the kill each run with terminations deferred, so a
-        # second signal cannot land between catching the first and acting on
-        # it; one that does is a "stop now" and skips the grace.
+        # A raised termination holds later ones back (boskos_pool.terminate),
+        # so a second signal between the catch and the forward is read at the
+        # forward as a "stop now" and skips the grace; the forward and the
+        # kill each run deferred as well. A signal after the ceiling in that
+        # gap escapes this body, and the finally below kills the child.
         stop_now = _with_terminations_deferred(lambda: proc.send_signal(signal.SIGINT))
         second = None
         if not stop_now:
@@ -161,6 +163,13 @@ def tofu_runner(argv, cwd=None, timeout=None, **_):
                 # project under Prow's kill timer.
                 raise second if isinstance(second, boskos_pool.Terminated) else boskos_pool.Terminated("a termination during the interrupt")
         raise first
+    finally:
+        # Whatever escaped above, the child does not outlive the runner: a
+        # project is released after this returns, and tofu must not still be
+        # applying in it.
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.communicate()
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
