@@ -97,12 +97,14 @@ class DenialClassifierTest(unittest.TestCase):
         # two SA checks may still report a genuinely missing GSA as missing.
         "ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown service account.",
         "boom",
-        "",
     )
 
     # Read did not happen, and permissions were not the reason.
     TRANSIENTS = (
         "timed out after 120s: gcloud projects describe p",
+        # A failure that said nothing (gcloud killed by a signal): no line
+        # says the resource is absent.
+        "",
         # Observed 2026-08-27 from a gcloud whose refresh token had lapsed. The
         # account still printed as ACTIVE under `gcloud auth list`, which is the
         # case check_toolchain's docstring says it cannot catch.
@@ -3759,11 +3761,23 @@ class FindingsCarryRepairsTest(unittest.TestCase):
             "ERROR: (gcloud.container.clusters.list) ResponseError: code=429, message=Too Many Requests",
             "ERROR: (gcloud.kms.keys.describe) UNAVAILABLE: The service is currently unavailable.",
             "ERROR: gcloud crashed (OperationalError): database is locked",
+            "ERROR: (gcloud.artifacts.repositories.describe) ABORTED: the operation was aborted, retry",
+            "ERROR: (gcloud.kms.keys.describe) UNKNOWN: an unknown error occurred",
+            "ERROR: (gcloud.projects.get-iam-policy) CANCELLED: the operation was cancelled",
+            "ERROR: (gcloud.container.clusters.list) HTTPError 408: Request Timeout",
         ):
             with self.subTest(err=err[:40]):
                 self.assertIsNone(checker._denial_reason(err))
                 self.assertIsNotNone(checker._unread_reason(err))
         self.assertIsNone(checker._unread_reason("ERROR: (gcloud.storage.buckets.describe) NOT_FOUND: bucket does not exist"))
+        self.assertIsNone(checker._unread_reason("ERROR: (gcloud.storage.buckets.describe) NOT_FOUND: unknown bucket"), "a lower-case word is not a status")
+        # A failure with no output at all names nothing absent.
+        for silent in ("", "   \n"):
+            self.assertEqual(checker._unread_reason(silent), checker.NO_OUTPUT_REASON)
+            details, warnings = [], []
+            self.assertTrue(checker._record_unreadable(silent, "absent", "Not checked", details, warnings))
+            self.assertEqual(details, [])
+            self.assertIn(checker.NO_OUTPUT_REASON, warnings[0])
 
     def test_gke_registry_and_minter_findings_carry_their_ids_and_repairs(self):
         with mock.patch.object(checker, "run_cmd") as run:
@@ -3849,6 +3863,12 @@ class TokenMinterKmsHalfTest(unittest.TestCase):
         self.assertNotIn("api.github.com", result.message)
 
 
+def _without_hcl_comments(text):
+    """HCL's three comment forms stripped: `#`, `//` and `/* */`. A role
+    commented out in any of them is a role removed."""
+    return re.sub(r"(#|//)[^\n]*", "", re.sub(r"/\*.*?\*/", "", text, flags=re.S))
+
+
 class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
     """POOL_STATE_READER_ROLES and the bot member must equal bench/tf/fleet's
     pool_state_readers default and pool_state_reader_roles local: the verifier
@@ -3859,7 +3879,7 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
         block = re.search(r"pool_state_reader_roles\s*=\s*\[(.*?)\]", main, re.S)
         self.assertIsNotNone(block, "pool_state_reader_roles is gone from main.tf")
         # Comments stripped first: a role commented out is a role removed.
-        live = re.sub(r"(#|//)[^\n]*", "", block.group(1))
+        live = _without_hcl_comments(block.group(1))
         self.assertEqual(sorted(re.findall(r'"([^"]+)"', live)), sorted(checker.POOL_STATE_READER_ROLES))
 
     def test_the_member_matches_the_variable_default(self):
@@ -3867,7 +3887,11 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
         block = re.search(r'variable "pool_state_readers".*?\n\}', variables, re.S)
         self.assertIsNotNone(block, "pool_state_readers is gone from variables.tf")
         default = re.search(r"default\s*=\s*\[(.*?)\]", block.group(0), re.S)
-        self.assertEqual(re.findall(r'"([^"]+)"', re.sub(r"(#|//)[^\n]*", "", default.group(1))), [checker.CI_HEALTH_BOT_MEMBER])
+        self.assertEqual(re.findall(r'"([^"]+)"', _without_hcl_comments(default.group(1))), [checker.CI_HEALTH_BOT_MEMBER])
+
+    def test_the_comment_strip_sees_all_three_hcl_forms(self):
+        text = 'x = [\n  "a", # "b"\n  // "c"\n  /* "d",\n  "e", */ "f",\n]'
+        self.assertEqual(re.findall(r'"([^"]+)"', _without_hcl_comments(text)), ["a", "f"])
 
 
 if __name__ == "__main__":

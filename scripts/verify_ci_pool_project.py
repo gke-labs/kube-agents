@@ -599,20 +599,24 @@ _DENIAL_PATTERNS = (
 # read was *refused* -- the Artifact Registry policy pair -- must keep telling
 # the two apart; _record_unreadable files them the same way because the
 # consequence for the caller is identical.
+# A failed command with no stderr: nothing to match, nothing that says absent.
+NO_OUTPUT_REASON = "the command failed without output (killed, or gone before it could say why)"
+
 _UNREAD_PATTERNS = (
     re.compile(r"timed out after \d+s", re.I),
     re.compile(r"invalid_grant", re.I),
     re.compile(r"problem refreshing your current auth tokens", re.I),
     re.compile(r"reauthentication (?:required|failed)", re.I),
     # A retry-later reply, or gcloud's busy credential store, is not absence;
-    # the scan runs six projects at once, and one wave of 429s would read as
-    # three drifted. The status codes are tied to how gcloud prints one, so
-    # a resource named kube-agents-evals-500 does not match.
-    re.compile(r"RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED|\bUNAVAILABLE\b|\bINTERNAL\b|database is locked"),
+    # the scan runs seven projects at once, and one wave of 429s would read
+    # as three drifted. gRPC's retryable statuses, as gcloud prints them
+    # (upper case, so a lower-case "unknown" in a message is not one); a
+    # resource named kube-agents-evals-500 does not match.
+    re.compile(r"RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED|\bUNAVAILABLE\b|\bINTERNAL\b|\bABORTED\b|\bUNKNOWN\b|\bCANCELLED\b|database is locked"),
     # A separator between the word and the code is required (`code=`, `status:
     # '`, `HTTP `, `HTTPError (`), so a resource named http500 or code503 is
     # not a status.
-    re.compile(r"(?:HTTPError|HTTP Error|HTTP|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()(?:429|500|502|503|504)\b", re.I),
+    re.compile(r"(?:HTTPError|HTTP Error|HTTP|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()(?:408|429|500|502|503|504)\b", re.I),
     # A transport failure on the runner -- gcloud never got an answer -- is
     # not absence either; without this a DNS or TLS blip on one wave became
     # three `*/failed` findings and a pool-drift issue.
@@ -695,7 +699,11 @@ def _unread_reason(err: str) -> Optional[str]:
     Wider than _denial_reason by the transient causes in _UNREAD_PATTERNS: a
     refusal, a timeout and an expired credential differ in what the operator
     should do next, and not at all in what this run may conclude from them.
+    A failure that said nothing at all (a gcloud killed by a signal) is unread
+    too: no line says the resource is absent.
     """
+    if not (err or "").strip():
+        return NO_OUTPUT_REASON
     reason = _denial_reason(err)
     if reason is not None:
         return reason

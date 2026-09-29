@@ -334,6 +334,27 @@ class EntryPoint(ScanHarness):
         self.assertEqual(rc, pool_state.EXIT_OK)
         self.assertEqual(sorted(json.loads(out.read_text(encoding="utf-8"))["projects"]), sorted([PROJECT, OTHER]))
 
+    def test_a_project_id_with_a_path_in_it_is_refused_at_the_door(self):
+        # An id is a directory name under the work directory: nothing with a
+        # path in it, or outside the mapping's shape, reaches the scan.
+        for bad in ("../evals-2", "/tmp/x", "kube-agents-evals-2/..", "Evals-2", "evals 2"):
+            stderr = __import__("io").StringIO()
+            with unittest.mock.patch("sys.stderr", stderr), self.assertRaises(SystemExit) as raised:
+                pool_state.main(["--out", str(self.root / "out.json"), "--projects", f"{PROJECT},{bad}", "--verifier", str(self.stub), "--workdir", str(self.workdir)])
+            self.assertEqual(raised.exception.code, 2, bad)
+            self.assertIn("not a project id", stderr.getvalue())
+            self.assertIn(bad, stderr.getvalue())
+        self.assertFalse(self.workdir.exists(), "nothing was created under the work directory")
+        self.assertFalse((self.workdir.parent / "evals-2").exists(), "nothing was created beside it")
+        self.assertTrue(pool_state.PROJECT_ID_RE.match("kube-agents-evals-35"))
+
+    def test_a_scalar_where_a_report_lists_lines_is_a_thin_verdict_not_a_dead_scan(self):
+        record = {"status": "fail", "message": "IAM requirements missing", "details": 5, "warnings": True, "unread": 0, "findings": 1}
+        checks_out, findings = pool_state.from_report({"checks": {"iam": record, "gke_and_state": {"status": "pass", "warnings": "one", "unread": 2}}}, ["iam", "gke_and_state"])
+        self.assertEqual(checks_out["iam"], {"state": "drifted", "detail": ["IAM requirements missing"], "unread": []})
+        self.assertEqual(checks_out["gke_and_state"], {"state": "healthy", "detail": [], "unread": []})
+        self.assertEqual(findings, {})
+
     def test_a_bad_project_timeout_is_refused_at_the_door(self):
         for bad in ("nan", "inf", "-1", "soon"):
             stderr = __import__("io").StringIO()

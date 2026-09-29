@@ -45,6 +45,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -120,6 +121,10 @@ REASON_VERIFIER_FAILED = "scripts/verify_ci_pool_project.py exited {rc} without 
 REASON_VERIFIER_TIMEOUT = "scripts/verify_ci_pool_project.py did not finish within {seconds}s"
 REASON_NO_REPORT = "scripts/verify_ci_pool_project.py wrote no report for this check"
 REASON_CHECK_UNCHECKED = "the verifier could read nothing about this item"
+# What `--projects` admits: the mapping row's shape in hack/ci-deploy.sh. An
+# id is also a directory name under the work directory, so nothing with a
+# path in it gets that far.
+PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 # GNU timeout's code, as fixture_state._run reports a ceiling.
 EXIT_TIMED_OUT = 124
 # Summary keys the entry point and the workflow's upload step read back.
@@ -171,6 +176,13 @@ def _project_entry(checks_out: dict[str, dict], findings: dict[str, dict], start
     return entry
 
 
+def _lines(record: dict, key: str) -> list[str]:
+    """A record's list field as strings; a field of any other shape is empty,
+    so a malformed report is a thin verdict rather than a dead scan."""
+    value = record.get(key)
+    return [str(line) for line in value] if isinstance(value, list) else []
+
+
 def from_report(report: dict, checks: tuple[str, ...] | list[str]) -> tuple[dict[str, dict], dict[str, dict]]:
     """(checks, findings) for one project from the verifier's --report document."""
     recorded = report.get(KEY_CHECKS) if isinstance(report, dict) else None
@@ -184,16 +196,17 @@ def from_report(report: dict, checks: tuple[str, ...] | list[str]) -> tuple[dict
             continue
         state = REPORT_STATUS_TO_STATE.get(str(record.get("status")), CHECK_NOT_CHECKED)
         if state == CHECK_DRIFTED:
-            detail = [str(line) for line in record.get("details") or []] or [str(record.get("message") or "")]
+            detail = _lines(record, "details") or [str(record.get("message") or "")]
         elif state == CHECK_NOT_CHECKED:
-            detail = [str(line) for line in record.get("warnings") or []] or [REASON_CHECK_UNCHECKED]
+            detail = _lines(record, "warnings") or [REASON_CHECK_UNCHECKED]
         else:
-            detail = [str(line) for line in record.get("warnings") or []]
+            detail = _lines(record, "warnings")
         checks_out[check] = {KEY_STATE: state, KEY_DETAIL: detail}
         if state in (CHECK_HEALTHY, CHECK_DRIFTED):
-            checks_out[check][KEY_UNREAD] = [str(line) for line in record.get(KEY_UNREAD) or []]
+            checks_out[check][KEY_UNREAD] = _lines(record, KEY_UNREAD)
         if state == CHECK_DRIFTED:
-            for finding in record.get("findings") or []:
+            listed = record.get("findings")
+            for finding in listed if isinstance(listed, list) else []:
                 if not isinstance(finding, dict) or not finding.get("id"):
                     continue
                 findings[str(finding["id"])] = {
@@ -461,11 +474,20 @@ def _finite_seconds(text: str) -> float:
     return value
 
 
+def _project_list(text: str) -> list[str]:
+    """argparse type: comma-separated project ids of the mapping's shape."""
+    projects = [p.strip() for p in text.split(",") if p.strip()]
+    bad = [p for p in projects if not PROJECT_ID_RE.match(p)]
+    if bad:
+        raise argparse.ArgumentTypeError(f"not a project id: {', '.join(repr(p) for p in bad)}")
+    return projects
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=pathlib.Path, required=True, help="where to write pool-state.json")
     parser.add_argument("--prior", type=pathlib.Path, help="the previously published pool-state.json (missing is fine)")
-    parser.add_argument("--projects", help="comma-separated project ids (default: gitops_repo_for_project() in hack/ci-deploy.sh)")
+    parser.add_argument("--projects", type=_project_list, help="comma-separated project ids (default: gitops_repo_for_project() in hack/ci-deploy.sh)")
     parser.add_argument("--checks", default=",".join(DEFAULT_CHECKS), help=f"comma-separated verifier check ids (default {','.join(DEFAULT_CHECKS)})")
     parser.add_argument("--location", default=DEFAULT_LOCATION, help=f"the verifier's --location (default {DEFAULT_LOCATION})")
     parser.add_argument("--ci-deploy-script", type=pathlib.Path, default=CI_DEPLOY_SCRIPT, help=argparse.SUPPRESS)
@@ -480,7 +502,7 @@ def parse_args(argv):
 def main(argv=None) -> int:
     args = parse_args(argv)
     try:
-        projects = [p.strip() for p in args.projects.split(",") if p.strip()] if args.projects else pool_projects(args.ci_deploy_script.read_text(encoding="utf-8"))
+        projects = args.projects or pool_projects(args.ci_deploy_script.read_text(encoding="utf-8"))
         checks = verifier.parse_checks(args.checks) or list(DEFAULT_CHECKS)
     except (OSError, ValueError) as exc:
         log(f"ERROR: {exc}")
