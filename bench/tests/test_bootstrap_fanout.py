@@ -229,12 +229,20 @@ def test_the_stack_waits_out_the_longest_gate_run() -> None:
 
 def test_the_stack_spells_the_mirrored_names_as_their_sources_do() -> None:
     gate = REPO / "agents" / "chat" / "scripts" / "bootstrap_scan_gate.py"
+    delivery = REPO / "agents" / "chat" / "scripts" / "bootstrap_delivery.py"
     guardrail = REPO / "deploy" / "docker" / "patches" / "kanban_guardrail_exit.py"
+    jobs = json.loads((REPO / "agents" / "chat" / "defaults" / "cron" / "jobs.json").read_text())["jobs"]
     stack = (REPO / "bench" / "tf" / "prebuilt" / "bootstrap-discovery" / "main.tf").read_text()
 
     def local(name: str) -> str:
         return re.search(rf'^\s*{name}\s*=\s*"([^"]*)"\s*$', stack, re.M).group(1)
 
+    scan_jobs = [job for job in jobs if job["id"] == local("scan_job")]
+    assert len(scan_jobs) == 1
+    assert local("scan_job") == _module_constant(delivery, "SCAN_JOB_ID")
+    assert local("gate_script") == scan_jobs[0]["script"]
+    for key in ("SCAN_IDEMPOTENCY_KEY", "CLUSTER_IDEMPOTENCY_KEY_PREFIX", "PRIORITIZE_IDEMPOTENCY_KEY"):
+        assert _module_constant(gate, key).startswith(local("key_like").removesuffix("%")), key
     assert local("cluster_key_like") == _module_constant(gate, "CLUSTER_IDEMPOTENCY_KEY_PREFIX") + "%"
     assert local("rate_limit_block") == _module_constant(guardrail, "RATE_LIMIT_REASON_PREFIX")
 
