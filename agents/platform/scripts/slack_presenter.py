@@ -60,15 +60,16 @@ SETTLE_REACTIONS = {
 
 #: Kanban notifier event kinds that settle delegated work. ``crashed`` and
 #: ``timed_out`` are absent on purpose: the dispatcher retries both, so the work
-#: has not settled. Bookkeeping kinds (``status``, ``archived``, ``unblocked``)
-#: settle nothing.
+#: has not settled. ``block_loop_detected`` sends the card back to triage, where
+#: it can run again, so it settles provisionally, like ``blocked``. Bookkeeping
+#: kinds (``status``, ``archived``, ``unblocked``) settle nothing.
 SETTLE_BY_KANBAN_KIND = {
     "completed": SETTLE_DONE,
     "blocked": SETTLE_BLOCKED,
     "review_requested": SETTLE_BLOCKED,
     "changes_requested": SETTLE_BLOCKED,
     "gave_up": SETTLE_FAILED,
-    "block_loop_detected": SETTLE_FAILED,
+    "block_loop_detected": SETTLE_BLOCKED,
 }
 
 #: Settle outcomes after which a later settle can still follow on the same ask:

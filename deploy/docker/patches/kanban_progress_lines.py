@@ -326,7 +326,9 @@ async def deliver(
                 )
         tracked.pop(key, None)
         result = await adapter.send(chat_id, message, metadata=metadata)
-        await _settle_reaction(adapter, sub, kind, board)
+        # A failed post is retried from a rewound cursor; the retry settles.
+        if getattr(result, "success", True) is not False:
+            await _settle_reaction(adapter, sub, kind, board)
         return result
 
     line = rolling_line(kind, getattr(ev, "payload", None)) or message

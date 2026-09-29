@@ -2013,7 +2013,7 @@ USER 10000:10000
 ARG KUBE_AGENTS_VERSION
 ENV KUBE_AGENTS_VERSION=${KUBE_AGENTS_VERSION}
 
-# Slack presentation (reactions by kind, settle reaction, answer layout), off by
+# Slack presentation (reactions by kind, settle reaction), off by
 # default. An install turns it on through the PlatformAgent's
 # spec.deployment.env (the chart's platformAgent.deployment.env), which the
 # container's environment takes over this default. Read by

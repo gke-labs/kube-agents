@@ -91,7 +91,7 @@ class SettleReactionTest(unittest.TestCase):
         self.assertEqual(sp.settle_for_kanban_kind("blocked"), "blocked")
         self.assertEqual(sp.settle_for_kanban_kind("review_requested"), "blocked")
         self.assertEqual(sp.settle_for_kanban_kind("gave_up"), "failed")
-        self.assertEqual(sp.settle_for_kanban_kind("block_loop_detected"), "failed")
+        self.assertEqual(sp.settle_for_kanban_kind("block_loop_detected"), "blocked")
         # Retried by the dispatcher, or bookkeeping: nothing has settled.
         for kind in ("crashed", "timed_out", "status", "heartbeat", "archived", "unblocked"):
             self.assertIsNone(sp.settle_for_kanban_kind(kind), kind)

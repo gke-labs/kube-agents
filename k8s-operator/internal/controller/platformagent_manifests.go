@@ -4164,8 +4164,8 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// one message and its own failure report.
 	//
 	// KAGE_SLACK_UX selects between Slack presentation code paths already in
-	// the image: which reaction goes on an ask, when it settles, and how a
-	// message is laid out. It is compared against `FLAG_ON_VALUES` in
+	// the image: which reaction goes on an ask and which settles it when the
+	// work finishes. It is compared against `FLAG_ON_VALUES` in
 	// `slack_presenter.py`; any other value is off, the image default. It names
 	// no path, URL, credential or image, and no value of it reaches anything
 	// beyond the behaviours listed here. A change that gates something new on

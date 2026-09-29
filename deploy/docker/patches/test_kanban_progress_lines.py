@@ -712,6 +712,17 @@ class SettleReactionHookTest(unittest.IsolatedAsyncioTestCase):
         await self._run(adapter, board="b1")
         self.assertEqual(self.calls, [(SUB["task_id"], "completed", "b1")])
 
+    async def test_a_terminal_post_that_failed_does_not_settle(self):
+        self.flag = True
+
+        class _Failing(_Adapter):
+            async def send(self, chat_id, content, metadata=None):
+                await super().send(chat_id, content, metadata)
+                return _Result(False, error="channel_not_found")
+
+        await self._run(_Failing(), board="b1")
+        self.assertEqual(self.calls, [])
+
     async def test_a_settle_that_explodes_never_reaches_the_notifier(self):
         self.flag = True
 
