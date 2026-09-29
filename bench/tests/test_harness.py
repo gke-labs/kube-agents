@@ -3143,3 +3143,18 @@ def test_an_errored_run_still_stamps_a_start(
 
     assert result.has_errors()
     assert transcript.get().started_at > 0.0
+
+
+def test_bench_run_writes_the_trajectory(
+    stub_agent: _StubAgentServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kube_agents_bench import run
+
+    monkeypatch.setenv("PROJECT_ID", "kind")
+    task = tmp_path / "task.yaml"
+    task.write_text("prompt: Which repositories does {{PROJECT_ID}} use?\n")
+
+    assert run.main([str(task), str(tmp_path / "out")]) == 0
+
+    doc = json.loads((tmp_path / "out" / "trajectory.json").read_text())
+    assert doc["input"][0]["content"][0]["text"] == "Which repositories does kind use?"
