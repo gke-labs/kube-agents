@@ -152,3 +152,9 @@ examples/gitops-repo/*/**
   examples/gitops-repo/knowledge/cluster-blueprint/standard-gke.md
   examples/gitops-repo/knowledge/index.md
   examples/gitops-repo/policy/README.md
+
+hack/harbor/**
+  hack/harbor/README.md
+  hack/harbor/skills/fleet-inventory/SKILL.md
+  hack/harbor/tasks/kube-clusters-from-memory/instruction.md
+  hack/harbor/tasks/kube-namespaces/instruction.md
