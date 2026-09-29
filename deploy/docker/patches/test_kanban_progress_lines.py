@@ -5,10 +5,12 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 
 import ast
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import apply_kanban_progress_lines as applier
 import kanban_notify_delivery
@@ -665,6 +667,61 @@ class DeliverTest(unittest.IsolatedAsyncioTestCase):
 
         await self._deliver(_beat(1, "one"), adapter=_Capturing())
         self.assertEqual(captured["metadata"], {"thread_id": SUB["thread_id"]})
+
+
+class SettleReactionHookTest(unittest.IsolatedAsyncioTestCase):
+    """The KAGE_SLACK_UX settle hook on the terminal path.
+
+    ``gateway.slack_ux_reactions`` is faked in ``sys.modules``: the real one
+    is covered by ``test_slack_ux_reactions.py``; this pins where deliver()
+    calls it and that, flag off, deliver() posts exactly what it did before.
+    """
+
+    def setUp(self):
+        self.calls = []
+        self.flag = False
+        test = self
+
+        async def settle_delegated(adapter, sub, kind, board=None):
+            test.calls.append((sub["task_id"], kind, board))
+
+        fake = SimpleNamespace(enabled=lambda: test.flag, settle_delegated=settle_delegated)
+        package = SimpleNamespace(slack_ux_reactions=fake)
+        patcher = mock.patch.dict(
+            sys.modules, {"gateway": package, "gateway.slack_ux_reactions": fake}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def _run(self, adapter, **kwargs):
+        watcher = SimpleNamespace()
+        await deliver(watcher, adapter, SUB, "heartbeat", _beat(1, "Working."), "", None, HEADER, **kwargs)
+        await deliver(watcher, adapter, SUB, "completed", _terminal(2), "✔ done", None, HEADER, **kwargs)
+
+    async def test_flag_off_posts_exactly_what_it_did_before(self):
+        with_hook, without = _Adapter(), _Adapter()
+        await self._run(with_hook, board="b1")
+        with mock.patch.dict(sys.modules, {"gateway": None, "gateway.slack_ux_reactions": None}):
+            await self._run(without)
+        self.assertEqual((with_hook.sent, with_hook.edits), (without.sent, without.edits))
+        self.assertEqual(self.calls, [])
+
+    async def test_flag_on_settles_after_the_terminal_send_only(self):
+        self.flag = True
+        adapter = _Adapter()
+        await self._run(adapter, board="b1")
+        self.assertEqual(self.calls, [(SUB["task_id"], "completed", "b1")])
+
+    async def test_a_settle_that_explodes_never_reaches_the_notifier(self):
+        self.flag = True
+
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError("reactions.add exploded")
+
+        sys.modules["gateway.slack_ux_reactions"].settle_delegated = boom
+        adapter = _Adapter()
+        await self._run(adapter)
+        self.assertEqual(adapter.sent[-1][1], "✔ done")
 
 
 if __name__ == "__main__":
