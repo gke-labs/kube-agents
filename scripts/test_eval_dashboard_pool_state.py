@@ -12,8 +12,9 @@ its own defect. What is pinned:
 * a failed check is `drifted` with its findings -- stable id, what was
   observed, the repair -- keyed by id; an unread check is `not_checked` with
   the verifier's warning; the verifier's exit code is never the verdict;
-* a verifier that hangs, crashes without a report, or is missing, and a
-  missing gcloud, are each "not checked" with a reason, exit 0;
+* a verifier that hangs or crashes without a report, and a missing gcloud,
+  are each "not checked" with a reason, exit 0; a missing verifier is a
+  repository bug, exit 1;
 * the workflow wires the scan into the hourly job and the tick reads it.
 """
 

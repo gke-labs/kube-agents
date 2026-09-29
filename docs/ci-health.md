@@ -516,7 +516,7 @@ the top of every hour (`0 * * * *`, a second cron in the same workflow; the
 `github.event.schedule` guards send each run to one job) it runs
 `scripts/eval_dashboard/fixture_state.py`, which, per pool project and in a
 temporary directory of its own, runs `hack/fleet-kubeconfigs.sh` and then
-`hack/fleet-fixture-state.py --wait 0 --report`, six projects at a time, and
+`hack/fleet-fixture-state.py --wait 0 --report`, seven projects at a time, and
 publishes `gs://kube-agents-dashboards/evals/fixture-state.json`. It is its
 own job rather than a step on the top-of-hour tick because it needs `kubectl`
 and `gke-gcloud-auth-plugin`, runs every mapped project for a few minutes (a
@@ -612,7 +612,7 @@ instead. The recovery comments on it as on any other.
 
 **What never fails the bot.** A missing `kubectl` or `gcloud`, a project the
 publisher cannot read, a missing grant, a runner or a state check that hangs
-past its ceiling (300 s per project, 1620 s for the scan): each is "not
+past its ceiling (300 s per project, 1920 s for the scan): each is "not
 checked" with its reason, the scan exits 0 and publishes, and the tick reads
 it as such. Only a repository bug — no mapping in `hack/ci-deploy.sh`, no
 catalog — reds the scan job. `fixture_state.py --projects <id> --no-impersonate`
@@ -627,7 +627,7 @@ the project (#1927: a role missing on all 30 projects for two weeks). The
 `fixture-state-scan` job runs the verifier on a clock instead. After the fleet
 scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
 `verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,token_minter_kms --report`
-against every pool project, six at a time, and publishes
+against every pool project, seven at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
 Left out: the fleet fixtures (the fleet scan reads those), the two GitHub checks

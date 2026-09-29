@@ -3694,7 +3694,6 @@ class FindingsCarryRepairsTest(unittest.TestCase):
     _litellm_wi_policy = IamGrantsTest._litellm_wi_policy
     _project_policy = IamGrantsTest._project_policy
     _fleet_reader_policy = IamGrantsTest._fleet_reader_policy
-    _reader_policy = IamGrantsTest._reader_policy
 
     """The console detail and the report finding are written together: every
     drift a scan can act on names a stable id and the command that closes it."""
