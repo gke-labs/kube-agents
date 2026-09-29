@@ -3576,7 +3576,12 @@ class CommandExecutorTest(unittest.TestCase):
 
     def test_an_emptied_group_gets_no_sigkill(self):
         # Once the group is seen empty its id is free for reuse, so the second
-        # signal goes only to a group the grace ran out on.
+        # signal goes only to a group the grace ran out on. The sleep replaces
+        # the shell so that the group empties on SIGTERM wherever the test
+        # runs: a sleep forked under the shell is reparented at the kill, and
+        # under a PID 1 that does not reap it stays a zombie in the group
+        # through the whole grace, and the SIGKILL this test says must not be
+        # sent is sent.
         sent = []
         real_killpg = os.killpg
 
@@ -3585,7 +3590,8 @@ class CommandExecutorTest(unittest.TestCase):
             return real_killpg(pgid, signum)
 
         executor = self.fake_kubectl(
-            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1), body="sleep 10"
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="exec sleep 10",
         )
         with mock.patch("credential_proxy.os.killpg", recording):
             result = executor.execute(["kubectl", "get", "pods"])
