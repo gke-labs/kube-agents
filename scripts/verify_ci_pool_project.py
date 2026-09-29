@@ -2881,9 +2881,14 @@ def check_token_minter(
     if pinned_version is None:
         if enabled_versions:
             probe_version = sorted(enabled_versions, key=lambda v: int(v) if v.isdigit() else 0)[-1]
+        probed = (
+            f"probed version {probe_version or 'none'} instead"
+            if probe_app
+            else "the key was checked with no version confirmed"
+        )
         warnings.append(Unread(
             f"Could not read githubMinter.kms.keyVersion from the chart ({pin_detail}), so the version this "
-            f"project's minter will sign with is unconfirmed; probed version {probe_version or 'none'} instead. "
+            f"project's minter will sign with is unconfirmed; {probed}. "
             "Confirm the chart's pin names an ENABLED version before registering."
         ))
     elif not version_states:
@@ -2901,8 +2906,11 @@ def check_token_minter(
     elif version_states[pinned_version] != "ENABLED":
         passed = False
         state = version_states[pinned_version]
+        # One id whatever the state: an id that moved with it would end an
+        # incident and re-file it as the version went from disabled to
+        # scheduled for destruction to destroyed.
         _drift(
-            details, findings, f"token-minter/pinned-version/{state.lower()}",
+            details, findings, "token-minter/pinned-version/not-enabled",
             f"The chart deploys cryptoKeyVersion {pinned_version} of {key}, whose state is "
             f"{version_states[pinned_version]}. Every lease would deploy a minter that cannot sign, and "
             "helm --wait would kill the run at its fifteen-minute timeout without naming the key. "
@@ -3051,8 +3059,18 @@ def run_checks(
                         read=False,
                     ))
             else:
+                # The project read failed outright (a describe error that is
+                # neither a refusal nor a transient): the dependents read
+                # nothing, and say so, rather than failing on a read they
+                # never made. The project check itself carries the failure.
                 for check_id, skipped, _ in dependents:
-                    add(check_id, CheckResult(skipped, False, "Skipped: could not determine project number" + (f" ({why})" if why else "")))
+                    add(check_id, CheckResult(
+                        skipped,
+                        True,
+                        "Not checked",
+                        warnings=[Unread(f"Not checked: {project_id}'s project number could not be determined" + (f" ({why})" if why else ""))],
+                        read=False,
+                    ))
 
     run(CHECK_GKE_AND_STATE, lambda: check_gke_and_state(project_id))
     run(CHECK_SEEDED_FLEET, lambda: check_seeded_fleet_fixtures(project_id))

@@ -90,6 +90,10 @@ DEADLINE_EVIDENCE_PREFIX = "deadline kills:"
 # GitHub rejects a longer title; the node list is compacted, then dropped
 # for a count, to stay under it.
 TITLE_MAX_CHARS = 256
+# GitHub's issue body limit; a pool-wide drift with a repair block per
+# (project, finding) can pass it, and a body that is refused files nothing.
+ISSUE_BODY_MAX_CHARS = 65536
+POOL_DRIFT_PROJECTS_OMITTED = "- … and {count} more project(s) omitted to fit the issue; pool-state.json carries every project's repair command (docs/ci-health.md, The pool-state scan)"
 
 TITLE = "Smoke gate outage: {count} {noun} failing on every PR since {since}"
 CASE_NOUN = ("case", "cases")
@@ -380,28 +384,42 @@ def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> st
     drift = incident.get("drift") or {}
     repairs = incident.get("repairs") or {}
     evidence = [f"- {line}" for line in health.get("evidence") or []]
-    per_project = []
+    blocks = []
     for project in sorted(drift):
-        per_project.append(f"- `{project}`")
+        block = [f"- `{project}`"]
         for finding, lines in sorted((drift.get(project) or {}).items()):
-            per_project.append(f"  - `{finding}`")
-            per_project.extend(f"    - {line}" for line in lines or ["(no detail recorded)"])
+            block.append(f"  - `{finding}`")
+            block.extend(f"    - {line}" for line in lines or ["(no detail recorded)"])
             repair = (repairs.get(project) or {}).get(finding)
             if repair:
-                per_project.append("    - repair:")
-                per_project.append("      ```")
-                per_project.extend(f"      {line}" for line in str(repair).splitlines())
-                per_project.append("      ```")
-    return POOL_DRIFT_BODY.format(
-        marker=POOL_DRIFT_MARKER.format(findings=",".join(findings)),
-        findings="\n".join(f"- `{finding}`" for finding in findings) or "- (none recorded)",
-        projects="\n".join(per_project) or "- (none recorded)",
-        since=since_text,
-        since_iso=health.get("since") or "?",
-        scanned_at=incident.get("window_start") or "?",
-        evidence="\n".join(evidence) or NO_EVIDENCE,
-        brief=brief_link,
-    )
+                block.append("    - repair:")
+                block.append("      ```")
+                block.extend(f"      {line}" for line in str(repair).splitlines())
+                block.append("      ```")
+        blocks.append("\n".join(block))
+
+    def render(kept):
+        omitted = len(blocks) - len(kept)
+        projects = list(kept) + ([POOL_DRIFT_PROJECTS_OMITTED.format(count=omitted)] if omitted else [])
+        return POOL_DRIFT_BODY.format(
+            marker=POOL_DRIFT_MARKER.format(findings=",".join(findings)),
+            findings="\n".join(f"- `{finding}`" for finding in findings) or "- (none recorded)",
+            projects="\n".join(projects) or "- (none recorded)",
+            since=since_text,
+            since_iso=health.get("since") or "?",
+            scanned_at=incident.get("window_start") or "?",
+            evidence="\n".join(evidence) or NO_EVIDENCE,
+            brief=brief_link,
+        )
+
+    # Whole projects are dropped from the end until the body fits GitHub's
+    # limit; the findings list, the evidence and the marker always stay.
+    kept = list(blocks)
+    body = render(kept)
+    while len(body) > ISSUE_BODY_MAX_CHARS and kept:
+        kept.pop()
+        body = render(kept)
+    return body
 
 
 class Tracker:

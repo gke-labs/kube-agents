@@ -1863,6 +1863,21 @@ class PoolDrift(RunHarness):
         short = post_health.gate_issue.render_pool_drift_title(pool_drift(), "Mon 9:00 AM ET")
         self.assertEqual(short, f"Pool drift: {FINDING} on 3 pool projects since Mon 9:00 AM ET")
 
+    def test_a_pool_wide_body_is_cut_to_githubs_limit_and_says_so(self):
+        # 35 projects × 5 findings with a repair block each passes 64 KiB; the
+        # body drops whole projects from the end and says how many, keeping
+        # the findings, the marker and the evidence.
+        many = [f"iam/pool-state-reader/missing/{role}" for role in ("roles/iam.securityReviewer", "roles/container.clusterViewer", "roles/artifactregistry.reader", "roles/cloudkms.viewer", "roles/storage.bucketViewer")]
+        projects = tuple(f"kube-agents-evals-{i}" for i in range(1, 36))
+        body = post_health.gate_issue.render_pool_drift_body(pool_drift(findings=tuple(many), projects=projects, evidence=["evidence line"]), "Mon 9:00 AM ET", "brief")
+        self.assertLessEqual(len(body), post_health.gate_issue.ISSUE_BODY_MAX_CHARS)
+        self.assertIn("more project(s) omitted", body)
+        self.assertIn("- `kube-agents-evals-1`", body)
+        self.assertIn(post_health.gate_issue.POOL_DRIFT_MARKER.format(findings=",".join(many)), body)
+        self.assertIn("evidence line", body)
+        small = post_health.gate_issue.render_pool_drift_body(pool_drift(), "Mon 9:00 AM ET", "brief")
+        self.assertNotIn("omitted", small)
+
     def test_the_bots_own_issue_is_re_found_when_its_title_is_a_count(self):
         # Four or more ids push the title to its count form, which names no
         # finding; the body's marker is how the bot re-finds it after a GREEN.

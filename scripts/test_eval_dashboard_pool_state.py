@@ -383,8 +383,12 @@ class Workflow(unittest.TestCase):
         steps = self.jobs["fixture-state-scan"]["steps"]
         upload = next(step for step in steps if "cp work/pool-state.json" in step.get("run", ""))
         run = upload["run"]
-        code = run[run.index("python3 -c '") + len("python3 -c '") :]
-        code = code[: code.index("\n'")]
+        # The whole `python3 -c '…'` word, run through the shell as the step
+        # does, so a quote inside the script that would end the word is caught.
+        start = run.index("python3 -c '")
+        end = run.index("\n'", start) + 2
+        shell_word = run[start:end].replace("python3 ", f"'{sys.executable}' ", 1)
+        code = run[start + len("python3 -c '") : end - 2]
         compile(code, "<upload step>", "exec")
         with tempfile.TemporaryDirectory() as tmp:
             work = pathlib.Path(tmp) / "work"
@@ -397,7 +401,7 @@ class Workflow(unittest.TestCase):
                 },
             }
             (work / "pool-state.json").write_text(json.dumps(document), encoding="utf-8")
-            proc = subprocess.run([sys.executable, "-c", code], cwd=tmp, capture_output=True, text=True, check=False)
+            proc = subprocess.run(["bash", "-c", shell_word], cwd=tmp, capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("1 of 2 projects checked; drifted on 1 (1 findings)", proc.stdout)
         self.assertIn(f"p1: drifted: {FINDING}", proc.stdout)

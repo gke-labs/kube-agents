@@ -782,7 +782,7 @@ jobs:
           import json
           doc = json.load(open("work/pool-state.json"))
           s = doc["summary"]
-          print(f"{s['checked']} of {s['projects']} projects checked; drifted on {s['drifted_projects']} ({s['findings']} findings); checks healthy {s['healthy']}, drifted {s['drifted']}, not checked {s['not_checked']}")
+          print("{checked} of {projects} projects checked; drifted on {drifted_projects} ({findings} findings); checks healthy {healthy}, drifted {drifted}, not checked {not_checked}".format(**s))
           for project, entry in sorted(doc["projects"].items()):
               if entry["findings"] or entry.get("error"):
                   print(f"  {project}: " + ("drifted: " + ", ".join(sorted(entry["findings"])) if entry["findings"] else "not checked: " + entry["error"]))

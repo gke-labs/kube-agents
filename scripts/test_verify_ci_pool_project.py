@@ -3357,10 +3357,14 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
-        skipped = [c for c in results if c.message.startswith("Skipped")]
-        # IAM, Artifact Registry and the warm-cache readers all need the number.
+        # IAM, Artifact Registry and the warm-cache readers all need the
+        # number; without it they read nothing, and say so, while the project
+        # check carries the failure.
+        skipped = [c for c in results if c.message == "Not checked" and c.read is False]
         self.assertEqual(len(skipped), 3)
-        self.assertTrue(all(not c.passed for c in skipped))
+        self.assertTrue(all(c.passed for c in skipped))
+        self.assertTrue(all(isinstance(c.warnings[0], checker.Unread) for c in skipped))
+        self.assertTrue(all(checker.report_status(c) == checker.REPORT_STATUS_UNCHECKED for c in skipped))
 
     def test_denied_project_read_does_not_fail_the_checks_that_needed_it(self):
         # The project number is missing because the read was refused, not
@@ -3544,7 +3548,7 @@ class ReportDocumentTest(unittest.TestCase):
         with mock.patch.object(checker, "check_project_and_apis", return_value=(None, checker.CheckResult("p", False, "Project describe failed: NOT_FOUND"))):
             failed = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_IAM])
         self.assertEqual(len(failed), 1)
-        self.assertIn("Project describe failed: NOT_FOUND", failed[0].message)
+        self.assertIn("Project describe failed: NOT_FOUND", failed[0].warnings[0])
         refused = checker.CheckResult("p", True, "Not checked", warnings=[checker.Unread("Could not describe: PERMISSION_DENIED")], read=False)
         with mock.patch.object(checker, "check_project_and_apis", return_value=(None, refused)):
             unread = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_IAM])
@@ -3555,7 +3559,7 @@ class ReportDocumentTest(unittest.TestCase):
         # commonest not-checked line, and a bare skip would win it.
         with mock.patch.object(checker, "check_project_and_apis", return_value=(None, checker.CheckResult("p", False, "Project describe failed: NOT_FOUND"))):
             both = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_PROJECT_AND_APIS, checker.CHECK_IAM])
-        self.assertIn("Project describe failed: NOT_FOUND", both[1].message)
+        self.assertIn("Project describe failed: NOT_FOUND", both[1].warnings[0])
 
     def test_a_blocked_toolchain_with_an_unwritable_report_path_still_exits_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3723,17 +3727,19 @@ class FindingsCarryRepairsTest(unittest.TestCase):
         self.assertIn("--role=roles/cloudkms.signerVerifier", ids["token-minter/signer/minter"])
         self.assertIn(f"--member={checker.PULL_SWEEP_MEMBER}", ids["token-minter/signer/pull-sweeper"])
         self.assertIn("token-minter/minter-gsa/workload-identity", ids)
-        self.assertIn("--key=github-token-minter-key", ids["token-minter/pinned-version/disabled"])
+        self.assertIn("--key=github-token-minter-key", ids["token-minter/pinned-version/not-enabled"])
         # `versions enable` only takes DISABLED; a scheduled destruction, a
-        # destroyed version or a failed import need the rotation repair.
+        # destroyed version or a failed import need the rotation repair. The
+        # id is the same whatever the state, so an incident follows the
+        # version as its state moves; the state is in the observation.
         for state in ("DESTROY_SCHEDULED", "DESTROYED", "PENDING_IMPORT", "IMPORT_FAILED"):
             versions = json.dumps([{"name": ".../cryptoKeyVersions/1", "state": state}])
             with mock.patch.object(checker, "run_cmd") as run, mock.patch.object(checker, "_chart_pinned_key_version", return_value=("1", "")):
                 run.side_effect = [_ok(versions), _ok(key), _ok(json.dumps({"bindings": []})), _ok(json.dumps({"bindings": []}))]
                 minter = checker.check_token_minter("kube-agents-evals-3", probe_app=False)
-            ids = {f.id: f.repair for f in minter.findings}
-            self.assertEqual(ids[f"token-minter/pinned-version/{state.lower()}"], checker.REPAIR_MINTER_ROTATION, state)
-            self.assertNotIn("token-minter/pinned-version/disabled", ids)
+            found = {f.id: f for f in minter.findings}
+            self.assertEqual(found["token-minter/pinned-version/not-enabled"].repair, checker.REPAIR_MINTER_ROTATION, state)
+            self.assertIn(state, found["token-minter/pinned-version/not-enabled"].observed)
 
     def test_a_denied_project_read_is_unread_not_a_finding(self):
         with mock.patch.object(checker, "run_cmd", return_value=(1, "", "ERROR: PERMISSION_DENIED: caller lacks resourcemanager.projects.get")):
