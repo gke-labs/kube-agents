@@ -248,7 +248,7 @@ The 0.05 the rule shipped with was a guess, and the issue that shipped it
 ([#1493](https://github.com/gke-labs/kube-agents/issues/1493)) said to arm it only after measuring
 how much an unchanged pull request moves the aggregate. Measured on 2026-09-29, read-only, from
 two sources. The summary tables are below; the full measurement, including the 94-row table of
-every presubmit run counted, is in the pull request that set the margin (PR #TBD).
+every presubmit run counted, is in the pull request that set the margin (#2122).
 
 **What is compared to what.** The pull request's side is every admitted case's scored
 repetitions pooled: twelve roster cases × three repetitions = 36 units, `infra` and `blocked`
