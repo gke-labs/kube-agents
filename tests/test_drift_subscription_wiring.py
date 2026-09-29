@@ -20,7 +20,10 @@ another document:
   - the chart block is written only when the module exists. The chart renders
     a `driftDetector` block into the CR as soon as one field is set, and the
     CR template says an install that never asked for drift detection should
-    not carry one.
+    not carry one. The same block carries `enabled` from
+    `enable_drift_detector`, and a precondition refuses the other order: the
+    consumer without the ingress is a detector that retries a pull it cannot
+    satisfy for the life of the pod, which is the silent failure above.
   - the composition's three defaults equal the module's, and the detector's
     `defaultSubscriptionName` equals the subscription's, so an install that
     never sets a name gets the resource the detector looks for. docs/README.md
@@ -51,6 +54,7 @@ CHART_VALUES = REPO_ROOT / "charts" / "kube-agents" / "values.yaml"
 CHART_CR_TEMPLATE = REPO_ROOT / "charts" / "kube-agents" / "templates" / "platform-agent-cr.yaml"
 
 FLAG_VARIABLE = "enable_drift_pubsub"
+DETECTOR_FLAG_VARIABLE = "enable_drift_detector"
 MODULE_CALL = "drift_pubsub"
 # Composition variable -> module variable, for the three names the module
 # takes and lifecycle.sh adopts by.
@@ -61,8 +65,12 @@ NAME_VARIABLES = {
 }
 SUBSCRIPTION_VARIABLE = "drift_pubsub_subscription"
 DETECTOR_DEFAULT_CONSTANT = "defaultSubscriptionName"
-CHART_VALUE_PATH = ("platformAgent", "harness", "driftDetector", "subscription")
-CHART_TEMPLATE_FIELD = '"subscription" $drift.subscription'
+DRIFT_VALUE_PREFIX = ("platformAgent", "harness", "driftDetector")
+# Each leaf the composition writes, and the CR template line that renders it.
+CHART_LEAVES = {
+    "subscription": '"subscription" $drift.subscription',
+    "enabled": '"enabled" $drift.enabled',
+}
 
 # A Terraform `variable "<name>" { ... }` block, up to its closing brace at
 # column zero. Blocks here are separated by a blank line and the next
@@ -76,15 +84,24 @@ GO_CONST_RE = re.compile(r"^\s*" + DETECTOR_DEFAULT_CONSTANT + r'\s*=\s*"(?P<val
 # merge() of the always-present map and the conditional drift block, bounded
 # by its own closing paren at its own indentation (six spaces).
 CHART_HARNESS_BLOCK_RE = re.compile(r"\n      harness = merge\(\n(?P<body>.*?)\n      \)\n", re.S)
-# The conditional as written: the flag, then a driftDetector map whose only
-# field is the subscription, read from the module instance rather than from
-# the variable so the Helm release waits for the subscription to exist.
+# The conditional as written: the ingress flag, then a driftDetector map
+# carrying the subscription -- read from the module instance rather than from
+# the variable, so the Helm release waits for the subscription to exist -- and
+# enabled, true or null rather than true or false so that the chart's
+# compactFields drops the field and the CRD default applies.
 CHART_DRIFT_BLOCK_RE = re.compile(
     r"var\." + FLAG_VARIABLE + r"\s*\?\s*\{\s*"
     r"driftDetector\s*=\s*\{\s*"
     r"subscription\s*=\s*module\." + MODULE_CALL + r"\[0\]\.subscription_name\s*"
+    r"enabled\s*=\s*var\." + DETECTOR_FLAG_VARIABLE + r"\s*\?\s*true\s*:\s*null\s*"
     r"\}\s*\}\s*:\s*\{\}",
     re.S,
+)
+# The precondition that refuses the consumer without the ingress. Read as one
+# line of HCL rather than by planning: Terraform is not a dependency here.
+PRECONDITION_RE = re.compile(
+    r"condition\s*=\s*!var\." + DETECTOR_FLAG_VARIABLE + r"\s*\|\|\s*var\." + FLAG_VARIABLE + r"\s*$",
+    re.M,
 )
 
 
@@ -144,19 +161,30 @@ class OneNameReachesBothConsumersTest(unittest.TestCase):
 
     def test_chart_is_passed_the_module_subscription_behind_the_flag(self):
         body = single(CHART_HARNESS_BLOCK_RE, self.main, "platformAgent.harness merge").group("body")
-        single(CHART_DRIFT_BLOCK_RE, body, "driftDetector.subscription conditional on the flag")
+        single(CHART_DRIFT_BLOCK_RE, body, "driftDetector block conditional on the flag")
 
-    def test_chart_exposes_the_value_path_the_composition_writes(self):
-        values = yaml.safe_load(CHART_VALUES.read_text(encoding="utf-8"))
-        node = values
-        for key in CHART_VALUE_PATH:
-            self.assertIn(key, node, f"chart values have no {'.'.join(CHART_VALUE_PATH)}; the composition writes it")
-            node = node[key]
-        self.assertIn(
-            CHART_TEMPLATE_FIELD,
-            CHART_CR_TEMPLATE.read_text(encoding="utf-8"),
-            "the CR template no longer renders driftDetector.subscription from the values path the composition writes",
+    def test_the_detector_cannot_be_enabled_without_the_ingress(self):
+        single(
+            PRECONDITION_RE,
+            self.main,
+            f"precondition refusing {DETECTOR_FLAG_VARIABLE} without {FLAG_VARIABLE}",
         )
+
+    def test_chart_exposes_the_value_paths_the_composition_writes(self):
+        values = yaml.safe_load(CHART_VALUES.read_text(encoding="utf-8"))
+        template = CHART_CR_TEMPLATE.read_text(encoding="utf-8")
+        for leaf, rendered in CHART_LEAVES.items():
+            with self.subTest(leaf=leaf):
+                path = (*DRIFT_VALUE_PREFIX, leaf)
+                node = values
+                for key in path:
+                    self.assertIn(key, node, f"chart values have no {'.'.join(path)}; the composition writes it")
+                    node = node[key]
+                self.assertIn(
+                    rendered,
+                    template,
+                    f"the CR template no longer renders driftDetector.{leaf} from the values path the composition writes",
+                )
 
 
 if __name__ == "__main__":

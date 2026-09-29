@@ -6543,6 +6543,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--enable-gke-backup-plan": "PARAM_ENABLE_GKE_BACKUP_PLAN",
         "--enable-pubsub-platform": "PARAM_ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
+        "--enable-drift-detector": "PARAM_ENABLE_DRIFT_DETECTOR",
         "--enable-google-chat": "PARAM_ENABLE_GOOGLE_CHAT",
         "--enable-slack": "PARAM_ENABLE_SLACK",
     }
@@ -6779,6 +6780,90 @@ class DomainScopedFlagsTest(unittest.TestCase):
             combined = proc.stdout + proc.stderr
             self.assertIn("applies to this run only", combined)
             self.assertIn("records no ENABLE_GKE_BACKUP_PLAN", combined)
+
+    def test_the_drift_detector_flag_says_so_when_it_beats_a_recorded_value(self):
+        """Reversing this one destroys the audit-log ingress and its backlog.
+
+        ENABLE_DRIFT_DETECTOR is the one key write_tfvars_from_state writes two
+        tfvars keys from, and the only boolean it omits rather than writing
+        false. A later run without it therefore writes neither key,
+        enable_drift_pubsub falls back to its default, and the apply destroys
+        the sink, topic and subscription along with whatever the subscription
+        was still retaining. install.sh applies with -auto-approve, so that
+        plan is never put in front of anyone.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=false\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("ENABLE_DRIFT_DETECTOR=false", combined)
+            self.assertIn("subscription", combined)
+            self.assertIn(
+                "repeat --enable-drift-detector on every later install.sh run",
+                combined,
+            )
+
+    def test_the_drift_detector_warning_needs_the_flag_to_have_been_typed(self):
+        """resolve_shared_defaults fills the PARAM, so it cannot answer this.
+
+        Unlike PARAM_ENABLE_GKE_BACKUP_PLAN, which nothing fills, this one
+        carries DEFAULT_ENABLE_DRIFT_DETECTOR by the time bootstrap runs — so
+        reading it the way the helper reads every other value would fire the
+        destroyed-ingress warning on every install over a file predating the
+        key, which is every install there is. DRIFT_DETECTOR_FLAG_PASSED is
+        what separates a typed `false` from a defaulted one.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "-y",
+                "resolve_shared_defaults\n"
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn(
+                "false",
+                subprocess.run(
+                    ["bash", "-c",
+                     f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}" >/dev/null 2>&1\n'
+                     f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+                     "resolve_shared_defaults\n"
+                     'printf "%s" "$PARAM_ENABLE_DRIFT_DETECTOR"'],
+                    capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                    env=get_isolated_test_env(),
+                ).stdout,
+                "sanity: the PARAM is filled, so an empty-PARAM guard would not hold",
+            )
+            self.assertNotIn("ENABLE_DRIFT_DETECTOR", combined)
+
+    def test_the_drift_detector_warning_reads_both_sides_as_booleans(self):
+        """A recorded `True` and a flagged `true` agree, and say nothing.
+
+        The key travels the same routes ENABLE_GKE_BACKUP_PLAN does — a
+        hand-written install.env, and a GitHub variable copied in verbatim by
+        render_install_env.sh — so a string comparison would hand the operator
+        a destroyed-ingress warning for a reversal that cannot happen.
+        """
+        for recorded in ("True", "yes", "1", "on"):
+            with self.subTest(recorded=recorded):
+                with tempfile.TemporaryDirectory() as tmp:
+                    destination = pathlib.Path(tmp) / "existing.env"
+                    destination.write_text(f"ENABLE_DRIFT_DETECTOR={recorded}\n")
+                    proc = self._parse(
+                        "--enable-drift-detector=true",
+                        f'bootstrap_install_env_file "{destination}" v1.2.3',
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    combined = proc.stdout + proc.stderr
+                    self.assertNotIn("ENABLE_DRIFT_DETECTOR", combined)
 
     def test_a_flag_that_agrees_with_the_recorded_value_is_not_warned_about(self):
         """Nothing is overridden, so there is nothing to lose by omitting it.
@@ -7162,6 +7247,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-gke-backup-plan",
         "--enable-pubsub-platform",
         "--enable-stockout-investigator",
+        "--enable-drift-detector",
         "--enable-hermes-dashboard",
     ]
 
@@ -7205,6 +7291,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-gke-backup-plan": "ENABLE_GKE_BACKUP_PLAN",
         "--enable-pubsub-platform": "ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "ENABLE_STOCKOUT_INVESTIGATOR",
+        "--enable-drift-detector": "ENABLE_DRIFT_DETECTOR",
     }
 
     def test_a_spelling_seeded_from_install_env_is_never_judged(self):

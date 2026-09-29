@@ -395,8 +395,12 @@ module "chat_pubsub" {
 # k8s-operator/cmd/drift-detector, ships in the images and starts in the
 # gateway pod when the PlatformAgent sets spec.harness.driftDetector.enabled;
 # this flag provisions its input and passes the subscription's name into that
-# block (the harness values below), and leaves enabling the detector to
-# extra_helm_values (docs/designs/drift-detection.md).
+# block (the harness values below), and enable_drift_detector is what starts
+# the consumer (docs/designs/drift-detection.md). The two are separate so that
+# the ingress can be provisioned on its own; the other order is refused by a
+# helm_release precondition below, because the harness block that carries
+# enabled is written only when this flag is on, so the composition would
+# otherwise accept the second variable and silently do nothing with it.
 module "drift_pubsub" {
   source = "../../modules/drift-pubsub"
   count  = var.enable_drift_pubsub ? 1 : 0
@@ -654,12 +658,16 @@ resource "helm_release" "kube_agents" {
         # rename to it. Only when the module exists -- the chart renders a
         # driftDetector block into the CR as soon as one field is set, and an
         # install that never asked for drift detection should not carry one
-        # (the chart's platform-agent-cr.yaml says why). Whether the detector
-        # starts is spec.harness.driftDetector.enabled, which this composition
-        # does not set; extra_helm_values reaches it.
+        # (the chart's platform-agent-cr.yaml says why).
+        #
+        # enabled is null rather than false when the detector is off, so the
+        # CRD's own default applies and the rendered CR is byte-identical to
+        # what an ingress-only install produced before this variable existed.
+        # The chart's compactFields drops nulls; it does not drop false.
         var.enable_drift_pubsub ? {
           driftDetector = {
             subscription = module.drift_pubsub[0].subscription_name
+            enabled      = var.enable_drift_detector ? true : null
           }
         } : {}
       )
@@ -848,6 +856,38 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !var.enable_github_minter || (local.github_org != "" && local.github_repo_name != "")
       error_message = "enable_github_minter requires github_repo in owner/repo (or github.com URL) form — the minty rule ConfigMap is scoped to that repository."
+    }
+
+    # What this refuses is a variable the composition would otherwise ignore
+    # in silence. driftDetector, enabled included, is written inside the
+    # enable_drift_pubsub ternary above, so with the ingress off the field is
+    # never rendered: the apply succeeds, nothing is provisioned, nothing
+    # starts, and the only evidence is a variable that did nothing. Refused
+    # rather than warned about, unlike check "slack_tokens_present" above,
+    # because a Slack install with no tokens says so in the pod log and this
+    # leaves no trace anywhere.
+    #
+    # The ternary is what keeps a driftDetector block out of the CR of an
+    # install that never asked for drift detection, and this is what keeps
+    # asking for it half-way from being accepted. Neither replaces the other.
+    precondition {
+      condition     = !var.enable_drift_detector || var.enable_drift_pubsub
+      error_message = "enable_drift_detector requires enable_drift_pubsub — the detector reads the Pub/Sub subscription that flag provisions, and without it this composition writes no driftDetector block at all, so the variable would do nothing and say nothing. Through the installer, ENABLE_DRIFT_DETECTOR=true sets both."
+    }
+
+    # The operator's own gate, brought forward to the plan. A numeric
+    # project_id works everywhere else in this composition -- gcloud resolves
+    # a project number, and the credential proxy and the context name both
+    # take one -- but driftDetectorEnabled() in the operator refuses it
+    # (k8s-operator/internal/controller/platformagent_manifests.go), because
+    # the join matches it against each audit record's project_id, which is
+    # always the ID. Left to run, such an install provisions the whole ingress
+    # -- a sink exporting every GKE cluster in the project into a subscription
+    # that retains 31 days and never expires -- and starts no consumer, with a
+    # Ready pod and no report to tell anyone.
+    precondition {
+      condition     = !var.enable_drift_detector || !can(regex("^[0-9]+$", var.project_id))
+      error_message = "enable_drift_detector requires project_id to be the project ID, not the project number: the detector matches it against each audit record's project_id, which is always the ID, so the operator refuses to start it and the ingress bills for a stream nothing reads."
     }
   }
 }

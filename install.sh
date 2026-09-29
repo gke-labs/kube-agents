@@ -399,10 +399,18 @@ PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
 # Whether a --scope-* flag was typed: the Day-2 menu reads the keys from
 # install.env alone and refuses a flag it would otherwise validate and drop.
 SCOPE_FLAG_PASSED="false"
+# The same question for --enable-drift-detector, asked for a different reason.
+# warn_flag_beats_unrecorded_file_value reads an empty PARAM as "nobody chose",
+# which is how --enable-gke-backup-plan stays quiet on a run that passed no
+# flag; resolve_shared_defaults fills this one with install.defaults.env's
+# answer, so by the time the warning runs the PARAM says "false" whether it was
+# typed or defaulted, and only this marker can still tell the two apart.
+DRIFT_DETECTOR_FLAG_PASSED="false"
 # Empty means "not chosen", like PARAM_MODEL_PROVIDER above; resolve_shared_defaults
 # fills in install.defaults.env's answer once the helpers are sourced.
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
 PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-}"
+PARAM_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 PARAM_ENABLE_GKE_BACKUP_PLAN="${ENABLE_GKE_BACKUP_PLAN:-}"
 # Set-ness, never ${VAR:-...}: `--enable-gvisor=` with no value sets this to the empty
 # string, and that has to survive to the validator in main rather than being
@@ -622,6 +630,10 @@ Flags for AI Agents & Automation:
                                 Enable Pub/Sub platform adapter AgentPlugin (default: false)
   --enable-stockout-investigator[=true|false]
                                 Enable GKE Stockout Investigator AgentPlugin (default: false)
+  --enable-drift-detector[=true|false]
+                                Report cluster changes made outside git. Exports this
+                                project's GKE audit log to Pub/Sub and starts the
+                                detector that reads it (default: false)
   --google-chat-allowed-users=EMAILS
                                 Comma-separated user emails allowed to talk to the
                                 agent over Google Chat. Empty allows all users
@@ -818,6 +830,10 @@ parse_args() {
       --enable-stockout-investigator|--enable-stockout|--enable-stockout-investigator=*|--enable-stockout=*)
         PARAM_ENABLE_STOCKOUT_INVESTIGATOR="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"; shift ;;
+      --enable-drift-detector|--enable-drift|--enable-drift-detector=*|--enable-drift=*)
+        PARAM_ENABLE_DRIFT_DETECTOR="$(flag_bool_value "$1")"
+        DRIFT_DETECTOR_FLAG_PASSED="true"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_DRIFT_DETECTOR"; shift ;;
       # Validated for emptiness here, ahead of resolve_shared_defaults.
       # PARAM_MEMORY is seeded from MEMORY and resolved with
       # ${PARAM_MEMORY:-$DEFAULT_MEMORY}, so `--memory=` out of a wrapper
@@ -1569,9 +1585,9 @@ bootstrap_install_env_file() {
     print_info "Left your install configuration as you wrote it: ${destination}"
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
-    # The two flags that override a recorded value for one run. This function
-    # never rewrites an existing file, so only a first install can record either
-    # on the operator's behalf.
+    # The flags that override a recorded value for one run. This function
+    # never rewrites an existing file, so only a first install can record any of
+    # them on the operator's behalf.
     warn_flag_beats_unrecorded_file_value "$destination" NAMESPACE --agent-namespace \
       "${PARAM_AGENT_NAMESPACE:-}" \
       "A later run without it resolves the default namespace, renders tfvars for that one, looks for the recovered Secret there, and is refused by lifecycle.sh's guard_release_namespace." \
@@ -1582,6 +1598,15 @@ bootstrap_install_env_file() {
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
       true \
       "every later install.sh run"
+    # The typed value, not the PARAM: see DRIFT_DETECTOR_FLAG_PASSED's comment.
+    local drift_detector_typed=""
+    if [ "${DRIFT_DETECTOR_FLAG_PASSED:-false}" = "true" ]; then
+      drift_detector_typed="${PARAM_ENABLE_DRIFT_DETECTOR:-}"
+    fi
+    warn_flag_beats_unrecorded_file_value "$destination" ENABLE_DRIFT_DETECTOR --enable-drift-detector \
+      "$drift_detector_typed" \
+      "This key writes both drift tfvars keys, so a later run without it writes neither and the apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there; the front door applies with -auto-approve, so nobody is shown that plan first." \
+      true
     # The scope keys: a flag applies its declaration for this run, and the
     # next full upgrade regenerates from the file, so a project the file does
     # not name is dropped again, its bindings revoked and its profiles retired.
@@ -1676,6 +1701,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   write_env_var "$tmp" ENABLE_STOCKOUT_INVESTIGATOR "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  write_env_var "$tmp" ENABLE_DRIFT_DETECTOR "${PARAM_ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}"
   # Recorded only when this run accepted it -- the decision, not the flag: a
   # flag passed against a cluster that already enforces accepted nothing. The
   # key is a standing decision about this cluster, and every later generator
@@ -2026,6 +2052,7 @@ resolve_shared_defaults() {
   PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  PARAM_ENABLE_DRIFT_DETECTOR="${PARAM_ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}"
 }
 
 # Run a command or function in the background, animating a spinner with elapsed
@@ -5252,6 +5279,7 @@ main() {
   export REGISTRY_PREFIX="$registry_prefix"
   export ENABLE_PUBSUB_PLATFORM="$PARAM_ENABLE_PUBSUB_PLATFORM"
   export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+  export ENABLE_DRIFT_DETECTOR="$PARAM_ENABLE_DRIFT_DETECTOR"
   # Exported only when asked for, the way it was only ever persisted when asked
   # for: an empty value here is an override the installer never took a flag
   # for, turning "leave the third-party images upstream" from a default into an

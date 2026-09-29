@@ -71,7 +71,9 @@ install without the interview.
   sink exporting GKE audit logs (`drift_pubsub_sink`), the drift-audit Pub/Sub
   topic (`drift_pubsub_topic`) and pull subscription
   (`drift_pubsub_subscription`), and the sink-writer and agent-GSA IAM on
-  them. See [Drift audit-log ingress](#drift-audit-log-ingress).
+  them; and, with `enable_drift_detector = true` alongside it, the
+  `spec.harness.driftDetector.enabled` field that starts the consumer. See
+  [Drift audit-log ingress](#drift-audit-log-ingress).
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on
@@ -706,42 +708,66 @@ The subscription is the input to the drift detector of
 Its consumer,
 [`k8s-operator/cmd/drift-detector`](../../../k8s-operator/cmd/drift-detector/README.md),
 ships in the platform-agent images and starts inside the gateway pod when the
-`PlatformAgent` sets `spec.harness.driftDetector.enabled`. This composition
-does not set that field: the flag provisions the ingress, and enabling the
-detector is one leaf in `extra_helm_values`
-(`platformAgent = { harness = { driftDetector = { enabled = true } } }`). With
-the flag on, the composition does write the subscription's name into that
-block (`platformAgent.harness.driftDetector.subscription`), so a renamed
-`drift_pubsub_subscription` is the one the detector pulls from; the detector's
-compiled-in default is the module's default name, which is why an install that
-leaves the name alone would work without that wire and one that renames it
-would not. Turned on without the detector, the sink publishes every mutating
-call on every GKE cluster in the project (about 60k messages a day after the
-module's lease filter, per its README) into a subscription that retains them
-for 31 days and never expires: Pub/Sub storage cost and a backlog until the
-detector is enabled. The reverse, the detector enabled on an install whose
-flag is off, is what the CRD field's description warns about: the process
-retries a pull that cannot succeed for the life of the pod, and the pod stays
-Ready. `lifecycle.sh apply` adopts a topic, subscription or sink of those
+`PlatformAgent` sets `spec.harness.driftDetector.enabled`, which is what
+`enable_drift_detector = true` (default `false`) writes. With
+`enable_drift_pubsub` on, the composition also writes the subscription's name
+into that block (`platformAgent.harness.driftDetector.subscription`), so a
+renamed `drift_pubsub_subscription` is the one the detector pulls from; the
+detector's compiled-in default is the module's default name, which is why an
+install that leaves the name alone would work without that wire and one that
+renames it would not.
+
+The two are separate variables so that a hand-driven apply can provision the
+ingress on its own, and that is the only order allowed. Turned on without the
+detector, the sink publishes every mutating call on every GKE cluster in the
+project (about 60k messages a day after the module's lease filter, per its
+README) into a subscription that retains them for 31 days and never expires:
+Pub/Sub storage cost and a backlog until the detector is enabled. The reverse
+is refused — a `helm_release` precondition fails the apply when
+`enable_drift_detector` is set without `enable_drift_pubsub`. The block
+carrying `enabled` is written only when the ingress is on, so what the
+precondition prevents is not the Ready-forever detector the CRD field's
+description warns about but something quieter: an apply that succeeds, renders
+no `driftDetector` block, provisions nothing, starts nothing, and leaves a
+variable that did nothing as the only evidence. A second precondition refuses
+`enable_drift_detector` when `project_id` is the project number rather than
+the project ID, which the rest of the composition accepts and the operator
+does not (`driftDetectorEnabled` in
+[`k8s-operator`](../../../k8s-operator/internal/controller/platformagent_manifests.go)
+matches it against each audit record's `project_id`, which is always the ID) —
+without it the ingress bills for a stream nothing reads.
+
+`lifecycle.sh apply` adopts a topic, subscription or sink of those
 names left behind by an earlier install before applying, the way it adopts
 the stockout trio, so a re-install does not 409 on them. That adoption is by
 name and cannot tell a leftover from another install's live trio, so a second
 install in the same project that turns the flag on sets its own three names
 first ([Remote state](#remote-state)).
 
-The variable is for a hand-driven apply. The installer front doors
-(`install.sh`, `upgrade.sh`) have no `install.env` key for it and regenerate
-`terraform.tfvars` without it on every run, so on a front-door install a
-`true` written into that file lasts until the next front-door run, whose
-apply then plans the sink, topic and subscription (with up to 31 days of
-retained messages) for removal under `-auto-approve`; no guard refuses that
-the way `guard_pubsub_subscription` refuses a rename. Switching the feature
-off is a teardown the guard reads as deliberate, so it checks the name only
-while the flag is on. Through the front
-doors, set it as a `TF_VAR_enable_drift_pubsub=true` line in `install.env`,
-the same channel `agent_ksa_name` uses: every front door sources that file
-with `set -a`, and Terraform reads `TF_VAR_*` where the generated file is
-silent.
+Through the installer front doors the two variables are one `install.env` key.
+`ENABLE_DRIFT_DETECTOR=true` (also `install.sh --enable-drift-detector`) writes
+both into the generated `terraform.tfvars`, which is the only order the
+precondition accepts. Off, it writes neither — the one boolean in that
+generated file omitted rather than written `false`. `enable_drift_pubsub` is
+reachable on its own as a `TF_VAR_enable_drift_pubsub=true` line in
+`install.env`, the same channel `agent_ksa_name` uses (every front door sources
+that file with `set -a`, and Terraform reads `TF_VAR_*` where the generated file
+is silent), and a tfvars key beats `TF_VAR_`: a written `false` would override
+such an install and plan its sink, topic and subscription — with up to 31 days
+of retained audit records nothing has acknowledged — for removal under
+`-auto-approve`, from a release note nobody read. Omission is what leaves it
+alone.
+
+Which makes turning the key off two different things. On an install that has
+only ever had the key, dropping it returns both variables to their `false`
+defaults and the next apply destroys the sink, topic and subscription, retained
+messages included — the ordinary teardown the other flags get, and the same
+`-auto-approve` destroy the paragraph above describes, arriving this time
+because it was asked for. Nothing refuses it: `guard_pubsub_subscription`
+checks the name only while the flag is on, because switching the feature off is
+a teardown it reads as deliberate rather than the rename it guards against. On
+an install carrying the `TF_VAR_` line, dropping the key stops the detector and
+leaves the ingress running, still exporting and still billing.
 
 **Manual steps that no IaC can perform** — canonical walkthrough:
 [INSTALL.md § Enable Google Chat & Slack Integrations](../../../INSTALL.md#step-5-enable-google-chat--slack-integrations-manual-required-steps):

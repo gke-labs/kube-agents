@@ -378,6 +378,55 @@ class InstallerCommonTest(unittest.TestCase):
         )
         self.assertIn("rc=2\n", proc.stdout, proc.stderr)
 
+    # ── the drift keys: written only when on, and both together ─────────────
+
+    def _drift_tfvars(self, **env):
+        """write_tfvars_from_state under these keys, returning the file's text."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", **env},
+                describe_stub=_autopilot_describe_stub(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            return dest.read_text()
+
+    def test_tfvars_writes_both_drift_keys_when_the_detector_is_on(self):
+        """The ingress and the consumer travel together, on every truthy
+        spelling install.env accepts.
+
+        The composition's helm_release precondition refuses
+        enable_drift_detector without enable_drift_pubsub, so one key here has
+        to produce both. The spellings are the point of the loop: every other
+        boolean in this generator reaches is_truthy through hcl_bool, and a
+        compare against the lowercase literal would read
+        ENABLE_DRIFT_DETECTOR=True as off and provision nothing at all, which
+        is the outcome with no error and nothing to observe afterwards.
+        """
+        for value in ("true", "True", "TRUE", "yes", "y", "1", "on", " true "):
+            with self.subTest(value=value):
+                content = self._drift_tfvars(ENABLE_DRIFT_DETECTOR=value)
+                self.assertIn("enable_drift_pubsub   = true", content)
+                self.assertIn("enable_drift_detector = true", content)
+
+    def test_tfvars_omits_the_drift_keys_when_the_detector_is_off(self):
+        """Omitted rather than written false, which is this generator's one
+        boolean exception, and the reason for it.
+
+        enable_drift_pubsub is also reachable on its own as a TF_VAR_ line in
+        install.env, and terraform.tfvars beats TF_VAR_. `enable_drift_pubsub
+        = false` here would therefore override an install already running the
+        audit-log ingress that way, and the next upgrade would destroy its
+        sink, topic and subscription under -auto-approve.
+        """
+        for value in ("false", "False", "no", "0", "off", "", None):
+            with self.subTest(value=value):
+                env = {} if value is None else {"ENABLE_DRIFT_DETECTOR": value}
+                content = self._drift_tfvars(**env)
+                self.assertNotIn("enable_drift_pubsub", content)
+                self.assertNotIn("enable_drift_detector", content)
+
     # ── the cert-manager probe: a Deployment alone cannot say whose it is ────
 
     def test_tfvars_keeps_cert_manager_when_the_state_manages_the_release(self):
