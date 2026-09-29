@@ -3070,6 +3070,9 @@ class CommandExecutorTest(unittest.TestCase):
         # and so does that shell's sleep. The second signal has to reach the
         # group whether or not the leader is still there, or the survivors
         # keep the pipes and run on outside the slot they were counted under.
+        # The liveness read is immediate on purpose: it relies on the kill
+        # waiting for the group to empty after SIGKILL, and polling here would
+        # pass while that wait regressed to a fire-and-return.
         pid_file = Path(self.temp_dir.name) / "stubborn.pid"
         executor = self.fake_kubectl(
             self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
@@ -3083,6 +3086,43 @@ class CommandExecutorTest(unittest.TestCase):
             self.process_is_live(int(pid_file.read_text().strip())),
             "a descendant that ignored SIGTERM outlived the command",
         )
+
+    def test_the_wait_after_sigkill_is_bounded(self):
+        # After SIGKILL the kill waits for the group to empty, so that what a
+        # command started is gone -- not merely signalled -- when `execute`
+        # returns. A group that never reads as empty (a member in
+        # uninterruptible sleep, an orphan its reaper has not collected) has
+        # to run that wait out rather than hold the slot: every signal-0 probe
+        # here answers that the group is still occupied, and the command still
+        # comes back within the grace plus the bound, the second signal sent
+        # once.
+        sent = []
+        real_killpg = os.killpg
+
+        def always_occupied(pgid, signum):
+            if signum == 0:
+                return None
+            sent.append(signum)
+            return real_killpg(pgid, signum)
+
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="trap '' TERM; sleep 10 & wait $!",
+        )
+        with mock.patch("credential_proxy.os.killpg", always_occupied):
+            result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertEqual(
+            [credential_proxy.signal.SIGTERM, credential_proxy.signal.SIGKILL], sent
+        )
+        floor_ms = (
+            1000
+            + credential_proxy.KILL_GRACE_SECONDS * 1000
+            + credential_proxy.KILL_SETTLE_SECONDS * 1000
+        )
+        self.assertGreaterEqual(result.duration_ms, floor_ms - 100)
+        self.assertLess(result.duration_ms, floor_ms + 3000)
 
     def test_a_hang_up_after_the_pipes_close_still_ends_the_command(self):
         # With both pipes closed the read loop has nothing to watch, so the
@@ -3109,6 +3149,8 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertTrue(result.abandoned)
         self.assertFalse(result.timed_out)
         self.assertLess(time.monotonic() - started, 10)
+        # Immediate, like the other liveness reads: the sleep exits on SIGTERM,
+        # and the kill returns from its grace only once the group is empty.
         self.assertFalse(
             self.process_is_live(int(pid_file.read_text().strip())),
             "the sleep the command started outlived the hang-up",
@@ -3133,7 +3175,13 @@ class CommandExecutorTest(unittest.TestCase):
 
     @staticmethod
     def process_is_live(pid):
-        """Is `pid` still running? A zombie or a missing entry both mean no."""
+        """Is `pid` still running? A zombie or a missing entry both mean no.
+
+        Read right after `execute()` returns, with no retry: `_kill_process_group`
+        returns only once the group is empty, after SIGTERM and after SIGKILL
+        alike, or once its bound for that has run out, and these tests are what
+        holds it to the first half of that.
+        """
         try:
             with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
                 for line in handle:
@@ -3169,6 +3217,8 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertTrue(result.abandoned)
         self.assertFalse(result.timed_out)
         self.assertLess(time.monotonic() - started, 10)
+        # Immediate, like the other liveness reads: the sleep exits on SIGTERM,
+        # and the kill returns from its grace only once the group is empty.
         self.assertFalse(
             self.process_is_live(int(pid_file.read_text().strip())),
             "the sleep the command started outlived the command",
