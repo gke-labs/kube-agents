@@ -3062,12 +3062,17 @@ class CommandExecutorTest(unittest.TestCase):
 
         self.assertTrue(result.timed_out)
         grace_ms = credential_proxy.KILL_GRACE_SECONDS * 1000
-        settle_ms = credential_proxy.KILL_SETTLE_SECONDS * 1000
         self.assertGreaterEqual(result.duration_ms, 1000 + grace_ms - 100)
-        # The wait after SIGKILL returns as soon as the group is gone -- a
-        # few milliseconds here, one poll interval at most -- not when its
-        # bound runs out. Half the bound is the line between the two.
-        self.assertLess(result.duration_ms, 1000 + grace_ms + settle_ms // 2)
+        # The ceiling says the second signal ended the command, not the sleep
+        # running out, so it needs seconds of slack rather than a fraction of
+        # one: the span includes forking the stub, which a loaded runner can
+        # take half a second over, and under a PID 1 that does not reap (the
+        # test process itself as PID 1 of a container, say) the killed sleep
+        # stays a zombie in the group and the wait after SIGKILL runs its
+        # whole bound. How quickly that wait returns once the group is gone
+        # is not a matter of wall-clock here; the fake-clock test below pins
+        # it.
+        self.assertLess(result.duration_ms, 9000)
 
     def test_a_descendant_that_ignores_sigterm_is_killed_with_the_group(self):
         # The leader (bash) dies on SIGTERM; the shell it started ignores it,
@@ -3138,6 +3143,62 @@ class CommandExecutorTest(unittest.TestCase):
         )
         self.assertGreaterEqual(result.duration_ms, floor_ms - 100)
         self.assertLess(result.duration_ms, floor_ms + 3000)
+
+    def test_the_wait_after_sigkill_returns_once_the_group_is_gone(self):
+        # The other half of the bound: the wait ends when the group empties,
+        # one poll later at most, not when KILL_SETTLE_SECONDS runs out. A
+        # wall-clock ceiling cannot pin that -- the span includes a fork and,
+        # under a PID 1 that does not reap, a zombie that holds the group for
+        # the whole bound -- so the clock is faked and the probes counted.
+        # The group here ignores SIGTERM, and after SIGKILL it reads occupied
+        # once (the members not yet scheduled to exit) and then empty.
+        class FakeClock:
+            def __init__(self):
+                self.now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, seconds):
+                self.now += seconds
+
+        clock = FakeClock()
+        sent = []
+        probes_after_kill = []
+
+        def group_that_empties_after_sigkill(pgid, signum):
+            if signum != 0:
+                sent.append((signum, clock.now))
+                return None
+            if sent and sent[-1][0] == credential_proxy.signal.SIGKILL:
+                probes_after_kill.append(clock.now)
+                if len(probes_after_kill) > 1:
+                    raise ProcessLookupError
+            return None
+
+        process = mock.Mock(spec=subprocess.Popen)
+        process.pid = 4242
+        process.poll.return_value = None
+        with (
+            mock.patch.object(credential_proxy, "time", clock),
+            mock.patch("credential_proxy.os.killpg", group_that_empties_after_sigkill),
+            self.assertNoLogs("credential-proxy", level="WARNING"),
+        ):
+            credential_proxy._kill_process_group(process)
+
+        self.assertEqual(
+            [credential_proxy.signal.SIGTERM, credential_proxy.signal.SIGKILL],
+            [signum for signum, _ in sent],
+        )
+        killed_at = sent[-1][1]
+        self.assertGreaterEqual(killed_at, credential_proxy.KILL_GRACE_SECONDS)
+        # Two probes: the one that found the group still there and the one
+        # that found it gone. A wait that ran to its bound would have made
+        # KILL_SETTLE_SECONDS / KILL_POLL_SECONDS of them.
+        self.assertEqual(2, len(probes_after_kill))
+        self.assertAlmostEqual(
+            credential_proxy.KILL_POLL_SECONDS, clock.now - killed_at, places=6
+        )
 
     def test_a_hang_up_after_the_pipes_close_still_ends_the_command(self):
         # With both pipes closed the read loop has nothing to watch, so the
