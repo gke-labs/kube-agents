@@ -195,19 +195,27 @@ NUMBER_WORDS = {
 
 
 def _outside_fences(lines):
-    """Yield `(1-indexed line number, text)` for lines outside ``` fences.
+    """Yield `(1-indexed line number, text)` for non-blank lines outside fences.
 
     Every heading scan below has to skip fenced blocks. A `### ` inside one is
     a shell comment or a JSON fragment, and counting it as a section heading
     shifts every span derived afterwards — silently, in the direction that
     makes a stale citation look correct.
+
+    The fences are read by `strip_fenced_blocks`, so the grammar is the one
+    the harness uses on issue bodies (CommonMark: a run of three or more
+    backticks or tildes indented at most three spaces, closed by a run of the
+    same character at least as long). A toggle on "```" is not that grammar:
+    it reads the inner fence of a four-backtick block as a closer and a
+    four-space-indented run as a delimiter, and either exposes a `### ` the
+    scan then counts. The function blanks fenced lines in place, so line
+    numbers survive; blank lines are dropped here, which no heading scan
+    notices. `scripts/generate_sop_geography.py` carries the same rule,
+    standard-library only, and its tests hold it to these cases.
     """
-    fenced = False
-    for number, line in enumerate(lines, start=1):
-        if line.lstrip().startswith("```"):
-            fenced = not fenced
-            continue
-        if not fenced:
+    stripped = audit_report.strip_fenced_blocks("\n".join(lines)).split("\n")
+    for number, line in enumerate(stripped, start=1):
+        if line:
             yield number, line
 
 
@@ -10467,6 +10475,33 @@ class TestFenceScanning(unittest.TestCase):
 
     def test_a_closer_may_carry_trailing_whitespace(self):
         self.assertIn("/remediate real", self.strip("```\nx\n``` \n/remediate real"))
+
+
+class TestOutsideFences(unittest.TestCase):
+    """The heading scans' fence rule is the harness's, not a toggle on ```."""
+
+    def numbers(self, text):
+        return [n for n, _ in _outside_fences(text.split("\n"))]
+
+    def test_a_heading_inside_a_fence_is_not_outside(self):
+        self.assertEqual([5], self.numbers("```bash\n### 2. comment\n```\n\n### 2. Checks"))
+
+    def test_a_shorter_run_inside_a_longer_fence_does_not_close_it(self):
+        # The shape inventory.md uses: a ```` block wrapping a ``` one. A
+        # toggle closes at the inner fence and counts the heading on line 3.
+        self.assertEqual([6], self.numbers("````\n```\n### 9. inner\n```\n````\n### 1. real"))
+
+    def test_a_tilde_fence_is_a_fence(self):
+        self.assertEqual([4], self.numbers("~~~\n### 9. inner\n~~~\n### 1. real"))
+
+    def test_a_four_space_indented_run_does_not_close_a_block(self):
+        self.assertEqual([5], self.numbers("```\n    ```\n### 9. inner\n```\n### 1. real"))
+
+    def test_three_spaces_of_indent_is_still_a_fence(self):
+        self.assertEqual([4], self.numbers("   ```\n### 9. inner\n   ```\n### 1. real"))
+
+    def test_an_unterminated_fence_runs_to_the_end(self):
+        self.assertEqual([1], self.numbers("### 1. real\n```\n### 9. inner\n"))
 
 
 class TestBlockQuoteScanning(unittest.TestCase):

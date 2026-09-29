@@ -22,9 +22,12 @@ heading outside a fenced block opens the section, and it runs to the line
 before the next ``### `` heading outside a fence, or to the end of the file. A
 ``### `` inside a fence is a shell comment or a JSON fragment, and counting it
 would shift every span after it in the direction that makes a stale pin look
-right. The section number and the spelled-out check count stay authored: the
-test checks both against the SOP, and a generator that wrote them would be
-grading its own work.
+right. A fence is what CommonMark calls one, in the grammar the fleet-audit
+harness's ``strip_fenced_blocks`` parses; the test reads its fences through
+that function, and this script carries the same rule because it imports
+nothing outside the standard library. The section number and the spelled-out
+check count stay authored: the test checks both against the SOP, and a
+generator that wrote them would be grading its own work.
 
 Usage::
 
@@ -48,8 +51,10 @@ SOP_DIR = REPO / "agents/platform/governance"
 
 # The three things a prompt says about its SOP. The first names the file the
 # other two describe, in the profile-home form the prompt uses; the patterns
-# are the geography test's, so what this writes is what that reads.
-SOP_REF_RE = re.compile(r"governance/([A-Za-z0-9_]+\.md)")
+# are the geography test's, so what this writes is what that reads. A prompt
+# that names two governance files is refused rather than measured: the pins
+# describe one of them, and neither this script nor the test can tell which.
+SOP_REF_RE = re.compile(r"governance/([A-Za-z0-9_-]+\.md)")
 TOTAL_RE = re.compile(r"all (\d+) lines of it")
 SPAN_RE = re.compile(r"are section (\d+), lines (\d+)-(\d+)")
 # A prompt is one line of the roster, so a line carrying the key and an SOP
@@ -61,21 +66,42 @@ PROMPT_LINE_RE = re.compile(r'^\s*"prompt":\s*"')
 # one line, a space before the colon) would otherwise be neither rewritten nor
 # compared, and ``--check`` would print ``ok`` over its stale numbers.
 PROMPT_KEY_SHAPE = '"prompt": "'
-FENCE = "```"
+# A fence is CommonMark's, as `strip_fenced_blocks` in the fleet-audit
+# harness parses it: it opens on a run of three or more backticks or tildes
+# indented at most three spaces, and closes on a run of the same character at
+# least as long, indented at most three spaces, with nothing else on the line.
+# A toggle on any line starting with ``` reads the inner fence of a
+# four-backtick block as its closer, a four-space-indented run as a delimiter
+# and a tilde fence as prose, and each exposes lines a heading scan then counts.
+FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+FENCE_MAX_INDENT = 3
 # How much of a refused prompt line an error quotes: enough to identify the job, not the whole prompt.
 ERROR_EXCERPT_CHARS = 120
 SECTION_HEADING = "### "
 
 
 def outside_fences(lines: list[str]):
-    """Yield ``(1-indexed line number, text)`` for lines outside ``` fences."""
-    fenced = False
+    """Yield ``(1-indexed line number, text)`` for lines outside fenced blocks.
+
+    The delimiters themselves are inside. An unterminated fence runs to the
+    end of the file, as it does in every Markdown renderer.
+    """
+    fence_char = ""
+    fence_len = 0
     for number, line in enumerate(lines, start=1):
-        if line.lstrip().startswith(FENCE):
-            fenced = not fenced
+        if fence_char:
+            run = line.rstrip().lstrip(" ")
+            indent = len(line.rstrip()) - len(run)
+            if indent <= FENCE_MAX_INDENT and set(run) == {fence_char} and len(run) >= fence_len:
+                fence_char = ""
+                fence_len = 0
             continue
-        if not fenced:
-            yield number, line
+        opened = FENCE_OPEN_RE.match(line)
+        if opened:
+            fence_char = opened.group(1)[0]
+            fence_len = len(opened.group(1))
+            continue
+        yield number, line
 
 
 def section_span(lines: list[str], section: str) -> tuple[int, int]:
@@ -101,9 +127,13 @@ def rewrite_prompt_line(line: str, sop_dir: Path) -> str:
     geography test's decision, not this script's. A prompt with one pin but
     not the other, or with a pin and no SOP reference to measure it against,
     is refused: the test fails that roster, and a generator that printed
-    ``ok`` over it would be the second gate disagreeing with the first.
+    ``ok`` over it would be the second gate disagreeing with the first. A
+    prompt naming two governance files is refused too, although the test
+    passes it as long as one of them is the stream's SOP: measuring the first
+    one mentioned would write the other file's numbers into the prompt, and
+    ``ok`` over the wrong digits is worse than a refusal the author can read.
     """
-    ref = SOP_REF_RE.search(line)
+    names = sorted(set(SOP_REF_RE.findall(line)))
     total = TOTAL_RE.search(line)
     span = SPAN_RE.search(line)
     if total is None and span is None:
@@ -111,11 +141,16 @@ def rewrite_prompt_line(line: str, sop_dir: Path) -> str:
     if total is None or span is None:
         missing = "length" if total is None else "checks-section span"
         raise ValueError(f"a prompt pins its SOP but states no {missing}: {line.strip()[:ERROR_EXCERPT_CHARS]}")
-    if ref is None:
+    if not names:
         raise ValueError(f"a prompt pins an SOP it does not name: {line.strip()[:ERROR_EXCERPT_CHARS]}")
-    sop = sop_dir / ref.group(1)
+    if len(names) > 1:
+        raise ValueError(
+            f"a prompt names {len(names)} governance files ({', '.join(names)}) and pins one of them; "
+            f"name only the SOP the pins describe: {line.strip()[:ERROR_EXCERPT_CHARS]}"
+        )
+    sop = sop_dir / names[0]
     if not sop.is_file():
-        raise ValueError(f"prompt cites {ref.group(1)}, which is not in {sop_dir}")
+        raise ValueError(f"prompt cites {names[0]}, which is not in {sop_dir}")
     lines = sop.read_text(encoding="utf-8").splitlines()
     section = span.group(1)
     try:
