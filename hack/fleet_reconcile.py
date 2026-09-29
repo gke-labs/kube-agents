@@ -93,6 +93,9 @@ OUTCOME_REFUSED = "refused"
 OUTCOME_FAILED = "failed"
 OUTCOME_BUSY = "busy"
 OUTCOME_PLANNED = "planned"
+# The project a termination landed in: its line names it, because the
+# recovery for an apply killed past its grace is against that project's state.
+OUTCOME_INTERRUPTED = "interrupted"
 # The outcomes that red the job: a project whose fleet is not what the stack
 # declares and stays that way. Busy is not one; the next run gets it.
 FAILING_OUTCOMES = frozenset({OUTCOME_REFUSED, OUTCOME_FAILED})
@@ -101,6 +104,7 @@ REASON_UNMAPPED = "not a mapped pool project (gitops_repo_for_project in hack/ci
 # Boskos's 404 does not say which; a mapped project lands here between its
 # mapping row and its Boskos registration, and reads busy until registered.
 REASON_BUSY = "not free in Boskos, or not registered there yet"
+REASON_INTERRUPTED = "terminated (%s) while tofu ran; an apply cut past its grace leaves the state locked: tofu force-unlock"
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -338,10 +342,22 @@ def _line(project, outcome):
     print("%s: %s (%s)" % (project, outcome[0], outcome[1]), flush=True)
 
 
+def _record(project, outcomes, runner, dry_run):
+    """reconcile_project with its outcome recorded and printed before the
+    caller sees it, the project a termination landed in included."""
+    try:
+        outcomes[project] = reconcile_project(project, runner=runner, dry_run=dry_run)
+    except boskos_pool.Terminated as exc:
+        outcomes[project] = (OUTCOME_INTERRUPTED, REASON_INTERRUPTED % exc)
+        _line(project, outcomes[project])
+        raise
+    _line(project, outcomes[project])
+
+
 def report(outcomes):
     failing = sorted(p for p, (outcome, _) in outcomes.items() if outcome in FAILING_OUTCOMES)
     print(
-        "reconciled %d project(s): %d applied, %d unchanged, %d planned, %d busy, %d refused or failed"
+        "reconciled %d project(s): %d applied, %d unchanged, %d planned, %d busy, %d refused or failed, %d interrupted"
         % (
             len(outcomes),
             sum(1 for o, _ in outcomes.values() if o == OUTCOME_APPLIED),
@@ -349,6 +365,7 @@ def report(outcomes):
             sum(1 for o, _ in outcomes.values() if o == OUTCOME_PLANNED),
             sum(1 for o, _ in outcomes.values() if o == OUTCOME_BUSY),
             len(failing),
+            sum(1 for o, _ in outcomes.values() if o == OUTCOME_INTERRUPTED),
         )
     )
     return failing
@@ -368,8 +385,7 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
     outcomes = {} if outcomes is None else outcomes
     for project in projects:
         if not lease:
-            outcomes[project] = reconcile_project(project, runner=runner, dry_run=dry_run)
-            _line(project, outcomes[project])
+            _record(project, outcomes, runner, dry_run)
             continue
         if project not in known:
             outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
@@ -380,8 +396,7 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
         def visit(p):
             # Recorded and printed inside the hold, so a termination that lands
             # during the release still leaves this project's apply on record.
-            outcomes[p] = reconcile_project(p, runner=runner, dry_run=dry_run)
-            _line(p, outcomes[p])
+            _record(p, outcomes, runner, dry_run)
 
         outcome = boskos_pool.acquire_and_hold(
             server,
@@ -412,9 +427,9 @@ def reconcile_pool(server, owner, size, runner=tofu_runner, dry_run=False, known
     def visit(project):
         if project not in known:
             outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
+            _line(project, outcomes[project])
         else:
-            outcomes[project] = reconcile_project(project, runner=runner, dry_run=dry_run)
-        _line(project, outcomes[project])
+            _record(project, outcomes, runner, dry_run)
 
     _, release_failures = boskos_pool.walk(server, owner, HOLD_STATE, size, visit, heartbeat=True)
     for project, reason in release_failures.items():
@@ -480,10 +495,15 @@ def main(argv=None):
             return EXIT_FAILED
         return EXIT_OK
     except boskos_pool.Terminated as exc:
-        # Every project reached has its line above; the summary says how far
-        # the run got before the signal.
+        # Every project reached has its line above, the one the signal landed
+        # in included; the summary says how far the run got.
         report(outcomes)
-        print("ERROR: terminated (%s) after %d project(s); held projects were released" % (exc, len(outcomes)), file=sys.stderr)
+        interrupted = sorted(p for p, (o, _) in outcomes.items() if o == OUTCOME_INTERRUPTED)
+        print(
+            "ERROR: terminated (%s) after %d project(s)%s; held projects were released"
+            % (exc, len(outcomes), "; interrupted in %s" % ", ".join(interrupted) if interrupted else ""),
+            file=sys.stderr,
+        )
         return boskos_pool.TERMINATED_EXIT_CODE
     except (ReconcileError, boskos_pool.BoskosError) as exc:
         report(outcomes)

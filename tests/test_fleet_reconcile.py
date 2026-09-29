@@ -435,8 +435,12 @@ class MainTest(unittest.TestCase):
             rc = reconcile.main(["--project", P7, "--project", P8, "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
         self.assertEqual(rc, boskos_pool.TERMINATED_EXIT_CODE)
         self.assertIn(f"{P7}: applied", stdout.getvalue())
-        self.assertIn("reconciled 1 project(s)", stdout.getvalue())
-        self.assertIn("terminated (signal 2) after 1 project(s)", stderr.getvalue())
+        # The project the signal landed in is named, with the recovery: the
+        # operator's force-unlock is against that project's state.
+        self.assertIn(f"{P8}: interrupted (terminated (signal 2) while tofu ran", stdout.getvalue())
+        self.assertIn("force-unlock", stdout.getvalue())
+        self.assertIn("reconciled 2 project(s): 1 applied, 0 unchanged, 0 planned, 0 busy, 0 refused or failed, 1 interrupted", stdout.getvalue())
+        self.assertIn(f"terminated (signal 2) after 2 project(s); interrupted in {P8}", stderr.getvalue())
 
     def test_drifted_reads_the_scan_resets_strands_and_applies_the_projects_listed(self):
         boskos = _Boskos(free=[P7, P8])
@@ -700,23 +704,33 @@ class TofuRunnerTest(unittest.TestCase):
     def test_a_termination_while_tofu_is_starting_still_interrupts_it(self):
         # A signal during Popen is deferred until the handle exists, then
         # takes the forward-and-kill path rather than leaving a child running.
+        # Without the deferral the handler raises before the handle is
+        # returned, the runner has nothing to forward to or kill, and the
+        # child lives on unreaped: the handle is kept here and the child is
+        # asserted exited and reaped when the runner raises.
         real_popen = subprocess.Popen
+        handles = []
 
         def popen_then_signal(*args, **kwargs):
             proc = real_popen(*args, **kwargs)
+            handles.append(proc)
             os.kill(os.getpid(), signal.SIGINT)
             return proc
 
-        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
-        started = time.monotonic()
-        try:
-            with mock.patch.object(reconcile.subprocess, "Popen", popen_then_signal):
-                with mock.patch.object(reconcile, "INTERRUPT_GRACE_SECONDS", 1.0):
-                    with self.assertRaises(boskos_pool.Terminated):
-                        reconcile.tofu_runner([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(30)"], timeout=30)
-        finally:
-            signal.signal(signal.SIGINT, previous)
-        self.assertLess(time.monotonic() - started, 6, "the child was interrupted and killed, not left for 30 s")
+        with tempfile.TemporaryDirectory() as tmp:
+            script, _ = self._stubborn_child(tmp)
+            previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+            started = time.monotonic()
+            try:
+                with mock.patch.object(reconcile.subprocess, "Popen", popen_then_signal):
+                    with mock.patch.object(reconcile, "INTERRUPT_GRACE_SECONDS", 1.0):
+                        with self.assertRaises(boskos_pool.Terminated):
+                            reconcile.tofu_runner([sys.executable, "-c", script], timeout=30)
+            finally:
+                signal.signal(signal.SIGINT, previous)
+            self.assertLess(time.monotonic() - started, 6, "the child was interrupted and killed, not left for 30 s")
+            self.assertEqual(len(handles), 1)
+            self.assertIsNotNone(handles[0].poll(), "the child is still running, detached from the runner")
 
     def test_a_second_termination_while_the_first_is_being_forwarded_kills_the_child(self):
         # A signal in the window between catching the first termination and
