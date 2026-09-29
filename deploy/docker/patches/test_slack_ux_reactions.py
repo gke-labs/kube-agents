@@ -226,15 +226,19 @@ class FlagOffIdentityTest(unittest.TestCase):
 
 
 class _Stub:
-    def __init__(self):
+    def __init__(self, ts=ASK, log=None):
         self.calls = []
+        self.ts = ts
+        self.log = log
         self._reacting_message_ids = {"m"}
 
     def _reacting_target(self, event):
-        return (ASK, TEAM, "m") if "m" in self._reacting_message_ids else None
+        return (self.ts, TEAM, "m") if "m" in self._reacting_message_ids else None
 
     async def _react(self, channel, ts, emoji, team_id, *, remove):
         self.calls.append((emoji, remove))
+        if self.log is not None:
+            self.log.append((ts, emoji))
         return True
 
 
@@ -257,8 +261,8 @@ class RuntimeTest(unittest.TestCase):
         cards.start()
         self.addCleanup(cards.stop)
 
-    def _turn(self, text, before, after, outcome="success"):
-        adapter = _Stub()
+    def _turn(self, text, before, after, outcome="success", adapter=None):
+        adapter = adapter or _Stub()
         self.boards[:] = [before, after]
         _run(runtime.on_processing_start(adapter, _event(text)))
         _run(runtime.on_processing_complete(adapter, _event(text), SimpleNamespace(value=outcome)))
@@ -301,11 +305,11 @@ class RuntimeTest(unittest.TestCase):
     def test_delegated_settles_when_the_last_card_does(self):
         adapter = self._turn("fix it", frozenset(), frozenset({"t_a"}))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
-        # A child finishes while the coordinator still runs: nothing yet.
-        self.boards[:] = [frozenset({"t_a"})]
+        # A card this ask did not open finishes: nothing, and no board is read.
+        reads = len(self.board_args)
         _run(runtime.settle_delegated(adapter, self._sub("t_child"), "completed", board="b1"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
-        self.assertEqual(self.board_args[-1], (CHANNEL, THREAD, "b1"))
+        self.assertEqual(len(self.board_args), reads)
         # The coordinator blocks on the user: ⏸️ at once.
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "blocked"))
         self.assertEqual(adapter.calls[-1], ("double_vertical_bar", False))
@@ -313,8 +317,7 @@ class RuntimeTest(unittest.TestCase):
         for kind in ("crashed", "timed_out", "status", "unblocked"):
             _run(runtime.settle_delegated(adapter, self._sub("t_a"), kind))
         self.assertEqual(len(adapter.calls), 2)
-        # It completes and nothing else is open: ✅, and the ask is forgotten.
-        self.boards[:] = [frozenset({"t_a"})]
+        # It completes: ✅, and the ask is forgotten.
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
         self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
@@ -322,9 +325,55 @@ class RuntimeTest(unittest.TestCase):
 
     def test_delegated_failure(self):
         adapter = self._turn("fix it", frozenset(), frozenset({"t_a"}))
-        self.boards[:] = [frozenset()]
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
         self.assertEqual(adapter.calls[-1], ("x", False))
+
+    def test_fan_out_with_a_give_up_settles_once_as_failed(self):
+        # Hermes leaves a gave-up card at status 'blocked', so it still reads as
+        # open on the board; the ask must settle on the event, not the board.
+        adapter = self._turn("fix it", frozenset(), frozenset({"t_a", "t_b"}))
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
+        self.assertEqual(len(adapter.calls), 2)
+
+    def test_a_stale_blocked_card_in_the_thread_does_not_hold_the_settle(self):
+        adapter = self._turn("fix it", frozenset({"t_old"}), frozenset({"t_old", "t_a"}))
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
+        # The stale card finishing later touches nothing.
+        _run(runtime.settle_delegated(adapter, self._sub("t_old"), "gave_up"))
+        self.assertEqual(len(adapter.calls), 2)
+
+    def test_two_asks_in_one_thread_settle_on_their_own_cards(self):
+        log = []
+        first = self._turn("fix it", frozenset(), frozenset({"t_a"}), adapter=_Stub("111.001", log))
+        second = self._turn("scale it", frozenset({"t_a"}), frozenset({"t_a", "t_b"}), adapter=_Stub("111.002", log))
+        _run(runtime.settle_delegated(second, self._sub("t_b"), "blocked"))
+        self.assertEqual(log[-1], ("111.002", "double_vertical_bar"))
+        _run(runtime.settle_delegated(second, self._sub("t_b"), "completed"))
+        self.assertEqual(log[-1], ("111.002", "white_check_mark"))
+        _run(runtime.settle_delegated(first, self._sub("t_a"), "gave_up"))
+        self.assertEqual(log[-1], ("111.001", "x"))
+        self.assertEqual(len(log), 5)
+
+    def test_a_card_that_finishes_before_the_ask_is_deferred(self):
+        # The notifier delivers the card's final event between the turn's board
+        # read and its deferral: the turn settles at once instead of waiting.
+        adapter = _Stub()
+        self.boards[:] = [frozenset()]
+        _run(runtime.on_processing_start(adapter, _event("fix it")))
+
+        async def read_then_race(chat_id, thread_id, board=None):
+            await runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up")
+            return frozenset({"t_a"})
+
+        with mock.patch.object(runtime, "open_cards", read_then_race):
+            _run(runtime.on_processing_complete(adapter, _event("fix it"), SimpleNamespace(value="success")))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+        self.assertFalse(runtime._deferred)
 
     def test_settle_ignores_other_platforms_and_unknown_threads(self):
         adapter = self._turn("fix it", frozenset(), frozenset({"t_a"}))
@@ -370,11 +419,23 @@ class OpenCardsQueryTest(unittest.TestCase):
 
 
 class MissingPresenterTest(unittest.TestCase):
+    def setUp(self):
+        importlib.reload(runtime)
+
     def test_treated_as_off(self):
         with mock.patch.object(runtime, "_presenter", None), mock.patch.dict(
             os.environ, {"KAGE_SLACK_UX": "1"}
         ):
             self.assertFalse(runtime.enabled())
+
+    def test_warns_only_when_the_flag_is_on(self):
+        for value, warns in (("0", False), ("false", False), ("on", True)):
+            importlib.reload(runtime)
+            with self.subTest(flag=value), mock.patch.object(runtime, "_presenter", None), mock.patch.dict(
+                os.environ, {"KAGE_SLACK_UX": value}
+            ), mock.patch.object(runtime.logger, "warning") as warning:
+                runtime.enabled()
+                self.assertEqual(warning.called, warns)
 
 
 # Keep the enum import used: the fixture's ProcessingOutcome is exec'd, this
