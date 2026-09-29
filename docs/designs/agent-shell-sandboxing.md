@@ -1716,9 +1716,9 @@ agent-side servers and their tests — `platform_mcp_server.py`, `session_kv_ser
 wholesale would put a file named `credential_proxy.py` inside the sandbox, which is the
 wrong thing for a reviewer to find even though it is inert there. So the image gets an
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
-`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`
-and `stall_report.py` — the entry points an agent is told to run, plus the transitive
-closure of what they import.
+`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
+`stall_report.py` and `inventory_findings.py` — the entry points an agent is told to run,
+plus the transitive closure of what they import.
 
 **The test for whether a script qualifies is what it needs, not how it is called.** An
 earlier version of this proposed "shell call sites, and absent from every `jobs.json`",
@@ -1730,8 +1730,9 @@ qualifying question is the one the cron section below already asks — does it n
 agent-pod-only resources: the `hermes` binary, the profiles tree, the session or kanban
 databases, Hermes' own Python namespace.
 
-Two scripts fail an agent that runs them from the shell: `cluster_agent_profile.py` and
-`cluster_agent_reconcile.py`. Each gets a stub at its path in the sandbox that prints why it cannot run there and exits non-zero. Leaving the
+Three scripts fail an agent that runs them from the shell: `cluster_agent_profile.py`,
+`cluster_agent_reconcile.py`, and `eod_report_generator.py`, which reads the session
+database and is named by its SOP for a hand run. Each gets a stub at its path in the sandbox that prints why it cannot run there and exits non-zero. Leaving the
 path empty was the other option and reads worse — the model gets `No such file or
 directory`, concludes the image is broken, and spends a turn proving it. The fuller
 answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
@@ -1742,10 +1743,11 @@ deleting a profile still has no tool.
 None of this is held together by review.
 [`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)
 reads the allowlist out of the Dockerfile and checks it against the agents' own
-instructions: every shared script named by a runtime path is baked or stubbed, the
-allowlist is closed under import, and nothing on it names an interpreter the sandbox
-does not have. Adding a skill that calls a new shared script fails that test rather
-than failing in a pod.
+instructions, which include the governance SOPs a card's worker follows and the Chat
+Agent's tree that writes those cards: every shared script named by a runtime path is
+baked or stubbed, the allowlist is closed under import, and nothing on it names an
+interpreter the sandbox does not have. Adding a skill that calls a new shared script
+fails that test rather than failing in a pod.
 
 **`SETTINGS.md` is mounted, at `/opt/data/SETTINGS.md`.** Its content is per-install:
 the operator renders it from `spec.integration.github.gitRepo` into an
