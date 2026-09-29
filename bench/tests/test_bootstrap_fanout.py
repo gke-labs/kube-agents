@@ -17,7 +17,8 @@
 ``fixtures/bootstrap_fanout/boards.json`` holds the board rows two live
 discovery sweeps left on one install -- ``main``, whose worker filed no
 Cluster Agent card, and ``branch``, whose worker filed one per profile -- with
-the project id replaced. The in-pod script runs here under the test
+the project id replaced and the Cluster Agent cards keyed by profile name, as
+the gate keys them. The in-pod script runs here under the test
 interpreter against a data root rebuilt from them; each failure case mutates
 one of the two.
 """
@@ -157,7 +158,7 @@ def test_the_read_returns_the_sweep_its_children_and_the_roster(tmp_path: Path) 
     assert len(payload["roster"]) == 4
     assert payload["unidentified"] == []
     keys = sorted(c["key"] for c in payload["children"])
-    assert keys[0] == "bootstrap-inventory-cluster-example-project-agent-harness-dev-cluster-us-central1"
+    assert keys[0] == "bootstrap-inventory-cluster-cluster-example-project-agent-harness-dev-cluster--1d9f820d"
     assert "bootstrap-inventory-prioritize" in keys
 
 
@@ -314,6 +315,17 @@ def test_a_card_assigned_to_the_wrong_profile_fails(pod) -> None:
     result = _verify("one_card_per_cluster_agent")
     assert result.status == "fail"
     assert "matching no Cluster Agent" in result.reason
+
+
+def test_a_card_keyed_by_the_cluster_identity_fails(pod) -> None:
+    # The hyphen-joined identity gives `proj-a`/`b` and `proj`/`a-b` one key.
+    board = _board("branch")
+    card = _card(board, "cluster-example-project-platform-agent-host")
+    card["idempotency_key"] = discovery.CLUSTER_KEY_PREFIX + "example-project-platform-agent-host-us-east4"
+    pod(board)
+    result = _verify("one_card_per_cluster_agent")
+    assert result.status == "fail"
+    assert "no card for ['cluster-example-project-platform-agent-host-us-east4']" in result.reason
 
 
 def test_a_profile_without_an_identity_is_not_on_the_roster(pod) -> None:

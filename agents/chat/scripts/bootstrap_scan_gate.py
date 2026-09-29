@@ -183,8 +183,8 @@ def _cluster_agent_calls() -> list[str]:
     preflight, and its cluster is better audited by the sweep itself in Step 4.
 
     A profile without a readable ``cluster_identity`` is left out, as the
-    reconcile neither counts nor prunes one: there is no cluster to key its card
-    by, and the card already sends every cluster the list misses to Step 4. A
+    reconcile neither counts nor prunes one: there is no cluster to name on its
+    card, and the card already sends every cluster the list misses to Step 4. A
     profile whose directory or config cannot be read is skipped the same way: a
     file like that is what keeps the reconcile failing until it gives up and
     files the sweep, so it must not take the other profiles with it. An entry
@@ -229,11 +229,14 @@ def _cluster_agent_calls() -> list[str]:
                 f"bootstrap_scan_gate: skipping Cluster Agent {name}: no complete cluster_identity in its config\n"
             )
             continue
-        project, cluster, location = identity["project"], identity["cluster"], identity["location"]
+        # Keyed by the profile name: the identity fields all allow hyphens, so
+        # joining them with hyphens gives two clusters one key, and the board
+        # answers the second create with the first card.
         calls.append(
             f"kanban_create(assignee='{name}', "
-            f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}{project}-{cluster}-{location}', "
-            f"title='Report cluster inventory: {cluster}', body=<the instructions below>)"
+            f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}', "
+            f"title='Report cluster inventory: `{identity['cluster']}` (`{identity['project']}`, "
+            f"`{identity['location']}`)', body=<the instructions below>)"
         )
     return calls
 

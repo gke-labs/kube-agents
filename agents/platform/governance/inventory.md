@@ -39,15 +39,18 @@ Use native Google Cloud CLI (`gcloud`) and Kubernetes (`kubectl`) read-only comm
 ## Step 2: Fan the per-cluster audit out to the Cluster Agents
 
 The workload audit is single-cluster runtime work, so each cluster's own Cluster Agent runs it, not
-you (`SOUL.md` §6). Create one card per cluster from Step 1 that has a Cluster Agent on the
-roster, **all of them up front, in one
-burst and with no `parents`**, so the dispatcher runs them concurrently:
+you (`SOUL.md` §6). **Your card lists one `kanban_create` call per Cluster Agent: make exactly
+those calls and no others.** The gate read them from the Cluster Agent profiles, which your terminal
+cannot see, so a roster you look up yourself is incomplete. If the card lists none, there are no
+Cluster Agents: skip to Step 4 and audit every cluster from Step 1 yourself. Make the calls **all up
+front, in one burst and with no `parents`**, so the dispatcher runs them concurrently. Each has this
+shape:
 
 ```
 kanban_create(
-  assignee='<that cluster's Cluster Agent profile>',
-  idempotency_key='bootstrap-inventory-cluster-<project>-<cluster>-<location>',
-  title='Report cluster inventory: <cluster>',
+  assignee='<the Cluster Agent profile>',
+  idempotency_key='bootstrap-inventory-cluster-<the Cluster Agent profile>',
+  title='Report cluster inventory: `<cluster>` (`<project>`, `<location>`)',
   body=<the instructions below>,
 )
 ```
@@ -70,7 +73,7 @@ followed named zero problems on a fleet that had them.
 **Do not create, repair, or delete a Cluster Agent profile.** Profile lifecycle belongs to
 `cluster_agent_reconcile.py`, which holds the scope and its exclusions and the create/prune
 rules; a profile you create by hand is one the next reconcile run may immediately prune, and you
-will loop. A cluster the roster does not cover is yours to audit in Step 4 — or, if you cannot
+will loop. A cluster no call on your card covers is yours to audit in Step 4 — or, if you cannot
 reach it, a row in the report saying so.
 
 ---
@@ -114,10 +117,10 @@ what makes the report whole: the children tell you only about clusters that had 
 the `Status` column has no other source, and any listed cluster that returned no `metadata` is one
 nobody has audited.
 
-**A cluster with no Cluster Agent has no `metadata`, and you audit it here yourself.** That is the
-whole install when the roster is empty, and usually none of them otherwise — the reconcile gives
-every listed cluster a profile — but derive the set by comparing the list against the clusters that
-reported rather than assuming it is empty. Follow Steps 2 to 4 of `cluster_inventory_audit_sop.md`
+**A cluster with no Cluster Agent has no `metadata`, and you audit it here yourself.** Those are
+the clusters in the list that no `kanban_create` call on your card names: all of them when the card
+lists none, and usually none otherwise, because the reconcile gives every listed cluster a profile.
+Take the set from the card's calls, not from a roster you look up. Follow Steps 2 to 4 of `cluster_inventory_audit_sop.md`
 for each, and record what you find in that SOP's Step 5 `metadata` shape: Step 2 is the
 control-plane topology the fleet table's columns need, and Steps 3 and 4 are the probes,
 requests/limits and QoS, HPA, security context, namespace governance, addons, observability and

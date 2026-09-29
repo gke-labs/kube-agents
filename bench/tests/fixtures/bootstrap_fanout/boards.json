@@ -40,7 +40,7 @@
         "created_at": 1790608098,
         "created_by": "platform",
         "id": "t_0fa00dd8",
-        "idempotency_key": "bootstrap-inventory-cluster-example-project-agent-harness-dev-cluster-us-central1",
+        "idempotency_key": "bootstrap-inventory-cluster-cluster-example-project-agent-harness-dev-cluster--1d9f820d",
         "status": "archived",
         "title": "Report cluster inventory: agent-harness-dev-cluster"
       },
@@ -67,7 +67,7 @@
         "created_at": 1790608099,
         "created_by": "platform",
         "id": "t_88b454c0",
-        "idempotency_key": "bootstrap-inventory-cluster-example-project-platform-agent-host-us-east4",
+        "idempotency_key": "bootstrap-inventory-cluster-cluster-example-project-platform-agent-host-us-east4",
         "status": "archived",
         "title": "Report cluster inventory: platform-agent-host"
       },
@@ -76,7 +76,7 @@
         "created_at": 1790608098,
         "created_by": "platform",
         "id": "t_be38b384",
-        "idempotency_key": "bootstrap-inventory-cluster-example-project-cc-triage-test-cluster-us-central1-a",
+        "idempotency_key": "bootstrap-inventory-cluster-cluster-example-project-cc-triage-test-cluster-us--66162cf2",
         "status": "archived",
         "title": "Report cluster inventory: cc-triage-test-cluster"
       },
@@ -85,7 +85,7 @@
         "created_at": 1790608099,
         "created_by": "platform",
         "id": "t_f2f3cc97",
-        "idempotency_key": "bootstrap-inventory-cluster-example-project-support-eval-cluster-us-central1-a",
+        "idempotency_key": "bootstrap-inventory-cluster-cluster-example-project-support-eval-cluster-us-central1-a",
         "status": "archived",
         "title": "Report cluster inventory: support-eval-cluster"
       }

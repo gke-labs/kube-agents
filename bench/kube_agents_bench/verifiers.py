@@ -718,7 +718,7 @@ class BootstrapFanoutVerifier(BaseVerifier):
     - ``one_card_per_cluster_agent``: every Cluster Agent that is registered,
       finished scaffolding and has a cluster identity got exactly one
       ``bootstrap-inventory-cluster-*`` card, assigned to it and keyed by its
-      cluster, and no such card went anywhere else.
+      profile name, and no such card went anywhere else.
     - ``no_card_waits_on_the_sweep``: no ``bootstrap-inventory-cluster-*``
       card names the sweep as a parent. A child waiting on the card that waits
       on it never runs until the sweep has given up on it.

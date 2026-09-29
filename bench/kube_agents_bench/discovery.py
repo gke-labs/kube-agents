@@ -107,8 +107,7 @@ for name in names:
     if not isinstance(ident, dict) or not all(ident.get(k) for k in ("project", "cluster", "location")):
         out["unidentified"].append(name)
         continue
-    key = "%s%s-%s-%s" % (PREFIX, ident["project"], ident["cluster"], ident["location"])
-    out["roster"].append({"profile": name, "key": key})
+    out["roster"].append({"profile": name, "key": PREFIX + name})
 
 try:
     conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)

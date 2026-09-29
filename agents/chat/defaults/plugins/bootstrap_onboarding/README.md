@@ -252,7 +252,29 @@ kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- cat /opt/data
 
 `INVENTORY.raw.md` is where a stalled sweep shows itself: present means the sweep finished and prioritization is the stage that has not.
 
-To deliberately re-run discovery, remove the markers for the stages you want to repeat (`.bootstrap_scan_filed` to re-file the sweep, `.bootstrap_greeted` to re-greet, `.bootstrap_completed` to allow another delivery). **`INVENTORY.raw.md` must go too** — unlike the report, nothing ever cleans it up, and the scan gate skips while it exists, so clearing only `.bootstrap_scan_filed` leaves discovery permanently disarmed:
+To deliberately re-run discovery, **archive the previous run's cards first**, while the markers
+still keep the gate idle. The board answers a `kanban_create` whose idempotency key matches a card
+that is not archived by returning that card and creating nothing, so a left-over
+`bootstrap-inventory-scan` card makes the gate's re-file a no-op, and a per-cluster card still open
+from an interrupted sweep either stands in for the new sweep's card or, under a key spelled
+differently, runs beside it for the same cluster. Archive newest first: archiving a card promotes
+whatever was waiting on it, so the sweep card goes last or its prioritize card is dispatched in
+between:
+
+```bash
+kubectl exec -i -n kubeagents-system ${POD_NAME} -c platform-agent -- /opt/hermes/.venv/bin/python3 - <<'PY'
+import sqlite3, subprocess
+board = sqlite3.connect("file:/opt/data/kanban.db?mode=ro", uri=True)
+rows = board.execute(
+    "SELECT id FROM tasks WHERE idempotency_key LIKE 'bootstrap-inventory-%' "
+    "AND status != 'archived' ORDER BY created_at DESC"
+).fetchall()
+for (task_id,) in rows:
+    subprocess.run(["/opt/hermes/.venv/bin/hermes", "kanban", "archive", task_id], check=True)
+PY
+```
+
+Then remove the markers for the stages you want to repeat (`.bootstrap_scan_filed` to re-file the sweep, `.bootstrap_greeted` to re-greet, `.bootstrap_completed` to allow another delivery). **`INVENTORY.raw.md` must go too** — unlike the report, nothing ever cleans it up, and the scan gate skips while it exists, so clearing only `.bootstrap_scan_filed` leaves discovery permanently disarmed:
 
 ```bash
 kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md /opt/data/.bootstrap_scan_filed /opt/data/.bootstrap_greeted /opt/data/.bootstrap_completed /opt/data/.bootstrap_reconcile_attempts
@@ -261,7 +283,9 @@ kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- rm -f /opt/da
 **Once a report has been delivered, clearing markers is not enough.** `_cleanup` removes both
 onboarding cron jobs after a successful delivery, so there is nothing left to fire and a marker
 reset produces silence. Check with `grep bootstrap /opt/data/cron/jobs.json` inside the pod; if the jobs are gone, either
-re-add them or skip the gate entirely and file the sweep card yourself. Filing directly skips the
+re-add them or skip the gate entirely and file the sweep card yourself. Archive the previous run's
+cards first, as above: the card body lists the same per-cluster keys every time, so the previous
+run's cards would answer them with their old results. Filing directly skips the
 gate's reconcile, and the card body forbids the worker from reconciling the roster itself, so run
 the reconcile first or the sweep fans out to a stale roster. Run these inside the agent
 container, the first two with the Hermes interpreter named in full: the card body lists the Cluster

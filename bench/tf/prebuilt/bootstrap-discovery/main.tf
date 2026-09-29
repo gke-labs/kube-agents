@@ -27,12 +27,8 @@
 # worker.
 #
 # Re-arming is the runbook in agents/chat/defaults/plugins/bootstrap_onboarding/
-# README.md §5 plus one step: the board deduplicates kanban_create on
-# idempotency key against every card that is not archived, so the previous
-# run's `bootstrap-inventory-*` cards are archived first, or the gate's
-# create returns the old card and no sweep runs. Newest first: archiving a
-# card promotes whatever was waiting on it, so the sweep goes last or its
-# prioritize card is dispatched in between.
+# README.md §5: the previous run's `bootstrap-inventory-*` cards are archived,
+# newest first, and then the markers are removed.
 #
 # It refuses an install where a person has connected (`.user_aligned`) or
 # onboarding already delivered (`.bootstrap_completed`): a fresh sweep there
@@ -122,13 +118,13 @@ resource "null_resource" "sweep" {
           # back files once its reconcile ends, so the listing also waits for
           # any gate run to exit, for up to gate_wait once the marker is back:
           # a gate run that read it absent while the restore was failing can
-          # take all of that. The restore is retried for as long. One that
-          # never succeeds leaves no wait, because the gate check execs into
-          # the same pod and reads a failed exec as a gate run.
+          # take all of that. The restore is retried for as long, and the wait
+          # starts over however the restore ended: one that failed on the
+          # write rather than the exec leaves a gate that can still file.
           failed=""
           waited=0
           if [ -n "$old_id" ]; then
-            until agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$old_id" >&2 && waited=0; do
+            until agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$old_id" >&2; do
               if [ "$waited" -ge ${local.gate_wait} ]; then
                 failed="$failed, put back the sweep marker"
                 break
@@ -137,6 +133,7 @@ resource "null_resource" "sweep" {
               waited=$((waited + 5))
             done
           fi
+          waited=0
           until [ "$(gate_running)" = idle ] || [ "$waited" -ge ${local.gate_wait} ]; do
             sleep 5
             waited=$((waited + 5))

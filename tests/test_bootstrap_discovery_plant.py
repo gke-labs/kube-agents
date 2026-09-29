@@ -67,7 +67,7 @@ _STEP_2_RE = re.compile(r"^old_id=\"\$\(agent_py <<'PY'\n(.*?)\nPY\n", re.S | re
 _PLANT_BLOCK = 0
 _DESTROY_BLOCK = 1
 _SWEEP = "t_sweep"
-_CLUSTER_KEY = "bootstrap-inventory-cluster-example-project-cluster-"
+_CLUSTER_KEY = "bootstrap-inventory-cluster-cluster-example-project-"
 
 _INTERPOLATIONS = {
     "local.home": "/opt/data",
@@ -438,8 +438,18 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
     def test_the_trap_names_a_marker_restore_it_never_managed(self):
         completed, calls = self._run(GATE_FILES=0, RESTORE_FAILS=1000, NO_PODS=1)
         self.assertNotEqual(completed.returncode, 0)
-        self.assertEqual(calls.count("sleep 5"), 60)
+        self.assertEqual(calls.count("sleep 5"), 2 * 300 // 5)
         self.assertEqual(len(self._indices(calls, "[open_cards]")), 3)
+        self.assertIn("Cleanup incomplete: could not put back the sweep marker.", completed.stderr)
+
+    def test_the_trap_waits_for_the_gate_after_a_restore_it_never_managed(self):
+        # The restore fails for the whole gate_wait while the leader's gate run
+        # is still going; that run files as it exits, and the trap archives it.
+        completed, calls = self._run(GATE_FILES=0, RESTORE_FAILS=1000, GATE_BUSY_CHECKS=10, RACE=1)
+        self.assertNotEqual(completed.returncode, 0)
+        archive = [i for i, call in enumerate(calls) if call.endswith("archive t_raced [archive]")]
+        self.assertEqual(len(self._indices(calls, "[gate pod/gw-leader]")), 11)
+        self.assertEqual(len(archive), 1, calls)
         self.assertIn("Cleanup incomplete: could not put back the sweep marker.", completed.stderr)
 
     def test_the_trap_names_a_card_it_could_not_archive(self):

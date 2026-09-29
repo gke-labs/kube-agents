@@ -194,10 +194,10 @@ class ScanGateTest(unittest.TestCase):
             rc = bootstrap_scan_gate.main(self.d)
         return rc, buf.getvalue().strip()
 
-    def _cluster_agent(self, project, cluster, location, registered=True, artifacts=SCAFFOLD_ARTIFACTS):
+    def _cluster_agent(self, project, cluster, location, registered=True, artifacts=SCAFFOLD_ARTIFACTS, name=None):
         # Named and stamped by the functions create_profile uses, so the fixture
         # carries the identity block the reconcile actually writes.
-        name = cluster_agent_profile.profile_name(project, cluster, location)
+        name = name or cluster_agent_profile.profile_name(project, cluster, location)
         home = cluster_agent_profile.profile_home(name)
         home.mkdir(parents=True)
         cluster_agent_profile._inject_cluster_identity(home, project, cluster, location)
@@ -348,22 +348,17 @@ class ScanGateTest(unittest.TestCase):
         mirror's directories and fanned out from that.
         """
         short = self._cluster_agent("proj", "prod", "us-east4")
-        # Long enough that profile_name() truncates and hashes it: the assignee is
-        # the profile name, and the key comes from the stamped identity.
+        # Long enough that profile_name() truncates and hashes it: the key is the
+        # profile name, as the assignee is, not the stamped identity.
         hashed = self._cluster_agent(
             "proj", "a-cluster-name-long-enough-to-be-hashed", "us-central1-a"
         )
         self.assertNotIn("us-central1-a", hashed)
         step2 = self._step_2(bootstrap_scan_gate._task_body())
         prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
-        self.assertIn(
-            f"kanban_create(assignee='{short}', idempotency_key='{prefix}proj-prod-us-east4'", step2
-        )
-        self.assertIn(
-            f"kanban_create(assignee='{hashed}', "
-            f"idempotency_key='{prefix}proj-a-cluster-name-long-enough-to-be-hashed-us-central1-a'",
-            step2,
-        )
+        self.assertIn(f"kanban_create(assignee='{short}', idempotency_key='{prefix}{short}'", step2)
+        self.assertIn(f"kanban_create(assignee='{hashed}', idempotency_key='{prefix}{hashed}'", step2)
+        self.assertIn("title='Report cluster inventory: `prod` (`proj`, `us-east4`)'", step2)
         self.assertEqual(step2.count("kanban_create("), 2)
         self.assertNotIn("/opt/hermes", step2)
         self.assertNotIn("profile list", step2)
@@ -378,10 +373,23 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(len(keys), 2)
         self.assertEqual(len(set(keys)), 2)
 
+    def test_identities_that_join_to_one_string_get_distinct_keys(self):
+        # `proj-a`/`b` and `proj`/`a-b` hyphen-join to the same string, so a key
+        # built from the identity gives both clusters one card. profile_name()
+        # joins them the same way; the second profile here stands for one whose
+        # directory name differs, which the key must follow.
+        first = self._cluster_agent("proj-a", "b", "us-central1")
+        second = self._cluster_agent("proj", "a-b", "us-central1", name="cluster-proj-a-b-us-central1-2")
+        step2 = self._step_2(bootstrap_scan_gate._task_body())
+        prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
+        self.assertEqual(
+            re.findall(r"idempotency_key='([^']+)'", step2), [f"{prefix}{first}", f"{prefix}{second}"]
+        )
+
     def test_step_2_leaves_out_what_is_not_a_cluster_agent(self):
         # `default` and `platform` share the directory; stamped and scaffolded here so
         # that only the reserved-name rule can be what drops them. An unstamped profile
-        # has no cluster to key its card by, and the reconcile skips it for the same reason.
+        # has no cluster to name on its card, and the reconcile skips it for the same reason.
         for reserved, cluster in (("default", "a"), ("platform", "b")):
             home = self.d / "profiles" / reserved
             home.mkdir(parents=True)
@@ -723,9 +731,9 @@ class ScanGateTest(unittest.TestCase):
         # (The aggregation card's key went with the fan-in shape, #1010: the
         # sweep card now waits for its children and writes the findings itself,
         # so the only spawned cards left are per-cluster and prioritize.)
-        self._cluster_agent("proj", "prod", "us-east4")
+        name = self._cluster_agent("proj", "prod", "us-east4")
         body = bootstrap_scan_gate._task_body()
-        self.assertIn(f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}proj-prod-us-east4", body)
+        self.assertIn(f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}", body)
         self.assertIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
 
     def test_parses_task_id_from_either_response_shape(self):
