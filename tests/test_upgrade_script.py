@@ -1197,7 +1197,9 @@ class RetagValuesAgainstHelmTest(unittest.TestCase):
         }
     }
     _HELM_TIMEOUT_SECONDS = 120
-    _SCHEMA_ERROR = "additional properties 'scope' not allowed"
+    # Helm 3.18+ and 4, then older Helm 3.
+    _SCHEMA_ERROR = r"additional properties 'scope' not allowed|Additional property scope is not allowed"
+    _SCOPE_DEFAULT = "\n  scope: null\n"
     _TEXT_TEMPLATE = (
         'note: {{ .Values.note | default "" | b64enc }}\n'
         "notes: {{ .Values.notes | default list | toJson | b64enc }}\n"
@@ -1218,6 +1220,12 @@ class RetagValuesAgainstHelmTest(unittest.TestCase):
         schema = json.loads(schema_path.read_text())
         del schema["properties"]["platformAgent"]["properties"]["scope"]
         schema_path.write_text(json.dumps(schema))
+        # 0.7.0 has no `scope` default either, and Helm 3 keeps a null default
+        # through to the schema check where Helm 4 discards it.
+        values_path = chart / "values.yaml"
+        values = values_path.read_text()
+        self.assertEqual(values.count(self._SCOPE_DEFAULT), 1)
+        values_path.write_text(values.replace(self._SCOPE_DEFAULT, "\n"))
         return repo
 
     def _text_chart(self):
@@ -1298,7 +1306,7 @@ helm_retag operator.image.tag
             timeout=self._HELM_TIMEOUT_SECONDS,
         )
         self.assertNotEqual(proc.returncode, 0, proc.stdout[-2000:])
-        self.assertIn(self._SCHEMA_ERROR, proc.stderr)
+        self.assertRegex(proc.stderr, self._SCHEMA_ERROR)
 
     def test_the_filtered_values_render(self):
         proc = self._retag(self._RECORDED, self._rollback_chart())
