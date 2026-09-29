@@ -10,4 +10,5 @@ uv.lock
 *.tfstate
 *.tfstate.backup
 .terraform.lock.hcl
+!tf/fleet/.terraform.lock.hcl
 kind-kubeconfig.yaml

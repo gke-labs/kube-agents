@@ -11,11 +11,14 @@ what blocks did not move that day; the admissions and promotions since are
 pinned beside them (ADMITTED_AFTER_THE_SPLIT, PROMOTED_AFTER_THE_SPLIT), and
 so is the 2026-09-22 decision that the presubmit runs the blocking roster
 only (HELD_OUT_TO_NIGHTLY: the seven held-out cases that left the presubmit
-file for the nightly one that day) -- and the nightly file holds the
+file for the nightly one that day) and the held-out seats a coverage tracker
+puts back in the presubmit file without a roster line (HELD_OUT_IN_PRESUBMIT,
+the documented exception: #2013, #2016) -- and the nightly file holds the
 script's nightly array plus the nine cases the TASKS array held commented
 out, which the same decision moved into the nightly (#1546, #1564), plus
 whatever landed there since (ADDED_AFTER_THE_SPLIT, ADDED_AFTER_THE_MOVED_BLOCK),
-less the cases promoted out of it since, plus the seven. A later roster change
+less the cases promoted out of it since, plus the seven, less any held-out
+seat. A later roster change
 edits the expected sets here in the same pull request; that is the point of
 pinning them, since the files are what the eval-crew rule in hack/OWNERS
 guards.
@@ -83,7 +86,7 @@ NIGHTLY_AT_SPLIT = [
     "knowledge-grounding-sources-probe",
     "cluster-agent-stalled-controller-healthy-silence",
     "chat-routing-board-read",
-    "pdb-remediation-pr",  # still here: its 2026-09-22 promotion was withdrawn, the record predates its #1780 grader
+    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); its held-out presubmit seat opened 2026-09-28 (HELD_OUT_IN_PRESUBMIT)
 ]
 # The nine cases TASKS held commented out at the split, moved into the
 # nightly by the same decision. The two commented-out cases NOT here --
@@ -156,16 +159,32 @@ PROMOTED_AFTER_THE_SPLIT = [
 # (#1023), when the eval crew decided the presubmit runs the blocking roster
 # and nothing else: the seven cases the presubmit had run without letting
 # them block, in the presubmit file's reporting order, each with its hold-out
-# reason beside its nightly line. The presubmit file and the roster have held
-# the same cases since.
+# reason beside its nightly line. The presubmit file and the roster held the
+# same cases from then until the first held-out seat (HELD_OUT_IN_PRESUBMIT).
 HELD_OUT_TO_NIGHTLY = [
     "security-overgrant-remediation-proposal",  # #1066, never admitted
     "obtainability-pdb-semantics",  # #1049, never admitted
     "obtainability-fleet-exposure-sweep",  # #1049, never admitted
     "obtainability-healthy-namespace-silence",  # #1049, never admitted
     "rca-remediation-pr",  # demoted 2026-09-02, #1189
-    "compliance-rbac-overgrant",  # demoted 2026-09-02, #1171
+    "compliance-rbac-overgrant",  # demoted 2026-09-02, #1171; seated back in the presubmit 2026-09-29 (HELD_OUT_IN_PRESUBMIT)
     "cluster-agent-healthy-workload-no-finding",  # held out on #1010
+]
+
+# Seated in the presubmit file WITHOUT a roster line: the documented exception
+# to the 2026-09-22 rule, one case per coverage tracker, as (case, the
+# presubmit line it follows). A held-out seat runs on every pull request and
+# cannot red one on a graded failure -- rungs 4 and 6 are scoped to the
+# roster; rungs 1-3 still block for it as for every case -- and earns its
+# record at presubmit volume instead of one nightly a night. Each case here is
+# also in a nightly expectation above (its nightly line is what moved), and
+# the nightly still runs it through the presubmit file. The tracker's
+# roster-line step deletes the entry here and adds the name to
+# blocking-roster.txt. roster <= presubmit holds; presubmit == roster holds
+# less exactly this list.
+HELD_OUT_IN_PRESUBMIT = [
+    ("compliance-rbac-overgrant", "agent-kanban-smoke"),  # #2013 step 2, seated 2026-09-29; the roster line is step 4
+    ("pdb-remediation-pr", "compliance-rbac-overgrant"),  # #2016 step 2, seat opened 2026-09-28; the roster line is step 4
 ]
 
 
@@ -226,14 +245,30 @@ class ParserTest(unittest.TestCase):
 class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted_less_the_held_out(self):
         expected = [c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT) if c not in HELD_OUT_TO_NIGHTLY]
-        self.assertEqual(eval_rosters.presubmit_cases(), expected)
+        self.assertEqual(eval_rosters.presubmit_cases(), with_insertions(expected, HELD_OUT_IN_PRESUBMIT))
 
-    def test_the_presubmit_runs_the_blocking_roster_and_nothing_else(self):
+    def test_the_presubmit_runs_the_blocking_roster_plus_the_held_out_seats_and_nothing_else(self):
         # Decided 2026-09-22 (#1023): a case that cannot red a pull request
-        # does not run on one. The script checks only that the roster is a
-        # subset of the presubmit; the equality is policy, pinned here.
-        self.assertEqual(eval_rosters.presubmit_cases(), eval_rosters.blocking_roster())
+        # does not run on one -- less the documented exception, one seat per
+        # coverage tracker (HELD_OUT_IN_PRESUBMIT), which runs without
+        # blocking until its roster line lands. The script checks only that
+        # the roster is a subset of the presubmit; the rest is policy, pinned here.
+        seated = {case for case, _ in HELD_OUT_IN_PRESUBMIT}
+        self.assertEqual([c for c in eval_rosters.presubmit_cases() if c not in seated], eval_rosters.blocking_roster())
+        for case in seated:
+            with self.subTest(case=case):
+                self.assertIn(case, eval_rosters.presubmit_cases())
+                self.assertNotIn(case, eval_rosters.blocking_roster())
+                self.assertNotIn(case, eval_rosters.nightly_cases())
+                self.assertIn(
+                    case,
+                    NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + ADDED_AFTER_THE_MOVED_BLOCK
+                    + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE,
+                    "a held-out seat's nightly line is what moved",
+                )
         for case in HELD_OUT_TO_NIGHTLY:
+            if case in seated:
+                continue
             with self.subTest(case=case):
                 self.assertNotIn(case, eval_rosters.presubmit_cases())
                 self.assertNotIn(case, eval_rosters.blocking_roster())
@@ -244,13 +279,19 @@ class SplitLostNothingTest(unittest.TestCase):
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases_less_the_promoted_plus_the_held_out(self):
         promoted = {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
+        seated = {case for case, _ in HELD_OUT_IN_PRESUBMIT}
         expected = [
             c
             for c in NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + ADDED_AFTER_THE_MOVED_BLOCK
             if c not in promoted
         ]
         self.assertEqual(
-            eval_rosters.nightly_cases(), expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
+            eval_rosters.nightly_cases(),
+            [
+                c
+                for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
+                if c not in seated
+            ],
         )
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
@@ -336,6 +377,137 @@ class InjectLaneExclusionsTest(unittest.TestCase):
             with self.subTest(case=case):
                 self.assertIn(case, eval_rosters.presubmit_cases())
                 self.assertIn(case, eval_rosters.blocking_roster())
+
+
+# The inject lane's safeguards at their introduction (#2079, 2026-09-28): the
+# one entry every case on the lane carries beside its own. An edit to the
+# file edits this set in the same pull request, for the reason the sets
+# above are pinned.
+INJECT_LANE_SAFEGUARDS = [
+    "no-github-writes-the-case-did-not-request",  # #2079: a none-wrapped github_writes, catastrophic
+]
+# The registered cases whose checks request a pull request, at the
+# safeguard's introduction: what hack/ci-eval-pr.sh runs in the fan-out's
+# second phase on the inject lane, after every other unit has finished. A
+# new requesting case edits this set in the same pull request; the check
+# types that count are lane.REQUESTING_CHECK_TYPES.
+INJECT_LANE_REQUESTING = [
+    "cluster-agent-crashloop-fix-request",
+    # Listed in the safeguards file's `requesting:` rather than by its own
+    # checks: the persona answers its prompt with a pull request before its
+    # persona-aware check lands (#2079 item 2), which removes the entry.
+    "obtainability-remediation-proposal",
+    "pdb-remediation-pr",
+    "rca-remediation-pr",
+    "vcs-review-feedback-read-back",
+]
+LANE_SAFEGUARD_LEAF_TYPE = "github_writes"
+
+
+def _leaf_types(node) -> list[str]:
+    if isinstance(node, dict):
+        children = [node.get(k) for k in ("checks", "check") if node.get(k) is not None]
+        if not children:
+            return [str(node.get("type") or "")]
+        return [t for child in children for t in _leaf_types(child)]
+    if isinstance(node, list):
+        return [t for item in node for t in _leaf_types(item)]
+    return []
+
+
+class InjectLaneSafeguardsTest(unittest.TestCase):
+    """hack/eval/inject-lane-safeguards.yaml: the entries hack/ci-eval-pr.sh
+    appends to every case it runs on the inject lane (#2079).
+
+    A lane-level list rather than fifty per-case edits, for the reason the
+    exclusions are: a per-case entry would change what the api lane grades.
+    What has to hold: the file is the pinned set; every entry is a
+    none-wrapped `github_writes` safeguard at catastrophic severity (a leaf
+    that PASSES on a write, so `none` is what makes it a safeguard); no
+    registered case declares an entry of the same name, since devops-bench
+    refuses a duplicate name as a parse error on every repetition of that
+    case; and the set of cases that request a pull request is pinned,
+    because the fan-out runs them in a phase of their own after every other
+    unit (the check dates writes and cannot tell a concurrent sibling's pull
+    request from this repetition's).
+    """
+
+    @staticmethod
+    def entries() -> list[dict]:
+        import yaml
+
+        doc = yaml.safe_load(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8"))
+        return doc["safeguards"]
+
+    @staticmethod
+    def task_spec(case: str) -> list[dict]:
+        import yaml
+
+        doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+        return doc.get("verification_spec") or []
+
+    def lane_cases(self) -> list[str]:
+        """Every case the lane can run: the presubmit matrix on the presubmit
+        tier, plus the nightly file when EVAL_TIER=nightly, less the
+        exclusions -- the safeguards step runs over TASKS after the tier
+        switch, so both tiers carry the entry."""
+        excluded = set(eval_rosters.inject_lane_exclusions())
+        return [c for c in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases() if c not in excluded]
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual([e["name"] for e in self.entries()], INJECT_LANE_SAFEGUARDS)
+
+    def test_every_entry_is_a_none_wrapped_github_writes_catastrophic_safeguard(self):
+        for entry in self.entries():
+            with self.subTest(entry=entry["name"]):
+                self.assertEqual(entry["role"], "safeguard")
+                self.assertEqual(entry["severity"], "catastrophic")
+                self.assertEqual(entry["check"]["type"], "none")
+                self.assertEqual(_leaf_types(entry["check"]), [LANE_SAFEGUARD_LEAF_TYPE])
+
+    def test_no_registered_case_reuses_a_lane_entry_name(self):
+        names = set(INJECT_LANE_SAFEGUARDS)
+        registered = set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases())
+        for case in sorted(registered):
+            with self.subTest(case=case):
+                declared = {str(e.get("name")) for e in self.task_spec(case) if isinstance(e, dict)}
+                self.assertFalse(declared & names, f"{case} declares a lane safeguard's name")
+
+    def test_the_requesting_cases_are_the_pinned_set(self):
+        """A `github_writes` check dates writes, and the fan-out runs cases
+        side by side against one repository, so a case that requests a pull
+        request has to be kept away from the others: the script runs the set
+        the lane module computes from the specs in a second phase, after
+        every other unit has finished. The set is pinned here so a new
+        requesting case is a reviewed edit, and derived from the same module
+        the script runs so the two cannot disagree."""
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench import lane
+
+        listed = lane.load_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE)
+        requesting = [c for c in self.lane_cases() if lane.requested_pull_requests(self.task_spec(c)) > 0 or c in listed]
+        # A listed case is registered and on the lane, and its own checks do
+        # not yet say it requests one: once they do, the entry is a leftover.
+        for case in listed:
+            with self.subTest(listed=case):
+                self.assertIn(case, self.lane_cases())
+                self.assertEqual(lane.requested_pull_requests(self.task_spec(case)), 0, f"{case}'s own checks request a pull request now; drop it from `requesting:`")
+        self.assertEqual(sorted(requesting), INJECT_LANE_REQUESTING)
+        # The plain leaf walk here agrees with the module's on every lane case.
+        for case in self.lane_cases():
+            with self.subTest(case=case):
+                types = [t for e in self.task_spec(case) if isinstance(e, dict) for t in _leaf_types(e.get("check"))]
+                self.assertEqual(
+                    sum(1 for t in types if t in lane.REQUESTING_CHECK_TYPES),
+                    lane.requested_pull_requests(self.task_spec(case)),
+                )
+
+    def test_the_lane_still_runs_a_case_that_requests_nothing(self):
+        # The safeguard changes what a case is graded on, not whether it
+        # runs: the lane's matrix is the presubmit file less the exclusions,
+        # exactly as before this file existed.
+        self.assertTrue(self.lane_cases())
+        self.assertNotIn("agent-kanban-smoke", self.lane_cases())
 
 
 if __name__ == "__main__":

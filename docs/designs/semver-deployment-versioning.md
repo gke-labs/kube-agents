@@ -34,8 +34,10 @@ documentation and governance playbooks around them.
    see `scripts/release/README.md`.
 4. **GA release pipeline creates stamped release child commit.** When promoting a staging-promoted
    candidate, `release-publish.yml` creates a single-parent child commit on detached HEAD
-   (baking `BAKED_RELEASE_VERSION` into installer scripts, and stamping SemVer release versions into Helm `Chart.yaml` and Terraform defaults), tags it `MAJOR.MINOR.PATCH` (`X.Y.Z`),
-   and orchestrates clean image promotion and chart publication. Because the GA tag points at this
+   (baking `BAKED_RELEASE_VERSION` into installer scripts, and stamping SemVer release versions into Helm `Chart.yaml` and Terraform defaults), tags it `MAJOR.MINOR.PATCH` (`X.Y.Z`), then pushes it to the branch `release/X.Y.Z`,
+   and orchestrates clean image promotion and chart publication. The branch is what makes the
+   commit belong to the repository rather than to its tag alone, and there is one per release
+   because each release stamps a fresh child of a `main` commit. Because the GA tag points at this
    stamped child commit outside `main`, `git log main` does not show the release commit and
    `git describe --tags` on `main` does not resolve to the GA tag (which is why `default_image_tag`
    matches numeric SemVer tags explicitly). Git tag resolution for Terraform module consumption
@@ -47,14 +49,14 @@ documentation and governance playbooks around them.
 
 ## 3. What ships
 
-| Artifact             | Mechanism                                                                                                                                                                                                                                                                     |
-| :------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Container images     | Built once on push to `main` (tagged with commit SHA and `:latest`). Clean Promotion (`release-publish.yml` / `promote_release_images.sh`) promotes verified images to `X.Y.Z` without rebuilding.                                                                            |
-| Operator default tag | Dynamic runtime derivation from running operator container image / `OPERATOR_IMAGE` env var (with `DefaultPlatformAgentVersion` for local development fallback).                                                                                                              |
-| Helm chart           | `charts/kube-agents/` (CRDs, operator, PlatformAgent CR), packaged with version = appVersion = tag, published and cosign-signed by digest via `release-publish.yml` (`publish_helm_chart.sh`).                                                                                |
-| Terraform modules    | `terraform/modules/{gke-cluster,kube-agents-iam,chat-pubsub,github-minter,drift-pubsub}/`, consumed via `?ref=1.2.0`; `terraform/examples/full-install/` composes the first four plus the chart into one apply (`drift-pubsub` is tagged and consumable but not yet composed) |
-| Release guide        | [Release versioning & promotion](../site/src/content/docs/deploy/release-versioning.md)                                                                                                                                                                                       |
-| Governance           | `standardization_validator_sop.md` Rule 3 (immutable-tag compliance); pre-release artifact checks live in CI (`validate.yml` and the RC pipeline), not in an agent SOP                                                                                                        |
+| Artifact             | Mechanism                                                                                                                                                                                                                                                                               |
+| :------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Container images     | Built once on push to `main` (tagged with commit SHA and `:latest`). Clean Promotion (`release-publish.yml` / `promote_release_images.sh`) promotes verified images to `X.Y.Z` without rebuilding.                                                                                      |
+| Operator default tag | Dynamic runtime derivation from running operator container image / `OPERATOR_IMAGE` env var (with `DefaultPlatformAgentVersion` for local development fallback).                                                                                                                        |
+| Helm chart           | `charts/kube-agents/` (CRDs, operator, PlatformAgent CR), packaged with version = appVersion = tag, published and cosign-signed by digest via `release-publish.yml` (`publish_helm_chart.sh`).                                                                                          |
+| Terraform modules    | `terraform/modules/{gke-cluster,kube-agents-iam,chat-pubsub,github-minter,gke-backup-plan,drift-pubsub}/`, consumed via `?ref=1.2.0`; `terraform/examples/full-install/` composes every module plus the chart into one apply (`drift-pubsub` behind `enable_drift_pubsub`, default off) |
+| Release guide        | [Release versioning & promotion](../site/src/content/docs/deploy/release-versioning.md)                                                                                                                                                                                                 |
+| Governance           | `standardization_validator_sop.md` Rule 3 (immutable-tag compliance); pre-release artifact checks live in CI (`validate.yml` and the RC pipeline), not in an agent SOP                                                                                                                  |
 
 ## 4. Version flow
 

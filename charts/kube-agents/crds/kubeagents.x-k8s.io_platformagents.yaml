@@ -10061,9 +10061,10 @@ spec:
                         Folders lists GCP folder IDs (numeric) whose every project, at any depth,
                         contributes its GKE clusters, resolved through Cloud Asset Inventory on each
                         run. The agent's service account needs roles/cloudasset.viewer and the read
-                        roles on the folder, granted by hand: the install's Terraform binds the
-                        projects `projects` names and no folder yet; a folder it cannot read
-                        freezes its previous members and is reported with the reason.
+                        roles on the folder: the install's Terraform binds them from the same scope
+                        input that renders this block, and a CR edited by hand needs the same grants
+                        made by hand; a folder it cannot read freezes its previous members and is
+                        reported with the reason.
                       items:
                         pattern: ^[0-9]{1,20}$
                         type: string
@@ -10864,6 +10865,61 @@ spec:
                         exports nothing; Default still means the GKE managed collector, and is what an
                         install gets when discovery is switched off or could not complete.
                       type: string
+                  type: object
+                usage:
+                  description: |-
+                    Usage summarises the agent's activity: the interfaces its spec enables and
+                    aggregate counters of what it has done.
+                  properties:
+                    activeInterfaces:
+                      description: |-
+                        ActiveInterfaces lists the communication channels the spec enables, sorted:
+                        "dashboard" unless spec.harness.hermes.dashboardEnabled is false, and
+                        "googlechat", "slack" and "teams" for each spec.integration entry whose
+                        enabled is true. Resolved on every reconcile and written by the Ready
+                        status update when it changes; a pass that parks the CR Degraded leaves
+                        the previous value, so read it alongside the Ready condition, as
+                        networkPolicy.generated is read. Absent while the served CRD predates it.
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: set
+                    eventsIngestedTotal:
+                      description: |-
+                        EventsIngestedTotal is the cumulative count of cluster events ingested and evaluated.
+                        Nothing writes it yet.
+                      format: int64
+                      type: integer
+                    lastActiveTime:
+                      description: |-
+                        LastActiveTime is the timestamp of the most recent interaction or event triage.
+                        Nothing writes it yet.
+                      format: date-time
+                      type: string
+                    remediationsAppliedTotal:
+                      description: |-
+                        RemediationsAppliedTotal is the cumulative count of remediations approved and applied.
+                        Nothing writes it yet.
+                      format: int64
+                      type: integer
+                    remediationsProposedTotal:
+                      description: |-
+                        RemediationsProposedTotal is the cumulative count of remediations generated.
+                        Nothing writes it yet.
+                      format: int64
+                      type: integer
+                    sessionsTotal:
+                      description: |-
+                        SessionsTotal is the cumulative number of interactive sessions handled.
+                        Nothing writes it yet.
+                      format: int64
+                      type: integer
+                    toolExecutionsTotal:
+                      description: |-
+                        ToolExecutionsTotal is the cumulative count of CLI and diagnostic tool invocations.
+                        Nothing writes it yet.
+                      format: int64
+                      type: integer
                   type: object
               type: object
           required:

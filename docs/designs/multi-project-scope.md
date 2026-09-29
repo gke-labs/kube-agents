@@ -1,6 +1,6 @@
 # An Opt-In Multi-Project Scope for the Platform Agent
 
-> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Step 3's runtime half is implemented too: `sharedVpcHosts` and `metricsScopes` on the CR, their two lookups and allowlist entries, the naming of monitored projects by number, their rows in `containers` and the freeze through them. Step 1's IAM bindings, installer path and the chart's rendering of `spec.scope` are implemented too: the `kube-agents-iam` module's `scope` input, the composition's `scope` variable feeding the module and the chart from one value, and the installer's `SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` keys. Steps 2 and 3's IAM bindings and installer paths (for step 3, the plan-time resolution of the two selectors), step 1's `platform_mcp_server.py` change, and steps 4 and 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
+> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Step 3's runtime half is implemented too: `sharedVpcHosts` and `metricsScopes` on the CR, their two lookups and allowlist entries, the naming of monitored projects by number, their rows in `containers` and the freeze through them. Steps 1 and 2's IAM bindings, installer paths and the chart's rendering of `spec.scope` are implemented too: the `kube-agents-iam` module's `scope` input binding `scope_roles` per explicit project and `scope_roles` plus `roles/cloudasset.viewer` on each folder and organisation, the composition's `scope` variable feeding the module and the chart from one value and enabling `cloudasset.googleapis.com` when a container is declared, the installer's `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` keys, and the pre-apply preflight for container IAM and the Asset API under organisation policy. Step 3's IAM bindings and installer path (the plan-time resolution of the two selectors), step 1's `platform_mcp_server.py` change, and steps 4 and 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
 > architecture documents define it as one agent per project. This document proposes replacing that
 > single project with a declared scope, and gives the order the change has to land in. Each section
 > says what is true on `main` now and what the design changes.
@@ -218,10 +218,11 @@ host-project API enablement (`google_project_service.required` in
 `terraform/examples/full-install/main.tf`), and `cloudasset.googleapis.com` joins that list when a
 folder or organisation is declared and not otherwise: an install that names explicit projects only
 never calls the Asset API, and must not fail under an organisation policy that forbids it. Where a
-container is declared, the installer preflights, before the apply and with the identity running
-Terraform, that the API can be enabled in the host project and that this identity can set IAM
-policy on the container; the agent's own `roles/cloudasset.viewer` is bound by the apply that
-follows. A policy that forbids the API is reported by name (§6, §10). A Resource Manager walk (`projects list` per folder, recursing into every
+container is declared, the installer preflights before the apply that the API is enabled in the
+host project or that no enforced organisation policy forbids it (read through gcloud's active
+account, whose answer does not depend on who asks) and that the identity Terraform applies with,
+read the way the google provider reads its credentials, can set IAM policy on the container; the
+agent's own `roles/cloudasset.viewer` is bound by the apply that follows. A policy that forbids the API is reported by name (§6, §10). A Resource Manager walk (`projects list` per folder, recursing into every
 sub-folder) was considered and dropped from this design: it is one call per folder plus one per
 project, needs `resourcemanager.folders.list` and `resourcemanager.projects.list` at the
 container on top of the viewer roles, and `parent.id` matches the immediate parent only, so a
@@ -379,7 +380,7 @@ in `terraform/modules/kube-agents-iam/variables.tf`) mirrors. The intersection m
 quota-consuming role such as `roles/serviceusage.serviceUsageConsumer` must not consume quota in
 projects the agent only reads. Widening `project_roles` widens the host project alone; widening
 what the scope carries is an edit to the allowlist, in one file, on purpose. The module refuses the
-plan when `scope.projects` is non-empty and the intersection carries neither
+plan when `scope.projects`, `scope.folders` or `scope.organizations` is non-empty and the intersection carries neither
 `roles/container.clusterViewer` nor `roles/container.viewer`, the two allowlist roles that carry
 `container.clusters.get` as well as `container.clusters.list`: `roles/iam.securityReviewer` lists
 but cannot get, so a project bound with it alone would read `ok` and fail every profile create.
@@ -402,16 +403,19 @@ which §9 takes up.
 
 Prerequisites the design has to state and the installer has to preflight:
 
-- The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or `resourcemanager.organizations.setIamPolicy` for an organisation; with the pool armed it also lists the container's projects at plan time, which needs `cloudasset.googleapis.com` searchable and `roles/cloudasset.viewer` on the container for that identity too. Today it needs only
+- The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or `resourcemanager.organizations.setIamPolicy` for an organisation; with the pool armed it also lists the container's projects at plan time, which needs `cloudasset.googleapis.com` searchable and `roles/cloudasset.viewer` on the container for that identity too. Before phase 2 it needed only
   project-level IAM admin. The installer's preflight reports which containers it cannot bind rather
-  than failing on the first.
+  than failing on the first, and makes the IAM probe as the credentials Terraform applies with, read
+  the way the google provider reads them, rather than as gcloud's active account.
 - A project in scope with `container.googleapis.com` disabled reads `api-disabled` (§4: its
   profiles kept, CREATE skipped); Terraform must not enable the API in other people's projects.
-- When a folder or organisation is declared, the identity running Terraform can enable
-  `cloudasset.googleapis.com` in the host project, checked before the apply that then binds the
-  agent's `roles/cloudasset.viewer` on each container. The preflight names an organisation policy
-  that forbids the API rather than failing inside `google_project_service`; an install that
-  declares only explicit projects skips this check and never enables the API (§4).
+- When a folder or organisation is declared, `cloudasset.googleapis.com` has to be enableable in
+  the host project. The preflight checks, before the apply that then binds the agent's
+  `roles/cloudasset.viewer` on each container, that the API is enabled already or that no enforced
+  organisation policy forbids it, and names the policy rather than failing inside
+  `google_project_service`; whether the applying identity holds `serviceusage.services.enable` is
+  left to the apply. An install that declares only explicit projects skips this check and never
+  enables the API (§4).
 - `project_roles` stays the list bound in the host project, and the mirror between it and
   `read_only_roles` that `tests/test_scoped_sa_pool_iam.py` checks is unchanged. The `scope_roles`
   allowlist lives beside it with a test that every entry is also in the default `project_roles`,
@@ -487,6 +491,7 @@ works. Each is listed with whether it blocks the first phase or follows it: `1` 
 | `docs/site/src/content/docs/reference/security-and-iam.md:80`                                                                                                                    | "reads Kubernetes objects in **every** cluster in the project" becomes "in every cluster in the scope"                                                                                 | docs  |
 | `docs/site/src/content/docs/reference/credential-isolation.md:205`                                                                                                               | Described the metadata lookup, with `RECONCILE_PROJECT` as its override, as how the script finds its one project; the page now says the override is pinned empty in the managed `.env` | done  |
 | `docs/site/src/content/docs/reference/security-and-iam.md:28`, `agents/platform/skills/manage-cluster/SKILL.md:41`, `agents/platform/skills/cluster-agent-lifecycle/SKILL.md:80` | Named `RECONCILE_EXCLUDE`, a bare cluster name matched project-blind, as the opt-out; each now names `spec.scope.exclude.clusters` with the variable as the one-release fallback       | done  |
+| `agents/platform/scripts/stall_watch.py`                                                                                                                                         | Listed one project's clusters (`STALL_WATCH_PROJECT`, else `GCP_PROJECT_ID`); it now also lists every project a Cluster Agent profile's identity names                                 | done  |
 
 Event delivery from other projects is the largest of these. The event watcher watches through each
 profile's kubeconfig and already labels every metric with `project` and `location`, so Kubernetes

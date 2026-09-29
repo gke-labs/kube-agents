@@ -130,12 +130,20 @@ variable "scope" {
     `exclude` travels with the declaration so the composition can render the CR
     from one object; it binds nothing here.
 
+    `folders` and `organizations` are numeric Resource Manager container IDs;
+    each gets the same allowlist plus roles/cloudasset.viewer, bound on the
+    container itself, so every project beneath it (including one created
+    later) inherits the grant and the reconcile can search the container's
+    asset index for clusters (design §4, §6). An organisation binding is wide:
+    the design recommends folders until the scoped service account pool
+    grants authority (§9).
+
     Empty, the default, binds nothing and the reconcile lists project_id alone.
-    Folders and organisations are not inputs yet; they arrive with the
-    container half of the design.
   EOT
   type = object({
-    projects = optional(list(string), [])
+    projects      = optional(list(string), [])
+    folders       = optional(list(string), [])
+    organizations = optional(list(string), [])
     exclude = optional(object({
       projects = optional(list(string), [])
       clusters = optional(list(object({
@@ -151,10 +159,19 @@ variable "scope" {
   validation {
     condition = (
       length(var.scope.projects) <= 100
+      && length(var.scope.folders) <= 100
+      && length(var.scope.organizations) <= 100
       && length(var.scope.exclude.projects) <= 100
       && length(var.scope.exclude.clusters) <= 100
     )
-    error_message = "scope.projects, scope.exclude.projects and scope.exclude.clusters each carry at most 100 entries, the cap the CRD enforces on the same lists."
+    error_message = "scope.projects, scope.folders, scope.organizations, scope.exclude.projects and scope.exclude.clusters each carry at most 100 entries, the cap the CRD enforces on the same lists."
+  }
+
+  validation {
+    condition = alltrue([
+      for container in concat(var.scope.folders, var.scope.organizations) : can(regex("^[0-9]{1,20}$", container))
+    ])
+    error_message = "Each scope.folders and scope.organizations entry is a numeric Resource Manager ID (^[0-9]{1,20}$), the pattern the CRD accepts for the same fields; folders/<id> and organizations/<id> prefixes are not accepted."
   }
 
   validation {
@@ -187,9 +204,11 @@ variable "scope" {
   validation {
     condition = (
       length(distinct(var.scope.projects)) == length(var.scope.projects)
+      && length(distinct(var.scope.folders)) == length(var.scope.folders)
+      && length(distinct(var.scope.organizations)) == length(var.scope.organizations)
       && length(distinct(var.scope.exclude.projects)) == length(var.scope.exclude.projects)
       && length(distinct([for c in var.scope.exclude.clusters : "${c.project_id}/${c.location}/${c.cluster_name}"])) == length(var.scope.exclude.clusters)
     )
-    error_message = "scope.projects, scope.exclude.projects and scope.exclude.clusters each name an entry once; the CRD rejects a repeat at admission, after IAM has been applied."
+    error_message = "scope.projects, scope.folders, scope.organizations, scope.exclude.projects and scope.exclude.clusters each name an entry once; the CRD rejects a repeat at admission, after IAM has been applied."
   }
 }

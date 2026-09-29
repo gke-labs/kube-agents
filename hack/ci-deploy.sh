@@ -90,17 +90,21 @@ readonly SANDBOX_SSH_KEY_TYPE="ed25519"
 readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 
 # EVAL_MODE_NEXT=1 flips the eval install to `spec.mode: next` once the
-# today-mode install has passed step 6, so the presubmit matrix can be run
-# against the next stack on demand (#1686, measuring #1661). Unset, or set to
+# today-mode install has passed step 6, so the matrix can be run against the
+# next stack: the presubmit's on demand, or the next lane's periodic on main
+# (#1686, measuring #1661). Unset, or set to
 # anything but "1", is today: every line the flag guards is skipped and the
 # script behaves exactly as it did before the flag existed.
 #
 # What the flag has to do, and where:
 #   - section 2a refuses it on the release-candidate path (no A2A images are
 #     published to point the operator at) and section 2b refuses it on a Prow
-#     run that is not a pull request's (a periodic under it would append
-#     next-mode samples to main's baseline record), and refuses a fan-out the
-#     bridge cannot be given as its concurrency, before anything is built;
+#     run that is neither a pull request's nor one of the next-lane jobs
+#     named below (a mis-set variable on the nightly or a postsubmit would
+#     otherwise run that job in next mode, recording and publishing nothing,
+#     so main's window and dashboard would silently miss it), and refuses a
+#     fan-out the bridge cannot be given as its concurrency, before anything
+#     is built;
 #   - step 4 also builds the A2A gateway, auth callout and worker images from
 #     a2a/Dockerfile.* (the operator's defaults for them name a private dev
 #     registry, #1557, which a leased project cannot pull from) and the Hermes
@@ -125,6 +129,18 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 # password key in platformagent_a2a_manifests.go). The CR name is the chart's
 # platformAgent.name default, which this deploy does not override.
 readonly PLATFORM_AGENT_CR_NAME="platform-agent"
+# The next lane's Prow jobs: its on-demand presubmit and its periodic on
+# main. Section 2b admits the flag on a run whose JOB_NAME is one of these
+# (space-separated, matched whole) or that carries a PULL_NUMBER -- the
+# presubmit is admitted by the second on a pull request and by the first on a
+# Tide batch, the periodic only by the first -- and refuses it on any other
+# Prow run, so the flag
+# leaking into the nightly's or a postsubmit's environment still stops the
+# deploy at second zero. The names are the jobs' own in oss-test-infra
+# (prow/prowjobs/gke-labs/kube-agents/); a rename there is a one-line edit here.
+# hack/ci-eval-pr.sh keeps such a run out of the baseline recorder on the flag
+# alone, so admitting a job here never lets it write main's window.
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly AGENT_CONTAINER_NAME="platform-agent"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
@@ -187,9 +203,11 @@ readonly BRIDGE_QUEUE_CAPACITY=1024
 readonly BRIDGE_CONSUMING_LOG_MSG='"msg":"hermes bridge consuming"'
 readonly BRIDGE_CONSUMING_LOG_PROFILE='"profile":"platform"'
 readonly MODE_NEXT_BRIDGE_LOG_ATTEMPTS=60
-# The provisioning Job depends on NATS and on the callout, and its retries
-# back off exponentially: 19.5 minutes to complete was measured under adverse
-# conditions (#1661), a few minutes on a healthy cluster.
+# The provisioning Job depends on NATS and on the callout. The operator now
+# creates it only once a callout replica serves (#1702); before that its
+# retries backed off exponentially and 19.5 minutes to complete was measured
+# under adverse conditions (#1661). A few minutes on a healthy cluster, and the
+# budget covers the wait for the callout too.
 readonly MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS=1500
 # What the Job's status.conditions say when it is over, either way. A Job
 # that exhausts its backoff carries Failed and never Complete, so the gate
@@ -475,16 +493,37 @@ else
   IS_PROW_RUN="false"
 fi
 
-# The mode flip exists for a pull request's run. bench-gate keeps main's
-# baseline honest by refusing to append a sample when PULL_NUMBER or
-# RC_COMMIT_SHA is set (bench/baselines/README.md); a periodic or postsubmit
-# carrying EVAL_MODE_NEXT=1 would set neither and append next-mode samples to
-# the window every pull request is judged against. Refuse that here.
+# The mode flip exists for the next lane's runs: a pull request's, or one of
+# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic on main). A flagged
+# run appends nothing to main's baseline and publishes no dashboard
+# (hack/ci-eval-pr.sh keeps it out of both on the flag alone; bench-gate
+# separately refuses a pull request's sample, bench/baselines/README.md), so
+# what the flag mis-set on a job that is not the lane's -- the nightly, a
+# postsubmit -- would do is run that job in next mode and leave main's window
+# and dashboard silently missing it, its verdict measuring the wrong stack.
+# Keyed on the job's name rather than on PULL_NUMBER, so the periodic is
+# admitted by being named and every other Prow run without a pull request is
+# still refused.
 if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
-  echo "ERROR: EVAL_MODE_NEXT=1 is set on a Prow run with no PULL_NUMBER (JOB_NAME=${JOB_NAME:-})." >&2
-  echo "       The flag is for a pull request's presubmit; a periodic or postsubmit under it" >&2
-  echo "       would record next-mode samples into main's baseline." >&2
-  exit 1
+  # One whole-string comparison per listed name, not a pattern over the
+  # joined list: a substring match on the space-padded list would also admit
+  # a JOB_NAME that spells two adjacent entries with a space between them.
+  MODE_NEXT_JOB_ADMITTED="false"
+  for mode_next_job in ${EVAL_MODE_NEXT_JOB_NAMES}; do
+    if [ "${mode_next_job}" = "${JOB_NAME:-}" ]; then
+      MODE_NEXT_JOB_ADMITTED="true"
+    fi
+  done
+  if [ "${MODE_NEXT_JOB_ADMITTED}" = "true" ]; then
+    echo "EVAL_MODE_NEXT=1: accepted on ${JOB_NAME} (a next-lane job with no PULL_NUMBER; the baseline store is read, never written)"
+  else
+    echo "ERROR: EVAL_MODE_NEXT=1 is set on a Prow run with no PULL_NUMBER (JOB_NAME=${JOB_NAME:-})." >&2
+    echo "       The flag is for a pull request's presubmit or a next-lane job named in" >&2
+    echo "       EVAL_MODE_NEXT_JOB_NAMES (${EVAL_MODE_NEXT_JOB_NAMES}); any other periodic or" >&2
+    echo "       postsubmit under it would run in next mode and record nothing to main's" >&2
+    echo "       baseline or dashboard, leaving that run silently missing from both." >&2
+    exit 1
+  fi
 fi
 
 # The bridge sidecar's concurrency is the matrix's fan-out, read from the same
@@ -921,11 +960,9 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # measured run through the door. Not gated either: the shell StatefulSet,
 # which does not change under next.
 #
-# A namespace ResourceQuota on limits.cpu refuses every A2A pod: none of them
-# declares a CPU limit (the callout declares a memory limit only, #1661).
-# Nothing this deploy or the chart renders carries such a quota, so no
-# LimitRange is added here. An install that has one needs the operator fix,
-# or a LimitRange of its own, before the flag.
+# Every A2A pod the operator renders carries CPU and memory requests and
+# limits (#1700), so a namespace ResourceQuota on limits.cpu admits them;
+# nothing this deploy or the chart renders carries such a quota either way.
 dump_mode_next_state() {
   kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o yaml | sed -n '/^status:/,$p' || true
   kubectl get pods,jobs,networkpolicies,pvc -n "${NAMESPACE}" -l "${A2A_PART_OF_SELECTOR}" || true

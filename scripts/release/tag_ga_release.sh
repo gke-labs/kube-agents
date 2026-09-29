@@ -32,13 +32,29 @@ RELEASE_COMMIT="$(create_stamped_release_commit "${RELEASE_VERSION}" "${RC_CANDI
 # the tag itself to the shared tagger. A mistaken GA tag is the one rung of the
 # ladder that cannot be fixed by deleting a tag, so it does not get a private
 # copy of the tagging logic either.
+# Where the release branch is, read before anything is pushed. ensure_release_branch
+# below refuses a branch already at another commit; finding that only after the
+# GA tag went out would leave the one artefact a failed run cannot take back.
+release_branch_placement "${RELEASE_VERSION}" "${RELEASE_COMMIT}" >/dev/null
+
 GA_TAG_DETAILS=(--detail "Release Version:     ${RELEASE_VERSION}")
 GA_TAG_DETAILS+=(--detail "RC Candidate Commit: ${RC_CANDIDATE_COMMIT_SHA:0:7}")
 if [ "${RELEASE_COMMIT}" != "${RC_CANDIDATE_COMMIT_SHA}" ]; then
   GA_TAG_DETAILS+=(--detail "Release Commit:      ${RELEASE_COMMIT:0:7}")
 fi
+GA_TAG_DETAILS+=(--detail "Release Branch:      $(release_branch_for_version "${RELEASE_VERSION}")")
 
-exec "${SCRIPT_DIR}/tag_commit.sh" \
+"${SCRIPT_DIR}/tag_commit.sh" \
   --title "CREATING AND PUSHING GA RELEASE GIT TAG" \
   "${GA_TAG_DETAILS[@]}" \
   "${RELEASE_VERSION}" "${RELEASE_COMMIT}" "Release ${RELEASE_VERSION}"
+
+# The branch is pushed after the tag, and the order is load-bearing. The tag is
+# what a re-run keys on: create_stamped_release_commit reuses the tagged commit
+# and verify_release_eligibility.sh reads the tag, so a run that fails here
+# re-runs the way one that fails at image promotion does, and pushes the branch
+# it did not get to. The other way round is not re-runnable: with the branch
+# pushed and no tag, the re-run stamps a fresh commit and refuses the branch it
+# pushed itself. Without the branch the stamped commit is reachable from the tag
+# alone, which GitHub shows as belonging to no branch on the repository.
+ensure_release_branch "${RELEASE_VERSION}" "${RELEASE_COMMIT}"

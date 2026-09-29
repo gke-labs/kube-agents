@@ -12,12 +12,17 @@ Tests safety guards in lifecycle.sh before terraform apply:
 
 import os
 import pathlib
+import pty
+import re
+import select
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
-from tests.testing.common import get_isolated_test_env
+from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _LIFECYCLE_SH = _REPO_ROOT / "terraform" / "examples" / "full-install" / "lifecycle.sh"
@@ -37,7 +42,15 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    gcloud_kms_notice="",
                    tfvar_enable_google_chat="true",
                    tfvar_chat_sub_name='"platform-agent-chat-events-sub"',
-                   tfvar_chat_topic_name='"platform-agent-chat-events"'):
+                   tfvar_chat_topic_name='"platform-agent-chat-events"',
+                   tfvar_enable_drift_pubsub="false",
+                   tfvar_drift_topic='"platform-agent-drift-audit"',
+                   tfvar_drift_sub='"platform-agent-drift-audit-sub"',
+                   tfvar_drift_sink='"platform-agent-drift-audit-sink"',
+                   tfvar_enable_stockout="false",
+                   tfvar_stockout_topic='"gke-stockout-alerts-topic"',
+                   tfvar_stockout_sub='"gke-stockout-alerts-sub"',
+                   console_fail_var=""):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -77,6 +90,13 @@ EOF
     exit 0
 elif [[ "$cmd" == "console" ]]; then
     read -r expr
+    # console_fail_var models a terraform console that cannot answer -- a state
+    # lock, a missing provider, a syntax error in the configuration -- for the
+    # one variable named. Checked before every other branch so it wins.
+    if [[ -n "{console_fail_var}" && "$expr" == *"{console_fail_var}"* ]]; then
+        echo 'Error: could not load the configuration' >&2
+        exit 1
+    fi
     if [[ "$expr" == *"agent_service_account_id"* ]]; then
         echo '{tfvar_agent_sa}'
         exit 0
@@ -118,6 +138,27 @@ elif [[ "$cmd" == "console" ]]; then
         exit 0
     elif [[ "$expr" == *"chat_topic_name"* ]]; then
         echo '{tfvar_chat_topic_name}'
+        exit 0
+    elif [[ "$expr" == *"enable_drift_pubsub"* ]]; then
+        echo '{tfvar_enable_drift_pubsub}'
+        exit 0
+    elif [[ "$expr" == *"drift_pubsub_topic"* ]]; then
+        echo '{tfvar_drift_topic}'
+        exit 0
+    elif [[ "$expr" == *"drift_pubsub_subscription"* ]]; then
+        echo '{tfvar_drift_sub}'
+        exit 0
+    elif [[ "$expr" == *"drift_pubsub_sink"* ]]; then
+        echo '{tfvar_drift_sink}'
+        exit 0
+    elif [[ "$expr" == *"enable_stockout_investigator"* ]]; then
+        echo '{tfvar_enable_stockout}'
+        exit 0
+    elif [[ "$expr" == *"stockout_pubsub_topic"* ]]; then
+        echo '{tfvar_stockout_topic}'
+        exit 0
+    elif [[ "$expr" == *"stockout_pubsub_subscription"* ]]; then
+        echo '{tfvar_stockout_sub}'
         exit 0
     fi
     echo 'null'
@@ -469,7 +510,14 @@ resource "google_service_account" "agent" {
         self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
 
     def test_guard_pubsub_subscription_no_op_when_chat_disabled(self):
-        proc = self._run_guard("guard_pubsub_subscription", tfvar_enable_google_chat="false")
+        """A subscription in state whose feature is switched off is a teardown, not a rename."""
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+            state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n}',
+            tfvar_enable_google_chat="false",
+            tfvar_chat_sub_name='"custom-chat-events-sub"',
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_guard_pubsub_subscription_no_op_when_subscription_not_in_state(self):
@@ -507,6 +555,181 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("chat_topic_name resolved to 'renamed-chat-topic', but this state's Pub/Sub subscription is attached to topic 'platform-agent-chat-events'", proc.stderr)
         self.assertIn('CHAT_TOPIC_NAME="platform-agent-chat-events"', proc.stderr)
+
+    # The drift and stockout subscriptions are the same resource type with the
+    # same ForceNew name and topic, so the guard covers them too. A drift
+    # recreate drops the audit records the detector exists to report, and the
+    # detector stays Ready either way.
+    _DRIFT_SUB_ADDRESS = "module.drift_pubsub[0].google_pubsub_subscription.drift_audit"
+    _DRIFT_SUB_STATE = (
+        'resource "google_pubsub_subscription" "drift_audit" {\n'
+        '    name = "platform-agent-drift-audit-sub"\n'
+        '    topic = "projects/test-proj/topics/platform-agent-drift-audit"\n}'
+    )
+    _STOCKOUT_SUB_ADDRESS = "google_pubsub_subscription.stockout_alerts[0]"
+    _STOCKOUT_SUB_STATE = (
+        'resource "google_pubsub_subscription" "stockout_alerts" {\n'
+        '    name = "gke-stockout-alerts-sub"\n'
+        '    topic = "projects/test-proj/topics/gke-stockout-alerts-topic"\n}'
+    )
+
+    def test_guard_pubsub_subscription_passes_when_drift_matches_state(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="true",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_no_op_when_drift_not_in_state(self):
+        """Chat in state and clean, drift renamed but absent: only what state manages is checked."""
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+            state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n}',
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_sub='"renamed-drift-audit-sub"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_drift_subscription_differs(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_sub='"renamed-drift-audit-sub"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("drift_pubsub_subscription resolved to 'renamed-drift-audit-sub', but this state manages Pub/Sub subscription 'platform-agent-drift-audit-sub'", proc.stderr)
+        self.assertIn("unacknowledged GKE audit records", proc.stderr)
+        # No install.env key carries this name, so the advice names the passthrough
+        # the front doors do read rather than inventing a key.
+        self.assertIn("No install.env key carries this subscription name", proc.stderr)
+        self.assertIn('TF_VAR_drift_pubsub_subscription="platform-agent-drift-audit-sub"', proc.stderr)
+        self.assertNotIn("record it in install.env", proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_drift_topic_differs(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_topic='"renamed-drift-audit"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("drift_pubsub_topic resolved to 'renamed-drift-audit', but this state's Pub/Sub subscription is attached to topic 'platform-agent-drift-audit'", proc.stderr)
+        self.assertIn("No install.env key carries this topic name", proc.stderr)
+        self.assertIn('TF_VAR_drift_pubsub_topic="platform-agent-drift-audit"', proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_a_blanked_name(self):
+        """`TF_VAR_drift_pubsub_subscription=` in install.env exports "", which beats the default."""
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_sub='""',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("An empty resolution is a blanked variable rather than a rename", proc.stderr)
+        self.assertIn('TF_VAR_drift_pubsub_subscription="platform-agent-drift-audit-sub"', proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_a_blanked_topic(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_topic='""',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("drift_pubsub_topic resolved to ''", proc.stderr)
+        self.assertIn("An empty resolution is a blanked variable rather than a rename", proc.stderr)
+
+    def test_guard_pubsub_subscription_no_op_when_drift_disabled(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="false",
+            tfvar_drift_sub='"renamed-drift-audit-sub"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_the_flag_cannot_be_read(self):
+        """A terraform console that cannot answer stops the apply rather than
+        reading as "feature disabled".
+
+        The flag is assigned to a local before it is compared for this reason:
+        tfvar ends in `exit 1`, which inside $( ) kills only the subshell, so
+        `[[ "$(tfvar "$flag")" == "true" ]] || continue` would skip the row and
+        let the rename through. Every other flag read in lifecycle.sh still has
+        that inline shape, so this pins the one that does not.
+        """
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_sub='"renamed-drift-audit-sub"',
+            console_fail_var="enable_drift_pubsub",
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("could not evaluate var.enable_drift_pubsub", proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_stockout_subscription_differs(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._STOCKOUT_SUB_ADDRESS,
+            state_show=self._STOCKOUT_SUB_STATE,
+            tfvar_enable_stockout="true",
+            tfvar_stockout_sub='"renamed-stockout-sub"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("stockout_pubsub_subscription resolved to 'renamed-stockout-sub', but this state manages Pub/Sub subscription 'gke-stockout-alerts-sub'", proc.stderr)
+        self.assertIn("unacknowledged stockout alerts", proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_stockout_topic_differs(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._STOCKOUT_SUB_ADDRESS,
+            state_show=self._STOCKOUT_SUB_STATE,
+            tfvar_enable_stockout="true",
+            tfvar_stockout_topic='"renamed-stockout-topic"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("stockout_pubsub_topic resolved to 'renamed-stockout-topic', but this state's Pub/Sub subscription is attached to topic 'gke-stockout-alerts-topic'", proc.stderr)
+
+    def test_guard_pubsub_subscription_no_op_when_stockout_disabled(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._STOCKOUT_SUB_ADDRESS,
+            state_show=self._STOCKOUT_SUB_STATE,
+            tfvar_enable_stockout="false",
+            tfvar_stockout_sub='"renamed-stockout-sub"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_checks_every_subscription_in_state(self):
+        """Chat clean and drift renamed in one state: the loop must not stop at the first row.
+
+        The terraform stub answers `state show` with the same body whatever address it
+        is given, so the chat variables are pointed at that body's names to make the
+        chat row compare equal and the loop reach the drift one.
+        """
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events\n" + self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_chat_sub_name='"platform-agent-drift-audit-sub"',
+            tfvar_chat_topic_name='"platform-agent-drift-audit"',
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_sub='"renamed-drift-audit-sub"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("drift_pubsub_subscription resolved to 'renamed-drift-audit-sub'", proc.stderr)
 
     def test_guard_minter_key_no_op_when_minter_disabled(self):
         """When enable_github_minter is false, guard_minter_key passes cleanly."""
@@ -601,6 +824,79 @@ resource "google_service_account" "agent" {
         )
         self.assertEqual(proc.returncode, 1)
         self.assertIn("has no ENABLED version.", proc.stderr)
+
+    # adopt_kms's drift-pubsub block. create_cluster is false in both so the
+    # cluster CMEK half adds no targets, and the minter and stockout flags stay
+    # off, so what adopt_kms imports is exactly what the drift flag adds.
+    # gcloud exits 0, so every describe reports its resource present.
+
+    def test_adopt_kms_imports_the_drift_pubsub_trio_when_the_flag_is_on(self):
+        """The composition's default names under the module's addresses, so a
+        re-install after a partial teardown adopts rather than 409s."""
+        proc = self._run_guard(
+            "adopt_kms",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("adopting pre-existing resource: projects/test-project/topics/platform-agent-drift-audit", proc.stdout)
+        self.assertIn("adopting pre-existing resource: projects/test-project/subscriptions/platform-agent-drift-audit-sub", proc.stdout)
+        self.assertIn("adopting pre-existing resource: projects/test-project/sinks/platform-agent-drift-audit-sink", proc.stdout)
+        self.assertIn("resource adoption complete: 3 imported", proc.stdout)
+        self.assertEqual(proc.stderr, "")
+
+    def test_adopt_kms_adopts_the_drift_pubsub_trio_under_the_names_this_state_would_create(self):
+        """A second install in the project names its own trio through the
+        drift_pubsub_* variables; adopt_kms reads those, never the module's
+        defaults, so the names it imports are the ones this state owns and
+        the first install's default-named trio is left alone."""
+        proc = self._run_guard(
+            "adopt_kms",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_topic='"second-drift-audit"',
+            tfvar_drift_sub='"second-drift-audit-sub"',
+            tfvar_drift_sink='"second-drift-audit-sink"',
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("adopting pre-existing resource: projects/test-project/topics/second-drift-audit", proc.stdout)
+        self.assertIn("adopting pre-existing resource: projects/test-project/subscriptions/second-drift-audit-sub", proc.stdout)
+        self.assertIn("adopting pre-existing resource: projects/test-project/sinks/second-drift-audit-sink", proc.stdout)
+        self.assertNotIn("platform-agent-drift-audit", proc.stdout)
+        self.assertIn("resource adoption complete: 3 imported", proc.stdout)
+
+    def test_adopt_kms_skips_the_drift_pubsub_trio_already_in_state(self):
+        proc = self._run_guard(
+            "adopt_kms",
+            state_list="module.drift_pubsub[0].google_pubsub_topic.drift_audit\n"
+                       "module.drift_pubsub[0].google_pubsub_subscription.drift_audit\n"
+                       "module.drift_pubsub[0].google_logging_project_sink.drift_audit",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("adopting", proc.stdout)
+        self.assertIn("resource adoption complete: 0 imported", proc.stdout)
+
+    def test_adopt_kms_never_names_the_drift_pubsub_trio_when_the_flag_is_off(self):
+        """Off is the default; an install that never set the flag must not
+        import a topic, subscription or sink that happens to share the name."""
+        proc = self._run_guard(
+            "adopt_kms",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="false",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("drift-audit", proc.stdout)
+        self.assertNotIn("drift_pubsub", proc.stdout)
+        self.assertIn("resource adoption complete: 0 imported", proc.stdout)
 
 
 class DeleteAgentCrEndpointTest(unittest.TestCase):
@@ -745,6 +1041,615 @@ class MissingEndpointHelperTest(unittest.TestCase):
         proc = self._source_without_helper("true")
         self.assertIn("gke_dns_endpoint.sh", proc.stderr)
         self.assertIn("IP endpoint", proc.stderr)
+
+
+# Terraform's own colouring, so the fixtures exercise the escape stripping the
+# filter needs on a real CI stream.
+_ESC = "\x1b"
+_BOLD, _RESET, _YELLOW, _RED = f"{_ESC}[1m", f"{_ESC}[0m", f"{_ESC}[33m", f"{_ESC}[31m"
+
+# Shaped like the helm_release diff CI printed, with fake values. The inner
+# `}` lines sit deeper than metadata's own closing brace, which is what the
+# filter must not stop at.
+_FAKE_KEY = "fake-api-server-key-0123456789"
+_FAKE_PEM = "-----BEGIN OPENSSH PRIVATE KEY-----"
+
+
+def _helm_metadata_block(marker, colour, closing_suffix):
+    # Terraform right-aligns action symbols in three columns ("  ~", "-/+"),
+    # so an attribute name, and the brace that closes it, never move.
+    sym = " " * (3 - len(marker)) + f"{colour}{marker}{_RESET}{_RESET}"
+    return [
+        f"    {sym} metadata                   = {{",
+        f"        {sym} notes          = <<-EOT",
+        "                NOTE: uninstalling needs the finalizer cleared first",
+        f"            EOT{closing_suffix}",
+        f"          {sym} values         = jsonencode(",
+        "              {",
+        "                  credentials = {",
+        "                      data = {",
+        f'                          API_SERVER_KEY          = "{_FAKE_KEY}"',
+        "                          SANDBOX_SSH_PRIVATE_KEY = <<-EOT",
+        f"                              {_FAKE_PEM}",
+        "                          EOT",
+        "                      }",
+        "                  }",
+        "              }",
+        "          )",
+        f"        }}{closing_suffix}",
+    ]
+
+
+_UPDATE_PLAN = "\n".join([
+    "Terraform will perform the following actions:",
+    "",
+    f"{_BOLD}  # helm_release.kube_agents{_RESET} will be updated in-place",
+    f'{_RESET}  {_YELLOW}~{_RESET}{_RESET} resource "helm_release" "kube_agents" {{',
+    f'      {_YELLOW}~{_RESET}{_RESET} id                         = "kube-agents" -> (known after apply)',
+    *_helm_metadata_block("~", _YELLOW, " -> (known after apply)"),
+    f"      {_YELLOW}~{_RESET}{_RESET} values                     = (sensitive value)",
+    "        # (26 unchanged attributes hidden)",
+    "    }",
+    "",
+    f"{_BOLD}Plan:{_RESET} 0 to add, 1 to change, 0 to destroy.",
+]) + "\n"
+
+_DESTROY_PLAN = "\n".join([
+    f"{_BOLD}  # helm_release.kube_agents{_RESET} will be {_BOLD}{_RED}destroyed{_RESET}",
+    f'{_RESET}  {_RED}-{_RESET}{_RESET} resource "helm_release" "kube_agents" {{',
+    *_helm_metadata_block("-", _RED, " -> null"),
+    f'      {_RED}-{_RESET}{_RESET} name                       = "kube-agents" -> null',
+    "    }",
+    "",
+    f"{_BOLD}Plan:{_RESET} 0 to add, 0 to change, 1 to destroy.",
+]) + "\n"
+
+# Real terraform puts the replace symbol on the resource line only, at column
+# 0; the attributes inside carry their own action.
+_REPLACE_PLAN = "\n".join([
+    f'{_RED}-{_RESET}/{_YELLOW}+{_RESET} resource "helm_release" "kube_agents" {{',
+    *_helm_metadata_block("~", _YELLOW, " -> (known after apply)"),
+    '      ~ namespace = "old" -> "new" # forces replacement',
+    "    }",
+]) + "\n"
+
+# google_compute_instance has a metadata map of its own. It is not chart
+# values, and hiding it would hide a real diff from the operator.
+_OTHER_RESOURCE_PLAN = "\n".join([
+    f'{_RESET}  {_YELLOW}~{_RESET}{_RESET} resource "google_compute_instance" "bastion" {{',
+    f"      {_YELLOW}~{_RESET}{_RESET} metadata = {{",
+    '          ~ "enable-oslogin" = "FALSE" -> "TRUE"',
+    "        }",
+    "    }",
+]) + "\n"
+
+# `terraform show` prints attributes with no action symbol at all. This is
+# Terraform 1.9.5 with helm provider 3.3.0 rendering a state that holds these
+# fake values, byte for byte.
+_SHOW_HELM_BODY = [
+    '    chart     = "kube-agents"',
+    '    id        = "kube-agents"',
+    "    metadata  = {",
+    '        app_version    = "0.7.0"',
+    '        chart          = "kube-agents"',
+    "        first_deployed = 1",
+    "        last_deployed  = 2",
+    '        name           = "kube-agents"',
+    '        namespace      = "kubeagents-system"',
+    "        notes          = <<-EOT",
+    "            NOTE: uninstalling needs the finalizer cleared first",
+    "        EOT",
+    "        revision       = 7",
+    "        values         = jsonencode(",
+    "            {",
+    "                credentials = {",
+    "                    data = {",
+    f'                        API_SERVER_KEY          = "{_FAKE_KEY}"',
+    "                        SANDBOX_SSH_PRIVATE_KEY = <<-EOT",
+    f"                            {_FAKE_PEM}",
+    "                            abc",
+    "                        EOT",
+    "                    }",
+    "                }",
+    "            }",
+    "        )",
+    '        version        = "0.7.0"',
+    "    }",
+    '    name      = "kube-agents"',
+    '    namespace = "kubeagents-system"',
+    "    values    = (sensitive value)",
+]
+_SHOW_OUTPUT = "\n".join([
+    "# helm_release.kube_agents:",
+    'resource "helm_release" "kube_agents" {',
+    *_SHOW_HELM_BODY,
+    "}",
+]) + "\n"
+
+# A plan that imports the release has no action to show either, so its body
+# carries no symbol; only the indent differs from `terraform show`.
+_IMPORT_PLAN = "\n".join([
+    "  # helm_release.kube_agents will be imported",
+    '    resource "helm_release" "kube_agents" {',
+    *("    " + line for line in _SHOW_HELM_BODY),
+    "    }",
+    "",
+    "Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.",
+]) + "\n"
+
+_OTHER_RESOURCE_SHOW = "\n".join([
+    "# google_compute_instance.bastion:",
+    'resource "google_compute_instance" "bastion" {',
+    "    metadata  = {",
+    '        "enable-oslogin" = "TRUE"',
+    "    }",
+    "}",
+]) + "\n"
+
+
+def _plain(text):
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def _source(call):
+    return f'KUBE_AGENTS_SOURCE_ONLY=true source "{_LIFECYCLE_SH}"\n{call}\n'
+
+
+def _read_until(fd, needle, timeout):
+    """Bytes read from fd until needle shows up or timeout passes."""
+    buf = b""
+    deadline = time.monotonic() + timeout
+    while needle not in buf:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        ready, _, _ = select.select([fd], [], [], left)
+        if not ready:
+            break
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            # A terminal whose other side has closed reads as EIO on Linux.
+            break
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+class RedactHelmReleaseMetadataTest(unittest.TestCase):
+    """helm_release's metadata repeats every chart value, which may include secrets.
+
+    The helm provider does not mark it sensitive, so a plan that touches the
+    release -- and every destroy -- prints the old values in full. The filter
+    keeps that block out of terraform's output, and so out of any log of it.
+    """
+
+    def _filter(self, text):
+        proc = subprocess.run(
+            ["bash", "-c", _source("redact_helm_release_metadata")],
+            input=text,
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(),
+            cwd=str(_LIFECYCLE_SH.parent),
+            timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def _assert_hidden(self, out, marker):
+        plain = _plain(out)
+        self.assertNotIn(_FAKE_KEY, plain)
+        self.assertNotIn(_FAKE_PEM, plain)
+        self.assertNotIn("NOTE: uninstalling", plain)
+        self.assertEqual(plain.count("hidden by lifecycle.sh"), 1, plain)
+        self.assertIn(f"    {marker:>3} metadata = (hidden by lifecycle.sh", plain)
+
+    def test_an_update_hides_the_old_values_and_keeps_the_rest_of_the_diff(self):
+        out = self._filter(_UPDATE_PLAN)
+        self._assert_hidden(out, "~")
+        plain = _plain(out)
+        # Everything past metadata's own closing brace is still there, so the
+        # skip ended at that brace and not at one of the nested ones.
+        self.assertIn('id                         = "kube-agents"', plain)
+        self.assertIn("values                     = (sensitive value)", plain)
+        self.assertIn("# (26 unchanged attributes hidden)", plain)
+        self.assertIn("Plan: 0 to add, 1 to change, 0 to destroy.", plain)
+        self.assertNotIn("} -> (known after apply)", plain)
+
+    def test_a_destroy_hides_the_values_it_is_about_to_delete(self):
+        out = self._filter(_DESTROY_PLAN)
+        self._assert_hidden(out, "-")
+        plain = _plain(out)
+        self.assertIn('name                       = "kube-agents" -> null', plain)
+        self.assertIn("Plan: 0 to add, 0 to change, 1 to destroy.", plain)
+
+    def test_a_replacement_hides_them_too(self):
+        out = self._filter(_REPLACE_PLAN)
+        self._assert_hidden(out, "~")
+        self.assertIn("# forces replacement", _plain(out))
+
+    def test_a_replace_symbol_on_the_attribute_itself_is_hidden(self):
+        # Not what terraform prints today; a renderer change must not reopen it.
+        for marker in ("-/+", "+/-"):
+            with self.subTest(marker=marker):
+                header = '  ~ resource "helm_release" "kube_agents" {'
+                block = "\n".join([header, *_helm_metadata_block(marker, _YELLOW, ""), "    }"])
+                self._assert_hidden(self._filter(block + "\n"), marker)
+
+    def test_the_list_form_of_older_providers_is_hidden(self):
+        # helm provider v2 rendered metadata as a list of one object.
+        lines = [
+            '  - resource "helm_release" "kube_agents" {',
+            "      - metadata = [",
+            "          - {",
+            f'              - values = "{_FAKE_KEY}"',
+            "            },",
+            "        ] -> null",
+            '      - name = "kube-agents" -> null',
+            "    }",
+        ]
+        plain = _plain(self._filter("\n".join(lines) + "\n"))
+        self.assertNotIn(_FAKE_KEY, plain)
+        self.assertIn("- metadata = (hidden by lifecycle.sh", plain)
+        self.assertIn('- name = "kube-agents" -> null', plain)
+
+    def test_crlf_line_endings_are_hidden_as_well(self):
+        out = self._filter(_UPDATE_PLAN.replace("\n", "\r\n"))
+        self._assert_hidden(out, "~")
+        self.assertIn("Plan: 0 to add, 1 to change, 0 to destroy.", _plain(out))
+
+    def test_lines_outside_the_block_pass_through_byte_for_byte(self):
+        # Colour included: the filter matches on a stripped copy and prints the
+        # original, so CI keeps its highlighting.
+        out = self._filter(_UPDATE_PLAN)
+        kept = [line for line in _UPDATE_PLAN.splitlines()
+                if line.startswith(f"{_BOLD}  # helm_release") or "(sensitive value)" in line]
+        self.assertEqual(len(kept), 2)
+        for line in kept:
+            self.assertIn(line, out.splitlines())
+
+    def test_another_resource_s_metadata_is_left_alone(self):
+        for text in (_OTHER_RESOURCE_PLAN, _OTHER_RESOURCE_SHOW):
+            with self.subTest(text=text.splitlines()[0]):
+                self.assertEqual(self._filter(text), text)
+
+    def test_terraform_show_prints_the_block_without_a_symbol_and_it_is_hidden(self):
+        # `terraform show` and `terraform state show` render state, where no
+        # attribute carries an action; the block has to be found without one.
+        plain = _plain(self._filter(_SHOW_OUTPUT))
+        self.assertNotIn(_FAKE_KEY, plain)
+        self.assertNotIn(_FAKE_PEM, plain)
+        self.assertNotIn("NOTE: uninstalling", plain)
+        self.assertEqual(plain.count("hidden by lifecycle.sh"), 1, plain)
+        self.assertIn("\n    metadata = (hidden by lifecycle.sh", plain)
+        # The skip ended at metadata's own brace: what follows it is intact.
+        self.assertIn('    name      = "kube-agents"\n', plain)
+        self.assertIn("    values    = (sensitive value)\n}\n", plain)
+
+    def test_an_import_plan_prints_it_without_a_symbol_too(self):
+        plain = _plain(self._filter(_IMPORT_PLAN))
+        self.assertNotIn(_FAKE_KEY, plain)
+        self.assertNotIn(_FAKE_PEM, plain)
+        self.assertEqual(plain.count("hidden by lifecycle.sh"), 1, plain)
+        self.assertIn("\n        metadata = (hidden by lifecycle.sh", plain)
+        self.assertIn('        name      = "kube-agents"\n', plain)
+        self.assertIn("Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.", plain)
+
+    def test_the_helm_state_ends_at_the_next_resource(self):
+        # Only the helm block is hidden; the instance after it keeps its diff.
+        out = _plain(self._filter(_UPDATE_PLAN + _OTHER_RESOURCE_PLAN))
+        self.assertEqual(out.count("hidden by lifecycle.sh"), 1, out)
+        self.assertIn('"enable-oslogin" = "FALSE" -> "TRUE"', out)
+
+    def test_the_helm_state_ends_at_a_data_source_too(self):
+        data = "\n".join([
+            ' <= data "google_compute_instance" "bastion" {',
+            "      + metadata = {",
+            '          + "enable-oslogin" = "TRUE"',
+            "        }",
+            "    }",
+        ]) + "\n"
+        out = _plain(self._filter(_UPDATE_PLAN + data))
+        self.assertEqual(out.count("hidden by lifecycle.sh"), 1, out)
+        self.assertIn('+ "enable-oslogin" = "TRUE"', out)
+
+    def test_a_block_that_never_closes_hides_the_rest_and_says_so(self):
+        # Fails closed: a missing closer must not let the values through.
+        closer = "        } -> (known after apply)"
+        self.assertIn(closer, _UPDATE_PLAN.splitlines())
+        unclosed = _UPDATE_PLAN.replace(closer + "\n", "")
+        plain = _plain(self._filter(unclosed))
+        self.assertNotIn(_FAKE_KEY, plain)
+        self.assertNotIn("Plan: 0 to add", plain)
+        self.assertIn("metadata block never closed", plain.splitlines()[-1])
+
+    def test_the_filter_outlives_ctrl_c_so_terraform_can_shut_down(self):
+        # Ctrl-C reaches the whole process group. Were the filter to die of it,
+        # terraform's graceful-shutdown output would hit a closed pipe and
+        # SIGPIPE would kill it before it saved state and released the lock.
+        proc = subprocess.Popen(
+            ["bash", "-c", _source("redact_helm_release_metadata")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=get_isolated_test_env(),
+            cwd=str(_LIFECYCLE_SH.parent),
+            start_new_session=True,
+        )
+        try:
+            proc.stdin.write(b"applying\n")
+            proc.stdin.flush()
+            self.assertIn(b"applying", _read_until(proc.stdout.fileno(), b"applying", 10))
+            os.killpg(proc.pid, signal.SIGINT)
+            time.sleep(0.5)
+            self.assertIsNone(proc.poll(), "the filter died of SIGINT")
+            proc.stdin.write(b"Interrupt received. Gracefully shutting down...\n")
+            proc.stdin.close()
+            rest = proc.stdout.read()
+            self.assertEqual(proc.wait(timeout=10), 0, proc.stderr.read())
+            self.assertIn(b"Gracefully shutting down", rest)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            proc.stdout.close()
+            proc.stderr.close()
+
+    def test_each_line_streams_before_the_next_arrives_on_every_awk_present(self):
+        # A helm wait runs ten minutes; a filter that buffers makes CI look
+        # hung. mawk buffers its input despite fflush() and needs -W interactive.
+        variants = {
+            "gawk": ["gawk"],
+            "mawk": ["mawk"],
+            "original-awk": ["original-awk"],
+            "busybox": ["busybox", "awk"],
+        }
+        tested = 0
+        for name, cmd in variants.items():
+            if not shutil.which(cmd[0]):
+                continue
+            tested += 1
+            with self.subTest(awk=name), tempfile.TemporaryDirectory() as tmp:
+                awk = pathlib.Path(tmp) / "awk"
+                awk.write_text(f'#!/bin/sh\nexec {" ".join(cmd)} "$@"\n')
+                awk.chmod(0o755)
+                proc = subprocess.Popen(
+                    ["bash", "-c", _source("redact_helm_release_metadata")],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=get_isolated_test_env(bin_dir=tmp),
+                    cwd=str(_LIFECYCLE_SH.parent),
+                )
+                try:
+                    proc.stdin.write(b"Still creating... [10m0s elapsed]\n")
+                    proc.stdin.flush()
+                    # The pipe stays open: the line has to come out on its own.
+                    got = _read_until(proc.stdout.fileno(), b"elapsed]", 5)
+                    self.assertIn(b"elapsed]", got, f"{name} held the line back")
+                finally:
+                    proc.stdin.close()
+                    proc.wait(timeout=10)
+                    proc.stdout.close()
+                    proc.stderr.close()
+        self.assertGreater(tested, 0, "no awk found to test")
+
+
+class LifecycleSubcommandFilterTest(unittest.TestCase):
+    """Each subcommand, run as a command, gets the filter it claims to.
+
+    The filter tests above prove the function; these prove the wiring -- that
+    plan, apply and destroy actually pipe through it and keep terraform's
+    exit code. Each run uses a copy of the script in a scratch tree, a PATH of
+    basic tools plus stubs, and an environment with nothing from the host.
+    Nothing in the checkout is read or written beyond that copy.
+    """
+
+    def _sandbox(self, root, output, tf_rc):
+        """A scratch tree with lifecycle.sh, and a PATH of basic tools and stubs.
+
+        terraform prints `output` for plan/apply/destroy and exits `tf_rc`; an
+        apply without -auto-approve first asks, as terraform does, and applies
+        only on "yes".
+        Returns the composition directory, the environment, and the file
+        every stub call is logged to.
+        """
+        comp = root / "terraform" / "examples" / "full-install"
+        comp.mkdir(parents=True)
+        shutil.copy(_LIFECYCLE_SH, comp / "lifecycle.sh")
+        shutil.copy(_REPO_ROOT / "install.defaults.env", root / "install.defaults.env")
+        helpers = root / "scripts" / "installer"
+        helpers.mkdir(parents=True)
+        shutil.copy(_REPO_ROOT / "scripts" / "installer" / "gke_dns_endpoint.sh", helpers)
+        bin_dir = create_minimal_tools_bin(root)
+        fixture = root / "terraform-output.txt"
+        fixture.write_text(output)
+        calls = root / "calls"
+        bash = shutil.which("bash")
+        # An empty state, and a console that answers null: every guard and
+        # adoption step stands down, and the run reaches terraform itself.
+        (bin_dir / "terraform").write_text(
+            f"#!{bash}\n"
+            f'echo "terraform $*" >> "{calls}"\n'
+            'case "$1" in\n'
+            "  state) exit 0 ;;\n"
+            "  console) read -r _; echo null; exit 0 ;;\n"
+            f'  plan|destroy) cat "{fixture}"; exit {tf_rc} ;;\n'
+            f'  apply) cat "{fixture}"\n'
+            f'    case " $* ${{TF_CLI_ARGS_apply:-}} " in *" -auto-approve "*) exit {tf_rc} ;; esac\n'
+            "    printf '  Enter a value: '; read -r answer\n"
+            f'    [ "$answer" = yes ] && exit {tf_rc}; exit 1 ;;\n'
+            "esac\n"
+            "exit 0\n"
+        )
+        # gcloud and kubectl answer "not found": the cluster is unreachable,
+        # there is no backup plan, no key ring to adopt.
+        for tool in ("gcloud", "kubectl"):
+            (bin_dir / tool).write_text(f'#!{bash}\necho "{tool} $*" >> "{calls}"\nexit 1\n')
+        for stub in ("terraform", "gcloud", "kubectl"):
+            (bin_dir / stub).chmod(0o755)
+        return comp, {"PATH": str(bin_dir), "HOME": str(root)}, calls
+
+    def _run_lifecycle(self, args, output="", tf_rc=0):
+        """Run lifecycle.sh with terraform printing `output` for plan/apply/destroy.
+
+        Returns the completed process and every stub call, one per line.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            comp, env, calls = self._sandbox(pathlib.Path(tmp), output, tf_rc)
+            proc = subprocess.run(
+                [shutil.which("bash"), str(comp / "lifecycle.sh"), *args],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(comp),
+                timeout=60,
+            )
+            return proc, calls.read_text() if calls.exists() else ""
+
+    def _terraform_call(self, calls, subcommand):
+        calls_of = [line.split() for line in calls.splitlines()]
+        matches = [call for call in calls_of if call[:2] == ["terraform", subcommand]]
+        self.assertEqual(len(matches), 1, calls)
+        return matches[0]
+
+    def _assert_hidden(self, out, marker):
+        RedactHelmReleaseMetadataTest._assert_hidden(self, out, marker)
+
+    def test_plan_keeps_the_detailed_exit_code_through_the_filter(self):
+        # upgrade.sh reads exit 2 as "changes pending". A pipe without pipefail
+        # would report the filter's 0 instead, and the plan would read as clean.
+        proc, calls = self._run_lifecycle(["plan", "-detailed-exitcode"], _UPDATE_PLAN, tf_rc=2)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("-detailed-exitcode", self._terraform_call(calls, "plan"))
+        self._assert_hidden(proc.stdout, "~")
+
+    def test_apply_is_filtered(self):
+        proc, calls = self._run_lifecycle(["apply", "-auto-approve"], _UPDATE_PLAN)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self._assert_hidden(proc.stdout, "~")
+        self.assertIn("-auto-approve", self._terraform_call(calls, "apply"))
+
+    def _run_with_a_terminal(self, args, stdin_is_terminal=True, answer=None, extra_env=None):
+        """Run lifecycle.sh with stdout and stderr on a terminal.
+
+        With `answer`, returns what printed before it was typed; without one,
+        everything printed. Also returns the exit code.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            comp, env, _ = self._sandbox(pathlib.Path(tmp), _UPDATE_PLAN, 0)
+            env.update(extra_env or {})
+            master, slave = pty.openpty()
+            proc = None
+            try:
+                proc = subprocess.Popen(
+                    [shutil.which("bash"), str(comp / "lifecycle.sh"), *args],
+                    stdin=slave if stdin_is_terminal else subprocess.DEVNULL,
+                    stdout=slave,
+                    stderr=slave,
+                    env=env,
+                    cwd=str(comp),
+                )
+                os.close(slave)
+                slave = None
+                if answer is None:
+                    out = _read_until(master, b"\0", 30)
+                else:
+                    out = _read_until(master, b"Enter a value: ", 10)
+                    os.write(master, answer.encode() + b"\n")
+                rc = proc.wait(timeout=30)
+            finally:
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                for fd in (master, slave):
+                    if fd is not None:
+                        os.close(fd)
+        return out.decode(errors="replace"), rc
+
+    def test_an_apply_that_will_ask_at_a_terminal_is_left_as_is_so_its_prompt_shows(self):
+        # Terraform's closing "Enter a value: " has no newline: through the
+        # line-based filter it would wait unseen until the answer was typed.
+        before, rc = self._run_with_a_terminal(["apply"], answer="yes")
+        self.assertIn("Enter a value: ", before)
+        self.assertEqual(rc, 0, before)
+
+    def test_an_approved_apply_at_a_terminal_is_still_filtered(self):
+        # upgrade.sh passes -auto-approve: nothing will be asked, and the whole
+        # diff prints, so there is nothing to leave unfiltered for.
+        for args, extra_env in (
+            (["apply", "-auto-approve"], {}),
+            (["apply"], {"TF_CLI_ARGS_apply": "-auto-approve"}),
+        ):
+            with self.subTest(args=args, extra_env=extra_env):
+                out, rc = self._run_with_a_terminal(args, extra_env=extra_env)
+                self.assertEqual(rc, 0, out)
+                self._assert_hidden(out, "~")
+
+    def test_an_apply_with_no_terminal_to_answer_from_is_filtered(self):
+        # stdout on a terminal but stdin not (a pty in CI): no one can answer,
+        # so terraform's question ends the run, and the diff before it is a log.
+        out, rc = self._run_with_a_terminal(["apply"], stdin_is_terminal=False)
+        self.assertEqual(rc, 1, out)
+        self._assert_hidden(out, "~")
+
+    def test_an_apply_piped_from_a_terminal_is_still_filtered(self):
+        # `./lifecycle.sh apply | tee apply.log`: a terminal on stdin says
+        # nothing about stdout, which here is a log.
+        with tempfile.TemporaryDirectory() as tmp:
+            comp, env, _ = self._sandbox(pathlib.Path(tmp), _UPDATE_PLAN, 0)
+            master, slave = pty.openpty()
+            try:
+                # Typed ahead: the terminal holds the answer until it is read.
+                os.write(master, b"yes\n")
+                proc = subprocess.run(
+                    [shutil.which("bash"), str(comp / "lifecycle.sh"), "apply"],
+                    stdin=slave,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    cwd=str(comp),
+                    timeout=60,
+                )
+            finally:
+                os.close(master)
+                os.close(slave)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self._assert_hidden(proc.stdout, "~")
+
+    def test_a_failed_apply_fails_the_script(self):
+        proc, _ = self._run_lifecycle(["apply", "-auto-approve"], _UPDATE_PLAN, tf_rc=1)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn(_FAKE_KEY, proc.stdout)
+
+    def test_destroy_is_filtered(self):
+        proc, calls = self._run_lifecycle(["destroy", "-auto-approve"], _DESTROY_PLAN)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self._assert_hidden(proc.stdout, "-")
+        call = self._terraform_call(calls, "destroy")
+        self.assertIn("-var=deletion_protection=false", call)
+        self.assertIn("-auto-approve", call)
+        self.assertIn("done. The KMS key rings remain", proc.stdout)
+
+    def test_a_failed_destroy_stops_before_reporting_done(self):
+        proc, _ = self._run_lifecycle(["destroy", "-auto-approve"], _DESTROY_PLAN, tf_rc=1)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn(_FAKE_KEY, proc.stdout)
+        self.assertNotIn("done. The KMS key rings remain", proc.stdout)
+
+    def test_usage_prints_the_whole_header_and_no_code(self):
+        # The usage arm prints a fixed line range of this file; the header grew
+        # with the redaction paragraph, so the range has to follow it.
+        proc, _ = self._run_lifecycle([])
+        self.assertEqual(proc.returncode, 1)
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        self.assertTrue(lines[0].startswith("Makes `apply` and `destroy` repeatable"), lines[:1])
+        self.assertIn("`plan`, `apply` and `destroy` hide helm_release's `metadata` block", proc.stdout)
+        self.assertEqual(lines[-1], "default kube-agents/<cluster_name>>. Unset, state stays local as before.")
+        self.assertNotIn("set -euo pipefail", proc.stdout)
 
 
 if __name__ == "__main__":

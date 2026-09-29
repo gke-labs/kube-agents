@@ -79,10 +79,12 @@
 set -euo pipefail
 
 # The tier exported to ci-eval-pr.sh, and so which matrix this lane grades:
-# `presubmit` is the merge-blocking set in eval/presubmit-cases.txt, `nightly`
-# appends eval/nightly-cases.txt. Counted from those files rather than stated
-# here, because both move: at the time of writing they are 12 and 30, so 42
-# cases, and at three repetitions 36 units against 126.
+# `presubmit` is the merge-blocking set in eval/presubmit-cases.txt plus its
+# held-out seats, `nightly` appends eval/nightly-cases.txt. Counted from those
+# files rather than stated here, because both move: on 2026-09-29 they are 14
+# (twelve on the roster and two held-out seats, the compliance canary, #2013,
+# and pdb-remediation-pr, #2016) and 37, so 51 cases, and at three
+# repetitions 42 units against 153.
 #
 # It is the smaller one because of the clock, not because the other cases are
 # unwanted. Step 5 of staging-promotion-pipeline.yml waits 330 minutes for this
@@ -102,6 +104,14 @@ set -euo pipefail
 # run whose cases stall rather than run: #1840's delegation block costs 45
 # minutes per repetition, and enough of those exceed any budget. That failure
 # is unsettled, so it withdraws the nomination and the next night asks again.
+# The held-out canary (#2013) adds three repetitions serialized on its task
+# lock, a ~50 minute chain at its 1002 s median and ~150 minutes if all three
+# reach the 3000 s delegation ceiling, run beside the other cases; the
+# held-out pdb-remediation-pr (#2016) adds three more on its own task lock, a
+# ~62 minute chain at its 1250 s hint and ~96 minutes at its measured
+# maximum. A graded miss on either leaves the verdict alone, since neither
+# is admitted; an erroring check on either (rungs 1-3) turns the verdict RED
+# like any case's.
 #
 # This read `nightly` from #1230 until now, under a comment saying #1175's
 # switch was not on main so nothing read the export. That was true when it was

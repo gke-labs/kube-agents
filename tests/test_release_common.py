@@ -824,6 +824,234 @@ source "{_COMMON_SH}"
         finally:
             temp_dir.cleanup()
 
+    # ─── ensure_release_branch ───────────────────────────────────────────────
+    # The GA release commit is pushed to `release/<X.Y.Z>` alongside its tag, so
+    # it belongs to a branch on the repository rather than to the tag alone. The
+    # contract is ensure_git_tag's, and these pin the two halves of it: the
+    # remote decides in CI, and nothing is ever force-pushed.
+
+    _FAKE_RELEASE_REPO = {"GH_ORG": "no-such-org-kube-agents", "GH_REPO": "no-such-repo"}
+
+    def _bare_remote_for(self, git, repo_dir):
+        """A bare repository standing in for github.com/<GH_ORG>/<GH_REPO>.
+
+        common.sh reaches the release repository by its https URL, so the URL is
+        rewritten onto the bare path; that covers ls-remote and the https push
+        fallback alike. `origin` is left unset so the fallback is what pushes.
+        """
+        bare_dir = pathlib.Path(repo_dir).parent / "remote.git"
+        git("init", "--bare", str(bare_dir))
+        git(
+            "config",
+            f"url.{bare_dir}.insteadOf",
+            f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git",
+        )
+        return bare_dir
+
+    def _remote_branch_sha(self, git, bare_dir, branch):
+        out = git("--git-dir", str(bare_dir), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").stdout
+        return out.strip()
+
+    def test_release_branch_for_version_is_the_prefixed_version(self):
+        proc = self._run_common_func(f'release_branch_for_version "{MOCK_TARGET_RELEASE_TAG}"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), f"release/{MOCK_TARGET_RELEASE_TAG}")
+
+    def test_ensure_release_branch_requires_version_and_commit(self):
+        for call in ("ensure_release_branch", f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}"'):
+            with self.subTest(call=call):
+                proc = self._run_common_func(call)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("version and commit SHA are required", proc.stderr)
+
+    def test_ensure_release_branch_off_ci_creates_locally_and_skips_the_push(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        head = git("rev-parse", "HEAD").stdout.strip()
+        branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+
+        proc = self._run_common_func(f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{head}"', cwd=repo_dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"Dry-run: Release branch '{branch}' created locally", proc.stdout)
+        self.assertEqual(git("rev-parse", branch).stdout.strip(), head)
+        # The caller's checkout is not moved onto the new branch.
+        self.assertEqual(git("symbolic-ref", "--short", "HEAD").stdout.strip(), "main")
+
+        again = self._run_common_func(f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{head}"', cwd=repo_dir)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("Dry-run", again.stdout)
+        self.assertEqual(git("rev-parse", branch).stdout.strip(), head)
+
+    def test_ensure_release_branch_refuses_to_move_a_local_branch(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        first = git("rev-parse", "HEAD").stdout.strip()
+        branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+        git("branch", branch, first)
+        (pathlib.Path(repo_dir) / "next.txt").write_text("next\n")
+        git("add", "next.txt")
+        git("commit", "-m", "feat: next")
+        second = git("rev-parse", "HEAD").stdout.strip()
+
+        proc = self._run_common_func(f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{second}"', cwd=repo_dir)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(f"Release branch '{branch}' already exists locally but points to commit {first}", proc.stderr)
+        self.assertEqual(git("rev-parse", branch).stdout.strip(), first)
+
+    def test_ensure_release_branch_in_ci_pushes_to_the_release_repository(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        bare_dir = self._bare_remote_for(git, repo_dir)
+        head = git("rev-parse", "HEAD").stdout.strip()
+        branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+
+        proc = self._run_common_func(
+            f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{head}"',
+            env={"CI": "true", **self._FAKE_RELEASE_REPO},
+            cwd=repo_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"Release branch '{branch}' successfully pushed", proc.stdout)
+        self.assertEqual(self._remote_branch_sha(git, bare_dir, branch), head)
+
+    def test_ensure_release_branch_in_ci_skips_when_the_remote_already_has_it(self):
+        """A re-run of the release job must find its first attempt's branch on the remote.
+
+        The local checkout has no such branch — a fresh checkout never does — so
+        the skip has to come from asking the remote, not from a local ref.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        bare_dir = self._bare_remote_for(git, repo_dir)
+        head = git("rev-parse", "HEAD").stdout.strip()
+        branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+        git("push", str(bare_dir), f"{head}:refs/heads/{branch}")
+        self.assertEqual(git("branch", "--list", branch).stdout.strip(), "")
+
+        proc = self._run_common_func(
+            f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{head}"',
+            env={"CI": "true", **self._FAKE_RELEASE_REPO},
+            cwd=repo_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Idempotent skip", proc.stdout)
+        self.assertNotIn("successfully pushed", proc.stdout)
+
+    def test_ensure_release_branch_in_ci_refuses_a_remote_branch_at_another_commit(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        bare_dir = self._bare_remote_for(git, repo_dir)
+        first = git("rev-parse", "HEAD").stdout.strip()
+        branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+        git("push", str(bare_dir), f"{first}:refs/heads/{branch}")
+        (pathlib.Path(repo_dir) / "next.txt").write_text("next\n")
+        git("add", "next.txt")
+        git("commit", "-m", "feat: next")
+        second = git("rev-parse", "HEAD").stdout.strip()
+
+        proc = self._run_common_func(
+            f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{second}"',
+            env={"CI": "true", **self._FAKE_RELEASE_REPO},
+            cwd=repo_dir,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(f"Release branch '{branch}' already exists on", proc.stderr)
+        self.assertIn(f"points to commit {first}, not target SHA {second}", proc.stderr)
+        # The remote was not force-pushed over.
+        self.assertEqual(self._remote_branch_sha(git, bare_dir, branch), first)
+
+    def test_ensure_release_branch_in_ci_fails_closed_when_the_remote_cannot_be_read(self):
+        """An unreadable remote is an error, not "no branch".
+
+        `origin` holds the branch at an ancestor of the target, which a plain
+        push would happily fast-forward. The https URL common.sh asks with
+        ls-remote is rewritten onto a path that does not exist, so the read
+        fails; the function must stop there rather than guess and push.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        bare_dir = pathlib.Path(repo_dir).parent / "origin.git"
+        git("init", "--bare", str(bare_dir))
+        git("remote", "add", "origin", str(bare_dir))
+        unreachable = pathlib.Path(repo_dir).parent / "unreachable.git"
+        git(
+            "config",
+            f"url.{unreachable}.insteadOf",
+            f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git",
+        )
+        first = git("rev-parse", "HEAD").stdout.strip()
+        branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+        git("push", "origin", f"{first}:refs/heads/{branch}")
+        (pathlib.Path(repo_dir) / "next.txt").write_text("next\n")
+        git("add", "next.txt")
+        git("commit", "-m", "feat: next")
+        second = git("rev-parse", "HEAD").stdout.strip()
+
+        proc = self._run_common_func(
+            f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{second}"',
+            env={"CI": "true", **self._FAKE_RELEASE_REPO},
+            cwd=repo_dir,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Could not read branches of", proc.stderr)
+        self.assertNotIn("successfully pushed", proc.stdout)
+        self.assertEqual(self._remote_branch_sha(git, bare_dir, branch), first)
+
+    def test_ensure_release_branch_in_ci_ignores_a_branch_whose_name_merely_ends_in_the_ref(self):
+        """ls-remote's pattern is tail-matched; the lookup must match the whole ref.
+
+        A stray `x/refs/heads/release/<v>` on the remote would otherwise read as
+        the release branch itself, and refuse the release.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        bare_dir = self._bare_remote_for(git, repo_dir)
+        head = git("rev-parse", "HEAD").stdout.strip()
+        branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+        git("switch", "-c", "stray")
+        (pathlib.Path(repo_dir) / "stray.txt").write_text("stray\n")
+        git("add", "stray.txt")
+        git("commit", "-m", "feat: stray")
+        git("push", str(bare_dir), f"HEAD:refs/heads/x/refs/heads/{branch}")
+        git("switch", "main")
+
+        proc = self._run_common_func(
+            f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{head}"',
+            env={"CI": "true", **self._FAKE_RELEASE_REPO},
+            cwd=repo_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"Release branch '{branch}' successfully pushed", proc.stdout)
+        self.assertEqual(self._remote_branch_sha(git, bare_dir, branch), head)
+
+    def test_release_branch_placement_reports_where_the_branch_is(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        bare_dir = self._bare_remote_for(git, repo_dir)
+        head = git("rev-parse", "HEAD").stdout.strip()
+        branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+        call = f'release_branch_placement "{MOCK_TARGET_RELEASE_TAG}" "{head}"'
+        ci = {"CI": "true", **self._FAKE_RELEASE_REPO}
+
+        absent = self._run_common_func(call, env=ci, cwd=repo_dir)
+        self.assertEqual(absent.returncode, 0, absent.stderr)
+        self.assertEqual(absent.stdout.strip(), "absent")
+
+        git("branch", branch, head)
+        local = self._run_common_func(call, env=ci, cwd=repo_dir)
+        self.assertEqual(local.returncode, 0, local.stderr)
+        self.assertEqual(local.stdout.strip(), "local")
+
+        git("push", str(bare_dir), f"{head}:refs/heads/{branch}")
+        remote = self._run_common_func(call, env=ci, cwd=repo_dir)
+        self.assertEqual(remote.returncode, 0, remote.stderr)
+        self.assertEqual(remote.stdout.strip(), "remote")
+
+        # Off CI the remote is not consulted; the local branch is what there is.
+        off_ci = self._run_common_func(call, cwd=repo_dir)
+        self.assertEqual(off_ci.returncode, 0, off_ci.stderr)
+        self.assertEqual(off_ci.stdout.strip(), "local")
+
     # ─── release_resolve_target ───────────────────────────────────────────────
     # The targeting trio must never be guessed in CI: a defaulted PROJECT_ID
     # points provision/teardown at a real project nobody named.

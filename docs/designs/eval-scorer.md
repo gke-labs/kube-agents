@@ -75,7 +75,8 @@ an `issues: read` credential the Prow job supplied. That was rung 2 working, not
 mounts one now. The canary `compliance-rbac-overgrant` ran on every presubmit until 2026-09-22,
 when the presubmit became the blocking roster only (#1023) and the never-admitted canary joined the
 other audit scenarios in the nightly tier (`hack/eval/nightly-cases.txt`), where those had been kept
-out of the presubmit on cost. The
+out of the presubmit on cost, and since 2026-09-29 it runs on every presubmit again as a held-out seat
+(#2013), where rung 2 reaches it as before. The
 alternative — scoping 1–3 to admitted cases — means an unscreened case can never report that its
 checks are broken, which is the state it is most likely to be in.
 
@@ -115,7 +116,8 @@ it delegates, so `classify_rep()` classifies the repetition `infra` under a reas
 with the marker. The dashboard reads that lead to count these apart from quota-storm repetitions
 (`scripts/eval_dashboard/SCHEMA.md`). A ceiling hit after a partial delivery carries no marker
 and grades on what arrived. Both the ceiling check and the never-ran signature sit after rung 1 —
-the catastrophic score grades the cluster rather than the record, so a tripped safeguard is
+the catastrophic score grades the world outside the record — the cluster, and on the inject lane
+the GitOps repository — rather than the record, so a tripped safeguard is
 positive evidence something acted and keeps blocking, whether the worker was still running at the
 deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
 one still blocks at rung 2. The near-misses still block at rung 3:
@@ -130,20 +132,26 @@ reduces to correctness. A task with no spec at all produces no correctness and i
 
 **The inject lane sets aside what its transport cannot show.** A record from the harness's inject
 transport carries the task's lifecycle envelope as its trajectory (`inject.task`, `inject.post`,
-`inject.edit`, `a2a.status-update`) and no tool call, and there are no card ids to read worker logs
-by, so every `tool_called`, `worker_commands` and `worker_agents` check is blind there: the first matrix run through
-the door (#2007, 2026-09-25) collapsed `agent-kanban-smoke` 0 of 3 with a correct answer in every
-repetition. `classify_rep()` therefore re-reads such a record before the rungs. The
-condition is the record's, not the environment's: the trajectory carries the transport's task
-marker and nothing outside the envelope — `_inject_blind()` in `scoring.py`, whose literals
-`test_scoring.py` holds equal to the transport's. When it holds, every report entry the task
-declares whose check is made of `tool_called`, `worker_commands` or `worker_agents` leaves and nothing else
-(`CaseSpec.transport_blind_checks`, by entry name; a compound mixing in an applicable leaf is not
-in the set, because that leaf can fail on any transport and setting the entry aside would hide it)
-is set aside as `not_applicable`, whatever
+`inject.edit`, `a2a.status-update`) and, when the door showed the task's tool-call trace, an
+`a2a.activity` marker followed by the task's calls in the api path's shape. There are never card
+ids to read worker logs by (the trace carries calls without their results) and never a worker's
+tagged entries, so `worker_commands`, `worker_agents` and a `tool_called` in the `workers` or
+`all` scope are blind on every such record; a router-scope `tool_called` is blind only when the
+door showed no trace: the first matrix run through the door (#2007, 2026-09-25) collapsed
+`agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
+re-reads such a record before the rungs. The condition is the record's, not the environment's: the
+trajectory carries the transport's task marker (`_inject_record()` in `scoring.py`), and for the
+router-scope `tool_called` also either no `a2a.activity` marker and nothing outside the envelope,
+or a marker that reports a loss (`_inject_blind()`); `test_scoring.py` holds the literals equal to
+the transport's. When it holds,
+every report entry the task declares whose check is made of `tool_called`, `worker_commands` or
+`worker_agents` leaves and nothing else (`CaseSpec.transport_blind_checks`, by entry name, split
+into `trace_blind_checks` and `worker_blind_checks` by which condition applies; a compound mixing
+in an applicable leaf is not in either set, because that leaf can fail on any transport and
+setting the entry aside would hide it) is set aside as `not_applicable`, whatever
 devops-bench recorded for it, and `VerificationCorrectness`, `VerificationCoverage` and
 `VerificationCatastrophic` are recomputed over the entries that remain with the same arithmetic as
-upstream's rollup. What remains grades on every rung as before: a cluster-state safeguard that
+upstream's rollup. What remains grades on every rung as before: a safeguard that reads the cluster or the GitOps repository and
 tripped still blocks at rung 1, an errored phrase check still blocks at rung 2, and a repetition
 passes or fails on the checks the transport can see, with the set-aside names in its reason. When
 no objective check remains the repetition is `not_applicable` — a fifth outcome beside `infra`,
@@ -153,10 +161,25 @@ least one such is **not graded on transport** (the `Rung` member and the build-l
 record is a crashed scoring pass on any transport and is not re-read; a record on the api
 transport never carries the marker, and `test_scoring.py` grades every captured api record, under
 every mutation the suite uses, identically with the rule present and removed; and an inject record
-that does carry a tool entry leaves the envelope and grades in full, so the rule retires itself
-on the first such record — getting one there is transport work not yet filed, since the relay
-never posts `activity` artifacts to a conversation and an executor publishing them (#2038) does
-not by itself reach the record. A case whose _premise_ needs the chat front door is a different matter from
+whose `a2a.activity` marker reports no loss grades its router-scope `tool_called` checks in full,
+with or without a call behind the marker. The transport writes that marker whenever the door's
+probe carried the task's tool-call trace at all (the relay never posts `activity` artifacts to a
+conversation, so the probe is where the harness reads them), so that half of the rule retires on
+the door's capability to show calls rather than on a call having happened: a `tool_called` check
+on a persona that made no call fails there as it would on the api transport. A marker whose
+`dropped`, `malformed`, `input_truncated` or `stale` argument is non-zero says the trajectory may
+not carry every call the persona made (the door's cap or the executor's budget dropped some, a
+part or a count could not be read, a wrapper's input was truncated and its nested names with it,
+or the read that ended the wait carried no trace and the fold holds an earlier read's), and such a
+record is treated as blind like one with no marker (`_inject_trace_vouched()`), since grading over
+it could fail a call that happened or pass a safeguard over one. One exception runs the other way:
+a `none`-wrapped check ("this tool was never called", `CaseSpec.negated_trace_blind_checks`) that
+_failed_ on a record carrying the marker stays graded whatever the loss, because the trace shows
+the forbidden call and a loss cannot unmake it; rung 1 blocks on it as on the api transport. The worker
+half is keyed on the transport alone (`_inject_record()`) and stays until a later change rebuilds
+the delegation wait for this path and takes those entries out of `worker_blind_checks`. A record
+from a door that cannot show the trace carries no marker and is graded as before. A case whose
+_premise_ needs the chat front door is a different matter from
 a check the transport blinds, and is the lane roster's
 ([`docs/eval-gate-roster.md`](../eval-gate-roster.md), "The inject lane").
 
@@ -835,7 +858,9 @@ is on `main` and carries no `PULL_NUMBER`, so both conditions above pass it thro
 is the third condition, enforced in the same two places, and it exists because `VersionKey` carries
 no field naming the build a sample came from: once written, a candidate's record and `main`'s are
 indistinguishable, and the candidate is then measured for non-inferiority against a window it just
-moved. `bench/baselines/README.md` is canonical for the rule; this paragraph records why the
+moved. A next-mode run (`EVAL_MODE_NEXT=1`) is the fourth condition and the second member of the
+class, for the same reason, enforced in `hack/ci-eval-pr.sh` alone until the key carries a mode
+field. `bench/baselines/README.md` is canonical for the rule; this paragraph records why the
 read-only class exists.
 
 Two independent reasons, and the weaker one is the one usually cited. The narrow reason is

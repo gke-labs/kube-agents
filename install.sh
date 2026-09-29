@@ -283,7 +283,7 @@ bootstrap_install_env() {
   # next run from a clean shell. A first install, which has no file yet, keeps
   # the environment and records it; a typed --scope-* flag still overrides
   # for one run and is warned about.
-  unset SCOPE_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -389,6 +389,8 @@ PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
 # The multi-project scope (spec.scope): empty means the management project
 # alone, so there is no default to resolve.
 PARAM_SCOPE_PROJECTS="${SCOPE_PROJECTS:-}"
+PARAM_SCOPE_FOLDERS="${SCOPE_FOLDERS:-}"
+PARAM_SCOPE_ORGANIZATIONS="${SCOPE_ORGANIZATIONS:-}"
 PARAM_SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}"
 PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
 # Whether a --scope-* flag was typed: the Day-2 menu reads the keys from
@@ -553,6 +555,11 @@ Flags for AI Agents & Automation:
   --scope-projects=IDS          GCP projects beyond the install's whose GKE clusters get a
                                 Cluster Agent (space- or comma-separated); the agent's
                                 service account is granted the read roles in each
+  --scope-folders=IDS           Numeric GCP folder IDs; every project beneath, at any depth,
+                                is in scope, the read roles and roles/cloudasset.viewer are
+                                bound on the folder, and the Cloud Asset API is enabled
+  --scope-organizations=IDS     Numeric GCP organisation IDs, bound the same way (wide;
+                                prefer folders)
   --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
                                 unmanaged
   --scope-exclude-clusters=TRIPLES
@@ -720,6 +727,8 @@ require_scope_flag_value() {
   [[ "$value" == *[![:space:],]* ]] && return 0
   case "$flag" in
     --scope-projects) key="SCOPE_PROJECTS" ;;
+    --scope-folders) key="SCOPE_FOLDERS" ;;
+    --scope-organizations) key="SCOPE_ORGANIZATIONS" ;;
     --scope-exclude-projects) key="SCOPE_EXCLUDE_PROJECTS" ;;
     *) key="SCOPE_EXCLUDE_CLUSTERS" ;;
   esac
@@ -760,6 +769,12 @@ parse_args() {
       --scope-projects=*)
         PARAM_SCOPE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_PROJECTS"; shift ;;
+      --scope-folders=*)
+        PARAM_SCOPE_FOLDERS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_FOLDERS"; shift ;;
+      --scope-organizations=*)
+        PARAM_SCOPE_ORGANIZATIONS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_ORGANIZATIONS"; shift ;;
       --scope-exclude-projects=*)
         PARAM_SCOPE_EXCLUDE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_PROJECTS"; shift ;;
@@ -1435,15 +1450,17 @@ bootstrap_install_env_file() {
     # next full upgrade regenerates from the file, so a project the file does
     # not name is dropped again, its bindings revoked and its profiles retired.
     local scope_key scope_flag scope_value
-    for scope_key in SCOPE_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
+    for scope_key in SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
       case "$scope_key" in
         SCOPE_PROJECTS) scope_flag="--scope-projects"; scope_value="${PARAM_SCOPE_PROJECTS:-}" ;;
+        SCOPE_FOLDERS) scope_flag="--scope-folders"; scope_value="${PARAM_SCOPE_FOLDERS:-}" ;;
+        SCOPE_ORGANIZATIONS) scope_flag="--scope-organizations"; scope_value="${PARAM_SCOPE_ORGANIZATIONS:-}" ;;
         SCOPE_EXCLUDE_PROJECTS) scope_flag="--scope-exclude-projects"; scope_value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}" ;;
         *) scope_flag="--scope-exclude-clusters"; scope_value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}" ;;
       esac
       warn_flag_beats_unrecorded_file_value "$destination" "$scope_key" "$scope_flag" \
         "$scope_value" \
-        "A later run without it regenerates the scope from the file: a project the file does not name is dropped from the scope on the next full upgrade, its read roles revoked and its Cluster Agent profiles retired over the reconcile's next two clean runs." \
+        "A later run without it regenerates the scope from the file: a project, folder or organisation the file does not name is dropped from the scope on the next full upgrade, its read roles revoked and its Cluster Agent profiles retired over the reconcile's next two clean runs." \
         false \
         "every later install.sh run"
     done
@@ -1503,6 +1520,8 @@ bootstrap_install_env_file() {
   # empty block, so the presence of the keys is what tells an operator where
   # a project is declared.
   write_env_var "$tmp" SCOPE_PROJECTS "${SCOPE_PROJECTS:-}"
+  write_env_var "$tmp" SCOPE_FOLDERS "${SCOPE_FOLDERS:-}"
+  write_env_var "$tmp" SCOPE_ORGANIZATIONS "${SCOPE_ORGANIZATIONS:-}"
   write_env_var "$tmp" SCOPE_EXCLUDE_PROJECTS "${SCOPE_EXCLUDE_PROJECTS:-}"
   write_env_var "$tmp" SCOPE_EXCLUDE_CLUSTERS "${SCOPE_EXCLUDE_CLUSTERS:-}"
   write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
@@ -2447,7 +2466,14 @@ print_generate_only_handoff() {
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
   echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
   echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
-  echo -e "  # carries that SCOPE_PROJECTS does not name is replaced by this apply."
+  echo -e "  # carries that the SCOPE_* keys in install.env do not declare (SCOPE_PROJECTS, SCOPE_FOLDERS,"
+  echo -e "  # SCOPE_ORGANIZATIONS and the two exclusions) is replaced by this apply, and the reconcile"
+  echo -e "  # retires what it drops; read spec.scope off the PlatformAgent and record it first."
+  if [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]; then
+    echo -e "  # The scope container preflight above does not refuse on this route: this apply binds the"
+    echo -e "  # declared folder or organisation with whatever credentials run it, which need setIamPolicy"
+    echo -e "  # on the container, and a warning above, if any, says what this identity could not."
+  fi
   echo ""
   echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
   echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
@@ -3789,6 +3815,7 @@ run_menu_system() {
         gcloud container clusters get-credentials "$cluster_name" --location "$REGION" \
           --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
         refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+        check_scope_container_access || exit 1
         apply_crd_upgrades "$repo_dir"
         print_info "Re-applying the install to GKE cluster '$cluster_name' (terraform apply)..."
         run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-$(date -u +%Y%m%dT%H%M%SZ).log"
@@ -3862,7 +3889,7 @@ main() {
     # flag here would be validated and then dropped without a word.
     if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
       print_error "--menu takes no --scope-* flag: it edits install.env in place and reads the scope keys from there."
-      print_info "Set SCOPE_PROJECTS, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
+      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
       exit 1
     fi
     run_menu_system
@@ -4706,6 +4733,8 @@ main() {
   require_supported_permission_set "$permission_set" || exit 1
   local custom_roles="${PARAM_CUSTOM_ROLES:-}"
   local scope_projects="${PARAM_SCOPE_PROJECTS:-}"
+  local scope_folders="${PARAM_SCOPE_FOLDERS:-}"
+  local scope_organizations="${PARAM_SCOPE_ORGANIZATIONS:-}"
   local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
   local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"
   # This rule is also written in init_var_platform_agent_permission_set
@@ -5036,6 +5065,8 @@ main() {
   export PLATFORM_AGENT_PERMISSION_SET="$permission_set"
   export PLATFORM_AGENT_CUSTOM_ROLES="$custom_roles"
   export SCOPE_PROJECTS="$scope_projects"
+  export SCOPE_FOLDERS="$scope_folders"
+  export SCOPE_ORGANIZATIONS="$scope_organizations"
   export SCOPE_EXCLUDE_PROJECTS="$scope_exclude_projects"
   export SCOPE_EXCLUDE_CLUSTERS="$scope_exclude_clusters"
   export GITOPS_ORG="$github_org"
@@ -5122,6 +5153,24 @@ main() {
     gcloud container clusters get-credentials "$cluster_name" --location "$region" \
       --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
     refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+  fi
+  # A declared folder or organisation is bound by the apply with this
+  # identity, in the container itself, and turns on the Asset API in the host
+  # project; both are checked before anything is applied, first install
+  # included, so a container this identity cannot bind or an organisation
+  # policy that forbids the API stops the run rather than failing it partway.
+  # The mode follows the route: a run that will apply is refused, a run that
+  # hands the apply to lifecycle.sh only warns, because that apply often runs
+  # later as a CI or platform identity and the credentials probed here are the
+  # ones at the keyboard. Here the route is known for --generate-only and -y;
+  # an interactive run learns it at the (Y/n/g) prompt below and is checked
+  # there, so the g answer is the same choice as the flag.
+  if [ "$PARAM_DRY_RUN" != "true" ]; then
+    if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+      check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+    elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+      check_scope_container_access || exit 1
+    fi
   fi
 
   # Prompt for opt-ins on existing cluster mutations before the summary
@@ -5274,9 +5323,14 @@ main() {
     prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)" confirm_choice "y"
     case "$confirm_choice" in
       [Yy])
+        # The apply is chosen: the container preflight refuses here, before
+        # step 12 writes anything, as it does above the summary for -y.
+        check_scope_container_access || exit 1
         ;;
       [Gg])
+        # The handoff is chosen: the same check only warns, as for the flag.
         PARAM_GENERATE_ONLY="true"
+        check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
         ;;
       *)
         print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"

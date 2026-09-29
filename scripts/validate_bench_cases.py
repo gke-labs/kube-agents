@@ -267,6 +267,11 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
+    # Likewise: "the run wrote to the GitOps repository since it started" is
+    # the assertion, and every field narrows it. The inject lane appends it
+    # to every case it runs (hack/eval/inject-lane-safeguards.yaml); a case
+    # may also declare it.
+    "github_writes": (),
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns"),
     "worker_agents": ("required_agents",),

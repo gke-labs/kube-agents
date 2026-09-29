@@ -55,7 +55,9 @@ python3 ./skills/inspect-repository/scripts/inspect_repository.py close --handle
 ```
 
 The handle survives between turns; the shell does not. Keep it, and **close it
-when you are done** — an open handle holds a clone on the broker's volume.
+when you are done** — an open handle holds a clone on the broker's volume. The
+broker reclaims a handle nothing has used for 30 minutes, so `no such workspace`
+after a long pause means open again, not that the repository is gone.
 `open` also prints `sha`, the commit the workspace was cloned at; a report
 that has to say which commit it read (the fleet-audit declared-intent record
 names each repository as `owner/name@sha`) takes it from there, since there
