@@ -1672,13 +1672,28 @@ bootstrap_install_env_file() {
     local drift_detector_chosen="${PARAM_ENABLE_DRIFT_DETECTOR:-}"
     local drift_detector_recorded drift_detector_consequence drift_detector_turning_off=""
     drift_detector_recorded="$(recorded_install_env_value "$destination" ENABLE_DRIFT_DETECTOR 2>/dev/null || true)"
+    # What a later run that passes no flag reads the key back from. The file
+    # when it records one; otherwise, with the file silent, this shell's own
+    # export -- PARAM_ENABLE_DRIFT_DETECTOR is seeded from the environment
+    # before parse_args overwrites it, so that export is what the next run
+    # from this shell chooses and what an upgrade.sh from it regenerates on.
+    local drift_detector_restorer="${destination}"
+    if [ -z "$drift_detector_recorded" ] && is_truthy "${ENABLE_DRIFT_DETECTOR:-false}"; then
+      drift_detector_restorer="the ENABLE_DRIFT_DETECTOR=${ENABLE_DRIFT_DETECTOR} this shell exports"
+    fi
     if [ -n "$drift_detector_chosen" ] && ! is_truthy "$drift_detector_chosen"; then
-      if is_truthy "${drift_detector_recorded:-false}"; then
+      if is_truthy "${drift_detector_recorded:-false}" || is_truthy "${ENABLE_DRIFT_DETECTOR:-false}"; then
+        # Off over something that asks for it on: the file, or -- with the file
+        # silent -- the shell. The second is a reversal too, and the one this
+        # guard exists to catch: the =false applies to this run, and the next
+        # run from the same shell re-reads the export, writes both keys and
+        # provisions the ingress again, empty and billing, with nothing said.
         drift_detector_turning_off="true"
       else
-        # Off over a file that does not ask for it on. This run writes neither
-        # key and so would every later run, so there is no reversal to
-        # announce -- and the helper's unrecorded branch would announce one.
+        # Off over a file that does not ask for it on, from a shell that does
+        # not either. This run writes neither key and so would every later run,
+        # so there is no reversal to announce -- and the helper's unrecorded
+        # branch would announce one.
         drift_detector_chosen=""
       fi
     fi
@@ -1692,27 +1707,48 @@ bootstrap_install_env_file() {
     # operator their audit records are about to be deleted is how a warning gets
     # discounted, and this is the population most likely to try the new key.
     #
-    # Read from the file, not from the environment. install.env has been sourced
-    # with `set -a` by the time this runs, so the value is in this shell either
-    # way and the two are indistinguishable there -- and nothing unsets TF_VAR_*
-    # (bootstrap_install_env clears only the SCOPE_ keys). Only the file line
-    # survives the next run: an operator who provisioned the ingress with
-    # `TF_VAR_enable_drift_pubsub=true ./install.sh` and recorded nothing has an
-    # upgrade.sh from a clean shell that regenerates tfvars with neither key,
-    # falls to the variable's false default and destroys the trio. Reading the
-    # environment would promise that operator the sink survives, and name a line
-    # in their install.env that is not there. This function never rewrites an
-    # existing file, so a line read here is a line that is still there after.
-    local drift_ingress_recorded
+    # Which source answers that depends on which apply the sentence is about,
+    # and the two branches below are about different ones.
+    #
+    # Turning off asks about the apply that is seconds away. Terraform reads
+    # TF_VAR_ out of the environment the front door hands it, and nothing on
+    # the way here unsets TF_VAR_* (load_install_env clears NAMESPACE and the
+    # five SCOPE_ keys, upgrade.sh clears three more, neither list reaches
+    # these), so a hand-written file line and a shell export both survive to
+    # `terraform apply` and either one keeps the trio standing through it.
+    # Reading only the file would tell the exporting operator this apply
+    # deletes their audit records when it does not, which is how a warning
+    # gets discounted.
+    #
+    # Turning on asks about a later run, and a later run is from whatever
+    # shell the operator is in by then, so only the file line counts. An
+    # operator who provisioned the ingress with
+    # `TF_VAR_enable_drift_pubsub=true ./install.sh` and recorded nothing has
+    # an upgrade.sh from a clean shell that regenerates tfvars with neither
+    # key, falls to the variable's false default and destroys the trio;
+    # promising them a sink that survives is the same discounting in the
+    # other direction. The export is still worth naming where it holds, which
+    # is why the turning-off branch carries the caveat rather than dropping
+    # the distinction. This function never rewrites an existing file, so a
+    # line read here is a line that is still there after.
+    local drift_ingress_recorded drift_ingress_caveat=""
     drift_ingress_recorded="$(recorded_install_env_value "$destination" TF_VAR_enable_drift_pubsub 2>/dev/null || true)"
+    local drift_ingress_keeper_file="" drift_ingress_keeper_now=""
     if is_truthy "${drift_ingress_recorded:-false}"; then
-      if [ -n "$drift_detector_turning_off" ]; then
-        drift_detector_consequence="This run writes neither drift tfvars key, so it stops the detector now; the TF_VAR_enable_drift_pubsub line in ${destination} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads. A later run without the flag re-reads the file and starts the detector again."
+      drift_ingress_keeper_file="the TF_VAR_enable_drift_pubsub line in ${destination}"
+      drift_ingress_keeper_now="$drift_ingress_keeper_file"
+    elif is_truthy "${TF_VAR_enable_drift_pubsub:-false}"; then
+      drift_ingress_keeper_now="TF_VAR_enable_drift_pubsub in this shell's environment"
+      drift_ingress_caveat=" ${destination} does not record it, so the first run from a shell without that export destroys them along with the audit records retained there."
+    fi
+    if [ -n "$drift_detector_turning_off" ]; then
+      if [ -n "$drift_ingress_keeper_now" ]; then
+        drift_detector_consequence="This run writes neither drift tfvars key, so it stops the detector now; ${drift_ingress_keeper_now} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads.${drift_ingress_caveat} A later run without the flag re-reads ${drift_detector_restorer} and starts the detector again."
       else
-        drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it writes neither and stops the detector; the TF_VAR_enable_drift_pubsub line in ${destination} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads."
+        drift_detector_consequence="This run writes neither drift tfvars key, so this apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there, with -auto-approve and no plan shown first; a later run without the flag re-reads ${drift_detector_restorer} and provisions them again, empty."
       fi
-    elif [ -n "$drift_detector_turning_off" ]; then
-      drift_detector_consequence="This run writes neither drift tfvars key, so this apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there, with -auto-approve and no plan shown first; a later run without the flag re-reads the file and provisions them again, empty."
+    elif [ -n "$drift_ingress_keeper_file" ]; then
+      drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it writes neither and stops the detector; ${drift_ingress_keeper_file} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads."
     else
       drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it writes neither and the apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there; the front door applies with -auto-approve, so nobody is shown that plan first."
     fi

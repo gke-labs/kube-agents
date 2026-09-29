@@ -7162,6 +7162,69 @@ class DomainScopedFlagsTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
             self.assertNotIn("ENABLE_DRIFT_DETECTOR", proc.stdout + proc.stderr)
 
+    def test_turning_it_off_over_an_exported_value_is_still_a_reversal(self):
+        """A silent file is not the same as nobody asking for the detector.
+
+        install.sh line 412 seeds PARAM_ENABLE_DRIFT_DETECTOR from an exported
+        ENABLE_DRIFT_DETECTOR, which is the documented route that predates the
+        flag, so an operator can have provisioned the ingress from a shell
+        export with nothing in install.env to show for it. Typing `=false` over
+        that is the reversal this guard exists to announce and the worst one it
+        has: the =false binds this run only, and the next run from the same
+        shell re-reads the export, writes both keys and provisions the sink,
+        topic and subscription again -- empty, billing, and nothing said. The
+        recorded value alone cannot see it, so the test above (which withholds
+        the value when the file never asked) must not swallow this one.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"ENABLE_DRIFT_DETECTOR": "true"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("this apply destroys", combined)
+            # Named, because "a later run without the flag" is ambiguous when
+            # the file is silent: the operator has to be told it is their own
+            # shell that brings the detector back, not a line they can edit.
+            self.assertIn("this shell exports", combined)
+
+    def test_turning_it_off_on_an_exported_tf_var_ingress_names_the_export(self):
+        """Whether this apply destroys the trio is a question about this apply.
+
+        Terraform reads TF_VAR_ out of the environment the front door hands it,
+        and nothing between here and the apply unsets TF_VAR_* -- load_install_env
+        clears NAMESPACE and the five SCOPE_ keys, upgrade.sh three more. So an
+        exported TF_VAR_enable_drift_pubsub keeps the sink, topic and
+        subscription through this run exactly as a file line would, and telling
+        that operator their audit records are being deleted is false. What
+        differs is how long it holds, which the caveat carries: the file records
+        nothing, so the first run from a shell without the export takes the trio
+        after all. The turning-on direction is the contrast and stays as it was
+        (test_an_exported_tf_var_ingress_is_still_reported_as_destroyed) --
+        that sentence is about a later run from an unknown shell, where only
+        the file line counts.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=true\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"TF_VAR_enable_drift_pubsub": "true"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("it stops the detector now", combined)
+            self.assertIn("keeps the Log Router sink", combined)
+            self.assertIn("this shell's environment", combined)
+            self.assertIn("does not record it", combined)
+            self.assertIn("from a shell without that export destroys them", combined)
+
     def test_an_unchosen_drift_detector_key_stays_empty_and_says_nothing(self):
         """Empty through resolve_shared_defaults is what keeps this quiet.
 
