@@ -9,6 +9,8 @@ plugin's side effects (origin binding, delivery trigger, presence marker) and
 the greeting context it returns.
 """
 
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -213,6 +215,104 @@ class PreLlmCallTest(unittest.TestCase):
         # ...and a real chat turn afterwards still gets its greeting.
         self.assertIsNotNone(self._call())
         self.assertTrue((self.data_dir / ".user_aligned").exists())
+
+    # --- the eval seam ----------------------------------------------------
+
+    def _plant(self, variant="in_progress", phrase="priya here", suffix="-running"):
+        marker = self.data_dir / f".bootstrap_greet_eval{suffix}"
+        marker.write_text(json.dumps({"variant": variant, "phrase": phrase}), encoding="utf-8")
+        return marker
+
+    def _eval_call(self, **overrides):
+        kwargs = {"platform": "api_server", "user_message": "hi! priya here, just installed you"}
+        kwargs.update(overrides)
+        return self._call(**kwargs)
+
+    def test_eval_marker_greets_on_a_platform_the_allowlist_excludes(self):
+        self._plant()
+        result = self._eval_call()
+        self.assertIsNotNone(result)
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+        self.assertIn("IN-PROGRESS-INSTRUCTIONS", result["context"])
+
+    def test_eval_marker_variant_picks_the_completed_instructions(self):
+        self._plant(variant="completed")
+        result = self._eval_call()
+        self.assertIn("SCAN COMPLETED", result["context"])
+        self.assertIn("COMPLETED-INSTRUCTIONS", result["context"])
+
+    def test_eval_marker_touches_no_onboarding_state(self):
+        self._plant()
+        self._eval_call(platform="google_chat")
+        self.update_job.assert_not_called()
+        self.trigger_job.assert_not_called()
+        self.assertFalse((self.data_dir / ".user_aligned").exists())
+        self.assertFalse((self.data_dir / plugin.GREETED_MARKER).exists())
+
+    def test_eval_marker_greets_even_after_onboarding_happened(self):
+        (self.data_dir / plugin.GREETED_MARKER).touch()
+        (self.data_dir / ".bootstrap_completed").touch()
+        self._plant()
+        self.assertIsNotNone(self._eval_call())
+
+    def test_eval_marker_is_consumed_once(self):
+        marker = self._plant()
+        self.assertIsNotNone(self._eval_call())
+        self.assertFalse(marker.exists())
+        self.assertIsNone(self._eval_call())
+
+    def test_eval_marker_waits_for_its_phrase(self):
+        marker = self._plant()
+        self.assertIsNone(self._eval_call(user_message="list my clusters"))
+        self.assertTrue(marker.exists())
+
+    def test_eval_marker_is_not_consumed_by_a_later_turn_or_cron(self):
+        marker = self._plant()
+        self.assertIsNone(self._eval_call(is_first_turn=False))
+        self.assertIsNone(self._eval_call(platform="cron"))
+        self.assertIsNone(self._eval_call(session_id="cron_abc"))
+        self.assertTrue(marker.exists())
+
+    def test_unreadable_eval_marker_is_ignored(self):
+        (self.data_dir / ".bootstrap_greet_eval-a").write_text("not json", encoding="utf-8")
+        (self.data_dir / ".bootstrap_greet_eval-b").write_text("[]", encoding="utf-8")
+        self.assertIsNone(self._eval_call())
+
+    def test_concurrent_eval_markers_are_each_taken_by_their_own_phrase(self):
+        running = self._plant(phrase="just installed you", suffix="-running")
+        done = self._plant(variant="completed", phrase="just set you up", suffix="-done")
+        result = self._eval_call(user_message="hey, priya here, just set you up")
+        self.assertIn("SCAN COMPLETED", result["context"])
+        self.assertTrue(running.exists())
+        self.assertFalse(done.exists())
+        result = self._eval_call(user_message="hi! priya here, just installed you")
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+        self.assertFalse(running.exists())
+
+    def test_only_bench_and_this_plugin_name_the_eval_marker(self):
+        repo = Path(__file__).resolve().parents[5]
+        try:
+            listed = subprocess.run(
+                ["git", "grep", "-l", "--fixed-strings", plugin.EVAL_GREET_MARKER],
+                cwd=repo, capture_output=True, text=True, check=False,
+            )
+        except FileNotFoundError:
+            self.skipTest("git is not installed")
+        if listed.returncode > 1:
+            self.skipTest(f"git grep failed: {listed.stderr.strip()}")
+        plugin_dir = Path(__file__).resolve().parent.relative_to(repo).as_posix() + "/"
+        strays = [
+            path for path in listed.stdout.splitlines()
+            if not (path.startswith("bench/") or path.startswith(plugin_dir))
+        ]
+        self.assertEqual(strays, [], "only the bench stack may write the eval seam's marker")
+
+    def test_absent_eval_marker_leaves_the_real_flow_unchanged(self):
+        self.assertIsNone(self._eval_call())
+        result = self._call(user_message="hi! priya here, just installed you")
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+        self.update_job.assert_called_once()
+        self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
 
 
 if __name__ == "__main__":

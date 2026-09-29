@@ -1,0 +1,174 @@
+---
+id: first-install-hello-running
+name: The first-install hello, scan still running, is short, read-only and asks one thing
+
+# The greeting a new user gets on their first chat turn after install, while the
+# first-look scan is still running: who it is in one word, that it only reads,
+# where the results will appear, that changes come as reviewed pull requests,
+# and one question (agents/chat/defaults/onboarding/scan_in_progress.md). The stack arms the bootstrap_onboarding plugin's eval seam, because
+# the bench reaches the agent over the API server, which the real greeting
+# excludes, on an install that greeted long ago.
+
+fixtures: []
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/first-install-hello"
+  teardown: true
+  variables:
+    case_suffix: "running"
+    variant: "in_progress"
+    # A substring of the prompt below and of no other case's prompt.
+    phrase: "just installed you"
+
+validated: false
+
+domain: chat-and-routing
+
+owner: jayantid
+
+prompt: "hi! priya here, just installed you"
+
+expected_output: |
+  critical requirements:
+  - One short message that greets Priya by name and introduces itself as Kage,
+    with no internal agent names and no architecture.
+  - It says it is taking a first look at the GKE fleet and only reading, so
+    nothing in the clusters changes, and that it will post what it finds in
+    this chat when it is done, without promising a time.
+  - It says any change it thinks should be made comes as a pull request for the
+    team to review.
+  - It ends on exactly one question, an offer of what to look at first. It asks
+    for nothing else: no SOPs, governance or time zone.
+  - It does not claim to have saved or remembered anything, list what it can
+    do, apologise, or use hype.
+
+verification_spec:
+  # Every check reads the final message, so each sets `mode: assert`: the reply
+  # cannot change once the run ends, and polling a failed phrase check would
+  # only wait out the timeout. Phrases are forgiving substrings over the
+  # lowercased, emphasis-stripped reply; patterns are re.search over it.
+
+  - name: greets-the-user-by-name
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["priya"]
+
+  - name: says-it-is-kage
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["kage"]
+
+  - name: says-it-only-reads
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        [
+          "read-only",
+          "only reading",
+          "only read",
+          "nothing in your clusters",
+          "won't change",
+          "nothing changed",
+          "not changing",
+        ]
+
+  - name: says-changes-come-as-pull-requests
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["pull request", "as a pr", "a pr for"]
+
+  - name: says-results-will-be-posted
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["post", "share", "send"]
+
+  - name: says-results-come-to-this-chat
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["here", "this chat"]
+
+  - name: asks-one-question-and-ends-on-it
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        # Two question marks: homework, not an offer.
+        - '\?[\s\S]*\?'
+        # The last character is not a question mark.
+        - '[^?\s]\s*\Z'
+
+  - name: at-most-sixty-words
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ['\A(?:\S+\s+){60}\S']
+
+  - name: no-architecture
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases:
+        [
+          "planning agent",
+          "platform agent",
+          "cluster agent",
+          "specialist",
+          "kanban",
+          "hierarchy",
+        ]
+
+  - name: no-stacked-asks
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ['\bsops?\b', "time ?zone", "governance"]
+
+  - name: claims-no-save
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ['\b(saved|remember(ed)?|noted|stored)\b']
+
+  - name: no-capability-list
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '(?m)^\s*(?:[-•]|\d+[.)])\s'
+        - "i can help( you)? with"
+
+  - name: no-apology-hype-or-filler
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\b(sorry|apologi[sz]e)'
+        - '\b(excited|thrilled|delighted|supercharge|seamless)'
+        - "let me know"
+        - "good (morning|afternoon|evening)"
