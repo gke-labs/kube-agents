@@ -346,6 +346,37 @@ of the note while it lasts. The Brief's lede carries the same numbers. There
 is no tile for it: the tiles recompute for the reader's date range, and the
 wait is a fixed 24-hour figure that is not in the run data.
 
+## The watched periodics
+
+Two Prow periodics keep the pool in shape from outside any run, and until this
+rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
+(the GitOps stale-pull-request sweep, every ten minutes) and the seeded-fleet
+reconcile, hourly against the drifted projects and weekly against every free
+one. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+per job with its label, its stale window and the artifact it writes, so adding
+the next periodic is one line. The hourly job's `Fetch the watched periodics'
+latest builds` step reads each job's `latest-build.txt` from the Prow archive,
+walks back to a build with a `finished.json` (the newest is often still
+running), keeps the reconcile's `fleet-reconcile.json` when the build wrote
+one, and hands the readings to `health.py --periodics-dir`.
+
+Like the pool note it rides beside the state and never becomes one. A job whose
+latest finished build failed is a `FAILED` note; one whose latest finished
+build is older than its stale window (an hour for the sweep, three for the
+hourly reconcile, eight days for the weekly) is `STALE`, whatever that build's
+verdict. The note carries the build, when it finished, `since` (kept across
+ticks through the previous `health.json`), the job's history link, where the
+recovery is written, and for the reconcile the projects it refused, failed or
+was interrupted in, with each one's reason, up to five. A job with no reading
+writes no note and ends none: that is the bot losing sight of the job, not the
+job recovering.
+
+The poster sends one message per failing build (a newer build that also failed
+is news: the fix did not take) and one when a job the space was told about
+passes again, on a reading only. The digest carries one line per open note.
+Nothing here files an issue: the recovery is a person's, and the message says
+where it is written (`docs/ci-pool-projects.md`, sections 3 and 6.2).
+
 ## The comment on a red pull request
 
 Each tick, `scripts/eval_dashboard/gate_comment.py` finds the

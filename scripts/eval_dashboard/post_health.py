@@ -84,14 +84,14 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from eval_dashboard import gate_issue, ghcli, nightly
+    from eval_dashboard import gate_issue, ghcli, nightly, periodics
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
     from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_span, wait_text
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import gate_issue, ghcli, nightly
+    from eval_dashboard import gate_issue, ghcli, nightly, periodics
     from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_span, wait_text
 
 STATE_SCHEMA_VERSION = 1
@@ -151,6 +151,8 @@ KIND_POOL = "pool"  # runs are waiting to start; once per episode
 KIND_POOL_CLEAR = "pool_clear"  # ... and once when they stop
 KIND_DIGEST = "digest"  # the daily numbers
 KIND_FIXTURE_SCAN = "fixture_scan"  # the fleet scan sees nothing, or sees again
+KIND_PERIODIC = "periodic"  # a watched Prow periodic failed or stopped; once per build
+KIND_PERIODIC_CLEAR = "periodic_clear"  # ... and once when its next run passes
 
 # Where the message goes. The space is a resource name, the token a bearer
 # credential minted by the workflow; the webhook is the legacy alternative.
@@ -391,6 +393,14 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
         kinds.append(KIND_STALE)
     if fixture_unknown(health) != bool((prev or {}).get("fixture_unknown")):
         kinds.append(KIND_FIXTURE_SCAN)
+    # A watched periodic: once per failing build (a new build that also
+    # failed is news: the fix did not take), and once more when a job the
+    # space was told about passes again. Only a reading clears -- no reading
+    # is the bot losing sight of the job, not the job recovering.
+    if periodic_news(health, prev):
+        kinds.append(KIND_PERIODIC)
+    if periodic_clears(health, prev):
+        kinds.append(KIND_PERIODIC_CLEAR)
 
     # The slow note goes out when the note appears, not when it clears: the
     # digest carries it while it lasts, and "back to normal" is not news.
@@ -844,6 +854,64 @@ def render_pool_clear(health: dict) -> str:
     return f"✅ *Smoke gate: queue clear* — runs are starting on time again{typical}."
 
 
+def periodic_key(note: dict) -> str:
+    """What one message stands for: the job's verdict on one build."""
+    return f"{note.get('verdict')}:{note.get('build')}"
+
+
+def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:
+    """The notes not yet told at their current build, by job."""
+    told = (prev or {}).get("periodics_told") or {}
+    return {job: note for job, note in (health.get("periodics") or {}).items() if told.get(job) != periodic_key(note)}
+
+
+def periodic_clears(health: dict, prev: dict | None) -> list[str]:
+    """The jobs the space was told about that a reading now shows clean."""
+    told = (prev or {}).get("periodics_told") or {}
+    current = health.get("periodics") or {}
+    read = set(health.get("periodics_read") or [])
+    return sorted(job for job in told if job in read and job not in current)
+
+
+def render_periodic(health: dict, prev: dict | None) -> str:
+    """One block per job with news: what failed, the projects it names, where
+    the recovery is written, and the job's history."""
+    blocks = []
+    for job, note in sorted(periodic_news(health, prev).items()):
+        when = clock(parse_iso(note.get("finished_at")))
+        if note.get("verdict") == periodics.VERDICT_STALE:
+            last = f"last finished run {when}" if note.get("finished_at") else "no finished run on record"
+            blocks.append(
+                f"⚪ *{note['label']} stopped* — {last}; `{job}` runs at most every {note['stale_after_h']}h and has missed one."
+                f" If the next one doesn't land, it needs checking.\n{note['history_url']}"
+            )
+            continue
+        dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
+        lines = [f"🟠 *{note['label']} failed* — build {note['build']} at {when}{dry}."]
+        lines.extend(f"- {line}" for line in note.get("detail") or [])
+        lines.append(f"Recovery: {note['doc']}.")
+        lines.append(note["history_url"])
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def render_periodic_clear(health: dict, prev: dict | None) -> str:
+    return "\n".join(
+        f"✅ *{periodics.WATCHED_BY_JOB[job].label if job in periodics.WATCHED_BY_JOB else job} passed again* — its latest run finished clean."
+        for job in periodic_clears(health, prev)
+    )
+
+
+def periodic_digest_lines(health: dict) -> list[str]:
+    lines = []
+    for _, note in sorted((health.get("periodics") or {}).items()):
+        if note.get("verdict") == periodics.VERDICT_STALE:
+            lines.append(f"⚪ {note['label']}: no finished run since {clock(parse_iso(note.get('finished_at')))}.")
+        else:
+            lines.append(f"🟠 {note['label']}: build {note['build']} failed {clock(parse_iso(note.get('finished_at')))}; {note['history_url']}")
+    return lines
+
+
 def render_fixture_scan(health: dict) -> str:
     block = fixture_state_of(health)
     when = clock(parse_iso(block.get("scanned_at")))
@@ -1000,6 +1068,7 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     fleet = fixture_digest_line(health)
     if fleet:
         lines.append(fleet)
+    lines.extend(periodic_digest_lines(health))
     lines.append(dashboard_link(DASHBOARD_VIEW_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
     return "\n".join(lines)
 
@@ -1019,6 +1088,10 @@ def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dic
         return render_pool(health)
     if kind == KIND_POOL_CLEAR:
         return render_pool_clear(health)
+    if kind == KIND_PERIODIC:
+        return render_periodic(health, prev)
+    if kind == KIND_PERIODIC_CLEAR:
+        return render_periodic_clear(health, prev)
     return render_change(health, prev, issue)
 
 
@@ -1228,6 +1301,15 @@ def run(
         told_state = told_state or (KIND_CHANGE not in kinds and KIND_RECOVERY not in kinds)
         told_stale = told_stale or KIND_STALE not in kinds
         told_fixture = told_fixture or KIND_FIXTURE_SCAN not in kinds
+    # The watched periodics: each job's told key moves only on a sent
+    # message (a failed send retries next tick), and a job leaves the map only
+    # on a sent clear, so "it is over" is never lost either.
+    periodics_told = dict(before.get("periodics_told") or {})
+    if KIND_PERIODIC in sent:
+        periodics_told.update({job: periodic_key(note) for job, note in (health.get("periodics") or {}).items()})
+    if KIND_PERIODIC_CLEAR in sent:
+        for job in periodic_clears(health, prev):
+            periodics_told.pop(job, None)
     source = health if told_state else before
     state = {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -1252,6 +1334,7 @@ def run(
         "pool_breached": pool_breached,
         "pool_causes": pool_causes,
         "pool_drained": pool_drained,
+        "periodics_told": periodics_told,
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),
         "updated_at": now.isoformat(timespec="seconds"),

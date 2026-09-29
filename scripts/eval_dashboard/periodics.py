@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""The Prow periodics that keep the pool in shape, read for the CI health bot.
+
+The pull sweep and the two seeded-fleet reconciles run on the build cluster and
+report nowhere but TestGrid. This module reads each one's latest finished build
+from the Prow archive (`latest-build.txt`, then `finished.json`, then the
+artifact the job wrote, if it writes one) and turns a failed or overdue run into
+a note health.py carries and post_health.py posts once, with the job's history
+link and, for the reconcile, the projects it refused or could not finish.
+
+    fetch --out-dir DIR      one <job>.json per watched periodic that has a
+                             finished build; a job that has never run writes
+                             nothing, and nothing here fails the tick.
+
+Which jobs are watched is WATCHED below; adding a periodic is one entry.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import pathlib
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+# Where Prow's pod utilities publish a periodic's builds, and Deck's history
+# page for one (the link every message carries).
+LOGS_ROOT = "gs://kube-agents-prow/logs"
+JOB_HISTORY_ROOT = "https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs"
+POINTER = "latest-build.txt"
+FINISHED = "finished.json"
+ARTIFACTS_DIR = "artifacts"
+# The pointer moves at job start, so the newest build is often still running;
+# the one before it has finished. Three covers a run of aborted builds.
+FALLBACK_BUILDS = 3
+GSUTIL_TIMEOUT_S = 60
+# finished.json's result for a passed run; anything else is a failure or an
+# abort, and `passed` says which.
+RESULT_SUCCESS = "SUCCESS"
+VERDICT_FAILED = "FAILED"
+VERDICT_STALE = "STALE"
+# How many refused or failed projects a message names before "and N more".
+DETAIL_LIMIT = 5
+# The reconcile's artifact (hack/fleet_reconcile.py --report) and the outcomes
+# in it worth naming.
+RECONCILE_ARTIFACT = "fleet-reconcile.json"
+RECONCILE_NAMED_OUTCOMES = ("refused", "failed", "interrupted")
+NOT_FOUND_MARKERS = ("NotFound", "No URLs matched", "404")
+KEY_JOB = "job"
+KEY_BUILD = "build"
+KEY_FINISHED_AT = "finished_at"
+KEY_PASSED = "passed"
+KEY_RESULT = "result"
+KEY_ARTIFACT = "artifact"
+KEY_SINCE = "since"
+KEY_VERDICT = "verdict"
+
+
+@dataclasses.dataclass(frozen=True)
+class Periodic:
+    job: str
+    label: str
+    # A finished build older than this is a job that stopped running: one
+    # missed run and a little, as the TestGrid stale-results setting was.
+    stale_after: timedelta
+    artifact: str | None
+    # Where the recovery is written up.
+    doc: str
+
+
+WATCHED = (
+    Periodic("ci-kube-agents-pull-sweep", "GitOps pull sweep", timedelta(hours=1), None, "docs/ci-pool-projects.md, section 3"),
+    Periodic("ci-kube-agents-fleet-reconcile", "seeded-fleet reconcile (hourly)", timedelta(hours=3), RECONCILE_ARTIFACT, "docs/ci-pool-projects.md, section 6.2"),
+    Periodic("ci-kube-agents-fleet-reconcile-all", "seeded-fleet reconcile (weekly)", timedelta(hours=192), RECONCILE_ARTIFACT, "docs/ci-pool-projects.md, section 6.2"),
+)
+WATCHED_BY_JOB = {p.job: p for p in WATCHED}
+
+
+def history_url(job: str) -> str:
+    return f"{JOB_HISTORY_ROOT}/{job}"
+
+
+def iso(value: datetime | None) -> str | None:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds") if value else None
+
+
+def parse_iso(value) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _gsutil(args: list[str], runner=subprocess.run) -> tuple[int, str, str]:
+    try:
+        proc = runner(["gsutil", "-q", *args], capture_output=True, text=True, timeout=GSUTIL_TIMEOUT_S, check=False)
+    except FileNotFoundError as exc:
+        return 127, "", str(exc)
+    except subprocess.TimeoutExpired as exc:
+        err = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return 124, "", err
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _not_found(err: str) -> bool:
+    return any(marker in (err or "") for marker in NOT_FOUND_MARKERS)
+
+
+def _finished(job: str, build: str, runner) -> dict | None:
+    rc, out, _ = _gsutil(["cat", f"{LOGS_ROOT}/{job}/{build}/{FINISHED}"], runner)
+    if rc != 0:
+        return None
+    try:
+        doc = json.loads(out)
+    except ValueError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _earlier_builds(job: str, newest: str, runner) -> list[str]:
+    rc, out, _ = _gsutil(["ls", f"{LOGS_ROOT}/{job}/"], runner)
+    if rc != 0:
+        return []
+    ids = []
+    for line in out.splitlines():
+        name = line.strip().rstrip("/").rsplit("/", 1)[-1]
+        if name.isdigit() and int(name) < int(newest):
+            ids.append(int(name))
+    return [str(i) for i in sorted(ids, reverse=True)[:FALLBACK_BUILDS]]
+
+
+def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | None:
+    """The latest finished build of one periodic, or None when it has none.
+
+    None is also what a pointer that cannot be read for a reason other than
+    NotFound returns, after a warning: the bot has gone blind on this job, and
+    an absent reading holds any open note rather than ending it."""
+    rc, out, err = _gsutil(["cat", f"{LOGS_ROOT}/{periodic.job}/{POINTER}"], runner)
+    if rc != 0:
+        if not _not_found(err):
+            log(f"warning: could not read {periodic.job}'s build pointer: {err.strip()}", file=sys.stderr)
+        return None
+    newest = out.strip()
+    if not newest.isdigit():
+        return None
+    for build in [newest, *_earlier_builds(periodic.job, newest, runner)]:
+        finished = _finished(periodic.job, build, runner)
+        if finished is None:
+            continue
+        timestamp = finished.get("timestamp")
+        finished_at = datetime.fromtimestamp(timestamp, tz=timezone.utc) if isinstance(timestamp, (int, float)) else None
+        reading = {
+            KEY_JOB: periodic.job,
+            KEY_BUILD: build,
+            KEY_FINISHED_AT: iso(finished_at),
+            KEY_PASSED: bool(finished.get("passed")),
+            KEY_RESULT: str(finished.get("result") or ""),
+        }
+        if periodic.artifact:
+            rc, out, _ = _gsutil(["cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner)
+            artifact = None
+            if rc == 0:
+                try:
+                    loaded = json.loads(out)
+                    artifact = loaded if isinstance(loaded, dict) else None
+                except ValueError:
+                    artifact = None
+            reading[KEY_ARTIFACT] = artifact
+        return reading
+    return None
+
+
+def fetch(out_dir: pathlib.Path, watched=WATCHED, runner=subprocess.run, log=print) -> dict[str, dict]:
+    """Write one <job>.json per periodic with a finished build; return them."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    readings = {}
+    for periodic in watched:
+        target = out_dir / f"{periodic.job}.json"
+        target.unlink(missing_ok=True)
+        reading = read_job(periodic, runner, log)
+        if reading is None:
+            continue
+        target.write_text(json.dumps(reading, indent=2) + "\n", encoding="utf-8")
+        readings[periodic.job] = reading
+    return readings
+
+
+def load_readings(directory: pathlib.Path | None, watched=WATCHED) -> dict[str, dict]:
+    """The readings `fetch` wrote, by job; an unreadable file is no reading."""
+    readings = {}
+    if directory is None or not directory.is_dir():
+        return readings
+    for periodic in watched:
+        path = directory / f"{periodic.job}.json"
+        if not path.is_file():
+            continue
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(loaded, dict) and loaded.get(KEY_JOB) == periodic.job:
+            readings[periodic.job] = loaded
+    return readings
+
+
+def reconcile_detail(artifact: dict | None) -> list[str]:
+    """What the reconcile's artifact says went wrong, one line per project."""
+    if not isinstance(artifact, dict):
+        return []
+    lines = []
+    outcomes = artifact.get("outcomes")
+    if isinstance(outcomes, dict):
+        for project in sorted(outcomes):
+            entry = outcomes[project]
+            if not isinstance(entry, dict) or entry.get("outcome") not in RECONCILE_NAMED_OUTCOMES:
+                continue
+            lines.append(f"{project}: {entry.get('outcome')} ({entry.get('detail') or 'no detail'})")
+    if artifact.get("error"):
+        lines.append(f"run: {artifact['error']}")
+    if len(lines) > DETAIL_LIMIT:
+        lines = lines[:DETAIL_LIMIT] + [f"and {len(lines) - DETAIL_LIMIT} more"]
+    return lines
+
+
+def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, watched=WATCHED) -> dict[str, dict]:
+    """The notes this tick: one per watched job whose latest finished build
+    failed, or is older than the job's stale window. `prev_notes` carries each
+    open note's `since`. A job with no reading writes no note and ends none."""
+    notes = {}
+    for periodic in watched:
+        reading = readings.get(periodic.job)
+        if not isinstance(reading, dict):
+            continue
+        finished_at = parse_iso(reading.get(KEY_FINISHED_AT))
+        if finished_at is None or now - finished_at > periodic.stale_after:
+            verdict = VERDICT_STALE
+        elif not reading.get(KEY_PASSED):
+            verdict = VERDICT_FAILED
+        else:
+            continue
+        before = (prev_notes or {}).get(periodic.job) or {}
+        artifact = reading.get(KEY_ARTIFACT) if isinstance(reading.get(KEY_ARTIFACT), dict) else None
+        notes[periodic.job] = {
+            KEY_JOB: periodic.job,
+            "label": periodic.label,
+            KEY_VERDICT: verdict,
+            KEY_SINCE: before.get(KEY_SINCE) or iso(now),
+            KEY_BUILD: reading.get(KEY_BUILD),
+            KEY_FINISHED_AT: reading.get(KEY_FINISHED_AT),
+            KEY_RESULT: reading.get(KEY_RESULT),
+            "stale_after_h": int(periodic.stale_after.total_seconds() // 3600),
+            "dry_run": bool(artifact.get("dry_run")) if artifact else None,
+            "detail": reconcile_detail(artifact) if verdict == VERDICT_FAILED else [],
+            "history_url": history_url(periodic.job),
+            "doc": periodic.doc,
+        }
+    return notes
+
+
+def evidence(note: dict) -> str:
+    if note[KEY_VERDICT] == VERDICT_STALE:
+        return f"{note['label']}: no finished run since {note[KEY_FINISHED_AT] or 'ever'} ({note[KEY_JOB]} runs at most every {note['stale_after_h']}h)"
+    detail = f": {'; '.join(note['detail'])}" if note.get("detail") else ""
+    return f"{note['label']}: build {note[KEY_BUILD]} failed at {note[KEY_FINISHED_AT]}{detail}"
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    fetch_cmd = sub.add_parser("fetch", help="write one <job>.json per watched periodic with a finished build")
+    fetch_cmd.add_argument("--out-dir", type=pathlib.Path, required=True)
+    fetch_cmd.add_argument("--job", action="append", help="watch only this job (repeatable; default: every watched job)")
+    return parser.parse_args(argv)
+
+
+def main(argv=None, runner=subprocess.run) -> int:
+    args = parse_args(argv)
+    watched = WATCHED
+    if args.job:
+        unknown = [job for job in args.job if job not in WATCHED_BY_JOB]
+        if unknown:
+            print(f"ERROR: not a watched periodic: {', '.join(unknown)}", file=sys.stderr)
+            return 2
+        watched = tuple(WATCHED_BY_JOB[job] for job in args.job)
+    readings = fetch(args.out_dir, watched, runner=runner)
+    for job in sorted(readings):
+        reading = readings[job]
+        print(f"{job}: build {reading[KEY_BUILD]} {reading[KEY_RESULT] or ('passed' if reading[KEY_PASSED] else 'failed')} at {reading[KEY_FINISHED_AT]}")
+    for periodic in watched:
+        if periodic.job not in readings:
+            print(f"{periodic.job}: no finished build")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

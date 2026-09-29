@@ -392,6 +392,18 @@ jobs:
               > work/pool-pressure.json
           fi
 
+      # The watched Prow periodics (scripts/eval_dashboard/periodics.py:
+      # the pull sweep and the two seeded-fleet reconciles): their latest
+      # finished build each, for the note health.py carries and the poster
+      # sends once when one fails or stops running. Best-effort like the
+      # read above: a job that has never run writes nothing, a denied read
+      # warns, and neither fails the tick.
+      - name: Fetch the watched periodics' latest builds
+        continue-on-error: true
+        run: |
+          mkdir -p work/periodics
+          python3 scripts/eval_dashboard/periodics.py fetch --out-dir work/periodics
+
       # The Trend page's input, still as the reader (step A). Best-effort by
       # construction: whatever stops the read (a failed listing, store.py
       # killed by its timeout or crashed, no wall clock left after the
@@ -494,13 +506,15 @@ jobs:
           # the bot filed so health.json can cite it, and for the pool
           # episode's start across a tick that read no artifact.
           # --fixture-state is the hourly scan's document, for the
-          # fixture_drift condition.
+          # fixture_drift condition. --periodics-dir is what the step above
+          # fetched of the watched Prow periodics.
           python3 scripts/eval_dashboard/health.py \
             --data work/data.json \
             --prev work/health-prev.json \
             --posted-state work/health-state.json \
             --pool-pressure work/pool-pressure.json \
             --fixture-state work/fixture-state.json \
+            --periodics-dir work/periodics \
             --out work/health.json
           python3 -c 'import json; h = json.load(open("work/health.json")); print(h["state"], "-", h["cause"] or "no cause", "- stale" if h["stale"] else "")'
 

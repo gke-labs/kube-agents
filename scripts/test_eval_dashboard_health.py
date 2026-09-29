@@ -1232,6 +1232,49 @@ def pooled(doc=None, now=T0, prev=None, posted=None, wall_clock=None, **artifact
     )
 
 
+def periodic_reading(job, when, passed=True, build="100", artifact=None):
+    reading = {"job": job, "build": build, "finished_at": health.iso(when), "passed": passed, "result": "SUCCESS" if passed else "FAILURE"}
+    if artifact is not None:
+        reading["artifact"] = artifact
+    return reading
+
+
+class PeriodicNote(unittest.TestCase):
+    """The watched Prow periodics ride beside the state as notes, never as a
+    state: a failed or overdue run is evidence and a `periodics` entry."""
+
+    WEEKLY = "ci-kube-agents-fleet-reconcile-all"
+    SWEEP = "ci-kube-agents-pull-sweep"
+
+    def judge(self, readings, prev=None, now=T0):
+        return health.adjudicate(data(), now, prev, health.Roster.fixed(ADMITTED), periodics_readings=readings)
+
+    def test_a_failed_reconcile_is_a_note_with_its_projects_and_the_state_stays_green(self):
+        artifact = {"dry_run": True, "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete google_container_cluster.seeded_b"}}}
+        result = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False, artifact=artifact)})
+        self.assertEqual(result["state"], "GREEN", "a failed periodic is a note, not a state")
+        note = result["periodics"][self.WEEKLY]
+        self.assertEqual((note["verdict"], note["build"], note["since"], note["dry_run"]), ("FAILED", "100", health.iso(T0), True))
+        self.assertEqual(note["detail"], ["kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)"])
+        self.assertEqual(result["periodics_read"], [self.WEEKLY])
+        self.assertTrue(any("seeded-fleet reconcile (weekly): build 100 failed" in line for line in result["evidence"]), result["evidence"])
+        # The episode's start carries through the previous health.json.
+        again = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False, build="100")}, prev=result, now=T0 + timedelta(hours=1))
+        self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0))
+
+    def test_a_clean_fresh_pool_writes_no_note_and_names_what_it_read(self):
+        result = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=10)), self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(days=2))})
+        self.assertEqual(result["periodics"], {})
+        self.assertEqual(result["periodics_read"], [self.WEEKLY, self.SWEEP])
+        self.assertFalse(any("reconcile" in line or "sweep" in line for line in result["evidence"]))
+
+    def test_an_overdue_job_is_stale_and_no_readings_is_no_note(self):
+        stale = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(hours=2))})
+        self.assertEqual(stale["periodics"][self.SWEEP]["verdict"], "STALE")
+        blind = self.judge(None)
+        self.assertEqual((blind["periodics"], blind["periodics_read"]), ({}, []))
+
+
 class PoolNote(unittest.TestCase):
     def test_a_breach_quotes_the_day_it_breached_on_not_the_window(self):
         # The #1069 incident's shape. The seven-day window keeps its quiet

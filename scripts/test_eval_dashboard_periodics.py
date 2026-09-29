@@ -1,0 +1,197 @@
+"""scripts/eval_dashboard/periodics.py: the watched Prow periodics' latest
+finished builds, read from the archive, and the notes health.py carries.
+
+* `fetch` reads the pointer, walks back to a finished build, keeps the
+  artifact when the job writes one, writes one <job>.json per job with a
+  build, and nothing for a job that never ran or whose pointer is denied;
+* `assess` notes a failed build and a job whose last finished build is older
+  than its stale window, keeps `since` across ticks, and names the reconcile
+  artifact's refused and failed projects;
+* the workflow fetches the readings before it adjudicates and hands the
+  directory to health.py.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import subprocess
+import sys
+import tempfile
+import unittest
+import unittest.mock
+from datetime import datetime, timedelta, timezone
+
+import yaml
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from eval_dashboard import periodics  # noqa: E402
+
+REPO = pathlib.Path(__file__).resolve().parents[1]
+WORKFLOW = REPO / ".github" / "workflows" / "ci-health.yml"
+NOW = datetime(2026, 9, 30, 14, 0, tzinfo=timezone.utc)
+SWEEP = periodics.WATCHED_BY_JOB["ci-kube-agents-pull-sweep"]
+WEEKLY = periodics.WATCHED_BY_JOB["ci-kube-agents-fleet-reconcile-all"]
+HOURLY = periodics.WATCHED_BY_JOB["ci-kube-agents-fleet-reconcile"]
+
+
+def epoch(when: datetime) -> int:
+    return int(when.timestamp())
+
+
+class FakeGsutil:
+    """Answers `gsutil -q cat|ls <path>` from a dict of gs:// paths to text;
+    a missing path is a NotFound unless `denied` names it."""
+
+    def __init__(self, objects: dict, denied=()):
+        self.objects = objects
+        self.denied = set(denied)
+        self.calls = []
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(cmd)
+        verb, path = cmd[2], cmd[3]
+        if path in self.denied:
+            return subprocess.CompletedProcess(cmd, 1, "", "AccessDeniedException: 403 caller does not have storage.objects.get access")
+        if verb == "cat":
+            if path in self.objects:
+                return subprocess.CompletedProcess(cmd, 0, self.objects[path], "")
+            return subprocess.CompletedProcess(cmd, 1, "", f"CommandException: No URLs matched: {path}")
+        if verb == "ls":
+            names = sorted({key[len(path):].split("/", 1)[0] for key in self.objects if key.startswith(path)})
+            return subprocess.CompletedProcess(cmd, 0, "".join(f"{path}{name}/\n" for name in names), "")
+        raise AssertionError(cmd)
+
+
+def archive(job, builds):
+    """{build id: (finished dict or None, artifact dict or None)} -> objects."""
+    root = f"{periodics.LOGS_ROOT}/{job}"
+    objects = {f"{root}/{periodics.POINTER}": max(builds, key=int) + "\n"}
+    for build, (finished, artifact) in builds.items():
+        objects[f"{root}/{build}/started.json"] = "{}"
+        if finished is not None:
+            objects[f"{root}/{build}/{periodics.FINISHED}"] = json.dumps(finished)
+        if artifact is not None:
+            objects[f"{root}/{build}/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"] = json.dumps(artifact)
+    return objects
+
+
+def finished(when, passed=True):
+    return {"timestamp": epoch(when), "passed": passed, "result": "SUCCESS" if passed else "FAILURE"}
+
+
+class FetchTest(unittest.TestCase):
+    def test_the_latest_finished_build_is_read_with_its_artifact(self):
+        report = {"schema_version": 1, "mode": "all", "dry_run": True, "exit": "failed", "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "1 to add; not a create: delete x"}}}
+        objects = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), report)})
+        gsutil = FakeGsutil(objects)
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=gsutil)
+            written = json.loads((pathlib.Path(tmp) / f"{WEEKLY.job}.json").read_text())
+        self.assertEqual(readings[WEEKLY.job], written)
+        self.assertEqual((written["build"], written["passed"], written["result"]), ("100", False, "FAILURE"))
+        self.assertEqual(written["finished_at"], (NOW - timedelta(hours=1)).isoformat(timespec="seconds"))
+        self.assertEqual(written["artifact"], report)
+
+    def test_a_running_newest_build_falls_back_to_the_one_before_it(self):
+        objects = archive(HOURLY.job, {"101": (None, None), "100": (finished(NOW - timedelta(minutes=50)), None), "99": (finished(NOW - timedelta(hours=2)), None)})
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(HOURLY,), runner=FakeGsutil(objects))
+        self.assertEqual(readings[HOURLY.job]["build"], "100")
+        self.assertIsNone(readings[HOURLY.job]["artifact"], "the hourly wrote no artifact for that build")
+
+    def test_a_job_that_never_ran_or_whose_pointer_is_denied_writes_nothing(self):
+        objects = archive(SWEEP.job, {"7": (finished(NOW - timedelta(minutes=5)), None)})
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp)
+            (out / f"{HOURLY.job}.json").write_text("stale from last tick")
+            readings = periodics.fetch(out, watched=(SWEEP, HOURLY), runner=FakeGsutil(objects))
+            self.assertEqual(sorted(readings), [SWEEP.job])
+            self.assertFalse((out / f"{HOURLY.job}.json").exists(), "last tick's file does not survive a job with no build")
+            warnings = []
+            denied = FakeGsutil(objects, denied={f"{periodics.LOGS_ROOT}/{SWEEP.job}/{periodics.POINTER}"})
+            readings = periodics.fetch(out, watched=(SWEEP,), runner=denied, log=lambda *a, **k: warnings.append(a[0]))
+        self.assertEqual(readings, {})
+        self.assertEqual(len(warnings), 1, "a denied pointer is said, a NotFound is not")
+        self.assertIn("build pointer", warnings[0])
+
+    def test_load_readings_skips_a_file_it_cannot_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp)
+            (out / f"{SWEEP.job}.json").write_text("{not json")
+            (out / f"{HOURLY.job}.json").write_text(json.dumps({"job": HOURLY.job, "build": "1", "finished_at": NOW.isoformat(), "passed": True, "result": "SUCCESS"}))
+            self.assertEqual(sorted(periodics.load_readings(out)), [HOURLY.job])
+        self.assertEqual(periodics.load_readings(None), {})
+
+
+class AssessTest(unittest.TestCase):
+    def reading(self, periodic, when, passed=True, artifact=None, build="100"):
+        reading = {"job": periodic.job, "build": build, "finished_at": when.isoformat(timespec="seconds"), "passed": passed, "result": "SUCCESS" if passed else "FAILURE"}
+        if periodic.artifact:
+            reading["artifact"] = artifact
+        return reading
+
+    def test_a_passed_fresh_build_is_no_note(self):
+        readings = {SWEEP.job: self.reading(SWEEP, NOW - timedelta(minutes=5)), WEEKLY.job: self.reading(WEEKLY, NOW - timedelta(days=3))}
+        self.assertEqual(periodics.assess(readings, NOW, {}), {})
+
+    def test_a_failed_build_is_a_note_naming_the_refused_projects(self):
+        artifact = {"dry_run": False, "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "not a create or an in-place update: delete google_container_cluster.seeded_b"}, "kube-agents-evals-4": {"outcome": "applied", "detail": "2 to add"}}, "error": "1 project(s) not reconciled: kube-agents-evals-3"}
+        readings = {WEEKLY.job: self.reading(WEEKLY, NOW - timedelta(hours=1), passed=False, artifact=artifact)}
+        notes = periodics.assess(readings, NOW, {})
+        note = notes[WEEKLY.job]
+        self.assertEqual((note["verdict"], note["build"], note["since"], note["dry_run"]), (periodics.VERDICT_FAILED, "100", NOW.isoformat(timespec="seconds"), False))
+        self.assertEqual(note["detail"], ["kube-agents-evals-3: refused (not a create or an in-place update: delete google_container_cluster.seeded_b)", "run: 1 project(s) not reconciled: kube-agents-evals-3"])
+        self.assertEqual(note["history_url"], f"{periodics.JOB_HISTORY_ROOT}/{WEEKLY.job}")
+        self.assertIn("build 100 failed", periodics.evidence(note))
+        # The next tick keeps the episode's start.
+        later = periodics.assess(readings, NOW + timedelta(hours=1), notes)
+        self.assertEqual(later[WEEKLY.job]["since"], note["since"])
+
+    def test_a_job_past_its_stale_window_is_stale_whatever_its_last_verdict(self):
+        readings = {WEEKLY.job: self.reading(WEEKLY, NOW - timedelta(days=9)), HOURLY.job: self.reading(HOURLY, NOW - timedelta(hours=2, minutes=59))}
+        notes = periodics.assess(readings, NOW, {})
+        self.assertEqual(sorted(notes), [WEEKLY.job])
+        self.assertEqual(notes[WEEKLY.job]["verdict"], periodics.VERDICT_STALE)
+        self.assertIn("no finished run since", periodics.evidence(notes[WEEKLY.job]))
+
+    def test_no_reading_writes_no_note(self):
+        self.assertEqual(periodics.assess({}, NOW, {WEEKLY.job: {"since": "x"}}), {})
+
+    def test_the_detail_is_capped(self):
+        outcomes = {f"kube-agents-evals-{i}": {"outcome": "failed", "detail": "x"} for i in range(1, 9)}
+        lines = periodics.reconcile_detail({"outcomes": outcomes})
+        self.assertEqual(len(lines), periodics.DETAIL_LIMIT + 1)
+        self.assertEqual(lines[-1], f"and {8 - periodics.DETAIL_LIMIT} more")
+
+
+class WorkflowWiring(unittest.TestCase):
+    def test_the_hourly_job_fetches_the_readings_and_hands_them_to_health(self):
+        jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+        steps = jobs["health"]["steps"] if "health" in jobs else next(iter(jobs.values()))["steps"]
+        names = [step.get("name") for step in steps]
+        fetch = next(step for step in steps if "periodics.py fetch" in step.get("run", ""))
+        self.assertTrue(fetch.get("continue-on-error"), "a failed fetch never fails the tick")
+        self.assertIn("--out-dir work/periodics", fetch["run"])
+        adjudicate = next(step for step in steps if step.get("name") == "Adjudicate")
+        self.assertIn("--periodics-dir work/periodics", adjudicate["run"])
+        self.assertLess(names.index(fetch["name"]), names.index("Adjudicate"))
+
+    def test_the_watched_jobs_are_the_periodics_in_oss_test_infra(self):
+        # The names are the Prow job names; a rename there is a rename here.
+        self.assertEqual([p.job for p in periodics.WATCHED], ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile", "ci-kube-agents-fleet-reconcile-all"])
+        for periodic in periodics.WATCHED:
+            self.assertTrue(periodic.stale_after >= timedelta(hours=1))
+
+    def test_main_names_what_it_wrote(self):
+        objects = archive(SWEEP.job, {"7": (finished(NOW - timedelta(minutes=5)), None)})
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch("sys.stdout", new_callable=lambda: __import__("io").StringIO()) as out:
+            rc = periodics.main(["fetch", "--out-dir", tmp, "--job", SWEEP.job, "--job", HOURLY.job], runner=FakeGsutil(objects))
+        self.assertEqual(rc, 0)
+        self.assertIn(f"{SWEEP.job}: build 7 SUCCESS", out.getvalue())
+        self.assertIn(f"{HOURLY.job}: no finished build", out.getvalue())
+        self.assertEqual(periodics.main(["fetch", "--out-dir", "/nonexistent", "--job", "nope"]), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

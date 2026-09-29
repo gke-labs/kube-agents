@@ -1773,6 +1773,68 @@ class FixtureDrift(RunHarness):
         self.assertFalse(self.recorded()["fixture_unknown"])
 
 
+def periodic_note(job="ci-kube-agents-fleet-reconcile-all", label="seeded-fleet reconcile (weekly)", verdict="FAILED", build="100", finished="2026-09-14T13:40:00+00:00", detail=(), dry_run=False, stale_after_h=192):
+    return {
+        "job": job, "label": label, "verdict": verdict, "since": finished, "build": build, "finished_at": finished, "result": "FAILURE" if verdict == "FAILED" else "SUCCESS",
+        "stale_after_h": stale_after_h, "dry_run": dry_run, "detail": list(detail), "history_url": f"https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs/{job}", "doc": "docs/ci-pool-projects.md, section 6.2",
+    }
+
+
+class WatchedPeriodics(RunHarness):
+    """A watched Prow periodic that fails or stops is said once per failing
+    build, with the projects it names and its history; its next clean run is
+    said once; no reading is neither."""
+
+    WEEKLY = "ci-kube-agents-fleet-reconcile-all"
+
+    def test_a_failed_reconcile_is_said_once_per_build_and_cleared_once(self):
+        failed = health("GREEN")
+        failed["periodics"] = {self.WEEKLY: periodic_note(detail=["kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)"])}
+        failed["periodics_read"] = [self.WEEKLY]
+        self.tick(failed, T14)
+        self.assertEqual(len(self.opener.texts), 1)
+        text = self.opener.texts[0]
+        self.assertTrue(text.startswith("🟠 *seeded-fleet reconcile (weekly) failed* — build 100 at 9:40 AM ET."), text)
+        self.assertIn("- kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)", text)
+        self.assertIn("Recovery: docs/ci-pool-projects.md, section 6.2.", text)
+        self.assertIn(f"https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs/{self.WEEKLY}", text)
+        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED:100"})
+        self.assertEqual(self.recorded()["state"], "GREEN")
+        self.tick(failed, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "said once")
+        # A newer build that also failed is news; a tick with no reading is not a clear.
+        failed["periodics"][self.WEEKLY]["build"] = "101"
+        self.tick(failed, T14 + timedelta(hours=1))
+        self.assertEqual(len(self.opener.texts), 2)
+        blind = health("GREEN")
+        blind["periodics"], blind["periodics_read"] = {}, []
+        self.tick(blind, T14 + timedelta(hours=2))
+        self.assertEqual(len(self.opener.texts), 2, "no reading is not a recovery")
+        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED:101"})
+        clean = health("GREEN")
+        clean["periodics"], clean["periodics_read"] = {}, [self.WEEKLY]
+        self.tick(clean, T14 + timedelta(hours=3))
+        self.assertEqual(self.opener.texts[-1], "✅ *seeded-fleet reconcile (weekly) passed again* — its latest run finished clean.")
+        self.assertEqual(self.recorded()["periodics_told"], {})
+        self.assertEqual(self.gh.writes(), [], "nothing is filed for a periodic")
+
+    def test_a_stopped_job_is_said_in_grey_with_its_last_run(self):
+        stopped = health("GREEN")
+        stopped["periodics"] = {self.WEEKLY: periodic_note(verdict="STALE", finished="2026-09-05T13:40:00+00:00")}
+        stopped["periodics_read"] = [self.WEEKLY]
+        self.tick(stopped, T14)
+        text = self.opener.texts[0]
+        self.assertTrue(text.startswith("⚪ *seeded-fleet reconcile (weekly) stopped* — last finished run"), text)
+        self.assertIn("runs at most every 192h and has missed one", text)
+
+    def test_the_digest_carries_a_line_per_noted_job(self):
+        doc = health("GREEN")
+        doc["periodics"] = {self.WEEKLY: periodic_note(dry_run=True)}
+        doc["periodics_read"] = [self.WEEKLY]
+        rendered = post_health.render_digest(doc, T14)
+        self.assertIn("🟠 seeded-fleet reconcile (weekly): build 100 failed 9:40 AM ET;", rendered)
+
+
 class DeadlineKillMessages(RunHarness):
     """#1894: runs killed at the job deadline with no verdict are an OUTAGE
     with their own sentence, an issue for the gate's owner, and a recovery

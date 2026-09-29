@@ -894,6 +894,16 @@ the episode ending. `metrics.pool_since` is the open episode's start, held
 across the ticks that read no artifact and so write no `pool`, and `null` once
 a tick reads one and writes none, which is the episode ending.
 
+`periodics` is the watched Prow periodics' notes, by job name, one for each job
+whose latest finished build failed (`verdict: FAILED`) or is older than the
+job's stale window (`STALE`): `{job, label, verdict, since, build,
+finished_at, result, stale_after_h, dry_run, detail[], history_url, doc}`,
+where `detail` names the projects the reconcile's artifact says it refused,
+failed or was interrupted in, and `since` is carried from the previous
+`health.json`. `periodics_read` names the jobs a reading arrived for this
+tick, whether or not they are noted; the poster clears a told job only on a
+reading that shows it clean (`scripts/eval_dashboard/periodics.py` owns both).
+
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus
 `"tick": "<ISO 8601 UTC>"`, oldest first (the reader sorts anyway and

@@ -62,10 +62,11 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from . import fixture_state, tiers
+    from . import fixture_state, periodics, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import fixture_state
+    import periodics
     import tiers
 try:
     import eval_rosters
@@ -1894,6 +1895,7 @@ def adjudicate(
     posted: dict | None = None,
     pool_pressure: dict | None = None,
     fixture_state_doc: dict | None = None,
+    periodics_readings: dict | None = None,
 ) -> dict:
     """data.json + previous health.json -> health.json (as a dict).
 
@@ -1908,7 +1910,12 @@ def adjudicate(
     artifact (rule 8); absent, the note and the digest's wait are None.
     `fixture_state_doc` is the hourly fleet scan's fixture-state.json when one
     is published; rule 3c reads it and the `fixture_state` block below
-    summarises it for the poster.
+    summarises it for the poster. `periodics_readings` is what
+    periodics.py fetched of the watched Prow periodics' latest finished
+    builds, by job; a failed or overdue one is a note beside the state
+    (`periodics`), never a state, and `periodics_read` names the jobs a
+    reading arrived for, so the poster can tell a job that recovered from
+    one it lost sight of.
     """
     if runs is None:
         runs = load_runs(data)
@@ -1979,6 +1986,9 @@ def adjudicate(
     pool = pool_note(pool_pressure, pool_clock, {"since": held, "breach_seen": bool(seen)})
     if pool:
         evidence.append(pool_evidence(pool))
+    readings = periodics_readings if isinstance(periodics_readings, dict) else {}
+    watched = periodics.assess(readings, now, (prev or {}).get("periodics") or {})
+    evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
     stale_after = DEFAULT_STALE_AFTER
     if isinstance(data.get("stale_after_s"), (int, float)):
         stale_after = timedelta(seconds=data["stale_after_s"])
@@ -2005,6 +2015,8 @@ def adjudicate(
         "fixture_state": fixture_state_block(assessed["fixture"]),
         "slow": slow,
         "pool": pool,
+        "periodics": watched,
+        "periodics_read": sorted(readings),
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,
         "generated_at": iso(now),
@@ -2242,6 +2254,7 @@ def parse_args(argv):
     parser.add_argument("--fixture-status", type=pathlib.Path, help="optional fixtures.json to surface in metrics")
     parser.add_argument("--pool-pressure", type=pathlib.Path, help="the pool-pressure periodic's pool-pressure.json, for rule 8 (missing is fine)")
     parser.add_argument("--fixture-state", type=pathlib.Path, help="the hourly fleet scan's fixture-state.json, for the fixture_drift condition (missing is fine)")
+    parser.add_argument("--periodics-dir", type=pathlib.Path, help="the directory periodics.py fetch wrote, one <job>.json per watched Prow periodic (missing is fine)")
     parser.add_argument("--case-notes", type=pathlib.Path, default=DEFAULT_CASE_NOTES, help="case-notes.yaml for tracking issues")
     roster = parser.add_mutually_exclusive_group()
     roster.add_argument("--admitted", help="comma-separated admitted roster (default: hack/eval/blocking-roster.txt)")
@@ -2290,6 +2303,7 @@ def main(argv=None) -> int:
             posted=load_json(args.posted_state),
             pool_pressure=load_json(args.pool_pressure),
             fixture_state_doc=load_json(args.fixture_state),
+            periodics_readings=periodics.load_readings(args.periodics_dir),
         )
         text = json.dumps(health, indent=2) + "\n"
 
