@@ -398,6 +398,7 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     reliability = kubernetes_namespace_v1.seeded_reliability.metadata[0].name
     debug       = kubernetes_namespace_v1.seeded_debug.metadata[0].name
     capacity    = kubernetes_namespace_v1.seeded_capacity.metadata[0].name
+    intent      = kubernetes_namespace_v1.seeded_intent.metadata[0].name
   }
 
   metadata {

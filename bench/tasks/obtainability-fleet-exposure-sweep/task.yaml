@@ -19,8 +19,14 @@
 # Planted defect required: a two-replica Deployment named "checkout-gateway"
 # in namespace "seeded-reliability" on the seeded fleet, with no
 # PodDisruptionBudget — the same no-pdb-workload role the probe reads. It is
-# the fleet's only unprotected multi-replica workload by construction, so
-# the sweep has exactly one right answer.
+# the fleet's only UNDECLARED unprotected multi-replica workload by
+# construction, so the sweep has exactly one right answer: the other one,
+# notification-relay in seeded-intent (role declared-no-pdb-workload), is
+# declared on purpose by knowledge/notification-relay-no-pdb.md in the pool
+# project's GitOps repository, and the SOP's declared-intent step lists it
+# under Declared intent rather than as exposure. A sweep that names it has
+# skipped that step, which is what obtainability-declared-intent-no-finding
+# grades directly.
 # Isolation class: read-only.
 # Eligible tier: presubmit once admitted; nightly since 2026-09-22.
 id: obtainability-fleet-exposure-sweep

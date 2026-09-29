@@ -40,10 +40,11 @@
 # matrix it costs a night is bought back by the wider fan-out. The one case
 # that stays out is one whose fixture does not exist at all; it waits in the
 # validator's FIXTURE_NOT_READY allowlist with the issue that plants it, and
-# today that is vcs-history-only-fact (#1253, needs the git-access-ab/r200
-# branch pushed to every pool project's GitOps repository) and
+# today those are vcs-history-only-fact (#1253, needs the git-access-ab/r200
+# branch pushed to every pool project's GitOps repository),
 # scope-second-project-denied (#1865, needs a second GCP project in scope
-# per pool project).
+# per pool project), b-0011-gitops (#1307) and
+# cluster-agent-stalled-controller-diagnosis (#1873).
 #
 # BUDGET, priced the way EVAL_REPETITIONS' comment in the script prices the
 # presubmit. The twenty-six-case matrix of 2026-09-09 priced at ~532-552min
@@ -131,6 +132,11 @@
 # repetitions measured 710-1325s). With the 2026-09-23 additions above it
 # grows the matrix to fifty cases and 150 units, ~1212-1232 serial
 # minutes, on nights the 2026-09-22 paragraph already says can truncate.
+#
+# 2026-09-29 adds obtainability-declared-intent-no-finding (#1409): one case,
+# three units, measured 209-1317s a repetition on its green presubmit run, so
+# this file's share is thirty-eight cases (114 units) of a fifty-two-case,
+# 156-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:

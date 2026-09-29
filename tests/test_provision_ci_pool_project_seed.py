@@ -66,6 +66,7 @@ case "$1 $2" in
   "api repos/gke-agentic/kube-agents-evals-99-infra/contents/knowledge/notification-relay-no-pdb.md")
     # The existence read: 404 (exit 1) until the note is there.
     [ "${FAKE_NOTE_PRESENT:-0}" = "1" ] && { echo '{"sha":"abc"}'; exit 0; }
+    [ "${FAKE_NOTE_READ_FAILS:-0}" = "1" ] && { echo "gh: HTTP 502" >&2; exit 1; }
     echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
   "api /orgs/gke-agentic/installations") exit 0 ;;
   "api -X") echo '{}'; exit 0 ;;
@@ -99,7 +100,7 @@ class ProvisionGitopsRepoSeedTest(unittest.TestCase):
         self.bindir = bindir
         self.log = pathlib.Path(self.tmp.name) / "gh.log"
 
-    def _run(self, default_branch: str, view_fails: bool = False, note_present: bool = False):
+    def _run(self, default_branch: str, view_fails: bool = False, note_present: bool = False, note_read_fails: bool = False):
         env = get_isolated_test_env(
             overrides={
                 "PATH": f"{self.bindir}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -107,6 +108,7 @@ class ProvisionGitopsRepoSeedTest(unittest.TestCase):
                 "FAKE_DEFAULT_BRANCH": default_branch,
                 "FAKE_VIEW_FAILS": "1" if view_fails else "0",
                 "FAKE_NOTE_PRESENT": "1" if note_present else "0",
+                "FAKE_NOTE_READ_FAILS": "1" if note_read_fails else "0",
                 "PROJECT_ID": "kube-agents-evals-99",
                 "GITOPS_REPO": "gke-agentic/kube-agents-evals-99-infra",
                 "APP_ID": "4675512",
@@ -163,6 +165,12 @@ class ProvisionGitopsRepoSeedTest(unittest.TestCase):
 
     def test_a_failed_read_stops_the_step_rather_than_seeding_blind(self):
         proc, puts = self._run(default_branch="", view_fails=True)
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("not seeding it blind", proc.stderr)
+        self.assertEqual([], puts)
+
+    def test_a_failed_note_read_stops_the_step_rather_than_seeding_blind(self):
+        proc, puts = self._run(default_branch="main", note_read_fails=True)
         self.assertNotEqual(0, proc.returncode)
         self.assertIn("not seeding it blind", proc.stderr)
         self.assertEqual([], puts)

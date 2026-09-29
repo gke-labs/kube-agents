@@ -425,13 +425,20 @@ if [ -z "${GITOPS_DEFAULT_BRANCH}" ]; then
 fi
 
 # The declaration the declared-intent eval case reads. A PUT without `sha` on a
-# path that exists fails, so the read comes first; a note someone edited by
+# path that exists fails, so the read comes first, and only a 404 means
+# "absent": any other failure stops the step, as the branch read above does,
+# rather than PUT over a note that may be there. A note someone edited by
 # hand is left as it is.
-if ! gh api "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" >/dev/null 2>&1; then
+if GITOPS_INTENT_NOTE_READ_ERROR="$(gh api "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" 2>&1 >/dev/null)"; then
+  :
+elif printf '%s' "${GITOPS_INTENT_NOTE_READ_ERROR}" | grep -q "HTTP 404"; then
   echo "Seeding ${GITOPS_REPO} with ${GITOPS_INTENT_NOTE_PATH} (the declared-intent note)..."
   gh api -X PUT "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" \
     -f message="${GITOPS_INTENT_NOTE_MESSAGE}" \
     -f content="$(printf '%s\n' "${GITOPS_INTENT_NOTE_CONTENT}" | base64 | tr -d '\n')" >/dev/null
+else
+  echo "ERROR: could not read ${GITOPS_INTENT_NOTE_PATH} in ${GITOPS_REPO} (${GITOPS_INTENT_NOTE_READ_ERROR}); not seeding it blind." >&2
+  exit 1
 fi
 
 INST_JSON="$(gh api /orgs/gke-agentic/installations --jq ".installations[] | select(.app_id==${APP_ID})" 2>/dev/null || echo "")"

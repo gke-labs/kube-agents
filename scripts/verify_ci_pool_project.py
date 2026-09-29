@@ -270,6 +270,13 @@ DEFAULT_GITHUB_APP_ID = 4675512
 GITOPS_SEED_FILE = "README.md"
 GITOPS_SEED_MESSAGE = "Initial commit"
 GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
+# The declared-intent note provisioning seeds after the first commit
+# (GITOPS_INTENT_NOTE_* in scripts/provision_ci_pool_project.sh); the
+# obtainability-declared-intent-no-finding case fails on a project whose
+# repository lacks it. The content is not repeated here: the repair the
+# verifier prints points at the script's copy.
+GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
+GITOPS_INTENT_NOTE_MESSAGE = "Declare notification-relay's missing PodDisruptionBudget as intended"
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
 # RSA_SIGN_PKCS1_2048_SHA256 and import_only, and the KSA that impersonates the
@@ -1976,7 +1983,7 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
         return CheckResult(name, False, f"{_FLEET_CATALOG} declares no fixture roles")
 
     # kubectl is absent from check_toolchain() because every other check here is
-    # gcloud or gh. Without it every probe fails, all eight roles report as
+    # gcloud or gh. Without it every probe fails, all nine roles report as
     # unplanted, and the run states a confident and wrong verdict about a fleet
     # it never looked at.
     rc, _, _ = run_cmd(["kubectl", "version", "--client=true"])
@@ -2259,6 +2266,39 @@ def gitops_seed_command(repo_slug: str) -> str:
         f"-f message='{GITOPS_SEED_MESSAGE}' "
         f"-f content=\"$(printf '%s\\n' '{GITOPS_SEED_CONTENT}' | base64 | tr -d '\\n')\""
     )
+
+
+def gitops_note_seed_command(repo_slug: str) -> str:
+    """The `gh api` call that puts the declared-intent note into a GitOps repository."""
+    return (
+        f"gh api -X PUT repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH} "
+        f"-f message=\"{GITOPS_INTENT_NOTE_MESSAGE}\" "
+        f"-f content=\"$(printf '%s\\n' \"$GITOPS_INTENT_NOTE_CONTENT\" | base64 | tr -d '\\n')\" "
+        f"(GITOPS_INTENT_NOTE_CONTENT is the value in scripts/provision_ci_pool_project.sh)"
+    )
+
+
+def check_gitops_declaration(project_id: str) -> CheckResult:
+    """Verify the GitOps repository carries the declared-intent note.
+
+    Provisioning seeds it for a new project, and the provisioning script is not
+    re-run on a registered one, so a project registered before the note existed
+    fails here until someone runs the printed command. A read that fails for a
+    reason other than 404 is unverified, not absent.
+    """
+    name = "GitOps Declared-Intent Note"
+    repo_slug = f"gke-agentic/{project_id}-infra"
+    rc, _out, err = run_cmd(["gh", "api", f"repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH}"])
+    if rc == 0:
+        return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH}")
+    if _GITHUB_NOT_FOUND.search(err or ""):
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} has no {GITOPS_INTENT_NOTE_PATH}, so obtainability-declared-intent-no-finding "
+            f"fails on this project. Seed it: {gitops_note_seed_command(repo_slug)}",
+        )
+    return CheckResult(name, False, f"Could not read {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {(err or '').strip()}")
 
 
 def check_github_repo_and_app(

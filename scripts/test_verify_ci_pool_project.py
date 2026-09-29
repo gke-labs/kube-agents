@@ -1451,6 +1451,41 @@ class ArtifactRegistryTest(unittest.TestCase):
         self.assertTrue(checker.AR_WRITER_ROLES < checker.AR_PULLER_ROLES)
 
 
+class GitopsDeclarationNoteTest(unittest.TestCase):
+    def test_a_repository_with_the_note_passes(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(json.dumps({"sha": "abc", "path": checker.GITOPS_INTENT_NOTE_PATH}))]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed, result.message)
+        self.assertIn("repos/gke-agentic/kube-agents-evals-3-infra/contents/knowledge/notification-relay-no-pdb.md", " ".join(run.call_args_list[0].args[0]))
+
+    def test_a_missing_note_fails_and_names_the_seed_command(self):
+        # A project registered before the note existed: provisioning is not
+        # re-run on it, so the verifier is what says the file is owed.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_fail("gh: Not Found (HTTP 404)")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("obtainability-declared-intent-no-finding", result.message)
+        self.assertIn("gh api -X PUT repos/gke-agentic/kube-agents-evals-3-infra/contents/knowledge/notification-relay-no-pdb.md", result.message)
+
+    def test_an_unreadable_note_is_not_reported_as_absent(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_fail("gh: HTTP 502")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("Could not read", result.message)
+        self.assertNotIn("Seed it", result.message)
+
+    def test_the_note_the_verifier_names_is_the_one_provisioning_seeds(self):
+        script = (pathlib.Path(__file__).resolve().parent / "provision_ci_pool_project.sh").read_text()
+        for name, value in (
+            ("GITOPS_INTENT_NOTE_PATH", checker.GITOPS_INTENT_NOTE_PATH),
+            ("GITOPS_INTENT_NOTE_MESSAGE", checker.GITOPS_INTENT_NOTE_MESSAGE),
+        ):
+            self.assertIn(f'{name}="{value}"', script, name)
+
+
 class GithubAppInstallationTest(unittest.TestCase):
     _APP_ID = checker.DEFAULT_GITHUB_APP_ID
 
@@ -3576,6 +3611,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
              mock.patch.object(checker, "check_seeded_fleet_fixtures", return_value=checker.CheckResult("f", True)), \
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
+             mock.patch.object(checker, "check_gitops_declaration", return_value=checker.CheckResult("n", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
@@ -3598,6 +3634,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
              mock.patch.object(checker, "check_seeded_fleet_fixtures", return_value=checker.CheckResult("f", True)), \
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
+             mock.patch.object(checker, "check_gitops_declaration", return_value=checker.CheckResult("n", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-6")

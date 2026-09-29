@@ -89,10 +89,11 @@ NIGHTLY_AT_SPLIT = [
     "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); its held-out presubmit seat opened 2026-09-28 (HELD_OUT_IN_PRESUBMIT)
 ]
 # The nine cases TASKS held commented out at the split, moved into the
-# nightly by the same decision. The two commented-out cases NOT here --
-# obtainability-declared-intent-no-finding (#1341) and vcs-history-only-fact
-# (#1253) -- have no fixture at all and wait in the validator's
-# FIXTURE_NOT_READY instead.
+# nightly by the same decision. The two commented-out cases NOT here had no
+# fixture at all and waited in the validator's FIXTURE_NOT_READY instead:
+# vcs-history-only-fact (#1253) still does, and
+# obtainability-declared-intent-no-finding (#1341) joined this file on
+# 2026-09-29 with its fixture (#1409, ADDED_AFTER_THE_SPLIT below).
 # Registered in the nightly file after the split, in file order, each by the
 # pull request that authored the case (a new case lands in the nightly first).
 ADDED_AFTER_THE_SPLIT = [
@@ -104,6 +105,7 @@ ADDED_AFTER_THE_SPLIT = [
     "cluster-agent-delegation-profile-lookup",  # #1840's delegation route, PR #1917
     "upgrades-master-behind-offered-elsewhere",  # the patch collector's §3.1 route check, with patch_readiness.py
     "obtainability-planted-orphan-service",  # the obtainability collector's §3.16 check, with collect.py
+    "obtainability-declared-intent-no-finding",  # #1341 criterion 4, activated with its declared-no-pdb-workload fixture (#1409)
 ]
 # Appended at the tail of the nightly file.
 ADDED_AT_THE_TAIL = [

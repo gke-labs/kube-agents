@@ -90,9 +90,9 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Nine fixtures: eight across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
-five seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security`,
-`seeded-capacity` and `seeded-deprecation`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
+Ten fixtures: nine across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
+six seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security`,
+`seeded-capacity`, `seeded-deprecation` and `seeded-intent`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
 only and no workloads at all: `b` is the held-back control plane, `c` is the configuration
 outlier. Every cluster is labelled `environment=seeded`, which is what confines the drift
 cohort to these three and keeps `platform-agent-host` and transient `eval-pr*` clusters
