@@ -1377,6 +1377,41 @@ unquote_shell_value() {
   printf '%s' "$raw" | sed 's/\\\(.\)/\1/g'
 }
 
+# Cut a recorded line down to what bash assigns from it.
+#
+# install.env is sourced, so `TF_VAR_enable_drift_pubsub=true # keeps the
+# ingress on` puts `true` in the environment: an unquoted `#` that starts a
+# word begins a comment, and the unquoted whitespace before it is not part of
+# the value either. Reading everything after the first `=` gives
+# `true # keeps the ingress on` instead, and is_truthy -- which strips all
+# whitespace and then matches the whole string -- reads that as off. Every
+# caller here compares a recorded value against a chosen one, so the guards
+# would report a reversal the next run cannot perform, or miss one it can.
+#
+# Only an unquoted, unescaped `#`, and only one that starts a word. `x#y`,
+# `"a # b"`, `'a # b'` and `x\#y` are all values bash keeps whole, and
+# SLACK_HOME_CHANNEL is written the last of those by %q. Hence the scan rather
+# than a sed: it carries the same quote and backslash state unquote_shell_value
+# reads afterwards, and `keep` marks the last character that is quoted,
+# escaped, or not whitespace -- which drops the trailing run bash drops too.
+strip_unquoted_comment() {
+  printf '%s' "${1:-}" | awk '
+    {
+      out = ""; keep = 0; sq = 0; dq = 0; n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (!sq && c == "\\" && i < n) { out = out c substr($0, i + 1, 1); i++; keep = length(out); continue }
+        if (!dq && c == "\x27") { sq = !sq; out = out c; keep = length(out); continue }
+        if (!sq && c == "\"") { dq = !dq; out = out c; keep = length(out); continue }
+        if (!sq && !dq && c == "#" && keep < length(out)) break
+        out = out c
+        if (sq || dq || c != " " && c != "\t") keep = length(out)
+      }
+      printf "%s", substr(out, 1, keep)
+    }
+  '
+}
+
 recorded_install_env_value() {
   local file="${1:-}" key="${2:-}" line=""
   [ -n "$file" ] && [ -f "$file" ] || return 0
@@ -1390,7 +1425,7 @@ recorded_install_env_value() {
   line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -1 || true)"
   [ -n "$line" ] || return 0
   line="${line#*=}"
-  unquote_shell_value "$line"
+  unquote_shell_value "$(strip_unquoted_comment "$line")"
 }
 
 # Say so when an interactive answer changed something the file still records

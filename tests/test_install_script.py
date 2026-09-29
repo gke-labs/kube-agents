@@ -6970,6 +6970,114 @@ class DomainScopedFlagsTest(unittest.TestCase):
             self.assertIn("keeps the Log Router sink", combined)
             self.assertNotIn("destroys", combined)
 
+    def test_a_commented_tf_var_ingress_line_is_read_the_way_bash_reads_it(self):
+        """A trailing `# comment` is not part of the value, and bash agrees.
+
+        install.env is sourced, so `TF_VAR_enable_drift_pubsub=true # keeps
+        the ingress on` puts `true` in the environment and Terraform sees the
+        ingress asked for. Reading everything after the first `=` gives
+        `true # keeps the ingress on`, is_truthy strips all whitespace and
+        matches the whole string, and the guard falls to the destroyed-ingress
+        consequence -- telling the operator whose sink survives that their
+        audit records are going. That is the falsehood the round before this
+        one removed, arriving back through the reader.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text(
+                "ENABLE_DRIFT_DETECTOR=false\n"
+                "TF_VAR_enable_drift_pubsub=true # keeps the ingress on\n"
+            )
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("keeps the Log Router sink", combined)
+            self.assertNotIn("destroys", combined)
+
+    def test_a_commented_recorded_value_does_not_invent_a_reversal(self):
+        """The same read, the other way round, on the key the guard compares.
+
+        `ENABLE_DRIFT_DETECTOR=true # on` is `true` to bash, so a run that
+        passes --enable-drift-detector agrees with the file and there is
+        nothing to announce. Read with the comment attached, the recorded value
+        is off, the chosen value is on, and the guard warns about a reversal
+        the next run cannot perform.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=true # on\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertNotIn("applies to this run only", combined)
+
+    # Spellings bash resolves differently from "everything after the first =".
+    # The comment cases are the finding; the rest are what a fix for it must
+    # not break -- a '#' mid-word, inside either quote, or backslash-escaped,
+    # which is how %q writes SLACK_HOME_CHANNEL="#gke-alerts".
+    QUOTING_SPELLINGS = [
+        "A=true # comment",
+        "B=#hash",
+        "C=x#y",
+        'D="a # b"',
+        "E=x\\#y",
+        "F='a # b'",
+        "G=true   ",
+        'H="a "',
+        "I=trailing\\ space\\ ",
+        "J='a' # after a quote",
+        "K=  ",
+    ]
+
+    def test_the_recorded_value_is_what_sourcing_the_file_would_assign(self):
+        """bash is the authority, because bash is the other reader.
+
+        load_install_env sources install.env, so every guard that compares a
+        recorded value against a chosen one is comparing against what bash put
+        in the environment. Asserting the reader against bash rather than
+        against a list of expected strings is what makes this hold for the
+        spelling nobody thought of: the two readers cannot disagree without
+        this failing.
+        """
+        keys = [line.split("=", 1)[0] for line in self.QUOTING_SPELLINGS]
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "spellings.env"
+            env_file.write_text("\n".join(self.QUOTING_SPELLINGS) + "\n")
+            body = "\n".join(
+                [
+                    f'for k in {" ".join(keys)}; do',
+                    f'  printf "READER\\t%s\\t[%s]\\n" "$k" "$(recorded_install_env_value \'{env_file}\' "$k")"',
+                    "done",
+                    f"set -a; source '{env_file}'; set +a",
+                    f'for k in {" ".join(keys)}; do',
+                    '  printf "BASH\\t%s\\t[%s]\\n" "$k" "${!k}"',
+                    "done",
+                ]
+            )
+            proc = self._parse("", body)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        seen = {"READER": {}, "BASH": {}}
+        for line in proc.stdout.splitlines():
+            if "\t" in line and line.split("\t", 1)[0] in seen:
+                which, key, value = line.split("\t", 2)
+                seen[which][key] = value
+        for key in keys:
+            with self.subTest(spelling=key):
+                self.assertIn(key, seen["BASH"], proc.stdout)
+                self.assertEqual(
+                    seen["BASH"][key],
+                    seen["READER"].get(key),
+                    f"recorded_install_env_value disagrees with sourcing the file for {key}",
+                )
+
     def test_turning_it_off_on_a_tf_var_ingress_says_the_detector_stops(self):
         """Both axes at once: the destroying is now, and nothing is destroyed.
 
