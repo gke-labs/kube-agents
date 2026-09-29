@@ -62,14 +62,16 @@ for _ in $(seq 1 "${STUB_LINES:-3}"); do echo "$line"; done
 FUNCTIONS = ("_agent_pod_watch_loop", "start_agent_pod_watch", "_stop_agent_pod_watch", FUNCTION)
 
 
-def lifted(restart_seconds: str | None = None) -> str:
+def lifted(restart_seconds: str | None = None, healthy_seconds: str | None = None) -> str:
     """The functions, their state and the constants they read, as written in ci-env.sh."""
     src = ENV_SCRIPT.read_text(encoding="utf-8")
     constants = re.findall(r"^readonly AGENT_DIAG_[A-Z_]+=.*$", src, re.MULTILINE)
-    if len(constants) != 12:  # pragma: no cover - a rename should say so loudly
-        raise AssertionError(f"expected twelve AGENT_DIAG_ constants in {ENV_SCRIPT}, found {constants}")
+    if len(constants) != 13:  # pragma: no cover - a rename should say so loudly
+        raise AssertionError(f"expected thirteen AGENT_DIAG_ constants in {ENV_SCRIPT}, found {constants}")
     if restart_seconds is not None:
         constants = [re.sub(r"(WATCH_RESTART_SECONDS=).*", rf"\g<1>{restart_seconds}", c) for c in constants]
+    if healthy_seconds is not None:
+        constants = [re.sub(r"(WATCH_HEALTHY_SECONDS=).*", rf"\g<1>{healthy_seconds}", c) for c in constants]
     state = re.findall(r'^AGENT_DIAG_(?:WATCH_[A-Z]+|COLLECTED)=""$', src, re.MULTILINE)
     if len(state) != 3:  # pragma: no cover
         raise AssertionError(f"expected the three state variables in {ENV_SCRIPT}, found {state}")
@@ -140,6 +142,7 @@ def stub_bin(tmp: pathlib.Path) -> pathlib.Path:
 def run_collect(
     watch: bool = False,
     restart_seconds: str | None = None,
+    healthy_seconds: str | None = None,
     watch_for: float = 1.0,
     collect_times: int = 1,
     **stub_env: str,
@@ -154,7 +157,7 @@ def run_collect(
     loops = tmp / "loop-pids"
     start = f'start_agent_pod_watch\necho "$AGENT_DIAG_WATCH_PIDS" > {loops}\nsleep {watch_for}\n' if watch else ""
     collect = f"{FUNCTION}\n" * collect_times
-    script = f'set -euo pipefail\n{lifted(restart_seconds)}\n{start}{collect}echo "STATUS AFTER: $?"\n'
+    script = f'set -euo pipefail\n{lifted(restart_seconds, healthy_seconds)}\n{start}{collect}echo "STATUS AFTER: $?"\n'
     env = {k: v for k, v in os.environ.items() if k != "AGENT_CLUSTER_CONTEXT"}
     env.update(
         PATH=f"{stubs}:{os.environ['PATH']}",
@@ -298,14 +301,29 @@ class AgentPodDiagnosticsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(len(twice), len(once), twice)
 
-    def test_a_closed_watch_is_reopened(self):
+    def test_a_watch_that_failed_to_open_is_retried_with_its_list(self):
+        """Until an open has held, nothing has recorded the list, so a retry
+        must not drop it."""
         _, artifacts, _ = run_collect(watch=True, restart_seconds="0", watch_for=1.5, STUB_WATCH_EXITS="1")
+        pods = (artifacts / "agent-pods-watch.txt").read_text(encoding="utf-8")
+        opens = [line for line in pods.splitlines() if line.startswith("WATCH: ")]
+        self.assertGreater(len(opens), 1, pods)
+        for line in opens:
+            self.assertNotIn("--watch-only", line, "a failed open recorded no list to skip")
+
+    def test_a_watch_that_held_is_reopened_at_once_without_relisting(self):
+        """A cut watch reopens with no pause, so no event falls in a gap, and
+        with --watch-only, so the held open's list stays inside the byte cap.
+        The 30 s pause here would leave one open in the window if applied."""
+        _, artifacts, _ = run_collect(
+            watch=True, restart_seconds="30", healthy_seconds="1", watch_for=5, STUB_WATCH_SECONDS="2"
+        )
         pods = (artifacts / "agent-pods-watch.txt").read_text(encoding="utf-8")
         opens = [line for line in pods.splitlines() if line.startswith("WATCH: ")]
         self.assertGreater(len(opens), 1, pods)
         self.assertNotIn("--watch-only", opens[0])
         for line in opens[1:]:
-            self.assertIn("--watch-only", line, "a reopen must not relist what the first open kept")
+            self.assertIn("--watch-only", line, "a reopen must not relist what the held open kept")
 
     def test_without_a_watch_the_snapshot_writes_no_watch_files(self):
         proc, artifacts, _ = run_collect()

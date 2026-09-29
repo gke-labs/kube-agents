@@ -86,9 +86,12 @@ readonly AGENT_DIAG_DEPLOYMENT="deployment/platform-agent-gateway"
 # Every one-shot read gives up after this, so an unreachable cluster costs
 # seconds per call on an exit that is often already an infrastructure failure.
 readonly AGENT_DIAG_REQUEST_TIMEOUT="30s"
-# The apiserver closes a watch after 30-60 minutes; the loop re-opens it after
-# this pause (and keeps retrying at this pace while the cluster is unreachable).
+# A watch that exits sooner than HEALTHY_SECONDS failed to open, and the loop
+# retries it after this pause, at this pace while the cluster is unreachable.
+# One that lasted was cut (the request timeout below, or the apiserver's own
+# 30-60 minute close) and is reopened at once, so the stream has no gap.
 readonly AGENT_DIAG_WATCH_RESTART_SECONDS=10
+readonly AGENT_DIAG_WATCH_HEALTHY_SECONDS=30
 # Each watch is also cut at this, so the loop re-checks that the eval is still
 # alive every few minutes rather than once per apiserver-closed watch (up to
 # an hour): a loop outliving a SIGKILLed eval is bounded by it.
@@ -186,16 +189,21 @@ collect_gateway_log() {
 _agent_pod_watch_loop() {
   local parent="$1" out="$2"
   shift 2
-  local child="" pause="" only=()
+  local child="" pause="" only=() opened=0
   trap 'kill ${child} ${pause} 2>/dev/null; exit 0' TERM
   while kill -0 "${parent}" 2>/dev/null; do
+    opened=${SECONDS}
     "$@" ${only[@]+"${only[@]}"} >> "${out}" 2>&1 &
     child=$!
     wait "${child}" || true
     child=""
-    # Every open lists everything before it watches; the first open's list is
-    # the record, and a reprint per reopen would push it out of the byte cap.
-    only=(--watch-only)
+    if (( SECONDS - opened >= AGENT_DIAG_WATCH_HEALTHY_SECONDS )); then
+      # Every open lists everything before it watches. Once one has held, its
+      # list is the record, and a reprint per reopen would push it out of the
+      # byte cap; until then, keep listing, or a failed first open loses it.
+      only=(--watch-only)
+      continue
+    fi
     # Backgrounded and waited on, not run in the foreground: bash defers a
     # trap until a foreground command returns, which held every exit for the
     # whole pause.
