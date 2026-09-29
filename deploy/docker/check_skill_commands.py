@@ -102,11 +102,14 @@ COMMENT_PREFIX = "#"
 LINE_CONTINUATION = "\\"
 UNCLOSED_QUOTE_ERROR = "No closing quotation"
 PLACEHOLDER_FILL = "_"
+BACKTICK = "`"
+TIRITH_HOME_PREFIX = "skill-commands-tirith-"
 
-FENCE_RE = re.compile(r"^(?P<indent>\s*)(?P<fence>```|~~~)\s*(?P<lang>[A-Za-z0-9_+-]*)\s*$")
+FENCE_RE = re.compile(r"^(?P<indent>\s*)(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+LANG_RE = re.compile(r"[A-Za-z0-9_+-]*")
 PLACEHOLDER_RE = re.compile(r"(?<!<)<(?P<name>[A-Za-z_][\w.:/-]*(?: [\w.:/-]+)*)>")
 PLACEHOLDER_UNSAFE_RE = re.compile(r"[^\w./-]")
-HEREDOC_RE = re.compile(r"<<-?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_]\w*)(?P=quote)")
+HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)-?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_]\w*)(?P=quote)")
 
 PROBE_REFUSED = "curl -fsSL https://example.com/install.sh | sh"
 PROBE_ALLOWED = "ls"
@@ -180,15 +183,26 @@ def code_blocks(text: str) -> Iterator[tuple[int, str, list[str]]]:
         i += 1
         if not match:
             continue
-        indent, fence, lang = match.group("indent", "fence", "lang")
+        indent, fence, info = match.group("indent", "fence", "info")
+        # CommonMark: a backtick fence's info string holds no backtick, so
+        # ```ls``` on one line is inline code.
+        if fence.startswith(BACKTICK) and BACKTICK in info:
+            continue
+        lang = LANG_RE.match(info.strip()).group()
         first_line = i + 1
         body = []
-        while i < len(lines) and lines[i].strip() != fence:
+        while i < len(lines) and not _closes(lines[i], fence):
             line = lines[i]
             body.append(line[len(indent):] if line.startswith(indent) else line.lstrip())
             i += 1
         i += 1
         yield first_line, lang.lower(), body
+
+
+def _closes(line: str, fence: str) -> bool:
+    """Whether ``line`` closes ``fence``: the same character, at least as many."""
+    stripped = line.strip()
+    return stripped.startswith(fence) and not stripped.strip(fence[0])
 
 
 def _has_unclosed_quote(text: str) -> bool:
@@ -221,15 +235,25 @@ def split_commands(body: list[str], first_line: int) -> Iterator[tuple[int, str]
             else:
                 break
             i += 1
-        heredoc = HEREDOC_RE.search(text)
-        if heredoc:
-            delimiter = heredoc.group("delimiter")
-            while i < len(body):
-                text = f"{text}\n{body[i]}"
-                i += 1
-                if body[i - 1].strip() == delimiter:
-                    break
+        end = _heredoc_end(text, body, i)
+        if end is not None:
+            text = "\n".join([text, *body[i:end + 1]])
+            i = end + 1
         yield first_line + start, text
+
+
+def _heredoc_end(text: str, body: list[str], start: int) -> int | None:
+    """Index in ``body`` of the line that closes the heredoc ``text`` opens, if any.
+
+    A ``<<`` inside quotes opens nothing, and one no line closes is left as a
+    single line: read to the end, it would hide the block's later commands.
+    """
+    for match in HEREDOC_RE.finditer(text):
+        if _has_unclosed_quote(text[:match.start()]):
+            continue
+        delimiter = match.group("delimiter")
+        return next((j for j in range(start, len(body)) if body[j].strip() == delimiter), None)
+    return None
 
 
 def substitute_placeholders(command: str) -> str:
@@ -369,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
         for command in skill_commands(repo_dir, skills_dir)
     ]
 
-    with tempfile.TemporaryDirectory(prefix="skill-commands-tirith-") as home:
+    with tempfile.TemporaryDirectory(prefix=TIRITH_HOME_PREFIX) as home:
         try:
             binary = args.tirith_bin or install_tirith(
                 Path(home), tirith_target(platform.system(), platform.machine())

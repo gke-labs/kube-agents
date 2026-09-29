@@ -168,13 +168,14 @@ verification_spec:
       # program only at the start of the summary or after `;`, `&`, `|` or
       # `(`: the `"$S" prepare` a `;` or `&&` chain shows as its first command.
       # The second is the assignment, which is how a multi-line call's
-      # `G=...` then `$G add` shows up once its lines are joined. Not seen: a
-      # variable command that is neither the chain's first shown command nor
-      # in the same call as its assignment, since the summary drops a chain's
-      # later commands and its `export` segments.
+      # `G=...` then `$G add` shows up once its lines are joined; capturing
+      # git's output, `SHA=$(/opt/vcs/libexec/git rev-parse HEAD)`, is not one.
+      # Not seen: a variable command that is neither the chain's first shown
+      # command nor in the same call as its assignment, since the summary
+      # drops a chain's later commands and its `export` segments.
       forbidden_patterns:
         - '(^|[;&|(]\s*)"?\$\{?[A-Za-z_]\w*\}?"?\s+(add|commit|status|log|show|diff|blame|grep|branch|ls-files|prepare|submit)\b'
-        - '(^|[\s;&|(])[A-Za-z_]\w*=\S*(/opt/vcs/libexec/git|submit_suggestion\.py)\b'
+        - '(^|[\s;&|(])[A-Za-z_]\w*=(?!"?(\$\(|`)/opt/vcs/libexec/git[\s)`])\S*(/opt/vcs/libexec/git|submit_suggestion\.py)\b'
   - name: the-pull-request-is-real-and-this-runs
     role: objective
     mode: assert

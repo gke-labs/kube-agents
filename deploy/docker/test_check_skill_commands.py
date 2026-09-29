@@ -54,6 +54,20 @@ class CodeBlocksTest(unittest.TestCase):
         text = "~~~sh\necho '```'\n```\nls\n~~~\n"
         self.assertEqual([["echo '```'", "```", "ls"]], [b for _, _, b in check.code_blocks(text)])
 
+    def test_an_info_string_keeps_the_language_and_the_boundaries(self):
+        text = "```bash title=x\n$G add f\n```\n(prose)\n```sh {1,3}\n$G commit\n```\n"
+        self.assertEqual(
+            [(2, "bash", ["$G add f"]), (6, "sh", ["$G commit"])], list(check.code_blocks(text))
+        )
+
+    def test_a_longer_fence_closes_only_on_a_run_as_long(self):
+        text = "````bash\ncat <<'EOF'\n```bash\ninner\n```\nEOF\nS submit\n`````\n"
+        body = ["cat <<'EOF'", "```bash", "inner", "```", "EOF", "S submit"]
+        self.assertEqual([(2, "bash", body)], list(check.code_blocks(text)))
+
+    def test_backticks_on_one_line_are_inline_code(self):
+        self.assertEqual([(3, "bash", ["ls"])], list(check.code_blocks("```x```\n```bash\nls\n```\n")))
+
     def test_an_unclosed_fence_runs_to_the_end(self):
         self.assertEqual([["ls", "pwd"]], [b for _, _, b in check.code_blocks("```sh\nls\npwd\n")])
 
@@ -77,6 +91,16 @@ class SplitCommandsTest(unittest.TestCase):
     def test_a_heredoc_runs_to_its_delimiter(self):
         body = "cat <<'EOF' > f\nit's here\nEOF\nls"
         self.assertEqual([(1, "cat <<'EOF' > f\nit's here\nEOF"), (4, "ls")], commands(body))
+
+    def test_a_here_string_is_not_a_heredoc(self):
+        self.assertEqual([(1, "cmd <<< word"), (2, "$G add f")], commands("cmd <<< word\n$G add f"))
+
+    def test_a_quoted_heredoc_marker_is_not_a_heredoc(self):
+        body = "grep -F '<<EOF' notes\nls\nEOF"
+        self.assertEqual([(1, "grep -F '<<EOF' notes"), (2, "ls"), (3, "EOF")], commands(body))
+
+    def test_a_heredoc_no_line_closes_is_one_line(self):
+        self.assertEqual([(1, "cat <<EOF"), (2, "ls"), (3, "pwd")], commands("cat <<EOF\nls\npwd"))
 
 
 class SubstitutePlaceholdersTest(unittest.TestCase):
