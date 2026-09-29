@@ -72,17 +72,18 @@ SANDBOX_PRINCIPAL = "hermes"
 # line rather than a second credential, and the separation the module docstring
 # describes is the only thing keeping them apart.
 #
-# Two writers pass it, both for the same reason: they have to write inside a
+# Three writers pass it, all for the same reason: they have to write inside a
 # tree that is `agent:agent` to the leaves, which uid 1001 cannot do.
 # `kanban_workspace_gc.py` unlinks scratch workspaces; `cluster_agent_profile.py`
-# writes one profile's kubeconfig. The alternative in either case — loosening
-# the modes so a shared group could reach in — buys a wider grant than the
-# narrower login does, and leaves uid 1001 writing into a tree uid 1000 owns,
-# which is a symlink-follow waiting to happen.
+# writes one profile's kubeconfig; `bootstrap_delivery.py` renames the delivered
+# onboarding report. The alternative in any case — loosening the modes so a
+# shared group could reach in — buys a wider grant than the narrower login does,
+# and leaves uid 1001 writing into a tree uid 1000 owns, which is a
+# symlink-follow waiting to happen.
 #
-# What makes it safe there does not generalise: neither writer consumes the
+# What makes it safe there does not generalise: no writer consumes the
 # command's output as a fact about the cluster, and a `.bashrc` that hijacked
-# either would be doing to uid 1000's own files what uid 1000 can already do. A
+# one would be doing to uid 1000's own files what uid 1000 can already do. A
 # caller that reads a command's output and believes it must use the default.
 #
 # `read_bytes` is the exception, and it is this module's own default rather than
@@ -463,7 +464,7 @@ def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL
     to tell "at the limit" from "over it", the way a local capped read does.
 
     `principal` defaults to `TERMINAL_PRINCIPAL`, which is NOT this module's
-    default and is deliberate. The other two callers that name it pass it to
+    default and is deliberate. The other callers that name it pass it to
     write inside an `agent`-owned tree; this one passes it to read with no more
     privilege than whoever wrote the file had. Every deliverable in the sandbox
     is written by the model's own shell, which logs in as `terminal.ssh_user` --

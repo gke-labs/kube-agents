@@ -12,6 +12,11 @@ The in-process job removal in bootstrap_delivery._cleanup imports cron.jobs,
 which is unavailable here; its import is guarded, so _cleanup degrades to a
 no-op for job removal while still archiving INVENTORY.md.
 
+bootstrap_delivery imports sandbox_exec from agents/platform/scripts, which the
+image copies into the same directory as the chat scripts. The delivery tests
+pin sandbox_enabled() rather than trusting that this machine has no
+/etc/hermes/config.yaml.
+
 The theme of these tests is that onboarding happens ONCE. Each stage is
 therefore checked twice: once for doing its job, and once for refusing to do it
 again.
@@ -39,6 +44,7 @@ import bootstrap_delivery  # noqa: E402
 import bootstrap_scan_gate  # noqa: E402
 import cluster_agent_profile  # noqa: E402
 import profile_scaffold  # noqa: E402
+import sandbox_exec  # noqa: E402
 from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS  # noqa: E402
 
 INVENTORY = "INVENTORY.md"
@@ -56,33 +62,33 @@ class DeliveryDecisionTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_no_deliver_when_nothing_present(self):
-        self.assertFalse(bootstrap_delivery._should_deliver(self.d))
+    def test_not_awaiting_when_nothing_present(self):
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
 
-    def test_no_deliver_when_only_inventory(self):
+    def test_not_awaiting_when_only_inventory(self):
         (self.d / INVENTORY).write_text("x")
-        self.assertFalse(bootstrap_delivery._should_deliver(self.d))
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
 
-    def test_no_deliver_when_only_aligned(self):
+    def test_awaiting_once_a_human_is_present(self):
+        # The report is not part of this check: with the sandbox on it is on
+        # another pod, and main() reads it only after this says yes.
         (self.d / ALIGNED).touch()
-        self.assertFalse(bootstrap_delivery._should_deliver(self.d))
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
 
-    def test_deliver_when_both_present_and_not_completed(self):
-        (self.d / INVENTORY).write_text("x")
-        (self.d / ALIGNED).touch()
-        self.assertTrue(bootstrap_delivery._should_deliver(self.d))
-
-    def test_no_deliver_when_already_completed(self):
+    def test_not_awaiting_when_already_completed(self):
         (self.d / INVENTORY).write_text("x")
         (self.d / ALIGNED).touch()
         (self.d / COMPLETED).touch()
-        self.assertFalse(bootstrap_delivery._should_deliver(self.d))
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
 
 
 class DeliveryMainTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.d = Path(self._tmp.name)
+        patcher = mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -150,12 +156,156 @@ class DeliveryMainTest(unittest.TestCase):
     def test_unreadable_report_leaves_state_untouched(self):
         # Nothing was delivered, so nothing may be marked delivered — otherwise
         # a transient read error silently costs the user the whole report.
-        (self.d / INVENTORY).mkdir()  # a directory: read_text raises OSError
+        (self.d / INVENTORY).mkdir()  # a directory: open() raises OSError
         (self.d / ALIGNED).touch()
         rc, out = self._run()
         self.assertEqual(rc, 1)
         self.assertEqual(out, "")
         self.assertFalse((self.d / COMPLETED).exists())
+
+    def test_a_report_past_the_cap_is_refused_not_cut(self):
+        (self.d / INVENTORY).write_bytes(b"x" * (bootstrap_delivery.REPORT_MAX_BYTES + 1))
+        (self.d / ALIGNED).touch()
+        rc, out = self._run()
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+
+    def test_a_report_at_the_cap_is_delivered(self):
+        report = "x" * bootstrap_delivery.REPORT_MAX_BYTES
+        (self.d / INVENTORY).write_text(report, encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        rc, out = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, report)
+
+
+class DeliveryFromSandboxTest(unittest.TestCase):
+    """With the shell sandbox on, the report is on the sandbox pod.
+
+    The prioritization worker writes INVENTORY.md through its terminal, which
+    is the sandbox; this pod holds only the markers. A report placed in the
+    local data dir must not be what gets delivered.
+    """
+
+    SANDBOX_REPORT = "/opt/data/INVENTORY.md"
+    SANDBOX_DELIVERED = "/opt/data/INVENTORY.delivered.md"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        (self.d / ALIGNED).touch()
+        self.read = self._patch("read_bytes", return_value=b"# Sandbox report\n")
+        self.run_ = self._patch(
+            "run", return_value=subprocess.CompletedProcess(["mv"], 0, stdout="", stderr="")
+        )
+        self._patch("sandbox_enabled", return_value=True)
+
+    def _patch(self, name, **kwargs):
+        patcher = mock.patch.object(sandbox_exec, name, **kwargs)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def _run(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = bootstrap_delivery.main(self.d)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_delivers_the_sandbox_copy_and_archives_it_there(self):
+        (self.d / INVENTORY).write_text("# Stale local copy\n", encoding="utf-8")
+        rc, out, _ = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "# Sandbox report\n")
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.read.assert_called_once()
+        self.assertEqual(self.read.call_args.args, (self.SANDBOX_REPORT,))
+        self.assertEqual(self.read.call_args.kwargs["max_bytes"], bootstrap_delivery.REPORT_MAX_BYTES + 1)
+        # The read runs as read_bytes' own default login; the rename as the
+        # terminal's, which owns the sandbox's /opt/data.
+        self.assertNotIn("principal", self.read.call_args.kwargs)
+        self.run_.assert_called_once()
+        self.assertEqual(
+            self.run_.call_args.args[0], ["/bin/mv", "-f", "--", self.SANDBOX_REPORT, self.SANDBOX_DELIVERED]
+        )
+        self.assertEqual(self.run_.call_args.kwargs["principal"], sandbox_exec.TERMINAL_PRINCIPAL)
+        # The local copy is not the sandbox's to archive.
+        self.assertTrue((self.d / INVENTORY).exists())
+        self.assertFalse((self.d / DELIVERED).exists())
+
+    def test_no_human_means_no_sandbox_read(self):
+        (self.d / ALIGNED).unlink()
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, ""))
+        self.read.assert_not_called()
+
+    def test_already_delivered_means_no_sandbox_read(self):
+        (self.d / COMPLETED).touch()
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, ""))
+        self.read.assert_not_called()
+
+    def test_no_report_in_the_sandbox_is_a_silent_run(self):
+        self.read.return_value = None
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, ""))
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.run_.assert_not_called()
+
+    def test_an_unreachable_sandbox_is_a_silent_retry(self):
+        # A non-zero exit becomes a failure alert in the user's chat on every
+        # tick, and a sandbox restart is not the user's problem.
+        for exc in (sandbox_exec.SandboxUnavailable("ssh: connect refused"),
+                    subprocess.TimeoutExpired(["ssh"], 30)):
+            with self.subTest(exc=type(exc).__name__):
+                self.read.side_effect = exc
+                rc, out, err = self._run()
+                self.assertEqual((rc, out), (0, ""))
+                self.assertIn("did not answer", err)
+                self.assertFalse((self.d / COMPLETED).exists())
+                self.run_.assert_not_called()
+
+    def test_an_unreadable_sandbox_config_is_a_failure(self):
+        sandbox_exec.sandbox_enabled.side_effect = sandbox_exec.SandboxMisconfigured("bad yaml")
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (1, ""))
+        self.read.assert_not_called()
+        self.assertFalse((self.d / COMPLETED).exists())
+
+    def test_a_sandbox_report_past_the_cap_is_refused(self):
+        self.read.return_value = b"x" * (bootstrap_delivery.REPORT_MAX_BYTES + 1)
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (1, ""))
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.run_.assert_not_called()
+
+    def test_bytes_that_are_not_utf8_are_still_delivered(self):
+        self.read.return_value = b"caf\xe9 report\n"
+        rc, out, _ = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "caf\ufffd report\n")
+
+    def test_a_failed_rename_still_counts_as_delivered(self):
+        for outcome in (
+            {"return_value": subprocess.CompletedProcess(["mv"], 1, stdout="", stderr="Permission denied")},
+            {"side_effect": sandbox_exec.SandboxUnavailable("gone")},
+        ):
+            with self.subTest(outcome=outcome):
+                (self.d / COMPLETED).unlink(missing_ok=True)
+                self.run_.reset_mock(return_value=True, side_effect=True)
+                self.run_.configure_mock(**outcome)
+                rc, out, err = self._run()
+                self.assertEqual((rc, out), (0, "# Sandbox report\n"))
+                self.assertTrue((self.d / COMPLETED).exists())
+                self.assertIn("could not archive INVENTORY.md in the sandbox", err)
+
+    def test_a_racing_run_does_not_touch_the_sandbox_report(self):
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, ""))
+        self.run_.assert_not_called()
 
 
 class ScanGateTest(unittest.TestCase):
