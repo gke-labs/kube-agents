@@ -109,12 +109,16 @@ REPORT_STATUS_UNCHECKED = "unchecked"
 REPORT_FINDING_FAILED = "failed"
 # A repair the reader has to confirm before running: it takes something away.
 REPAIR_CONFIRM_PREFIX = "# confirm first: "
-# Repairs that are a procedure, by runbook section.
-REPAIR_REPOSITORY = "scripts/provision_ci_pool_project.sh, or docs/ci-pool-projects.md section 4"
+# Repairs that are a procedure, by runbook section. None names
+# scripts/provision_ci_pool_project.sh: the scan reads registered projects
+# only, and the runbook's section 8 forbids re-running the script on one (it
+# rotates the api_server_key under a leased run); the hand steps in the
+# sections named are the repair.
+REPAIR_REPOSITORY = "create the repository by hand per docs/ci-pool-projects.md section 4 (not scripts/provision_ci_pool_project.sh, which must not be re-run on a registered project: section 8)"
 REPAIR_CLEANUP_POLICY = "docs/ci-pool-projects.md section 4, Cleanup policy"
-REPAIR_HOST_CLUSTER = "scripts/provision_ci_pool_project.sh --skip-fleet, or docs/ci-pool-projects.md section 2"
+REPAIR_HOST_CLUSTER = "docs/ci-pool-projects.md section 2 by hand, against the project's existing full-install state so its api_server_key is kept (not scripts/provision_ci_pool_project.sh, which must not be re-run on a registered project: section 8)"
 REPAIR_HOST_CMEK = "gcloud container clusters update platform-agent-host --database-encryption-key=<the project's key>, as install.sh does for an existing cluster (docs/ci-pool-projects.md section 2)"
-REPAIR_STATE_BUCKET = "scripts/provision_ci_pool_project.sh, or docs/ci-pool-projects.md section 2"
+REPAIR_STATE_BUCKET = "gcloud storage buckets create gs://{project_id}-tf-state --project={project_id} --location=us-central1 --uniform-bucket-level-access && gcloud storage buckets update gs://{project_id}-tf-state --versioning (docs/ci-pool-projects.md section 2; not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
 REPAIR_FLEET_APPLY = "re-apply bench/tf/fleet against {project_id} (bench/tf/fleet/README.md, State and reconcile)"
 REPAIR_MINTER = "docs/ci-pool-projects.md section 5.2 (the ci-pool-minter composition owns the key)"
 REPAIR_MINTER_ROTATION = "import the version the chart pins, or bump githubMinter.kms.keyVersion in charts/kube-agents/values.yaml to an ENABLED one (docs/site/src/content/docs/deploy/token-minter.md)"
@@ -592,11 +596,15 @@ _UNREAD_PATTERNS = (
     # three drifted. The status codes are tied to how gcloud prints one, so
     # a resource named kube-agents-evals-500 does not match.
     re.compile(r"RESOURCE_EXHAUSTED|\bUNAVAILABLE\b|\bINTERNAL\b|database is locked"),
-    re.compile(r"(?:HTTPError|HTTP Error|HTTP|code|status)['\"]?\s*[=:]?\s*['\"]?\(?(?:429|500|502|503|504)\b", re.I),
+    # A separator between the word and the code is required (`code=`, `status:
+    # '`, `HTTP `, `HTTPError (`), so a resource named http500 or code503 is
+    # not a status.
+    re.compile(r"(?:HTTPError|HTTP Error|HTTP|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()(?:429|500|502|503|504)\b", re.I),
     # A transport failure on the runner -- gcloud never got an answer -- is
     # not absence either; without this a DNS or TLS blip on one wave became
     # three `*/failed` findings and a pool-drift issue.
-    re.compile(r"gcloud crashed|ConnectionError|NewConnectionError|SSLError|ReadTimeout|Connection reset|Temporary failure in name resolution|Name or service not known", re.I),
+    # In gcloud's own crash form, so a resource named readtimeout is not one.
+    re.compile(r"gcloud crashed \((?:\w*ConnectionError|SSLError|ReadTimeout|ConnectTimeout|ProtocolError|RemoteDisconnected)\)|Temporary failure in name resolution|Name or service not known|Connection reset by peer", re.I),
 )
 
 # gh prints `gh: Not Found (HTTP 404)` both for a resource that is absent and
@@ -1765,7 +1773,7 @@ def check_gke_and_state(project_id: str) -> CheckResult:
             warnings,
         ):
             passed = False
-            findings.append(Finding("gke/state-bucket", details[-1], REPAIR_STATE_BUCKET))
+            findings.append(Finding("gke/state-bucket", details[-1], REPAIR_STATE_BUCKET.format(project_id=project_id)))
     else:
         bucket_checked = True
 

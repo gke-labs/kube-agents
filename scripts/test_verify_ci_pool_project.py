@@ -120,6 +120,10 @@ class DenialClassifierTest(unittest.TestCase):
     # A status code inside a resource name is not a status.
     NUMBERED_ABSENCES = (
         "ERROR: (gcloud.storage.buckets.describe) gs://kube-agents-evals-500-tf-state not found: 404.",
+        # The prefix word directly before the digits, or a transport word, inside a name.
+        "ERROR: (gcloud.storage.buckets.describe) gs://kube-agents-http500-tf-state not found: 404.",
+        "ERROR: (gcloud.kms.keys.describe) NOT_FOUND: CryptoKey projects/p/locations/us-central1/keyRings/code503/cryptoKeys/k not found.",
+        "ERROR: (gcloud.kms.keys.describe) NOT_FOUND: CryptoKey projects/p/locations/us-central1/keyRings/readtimeout-ring/cryptoKeys/sslerror not found.",
         "ERROR: (gcloud.projects.describe) NOT_FOUND: Project 'kube-agents-evals-429' not found or deleted.",
         "ERROR: (gcloud.kms.keys.describe) NOT_FOUND: CryptoKey projects/kube-agents-evals-503/locations/us-central1/keyRings/r/cryptoKeys/k not found.",
     )
@@ -3698,7 +3702,7 @@ class FindingsCarryRepairsTest(unittest.TestCase):
             {
                 "gke/cluster/seeded-b": checker.REPAIR_FLEET_APPLY.format(project_id="kube-agents-evals-3"),
                 "gke/host-cmek": checker.REPAIR_HOST_CMEK,
-                "gke/state-bucket": checker.REPAIR_STATE_BUCKET,
+                "gke/state-bucket": checker.REPAIR_STATE_BUCKET.format(project_id="kube-agents-evals-3"),
             },
         )
         repo = json.dumps({"format": "DOCKER", "cleanupPolicies": {}, "cleanupPolicyDryRun": True})
