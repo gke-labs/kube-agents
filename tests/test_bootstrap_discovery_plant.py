@@ -35,6 +35,7 @@ Terraform renders it and run against a stub `kubectl`/`gcloud`/`sleep`. Step
 4's board query also runs on its own against a sqlite board.
 """
 
+import json
 import os
 import pathlib
 import re
@@ -50,6 +51,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MODULE = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "bootstrap-discovery" / "main.tf"
 _HEREDOC_RE = re.compile(r"command\s*=\s*<<-EOT\n(.*?)\n\s*EOT\n", re.S)
 _RUN_STATE_RE = re.compile(r"^run_state\(\) \{\n  agent_py [^\n]*<<'PY'\n(.*?)\nPY\n", re.S | re.M)
+_STEP_1_RE = re.compile(r"^state=\"\$\(agent_py [^\n]*<<'PY' \|\| true\n(.*?)\nPY\n", re.S | re.M)
 _PLANT_BLOCK = 0
 _SWEEP = "t_sweep"
 _CLUSTER_KEY = "bootstrap-inventory-cluster-example-project-cluster-"
@@ -66,6 +68,7 @@ _INTERPOLATIONS = {
     "local.inventory": "/opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md",
     "local.gate_script": "bootstrap_scan_gate.py",
     "local.gate_wait": "300",
+    "local.scan_job": "bootstrap-inventory-scan",
     "local.rate_limit_block": "provider rate limit: API retries exhausted",
     "var.project_id": "kube-agents-evals",
     "var.host_cluster_name": "platform-agent-host",
@@ -118,13 +121,13 @@ target = next(a for a in argv if a.startswith(("deployment/", "pod/")))
 script = cmd[2] if cmd[:2] == ["sh", "-c"] else ""
 stdin = sys.stdin.read() if cmd[1:2] == ["-"] else ""
 
-if ".user_aligned" in script:
+if ".user_aligned" in stdin:
     record("state")
-    print("clear")
+    print(os.environ.get("STEP_1_STATE", "clear"))
 elif "s/^task_id=//p" in script:
     record("sweep_id")
     if not (state / "rearmed").exists():
-        print("t_old")
+        print(os.environ.get("OLD_ID", "t_old"))
     elif os.environ.get("GATE_FILES") == "1" and bump("sweep_reads") >= 1:
         print("t_new")
 elif "task_id=$1" in script:
@@ -148,7 +151,11 @@ elif "/proc" in stdin:
 elif "task_runs" in stdin:
     record("run_state")
     states = os.environ.get("RUN_STATES", "1 1 1 1").split(";")
-    print(states[min(bump("run_state"), len(states) - 1)])
+    answer = states[min(bump("run_state"), len(states) - 1)]
+    if answer == "fail":
+        sys.stderr.write("error: unable to upgrade connection: container not found\n")
+        sys.exit(1)
+    print(answer)
 elif "idempotency_key LIKE" in stdin:
     record("open_cards")
     raced = os.environ.get("RACE") == "1" and (state / "gate_done").exists()
@@ -234,6 +241,34 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertIn("Sweep card t_new filed 3 Cluster Agent card(s)", completed.stdout)
         self.assertEqual(self._indices(calls, "[archive]"), [])
 
+    def test_step_4_hands_over_on_the_last_good_read_when_later_reads_fail(self):
+        # A worker is running and has filed two cards; then every read fails.
+        completed, calls = self._run(GATE_FILES=1, RUN_STATES="1 0 2 0;fail")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[run_state]")), 900 // 15 + 1)
+        self.assertIn("Board reads after 0s failed", completed.stderr)
+        self.assertIn("Sweep card t_new has 0 ended run(s) and 2 Cluster Agent card(s)", completed.stdout)
+        self.assertEqual(self._indices(calls, "[archive]"), [])
+
+    def test_step_4_reports_a_board_it_never_read_as_unread(self):
+        completed, calls = self._run(GATE_FILES=1, RUN_STATES="fail")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("no read of sweep card t_new's runs from the board succeeded", completed.stderr)
+        self.assertNotIn("no worker picked up", completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[open_cards]")), 3)
+
+    def test_step_4_reports_a_sweep_no_worker_picked_up(self):
+        completed, calls = self._run(GATE_FILES=1, RUN_STATES="0 0 0 0")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("no worker picked up sweep card t_new within 900s", completed.stderr)
+        self.assertNotIn("Board reads after", completed.stderr)
+
+    def test_step_1_refuses_a_paused_scan_job_before_re_arming(self):
+        completed, calls = self._run(STEP_1_STATE="paused")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("cron job is paused", completed.stderr)
+        self.assertEqual([c for c in calls if c.endswith(("[rearm]", "[archive]", "[restore]"))], [])
+
     def test_the_trap_archives_a_sweep_the_leaders_gate_files_after_the_restore(self):
         # The gate never files within the plant's wait, so step 3 fails. The
         # leader's gate run is still going when the trap starts and files its
@@ -245,6 +280,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         leader = self._indices(calls, "[gate pod/gw-leader]")
         archive = [i for i, call in enumerate(calls) if call.endswith("archive t_raced [archive]")]
         self.assertEqual(len(restore), 1)
+        self.assertTrue(calls[restore[0]].endswith(" sh t_old [restore]"), calls[restore[0]])
         self.assertEqual(len(leader), 3, calls)
         self.assertEqual(len(archive), 1, calls)
         self.assertLess(restore[0], leader[0])
@@ -258,12 +294,61 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertEqual(len(self._indices(calls, "[gate pod/gw-leader]")), 300 // 5 + 1)
         self.assertEqual(len(self._indices(calls, "[open_cards]")), 3)
 
+    def test_the_trap_writes_no_marker_on_an_install_that_had_none(self):
+        # The gate had not filed on this install yet, so there is no marker to
+        # put back, and writing one would stop the gate filing its own sweep.
+        completed, calls = self._run(GATE_FILES=0, OLD_ID="", RACE=1)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("previous sweep card: none", completed.stdout)
+        self.assertEqual(self._indices(calls, "[restore]"), [])
+        self.assertEqual(len([c for c in calls if c.endswith("archive t_raced [archive]")]), 1, calls)
+
     def test_the_trap_waits_out_the_ceiling_when_no_gateway_pod_is_listed(self):
         completed, calls = self._run(GATE_FILES=0, NO_PODS=1, RACE=0)
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual([c for c in calls if "[gate " in c], [])
         self.assertEqual(calls.count("sleep 5"), 300 // 5)
         self.assertEqual(len(self._indices(calls, "[open_cards]")), 3)
+
+
+class Step1StateQueryTest(unittest.TestCase):
+    """Step 1's read, run under the test interpreter against a data dir."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self._home = pathlib.Path(self._dir.name)
+        (self._home / "cron").mkdir()
+        self._script = _STEP_1_RE.search(_render_plant(**{"local.home": self._dir.name})).group(1)
+
+    def _state(self, jobs=None, markers=()):
+        if jobs is not None:
+            (self._home / "cron" / "jobs.json").write_text(json.dumps({"jobs": jobs}))
+        for marker in markers:
+            (self._home / marker).touch()
+        completed = subprocess.run(
+            [sys.executable, "-", _INTERPOLATIONS["local.scan_job"]],
+            input=self._script,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    def test_an_enabled_scan_job_reads_clear(self):
+        self.assertEqual(self._state([{"id": "other", "enabled": False}, {"id": "bootstrap-inventory-scan", "enabled": True}]), "clear")
+
+    def test_a_paused_scan_job_reads_paused(self):
+        self.assertEqual(self._state([{"id": "bootstrap-inventory-scan", "enabled": False}]), "paused")
+
+    def test_a_missing_scan_job_reads_nojob(self):
+        self.assertEqual(self._state([{"id": "other", "enabled": True}]), "nojob")
+        (self._home / "cron" / "jobs.json").unlink()
+        self.assertEqual(self._state(), "nojob")
+
+    def test_the_markers_are_read_before_the_job(self):
+        self.assertEqual(self._state([], markers=[".bootstrap_completed"]), "completed")
+        self.assertEqual(self._state(markers=[".user_aligned"]), "aligned")
 
 
 class RunStateQueryTest(unittest.TestCase):

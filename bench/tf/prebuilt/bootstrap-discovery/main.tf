@@ -61,6 +61,7 @@ locals {
   # cron tick.
   gate_script = "bootstrap_scan_gate.py"
   gate_wait   = 300
+  scan_job    = "bootstrap-inventory-scan"
   # bootstrap_scan_gate.py's CLUSTER_IDEMPOTENCY_KEY_PREFIX.
   cluster_key_like = "bootstrap-inventory-cluster-%"
   # deploy/docker/patches/kanban_guardrail_exit.py: RATE_LIMIT_REASON_PREFIX,
@@ -101,10 +102,14 @@ resource "null_resource" "sweep" {
           echo "Plant failed (exit $status); archiving the bootstrap-inventory cards it left open." >&2
           # The gate files only while this marker is absent, and a sweep filed
           # after this exit would run with nothing to archive it, so the
-          # marker goes back before the cards are listed. A gate run that read
-          # the marker before it went back files once its reconcile ends, so
-          # the listing also waits for any gate run to exit.
-          agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$${old_id:-none}" >&2
+          # marker goes back before the cards are listed. An install that had
+          # none is left without one, or its gate would never file its own
+          # sweep. A gate run that read the marker before it went back files
+          # once its reconcile ends, so the listing also waits for any gate
+          # run to exit.
+          if [ -n "$old_id" ]; then
+            agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$old_id" >&2
+          fi
           waited=0
           until [ "$(gate_running)" = idle ] || [ "$waited" -ge ${local.gate_wait} ]; do
             sleep 5
@@ -204,7 +209,23 @@ resource "null_resource" "sweep" {
       # ---- 1. Refuse an install where the sweep would reach a person -------
       # One read that has to answer `clear`, so a failed exec refuses rather
       # than reading as "no marker".
-      state="$(agent sh -c 'if [ -e ${local.home}/.user_aligned ]; then echo aligned; elif [ -e ${local.home}/.bootstrap_completed ]; then echo completed; elif grep -q "\"bootstrap-inventory-scan\"" ${local.home}/cron/jobs.json 2>/dev/null; then echo clear; else echo nojob; fi' || true)"
+      state="$(agent_py "${local.scan_job}" <<'PY' || true
+      import json, os, sys
+      home = "${local.home}"
+      if os.path.exists(home + "/.user_aligned"):
+          print("aligned")
+      elif os.path.exists(home + "/.bootstrap_completed"):
+          print("completed")
+      else:
+          try:
+              with open(home + "/cron/jobs.json") as fh:
+                  jobs = json.load(fh).get("jobs", [])
+          except FileNotFoundError:
+              jobs = []
+          job = next((j for j in jobs if j.get("id") == sys.argv[1]), None)
+          print("nojob" if job is None else "clear" if job.get("enabled", True) else "paused")
+      PY
+      )"
       case "$state" in
         clear) ;;
         aligned)
@@ -215,6 +236,9 @@ resource "null_resource" "sweep" {
           exit 1 ;;
         nojob)
           echo "ERROR: the bootstrap-inventory-scan cron job is not in ${local.home}/cron/jobs.json on ${var.host_cluster_name}, so nothing will file a sweep." >&2
+          exit 1 ;;
+        paused)
+          echo "ERROR: the ${local.scan_job} cron job is paused (\"enabled\": false in ${local.home}/cron/jobs.json) on ${var.host_cluster_name}, so nothing will file a sweep. The agent pod's next start re-enables it." >&2
           exit 1 ;;
         *)
           echo "ERROR: could not read the onboarding markers on ${var.host_cluster_name} (got '$state')." >&2
@@ -287,21 +311,41 @@ resource "null_resource" "sweep" {
       print(runs[0], runs[1], filed, after)
       PY
       }
+      # Only a read of four counts is used: a failed exec or query prints
+      # nothing, and that is not a sweep with no runs. read_at is when the
+      # last one succeeded.
+      counts='^[0-9]+ [0-9]+ [0-9]+ [0-9]+$'
+      read_at=""
+      read_run_state() {
+        out="$(run_state)" || out=""
+        if [[ "$out" =~ $counts ]]; then
+          read -r started ended filed after <<<"$out"
+          read_at=$elapsed
+        fi
+      }
       elapsed=0
-      read -r started ended filed after <<<"$(run_state)"
-      until [ "$${after:-0}" -ge 1 ]; do
+      after=0
+      read_run_state
+      until [ "$after" -ge 1 ]; do
         if [ "$elapsed" -ge ${local.run_wait} ]; then
-          if [ "$${started:-0}" -eq 0 ]; then
-            echo "ERROR: no worker picked up sweep card $sweep within $${elapsed}s, so there is no fan-out to grade." >&2
+          if [ -z "$read_at" ]; then
+            echo "ERROR: no read of sweep card $sweep's runs from the board succeeded in $${elapsed}s, so there is nothing to grade. The read errors are above." >&2
+            exit 1
+          fi
+          if [ "$read_at" -lt "$elapsed" ]; then
+            echo "Board reads after $${read_at}s failed; what follows is from the read at $${read_at}s." >&2
+          fi
+          if [ "$started" -eq 0 ]; then
+            echo "ERROR: no worker picked up sweep card $sweep within $${read_at}s, so there is no fan-out to grade." >&2
             agent ${local.hermes} kanban show "$sweep" >&2 || true
             exit 1
           fi
-          echo "Sweep card $sweep has $${ended:-0} ended run(s) and $${filed:-0} Cluster Agent card(s) after $${elapsed}s; handing over to the verifier."
+          echo "Sweep card $sweep has $ended ended run(s) and $filed Cluster Agent card(s) after $${elapsed}s; handing over to the verifier."
           exit 0
         fi
         sleep ${local.poll}
         elapsed=$((elapsed + ${local.poll}))
-        read -r started ended filed after <<<"$(run_state)"
+        read_run_state
       done
       echo "Sweep card $sweep filed $filed Cluster Agent card(s) and ended a run after $${elapsed}s."
     EOT
