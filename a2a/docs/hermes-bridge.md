@@ -229,8 +229,11 @@ keeps a bind over a backlog of abandoned submissions from opening a consumer per
 speed, and the replay that remains is paced: at most `BRIDGE_CONCURRENCY` of them are in hand
 at once, each held until its ephemeral's five-second threshold has run after it returned, so the
 look-ahead holds that many live consumer slots at most, plus whatever the server has not yet
-reaped at the window's edge; the operator's reserve counts twice that, its tail factor, and that
-is the bound the bridge's own test holds the stream to. A run the durable's cancel has already
+reaped at the window's edge. The operator's reserve counts twice the default
+`BRIDGE_CONCURRENCY` of 2 (its tail factor), since the operator leaves the variable unset; a
+bridge started with a higher value, as the eval's sidecar is, can hold more look-ahead consumers
+than the reserve counts. Twice `BRIDGE_CONCURRENCY` is the bound the bridge's own test holds the
+stream to. A run the durable's cancel has already
 ended takes no slot at all. `working` is published only after that read, so a cancelled
 run never shows it. It is
 a read, not a consume: the durable still delivers the cancel to the handler afterwards, and

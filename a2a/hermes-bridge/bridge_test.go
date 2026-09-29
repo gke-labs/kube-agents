@@ -901,9 +901,10 @@ echo never`, markers)), fanOut)
 // parser accepts behind each cancel, reaches the fallback replay on every
 // task, and the replay is paced: at most Concurrency of them are in hand at
 // once, each held until its ephemeral is reaped, so the look-ahead holds at
-// most that many consumer slots however long the backlog is (the reserve's
-// row, with its tail factor, is twice that, and is what this test holds the
-// sampled peak to, since the server's reaping lags the clock by a little).
+// most that many consumer slots however long the backlog is. This test holds
+// the sampled peak to twice Concurrency, the shape of the operator reserve's
+// row with its tail factor (which the reserve counts at the default
+// Concurrency), since the server's reaping lags the clock by a little.
 // Every task is still refused without a spawn; it just takes the windows it
 // takes. Unpaced, twelve such tasks opened twelve ephemerals inside a tenth
 // of a second.
@@ -920,7 +921,7 @@ func TestLookAhead_FallbackReplayIsPacedToTheReserve(t *testing.T) {
 	js := testJetStream(t, url)
 	markers := t.TempDir()
 	const tasks, workers = 12, 4
-	const slotCeiling = 2 * workers // in flight and the tail, the reserve's row
+	const slotCeiling = 2 * workers // in flight and the tail, the reserve row's shape
 
 	var origins []*lib.Envelope
 	for i := 0; i < tasks; i++ {
@@ -1120,6 +1121,12 @@ func TestCancelInStream_Cases(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cancel(); b.close() })
+	// A held slot's release stays pending instead of firing on the real
+	// threshold, so a case's delta cannot shift by a timer armed by an
+	// earlier case firing between its two reads. holdsScheduled counts the
+	// holds, which must match the slots each case leaves in hand.
+	holdsScheduled := 0
+	b.holdReplaySlot = func(func()) { holdsScheduled++ }
 
 	runFor := func(origin *lib.Envelope) *taskRun {
 		x, err := b.c.NewTaskExecution(origin, b.from, "platform")
@@ -1140,8 +1147,8 @@ func TestCancelInStream_Cases(t *testing.T) {
 	// holds says whether the case leaves a replay slot in hand afterwards:
 	// only a fallback replay that opened a consumer does. The direct-get
 	// answers take no slot, and a fallback over an empty subject gives its
-	// slot straight back. The delta is read case by case, within the
-	// threshold a held slot lasts.
+	// slot straight back. The delta is read case by case; the held slots'
+	// releases never fire here (holdReplaySlot above).
 	cases := []struct {
 		name  string
 		run   func() *taskRun
@@ -1229,7 +1236,7 @@ func TestCancelInStream_Cases(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			before := len(b.replaySlots)
+			before, beforeHolds := len(b.replaySlots), holdsScheduled
 			got, err := b.cancelInStream(ctx, tc.run())
 			if err != nil {
 				t.Fatalf("cancelInStream: %v", err)
@@ -1237,9 +1244,12 @@ func TestCancelInStream_Cases(t *testing.T) {
 			if got != tc.want {
 				t.Fatalf("cancelInStream = %v, want %v", got, tc.want)
 			}
-			held := len(b.replaySlots) - before
-			if want := map[bool]int{true: 1, false: 0}[tc.holds]; held != want {
+			want := map[bool]int{true: 1, false: 0}[tc.holds]
+			if held := len(b.replaySlots) - before; held != want {
 				t.Fatalf("replay slots held by this case = %d, want %d", held, want)
+			}
+			if scheduled := holdsScheduled - beforeHolds; scheduled != want {
+				t.Fatalf("slot holds scheduled by this case = %d, want %d", scheduled, want)
 			}
 		})
 	}

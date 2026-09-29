@@ -170,9 +170,16 @@ type Bridge struct {
 	// threshold after it returns, so the slots in hand are the consumers the
 	// look-ahead is holding, Concurrency at most plus whatever the server
 	// has not yet reaped, whatever shape the backlog has. The operator's
-	// TASKS reserve counts twice that (a2aTasksReplayBridgeLookAhead and
-	// its tail factor).
+	// TASKS reserve counts twice the default Concurrency, not the configured
+	// one (a2aTasksReplayBridgeLookAhead and its tail factor), because it
+	// leaves BRIDGE_CONCURRENCY unset.
 	replaySlots chan struct{}
+
+	// holdReplaySlot schedules release of a slot whose replay opened a
+	// consumer: after the ephemeral's inactive threshold by default; a field
+	// so a test can keep the release pending and count slots in hand without
+	// racing the timer.
+	holdReplaySlot func(release func())
 }
 
 // New connects and sweeps but does not consume yet; Run does.
@@ -190,6 +197,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		replaySlots: make(chan struct{}, cfg.Concurrency),
 	}
 	b.lookAhead = b.cancelInStream
+	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }
 	b.deliver = b.handle
 	var err error
 	b.c, err = lib.Connect(ctx, cfg.NATSURL,
@@ -630,7 +638,7 @@ func (b *Bridge) takeReplaySlot(ctx context.Context) (release func(opened bool),
 			<-b.replaySlots
 			return
 		}
-		time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, func() { <-b.replaySlots })
+		b.holdReplaySlot(func() { <-b.replaySlots })
 	}, nil
 }
 
