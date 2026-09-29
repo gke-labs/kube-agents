@@ -1574,9 +1574,23 @@ warn_flag_beats_unrecorded_file_value() {
     print_warning "${flag}=${value} applies to this run only: ${file} records no ${key}."
   fi
   print_info "$consequence"
+  # The bare form of a boolean flag means true (flag_bool_value), so "repeat
+  # --enable-drift-detector" told an operator who typed --enable-drift-detector=false
+  # to do the opposite of what they chose -- following it would re-provision
+  # the ingress the run they were warned about had just dropped, and the file
+  # still recording true would leave the guard silent about that. Render the
+  # value for a boolean whose chosen value is not true.
+  #
+  # Only for a boolean. A list flag's value is space-separated, so
+  # "--scope-projects=a b c" would not paste back as one argument, and the
+  # first remedy on this line already carries the value for it.
+  local repeat_flag="$flag"
+  if [ "$compare_as_bool" = "true" ] && ! is_truthy "$value"; then
+    repeat_flag="${flag}=${value}"
+  fi
   # %q, because the scope keys are the first list-valued values through here and
   # a space-separated one printed bare would not paste back as one assignment.
-  print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${flag} on ${repeat_on}."
+  print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${repeat_flag} on ${repeat_on}."
 }
 
 bootstrap_install_env_file() {
@@ -1599,26 +1613,54 @@ bootstrap_install_env_file() {
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
       true \
       "every later install.sh run"
-    # Direction-aware, unlike every other call here, because this key is the
-    # only one whose two directions have different consequences and different
-    # timing. Turning it ON leaves the loss for a later run; turning it OFF
+    # Four consequence strings, unlike every other call here, which take one.
+    # This key is the only one whose consequence varies, and it varies on two
+    # things at once.
+    #
+    # Direction. Turning it ON leaves the loss for a later run; turning it OFF
     # over a file that records it on does the destroying now, and the later run
-    # re-reads the file and puts it back. One consequence string cannot say
-    # both, and the wrong one tells the operator the destruction is deferred at
-    # the moment it is about to happen.
+    # re-reads the file and puts it back. The wrong one of those tells the
+    # operator the destruction is deferred at the moment it is about to happen.
+    #
+    # Whether anything is destroyed at all, which the TF_VAR_ block below
+    # explains.
+    #
+    # A string that covered every case would say nothing an operator could act
+    # on, and each of these is read by someone about to be surprised.
     local drift_detector_chosen="${PARAM_ENABLE_DRIFT_DETECTOR:-}"
-    local drift_detector_recorded drift_detector_consequence
-    drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it writes neither and the apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there; the front door applies with -auto-approve, so nobody is shown that plan first."
+    local drift_detector_recorded drift_detector_consequence drift_detector_turning_off=""
     drift_detector_recorded="$(recorded_install_env_value "$destination" ENABLE_DRIFT_DETECTOR 2>/dev/null || true)"
     if [ -n "$drift_detector_chosen" ] && ! is_truthy "$drift_detector_chosen"; then
       if is_truthy "${drift_detector_recorded:-false}"; then
-        drift_detector_consequence="This run writes neither drift tfvars key, so this apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there, with -auto-approve and no plan shown first; a later run without the flag re-reads the file and provisions them again, empty."
+        drift_detector_turning_off="true"
       else
         # Off over a file that does not ask for it on. This run writes neither
         # key and so would every later run, so there is no reversal to
         # announce -- and the helper's unrecorded branch would announce one.
         drift_detector_chosen=""
       fi
+    fi
+    # The other axis: whether dropping the two tfvars keys destroys the ingress
+    # at all. It does not on an install whose install.env carries a hand-written
+    # TF_VAR_enable_drift_pubsub=true line, which was the only front-door route
+    # to the ingress before this key existed. write_tfvars_from_state omits both
+    # drift keys rather than writing false precisely so that line keeps working,
+    # and a tfvars key beats TF_VAR_, so dropping them there stops the detector
+    # and leaves the sink, topic and subscription standing. install.env has been
+    # sourced with `set -a` by the time this runs, so the line is in this
+    # shell's environment and can be read. Telling that operator their audit
+    # records are about to be deleted is how a warning gets discounted, and this
+    # is the population most likely to try the new key.
+    if is_truthy "${TF_VAR_enable_drift_pubsub:-false}"; then
+      if [ -n "$drift_detector_turning_off" ]; then
+        drift_detector_consequence="This run writes neither drift tfvars key, so it stops the detector now; the TF_VAR_enable_drift_pubsub line in ${destination} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads. A later run without the flag re-reads the file and starts the detector again."
+      else
+        drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it writes neither and stops the detector; the TF_VAR_enable_drift_pubsub line in ${destination} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads."
+      fi
+    elif [ -n "$drift_detector_turning_off" ]; then
+      drift_detector_consequence="This run writes neither drift tfvars key, so this apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there, with -auto-approve and no plan shown first; a later run without the flag re-reads the file and provisions them again, empty."
+    else
+      drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it writes neither and the apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there; the front door applies with -auto-approve, so nobody is shown that plan first."
     fi
     warn_flag_beats_unrecorded_file_value "$destination" ENABLE_DRIFT_DETECTOR --enable-drift-detector \
       "$drift_detector_chosen" \

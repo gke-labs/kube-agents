@@ -6804,6 +6804,11 @@ class DomainScopedFlagsTest(unittest.TestCase):
             self.assertIn("applies to this run only", combined)
             self.assertIn("ENABLE_DRIFT_DETECTOR=false", combined)
             self.assertIn("subscription", combined)
+            # Destruction, not merely a stopped detector: this install has no
+            # TF_VAR_enable_drift_pubsub line, so dropping the two tfvars keys
+            # takes the ingress with them. The test below is the same run with
+            # that line present, and the two strings have to differ.
+            self.assertIn("the apply destroys", combined)
             self.assertIn(
                 "repeat --enable-drift-detector on every later install.sh run",
                 combined,
@@ -6841,6 +6846,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
             self.assertIn("applies to this run only", combined)
             self.assertIn("records no ENABLE_DRIFT_DETECTOR", combined)
             self.assertIn("a later run without it writes neither", combined)
+            self.assertIn("the apply destroys", combined)
 
     def test_turning_the_drift_detector_off_says_this_apply_destroys_them(self):
         """The consequence is not symmetrical, and the timing inverts with it.
@@ -6862,6 +6868,104 @@ class DomainScopedFlagsTest(unittest.TestCase):
             combined = proc.stdout + proc.stderr
             self.assertIn("applies to this run only", combined)
             self.assertIn("this apply destroys", combined)
+            self.assertNotIn("a later run without it writes neither", combined)
+
+    def test_turning_it_off_repeats_the_flag_with_the_value_that_was_typed(self):
+        """A bare boolean flag means true, so the remedy has to carry =false.
+
+        flag_bool_value reads --enable-drift-detector with no `=` as true.
+        "repeat --enable-drift-detector on every later install.sh run" therefore
+        told an operator who had just typed =false to do the opposite: following
+        it re-provisions the ingress this very run dropped, and the file, still
+        recording true, leaves the guard silent the next time round.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=true\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("repeat --enable-drift-detector=false on", combined)
+            self.assertNotIn("repeat --enable-drift-detector on", combined)
+
+    def test_the_repeated_flag_carries_its_value_for_every_boolean_key(self):
+        """The fix belongs to the helper, not to the drift call site.
+
+        ENABLE_GKE_BACKUP_PLAN is the other boolean through here and had the
+        same inverted remedy. Asserting it is what stops a later reader moving
+        the value-rendering into bootstrap_install_env_file's drift branch,
+        where the next boolean key added would inherit the bug again.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_GKE_BACKUP_PLAN=true\n")
+            proc = self._parse(
+                "--enable-gke-backup-plan=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("repeat --enable-gke-backup-plan=false on", combined)
+            self.assertNotIn("repeat --enable-gke-backup-plan on", combined)
+
+    def test_a_hand_written_tf_var_ingress_is_not_reported_as_destroyed(self):
+        """Nothing is destroyed on the one install most likely to read this.
+
+        TF_VAR_enable_drift_pubsub=true in install.env was the only front-door
+        route to the ingress before this key existed, and it still works:
+        write_tfvars_from_state omits both drift keys rather than writing
+        false, deliberately, and a tfvars key beats TF_VAR_. So dropping them
+        stops the detector and leaves the sink, topic and subscription
+        standing. Telling that operator their audit records are about to be
+        deleted is how a warning gets discounted.
+
+        load_install_env is the route the value travels: it sources the file
+        with `set -a`, which is what puts the line in the environment the guard
+        reads.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text(
+                "ENABLE_DRIFT_DETECTOR=false\nTF_VAR_enable_drift_pubsub=true\n"
+            )
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("a later run without it writes neither", combined)
+            self.assertIn("keeps the Log Router sink", combined)
+            self.assertNotIn("destroys", combined)
+
+    def test_turning_it_off_on_a_tf_var_ingress_says_the_detector_stops(self):
+        """Both axes at once: the destroying is now, and nothing is destroyed.
+
+        The direction says this apply is where the change lands, and the
+        TF_VAR_ line says what lands is a stopped detector over an ingress that
+        goes on retaining records nothing reads. Either half alone gets the
+        sentence wrong.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text(
+                "ENABLE_DRIFT_DETECTOR=true\nTF_VAR_enable_drift_pubsub=true\n"
+            )
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("it stops the detector now", combined)
+            self.assertIn("keeps the Log Router sink", combined)
+            self.assertNotIn("destroys", combined)
             self.assertNotIn("a later run without it writes neither", combined)
 
     def test_turning_it_off_over_a_file_that_never_asked_says_nothing(self):
