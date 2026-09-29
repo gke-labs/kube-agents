@@ -1106,6 +1106,16 @@ class RetagValuesTest(_StubHelm, unittest.TestCase):
         values = {"platformAgent": {"name": "p"}, "open": {"anything": 1}}
         self.assertEqual(self._values(self._run(json.dumps(values), drop=False)), values)
 
+    def test_a_named_key_shows_its_escapes_rather_than_sending_them_to_the_terminal(self):
+        """The names go out through `echo -e`, which turns `\\033` into ESC."""
+        for drop in (True, False):
+            with self.subTest(drop=drop):
+                proc = self._run(json.dumps({"a\x1bb\\033c\u2028d": 1}), drop=drop)
+                self.assertIn("'a\\u001bb\\033c\\u2028d'", proc.stdout)
+                # The colours are ESC sequences of their own, so look for the key's.
+                for raw in ("a\x1bb", "b\x1bc", "\u2028"):
+                    self.assertNotIn(raw, proc.stdout + proc.stderr)
+
     def test_an_object_the_schema_leaves_open_keeps_every_key(self):
         values = {"open": {"anything": {"nested": 1}}}
         proc = self._run(json.dumps(values))

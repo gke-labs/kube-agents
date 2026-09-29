@@ -627,6 +627,8 @@ harness_retag_keys() {
 # and a node using a keyword the walk does not model (`$ref`, `allOf`, ...) is
 # left for Helm to judge. A chart without a schema drops nothing. Names are
 # printed, never values: the recorded values carry the install's credentials.
+# A name is printed through `echo -e`, so its backslashes and unprintable
+# characters are written as escapes a terminal shows rather than acts on.
 # Assigns rather than prints, for the reasons recorded_plugin_image_tag_keys
 # gives. Arguments: release, namespace, schema path.
 RETAG_VALUES_JSON=""
@@ -683,6 +685,20 @@ except FileNotFoundError:
 dropped = []
 
 
+def visible(key):
+    out = []
+    for char in key:
+        if char == "\\":
+            out.append("\\\\")
+        elif char.isprintable():
+            out.append(char)
+        elif ord(char) <= 0xFFFF:
+            out.append(f"\\\\u{ord(char):04x}")
+        else:
+            out.append(f"\\\\U{ord(char):08x}")
+    return "".join(out)
+
+
 def prune(node, node_schema, path):
     if not isinstance(node_schema, dict) or any(k in node_schema for k in UNMODELLED_KEYWORDS):
         return
@@ -705,7 +721,7 @@ def prune(node, node_schema, path):
 
 prune(values, schema, "")
 with open(sys.argv[2], "w", encoding="utf-8") as dropped_file:
-    dropped_file.write("".join(f"{key}\n" for key in dropped))
+    dropped_file.write("".join(f"{visible(key)}\n" for key in dropped))
 text = BELOW_ASTRAL.sub(lambda match: f"\\u{ord(match.group()):04x}", json.dumps(values, ensure_ascii=False))
 sys.stdout.buffer.write(text.encode("utf-8"))
 ' "$schema" "$dropped_file" 2>"$stderr_file")"; then
