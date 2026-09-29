@@ -51,10 +51,12 @@ module is the seam to delete when that lands.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-__all__ = ["TranscriptSnapshot", "clear", "get", "set"]
+__all__ = ["TranscriptSnapshot", "clear", "dump", "get", "load", "set"]
 
 
 @dataclass(frozen=True)
@@ -153,3 +155,19 @@ def clear() -> None:
     """Empty the stash. Called before each run so stale data cannot be graded."""
     global _current
     _current = None
+
+
+def dump(path: Path, prompt: str = "") -> None:
+    """Write the current transcript to ``path`` as ATIF."""
+    from kube_agents_bench import atif
+
+    if _current is not None:
+        path.write_text(json.dumps(atif.from_snapshot(_current, prompt), indent=2))
+
+
+def load(path: Path) -> None:
+    """Make the ATIF trajectory at ``path`` the current transcript."""
+    from kube_agents_bench import atif
+
+    global _current
+    _current = atif.to_snapshot(json.loads(path.read_text()))
