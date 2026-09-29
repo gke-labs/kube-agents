@@ -66,14 +66,28 @@ KEY_RESULT = "result"
 KEY_ARTIFACT = "artifact"
 KEY_SINCE = "since"
 KEY_VERDICT = "verdict"
+KEY_TIMESTAMP = "timestamp"
+KEY_LABEL = "label"
+KEY_STALE_AFTER_H = "stale_after_h"
+KEY_DRY_RUN = "dry_run"
+KEY_DETAIL = "detail"
+KEY_HISTORY_URL = "history_url"
+KEY_DOC = "doc"
+# The reconcile's report (hack/fleet_reconcile.py write_report).
+REPORT_KEY_OUTCOMES = "outcomes"
+REPORT_KEY_OUTCOME = "outcome"
+REPORT_KEY_DETAIL = "detail"
+REPORT_KEY_ERROR = "error"
 
 
 @dataclasses.dataclass(frozen=True)
 class Periodic:
     job: str
     label: str
-    # A finished build older than this is a job that stopped running: one
-    # missed run and a little, as the TestGrid stale-results setting was.
+    # A finished build older than this is a job that stopped running. It is a
+    # window, not the cadence: the sweep runs every ten minutes and the hourly
+    # reconcile hourly, and each window is what the TestGrid stale-results
+    # setting was for the job.
     stale_after: timedelta
     artifact: str | None
     # Where the recovery is written up.
@@ -81,7 +95,7 @@ class Periodic:
 
 
 WATCHED = (
-    Periodic("ci-kube-agents-pull-sweep", "GitOps pull sweep", timedelta(hours=1), None, "docs/ci-pool-projects.md, section 3"),
+    Periodic("ci-kube-agents-pull-sweep", "GitOps pull sweep", timedelta(hours=1), None, "docs/ci-pool-projects.md, section 5.5"),
     Periodic("ci-kube-agents-fleet-reconcile", "seeded-fleet reconcile (hourly)", timedelta(hours=3), RECONCILE_ARTIFACT, "docs/ci-pool-projects.md, section 6.2"),
     Periodic("ci-kube-agents-fleet-reconcile-all", "seeded-fleet reconcile (weekly)", timedelta(hours=192), RECONCILE_ARTIFACT, "docs/ci-pool-projects.md, section 6.2"),
 )
@@ -145,9 +159,10 @@ def _finished(job: str, build: str, runner) -> dict | None:
     return doc
 
 
-def _earlier_builds(job: str, newest: str, runner) -> list[str]:
-    rc, out, _ = _gsutil(["ls", f"{LOGS_ROOT}/{job}/"], runner)
+def _earlier_builds(job: str, newest: str, runner, log=print) -> list[str]:
+    rc, out, err = _gsutil(["ls", f"{LOGS_ROOT}/{job}/"], runner)
     if rc != 0:
+        log(f"{WARNING_PREFIX}could not list {job}'s builds behind a running {newest}: {err.strip()}", file=sys.stderr)
         return []
     ids = []
     for line in out.splitlines():
@@ -157,12 +172,12 @@ def _earlier_builds(job: str, newest: str, runner) -> list[str]:
     return [str(i) for i in sorted(ids, reverse=True)[:FALLBACK_BUILDS]]
 
 
-def _candidates(job: str, newest: str, runner):
+def _candidates(job: str, newest: str, runner, log=print):
     """The newest build, then -- only if it is needed -- the finished builds
     before it: the listing is one call over a prefix that only grows, and the
     newest build has finished most of the time."""
     yield newest
-    yield from _earlier_builds(job, newest, runner)
+    yield from _earlier_builds(job, newest, runner, log)
 
 
 def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | None:
@@ -179,8 +194,9 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
     newest = out.strip()
     # isdecimal, not isdigit: the latter admits characters int() rejects.
     if not newest.isdecimal():
+        log(f"{WARNING_PREFIX}{periodic.job}'s build pointer is not a build id: {newest!r}", file=sys.stderr)
         return None
-    for build in _candidates(periodic.job, newest, runner):
+    for build in _candidates(periodic.job, newest, runner, log):
         try:
             finished = _finished(periodic.job, build, runner)
         except Unreadable as exc:
@@ -190,7 +206,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             # Still running, never finished, or stopped by Prow: not a run
             # of the job, so the one before it is what there is to read.
             continue
-        timestamp = finished.get("timestamp")
+        timestamp = finished.get(KEY_TIMESTAMP)
         try:
             finished_at = datetime.fromtimestamp(timestamp, tz=timezone.utc) if isinstance(timestamp, (int, float)) else None
         except (OverflowError, OSError, ValueError):
@@ -199,18 +215,24 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             KEY_JOB: periodic.job,
             KEY_BUILD: build,
             KEY_FINISHED_AT: iso(finished_at),
-            KEY_PASSED: bool(finished.get("passed")),
-            KEY_RESULT: str(finished.get("result") or ""),
+            KEY_PASSED: bool(finished.get(KEY_PASSED)),
+            KEY_RESULT: str(finished.get(KEY_RESULT) or ""),
         }
         if periodic.artifact:
-            rc, out, _ = _gsutil(["cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner)
+            # Absent is a run that wrote none; any other failure is unreadable
+            # and the tick is blind on this job, as for finished.json: a note
+            # is posted once, so one written without its projects stays so.
+            rc, out, err = _gsutil(["cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner)
             artifact = None
             if rc == 0:
                 try:
                     loaded = json.loads(out)
-                    artifact = loaded if isinstance(loaded, dict) else None
                 except ValueError:
-                    artifact = None
+                    loaded = None
+                artifact = loaded if isinstance(loaded, dict) else None
+            elif not _not_found(err):
+                log(f"{WARNING_PREFIX}could not read {periodic.job}'s {build}/{periodic.artifact}: {err.strip()}", file=sys.stderr)
+                return None
             reading[KEY_ARTIFACT] = artifact
         return reading
     return None
@@ -254,17 +276,18 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
     if not isinstance(artifact, dict):
         return []
     lines = []
-    outcomes = artifact.get("outcomes")
+    outcomes = artifact.get(REPORT_KEY_OUTCOMES)
     if isinstance(outcomes, dict):
         for project in sorted(outcomes):
             entry = outcomes[project]
-            if not isinstance(entry, dict) or entry.get("outcome") not in RECONCILE_NAMED_OUTCOMES:
+            if not isinstance(entry, dict) or entry.get(REPORT_KEY_OUTCOME) not in RECONCILE_NAMED_OUTCOMES:
                 continue
-            lines.append(f"{project}: {entry.get('outcome')} ({entry.get('detail') or 'no detail'})")
-    if artifact.get("error"):
-        lines.append(f"run: {artifact['error']}")
+            lines.append(f"{project}: {entry.get(REPORT_KEY_OUTCOME)} ({entry.get(REPORT_KEY_DETAIL) or 'no detail'})")
+    # The cap counts projects; the run's own error line comes after it.
     if len(lines) > DETAIL_LIMIT:
         lines = lines[:DETAIL_LIMIT] + [f"and {len(lines) - DETAIL_LIMIT} more"]
+    if artifact.get(REPORT_KEY_ERROR):
+        lines.append(f"run: {artifact[REPORT_KEY_ERROR]}")
     return lines
 
 
@@ -288,24 +311,24 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
         artifact = reading.get(KEY_ARTIFACT) if isinstance(reading.get(KEY_ARTIFACT), dict) else None
         notes[periodic.job] = {
             KEY_JOB: periodic.job,
-            "label": periodic.label,
+            KEY_LABEL: periodic.label,
             KEY_VERDICT: verdict,
             KEY_SINCE: before.get(KEY_SINCE) or iso(now),
             KEY_BUILD: reading.get(KEY_BUILD),
             KEY_FINISHED_AT: reading.get(KEY_FINISHED_AT),
             KEY_RESULT: reading.get(KEY_RESULT),
-            "stale_after_h": int(periodic.stale_after.total_seconds() // SECONDS_PER_HOUR),
-            "dry_run": bool(artifact.get("dry_run")) if artifact else None,
-            "detail": reconcile_detail(artifact) if verdict == VERDICT_FAILED else [],
-            "history_url": history_url(periodic.job),
-            "doc": periodic.doc,
+            KEY_STALE_AFTER_H: int(periodic.stale_after.total_seconds() // SECONDS_PER_HOUR),
+            KEY_DRY_RUN: bool(artifact.get(KEY_DRY_RUN)) if artifact else None,
+            KEY_DETAIL: reconcile_detail(artifact) if verdict == VERDICT_FAILED else [],
+            KEY_HISTORY_URL: history_url(periodic.job),
+            KEY_DOC: periodic.doc,
         }
     return notes
 
 
 def evidence(note: dict) -> str:
     if note[KEY_VERDICT] == VERDICT_STALE:
-        return f"{note['label']}: no finished run since {note[KEY_FINISHED_AT] or 'ever'} ({note[KEY_JOB]} runs at most every {note['stale_after_h']}h)"
+        return f"{note[KEY_LABEL]}: no finished run since {note[KEY_FINISHED_AT] or 'ever'} ({note[KEY_JOB]} has finished nothing in {note[KEY_STALE_AFTER_H]}h)"
     detail = f": {'; '.join(note['detail'])}" if note.get("detail") else ""
     return f"{note['label']}: build {note[KEY_BUILD]} failed at {note[KEY_FINISHED_AT]}{detail}"
 

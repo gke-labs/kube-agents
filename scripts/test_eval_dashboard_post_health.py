@@ -1885,7 +1885,7 @@ class WatchedPeriodics(RunHarness):
         self.tick(stopped, T14)
         text = self.opener.texts[0]
         self.assertTrue(text.startswith("⚪ *seeded-fleet reconcile (weekly) stopped* — last finished run"), text)
-        self.assertIn("runs at most every 192h and has missed one", text)
+        self.assertIn("has finished nothing in 192h", text)
 
     def test_the_digest_carries_a_line_per_noted_job(self):
         doc = health("GREEN")

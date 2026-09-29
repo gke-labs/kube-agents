@@ -116,6 +116,11 @@ REASON_CEILING = "did not finish within %ds; tofu was interrupted, and killed if
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_NAMES = {EXIT_OK: "ok", EXIT_FAILED: "failed", boskos_pool.TERMINATED_EXIT_CODE: "terminated"}
+EXIT_NAME_ERROR = "error"
+MODE_PROJECT = "project"
+MODE_DRIFTED = "drifted"
+MODE_ALL = "all"
+ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 class ReconcileError(Exception):
@@ -502,14 +507,14 @@ def write_report(path, args, outcomes, code, error, started):
     """The run's outcomes as one JSON document, written last: what the CI
     health bot names when a run fails, and nothing a signal can cut short
     except the write itself."""
-    mode = "project" if args.project else ("drifted" if args.drifted else "all")
+    mode = MODE_PROJECT if args.project else (MODE_DRIFTED if args.drifted else MODE_ALL)
     document = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "mode": mode,
         "dry_run": bool(args.dry_run),
         "started_at": _iso(started),
         "finished_at": _iso(time.time()),
-        "exit": EXIT_NAMES.get(code, "error"),
+        "exit": EXIT_NAMES.get(code, EXIT_NAME_ERROR),
         "exit_code": code,
         "error": error,
         "outcomes": {project: {"outcome": outcome, "detail": detail} for project, (outcome, detail) in sorted(outcomes.items())},
@@ -526,7 +531,7 @@ def write_report(path, args, outcomes, code, error, started):
 
 
 def _iso(epoch):
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+    return time.strftime(ISO_UTC_FORMAT, time.gmtime(epoch))
 
 
 def _run(args, outcomes, error):

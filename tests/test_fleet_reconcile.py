@@ -496,12 +496,11 @@ class MainTest(unittest.TestCase):
             doc = json.loads(explicit.read_text())
             self.assertEqual((doc["exit"], doc["outcomes"][P7]["outcome"]), ("failed", reconcile.OUTCOME_REFUSED))
             self.assertIn("1 project(s) not reconciled", doc["error"])
-            # No ARTIFACTS and no flag: nothing is written.
-            explicit.unlink()
-            with mock.patch.dict(os.environ, {}, clear=False):
+            # No ARTIFACTS and no flag: no report is written anywhere.
+            with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(reconcile, "write_report") as writer:
                 os.environ.pop(reconcile.ARTIFACTS_ENV, None)
                 self._main(["--project", P7, "--dry-run"], _Boskos(free=[P7]), _Tofu({P7: UPDATE_ONLY}))
-            self.assertFalse(explicit.exists())
+            writer.assert_not_called()
 
     def test_an_unhandled_exception_still_writes_its_report(self):
         with tempfile.TemporaryDirectory() as tmp:

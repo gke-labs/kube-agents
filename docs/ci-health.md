@@ -379,7 +379,7 @@ digest carries it daily), a job that has stopped (in grey, whether or not its
 last build failed), and one when a job the space was told about passes again,
 on a reading only. The digest carries one line per open note.
 Nothing here files an issue: the recovery is a person's, and the message says
-where it is written (`docs/ci-pool-projects.md`, sections 3 and 6.2).
+where it is written (`docs/ci-pool-projects.md`, sections 5.5 and 6.2).
 
 ## The comment on a red pull request
 

@@ -217,11 +217,27 @@ class AssessTest(unittest.TestCase):
     def test_no_reading_writes_no_note(self):
         self.assertEqual(periodics.assess({}, NOW, {WEEKLY.job: {"since": "x"}}), {})
 
-    def test_the_detail_is_capped(self):
+    def test_the_detail_is_capped_on_projects_and_the_run_line_follows(self):
         outcomes = {f"kube-agents-evals-{i}": {"outcome": "failed", "detail": "x"} for i in range(1, 9)}
-        lines = periodics.reconcile_detail({"outcomes": outcomes})
-        self.assertEqual(len(lines), periodics.DETAIL_LIMIT + 1)
-        self.assertEqual(lines[-1], f"and {8 - periodics.DETAIL_LIMIT} more")
+        lines = periodics.reconcile_detail({"outcomes": outcomes, "error": "8 project(s) not reconciled"})
+        self.assertEqual(len(lines), periodics.DETAIL_LIMIT + 2)
+        self.assertEqual(lines[periodics.DETAIL_LIMIT], f"and {8 - periodics.DETAIL_LIMIT} more")
+        self.assertEqual(lines[-1], "run: 8 project(s) not reconciled")
+
+    def test_a_listing_that_fails_and_a_bad_pointer_are_said(self):
+        root = f"{periodics.LOGS_ROOT}/{SWEEP.job}"
+        objects = archive(SWEEP.job, {"9": (None, None), "8": (finished(NOW - timedelta(minutes=13)), None)})
+        warnings = []
+        denied = FakeGsutil(objects, denied={f"{root}/"})
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=denied, log=lambda *a, **k: warnings.append(a[0])), {})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("could not list", warnings[0])
+        objects[f"{root}/{periodics.POINTER}"] = "\n"
+        warnings.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0])), {})
+        self.assertIn("not a build id", warnings[0])
 
 
 class WorkflowWiring(unittest.TestCase):

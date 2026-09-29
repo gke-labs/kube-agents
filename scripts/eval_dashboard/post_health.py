@@ -894,7 +894,7 @@ def render_periodic(health: dict, prev: dict | None) -> str:
         if note.get("verdict") == periodics.VERDICT_STALE:
             last = f"last finished run {when}" if note.get("finished_at") else "no finished run on record"
             blocks.append(
-                f"⚪ *{note['label']} stopped* — {last}; `{job}` runs at most every {note['stale_after_h']}h and has missed one."
+                f"⚪ *{note['label']} stopped* — {last}; `{job}` has finished nothing in {note['stale_after_h']}h."
                 f" If the next one doesn't land, it needs checking.\n{note['history_url']}"
             )
             continue
@@ -1332,6 +1332,11 @@ def run(
     if KIND_PERIODIC in sent:
         for job, note in (health.get("periodics") or {}).items():
             periodics_told[job] = periodic_key(note)
+            clean_seen.discard(job)
+    # A job no longer watched is never read again, so it would never clear.
+    for job in list(periodics_told):
+        if job not in periodics.WATCHED_BY_JOB:
+            periodics_told.pop(job)
             clean_seen.discard(job)
     source = health if told_state else before
     state = {
