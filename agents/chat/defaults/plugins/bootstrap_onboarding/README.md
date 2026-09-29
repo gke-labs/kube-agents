@@ -62,7 +62,7 @@ graph TD
 
     D -->|already greeted or completed?| DG{"skip / prime once"}
     DG -->|bind deliver: origin, touch .user_aligned, trigger, then .bootstrap_greeted| G["Delivery job pointed at this chat"]
-    DG -->|inject greeting instructions| H["LLM greets + asks SOPs/timezone (no inventory content)"]
+    DG -->|inject greeting instructions| H["LLM greets as Kage + asks one question (no inventory content)"]
 
     C -->|Periodic / triggered tick| I{"INVENTORY.md AND .user_aligned present, and not completed?"}
     I -->|No| J["Emit nothing -> silent run"]
@@ -89,6 +89,7 @@ The flow coordinates state through flag files under `/opt/data/`:
 | **`/opt/data/.user_aligned`**                 | Python, in `plugin.py`                      | Touched in `handle_pre_llm_call` on the first interactive user turn, and only once an origin has been bound. Signals to the delivery job that a human has joined the chat. **Safety rule:** background tasks must never create or write this marker (see Rule 4).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | **`/opt/data/.bootstrap_greeted`**            | Python, in `plugin.py`                      | Written after the opening turn has been primed. Every new session's first turn re-enters the hook, so without this the greeting, the presence marker, and the delivery re-binding all repeat per session until a report is finally delivered.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | **`/opt/data/.bootstrap_completed`**          | `bootstrap_delivery.py` (`_claim_delivery`) | Created with `O_CREAT \| O_EXCL` **before** the report reaches stdout — it is the delivery claim, not a receipt. Whichever run wins the create delivers; any other run exits silently. Its presence also means onboarding is permanently done: the plugin stays quiet and both jobs stay inert even after `INVENTORY.md` has been renamed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **`/opt/data/.bootstrap_greet_eval-<case>`**  | the first-install-hello bench stack         | The eval seam (Rule 5): a one-shot request for the greeting, JSON `phrase` and `variant`, taken and unlinked by the first non-cron turn whose message contains the phrase. Nothing on a real install writes it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
 ---
 
@@ -103,7 +104,7 @@ Both cases converge on the same delivery path: the `no_agent` delivery job posts
    - touches `/opt/data/.user_aligned`;
    - calls `trigger_job("bootstrap-inventory-delivery")` so it fires on the next tick;
    - writes `.bootstrap_greeted` so no later session repeats any of the above;
-   - injects `defaults/onboarding/scan_in_progress.md` (a greeting + "the report will arrive here when ready" + a request for SOPs/timezone). It does **not** inject the inventory.
+   - injects `defaults/onboarding/scan_in_progress.md` (a short Kage greeting: read-only, "I'll post what I find here when it's done", changes come as pull requests, one closing question). It does **not** inject the inventory.
 
    If the turn is not from a supported durable chat adapter, or no chat origin can be bound, the plugin writes **no** markers and returns `None`: that turn has nowhere to deliver a later report, so onboarding stays armed for the next durable chat turn. `DURABLE_CHAT_PLATFORMS` is a positive allowlist; new adapters must opt in only after implementing persistent delivery.
 
@@ -127,7 +128,7 @@ sequenceDiagram
     Hook->>Disk: touch /opt/data/.user_aligned
     Hook->>Disk: trigger_job(delivery)
     Hook->>Agent: Inject scan_in_progress.md (greeting only)
-    Agent->>User: Welcome + "report arrives here when ready" + ask SOPs/timezone
+    Agent->>User: Kage hello + "I'll post it here when it's done" + one question
     Note over Scan: Discovery completes -> write raw findings, file prioritize card, return [SILENT]
     Scan->>Disk: Save complete /opt/data/INVENTORY.raw.md
     Note over Scan: Prioritize card (fresh worker) reads raw only
@@ -141,7 +142,7 @@ sequenceDiagram
 ### Case B: User engages after the scan finished (quiet boot)
 
 1. **Silent completion:** during the unattended boot the scan writes `/opt/data/INVENTORY.raw.md`, the prioritization card ranks it into `/opt/data/INVENTORY.md`, and both return `[SILENT]`. The delivery job stays silent because `.user_aligned` is absent, so the report waits on disk.
-2. **Turn 1 (`pre_llm_call`):** the plugin does exactly the same things as in Case A (bind origin → touch `.user_aligned` → trigger delivery → mark `.bootstrap_greeted`) and injects `defaults/onboarding/scan_completed.md` (a greeting + "the full report is being delivered now" + a request for SOPs/timezone).
+2. **Turn 1 (`pre_llm_call`):** the plugin does exactly the same things as in Case A (bind origin → touch `.user_aligned` → trigger delivery → mark `.bootstrap_greeted`) and injects `defaults/onboarding/scan_completed.md` (the same short greeting, saying the summary is in this chat and ending on an offer to start on a finding).
 3. **Next delivery tick:** both files now exist → the script delivers `INVENTORY.md` verbatim to the origin chat and runs `_cleanup`.
 
 The report therefore arrives as its own message shortly after the greeting, identical to Case A — the user always sees the same verbatim report, never an LLM-reformatted one.
@@ -162,7 +163,7 @@ sequenceDiagram
     Agent->>Hook: pre_llm_call (is_first_turn=True)
     Hook->>Disk: update_job(delivery, deliver=origin) ; touch .user_aligned ; trigger_job(delivery)
     Hook->>Agent: Inject scan_completed.md (greeting only)
-    Agent->>User: Welcome + "full report incoming" + ask SOPs/timezone
+    Agent->>User: Kage hello + "the summary is in this chat" + one question
     Deliver->>Disk: Claim delivery (create .bootstrap_completed, O_EXCL)
     Deliver->>User: Emit INVENTORY.md verbatim -> delivered to origin
     Deliver->>Disk: _cleanup: archive INVENTORY.delivered.md, remove both jobs
@@ -212,6 +213,7 @@ When changing onboarding instructions, scripts, or the plugin under `agents/chat
       return None
   ```
   Cron sessions use `platform="cron"` and a `session_id` of the form `cron_<job_id>_<timestamp>`, so either cron check is sufficient. The positive durable-platform check makes all other non-deliverable surfaces fail closed and prevents the greeting from promising a follow-up they cannot receive.
+- **The one exception is the eval seam.** Between the cron check and the platform check, a `.bootstrap_greet_eval-<case>` request whose phrase is in the user's message is unlinked and its variant's greeting injected, on any platform. It binds no delivery and writes no marker, so onboarding state is the same after it as before. Only `bench/tf/prebuilt/first-install-hello` writes one, one per case so concurrent cases do not take each other's; `test_plugin.py` fails if anything else in the repository names the prefix.
 
 ### 6. Enable native multi-chunk delivery (`splits_long_messages`)
 
@@ -346,7 +348,8 @@ Unit tests cover the deterministic pieces of the flow (they mock the Hermes
 - `test_plugin.py` — the `pre_llm_call` state machine: durable-platform,
   cron/first-turn/completed gating, greeting exactly once across sessions, origin binding before
   `.user_aligned` (and no markers at all when nothing can be bound), the
-  delivery trigger, and that the inventory is never injected into the turn.
+  delivery trigger, that the inventory is never injected into the turn, and the eval seam
+  (phrase-matched, one-shot, no side effects, inert when absent).
 - `../../../scripts/test_bootstrap_onboarding_scripts.py` — the delivery
   decision, the atomic claim and verbatim emit/archive, the scan job's
   file-once-then-skip behaviour across repeated ticks, the Cluster Agent

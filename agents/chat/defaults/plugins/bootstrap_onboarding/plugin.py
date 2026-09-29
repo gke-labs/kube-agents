@@ -47,16 +47,18 @@ EVAL_VARIANT_COMPLETED = "completed"
 
 # Fallbacks used only if the onboarding instruction files are unreadable.
 _FALLBACK_IN_PROGRESS = (
-    "Greet the user as the Planning Agent, the front door to their GKE agent team. Explain that background "
-    "environment discovery is running and its full report will be delivered to this chat "
-    "as soon as it finishes. Ask for the team's SOPs and time zone. Do not present the "
-    "report yourself and do not claim to have saved anything."
+    "In one message of at most 60 words, greet the user by name as Kage. Say you are taking a "
+    "first, read-only look at their GKE fleet, so nothing in their clusters changes, and will "
+    "post what you find here when it is done; give no time. Say any change you suggest comes as "
+    "a pull request for their team to review. End on one question: is there anything they want "
+    "you to look at first? Ask nothing else and do not claim to have saved anything."
 )
 _FALLBACK_COMPLETED = (
-    "Greet the user as the Planning Agent, the front door to their GKE agent team. Explain that environment "
-    "discovery is complete and its full report is being delivered to this chat now. Ask "
-    "for the team's SOPs and time zone. Do not restate the report and do not claim to "
-    "have saved anything."
+    "In one message of at most 60 words, greet the user by name as Kage. Say your first look at "
+    "their GKE fleet is done and the summary is in this chat, and that you only read their "
+    "clusters, so nothing changed. Say any change you suggest comes as a pull request for their "
+    "team to review. End on one question: do they want you to start on one of those findings? "
+    "Ask nothing else, do not restate the report, and do not claim to have saved anything."
 )
 
 
@@ -163,7 +165,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
       2. triggers the delivery job so the report arrives promptly;
       3. injects a short greeting instruction — never the inventory itself. The
          report is delivered verbatim by the ``no_agent`` delivery job, so the
-         model only greets the user and asks for their operating preferences;
+         model only greets the user and offers to start somewhere;
       4. records ``.bootstrap_greeted`` so no later session repeats any of it.
 
     Every later first turn returns None: the chat that primed onboarding owns
