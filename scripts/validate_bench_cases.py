@@ -175,6 +175,11 @@ FIXTURE_NOT_READY = {
         "no CI tier can run it yet; run it locally "
         "with bench/hack/run-gitops-pilot.sh"
     ),
+    "b-0022b-gitops": (
+        "#1307: the second task through the GitOps fix-cycle stack (gitops_task "
+        "b-0022b); parked for the same reason as b-0011-gitops; run it locally "
+        "with TASK=b-0022b bench/hack/run-gitops-pilot.sh"
+    ),
     "scope-second-project-denied": (
         "#1865: needs a second GCP project per pool project, declared in the "
         "harness install's spec.scope.projects, whose listing the agent's service "

@@ -32,7 +32,7 @@ variable "location" {
 
 variable "node_count" {
   type        = number
-  description = "Number of worker nodes. One e2-standard-2 fits the b-0011 workloads plus Argo CD core."
+  description = "Number of worker nodes. One e2-standard-2 fits b-0011 plus Argo CD core; b-0022b needs two once shelfview is scaled to 3 (its case sets node_count: 2)."
   default     = 1
 }
 
@@ -76,10 +76,24 @@ variable "wait_timeout" {
 # Declared so that does not trip an undeclared-variable warning; unused here.
 variable "namespace" {
   type    = string
-  default = "payments"
+  default = ""
 }
 
 # --- GitOps cycle -------------------------------------------------------------
+
+# Which devops-bench task this run seeds. Selects the seed assertions
+# (scripts/seed/<task>.sh), the healthy manifests the broken base is rendered
+# from (manifests/<task>/), and the per-task defaults in main.tf's locals
+# (task directory in the repository, broken-base commit). The case's task.yaml
+# sets it through infrastructure.variables.
+variable "gitops_task" {
+  type        = string
+  description = "devops-bench task id seeded through the GitOps cycle: b-0011 or b-0022b."
+  validation {
+    condition     = contains(["b-0011", "b-0022b"], var.gitops_task)
+    error_message = "gitops_task must be one of: b-0011, b-0022b (a task needs scripts/seed/<task>.sh, manifests/<task>/ and a broken-base commit in main.tf)."
+  }
+}
 
 variable "gitops_repo" {
   type        = string
@@ -88,18 +102,24 @@ variable "gitops_repo" {
 
 variable "gitops_task_path" {
   type        = string
-  description = "Directory in gitops_repo holding this task's broken base."
-  default     = "tasks/b-0011"
+  description = "Directory in gitops_repo holding this task's broken base. Empty means tasks/<gitops_task>."
+  default     = ""
 }
 
 variable "gitops_broken_base_sha" {
   type        = string
-  description = "Commit in gitops_repo that the per-run branch is cut from: the task's broken base as scripts/render-broken-base.sh renders it, committed under gitops_task_path. No default: it is a commit in your repository (see gke-labs/kube-agents#1307)."
+  description = "Commit in gitops_repo that the per-run branch is built on: one that already carries the task's broken base under gitops_task_path (scripts/render-broken-base.sh output), or a per-run repository's root, on which run-branch.sh commits the broken render. No default: it is a commit in your repository (gke-labs/kube-agents#1307, #1773)."
+}
+
+variable "gitops_history_parent_sha" {
+  type        = string
+  description = "Commit the staged history's healthy commit is built on (scripts/run-branch.sh create/advance). Required for the tasks main.tf lists as staged (b-0011), whose seeding is that history; other tasks start at gitops_broken_base_sha. A per-run repository passes its root commit."
+  default     = ""
 }
 
 variable "gitops_run_branch" {
   type        = string
-  description = "Per-run branch Argo tracks and the agent's PR targets. Empty means run/<cluster_name>/b-0011, which is what the task prompt tells the agent."
+  description = "Per-run branch Argo tracks and the agent's PR targets. Empty means run/<cluster_name>/<gitops_task>, which is what the task prompt tells the agent."
   default     = ""
 }
 
