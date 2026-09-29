@@ -15,9 +15,11 @@ revert, and it needs a plan read first.
 
 Because the script that runs is `N-1`'s, its timeouts and Helm flags are `N-1`'s too, and this
 page says where the published releases differ. A copy of the script that carries no baked version
-— one taken from `main` rather than from release `N-1` — is the exception: it fetches only `N-1`'s
-chart, CRDs and installer library, so a rollback done that way has the current script's behaviour
-against `N-1`'s chart. This page describes the checkout.
+— one taken from `main` rather than from release `N-1` — fetches only `N-1`'s chart, CRDs and
+installer library, and it cannot complete a rollback to any release through `0.7.0`: it calls
+installer functions those releases' libraries do not define, so its operator step, `--plan` and
+full mode each stop before they apply anything of `N-1`. Roll back from the `N-1` checkout, which
+is what this page describes.
 
 The forward move, the three upgrade modes, and how a run resolves the version it targets are in
 [Upgrade](/kube-agents/install/upgrade/); this page covers going backwards only.
@@ -271,15 +273,20 @@ checks before it renders or applies anything, so the release itself keeps its la
   flag that drops a reused key, so for such a pair the Helm-only rollback does not complete. The
   full mode does, because its Helm release renders from the composition's values rather than the
   recorded ones (the section above), at the price of a GCP-level apply and the plan read that
-  goes before it. The first release after `0.7.0` rolling back to `0.7.0` is such a pair. Its
-  composition records `platformAgent.scope` in the release on every apply, empty lists included,
-  and `platformAgent.harness.driftDetector` on an install with `enable_drift_pubsub`; `0.7.0`'s
-  chart declares neither, so an install that release applied stops at the operator step with
-  `at '/platformAgent': additional properties 'scope' not allowed`. Take it through the full mode
-  from the `0.7.0` checkout: `./upgrade.sh --plan --image-tag 0.7.0`, read the plan, then
-  `./upgrade.sh --upgrade-mode=full --image-tag 0.7.0`. A copy of the script from `main` does
-  not get past it either: it sources `0.7.0`'s installer library, which lacks a function the
-  current script calls, so its operator step stops before it applies anything of `0.7.0`.
+  goes before it.
+
+  Two pairs are refused this way, each on an install the newer release's composition applied (a
+  fresh install of it, or a full-mode upgrade to it). `0.7.0` rolling back to `0.6.0`: `0.7.0`'s
+  composition records `litellm.maxTokens` on every apply, and `0.6.0`'s chart does not declare it.
+  The first release after `0.7.0` rolling back to `0.7.0`: its composition records
+  `platformAgent.scope` on every apply, empty lists included, and
+  `platformAgent.harness.driftDetector` on an install with `enable_drift_pubsub`, and `0.7.0`'s
+  chart declares neither. Either stops at the operator step with a schema error naming the key:
+  `at '/litellm': additional properties 'maxTokens' not allowed` from a current Helm,
+  `litellm: Additional property maxTokens is not allowed` from an older Helm 3 release. Take
+  either through the full mode from the `N-1` checkout: `./upgrade.sh --plan --image-tag <N-1>`,
+  read the plan, then `./upgrade.sh --upgrade-mode=full --image-tag <N-1>`.
+
 - **`N`'s operator owns an object that `N-1`'s chart renders.** Helm refuses to adopt an object
   that carries another manager's ownership labels (`exists and cannot be imported into the
 current release: invalid ownership metadata`). The `litellm-policy` NetworkPolicy is the case
