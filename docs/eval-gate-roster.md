@@ -52,7 +52,10 @@ selects who decides, and it defaults to `roster`:
   `bench/kube_agents_bench/baselines.py` still computes what the store would do and
   reports it per case — `would-admit` and `would-demote` for a full window
   (`EVAL_ADMISSION_MIN_RUNS` runs, default 20, at the current key, above or below the
-  `EVAL_ADMISSION_RATE` bar), `collecting` for a partial one, `stale` for evidence only at a
+  `EVAL_ADMISSION_RATE` bar, 0.90 since 2026-09-29 so that it is the same ≥ 90 % bar the
+  held-out entries below hold a case to; the measurement it was set from is
+  [on #1493](https://github.com/gke-labs/kube-agents/issues/1493#issuecomment-5892741229)),
+  `collecting` for a partial one, `stale` for evidence only at a
   superseded key, `none` for nothing — and a roster edit cites that sentence. Nothing the
   nightly appends changes which cases block.
 - **`record`**: the store decides once it holds a full window for a case, either way — a
@@ -465,7 +468,17 @@ to have shown all of the following first, and the decision is still a team one a
    `EVAL_ADMISSION_RATE` sits above it: two consecutive nights on the same `main` commit are
    the "run it twice, see how much it moves" calibration
    [`docs/designs/testing-strategy.md`](designs/testing-strategy.md) §4.2 asks for, and a
-   bar below the noise floor demotes cases for weather.
+   bar below the noise floor demotes cases for weather. Read once so far, on 2026-09-29
+   ([#1493](https://github.com/gke-labs/kube-agents/issues/1493)): over the four full-matrix
+   nights since oss-test-infra#2707, 20 of the 45 cases with all four nights moved 0 points
+   and 31 moved at most one repetition, so the bar moved from 0.95 (19 of 20, a number nobody
+   had chosen from data) to 0.90, the bar the entries above already hold a case to. At 0.95
+   the record would have demoted 6 of the 12 roster cases (17/21, 19/21, 18/21, 18/21, 18/20,
+   16/20); at 0.90 it demotes 4, and the two that flip are the ones one miss short of the
+   old bar. This item is not "holds" yet: one reading, and the four that remain below the
+   bar are not one story — the two crashloop cases miss this week only, capacity misses in
+   both weeks, and upgrades-lagging-master-probe's misses are all from 09-20 to 09-25 with
+   12 of 12 since.
 
 Switching before 2 holds leaves a listed case with no full window with the list (the list
 is the fallback in `record` mode) but hands every full-window case to the record the same
