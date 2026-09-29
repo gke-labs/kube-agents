@@ -855,11 +855,13 @@ def render_pool_clear(health: dict) -> str:
 
 
 def periodic_key(note: dict) -> str:
-    """What one message stands for: the job's verdict this episode. A newer
-    build that fails the same way is not news (the digest carries it daily);
-    a job that failed and then stopped is two facts, so the verdict flipping
-    is."""
-    return str(note.get("verdict"))
+    """What one message stands for: the job's verdict this episode, the
+    episode named by its start. A newer build that fails the same way is not
+    news (the digest carries it daily); a job that failed and then stopped is
+    two facts, so the verdict flipping is; and a new episode after a clean
+    reading is news even when the clear's own send failed, because a clean
+    reading resets `since`."""
+    return f"{note.get('verdict')}@{note.get('since')}"
 
 
 def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:

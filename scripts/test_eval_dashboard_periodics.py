@@ -100,6 +100,30 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(readings[HOURLY.job]["build"], "100")
         self.assertIsNone(readings[HOURLY.job]["artifact"], "the hourly wrote no artifact for that build")
 
+    def test_the_prefix_is_listed_only_when_the_newest_build_has_not_finished(self):
+        # One listing per job per tick over a prefix that only grows, and the
+        # newest build has finished most of the time: it is not made then.
+        objects = archive(SWEEP.job, {"8": (finished(NOW - timedelta(minutes=3)), None), "7": (finished(NOW - timedelta(minutes=13)), None)})
+        gsutil = FakeGsutil(objects)
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=gsutil)
+        self.assertEqual(readings[SWEEP.job]["build"], "8")
+        self.assertEqual([c[2] for c in gsutil.calls], ["cat", "cat"], "pointer and finished.json only, no ls")
+
+    def test_an_aborted_newest_build_is_walked_past_not_reported_as_failed(self):
+        # Prow's sidecar writes finished.json with result ABORTED when it
+        # stops a pod (a drained node, a plank abort): not a run of the job.
+        aborted = {"timestamp": epoch(NOW - timedelta(minutes=30)), "passed": False, "result": "ABORTED"}
+        objects = archive(WEEKLY.job, {"101": (aborted, None), "100": (finished(NOW - timedelta(days=1)), None)})
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects))
+        self.assertEqual((readings[WEEKLY.job]["build"], readings[WEEKLY.job]["passed"]), ("100", True))
+        self.assertEqual(periodics.assess(readings, NOW, {}), {})
+        # Every build aborted: nothing to read, no note.
+        only_aborted = archive(WEEKLY.job, {"101": (aborted, None)})
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(only_aborted)), {})
+
     def test_a_job_that_never_ran_or_whose_pointer_is_denied_writes_nothing(self):
         objects = archive(SWEEP.job, {"7": (finished(NOW - timedelta(minutes=5)), None)})
         with tempfile.TemporaryDirectory() as tmp:

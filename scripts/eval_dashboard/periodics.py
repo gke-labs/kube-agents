@@ -36,6 +36,10 @@ ARTIFACTS_DIR = "artifacts"
 # the one before it has finished. Three covers a run of aborted builds.
 FALLBACK_BUILDS = 3
 GSUTIL_TIMEOUT_S = 60
+# finished.json's result for a build Prow stopped (a drained node, a plank
+# abort): not a run of the job, so the reader walks past it as it does a
+# build with no finished.json.
+RESULT_ABORTED = "ABORTED"
 VERDICT_FAILED = "FAILED"
 VERDICT_STALE = "STALE"
 # How many refused or failed projects a message names before "and N more".
@@ -149,6 +153,14 @@ def _earlier_builds(job: str, newest: str, runner) -> list[str]:
     return [str(i) for i in sorted(ids, reverse=True)[:FALLBACK_BUILDS]]
 
 
+def _candidates(job: str, newest: str, runner):
+    """The newest build, then -- only if it is needed -- the finished builds
+    before it: the listing is one call over a prefix that only grows, and the
+    newest build has finished most of the time."""
+    yield newest
+    yield from _earlier_builds(job, newest, runner)
+
+
 def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | None:
     """The latest finished build of one periodic, or None when it has none.
 
@@ -164,13 +176,15 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
     # isdecimal, not isdigit: the latter admits characters int() rejects.
     if not newest.isdecimal():
         return None
-    for build in [newest, *_earlier_builds(periodic.job, newest, runner)]:
+    for build in _candidates(periodic.job, newest, runner):
         try:
             finished = _finished(periodic.job, build, runner)
         except Unreadable as exc:
             log(f"{WARNING_PREFIX}could not read {periodic.job}'s {exc}", file=sys.stderr)
             return None
-        if finished is None:
+        if finished is None or finished.get(KEY_RESULT) == RESULT_ABORTED:
+            # Still running, never finished, or stopped by Prow: not a run
+            # of the job, so the one before it is what there is to read.
             continue
         timestamp = finished.get("timestamp")
         try:
