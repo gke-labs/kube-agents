@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import apply_kanban_progress_lines as applier
+import kanban_notifier
 import kanban_notify_delivery
 from kanban_handoff_clip import ELLIPSIS
 from kanban_progress_lines import (
@@ -735,7 +736,7 @@ SLACK_SUB = {
 
 class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
     """KAGE_SLACK_UX on a Slack card: the trail settles to one line, and a
-    failure the creator's wake explains posts nothing of its own.
+    failure the creator's wake explains is held for the wake step, not posted.
 
     ``gateway.slack_ux_reactions`` is faked as in :class:`SettleReactionHookTest`;
     ``kanban_notifier`` is the real module, imported flat.
@@ -764,7 +765,7 @@ class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(wake.stop)
 
     async def _run(self, adapter, sub, kind, message):
-        watcher = SimpleNamespace()
+        watcher = self.watcher = SimpleNamespace()
         await deliver(watcher, adapter, sub, "heartbeat", _beat(1, "Checking seeded-a."), "", None, HEADER)
         await deliver(watcher, adapter, sub, "heartbeat", _beat(2, "Reading pod state."), "", None, HEADER)
         return await deliver(watcher, adapter, sub, kind, _terminal(3, kind), message, None, HEADER)
@@ -782,6 +783,20 @@ class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(adapter.sent), 1, "the gave-up line was posted")
         self.assertEqual(adapter.edits[-1][1], f"{STOPPED} [default] @platform Reading pod state.")
         self.assertEqual(self.calls, [("t_e0c1", "gave_up")])
+
+    async def test_an_explained_failure_is_held_for_the_wake_step(self):
+        await self._run(_Adapter(), SLACK_SUB, "gave_up", "✖ gave up")
+        held = getattr(self.watcher, kanban_notifier.HELD_ATTR)
+        self.assertEqual(
+            held[sub_key(SLACK_SUB)], {3: ("gave_up", SLACK_SUB["chat_id"], "✖ gave up", {})},
+        )
+
+    async def test_a_line_that_cannot_be_held_is_posted(self):
+        adapter = _Adapter()
+        with mock.patch("kanban_notifier.hold_explained", side_effect=RuntimeError("boom")):
+            result = await self._run(adapter, SLACK_SUB, "gave_up", "✖ gave up")
+        self.assertIsNotNone(result)
+        self.assertEqual(adapter.sent[-1][1], "✖ gave up")
 
     async def test_a_failure_nobody_is_woken_for_still_posts(self):
         adapter = _Adapter()

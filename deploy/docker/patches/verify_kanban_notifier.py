@@ -8,8 +8,9 @@ replaces ``verify_kanban_wake_kinds.py`` and the delivery half of
 file), and it additionally covers the clip wiring, which previously had nothing
 behind it but two ``grep -q``\\ s in the Dockerfile.
 
-The applier only proves its three anchors matched, and a matched anchor is the
-weaker half of all five concerns here:
+The applier only proves its five anchors matched, and a matched anchor is the
+weaker half of every concern here — the five below, and the ``KAGE_SLACK_UX``
+completion message and held failure lines, which sections 11 and 12 drive:
 
 * **Clip.** A textual grep proves ``_clip_handoff`` is called; it does not prove
   the name resolves at runtime, and the whole patch exists because a URL arrived
@@ -131,7 +132,7 @@ class Event:
 
 
 # --- 1. The wiring resolved ---------------------------------------------------
-# All three names are appended in one import trailer, so one of them failing to
+# Every name is appended in one import trailer, so one of them failing to
 # resolve means none of them did — but they are checked separately because the
 # failure that matters is per-symbol: a rename in kanban_notifier.py breaks
 # exactly one, and the notifier would then raise on the delivery path.
@@ -1055,6 +1056,131 @@ for _platform in ("slack", "google_chat"):
         notifier._fmt_completed(_completion_event, _completion_card)[0]
         == "✔ [kage-management] Kanban t_1 done — checkout-gateway\nBoth pods are up.",
     )
+
+# --- 12. A failure held for the wake is still told when the wake fails ------
+# Drives the real, patched ``_KanbanNotification.deliver()`` -- the real
+# ``_send_pings`` and its ping checkpoint, the real ``_send_event`` routed
+# through ``kanban_progress_lines``, the real wake gate and failure accounting
+# -- with only the transport faked: the adapter, the wake itself, the cursor
+# ops, and ``gateway.slack_ux_reactions``, which is installed later in the build
+# and so is stood in here with the flag on. What it proves is the P1 this
+# section was written for: with the flag on, a Slack failure the wake was
+# expected to explain posts nothing when the wake lands, and posts its line
+# exactly once when the wake raises, however many retries follow.
+print("held failure lines:")
+import asyncio  # noqa: E402
+import types  # noqa: E402
+
+import gateway as _gateway_pkg  # noqa: E402
+
+check(
+    "the notifier resolved the held-lines import",
+    hasattr(notifier, "_kanban_tell_unexplained"),
+    "the trailer import did not execute",
+)
+
+
+class _HeldAdapter:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.sent.append(content)
+        return SimpleNamespace(success=True, message_id=f"m{len(self.sent)}")
+
+    async def edit_message(self, chat_id, message_id, content):
+        return SimpleNamespace(success=True, message_id=message_id)
+
+
+class _HeldRunner:
+    def __init__(self):
+        self.wakes = 0
+
+    def _kanban_sub_op(self, board, op, sub, **kwargs):
+        if op == "record_notify_ping":
+            sub["last_ping_event_id"] = kwargs["event_id"]
+
+
+class _HeldNotification(notifier._KanbanNotification):
+    async def wake(self):
+        self.runner.wakes += 1
+        outcome = self.runner.wake_outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+
+    async def rewind(self):
+        pass
+
+    async def advance(self):
+        pass
+
+    async def unsub(self):
+        pass
+
+
+def _held_run(flag, wake_outcomes):
+    """Tick a gave_up delivery once per wake outcome; return (sends, wakes)."""
+    reactions = types.ModuleType("gateway.slack_ux_reactions")
+    reactions.enabled = lambda: flag
+
+    async def _settle(adapter, sub, kind, board=None):
+        return None
+
+    reactions.settle_delegated = _settle
+    real_route = notifier._adapter_for_subscription
+    adapter, runner, fail_counts = _HeldAdapter(), _HeldRunner(), {}
+    runner.wake_outcomes = list(wake_outcomes)
+    sub = {
+        "task_id": "t_held", "platform": "slack", "chat_id": "C1", "thread_id": "1.2",
+        "delivery_mode": "notify+wake",
+    }
+    event = SimpleNamespace(id=7, kind="gave_up", payload={"reason": "retries exhausted"})
+    real_module = sys.modules.get("gateway.slack_ux_reactions")
+    real_attr = getattr(_gateway_pkg, "slack_ux_reactions", None)
+    sys.modules["gateway.slack_ux_reactions"] = reactions
+    _gateway_pkg.slack_ux_reactions = reactions
+    notifier._adapter_for_subscription = lambda *args: adapter
+    try:
+        for _ in wake_outcomes:
+            delivery = _HeldNotification(
+                runner, {"sub": sub, "task": None, "events": [event], "board": None, "cursor": 7},
+                platform_cls=lambda name: name, sub_fail_counts=fail_counts,
+            )
+            asyncio.run(delivery.deliver())
+    finally:
+        notifier._adapter_for_subscription = real_route
+        if real_module is None:
+            sys.modules.pop("gateway.slack_ux_reactions", None)
+        else:
+            sys.modules["gateway.slack_ux_reactions"] = real_module
+        if real_attr is None:
+            vars(_gateway_pkg).pop("slack_ux_reactions", None)
+        else:
+            _gateway_pkg.slack_ux_reactions = real_attr
+    return adapter.sent, runner.wakes
+
+
+try:
+    _sent, _wakes = _held_run(True, [None])
+    check(
+        "flag on: a failure whose wake lands posts nothing and wakes once",
+        (_sent, _wakes) == ([], 1),
+        f"sent {_sent!r}, woke {_wakes}",
+    )
+    _sent, _wakes = _held_run(True, [RuntimeError("profile gone"), RuntimeError("again"), None])
+    check(
+        "flag on: a failure whose wake raises posts its line exactly once",
+        len(_sent) == 1 and "t_held" in _sent[0] and _wakes == 3,
+        f"sent {_sent!r}, woke {_wakes}",
+    )
+    _sent_off, _ = _held_run(False, [None])
+    check(
+        "flag off: the failure line posts as upstream's",
+        len(_sent_off) == 1 and "t_held" in _sent_off[0],
+        f"sent {_sent_off!r}",
+    )
+except Exception as exc:  # noqa: BLE001 -- report, do not crash past the summary
+    check("the patched deliver() ran", False, repr(exc))
 
 print()
 if FAILURES:

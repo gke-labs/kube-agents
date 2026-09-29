@@ -11,6 +11,7 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 """
 
 import ast
+import asyncio
 import contextlib
 import difflib
 import json
@@ -35,6 +36,10 @@ from apply_kanban_notifier import (
     INCIDENT_PATCHED,
     MARKER_CALL,
     RELATIVE,
+    TELL_ANCHOR,
+    TELL_NONE,
+    TELL_PATCHED,
+    TELL_WOKEN,
     TRAILER,
     WAKE_ANCHOR,
     WAKE_PATCHED,
@@ -46,6 +51,8 @@ from kanban_notifier import (
     COMPLETION_HEAD,
     DEFAULT_WAKE_KINDS,
     EXPLAINED_KINDS,
+    HELD_ATTR,
+    HELD_MAX,
     MAX_NOTES,
     NOTE_SIGNATURE,
     RESULT_LIMIT,
@@ -59,11 +66,13 @@ from kanban_notifier import (
     creator_session_key,
     explained_by_wake,
     handoff_with_result,
+    hold_explained,
     note_suppressed_completion,
     resolve_wake_kinds,
     result_block,
     store_incident_report,
     suppressed_kinds,
+    tell_unexplained,
     unstructured_result,
     wake_kinds_for,
 )
@@ -1649,14 +1658,103 @@ class ExplainedByWakeTest(unittest.TestCase):
         self.assertTrue(set(EXPLAINED_KINDS) <= set(DEFAULT_WAKE_KINDS))
 
 
+class _SendLog:
+    """An adapter whose ``send`` records each call, raising or failing on request."""
+
+    def __init__(self, outcome=None):
+        self.sent = []
+        self.outcome = outcome
+
+    async def send(self, chat_id, message, metadata=None):
+        self.sent.append((chat_id, message, metadata))
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+class HeldFailureLinesTest(unittest.TestCase):
+    def setUp(self):
+        self.runner = types.SimpleNamespace()
+
+    def tell(self, adapter, woken, sub=None):
+        asyncio.run(tell_unexplained(self.runner, adapter, sub or _sub(), woken))
+
+    def test_a_line_the_wake_covered_is_dropped(self):
+        hold_explained(self.runner, _sub(), "gave_up", 7, "✖ gave up", {"thread_id": "1.2"})
+        adapter = _SendLog()
+        self.tell(adapter, {"gave_up"})
+        self.assertEqual(adapter.sent, [])
+        self.assertEqual(getattr(self.runner, HELD_ATTR), {})
+
+    def test_a_line_no_wake_covered_is_posted_once(self):
+        hold_explained(self.runner, _sub(), "gave_up", 7, "✖ gave up", {"thread_id": "1.2"})
+        adapter = _SendLog()
+        self.tell(adapter, set())
+        self.tell(adapter, set())
+        self.assertEqual(adapter.sent, [("C1", "✖ gave up", {"thread_id": "1.2"})])
+
+    def test_only_the_kinds_outside_the_wake_are_posted(self):
+        hold_explained(self.runner, _sub(), "blocked", 3, "⏸ blocked", None)
+        hold_explained(self.runner, _sub(), "gave_up", 7, "✖ gave up", None)
+        adapter = _SendLog()
+        self.tell(adapter, {"gave_up"})
+        self.assertEqual([m for _, m, _ in adapter.sent], ["⏸ blocked"])
+
+    def test_a_replayed_event_is_held_once(self):
+        for _ in range(2):
+            hold_explained(self.runner, _sub(), "gave_up", 7, "✖ gave up", None)
+        adapter = _SendLog()
+        self.tell(adapter, set())
+        self.assertEqual(len(adapter.sent), 1)
+
+    def test_another_subscription_keeps_its_line(self):
+        other = dict(_sub(), task_id="t_other")
+        hold_explained(self.runner, other, "gave_up", 7, "✖ other", None)
+        adapter = _SendLog()
+        self.tell(adapter, set())
+        self.assertEqual(adapter.sent, [])
+        self.tell(adapter, set(), sub=other)
+        self.assertEqual(len(adapter.sent), 1)
+
+    def test_a_failed_post_is_held_for_the_retry(self):
+        for outcome in (RuntimeError("slack down"), types.SimpleNamespace(success=False, error="x")):
+            with self.subTest(outcome=outcome):
+                self.runner = types.SimpleNamespace()
+                hold_explained(self.runner, _sub(), "gave_up", 7, "✖ gave up", None)
+                with self.assertLogs("gateway.run", level="WARNING"):
+                    self.tell(_SendLog(outcome), set())
+                adapter = _SendLog()
+                self.tell(adapter, set())
+                self.assertEqual(len(adapter.sent), 1)
+
+    def test_nothing_held_sends_nothing_and_never_raises(self):
+        adapter = _SendLog(RuntimeError("never called"))
+        self.tell(adapter, set())
+        self.assertEqual(adapter.sent, [])
+        # A runner whose attribute is not a mapping is logged, not raised.
+        setattr(self.runner, HELD_ATTR, object())
+        with self.assertLogs("gateway.run", level="WARNING"):
+            self.tell(adapter, set())
+
+    def test_the_hold_is_bounded(self):
+        for i in range(HELD_MAX + 5):
+            hold_explained(self.runner, dict(_sub(), task_id=f"t_{i}"), "gave_up", 1, "✖", None)
+        held = getattr(self.runner, HELD_ATTR)
+        self.assertEqual(len(held), HELD_MAX)
+        self.assertNotIn(("t_0", "slack", "C1", "1.2"), held)
+
+
 # =============================================================================
 # The applier
 # =============================================================================
 
 # gateway/kanban_watchers_notifier.py reduced to the lines the patch rewrites,
-# kept at their real nesting because all three anchors are indentation-
-# sensitive: ``_fmt_completed`` is module-level, ``build_wake_text`` and
-# ``_send_pings`` are methods of ``_KanbanNotification``. The ``return f"✔`` line
+# kept at their real nesting because all five anchors are indentation-
+# sensitive: ``_fmt_completed`` is module-level, ``build_wake_text``,
+# ``_send_pings`` and ``deliver`` are methods of ``_KanbanNotification``.
+# ``deliver``'s wake step is upstream's verbatim, and ``_send_pings`` keeps the
+# ping checkpoint that makes a wake retry skip the ping, because
+# DeliverEndToEndTest runs this class. The ``return f"✔`` line
 # is anchor 4, and the handoff hook has to land between the clip and it, which
 # is the whole contract of anchor 1. ``_WAKE_KINDS`` stays at
 # module level in the patched file too: ``build_wake_text`` still orders the
@@ -1705,8 +1803,11 @@ class _KanbanNotification:
             msg = self.format_event(ev)
             if msg is None:
                 continue
+            if ev.id <= self.sub.get("last_ping_event_id", 0):
+                continue
             try:
                 await self._send_event(ev, msg)
+                self.sub["last_ping_event_id"] = ev.id
                 self.clear_failures()
             except Exception as exc:
                 await self.delivery_failed(exc)
@@ -1717,8 +1818,31 @@ class _KanbanNotification:
         if not await self._send_pings():
             return
         self.build_wake_text()
+        wake_kinds, is_push = self.wake_kinds, self.is_push_adapter
+        from gateway.wake import WakeNotAccepted
+
+        # A requested wake is required even when its passive ping already landed.
+        if wake_kinds:
+            try:
+                await self.wake()
+                self.clear_failures()
+            except WakeNotAccepted:
+                # Startup / full queue is not a dead destination. Keep the durable
+                # subscription alive regardless of how long admission takes.
+                await self.rewind()
+                return
+            except Exception as _wk_err:
+                await self._wake_failed(
+                    "kanban notifier: wake-only delivery failed for %s (attempt %d/%d): %s" if is_push
+                    else "kanban notifier: wake self-post failed for %s (attempt %d/%d): %s",
+                    _wk_err,
+                )
+                return
+
+        # Delivery complete: advance the cursor (the dedup mechanism).
         await self.advance()
-        await self.unsub()
+        if self.task and self.task.status == "archived":
+            await self.unsub()
 '''
 
 #: Drifts that break exactly one anchor each, for the tests that need to name
@@ -1727,6 +1851,7 @@ HANDOFF_DRIFT = ("_first_line(str(payload_summary), 200)", "_first_line(str(payl
 WAKE_DRIFT = ("if ev.kind in _WAKE_KINDS}", "if ev.kind in _WAKE_KINDS and ev}")
 INCIDENT_DRIFT = ("                self.clear_failures()\n", "                self.clear_failures()  # noqa\n")
 COMPLETION_DRIFT = ("done — {n.title}{handoff}", "done: {n.title}{handoff}")
+TELL_DRIFT = ("            except WakeNotAccepted:\n", "            except WakeNotAccepted as _e:\n")
 
 
 def patch_tree(source):
@@ -1764,8 +1889,8 @@ def method_source(source, name):
 
 
 class ApplyTest(unittest.TestCase):
-    def test_all_four_anchors_match_upstream_exactly_once(self):
-        for anchor in (HANDOFF_ANCHOR, WAKE_ANCHOR, INCIDENT_ANCHOR, COMPLETION_ANCHOR):
+    def test_all_five_anchors_match_upstream_exactly_once(self):
+        for anchor in (HANDOFF_ANCHOR, WAKE_ANCHOR, INCIDENT_ANCHOR, COMPLETION_ANCHOR, TELL_ANCHOR):
             self.assertEqual(UPSTREAM_NOTIFIER.count(anchor), 1, anchor)
 
     def test_only_the_completion_anchor_holds_the_message_line(self):
@@ -1834,6 +1959,7 @@ class ApplyTest(unittest.TestCase):
             "handoff_with_result as _kanban_handoff_with_result",
             "note_suppressed_completion as _kanban_note_suppressed",
             "store_incident_report as _kanban_store_incident",
+            "tell_unexplained as _kanban_tell_unexplained",
             "wake_kinds_for as _wake_kinds_for",
         ):
             self.assertIn(name, patched)
@@ -1868,6 +1994,26 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("found 0", str(ctx.exception))
         self.assertIn("completion message", str(ctx.exception))
 
+    def test_a_drifted_wake_step_anchor_fails_loudly(self):
+        with self.assertRaises(SystemExit) as ctx:
+            patch_tree(UPSTREAM_NOTIFIER.replace(*TELL_DRIFT))
+        self.assertIn("found 0", str(ctx.exception))
+        self.assertIn("held failure lines", str(ctx.exception))
+
+    def test_the_held_lines_are_settled_on_every_wake_outcome_but_admission_retry(self):
+        deliver = method_source(patch_tree(UPSTREAM_NOTIFIER), "deliver")
+        self.assertEqual(deliver.count(TELL_NONE.strip()), 2)
+        self.assertEqual(deliver.count(TELL_WOKEN.strip()), 1)
+        # Wake admitted: after the wake, inside its try.
+        self.assertLess(deliver.index("await self.wake()"), deliver.index(TELL_WOKEN.strip()))
+        self.assertLess(deliver.index(TELL_WOKEN.strip()), deliver.index("except WakeNotAccepted:"))
+        # WakeNotAccepted keeps the held line for the retry.
+        not_accepted = deliver[deliver.index("except WakeNotAccepted:"):deliver.index("except Exception as _wk_err:")]
+        self.assertNotIn("_kanban_tell_unexplained", not_accepted)
+        # Wake raised: before the failure accounting that may unsubscribe.
+        raised = deliver[deliver.index("except Exception as _wk_err:"):]
+        self.assertLess(raised.index(TELL_NONE.strip()), raised.index("await self._wake_failed("))
+
     def test_a_drifted_later_anchor_leaves_the_file_untouched(self):
         # The applier edits a string and writes once at the end, so a failure
         # on a later anchor must not leave the earlier edits on disk.
@@ -1881,7 +2027,7 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(target.read_text(), drifted)
 
     def test_applying_twice_fails_rather_than_silently_no_opping(self):
-        # All three anchors are destroyed by their own replacement, so a re-run
+        # Every anchor is destroyed by its own replacement, so a re-run
         # would fail on "found 0" anyway — but that message blames upstream
         # drift for what is really a duplicated build step, and the old delivery
         # applier had an anchor that survived patching and did silently stack.
@@ -1928,7 +2074,7 @@ class MinimalDiffTest(unittest.TestCase):
     still be pinned is that the patch is *only* its named blocks: the lines
     removed from upstream are the two hard slices, the wake-set comprehension
     and the completion message's return, and the lines added are the
-    replacements those four anchors spell out plus the trailer. Anything else — a "while I was in there" — shows
+    replacements those five anchors spell out plus the trailer. Anything else — a "while I was in there" — shows
     up here as an unexplained line, which is what a behaviour change wearing a
     refactor's clothes looks like.
     """
@@ -1953,6 +2099,7 @@ class MinimalDiffTest(unittest.TestCase):
             (WAKE_ANCHOR, WAKE_PATCHED),
             (INCIDENT_ANCHOR, INCIDENT_PATCHED),
             (COMPLETION_ANCHOR, COMPLETION_PATCHED),
+            (TELL_ANCHOR, TELL_PATCHED),
         ):
             expected += _diff_lines(anchor, patched)[1]
         expected += TRAILER.splitlines()
@@ -2043,6 +2190,177 @@ class MinimalDiffTest(unittest.TestCase):
         self.assertEqual(len(wake_call), 1, inserted)
         self.assertIn("passive_delivered=self.send_passive", wake_call[0])
         self.assertIn('self.send_passive = mode != "wake"', VERIFIER_SOURCE)
+
+
+import kanban_progress_lines  # noqa: E402
+
+
+class _WakeNotAccepted(Exception):
+    """Stands in for ``gateway.wake.WakeNotAccepted``."""
+
+
+class _Ev:
+    def __init__(self, id, kind):
+        self.id, self.kind, self.payload = id, kind, None
+
+
+class _Delivery:
+    """The leaves of one ``_KanbanNotification``, recorded, around a fixture class.
+
+    Everything the class under test calls and the fixture leaves out: the ping
+    send (through ``kanban_progress_lines.deliver``, as the progress-lines patch
+    routes it), the wake, and the cursor and failure accounting.
+    """
+
+    def __init__(self, test, notifier_ns, runner, adapter, sub, events, wake_outcomes):
+        base = notifier_ns["_KanbanNotification"]
+        record = self
+
+        class Notification(base):
+            async def _send_event(self, ev, msg):
+                res = await kanban_progress_lines.deliver(
+                    self.runner, self.adapter, self.sub, ev.kind, ev, msg, {}, header="h",
+                )
+                if getattr(res, "success", True) is False:
+                    raise RuntimeError("send failed")
+
+            def format_event(self, ev):
+                return f"✖ card {ev.kind}"
+
+            async def wake(self):
+                record.wakes += 1
+                outcome = record.wake_outcomes.pop(0)
+                if outcome is not None:
+                    raise outcome
+
+            def clear_failures(self):
+                record.failures = 0
+
+            async def delivery_failed(self, exc):
+                record.failures += 1
+                record.rewinds += 1
+
+            async def _wake_failed(self, fmt, exc):
+                await self.delivery_failed(exc)
+
+            async def rewind(self):
+                record.rewinds += 1
+
+            async def advance(self):
+                record.advanced += 1
+
+            async def unsub(self):
+                pass
+
+        self.cls = Notification
+        self.runner, self.adapter, self.sub, self.events = runner, adapter, sub, events
+        self.wake_outcomes = list(wake_outcomes)
+        self.wakes = self.failures = self.rewinds = self.advanced = 0
+
+    def tick(self):
+        """One notifier tick: a fresh object per delivery, as upstream builds it."""
+        n = self.cls(self.runner, {"sub": self.sub, "task": None, "events": self.events, "board": None})
+        n.adapter, n.is_push_adapter = self.adapter, True
+        asyncio.run(n.deliver())
+
+
+class DeliverEndToEndTest(unittest.TestCase):
+    """The patched ``_KanbanNotification.deliver()``, run tick by tick.
+
+    A Slack failure on a ``notify+wake`` subscription, with the config
+    agents/chat/config.yaml ships. The wake gate is upstream's code under test
+    here, not a patched ``resolve_wake_kinds``, so a wake set that stops holding
+    the kind shows up as the line being posted.
+    """
+
+    def setUp(self):
+        self.reactions = []
+        self.flag = False
+
+        async def settle_delegated(adapter, sub, kind, board):
+            self.reactions.append(kind)
+
+        reactions = types.SimpleNamespace(enabled=lambda: self.flag, settle_delegated=settle_delegated)
+        wake = types.SimpleNamespace(WakeNotAccepted=_WakeNotAccepted, adapter_supports_push=lambda a: True)
+        config = types.SimpleNamespace(load_config=lambda: {"kanban": {"wake_on_events": FAILURE_ONLY}})
+        notifier_module = sys.modules["kanban_notifier"]
+        gateway = types.SimpleNamespace(
+            slack_ux_reactions=reactions, wake=wake, kanban_notifier=notifier_module,
+        )
+        patcher = mock.patch.dict(sys.modules, {
+            "gateway": gateway,
+            "gateway.slack_ux_reactions": reactions,
+            "gateway.wake": wake,
+            "gateway.kanban_notifier": notifier_module,
+            "hermes_cli": types.SimpleNamespace(config=config),
+            "hermes_cli.config": config,
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_ticks(self, source, flag, wake_outcomes, ticks=None):
+        self.flag = flag
+        ns = {"__name__": "kanban_watchers_notifier_fixture"}
+        exec(compile(source, "kanban_watchers_notifier.py", "exec"), ns)
+        adapter = _SendLog()
+        delivery = _Delivery(
+            self, ns, types.SimpleNamespace(), adapter, _sub(), [_Ev(7, "gave_up")], wake_outcomes,
+        )
+        for _ in range(ticks or len(wake_outcomes)):
+            delivery.tick()
+        return delivery, [m for _, m, _ in adapter.sent]
+
+    def test_flag_on_a_wake_that_lands_is_the_only_word(self):
+        delivery, sent = self.run_ticks(patch_tree(UPSTREAM_NOTIFIER), True, [None])
+        self.assertEqual(sent, [])
+        self.assertEqual(delivery.wakes, 1)
+        self.assertEqual(delivery.advanced, 1)
+        self.assertEqual(self.reactions, ["gave_up"])
+
+    def test_flag_on_a_wake_that_raises_still_tells_the_thread_once(self):
+        # Two failed wakes, then one that lands: the line goes out on the first
+        # failure, and neither the retry nor the late wake sends it again.
+        delivery, sent = self.run_ticks(
+            patch_tree(UPSTREAM_NOTIFIER), True, [RuntimeError("profile gone"), RuntimeError("again"), None],
+        )
+        self.assertEqual(sent, ["✖ card gave_up"])
+        self.assertEqual(delivery.wakes, 3)
+        self.assertEqual(delivery.advanced, 1)
+
+    def test_flag_on_a_full_queue_waits_for_the_retry(self):
+        delivery, sent = self.run_ticks(patch_tree(UPSTREAM_NOTIFIER), True, [_WakeNotAccepted()], ticks=1)
+        self.assertEqual(sent, [])
+        self.assertEqual(delivery.failures, 0)
+        delivery.wake_outcomes.append(None)
+        delivery.tick()
+        self.assertEqual([m for _, m, _ in delivery.adapter.sent], [])
+        # And a full queue followed by a raise still tells it.
+        _, sent = self.run_ticks(
+            patch_tree(UPSTREAM_NOTIFIER), True, [_WakeNotAccepted(), RuntimeError("profile gone")],
+        )
+        self.assertEqual(sent, ["✖ card gave_up"])
+
+    def test_flag_on_a_wake_set_without_the_kind_posts_the_line(self):
+        # The mirror in explained_by_wake predicted a wake; the notifier's own
+        # gate did not ask for one. The line is then the only word.
+        patched = patch_tree(UPSTREAM_NOTIFIER).replace(
+            "if self.wake_agent\n", "if self.wake_agent and False\n", 1,
+        )
+        delivery, sent = self.run_ticks(patched, True, [], ticks=1)
+        self.assertEqual(sent, ["✖ card gave_up"])
+        self.assertEqual(delivery.wakes, 0)
+
+    def test_flag_off_matches_upstream_on_every_wake_outcome(self):
+        for outcomes in ([None], [RuntimeError("x"), None], [_WakeNotAccepted(), None]):
+            with self.subTest(outcomes=outcomes):
+                up, up_sent = self.run_ticks(UPSTREAM_NOTIFIER, False, outcomes)
+                ours, our_sent = self.run_ticks(patch_tree(UPSTREAM_NOTIFIER), False, outcomes)
+                self.assertEqual(our_sent, up_sent)
+                self.assertEqual(our_sent, ["✖ card gave_up"])
+                self.assertEqual(
+                    (ours.wakes, ours.rewinds, ours.advanced), (up.wakes, up.rewinds, up.advanced),
+                )
+                self.assertFalse(getattr(ours.runner, HELD_ATTR, None))
 
 
 class VerifierSendAnchorTest(unittest.TestCase):

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Wire gateway/kanban_notifier.py into the Hermes source tree.
 
-Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Four anchored
+Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Five anchored
 edits in ``gateway/kanban_watchers_notifier.py`` plus one import trailer. Two
 of the anchors are the same two sites this applier has always owned — the
 completion handoff and the wake set — the third carries the incident-store
-call, which used to share the wake anchor and no longer can (below), and the
+call, which used to share the wake anchor and no longer can (below), the
 fourth routes the completion message through ``completion_text`` so
-``KAGE_SLACK_UX`` can drop its head line on Slack.
+``KAGE_SLACK_UX`` can drop its head line on Slack, and the fifth settles the
+failure lines that flag held for the wake.
 
 Where the sites live, as of v2026.9.14. Upstream's September decomposition
 (``fd2bfa1893``) moved the notifier's per-subscription delivery out of the
@@ -57,7 +58,8 @@ Not merged in, deliberately:
 * ``gateway/kanban_notify_delivery.py`` edits the claim in
   ``_Collector._claim_for_sub`` and the ``await self.advance()`` at the
   success-path tail of ``_KanbanNotification.deliver()`` — both in this file,
-  neither touched here.
+  neither touched here. Anchor 5 ends inside the wake step's ``try``, above
+  that tail.
 
 Why the changes are needed is documented in the module docstrings of
 ``deploy/docker/patches/kanban_notifier.py`` and
@@ -85,6 +87,10 @@ PING_INDENT = " " * 16
 #: One block outward from those lines: the ``except`` that closes their
 #: ``try``, which the incident anchor ends on.
 PING_EXCEPT_INDENT = " " * 12
+#: The wake step in ``deliver()``: method body, then ``if``, ``try``, and the
+#: ``except`` bodies.
+DELIVER_INDENT = " " * 8
+WAKE_TRY_INDENT = " " * 16
 
 # --- Anchor 1: the completion handoff ----------------------------------------
 #
@@ -249,11 +255,70 @@ COMPLETION_PATCHED = (
     f"{HANDOFF_INDENT}return {COMPLETION_CALL}, wake_handoff, None\n"
 )
 
+# --- Anchor 5: settling the held failure lines --------------------------------
+#
+# With ``KAGE_SLACK_UX`` on, ``kanban_progress_lines`` holds a Slack failure
+# line the creator's wake is expected to explain, and ``_send_pings`` has
+# recorded it as sent. Only the wake step knows whether that expectation held,
+# so the held lines are settled here, once per outcome:
+#
+# * no wake at all: post them. The mirror in ``explained_by_wake`` predicted a
+#   wake that ``build_wake_text`` did not ask for, and the line is then the only
+#   word the thread gets.
+# * wake admitted: drop the kinds it was admitted for, post any others.
+# * wake raised: post them, before ``_wake_failed`` rewinds or drops the
+#   subscription, so even the attempt that unsubscribes tells the thread.
+# * ``WakeNotAccepted``: nothing. The claim is rewound, the held line waits,
+#   and the retry settles it.
+#
+# ``_kanban_tell_unexplained`` never raises and returns at once when nothing is
+# held, which is every delivery with the flag off. See section 6 of
+# gateway/kanban_notifier.py.
+
+TELL_WOKEN = (
+    "await _kanban_tell_unexplained(self.runner, self.adapter, self.sub, wake_kinds)\n"
+)
+TELL_NONE = (
+    "await _kanban_tell_unexplained(self.runner, self.adapter, self.sub, set())\n"
+)
+
+TELL_ANCHOR = (
+    f"{DELIVER_INDENT}if wake_kinds:\n"
+    f"{DELIVER_INDENT}    try:\n"
+    f"{DELIVER_INDENT}        await self.wake()\n"
+    f"{DELIVER_INDENT}        self.clear_failures()\n"
+    f"{DELIVER_INDENT}    except WakeNotAccepted:\n"
+    f"{WAKE_TRY_INDENT}# Startup / full queue is not a dead destination. Keep the durable\n"
+    f"{WAKE_TRY_INDENT}# subscription alive regardless of how long admission takes.\n"
+    f"{WAKE_TRY_INDENT}await self.rewind()\n"
+    f"{WAKE_TRY_INDENT}return\n"
+    f"{DELIVER_INDENT}    except Exception as _wk_err:\n"
+)
+
+TELL_PATCHED = (
+    f"{DELIVER_INDENT}# kube-agents patch: see gateway/kanban_notifier.py\n"
+    f"{DELIVER_INDENT}if not wake_kinds:\n"
+    f"{DELIVER_INDENT}    {TELL_NONE}"
+    f"{DELIVER_INDENT}if wake_kinds:\n"
+    f"{DELIVER_INDENT}    try:\n"
+    f"{DELIVER_INDENT}        await self.wake()\n"
+    f"{DELIVER_INDENT}        self.clear_failures()\n"
+    f"{WAKE_TRY_INDENT}{TELL_WOKEN}"
+    f"{DELIVER_INDENT}    except WakeNotAccepted:\n"
+    f"{WAKE_TRY_INDENT}# Startup / full queue is not a dead destination. Keep the durable\n"
+    f"{WAKE_TRY_INDENT}# subscription alive regardless of how long admission takes.\n"
+    f"{WAKE_TRY_INDENT}await self.rewind()\n"
+    f"{WAKE_TRY_INDENT}return\n"
+    f"{DELIVER_INDENT}    except Exception as _wk_err:\n"
+    f"{WAKE_TRY_INDENT}{TELL_NONE}"
+)
+
 EDITS = (
     ("completion handoff", HANDOFF_ANCHOR, HANDOFF_PATCHED),
     ("wake set", WAKE_ANCHOR, WAKE_PATCHED),
     ("incident row", INCIDENT_ANCHOR, INCIDENT_PATCHED),
     ("completion message", COMPLETION_ANCHOR, COMPLETION_PATCHED),
+    ("held failure lines", TELL_ANCHOR, TELL_PATCHED),
 )
 
 # Appended rather than inserted: unlike a `check_fn=`, these names are resolved
@@ -267,11 +332,12 @@ TRAILER = (
     "    handoff_with_result as _kanban_handoff_with_result,\n"
     "    note_suppressed_completion as _kanban_note_suppressed,\n"
     "    store_incident_report as _kanban_store_incident,\n"
+    "    tell_unexplained as _kanban_tell_unexplained,\n"
     "    wake_kinds_for as _wake_kinds_for,\n"
     ")\n"
 )
 
-#: Text that only exists after a successful run. All four anchors are
+#: Text that only exists after a successful run. All five anchors are
 #: destroyed by their own replacement, so a re-run would already fail on
 #: "found 0" — but that message blames upstream drift for what is actually a
 #: duplicated build step, and before the old delivery applier grew this guard a
@@ -287,6 +353,7 @@ SENTINELS = (
     "_kanban_note_suppressed(",
     "_kanban_store_incident(",
     COMPLETION_CALL,
+    "_kanban_tell_unexplained(self.runner",
 )
 
 
