@@ -1,0 +1,28 @@
+# Which GitOps repositories the agent manages, read from its own configuration
+# (/etc/gitops/managed_repos), not discovered. Each eval project's repository
+# is <owner>/<project>-infra (hack/ci-deploy.sh); on kind, hack/kind-up.sh
+# registers a fake kind-infra.
+id: list-gitops-repos
+name: List the GitOps repositories the agent manages
+prompt: >-
+  Which GitOps repositories do you manage?
+expected_output: >-
+  The repositories in managed_repos, by name.
+infrastructure:
+  deployer: noop
+validated: false
+domain: chat-and-routing
+owner: maintainers
+verification_spec:
+  - name: names-the-managed-repo
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["{{PROJECT_ID}}-infra"]
+  - name: not-discovered
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns: ['\bkubectl\b', '\bgcloud\b', '\bgh\s+(repo\s+list|search\s+repos)\b']
