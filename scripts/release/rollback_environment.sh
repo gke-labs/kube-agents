@@ -6,9 +6,11 @@
 # This is the rollback runbook (docs/site/src/content/docs/deploy/rollback.md)
 # run by a machine: from a clean checkout of the GA tag, `upgrade.sh
 # --upgrade-mode=operator` then `--upgrade-mode=harness`, both `--image-tag`
-# that GA. The roll-forward is the same pair from the candidate checkout, so
-# one run exercises both directions between N-1 and N and leaves the
-# environment where it found it.
+# that GA, and --drop-undeclared-values where the GA's script takes it. The
+# roll-forward is the same pair from the candidate checkout, so one run
+# exercises both directions between N-1 and N and leaves the environment on
+# the candidate's images. A value the rollback dropped is not restored: the
+# roll-forward renders it from the candidate chart's default.
 #
 # Inputs (environment):
 #   CANDIDATE_SHA            The commit the environment runs now (N). Required.

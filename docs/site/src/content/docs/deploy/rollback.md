@@ -79,9 +79,9 @@ From the `N-1` checkout, a dry run, then operator and harness back to back:
 ```
 
 Where `N-1` is a release after `0.7.0`, add `--drop-undeclared-values` to the operator and harness
-commands. Without it, their script stops before applying anything when the release records a value
-`N-1`'s chart does not declare, and names each one; with it, the script drops and names them. The
-scripts of `0.7.0` and earlier do not take the flag.
+commands. Without it, their script stops before any of `N-1` is applied when the release records a
+value `N-1`'s chart does not declare, and names each one; with it, the script drops and names them.
+The scripts of `0.7.0` and earlier do not take the flag.
 
 `--dry-run` prints the target and the image references the step would apply, from the
 configuration alone, and contacts nothing. It refuses a checkout at the wrong commit, as the real
@@ -180,8 +180,9 @@ them from the stored object, and `N-1`'s chart does not render them. The full mo
 Helm values that produced them. A re-tag by the script of `0.7.0` or earlier keeps those values in
 the release's recorded values: a later forward re-tag renders them again, and the schema refusal
 below turns on them. A re-tag by a script from after `0.7.0`, run with `--drop-undeclared-values`,
-drops each one `N-1`'s values schema refuses as undeclared, so after such a rollback the release no longer records it, and the next
-forward re-tag renders it from `N`'s chart default until a full-mode apply sets it again.
+drops each one `N-1`'s values schema refuses as undeclared, so after such a rollback the release no
+longer records it, and the next forward re-tag renders it from `N`'s chart default until a
+full-mode apply sets it again.
 
 The agent's persistent volume, apart from what the entrypoint re-syncs from the image. The
 harness step rolls the pod, and the volume follows it; what the next start does to it is `N-1`'s
@@ -225,7 +226,7 @@ The composition refuses some of those destructions itself: its `lifecycle.sh` ex
 `terraform apply` when the regenerated configuration disagrees with state on the cluster, the
 agent's service account, the CMEK key, the release namespace, the Pub/Sub subscription or the
 minter key. That refusal comes after the full mode's CRD apply, so it leaves `N-1`'s CRDs in
-place, like the schema refusal below. How to read a `destroy` line in the plan, as missing
+place, as the schema refusal below does when `N-1` is `0.7.0` or earlier. How to read a `destroy` line in the plan, as missing
 configuration first and real drift second, is in the
 [installer README](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md).
 
@@ -256,8 +257,10 @@ that set `NAMESPACE` in `install.env` uses that one. `platform-agent` is the cha
 ## When a rollback is refused
 
 The first two refusals happen before anything on the cluster moves, and the third before any of
-`N-1` is applied. The last two land in the operator step after `N-1`'s CRDs are applied; Helm
-checks before it renders or applies anything, so the release itself keeps its last revision.
+`N-1` is applied. The last two land in the operator step after `N-1`'s CRDs are applied, except
+that from the first release after `0.7.0` the script makes the schema check itself, before the CRD
+apply. Helm checks before it renders or applies anything, so the release itself keeps its last
+revision.
 
 - **The sources do not match the tag.** The checkout's `HEAD` is not the tag's commit, the tree
   has uncommitted changes, or the bundle's baked version is not the `--image-tag` given. Start
@@ -284,11 +287,11 @@ checks before it renders or applies anything, so the release itself keeps its la
   script uses, `kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/`. For a
   pair whose `N-1` is `0.7.0` or earlier the Helm-only rollback therefore does not complete. From
   the first release after `0.7.0` the re-tag checks the recorded values against the schema before
-  it applies anything, and names and stops on each key the schema refuses as undeclared. Given
+  any of `N-1` is applied, and names and stops on each key the schema refuses as undeclared. Given
   `--drop-undeclared-values` it drops those keys instead, so with the flag the refusal no longer
-  happens where `N-1` is that release or later. The full mode completes either way, because its Helm release renders from the
-  composition's values rather than the recorded ones (the section above), at the price of a
-  GCP-level apply and the plan read that goes before it.
+  happens where `N-1` is that release or later. The full mode completes either way, because its
+  Helm release renders from the composition's values rather than the recorded ones (the section
+  above), at the price of a GCP-level apply and the plan read that goes before it.
 
   Two pairs are refused this way, each on an install the newer release's composition applied (a
   fresh install of it, or a full-mode upgrade to it). `0.7.0` rolling back to `0.6.0`: `0.7.0`'s
