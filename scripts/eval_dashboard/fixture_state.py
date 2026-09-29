@@ -364,6 +364,20 @@ def drift_map(document: dict | None) -> dict[str, list[str]]:
     return out
 
 
+def unread_units(document: dict | None) -> int:
+    """How many roles went unread on projects the scan did check."""
+    count = 0
+    projects = (document or {}).get(KEY_PROJECTS) if isinstance(document, dict) else None
+    for entry in (projects or {}).values() if isinstance(projects, dict) else []:
+        roles = (entry or {}).get(KEY_ROLES) if isinstance(entry, dict) else None
+        if not isinstance(roles, dict):
+            continue
+        states = [v.get(KEY_STATE) for v in roles.values() if isinstance(v, dict)]
+        if any(s in (ROLE_HEALTHY, ROLE_DRIFTED) for s in states):
+            count += sum(1 for s in states if s == ROLE_NOT_CHECKED)
+    return count
+
+
 def read_map(document: dict | None) -> dict[str, list[str]]:
     """{project: [roles the scan read there, healthy or drifted]}, sorted."""
     out: dict[str, list[str]] = {}

@@ -533,17 +533,23 @@ def run_cmd(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     env: Optional[dict] = None,
 ) -> Tuple[int, str, str]:
+    # The deadline note goes before the command, which can be longer than
+    # the 200 characters _unread_reason keeps of a line.
+    cut = False
     if _RUN_DEADLINE is not None:
         remaining = _RUN_DEADLINE - time.monotonic()
         if remaining <= 0:
-            return 124, "", f"timed out after 0s: {' '.join(cmd)} ({DEADLINE_CUT})"
-        timeout = min(timeout, max(1, int(remaining)))
+            return 124, "", f"timed out after 0s ({DEADLINE_CUT}): {' '.join(cmd)}"
+        if remaining < timeout:
+            timeout = max(1, int(remaining))
+            cut = True
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         # 124 is what GNU timeout(1) reports, so a caller that only looks at the
         # code still sees a failure rather than a success.
-        return 124, "", f"timed out after {timeout}s: {' '.join(cmd)}"
+        note = f" ({DEADLINE_CUT})" if cut else ""
+        return 124, "", f"timed out after {timeout}s{note}: {' '.join(cmd)}"
     except FileNotFoundError as exc:
         return 127, "", str(exc)
     return proc.returncode, proc.stdout, proc.stderr
@@ -602,7 +608,7 @@ _UNREAD_PATTERNS = (
     # the scan runs six projects at once, and one wave of 429s would read as
     # three drifted. The status codes are tied to how gcloud prints one, so
     # a resource named kube-agents-evals-500 does not match.
-    re.compile(r"RESOURCE_EXHAUSTED|\bUNAVAILABLE\b|\bINTERNAL\b|database is locked"),
+    re.compile(r"RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED|\bUNAVAILABLE\b|\bINTERNAL\b|database is locked"),
     # A separator between the word and the code is required (`code=`, `status:
     # '`, `HTTP `, `HTTPError (`), so a resource named http500 or code503 is
     # not a status.
@@ -610,10 +616,12 @@ _UNREAD_PATTERNS = (
     # A transport failure on the runner -- gcloud never got an answer -- is
     # not absence either; without this a DNS or TLS blip on one wave became
     # three `*/failed` findings and a pool-drift issue.
-    # In gcloud's own crash form, so a resource named readtimeout is not one.
+    # Any gcloud crash: an uncaught exception inside gcloud never returned the
+    # resource's state, whatever its class (a transport error, a full disk, a
+    # credential store it could not open). The phrase is gcloud's own, so a
+    # resource named readtimeout is still an absence.
     re.compile(
-        r"gcloud crashed \(\w*(?:Connection|Timeout|Transport|Proxy|ServerNotFound|ChunkedEncoding|MaxRetry|RemoteDisconnected|Protocol|SSL|IncompleteRead)\w*\)"
-        r"|Temporary failure in name resolution|Name or service not known|Connection reset by peer|Unable to find the server at",
+        r"\bgcloud crashed\b|Temporary failure in name resolution|Name or service not known|Connection reset by peer|Unable to find the server at",
         re.I,
     ),
 )

@@ -1088,6 +1088,7 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
         "stale": False,
         "unknown": False,
         "scanned_at": None,
+        "unread_units": 0,
         "roles": [],
         "projects": [],
         "drift": {},
@@ -1109,6 +1110,7 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     projects = state_doc.get(module.KEY_PROJECTS)
     out["total"] = len(projects) if isinstance(projects, dict) else 0
     out["checked"] = module.checked_projects(state_doc)
+    out["unread_units"] = module.unread_units(state_doc)
     if scanned_at is None or now - scanned_at > FIXTURE_STATE_MAX_AGE:
         out["stale"] = True
         age = f"{int((now - scanned_at).total_seconds() // 3600)}h" if scanned_at else "of unknown age"
@@ -2173,6 +2175,7 @@ def scan_block(scan_result: dict) -> dict | None:
         "scanned_at": iso(scan_result["scanned_at"]),
         "projects": scan_result["total"],
         "checked": scan_result["checked"],
+        "unread_units": scan_result.get("unread_units", 0),
         "drifted": scan_result["current"],
         "unknown": scan_result["unknown"],
         "stale": scan_result["stale"],

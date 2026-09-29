@@ -849,7 +849,7 @@ scan found a pool project no longer shaped as the verifier requires;
 docs/ci-health.md, "The pool-state scan") is the same shape: `roles` are the
 verifier's finding ids, `incident` also carries `repairs` (`{project: {finding:
 command}}`), and the `pool_state` block beside `fixture_state` summarises the
-scan; `pool-state.json` is its document, which no page reads: per project, per check, `state`, `detail`, and for a healthy check `unread`, the reads the verifier could not make, which is what keeps a check out of the incident's `reads` exit. Both scan
+scan; `pool-state.json` is its document, which no page reads: per project, per check, `state`, `detail`, and for a healthy or drifted check `unread`, the reads the verifier could not make, which is what keeps a check out of the incident's `reads` exit. Both blocks also carry `unread_units`, how many roles or checks went unread on projects that were checked, which the pool digest line reports instead of calling the pool clean. Both scan
 incidents carry `reads` (`{project: [what a later scan must read again]}`). `slow` is `null` or, on a `GREEN` tick, the slow-gate note
 (`{since, runs, min_s, median_s, max_s, baseline_days, baseline_runs,
 baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow

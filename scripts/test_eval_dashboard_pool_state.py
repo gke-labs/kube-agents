@@ -194,6 +194,18 @@ class OneProject(ScanHarness):
         self.assertEqual(pool_state.read_map(doc)[PROJECT], sorted(set(CHECKS) - {"iam"}))
         self.assertIn(FINDING, doc["projects"][PROJECT]["findings"])
 
+    def test_unread_checks_on_checked_projects_are_counted(self):
+        # One check read, four not: the project counts as checked, and the
+        # four are what keeps the digest from calling it clean.
+        world = {check: unchecked("429") for check in CHECKS}
+        world["project_and_apis"] = {"status": "pass", "message": "ok", "exit": 0}
+        doc = self.scan({PROJECT: report(**world)})
+        self.assertEqual(pool_state.checked_projects(doc), 1)
+        self.assertEqual(pool_state.unread_units(doc), len(CHECKS) - 1)
+        self.assertEqual(pool_state.unread_units(self.scan({PROJECT: report()})), 0)
+        blind = self.scan({PROJECT: report(**{check: unchecked() for check in CHECKS})})
+        self.assertEqual(pool_state.unread_units(blind), 0, "an unchecked project is blind, not partial")
+
     def test_advice_on_a_read_that_happened_still_counts_as_read_in_full(self):
         # The minter check warns about a second ENABLED key version on a
         # project it read whole; the exit may still take it as proof.

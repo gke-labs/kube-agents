@@ -302,6 +302,19 @@ def _read_checks(entry: dict, whole: bool) -> list[str]:
     return sorted(out)
 
 
+def unread_units(document: dict | None) -> int:
+    """How many checks went unread on projects the scan did check: the
+    digest's "every one shaped as the verifier requires" is only as true as
+    this is zero."""
+    count = 0
+    for project, entry in _entries(document):
+        checks = entry.get(KEY_CHECKS) if isinstance(entry, dict) else None
+        if not isinstance(checks, dict) or not _read_checks(entry, whole=False):
+            continue
+        count += sum(1 for verdict in checks.values() if isinstance(verdict, dict) and verdict.get(KEY_STATE) == CHECK_NOT_CHECKED)
+    return count
+
+
 def read_map(document: dict | None) -> dict[str, list[str]]:
     """{project: [check ids read in full]}, sorted: what rule 6's exit may
     take as proof a finding is gone."""

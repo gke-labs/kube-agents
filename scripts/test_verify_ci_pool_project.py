@@ -9,6 +9,7 @@ import os
 import pathlib
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -123,6 +124,11 @@ class DenialClassifierTest(unittest.TestCase):
         "ERROR: gcloud crashed (ConnectionAbortedError): [Errno 53] Software caused connection abort",
         "ERROR: gcloud crashed (TimeoutError): [Errno 60] Operation timed out",
         "ERROR: gcloud crashed (MaxRetryError): HTTPSConnectionPool(host='iam.googleapis.com', port=443): Max retries exceeded (Caused by ReadTimeoutError(\"HTTPSConnectionPool(host='iam.googleapis.com', port=443): Read timed out.\"))",
+        # Any other gcloud crash: it never returned the resource's state.
+        "ERROR: gcloud crashed (OSError): [Errno 28] No space left on device",
+        "ERROR: gcloud crashed (OperationalError): unable to open database file",
+        # A server-side timeout, in the same STATUS form as a quota reply.
+        "ERROR: (gcloud.artifacts.repositories.describe) DEADLINE_EXCEEDED: Deadline expired before operation could complete.",
         "ERROR: gcloud crashed (SSLError): [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed",
         "ERROR: gcloud crashed (ReadTimeout): HTTPSConnectionPool(host='container.googleapis.com', port=443): Read timed out.",
     )
@@ -3568,11 +3574,20 @@ class ReportDocumentTest(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 5)
             self.assertIsNotNone(checker._unread_reason(err), err)
             checker._RUN_DEADLINE = time.monotonic() - 1
-            rc, _, err = checker.run_cmd(["sleep", "30"])
+            # python ignores the extra arguments (sleep would refuse them).
+            long_cmd = [sys.executable, "-c", "import time; time.sleep(30)"] + ["--very-long-flag=%s" % ("x" * 40)] * 6
+            rc, _, err = checker.run_cmd(long_cmd)
             self.assertEqual(rc, 124)
-            # Inside a check that had started: not "before this check".
+            # Inside a check that had started: not "before this check", and
+            # the note survives the 200-character cut of the reason.
             self.assertIn(checker.DEADLINE_CUT, err)
             self.assertNotIn(checker.DEADLINE_PASSED, err)
+            self.assertIn(checker.DEADLINE_CUT, checker._unread_reason(err))
+            # A command cut short by the deadline says so too.
+            checker._RUN_DEADLINE = time.monotonic() + 1
+            rc, _, err = checker.run_cmd(long_cmd)
+            self.assertEqual(rc, 124)
+            self.assertIn(checker.DEADLINE_CUT, checker._unread_reason(err))
         finally:
             checker._RUN_DEADLINE = None
 

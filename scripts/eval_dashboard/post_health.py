@@ -940,6 +940,11 @@ def pool_state_digest_line(health: dict) -> str | None:
             f" ({', '.join(findings)}); a 403 from a run that leased one of them is the pool's, not the code."
         )
     unchecked = f", {total - checked} not checked" if total > checked else ""
+    unread = int(block.get("unread_units") or 0)
+    if unread:
+        # A project counts as checked when one check read anything; a scan
+        # that read little must not be reported as a clean bill.
+        return f"🧭 *Pool projects:* {checked} of {total} pool projects checked at {when}, no drift in what was read; {unread} {plural(unread, 'check')} not read{unchecked}."
     return f"🧭 *Pool projects:* {checked} of {total} pool projects checked at {when}, every one shaped as the verifier requires{unchecked}."
 
 

@@ -1783,8 +1783,8 @@ FINDING_REPAIR = 'gcloud projects add-iam-policy-binding {project} --member="ser
 POOL_BLIND_REASON = "Could not describe kube-agents-evals-1, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED"
 
 
-def pool_block(drifted=None, scanned=SCAN_AT, projects=30, checked=30, unknown=False, stale=False, reason=None):
-    return {"scanned_at": scanned, "projects": projects, "checked": checked, "drifted": drifted or {}, "unknown": unknown, "stale": stale, "reason": reason}
+def pool_block(drifted=None, scanned=SCAN_AT, projects=30, checked=30, unknown=False, stale=False, reason=None, unread_units=0):
+    return {"scanned_at": scanned, "projects": projects, "checked": checked, "unread_units": unread_units, "drifted": drifted or {}, "unknown": unknown, "stale": stale, "reason": reason}
 
 
 def pool_drift(since=SCAN_AT, findings=(FINDING,), projects=DRIFT_PROJECTS, evidence=()):
@@ -1922,6 +1922,7 @@ class PoolDrift(RunHarness):
         self.assertEqual(line(None), [])
         self.assertEqual(line(pool_block()), ["🧭 *Pool projects:* 30 of 30 pool projects checked at 9:00 AM ET, every one shaped as the verifier requires."])
         self.assertEqual(line(pool_block(checked=28)), ["🧭 *Pool projects:* 28 of 30 pool projects checked at 9:00 AM ET, every one shaped as the verifier requires, 2 not checked."])
+        self.assertEqual(line(pool_block(unread_units=140)), ["🧭 *Pool projects:* 30 of 30 pool projects checked at 9:00 AM ET, no drift in what was read; 140 checks not read."])
         self.assertEqual(
             line(pool_block(drifted={"kube-agents-evals-1": [FINDING], "kube-agents-evals-4": [FINDING]})),
             [f"🧭 *Pool projects:* 2 of 30 checked pool projects drifted at 9:00 AM ET ({FINDING}); a 403 from a run that leased one of them is the pool's, not the code."],
