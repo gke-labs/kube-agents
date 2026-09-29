@@ -1584,9 +1584,16 @@ warn_flag_beats_unrecorded_file_value() {
   # Only for a boolean. A list flag's value is space-separated, so
   # "--scope-projects=a b c" would not paste back as one argument, and the
   # first remedy on this line already carries the value for it.
+  #
+  # `=false`, not the value as spelled. is_truthy reads `no`, `0`, `off` and
+  # `False` as off, and an exported ENABLE_GKE_BACKUP_PLAN=no arrives here
+  # verbatim -- but validate_bool_flag_value accepts only the literals `true`
+  # and `false`, so pasting the spelling back would print a remedy the
+  # installer rejects. The warning line above already carries what was given;
+  # this line has to be runnable.
   local repeat_flag="$flag"
   if [ "$compare_as_bool" = "true" ] && ! is_truthy "$value"; then
-    repeat_flag="${flag}=${value}"
+    repeat_flag="${flag}=false"
   fi
   # %q, because the scope keys are the first list-valued values through here and
   # a space-separated one printed bare would not paste back as one assignment.

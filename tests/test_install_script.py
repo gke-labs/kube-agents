@@ -6911,6 +6911,32 @@ class DomainScopedFlagsTest(unittest.TestCase):
             self.assertIn("repeat --enable-gke-backup-plan=false on", combined)
             self.assertNotIn("repeat --enable-gke-backup-plan on", combined)
 
+    def test_the_repeated_flag_is_canonical_even_when_the_value_is_not(self):
+        """The remedy has to be a command the installer accepts.
+
+        The chosen value does not have to arrive as a flag. PARAM_* is seeded
+        from the environment verbatim, so `ENABLE_GKE_BACKUP_PLAN=no
+        ./install.sh` reaches here as the string `no` -- which is_truthy reads
+        as off, and which validate_bool_flag_value refuses: it matches only the
+        literals `true` and `false` and exits 1 with "must be either true or
+        false". Pasting the spelling back would print a remedy that aborts the
+        run it is telling the operator to make. The warning line above already
+        names what was given; this line renders the canonical spelling of it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("NAMESPACE=kubeagents-system\n")
+            proc = self._parse(
+                "",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"ENABLE_GKE_BACKUP_PLAN": "no"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("records no ENABLE_GKE_BACKUP_PLAN", combined)
+            self.assertIn("repeat --enable-gke-backup-plan=false on", combined)
+            self.assertNotIn("repeat --enable-gke-backup-plan=no", combined)
+
     def test_a_hand_written_tf_var_ingress_is_not_reported_as_destroyed(self):
         """Nothing is destroyed on the one install most likely to read this.
 
