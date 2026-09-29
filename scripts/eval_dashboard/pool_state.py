@@ -339,16 +339,22 @@ def checked_projects(document: dict | None) -> int:
 
 
 def not_checked_reason(document: dict | None) -> str | None:
-    """The commonest reason a check went unchecked, for a scan that saw nothing."""
+    """The reason a check went unchecked, for a scan that saw nothing: the
+    project check's own line when it has one, since the checks that need the
+    project number restate it, else the commonest line."""
     reasons: collections.Counter = collections.Counter()
+    root: collections.Counter = collections.Counter()
     for _, entry in _entries(document):
         if entry.get(KEY_ERROR):
             reasons[str(entry[KEY_ERROR])] += 1
             continue
-        for verdict in (entry.get(KEY_CHECKS) or {}).values():
+        for check, verdict in (entry.get(KEY_CHECKS) or {}).items():
             if isinstance(verdict, dict) and verdict.get(KEY_STATE) == CHECK_NOT_CHECKED and verdict.get(KEY_DETAIL):
-                reasons[str(verdict[KEY_DETAIL][0])] += 1
-    return reasons.most_common(1)[0][0] if reasons else None
+                (root if check == verifier.CHECK_PROJECT_AND_APIS else reasons)[str(verdict[KEY_DETAIL][0])] += 1
+    for counter in (root, reasons):
+        if counter:
+            return counter.most_common(1)[0][0]
+    return None
 
 
 def summarize(projects: dict[str, dict]) -> dict:

@@ -208,6 +208,13 @@ class OneProject(ScanHarness):
         self.assertEqual(pool_state.checked_projects(doc), 0)
         self.assertEqual(pool_state.not_checked_reason(doc), "Could not describe kube-agents-evals-2: PERMISSION_DENIED")
         self.assertEqual(doc["summary"]["checked"], 0)
+        # The verifier's real shape: the project check names the refusal and
+        # the two checks that need its number restate it in their own words;
+        # the reason quoted is the project check's, not the commonest line.
+        world = {check: unchecked("Not checked: kube-agents-evals-2's project number could not be read (Could not describe kube-agents-evals-2: PERMISSION_DENIED)") for check in CHECKS}
+        world["project_and_apis"] = unchecked("Could not describe kube-agents-evals-2, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED")
+        doc = self.scan({PROJECT: report(**world)})
+        self.assertTrue(pool_state.not_checked_reason(doc).startswith("Could not describe kube-agents-evals-2, so neither"))
 
     def test_a_check_the_report_omits_is_not_checked(self):
         checks_out, findings = pool_state.from_report({"checks": {"iam": {"status": "pass"}}}, ["iam", "gke_and_state"])

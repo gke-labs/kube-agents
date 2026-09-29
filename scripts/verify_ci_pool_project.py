@@ -118,6 +118,9 @@ REPAIR_STATE_BUCKET = "scripts/provision_ci_pool_project.sh, or docs/ci-pool-pro
 REPAIR_FLEET_APPLY = "re-apply bench/tf/fleet against {project_id} (bench/tf/fleet/README.md, State and reconcile)"
 REPAIR_MINTER = "docs/ci-pool-projects.md section 5.2 (the ci-pool-minter composition owns the key)"
 REPAIR_MINTER_ROTATION = "import the version the chart pins, or bump githubMinter.kms.keyVersion in charts/kube-agents/values.yaml to an ENABLED one (docs/site/src/content/docs/deploy/token-minter.md)"
+# The one version state `kms keys versions enable` takes; a scheduled or done
+# destruction and a failed or pending import need the rotation repair.
+KMS_VERSION_DISABLED = "DISABLED"
 # hack/ci-deploy.sh's warm cache image lives in the Prow project's `us` repository.
 WARM_CACHE_REPOSITORY_PROJECT = "kube-agents-prow"
 WARM_CACHE_REPOSITORY_LOCATION = "us"
@@ -952,9 +955,11 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
             True,
             "Not checked",
             warnings=[
-                f"Could not describe {project_id}, so neither it nor anything derived from its project "
-                f"number was checked: {reason}. Reading a project needs "
-                f"resourcemanager.projects.get on it."
+                Unread(
+                    f"Could not describe {project_id}, so neither it nor anything derived from its project "
+                    f"number was checked: {reason}. Reading a project needs "
+                    f"resourcemanager.projects.get on it."
+                )
             ],
             read=False,
         )
@@ -2887,14 +2892,17 @@ def check_token_minter(
         )
     elif version_states[pinned_version] != "ENABLED":
         passed = False
+        state = version_states[pinned_version]
         _drift(
-            details, findings, "token-minter/pinned-version/disabled",
+            details, findings, f"token-minter/pinned-version/{state.lower()}",
             f"The chart deploys cryptoKeyVersion {pinned_version} of {key}, whose state is "
             f"{version_states[pinned_version]}. Every lease would deploy a minter that cannot sign, and "
             "helm --wait would kill the run at its fifteen-minute timeout without naming the key. "
             "The pin is read from this checkout, so try `git fetch && git rebase` first -- a stale "
             "tree reports a version main has already moved past.",
-            f"gcloud kms keys versions enable {pinned_version} --key={key} --keyring={keyring} --location={location} --project={project_id}",
+            f"gcloud kms keys versions enable {pinned_version} --key={key} --keyring={keyring} --location={location} --project={project_id}"
+            if state == KMS_VERSION_DISABLED
+            else REPAIR_MINTER_ROTATION,
         )
     else:
         probe_version = pinned_version
@@ -3013,10 +3021,11 @@ def run_checks(
         else:
             project_number, proj_check = check_project_and_apis(project_id)
             add(CHECK_PROJECT_AND_APIS, proj_check)
-            # The reason the project read failed travels with the dependents
-            # when the project check itself was not asked for; without it a
-            # --checks subset reports a skip with no cause.
-            why = "" if CHECK_PROJECT_AND_APIS in wanted else proj_check.message
+            # The reason the project read failed travels with the dependents,
+            # so a skip names its cause on its own line -- in a --checks subset
+            # without the project check, and in the scan's document, whose
+            # blind-scan reason is the commonest not-checked line.
+            why = proj_check.message
             if project_number:
                 for check_id, _, thunk in dependents:
                     run(check_id, lambda thunk=thunk: thunk(project_number))
@@ -3024,7 +3033,7 @@ def run_checks(
                 # The project number is missing because reading the project was refused,
                 # not because the project is wrong. Failing the two checks that need it
                 # would put the conflation straight back, one level up.
-                cause = next(iter(proj_check.warnings), "") if why else ""
+                cause = next(iter(proj_check.warnings), "")
                 for check_id, skipped, _ in dependents:
                     add(check_id, CheckResult(
                         skipped,

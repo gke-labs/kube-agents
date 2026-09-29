@@ -3546,10 +3546,12 @@ class ReportDocumentTest(unittest.TestCase):
             unread = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_IAM])
         self.assertIn("PERMISSION_DENIED", unread[0].warnings[0])
         self.assertIsInstance(unread[0].warnings[0], checker.Unread)
-        # With the project check selected the cause is in its own record.
+        # With the project check selected the cause is in its own record and
+        # on the dependent's line too: the scan's blind-scan reason is the
+        # commonest not-checked line, and a bare skip would win it.
         with mock.patch.object(checker, "check_project_and_apis", return_value=(None, checker.CheckResult("p", False, "Project describe failed: NOT_FOUND"))):
             both = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_PROJECT_AND_APIS, checker.CHECK_IAM])
-        self.assertEqual(both[1].message, "Skipped: could not determine project number")
+        self.assertIn("Project describe failed: NOT_FOUND", both[1].message)
 
     def test_a_blocked_toolchain_with_an_unwritable_report_path_still_exits_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3718,6 +3720,16 @@ class FindingsCarryRepairsTest(unittest.TestCase):
         self.assertIn(f"--member={checker.PULL_SWEEP_MEMBER}", ids["token-minter/signer/pull-sweeper"])
         self.assertIn("token-minter/minter-gsa/workload-identity", ids)
         self.assertIn("--key=github-token-minter-key", ids["token-minter/pinned-version/disabled"])
+        # `versions enable` only takes DISABLED; a scheduled destruction, a
+        # destroyed version or a failed import need the rotation repair.
+        for state in ("DESTROY_SCHEDULED", "DESTROYED", "PENDING_IMPORT", "IMPORT_FAILED"):
+            versions = json.dumps([{"name": ".../cryptoKeyVersions/1", "state": state}])
+            with mock.patch.object(checker, "run_cmd") as run, mock.patch.object(checker, "_chart_pinned_key_version", return_value=("1", "")):
+                run.side_effect = [_ok(versions), _ok(key), _ok(json.dumps({"bindings": []})), _ok(json.dumps({"bindings": []}))]
+                minter = checker.check_token_minter("kube-agents-evals-3", probe_app=False)
+            ids = {f.id: f.repair for f in minter.findings}
+            self.assertEqual(ids[f"token-minter/pinned-version/{state.lower()}"], checker.REPAIR_MINTER_ROTATION, state)
+            self.assertNotIn("token-minter/pinned-version/disabled", ids)
 
     def test_a_denied_project_read_is_unread_not_a_finding(self):
         with mock.patch.object(checker, "run_cmd", return_value=(1, "", "ERROR: PERMISSION_DENIED: caller lacks resourcemanager.projects.get")):
@@ -3725,9 +3737,12 @@ class FindingsCarryRepairsTest(unittest.TestCase):
         self.assertEqual((result.passed, result.read, result.findings), (True, False, []))
         result.check_id = "project_and_apis"
         self.assertEqual(checker.report_status(result), "unchecked")
+        # The refusal is an Unread, so the report's `unread` says what its status says.
+        self.assertTrue(any(isinstance(w, checker.Unread) for w in result.warnings), result.warnings)
 
 
 class TokenMinterKmsHalfTest(unittest.TestCase):
+
     def test_the_kms_half_never_signs_or_calls_github(self):
         versions = json.dumps([{"name": "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1", "state": "ENABLED"}])
         key = json.dumps({"purpose": checker.KMS_KEY_PURPOSE, "versionTemplate": {"algorithm": checker.KMS_KEY_ALGORITHM}, "importOnly": True})
