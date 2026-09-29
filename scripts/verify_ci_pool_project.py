@@ -3035,7 +3035,7 @@ def run_checks(
         run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))
     elif CHECK_TOKEN_MINTER_KMS in wanted:
         run(CHECK_TOKEN_MINTER_KMS, lambda: check_token_minter(project_id, app_id, location, probe_app=False))
-    return results
+    return sorted(results, key=lambda result: CHECK_IDS.index(result.check_id))
 
 
 def parse_checks(spec: Optional[str]) -> Optional[List[str]]:
