@@ -121,7 +121,10 @@ SANITIZER_REASON_STRIP = " \t\r-:"
 # key/value and e-mail patterns are deliberately absent: each matches ordinary
 # prose in a prompt ("the token the workload presents", an address in an
 # expected_output), and a check that reds prose is a check that gets escaped
-# by reflex. The value is the reader-facing name for the finding.
+# by reflex. The env-pair and URL-password patterns are absent too: they match
+# structure (an env list, `scheme://user:pw@`), which a fixture's sample
+# manifests and connection strings carry on purpose, not a token shape. The
+# value is the reader-facing name for the finding.
 REDACTOR_FILE = REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "common" / "redactor.py"
 REDACTOR_CLASS = "AuditRedactor"
 # The name the redactor module is registered under when loaded from its file;
@@ -136,6 +139,8 @@ CREDENTIAL_SHAPES: dict[str, str] = {
     "SLACK_TOKEN_PATTERN": "a Slack token",
     "JWT_PATTERN": "a JWT",
     "OPENAI_TOKEN_PATTERN": "an sk- API key",
+    "PREFIXED_SK_TOKEN_PATTERN": "an Anthropic or hyphenated OpenAI key",
+    "AWS_ACCESS_KEY_ID_PATTERN": "an AWS access key id",
 }
 
 # Cases that are neither in TASKS nor nightly-tiered, on purpose, for now.

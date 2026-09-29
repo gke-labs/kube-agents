@@ -42,8 +42,9 @@ so nothing credential-shaped leaves it and a chatty worker cannot make the exec
 output unbounded. The scrubber is the install's own ``AuditRedactor`` (the one
 the audit log and the LiteLLM gateway run every message through), loaded by
 path from the image (:data:`REDACTOR_PATH`), plus a supplement for what it does
-not cover: a Secret's JSON ``data`` object, the continuation lines of a block
-scalar under ``data:``, and userinfo in a URL. Blanking is by shape, not by ``kind``: a ConfigMap's
+not cover: a JSON ``data`` object in text that names no Secret or that is cut
+short, and URL userinfo for images whose redactor predates its URL rule (the
+pattern matches the redactor's, so the two agree). Blanking is by shape, not by ``kind``: a ConfigMap's
 ``data:`` is blanked as a Secret's is, the call the redactor documents as the
 safe direction to err in. A pod whose redactor cannot be loaded withholds every
 result and argument rather than sending them unscrubbed; the call names, tags
@@ -198,16 +199,19 @@ TOKEN_COLUMNS = (
 # What AuditRedactor leaves behind in the text a worker reads. In a Secret
 # payload: the continuation lines of a block scalar under data:/stringData:
 # (its line scan blanks key: value pairs only), and the JSON form,
-# "data": {...}, closed or cut short. In free text: userinfo in a URL, which
-# it has no pattern for, and a `NAME: value` / `NAME=value` line whose name
-# its key-based walk would blank in a mapping but its text pattern does not
-# (`AWS_SECRET_ACCESS_KEY:` in a `kubectl describe pod`, `client-key-data:`
-# in a kubeconfig) -- the name test reuses the redactor's own key vocabulary.
+# "data": {...}, in text that names no Secret or cut short. In free text:
+# userinfo in a URL, for images whose redactor predates its URL rule (same
+# character classes, so the password runs to the last `@`), and a
+# `NAME: value` / `NAME=value` line whose name its key-based walk would blank
+# in a mapping but its text pattern does not (`DB_CREDENTIALS:` in a
+# `kubectl describe pod`), plus the `*-key-data` / `*-certificate-data` names
+# neither blanks (`client-key-data:` in a kubeconfig), which KEY_DATA_WORDS
+# adds.
 YAML_BLOCK_RE = re.compile(r"^(\s*)(data|stringData)\s*:\s*$")
 YAML_PAIR_RE = re.compile(r"^(\s*)([^\s:]+)\s*:\s*(.*)$")
 JSON_BLOCK_RE = re.compile(r'("(?:data|stringData)"\s*:\s*\{)([^{}]*)(\}|\Z)')
 JSON_PAIR_RE = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)')
-URL_USERINFO_RE = re.compile(r"(://[^\s/:@]+:)[^\s/@]+(?=@)")
+URL_USERINFO_RE = re.compile(r"(://[^\s:/?#@\[\]\"'<>{}\\|^`,;]*:)[^\s/?#\[\]\"'<>{}\\|^`,;]+(?=@)")
 # The separator stays on the line, so `Environment:` above an indented env
 # line does not swallow it; the value is the rest of the line, the safe side.
 TEXT_KV_RE = re.compile(r"(?m)(?<![\w.\-/\"])([\w.\-]+)([ \t]*[:=][ \t]*)([^\n]+)")
