@@ -6922,9 +6922,10 @@ class DomainScopedFlagsTest(unittest.TestCase):
         standing. Telling that operator their audit records are about to be
         deleted is how a warning gets discounted.
 
-        load_install_env is the route the value travels: it sources the file
-        with `set -a`, which is what puts the line in the environment the guard
-        reads.
+        The guard reads the line out of the file. load_install_env is called
+        anyway because main() calls it first and its `set -a` puts the same
+        value in the environment: the real call order is the one where the two
+        sources agree, and the test below is the one where they do not.
         """
         with tempfile.TemporaryDirectory() as tmp:
             destination = pathlib.Path(tmp) / "existing.env"
@@ -6967,6 +6968,34 @@ class DomainScopedFlagsTest(unittest.TestCase):
             self.assertIn("keeps the Log Router sink", combined)
             self.assertNotIn("destroys", combined)
             self.assertNotIn("a later run without it writes neither", combined)
+
+    def test_an_exported_tf_var_ingress_is_still_reported_as_destroyed(self):
+        """The environment is not the file, and only the file survives the run.
+
+        An operator who provisioned the ingress with
+        `TF_VAR_enable_drift_pubsub=true ./install.sh` and recorded nothing has
+        the variable in this shell, indistinguishable from the sourced line --
+        nothing unsets TF_VAR_* between the two. But their next upgrade.sh from
+        a clean shell has neither the export nor a tfvars key, so
+        write_tfvars_from_state omits both, enable_drift_pubsub falls to its
+        false default, and the apply destroys the sink, topic and subscription
+        with the records retained there. A guard reading the environment would
+        promise that operator the opposite, and cite a line their install.env
+        does not contain.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=false\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"TF_VAR_enable_drift_pubsub": "true"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("the apply destroys", combined)
+            self.assertNotIn("keeps the Log Router sink", combined)
 
     def test_turning_it_off_over_a_file_that_never_asked_says_nothing(self):
         """Nothing diverges, so the destroyed-ingress line would be a lie.

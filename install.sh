@@ -1646,12 +1646,24 @@ bootstrap_install_env_file() {
     # to the ingress before this key existed. write_tfvars_from_state omits both
     # drift keys rather than writing false precisely so that line keeps working,
     # and a tfvars key beats TF_VAR_, so dropping them there stops the detector
-    # and leaves the sink, topic and subscription standing. install.env has been
-    # sourced with `set -a` by the time this runs, so the line is in this
-    # shell's environment and can be read. Telling that operator their audit
-    # records are about to be deleted is how a warning gets discounted, and this
-    # is the population most likely to try the new key.
-    if is_truthy "${TF_VAR_enable_drift_pubsub:-false}"; then
+    # and leaves the sink, topic and subscription standing. Telling that
+    # operator their audit records are about to be deleted is how a warning gets
+    # discounted, and this is the population most likely to try the new key.
+    #
+    # Read from the file, not from the environment. install.env has been sourced
+    # with `set -a` by the time this runs, so the value is in this shell either
+    # way and the two are indistinguishable there -- and nothing unsets TF_VAR_*
+    # (bootstrap_install_env clears only the SCOPE_ keys). Only the file line
+    # survives the next run: an operator who provisioned the ingress with
+    # `TF_VAR_enable_drift_pubsub=true ./install.sh` and recorded nothing has an
+    # upgrade.sh from a clean shell that regenerates tfvars with neither key,
+    # falls to the variable's false default and destroys the trio. Reading the
+    # environment would promise that operator the sink survives, and name a line
+    # in their install.env that is not there. This function never rewrites an
+    # existing file, so a line read here is a line that is still there after.
+    local drift_ingress_recorded
+    drift_ingress_recorded="$(recorded_install_env_value "$destination" TF_VAR_enable_drift_pubsub 2>/dev/null || true)"
+    if is_truthy "${drift_ingress_recorded:-false}"; then
       if [ -n "$drift_detector_turning_off" ]; then
         drift_detector_consequence="This run writes neither drift tfvars key, so it stops the detector now; the TF_VAR_enable_drift_pubsub line in ${destination} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads. A later run without the flag re-reads the file and starts the detector again."
       else
