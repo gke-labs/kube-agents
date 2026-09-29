@@ -199,6 +199,9 @@ resource "null_resource" "sweep" {
       sweep_id() {
         agent sh -c 'sed -n "s/^task_id=//p" ${local.home}/.bootstrap_scan_filed 2>/dev/null; true' || true
       }
+      # Unlike the destroy's copy, a failed rm fails the apply: the sandbox's
+      # /opt/data outlives its pod, and a report left there makes the sweep
+      # skip discovery (agents/platform/governance/inventory.md).
       clear_inventory() {
         for pod in $(kubectl get pods -n "${var.agent_namespace}" -l "${var.sandbox_selector}" -o name); do
           kubectl exec -n "${var.agent_namespace}" "$pod" -c "${var.sandbox_container}" -- rm -f ${local.inventory}
