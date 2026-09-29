@@ -348,6 +348,15 @@ class EntryPoint(ScanHarness):
         self.assertFalse((self.workdir.parent / "evals-2").exists(), "nothing was created beside it")
         self.assertTrue(pool_state.PROJECT_ID_RE.match("kube-agents-evals-35"))
 
+    def test_a_verifier_that_cannot_be_started_is_not_checked_not_a_dead_scan(self):
+        # Whatever the spawn raises (a fork that fails under load, an
+        # interpreter that cannot be executed) is that project's reason.
+        def cannot_fork(argv, **kwargs):
+            raise PermissionError(13, "Permission denied", argv[0])
+        entry = pool_state.scan_project(PROJECT, ["iam"], self.root / "work", 5.0, verifier_script=self.stub, runner=cannot_fork)
+        self.assertTrue(entry["error"].startswith("scripts/verify_ci_pool_project.py could not be run: PermissionError"), entry["error"])
+        self.assertEqual(entry["checks"]["iam"]["state"], "not_checked")
+
     def test_a_repeated_project_id_is_scanned_once(self):
         # Two workers on one report file would race; the door keeps one.
         self.world.write_text(json.dumps({PROJECT: report()}), encoding="utf-8")

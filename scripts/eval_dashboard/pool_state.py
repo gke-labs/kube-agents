@@ -29,8 +29,8 @@ project).
 
 The project list is `gitops_repo_for_project()` in hack/ci-deploy.sh, read
 the way fixture_state.py reads it. Nothing here fails the bot's run: a
-missing gcloud, a verifier that timed out, a project the bot cannot read are
-each "not checked" with a reason, exit 0. Only a repository bug (no mapping,
+missing gcloud, a verifier that timed out or could not be started, a project
+the bot cannot read are each "not checked" with a reason, exit 0. Only a repository bug (no mapping,
 no verifier) exits 1.
 
 Run:  python3 scripts/eval_dashboard/pool_state.py --out pool-state.json [--prior pool-state.json]
@@ -124,6 +124,7 @@ REASON_CHECK_UNCHECKED = "the verifier could read nothing about this item"
 REASON_WORKDIR = "the scan could not prepare a work directory for this project: {error}"
 REASON_REPORT_UNREADABLE = "scripts/verify_ci_pool_project.py exited {rc} and its report could not be read: {error}"
 REASON_PROJECT_PLACEHOLDER = "<project>"
+REASON_VERIFIER_UNRUNNABLE = "scripts/verify_ci_pool_project.py could not be run: {error}"
 # What `--projects` admits: the mapping row's shape in hack/ci-deploy.sh, at
 # GCP's 30-character cap. An id is also a directory name under the work
 # directory, so nothing with a path in it, or too long for one, gets that far.
@@ -197,25 +198,25 @@ def from_report(report: dict, checks: tuple[str, ...] | list[str]) -> tuple[dict
         if record is None:
             checks_out[check] = {KEY_STATE: CHECK_NOT_CHECKED, KEY_DETAIL: [REASON_NO_REPORT]}
             continue
-        state = REPORT_STATUS_TO_STATE.get(str(record.get("status")), CHECK_NOT_CHECKED)
+        state = REPORT_STATUS_TO_STATE.get(str(record.get(verifier.REPORT_KEY_STATUS)), CHECK_NOT_CHECKED)
         if state == CHECK_DRIFTED:
-            detail = _lines(record, "details") or [str(record.get("message") or "")]
+            detail = _lines(record, verifier.REPORT_KEY_DETAILS) or [str(record.get(verifier.REPORT_KEY_MESSAGE) or "")]
         elif state == CHECK_NOT_CHECKED:
-            detail = _lines(record, "warnings") or [REASON_CHECK_UNCHECKED]
+            detail = _lines(record, verifier.REPORT_KEY_WARNINGS) or [REASON_CHECK_UNCHECKED]
         else:
-            detail = _lines(record, "warnings")
+            detail = _lines(record, verifier.REPORT_KEY_WARNINGS)
         checks_out[check] = {KEY_STATE: state, KEY_DETAIL: detail}
         if state in (CHECK_HEALTHY, CHECK_DRIFTED):
-            checks_out[check][KEY_UNREAD] = _lines(record, KEY_UNREAD)
+            checks_out[check][KEY_UNREAD] = _lines(record, verifier.REPORT_KEY_UNREAD)
         if state == CHECK_DRIFTED:
-            listed = record.get("findings")
+            listed = record.get(verifier.REPORT_KEY_FINDINGS)
             for finding in listed if isinstance(listed, list) else []:
-                if not isinstance(finding, dict) or not finding.get("id"):
+                if not isinstance(finding, dict) or not finding.get(verifier.FINDING_KEY_ID):
                     continue
-                findings[str(finding["id"])] = {
+                findings[str(finding[verifier.FINDING_KEY_ID])] = {
                     KEY_CHECK: check,
-                    KEY_DETAIL: [str(finding.get("observed") or "")],
-                    KEY_REPAIR: str(finding.get("repair") or ""),
+                    KEY_DETAIL: [str(finding.get(verifier.FINDING_KEY_OBSERVED) or "")],
+                    KEY_REPAIR: str(finding.get(verifier.FINDING_KEY_REPAIR) or ""),
                 }
     return checks_out, findings
 
@@ -257,19 +258,23 @@ def scan_project(
     except OSError as exc:
         reason = REASON_WORKDIR.format(error=exc)
         return _project_entry(_all_checks(checks, CHECK_NOT_CHECKED, [reason]), {}, started, reason)
-    rc, _, err = _run(
-        [
-            sys.executable, str(verifier_script),
-            "--project-id", project,
-            "--checks", ",".join(checks),
-            "--location", location,
-            "--report", str(report),
-            "--deadline-seconds", str(verifier_deadline(timeout)),
-        ],
-        dict(environ),
-        timeout,
-        runner,
-    )
+    try:
+        rc, _, err = _run(
+            [
+                sys.executable, str(verifier_script),
+                "--project-id", project,
+                "--checks", ",".join(checks),
+                "--location", location,
+                "--report", str(report),
+                "--deadline-seconds", str(verifier_deadline(timeout)),
+            ],
+            dict(environ),
+            timeout,
+            runner,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the contract above: a reason, never a dead scan
+        reason = REASON_VERIFIER_UNRUNNABLE.format(error=f"{type(exc).__name__}: {exc}")
+        return _project_entry(_all_checks(checks, CHECK_NOT_CHECKED, [reason]), {}, started, reason)
     if rc == EXIT_TIMED_OUT:
         reason = REASON_VERIFIER_TIMEOUT.format(seconds=int(timeout))
         return _project_entry(_all_checks(checks, CHECK_NOT_CHECKED, [reason]), {}, started, reason)

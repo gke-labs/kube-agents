@@ -1102,6 +1102,7 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
         "read": {},
         "checked": 0,
         "total": 0,
+        "scanned": [],
         "reason": None,
         "evidence": [],
     }
@@ -1113,6 +1114,7 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     out["scanned_at"] = scanned_at
     projects = state_doc.get(module.KEY_PROJECTS)
     out["total"] = len(projects) if isinstance(projects, dict) else 0
+    out["scanned"] = sorted(projects) if isinstance(projects, dict) else []
     out["checked"] = module.checked_projects(state_doc)
     out["unread_units"] = module.unread_units(state_doc)
     if scanned_at is None or now - scanned_at > FIXTURE_STATE_MAX_AGE:
@@ -1937,9 +1939,13 @@ def _scan_hold(scan_result: dict, incident: dict | None, label: str) -> str | No
     roles = set(incident.get("roles") or [])
     reads = incident.get("reads") if isinstance(incident.get("reads"), dict) else None
     read = scan_result.get("read") or {}
+    # A project the scan no longer lists has left the pool mapping; it is not
+    # waited on, or an incident on a retired project would hold forever.
+    scanned = set(scan_result.get("scanned") or [])
+    waiting = [project for project in incident.get("projects") or [] if not scanned or project in scanned]
     unread = sorted(
         project
-        for project in incident.get("projects") or []
+        for project in waiting
         if not set(reads.get(project, roles) if reads is not None else roles) <= set(read.get(project, []))
     )
     if unread:
@@ -1950,11 +1956,7 @@ def _scan_hold(scan_result: dict, incident: dict | None, label: str) -> str | No
     # the scan itself.
     current = scan_result.get("current") or {}
     failing = scan_result.get("failing") or {}
-    still = sorted(
-        project
-        for project in incident.get("projects") or []
-        if _units_still_shown(roles, current.get(project) or [], failing.get(project) or [])
-    )
+    still = sorted(project for project in waiting if _units_still_shown(roles, current.get(project) or [], failing.get(project) or []))
     if still:
         return f"the {label} scan still shows the drift on {_project_list(still)}"
     return None

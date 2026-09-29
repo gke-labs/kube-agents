@@ -411,6 +411,23 @@ class GkeAndCmekTest(unittest.TestCase):
         self.assertFalse(any("Missing GKE cluster" in d for d in result.details), result.details)
         self.assertIn("not checked", result.message)
 
+    def test_a_partial_cluster_listing_is_unread_not_missing_clusters(self):
+        # gcloud lists the zones that answered and warns about the one that did
+        # not, exit 0; a cluster absent from that list was not seen missing.
+        clusters = f"{checker.HOST_CLUSTER}\tENCRYPTED\nseeded-a\tENCRYPTED"
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                (0, clusters, "WARNING: The following zones did not respond: us-central1-a. List results may be incomplete."),
+                _ok("bucket"),
+            ]
+            result = checker.check_gke_and_state("kube-agents-evals-3")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual([f.id for f in result.findings if f.id.startswith("gke/cluster/")], [])
+        unread = [w for w in result.warnings if isinstance(w, checker.Unread)]
+        self.assertEqual(len(unread), 1, result.warnings)
+        self.assertIn("did not respond", unread[0])
+        self.assertIn("not checked", result.message)
+
     def test_cluster_list_failing_for_another_reason_still_fails(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [

@@ -108,6 +108,22 @@ REPORT_STATUS_UNCHECKED = "unchecked"
 # A failing check that named no finding of its own still reports one, under
 # this id, so nothing a check found is lost from the document.
 REPORT_FINDING_FAILED = "failed"
+# The report's field names, read back by scripts/eval_dashboard/pool_state.py.
+REPORT_KEY_NAME = "name"
+REPORT_KEY_STATUS = "status"
+REPORT_KEY_MESSAGE = "message"
+REPORT_KEY_DETAILS = "details"
+REPORT_KEY_WARNINGS = "warnings"
+REPORT_KEY_UNREAD = "unread"
+REPORT_KEY_FINDINGS = "findings"
+FINDING_KEY_ID = "id"
+FINDING_KEY_OBSERVED = "observed"
+FINDING_KEY_REPAIR = "repair"
+# How much of a KMS error the console line keeps.
+KMS_ERROR_TAIL_CHARS = 160
+# gcloud lists what answered and warns about the zones that did not, exit 0:
+# a cluster absent from that list was not seen missing.
+PARTIAL_LISTING_RE = re.compile(r"did not respond|may be incomplete", re.I)
 # A repair the reader has to confirm before running: it takes something away.
 REPAIR_CONFIRM_PREFIX = "# confirm first: "
 # Repairs that are a procedure, by runbook section. None names
@@ -515,7 +531,7 @@ class Finding:
         self.repair = repair
 
     def as_dict(self) -> dict:
-        return {"id": self.id, "observed": self.observed, "repair": self.repair}
+        return {FINDING_KEY_ID: self.id, FINDING_KEY_OBSERVED: self.observed, FINDING_KEY_REPAIR: self.repair}
 
 
 class CheckResult:
@@ -1829,6 +1845,12 @@ def check_gke_and_state(project_id: str) -> CheckResult:
             warnings,
         ):
             passed = False
+    elif PARTIAL_LISTING_RE.search(err or ""):
+        partial = next((line.strip() for line in err.splitlines() if PARTIAL_LISTING_RE.search(line)), err.strip())
+        warnings.append(Unread(
+            f"Could not list all the clusters in {project_id} ({partial}), so neither the four expected "
+            f"clusters nor {HOST_CLUSTER}'s CMEK state was checked"
+        ))
     else:
         clusters_checked = True
 
@@ -2804,7 +2826,7 @@ def check_token_minter(
     if rc != 0:
         if not _record_unreadable(
             err,
-            f"Cloud KMS key {key} in keyring {keyring} ({location}) not found or error: {err.strip()[:160]}",
+            f"Cloud KMS key {key} in keyring {keyring} ({location}) not found or error: {err.strip()[:KMS_ERROR_TAIL_CHARS]}",
             f"Could not list the versions of KMS key {key} in keyring {keyring} ({location}), so whether "
             "the App PEM has been imported was not checked",
             details,
@@ -3253,13 +3275,13 @@ def report_document(project_id: str, checks: List[CheckResult], now: Optional[da
             observed = "; ".join([check.message, *check.details]).strip("; ")
             findings = [Finding(f"{check_id}/{REPORT_FINDING_FAILED}", observed).as_dict()]
         out[check_id] = {
-            "name": check.name,
-            "status": status,
-            "message": check.message,
-            "details": list(check.details),
-            "warnings": list(check.warnings),
-            "unread": [w for w in check.warnings if isinstance(w, Unread)],
-            "findings": findings,
+            REPORT_KEY_NAME: check.name,
+            REPORT_KEY_STATUS: status,
+            REPORT_KEY_MESSAGE: check.message,
+            REPORT_KEY_DETAILS: list(check.details),
+            REPORT_KEY_WARNINGS: list(check.warnings),
+            REPORT_KEY_UNREAD: [w for w in check.warnings if isinstance(w, Unread)],
+            REPORT_KEY_FINDINGS: findings,
         }
     return {
         "schema_version": REPORT_SCHEMA_VERSION,

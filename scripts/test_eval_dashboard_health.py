@@ -2444,6 +2444,22 @@ class PoolDrift(unittest.TestCase):
         self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
         self.assertTrue(any(f"still shows the drift on {project(2)}" in line for line in held["evidence"]), held["evidence"])
 
+    def test_a_project_retired_from_the_mapping_no_longer_holds_the_incident(self):
+        # An incident's project removed from hack/ci-deploy.sh is absent from
+        # every later document; it is not "unread" forever, and the exit
+        # asks only about the projects the scan still lists.
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        clean = pool_scan(at=later - timedelta(minutes=5), previous={project(i): [FINDING] for i in (1, 2, 3)})
+        del clean["projects"][project(2)]
+        self.assertEqual(self.judge(clean, prev=prev, now=later)["condition"], None)
+        # ...while a project that is listed and unread still holds it.
+        blind = pool_scan(at=later - timedelta(minutes=5), checked={project(i) for i in range(1, 31)} - {project(3)}, previous={project(i): [FINDING] for i in (1, 2, 3)})
+        del blind["projects"][project(2)]
+        held = self.judge(blind, prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"]), ("DEGRADED", "pool_drift"))
+
     def test_a_fixture_incident_recorded_before_reads_existed_still_exits_on_its_roles(self):
         # The live health.json at merge time may hold a fixture_drift incident
         # without `reads`; the exit then asks for the roles themselves.
