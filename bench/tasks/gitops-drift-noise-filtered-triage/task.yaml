@@ -151,16 +151,39 @@
 # alone would pass for that agent. Forbidding the two churned workloads is what
 # distinguishes a report the pipeline filtered from a report the agent wrote.
 #
-# WHY THE HUMAN CHANGE IS NOT THE NEWEST ONE
+# WHY THE HUMAN CHANGE IS THE FIRST ONE
 #
-# The churn continues after it, deliberately. The prompt tells the agent to
-# take the most recent card concerning either namespace — the status filter and
-# the "most recent" instruction are inherited from the sibling, where a bare
-# kanban_list pages oldest-first and misses the newest — so if the pipeline
-# filtered nothing, the newest card would be controller churn and the agent
-# would reproduce that instead. The objectives below then fail on both halves
-# at once: eval-drift-payments-api absent, a churned workload present. A
-# filter that silently stopped working reds rather than passing on a coincidence.
+# The churn continues after it — all eleven records of it, deliberately. The
+# prompt tells the agent to take the most recent card concerning either
+# namespace — the status filter and the "most recent" instruction are inherited
+# from the sibling, where a bare kanban_list pages oldest-first and misses the
+# newest — so if the pipeline filtered nothing, the newest card would be
+# controller churn and the agent would reproduce that instead. The objectives
+# below then fail on both halves at once: eval-drift-payments-api absent, a
+# churned workload present. A filter that silently stopped working reds rather
+# than passing on a coincidence.
+#
+# First, rather than merely somewhere before the last of the churn, and the
+# reason is the quota. _inject_drift claims DRIFT_QUOTA_KEY per record and a
+# suppressed record files no card (BLOCKER 2), so an unfiltered pipeline files
+# cards for the first Q arrivals and no more, where Q is what is left of the
+# ceiling when the repetition starts. The newest card is then arrival Q, not
+# the last record published — and on the repetition where the human record's
+# arrival position is Q, the newest card is the human one, both phrase
+# objectives pass, and the run the case exists to red is recorded as green.
+# Putting the human record first narrows that window to Q = 1 and turns it
+# into one condition the unpark has to meet: at least two slots of the drift
+# bucket left per repetition, so a broken filter always files at least one
+# churn card after the human one. The ALERT_DAILY_LIMIT_DRIFT raise BLOCKER 2
+# already owes is what supplies them, and this is a second reason to size the
+# headroom rather than to clear six exactly.
+#
+# Arrival position, not publish position. The subscription carries no ordering
+# key — terraform/modules/drift-pubsub/main.tf says so where it explains why
+# there is no dead-letter policy — so the fixture cannot lean on Pub/Sub to
+# deliver in the order it published. It has to space the human record far
+# enough ahead of the burst that its delivery cannot be overtaken, which is
+# what the pacing bullet below asks for.
 #
 # This is also why the prompt names both namespaces rather than only the one
 # holding the human change. Scoping the search to that namespace would tell the
@@ -203,9 +226,23 @@
 #   topic for the detector to pull and classify. They have to parse as the
 #   Cloud Audit Log entries the detector expects and to name the objects the
 #   stack actually planted, because the managedFields join reads those objects.
-# - Pacing: the human change lands before the last of the churn (see above),
-#   and the whole burst early enough that the card is filed before the prompt
-#   turn begins.
+# - Two fields beyond the object reference decide whether that join runs at
+#   all, and neither is inferable from the sentence above.
+#   resource.labels.project_id, .location and .cluster_name have to name the
+#   HOST cluster: parseAuditEntry takes the record's cluster identity from
+#   them (audit.go), the joiner looks that identity up in its credentials map
+#   (join.go), and a record naming a cluster it holds no credentials for is
+#   forwarded without ownership — which the daemon renders as "Field
+#   ownership: not read" and which leaves the report nothing to name
+#   argocd-controller and kubectl-edit from, the third thing expected_output
+#   requires. The detector's own testdata captures all say
+#   example-project/us-central1/prod-1, so they cannot be copied as they
+#   stand. And every record needs its own insertId: it is what the detector
+#   deduplicates on (audit.go) and what the ledger row carries as object_uid.
+# - Pacing: the human record is published first, far enough ahead of the burst
+#   that its delivery cannot be overtaken (see above); the eleven churn
+#   records follow; and the whole burst lands early enough that the card is
+#   filed before the prompt turn begins.
 #
 # Isolation class: namespace-scoped — both namespaces are the case's own.
 # Eligible tier: nightly.
