@@ -269,18 +269,21 @@ the sixth once `main` sits near 0.94. The measurement and the two-proportion alt
 
 **It is advisory until armed, and arming is one line in Prow.** With `EVAL_AGGREGATE_ARMED`
 unset — the script's default, pinned by `bench/tests/test_gate.py` — a rate below the margin is a
-note in the verdict, not a red. To arm it, add to `pull-kube-agents-smoke-test`'s `env:` in
-`prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml` of
-`GoogleCloudPlatform/oss-test-infra`, beside the existing `EVAL_BASELINE_STORE` entry:
+note in the verdict, not a red. To arm it, add one line to `pull-kube-agents-smoke-test`'s
+script in `prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml` of
+`GoogleCloudPlatform/oss-test-infra`, beside the existing `export EVAL_BASELINE_STORE=...` line
+(the job has no `env:` block; every `EVAL_*` setting is an `export` in its `bash -c` script):
 
-```yaml
-- name: EVAL_AGGREGATE_ARMED
-  value: "1"
+```bash
+export EVAL_AGGREGATE_ARMED="1"
 ```
 
 Nothing in this repository changes for the flip, and the same line removed disarms it. The nightly
 periodic does not get the line: it records `main` and grades itself against a window that already
-holds its own night, so its aggregate is a report, never a gate.
+holds its own night, so its aggregate is a report, never a gate. Revisit the margin when `main`'s
+window rate passes 0.96 (at that point 0.10 starts redding five failed repetitions, which the
+sample contains); the eval dashboard's Trend page draws that window from the same store, per case
+and per domain, so it is the place to watch for it.
 
 **What an author sees when it fires.** No case is marked blocking; the failures are spread. The
 job's final log line is the ordinary `PR Smoke Test Evaluation Failed -- see .../eval-verdict.md`,

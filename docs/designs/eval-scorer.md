@@ -247,8 +247,8 @@ times to produce one.
 The 0.05 the rule shipped with was a guess, and the issue that shipped it
 ([#1493](https://github.com/gke-labs/kube-agents/issues/1493)) said to arm it only after measuring
 how much an unchanged pull request moves the aggregate. Measured on 2026-09-29, read-only, from
-two sources; the full tables, recounted from the store, are in the run's measurement note beside
-the pull request that recorded this section.
+two sources. The summary tables are below; the full measurement, including the 94-row table of
+every presubmit run counted, is in the pull request that set the margin (PR #TBD).
 
 **What is compared to what.** The pull request's side is every admitted case's scored
 repetitions pooled: twelve roster cases × three repetitions = 36 units, `infra` and `blocked`
@@ -301,7 +301,7 @@ failed repetitions.
 
 | margin                       | reds in the sample              | headroom over the worst run | failed reps tolerated at `main` = 0.924 / 0.94 / 0.96 |
 | ---------------------------- | ------------------------------- | --------------------------- | ----------------------------------------------------- |
-| 0.05 (shipped)               | #2100; the 09-27→28 night pair  | none                        | 4 / 4 / 3                                             |
+| 0.05 (shipped)               | #2100; the 09-27→28 night pair  | none                        | 4 / 3 / 3                                             |
 | 0.07 (smallest)              | none                            | 0.007, a quarter of a unit  | 5 / 4 / 3                                             |
 | **0.10**                     | none                            | 0.037, more than one unit   | 6 / 5 / 5                                             |
 | two-proportion, one-sided 5% | none (largest z 1.26, on #2100) | —                           | 5 / 4 / 3                                             |
@@ -313,9 +313,10 @@ and reds the seventh today, the sixth from about 0.934. Priced as a false-red ra
 independent repetitions: at the presubmit's own failure rate (116/3348 = 0.035) seven of 36 is
 about one run in five thousand; at the nightly's window rate (0.076) about one in fifty-five. The
 two-proportion test reds nothing in the sample either and sits one failed repetition stricter at
-every window; it is the right replacement when the roster or the repetition count changes, and
-the flat margin stays for now because the verdict line prints it and a reader can check it by
-hand. Revisit the number when `main`'s window rate passes 0.96 or the roster leaves twelve.
+today's window, two at 0.96; it is the right replacement when the roster or the repetition count
+changes, and the flat margin stays for now because the verdict line prints it and a reader can
+check it by hand. Revisit the number when `main`'s window rate passes 0.96 or the roster leaves
+twelve.
 
 Every threshold above is a named constant read from the environment. All of them are starting
 points, to be tuned by running the suite against `main` and setting the bars above the observed
