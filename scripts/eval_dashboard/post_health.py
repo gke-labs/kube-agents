@@ -223,9 +223,11 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # message that says the scan is blind.
 FIXTURE_SCAN_DOC = "docs/ci-health.md"
 FIXTURE_RECONCILE_HINT = "Fleet owner: re-apply bench/tf/fleet in the projects named."
-# The pool-state scan's message: the issue carries the exact command per
-# project, so the space is told where to look rather than what to type.
-POOL_REPAIR_HINT = "Pool owner: the tracking issue carries the repair command per project."
+# The pool-state scan's message: the scan's document always carries the exact
+# command per project, and the bot's own issue does when it filed one (an
+# adopted human issue, or a failed filing, does not), so the space is told
+# where to look rather than what to type.
+POOL_REPAIR_HINT = "Pool owner: the repair command per project is in pool-state.json (docs/ci-health.md, The pool-state scan) and in the bot's tracking issue when it filed one."
 
 # Rule 8 sends the reader somewhere. The build cluster is named by its real
 # identifiers because `build-kube-agents` is Prow's context alias for it
@@ -703,7 +705,7 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
     elif condition == CONDITION_POOL_DRIFT:
         tag = issue_tag(issue)
         tracking = f" Tracking {tag}." if tag else ""
-        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Retest once the pool owner has run the repair the tracking issue carries. {POOL_REPAIR_HINT}{tracking}"]
+        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Retest once the pool owner has run the repair. {POOL_REPAIR_HINT}{tracking}"]
     else:
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours died before any test ran, retest."]
     lines.append(incident_link(health))

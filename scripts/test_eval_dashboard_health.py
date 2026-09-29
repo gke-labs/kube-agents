@@ -2348,7 +2348,7 @@ class PoolDrift(unittest.TestCase):
         self.assertEqual(
             result["advice"],
             f"A 403 or a missing-resource red from a run that leased {project(1)} is the pool project's shape, not your change"
-            f" ({FINDING}); retest once the pool owner has run the repair the tracking issue carries.",
+            f" ({FINDING}); retest once the pool owner has run the repair, which pool-state.json names per project.",
         )
 
     def test_three_projects_in_one_scan_degrade_and_two_do_not(self):

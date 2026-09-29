@@ -501,7 +501,7 @@ ADVICE_FIXTURE_DRIFT = (
 )
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
-    " ({findings}); retest once the pool owner has run the repair the tracking issue carries."
+    " ({findings}); retest once the pool owner has run the repair, which pool-state.json names per project."
 )
 ADVICE_CEILING = (
     "Retest once workers are finishing again; those runs read NOT EVALUATED, not red."

@@ -107,10 +107,11 @@ KEY_REPAIR = "repair"
 # check counting as read in full; a refused read does, whichever way the
 # check's other reads came out.
 KEY_UNREAD = "unread"
-# The verifier stops starting checks this far before the scan's per-project
-# ceiling, leaving room for one read to hang to the verifier's own limit, so
-# the report keeps every verdict the run reached instead of being killed.
-DEADLINE_MARGIN_S = 10
+# The verifier's deadline sits this far inside the scan's per-project
+# ceiling: past it the verifier starts no check and cuts every command short,
+# so the report is written with every verdict the run reached, with this much
+# left for the process to start and the report to be written.
+DEADLINE_MARGIN_S = 30
 
 # Reasons written when a whole project could not be checked.
 REASON_NO_BINARY = "{binary} is not on PATH, so nothing was checked"
@@ -204,7 +205,7 @@ def from_report(report: dict, checks: tuple[str, ...] | list[str]) -> tuple[dict
 
 def verifier_deadline(timeout: float) -> int:
     """Seconds into the run after which the verifier starts no more checks."""
-    return max(1, int(timeout) - verifier.DEFAULT_TIMEOUT_SECONDS - DEADLINE_MARGIN_S)
+    return max(1, int(timeout) - DEADLINE_MARGIN_S)
 
 
 def scan_project(

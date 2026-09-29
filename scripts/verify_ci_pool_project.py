@@ -162,6 +162,11 @@ DEFAULT_TIMEOUT_SECONDS = 120
 # the pool-state scan runs the verifier under its own per-project ceiling and
 # would otherwise lose every finished check's verdict to one hung read.
 DEADLINE_PASSED = "the run's deadline passed before this check"
+# The run's deadline as a time.monotonic() value, set by verify_project from
+# --deadline-seconds and read by run_cmd: every command after it is cut to
+# the time left and returns 124 at once once none is, so a stall inside a
+# check cannot carry the run past a caller's ceiling either.
+_RUN_DEADLINE: Optional[float] = None
 
 REQUIRED_APIS = {
     # bench/tf/fleet declares google_compute_disk (the planted orphan-pd-* the
@@ -514,6 +519,11 @@ def run_cmd(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     env: Optional[dict] = None,
 ) -> Tuple[int, str, str]:
+    if _RUN_DEADLINE is not None:
+        remaining = _RUN_DEADLINE - time.monotonic()
+        if remaining <= 0:
+            return 124, "", f"timed out after 0s: {' '.join(cmd)} ({DEADLINE_PASSED})"
+        timeout = min(timeout, max(1, int(remaining)))
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
@@ -3212,8 +3222,10 @@ def verify_project(
     report_path: Optional[Path] = None,
     deadline_seconds: Optional[float] = None,
 ) -> int:
+    global _RUN_DEADLINE
     selected = checks if checks is not None else list(DEFAULT_CHECKS)
     deadline = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
+    _RUN_DEADLINE = deadline
     blockers = check_toolchain(needs_gh=bool(GITHUB_CHECKS.intersection(selected)))
     if blockers:
         print("\n" + "=" * 80)

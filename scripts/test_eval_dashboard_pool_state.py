@@ -223,9 +223,10 @@ class WhatNeverFailsTheBot(ScanHarness):
         self.assertTrue(all(verdict["state"] == "not_checked" for verdict in entry["checks"].values()))
 
     def test_the_verifier_gets_a_deadline_inside_the_scans_ceiling(self):
-        # One hung read (the verifier's 120 s) must not cost the whole report:
-        # the verifier stops starting checks 130 s before the scan's ceiling.
-        self.assertEqual(pool_state.verifier_deadline(300), 170)
+        # A stall must not cost the whole report: past the deadline the
+        # verifier starts no check and cuts every command short, 30 s inside
+        # the scan's ceiling.
+        self.assertEqual(pool_state.verifier_deadline(300), 270)
         self.assertEqual(pool_state.verifier_deadline(20), 1)
         self.scan({PROJECT: report()})
         argv = self.calls()[0]
@@ -331,11 +332,14 @@ class Workflow(unittest.TestCase):
         self.assertIn('--project-timeout "$POOL_STATE_PROJECT_TIMEOUT_S"', run)
         self.assertIn('timeout "$POOL_STATE_TIMEOUT_S"', run)
         self.assertEqual(steps[fleet].get("id"), "fleet_scan")
+        fleet_upload = next(step for step in steps if "cp work/fixture-state.json" in step.get("run", ""))
+        self.assertEqual(fleet_upload.get("id"), "fleet_upload")
         for step in (steps[scan], steps[scan - 1], steps[scan + 1]):
-            # The one failure the pool steps run through is the fleet scan's;
-            # `always()` or `!cancelled()` would also run them after an auth
-            # or setup failure, with no credential and no work directory.
-            self.assertEqual(step.get("if"), "${{ success() || steps.fleet_scan.outcome == 'failure' }}", f"{step.get('name')} must run whether or not the fleet scan's step failed, and after nothing else's")
+            # The failures the pool steps run through are the fleet scan's and
+            # its upload's; `always()` or `!cancelled()` would also run them
+            # after an auth or setup failure, with no credential and no work
+            # directory.
+            self.assertEqual(step.get("if"), "${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}", f"{step.get('name')} must run whether or not the fleet scan or its upload failed, and after nothing else's")
         upload = next(step for step in steps if "cp work/pool-state.json" in step.get("run", ""))
         self.assertIn('"$DASHBOARD_BUCKET/pool-state.json"', upload["run"])
         self.assertIn("Fetch the previous pool-state scan", names)

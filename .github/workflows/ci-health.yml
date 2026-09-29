@@ -736,6 +736,7 @@ jobs:
             --project-timeout "$FIXTURE_STATE_PROJECT_TIMEOUT_S"
 
       - name: Upload fixture-state.json next to health.json
+        id: fleet_upload
         run: |
           gsutil -q -h "Cache-Control: no-cache" cp work/fixture-state.json "$DASHBOARD_BUCKET/fixture-state.json"
           python3 -c '
@@ -754,7 +755,7 @@ jobs:
       # the publisher itself. It publishes even when the fleet scan above
       # failed the step, and vice versa, since each has its own document.
       - name: Fetch the previous pool-state scan
-        if: ${{ success() || steps.fleet_scan.outcome == 'failure' }}
+        if: ${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}
         run: |
           gsutil -q cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state-prior.json || echo "no previous pool-state.json; first scan"
 
@@ -764,7 +765,7 @@ jobs:
       # repository bug (no project mapping, no verifier) or the ceiling
       # exits non-zero here.
       - name: Scan every pool project's shape
-        if: ${{ success() || steps.fleet_scan.outcome == 'failure' }}
+        if: ${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}
         run: |
           timeout "$POOL_STATE_TIMEOUT_S" python3 scripts/eval_dashboard/pool_state.py \
             --out work/pool-state.json \
@@ -773,7 +774,7 @@ jobs:
             --project-timeout "$POOL_STATE_PROJECT_TIMEOUT_S"
 
       - name: Upload pool-state.json next to fixture-state.json
-        if: ${{ success() || steps.fleet_scan.outcome == 'failure' }}
+        if: ${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}
         run: |
           test -s work/pool-state.json || { echo "::error::the pool-state scan wrote no document"; exit 1; }
           gsutil -q -h "Cache-Control: no-cache" cp work/pool-state.json "$DASHBOARD_BUCKET/pool-state.json"

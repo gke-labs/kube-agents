@@ -1818,8 +1818,8 @@ class PoolDrift(RunHarness):
             [
                 (
                     f"🟡 *Smoke gate: flaky* — pool finding {FINDING} on 3 pool projects since 9:00 AM ET;"
-                    " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code. Retest once the pool owner has run the repair the tracking issue carries."
-                    " Pool owner: the tracking issue carries the repair command per project. Tracking #1300.\n"
+                    " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code. Retest once the pool owner has run the repair."
+                    " Pool owner: the repair command per project is in pool-state.json (docs/ci-health.md, The pool-state scan) and in the bot's tracking issue when it filed one. Tracking #1300.\n"
                     f"{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"
                 )
             ],

@@ -3519,6 +3519,23 @@ class ReportDocumentTest(unittest.TestCase):
         self.assertEqual(iam.call_count, 1)
         self.assertTrue(all(r.message != "Not checked" for r in results))
 
+    def test_the_deadline_cuts_a_command_inside_a_check_short(self):
+        # A stall inside a check, not only between checks: a command started
+        # before the deadline is cut to the time left, and one after it never runs.
+        try:
+            checker._RUN_DEADLINE = time.monotonic() + 1
+            started = time.monotonic()
+            rc, _, err = checker.run_cmd(["sleep", "30"])
+            self.assertEqual(rc, 124)
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertIsNotNone(checker._unread_reason(err), err)
+            checker._RUN_DEADLINE = time.monotonic() - 1
+            rc, _, err = checker.run_cmd(["sleep", "30"])
+            self.assertEqual(rc, 124)
+            self.assertIn(checker.DEADLINE_PASSED, err)
+        finally:
+            checker._RUN_DEADLINE = None
+
     def test_a_checks_subset_carries_the_reason_the_project_read_failed(self):
         with mock.patch.object(checker, "check_project_and_apis", return_value=(None, checker.CheckResult("p", False, "Project describe failed: NOT_FOUND"))):
             failed = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_IAM])
@@ -3581,17 +3598,25 @@ class ReportDocumentTest(unittest.TestCase):
     def test_the_command_line_takes_checks_and_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "report.json"
-            with mock.patch("sys.argv", ["verify_ci_pool_project.py", "--project-id", "kube-agents-evals-3", "--checks", "iam,gke_and_state", "--report", str(path), "--deadline-seconds", "170"]), \
+            with mock.patch("sys.argv", ["verify_ci_pool_project.py", "--project-id", "kube-agents-evals-3", "--checks", "iam,gke_and_state", "--report", str(path), "--deadline-seconds", "270"]), \
                  mock.patch.object(checker, "verify_project", return_value=0) as verify:
                 self.assertEqual(checker.main(), 0)
-            self.assertEqual(verify.call_args.args[4:], (["iam", "gke_and_state"], path, 170.0))
+            self.assertEqual(verify.call_args.args[4:], (["iam", "gke_and_state"], path, 270.0))
         with mock.patch("sys.argv", ["verify_ci_pool_project.py", "--project-id", "p", "--checks", "nope"]), mock.patch("sys.stderr"):
             with self.assertRaises(SystemExit) as raised:
                 checker.main()
         self.assertEqual(raised.exception.code, checker.EXIT_USAGE)
 
 
-class FindingsCarryRepairsTest(IamGrantsTest):
+class FindingsCarryRepairsTest(unittest.TestCase):
+    # The IAM suite's policy builders, borrowed as functions: subclassing the
+    # suite would run its tests a second time under this name.
+    _wi_policy = IamGrantsTest._wi_policy
+    _litellm_wi_policy = IamGrantsTest._litellm_wi_policy
+    _project_policy = IamGrantsTest._project_policy
+    _fleet_reader_policy = IamGrantsTest._fleet_reader_policy
+    _reader_policy = IamGrantsTest._reader_policy
+
     """The console detail and the report finding are written together: every
     drift a scan can act on names a stable id and the command that closes it."""
 

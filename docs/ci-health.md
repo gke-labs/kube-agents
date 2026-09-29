@@ -685,9 +685,9 @@ scan's finding lines), as is the bot's own issue when its title fell back to a
 count, matched on the finding ids its hidden marker carries.
 
 **What never fails the bot.** A missing `gcloud`, a project the bot cannot read, a
-verifier past the per-project ceiling (300 s; the verifier stops starting checks 170 s
-in, so one read hung to its own 120 s limit costs that check, not the report): "not
-checked" with the reason, exit 0, published. Only a repository bug (no mapping, no verifier) reds the step. The
+verifier past the per-project ceiling (300 s; the verifier's own deadline is 270 s in,
+past which it starts no check and cuts every command short, so a stall costs the reads it
+hit and not the report): "not checked" with the reason, exit 0, published. Only a repository bug (no mapping, no verifier) reds the step. The
 scan's own ceiling (1620 s: five waves of seven projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
 is a backstop: past it the step is killed and publishes nothing, and the tick
 reports the last document as stale. `pool_state.py --projects <id>` runs the same scan from a
