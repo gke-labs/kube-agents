@@ -441,9 +441,12 @@ class MainTest(unittest.TestCase):
     def test_drifted_reads_the_scan_resets_strands_and_applies_the_projects_listed(self):
         boskos = _Boskos(free=[P7, P8])
         scan = {"projects": {P8: {"roles": {"idle-pool": {"state": "drifted", "detail": []}}}, P7: {"roles": {"idle-pool": {"state": "healthy", "detail": []}}}}}
-        rc, _ = self._main(["--drifted"], boskos, _Tofu({P8: UPDATE_ONLY}), scan=scan)
+        tofu = _Tofu({P8: UPDATE_ONLY})
+        rc, _ = self._main(["--drifted"], boskos, tofu, scan=scan)
         self.assertEqual(rc, reconcile.EXIT_OK)
         self.assertEqual(boskos.acquired, [P8])
+        self.assertEqual(tofu.verbs(), ["init", "plan", "show", "apply"], "the drifted project is applied, not only planned")
+        self.assertIn("-var=project_id=%s" % P8, tofu.calls[1])
         self.assertEqual(boskos.resets[0]["state"], reconcile.HOLD_STATE)
         self.assertEqual(boskos.resets[0]["expire"], reconcile.STRANDED_AFTER)
 
