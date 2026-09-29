@@ -38,11 +38,16 @@ from kube_agents_bench import transcript
 TIMEOUT_SEC = 120.0
 
 
-def score(task_path: Path, out_dir: Path) -> dict[str, Any]:
+def load_task(task_path: Path) -> dict[str, Any]:
+    """The task.yaml at ``task_path``, with the placeholders the env supplies filled in."""
     text = task_path.read_text()
     for var in ("PROJECT_ID", "CLUSTER_NAME"):
         text = text.replace("{{" + var + "}}", os.environ.get(var, ""))
-    entries, errors = parse_entries(yaml.safe_load(text).get("verification_spec"))
+    return yaml.safe_load(text)
+
+
+def score(task_path: Path, out_dir: Path) -> dict[str, Any]:
+    entries, errors = parse_entries(load_task(task_path).get("verification_spec"))
 
     transcript.load(out_dir / "trajectory.json")
     agent = VerifierAgent()
