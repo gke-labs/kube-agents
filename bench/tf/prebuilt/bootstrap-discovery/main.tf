@@ -105,6 +105,8 @@ resource "null_resource" "sweep" {
       rearmed=""
       on_exit() {
         status=$?
+        # A second signal would end the cleanup part-way.
+        trap '' TERM INT
         set +e
         if [ "$status" -ne 0 ] && [ -n "$rearmed" ]; then
           echo "Plant failed (exit $status); archiving the bootstrap-inventory cards it left open." >&2

@@ -113,7 +113,7 @@ _DESTROY_INTERPOLATIONS = {
 # that a check of the first pod alone reads idle. Without the Running filter the
 # listing also returns an evicted pod whose exec fails.
 _KUBECTL_STUB = r'''#!/usr/bin/env python3
-import os, pathlib, sys
+import os, pathlib, signal, sys
 
 argv = sys.argv[1:]
 state = pathlib.Path(os.environ["STATE"])
@@ -171,6 +171,8 @@ elif "task_id=$1" in script:
     if bump("restores") < int(os.environ.get("RESTORE_FAILS", "0")):
         sys.stderr.write("error: unable to upgrade connection: container not found\n")
         sys.exit(1)
+    if os.environ.get("SIGNAL_ON_RESTORE") == "1":
+        os.kill(os.getppid(), signal.SIGTERM)
 elif "rm" in cmd and "/opt/data/.bootstrap_scan_filed" in cmd:
     record("rearm")
 elif "rm" in cmd and "/opt/data/INVENTORY.md" in cmd:
@@ -445,6 +447,15 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertEqual(len(archive), 1, calls)
         self.assertNotIn("Cleanup incomplete", completed.stderr)
 
+    def test_a_signal_during_the_trap_does_not_cut_its_cleanup_short(self):
+        completed, calls = self._run(GATE_FILES=0, RACE=1, SIGNAL_ON_RESTORE=1)
+        self.assertNotEqual(completed.returncode, 0)
+        restore = self._indices(calls, "[restore]")
+        archive = self._indices(calls, "archive t_raced [archive]")
+        self.assertEqual(len(restore), 1)
+        self.assertEqual(len(archive), 1, calls)
+        self.assertGreater(archive[0], restore[0])
+
     def test_the_trap_names_a_marker_restore_it_never_managed(self):
         completed, calls = self._run(GATE_FILES=0, RESTORE_FAILS=1000, NO_PODS=1)
         self.assertNotEqual(completed.returncode, 0)
@@ -621,7 +632,7 @@ class RunStateQueryTest(unittest.TestCase):
     def tearDownClass(cls):
         cls._dir.cleanup()
 
-    def _query(self, runs, children, prioritize_at=None, other_runs=()):
+    def _query(self, runs, children, prioritize_at=None, other_runs=(), other_children=()):
         board = pathlib.Path(self._home) / "kanban.db"
         board.unlink(missing_ok=True)
         cards = [(f"t_child{i}", _CLUSTER_KEY + str(i), at) for i, at in enumerate(children or [])]
@@ -629,7 +640,9 @@ class RunStateQueryTest(unittest.TestCase):
             cards.append(("t_prioritize", "bootstrap-inventory-prioritize", prioritize_at))
         with sqlite3.connect(board) as conn:
             conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, idempotency_key TEXT)")
-            conn.executemany("INSERT INTO tasks VALUES (?, ?)", [(tid, key) for tid, key, _ in cards])
+            conn.executemany(
+                "INSERT INTO tasks VALUES (?, ?)", [(tid, key) for tid, key, *_ in cards + list(other_children)]
+            )
             conn.execute(
                 "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, "
                 "started_at INTEGER NOT NULL, ended_at INTEGER, outcome TEXT, summary TEXT)"
@@ -645,7 +658,8 @@ class RunStateQueryTest(unittest.TestCase):
                 )
                 conn.executemany(
                     "INSERT INTO kanban_worker_children VALUES (?, ?, ?)",
-                    [(tid, _SWEEP, at) for tid, _, at in cards],
+                    [(tid, _SWEEP, at) for tid, _, at in cards]
+                    + [(tid, creator, at) for tid, _, creator, at in other_children],
                 )
         completed = subprocess.run(
             [
@@ -721,6 +735,12 @@ class RunStateQueryTest(unittest.TestCase):
         old = [("t_old_sweep", 50, 900, "completed", "done")]
         self.assertEqual(self._query([(100, 210, "blocked", "Waiting for the roster")], [], other_runs=old), "1 1 0 0")
         self.assertEqual(self._query([(100, 150, "completed", "done")], [120, 200], other_runs=old), "1 1 2 0")
+
+    def test_a_card_another_sweep_filed_does_not_count(self):
+        # Re-arming archives the previous sweep's cards; their children rows stay.
+        old = [("t_old_child", _CLUSTER_KEY + "old", "t_old_sweep", 50)]
+        self.assertEqual(self._query([(100, 210, "blocked", "Waiting for the roster")], [], other_children=old), "1 1 0 0")
+        self.assertEqual(self._query([(100, 210, "completed", "done")], [120, 200], other_children=old), "1 1 2 1")
 
 
 if __name__ == "__main__":
