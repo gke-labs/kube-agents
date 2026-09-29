@@ -1,9 +1,10 @@
 """Slack presentation for kube-agents: answer layout, buttons and reactions.
 
 Pure functions only. Nothing here imports the Hermes gateway, the Slack SDK or
-the network, so the same module serves every process that posts to Slack (the
-gateway's adapter patches, the kanban notifier, session_kv_server,
-bootstrap_delivery) and can move with Slack ingress when it leaves the gateway.
+the network, so any process that posts to Slack can use it, and it can move
+with Slack ingress when it leaves the gateway. Today its one caller is the
+gateway's reactions patch (``slack_ux_reactions``), which the kanban notifier
+also reaches.
 Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 

@@ -28,10 +28,11 @@ With the flag on:
 * A turn that answered directly settles at once: ✅, or ❌ on failure. A
   cancelled turn adds nothing.
 * A turn that put new cards on the board, subscribed to this thread, defers
-  its settle to the cards. The kanban notifier calls :func:`settle_delegated`
-  on each terminal event: ⏸️ as soon as a card blocks on the user, and ✅/❌
-  once the last open card subscribed to the thread settles, so a fan-out
-  settles once, when all of it has.
+  its settle to those cards, and only those: a card already open when the ask
+  arrived is not its to wait on. The kanban notifier calls
+  :func:`settle_delegated` on each terminal event: ⏸️ as soon as one of the
+  ask's cards blocks on the user, and once every one of them has finished, ✅,
+  or ❌ if any gave up. A fan-out settles once, when all of it has.
 
 The deferred asks live in this process only (the notifier runs in the gateway
 process too). A gateway restart between the turn and the settle loses the
@@ -60,6 +61,10 @@ except ImportError:  # the scripts directory is not on PYTHONPATH
 #: The flag, read here only to word the warning when the presenter is missing.
 FLAG_ENV = "KAGE_SLACK_UX"
 
+#: ``slack_presenter.FLAG_ON_VALUES``, copied because the warning below fires
+#: exactly when that module cannot be imported.
+FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
+
 #: The platform name kanban subscriptions carry for Slack.
 PLATFORM = "slack"
 
@@ -77,12 +82,36 @@ OUTCOME_SETTLES = {"success": "done", "failure": "failed"}
 
 #: Bounds on the in-process maps, oldest evicted first. A turn's start snapshot
 #: is dropped at its completion; a deferred ask at its final settle. The caps
-#: only matter for events that never complete.
+#: only matter for events that never complete. ``FINISHED_MAX`` bounds the
+#: cards remembered as finished, which only needs to outlast one turn's
+#: completion.
 STARTED_MAX = 512
 DEFERRED_MAX = 512
+FINISHED_MAX = 512
+
+
+class _Ask:
+    """A Slack ask whose settle waits on the cards its turn opened.
+
+    A plain class, not a dataclass: the build-time verify loads this module by
+    path without registering it in ``sys.modules``, which ``@dataclass`` needs.
+    """
+
+    __slots__ = ("cards", "failed", "team_id", "ts")
+
+    def __init__(self, ts: str, team_id: Any, cards: set, failed: bool = False) -> None:
+        self.ts = ts
+        self.team_id = team_id
+        self.cards = cards
+        self.failed = failed
+
 
 _started: OrderedDict[Any, frozenset | None] = OrderedDict()
-_deferred: OrderedDict[tuple, list] = OrderedDict()
+_deferred: OrderedDict[tuple, list[_Ask]] = OrderedDict()
+#: Cards the notifier has reported finished, and whether each failed. A card can
+#: finish between the turn's board read and the moment its ask is deferred; the
+#: turn checks here so it never waits on a card that has already settled.
+_finished: OrderedDict[str, bool] = OrderedDict()
 _warned_missing = False
 
 
@@ -91,7 +120,7 @@ def enabled() -> bool:
     global _warned_missing
     if _presenter is not None:
         return _presenter.enabled()
-    if os.environ.get(FLAG_ENV, "").strip() and not _warned_missing:
+    if os.environ.get(FLAG_ENV, "").strip().lower() in FLAG_ON_VALUES and not _warned_missing:
         _warned_missing = True
         logger.warning(
             "slack_ux_reactions: %s is set but slack_presenter is not importable; "
@@ -162,36 +191,57 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
         return
     after = await open_cards(chat_id, thread_id)
     if before is not None and after is not None and after - before:
-        asks = _deferred.get((chat_id, thread_id), [])
-        _remember(_deferred, (chat_id, thread_id), [*asks, (ts, team_id)], DEFERRED_MAX)
-        return
+        new = after - before
+        waiting = set(new) - set(_finished)
+        failed = any(_finished.get(card, False) for card in new)
+        if waiting:
+            asks = _deferred.get((chat_id, thread_id), [])
+            ask = _Ask(ts, team_id, waiting, failed)
+            _remember(_deferred, (chat_id, thread_id), [*asks, ask], DEFERRED_MAX)
+            return
+        if failed:
+            settle = _presenter.SETTLE_FAILED
     await adapter._react(chat_id, ts, _presenter.settle_reaction(settle), team_id, remove=False)
 
 
 async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None = None) -> None:
-    """Settle the asks waiting on this thread's cards, after a notifier terminal event.
+    """Settle the asks waiting on this card, after a notifier terminal event.
 
-    ⏸️ goes on the newest waiting ask as soon as any card blocks. ✅ or ❌ goes
-    on every waiting ask once no other open card is subscribed to the thread,
-    and the asks are forgotten. A thread with no waiting ask is left alone.
+    ⏸️ goes on each ask waiting on the card as soon as it blocks. A final event
+    takes the card off each ask's set; an ask whose set empties gets ✅, or ❌
+    if any of its cards gave up, and is forgotten. A card no ask is waiting on
+    is left alone. ``board`` is accepted for the notifier's call and unused:
+    each ask already knows its cards, so no board is read.
     """
     if not enabled() or (sub.get("platform") or "").lower() != PLATFORM:
         return
     settle = _presenter.settle_for_kanban_kind(kind)
-    if settle is None:
+    card = sub.get("task_id")
+    if settle is None or not card:
         return
     key = (sub.get("chat_id"), str(sub.get("thread_id") or ""))
-    asks = _deferred.get(key)
+    provisional = settle in _presenter.PROVISIONAL_SETTLES
+    if not provisional:
+        _remember(_finished, card, settle == _presenter.SETTLE_FAILED, FINISHED_MAX)
+    asks = [ask for ask in _deferred.get(key, []) if card in ask.cards]
     if not asks or not hasattr(adapter, "_react"):
         return
-    emoji = _presenter.settle_reaction(settle)
-    if settle in _presenter.PROVISIONAL_SETTLES:
-        ts, team_id = asks[-1]
-        await adapter._react(key[0], ts, emoji, team_id, remove=False)
+    if provisional:
+        for ask in asks:
+            await adapter._react(key[0], ask.ts, _presenter.settle_reaction(settle), ask.team_id, remove=False)
         return
-    others = await open_cards(key[0], key[1], board)
-    if others is None or others - {sub.get("task_id")}:
-        return
-    _deferred.pop(key, None)
-    for ts, team_id in asks:
-        await adapter._react(key[0], ts, emoji, team_id, remove=False)
+    settled = []
+    for ask in asks:
+        ask.cards.discard(card)
+        ask.failed = ask.failed or settle == _presenter.SETTLE_FAILED
+        if not ask.cards:
+            settled.append(ask)
+    if settled:
+        remaining = [ask for ask in _deferred.get(key, []) if ask not in settled]
+        if remaining:
+            _deferred[key] = remaining
+        else:
+            _deferred.pop(key, None)
+    for ask in settled:
+        outcome = _presenter.SETTLE_FAILED if ask.failed else _presenter.SETTLE_DONE
+        await adapter._react(key[0], ask.ts, _presenter.settle_reaction(outcome), ask.team_id, remove=False)

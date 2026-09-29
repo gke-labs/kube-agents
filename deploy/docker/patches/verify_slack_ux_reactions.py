@@ -181,7 +181,7 @@ async def _drive(module) -> None:
 
     # A delegated answer: nothing at completion; the notifier's terminal event settles it.
     adapter = _StubAdapter()
-    boards[:] = [frozenset(), frozenset({CARD}), frozenset({CARD})]
+    boards[:] = [frozenset(), frozenset({CARD})]
     await module.on_processing_start(adapter, _event("is seeded-a healthy?"))
     await module.on_processing_complete(adapter, _event("is seeded-a healthy?"), success)
     sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD, "task_id": CARD}
