@@ -152,10 +152,13 @@ def tool_operations(
 #:     checking checkout-gateway.
 #:
 #: The last branch matches that line only when it is the whole sentence,
-#: starts lowercase, case-sensitively, and opens with one of the verbs the
-#: template shows: a report sentence opens with a capital, so "Checking the
-#: logs showed a crash." is kept as an answer, and so is a lowercase answer
-#: such as "nothing is restarting." that merely starts with an -ing word.
+#: starts lowercase, case-sensitively, opens with one of the verbs the
+#: template shows, and follows it with one to five words and no comma, colon
+#: or semicolon before the closing period. A report sentence opens with a
+#: capital, so "Checking the logs showed a crash." is kept as an answer; so is
+#: a lowercase answer such as "nothing is restarting." that does not open with
+#: one of those verbs, and "looking at the logs, the pod restarted 4 times.",
+#: which does but runs past the target into a finding.
 #:
 #: The other branches are the receipt that template replaced, still sent by an
 #: install on an older image:
@@ -177,7 +180,7 @@ _DELEGATION_ACK = re.compile(
     r"\bdelegat(?:ed|ing)\b[^.\n]{0,60}\b\**\w[\w-]*\**\s+agent\b"
     r"|\bstarted this as task\s+[`'\"]?t_[0-9a-f]+"
     r"|\bwill post into this thread\b"
-    r"|(?-i:\A(?:checking|looking|reviewing|auditing|investigating) [^\n]{1,80}\.\Z)",
+    r"|(?-i:\A(?:checking|looking|reviewing|auditing|investigating)(?: [^\s,;:]+){1,5}\.\Z)",
     re.IGNORECASE,
 )
 

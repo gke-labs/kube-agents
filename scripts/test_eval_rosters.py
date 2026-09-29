@@ -136,6 +136,7 @@ ADDED_AFTER_THE_MOVE = [
     "obtainability-design-quota-vs-capacity",  # the two obtainability-journey probes, PR #1841
     "obtainability-window-planning-probe",
     "bootstrap-discovery-fanout",  # the onboarding discovery fan-out, PR #2085
+    "chat-voice-ack-names-target",  # the front door's delegation ack
 ]
 
 # Admitted after the split, each by a pull request that cited the record

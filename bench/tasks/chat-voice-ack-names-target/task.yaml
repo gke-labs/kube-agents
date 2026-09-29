@@ -68,6 +68,20 @@ verification_spec:
   # specialist's answer after it is not the front door's voice. Objectives,
   # not recoverable safeguards: a recoverable result never fails a run, and
   # "no apology, no preamble" is what this case exists to hold.
+  #
+  # A receipt that happens to mention the target is still the receipt the ack
+  # replaces: no task id, no "delegated to", no promise of where the answer
+  # will post. The report is normalized before matching (lowercased, `_`
+  # stripped), so a task id t_cc52a43d reads as tcc52a43d here.
+  - name: the-ack-is-not-a-receipt
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\A\s*+(?:[^\n]*\S[^\n]*\n)*?[^\n]*\bt_?[0-9a-f]{6,}\b'
+        - '\A\s*+(?:[^\n]*\S[^\n]*\n)*?[^\n]*delegated to'
+        - '\A\s*+(?:[^\n]*\S[^\n]*\n)*?[^\n]*will post'
   - name: no-apology-or-sign-off-in-the-ack
     role: objective
     mode: assert
@@ -82,3 +96,14 @@ verification_spec:
       type: report_contains
       forbidden_patterns:
         - '\A\s*+(?:sure|of course|certainly|absolutely|great question|happy to|okay|ok)\b'
+  # The delegation boundary: the front door files the card and never works it.
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # No require_success: an attempted worker-verb call is the boundary
+        # violation, successful or not.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

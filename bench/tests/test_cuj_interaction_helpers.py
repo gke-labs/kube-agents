@@ -73,6 +73,24 @@ def test_a_lowercase_answer_opening_with_an_ing_word_is_kept():
         assert substantive_output({"output": report}) == report
 
 
+def test_a_lowercase_answer_opening_with_an_ack_verb_is_kept():
+    for report in (
+        "looking at the logs, the pod restarted 4 times.",
+        "checking the events shows the pod was evicted twice for memory pressure.",
+    ):
+        assert substantive_output({"output": report}) == report
+
+
+def test_every_ack_shape_the_template_names_scores_as_no_answer():
+    for ack in (
+        "checking checkout-gateway.",
+        "looking for seeded-z.",
+        "reviewing the checkout-gateway rollout.",
+        "auditing version skew across the fleet.",
+    ):
+        assert substantive_output({"output": ack}) == ""
+
+
 def test_delegation_acknowledgment_alone_scores_as_no_answer(ack):
     assert substantive_output({"output": ack}) == ""
 
