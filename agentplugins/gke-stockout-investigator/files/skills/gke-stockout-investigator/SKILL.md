@@ -122,9 +122,9 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
    One name per workload is what makes the duplicate check a check.
 
    > [!CAUTION]
-   > **Every version-control command from here on runs inside the printed `workspace`, and through the credential-free binary `/opt/vcs/libexec/git`.** Export it once — `export G=/opt/vcs/libexec/git` — and use `$G` for `add`, `commit`, `diff` and every other local verb. Plain `git` on this machine is a different program that reaches the network holding a credential; running it is a security error rather than a retryable failure. Do not alias it: each command arrives in a fresh non-interactive shell, which never expands aliases. There is no shared clone to work in either — `/opt/data/workspace` and any other invented path will be rejected.
+   > **Every version-control command from here on runs inside the printed `workspace`, and through the credential-free binary `/opt/vcs/libexec/git`.** Call it by that full path for `add`, `commit`, `diff` and every other local verb. Plain `git` on this machine is a different program that reaches the network holding a credential; running it is a security error rather than a retryable failure. Do not put the path in a shell variable or an alias: the command scanner refuses a command whose program is a variable (`$G add`), and in an unattended run that refusal is final; each command also arrives in a fresh non-interactive shell, which never expands aliases. There is no shared clone to work in either — `/opt/data/workspace` and any other invented path will be rejected.
 
-   `prepare` has already brought the repository down and cut the branch from the repository's own default branch (`base`), so do **not** run a separate token refresh, `$G checkout main`, `$G pull` or `$G checkout -b`. The copy has no remote to fetch from; the revisions go back up in Step 7.
+   `prepare` has already brought the repository down and cut the branch from the repository's own default branch (`base`), so do **not** run a separate token refresh, `/opt/vcs/libexec/git checkout main`, `/opt/vcs/libexec/git pull` or `/opt/vcs/libexec/git checkout -b`. The copy has no remote to fetch from; the revisions go back up in Step 7.
 
 3. **Search the workspace**: Locate the YAML manifests **inside the printed `workspace`** using targeted file searches (DO NOT use pattern `.*` or broad wildcard loops that paginate indefinitely):
    - For ComputeClass definitions, check `<workspace>/agents/platform/skills/gke-compute-classes/assets/` directly or use `search_files(pattern="compute-class")`.
@@ -258,7 +258,7 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
 1. Apply the fixes to the ComputeClass or workload YAML files **inside `<workspace>`**.
    - **Mandatory YAML Comments**: For EVERY change or addition in a YAML manifest (e.g. `topology.kubernetes.io/zone`, `nodeSelector`, `ComputeClass` priorities), append an inline YAML comment (`# Remediation: ...`) explaining how this specific change helps prevent or mitigate stockouts.
 2. **Self-Review Step**:
-   - Run `cd <workspace> && $G diff` to inspect all proposed changes before committing.
+   - Run `cd <workspace> && /opt/vcs/libexec/git diff` to inspect all proposed changes before committing.
    - Verify that ONLY changes strictly necessary to mitigate the stockout are included (no unrelated formatting or whitespace edits).
    - Confirm that every updated YAML line includes the explanatory remediation comment.
 3. **Special Case (Major Changes / Migration)**: If migrating to another region or changing architecture (Rule E), do NOT just change files. You **must** also write a detailed migration playbook in `<workspace>/docs/migrations/stockout-<workload_name>-plan.md`. This plan must detail:
@@ -266,8 +266,8 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
    - Resource copy strategy (DBs, storage, persistent volumes).
    - Network routing/DNS cutover approach.
    - Rollout steps.
-4. **PR Staging Hygiene (MANDATORY)**: Stage ONLY the specific modified/created files using exact file paths relative to the repository root (e.g., `cd <workspace> && $G add deployment/<workload_name>.yaml deployment/<compute_class_name>.yaml`). **NEVER use `$G add .`, `$G add -A`, or `$G commit -a`**, as doing so will accidentally commit unrelated scratch files or workspace logs.
-5. Commit using a Conventional Commit message (e.g., `cd <workspace> && $G commit -m "fix(compute-class): add fallback machine families to remediate stockout"`).
+4. **PR Staging Hygiene (MANDATORY)**: Stage ONLY the specific modified/created files using exact file paths relative to the repository root (e.g., `cd <workspace> && /opt/vcs/libexec/git add deployment/<workload_name>.yaml deployment/<compute_class_name>.yaml`). **NEVER use `/opt/vcs/libexec/git add .`, `/opt/vcs/libexec/git add -A`, or `/opt/vcs/libexec/git commit -a`**, as doing so will accidentally commit unrelated scratch files or workspace logs.
+5. Commit using a Conventional Commit message (e.g., `cd <workspace> && /opt/vcs/libexec/git commit -m "fix(compute-class): add fallback machine families to remediate stockout"`).
 
 ### 7. Submit Suggestion & Open PR
 

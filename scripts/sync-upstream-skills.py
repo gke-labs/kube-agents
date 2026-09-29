@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Syncs GKE agent skills from the upstream google/skills repository (skills/cloud)."""
+"""Syncs GKE agent skills from the upstream google/skills repository (skills/cloud).
+
+The platform image build runs the shell blocks of every synced SKILL.md through
+deploy/docker/check_skill_commands.py, so a sync that brings in a command Tirith
+refuses, or rewrites one listed in its KNOWN_FINDINGS, fails that build until the
+list is updated.
+"""
 
 import os
 import shutil
