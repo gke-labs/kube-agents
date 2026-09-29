@@ -45,15 +45,19 @@
 # is withdrawn by moving its line from presubmit-cases.txt back to
 # nightly-cases.txt, no roster edit.
 
-reliability-pdb-probe
-capacity-pinned-pool-probe
-security-overgrant-probe
-upgrades-lagging-master-probe
-consistency-authorized-networks-probe
-cost-idle-pool-probe
-obtainability-remediation-proposal
-cluster-agent-crashloop-debug
-cluster-agent-crashloop-misleading-symptom
-cluster-agent-crashloop-evidence-chain
-incident-triage-oom-event-probe
-agent-kanban-smoke
+# BENCH #1409: disabled for the one-case run -- reliability-pdb-probe
+# BENCH #1409: disabled for the one-case run -- capacity-pinned-pool-probe
+# BENCH #1409: disabled for the one-case run -- security-overgrant-probe
+# BENCH #1409: disabled for the one-case run -- upgrades-lagging-master-probe
+# BENCH #1409: disabled for the one-case run -- consistency-authorized-networks-probe
+# BENCH #1409: disabled for the one-case run -- cost-idle-pool-probe
+# BENCH #1409: disabled for the one-case run -- obtainability-remediation-proposal
+# BENCH #1409: disabled for the one-case run -- cluster-agent-crashloop-debug
+# BENCH #1409: disabled for the one-case run -- cluster-agent-crashloop-misleading-symptom
+# BENCH #1409: disabled for the one-case run -- cluster-agent-crashloop-evidence-chain
+# BENCH #1409: disabled for the one-case run -- incident-triage-oom-event-probe
+# BENCH #1409: disabled for the one-case run -- agent-kanban-smoke
+
+# BENCH ONLY, NOT FOR MERGE (#1409): the one case this bench runs; the roster is a
+# non-empty subset of the presubmit file, so it names the same case.
+obtainability-declared-intent-no-finding

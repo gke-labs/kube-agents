@@ -69,12 +69,12 @@
 # trusting any count in prose.
 
 # ── The domain probes ────────────────────────────────────────────────────────
-./tasks/reliability-pdb-probe/task.yaml
-./tasks/capacity-pinned-pool-probe/task.yaml
-./tasks/security-overgrant-probe/task.yaml
-./tasks/upgrades-lagging-master-probe/task.yaml
-./tasks/consistency-authorized-networks-probe/task.yaml
-./tasks/cost-idle-pool-probe/task.yaml
+# BENCH #1409: disabled for the one-case run -- ./tasks/reliability-pdb-probe/task.yaml
+# BENCH #1409: disabled for the one-case run -- ./tasks/capacity-pinned-pool-probe/task.yaml
+# BENCH #1409: disabled for the one-case run -- ./tasks/security-overgrant-probe/task.yaml
+# BENCH #1409: disabled for the one-case run -- ./tasks/upgrades-lagging-master-probe/task.yaml
+# BENCH #1409: disabled for the one-case run -- ./tasks/consistency-authorized-networks-probe/task.yaml
+# BENCH #1409: disabled for the one-case run -- ./tasks/cost-idle-pool-probe/task.yaml
 
 # The reliability prompt variation that grades what the probe does not ask
 # for: reliability-pdb-probe asks whether checkout-gateway survives a drain;
@@ -87,7 +87,7 @@
 # obtainability-direct-query, obtainability-refusal-direct-mutation, and
 # since 2026-09-22 #1049's three (pdb-semantics, fleet-exposure-sweep,
 # healthy-namespace-silence) -- run in the nightly.
-./tasks/obtainability-remediation-proposal/task.yaml
+# BENCH #1409: disabled for the one-case run -- ./tasks/obtainability-remediation-proposal/task.yaml
 
 # Activated by #939, the first Phase 2 domain scenario to run. It was blocked
 # on A5 and nothing else -- no GitHub write, so no A1 and no A4 -- and it
@@ -96,7 +96,7 @@
 # binding the role to a kubeconfig. It is the cheapest case in this list
 # (142s on the 2026-08-25 run) and it proves the chain the probes above stand
 # on.
-./tasks/cluster-agent-crashloop-debug/task.yaml
+# BENCH #1409: disabled for the one-case run -- ./tasks/cluster-agent-crashloop-debug/task.yaml
 
 # Two of the three cluster-debugging cases #982 added in the same family
 # (measured 190s, 142s and 220s on build 2092719124550520832, all
@@ -115,8 +115,8 @@
 # (VerificationCatastrophic and VerificationCoverage both 1.0 throughout).
 # The fourth of the family, cluster-agent-pending-replicas-capped-pool, runs
 # in the nightly; nightly-cases.txt says why.
-./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml
-./tasks/cluster-agent-crashloop-evidence-chain/task.yaml
+# BENCH #1409: disabled for the one-case run -- ./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml
+# BENCH #1409: disabled for the one-case run -- ./tasks/cluster-agent-crashloop-evidence-chain/task.yaml
 
 # The incident-triage domain's presubmit-eligible probe (#1023, authored in
 # #1625), moved in from nightly-cases.txt on 2026-09-22 on the record it
@@ -132,13 +132,13 @@
 # cluster-debugging cases above share; no infra lock, no watcher, no card
 # wait. Priced at 700s in unit_cost_hint. This line is what took
 # incident-triage off the docs/designs/domains.yaml allowlist.
-./tasks/incident-triage-oom-event-probe/task.yaml
+# BENCH #1409: disabled for the one-case run -- ./tasks/incident-triage-oom-event-probe/task.yaml
 
 # agent-kanban-smoke is deployer: noop, so it adds a delegation round trip
 # (~100-300s), not a cluster. Re-admitted to the blocking roster after the
 # 2026-08-27 redesign (a real SRE question graded on kanban_create plus
 # cluster names).
-./tasks/agent-kanban-smoke/task.yaml
+# BENCH #1409: disabled for the one-case run -- ./tasks/agent-kanban-smoke/task.yaml
 
 # BENCH ONLY, NOT FOR MERGE (#1409): runs the parked declared-intent case on
 # the smoke test to record its red before the fixture and the declaration
