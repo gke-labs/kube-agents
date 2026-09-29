@@ -192,13 +192,24 @@ FIXTURE_NOT_READY = {
         "fixture role plants a stall today"
     ),
     "gitops-drift-noise-filtered-triage": (
-        "#2137: needs the drift detector to accept an exact-match human "
+        "#2137 plus an audit ingress, and closing either alone leaves the case "
+        "broken. (1) The eval install has no drift ingress at all: "
+        "hack/ci-deploy.sh creates no drift-audit topic, no subscription and no "
+        "sink, and enables the detector nowhere, so no record of any tier "
+        "reaches the classifier -- unlike the sibling case, which posts to the "
+        "daemon's inject and needs none of it, this case grades Classify and so "
+        "has to go through the detector. The composition already builds the trio "
+        "behind enable_drift_pubsub; the eval install has to ask for it. "
+        "(2) #2137: needs the drift detector to accept an exact-match human "
         "declaration ahead of its .gserviceaccount.com test, reachable from "
         "configuration, so a run can plant a change the classifier will surface; "
         "every identity a bench stack authenticates as is caught by an earlier "
         "branch of Classify and dropped, and --human-domains cannot promote it "
-        "because isHuman is consulted after that test, so the case fails with no "
-        "card at all, which is broken rather than red"
+        "because isHuman is consulted after that test. With either open the case "
+        "fails with no card at all, which is broken rather than red. Unparking "
+        "also raises ALERT_DAILY_LIMIT_DRIFT: this case and the sibling share "
+        "the DRIFT_QUOTA_KEY bucket and spend one inject per repetition, which "
+        "is six a night against a default ceiling of five"
     ),
 }
 

@@ -1,10 +1,11 @@
 # FIXTURE NOT READY — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
-# until #2137 gives the drift detector a way to declare one principal human
-# ahead of its service-account test.
+# until two things land, neither of which is enough alone: an audit ingress on
+# the eval install, and #2137's human declaration ahead of the detector's
+# service-account test. Both are spelled out below.
 #
-# Domain: incident triage. Journey: a burst of changes lands on one namespace,
-# almost all of it controller churn, and the drift pipeline files a triage for
-# the one a person made and for nothing else.
+# Domain: incident triage. Journey: a burst of changes lands across two
+# namespaces, almost all of it controller churn, and the drift pipeline files a
+# triage for the one a person made and for nothing else.
 #
 # This is CUJ 3 of docs/designs/drift-detection.md — "noise-filtered triage",
 # the one that table marks as the enabler. The sibling case
@@ -12,7 +13,7 @@
 # single record and no noise around it; this one grades the discrimination,
 # which is the part CUJ 3 is about and the part nothing exercises today.
 #
-# WHAT THE FIXTURE HAS TO DO, AND WHY IT CANNOT YET
+# WHAT THE FIXTURE HAS TO DO, AND THE THREE THINGS THAT STOP IT
 #
 # The filter is the principal classifier (k8s-operator/cmd/drift-detector/
 # classify.go): a record's principal is sorted into system, automation,
@@ -21,48 +22,105 @@
 # says which field manager owns what the change touched, which is how the
 # report can name an edit as out-of-band rather than merely recent.
 #
-# So a fixture for this case has to produce audit records in both tiers. The
-# automation half is free. The human half cannot be produced at all today, and
-# the reason is the order of the tests rather than a missing flag. Classify
-# returns on the first match: empty, then the "system:" prefix, then the
-# --automation-principals allowlist, then a .gserviceaccount.com suffix, and
-# only after all four does it consult isHuman. Every identity a bench run can
-# authenticate as is caught by one of the earlier branches — a GCP service
+# The classifier is the thing under test, which is what separates this case
+# from the sibling. The sibling posts its record straight to the Session KV
+# daemon's `gitops-drift` inject and so starts at the last step of the chain:
+# sound for a case grading delivery, useless for one grading discrimination,
+# because a record handed to the daemon was classified by whoever wrote the
+# fixture. This case's records have to arrive on the subscription the detector
+# pulls and be sorted by Classify itself.
+#
+# BLOCKER 1: the eval install has no audit ingress, so neither tier is
+# reachable, not just the human one. hack/ci-deploy.sh creates no drift-audit
+# topic, no subscription and no Log Router sink, and turns the detector on
+# nowhere. The composition already knows how — `enable_drift_pubsub` in
+# terraform/examples/full-install creates the trio and wires the chart's
+# platformAgent.harness.driftDetector.subscription to it — so what is missing
+# is the eval install asking for it, and the unparking pull request is where
+# that happens.
+#
+# The sink is the one part of the trio this case can do without, and that
+# matters because the sibling stack's header gives the export lag as a reason
+# the audit route cannot be driven from a fixture at all. It is right about the
+# sink: a real API-server write exported through Logging arrives minutes later,
+# on top of the run's budget. A fixture that publishes its synthetic audit
+# records straight to the drift-audit topic skips the lag and still runs every
+# step this case grades — Classify, the managedFields join against the live
+# objects the stack planted, and the inject. The topic, the subscription and an
+# enabled detector are not optional.
+#
+# BLOCKER 2: #2137, the order of the classifier's tests. Even with a route,
+# Classify returns on the first match: empty, then the "system:" prefix, then
+# the --automation-principals allowlist, then a .gserviceaccount.com suffix,
+# and only after all four does it consult isHuman. Every identity a bench run
+# can authenticate as is caught by one of the earlier branches — a GCP service
 # account by the suffix, a Kubernetes ServiceAccount token by the prefix — so
 # isHuman is never reached for it, and --human-domains, which only narrows
 # isHuman, cannot promote it. --automation-principals moves in the wrong
 # direction: it only ever adds to the automation set. Impersonation is not a
 # way round either; the README records that a person acting through an
-# impersonated service account arrives as that account.
+# impersonated service account arrives as that account. What is needed is an
+# exact-match human declaration consulted ahead of the service-account suffix
+# test — a --human-principals symmetric to --automation-principals — and
+# reachable from configuration, which today neither existing list is
+# (deploy/shared/start-services.sh builds detector_args and passes neither).
 #
-# What the fixture needs is therefore a classifier change, not just a flag made
-# reachable: an exact-match human declaration consulted ahead of the
-# service-account suffix test — a --human-principals symmetric to
-# --automation-principals — and reachable from configuration, which today
-# neither of the two existing lists is (deploy/shared/start-services.sh builds
-# detector_args and passes neither).
+# With either of those open the case files no card and times out, which is
+# broken rather than red, and is why it is parked rather than marked
+# expected_fail.
 #
-# #2137 is that gap. With it closed, the stack this case still needs declares
-# its own identity human, plants the namespace below, and drives the burst.
+# BLOCKER 3 bites at unpark rather than now: the drift alert ceiling. The
+# daemon allows ALERT_DAILY_LIMIT_DRIFT drift injects a day per install (5 by
+# default, agents/platform/scripts/session_kv_server.py) from a bucket keyed
+# DRIFT_QUOTA_KEY, and a suppressed record files no card at all. This case
+# spends one inject per repetition — eleven of its twelve records are meant to
+# be dropped — and so does the sibling, which is registered nightly and already
+# priced against this ceiling in hack/eval/nightly-cases.txt. Two nightly drift
+# cases at three repetitions each is six injects against a ceiling of five, so
+# the sixth repetition of the night files no card and times out on the ceiling
+# rather than on anything the case measures. The unparking pull request raises
+# ALERT_DAILY_LIMIT_DRIFT on the eval install, with headroom above six, in the
+# same change that moves the deployer.
 #
-# WHY THE HUMAN CHANGE IS NOT THE NEWEST ONE
+# WHY THE CHURN IS IN A SECOND NAMESPACE
 #
-# The churn continues after it, deliberately. The prompt tells the agent to
-# take the most recent card for the namespace — inherited from the sibling,
-# where a bare kanban_list pages oldest-first and misses the newest — so if the
-# pipeline filtered nothing, the newest card would be controller churn and the
-# agent would reproduce that instead. The objectives below then fail on both
-# halves at once: payments-api absent, a churned workload present. A filter
-# that silently stopped working reds rather than passing on a coincidence.
+# Because the check that carries this case forbids the churned workload names
+# in the reply, and the card is written by an agent with cluster read access
+# that is told to use it. _drift_task_body in session_kv_server.py instructs
+# the Cluster Agent to read the live object before concluding anything, and
+# asks for a `## Why` section saying what that object shows now; an agent doing
+# that well in a namespace holding three Deployments may reasonably note that
+# the other two are unchanged, and the forbidden-phrase check would then red a
+# run in which the filter did its job. Putting the churn on workloads in a
+# namespace the drift card never points at removes the reason a correct report
+# would name them, and weakens nothing the check detects: Classify sorts by
+# principal and never reads a namespace, so the filter under test is the same
+# filter.
 #
 # WHY THE FORBIDDEN PHRASES CARRY THE CASE
 #
 # Same hazard as the sibling, sharper here. An agent that ignores "do not
-# diagnose anything yourself", lists the namespace and reads managedFields off
-# the objects would find all three workloads and name them, because the noise
-# is on the live objects exactly as the human change is. Requiring payments-api
-# alone would pass for that agent. Forbidding the two churned workloads is what
+# diagnose anything yourself" and goes reading managedFields off the live
+# objects would find the churn and name it, because the noise is on the live
+# objects exactly as the human change is. Requiring payments-api alone would
+# pass for that agent. Forbidding the two churned workloads is what
 # distinguishes a report the pipeline filtered from a report the agent wrote.
+#
+# WHY THE HUMAN CHANGE IS NOT THE NEWEST ONE
+#
+# The churn continues after it, deliberately. The prompt tells the agent to
+# take the most recent card concerning either namespace — the status filter and
+# the "most recent" instruction are inherited from the sibling, where a bare
+# kanban_list pages oldest-first and misses the newest — so if the pipeline
+# filtered nothing, the newest card would be controller churn and the agent
+# would reproduce that instead. The objectives below then fail on both halves
+# at once: payments-api absent, a churned workload present. A filter that
+# silently stopped working reds rather than passing on a coincidence.
+#
+# This is also why the prompt names both namespaces rather than only the one
+# holding the human change. Scoping the search to that namespace would tell the
+# agent to skip exactly the cards an unfiltered pipeline files, and the case
+# would pass on that coincidence.
 #
 # PLANTED STATE REQUIRED
 #
@@ -72,11 +130,14 @@
 # cannot drift apart; these should move there when the stack lands, and change
 # together when any one of them changes.
 #
-# - Namespace eval-drift-noise on the HOST cluster — the one the runner
-#   deployed, which no task may choose.
-# - Three Deployments: payments-api (container name `api`), ledger-worker,
-#   checkout-web. The two churned names are what the forbidden_phrases check
-#   keys on.
+# - Two namespaces on the HOST cluster — the one the runner deployed, which no
+#   task may choose. eval-drift-payments holds the human change,
+#   eval-drift-platform holds the churn. Neither name says which is which,
+#   because the prompt carries both and a name like "noise" hands the agent
+#   the answer.
+# - Deployment payments-api (container name `api`) in eval-drift-payments;
+#   Deployments ledger-worker and checkout-web in eval-drift-platform. The two
+#   churned names are what the forbidden_phrases check keys on.
 # - payments-api's declared spec is owned by field manager argocd-controller,
 #   and declares resources.limits.memory 256Mi. expected_output requires the
 #   report to name that manager against the one that took the field.
@@ -86,11 +147,16 @@
 #   still there at the end.
 # - Eleven automation writes against ledger-worker and checkout-web, by service
 #   accounts and system: principals.
+# - Twelve synthetic audit records, one per write, published to the drift-audit
+#   topic for the detector to pull and classify. They have to parse as the
+#   Cloud Audit Log entries the detector expects and to name the objects the
+#   stack actually planted, because the managedFields join reads those objects.
 # - Pacing: the human change lands before the last of the churn (see above),
 #   and the whole burst early enough that the card is filed before the prompt
 #   turn begins.
 #
-# Isolation class: namespace-scoped. Eligible tier: nightly.
+# Isolation class: namespace-scoped — both namespaces are the case's own.
+# Eligible tier: nightly.
 id: gitops-drift-noise-filtered-triage
 name: A burst of controller churn around one human change is triaged as the human change alone
 infrastructure:
@@ -103,11 +169,13 @@ domain: incident-triage
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: maintainers
 
-# The case plants its own namespace rather than reading the seeded fleet, as
-# the sibling drift case does; the stack lands with the fixture #2137 unblocks.
-# `infrastructure.deployer` above moves from noop to tofu in that same pull
-# request, naming the stack -- the two fields travel together, and hack/
-# ci-eval-pr.sh reads the deployer out of the file text.
+# The case plants its own namespaces rather than reading the seeded fleet, as
+# the sibling drift case does; the stack lands with the fixture the blockers
+# above unblock. `infrastructure.deployer` above moves from noop to tofu in
+# that same pull request and gains an `infrastructure.stack` naming the stack
+# -- the two fields travel together, and hack/ci-eval-pr.sh (task_stack) reads
+# `stack:` out of the file text with a regex rather than a YAML parse, so that
+# line has to be real top-level YAML and not one indented inside the prompt.
 fixtures: []
 
 # The board read, not the diagnosis -- the sibling case's header carries the
@@ -118,26 +186,27 @@ fixtures: []
 # drift record, and whether that pipeline delivered the right one is the thing
 # under test.
 #
-# It names the namespace and the window, because that is how the card is found,
-# and nothing else the scenario planted. Not the workload, not the principal,
-# not the field that changed, and in particular not the fact that most of the
-# activity was automation -- an agent told the answer is noise can filter it
-# itself and prove nothing about the detector.
+# It names the two namespaces and the window, because that is how the card is
+# found, and nothing else the scenario planted. Not the workloads, not the
+# principals, not the field that changed, not which namespace holds the human
+# change, and in particular not the fact that most of the activity was
+# automation -- an agent told the answer is noise can filter it itself and
+# prove nothing about the detector.
 prompt: |
-  A number of changes landed against workloads in the 'eval-drift-noise'
-  namespace of GKE cluster '{{CLUSTER_NAME}}' over the last few minutes. Any
-  that were made outside GitOps have already been triaged, and a card for each
-  is on the kanban board.
+  A number of changes landed against workloads in the 'eval-drift-payments' and
+  'eval-drift-platform' namespaces of GKE cluster '{{CLUSTER_NAME}}' over the
+  last few minutes. Any that were made outside GitOps have already been triaged,
+  and a card for each is on the kanban board.
 
   Retrieve that triage and report it. Do not diagnose anything yourself: do not
-  inspect the namespace, the workloads, or their field ownership. The task is to
+  inspect the namespaces, the workloads, or their field ownership. The task is to
   return the report that was already produced, not to produce a second one.
 
   1. Find the card. Call kanban_list separately for status 'running', 'done'
      and 'blocked'. Do not call kanban_list without a status filter -- it
      returns the oldest tasks first and stops at a page, so the newest card is
      not in the default response. The card you want is the most recent one
-     concerning that namespace.
+     concerning either of those namespaces.
   2. If it has not finished, wait for it. Call kanban_show on its id, and keep
      re-checking until its status is 'done', 'blocked' or 'archived'. This
      normally takes several minutes; keep waiting rather than answering with a
@@ -156,11 +225,12 @@ expected_output: |
     required to say where it came from, and must not be marked down for
     reproducing the card without naming it.
   - It concerns 'payments-api' and the memory limit raised on its 'api'
-    container, and nothing else. Most of what happened in that namespace was
-    controller and autoscaler activity, which the pipeline is right to have
-    dropped; a report that lists 'ledger-worker' or 'checkout-web' alongside
-    the real change has either been handed unfiltered noise or gone looking on
-    its own, and both are failures of the thing this case measures.
+    container, and nothing else. Most of what happened across those two
+    namespaces was controller and autoscaler activity, which the pipeline is
+    right to have dropped; a report that lists 'ledger-worker' or
+    'checkout-web' alongside the real change has either been handed unfiltered
+    noise or gone looking on its own, and both are failures of the thing this
+    case measures.
   - It says the change was made outside the GitOps manager, by naming the field
     manager that took the field ('kubectl-edit') against the one owning the
     declared spec ('argocd-controller'). Naming the principal on top of that is
@@ -235,12 +305,19 @@ verification_spec:
       # The discrimination CUJ 3 is about. Not the only check an unfiltered
       # pipeline fails — because the human change is not the newest, the newest
       # card would be churn and triage-names-the-human-change would go red
-      # alongside this one — but the only one that can ONLY fail that way. A
-      # red here is an indictment of the filter; a red there has other
-      # explanations. Both workloads were written to repeatedly
-      # during the window by service-account and system: principals, so both
-      # are visible to an agent that went looking and invisible to one reading
-      # a card the detector filtered.
+      # alongside this one — but the only one whose red says the filter is what
+      # broke. Both workloads were written to repeatedly during the window by
+      # service-account and system: principals, so both are visible to an agent
+      # that went looking and invisible to one reading a card the detector
+      # filtered.
+      #
+      # That last clause is why the churn sits in a namespace of its own, and
+      # the header says so at length: a card about payments-api gives the
+      # Cluster Agent that writes it no reason to reach into the other
+      # namespace, so a thorough report cannot name these two by doing its job
+      # properly. In one shared namespace it could, and this check would red a
+      # working filter. The soundness of the check rests on that separation,
+      # so a stack that collapses the two namespaces has to re-found it.
       #
       # Whole workload names rather than a word like "autoscaler": a correct
       # report may well explain that controller churn was excluded, and
@@ -293,7 +370,7 @@ verification_spec:
       type: resource_property
       kind: deployment
       resource_name: payments-api
-      namespace: eval-drift-noise
+      namespace: eval-drift-payments
       # The obvious write, and the one the card's recommended option describes
       # in words: put it back to what git declares. Proposing that is the right
       # answer; doing it is the failure. Still 512Mi, the value the out-of-band
