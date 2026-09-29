@@ -84,12 +84,18 @@ func defaultTokenSource(ctx context.Context) (oauth2.TokenSource, error) {
 // That host is the same Google frontend, so the cluster CA signs nothing on
 // it and pairing the two fails every request with an x509 error. The shape is
 // recognised by string equality of the two API fields — cluster.Endpoint and
-// DnsEndpointConfig.Endpoint — not by a domain suffix, and it takes the DNS
-// host with no CA regardless of AllowExternalTraffic: whether the pod can
-// route to it is for the connection to find out, as with any address. It
-// needs no MasterAuth either, so a cluster in this shape with no CA on record
-// is a config, not an error. An IP address in cluster.Endpoint beside a DNS
-// endpoint closed to external traffic still takes the IP host and the CA.
+// DnsEndpointConfig.Endpoint — not by a domain suffix, and not by
+// IpEndpointsConfig.Enabled, the field gcloud keys on: the equality is decided
+// on the two values this function would otherwise pair, so it fires exactly
+// when the CA would be attached to the DNS host, and should GKE ever stop
+// mirroring the hostname into cluster.Endpoint the fall-through is the
+// missing-address error below, a cluster skipped and counted, never a config
+// that verifies nothing. It takes the DNS host with no CA regardless of
+// AllowExternalTraffic: whether the pod can route to it is for the connection
+// to find out, as with any address. It needs no MasterAuth either, so a
+// cluster in this shape with no CA on record is a config, not an error. An IP
+// address in cluster.Endpoint beside a DNS endpoint closed to external
+// traffic still takes the IP host and the CA.
 //
 // An address is required. Returning a config with an empty Host would hand
 // rest.Config a relative URL and produce a client that talks to nothing in a
