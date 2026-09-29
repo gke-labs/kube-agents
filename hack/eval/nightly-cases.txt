@@ -40,12 +40,10 @@
 # matrix it costs a night is bought back by the wider fan-out. The one case
 # that stays out is one whose fixture does not exist at all; it waits in the
 # validator's FIXTURE_NOT_READY allowlist with the issue that plants it, and
-# today that is obtainability-declared-intent-no-finding (#1341, needs a
-# second multi-replica workload as a role of its own plus a declaration
-# seeded in each pool project's *-infra repository), vcs-history-only-fact
-# (#1253, needs the git-access-ab/r200 branch pushed to every pool
-# project's GitOps repository) and scope-second-project-denied (#1865, needs
-# a second GCP project in scope per pool project).
+# today that is vcs-history-only-fact (#1253, needs the git-access-ab/r200
+# branch pushed to every pool project's GitOps repository) and
+# scope-second-project-denied (#1865, needs a second GCP project in scope
+# per pool project).
 #
 # BUDGET, priced the way EVAL_REPETITIONS' comment in the script prices the
 # presubmit. The twenty-six-case matrix of 2026-09-09 priced at ~532-552min
@@ -294,6 +292,18 @@
 # ledger. The collector (`collect.py`) computes the check. Priced with the
 # 900s audit band.
 ./tasks/obtainability-planted-orphan-service/task.yaml
+
+# The obtainability stream's declared-intent case (#1341 criterion 4, #1409):
+# notification-relay in seeded-intent (role declared-no-pdb-workload, a
+# second two-replica workload without a budget, so the declaration silences
+# none of the five checkout-gateway cases) plus the knowledge/ note in every
+# pool project's *-infra repository that declares the posture, which
+# scripts/provision_ci_pool_project.sh seeds. Graded on the reply naming the
+# note and closing "missing-PDB findings: 0". Red on the smoke test before
+# the fixture and note existed (build 2104920166281252864, 0/3), green after
+# (build 2104979469071552512, 3/3, 209-1317s), both on this case's bench
+# pull request. deployer: noop, read-only over the seeded fleet.
+./tasks/obtainability-declared-intent-no-finding/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was

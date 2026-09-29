@@ -67,6 +67,18 @@ fixtures:
       Two replicas with no PodDisruptionBudget. Two rather than one because the
       reliability SOP flags spec.replicas >= 2 only.
 
+  - role: declared-no-pdb-workload
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/notification-relay
+    namespace: seeded-intent
+    defect: >-
+      Two replicas with no PodDisruptionBudget, the posture a knowledge/ note in
+      the pool project's GitOps repository declares on purpose. A second such
+      workload so the declaration silences none of the cases that grade
+      checkout-gateway.
+
   - role: crashloop-workload
     slot: a
     available_from_day: 0

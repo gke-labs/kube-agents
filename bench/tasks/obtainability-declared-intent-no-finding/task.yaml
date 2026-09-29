@@ -1,48 +1,33 @@
-# PARKED — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
-# (#1341), in no roster file under hack/eval/ until its fixture exists. The health signal this case grades is a REPOSITORY DECLARATION
-# rather than workload health: the obtainability SOP's declared-intent step
-# (§4a, #1341) reads the linked repositories before it reports a posture, and
-# a two-replica workload whose missing PodDisruptionBudget is declared on
+# The health signal this case grades is a REPOSITORY DECLARATION rather than
+# workload health: the obtainability SOP's declared-intent step (§4a, #1341)
+# reads the linked repositories before it reports a posture, and a
+# two-replica workload whose missing PodDisruptionBudget is declared on
 # purpose in the GitOps repo's knowledge/ directory is not a finding — it is
 # listed under the ledger's Declared intent section with the file's path.
 # This is obtainability-healthy-namespace-silence's shape (an output
 # contract, 0 the only correct count) with the reason for the zero moved
 # from the cluster into the repository.
 #
-# Two things have to exist before this case joins hack/eval/nightly-cases.txt,
-# and neither is
-# repository work this case can carry:
-#   1. The declaration. Each eval project's GitOps repo
-#      (gke-agentic/<project>-infra, hack/ci-deploy.sh gitops_repo_for_project)
-#      needs an OKF note under knowledge/ (a path its .kube-agents/intent.yaml
-#      names, or the whole tree without one) whose `declares:` frontmatter
-#      carries {check: no-pdb, namespace: seeded-reliability, object:
-#      Deployment/checkout-gateway} — the harness reads the frontmatter, not
-#      the prose — committed by an account with write access to those
-#      repositories. None carries one today.
-#   2. A fixture of its own. checkout-gateway's missing budget is the planted
-#      defect five ACTIVE cases grade (reliability-pdb-probe,
-#      obtainability-remediation-proposal, obtainability-pdb-semantics,
-#      obtainability-fleet-exposure-sweep, and nightly
-#      obtainability-planted-pdb), so a declaration for it silences all five
-#      on every run. The declaration has to cover a second multi-replica
-#      workload in a namespace of its own — a new role in
-#      bench/tf/fleet/fixtures.json, planted per docs/designs/
-#      bench-fleet-catalog.md — and this file's fixtures:, prompt and
-#      safeguards then move to that role. bench/tasks/DRAFTS.md, "Declared
-#      intent", carries the status.
-# Until both land the case is written against the one workload a posture
-# check fires on, so that the prompt, the contract and the safeguards can be
-# reviewed now rather than drafted from scratch later.
+# Two things outside this file make it gradable, both planted per pool
+# project:
+#   1. The fixture. notification-relay in seeded-intent (role
+#      declared-no-pdb-workload, bench/tf/fleet/fixtures.json): two replicas,
+#      no budget. A workload of its own because checkout-gateway's missing
+#      budget is the defect five active cases grade, and a declaration for
+#      it would silence all five.
+#   2. The declaration. knowledge/notification-relay-no-pdb.md in each pool
+#      project's GitOps repo (gke-agentic/<project>-infra), whose `declares:`
+#      frontmatter carries {check: no-pdb, namespace: seeded-intent, object:
+#      Deployment/notification-relay}; the harness reads the frontmatter, not
+#      the prose. scripts/provision_ci_pool_project.sh seeds it.
 #
 # Domain: reliability (obtainability-audit).
 # Journey: Declared-intent silence — a posture the audit would flag is
 # declared on purpose in the linked repository, the agent consults the
 # declaration, reports no finding, and names where the declaration lives.
 #
-# Planted defect required: checkout-gateway (role no-pdb-workload,
-# bench/tf/fleet/fixtures.json): two replicas, no PodDisruptionBudget — PLUS
-# the repository declaration described above, which is not planted today.
+# Planted defect required: notification-relay (role declared-no-pdb-workload)
+# plus the repository declaration above.
 # Isolation class: read-only.
 # Eligible tier: presubmit.
 id: obtainability-declared-intent-no-finding
@@ -77,8 +62,7 @@ domain: reliability
 owner: maintainers
 
 # Named by ROLE rather than by cluster, as every fleet case is; the rule is
-# docs/designs/bench-fleet-catalog.md. See the header: this role is a
-# placeholder until the case has a fixture of its own.
+# docs/designs/bench-fleet-catalog.md.
 fixtures:
   - declared-no-pdb-workload
 

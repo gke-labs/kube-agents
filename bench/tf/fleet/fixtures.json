@@ -12,9 +12,7 @@
     "crashloop-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-debug",
-      "probes": [
-        "deployment/payments-api"
-      ],
+      "probes": ["deployment/payments-api"],
       "fixture": "payments-api Deployment, deterministic OOMKilled crashloop, 64Mi memory limit",
       "state": [
         {
@@ -36,9 +34,7 @@
     "no-pdb-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-reliability",
-      "probes": [
-        "deployment/checkout-gateway"
-      ],
+      "probes": ["deployment/checkout-gateway"],
       "fixture": "checkout-gateway Deployment, two replicas, no PodDisruptionBudget in the namespace",
       "state": [
         {
@@ -84,9 +80,7 @@
     "rbac-overgrant": {
       "cluster_slot": "a",
       "namespace": null,
-      "probes": [
-        "clusterrolebinding/debug-binding"
-      ],
+      "probes": ["clusterrolebinding/debug-binding"],
       "fixture": "debug-binding ClusterRoleBinding granting cluster-admin to the seeded-security default ServiceAccount",
       "state": [
         {
@@ -108,9 +102,7 @@
     "idle-nodepool": {
       "cluster_slot": "a",
       "namespace": null,
-      "probes": [
-        "node?cloud.google.com/gke-nodepool=idle-batch-pool"
-      ],
+      "probes": ["node?cloud.google.com/gke-nodepool=idle-batch-pool"],
       "fixture": "idle-batch-pool node pool running zero non-system pods, held empty by a NO_SCHEDULE taint",
       "state": [
         {
@@ -229,9 +221,7 @@
     "declared-no-pdb-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-intent",
-      "probes": [
-        "deployment/notification-relay"
-      ],
+      "probes": ["deployment/notification-relay"],
       "fixture": "notification-relay Deployment, two replicas, no PodDisruptionBudget in the namespace; the workload a repository declaration covers, so the declared-intent case silences nothing another case grades",
       "state": [
         {
