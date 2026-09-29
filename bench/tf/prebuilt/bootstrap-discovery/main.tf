@@ -20,7 +20,7 @@
 # whatever Cluster Agent cards it is going to file, which is what the case
 # grades. Short of that, it hands whatever the worker filed to the verifier
 # at `run_wait`, or fails the apply if no worker has picked the sweep up by
-# then. It does not wait for the Cluster Agent cards itself: the worker's SOP
+# then or no read of the board has succeeded. It does not wait for the Cluster Agent cards itself: the worker's SOP
 # polls them to the end inside its run, but a worker can end its run while
 # they are still running (#1981). The destroy archives them, and archiving a
 # running card ends its worker.
@@ -35,7 +35,9 @@
 #
 # It refuses an install where a person has connected (`.user_aligned`) or
 # onboarding already delivered (`.bootstrap_completed`): a fresh sweep there
-# ends in a report sent to a real chat.
+# ends in a report sent to a real chat. It also refuses one whose
+# `bootstrap-inventory-scan` job is missing or paused, where nothing would
+# file the sweep.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -101,12 +103,14 @@ resource "null_resource" "sweep" {
         if [ "$status" -ne 0 ] && [ -n "$rearmed" ]; then
           echo "Plant failed (exit $status); archiving the bootstrap-inventory cards it left open." >&2
           # The gate files only while this marker is absent, and a sweep filed
-          # after this exit would run with nothing to archive it, so the
-          # marker goes back before the cards are listed. An install that had
-          # none is left without one, or its gate would never file its own
-          # sweep. A gate run that read the marker before it went back files
-          # once its reconcile ends, so the listing also waits for any gate
-          # run to exit.
+          # after this exit would run with nothing to archive it, so a gate
+          # step 2 opened is closed again before the cards are listed. One
+          # that was open gets no marker: if it has not filed yet, it still
+          # files its own sweep; if it filed during this run, its own marker
+          # stays, as after the destroy, and its sweep is among the cards
+          # archived below. A gate run that read the marker before it went
+          # back files once its reconcile ends, so the listing also waits for
+          # any gate run to exit.
           if [ -n "$old_id" ]; then
             agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$old_id" >&2
           fi
@@ -209,7 +213,7 @@ resource "null_resource" "sweep" {
         agent rm -f ${local.inventory}
       }
 
-      # ---- 1. Refuse an install where the sweep would reach a person -------
+      # ---- 1. Refuse an install that would reach a person or file nothing --
       # One read that has to answer `clear`, so a failed exec refuses rather
       # than reading as "no marker".
       state="$(agent_py "${local.scan_job}" <<'PY' || true
@@ -244,12 +248,27 @@ resource "null_resource" "sweep" {
           echo "ERROR: the ${local.scan_job} cron job is paused (\"enabled\": false in ${local.home}/cron/jobs.json) on ${var.host_cluster_name}, so nothing will file a sweep. The agent pod's next start re-enables it." >&2
           exit 1 ;;
         *)
-          echo "ERROR: could not read the onboarding markers on ${var.host_cluster_name} (got '$state')." >&2
+          echo "ERROR: could not read the onboarding markers or ${local.home}/cron/jobs.json on ${var.host_cluster_name} (got '$state')." >&2
           exit 1 ;;
       esac
 
       # ---- 2. Clear the previous sweep -------------------------------------
-      old_id="$(sweep_id)"
+      # What the trap puts back: the previous sweep's id, `none` when only an
+      # inventory file kept the gate closed, or nothing when it was open. A
+      # failed read stops the apply before anything changes; taken for an
+      # open gate, it would have the trap leave this one open.
+      old_id="$(agent_py <<'PY'
+      import os
+      home = "${local.home}"
+      try:
+          with open(home + "/.bootstrap_scan_filed") as fh:
+              ids = [line.strip()[len("task_id="):] for line in fh if line.startswith("task_id=")]
+          print(ids[0] if ids and ids[0] else "none")
+      except FileNotFoundError:
+          if any(os.path.exists(path) for path in "${local.inventory}".split()):
+              print("none")
+      PY
+      )"
       rearmed=1
       for id in $(open_cards); do
         agent ${local.hermes} kanban archive "$id"

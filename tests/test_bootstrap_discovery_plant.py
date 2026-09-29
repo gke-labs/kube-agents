@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The bootstrap-discovery plant's two waits, run against a stub cluster.
+"""The bootstrap-discovery plant, run against a stub cluster.
 
 `bench/tf/prebuilt/bootstrap-discovery/main.tf` re-arms the onboarding gate and
-waits for the sweep it files. Both behaviours pinned here fail quietly on a
+waits for the sweep it files. Three behaviours pinned here fail quietly on a
 real install:
 
   1. Step 4 must not hand over on a run that ended before the sweep filed its
@@ -29,10 +29,16 @@ real install:
      as absent files its sweep after the trap puts the marker back, and above
      one replica that run is on the leader, not whichever pod `kubectl exec
      deployment/...` picks.
+  3. On failure, the exit trap must close a gate step 2 opened, and no other:
+     left open, the gate files a sweep nothing archives; closed where it was
+     open, it never files that install's own sweep. So a failed read of what
+     closed the gate stops the apply before step 2 changes anything.
 
-As in `test_autoops_incident_plant.py`, the provisioner is rendered the way
-Terraform renders it and run against a stub `kubectl`/`gcloud`/`sleep`. Step
-4's board query also runs on its own against a sqlite board.
+The rest pin step 1's refusals and step 4's handling of a board read that
+fails. As in `test_autoops_incident_plant.py`, the provisioner is rendered the
+way Terraform renders it and run against a stub `kubectl`/`gcloud`/`sleep`.
+The reads in steps 1 and 2 also run on their own against a data directory, and
+step 4's board query against a sqlite board.
 """
 
 import json
@@ -52,6 +58,7 @@ _MODULE = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "bootstrap-discovery" / "ma
 _HEREDOC_RE = re.compile(r"command\s*=\s*<<-EOT\n(.*?)\n\s*EOT\n", re.S)
 _RUN_STATE_RE = re.compile(r"^run_state\(\) \{\n  agent_py [^\n]*<<'PY'\n(.*?)\nPY\n", re.S | re.M)
 _STEP_1_RE = re.compile(r"^state=\"\$\(agent_py [^\n]*<<'PY' \|\| true\n(.*?)\nPY\n", re.S | re.M)
+_STEP_2_RE = re.compile(r"^old_id=\"\$\(agent_py <<'PY'\n(.*?)\nPY\n", re.S | re.M)
 _PLANT_BLOCK = 0
 _SWEEP = "t_sweep"
 _CLUSTER_KEY = "bootstrap-inventory-cluster-example-project-cluster-"
@@ -124,17 +131,21 @@ stdin = sys.stdin.read() if cmd[1:2] == ["-"] else ""
 if ".user_aligned" in stdin:
     record("state")
     print(os.environ.get("STEP_1_STATE", "clear"))
+elif ".bootstrap_scan_filed" in stdin:
+    record("old_id")
+    old_id = os.environ.get("OLD_ID", "t_old")
+    if old_id == "fail":
+        sys.stderr.write("error: unable to upgrade connection: container not found\n")
+        sys.exit(1)
+    print(old_id)
 elif "s/^task_id=//p" in script:
     record("sweep_id")
-    if not (state / "rearmed").exists():
-        print(os.environ.get("OLD_ID", "t_old"))
-    elif os.environ.get("GATE_FILES") == "1" and bump("sweep_reads") >= 1:
+    if os.environ.get("GATE_FILES") == "1" and bump("sweep_reads") >= 1:
         print("t_new")
 elif "task_id=$1" in script:
     record("restore")
 elif "rm" in cmd and "/opt/data/.bootstrap_scan_filed" in cmd:
     record("rearm")
-    (state / "rearmed").touch()
 elif "archive" in cmd:
     record("archive")
 elif "/proc" in stdin:
@@ -294,14 +305,27 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertEqual(len(self._indices(calls, "[gate pod/gw-leader]")), 300 // 5 + 1)
         self.assertEqual(len(self._indices(calls, "[open_cards]")), 3)
 
-    def test_the_trap_writes_no_marker_on_an_install_that_had_none(self):
-        # The gate had not filed on this install yet, so there is no marker to
-        # put back, and writing one would stop the gate filing its own sweep.
+    def test_the_trap_writes_no_marker_on_an_install_whose_gate_was_open(self):
+        # Nothing had closed the gate on this install, so a marker would stop
+        # it filing its own sweep. The sweep it raced in is still archived.
         completed, calls = self._run(GATE_FILES=0, OLD_ID="", RACE=1)
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("previous sweep card: none", completed.stdout)
         self.assertEqual(self._indices(calls, "[restore]"), [])
         self.assertEqual(len([c for c in calls if c.endswith("archive t_raced [archive]")]), 1, calls)
+
+    def test_the_trap_closes_a_gate_only_an_inventory_file_had_closed(self):
+        completed, calls = self._run(GATE_FILES=0, OLD_ID="none", RACE=0)
+        self.assertNotEqual(completed.returncode, 0)
+        restore = self._indices(calls, "[restore]")
+        self.assertEqual(len(restore), 1, calls)
+        self.assertTrue(calls[restore[0]].endswith(" sh none [restore]"), calls[restore[0]])
+
+    def test_a_failed_read_of_the_gate_stops_the_apply_before_re_arming(self):
+        completed, calls = self._run(OLD_ID="fail")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn("Plant failed", completed.stderr)
+        self.assertEqual([c for c in calls if c.endswith(("[rearm]", "[archive]", "[restore]"))], [])
 
     def test_the_trap_waits_out_the_ceiling_when_no_gateway_pod_is_listed(self):
         completed, calls = self._run(GATE_FILES=0, NO_PODS=1, RACE=0)
@@ -349,6 +373,47 @@ class Step1StateQueryTest(unittest.TestCase):
     def test_the_markers_are_read_before_the_job(self):
         self.assertEqual(self._state([], markers=[".bootstrap_completed"]), "completed")
         self.assertEqual(self._state(markers=[".user_aligned"]), "aligned")
+
+
+class Step2GateQueryTest(unittest.TestCase):
+    """Step 2's read of what closed the gate, run under the test interpreter
+    against a data dir."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self._home = pathlib.Path(self._dir.name)
+        home = self._dir.name
+        overrides = {"local.home": home, "local.inventory": f"{home}/INVENTORY.raw.md {home}/INVENTORY.md"}
+        self._script = _STEP_2_RE.search(_render_plant(**overrides)).group(1)
+
+    def _old_id(self, files=None):
+        for name, text in (files or {}).items():
+            (self._home / name).write_text(text)
+        completed = subprocess.run(
+            [sys.executable, "-"], input=self._script, capture_output=True, text=True, check=True
+        )
+        return completed.stdout.strip()
+
+    def test_a_marker_reads_as_its_task_id(self):
+        self.assertEqual(self._old_id({".bootstrap_scan_filed": "task_id=t_1\nfiled_at=1\n"}), "t_1")
+
+    def test_a_marker_without_a_task_id_reads_none(self):
+        self.assertEqual(self._old_id({".bootstrap_scan_filed": ""}), "none")
+
+    def test_an_inventory_file_alone_reads_none(self):
+        for name in ("INVENTORY.raw.md", "INVENTORY.md"):
+            with self.subTest(name=name):
+                self.assertEqual(self._old_id({name: "report"}), "none")
+                (self._home / name).unlink()
+
+    def test_an_open_gate_reads_empty(self):
+        self.assertEqual(self._old_id(), "")
+
+    def test_a_marker_it_cannot_read_fails_the_read(self):
+        (self._home / ".bootstrap_scan_filed").mkdir()
+        with self.assertRaises(subprocess.CalledProcessError):
+            self._old_id()
 
 
 class RunStateQueryTest(unittest.TestCase):

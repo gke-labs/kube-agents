@@ -12,15 +12,17 @@
 # job to file a new sweep card, and returns once that card's worker has filed
 # its Cluster Agent cards and then ended its run itself (or completed without
 # filing one), or at the stack's `run_wait` (900s) with whatever it has filed
-# by then; the apply fails if no worker has picked the card up by then. The
-# objective then compares the cards it filed against the Cluster Agent roster,
-# read straight from the profiles on the agent's disk rather than through the
-# gate, so a build whose gate hands the worker no roster fails here instead of
-# erroring. The stack's header says why re-arming archives the previous
-# sweep's cards first.
+# by then; the apply fails if no worker has picked the card up by then or no
+# read of the board has succeeded. The objective then compares the cards it
+# filed against the Cluster Agent roster, read straight from the profiles on
+# the agent's disk rather than through the gate, so a build whose gate hands
+# the worker no roster fails here instead of erroring. The stack's header says
+# why re-arming archives the previous sweep's cards first.
 #
 # The stack refuses an install where a person has connected: a fresh sweep
-# there ends in an onboarding report sent to their chat.
+# there ends in an onboarding report sent to their chat. It also refuses one
+# whose `bootstrap-inventory-scan` job is missing or paused, where nothing
+# would file the sweep.
 #
 # Isolation class: read-only on the cluster; it re-files the onboarding sweep
 # on the install under test, and the destroy archives every card the sweep
