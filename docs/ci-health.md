@@ -605,8 +605,9 @@ line "Filed automatically by the smoke health bot; the fleet owner should
 re-apply the stack in the projects named; the bot will not close it." An open
 `presubmit-gate` issue that already names every drifted role is adopted
 instead. The recovery comments on it as on any other.
-The hourly `ci-kube-agents-fleet-reconcile` periodic re-applies the stack in
-the projects the scan names (`docs/ci-pool-projects.md` §6.2), and the
+Once its `oss-test-infra` entry exists, the hourly `ci-kube-agents-fleet-reconcile`
+periodic re-applies the stack in the projects the scan names
+(`docs/ci-pool-projects.md` §6.2), and the
 recovery comment follows the first scan after that apply, one to two hours
 after the report. No recovery by then is a drift the re-apply did not fix, a
 plan it refused, an apply that failed, or a project leased each time the

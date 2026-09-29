@@ -507,14 +507,19 @@ class HoldTest(unittest.TestCase):
 
         boskos = _Boskos_signalling_release(free=[P7])
         previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        outcomes = {}
+        stdout = io.StringIO()
         try:
-            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", stdout):
                 with self.assertRaises(boskos_pool.Terminated):
-                    reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN)
+                    reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN, outcomes=outcomes)
         finally:
             signal.signal(signal.SIGINT, previous)
         self.assertEqual(boskos.released, [P7], "released before the termination was delivered")
         self.assertIs(signal.getsignal(signal.SIGINT), previous)
+        # The apply that happened is on record and on stdout before the raise.
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertIn(f"{P7}: applied", stdout.getvalue())
 
     def test_a_termination_during_the_acquire_releases_the_project_and_then_propagates(self):
         # Between the acquire and the armed finally: deferred, then raised
@@ -684,6 +689,27 @@ class TofuRunnerTest(unittest.TestCase):
                 timer.cancel()
                 signal.signal(signal.SIGINT, previous)
             self.assertTrue(os.path.exists(marker), "the child never saw SIGINT")
+
+    def test_a_termination_while_tofu_is_starting_still_interrupts_it(self):
+        # A signal during Popen is deferred until the handle exists, then
+        # takes the forward-and-kill path rather than leaving a child running.
+        real_popen = subprocess.Popen
+
+        def popen_then_signal(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            os.kill(os.getpid(), signal.SIGINT)
+            return proc
+
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        started = time.monotonic()
+        try:
+            with mock.patch.object(reconcile.subprocess, "Popen", popen_then_signal):
+                with mock.patch.object(reconcile, "INTERRUPT_GRACE_SECONDS", 1.0):
+                    with self.assertRaises(boskos_pool.Terminated):
+                        reconcile.tofu_runner([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(30)"], timeout=30)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        self.assertLess(time.monotonic() - started, 6, "the child was interrupted and killed, not left for 30 s")
 
     def test_a_finished_child_is_returned_with_its_output(self):
         result = reconcile.tofu_runner([sys.executable, "-c", "print('hi')"], timeout=10)

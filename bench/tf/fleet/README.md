@@ -41,11 +41,12 @@ re-initializing against that project's bucket and naming the project on the appl
 
 Local validation without credentials: `tofu init -backend=false && tofu validate`.
 
-Drift is corrected by re-applying this stack on a schedule: `hack/fleet_reconcile.py`,
-from two Prow periodics that run `main` only and hold each project through Boskos for
-its one apply — hourly for the projects the CI health bot's scan reports drifted, weekly
-for all of them (`docs/ci-pool-projects.md` §6.2). It applies only creates and in-place updates and
-refuses anything else; that apply is a person's. Its `init` runs with `-lockfile=readonly`, so the
+Drift is corrected by re-applying this stack with `hack/fleet_reconcile.py`, which holds each
+project through Boskos for its one apply, applies only creates and in-place updates and
+refuses anything else; that apply is a person's. Its schedule is two Prow periodic entries in
+`oss-test-infra`, `main` only: hourly for the projects the CI health bot's scan reports
+drifted, weekly for all of them (`docs/ci-pool-projects.md` §6.2). Until those entries exist,
+a hand run of the script is the reconcile. Its `init` runs with `-lockfile=readonly`, so the
 providers are the ones `.terraform.lock.hcl` pins; to move them, change `versions.tf` if the major
 changes and run `tofu providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64`
 here, and commit the result. Detecting the drift is a separate job, and

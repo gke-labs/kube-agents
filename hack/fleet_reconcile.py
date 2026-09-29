@@ -120,12 +120,22 @@ def tofu_runner(argv, cwd=None, timeout=None, **_):
     tofu exit at once, mid-operation.
     """
     env = dict(os.environ, **TOFU_ENV)
-    proc = subprocess.Popen(
-        argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True
-    )
+    proc = None
     try:
+        # A termination while the child is being started would leave it
+        # running with no handle to interrupt or kill; deferred until Popen
+        # has returned, it lands below with `proc` in hand.
+        boskos_pool._hold_signals(True)
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True
+            )
+        finally:
+            boskos_pool._hold_signals(False)
         out, err = proc.communicate(timeout=timeout)
     except (subprocess.TimeoutExpired, boskos_pool.Terminated) as first:
+        if proc is None:
+            raise
         proc.send_signal(signal.SIGINT)
         try:
             proc.communicate(timeout=INTERRUPT_GRACE_SECONDS)
@@ -341,22 +351,28 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
             _line(project, outcomes[project])
             continue
         release_failures = {}
+
+        def visit(p):
+            # Recorded and printed inside the hold, so a termination that lands
+            # during the release still leaves this project's apply on record.
+            outcomes[p] = reconcile_project(p, runner=runner, dry_run=dry_run)
+            _line(p, outcomes[p])
+
         outcome = boskos_pool.acquire_and_hold(
             server,
             owner,
             HOLD_STATE,
             lambda project=project: boskos_pool.acquire(server, owner, HOLD_STATE, name=project),
-            lambda p: reconcile_project(p, runner=runner, dry_run=dry_run),
+            visit,
             release_failures,
             heartbeat=True,
         )
         if outcome is boskos_pool.NOT_ACQUIRED:
             outcomes[project] = (OUTCOME_BUSY, REASON_BUSY)
-        else:
-            outcomes[project] = outcome
-            if project in release_failures:
-                outcomes[project] = (OUTCOME_FAILED, release_failures[project])
-        _line(project, outcomes[project])
+            _line(project, outcomes[project])
+        elif project in release_failures:
+            outcomes[project] = (OUTCOME_FAILED, release_failures[project])
+            _line(project, outcomes[project])
     return outcomes
 
 
