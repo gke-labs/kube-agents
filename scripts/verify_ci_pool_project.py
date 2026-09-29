@@ -95,8 +95,9 @@ DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c != CHECK_TOKEN_MINTER_KMS)
 # over gcloud -- is not stopped at the door for a tool no selected check uses.
 GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP})
 # The checks that read GCP, and so need a gcloud credential before they run:
-# every check but the mapping, which reads the checkout and the remote ref.
-GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING}
+# every check but the mapping, which reads the checkout and the remote ref,
+# and the GitHub check, whose reads are all `gh`.
+GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING} - GITHUB_CHECKS
 # What the hourly pool-state scan runs: every read-only check on the project.
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
 # two GitHub checks (each needs a credential the health bot must not hold),
@@ -1968,12 +1969,12 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
             name,
             True,
             "Not checked",
-            warnings=[
+            warnings=[Unread(
                 "kubectl is not on PATH, so the planted fixtures were not checked. "
                 f"Install it and re-run, or run {FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV}=1 "
                 f"FLEET_PROJECT_ID={project_id} hack/fleet-kubeconfigs.sh by hand and "
                 "read its summary line."
-            ],
+            )],
         )
 
     with tempfile.TemporaryDirectory(prefix="verify-fleet-") as tmp:
@@ -2067,7 +2068,7 @@ def _fleet_state_result(
             presence.message,
             warnings=[
                 *presence.warnings,
-                (
+                Unread(
                     "hack/fleet-fixture-state.py printed no summary line, so nothing is known "
                     f"about the fixtures' state in {project_id}. Last line of its output: {last}"
                 ),
@@ -2137,10 +2138,10 @@ def _fleet_presence_result(
                     name,
                     True,
                     "Not checked",
-                    warnings=[
+                    warnings=[Unread(
                         f"hack/fleet-kubeconfigs.sh exited {rc} without reading the fleet, so nothing "
                         f"is known about the fixtures in {project_id}: {reason}"
-                    ],
+                    )],
                 )
             return CheckResult(
                 name,

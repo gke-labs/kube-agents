@@ -878,6 +878,25 @@ class SeededFleetFixturesTest(unittest.TestCase):
             unreachable = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
         self.assertTrue(unreachable.passed, unreachable.details)
         self.assertTrue(unreachable.warnings and all(isinstance(w, checker.Unread) for w in unreachable.warnings), unreachable.warnings)
+        # The other three did-not-read shapes: the state script silent on
+        # exit 0, the presence script's credential gate (exit 3), kubectl gone.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles())), (0, "", "")]
+            no_summary = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(no_summary.passed, no_summary.details)
+        self.assertTrue(no_summary.warnings and all(isinstance(w, checker.Unread) for w in no_summary.warnings), no_summary.warnings)
+        self.assertEqual(checker.report_status(no_summary), checker.REPORT_STATUS_PASS)
+        no_summary.check_id = checker.CHECK_SEEDED_FLEET
+        self.assertEqual(len(checker.report_document("kube-agents-evals-5", [no_summary])["checks"][checker.CHECK_SEEDED_FLEET]["unread"]), 1)
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (checker.FLEET_EXIT_READONLY_UNAVAILABLE, "", "ERROR: no mintable read-only account")]
+            gated = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(gated.passed, gated.details)
+        self.assertTrue(gated.warnings and all(isinstance(w, checker.Unread) for w in gated.warnings), gated.warnings)
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [(127, "", "not found")]
+            no_kubectl = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(no_kubectl.warnings and all(isinstance(w, checker.Unread) for w in no_kubectl.warnings), no_kubectl.warnings)
 
     def test_a_silent_state_script_exit_is_a_failure_like_the_presence_halfs(self):
         # The state half (hack/fleet-fixture-state.py) follows the presence
@@ -3637,7 +3656,7 @@ class ChecksSelectionTest(unittest.TestCase):
         # check alone runs on a machine with neither tool.
         with mock.patch.object(checker, "run_cmd", side_effect=AssertionError("no tool was asked for")):
             self.assertEqual(checker.check_toolchain(needs_gh=False, needs_gcloud=False), [])
-        self.assertEqual(checker.GCP_CHECKS, frozenset(checker.CHECK_IDS) - {checker.CHECK_CODEBASE_MAPPING})
+        self.assertEqual(checker.GCP_CHECKS, frozenset(checker.CHECK_IDS) - {checker.CHECK_CODEBASE_MAPPING} - checker.GITHUB_CHECKS)
         seen = {}
         with mock.patch.object(checker, "check_toolchain", side_effect=lambda **kw: seen.update(kw) or ["stop here"]), mock.patch("sys.stdout", io.StringIO()):
             checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_CODEBASE_MAPPING])
@@ -3645,6 +3664,10 @@ class ChecksSelectionTest(unittest.TestCase):
         with mock.patch.object(checker, "check_toolchain", side_effect=lambda **kw: seen.update(kw) or ["stop here"]), mock.patch("sys.stdout", io.StringIO()):
             checker.verify_project("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS))
         self.assertEqual(seen, {"needs_gh": False, "needs_gcloud": True})
+        # The GitHub check alone reads only through gh: no gcloud asked for.
+        with mock.patch.object(checker, "check_toolchain", side_effect=lambda **kw: seen.update(kw) or ["stop here"]), mock.patch("sys.stdout", io.StringIO()):
+            checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_GITHUB_REPO_AND_APP])
+        self.assertEqual(seen, {"needs_gh": True, "needs_gcloud": False})
         with mock.patch.object(checker, "run_cmd", side_effect=[(0, "me@example.com\n", ""), (127, "", "no gh")]):
             self.assertEqual(len(checker.check_toolchain(needs_gh=True)), 1)
         self.assertFalse(checker.GITHUB_CHECKS.intersection(checker.POOL_STATE_CHECKS))
