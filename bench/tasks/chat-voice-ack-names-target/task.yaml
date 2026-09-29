@@ -1,0 +1,84 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. What it grades is the front door's voice on the
+# one reply it writes for every delegated ask: the acknowledgment
+# (agents/chat/SOUL.md §2, step 4). The ack is status, not conversation, so
+# it names what is being checked ("checking checkout-gateway.") rather than
+# who it was handed to and under which task id. A generic receipt tells the
+# user nothing they did not already know from sending the message; an ack
+# that names its target confirms the ask was read right before any work
+# comes back.
+#
+# The objective reads only the head of final_message, which is the
+# delegating turn's own closing message (bench/kube_agents_bench/parsing.py)
+# with the delivered card results appended after it
+# (harness.py _append_final). A phrase check over the whole final message
+# would pass on the specialist's answer alone, which names the workload
+# however the ack reads, so the check is a pattern anchored at the start:
+# the first non-blank line has to carry the target. The possessive `\s*+`
+# skips leading blank or whitespace-only lines without backtracking into a
+# false failure.
+#
+# The specialist's answer is deliberately not graded. Whether checkout-gateway
+# is restarting depends on the install's fleet (the seeded fleet runs it; a
+# dev project without the fleet does not), and this case grades the front
+# door, so it declares no `fixtures:` and reads only the transcript.
+#
+# Planted defect required: none. Isolation class: read-only.
+id: chat-voice-ack-names-target
+name: Front door's delegation ack names what it is checking
+prompt: >-
+  is checkout-gateway restarting? someone in #oncall said it's crashlooping
+expected_output: >-
+  The front door files a kanban task for a specialist and replies with a
+  short acknowledgment that names what it is checking, for example
+  "checking checkout-gateway." It carries no apology, no preamble and no
+  offer of further help. The specialist's answer follows in the thread.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the front door's reply to a routed ask.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: jayantid
+
+verification_spec:
+  # The ack is only an ack if work was handed over; a front door that answered
+  # from imagination would pass the voice checks and fail this one.
+  - name: the-ask-was-delegated
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  - name: the-ack-names-its-target
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\A\s*+(?![^\n]*checkout-gateway)'
+  # The ack paragraph is everything before the first blank line. The
+  # specialist's answer after it is not the front door's voice. Objectives,
+  # not recoverable safeguards: a recoverable result never fails a run, and
+  # "no apology, no preamble" is what this case exists to hold.
+  - name: no-apology-or-sign-off-in-the-ack
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\A\s*+(?:[^\n]*\S[^\n]*\n)*?[^\n]*(?:sorry|apolog|let me know)'
+  - name: the-ack-opens-without-preamble
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\A\s*+(?:sure|of course|certainly|absolutely|great question|happy to|okay|ok)\b'

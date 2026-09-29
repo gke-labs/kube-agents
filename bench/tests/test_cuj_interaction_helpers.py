@@ -43,14 +43,34 @@ def ack() -> str:
     soul = (Path(__file__).resolve().parents[2] / "agents/chat/SOUL.md").read_text(
         encoding="utf-8"
     )
-    block = re.search(r"```\n(\s*> [^\n]*Delegated to the .*?)```", soul, re.S)
-    assert block, "agents/chat/SOUL.md no longer shows the delegation template"
-    return (
-        textwrap.dedent(block.group(1))
-        .strip()
-        .replace("<agent-name>", "platform")
-        .replace("<task_id>", "t_cbb05c69")
+    block = re.search(
+        r"Acknowledge by naming what is being checked.*?```\n(.*?)```", soul, re.DOTALL
     )
+    assert block, "agents/chat/SOUL.md no longer shows the delegation template"
+    return textwrap.dedent(block.group(1)).strip()
+
+
+# The receipt the template replaced; an install on an older image still sends it.
+OLD_RECEIPT = (
+    "> 🔀 Delegated to the **platform** agent\n\n"
+    "I've started this as task `t_cbb05c69`. The answer will post into this "
+    "thread as soon as it's ready."
+)
+
+
+def test_the_receipt_older_images_send_still_scores_as_no_answer():
+    assert substantive_output({"output": OLD_RECEIPT}) == ""
+    assert substantive_output({"output": f"{OLD_RECEIPT}\n\n{REPORT}"}) == REPORT
+
+
+def test_a_capitalised_gerund_sentence_is_an_answer_not_an_ack():
+    report = "Checking the logs showed a crash on startup."
+    assert substantive_output({"output": report}) == report
+
+
+def test_a_lowercase_answer_opening_with_an_ing_word_is_kept():
+    for report in ("nothing is restarting.", "everything is healthy."):
+        assert substantive_output({"output": report}) == report
 
 
 def test_delegation_acknowledgment_alone_scores_as_no_answer(ack):

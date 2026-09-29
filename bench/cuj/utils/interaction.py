@@ -146,7 +146,19 @@ def tool_operations(
     ]
 
 
-#: The hand-off Kage is told to send, verbatim from agents/chat/SOUL.md §4:
+#: The hand-off Kage is told to send (agents/chat/SOUL.md §2, step 4) is one
+#: lowercase line naming what it is checking:
+#:
+#:     checking checkout-gateway.
+#:
+#: The last branch matches that line only when it is the whole sentence,
+#: starts lowercase, case-sensitively, and opens with one of the verbs the
+#: template shows: a report sentence opens with a capital, so "Checking the
+#: logs showed a crash." is kept as an answer, and so is a lowercase answer
+#: such as "nothing is restarting." that merely starts with an -ing word.
+#:
+#: The other branches are the receipt that template replaced, still sent by an
+#: install on an older image:
 #:
 #:     > 🔀 Delegated to the **<agent-name>** agent
 #:
@@ -155,16 +167,17 @@ def tool_operations(
 #:
 #: Matching has to survive that formatting — the agent name arrives wrapped in
 #: bold markers and the task id in backticks — and must not fire on a report
-#: that merely cites its own task id. Every branch therefore pairs hand-off
-#: phrasing with the thing handed off.
+#: that merely cites its own task id. Each of those branches therefore pairs
+#: hand-off phrasing with the thing handed off.
 #:
-#: Each branch is the template's own wording, not a paraphrase of it: "Results
+#: Each receipt branch is the template's own wording, not a paraphrase of it: "Results
 #: for the design will post below" and "Assigned under task t_...: start at
 #: 14:00" are answers that a looser matcher stripped.
 _DELEGATION_ACK = re.compile(
     r"\bdelegat(?:ed|ing)\b[^.\n]{0,60}\b\**\w[\w-]*\**\s+agent\b"
     r"|\bstarted this as task\s+[`'\"]?t_[0-9a-f]+"
-    r"|\bwill post into this thread\b",
+    r"|\bwill post into this thread\b"
+    r"|(?-i:\A(?:checking|looking|reviewing|auditing|investigating) [^\n]{1,80}\.\Z)",
     re.IGNORECASE,
 )
 
