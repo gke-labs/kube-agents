@@ -4,7 +4,8 @@ Run: python3 -m unittest agents/chat/scripts/test_bootstrap_onboarding_scripts.p
 
 Covers the deterministic decision + I/O logic of:
   - bootstrap_delivery.py  (no_agent delivery of INVENTORY.md, exactly once)
-  - bootstrap_scan_gate.py (files the sweep as a kanban task; stops re-filing)
+  - bootstrap_scan_gate.py (files the sweep as a kanban task, with a card for
+                            each ready Cluster Agent; stops re-filing)
 
 The in-process job removal in bootstrap_delivery._cleanup imports cron.jobs,
 which is unavailable here; its import is guarded, so _cleanup degrades to a

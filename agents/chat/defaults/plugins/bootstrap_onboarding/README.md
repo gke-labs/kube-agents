@@ -312,9 +312,10 @@ Unit tests cover the deterministic pieces of the flow (they mock the Hermes
   delivery trigger, and that the inventory is never injected into the turn.
 - `../../../scripts/test_bootstrap_onboarding_scripts.py` — the delivery
   decision, the atomic claim and verbatim emit/archive, the scan job's
-  file-once-then-skip behaviour across repeated ticks, and the prioritization
-  handoff: that the sweep card hands ranking to a separate card rather than
-  doing it inline, and that the raw and delivered paths never collapse into one.
+  file-once-then-skip behaviour across repeated ticks, the Cluster Agent
+  roster the gate writes into the sweep card, and the prioritization handoff:
+  that the sweep card hands ranking to a separate card rather than doing it
+  inline, and that the raw and delivered paths never collapse into one.
 
 Each once-only step is covered twice: once for acting, once for refusing to act
 again (Rule 8).
