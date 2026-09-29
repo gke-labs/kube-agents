@@ -105,6 +105,7 @@ _DESTROY_INTERPOLATIONS = {
     "self.triggers.container": _INTERPOLATIONS["var.agent_container"],
     "self.triggers.sandbox_selector": _INTERPOLATIONS["var.sandbox_selector"],
     "self.triggers.sandbox_container": _INTERPOLATIONS["var.sandbox_container"],
+    "self.triggers.pod_wait": _INTERPOLATIONS["local.pod_wait"],
 }
 
 # Records every call to $CALLS, tagging the in-pod Python by what it reads, and
@@ -402,13 +403,17 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertEqual(self._indices(calls, "[rearm]"), [])
 
     def test_every_exec_into_the_deployment_bounds_its_wait_for_a_pod(self):
-        # With no pod, kubectl waits 60s by default for one to be created, so
-        # every retry in the trap and steps 3 and 4 would take a minute.
-        completed, calls = self._run(GATE_FILES=0, RESTORE_FAILS=1)
+        # With no pod, each of these would wait kubectl's default 60s to fail.
+        completed, plant_calls = self._run(GATE_FILES=0, RESTORE_FAILS=1)
         self.assertNotEqual(completed.returncode, 0)
+        destroyed, calls = self._run(self._destroy_script, OPEN_CARDS="t_prev")
+        self.assertEqual(destroyed.returncode, 0, destroyed.stderr)
+        destroy_calls = calls[len(plant_calls) :]
+        for tag in ("[restore]", "[old_id]"):
+            self.assertTrue(any(call.endswith(tag) for call in plant_calls), tag)
+        for tag in ("[open_cards]", "archive t_prev [archive]", "[clear deployment/platform-agent-gateway]"):
+            self.assertTrue(any(call.endswith(tag) for call in destroy_calls), tag)
         execs = [call for call in calls if call.startswith("kubectl exec") and "deployment/" in call]
-        self.assertTrue(any(call.endswith("[restore]") for call in execs), calls)
-        self.assertTrue(any(call.endswith("[old_id]") for call in execs), calls)
         for call in execs:
             self.assertIn("--pod-running-timeout=5s", call)
 

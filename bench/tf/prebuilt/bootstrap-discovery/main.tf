@@ -76,7 +76,7 @@ locals {
   list_wait  = 5
   # How long an exec into the agent Deployment waits for a pod when it has
   # none. A pod created in that time is not running yet and fails the exec
-  # anyway, so kubectl's default of 60s only adds a minute to every retry.
+  # anyway, so kubectl's default of 60s only delays each failure by a minute.
   pod_wait = 5
 }
 
@@ -90,6 +90,7 @@ resource "null_resource" "sweep" {
     container         = var.agent_container
     sandbox_selector  = var.sandbox_selector
     sandbox_container = var.sandbox_container
+    pod_wait          = local.pod_wait
   }
 
   provisioner "local-exec" {
@@ -444,7 +445,7 @@ resource "null_resource" "sweep" {
       # at the end: with on_failure = continue, Terraform counts this destroy
       # done whatever its exit status.
       failed=""
-      ids="$(kubectl exec -i -n "$ns" "$target" -c "${self.triggers.container}" -- \
+      ids="$(kubectl exec -i -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
         /opt/hermes/.venv/bin/python3 - "bootstrap-inventory-%" <<'PY'
       import sqlite3, sys
       c = sqlite3.connect("file:/opt/data/kanban.db?mode=ro", uri=True)
@@ -453,12 +454,12 @@ resource "null_resource" "sweep" {
       PY
       )" || failed="$failed, list the open cards"
       for id in $ids; do
-        kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" -- \
+        kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
           /opt/hermes/.venv/bin/hermes kanban archive "$id" || failed="$failed, archive $id"
       done
       # The sweep marker stays, so the gate does not file again once this
       # case is gone.
-      kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" -- \
+      kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
         rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md || failed="$failed, remove the agent's INVENTORY files"
       if sandbox_pods="$(kubectl get pods -n "$ns" -l "${self.triggers.sandbox_selector}" -o name)"; then
         for pod in $sandbox_pods; do
