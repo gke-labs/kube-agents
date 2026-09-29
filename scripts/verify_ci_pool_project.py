@@ -121,6 +121,10 @@ REPAIR_HOST_CLUSTER = "docs/ci-pool-projects.md section 2 by hand, against the p
 REPAIR_HOST_CMEK = "gcloud container clusters update platform-agent-host --database-encryption-key=<the project's key>, as install.sh does for an existing cluster (docs/ci-pool-projects.md section 2)"
 REPAIR_STATE_BUCKET = "gcloud storage buckets create gs://{project_id}-tf-state --project={project_id} --location=us-central1 --uniform-bucket-level-access && gcloud storage buckets update gs://{project_id}-tf-state --versioning (docs/ci-pool-projects.md section 2; not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
 REPAIR_FLEET_APPLY = "re-apply bench/tf/fleet against {project_id} (bench/tf/fleet/README.md, State and reconcile)"
+# An absent service account. The platform GSA is the full-install
+# composition's; the LiteLLM GSA has a hand repair in the runbook.
+REPAIR_PLATFORM_GSA = "docs/ci-pool-projects.md section 3: the full-install composition creates kubeagents-platform-gsa; re-create it against the project's existing full-install state (not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
+REPAIR_LITELLM_GSA = "the hand repair in docs/ci-pool-projects.md section 3 (gcloud iam service-accounts create kubeagents-litellm-gsa, roles/aiplatform.user, and its Workload Identity binding)"
 REPAIR_MINTER = "docs/ci-pool-projects.md section 5.2 (the ci-pool-minter composition owns the key)"
 REPAIR_MINTER_ROTATION = "import the version the chart pins, or bump githubMinter.kms.keyVersion in charts/kube-agents/values.yaml to an ENABLED one (docs/site/src/content/docs/deploy/token-minter.md)"
 # The one version state `kms keys versions enable` takes; a scheduled or done
@@ -607,7 +611,11 @@ _UNREAD_PATTERNS = (
     # not absence either; without this a DNS or TLS blip on one wave became
     # three `*/failed` findings and a pool-drift issue.
     # In gcloud's own crash form, so a resource named readtimeout is not one.
-    re.compile(r"gcloud crashed \((?:\w*ConnectionError|SSLError|ReadTimeout|ConnectTimeout|ProtocolError|RemoteDisconnected)\)|Temporary failure in name resolution|Name or service not known|Connection reset by peer", re.I),
+    re.compile(
+        r"gcloud crashed \(\w*(?:Connection|Timeout|Transport|Proxy|ServerNotFound|ChunkedEncoding|MaxRetry|RemoteDisconnected|Protocol|SSL|IncompleteRead)\w*\)"
+        r"|Temporary failure in name resolution|Name or service not known|Connection reset by peer|Unable to find the server at",
+        re.I,
+    ),
 )
 
 # gh prints `gh: Not Found (HTTP 404)` both for a resource that is absent and
@@ -1047,6 +1055,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             warnings,
         ):
             passed = False
+            findings.append(Finding("iam/platform-gsa/absent", details[-1], REPAIR_PLATFORM_GSA))
     else:
         wi_checked = True
         try:
@@ -1090,6 +1099,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             warnings,
         ):
             passed = False
+            findings.append(Finding("iam/litellm-gsa/absent", details[-1], REPAIR_LITELLM_GSA))
     else:
         try:
             policy = _load_json(out)
@@ -1309,6 +1319,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             warnings,
         ):
             passed = False
+            findings.append(Finding("iam/fleet-reader/absent", details[-1], REPAIR_FLEET_APPLY.format(project_id=project_id)))
     else:
         fleet_reader_checked = True
         try:

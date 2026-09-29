@@ -431,6 +431,18 @@ def scan(
 # --------------------------------------------------------------------------- #
 
 
+def _finite_seconds(text: str) -> float:
+    """argparse type: a finite, non-negative number of seconds, refused at
+    the door rather than inside a worker thread."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds")
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite, non-negative number of seconds")
+    return value
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=pathlib.Path, required=True, help="where to write pool-state.json")
@@ -442,7 +454,7 @@ def parse_args(argv):
     parser.add_argument("--verifier", type=pathlib.Path, default=VERIFIER_SCRIPT, help=argparse.SUPPRESS)
     parser.add_argument("--workdir", type=pathlib.Path, help="where the per-project reports go (default: a temporary directory, removed afterwards)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"projects scanned at once (default {DEFAULT_WORKERS})")
-    parser.add_argument("--project-timeout", type=float, default=DEFAULT_PROJECT_TIMEOUT_S, help=f"seconds per project for the verifier (default {DEFAULT_PROJECT_TIMEOUT_S})")
+    parser.add_argument("--project-timeout", type=_finite_seconds, default=DEFAULT_PROJECT_TIMEOUT_S, help=f"seconds per project for the verifier (default {DEFAULT_PROJECT_TIMEOUT_S})")
     parser.add_argument("--now", help="the scan time to record, ISO 8601 (default: now)")
     return parser.parse_args(argv)
 

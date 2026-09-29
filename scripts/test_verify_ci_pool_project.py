@@ -113,8 +113,16 @@ class DenialClassifierTest(unittest.TestCase):
         "ERROR: (gcloud.projects.get-iam-policy) HttpError accessing <https://cloudresourcemanager.googleapis.com/v1/projects/p:getIamPolicy?alt=json>: response: <{'status': '429'}>, content <{\"error\": {\"code\": 429, \"message\": \"Quota exceeded\"}}>",
         "ERROR: (gcloud.container.clusters.list) ResponseError: code=503, message=The service is currently unavailable.",
         "ERROR: (gcloud.artifacts.repositories.describe) INTERNAL: Internal error encountered.",
-        # A transport failure: gcloud never got an answer.
+        # A transport failure: gcloud never got an answer, under whichever
+        # class the transport in use raised.
         "ERROR: gcloud crashed (ConnectionError): HTTPSConnectionPool(host='cloudresourcemanager.googleapis.com', port=443): Max retries exceeded with url: /v1/projects/p (Caused by NewConnectionError('Temporary failure in name resolution'))",
+        "ERROR: gcloud crashed (ServerNotFoundError): Unable to find the server at cloudresourcemanager.googleapis.com",
+        "ERROR: gcloud crashed (TransportError): HTTPSConnectionPool(host='oauth2.googleapis.com', port=443): Max retries exceeded (Caused by NewConnectionError('[Errno 111] Connection refused'))",
+        "ERROR: gcloud crashed (ChunkedEncodingError): ('Connection broken: IncompleteRead(0 bytes read)', IncompleteRead(0 bytes read))",
+        "ERROR: gcloud crashed (ProxyError): HTTPSConnectionPool(host='container.googleapis.com', port=443): Max retries exceeded",
+        "ERROR: gcloud crashed (ConnectionAbortedError): [Errno 53] Software caused connection abort",
+        "ERROR: gcloud crashed (TimeoutError): [Errno 60] Operation timed out",
+        "ERROR: gcloud crashed (MaxRetryError): HTTPSConnectionPool(host='iam.googleapis.com', port=443): Max retries exceeded (Caused by ReadTimeoutError(\"HTTPSConnectionPool(host='iam.googleapis.com', port=443): Read timed out.\"))",
         "ERROR: gcloud crashed (SSLError): [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed",
         "ERROR: gcloud crashed (ReadTimeout): HTTPSConnectionPool(host='container.googleapis.com', port=443): Read timed out.",
     )
@@ -2443,6 +2451,23 @@ class IamGrantsTest(unittest.TestCase):
         self.assertTrue(result.passed, result.details)
         self.assertEqual(result.message, "Cloud Build and Compute SAs hold reader on the warm cache repository")
         self.assertTrue(result.read)
+
+    def test_an_absent_service_account_is_a_finding_with_its_repair(self):
+        gone = _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown service account.")
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [gone, gone, _ok(self._project_policy()), gone]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        found = {f.id: f.repair for f in result.findings}
+        self.assertEqual(found["iam/platform-gsa/absent"], checker.REPAIR_PLATFORM_GSA)
+        self.assertEqual(found["iam/litellm-gsa/absent"], checker.REPAIR_LITELLM_GSA)
+        self.assertIn("kube-agents-evals-3", found["iam/fleet-reader/absent"])
+        doc = checker.report_document("kube-agents-evals-3", [self._tagged_iam(result)])
+        self.assertIn("iam/platform-gsa/absent", [f["id"] for f in doc["checks"]["iam"]["findings"]])
+
+    def _tagged_iam(self, result):
+        result.check_id = "iam"
+        return result
 
     def test_the_warm_cache_read_is_its_own_check_and_not_the_scans(self):
         # The IAM check as the bot must read in full: the one read outside the

@@ -306,6 +306,14 @@ class EntryPoint(ScanHarness):
         self.assertEqual(rc, pool_state.EXIT_REPOSITORY_BUG)
         self.assertIn("nowhere.py", err)
 
+    def test_a_bad_project_timeout_is_refused_at_the_door(self):
+        for bad in ("nan", "inf", "-1", "soon"):
+            stderr = __import__("io").StringIO()
+            with unittest.mock.patch("sys.stderr", stderr), self.assertRaises(SystemExit) as raised:
+                pool_state.main(["--out", str(self.root / "out.json"), "--projects", PROJECT, "--verifier", str(self.stub), "--project-timeout", bad])
+            self.assertEqual(raised.exception.code, 2, bad)
+            self.assertIn("seconds", stderr.getvalue())
+
     def test_an_unknown_check_is_a_repository_bug(self):
         rc, err = self._run("--out", str(self.root / "out.json"), "--projects", PROJECT, "--verifier", str(self.stub), "--checks", "iam,no_such_check")
         self.assertEqual(rc, pool_state.EXIT_REPOSITORY_BUG)
