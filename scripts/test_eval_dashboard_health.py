@@ -1288,6 +1288,9 @@ class PeriodicNote(unittest.TestCase):
         partial = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(hours=1))}, prev=first, now=T0 + timedelta(hours=1))
         self.assertEqual(partial["periodics_since"], {self.WEEKLY: health.iso(T0)})
         self.assertEqual(partial["periodics_read"], [self.SWEEP])
+        # A job no longer watched leaves the carry.
+        retired = dict(first, periodics_since={**first["periodics_since"], "ci-kube-agents-retired": health.iso(T0)})
+        self.assertEqual(self.judge(None, prev=retired, now=T0 + timedelta(hours=1))["periodics_since"], {self.WEEKLY: health.iso(T0)})
 
     def test_staleness_is_measured_on_the_wall_clock_not_the_data_horizon(self):
         # A stalled archive freezes data.json's generated_at with the jobs; the

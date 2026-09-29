@@ -1878,6 +1878,27 @@ class WatchedPeriodics(RunHarness):
         self.tick(restamped, T14 + timedelta(hours=1))
         self.assertEqual(len(self.opener.texts), 1, "not re-announced")
 
+    def test_a_job_no_longer_watched_leaves_the_told_map(self):
+        doc = health("GREEN")
+        doc["periodics"] = {self.WEEKLY: periodic_note()}
+        doc["periodics_read"] = [self.WEEKLY]
+        self.tick(doc, T14)
+        state = json.loads(self.state.read_text())
+        state["periodics_told"]["ci-kube-agents-retired"] = "FAILED"
+        state["periodics_clean_seen"] = ["ci-kube-agents-retired"]
+        self.state.write_text(json.dumps(state))
+        self.tick(doc, T14 + timedelta(minutes=15))
+        self.assertEqual((self.recorded()["periodics_told"], self.recorded()["periodics_clean_seen"]), ({self.WEEKLY: "FAILED"}, []))
+
+    def test_a_stale_note_without_a_finish_time_does_not_say_nothing_finished(self):
+        doc = health("GREEN")
+        doc["periodics"] = {self.WEEKLY: dict(periodic_note(verdict="STALE"), finished_at=None)}
+        doc["periodics_read"] = [self.WEEKLY]
+        self.tick(doc, T14)
+        text = self.opener.texts[0]
+        self.assertIn("finish time unreadable", text)
+        self.assertNotIn("has finished nothing", text)
+
     def test_a_stopped_job_is_said_in_grey_with_its_last_run(self):
         stopped = health("GREEN")
         stopped["periodics"] = {self.WEEKLY: periodic_note(verdict="STALE", finished="2026-09-05T13:40:00+00:00")}

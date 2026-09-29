@@ -1990,9 +1990,14 @@ def adjudicate(
     # An open note's start survives a blind tick through `periodics_since`,
     # as the pool episode's does through `pool_since`: a tick with readings
     # and no note for a job ends its episode; one with no readings keeps it.
-    before_since = (prev or {}).get("periodics_since") or {}
-    prev_notes = {job: {"since": since} for job, since in before_since.items() if isinstance(since, str)}
-    prev_notes.update((prev or {}).get("periodics") or {})
+    # `periodics_since` carries every open note's start, noted or blind, so it
+    # is the one source the notes start from; jobs no longer watched drop out.
+    before_since = {
+        job: since
+        for job, since in ((prev or {}).get("periodics_since") or {}).items()
+        if isinstance(since, str) and job in periodics.WATCHED_BY_JOB
+    }
+    prev_notes = {job: {"since": since} for job, since in before_since.items()}
     # The wall clock, as the pool note's: a job that stopped is measured
     # against the time it is, not data.json's horizon, which a stalled
     # archive freezes together with the jobs.

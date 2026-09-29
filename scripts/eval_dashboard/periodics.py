@@ -21,6 +21,7 @@ import argparse
 import dataclasses
 import json
 import pathlib
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -48,7 +49,10 @@ DETAIL_LIMIT = 5
 # in it worth naming.
 RECONCILE_ARTIFACT = "fleet-reconcile.json"
 RECONCILE_NAMED_OUTCOMES = ("refused", "failed", "interrupted")
-NOT_FOUND_MARKERS = ("NotFound", "No URLs matched", "404")
+# gsutil's absent-object wording, the set scripts/release/poll_rc_eval_verdict.py
+# settled on for this archive: never a bare 404, because gsutil echoes the
+# failing URL and a 19-digit build id can contain those digits.
+NOT_FOUND_PATTERNS = ("matched no objects", "no urls matched", "notfoundexception: 404")
 # GitHub Actions renders a line with this prefix as a workflow warning, as the
 # sibling pool-pressure step's `echo "::warning::..."` does.
 WARNING_PREFIX = "::warning::"
@@ -132,7 +136,8 @@ def _gsutil(args: list[str], runner=subprocess.run) -> tuple[int, str, str]:
 
 
 def _not_found(err: str) -> bool:
-    return any(marker in (err or "") for marker in NOT_FOUND_MARKERS)
+    text = (err or "").lower()
+    return any(pattern in text for pattern in NOT_FOUND_PATTERNS)
 
 
 class Unreadable(Exception):
@@ -229,7 +234,12 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
                     loaded = json.loads(out)
                 except ValueError:
                     loaded = None
-                artifact = loaded if isinstance(loaded, dict) else None
+                if not isinstance(loaded, dict):
+                    # Present but cut short (the report is written last, and
+                    # a signal can cut the write): unreadable, as above.
+                    log(f"{WARNING_PREFIX}could not read {periodic.job}'s {build}/{periodic.artifact}: not a JSON object", file=sys.stderr)
+                    return None
+                artifact = loaded
             elif not _not_found(err):
                 log(f"{WARNING_PREFIX}could not read {periodic.job}'s {build}/{periodic.artifact}: {err.strip()}", file=sys.stderr)
                 return None
@@ -328,9 +338,11 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
 
 def evidence(note: dict) -> str:
     if note[KEY_VERDICT] == VERDICT_STALE:
-        return f"{note[KEY_LABEL]}: no finished run since {note[KEY_FINISHED_AT] or 'ever'} ({note[KEY_JOB]} has finished nothing in {note[KEY_STALE_AFTER_H]}h)"
-    detail = f": {'; '.join(note['detail'])}" if note.get("detail") else ""
-    return f"{note['label']}: build {note[KEY_BUILD]} failed at {note[KEY_FINISHED_AT]}{detail}"
+        if not note[KEY_FINISHED_AT]:
+            return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} finished at a time the archive does not give, so the {note[KEY_STALE_AFTER_H]}h window cannot be measured"
+        return f"{note[KEY_LABEL]}: no finished run since {note[KEY_FINISHED_AT]} ({note[KEY_JOB]} has finished nothing in {note[KEY_STALE_AFTER_H]}h)"
+    detail = f": {'; '.join(note[KEY_DETAIL])}" if note.get(KEY_DETAIL) else ""
+    return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} failed at {note[KEY_FINISHED_AT]}{detail}"
 
 
 def parse_args(argv):

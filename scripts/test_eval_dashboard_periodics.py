@@ -151,6 +151,23 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("101/finished.json", warnings[0])
 
+    def test_a_build_id_containing_404_in_an_error_is_not_read_as_absent(self):
+        # gsutil echoes the failing URL; a 503 on .../1404/finished.json is
+        # not a NotFound, and the walk must not report the build before it.
+        objects = archive(WEEKLY.job, {"1404": (finished(NOW - timedelta(hours=1), passed=False), None), "1400": (finished(NOW - timedelta(days=1)), None)})
+        class Flaky(FakeGsutil):
+            def __call__(self, cmd, **kwargs):
+                if cmd[3].endswith("/1404/finished.json"):
+                    return subprocess.CompletedProcess(cmd, 1, "", f"ServiceException: 503 Backend error reading {cmd[3]}")
+                return super().__call__(cmd, **kwargs)
+        warnings = []
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=Flaky(objects), log=lambda *a, **k: warnings.append(a[0])), {})
+        self.assertEqual(len(warnings), 1)
+        self.assertTrue(periodics._not_found("CommandException: No URLs matched: gs://x/y"))
+        self.assertTrue(periodics._not_found("NotFoundException: 404 gs://x/y does not exist."))
+        self.assertFalse(periodics._not_found("ServiceException: 503 on gs://kube-agents-prow/logs/j/2097891568546404123/started.json"))
+
     def test_a_present_but_unparseable_finished_json_is_a_blind_tick(self):
         # An empty or truncated object is not "still running": walking past it
         # would report the build before as the latest finished run.
@@ -223,6 +240,49 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(len(lines), periodics.DETAIL_LIMIT + 2)
         self.assertEqual(lines[periodics.DETAIL_LIMIT], f"and {8 - periodics.DETAIL_LIMIT} more")
         self.assertEqual(lines[-1], "run: 8 project(s) not reconciled")
+
+    def test_a_pointer_or_listing_of_digit_lookalikes_is_not_a_build(self):
+        # str.isdigit admits what int rejects; the reader keys on isdecimal.
+        root = f"{periodics.LOGS_ROOT}/{SWEEP.job}"
+        objects = archive(SWEEP.job, {"8": (finished(NOW - timedelta(minutes=3)), None)})
+        objects[f"{root}/{periodics.POINTER}"] = "\u00b2\n"
+        warnings = []
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0])), {})
+        self.assertIn("not a build id", warnings[0])
+        objects = archive(SWEEP.job, {"9": (None, None), "8": (finished(NOW - timedelta(minutes=13)), None)})
+        objects[f"{root}/\u2460/started.json"] = "{}"
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects))
+        self.assertEqual(readings[SWEEP.job]["build"], "8")
+
+    def test_an_unreadable_artifact_is_a_blind_tick_not_a_note_without_its_projects(self):
+        root = f"{periodics.LOGS_ROOT}/{WEEKLY.job}"
+        report = {"outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "x"}}}
+        objects = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), report)})
+        denied = FakeGsutil(objects, denied={f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"})
+        warnings = []
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=denied, log=lambda *a, **k: warnings.append(a[0])), {})
+        self.assertEqual(len(warnings), 1)
+        # Present but cut short: unreadable the same way.
+        objects[f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"] = '{"outcomes": {'
+        warnings.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0])), {})
+        self.assertIn("not a JSON object", warnings[0])
+        # A run that wrote no artifact is a reading without one.
+        absent = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), None)})
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(absent))
+        self.assertIsNone(readings[WEEKLY.job]["artifact"])
+
+    def test_a_stale_note_without_a_finish_time_says_the_window_cannot_be_measured(self):
+        readings = {HOURLY.job: {"job": HOURLY.job, "build": "5", "finished_at": None, "passed": True, "result": "SUCCESS"}}
+        note = periodics.assess(readings, NOW, {})[HOURLY.job]
+        self.assertEqual(note["verdict"], periodics.VERDICT_STALE)
+        self.assertIn("cannot be measured", periodics.evidence(note))
+        self.assertNotIn("finished nothing", periodics.evidence(note))
 
     def test_a_listing_that_fails_and_a_bad_pointer_are_said(self):
         root = f"{periodics.LOGS_ROOT}/{SWEEP.job}"

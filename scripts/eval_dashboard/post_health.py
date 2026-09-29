@@ -892,11 +892,16 @@ def render_periodic(health: dict, prev: dict | None) -> str:
     for job, note in sorted(periodic_news(health, prev).items()):
         when = clock(parse_iso(note.get("finished_at")))
         if note.get("verdict") == periodics.VERDICT_STALE:
-            last = f"last finished run {when}" if note.get("finished_at") else "no finished run on record"
-            blocks.append(
-                f"⚪ *{note['label']} stopped* — {last}; `{job}` has finished nothing in {note['stale_after_h']}h."
-                f" If the next one doesn't land, it needs checking.\n{note['history_url']}"
-            )
+            if note.get("finished_at"):
+                blocks.append(
+                    f"⚪ *{note['label']} stopped* — last finished run {when}; `{job}` has finished nothing in {note['stale_after_h']}h."
+                    f" If the next one doesn't land, it needs checking.\n{note['history_url']}"
+                )
+            else:
+                blocks.append(
+                    f"⚪ *{note['label']}: last run's finish time unreadable* — build {note['build']} finished, but the archive gives no time for it,"
+                    f" so the {note['stale_after_h']}h window cannot be measured. Someone check the job.\n{note['history_url']}"
+                )
             continue
         dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
         lines = [f"🟠 *{note['label']} failed* — build {note['build']} at {when}{dry}."]

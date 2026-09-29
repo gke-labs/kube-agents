@@ -510,6 +510,7 @@ class MainTest(unittest.TestCase):
                     reconcile.main(["--project", P7, "--report", str(report), "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
             doc = json.loads(report.read_text())
             self.assertEqual((doc["exit"], doc["exit_code"], doc["outcomes"]), ("error", None, {}))
+            self.assertEqual(doc["error"], "KeyError: 'boom'", "the report names what killed the run")
 
     def test_a_terminated_run_still_writes_its_report(self):
         def tofu(argv, **_):

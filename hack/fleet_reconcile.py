@@ -495,6 +495,10 @@ def main(argv=None):
     code = None
     try:
         code = _run(args, outcomes, error)
+    except BaseException as exc:
+        # Unhandled: the report still names what killed the run.
+        error.append("%s: %s" % (type(exc).__name__, exc))
+        raise
     finally:
         # Written whatever happened above: an exception no arm of _run
         # handles still leaves a report, with `exit` "error" and no code.
