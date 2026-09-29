@@ -65,6 +65,14 @@ readonly ENVOY_LOG_TAIL_LINES=20000
 # a replaced pod starts a fresh log, so a green run whose repetitions ended
 # "bridge-shutdown" kept no record of whether it was an OOM kill, an eviction
 # or a rollout. Same bounds as the gateway log: a line tail, then a byte cap.
+#
+# The snapshot runs at exit, hours after an early repetition: events have
+# aged out by then (the apiserver keeps them an hour), and `logs --previous`
+# reads the current pod, so a replaced pod's containers are gone with it. So
+# start_agent_pod_watch, started once the eval knows its host cluster, streams
+# pod changes and events to a scratch file for the eval's lifetime, and the
+# snapshot stops it and keeps the tail. What no capture here recovers is the
+# log of a container in a pod that has since been deleted.
 readonly AGENT_DIAG_LOG_TAIL_LINES=20000
 readonly AGENT_DIAG_LOG_MAX_BYTES=$((8 * 1024 * 1024))
 # Events are one line each; the namespace's whole retained window fits.
@@ -78,6 +86,16 @@ readonly AGENT_DIAG_DEPLOYMENT="deployment/platform-agent-gateway"
 # One line per pod, then one per container: restarts, the last termination
 # (reason, exit code, when), and since when it has been running. Evicted pods
 # carry their reason at pod level, so the pod line has status.reason.
+# Every one-shot read gives up after this, so an unreachable cluster costs
+# seconds per call on an exit that is often already an infrastructure failure.
+readonly AGENT_DIAG_REQUEST_TIMEOUT="30s"
+# The apiserver closes a watch after 30-60 minutes; the loop re-opens it after
+# this pause (and keeps retrying at this pace while the cluster is unreachable).
+readonly AGENT_DIAG_WATCH_RESTART_SECONDS=10
+# Absolute times only: a watch line is read hours after it was printed, so the
+# relative ages `-o wide` prints would say nothing.
+readonly AGENT_DIAG_WATCH_POD_COLUMNS="NAME:.metadata.name,PHASE:.status.phase,REASON:.status.reason,STARTED:.status.startTime,DELETING:.metadata.deletionTimestamp,CONTAINERS:.status.containerStatuses[*].name,RESTARTS:.status.containerStatuses[*].restartCount,LAST:.status.containerStatuses[*].lastState.terminated.reason,EXIT:.status.containerStatuses[*].lastState.terminated.exitCode,FINISHED:.status.containerStatuses[*].lastState.terminated.finishedAt"
+readonly AGENT_DIAG_WATCH_EVENT_COLUMNS="FIRST:.firstTimestamp,LAST:.lastTimestamp,EVENT:.eventTime,COUNT:.count,TYPE:.type,REASON:.reason,OBJECT:.involvedObject.kind,NAME:.involvedObject.name,MESSAGE:.message"
 readonly AGENT_DIAG_POD_STATUS_JSONPATH='{range .items[*]}{.metadata.name}{"\tphase="}{.status.phase}{"\treason="}{.status.reason}{"\tstarted="}{.status.startTime}{"\n"}{range .status.containerStatuses[*]}{"  "}{.name}{"\trestarts="}{.restartCount}{"\tlast="}{.lastState.terminated.reason}{"\texit="}{.lastState.terminated.exitCode}{"\tfinished="}{.lastState.terminated.finishedAt}{"\trunningSince="}{.state.running.startedAt}{"\n"}{end}{end}'
 
 ensure_helm() {
@@ -114,8 +132,8 @@ ensure_helm() {
 # `if [ "$exit_code" -ne 0 ]`. That meant the eval job had NEVER kept a record
 # from a passing run -- exactly backwards for a rate-based gate, whose baseline
 # store is built from green runs on main. The copy is one `cp`, so there is no
-# reason to condition it; the expensive diagnostics (kubectl logs, describe
-# pods, gcloud builds list) stay failure-only below.
+# reason to condition it; the expensive diagnostics (describe pods, gcloud
+# builds list, the controller, LiteLLM and Envoy tails) stay failure-only below.
 #
 # Callers must invoke this BEFORE dump_prow_artifacts_on_failure: that function
 # reads `$?` on its first line, so anything running ahead of it must leave the
@@ -157,6 +175,64 @@ collect_gateway_log() {
     | tail -c "${GATEWAY_LOG_MAX_BYTES}" > "${artifact_dir}/platform-agent-gateway.log" || true
 }
 
+# ─── Agent Pod Watch (the eval's lifetime) ───────────────────────────────────
+# Re-opens `"$@"` whenever the apiserver closes it, appending to `out`, until
+# TERM or until `parent` is gone. The kubectl runs as a child and is killed by
+# the trap: killing only this loop would orphan a watch that never ends.
+_agent_pod_watch_loop() {
+  local parent="$1" out="$2"
+  shift 2
+  local child=""
+  trap 'kill "${child}" 2>/dev/null; exit 0' TERM
+  while kill -0 "${parent}" 2>/dev/null; do
+    "$@" >> "${out}" 2>&1 &
+    child=$!
+    wait "${child}" || true
+    sleep "${AGENT_DIAG_WATCH_RESTART_SECONDS}" || true
+  done
+}
+
+# Starts the pod and event watches the AGENT_DIAG_ header describes, pinned to
+# AGENT_CLUSTER_CONTEXT. Call once the context is known; a second call is a
+# no-op. `disown` for the reason the Boskos heartbeat gives in ci-eval-pr.sh:
+# the fan-out sizes its lanes with `jobs -rp`. Never fails the caller.
+AGENT_DIAG_WATCH_PIDS=""
+AGENT_DIAG_WATCH_DIR=""
+start_agent_pod_watch() {
+  [ -z "${AGENT_DIAG_WATCH_PIDS}" ] || return 0
+  local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
+  local kctl=(kubectl)
+  if [ -n "${AGENT_CLUSTER_CONTEXT:-}" ]; then
+    kctl+=(--context "${AGENT_CLUSTER_CONTEXT}")
+  fi
+  AGENT_DIAG_WATCH_DIR=$(mktemp -d) || return 0
+  _agent_pod_watch_loop "$$" "${AGENT_DIAG_WATCH_DIR}/pods" \
+    "${kctl[@]}" get pods -n "${ns}" --watch -o custom-columns="${AGENT_DIAG_WATCH_POD_COLUMNS}" &
+  AGENT_DIAG_WATCH_PIDS="$!"
+  disown "$!" 2>/dev/null || true
+  _agent_pod_watch_loop "$$" "${AGENT_DIAG_WATCH_DIR}/events" \
+    "${kctl[@]}" get events -n "${ns}" --watch -o custom-columns="${AGENT_DIAG_WATCH_EVENT_COLUMNS}" &
+  AGENT_DIAG_WATCH_PIDS="${AGENT_DIAG_WATCH_PIDS} $!"
+  disown "$!" 2>/dev/null || true
+  return 0
+}
+
+# Stops the watches and keeps their tails. Only the first call after a start
+# writes, so the failure dumper's second call leaves the files in place.
+_stop_agent_pod_watch() {
+  local artifact_dir="$1"
+  [ -n "${AGENT_DIAG_WATCH_PIDS}" ] || return 0
+  local pid
+  for pid in ${AGENT_DIAG_WATCH_PIDS}; do
+    kill "${pid}" 2>/dev/null || true
+  done
+  AGENT_DIAG_WATCH_PIDS=""
+  tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" "${AGENT_DIAG_WATCH_DIR}/pods" \
+    > "${artifact_dir}/agent-pods-watch.txt" 2>/dev/null || true
+  tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" "${AGENT_DIAG_WATCH_DIR}/events" \
+    > "${artifact_dir}/agent-events-watch.txt" 2>/dev/null || true
+}
+
 # ─── Agent Pod Diagnostics (runs on PASS as well as on failure) ───────────────
 # The AGENT_DIAG_ constants above say what and why. Same contract as
 # collect_gateway_log: every command ends in `|| true`, so `$?` is left for
@@ -168,11 +244,12 @@ collect_gateway_log() {
 collect_agent_pod_diagnostics() {
   local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
   local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
-  local kctl=(kubectl)
+  local kctl=(kubectl --request-timeout="${AGENT_DIAG_REQUEST_TIMEOUT}")
   if [ -n "${AGENT_CLUSTER_CONTEXT:-}" ]; then
     kctl+=(--context "${AGENT_CLUSTER_CONTEXT}")
   fi
   mkdir -p "${artifact_dir}" || true
+  _stop_agent_pod_watch "${artifact_dir}"
 
   "${kctl[@]}" get pods -n "${ns}" -o jsonpath="${AGENT_DIAG_POD_STATUS_JSONPATH}" \
     > "${artifact_dir}/agent-pod-status.txt" 2>&1 || true
@@ -223,9 +300,9 @@ dump_prow_artifacts_on_failure() {
     # 2. Current running & previous crashed pod logs (crucial for rollout deadline / CrashLoopBackOff failures).
     #    The running pod's log is the every-run capture above, taken again here
     #    so a caller without a green-path collector (ci-deploy.sh) still gets it.
-    #    The previous agent container, the bridge sidecar, pod restarts and
-    #    events come from the every-run collector, called here for the same
-    #    reason (it replaces this dumper's own, shorter --previous tail).
+    #    The previous agent container (platform-agent-previous.log), the
+    #    bridge sidecar, pod restarts and events come from the every-run
+    #    collector, called here for the same reason, with its bounds.
     collect_gateway_log
     collect_agent_pod_diagnostics
     kubectl logs deployment/kube-agents-controller-manager -n "${ns}" --tail=1000 > "${artifact_dir}/controller-manager.log" 2>&1 || true

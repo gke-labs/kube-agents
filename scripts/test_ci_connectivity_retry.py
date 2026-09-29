@@ -197,6 +197,7 @@ class FailureDumpArtifactsTest(unittest.TestCase):
             [
                 "set -euo pipefail",
                 "collect_bench_results() { :; }",
+                "collect_agent_pod_diagnostics() { :; }",
                 gateway_collector(),
                 dump_function(),
                 "false || dump_prow_artifacts_on_failure",
