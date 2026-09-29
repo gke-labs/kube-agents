@@ -223,11 +223,12 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # message that says the scan is blind.
 FIXTURE_SCAN_DOC = "docs/ci-health.md"
 FIXTURE_RECONCILE_HINT = "Fleet owner: re-apply bench/tf/fleet in the projects named."
-# The pool-state scan's message: the scan's document always carries the exact
-# command per project, and the bot's own issue does when it filed one (an
-# adopted human issue, or a failed filing, does not), so the space is told
+# The pool-state scan's message: the scan's document carries the command per
+# project for every named finding, and what was observed for a check that
+# failed without naming one; the bot's own issue does too when it filed one
+# (an adopted human issue, or a failed filing, does not). The space is told
 # where to look rather than what to type.
-POOL_REPAIR_HINT = "Pool owner: the repair command per project is in pool-state.json (docs/ci-health.md, The pool-state scan) and in the bot's tracking issue when it filed one."
+POOL_REPAIR_HINT = "Pool owner: the repair command per project (or, for a check that failed without naming one, what was observed) is in pool-state.json (docs/ci-health.md, The pool-state scan) and in the bot's tracking issue when it filed one."
 
 # Rule 8 sends the reader somewhere. The build cluster is named by its real
 # identifiers because `build-kube-agents` is Prow's context alias for it

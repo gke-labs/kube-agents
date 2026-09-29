@@ -645,8 +645,10 @@ Left out: the fleet fixtures (the fleet scan reads those), the two GitHub checks
 `not_checked`) and `findings` one entry per thing found wrong, keyed by the
 verifier's stable id (`iam/platform-gsa/missing/roles/serviceusage.serviceUsageConsumer`,
 `gke/cluster/seeded-b`, `token-minter/signer/pull-sweeper`): `{check, detail,
-repair}`, where `repair` is the command or runbook section that closes it, and a
-repair that removes something starts with `# confirm first:`. `previous` is the
+repair}`, where `repair` is the command or runbook section that closes it (empty
+for a `<check>/failed` finding, the verifier's fallback for a check that failed
+without naming one: `detail` is then what it saw), and a repair that removes
+something starts with `# confirm first:`. `previous` is the
 prior scan's `scanned_at` and its `{project: [finding ids]}` map.
 
 **The identity and the grant.** Every read runs as the bot itself,

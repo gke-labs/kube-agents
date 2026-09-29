@@ -1819,7 +1819,7 @@ class PoolDrift(RunHarness):
                 (
                     f"🟡 *Smoke gate: flaky* — pool finding {FINDING} on 3 pool projects since 9:00 AM ET;"
                     " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code. Retest once the pool owner has run the repair."
-                    " Pool owner: the repair command per project is in pool-state.json (docs/ci-health.md, The pool-state scan) and in the bot's tracking issue when it filed one. Tracking #1300.\n"
+                    " Pool owner: the repair command per project (or, for a check that failed without naming one, what was observed) is in pool-state.json (docs/ci-health.md, The pool-state scan) and in the bot's tracking issue when it filed one. Tracking #1300.\n"
                     f"{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"
                 )
             ],
@@ -1878,6 +1878,19 @@ class PoolDrift(RunHarness):
         self.assertIn(evidence_line, body)
         small = post_health.gate_issue.render_pool_drift_body(pool_drift(), "Mon 9:00 AM ET", "brief")
         self.assertNotIn("omitted", small)
+
+    def test_a_failed_unit_with_no_repair_says_so_in_the_issue(self):
+        # `iam/failed` is the verifier's fallback for a check that failed
+        # without naming a finding: no command exists, and the issue says so
+        # beside the lines rather than promising one.
+        doc = pool_drift(findings=("iam/failed",))
+        for project in DRIFT_PROJECTS:
+            doc["incident"]["repairs"][project]["iam/failed"] = ""
+            doc["incident"]["drift"][project]["iam/failed"] = ["Failed parsing the IAM policy: Expecting value"]
+        body = post_health.gate_issue.render_pool_drift_body(doc, "Mon 9:00 AM ET", "brief")
+        self.assertIn(post_health.gate_issue.POOL_NO_REPAIR_LINE, body)
+        self.assertIn("Failed parsing the IAM policy: Expecting value", body)
+        self.assertNotIn("```", body, "no empty repair block")
 
     def test_the_pool_issue_quotes_only_the_pool_scans_evidence(self):
         # A fixture line in the body would let the fixture tracker adopt the

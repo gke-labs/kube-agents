@@ -187,6 +187,9 @@ POOL_DRIFT_TITLE_MANY = "Pool drift: {count} findings on {projects} pool {noun} 
 # can re-find it when the title has fallen back to a count. The ids live in
 # the marker rather than being matched over the body, because the body also
 # quotes the evidence, which names findings that did not fire.
+# A `<check>/failed` finding (the verifier's fallback for a check that failed
+# without naming one) carries no command; the issue says so beside the lines.
+POOL_NO_REPAIR_LINE = "repair: none recorded; the check failed without naming one, and the lines above are what it saw"
 POOL_DRIFT_MARKER = "<!-- kube-agents-bot:pool-drift {findings} -->"
 POOL_DRIFT_MARKER_RE = re.compile(r"<!-- kube-agents-bot:pool-drift ([^ >]*) -->")
 POOL_DRIFT_BODY = """\
@@ -413,6 +416,8 @@ def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> st
                 block.append("      ```")
                 block.extend(f"      {line}" for line in str(repair).splitlines())
                 block.append("      ```")
+            else:
+                block.append(f"    - {POOL_NO_REPAIR_LINE}")
         blocks.append("\n".join(block))
 
     def render(kept):

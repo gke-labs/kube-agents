@@ -581,6 +581,14 @@ class SeededFleetFixturesTest(unittest.TestCase):
             run.side_effect = [_ok("v1.30.0"), (1, "", "ERROR: catalog is malformed")]
             result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
         self.assertFalse(result.passed, result)
+        # ...and so is a silent one: the script prints a line on every exit
+        # path it has, so nothing on stderr is a kill or a trip, not an unread.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (1, "", "")]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed, result)
+        self.assertIn("exited 1 without reporting", result.message)
+        self.assertEqual(result.details, ["no output"])
         with open(checker._FLEET_KUBECONFIGS, encoding="utf-8") as fh:
             self.assertIn(f"_FLEET_EXIT_READONLY_UNAVAILABLE={checker.FLEET_EXIT_READONLY_UNAVAILABLE}", fh.read())
 

@@ -2112,8 +2112,10 @@ def _fleet_presence_result(
         if rc != 0:
             # Exit 3 is the gate, before any read, in every shape it prints,
             # and its one line is the reason whole; the other codes are unread
-            # only when stderr says why.
-            reason = last if rc == FLEET_EXIT_READONLY_UNAVAILABLE else _unread_reason(err)
+            # only when stderr says why, and a silent exit is the project's
+            # (the script prints a line on every exit path it has, so silence
+            # is a kill or a trip, and either is a finding to look at).
+            reason = last if rc == FLEET_EXIT_READONLY_UNAVAILABLE else (_unread_reason(err) if err.strip() else None)
             if reason:
                 return CheckResult(
                     name,
