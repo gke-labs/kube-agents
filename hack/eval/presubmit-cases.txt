@@ -138,7 +138,7 @@
 # (~100-300s), not a cluster. Re-admitted to the blocking roster after the
 # 2026-08-27 redesign (a real SRE question graded on kanban_create plus
 # cluster names).
-# BENCH #1409: disabled for the one-case run -- ./tasks/agent-kanban-smoke/task.yaml
+./tasks/agent-kanban-smoke/task.yaml
 
 # BENCH ONLY, NOT FOR MERGE (#1409): runs the parked declared-intent case on
 # the smoke test to record its red before the fixture and the declaration

@@ -12,7 +12,9 @@
     "crashloop-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-debug",
-      "probes": ["deployment/payments-api"],
+      "probes": [
+        "deployment/payments-api"
+      ],
       "fixture": "payments-api Deployment, deterministic OOMKilled crashloop, 64Mi memory limit",
       "state": [
         {
@@ -34,7 +36,9 @@
     "no-pdb-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-reliability",
-      "probes": ["deployment/checkout-gateway"],
+      "probes": [
+        "deployment/checkout-gateway"
+      ],
       "fixture": "checkout-gateway Deployment, two replicas, no PodDisruptionBudget in the namespace",
       "state": [
         {
@@ -80,7 +84,9 @@
     "rbac-overgrant": {
       "cluster_slot": "a",
       "namespace": null,
-      "probes": ["clusterrolebinding/debug-binding"],
+      "probes": [
+        "clusterrolebinding/debug-binding"
+      ],
       "fixture": "debug-binding ClusterRoleBinding granting cluster-admin to the seeded-security default ServiceAccount",
       "state": [
         {
@@ -102,7 +108,9 @@
     "idle-nodepool": {
       "cluster_slot": "a",
       "namespace": null,
-      "probes": ["node?cloud.google.com/gke-nodepool=idle-batch-pool"],
+      "probes": [
+        "node?cloud.google.com/gke-nodepool=idle-batch-pool"
+      ],
       "fixture": "idle-batch-pool node pool running zero non-system pods, held empty by a NO_SCHEDULE taint",
       "state": [
         {
@@ -215,6 +223,29 @@
           "op": "any_eq",
           "value": "192.0.2.10",
           "why": "the hand-written subset on a selector-less Service, which the endpoints controller leaves alone. An Endpoints without it was rewritten or replaced, and the object the writer patches is no longer the planted one"
+        }
+      ]
+    },
+    "declared-no-pdb-workload": {
+      "cluster_slot": "a",
+      "namespace": "seeded-intent",
+      "probes": [
+        "deployment/notification-relay"
+      ],
+      "fixture": "notification-relay Deployment, two replicas, no PodDisruptionBudget in the namespace; the workload a repository declaration covers, so the declared-intent case silences nothing another case grades",
+      "state": [
+        {
+          "subject": "deployment/notification-relay",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 2,
+          "why": "the posture is a healthy two-replica workload without a budget; Pending replicas would make the missing budget a fault rather than a declared posture"
+        },
+        {
+          "subject": "poddisruptionbudget?",
+          "path": null,
+          "op": "absent",
+          "why": "a PodDisruptionBudget anyone adds to seeded-intent removes the posture the declaration covers, and the case then grades nothing"
         }
       ]
     }
