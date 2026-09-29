@@ -1103,6 +1103,7 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
         "checked": 0,
         "total": 0,
         "scanned": [],
+        "partial": False,
         "reason": None,
         "evidence": [],
     }
@@ -1115,6 +1116,11 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     projects = state_doc.get(module.KEY_PROJECTS)
     out["total"] = len(projects) if isinstance(projects, dict) else 0
     out["scanned"] = sorted(projects) if isinstance(projects, dict) else []
+    # A document a hand run wrote for a few named projects says so; a project
+    # absent from it was not read, where one absent from the pool's document
+    # has left the mapping.
+    scope_key = getattr(module, "KEY_SCOPE", None)
+    out["partial"] = bool(scope_key) and state_doc.get(scope_key) == getattr(module, "SCOPE_SELECTED", None)
     out["checked"] = module.checked_projects(state_doc)
     out["unread_units"] = module.unread_units(state_doc)
     if scanned_at is None or now - scanned_at > FIXTURE_STATE_MAX_AGE:
@@ -1939,16 +1945,14 @@ def _scan_hold(scan_result: dict, incident: dict | None, label: str) -> str | No
     roles = set(incident.get("roles") or [])
     reads = incident.get("reads") if isinstance(incident.get("reads"), dict) else None
     read = scan_result.get("read") or {}
-    # A project the scan no longer lists has left the pool mapping; it is not
-    # waited on, or an incident on a retired project would hold forever.
+    # A project the pool's document no longer lists has left the mapping; it
+    # is not waited on, or an incident on a retired project would hold
+    # forever (one whose every project was retired ends here). A document a
+    # hand run wrote for named projects is different: a project absent from
+    # it was not read, and holds as unread below.
     scanned = set(scan_result.get("scanned") or [])
     named = list(incident.get("projects") or [])
-    waiting = [project for project in named if not scanned or project in scanned]
-    if named and not waiting:
-        # None of them is listed: a hand-uploaded --projects document or a
-        # mapping the row regex no longer reads. Nothing was observed about
-        # the incident, so it holds.
-        return f"the {label} scan lists none of {_project_list(named)}"
+    waiting = named if scan_result.get("partial") else [project for project in named if not scanned or project in scanned]
     unread = sorted(
         project
         for project in waiting

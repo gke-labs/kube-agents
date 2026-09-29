@@ -1381,12 +1381,14 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     f"{len(bot_missing)} role(s) on {project_id}: {', '.join(sorted(bot_missing))}. Its hourly "
                     "pool-state scan reads the project as this account, so the project scans as not "
                     "checked and drift there goes unseen. Re-apply bench/tf/fleet against "
-                    f"{project_id}, or run the grant in docs/ci-health.md (The pool-state scan)"
+                    f"{project_id}, or run the grant in docs/ci-health.md (The pool-state scan). "
+                    "This reads the project's own policy: a grant on a folder or the organisation, "
+                    "or through a group, is not seen here and shows as missing"
                 )
                 for role in sorted(bot_missing):
                     findings.append(Finding(
                         f"iam/pool-state-reader/missing/{role}",
-                        f"The CI health bot is missing {role} on {project_id}",
+                        f"The CI health bot is missing {role} on {project_id} (in the project's own policy; a grant above it or through a group is not read here)",
                         _project_binding(project_id, CI_HEALTH_BOT_MEMBER, role),
                     ))
         except Exception as exc:

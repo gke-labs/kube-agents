@@ -357,6 +357,16 @@ class EntryPoint(ScanHarness):
         self.assertTrue(entry["error"].startswith("scripts/verify_ci_pool_project.py could not be run: PermissionError"), entry["error"])
         self.assertEqual(entry["checks"]["iam"]["state"], "not_checked")
 
+    def test_the_document_says_whether_it_covers_the_pool_or_named_projects(self):
+        self.world.write_text(json.dumps({PROJECT: report()}), encoding="utf-8")
+        out = self.root / "pool-state.json"
+        with unittest.mock.patch.dict(os.environ, {"STUB_WORLD": str(self.world), "STUB_LOG": str(self.log)}), \
+             unittest.mock.patch.object(pool_state, "missing_binaries", return_value=[]):
+            rc, _ = self._run("--out", str(out), "--projects", PROJECT, "--verifier", str(self.stub), "--now", NOW.isoformat(), "--workdir", str(self.workdir))
+        self.assertEqual(rc, pool_state.EXIT_OK)
+        self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["scope"], pool_state.SCOPE_SELECTED)
+        self.assertEqual(pool_state.scan([], ["iam"], self.workdir, now=NOW)["scope"], pool_state.SCOPE_POOL)
+
     def test_a_repeated_project_id_is_scanned_once(self):
         # Two workers on one report file would race; the door keeps one.
         self.world.write_text(json.dumps({PROJECT: report()}), encoding="utf-8")

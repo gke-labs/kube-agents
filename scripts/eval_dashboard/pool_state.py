@@ -100,6 +100,13 @@ KEY_SUMMARY = fixture_state.KEY_SUMMARY
 KEY_PREVIOUS = fixture_state.KEY_PREVIOUS
 KEY_DRIFTED = fixture_state.KEY_DRIFTED
 KEY_ERROR = fixture_state.KEY_ERROR
+# What the document covers: the whole mapping (the hourly job), or the ids a
+# hand run named with --projects. The health rule reads a project absent from
+# a pool-scoped document as retired from the mapping; from a selected one, as
+# not read.
+KEY_SCOPE = "scope"
+SCOPE_POOL = "pool"
+SCOPE_SELECTED = "selected"
 KEY_CHECKS = "checks"
 KEY_FINDINGS = "findings"
 KEY_CHECK = "check"
@@ -466,6 +473,7 @@ def scan(
     workers: int = DEFAULT_WORKERS,
     project_timeout: float = DEFAULT_PROJECT_TIMEOUT_S,
     which=shutil.which,
+    scope: str = SCOPE_POOL,
     **project_kwargs,
 ) -> dict:
     """pool-state.json as a dict. `prior` is the previously published
@@ -490,6 +498,7 @@ def scan(
     return {
         "schema_version": SCHEMA_VERSION,
         KEY_SCANNED_AT: iso(now),
+        KEY_SCOPE: scope,
         KEY_DURATION: int(time.monotonic() - started),
         KEY_CHECKS: list(checks),
         KEY_PROJECTS: entries,
@@ -572,6 +581,7 @@ def main(argv=None) -> int:
             now=parse_iso(args.now),
             workers=args.workers,
             project_timeout=args.project_timeout,
+            scope=SCOPE_SELECTED if args.projects else SCOPE_POOL,
             location=args.location,
             verifier_script=args.verifier,
         )

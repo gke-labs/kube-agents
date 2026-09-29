@@ -2315,6 +2315,7 @@ def pool_scan(drifted=None, previous=None, at=None, projects=30, checked=None, u
     return {
         "schema_version": 1,
         "scanned_at": health.iso(at),
+        "scope": "pool",
         "checks": list(POOL_CHECKS),
         "projects": entries,
         "previous": {"scanned_at": health.iso(at - timedelta(hours=1)), "drifted": previous or {}},
@@ -2460,19 +2461,33 @@ class PoolDrift(unittest.TestCase):
         held = self.judge(blind, prev=prev, now=later)
         self.assertEqual((held["state"], held["condition"]), ("DEGRADED", "pool_drift"))
 
-    def test_a_document_listing_none_of_the_incidents_projects_holds_it(self):
-        # A hand-uploaded --projects document, or a mapping the row regex no
-        # longer reads: nothing was observed about the incident's projects, so
-        # it holds rather than reading as a recovery nothing saw.
+    def test_a_selected_document_missing_the_incidents_projects_holds_it(self):
+        # A hand run's --projects document says `scope: selected`: a project
+        # absent from it was not read, so nothing was observed about the
+        # incident and it holds rather than reading as a recovery nothing saw.
         firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
         prev = self.judge(firing)
         later = T0 + timedelta(hours=1)
         others = pool_scan(at=later - timedelta(minutes=5), previous={project(i): [FINDING] for i in (1, 2, 3)})
+        others["scope"] = "selected"
         for i in (1, 2, 3):
             del others["projects"][project(i)]
         held = self.judge(others, prev=prev, now=later)
         self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
-        self.assertTrue(any("lists none of" in line for line in held["evidence"]), held["evidence"])
+        self.assertTrue(any("could not read" in line for line in held["evidence"]), held["evidence"])
+
+    def test_an_incident_whose_every_project_was_retired_ends(self):
+        # The pool's own document (`scope: pool`) no longer listing any of an
+        # incident's projects means they left the mapping: nothing is waited
+        # on, and the incident ends rather than holding forever.
+        firing = pool_scan(drifted={project(2): [FINDING]}, previous={project(2): [FINDING]})
+        prev = self.judge(firing)
+        self.assertEqual(prev["condition"], "pool_drift")
+        later = T0 + timedelta(hours=1)
+        retired = pool_scan(at=later - timedelta(minutes=5), previous={project(2): [FINDING]})
+        del retired["projects"][project(2)]
+        self.assertEqual(retired["scope"], "pool")
+        self.assertEqual(self.judge(retired, prev=prev, now=later)["condition"], None)
 
     def test_a_fixture_incident_recorded_before_reads_existed_still_exits_on_its_roles(self):
         # The live health.json at merge time may hold a fixture_drift incident

@@ -659,8 +659,11 @@ verifier; together they cover every read the scan's checks make, and none writes
 the one read outside the project, the warm-cache repository's policy in the Prow
 project, is the verifier's `warm_cache` check, which the scan does not run). `bench/tf/fleet`
 grants them (`pool_state_readers`), so a project gets them from its fleet apply and
-the verifier fails one that lacks them (`--report` carries the binding). Projects
-applied before that default are one loop, run once by a project owner:
+the verifier fails one that lacks them (`--report` carries the binding). Grant them
+on the project: the check reads the project's own policy, so a grant on a folder or
+the organisation, or through a group, is not seen and reads as missing on every
+project. Projects applied before that default are one loop, run once by a project
+owner:
 
 ```bash
 BOT=eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com
