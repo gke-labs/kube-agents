@@ -34,14 +34,16 @@ real install:
      open, it never files that install's own sweep. So a failed read of what
      closed the gate stops the apply before step 2 changes anything.
 
-The rest pin step 1's refusals, step 2 stopping when it cannot list the
-sandbox pods or remove the INVENTORY files from one, step 4's handling of a
-board read that fails and of a sweep no worker picked up, the trap retrying a
-card listing that fails, and the trap and the destroy carrying on past a
-failed step and naming it. As in `test_autoops_incident_plant.py`, the
-provisioners are rendered the way Terraform renders them and run against a
-stub `kubectl`/`gcloud`/`sleep`. The reads in steps 1 and 2 also run on their
-own against a data directory, and step 4's board query against a sqlite board.
+The rest pin step 1's refusals, step 2 stopping when it cannot list the open
+cards or the sandbox pods, or remove the INVENTORY files from one, step 4's
+handling of a board read that fails and of a sweep no worker picked up, the
+trap retrying a marker restore or a card listing that fails, the trap and the
+destroy carrying on past a failed step and naming it, and every exec into the
+agent Deployment bounding its wait for a pod. As in
+`test_autoops_incident_plant.py`, the provisioners are rendered the way
+Terraform renders them and run against a stub `kubectl`/`gcloud`/`sleep`. The
+reads in steps 1 and 2 also run on their own against a data directory, and
+step 4's board query against a sqlite board.
 """
 
 import json
@@ -81,6 +83,7 @@ _INTERPOLATIONS = {
     "local.gate_wait": "300",
     "local.list_tries": "3",
     "local.list_wait": "5",
+    "local.pod_wait": "5",
     "local.scan_job": "bootstrap-inventory-scan",
     "local.rate_limit_block": "provider rate limit: API retries exhausted",
     "var.project_id": "kube-agents-evals",
@@ -388,11 +391,43 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertEqual(len(self._indices(calls, "[clear deployment/platform-agent-gateway]")), 2)
         self.assertIn("Cleanup incomplete: could not remove the INVENTORY files.", completed.stderr)
 
+    def test_a_failed_card_listing_stops_the_apply_before_the_marker_goes(self):
+        completed, calls = self._run(GATE_FILES=0, OPEN_CARDS="t_prev", FAILED_LISTINGS="1")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn("still open after archiving", completed.stderr)
+        listings = self._indices(calls, "[open_cards]")
+        restore = self._indices(calls, "[restore]")
+        self.assertLess(listings[0], restore[0])
+        self.assertLess(restore[0], listings[1])
+        self.assertEqual(self._indices(calls, "[rearm]"), [])
+
+    def test_every_exec_into_the_deployment_bounds_its_wait_for_a_pod(self):
+        # With no pod, kubectl waits 60s by default for one to be created, so
+        # every retry in the trap and steps 3 and 4 would take a minute.
+        completed, calls = self._run(GATE_FILES=0, RESTORE_FAILS=1)
+        self.assertNotEqual(completed.returncode, 0)
+        execs = [call for call in calls if call.startswith("kubectl exec") and "deployment/" in call]
+        self.assertTrue(any(call.endswith("[restore]") for call in execs), calls)
+        self.assertTrue(any(call.endswith("[old_id]") for call in execs), calls)
+        for call in execs:
+            self.assertIn("--pod-running-timeout=5s", call)
+
     def test_the_trap_retries_the_marker_restore_while_the_agent_is_down(self):
         completed, calls = self._run(GATE_FILES=0, RESTORE_FAILS=2)
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(len(self._indices(calls, "[restore]")), 3)
         self.assertEqual(calls.count("sleep 5"), 2)
+        self.assertNotIn("Cleanup incomplete", completed.stderr)
+
+    def test_the_trap_waits_a_full_gate_run_after_a_late_restore(self):
+        # The restore fails for 100 s while the leader's gate run, which read
+        # the marker absent, runs for another 250 s and files as it exits.
+        completed, calls = self._run(GATE_FILES=0, RESTORE_FAILS=20, GATE_BUSY_CHECKS=50, RACE=1)
+        self.assertNotEqual(completed.returncode, 0)
+        archive = [i for i, call in enumerate(calls) if call.endswith("archive t_raced [archive]")]
+        self.assertEqual(len(self._indices(calls, "[restore]")), 21)
+        self.assertEqual(len(self._indices(calls, "[gate pod/gw-leader]")), 51)
+        self.assertEqual(len(archive), 1, calls)
         self.assertNotIn("Cleanup incomplete", completed.stderr)
 
     def test_the_trap_names_a_marker_restore_it_never_managed(self):

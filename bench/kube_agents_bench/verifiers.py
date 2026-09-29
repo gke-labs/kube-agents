@@ -723,7 +723,8 @@ class BootstrapFanoutVerifier(BaseVerifier):
     queried, or a sweep card the board does not know is ``status="error"``,
     and so is an empty roster for ``one_card_per_cluster_agent``.
     ``no_card_waits_on_the_sweep`` does not read the roster, so an empty one
-    is not an error for it.
+    is not an error for it. A ``fail`` from an earlier poll outranks a final
+    read that errors.
     """
 
     type: Literal["bootstrap_fanout"]
@@ -731,7 +732,30 @@ class BootstrapFanoutVerifier(BaseVerifier):
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         read_timeout = min(single_call_timeout(timeout_sec), _FANOUT_READ_TIMEOUT_SEC)
-        return self._poll_to_result(lambda: self._check(read_timeout), timeout_sec)
+        # _poll_to_result reports the last poll even when it is an error, so a
+        # fan-out that stayed broken would read as an unreadable pod whenever
+        # the final read failed. The latest fail stands in that case.
+        last_fail: tuple[str, dict[str, Any] | None] | None = None
+
+        def attempt() -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+            nonlocal last_fail
+            status, reason, raw = self._check(read_timeout)
+            if status == "fail":
+                last_fail = (reason, raw)
+            return status, reason, raw
+
+        result = self._poll_to_result(attempt, timeout_sec)
+        if result.status == "error" and last_fail is not None:
+            reason, raw = last_fail
+            return VerificationResult(
+                success=False,
+                status="fail",
+                elapsed_time=result.elapsed_time,
+                reason=f"{reason} (the last read failed: {result.reason})",
+                name=self.name,
+                raw=raw,
+            )
+        return result
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         payload, why = discovery.read_fanout(_agent_shell, read_timeout)

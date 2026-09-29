@@ -74,6 +74,10 @@ locals {
   # between them: what failed the apply can fail one listing too.
   list_tries = 3
   list_wait  = 5
+  # How long an exec into the agent Deployment waits for a pod when it has
+  # none. A pod created in that time is not running yet and fails the exec
+  # anyway, so kubectl's default of 60s only adds a minute to every retry.
+  pod_wait = 5
 }
 
 resource "null_resource" "sweep" {
@@ -115,13 +119,15 @@ resource "null_resource" "sweep" {
           # stays, as after the destroy, and its sweep is among the cards
           # archived below. A gate run that read the marker before it went
           # back files once its reconcile ends, so the listing also waits for
-          # any gate run to exit. The restore is retried under the same ceiling
-          # as that wait: an agent pod that is down fails both, and once it is
-          # back the gate files if the marker is still absent.
+          # any gate run to exit, for up to gate_wait once the marker is back:
+          # a gate run that read it absent while the restore was failing can
+          # take all of that. The restore is retried for as long. One that
+          # never succeeds leaves no wait, because the gate check execs into
+          # the same pod and reads a failed exec as a gate run.
           failed=""
           waited=0
           if [ -n "$old_id" ]; then
-            until agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$old_id" >&2; do
+            until agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$old_id" >&2 && waited=0; do
               if [ "$waited" -ge ${local.gate_wait} ]; then
                 failed="$failed, put back the sweep marker"
                 break
@@ -174,11 +180,11 @@ resource "null_resource" "sweep" {
 
       agent() {
         kubectl exec -n "${var.agent_namespace}" "deployment/${var.agent_deployment}" \
-          -c "${var.agent_container}" -- "$@"
+          -c "${var.agent_container}" --pod-running-timeout=${local.pod_wait}s -- "$@"
       }
       agent_py() {
         kubectl exec -i -n "${var.agent_namespace}" "deployment/${var.agent_deployment}" \
-          -c "${var.agent_container}" -- ${local.python} - "$@"
+          -c "${var.agent_container}" --pod-running-timeout=${local.pod_wait}s -- ${local.python} - "$@"
       }
       open_cards() {
         agent_py "${local.key_like}" <<'PY'
@@ -309,7 +315,9 @@ resource "null_resource" "sweep" {
       PY
       )"
       rearmed=1
-      for id in $(open_cards); do
+      # Listed first: a failure inside a `for` word list fails nothing.
+      ids="$(open_cards)"
+      for id in $ids; do
         agent ${local.hermes} kanban archive "$id"
       done
       leftover="$(open_cards)"

@@ -341,6 +341,23 @@ def test_a_marker_naming_an_unknown_card_is_an_error(pod) -> None:
     assert "is not on the board" in result.reason
 
 
+def test_a_fail_outranks_a_final_read_that_errors(pod, monkeypatch: pytest.MonkeyPatch) -> None:
+    pod(_board("main"))
+    read = verifiers._agent_shell
+    reads = {"n": 0}
+
+    def fail_then_unreadable(script: str, timeout: float) -> str:
+        reads["n"] += 1
+        return read(script, timeout) if reads["n"] == 1 else ""
+
+    monkeypatch.setattr(verifiers, "_agent_shell", fail_then_unreadable)
+    result = BootstrapFanoutVerifier(type="bootstrap_fanout", require="one_card_per_cluster_agent").verify(2.0)
+    assert reads["n"] > 1
+    assert result.status == "fail", result.reason
+    assert "filed 0 cluster card(s) for 4 Cluster Agent(s)" in result.reason
+    assert "the last read failed" in result.reason
+
+
 def test_an_unreadable_pod_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(verifiers, "_agent_shell", lambda s, t: "")
     assert _verify("one_card_per_cluster_agent").status == "error"
