@@ -137,13 +137,13 @@ kubectl describe pod -n kubeagents-system -l app=platform-agent-gateway
 - Every object the chart renders, including the `PlatformAgent` resource, re-rendered from
   `N-1`'s templates. Objects `N`'s chart rendered and `N-1`'s does not are deleted by the upgrade;
   that is Helm's ordinary behaviour.
-- Which values those templates are rendered with depends on the script. From `0.5.0` on the
-  re-tag is `helm upgrade --reset-then-reuse-values`: `N-1`'s chart defaults, with the values the
-  install set on top. From the first release after `0.7.0` it is the same, less any value the
-  install set that `N-1`'s values schema does not declare, which the script drops and names
-  before it applies anything. `0.4.0` and earlier use `--reuse-values`, which keeps every value
-  `N`'s release computed, defaults included, so a chart default `N` changed stays at `N`'s value
-  after a rollback to `0.4.0` even though the chart version reads `0.4.0`.
+- Which values those templates are rendered with depends on the script. From `0.5.0` through
+  `0.7.0` the re-tag is `helm upgrade --reset-then-reuse-values`: `N-1`'s chart defaults, with the
+  values the install set on top. From the first release after `0.7.0` it is the same, less any
+  value the install set that `N-1`'s values schema refuses as undeclared, which the script drops
+  and names before any of `N-1` is applied. `0.4.0` and earlier use `--reuse-values`, which
+  keeps every value `N`'s release computed, defaults included, so a chart default `N` changed
+  stays at `N`'s value after a rollback to `0.4.0` even though the chart version reads `0.4.0`.
 
 ## What they leave as it is
 
@@ -173,9 +173,9 @@ Fields `N` added to the `PlatformAgent` schema. Once `N-1`'s CRD is applied, the
 them from the stored object, and `N-1`'s chart does not render them. The Helm values that produced
 them stay in the release's recorded values: a later forward re-tag renders them again, the schema
 refusal below turns on them, and the full mode discards them. A re-tag by a script from after
-`0.7.0` drops each one `N-1`'s values schema does not declare, so after such a rollback the release
-no longer records it, and the next forward re-tag renders it from `N`'s chart default until a
-full-mode apply sets it again.
+`0.7.0` drops each one `N-1`'s values schema refuses as undeclared, so after such a rollback the
+release no longer records it, and the next forward re-tag renders it from `N`'s chart default
+until a full-mode apply sets it again.
 
 The agent's persistent volume, apart from what the entrypoint re-syncs from the image. The
 harness step rolls the pod, and the volume follows it; what the next start does to it is `N-1`'s

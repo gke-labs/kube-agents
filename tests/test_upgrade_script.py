@@ -442,7 +442,7 @@ class UpgradeRunContractTest(unittest.TestCase):
             ("operator", 'retag_values "$KUBE_AGENTS_HELM_RELEASE"', "apply_crd_upgrades"),
             (
                 "harness",
-                'retag_values "$KUBE_AGENTS_HELM_RELEASE"',
+                'harness_retag_keys "$RETAG_VALUES_JSON"',
                 'helm_retag "${HARNESS_RETAG_KEYS[@]}"',
             ),
             ("full", "check_service_account_ownership || exit 1", "apply_crd_upgrades"),
@@ -691,18 +691,26 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         branch owes is to call it and to hand the whole list to helm_retag,
         which turns each key into `--set key=<tag>` (#1808).
 
-        Order, not adjacency: the values read and UPGRADE_APPLY_STARTED sit
-        between the two, because the reads are the last things here that can
-        fail without having changed anything. That placement is
+        The keys come from the values retag_values kept, so the read goes
+        first. Order, not adjacency: UPGRADE_APPLY_STARTED sits between the
+        assembly and the re-tag, because the reads are the last things here
+        that can fail without having changed anything. That placement is
         UpgradeRunContractTest.test_the_apply_gate_sits_after_every_refusal_in_its_arm's
         to keep.
         """
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         harness = text[text.index("    harness)") : text.index("    full)")]
-        assemble = '\n      harness_retag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"\n'
+        read = '\n      retag_values "$KUBE_AGENTS_HELM_RELEASE"'
+        assemble = '\n      harness_retag_keys "$RETAG_VALUES_JSON"\n'
         retag_call = '\n      helm_retag "${HARNESS_RETAG_KEYS[@]}"\n'
+        self.assertIn(read, harness, f"the values read left the arm ({len(harness)} chars read)")
         self.assertIn(assemble, harness, f"the key assembly left the arm ({len(harness)} chars read)")
         self.assertIn(retag_call, harness, f"the re-tag left the arm ({len(harness)} chars read)")
+        self.assertLess(
+            harness.index(read),
+            harness.index(assemble),
+            "the plugin keys come from values the filter has not seen, so a --set can put back a dropped block",
+        )
         self.assertLess(
             harness.index(assemble),
             harness.index(retag_call),
@@ -849,21 +857,32 @@ class AgentNamespaceFlagTest(unittest.TestCase):
 class _StubHelm:
     """Sources upgrade.sh with a stub `helm` on PATH and runs a snippet after it.
 
-    The stub prints `stdout_json` on stdout, `stderr_text` on stderr, and
-    exits `helm_exit`. The script's own ERR trap is stood in for by one that
-    writes a banner, so a failure inside the functions shows where the real
-    run would abort.
+    `helm history` prints `history_json` and exits `history_exit`; any other
+    command prints `stdout_json` on stdout, `stderr_text` on stderr, and exits
+    `helm_exit`. Every call's arguments are appended to `self.helm_log`. The
+    script's own ERR trap is stood in for by one that writes a banner, so a
+    failure inside the functions shows where the real run would abort.
     """
 
-    def _run_with_helm(self, snippet, stdout_json, helm_exit=0, stderr_text=""):
+    _DEPLOYED_HISTORY = '[{"revision": 1, "status": "deployed"}]'
+
+    def _run_with_helm(
+        self, snippet, stdout_json, helm_exit=0, stderr_text="", history_json=_DEPLOYED_HISTORY, history_exit=0
+    ):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         bin_dir = pathlib.Path(tmp.name) / "bin"
         bin_dir.mkdir()
+        self.helm_log = pathlib.Path(tmp.name) / "helm.log"
         helm = bin_dir / "helm"
         helm.write_text(
             "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$*\" >> {shlex.quote(str(self.helm_log))}\n"
             f"printf '%s\\n' {shlex.quote(stderr_text)} >&2\n"
+            'if [ "$1" = "history" ]; then\n'
+            f"  cat <<'JSON'\n{history_json}\nJSON\n"
+            f"  exit {history_exit}\n"
+            "fi\n"
             f"cat <<'JSON'\n{stdout_json}\nJSON\n"
             f"exit {helm_exit}\n"
         )
@@ -881,15 +900,20 @@ trap 'echo "ABORT BANNER line $LINENO" >&2' ERR
         )
 
 
-class RecordedPluginImageTagKeysTest(_StubHelm, unittest.TestCase):
-    """recorded_plugin_image_tag_keys against a stub helm, under the system bash."""
+class RecordedPluginImageTagKeysTest(unittest.TestCase):
+    """recorded_plugin_image_tag_keys on the values it is given, under the system bash."""
 
-    _SNIPPET = 'recorded_plugin_image_tag_keys kube-agents kubeagents-system\nprintf "%s\\n" "$RECORDED_PLUGIN_IMAGE_TAG_KEYS"\necho "rc=$?"'
+    def _run(self, values_json):
+        script = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+trap 'echo "ABORT BANNER line $LINENO" >&2' ERR
+recorded_plugin_image_tag_keys {shlex.quote(values_json)}
+printf "%s\\n" "$RECORDED_PLUGIN_IMAGE_TAG_KEYS"
+echo "rc=$?"
+"""
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=get_isolated_test_env())
 
-    def _run(self, values_json, helm_exit=0, stderr_text=""):
-        return self._run_with_helm(self._SNIPPET, values_json, helm_exit=helm_exit, stderr_text=stderr_text)
-
-    def test_every_plugin_tag_the_release_records_is_printed(self):
+    def test_every_plugin_tag_the_values_record_is_printed(self):
         proc = self._run(
             '{"plugins":{"pubsubPlatform":{"enabled":false,"image":{"tag":"abc"}},'
             '"stockoutInvestigator":{"image":{"tag":"abc"}},'
@@ -916,16 +940,6 @@ class RecordedPluginImageTagKeysTest(_StubHelm, unittest.TestCase):
         self.assertEqual(proc.stdout.split(), ["rc=0"])
         self.assertNotIn("ABORT BANNER", proc.stderr)
 
-    def test_a_helm_warning_on_stderr_does_not_break_the_read(self):
-        """Helm warns on stderr on successful commands (a group-readable kubeconfig)."""
-        proc = self._run(
-            '{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}}}}',
-            stderr_text="WARNING: Kubernetes configuration file is group-readable. This is insecure.",
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.split()[:-1], ["plugins.pubsubPlatform.image.tag"])
-        self.assertNotIn("ABORT BANNER", proc.stderr)
-
     def test_a_malformed_plugins_value_is_an_error_not_an_empty_list(self):
         """upgrade.sh runs under set -e, so the failed call ends the sourced run."""
         proc = self._run('{"plugins":"oops"}')
@@ -937,23 +951,13 @@ class RecordedPluginImageTagKeysTest(_StubHelm, unittest.TestCase):
         # inside the jq substitution as well, which `trap - ERR` there prevents.
         self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
 
-    def test_a_failing_helm_read_is_an_error_that_names_the_cause(self):
-        """An empty list would run the pre-fix re-tag and leave the plugins behind."""
-        proc = self._run("", helm_exit=1, stderr_text="Error: release: not found")
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertNotIn("rc=", proc.stdout)
-        self.assertIn("Could not read the values of Helm release", proc.stdout)
-        self.assertIn("Error: release: not found", proc.stdout)
-        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
-
 
 class HarnessRetagKeysTest(_StubHelm, unittest.TestCase):
-    """harness_retag_keys against a stub helm: the list helm_retag receives."""
+    """harness_retag_keys: the list helm_retag receives."""
 
-    _SNIPPET = 'harness_retag_keys kube-agents kubeagents-system\nprintf "%s\\n" "${HARNESS_RETAG_KEYS[@]}"'
-
-    def _run(self, values_json, helm_exit=0):
-        return self._run_with_helm(self._SNIPPET, values_json, helm_exit=helm_exit)
+    def _run(self, values_json):
+        snippet = f'harness_retag_keys {shlex.quote(values_json)}\nprintf "%s\\n" "${{HARNESS_RETAG_KEYS[@]}}"'
+        return self._run_with_helm(snippet, "{}")
 
     def test_the_plugin_keys_follow_the_agent_and_sandbox_keys(self):
         proc = self._run('{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}},"stockoutInvestigator":{"image":{"tag":"abc"}}}}')
@@ -974,11 +978,41 @@ class HarnessRetagKeysTest(_StubHelm, unittest.TestCase):
         self.assertEqual(proc.stdout.split(), ["platformAgent.deployment.image.tag", "agentSandbox.image.tag"])
         self.assertNotIn("ABORT BANNER", proc.stderr)
 
-    def test_a_failed_read_stops_before_any_list_is_handed_on(self):
-        proc = self._run("{}", helm_exit=1)
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertNotIn("platformAgent.deployment.image.tag", proc.stdout)
-        self.assertIn("Could not read the values of Helm release", proc.stdout)
+    def test_a_plugin_the_filter_dropped_gets_no_set(self):
+        """A `--set` for a plugin the chart does not declare puts the block back, and Helm refuses it."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        schema_path = pathlib.Path(tmp.name) / "values.schema.json"
+        schema_path.write_text(
+            json.dumps(
+                {
+                    "type": "object",
+                    "properties": {
+                        "plugins": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {"pubsubPlatform": {"type": "object"}},
+                        }
+                    },
+                }
+            )
+        )
+        snippet = (
+            f"retag_values kube-agents kubeagents-system {shlex.quote(str(schema_path))}\n"
+            'harness_retag_keys "$RETAG_VALUES_JSON"\n'
+            'printf "key=%s\\n" "${HARNESS_RETAG_KEYS[@]}"'
+        )
+        proc = self._run_with_helm(
+            snippet,
+            '{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}},"stockoutInvestigator":{"image":{"tag":"abc"}}}}',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("Dropping 'plugins.stockoutInvestigator'", proc.stdout)
+        keys = [line[len("key=") :] for line in proc.stdout.splitlines() if line.startswith("key=")]
+        self.assertEqual(
+            keys,
+            ["platformAgent.deployment.image.tag", "agentSandbox.image.tag", "plugins.pubsubPlatform.image.tag"],
+        )
 
 
 class RetagValuesTest(_StubHelm, unittest.TestCase):
@@ -1017,7 +1051,7 @@ class RetagValuesTest(_StubHelm, unittest.TestCase):
     }
     _VALUES_PREFIX = "values="
 
-    def _run(self, values_json, schema_text=None, helm_exit=0):
+    def _run(self, values_json, schema_text=None, helm_exit=0, **stub):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         schema_path = pathlib.Path(tmp.name) / "values.schema.json"
@@ -1027,7 +1061,12 @@ class RetagValuesTest(_StubHelm, unittest.TestCase):
             f"retag_values kube-agents kubeagents-system {shlex.quote(str(schema_path))}\n"
             f'echo "{self._VALUES_PREFIX}$RETAG_VALUES_JSON"'
         )
-        return self._run_with_helm(snippet, values_json, helm_exit=helm_exit)
+        return self._run_with_helm(snippet, values_json, helm_exit=helm_exit, **stub)
+
+    def _read_revision(self):
+        reads = [line.split() for line in self.helm_log.read_text().splitlines() if line.startswith("get values")]
+        self.assertEqual(len(reads), 1, reads)
+        return reads[0][reads[0].index("--revision") + 1]
 
     def _values(self, proc):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -1088,6 +1127,41 @@ class RetagValuesTest(_StubHelm, unittest.TestCase):
         self.assertIn("Could not read the values of Helm release", proc.stdout)
         self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
 
+    def test_the_values_are_read_from_the_revision_the_reuse_flag_would_reuse(self):
+        """A failed latest revision holds values that never served; Helm reuses the last deployed one."""
+        for history, revision in (
+            ('[{"revision": 1, "status": "superseded"}, {"revision": 2, "status": "deployed"}]', "2"),
+            ('[{"revision": 2, "status": "deployed"}, {"revision": 3, "status": "failed"}]', "2"),
+            ('[{"revision": 1, "status": "failed"}]', "1"),
+        ):
+            with self.subTest(history=history):
+                self._values(self._run("{}", history_json=history))
+                self.assertEqual(self._read_revision(), revision)
+
+    def test_a_failing_history_read_is_an_error_that_names_the_cause(self):
+        proc = self._run("{}", history_json="", history_exit=1)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn(self._VALUES_PREFIX, proc.stdout)
+        self.assertIn("Could not read the history of Helm release", proc.stdout)
+        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
+
+    def test_a_helm_warning_on_stderr_does_not_break_the_read(self):
+        """Helm warns on stderr on successful commands (a group-readable kubeconfig)."""
+        values = {"platformAgent": {"name": "p"}}
+        proc = self._run(
+            json.dumps(values),
+            stderr_text="WARNING: Kubernetes configuration file is group-readable. This is insecure.",
+        )
+        self.assertEqual(self._values(proc), values)
+        self.assertNotIn("ABORT BANNER", proc.stderr)
+
+    def test_text_outside_ascii_passes_through_unescaped(self):
+        """Helm's YAML parser refuses the surrogate-pair escapes json.dumps writes by default."""
+        values = {"open": {"note": "deploy \U0001F680 caf\u00e9"}}
+        proc = self._run(json.dumps(values, ensure_ascii=False))
+        self.assertEqual(self._values(proc), values)
+        self.assertNotIn("\\ud83d", proc.stdout)
+
     def test_a_malformed_schema_is_an_error_not_an_unfiltered_upgrade(self):
         proc = self._run('{"stray":1}', schema_text="{not json")
         self.assertNotEqual(proc.returncode, 0)
@@ -1102,8 +1176,9 @@ class RetagValuesAgainstHelmTest(unittest.TestCase):
 
     The target chart is this repository's chart with `platformAgent.scope` taken
     out of its schema: the shape of a rollback to 0.7.0 from an install whose
-    composition records `scope`. `helm get values` is stubbed; `helm template`,
-    which runs the same schema check as `helm upgrade`, is the real binary.
+    composition records `scope`. `helm history` and `helm get values` are
+    stubbed; `helm template`, which runs the same schema check as
+    `helm upgrade`, is the real binary.
     """
 
     _RECORDED = {
@@ -1148,6 +1223,10 @@ class RetagValuesAgainstHelmTest(unittest.TestCase):
         helm = bin_dir / "helm"
         helm.write_text(
             "#!/usr/bin/env bash\n"
+            'if [ "$1" = "history" ]; then\n'
+            """  echo '[{"revision": 1, "status": "deployed"}]'\n"""
+            "  exit 0\n"
+            "fi\n"
             'if [ "$1" = "get" ]; then\n'
             f"  cat <<'JSON'\n{json.dumps(self._RECORDED)}\nJSON\n"
             "  exit 0\n"

@@ -68,7 +68,8 @@ cp /path/to/your/install/install.env .
   ssh, and every plugin image the release records — all are built from the same revision —
   through one `helm upgrade` that re-applies the values the release recorded over the chart's
   defaults. It drops, and names, any recorded key the chart it applies does not declare, which
-  Helm's schema check would otherwise refuse.
+  Helm's schema check would otherwise refuse; what that key set falls back to the chart's
+  defaults until a full-mode run renders `install.env` onto the chart again.
 - `--upgrade-mode=operator` applies the chart's CRDs with `kubectl` first — Helm never touches
   `crds/` on an upgrade — then re-tags the operator image the same way.
 - `--upgrade-mode=full`, the default, applies the CRDs and then runs a full `terraform apply`
