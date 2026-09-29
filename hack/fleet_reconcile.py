@@ -170,9 +170,13 @@ def plan_changes(show_json):
     if not isinstance(resource_changes, list):
         raise ReconcileError("tofu show wrote resource_changes that is not a JSON array")
     for change in resource_changes:
-        if not isinstance(change, dict) or not isinstance(change.get("change") or {}, dict):
+        # The raw values, not `or {}` / `or []` defaults: a falsy wrong type
+        # would otherwise read as "no actions" and the entry would be applied
+        # unclassified.
+        block = change.get("change") if isinstance(change, dict) else None
+        if not isinstance(block, dict):
             raise ReconcileError("tofu show wrote a resource change that is not a JSON object")
-        actions = (change.get("change") or {}).get("actions") or []
+        actions = block.get("actions")
         if not isinstance(actions, list) or not all(isinstance(action, str) for action in actions):
             raise ReconcileError("tofu show wrote a resource change whose actions are not a list of strings")
         actions = list(actions)
@@ -257,7 +261,10 @@ def load_fixture_state(source, runner=subprocess.run):
             raise ReconcileError("could not read %s: %s" % (source, _tail(result.stderr)))
         raw = result.stdout
     else:
-        raw = pathlib.Path(source).read_text()
+        try:
+            raw = pathlib.Path(source).read_text()
+        except OSError as exc:
+            raise ReconcileError("could not read %s: %s" % (source, exc))
     try:
         return json.loads(raw)
     except ValueError as exc:
@@ -270,7 +277,10 @@ def drifted_projects(document):
 
 def pool_projects(ci_deploy_script=fixture_state.CI_DEPLOY_SCRIPT):
     """The projects the pool maps, the only names this script will ask Boskos for."""
-    text = pathlib.Path(ci_deploy_script).read_text()
+    try:
+        text = pathlib.Path(ci_deploy_script).read_text()
+    except OSError as exc:
+        raise ReconcileError("could not read %s: %s" % (ci_deploy_script, exc))
     match = fixture_state.MAPPING_RE.search(text)
     if not match:
         raise ReconcileError("no gitops_repo_for_project() in %s" % ci_deploy_script)
@@ -412,6 +422,9 @@ def main(argv=None):
         return boskos_pool.TERMINATED_EXIT_CODE
     except (ReconcileError, boskos_pool.BoskosError) as exc:
         print("ERROR: %s" % exc, file=sys.stderr)
+        return EXIT_FAILED
+    except subprocess.SubprocessError as exc:
+        print("ERROR: could not run a command (%s: %s)" % (type(exc).__name__, exc), file=sys.stderr)
         return EXIT_FAILED
     except boskos_pool.REACH_ERRORS as exc:
         print("ERROR: could not reach a service (%s: %s)" % (type(exc).__name__, exc), file=sys.stderr)

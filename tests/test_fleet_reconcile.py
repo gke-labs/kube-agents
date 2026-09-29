@@ -156,7 +156,9 @@ class PlanInspectionTest(unittest.TestCase):
         versions = (reconcile.FLEET_DIR / "versions.tf").read_text()
         for provider in ("google", "kubernetes"):
             self.assertIn(f'provider "registry.opentofu.org/hashicorp/{provider}"', lock)
-        for constraint in re.findall(r'version\s*=\s*"(~> [\d.]+)"', versions):
+        constraints = re.findall(r'version\s*=\s*"(~> [\d.]+)"', versions)
+        self.assertEqual(len(constraints), 2, "one `~>` constraint per provider; another form needs this test and the lock re-done")
+        for constraint in constraints:
             self.assertIn(f'constraints = "{constraint}"', lock)
         # One h1 hash per locked platform per provider: linux_amd64 for the
         # periodic, darwin for the hands that run it locally.
@@ -192,7 +194,9 @@ class PlanInspectionTest(unittest.TestCase):
         self.assertNotIn("apply", tofu.verbs())
 
     def test_a_show_that_is_json_but_not_an_object_is_that_projects_failure(self):
-        for body in ("[]", "null", '{"resource_changes": [null]}', '{"resource_changes": {"a": {}}}', '{"resource_changes": 5}', '{"resource_changes": "abc"}', '{"resource_changes": [{"address": "a", "change": "x"}]}', '{"resource_changes": [{"address": "a", "change": {"actions": [null]}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": 5}}]}'):
+        for body in ("[]", "null", '{"resource_changes": [null]}', '{"resource_changes": {"a": {}}}', '{"resource_changes": 5}', '{"resource_changes": "abc"}', '{"resource_changes": [{"address": "a", "change": "x"}]}', '{"resource_changes": [{"address": "a", "change": {"actions": [null]}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": 5}}]}',
+                     # Falsy wrong types must be refused as loudly as truthy ones.
+                     '{"resource_changes": [{"address": "a", "change": []}]}', '{"resource_changes": [{"address": "a", "change": 0}]}', '{"resource_changes": [{"address": "a", "change": {"actions": 0}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": {}}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": ""}}]}'):
             tofu = _Tofu({P7: body})
             outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
             self.assertEqual(outcome, reconcile.OUTCOME_FAILED, body)
@@ -259,6 +263,13 @@ class TargetsTest(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, json.dumps({"projects": {}}), "")
 
         self.assertEqual(reconcile.load_fixture_state(reconcile.DEFAULT_FIXTURE_STATE, runner=gcloud), {"projects": {}})
+
+    def test_a_missing_local_scan_file_is_named_not_called_a_service(self):
+        with self.assertRaises(reconcile.ReconcileError) as raised:
+            reconcile.load_fixture_state("/no/such/fixture-state.json")
+        self.assertIn("could not read /no/such/fixture-state.json", str(raised.exception))
+        with self.assertRaises(reconcile.ReconcileError):
+            reconcile.pool_projects("/no/such/ci-deploy.sh")
 
     def test_an_unreadable_scan_is_a_fault(self):
         def gcloud(argv, **_):
