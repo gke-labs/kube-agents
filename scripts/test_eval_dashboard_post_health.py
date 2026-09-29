@@ -1869,14 +1869,26 @@ class PoolDrift(RunHarness):
         # the findings, the marker and the evidence.
         many = [f"iam/pool-state-reader/missing/{role}" for role in ("roles/iam.securityReviewer", "roles/container.clusterViewer", "roles/artifactregistry.reader", "roles/cloudkms.viewer", "roles/storage.bucketViewer")]
         projects = tuple(f"kube-agents-evals-{i}" for i in range(1, 36))
-        body = post_health.gate_issue.render_pool_drift_body(pool_drift(findings=tuple(many), projects=projects, evidence=["evidence line"]), "Mon 9:00 AM ET", "brief")
+        evidence_line = f"{many[0]} found on 35 pool project(s) at the 12:00 UTC scan; widespread"
+        body = post_health.gate_issue.render_pool_drift_body(pool_drift(findings=tuple(many), projects=projects, evidence=[evidence_line]), "Mon 9:00 AM ET", "brief")
         self.assertLessEqual(len(body), post_health.gate_issue.ISSUE_BODY_MAX_CHARS)
         self.assertIn("more project(s) omitted", body)
         self.assertIn("- `kube-agents-evals-1`", body)
         self.assertIn(post_health.gate_issue.POOL_DRIFT_MARKER.format(findings=",".join(many)), body)
-        self.assertIn("evidence line", body)
+        self.assertIn(evidence_line, body)
         small = post_health.gate_issue.render_pool_drift_body(pool_drift(), "Mon 9:00 AM ET", "brief")
         self.assertNotIn("omitted", small)
+
+    def test_the_pool_issue_quotes_only_the_pool_scans_evidence(self):
+        # A fixture line in the body would let the fixture tracker adopt the
+        # pool's ticket (it matches its roles against open bodies).
+        fixture_line = "crashloop-workload drifted on 1 pool project(s) (kube-agents-evals-4) at the 12:00 UTC scan; not yet repeated or widespread"
+        pool_line = f"{FINDING} found on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 12:00 UTC scan; repeated"
+        outage_line = "shared break: 2 cases failing on every PR (agent-kanban-smoke, gitops-pr) since 8:00 AM"
+        body = post_health.gate_issue.render_pool_drift_body(pool_drift(evidence=[fixture_line, pool_line, outage_line]), "Mon 9:00 AM ET", "brief")
+        self.assertIn(pool_line, body)
+        self.assertNotIn("crashloop-workload", body)
+        self.assertNotIn("agent-kanban-smoke", body)
 
     def test_the_bots_own_issue_is_re_found_when_its_title_is_a_count(self):
         # Four or more ids push the title to its count form, which names no

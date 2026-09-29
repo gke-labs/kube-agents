@@ -378,12 +378,29 @@ def render_pool_drift_title(health: dict, since_text: str) -> str:
     return title
 
 
+# The pool scan's evidence lines: the finding ids, or the pool scan's own
+# wording ("<id> found on N pool project(s)", "pool-state scan …"). The
+# fixture scan's lines say "drifted on" and name fixture roles, and the
+# fixture tracker adopts an open issue whose body names its roles, so
+# quoting them here would hand it the pool's ticket.
+POOL_EVIDENCE_MARKERS = (" found on ", "pool-state", "pool drift")
+
+
+def _pool_evidence(lines, findings):
+    kept = []
+    for line in lines:
+        text = str(line)
+        if any(finding in text for finding in findings) or any(marker in text.lower() for marker in POOL_EVIDENCE_MARKERS):
+            kept.append(text)
+    return kept
+
+
 def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> str:
     incident = health.get("incident") or {}
     findings = list(incident.get("roles") or [])
     drift = incident.get("drift") or {}
     repairs = incident.get("repairs") or {}
-    evidence = [f"- {line}" for line in health.get("evidence") or []]
+    evidence = [f"- {line}" for line in _pool_evidence(health.get("evidence") or [], findings)]
     blocks = []
     for project in sorted(drift):
         block = [f"- `{project}`"]

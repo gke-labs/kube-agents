@@ -1045,6 +1045,10 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     wi_checked = False
     roles_checked = False
     fleet_reader_checked = False
+    # An account that is not there is one finding; its roles are not N more
+    # with repairs to a member that does not exist.
+    platform_absent = False
+    litellm_absent = False
 
     gsa_email = f"kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
     rc, out, err = run_cmd([
@@ -1063,6 +1067,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             warnings,
         ):
             passed = False
+            platform_absent = True
             findings.append(Finding("iam/platform-gsa/absent", details[-1], REPAIR_PLATFORM_GSA))
     else:
         wi_checked = True
@@ -1107,6 +1112,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             warnings,
         ):
             passed = False
+            litellm_absent = True
             findings.append(Finding("iam/litellm-gsa/absent", details[-1], REPAIR_LITELLM_GSA))
     else:
         try:
@@ -1201,7 +1207,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
 
             platform_missing = PLATFORM_GSA_ROLES - platform_held
             platform_extra = platform_held - PLATFORM_GSA_ROLES
-            if platform_missing:
+            if platform_missing and not platform_absent:
                 passed = False
                 details.append(
                     f"The platform agent GSA is missing {len(platform_missing)} role(s) on "
@@ -1234,7 +1240,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     ))
             litellm_missing = LITELLM_GSA_ROLES - litellm_held
             litellm_extra = litellm_held - LITELLM_GSA_ROLES
-            if litellm_missing:
+            if litellm_missing and not litellm_absent:
                 passed = False
                 details.append(
                     f"The LiteLLM gateway GSA is missing {len(litellm_missing)} role(s) on "
@@ -2874,6 +2880,7 @@ def check_token_minter(
             warnings,
         ):
             passed = False
+            findings.append(Finding("token-minter/minter-gsa/absent", details[-1], REPAIR_MINTER))
     else:
         gsa_checked = True
         try:

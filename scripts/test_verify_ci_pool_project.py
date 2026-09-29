@@ -2468,6 +2468,8 @@ class IamGrantsTest(unittest.TestCase):
         self.assertEqual(found["iam/platform-gsa/absent"], checker.REPAIR_PLATFORM_GSA)
         self.assertEqual(found["iam/litellm-gsa/absent"], checker.REPAIR_LITELLM_GSA)
         self.assertIn("kube-agents-evals-3", found["iam/fleet-reader/absent"])
+        # One finding per absent account, not one per role it would have held.
+        self.assertFalse([f for f in result.findings if "/missing/" in f.id], [f.id for f in result.findings])
         doc = checker.report_document("kube-agents-evals-3", [self._tagged_iam(result)])
         self.assertIn("iam/platform-gsa/absent", [f["id"] for f in doc["checks"]["iam"]["findings"]])
 
@@ -3787,6 +3789,14 @@ class FindingsCarryRepairsTest(unittest.TestCase):
             found = {f.id: f for f in minter.findings}
             self.assertEqual(found["token-minter/pinned-version/not-enabled"].repair, checker.REPAIR_MINTER_ROTATION, state)
             self.assertIn(state, found["token-minter/pinned-version/not-enabled"].observed)
+        # The minter GSA gone: a finding of its own, beside the signer one.
+        gone = _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown service account.")
+        versions = json.dumps([{"name": ".../cryptoKeyVersions/1", "state": "ENABLED"}])
+        with mock.patch.object(checker, "run_cmd") as run, mock.patch.object(checker, "_chart_pinned_key_version", return_value=("1", "")):
+            run.side_effect = [_ok(versions), _ok(key), _ok(json.dumps({"bindings": []})), gone]
+            minter = checker.check_token_minter("kube-agents-evals-3", probe_app=False)
+        found = {f.id: f.repair for f in minter.findings}
+        self.assertEqual(found["token-minter/minter-gsa/absent"], checker.REPAIR_MINTER)
 
     def test_a_denied_project_read_is_unread_not_a_finding(self):
         with mock.patch.object(checker, "run_cmd", return_value=(1, "", "ERROR: PERMISSION_DENIED: caller lacks resourcemanager.projects.get")):
@@ -3826,14 +3836,16 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
         main = (checker._ROOT / "bench" / "tf" / "fleet" / "main.tf").read_text()
         block = re.search(r"pool_state_reader_roles\s*=\s*\[(.*?)\]", main, re.S)
         self.assertIsNotNone(block, "pool_state_reader_roles is gone from main.tf")
-        self.assertEqual(sorted(re.findall(r'"([^"]+)"', block.group(1))), sorted(checker.POOL_STATE_READER_ROLES))
+        # Comments stripped first: a role commented out is a role removed.
+        live = re.sub(r"(#|//)[^\n]*", "", block.group(1))
+        self.assertEqual(sorted(re.findall(r'"([^"]+)"', live)), sorted(checker.POOL_STATE_READER_ROLES))
 
     def test_the_member_matches_the_variable_default(self):
         variables = (checker._ROOT / "bench" / "tf" / "fleet" / "variables.tf").read_text()
         block = re.search(r'variable "pool_state_readers".*?\n\}', variables, re.S)
         self.assertIsNotNone(block, "pool_state_readers is gone from variables.tf")
         default = re.search(r"default\s*=\s*\[(.*?)\]", block.group(0), re.S)
-        self.assertEqual(re.findall(r'"([^"]+)"', default.group(1)), [checker.CI_HEALTH_BOT_MEMBER])
+        self.assertEqual(re.findall(r'"([^"]+)"', re.sub(r"(#|//)[^\n]*", "", default.group(1))), [checker.CI_HEALTH_BOT_MEMBER])
 
 
 if __name__ == "__main__":
