@@ -191,6 +191,15 @@ FIXTURE_NOT_READY = {
         "on seeded cluster A waiting on a ConfigMap that does not exist; no "
         "fixture role plants a stall today"
     ),
+    "gitops-drift-noise-filtered-triage": (
+        "#2137: needs the drift detector to accept an exact-match human "
+        "declaration ahead of its .gserviceaccount.com test, reachable from "
+        "configuration, so a run can plant a change the classifier will surface; "
+        "every identity a bench stack authenticates as is caught by an earlier "
+        "branch of Classify and dropped, and --human-domains cannot promote it "
+        "because isHuman is consulted after that test, so the case fails with no "
+        "card at all, which is broken rather than red"
+    ),
 }
 
 # Cases that claim no domain because no row in domains.yaml describes them.
