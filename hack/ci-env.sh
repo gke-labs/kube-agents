@@ -186,18 +186,23 @@ collect_gateway_log() {
 _agent_pod_watch_loop() {
   local parent="$1" out="$2"
   shift 2
-  local child="" pause=""
+  local child="" pause="" only=()
   trap 'kill ${child} ${pause} 2>/dev/null; exit 0' TERM
   while kill -0 "${parent}" 2>/dev/null; do
-    "$@" >> "${out}" 2>&1 &
+    "$@" ${only[@]+"${only[@]}"} >> "${out}" 2>&1 &
     child=$!
     wait "${child}" || true
+    child=""
+    # Every open lists everything before it watches; the first open's list is
+    # the record, and a reprint per reopen would push it out of the byte cap.
+    only=(--watch-only)
     # Backgrounded and waited on, not run in the foreground: bash defers a
     # trap until a foreground command returns, which held every exit for the
     # whole pause.
     sleep "${AGENT_DIAG_WATCH_RESTART_SECONDS}" &
     pause=$!
     wait "${pause}" || true
+    pause=""
   done
 }
 

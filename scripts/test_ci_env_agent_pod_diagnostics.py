@@ -280,11 +280,15 @@ class AgentPodDiagnosticsTest(unittest.TestCase):
         deadline = time.monotonic() + EXIT_DEADLINE_SECONDS
         while not loops.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
+        self.assertTrue(loops.exists(), proc.stderr.read1().decode() if proc.poll() is not None else "")
         pids = [int(p) for p in loops.read_text(encoding="utf-8").split()]
         self.assertEqual(len(pids), 2)
         proc.kill()
         proc.communicate(timeout=EXIT_DEADLINE_SECONDS)  # EOF, or the pipe is still held
         self.assertTrue(all_exit(pids), "a loop outlived its SIGKILLed parent")
+        kubectls = [int(p) for p in (tmp / "watch-pids").read_text(encoding="utf-8").split()]
+        self.assertTrue(kubectls)
+        self.assertTrue(all_exit(kubectls), "a watch kubectl outlived its SIGKILLed eval")
 
     def test_a_second_call_does_not_repeat_the_snapshot(self):
         """The trap and the failure dumper both call it on a red run; the
@@ -297,7 +301,11 @@ class AgentPodDiagnosticsTest(unittest.TestCase):
     def test_a_closed_watch_is_reopened(self):
         _, artifacts, _ = run_collect(watch=True, restart_seconds="0", watch_for=1.5, STUB_WATCH_EXITS="1")
         pods = (artifacts / "agent-pods-watch.txt").read_text(encoding="utf-8")
-        self.assertGreater(pods.count("WATCH: "), 1, pods)
+        opens = [line for line in pods.splitlines() if line.startswith("WATCH: ")]
+        self.assertGreater(len(opens), 1, pods)
+        self.assertNotIn("--watch-only", opens[0])
+        for line in opens[1:]:
+            self.assertIn("--watch-only", line, "a reopen must not relist what the first open kept")
 
     def test_without_a_watch_the_snapshot_writes_no_watch_files(self):
         proc, artifacts, _ = run_collect()
