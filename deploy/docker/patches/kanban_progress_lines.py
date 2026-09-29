@@ -259,6 +259,27 @@ def _remember(
         tracked.pop(next(iter(tracked)), None)
 
 
+async def _settle_reaction(adapter: Any, sub: dict, kind: str, board: Optional[str]) -> None:
+    """With ``KAGE_SLACK_UX`` on, settle the Slack ask this card's thread is waiting on.
+
+    Best-effort, for the reason the terminal path below settles its rolling
+    message best-effort: a cosmetic failure must not reach the notifier's
+    ``except``. With the flag off this returns before touching anything. See
+    ``gateway/slack_ux_reactions.py``.
+    """
+    try:
+        from gateway import slack_ux_reactions
+    except ImportError:
+        return
+    try:
+        if slack_ux_reactions.enabled():
+            await slack_ux_reactions.settle_delegated(adapter, sub, kind, board)
+    except Exception as exc:  # noqa: BLE001 — never fail a delivery on a reaction
+        logger.debug(
+            "kanban progress: settle reaction for %s failed: %s", sub.get("task_id"), exc,
+        )
+
+
 async def deliver(
     watcher: Any,
     adapter: Any,
@@ -268,6 +289,7 @@ async def deliver(
     message: str,
     metadata: Optional[dict],
     header: str,
+    board: Optional[str] = None,
 ) -> Any:
     """Deliver one notifier event, rolling progress into a single message.
 
@@ -303,7 +325,9 @@ async def deliver(
                     "for %s: %s", sub.get("task_id"), exc,
                 )
         tracked.pop(key, None)
-        return await adapter.send(chat_id, message, metadata=metadata)
+        result = await adapter.send(chat_id, message, metadata=metadata)
+        await _settle_reaction(adapter, sub, kind, board)
+        return result
 
     line = rolling_line(kind, getattr(ev, "payload", None)) or message
     if entry and event_id and event_id <= entry["last_event_id"]:
