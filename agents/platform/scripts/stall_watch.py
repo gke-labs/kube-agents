@@ -14,13 +14,16 @@ someone asks a Cluster Agent to run ``gke-stall-detection``, nothing looks
 This is a ``no_agent`` entry on the Platform Agent's roster. The tick prompts
 no model. Each tick:
 
-1. lists the project's clusters; ``RUNNING`` and ``RECONCILING`` clusters
-   with a scaffolded Cluster Agent profile are swept (a reconciling control
-   plane still answers), any other status is recorded as unreadable with the
-   status rather than skipped, and a cluster with no profile, one the
-   reconciler's ``RECONCILE_EXCLUDE`` pruned or has not yet scaffolded, is
-   left unread: the exclusion is the operator keeping a model turn off that
-   cluster, and this watch follows the same roster;
+1. lists the clusters of the management project and of every project a
+   Cluster Agent profile's ``cluster_identity`` names, which is how a project
+   ``spec.scope`` brought in reaches the watch; ``RUNNING`` and
+   ``RECONCILING`` clusters with a scaffolded Cluster Agent profile are swept
+   (a reconciling control plane still answers), any other status is recorded
+   as unreadable with the status rather than skipped, and a cluster with no
+   profile, one the reconciler pruned for ``spec.scope.exclude.clusters`` or
+   ``RECONCILE_EXCLUDE`` or has not yet scaffolded, is left unread: the
+   exclusion is the operator keeping a model turn off that cluster, and this
+   watch follows the same roster;
 2. per cluster, fetches credentials into a per-cluster kubeconfig and lists
    the namespaces that are not system namespaces;
 3. per namespace, runs the Cluster Agent's ``stall_report.py --json`` over a
@@ -101,6 +104,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -120,11 +125,15 @@ PLATFORM_PROFILE = "platform"
 CRON_DIR = "cron"
 STATE_FILE_NAME = "stall_watch.json"
 STATE_PATH_ENV = "STALL_WATCH_STATE"
-STATE_SCHEMA_VERSION = 3
+STATE_SCHEMA_VERSION = 4
+#: The version that keyed a cluster without its project. It swept only the
+#: management project, so its keys are read as that project's.
+PROJECTLESS_SCHEMA_VERSION = 3
 STATE_TMP_SUFFIX = ".tmp"
 
-#: The project to sweep: the watch's own override first, then the one the
-#: operator already sets on the agent container from spec.harness.projectID.
+#: The management project, listed on every tick: the watch's own override
+#: first, then the one the operator already sets on the agent container from
+#: spec.harness.projectID. The other projects are the Cluster Agent roster's.
 PROJECT_ENVS = ("STALL_WATCH_PROJECT", "GCP_PROJECT_ID")
 KINDS_ENV = "STALL_WATCH_KINDS"
 REPORT_SCRIPT_ENV = "STALL_WATCH_REPORT_SCRIPT"
@@ -233,6 +242,15 @@ SYSTEM_NAMESPACE_PREFIXES = ("gke-", "gke-managed-", "config-management-")
 #: goes dark mid-sweep costs one scan timeout rather than one per namespace.
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 CLUSTER_LIST_TIMEOUT_SECONDS = 120
+#: Projects are listed the way the reconciler lists them: the management
+#: project first and alone, since its ssh opens the connection the rest share,
+#: then LIST_WORKERS at a time, each gcloud timeout cut to the budget left. A
+#: listing still running at the deadline is unlisted this tick. One at a time,
+#: a hundred projects (the scope's cap) each hanging to the gcloud timeout would
+#: outlast the whole tick.
+LIST_WORKERS = 8
+LIST_BUDGET_SECONDS = 150
+LIST_GRACE_SECONDS = 5
 GET_CREDENTIALS_TIMEOUT_SECONDS = 60
 NAMESPACE_LIST_TIMEOUT_SECONDS = 60
 NAMESPACE_SCAN_TIMEOUT_SECONDS = 300
@@ -243,11 +261,17 @@ REPORT_UNREADABLE_EXIT = 2
 #: Where the ledger keeps an open card per `cluster/namespace` scope.
 EPISODES_KEY = "episodes"
 #: Only a cluster with a scaffolded Cluster Agent profile is swept, and its
-#: card goes to that profile. A cluster without one, pruned through the
-#: reconciler's RECONCILE_EXCLUDE or not yet scaffolded, is neither read nor
+#: card goes to that profile. A cluster without one, pruned for the scope's
+#: exclude.clusters or RECONCILE_EXCLUDE or not yet scaffolded, is neither read nor
 #: filed for: the exclusion is the operator keeping a model turn off that
 #: cluster, and a card would hand its rows to another profile instead.
 NO_PROFILE_REASON = "no Cluster Agent profile; not read"
+#: A profile whose cluster_identity cannot be read adds no project to the
+#: roster. Its cluster is swept when its project is listed anyway, and otherwise
+#: keeps its rows.
+NO_IDENTITY_REASON = "no readable cluster_identity; adds no project to the sweep"
+#: The ledger's key for such a profile.
+PROFILE_SCOPE = "profile"
 #: Cards opened per tick. Each is a Cluster Agent turn, and the number of
 #: namespaces with a new stall is chosen by whoever can create namespaces, so
 #: the rest keep their rows and wait, oldest first sighting first: a tenant
@@ -313,9 +337,12 @@ CLEAR_AFTER_MISSED_SCANS = {"repeating-warnings": 2, "dangling-reference": 2}
 DEFAULT_CLEAR_AFTER_MISSED_SCANS = 1
 TRUNCATION_MARKER = "..."
 LEDGER_KEY_SEPARATOR = "|"
-#: A cluster is `name@location`: two projects' clusters may share a name
-#: across regions, and the kubeconfig and every sibling key on both.
+#: A cluster is `project:name@location`, the triple the scope's
+#: exclude.clusters names. A domain-scoped project ID has a colon of its own
+#: and cluster names and locations have neither separator, so a key is split
+#: from the right.
 CLUSTER_ID_SEPARATOR = "@"
+PROJECT_SEPARATOR = ":"
 SCOPE_SEPARATOR = "/"
 #: A repeating-warnings detail carries the event count (`SYNC x743: ...`), which
 #: rises every tick; the ledger keys the row on the detail with the count removed.
@@ -419,13 +446,13 @@ def project_id() -> str | None:
     return r.stdout.strip() or None
 
 
-def list_clusters(project: str) -> tuple[list[dict], str | None]:
+def list_clusters(project: str, timeout: float = CLUSTER_LIST_TIMEOUT_SECONDS) -> tuple[list[dict], str | None]:
     """Every cluster as {name, location, status}, and why the listing is
     incomplete when gcloud said so. Raises on a list that could not be read,
     so the caller can tell an empty project from a failed call."""
     r = run_sandbox(
         ["gcloud", "container", "clusters", "list", f"--project={project}", "--format=json"],
-        timeout=CLUSTER_LIST_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     if r.returncode != 0:
         raise RuntimeError(f"gcloud container clusters list exited {r.returncode}: {stderr_excerpt(r.stderr)}")
@@ -552,12 +579,21 @@ def empty_state() -> dict:
     return {"version": STATE_SCHEMA_VERSION, "stalls": {}, "unreadable": {}, EPISODES_KEY: {}, GENERATIONS_KEY: {}, "sweep_error": None, "updated_at": None, CURSOR_KEY: None}
 
 
-def load_state(path: Path) -> dict:
+def load_state(path: Path, project: str | None = None) -> dict:
+    """The ledger, a projectless one moved under the management project first.
+    Without that project a projectless ledger comes back as it is, version
+    included: the tick cannot sweep, so it saves the ledger unchanged and the
+    next tick moves it. Discarding it would file a second card for every
+    namespace with an open one."""
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         return empty_state()
-    if not isinstance(data, dict) or data.get("version") != STATE_SCHEMA_VERSION:
+    if not isinstance(data, dict):
+        return empty_state()
+    if data.get("version") == PROJECTLESS_SCHEMA_VERSION and project:
+        data = with_project(data, project)
+    if data.get("version") not in (STATE_SCHEMA_VERSION, PROJECTLESS_SCHEMA_VERSION):
         return empty_state()
     state = empty_state()
     state.update({k: data.get(k, v) for k, v in state.items()})
@@ -575,13 +611,38 @@ def stable_detail(detail: str) -> str:
     return EVENT_COUNT_IN_DETAIL.sub(r"\1: ", detail)
 
 
-def cluster_id(name: str, location: str) -> str:
-    return f"{name}{CLUSTER_ID_SEPARATOR}{location}"
+def cluster_id(project: str, name: str, location: str) -> str:
+    return f"{project}{PROJECT_SEPARATOR}{name}{CLUSTER_ID_SEPARATOR}{location}"
+
+
+def split_cluster_id(cid: str) -> tuple[str, str, str]:
+    head, _, location = cid.rpartition(CLUSTER_ID_SEPARATOR)
+    project, _, name = head.rpartition(PROJECT_SEPARATOR)
+    return project, name, location
 
 
 def cluster_label(cid: str) -> str:
-    name, sep, location = cid.partition(CLUSTER_ID_SEPARATOR)
-    return f"`{name}` ({location})" if sep else f"`{name}`"
+    project, name, location = split_cluster_id(cid)
+    return f"`{project}/{name}` ({location})"
+
+
+def with_project(data: dict, project: str) -> dict:
+    """A projectless ledger with every cluster key moved under `project`. The
+    unreadable map is dropped: every tick rewrites it."""
+    prefix = f"{project}{PROJECT_SEPARATOR}"
+    stalls = {prefix + k: {**e, "cluster": prefix + str(e.get("cluster", ""))} for k, e in (data.get("stalls") or {}).items()}
+    cursor = data.get(CURSOR_KEY)
+    if isinstance(cursor, dict) and cursor.get("cluster"):
+        cursor = {**cursor, "cluster": prefix + cursor["cluster"]}
+    return {
+        **data,
+        "version": STATE_SCHEMA_VERSION,
+        "stalls": stalls,
+        "unreadable": {},
+        EPISODES_KEY: {prefix + k: v for k, v in (data.get(EPISODES_KEY) or {}).items()},
+        GENERATIONS_KEY: {prefix + k: v for k, v in (data.get(GENERATIONS_KEY) or {}).items()},
+        CURSOR_KEY: cursor,
+    }
 
 
 def ledger_key(cid: str, finding: dict) -> str:
@@ -615,17 +676,17 @@ UNKNOWN = "unknown"
 class Sweep:
     """What one pass over the fleet saw."""
 
-    def __init__(self, project: str = "") -> None:
-        self.project = project
+    def __init__(self, projects: Iterable[str] = ()) -> None:
+        self.projects = set(projects)
         self.rows: dict[str, dict] = {}
         #: `cluster/namespace` scopes whose scan ran this tick, and for the
         #: ones that skipped a kind or the events, what they skipped.
         self.read_scopes: set[str] = set()
         self.partial_scopes: dict[str, set[str]] = {}
-        #: Every cluster the project listed, whatever its status, and whether
-        #: gcloud vouched for the listing being complete.
+        #: Every managed cluster the projects listed, whatever its status, and
+        #: the projects whose listing failed or gcloud called incomplete.
         self.listed_clusters: set[str] = set()
-        self.listing_complete = True
+        self.unlisted_projects: set[str] = set()
         #: Listed clusters with no Cluster Agent profile: not read, not listed
         #: here, so their rows clear the way a deleted cluster's do.
         self.unmanaged: set[str] = set()
@@ -652,7 +713,14 @@ class Sweep:
         is UNKNOWN."""
         cid, namespace = entry.get("cluster", ""), entry.get("namespace", "")
         if cid not in self.listed_clusters:
-            return GONE if self.listing_complete else UNKNOWN
+            project, name, location = split_cluster_id(cid)
+            if project in self.unlisted_projects:
+                return UNKNOWN
+            if project not in self.projects and cluster_agent_for(project, name, location) is not None:
+                # The profile is there but its identity did not name the
+                # project, so the project was not listed this tick.
+                return UNKNOWN
+            return GONE
         namespaces = self.listed_namespaces.get(cid)
         if namespaces is not None and namespace not in namespaces:
             return GONE
@@ -666,6 +734,11 @@ class Sweep:
         if any(resource_names_kind(r, kind) for r in skipped if r != EVENTS_MARKER):
             return UNKNOWN
         return ABSENT
+
+    def left_roster(self, cid: str) -> bool:
+        """Whether the cluster's rows went because it lost its Cluster Agent
+        profile, rather than because the cluster or namespace was deleted."""
+        return cid in self.unmanaged or split_cluster_id(cid)[0] not in self.projects
 
     def out_of_budget(self, started: float, cid: str, namespace: str | None = None) -> bool:
         if self.budget_exhausted:
@@ -698,30 +771,109 @@ def rotate_to_cursor(sweepable: list, cursor: dict | None) -> list:
     return sweepable
 
 
-def sweep_fleet(project: str, cursor: dict | None = None) -> Sweep:
-    sweep = Sweep(project)
+def profile_identity(home: Path) -> dict[str, str] | None:
+    """The profile's cluster_identity, or None when it is absent or cannot be
+    read. The file is in the model-writable agent home, so a malformed one
+    reads as absent rather than failing every project's sweep."""
+    from cluster_agent_profile import read_cluster_identity  # lazy, as in cluster_agent_for
+
+    try:
+        return read_cluster_identity(home)
+    except Exception:  # noqa: BLE001 - any unreadable file is an absent identity
+        return None
+
+
+def roster_projects() -> tuple[set[str], dict[str, str]]:
+    """The projects the Cluster Agent profiles' identities name, and a ledger
+    entry for each profile whose identity names none."""
+    from cluster_agent_profile import RESERVED_PROFILES  # lazy, as in cluster_agent_for
+
+    base = Path(gitops_workspace.agent_home()) / PROFILES_DIR
+    if not base.is_dir():
+        return set(), {}
+    projects, unread = set(), {}
+    for home in base.iterdir():
+        if home.name in RESERVED_PROFILES or not home.is_dir():
+            continue
+        identity = profile_identity(home)
+        if identity:
+            projects.add(identity["project"])
+        else:
+            unread[f"{PROFILE_SCOPE} {home.name}"] = NO_IDENTITY_REASON
+    return projects, unread
+
+
+def list_projects(projects: list[str], first: str, started: float) -> dict[str, tuple[list[dict], str | None] | Exception]:
+    """Every project's listing, or what it failed with; a listing still
+    running at the deadline fails with TimeoutExpired. `first` starts the
+    budget, so it gets gcloud's whole timeout."""
+    deadline = started + LIST_BUDGET_SECONDS
+
+    def listing(project: str, timeout: float) -> tuple[list[dict], str | None] | Exception:
+        try:
+            return list_clusters(project, timeout=timeout)
+        except sandbox_exec.SandboxUnavailable:
+            raise
+        except READ_FAILURES as exc:
+            return exc
+
+    def within_budget(project: str) -> tuple[list[dict], str | None] | Exception:
+        return listing(project, max(1.0, min(CLUSTER_LIST_TIMEOUT_SECONDS, deadline - time.monotonic())))
+
+    results = {first: listing(first, CLUSTER_LIST_TIMEOUT_SECONDS)}
+    rest = [p for p in projects if p != first]
+    if not rest:
+        return results
+    pool = ThreadPoolExecutor(max_workers=min(LIST_WORKERS, len(rest)))
+    futures = {project: pool.submit(within_budget, project) for project in rest}
+    done, _ = wait(futures.values(), timeout=max(0.0, deadline + LIST_GRACE_SECONDS - time.monotonic()))
+    pool.shutdown(wait=False, cancel_futures=True)
+    for project, future in futures.items():
+        # result() re-raises a lost sandbox from the worker.
+        results[project] = future.result() if future in done else subprocess.TimeoutExpired("gcloud container clusters list", LIST_BUDGET_SECONDS)
+    return results
+
+
+def sweep_fleet(management_project: str, cursor: dict | None = None) -> Sweep:
+    """Sweep the management project and every project on the roster. One
+    project's listing failing holds that project's rows; every listing failing
+    fails the sweep."""
+    projects, unread_profiles = roster_projects()
+    sweep = Sweep({management_project} | projects)
+    sweep.unreadable.update(unread_profiles)
     started = time.monotonic()
     source = report_source()
-    clusters, incomplete = list_clusters(project)
-    if incomplete:
-        sweep.listing_complete = False
-        sweep.unreadable[LISTING_SCOPE] = f"incomplete: {incomplete}"
+    failures: dict[str, Exception] = {}
+    listings = list_projects(sorted(sweep.projects), management_project, started)
     # Every listed cluster is registered before any is read: a cluster the
     # budget never reaches is unread, not gone.
     sweepable = []
-    for cluster in clusters:
-        cid = cluster_id(cluster["name"], cluster["location"])
-        if cluster_agent_for(project, cluster["name"], cluster["location"]) is None:
-            sweep.unmanaged.add(cid)
-            sweep.unreadable[scope_key(cid)] = NO_PROFILE_REASON
+    for project in sorted(sweep.projects):
+        listing = listings[project]
+        if isinstance(listing, Exception):
+            failures[project] = listing
+            sweep.unlisted_projects.add(project)
+            sweep.unreadable[f"{LISTING_SCOPE} {project}"] = failure_text(listing)
             continue
-        sweep.listed_clusters.add(cid)
-        if cluster["status"] in SWEEPABLE_CLUSTER_STATUSES:
-            sweepable.append((cid, cluster))
-        else:
-            sweep.unreadable[scope_key(cid)] = f"status={cluster['status'] or 'unknown'}"
+        clusters, incomplete = listing
+        if incomplete:
+            sweep.unlisted_projects.add(project)
+            sweep.unreadable[f"{LISTING_SCOPE} {project}"] = f"incomplete: {incomplete}"
+        for cluster in clusters:
+            cid = cluster_id(project, cluster["name"], cluster["location"])
+            if cluster_agent_for(project, cluster["name"], cluster["location"]) is None:
+                sweep.unmanaged.add(cid)
+                sweep.unreadable[scope_key(cid)] = NO_PROFILE_REASON
+                continue
+            sweep.listed_clusters.add(cid)
+            if cluster["status"] in SWEEPABLE_CLUSTER_STATUSES:
+                sweepable.append((cid, cluster))
+            else:
+                sweep.unreadable[scope_key(cid)] = f"status={cluster['status'] or 'unknown'}"
+    if len(failures) == len(sweep.projects):
+        raise failures[management_project]
     for cid, cluster in rotate_to_cursor(sweepable, cursor):
-        name, location = cluster["name"], cluster["location"]
+        project, name, location = split_cluster_id(cid)
         if sweep.out_of_budget(started, cid):
             break
         try:
@@ -877,9 +1029,15 @@ def cluster_agent_for(project: str, cluster: str, location: str) -> str | None:
     from cluster_agent_profile import profile_name  # lazy: pulls the scaffold module's imports
 
     name = profile_name(project, cluster, location)
-    if (Path(gitops_workspace.agent_home()) / PROFILES_DIR / name).is_dir():
-        return name
-    return None
+    home = Path(gitops_workspace.agent_home()) / PROFILES_DIR / name
+    if not home.is_dir():
+        return None
+    identity = profile_identity(home)
+    if identity and (identity["project"], identity["cluster"], identity["location"]) != (project, cluster, location):
+        # profile_name collapses separators, so `acme-prod`/`web` and
+        # `acme`/`prod-web` share a name; the identity says whose it is.
+        return None
+    return name
 
 
 def scope_label_text(scope: str) -> str:
@@ -1129,7 +1287,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     for scope in sorted(candidates, key=lambda sc: (scope_first_seen(state, sc), sc)):
         new_rows = candidates[scope]
         cid, namespace = split_scope(scope)
-        name, _, location = cid.partition(CLUSTER_ID_SEPARATOR)
+        project, name, location = split_cluster_id(cid)
         episode = episodes.get(scope)
         # A card carries every object the scope holds, not only the ones that
         # appeared this tick.
@@ -1162,15 +1320,15 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         if opened >= MAX_CARDS_PER_TICK:
             held += 1
             continue
-        assignee = cluster_agent_for(sweep.project, name, location)
+        assignee = cluster_agent_for(project, name, location)
         if assignee is None:
             # The profile went between the sweep and the card; the next sweep
             # leaves the cluster out and its rows clear.
             sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no card for {scope}\n")
             continue
         generation = int(state.setdefault(GENERATIONS_KEY, {}).get(scope) or 0)
-        title = card_title(name, namespace, rows)
-        body = card_body(sweep.project, name, location, namespace, rows, scope_first_seen(state, scope) or now)
+        title = card_title(f"{project}/{name}", namespace, rows)
+        body = card_body(project, name, location, namespace, rows, scope_first_seen(state, scope) or now)
         task_id = open_card(title, body, assignee, card_key(cid, namespace, generation))
         skipped = 0
         status = card_status(task_id) if task_id else None
@@ -1223,7 +1381,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     for scope in sorted(set(episodes) - open_scopes):
         episode = episodes[scope]
         cleared = names_text(object_names(cleared_by_scope.get(scope, [])) or episode.get("objects", []))
-        if split_scope(scope)[0] in sweep.unmanaged:
+        if sweep.left_roster(split_scope(scope)[0]):
             cleared = "the cluster left the Cluster Agent roster"
             note = f"The cluster left the Cluster Agent roster; the watch no longer reads it, as of {now}."
         else:
@@ -1256,13 +1414,18 @@ def namespace_of(scope: str) -> str:
 
 
 def tick(state_path: Path, *, dry_run: bool) -> list[str]:
-    state = load_state(state_path)
     now = now_iso()
     lines: list[str] = []
     try:
         project = project_id()
-        if not project:
-            raise RuntimeError(f"no GCP project: set {PROJECT_ENVS[0]} or configure gcloud in the sandbox")
+    except Exception as exc:  # noqa: BLE001 - reported below as the sweep failure
+        project, lookup_error = None, exc
+    else:
+        lookup_error = None if project else RuntimeError(f"no GCP project: set {PROJECT_ENVS[0]} or configure gcloud in the sandbox")
+    state = load_state(state_path, project)
+    try:
+        if lookup_error:
+            raise lookup_error
         sweep = sweep_fleet(project, state.get(CURSOR_KEY))
     except Exception as exc:  # noqa: BLE001 - a failed sweep is reported once, not raised every tick
         text = failure_text(exc)

@@ -144,8 +144,10 @@ the presubmit exports nothing new until it chooses to. The exchange:
    reading the conversation, so it treats that edit as the terminal: infrastructure, the
    gateway failed to publish, and no cancel, because nothing was ever on a subject.
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
-   `final_message`); map `activity` and `progress` artifacts into the trajectory when the
-   executor publishes them. Token counts are not on the bus, and the scorer's liveness rule
+   `final_message`); map `activity` artifacts into the trajectory when the executor publishes them
+   (the `progress` artifact's last line goes to the harness result's `metadata`, which devops-bench
+   does not write to the record, so it reaches the log and nothing graded). Token counts are not
+   on the bus, and the scorer's liveness rule
    fails a record whose token total is null, so the inject record is written the way the
    diagnostic transport below writes its own: every lifecycle event of the task, `submitted`,
    `working` and the terminal, is a trajectory entry under the status-event name, the token
@@ -312,22 +314,32 @@ gate, an `authority` block that names a real principal, and the reply rendered i
 
 **Which verifiers work.** `report_contains` reads the answer text and works unchanged.
 `resource_property` and `fleet_resource_property` read the cluster and never touched the
-transport. `tool_called` reads the trajectory, which on this path carries no tool-call data:
-the relay never posts `activity` artifacts to a conversation, so a transport that reads one
-sees none whatever the executor publishes, and recording them is transport work of its own. The
-executors differ beneath that — the Hermes bridge publishes status updates and a `result`
-artifact and no `activity` or `progress` artifacts, while the worker adapter publishes `activity`
-and `progress` beside the result — so a case that gates on `tool_called` has no data on stage 1
-until both the executor publishes activity and the transport records it. `worker_commands` reads
+transport. `tool_called` reads the trajectory, which on this path carries tool-call data only
+when the executor publishes `activity` artifacts and the door's probe carries them: the relay
+never posts `activity` to a conversation, so the harness reads the trace off the read route when
+the probe body carries an `activity` key (`[]` for a run that called nothing), maps each entry to
+a trajectory item in the api path's shape, and writes one `a2a.activity` marker whenever the key
+was present at all; a probe without the key leaves the record with no marker and no calls. Which
+executor publishes `activity`, and whether the door carries it, is each component's own to state
+(the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the
+harness asks neither and grades on what the probe carried. `worker_commands` reads
 the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
 signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
-as a failure meanwhile: on a record whose trajectory is this transport's envelope with no tool
-call in it, the scorer sets every `tool_called`, `worker_commands` and `worker_agents` entry aside as not
-applicable and grades the checks that remain; a case with no other objective is not graded on
-the lane rather than collapsed, and the rule retires itself on the first record that carries a
-tool entry ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
-cannot show") — which, as above, is transport work that is not filed. A case whose premise
+as a failure meanwhile: on this transport's record the scorer sets every `worker_commands` and
+`worker_agents` entry aside as not applicable, and every `tool_called` entry too when the record
+carries no `a2a.activity` marker or a marker that reports a loss (calls the door's cap or the
+executor's budget dropped, a count or part it could not read, an input truncated with its nested
+names, or a trace older than the read that ended the wait), and grades the checks that remain
+(a `none`-wrapped check that failed stays graded whatever the loss: the trace shows the call); a
+case with no other objective is not graded on the lane rather than collapsed. A
+marker reporting no loss retires the set-aside for a `tool_called` in its default `router` scope
+— it states the door's capability to show calls, whether or not the run made one — and nothing
+else: a `tool_called` in the `workers` or `all`
+scope reads the workers' tagged entries, which the trace does not carry, and stays set aside with
+the worker checks
+([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
+cannot show"). A case whose premise
 needs the front door — `agent-kanban-smoke`, which grades
 the chat profile's `kanban_create` — is a different matter: the door addresses `platform`
 directly, so `hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the
@@ -450,8 +462,9 @@ adapter's `verifiedBy: chat-event-topic-iam` and its allowed-users gate exactly 
 Chat adapter" section has them: the gate is the operator-pinned allowed-users set carried as
 environment, and the `verifiedBy` value names a project-IAM boundary, not a per-request proof. It
 lands in the same change that gives the gateway rendered under `next` the credential proxy's chat
-relay URL as its backend, so an install with Google Chat configured has a gateway that starts
-without a Discord Secret; a render that drops the relay URL leaves a gateway on the door alone,
+relay URL as its backend, and teaches the operator's own backend check the same (the render
+withholds a gateway it believes has no backend, `a2aGatewayBackend`), so an install with Google
+Chat configured has a gateway that is rendered and starts without a Discord Secret; a render that drops the relay URL leaves a gateway on the door alone,
 which the read route reports as inject-only and the stage's preflight fails as infrastructure
 before any case runs, the guard paragraph in stage 1 saying why the guard no longer catches it.
 And it settles the one-backend guard with the Slack adapter in flight, so the relay URL beside a
@@ -500,7 +513,8 @@ moved with it. Today's wait cannot be re-entered as it is: it is a method of the
 that re-posts `/v1/responses`, takes card ids from `kanban_create` tool results and statuses from
 the kanban store or from `kanban_show` payloads in the trajectory, and gives up after three status
 turns that report nothing, and
-on this path the trajectory holds no tool calls, only the lifecycle entries of step 4. Stage 1
+on this path the trajectory holds no tool results (the door's trace carries calls without their
+results), so no card id can be read from it. Stage 1
 writes the wait again for the inject path: card ids and statuses read from the `result` text, the
 status question sent as a new turn on the same conversation key with its own backend message
 id, `<run>/<case>/<rep>/status-<n>`, so the dedupe does not answer it with the opening task,
@@ -520,8 +534,9 @@ today-mode install has passed its own readiness and connectivity checks. It reco
 Deployment's generation, merge-patches the CR, and waits for the generation to move before
 asking any workload for status, because the flip is a rollout and a status read before it lands
 describes the old pods. It then gates, in order, on the NATS StatefulSet, the callout Deployment,
-the provisioning Job reaching `complete` (the Job depends on the callout and has been measured at
-19.5 minutes under adverse conditions, so its bound is generous), and the agent Deployment. Then
+the provisioning Job reaching `complete` (the Job depends on the callout; before the operator
+ordered its creation after a serving callout replica it was measured at 19.5 minutes under adverse
+conditions, so its bound is generous), and the agent Deployment. Then
 the door and the executor. The deploy arms the gateway's inject door on the operator under the
 same flag (`A2A_INJECT_BACKEND=true` through the chart's `operator.extraEnv`, beside the A2A
 image overrides) and waits for the door's Service and token Secret; it then declares the bridge
@@ -550,16 +565,20 @@ unset both scripts are byte for byte what they were, and the presubmit's own tes
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.
-The next stack still has holes independent of any case (no resource requests on the NATS,
-gateway or provisioning pods, images in a private registry, and whatever the first runs through
-the door find), and a default-on flip would red every pull request for reasons none of them
-caused. And the record that earns `next` a place in what every pull request measures is built by
+The next stack still has holes independent of any case (images in a private registry, and
+whatever the first runs through the door find), and a default-on flip would red every pull
+request for reasons none of them caused. And the record that earns `next` a place in what every pull request measures is built by
 running it: a scheduled lane on `main` under the flag, with a record of its own, not the
-presubmit. That lane is not built yet, and the flag does not admit it as it stands: section 2b of
-the deploy refuses `EVAL_MODE_NEXT=1` on a Prow run with no pull request, because `bench-gate`
-would append that run's samples to `main`'s baseline, the window every pull request is judged
-against. The lane's change is what gives such a run a store of its own and lifts that refusal for
-it; until then the flag runs on a pull request's presubmit, on demand.
+presubmit. The flag admits that lane by name and nothing else without a pull request: section 2b
+of the deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME`
+is one of the next lane's jobs (`EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh`, the on-demand
+presubmit and the periodic on main), and refuses it on any other Prow run, so the flag mis-set
+on the nightly or a postsubmit still stops the deploy before anything is built. The record of its
+own does not exist yet: the baseline key has no mode field, so a next-mode sample appended to the
+store would be today's once written, and the dashboard has no next lane to file a run under. Until
+both exist, `hack/ci-eval-pr.sh` keeps every flagged run out of the baseline recorder and the
+dashboard publisher on the flag alone, whatever its job type; the periodic reads the store, when
+one is armed, and writes nothing shared.
 
 ## Open questions
 

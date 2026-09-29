@@ -25,11 +25,17 @@ terraform {
   required_providers {
     google = {
       source  = "hashicorp/google"
-      version = ">= 5.0.0"
+      # One major each, and the exact versions are pinned by the committed
+      # .terraform.lock.hcl beside this file: the scheduled reconcile applies
+      # this stack unattended in every pool project with -lockfile=readonly,
+      # so a provider release is adopted by a person re-running
+      # `tofu providers lock` (README.md, "State and reconcile"), not by the
+      # next run. 8.4.0 and 3.2.1 are what the fleet is applied with today.
+      version = "~> 8.0"
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
-      version = ">= 2.30.0"
+      version = "~> 3.0"
     }
   }
 }

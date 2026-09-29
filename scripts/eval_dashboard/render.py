@@ -230,9 +230,9 @@ DEMOTED_RE = re.compile(r"\bdemoted (\d{4}-\d{2}-\d{2})")
 # rows are blocking). The words the pages print for each live in pages.js.
 STATUS_BLOCKING = "blocking"  # active and in hack/eval/blocking-roster.txt
 STATUS_HELD_OUT = "held_out"  # active, never admitted (or no date on record)
-# Off the roster with a demotion date on the roster page -- active or, since
-# 2026-09-22 (#1023: the presubmit runs the roster only, so a demoted case is
-# a nightly case), nightly-only.
+# Off the roster with a demotion date on the roster page -- nightly-only
+# since 2026-09-22 (#1023: the presubmit runs the roster only), or active as
+# a held-out presubmit seat (the compliance canary since 2026-09-29, #2013).
 STATUS_DEMOTED = "demoted"
 STATUS_NIGHTLY_ONLY = "nightly_only"  # in hack/eval/nightly-cases.txt only, no demotion date
 STATUS_RETIRED = "retired"  # in neither matrix on this checkout
@@ -804,8 +804,8 @@ def case_status(case: dict, admitted: frozenset | None, demoted: dict[str, str])
     """(status, demoted_on). Blocking is active *and* on the roster; an
     active case off the roster is held out, "demoted" when the roster page
     dates it; a case only the nightly runs is "demoted" too when the roster
-    page dates it -- since 2026-09-22 the presubmit runs the roster only, so
-    a demoted case leaves the presubmit file for the nightly one and its
+    page dates it -- since 2026-09-22 a demoted case leaves the presubmit
+    file for the nightly one (unless seated back held out, #2013), where its
     date would otherwise be read for nobody -- and nightly-only when it does
     not; a case in neither matrix on this checkout is retired. An unreadable
     roster (``admitted`` None) reads every active case as blocking, which

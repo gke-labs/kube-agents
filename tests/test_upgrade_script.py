@@ -2802,15 +2802,18 @@ class ScopeCheckWiringTest(unittest.TestCase):
         # fetch and the two Secret backfills above the arm have run).
         full = self.text[self.text.index("    full)\n"):]
         check = full.index('refuse_apply_over_undeclared_scope "$target_namespace" || exit 1')
+        preflight = full.index("check_scope_container_access || exit 1")
         crds = full.index('apply_crd_upgrades "$repo_dir"')
         apply = full.index("apply -auto-approve -input=false")
-        self.assertLess(check, crds)
+        self.assertLess(check, preflight)
+        self.assertLess(preflight, crds)
         self.assertLess(crds, apply)
 
     def test_a_plan_warns_and_never_refuses(self):
         plan = self.text[self.text.index('if [ "$PARAM_PLAN" = "true" ]; then\n    print_step "4. Planning'):]
         plan = plan[:plan.index("plan -detailed-exitcode")]
         self.assertIn('refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"\n', plan)
+        self.assertIn('check_scope_container_access "$SCOPE_CHECK_MODE_WARN"\n', plan)
 
     def test_the_retag_modes_do_not_call_it(self):
         for mode in ("    operator)\n", "    harness)\n"):
@@ -2818,6 +2821,7 @@ class ScopeCheckWiringTest(unittest.TestCase):
             arm = arm[:arm.index("      ;;\n")]
             with self.subTest(mode=mode.strip()):
                 self.assertNotIn("refuse_apply_over_undeclared_scope", arm)
+                self.assertNotIn("check_scope_container_access", arm)
 
     def test_python3_is_a_required_tool(self):
         self.assertIn("local required_tools=(gcloud kubectl helm python3)", self.text)

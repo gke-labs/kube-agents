@@ -615,9 +615,11 @@ platformAgent:
       userProfileEnabled: null # CRD default: false
     # Out-of-band change detection. The drift-detector reads GKE
     # admin-activity audit records from a Pub/Sub subscription and reports the
-    # ones a person made outside git, so it needs that subscription to exist:
-    # apply terraform/modules/drift-pubsub against this project before
-    # enabling it. Left off, the whole block is omitted and the detector is
+    # ones a person made outside git, so it needs that subscription to exist.
+    # terraform/examples/full-install creates it with enable_drift_pubsub =
+    # true, which defaults to false; an install that renders this chart without
+    # the composition applies terraform/modules/drift-pubsub against this
+    # project itself. Left off, the whole block is omitted and the detector is
     # shipped in the image without being started.
     driftDetector:
       enabled: null # CRD default: false
@@ -830,16 +832,20 @@ platformAgent:
       # roles. The federated principal needs only roles/iam.workloadIdentityUser
       # on it.
       serviceAccountEmail: ""
-  # The GCP projects, beyond the one the agent runs in, whose GKE clusters the
-  # hourly Cluster Agent reconcile enumerates, and what it leaves unmanaged:
-  # rendered as spec.scope on the PlatformAgent (the CRD reference on the site
-  # documents the field). The agent's service account needs the read roles in
-  # each project named; the Terraform composition binds them from the same
-  # value it passes here, and a chart installed on its own needs them granted
-  # by hand.
+  # The GCP projects, folders and organisations, beyond the project the agent
+  # runs in, whose GKE clusters the hourly Cluster Agent reconcile enumerates,
+  # and what it leaves unmanaged: rendered as spec.scope on the PlatformAgent
+  # (the CRD reference on the site documents the field). The agent's service
+  # account needs the read roles in each project named, and the read roles
+  # plus roles/cloudasset.viewer on each folder and organisation; the
+  # Terraform composition binds them from the same value it passes here, and
+  # a chart installed on its own needs them granted by hand.
   #
-  # A map renders the block as it is, empty lists included: an empty scope is a
-  # present block with empty lists, which the reconcile reads as the
+  # A map renders the block as it is, empty lists included (folders and
+  # organizations only when the map carries the key, so a release record from
+  # before the chart knew them re-renders without them and a retag's patch
+  # leaves the CR's lists alone; the composition always passes both): an
+  # empty scope is a present block with empty lists, which the reconcile reads as the
   # declaration that drops projects (their Cluster Agent profiles retire over
   # its next two clean runs), so the composition always passes a map and a
   # project leaves the scope by being removed from projects. null, the default,
@@ -859,6 +865,8 @@ platformAgent:
   #
   #   scope:
   #     projects: [payments-prod, payments-staging]
+  #     folders: ["123456789012"]   # numeric IDs; every project beneath, at any depth
+  #     organizations: []           # numeric IDs; wide, prefer folders
   #     exclude:
   #       projects: ["*-sandbox"]     # project IDs or shell-style globs
   #       clusters:                   # one cluster, by the full triple

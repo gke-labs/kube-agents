@@ -52,7 +52,14 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # from the Secret the operator renders beside the door -- <agent>-a2a-inject,
 # key `token` (a2aInjectName and a2aInjectTokenKey in the operator; the deploy
 # already waited for it). Unset, the matrix runs over the agent API exactly
-# as before; section 4 below is the only site that reads the flag.
+# as before. Three places read the flag: section 4 below; the baseline
+# recorder (its decision, EVAL_IS_MAIN_RUN, and the log line at the record
+# step after the fan-out); and the dashboard publisher's gate, which mirrors
+# the recorder's. A flagged run passes neither: the next lane's periodic on
+# main runs under it with no PULL_NUMBER, the shape both otherwise write
+# from, and a next-mode sample in today's window would be indistinguishable
+# once written (VersionKey in bench/kube_agents_bench/baselines.py carries
+# no mode field), as would a dashboard that has no next lane to file it under.
 readonly EVAL_INJECT_TRANSPORT="inject"
 readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
 readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
@@ -549,7 +556,9 @@ source "${SCRIPT_DIR}/ci-env.sh"
 # prerequisite 2 below puts the credential itself out of the presubmit's
 # reach; that split is what makes the boundary structural, exactly as
 # docs/designs/eval-scorer.md#the-two-service-accounts argues for the
-# baseline store.
+# baseline store. The recorder's fourth condition, EVAL_MODE_NEXT unset,
+# is mirrored too: the next lane's periodic reports nothing to a dashboard
+# that has no lane for it yet.
 #
 # Nothing publishes until BOTH prerequisites exist:
 #   1. the nightly periodic (NEVER the presubmit) exports
@@ -592,6 +601,10 @@ publish_eval_dashboard() {
   fi
   if [ -n "${RC_COMMIT_SHA:-}" ]; then
     echo "eval-dashboard publish skipped: RC_COMMIT_SHA=${RC_COMMIT_SHA} is set: a release-candidate run measures a candidate, it does not report main's history"
+    return 0
+  fi
+  if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+    echo "eval-dashboard publish skipped: EVAL_MODE_NEXT=1 is set: a next-mode run does not report main's history, and the dashboard has no next lane yet"
     return 0
   fi
   if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
@@ -1704,7 +1717,9 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # at EVAL_TASK_PARALLELISM=8 (6 from #1491 until oss-test-infra#2707, merged
 # 2026-09-25), and that is the copy to keep current. Since 2026-09-22 (#1023) the
 # presubmit file is the blocking roster and nothing else, so this file is
-# also where every held-out case lives, with its hold-out reason.
+# where a held-out case lives, with its hold-out reason, unless a coverage
+# tracker seats it in the presubmit file held out (#2013; the presubmit
+# file's last section).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -1941,6 +1956,21 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # new one, and until they have, this note is the projection rather than the
 # record. Still no Prow deadline change: the matrix shrank.
 #
+# 2026-09-29: the compliance canary is back in the presubmit file, held out
+# (#2013 step 2): THIRTEEN tasks, 39 units, against the same 360m deadline.
+# What arrived is three units at 1002s median / 2074s p90 (903 presubmit
+# repetitions, 2026-09-04 to 09-15), 3000s at the delegation ceiling,
+# serialized on their task lock: a ~50min chain at the median, ~104min at
+# p90, ~150min if every repetition runs to the ceiling. Against the
+# twelve-case fan-out that is +10-20min of wall clock in a typical run (the
+# chain hides inside the span; the cost is displaced lane time) and
+# +30-45min at p90, when the chain becomes the critical path. The
+# dispatcher-stall residual adds ~15-20min of wait per delegation and takes
+# a repetition to the ceiling only at p90. The record predates the
+# collector that moves check evaluation out of the worker; the first runs
+# of the thirteen-case matrix measure it, and until they have, this is the
+# projection. No Prow deadline change.
+#
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
 # pull request. It is not a legitimate default: at 1 the collapse rung
@@ -2131,15 +2161,18 @@ mkdir -p "${ARTIFACT_DIR}"
 CASE_RESULTS=()
 
 # Whether this run appends to the baseline store, decided once here and read
-# by record_case inside the fan-out and by the record step after it. The three
-# conditions -- a main-branch job type, no PULL_NUMBER, no release candidate --
-# and why each one is there are explained at that step ("Baseline collection",
-# below the fan-out).
+# by record_case inside the fan-out and by the record step after it. The four
+# conditions -- a main-branch job type, no PULL_NUMBER, no release candidate,
+# not a next-mode run -- and why each one is there are explained at that step
+# ("Baseline collection", below the fan-out).
 case "${JOB_TYPE:-}" in
   postsubmit | periodic) EVAL_IS_MAIN_RUN="true" ;;
   *) EVAL_IS_MAIN_RUN="false" ;;
 esac
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
+if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 # The commit each line is stamped with. A postsubmit carries it as
@@ -2195,12 +2228,18 @@ unit_cost_hint() {
     upgrades-master-behind-offered-elsewhere) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
-    # Nightly-only since 2026-09-22 (#1023; held out on #1171 and #1189),
-    # presubmit before that. The canary measured 1002s median, 2074s p90,
-    # over 903 presubmit repetitions 2026-09-04 to 09-15; the hint stays at
-    # the 700 it carried as a presubmit case until the nightly record says
-    # otherwise.
-    compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
+    # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
+    # 2026-09-22 to then (#1023; held out on #1171, closed 2026-09-08, the
+    # bar now on #2013 step 3). The canary measured 1002s median, 2074s p90,
+    # over 903 presubmit repetitions 2026-09-04 to 09-15; priced at that
+    # median, the way capacity (540) and the incident probe (700) are, so it
+    # launches first in each presubmit repetition round. Its three repetitions
+    # serialize on the task lock, so ~50min at the median and ~104min at p90
+    # is the chain a presubmit carries for it.
+    compliance-rbac-overgrant) echo 1000 ;;
+    # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
+    # before that, priced at the 700 it carried there.
+    rca-remediation-pr) echo 700 ;;
     # Nightly-only. The 2026-09-22 promotion (#1023) was withdrawn before
     # merge: its record was graded by the check #1780 replaced. Measured
     # 980-1929s across build 2099539376672346112's three repetitions (267-559s
@@ -2461,7 +2500,7 @@ grade_case() { # <task-path> <task-name>
     --json-out "${ARTIFACT_DIR}/case-${name}.json")
 }
 
-# One case's baseline line, under the same three conditions as the record step
+# One case's baseline line, under the same four conditions as the record step
 # after the fan-out (EVAL_IS_MAIN_RUN, decided above it) and never fatal: an
 # append that fails here is retried by that step, which passes the same
 # manifest and so appends only what is not in it yet.
@@ -2744,6 +2783,17 @@ profile_begin "record + final gate"
 # record once written. The candidate would then be measured for non-inferiority
 # against a window it had just moved.
 #
+# EVAL_MODE_NEXT=1 is the fourth, for the same reason as the third. The next
+# lane's periodic on main (ci-kube-agents-eval-next) is also a periodic with
+# no PULL_NUMBER, and the key has no mode field either, so its samples would
+# be today's the moment they landed. The deploy admits the flag on that job
+# by name (EVAL_MODE_NEXT_JOB_NAMES in hack/ci-deploy.sh); this is what keeps
+# the admission from moving the window. Whatever the job's identity may hold
+# on the store is a grant in oss-test-infra this script cannot see, not a
+# property of it. A next record of its own is the mode field on the key;
+# until it exists a flagged run reads the store, when one is armed, and
+# appends nothing.
+#
 # The decision itself (EVAL_IS_MAIN_RUN) and the commit stamp are taken above
 # the fan-out, because record_case appends each case's line inside it as soon
 # as the case is graded. This pass covers what the fan-out did not record --
@@ -2761,6 +2811,8 @@ if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
     echo "WARNING: recording baseline evidence failed; the verdict below is unaffected."
 elif [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "Release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}): the baseline store is read, never written — the candidate is judged against main's window, not added to it."
+elif [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ -z "${PULL_NUMBER:-}" ]; then
+  echo "Next-mode run (EVAL_MODE_NEXT=1, JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written — a next-mode sample has no key of its own and would land in today's window."
 else
   echo "Not a main-branch recorder run (JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written."
 fi

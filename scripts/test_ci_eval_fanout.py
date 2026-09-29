@@ -115,7 +115,7 @@ class QueueOrderTest(unittest.TestCase):
             [
                 lifted("unit_cost_hint"),
                 f"EVAL_REPETITIONS={reps}",
-                # compliance carries a 700 hint, the probe 200: order within a
+                # compliance carries a 1000 hint, the probe 200: order within a
                 # repetition must be cost-descending.
                 'TASKS=("t/reliability-pdb-probe/task.yaml" "t/compliance-rbac-overgrant/task.yaml")',
                 'TASK_NAMES=(reliability-pdb-probe compliance-rbac-overgrant)',

@@ -908,10 +908,10 @@ main() {
   # values change here is whether the floor check gets to abort.
   export ENABLE_GVISOR="false"
   # The scope keys, for the same reason: the generator checks each excluded
-  # cluster's shape and terraform evaluates the scope variable's validations
+  # cluster's shape and each container ID, and terraform evaluates the scope variable's validations
   # on a destroy too, and a teardown must not be refusable on a typo's
   # account. The destroy removes the bindings in state whatever these say.
-  export SCOPE_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""
+  export SCOPE_PROJECTS="" SCOPE_FOLDERS="" SCOPE_ORGANIZATIONS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

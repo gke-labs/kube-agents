@@ -134,7 +134,47 @@ const (
 	a2aProvisionImageEnvVar = "A2A_PROVISION_IMAGE"
 	// nats-box carries the nats CLI the provisioning script drives.
 	defaultA2AProvisionImage = "natsio/nats-box:0.14.5"
-	a2aGatewayImageEnvVar    = "A2A_GATEWAY_IMAGE"
+
+	// Requests and limits on the next-stack pods. A namespace whose
+	// ResourceQuota requires limits refuses a pod that omits them at
+	// admission, per container, and the refusal surfaces as a stack that
+	// never schedules while nothing in the render looks wrong (the sandbox's
+	// own resources block says the same). On a GKE Autopilot cluster a pod
+	// with no requests is also sized at the platform's per-pod default (0.5
+	// vCPU and 2GiB on the general-purpose class, observed on the dev
+	// install), which is more than any of these uses; and on an Autopilot
+	// cluster without Pod bursting the limit is rewritten to equal the
+	// request, so every request below is also a ceiling the pod can live
+	// under, which is why NATS asks for more than it uses idle.
+	//
+	// Sized from what the pods use on a dev install (NATS about 10Mi and a
+	// few millicores idle with the four streams provisioned; the gateway and
+	// the callout under 20Mi; the provisioning Job a short nats CLI run) with
+	// headroom for an eval run's traffic, not from a load measurement. NATS
+	// gets the most: JetStream keeps stream indexes in memory and the TASKS
+	// stream is sized at 20GiB on disk. Named constants so the next
+	// measurement changes one line.
+	a2aNATSCPURequest    = "250m"
+	a2aNATSMemoryRequest = "512Mi"
+	a2aNATSCPULimit      = "1"
+	a2aNATSMemoryLimit   = "1Gi"
+
+	a2aGatewayCPURequest    = "50m"
+	a2aGatewayMemoryRequest = "64Mi"
+	a2aGatewayCPULimit      = "500m"
+	a2aGatewayMemoryLimit   = "512Mi"
+
+	a2aProvisionCPURequest    = "50m"
+	a2aProvisionMemoryRequest = "64Mi"
+	a2aProvisionCPULimit      = "200m"
+	a2aProvisionMemoryLimit   = "256Mi"
+
+	// The callout already carried requests and a memory limit; the CPU
+	// limit is what a limits.cpu quota was still missing, and a refused
+	// callout is a provision Job the operator never creates (the gate on
+	// its creation in reconcileA2A) and a CR that reads Provisioning for it.
+	a2aCalloutCPULimit    = "500m"
+	a2aGatewayImageEnvVar = "A2A_GATEWAY_IMAGE"
 	// The stage 1 dev registry. A dev toggle's default may name a dev
 	// registry; graduation moves this to the release pipeline alongside the
 	// other first-party images.
@@ -318,6 +358,31 @@ const (
 	// credential digest reaches a rendered name.
 	a2aProvisionJobNameInfix      = "-a2a-provision-"
 	a2aProvisionJobNameHashLength = 8
+
+	// a2aDiscordBotSecretName is the hand-made Secret carrying the Discord bot
+	// token, the one chat backend the gateway can be given today without a door.
+	a2aDiscordBotSecretName = "discord-bot"
+	a2aDiscordBotTokenKey   = "token" // #nosec G101 -- Secret key name, not a credential
+
+	// The condition the status writers publish while a next install's gateway
+	// is withheld for want of a backend (#1660, option 1). Informational rather
+	// than Degraded: the install did nothing wrong, it configured no chat
+	// backend, and the rest of the stack is up. The message names what would
+	// render it.
+	a2aGatewayConditionType = "A2AGateway"
+	a2aGatewayDarkReason    = "NoChatBackend"
+
+	// The condition that records the bus having been provisioned once: written
+	// the first pass that sees the provisioning Job complete, whichever phase
+	// that pass ends on, kept through the Job's later lives (the 24h TTL
+	// removes a finished Job and create-if-absent runs it again; a digest
+	// change runs a new one), removed with the rest of the stack when the mode
+	// flips to today. It is what lets Ready stop counting the Job after the
+	// first completion. Only this code writes it, so a Ready inherited from an
+	// operator that never counted the Job cannot seed it: that operator is the
+	// one #1701 describes, and its Ready is exactly the claim not to trust.
+	busProvisionedConditionType = "BusProvisioned"
+	busProvisionedReason        = "ProvisionJobComplete"
 
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
@@ -1473,6 +1538,20 @@ func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secr
 // and leaks the PV on every CR deletion. One spelling, both sites.
 const a2aNATSDataClaim = "data"
 
+// a2aResources builds the requests-and-limits block from the constants above.
+func a2aResources(cpuRequest, memoryRequest, cpuLimit, memoryLimit string) corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpuRequest),
+			corev1.ResourceMemory: resource.MustParse(memoryRequest),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpuLimit),
+			corev1.ResourceMemory: resource.MustParse(memoryLimit),
+		},
+	}
+}
+
 func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string) *appsv1.StatefulSet {
 	name := a2aNATSName(agent)
 	labels := a2aLabels(agent, "nats")
@@ -1518,6 +1597,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 							{Name: a2aNATSDataClaim, MountPath: "/data"},
 						},
 						SecurityContext: hardenedSecurityContext(),
+						Resources:       a2aResources(a2aNATSCPURequest, a2aNATSMemoryRequest, a2aNATSCPULimit, a2aNATSMemoryLimit),
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("monitor")},
@@ -2186,6 +2266,7 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						Image:           a2aProvisionImage(),
 						Command:         []string{"sh", "-c", script},
 						SecurityContext: hardenedSecurityContext(),
+						Resources:       a2aResources(a2aProvisionCPURequest, a2aProvisionMemoryRequest, a2aProvisionCPULimit, a2aProvisionMemoryLimit),
 						// nats-box ships WORKDIR /root and declares no USER,
 						// so it expects to run as root (measured with
 						// `crane config` on 0.14.5). The pod above runs it as
@@ -2676,6 +2757,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						// it wants a directory it can traverse, not one it can
 						// write.
 						WorkingDir: "/",
+						Resources:  a2aResources(a2aGatewayCPURequest, a2aGatewayMemoryRequest, a2aGatewayCPULimit, a2aGatewayMemoryLimit),
 						Env: append([]corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							{Name: "NATS_USER", Value: "gateway"},
@@ -2688,8 +2770,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// reference is optional so the pod schedules
 							// before it.
 							{Name: "DISCORD_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{Name: "discord-bot"},
-								Key:                  "token",
+								LocalObjectReference: corev1.LocalObjectReference{Name: a2aDiscordBotSecretName},
+								Key:                  a2aDiscordBotTokenKey,
 								Optional:             ptr.To(true),
 							}}},
 							// Rendered explicitly even when the CR is silent:
@@ -2791,6 +2873,60 @@ type a2aProvisionState struct {
 	// written on the way OUT of the previous one, and nothing else is
 	// guaranteed to wake the reconcile that finally sees it.
 	gatewayHeld bool
+	// gatewayDark reports that the gateway Deployment was withheld because
+	// the install configures no chat backend for it: no discord-bot Secret
+	// and no door armed (a2aGatewayBackend). gatewayDarkReason is the
+	// remedy, for the condition the status writer publishes. A gateway that
+	// already exists is never withheld on this account; see the call site.
+	gatewayDark       bool
+	gatewayDarkReason string
+	// jobName is the provisioning Job this pass rendered, by its digest
+	// name. The status writer names it when it is what Ready waits on,
+	// and carrying it saves re-rendering the JobSpec to hash it again.
+	jobName string
+	// jobHeld reports that the provision Job's creation was withheld this
+	// pass because no auth callout replica is ready yet (the gate at the
+	// create site). It shares the requeue with !done, which it implies.
+	jobHeld bool
+}
+
+// a2aGatewayBackend reports whether the install gives the gateway a chat
+// backend to start on, and if not, what would. The gateway binary refuses to
+// start without one (a2a/gateway/config.go, "no chat backend"), so rendering
+// its Deployment without one is a crash loop by construction; the render
+// asks first. The answers, in the order the gateway itself accepts them:
+// the inject door armed on the operator (the eval install's case, #1660's
+// decision that the door alone is an ingress); the discord-bot Secret
+// present in the namespace. The Google Chat relay joins here when the
+// operator renders it (#1705), and the A2A door when its render lands.
+//
+// The Secret is read through a2aReader, uncached, for the reason every other
+// Secret read here is (see removeA2AInjectBackend): the operator ships
+// secrets with get only, and a cached Get would start a cluster-wide
+// informer whose LIST is forbidden.
+func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, string, error) {
+	if a2aInjectBackendEnabled() {
+		return true, "", nil
+	}
+	secret := &corev1.Secret{}
+	err := r.a2aReader().Get(ctx, types.NamespacedName{Name: a2aDiscordBotSecretName, Namespace: agent.Namespace}, secret)
+	switch {
+	case err == nil && len(secret.Data[a2aDiscordBotTokenKey]) > 0:
+		return true, "", nil
+	case err == nil:
+		// The Secret is there and the key the gateway reads is not: the env
+		// reference is optional, so a rendered gateway would start with no
+		// token and exit on "no chat backend", which is the crash loop this
+		// check exists to prevent. Withheld, with the key named.
+		return false, fmt.Sprintf("the %s Secret in %s carries no %q key, so the A2A gateway has no chat backend and its "+
+			"Deployment is not rendered: put the Discord bot token under that key; an eval install arms the inject door "+
+			"(%s=true on the operator) instead", a2aDiscordBotSecretName, agent.Namespace, a2aDiscordBotTokenKey, a2aInjectBackendEnvVar), nil
+	case !errors.IsNotFound(err):
+		return false, "", err
+	}
+	return false, fmt.Sprintf("no chat backend is configured for the A2A gateway, so its Deployment is not rendered: "+
+		"create the %s Secret (key %s) in %s; an eval install arms the inject door (%s=true on the operator) instead",
+		a2aDiscordBotSecretName, a2aDiscordBotTokenKey, agent.Namespace, a2aInjectBackendEnvVar), nil
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -2944,6 +3080,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// name and a fresh run. The superseded generation is swept below rather
 	// than left to its TTL, for the reason the sweep's own comment gives.
 	job := buildA2AProvisionJob(agent)
+	state.jobName = job.Name
 	if err := ctrl.SetControllerReference(agent, job, r.Scheme); err != nil {
 		return state, err
 	}
@@ -2953,7 +3090,35 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		if !errors.IsNotFound(err) {
 			return state, err
 		}
-		if err := r.Create(ctx, job); err != nil {
+		// Ordered after the callout, at creation (#1702). The callout is
+		// the Job's authentication path: the provision principal has no
+		// static password, so every connection it makes is decided by a
+		// callout replica serving the identity map, and a Job that starts
+		// first fails on "authentication error" and spends its backoff on
+		// the ordering -- measured at nine attempts and nineteen minutes
+		// with no streams for that whole window. The question is weaker
+		// than the gateway gate's: any ready callout replica will do
+		// (a2aCalloutServesAnyReplica), where the gateway wants one on the
+		// current template. The gateway is minted against the map version
+		// this pass rendered; the Job only needs its principal
+		// authenticated, and every replica serves the current map because
+		// the store watches the ConfigMap (a2a/authcallout/store.go,
+		// WatchConfigMap). Holding the Job on the stricter rule would hold
+		// it through every callout roll and for good on a wedged one,
+		// while replicas that authenticate it are serving. Creation only:
+		// a Job that exists has its status read whatever the callout is
+		// doing now, because its pods are the Job controller's to retry.
+		// No live re-read is needed here, unlike the gateway gate: the Get
+		// above went through a2aReader, so a stale NotFound cannot
+		// re-create a Job that exists. A held Job is a pass with
+		// done=false, which is already the requeue.
+		if hold, err := r.a2aProvisionJobWaitsForCallout(ctx, agent); err != nil {
+			return state, err
+		} else if hold {
+			state.jobHeld = true
+			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready",
+				"job", job.Name, "callout", a2aCalloutName(agent))
+		} else if err := r.Create(ctx, job); err != nil {
 			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
 		}
 	} else {
@@ -3061,10 +3226,17 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// or agent deletion, holding one slot of the namespace pod quota the
 	// whole time (#1389). An unpullable image is the likely way to get there
 	// once the name tracks the pod spec (#1347), and a bad script is the way
-	// today. The sweep runs after the current Job is ensured above, never
-	// before it: a reconcile leaves N+1 provision Jobs for a moment, never
-	// zero. The status scan above read the current name only, so a Failed
+	// today. The sweep runs after the current Job is ensured above, or held
+	// (see below): on an ordinary pass a reconcile leaves N+1 provision Jobs
+	// for a moment, never zero. The status scan above read the current name only, so a Failed
 	// on a generation deleted here never reached the phase.
+	// The sweep runs whether or not the current Job was held. A superseded
+	// Job with a Pending pod holds a slot of the namespace pod quota, and
+	// on a quota at its edge that slot is the one the callout's surge pod
+	// needs to become ready -- so a sweep that waited for the hold to lift
+	// would wait on itself. A held pass therefore can leave zero provision
+	// Jobs for the length of the hold; the next pass after the callout
+	// serves creates the current one.
 	if err := r.deleteA2AProvisionJobs(ctx, agent, job.Name); err != nil {
 		return state, fmt.Errorf("failed to delete superseded A2A provision Jobs: %w", err)
 	}
@@ -3137,6 +3309,45 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// negative that gatewayHeld's requeue clears.
 	dep := buildA2AGatewayDeployment(agent)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
+		return state, err
+	}
+	// Before the callout gate: a gateway with no chat backend to start on
+	// is a crash loop, so its first creation is withheld and the CR says
+	// why (#1660, option 1). Creation only, the same rule as the callout
+	// gate below and for the same reason: a gateway that exists is
+	// reconciled whatever happened to its backend, because deleting it
+	// would hand every session pod that hangs off its UID to the garbage
+	// collector. An operator who removes the discord-bot Secret from under
+	// a running gateway gets the crash loop that has always followed that,
+	// visible on the pod; an operator who never created one gets no
+	// Deployment and a condition instead.
+	//
+	// Existence first, backend second, so the backend question (an uncached
+	// Secret read when no door is armed) is asked only on the pass that
+	// would create the gateway, and a running install pays nothing for it.
+	// Through the informer rather than a2aReader, unlike the callout gate
+	// below, because the stale directions cost differently here: a stale
+	// NotFound withholds an apply the gateway does not need for one pass,
+	// and a stale hit -- the Deployment deleted inside the informer's lag,
+	// with the Secret gone at the same moment -- falls through to the callout
+	// gate's live read and at worst re-creates the crash-looping gateway
+	// every install had before this gate. A live read would buy that corner
+	// with one API call per pass on every next install.
+	if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{}); errors.IsNotFound(err) {
+		configured, why, berr := r.a2aGatewayBackend(ctx, agent)
+		if berr != nil {
+			return state, berr
+		}
+		if !configured {
+			state.gatewayDark = true
+			state.gatewayDarkReason = why
+			logf.FromContext(ctx).Info("withholding the A2A gateway: no chat backend is configured", "deployment", dep.Name)
+			if err := r.removeA2AInjectBackend(ctx, agent); err != nil {
+				return state, err
+			}
+			return state, nil
+		}
+	} else if err != nil {
 		return state, err
 	}
 	if hold, err := r.a2aGatewayWaitsForCallout(ctx, agent, dep, calloutGeneration); err != nil {
@@ -3331,6 +3542,34 @@ func a2aCalloutCanServeANewGateway(dep *appsv1.Deployment, appliedGeneration int
 		return false
 	}
 	return dep.Status.ReadyReplicas+dep.Status.UpdatedReplicas-dep.Status.Replicas >= 1
+}
+
+// a2aCalloutServesAnyReplica is the provision Job's question of the callout:
+// is any replica ready, on whatever template. Weaker than
+// a2aCalloutCanServeANewGateway on purpose (see the Job's create site), and
+// one is enough for the same reason: the replicas form a queue group. The
+// only false direction is an informer copy that still counts a replica the
+// kubelet has since taken down, which costs the Job one attempt against a
+// callout that is briefly gone -- the state every Job was created into before
+// the gate existed.
+func a2aCalloutServesAnyReplica(dep *appsv1.Deployment) bool {
+	return dep.Status.ReadyReplicas >= 1
+}
+
+// a2aProvisionJobWaitsForCallout reports whether the provision Job's creation
+// must wait this pass: no callout Deployment in the informer yet, or one with
+// no ready replica. The caller has already established, through a2aReader,
+// that no Job exists under the current name.
+func (r *PlatformAgentReconciler) a2aProvisionJobWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	callout := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}, callout)
+	if client.IgnoreNotFound(err) != nil {
+		return false, err
+	}
+	if err != nil {
+		return true, nil
+	}
+	return !a2aCalloutServesAnyReplica(callout), nil
 }
 
 // a2aGatewayWaitsForCallout reports whether the gateway Deployment must be

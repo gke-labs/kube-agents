@@ -109,11 +109,55 @@ class ScopeAllowlistTest(unittest.TestCase):
         self.assertIn("setproduct(sort(tolist(local.scope_projects)), local.scope_roles)", self.scope_tf)
 
     def test_an_unmanageable_scope_fails_the_plan(self):
+        # For a container as for a project: a folder bound with no role that
+        # lists and gets clusters would read ok and fail every profile create.
         agent = _resource(self.main_tf, "google_service_account", "agent")
-        self.assertIn("condition     = length(local.scope_projects) == 0 || local.scope_can_manage", agent)
+        self.assertIn("condition     = !local.scope_declares_anything || local.scope_can_manage", agent)
         self.assertIn("PLATFORM_AGENT_CUSTOM_ROLES", agent)
         self.assertIn("scope_can_manage = anytrue([for role in local.scope_roles : contains(local.scope_managing_roles, role)])",
                       self.scope_tf)
+        self.assertIn("scope_declares_anything = length(local.scope_projects) + length(local.scope_folders) + length(local.scope_organizations) > 0",
+                      self.scope_tf)
+
+
+class ScopeContainerBindingsTest(unittest.TestCase):
+    """A folder or organisation is bound on the container itself with the
+    intersected allowlist plus roles/cloudasset.viewer, the one role the
+    reconcile's container search needs there (design §6), and nothing else."""
+
+    def setUp(self):
+        self.scope_tf = (_MODULE / "scope.tf").read_text()
+
+    def test_the_container_roles_are_the_allowlist_plus_the_asset_viewer(self):
+        self.assertIn('scope_container_asset_role = "roles/cloudasset.viewer"', self.scope_tf)
+        self.assertIn("scope_container_roles = concat(local.scope_roles, [local.scope_container_asset_role])", self.scope_tf)
+        # Not in the project allowlist: the host project is listed with
+        # `clusters list`, never searched.
+        self.assertNotIn("roles/cloudasset.viewer", _hcl_string_list(self.scope_tf, "scope_role_allowlist"))
+
+    def test_folders_bind_on_the_folder_with_the_container_roles(self):
+        binding = _resource(self.scope_tf, "google_folder_iam_member", "scope_roles")
+        self.assertIn("for_each = local.scope_folder_bindings", binding)
+        self.assertIn('folder = "folders/${each.value.folder}"', binding)
+        self.assertIn("role   = each.value.role", binding)
+        self.assertIn('member = "serviceAccount:${google_service_account.agent.email}"', binding)
+        self.assertNotIn("var.project_roles", binding)
+        self.assertIn("setproduct(sort(tolist(local.scope_folders)), local.scope_container_roles)", self.scope_tf)
+
+    def test_organisations_bind_on_the_organisation_with_the_container_roles(self):
+        binding = _resource(self.scope_tf, "google_organization_iam_member", "scope_roles")
+        self.assertIn("for_each = local.scope_organization_bindings", binding)
+        self.assertIn("org_id = each.value.organization", binding)
+        self.assertIn("role   = each.value.role", binding)
+        self.assertIn('member = "serviceAccount:${google_service_account.agent.email}"', binding)
+        self.assertNotIn("var.project_roles", binding)
+        self.assertIn("setproduct(sort(tolist(local.scope_organizations)), local.scope_container_roles)", self.scope_tf)
+
+    def test_the_outputs_surface_the_containers_and_their_roles(self):
+        outputs = (_MODULE / "outputs.tf").read_text()
+        self.assertIn("value       = sort(tolist(local.scope_folders))", outputs)
+        self.assertIn("value       = sort(tolist(local.scope_organizations))", outputs)
+        self.assertIn("value       = local.scope_container_roles", outputs)
 
 
 def _crd_scope_schema():
@@ -138,7 +182,9 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
         self.crd = _crd_scope_schema()
 
     def test_the_shape_and_defaults(self):
-        for line in ("projects = optional(list(string), [])",
+        for line in ("projects      = optional(list(string), [])",
+                     "folders       = optional(list(string), [])",
+                     "organizations = optional(list(string), [])",
                      "clusters = optional(list(object({",
                      "nullable = false",
                      "default  = {}"):
@@ -148,6 +194,8 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
     def test_each_list_carries_the_crds_cap(self):
         lists = {
             "var.scope.projects": self.crd["projects"],
+            "var.scope.folders": self.crd["folders"],
+            "var.scope.organizations": self.crd["organizations"],
             "var.scope.exclude.projects": self.crd["exclude"]["properties"]["projects"],
             "var.scope.exclude.clusters": self.crd["exclude"]["properties"]["clusters"],
         }
@@ -160,6 +208,12 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
         globs = self.crd["exclude"]["properties"]["projects"]["items"]["pattern"]
         self.assertIn(f'regex("{_hcl_regex(projects)}", project)', self.variable)
         self.assertIn(f'regex("{_hcl_regex(globs)}", entry)', self.variable)
+
+    def test_the_container_id_pattern_is_the_crds_for_both_lists(self):
+        folders = self.crd["folders"]["items"]["pattern"]
+        self.assertEqual(folders, self.crd["organizations"]["items"]["pattern"])
+        self.assertIn(f'for container in concat(var.scope.folders, var.scope.organizations) : can(regex("{_hcl_regex(folders)}", container))',
+                      self.variable)
 
     def test_the_cluster_triple_pattern_and_length_are_the_crds(self):
         # The CRD states the triple's parts as a pattern plus maxLength; the
@@ -175,9 +229,13 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
 
     def test_the_crds_set_and_map_lists_are_checked_for_repeats(self):
         self.assertEqual(self.crd["projects"]["x-kubernetes-list-type"], "set")
+        self.assertEqual(self.crd["folders"]["x-kubernetes-list-type"], "set")
+        self.assertEqual(self.crd["organizations"]["x-kubernetes-list-type"], "set")
         self.assertEqual(self.crd["exclude"]["properties"]["projects"]["x-kubernetes-list-type"], "set")
         self.assertEqual(self.crd["exclude"]["properties"]["clusters"]["x-kubernetes-list-type"], "map")
         for rule in ("length(distinct(var.scope.projects)) == length(var.scope.projects)",
+                     "length(distinct(var.scope.folders)) == length(var.scope.folders)",
+                     "length(distinct(var.scope.organizations)) == length(var.scope.organizations)",
                      "length(distinct(var.scope.exclude.projects)) == length(var.scope.exclude.projects)",
                      'length(distinct([for c in var.scope.exclude.clusters : "${c.project_id}/${c.location}/${c.cluster_name}"])) == length(var.scope.exclude.clusters)'):
             with self.subTest(rule=rule[:50]):
@@ -193,7 +251,11 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
 
     def test_the_composition_declares_the_variable_like_the_module(self):
         variable = _block(self.variables, "variable", "scope")
-        self.assertIn("projects = optional(list(string), [])", variable)
+        for line in ("projects      = optional(list(string), [])",
+                     "folders       = optional(list(string), [])",
+                     "organizations = optional(list(string), [])"):
+            with self.subTest(line=line):
+                self.assertIn(line, variable)
         self.assertIn("nullable = false", variable)
         self.assertIn("default  = {}", variable)
 
@@ -205,7 +267,9 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         values = re.search(r"\n      scope = \{\n(?P<body>.*?)\n      \}\n", self.main_tf, re.DOTALL)
         self.assertIsNotNone(values, "platformAgent.scope is not in the helm values")
         body = values.group("body")
-        self.assertIn("projects = var.scope.projects", body)
+        self.assertIn("projects      = var.scope.projects", body)
+        self.assertIn("folders       = var.scope.folders", body)
+        self.assertIn("organizations = var.scope.organizations", body)
         self.assertIn("projects = var.scope.exclude.projects", body)
         for key in ("projectId   = cluster.project_id",
                     "location    = cluster.location",
@@ -220,8 +284,19 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
 
     def test_the_outputs_are_surfaced(self):
         outputs = (_COMPOSITION / "outputs.tf").read_text()
-        self.assertIn("value       = module.kube_agents_iam.scope_projects", outputs)
-        self.assertIn("value       = module.kube_agents_iam.scope_roles", outputs)
+        for name in ("scope_projects", "scope_roles", "scope_folders", "scope_organizations", "scope_container_roles"):
+            with self.subTest(output=name):
+                self.assertIn(f"value       = module.kube_agents_iam.{name}", outputs)
+
+    def test_the_asset_api_is_enabled_only_when_a_container_is_declared(self):
+        # An install that names explicit projects alone never calls the Asset
+        # API and must not fail under an organisation policy that forbids it
+        # (design §4); one that names a folder or organisation needs it on.
+        self.assertIn('scope_apis = length(var.scope.folders) + length(var.scope.organizations) > 0 ? [\n    "cloudasset.googleapis.com",\n  ] : []',
+                      self.main_tf)
+        self.assertIn("required_apis = toset(concat(local.base_apis, local.pubsub_apis, local.chat_apis, local.scope_apis))",
+                      self.main_tf)
+        self.assertNotIn('"cloudasset.googleapis.com"', re.search(r"base_apis = \[(.*?)\]", self.main_tf, re.DOTALL).group(1))
 
 
 if __name__ == "__main__":

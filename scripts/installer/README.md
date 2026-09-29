@@ -165,9 +165,10 @@ absent destroys the stockout log sink, its alerts topic and subscription, and th
 grants; `ENABLE_PUBSUB_PLATFORM` absent removes the adapter plugin from the release (the
 composition owns no Pub/Sub resource for it alone); `GOOGLE_CHAT_ENABLED` absent removes the
 Chat topic and subscription; `PLATFORM_AGENT_PERMISSION_SET` absent falls back to `read-only`
-and drops the custom roles; `SCOPE_PROJECTS` absent renders an empty scope block, which revokes
-the read roles in every project it named and retires those projects' Cluster Agent profiles
-over the reconcile's next two clean runs.
+and drops the custom roles; `SCOPE_PROJECTS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` absent
+renders an empty list for it in the scope block, which revokes the read roles in every project,
+folder or organisation it named and retires those projects' Cluster Agent profiles over the
+reconcile's next two clean runs.
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
@@ -220,17 +221,22 @@ when kubectl's current context is this install's cluster). `API_SERVER_KEY` is g
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
 
-### Projects in scope
+### Projects, folders and organisations in scope
 
-`SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` are the
-`PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install from the
-same value: the generator renders them as the composition's `scope` object, the IAM module
-binds the read roles in every project named, and the chart renders the same object into the
-CR. The lists are space- or comma-separated like every other list key; an excluded project may
-be a shell-style glob; an excluded cluster is `project/location/cluster`, and an entry that
-does not split into three parts stops the run before `terraform.tfvars` is written. The
-patterns, caps and repeats the CRD enforces are checked by the module's variable validation,
-which fails the plan before any binding.
+`SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and
+`SCOPE_EXCLUDE_CLUSTERS` are the `PlatformAgent`'s `spec.scope`, declared once and reaching both
+halves of the install from the same value: the generator renders them as the composition's `scope`
+object, the IAM module binds the read roles in every project named and the read roles plus
+`roles/cloudasset.viewer` on every folder and organisation named, and the chart renders the same
+object into the CR. The lists are space- or comma-separated like every other list key; a folder or
+organisation is its bare numeric ID, and an entry that is not one stops the run before
+`terraform.tfvars` is written; an excluded project may be a shell-style glob; an excluded cluster
+is `project/location/cluster`, and an entry that does not split into three parts stops the run the
+same way. The patterns, caps and repeats the CRD enforces are checked by the module's variable
+validation, which fails the plan before any binding. A folder or organisation also adds
+`cloudasset.googleapis.com` to the APIs the composition enables in the host project, because the
+reconcile resolves a container's members through it; an install that names explicit projects
+alone never enables it.
 
 The block is written on every run, empty lists included: an emptied `projects` list is the
 declaration that drops projects, and a missing block would declare nothing, so removing a
@@ -240,28 +246,74 @@ leaves the scope. A file that lacks the keys declares an empty scope, like every
 the release's recorded values and change nothing about the scope. `upgrade.sh`, `uninstall.sh`
 and the Day-2 menu read the keys from `install.env` alone (`load_install_env` drops a value
 inherited from the shell, as it does `NAMESPACE`, and `install.sh` does the same once an
-`install.env` exists); `install.sh` also takes the three `--scope-*` flags, and on a first install
-the environment, and records them, and an empty `--scope-*=` is refused. A malformed `SCOPE_EXCLUDE_CLUSTERS` entry stops every front door but `uninstall.sh`,
-retags included, until the line is fixed; there is no bypass.
+`install.env` exists); `install.sh` also takes the `--scope-*` flags, and on a first install
+the environment, and records them, and an empty `--scope-*=` is refused. A malformed
+`SCOPE_EXCLUDE_CLUSTERS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` entry stops every front door but
+`uninstall.sh`, retags included, until the line is fixed; there is no bypass.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the
-keys account for, printing the three lines that reproduce it; a read that cannot decide (no
+keys account for, printing the `SCOPE_*` lines that reproduce it; a read that cannot decide (no
 context, an unreadable CR or release) refuses too, because the apply itself needs no kubeconfig
 and would go ahead over a scope nobody read (`refuse_apply_over_undeclared_scope` in
-`installer_common.sh`; `upgrade.sh --plan` warns instead). An `install.sh` re-run and the
-menu apply the chart's CRDs before their apply, as `upgrade.sh` does, so the block lands on
+`installer_common.sh`; `upgrade.sh --plan` warns instead). The `sharedVpcHosts` and
+`metricsScopes` selectors have no key yet and are reported, never weighed. An `install.sh` re-run
+and the menu apply the chart's CRDs before their apply, as `upgrade.sh` does, so the block lands on
 every front door rather than being pruned by a served schema that predates the field.
 
-The bindings live in projects the applying identity has to be able to set IAM policy in. A
-scoped project that is deleted, or whose owner revokes that permission, fails the refresh or
-destroy of its bindings on every later plan, full upgrade and uninstall. Remove it from
-`SCOPE_PROJECTS` and forget its bindings from state, from the composition directory the last
-`lifecycle.sh` run initialised against the install's backend:
+When a folder or organisation is declared, a second check runs before every apply, first install
+included (`check_scope_container_access`): that `cloudasset.googleapis.com` is enabled in the
+host project or no enforced organisation policy (`constraints/gcp.restrictServiceUsage`, the
+legacy `constraints/serviceuser.services`; a policy in dry run enforces nothing and is not read)
+denies it, read through gcloud's active account, and that the identity Terraform applies with
+holds `resourcemanager.folders.setIamPolicy` on each folder and
+`resourcemanager.organizations.setIamPolicy` on each organisation, asked through Resource
+Manager's `testIamPermissions` with a token minted for the credentials the google provider will
+read, in its order: `GOOGLE_OAUTH_ACCESS_TOKEN`, else `GOOGLE_CREDENTIALS`,
+`GOOGLE_CLOUD_KEYFILE_JSON` or `GCLOUD_KEYFILE_JSON` (an existing path is a key file, anything
+else is the key's JSON, the provider's own rule), else the Application Default Credentials, which
+read `GOOGLE_APPLICATION_CREDENTIALS` first, each impersonating `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT`
+when it is set. The messages name that identity, so a refusal points at the
+principal that will apply rather than at whatever ADC the workstation holds, and a credential
+variable's value is never printed. The token reaches `curl` on its stdin and an inline key
+reaches `gcloud` through a file that exists only for the mint and is removed on any exit of it,
+a signal included. Every container is probed and every failure named before the run
+refuses; a probe that cannot decide (no `curl`, no token, a transport error) warns and lets the
+apply report it, because an apply that cannot bind fails loudly, unlike the silent replace the
+first check guards against. `upgrade.sh --plan`, `install.sh --generate-only` and the interactive
+`g` answer warn instead of refusing, the first because it applies nothing and the other two
+because the apply they hand to `lifecycle.sh` may run as an identity other than the one at the
+keyboard; an interactive run is checked at the `(Y/n/g)` prompt, where its route is known, so a
+`Y` refuses before anything is applied. The retag modes and `install.sh --dry-run` do not run it.
+Declaring an organisation prints a warning on every run that reaches the check: the binding
+reaches every project in it. gcloud's own credential overrides are kept out of every gcloud call
+the check makes: the `CLOUDSDK_AUTH_*` variables are cleared for the mint and for the property
+read that guards it, and a set `auth/impersonate_service_account` or `auth/access_token_file`
+property in the active configuration file, which the provider does not read, makes the probe
+undecided with the property named, unless `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT` overrides the
+first explicitly.
+
+An install that declared a folder or organisation on the `PlatformAgent` by hand before the
+installer had a key for it, and had its roles bound by hand, is refused at its next full upgrade
+like any hand edit, and the lines it prints include `SCOPE_FOLDERS` and `SCOPE_ORGANIZATIONS`.
+Recording them hands the container's bindings to Terraform, which creates them with the applying
+credentials, so those credentials need `setIamPolicy` on the container even where an
+administrator made the hand grant; the alternatives are to obtain it for the identity that
+applies, or to take the container off the `PlatformAgent`, which retires its members over the
+reconcile's next two clean runs, and manage those projects through `SCOPE_PROJECTS` instead.
+
+The bindings live in projects, folders and organisations the applying identity has to be able to
+set IAM policy in. A scoped project or container that is deleted, or whose owner revokes that
+permission, fails the refresh or destroy of its bindings on every later plan, full upgrade and
+uninstall. Remove it from `SCOPE_PROJECTS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` and forget
+its bindings from state, from the composition directory the last `lifecycle.sh` run initialised
+against the install's backend (the address is `module.kube_agents_iam.google_project_iam_member.scope_roles`,
+`module.kube_agents_iam.google_folder_iam_member.scope_roles` or
+`module.kube_agents_iam.google_organization_iam_member.scope_roles`, keyed `<id>/<role>`):
 
 ```bash
 cd terraform/examples/full-install
-terraform state list | grep 'scope_roles\["<project>/' | while IFS= read -r address; do
+terraform state list | grep 'scope_roles\["<id>/' | while IFS= read -r address; do
   terraform state rm "$address"
 done
 ```

@@ -53,6 +53,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import boskos_pool  # noqa: E402
+
 API_ROOT = "https://api.github.com"
 GITHUB_API_VERSION = "2022-11-28"
 USER_AGENT = "kube-agents-pull-sweep"
@@ -111,21 +114,13 @@ KMS_DIGEST_ALGORITHM = "sha256"
 GCLOUD_TIMEOUT_SECONDS = 60
 GCLOUD_ERROR_CHARS = 300
 
-# The Prow wrapper's Boskos conventions (oss-test-infra
-# prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml): the server
-# inside the build cluster, the resource type, and the states. A project is
-# held in BOSKOS_SWEEP_STATE only while its repository is being swept.
-BOSKOS_DEFAULT_SERVER = "http://boskos.boskos.svc.cluster.local"
-BOSKOS_RESOURCE_TYPE = "kube-agents-evals-project"
-BOSKOS_FREE_STATE = "free"
+# The Boskos walk itself is hack/boskos_pool.py, shared with the fleet
+# reconcile. A project is held in BOSKOS_SWEEP_STATE only while its repository
+# is being swept.
+BOSKOS_DEFAULT_SERVER = boskos_pool.DEFAULT_SERVER
+BOSKOS_RESOURCE_TYPE = boskos_pool.RESOURCE_TYPE
 BOSKOS_SWEEP_STATE = "cleaning"
-BOSKOS_TIMEOUT_SECONDS = 30
-# Boskos answers /acquire with 404 when no resource is in the requested state.
-BOSKOS_NO_RESOURCE_CODE = 404
-# Boskos picks any free resource, so after a release the same project can come
-# straight back. Stop after this many consecutive repeats: the pool has been
-# walked, and anything unvisited is busy.
-BOSKOS_MAX_CONSECUTIVE_REPEATS = 3
+BOSKOS_MAX_CONSECUTIVE_REPEATS = boskos_pool.MAX_CONSECUTIVE_REPEATS
 DEFAULT_BOSKOS_OWNER = "ci-kube-agents-pull-sweep"
 # A sweep killed mid-hold (deadline, node loss) would leave its project in
 # BOSKOS_SWEEP_STATE: not free, not busy, unusable. Each run starts by asking
@@ -135,10 +130,9 @@ DEFAULT_BOSKOS_OWNER = "ci-kube-agents-pull-sweep"
 # runs). A sweep holds a project for seconds, so nothing live is inside the
 # window.
 BOSKOS_STRANDED_AFTER = "5m"
-# Prow ends a job with SIGTERM and a grace period before SIGKILL. Python's
-# default SIGTERM action skips `finally`, which is where a held project is
-# released; converting it to an exception is what lets the release run.
-TERMINATED_EXIT_CODE = 143
+TERMINATED_EXIT_CODE = boskos_pool.TERMINATED_EXIT_CODE
+Terminated = boskos_pool.Terminated
+_terminate = boskos_pool.terminate
 
 # The project-to-repository mapping keeps its one home in hack/ci-deploy.sh; a
 # dozen documents and scripts read it out of that file. The lines are
@@ -150,14 +144,6 @@ MAPPING_LINE_RE = re.compile(r'^\s+([A-Za-z0-9-]+)\)\s+echo "([^"/]+/[^"]+)"\s+;
 
 class SweepError(Exception):
     """A fault that stops one repository's sweep. The caller reports it."""
-
-
-class Terminated(Exception):
-    """SIGTERM arrived; the run unwinds, releasing what it holds."""
-
-
-def _terminate(signum, frame):
-    raise Terminated("signal %d" % signum)
 
 
 def _b64(raw):
@@ -475,70 +461,9 @@ def pool_repos(ci_deploy_script=CI_DEPLOY_SCRIPT):
     return mapping
 
 
-def _boskos(server, action, params):
-    query = urllib.parse.urlencode(params)
-    request = urllib.request.Request(
-        "%s/%s?%s" % (server.rstrip("/"), action, query), method="POST"
-    )
-    with urllib.request.urlopen(request, timeout=BOSKOS_TIMEOUT_SECONDS) as response:
-        raw = response.read()
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except ValueError as exc:
-        raise SweepError("Boskos answered %s with a body that is not JSON: %s" % (action, exc))
-
-
-def boskos_acquire(server, owner):
-    """One free project moved to the sweep state, or None when there is none."""
-    try:
-        resource = _boskos(
-            server,
-            "acquire",
-            {
-                "type": BOSKOS_RESOURCE_TYPE,
-                "state": BOSKOS_FREE_STATE,
-                "dest": BOSKOS_SWEEP_STATE,
-                "owner": owner,
-            },
-        )
-    except urllib.error.HTTPError as exc:
-        if exc.code == BOSKOS_NO_RESOURCE_CODE:
-            return None
-        raise
-    return (resource or {}).get("name") or None
-
-
-def boskos_release(server, owner, name):
-    _boskos(server, "release", {"name": name, "dest": BOSKOS_FREE_STATE, "owner": owner})
-
-
 def boskos_reset_stranded(server):
-    """Projects an earlier sweep left in the sweep state, returned to free.
-
-    Returns their names. A failure here is reported and does not stop the
-    sweep: the projects it would have freed stay where they are until the next
-    run, which is no worse than not having asked.
-    """
-    try:
-        stranded = _boskos(
-            server,
-            "reset",
-            {
-                "type": BOSKOS_RESOURCE_TYPE,
-                "state": BOSKOS_SWEEP_STATE,
-                "dest": BOSKOS_FREE_STATE,
-                "expire": BOSKOS_STRANDED_AFTER,
-            },
-        )
-    except (SweepError, urllib.error.HTTPError, OSError, http.client.HTTPException) as exc:
-        print("could not reset stranded projects: %s" % exc, file=sys.stderr)
-        return []
-    names = sorted(stranded or {})
-    for name in names:
-        print("returned %s to free: left in %s by an earlier sweep" % (name, BOSKOS_SWEEP_STATE))
-    return names
+    """Projects an earlier sweep left in the sweep state, returned to free."""
+    return boskos_pool.reset_stranded(server, BOSKOS_SWEEP_STATE, BOSKOS_STRANDED_AFTER, "sweep")
 
 
 def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.run):
@@ -552,48 +477,28 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
     closed = {}
     failures = {}
     unmapped = []
-    visited = set()
-    repeats = 0
-    # Bounded twice: by consecutive repeats, and by an absolute count no pool
-    # can reach, so a Boskos that keeps answering cannot hold the job open.
-    for _ in range(2 * len(mapping) + BOSKOS_MAX_CONSECUTIVE_REPEATS):
-        name = boskos_acquire(server, owner)
-        if name is None:
-            break
+
+    def visit(name):
+        repo = mapping.get(name)
+        if not repo:
+            print("skipping %s: maps to no GitOps repository" % name)
+            unmapped.append(name)
+            return
+        print("sweeping %s (%s)" % (name, repo))
         try:
-            if name in visited:
-                repeats += 1
-                if repeats >= BOSKOS_MAX_CONSECUTIVE_REPEATS:
-                    break
-                continue
-            repeats = 0
-            visited.add(name)
-            repo = mapping.get(name)
-            if not repo:
-                print("skipping %s: maps to no GitOps repository" % name)
-                unmapped.append(name)
-                continue
-            print("sweeping %s (%s)" % (name, repo))
-            try:
-                closed[name] = sweep_repo(name, repo, app_id, dry_run=dry_run, runner=runner)
-            except (
-                SweepError,
-                urllib.error.HTTPError,
-                OSError,
-                http.client.HTTPException,
-                subprocess.SubprocessError,
-            ) as exc:
-                print("  %s: %s" % (name, exc), file=sys.stderr)
-                failures[name] = str(exc)
-        finally:
-            try:
-                boskos_release(server, owner, name)
-            except (SweepError, urllib.error.HTTPError, OSError, http.client.HTTPException) as exc:
-                # The project stays in the sweep state until the next run's
-                # reset returns it; the walk goes on, and an exception already
-                # unwinding (SIGTERM) is not replaced by this one.
-                print("  %s: release failed (%s); the next run's reset returns it" % (name, exc), file=sys.stderr)
-                failures[name] = "release failed: %s" % exc
+            closed[name] = sweep_repo(name, repo, app_id, dry_run=dry_run, runner=runner)
+        except (
+            SweepError,
+            urllib.error.HTTPError,
+            OSError,
+            http.client.HTTPException,
+            subprocess.SubprocessError,
+        ) as exc:
+            print("  %s: %s" % (name, exc), file=sys.stderr)
+            failures[name] = str(exc)
+
+    _, release_failures = boskos_pool.walk(server, owner, BOSKOS_SWEEP_STATE, len(mapping), visit)
+    failures.update(release_failures)
     print(
         "swept %d project(s): closed %d pull request(s), %d failed, %d unmapped"
         % (len(closed) + len(failures), sum(closed.values()), len(failures), len(unmapped))
@@ -661,7 +566,7 @@ def main(argv=None):
     except Terminated as exc:
         print("ERROR: terminated (%s); held projects were released" % exc, file=sys.stderr)
         return TERMINATED_EXIT_CODE
-    except SweepError as exc:
+    except (SweepError, boskos_pool.BoskosError) as exc:
         print("ERROR: %s" % exc, file=sys.stderr)
         return 1
     except urllib.error.HTTPError as exc:

@@ -1326,14 +1326,19 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     ``output`` and ``final_message`` are the deliverable -- the posts the
     conversation received for this task that the relay never rewrote, which is
     what a customer would read as the answer. The trajectory is the
-    conversation itself plus the task's lifecycle: the relay does not post
-    ``activity`` artifacts, so no transport reading a conversation carries
-    tool calls, and what it carries instead is every executor state the read
-    route showed and the terminal, as ``a2a.status-update`` entries. Tokens
-    stay null -- the gateway reports no usage -- and ``metadata`` says so
-    rather than inventing a number. ``identity`` is the run, case and
-    repetition the key and message id were built from, stored beside the
-    task id so the record joins to the gateway's ingress log.
+    conversation itself, the task's lifecycle -- every executor state the
+    read route showed and the terminal, as ``a2a.status-update`` entries --
+    and the task's tool calls when the door showed them: the relay does not
+    post ``activity`` artifacts to a conversation, so they come from the
+    read route's probe instead, one entry per call in the api transport's
+    shape behind an ``a2a.activity`` marker that says the door carried the
+    trace at all (``inject_transport.EVENT_ENTRY_ACTIVITY``; a door that
+    cannot show it writes neither, and the scorer sets router-scope
+    ``tool_called`` checks aside only then). Tokens stay null -- the gateway reports no usage --
+    and ``metadata`` says so rather than inventing a number. ``identity`` is
+    the run, case and repetition the key and message id were built from,
+    stored beside the task id so the record joins to the gateway's ingress
+    log.
     """
     fold = exchange.fold
     return AgentResult(
@@ -1356,6 +1361,14 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
             "posts": len(fold.posts),
             "entries": len(fold.entries),
             "malformed_entries": fold.malformed,
+            # The marker's arguments (calls written, calls dropped), or None
+            # on a door that carried no trace; the progress artifact's last
+            # line, or None when none was carried. Like the rest of this
+            # block they reach the harness log and not the record --
+            # devops-bench drops ``metadata`` -- so the record's evidence is
+            # the ``a2a.activity`` entry in the trajectory.
+            "activity": fold.activity_summary,
+            "progress": fold.progress or None,
             "tokens_note": _INJECT_TOKENS_NOTE,
         },
     )
@@ -2027,9 +2040,10 @@ class KubeAgentsHarness(AgentHarness):
             # than the transport's on purpose (the A2A owner's instruction on
             # #1661): when agent-initiated delegation becomes a child task on
             # the bus, this whole block goes and the transport is untouched.
-            # Card ids are read from the trajectory, which on this path
-            # carries no tool calls, so the wait finds nothing outstanding and
-            # settles at once. A status turn is a further message on the same
+            # Card ids are read from ``kanban_create`` tool RESULTS in the
+            # trajectory, and the tool calls this path carries (the door's
+            # activity trace) have no results, so the wait finds nothing
+            # outstanding and settles at once. A status turn is a further message on the same
             # conversation, the way a second message in a chat thread is --
             # and it is a new task rather than a steer, because the first
             # task's terminal has already released the conversation. Each

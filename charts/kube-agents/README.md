@@ -550,7 +550,11 @@ Five knobs need context beyond the chart:
   install must pin the dashboard on or off rather than float with the CRD.
 - `harness.driftDetector.enabled` needs
   [`terraform/modules/drift-pubsub`](../../terraform/modules/drift-pubsub/)
-  applied against the project first. The chart does not check, and neither does
+  applied against the project first.
+  [`terraform/examples/full-install`](../../terraform/examples/full-install/README.md#drift-audit-log-ingress)
+  does that as part of its own apply when `enable_drift_pubsub = true`; an
+  install that renders this chart without the composition applies the module
+  itself. The chart does not check, and neither does
   the detector: enabled without a subscription to read, it comes up and retries
   a pull that cannot succeed for the life of the pod, never exits, and leaves
   the pod Ready. That is why it defaults to off.
@@ -578,17 +582,19 @@ before any GKE call. The
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
 
-### Projects in scope
+### Projects, folders and organisations in scope
 
 `platformAgent.scope` is rendered as `spec.scope` on the `PlatformAgent`: the GCP projects,
-beyond the one the agent runs in, whose GKE clusters get a Cluster Agent, and the projects and
-clusters it leaves unmanaged (the
+folders and organisations, beyond the project the agent runs in, whose GKE clusters get a Cluster
+Agent, and the projects and clusters it leaves unmanaged (the
 [CRD reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/operator/platformagent-crd.md#specscope)
-documents the field). An empty scope is a present block with empty lists, and the chart renders it whenever it is given one, `{}` included, because the reconcile reads an emptied `projects` list as the declaration that drops projects. `null`, the chart's default, is not an empty scope: it is the chart being told nothing, and the composition never tells it nothing. The block is never dropped for being empty. While no earlier revision rendered the block, a `null` leaves a scope the CR already carries alone, because Helm patches a custom resource from the difference between its rendered manifests; once a revision has rendered it, a render without it removes `spec.scope` from the CR, which the reconcile reads as no declaration (the management project alone, nothing retired), so `null` clears a scope without retiring its projects and emptying `projects` is how projects are dropped. The
+documents the field). An empty scope is a present block with empty lists, and the chart renders it whenever it is given one, `{}` included (`folders` and `organizations` only when the value carries the key, so a release record written before the chart knew them re-renders without them and a retag's patch leaves the CR's lists alone; the composition always passes both; the reverse holds too: a chart rolled back past the two keys patches them off a CR that carries them, which an operator at or after phase 2 renders as emptied lists, a drop, so take the block off the CR first as the CRD page says), because the reconcile reads an emptied `projects` list as the declaration that drops projects. `null`, the chart's default, is not an empty scope: it is the chart being told nothing, and the composition never tells it nothing. The block is never dropped for being empty. While no earlier revision rendered the block, a `null` leaves a scope the CR already carries alone, because Helm patches a custom resource from the difference between its rendered manifests; once a revision has rendered it, a render without it removes `spec.scope` from the CR, which the reconcile reads as no declaration (the management project alone, nothing retired), so `null` clears a scope without retiring its projects and emptying `projects` is how projects are dropped. The
 `terraform/examples/full-install` composition always passes a map, so on that path a project
 leaves the scope by being removed from `projects` and applied. Once a release has rendered the block the value is the declaration: the installer refuses the next full upgrade over a `spec.scope` edited by hand until `install.env` records it or the CR is put back, and a retag, or a hand-driven composition apply whose rendered scope is unchanged, leaves the edit in place because Helm sends only the difference between its rendered manifests.
-The agent's service account needs the read roles in each project named; the composition binds
-them from the same value, and a chart installed on its own needs them granted by hand.
+The agent's service account needs the read roles in each project named, and the read roles plus
+`roles/cloudasset.viewer` on each folder and organisation (numeric IDs, every project beneath
+inherits the grant); the composition binds them from the same value, and a chart installed on its
+own needs them granted by hand.
 
 ### ServiceAccount ownership
 
