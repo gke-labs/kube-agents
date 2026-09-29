@@ -324,6 +324,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
     def test_a_failed_read_of_the_gate_stops_the_apply_before_re_arming(self):
         completed, calls = self._run(OLD_ID="fail")
         self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(len(self._indices(calls, "[old_id]")), 1)
         self.assertNotIn("Plant failed", completed.stderr)
         self.assertEqual([c for c in calls if c.endswith(("[rearm]", "[archive]", "[restore]"))], [])
 
