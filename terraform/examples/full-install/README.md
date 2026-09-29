@@ -211,7 +211,14 @@ lines in `install.env`, since the generator writes none of them) or leaves the
 flag off; otherwise its apply adopts the first install's topic, subscription
 and sink into its own state, and its teardown removes them, retained messages
 included. The stockout trio (`stockout_pubsub_*`) is adopted the same way and
-carries the same requirement.
+carries the same requirement. Renaming a subscription already in state is a
+different failure, and `guard_pubsub_subscription` refuses it for the Chat,
+drift and stockout subscriptions alike, while the feature's flag is on: `name`
+and `topic` are ForceNew on `google_pubsub_subscription`, so the apply would
+destroy and recreate the subscription — and the topic with it, where the topic
+name is what changed — under `-auto-approve`, dropping whatever it had not
+acknowledged: the Chat events, the stockout alerts, or the GKE audit records
+the drift detector exists to report.
 Versioning is the recovery story:
 a corrupted or mistakenly-overwritten state file can be rolled back to a prior
 generation by copying it over the live object (`gcloud storage ls -a` lists the
@@ -678,7 +685,9 @@ The variable is for a hand-driven apply. The installer front doors
 `true` written into that file lasts until the next front-door run, whose
 apply then plans the sink, topic and subscription (with up to 31 days of
 retained messages) for removal under `-auto-approve`; no guard refuses that
-the way `guard_pubsub_subscription` refuses a Chat rename. Through the front
+the way `guard_pubsub_subscription` refuses a rename. Switching the feature
+off is a teardown the guard reads as deliberate, so it checks the name only
+while the flag is on. Through the front
 doors, set it as a `TF_VAR_enable_drift_pubsub=true` line in `install.env`,
 the same channel `agent_ksa_name` uses: every front door sources that file
 with `set -a`, and Terraform reads `TF_VAR_*` where the generated file is

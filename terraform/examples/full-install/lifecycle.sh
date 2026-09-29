@@ -167,6 +167,26 @@ readonly STATE_LOCK_MESSAGE_PATTERN='(Acquiring|Releasing) state lock\.'
 readonly DRIFT_TOPIC_ADDRESS="module.drift_pubsub[0].google_pubsub_topic.drift_audit"
 readonly DRIFT_SUBSCRIPTION_ADDRESS="module.drift_pubsub[0].google_pubsub_subscription.drift_audit"
 readonly DRIFT_SINK_ADDRESS="module.drift_pubsub[0].google_logging_project_sink.drift_audit"
+# The stockout trio, the other three adopt_kms imports. It is declared at the
+# composition's top level rather than in a module, so its addresses carry no
+# module prefix.
+readonly STOCKOUT_TOPIC_ADDRESS="google_pubsub_topic.stockout_alerts[0]"
+readonly STOCKOUT_SUBSCRIPTION_ADDRESS="google_pubsub_subscription.stockout_alerts[0]"
+readonly STOCKOUT_SINK_ADDRESS="google_logging_project_sink.stockout_alerts[0]"
+
+# Every Pub/Sub subscription this composition can manage, as
+# "<enable flag>|<state address>|<name variable>|<topic variable>|<what a
+# recreate drops>|<install.env name key>|<install.env topic key>".
+#
+# The install.env keys are empty for the drift and stockout trios on purpose:
+# install.env.example carries CHAT_TOPIC_NAME and CHAT_SUB_NAME and nothing for
+# the other four, so subscription_name_advice points those at the TF_VAR_
+# passthrough instead of naming a key that does not exist.
+readonly GUARDED_SUBSCRIPTIONS=(
+  "enable_google_chat|$CHAT_SUBSCRIPTION_ADDRESS|chat_subscription_name|chat_topic_name|unacknowledged Google Chat events|CHAT_SUB_NAME|CHAT_TOPIC_NAME"
+  "enable_drift_pubsub|$DRIFT_SUBSCRIPTION_ADDRESS|drift_pubsub_subscription|drift_pubsub_topic|unacknowledged GKE audit records, the out-of-band changes the drift detector exists to report||"
+  "enable_stockout_investigator|$STOCKOUT_SUBSCRIPTION_ADDRESS|stockout_pubsub_subscription|stockout_pubsub_topic|unacknowledged stockout alerts||"
+)
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -399,9 +419,9 @@ adopt_kms() {
     stockout_sub=$(tfvar stockout_pubsub_subscription)
     stockout_sink=$(tfvar stockout_pubsub_sink)
     targets+=(
-      "google_pubsub_topic.stockout_alerts[0]	pubsub_topic	projects/$project/topics/$stockout_topic"
-      "google_pubsub_subscription.stockout_alerts[0]	pubsub_sub	projects/$project/subscriptions/$stockout_sub"
-      "google_logging_project_sink.stockout_alerts[0]	logging_sink	projects/$project/sinks/$stockout_sink"
+      "$STOCKOUT_TOPIC_ADDRESS	pubsub_topic	projects/$project/topics/$stockout_topic"
+      "$STOCKOUT_SUBSCRIPTION_ADDRESS	pubsub_sub	projects/$project/subscriptions/$stockout_sub"
+      "$STOCKOUT_SINK_ADDRESS	logging_sink	projects/$project/sinks/$stockout_sink"
     )
   fi
 
@@ -663,56 +683,97 @@ guard_gsa_identity() {
   fi
 }
 
+# Where a reader whose recorded name disagrees with the resolved one records
+# it. The front doors regenerate terraform.tfvars from install.env on every
+# run, so a name written into terraform.tfvars by hand does not survive them,
+# and install.env is the answer either way -- but by two different routes. A
+# name with a key of its own is that key. A name without one reaches Terraform
+# as a TF_VAR_ passthrough, because the generator writes no line for it and so
+# has nothing to overwrite it with; the enable_drift_pubsub description and the
+# composition README's second-install section say the same. Naming the key that
+# does not exist would send the reader nowhere, and so would omitting the
+# passthrough: the likeliest way this guard fires on a front-door install is
+# that TF_VAR_ line having gone missing from install.env, which is a one-line
+# repair.
+subscription_name_advice() { # <noun> <variable> <install.env key, empty when there is none> <recorded value>
+  local noun="$1" variable="$2" env_key="$3" recorded="$4"
+  if [[ -n "$env_key" ]]; then
+    warn "If this install uses an existing $noun, record it in install.env, which the front doors regenerate terraform.tfvars from:"
+    warn "  ${env_key}=\"${recorded}\""
+    warn "A hand-driven apply sets $variable in terraform.tfvars instead."
+    return 0
+  fi
+  warn "No install.env key carries this $noun. Through the front doors it is a passthrough line in install.env, which every front door sources with 'set -a':"
+  warn "  TF_VAR_${variable}=\"${recorded}\""
+  warn "A hand-driven apply sets $variable in terraform.tfvars instead."
+}
+
 # `name` and `topic` are ForceNew on google_pubsub_subscription, and `name` is
 # ForceNew on google_pubsub_topic. The subscription resource carries neither
-# create_before_destroy nor prevent_destroy. If a custom or default subscription
-# is managed in state and chat_subscription_name or chat_topic_name in terraform.tfvars
-# resolves to a different name/topic, the next apply destroys the live subscription
-# (and its topic) and recreates it under -auto-approve, dropping unacknowledged Google Chat events.
+# create_before_destroy nor prevent_destroy. If a subscription is managed in
+# state and its name or topic variable resolves to something else, the next
+# apply destroys the live subscription (and its topic) and recreates it under
+# -auto-approve, dropping whatever it had not acknowledged.
+#
+# Every subscription in GUARDED_SUBSCRIPTIONS is checked, not the chat one
+# alone: the drift and stockout trios are the same resource type with the same
+# ForceNew fields, and the drift one's unacknowledged messages are the audit
+# records of out-of-band changes -- the very thing the detector reports, lost
+# in a way nothing surfaces, because the detector stays Ready either way.
 # Same shape as guard_gsa_identity.
 guard_pubsub_subscription() {
-  [[ "$(tfvar enable_google_chat)" == "true" ]] || return 0
   load_state
-  local addr="$CHAT_SUBSCRIPTION_ADDRESS"
-  in_state "$addr" || return 0
+  local entry flag addr name_variable topic_variable loses name_key topic_key
+  for entry in "${GUARDED_SUBSCRIPTIONS[@]}"; do
+    IFS='|' read -r flag addr name_variable topic_variable loses name_key topic_key <<<"$entry"
 
-  local recorded_name
-  recorded_name=$(state_attr "$addr" name)
-  local recorded_topic
-  recorded_topic=$(state_attr "$addr" topic)
+    # State first: in_state reads the list already in memory, while tfvar is a
+    # `terraform console` round trip, so a feature whose subscription this
+    # state does not manage costs nothing.
+    in_state "$addr" || continue
 
-  local desired_name
-  if ! desired_name=$(tfvar chat_subscription_name 2>/dev/null); then
-    desired_name=""
-  fi
-  [[ -n "$desired_name" ]] || desired_name="$DEFAULT_CHAT_SUB_NAME"
+    # Assigned rather than compared inline. tfvar ends in `exit 1`, which
+    # inside $( ) kills only the subshell: `[[ "$(tfvar x)" == true ]]` reads a
+    # failed console as "not enabled" and skips the guard, while an assignment
+    # fails under `set -e` and stops the apply. A guard that cannot read the
+    # configuration has to fail closed.
+    local enabled
+    enabled=$(tfvar "$flag")
+    [[ "$enabled" == "true" ]] || continue
 
-  if [[ -n "$recorded_name" && "$recorded_name" != "$desired_name" ]]; then
-    warn "chat_subscription_name resolved to '$desired_name', but this state manages Pub/Sub subscription '$recorded_name' ($addr)."
-    warn "Applying now would plan the subscription's DESTRUCTION and recreation under -auto-approve,"
-    warn "dropping unacknowledged Google Chat events."
-    warn "If this install uses an existing subscription name, record it in install.env, which the front doors regenerate terraform.tfvars from:"
-    warn "  CHAT_SUB_NAME=\"$recorded_name\""
-    warn "A hand-driven apply sets chat_subscription_name in terraform.tfvars instead."
-    exit 1
-  fi
+    local recorded_name recorded_topic desired_name desired_topic stripped_topic
+    recorded_name=$(state_attr "$addr" name)
+    recorded_topic=$(state_attr "$addr" topic)
 
-  local desired_topic
-  if ! desired_topic=$(tfvar chat_topic_name 2>/dev/null); then
-    desired_topic=""
-  fi
-  [[ -n "$desired_topic" ]] || desired_topic="$DEFAULT_CHAT_TOPIC_NAME"
+    # Every one of these variables declares a non-empty default in
+    # variables.tf, so terraform console answers with that default when nothing
+    # sets it and the guard needs no second copy of the name. An empty answer
+    # is therefore a variable someone blanked -- a `TF_VAR_drift_pubsub_subscription=`
+    # line in install.env exports "" through `set -a`, which overrides the
+    # default -- and it is compared like any other mismatch rather than waved
+    # through: the recreate it plans destroys the live subscription and then
+    # fails on the create.
+    desired_name=$(tfvar "$name_variable")
+    if [[ -n "$recorded_name" && "$recorded_name" != "$desired_name" ]]; then
+      warn "$name_variable resolved to '$desired_name', but this state manages Pub/Sub subscription '$recorded_name' ($addr)."
+      warn "Applying now would plan the subscription's DESTRUCTION and recreation under -auto-approve,"
+      warn "dropping $loses."
+      [[ -n "$desired_name" ]] || warn "An empty resolution is a blanked variable rather than a rename, and the recreate would fail after the destroy had run."
+      subscription_name_advice "subscription name" "$name_variable" "$name_key" "$recorded_name"
+      exit 1
+    fi
 
-  local stripped_topic="${recorded_topic##*/}"
-  if [[ -n "$stripped_topic" && "$stripped_topic" != "$desired_topic" ]]; then
-    warn "chat_topic_name resolved to '$desired_topic', but this state's Pub/Sub subscription is attached to topic '$stripped_topic' ($addr)."
-    warn "Applying now would plan the topic and subscription's DESTRUCTION and recreation under -auto-approve,"
-    warn "dropping unacknowledged Google Chat events."
-    warn "If this install uses an existing topic name, record it in install.env, which the front doors regenerate terraform.tfvars from:"
-    warn "  CHAT_TOPIC_NAME=\"$stripped_topic\""
-    warn "A hand-driven apply sets chat_topic_name in terraform.tfvars instead."
-    exit 1
-  fi
+    desired_topic=$(tfvar "$topic_variable")
+    stripped_topic="${recorded_topic##*/}"
+    if [[ -n "$stripped_topic" && "$stripped_topic" != "$desired_topic" ]]; then
+      warn "$topic_variable resolved to '$desired_topic', but this state's Pub/Sub subscription is attached to topic '$stripped_topic' ($addr)."
+      warn "Applying now would plan the topic and subscription's DESTRUCTION and recreation under -auto-approve,"
+      warn "dropping $loses."
+      [[ -n "$desired_topic" ]] || warn "An empty resolution is a blanked variable rather than a rename, and the recreate would fail after the destroy had run."
+      subscription_name_advice "topic name" "$topic_variable" "$topic_key" "$stripped_topic"
+      exit 1
+    fi
+  done
 }
 
 # `name` is ForceNew on google_kms_key_ring and google_kms_crypto_key, neither

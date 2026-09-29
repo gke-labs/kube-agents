@@ -41,7 +41,10 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_enable_drift_pubsub="false",
                    tfvar_drift_topic='"platform-agent-drift-audit"',
                    tfvar_drift_sub='"platform-agent-drift-audit-sub"',
-                   tfvar_drift_sink='"platform-agent-drift-audit-sink"'):
+                   tfvar_drift_sink='"platform-agent-drift-audit-sink"',
+                   tfvar_enable_stockout="false",
+                   tfvar_stockout_topic='"gke-stockout-alerts-topic"',
+                   tfvar_stockout_sub='"gke-stockout-alerts-sub"'):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -134,6 +137,15 @@ elif [[ "$cmd" == "console" ]]; then
         exit 0
     elif [[ "$expr" == *"drift_pubsub_sink"* ]]; then
         echo '{tfvar_drift_sink}'
+        exit 0
+    elif [[ "$expr" == *"enable_stockout_investigator"* ]]; then
+        echo '{tfvar_enable_stockout}'
+        exit 0
+    elif [[ "$expr" == *"stockout_pubsub_topic"* ]]; then
+        echo '{tfvar_stockout_topic}'
+        exit 0
+    elif [[ "$expr" == *"stockout_pubsub_subscription"* ]]; then
+        echo '{tfvar_stockout_sub}'
         exit 0
     fi
     echo 'null'
@@ -485,7 +497,14 @@ resource "google_service_account" "agent" {
         self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
 
     def test_guard_pubsub_subscription_no_op_when_chat_disabled(self):
-        proc = self._run_guard("guard_pubsub_subscription", tfvar_enable_google_chat="false")
+        """A subscription in state whose feature is switched off is a teardown, not a rename."""
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+            state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n}',
+            tfvar_enable_google_chat="false",
+            tfvar_chat_sub_name='"custom-chat-events-sub"',
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_guard_pubsub_subscription_no_op_when_subscription_not_in_state(self):
@@ -523,6 +542,160 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("chat_topic_name resolved to 'renamed-chat-topic', but this state's Pub/Sub subscription is attached to topic 'platform-agent-chat-events'", proc.stderr)
         self.assertIn('CHAT_TOPIC_NAME="platform-agent-chat-events"', proc.stderr)
+
+    # The drift and stockout subscriptions are the same resource type with the
+    # same ForceNew name and topic, so the guard covers them too. A drift
+    # recreate drops the audit records the detector exists to report, and the
+    # detector stays Ready either way.
+    _DRIFT_SUB_ADDRESS = "module.drift_pubsub[0].google_pubsub_subscription.drift_audit"
+    _DRIFT_SUB_STATE = (
+        'resource "google_pubsub_subscription" "drift_audit" {\n'
+        '    name = "platform-agent-drift-audit-sub"\n'
+        '    topic = "projects/test-proj/topics/platform-agent-drift-audit"\n}'
+    )
+    _STOCKOUT_SUB_ADDRESS = "google_pubsub_subscription.stockout_alerts[0]"
+    _STOCKOUT_SUB_STATE = (
+        'resource "google_pubsub_subscription" "stockout_alerts" {\n'
+        '    name = "gke-stockout-alerts-sub"\n'
+        '    topic = "projects/test-proj/topics/gke-stockout-alerts-topic"\n}'
+    )
+
+    def test_guard_pubsub_subscription_passes_when_drift_matches_state(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="true",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_no_op_when_drift_not_in_state(self):
+        """Chat in state and clean, drift renamed but absent: only what state manages is checked."""
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+            state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n}',
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_sub='"renamed-drift-audit-sub"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_drift_subscription_differs(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_sub='"renamed-drift-audit-sub"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("drift_pubsub_subscription resolved to 'renamed-drift-audit-sub', but this state manages Pub/Sub subscription 'platform-agent-drift-audit-sub'", proc.stderr)
+        self.assertIn("unacknowledged GKE audit records", proc.stderr)
+        # No install.env key carries this name, so the advice names the passthrough
+        # the front doors do read rather than inventing a key.
+        self.assertIn("No install.env key carries this subscription name", proc.stderr)
+        self.assertIn('TF_VAR_drift_pubsub_subscription="platform-agent-drift-audit-sub"', proc.stderr)
+        self.assertNotIn("record it in install.env", proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_drift_topic_differs(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_topic='"renamed-drift-audit"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("drift_pubsub_topic resolved to 'renamed-drift-audit', but this state's Pub/Sub subscription is attached to topic 'platform-agent-drift-audit'", proc.stderr)
+        self.assertIn("No install.env key carries this topic name", proc.stderr)
+        self.assertIn('TF_VAR_drift_pubsub_topic="platform-agent-drift-audit"', proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_a_blanked_name(self):
+        """`TF_VAR_drift_pubsub_subscription=` in install.env exports "", which beats the default."""
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_sub='""',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("An empty resolution is a blanked variable rather than a rename", proc.stderr)
+        self.assertIn('TF_VAR_drift_pubsub_subscription="platform-agent-drift-audit-sub"', proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_a_blanked_topic(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_topic='""',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("drift_pubsub_topic resolved to ''", proc.stderr)
+        self.assertIn("An empty resolution is a blanked variable rather than a rename", proc.stderr)
+
+    def test_guard_pubsub_subscription_no_op_when_drift_disabled(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="false",
+            tfvar_drift_sub='"renamed-drift-audit-sub"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_stockout_subscription_differs(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._STOCKOUT_SUB_ADDRESS,
+            state_show=self._STOCKOUT_SUB_STATE,
+            tfvar_enable_stockout="true",
+            tfvar_stockout_sub='"renamed-stockout-sub"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("stockout_pubsub_subscription resolved to 'renamed-stockout-sub', but this state manages Pub/Sub subscription 'gke-stockout-alerts-sub'", proc.stderr)
+        self.assertIn("unacknowledged stockout alerts", proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_stockout_topic_differs(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._STOCKOUT_SUB_ADDRESS,
+            state_show=self._STOCKOUT_SUB_STATE,
+            tfvar_enable_stockout="true",
+            tfvar_stockout_topic='"renamed-stockout-topic"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("stockout_pubsub_topic resolved to 'renamed-stockout-topic', but this state's Pub/Sub subscription is attached to topic 'gke-stockout-alerts-topic'", proc.stderr)
+
+    def test_guard_pubsub_subscription_no_op_when_stockout_disabled(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._STOCKOUT_SUB_ADDRESS,
+            state_show=self._STOCKOUT_SUB_STATE,
+            tfvar_enable_stockout="false",
+            tfvar_stockout_sub='"renamed-stockout-sub"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_checks_every_subscription_in_state(self):
+        """Chat clean and drift renamed in one state: the loop must not stop at the first row.
+
+        The terraform stub answers `state show` with the same body whatever address it
+        is given, so the chat variables are pointed at that body's names to make the
+        chat row compare equal and the loop reach the drift one.
+        """
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events\n" + self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_chat_sub_name='"platform-agent-drift-audit-sub"',
+            tfvar_chat_topic_name='"platform-agent-drift-audit"',
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_sub='"renamed-drift-audit-sub"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("drift_pubsub_subscription resolved to 'renamed-drift-audit-sub'", proc.stderr)
 
     def test_guard_minter_key_no_op_when_minter_disabled(self):
         """When enable_github_minter is false, guard_minter_key passes cleanly."""
