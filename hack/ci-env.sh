@@ -198,12 +198,15 @@ _agent_pod_watch_loop() {
     wait "${child}" || true
     child=""
     if (( SECONDS - opened >= AGENT_DIAG_WATCH_HEALTHY_SECONDS )); then
-      # Every open lists everything before it watches. Once one has held, its
-      # list is the record, and a reprint per reopen would push it out of the
-      # byte cap; until then, keep listing, or a failed first open loses it.
+      # Every open lists everything before it watches. After a held open the
+      # stream is continuous but for one kubectl restart, and a reprint per
+      # cut would push the record out of the byte cap.
       only=(--watch-only)
       continue
     fi
+    # A fast exit means the watch could not be held (unreachable, 5xx, auth):
+    # the stream has a gap of unknown length, so the next open lists again.
+    only=()
     # Backgrounded and waited on, not run in the foreground: bash defers a
     # trap until a foreground command returns, which held every exit for the
     # whole pause.
@@ -295,8 +298,12 @@ collect_agent_pod_diagnostics() {
     | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/platform-agent-previous.log" || true
 
   local containers=""
-  containers=$("${kctl[@]}" get "${AGENT_DIAG_DEPLOYMENT}" -n "${ns}" \
-    -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null) || true
+  if ! containers=$("${kctl[@]}" get "${AGENT_DIAG_DEPLOYMENT}" -n "${ns}" \
+    -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null); then
+    # Unknown is not absent: try the bridge reads, so their error is on record
+    # rather than the run looking like one with no sidecar.
+    containers="${AGENT_DIAG_BRIDGE_CONTAINER}"
+  fi
   case " ${containers} " in
     *" ${AGENT_DIAG_BRIDGE_CONTAINER} "*)
       "${kctl[@]}" logs "${AGENT_DIAG_DEPLOYMENT}" -c "${AGENT_DIAG_BRIDGE_CONTAINER}" -n "${ns}" \
