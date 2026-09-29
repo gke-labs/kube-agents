@@ -78,6 +78,19 @@ func defaultTokenSource(ctx context.Context) (oauth2.TokenSource, error) {
 // no CA of its own — it terminates on a Google frontend with a WebPKI
 // certificate — where the IP endpoint is signed by the cluster's own CA.
 //
+// A third shape sits between those two. With the IP endpoint disabled
+// (ipEndpointsConfig.enabled = false), GKE publishes the DNS hostname in
+// cluster.Endpoint whether or not the DNS endpoint allows external traffic.
+// That host is the same Google frontend, so the cluster CA signs nothing on
+// it and pairing the two fails every request with an x509 error. The shape is
+// recognised by string equality of the two API fields — cluster.Endpoint and
+// DnsEndpointConfig.Endpoint — not by a domain suffix, and it takes the DNS
+// host with no CA regardless of AllowExternalTraffic: whether the pod can
+// route to it is for the connection to find out, as with any address. It
+// needs no MasterAuth either, so a cluster in this shape with no CA on record
+// is a config, not an error. An IP address in cluster.Endpoint beside a DNS
+// endpoint closed to external traffic still takes the IP host and the CA.
+//
 // An address is required. Returning a config with an empty Host would hand
 // rest.Config a relative URL and produce a client that talks to nothing in a
 // way no error names.
@@ -88,6 +101,9 @@ func ClientConfigForIdentity(cluster *container.Cluster) (*rest.Config, error) {
 	if endpoints := cluster.ControlPlaneEndpointsConfig; endpoints != nil && endpoints.DnsEndpointConfig != nil {
 		dns := endpoints.DnsEndpointConfig
 		if dns.AllowExternalTraffic && dns.Endpoint != "" {
+			return &rest.Config{Host: httpsScheme + dns.Endpoint}, nil
+		}
+		if dns.Endpoint != "" && cluster.Endpoint == dns.Endpoint {
 			return &rest.Config{Host: httpsScheme + dns.Endpoint}, nil
 		}
 	}
