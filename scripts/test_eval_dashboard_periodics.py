@@ -256,7 +256,7 @@ class AssessTest(unittest.TestCase):
             readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects))
         self.assertEqual(readings[SWEEP.job]["build"], "8")
 
-    def test_an_unreadable_artifact_is_a_blind_tick_not_a_note_without_its_projects(self):
+    def test_an_unreadable_artifact_is_a_blind_tick_and_a_cut_one_is_said(self):
         root = f"{periodics.LOGS_ROOT}/{WEEKLY.job}"
         report = {"outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "x"}}}
         objects = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), report)})
@@ -265,12 +265,14 @@ class AssessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=denied, log=lambda *a, **k: warnings.append(a[0])), {})
         self.assertEqual(len(warnings), 1)
-        # Present but cut short: unreadable the same way.
+        # Present but cut short: no later tick can read it either, so the
+        # failure is a reading whose detail says the report was unreadable.
         objects[f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"] = '{"outcomes": {'
         warnings.clear()
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0])), {})
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0]))
         self.assertIn("not a JSON object", warnings[0])
+        self.assertEqual(periodics.reconcile_detail(readings[WEEKLY.job]["artifact"]), [f"run: {periodics.REPORT_UNREADABLE}"])
         # A run that wrote no artifact is a reading without one.
         absent = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), None)})
         with tempfile.TemporaryDirectory() as tmp:
@@ -301,12 +303,13 @@ class AssessTest(unittest.TestCase):
 
 
 class WorkflowWiring(unittest.TestCase):
-    def test_the_hourly_job_fetches_the_readings_and_hands_them_to_health(self):
+    def test_the_15_minute_tick_fetches_the_readings_and_hands_them_to_health(self):
         jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
-        steps = jobs["health"]["steps"] if "health" in jobs else next(iter(jobs.values()))["steps"]
+        steps = jobs["refresh-and-adjudicate"]["steps"]
         names = [step.get("name") for step in steps]
         fetch = next(step for step in steps if "periodics.py fetch" in step.get("run", ""))
         self.assertTrue(fetch.get("continue-on-error"), "a failed fetch never fails the tick")
+        self.assertTrue(fetch.get("timeout-minutes"), "a hung read cannot eat the verdict's half of the job")
         self.assertIn("--out-dir work/periodics", fetch["run"])
         adjudicate = next(step for step in steps if step.get("name") == "Adjudicate")
         self.assertIn("--periodics-dir work/periodics", adjudicate["run"])

@@ -1920,7 +1920,7 @@ class WatchedPeriodics(RunHarness):
         doc["periodics"] = {self.WEEKLY: periodic_note(verdict="STALE", finished=None)}
         doc["periodics_read"] = [self.WEEKLY]
         rendered = post_health.render_digest(doc, T14)
-        self.assertIn("⚪ seeded-fleet reconcile (weekly): build 100 finished at a time the archive does not give.", rendered)
+        self.assertIn("⚪ seeded-fleet reconcile (weekly): build 100 finished at a time its finished.json does not give.", rendered)
         self.assertNotIn("no finished run on record", rendered)
 
 

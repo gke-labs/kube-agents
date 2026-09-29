@@ -3,7 +3,8 @@
 Every 15 minutes `.github/workflows/ci-health.yml` refreshes the eval dashboard
 (the incremental collect → render → publish that `hack/ci-dashboard-refresh.sh`
 runs, split across two identities: `github-actions@kube-agents-prow` reads the
-Prow archive, `eval-dashboard-publisher@kube-agents-prow` writes the bucket),
+Prow archive and the log buckets kube-agents owns,
+`eval-dashboard-publisher@kube-agents-prow` writes the bucket),
 then `scripts/eval_dashboard/health.py` reads the `data.json` just collected,
 decides whether `pull-kube-agents-smoke-test` is **GREEN**, **DEGRADED** or
 **OUTAGE** and why, and writes `health.json` next to it — before the render, so
@@ -19,7 +20,9 @@ it beside the grader's reason (builds graded before 2026-09-15 carry none).
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
 ([below](#a-slow-gate)), plus one when runs start waiting to be scheduled and
-one when they stop ([below](#a-backed-up-pool)).
+one when they stop ([below](#a-backed-up-pool)), plus, for the watched Prow
+periodics, one when a run fails or a job stops and one when it passes again
+([below](#the-watched-periodics)).
 The digest also carries one line on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected): the cases recorded, how many
 passed all reps, partial and failed, what is newly failing against the night
@@ -68,7 +71,8 @@ that say the pool check itself is not reporting — `wait unknown` and `pool
 check stopped` — link to the periodic's job history instead, the one place
 that shows whether it has started running again. `queue clear` and the two
 data-freshness messages carry no link: what they report is the absence of
-something to show. The scope rides in the URL
+something to show. The watched-periodic messages link to the job's Deck
+history; the passed-again one carries no link. The scope rides in the URL
 fragment because the host's login redirect drops a query string and a browser
 carries the fragment through the redirect.
 The contract, and the older `?cases=…#gate` form the pages still read (it
@@ -348,13 +352,13 @@ wait is a fixed 24-hour figure that is not in the run data.
 
 ## The watched periodics
 
-Two Prow periodics keep the pool in shape from outside any run, and until this
+Three Prow periodics keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, every ten minutes) and the seeded-fleet
 reconcile, hourly against the drifted projects and weekly against every free
 one. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window and the artifact it writes, so adding
-the next periodic is one line. The hourly job's `Fetch the watched periodics'
+the next periodic is one line. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
 `gs://kube-agents-periodic-logs`, the bucket these jobs log to (their own
 identities cannot write the Prow archive),
@@ -382,8 +386,8 @@ last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
 was told about passes again, on a reading only. The digest carries one line per
 open note.
-Nothing here files an issue: the recovery is a person's, and the message says
-where it is written (`docs/ci-pool-projects.md`, sections 5.5 and 6.2).
+Nothing here files an issue: the recovery is a person's, and the failed
+message says where it is written (`docs/ci-pool-projects.md`, sections 5.5 and 6.2).
 
 ## The comment on a red pull request
 
@@ -644,7 +648,7 @@ line "Filed automatically by the smoke health bot; the fleet owner should
 re-apply the stack in the projects named; the bot will not close it." An open
 `presubmit-gate` issue that already names every drifted role is adopted
 instead. The recovery comments on it as on any other.
-Once its `oss-test-infra` entry exists, the hourly `ci-kube-agents-fleet-reconcile`
+The hourly `ci-kube-agents-fleet-reconcile`
 periodic re-applies the stack in the projects the scan names
 (`docs/ci-pool-projects.md` §6.2), and the
 recovery comment follows the first scan after that apply, one to two hours
@@ -667,8 +671,9 @@ After `health.json` is uploaded, the same object is appended as one line to
 record per tick, oldest first, nothing trimmed). Each record is the
 `health.json` document verbatim — `schema_version`, `state`, `condition`,
 `since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
-`evidence`, `advice`, `recovering`, `stale`, `slow`, `pool`, `metrics`,
-`dashboard_url`, `generated_at` — plus `tick`, the ISO 8601 UTC time the line
+`evidence`, `advice`, `recovering`, `stale`, `slow`, `pool`, `fixture_state`,
+`periodics`, `periodics_read`, `periodics_since`, `metrics`, `dashboard_url`,
+`generated_at` — plus `tick`, the ISO 8601 UTC time the line
 was appended.
 `generated_at` is the data's horizon and `tick` the wall clock, so a stalled
 refresh shows as many ticks sharing one `generated_at`. GCS has no append: the

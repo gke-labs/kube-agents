@@ -3,8 +3,8 @@
 
 The pull sweep and the two seeded-fleet reconciles run on the build cluster and
 report nowhere but TestGrid. This module reads each one's latest finished build
-from the Prow archive (`latest-build.txt`, then `finished.json`, then the
-artifact the job wrote, if it writes one) and turns a failed or overdue run into
+from the bucket they log to, gs://kube-agents-periodic-logs (`latest-build.txt`,
+then `finished.json`, then the artifact the job wrote, if it writes one) and turns a failed or overdue run into
 a note health.py carries and post_health.py posts once, with the job's history
 link and, for the reconcile, the projects it refused or could not finish.
 
@@ -63,9 +63,13 @@ NOT_FOUND_PATTERNS = ("matched no objects", "no urls matched", "notfoundexceptio
 # GitHub Actions renders a line with this prefix as a workflow warning, as the
 # sibling pool-pressure step's `echo "::warning::..."` does.
 WARNING_PREFIX = "::warning::"
-# run()'s conventions for a binary that is missing and a call that timed out,
-# and argparse's exit for a bad command line.
+# argparse's exit for a bad command line.
 EXIT_USAGE = 2
+# One reading file per job, written by `fetch` and read by `load_readings`.
+READING_SUFFIX = ".json"
+# The detail line for a report that is present but not a JSON object: written
+# last, a signal can cut it, and no later tick can read it either.
+REPORT_UNREADABLE = "report unreadable: not a JSON object"
 SECONDS_PER_HOUR = 3600
 KEY_JOB = "job"
 KEY_BUILD = "build"
@@ -218,9 +222,12 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             KEY_RESULT: str(finished.get(KEY_RESULT) or ""),
         }
         if periodic.artifact:
-            # Absent is a run that wrote none; any other failure is unreadable
-            # and the tick is blind on this job, as for finished.json: a note
-            # is posted once, so one written without its projects stays so.
+            # Absent is a run that wrote none. Present but not a JSON object is
+            # a report cut short, which no later tick can read either, so the
+            # failure is posted with that said rather than never. Any other
+            # failure is unreadable and the tick is blind on this job, as for
+            # finished.json: a note is posted once, and one written without its
+            # projects would stay so.
             out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner=runner)
             artifact = None
             if out is not None:
@@ -229,10 +236,8 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
                 except ValueError:
                     loaded = None
                 if not isinstance(loaded, dict):
-                    # Present but cut short (the report is written last, and
-                    # a signal can cut the write): unreadable, as above.
-                    log(f"{WARNING_PREFIX}could not read {periodic.job}'s {build}/{periodic.artifact}: not a JSON object", file=sys.stderr)
-                    return None
+                    log(f"{WARNING_PREFIX}{periodic.job}'s {build}/{periodic.artifact} is not a JSON object; the note will say so", file=sys.stderr)
+                    loaded = {REPORT_KEY_ERROR: REPORT_UNREADABLE}
                 artifact = loaded
             elif not _not_found(err):
                 log(f"{WARNING_PREFIX}could not read {periodic.job}'s {build}/{periodic.artifact}: {err.strip()}", file=sys.stderr)
@@ -247,7 +252,7 @@ def fetch(out_dir: pathlib.Path, watched=WATCHED, runner=subprocess.run, log=pri
     out_dir.mkdir(parents=True, exist_ok=True)
     readings = {}
     for periodic in watched:
-        target = out_dir / f"{periodic.job}.json"
+        target = out_dir / f"{periodic.job}{READING_SUFFIX}"
         target.unlink(missing_ok=True)
         reading = read_job(periodic, runner, log)
         if reading is None:
@@ -263,7 +268,7 @@ def load_readings(directory: pathlib.Path | None, watched=WATCHED) -> dict[str, 
     if directory is None or not directory.is_dir():
         return readings
     for periodic in watched:
-        path = directory / f"{periodic.job}.json"
+        path = directory / f"{periodic.job}{READING_SUFFIX}"
         if not path.is_file():
             continue
         try:
@@ -333,7 +338,7 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
 def evidence(note: dict) -> str:
     if note[KEY_VERDICT] == VERDICT_STALE:
         if not note[KEY_FINISHED_AT]:
-            return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} finished at a time the archive does not give, so the {note[KEY_STALE_AFTER_H]}h window cannot be measured"
+            return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} finished at a time its finished.json does not give, so the {note[KEY_STALE_AFTER_H]}h window cannot be measured"
         return f"{note[KEY_LABEL]}: no finished run since {note[KEY_FINISHED_AT]} ({note[KEY_JOB]} has finished nothing in {note[KEY_STALE_AFTER_H]}h)"
     detail = f": {'; '.join(note[KEY_DETAIL])}" if note.get(KEY_DETAIL) else ""
     return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} failed at {note[KEY_FINISHED_AT]}{detail}"

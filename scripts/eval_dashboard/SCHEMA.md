@@ -124,7 +124,6 @@ the same layout and is collected from the moment it starts running.
   for a case whose every objective check is not applicable on that
   transport — does not parse and yields no entry, so such a case is missing
   from `tasks[]` rather than misfiled; the next-mode key is #2008's):
-
   - `result` — `pass` for `[PASSED]`, `fail` for `[FAILED]` **and**
     `[UNSTABLE]` (a multi-repetition case that passed some but not all
     graded repetitions is not a clean pass; `reps` carries the split),
@@ -899,9 +898,13 @@ a tick reads one and writes none, which is the episode ending.
 whose latest finished build failed (`verdict: FAILED`) or is older than the
 job's stale window, or carries no readable finish time (`STALE`): `{job, label, verdict, since, build,
 finished_at, result, stale_after_h, dry_run, detail[], history_url, doc}`,
-where `detail` names the projects the reconcile's artifact says it refused,
-failed or was interrupted in, and `since` is carried from the previous
-`health.json`. `periodics_read` names the jobs a reading arrived for this
+where `detail` (on `FAILED` only) names the projects the reconcile's artifact
+says it refused, failed or was interrupted in, up to five, then the run's own
+`error` line, which also says when the report was not a JSON object; `since` is
+carried from the previous `health.json`. That artifact, `fleet-reconcile.json`
+from `hack/fleet_reconcile.py --report`, is `{schema_version, mode, dry_run,
+started_at, finished_at, exit, exit_code, error, outcomes{project: {outcome,
+detail}}, summary}`; the reader uses `outcomes`, `error` and `dry_run`. `periodics_read` names the jobs a reading arrived for this
 tick, whether or not they are noted; the poster clears a told job only on a
 reading that shows it clean. `periodics_since` is each open note's start, kept
 for a job across the ticks with no reading for it (which write no note for it)

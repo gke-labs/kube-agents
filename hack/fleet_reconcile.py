@@ -22,6 +22,10 @@ are applied, and a plan with anything else (a destroy, a replace, a forget)
 is refused and named, because nothing this stack declares should ever need
 that on a re-apply, and a plan that does is a code change or an incident a
 person should look at first.
+
+`--report` writes fleet-reconcile.json (mode, dry run, exit, error, the
+per-project outcomes and a summary), under $ARTIFACTS when Prow sets it, for
+the CI health bot to read (scripts/eval_dashboard/periodics.py).
 """
 
 import argparse

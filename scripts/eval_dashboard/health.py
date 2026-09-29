@@ -14,10 +14,13 @@ a job.
 
 It is a pure function: data.json (schema v1, SCHEMA.md) plus the previously
 written health.json in -- and, when the hourly seeded-fleet scan has
-published one, fixture-state.json (scripts/eval_dashboard/fixture_state.py)
--- health.json out::
+published one, fixture-state.json (scripts/eval_dashboard/fixture_state.py),
+and the watched periodics' readings (`--periodics-dir`,
+scripts/eval_dashboard/periodics.py) -- health.json out (abridged; SCHEMA.md
+has every key)::
 
-    {state, since, cause, failing_cases, evidence, advice, slow, pool, metrics, generated_at}
+    {state, since, cause, failing_cases, evidence, advice, slow, pool,
+     fixture_state, periodics, periodics_read, periodics_since, metrics, generated_at}
 
 `state` is GREEN, DEGRADED or OUTAGE. The rules are the module-level
 constants below -- each names the incident it was tuned on -- and the state

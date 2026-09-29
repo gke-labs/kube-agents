@@ -11,8 +11,9 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # the state changes plus one digest a day (scripts/eval_dashboard/
 # post_health.py). docs/ci-health.md explains the states, the rules and the
 # advice each one carries. The data and the verdict are fresh together; the
-# one input fetched outside that collect is pool-pressure's hourly artifact
-# (#1607), and it is optional -- its absence just drops the queue-wait note.
+# two inputs fetched outside that collect, pool-pressure's hourly artifact
+# (#1607) and the watched periodics' latest builds, are optional -- an absence
+# just drops that note.
 # The order is adjudicate ->
 # upload health.json -> append history -> render -> publish -> post ->
 # comment, so the Brief a reader opens from a message already shows the
@@ -401,6 +402,9 @@ jobs:
       # warns, and neither fails the tick.
       - name: Fetch the watched periodics' latest builds
         continue-on-error: true
+        # Bounded: a hung read here would otherwise run into the job's
+        # 30-minute timeout, which cancels the verdict, the render and the post.
+        timeout-minutes: 5
         run: |
           mkdir -p work/periodics
           python3 scripts/eval_dashboard/periodics.py fetch --out-dir work/periodics

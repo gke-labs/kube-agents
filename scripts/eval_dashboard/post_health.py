@@ -26,12 +26,16 @@ at all (health.json's `fixture_state.unknown`, the bot's grant missing), the
 space is told once, and once more when the scan sees the fleet again. That
 is never a drift. The digest carries one line on the latest scan.
 
-A fifth, one line and once per episode: when health.json carries a `slow`
+A sixth, one line and once per episode: when health.json carries a `slow`
 note (the gate's green runs are taking far longer than usual, #1586), the
 space hears it the first tick it appears and not again until it has cleared
 and come back; the digest repeats the line while it lasts. It is not a state
 change -- nothing is broken and /retest does not help -- so it moves nothing
-else.
+else. A seventh pair, the pool note: once when the pool-pressure periodic
+reports runs waiting to be scheduled and once when they stop (KIND_POOL,
+KIND_POOL_CLEAR). An eighth pair, the watched Prow periodics (KIND_PERIODIC,
+KIND_PERIODIC_CLEAR): a failed run or a stopped job once per episode and
+verdict, and once when a told job passes again.
 
 Every time a reader sees is on the reader's clock: America/Toronto, written
 "7:30 AM ET", never UTC (the deep links and the state file keep ISO UTC).
@@ -899,7 +903,7 @@ def render_periodic(health: dict, prev: dict | None) -> str:
                 )
             else:
                 blocks.append(
-                    f"⚪ *{note['label']}: last run's finish time unreadable* — build {note['build']} finished, but the archive gives no time for it,"
+                    f"⚪ *{note['label']}: last run's finish time unreadable* — build {note['build']} finished, but its finished.json gives no time for it,"
                     f" so the {note['stale_after_h']}h window cannot be measured. Someone check the job.\n{note['history_url']}"
                 )
             continue
@@ -923,7 +927,7 @@ def periodic_digest_lines(health: dict) -> list[str]:
     lines = []
     for _, note in sorted((health.get("periodics") or {}).items()):
         if note.get("verdict") == periodics.VERDICT_STALE:
-            last = f"no finished run since {clock(parse_iso(note.get('finished_at')))}" if note.get("finished_at") else f"build {note['build']} finished at a time the archive does not give"
+            last = f"no finished run since {clock(parse_iso(note.get('finished_at')))}" if note.get("finished_at") else f"build {note['build']} finished at a time its finished.json does not give"
             lines.append(f"⚪ {note['label']}: {last}.")
         else:
             lines.append(f"🟠 {note['label']}: build {note['build']} failed {clock(parse_iso(note.get('finished_at')))}; {note['history_url']}")
