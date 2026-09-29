@@ -39,8 +39,8 @@ cards or the sandbox pods, or remove the INVENTORY files from one, step 4's
 handling of a board read that fails and of a sweep no worker picked up, the
 trap retrying a marker restore or a card listing that fails, the trap and the
 destroy carrying on past a failed step and naming it, the trap ignoring a
-second signal during its cleanup, and every exec into the agent Deployment
-bounding its wait for a pod. As in
+signal that arrives during its cleanup, and every exec into the agent
+Deployment bounding its wait for a pod. As in
 `test_autoops_incident_plant.py`, the provisioners are rendered the way
 Terraform renders them and run against a stub `kubectl`/`gcloud`/`sleep`. The
 reads in steps 1 and 2 also run on their own against a data directory, and
@@ -107,6 +107,11 @@ _DESTROY_INTERPOLATIONS = {
     "self.triggers.sandbox_selector": _INTERPOLATIONS["var.sandbox_selector"],
     "self.triggers.sandbox_container": _INTERPOLATIONS["var.sandbox_container"],
     "self.triggers.pod_wait": _INTERPOLATIONS["local.pod_wait"],
+    "self.triggers.home": _INTERPOLATIONS["local.home"],
+    "self.triggers.hermes": _INTERPOLATIONS["local.hermes"],
+    "self.triggers.python": _INTERPOLATIONS["local.python"],
+    "self.triggers.key_like": _INTERPOLATIONS["local.key_like"],
+    "self.triggers.inventory": _INTERPOLATIONS["local.inventory"],
 }
 
 # Records every call to $CALLS, tagging the in-pod Python by what it reads, and
@@ -172,8 +177,8 @@ elif "task_id=$1" in script:
     if bump("restores") < int(os.environ.get("RESTORE_FAILS", "0")):
         sys.stderr.write("error: unable to upgrade connection: container not found\n")
         sys.exit(1)
-    if os.environ.get("SIGNAL_ON_RESTORE") == "1":
-        os.kill(os.getppid(), signal.SIGTERM)
+    if os.environ.get("SIGNAL_ON_RESTORE"):
+        os.kill(os.getppid(), getattr(signal, "SIG" + os.environ["SIGNAL_ON_RESTORE"]))
 elif "rm" in cmd and "/opt/data/.bootstrap_scan_filed" in cmd:
     record("rearm")
 elif "rm" in cmd and "/opt/data/INVENTORY.md" in cmd:
@@ -287,6 +292,12 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         calls = self._calls.read_text().splitlines() if self._calls.exists() else []
         return completed, calls
 
+    def _clear(self):
+        """Forget the calls and state of an earlier _run in the same test."""
+        self._calls.unlink(missing_ok=True)
+        shutil.rmtree(self._state)
+        self._state.mkdir()
+
     @staticmethod
     def _indices(calls, needle):
         return [i for i, call in enumerate(calls) if call.endswith(needle)]
@@ -337,6 +348,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         }
         for state, message in refusals.items():
             with self.subTest(state=state):
+                self._clear()
                 completed, calls = self._run(STEP_1_STATE=state)
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(message, completed.stderr)
@@ -449,13 +461,16 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertNotIn("Cleanup incomplete", completed.stderr)
 
     def test_a_signal_during_the_trap_does_not_cut_its_cleanup_short(self):
-        completed, calls = self._run(GATE_FILES=0, RACE=1, SIGNAL_ON_RESTORE=1)
-        self.assertNotEqual(completed.returncode, 0)
-        restore = self._indices(calls, "[restore]")
-        archive = self._indices(calls, "archive t_raced [archive]")
-        self.assertEqual(len(restore), 1)
-        self.assertEqual(len(archive), 1, calls)
-        self.assertGreater(archive[0], restore[0])
+        for name in ("TERM", "INT"):
+            with self.subTest(signal=name):
+                self._clear()
+                completed, calls = self._run(GATE_FILES=0, RACE=1, SIGNAL_ON_RESTORE=name)
+                self.assertNotEqual(completed.returncode, 0)
+                restore = self._indices(calls, "[restore]")
+                archive = self._indices(calls, "archive t_raced [archive]")
+                self.assertEqual(len(restore), 1)
+                self.assertEqual(len(archive), 1, calls)
+                self.assertGreater(archive[0], restore[0])
 
     def test_the_trap_names_a_marker_restore_it_never_managed(self):
         completed, calls = self._run(GATE_FILES=0, RESTORE_FAILS=1000, NO_PODS=1)
