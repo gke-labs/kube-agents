@@ -34,8 +34,8 @@ real install:
      open, it never files that install's own sweep. So a failed read of what
      closed the gate stops the apply before step 2 changes anything.
 
-The rest pin step 1's refusals and step 4's handling of a board read that
-fails. As in `test_autoops_incident_plant.py`, the provisioner is rendered the
+The rest pin step 1's refusals, step 2 stopping when it cannot list the
+sandbox pods, and step 4's handling of a board read that fails. As in `test_autoops_incident_plant.py`, the provisioner is rendered the
 way Terraform renders it and run against a stub `kubectl`/`gcloud`/`sleep`.
 The reads in steps 1 and 2 also run on their own against a data directory, and
 step 4's board query against a sqlite board.
@@ -120,6 +120,9 @@ if argv[:1] == ["get"]:
         if "--field-selector=status.phase=Running" not in argv:
             print("pod/gw-evicted")
     elif "app=platform-agent-shell" in argv:
+        if os.environ.get("SANDBOX_LIST_FAIL") == "1":
+            sys.stderr.write("error: You must be logged in to the server (Unauthorized)\n")
+            sys.exit(1)
         print("pod/platform-agent-shell-0")
     sys.exit(0)
 
@@ -327,6 +330,12 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertEqual(len(self._indices(calls, "[old_id]")), 1)
         self.assertNotIn("Plant failed", completed.stderr)
         self.assertEqual([c for c in calls if c.endswith(("[rearm]", "[archive]", "[restore]"))], [])
+
+    def test_a_failed_sandbox_listing_stops_the_apply_before_the_marker_goes(self):
+        completed, calls = self._run(SANDBOX_LIST_FAIL="1")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Plant failed", completed.stderr)
+        self.assertEqual(self._indices(calls, "[rearm]"), [])
 
     def test_the_trap_waits_out_the_ceiling_when_no_gateway_pod_is_listed(self):
         completed, calls = self._run(GATE_FILES=0, NO_PODS=1, RACE=0)

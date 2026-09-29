@@ -204,11 +204,14 @@ resource "null_resource" "sweep" {
       sweep_id() {
         agent sh -c 'sed -n "s/^task_id=//p" ${local.home}/.bootstrap_scan_filed 2>/dev/null; true' || true
       }
-      # Unlike the destroy's copy, a failed rm fails the apply: the sandbox's
-      # /opt/data outlives its pod, and a report left there makes the sweep
-      # skip discovery (agents/platform/governance/inventory.md).
+      # Unlike the destroy's copy, a failed listing or rm fails the apply: the
+      # sandbox's /opt/data outlives its pod, and a report left there makes
+      # the sweep skip discovery (agents/platform/governance/inventory.md).
+      # errexit does not see a failure inside a `for` word list, hence the
+      # assignment.
       clear_inventory() {
-        for pod in $(kubectl get pods -n "${var.agent_namespace}" -l "${var.sandbox_selector}" -o name); do
+        sandbox_pods="$(kubectl get pods -n "${var.agent_namespace}" -l "${var.sandbox_selector}" -o name)"
+        for pod in $sandbox_pods; do
           kubectl exec -n "${var.agent_namespace}" "$pod" -c "${var.sandbox_container}" -- rm -f ${local.inventory}
         done
         agent rm -f ${local.inventory}
