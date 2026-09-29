@@ -119,6 +119,30 @@ esac
         self.assertTrue(expected <= listed, f"nullable strings missing from the sweep: {expected - listed}")
         self.assertIn("project_id", listed)
 
+    def test_every_swept_name_is_a_declared_variable(self):
+        """The sweep greps lifecycle.sh for `$(tfvar <name>)`, and the grep does
+        not know a comment from code. A name written out inside one -- an
+        illustrative `$(tfvar x)` explaining the helper -- joins the sweep and
+        reds the check on a real terraform with "an input variable with the name
+        x has not been declared". That failure needs terraform, so CI is the
+        first place it shows; this case catches it from the list mode alone."""
+        variables_tf = (_REPO_ROOT / "terraform" / "examples" / "full-install" / "variables.tf").read_text()
+        declared = set(re.findall(r'^variable "([^"]+)" \{', variables_tf, re.M))
+        self.assertIn("project_id", declared)
+        result = subprocess.run(
+            ["bash", str(_SCRIPT), "--list"],
+            capture_output=True, text=True, cwd=str(_REPO_ROOT),
+            env=get_isolated_test_env(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        listed = set(result.stdout.split())
+        self.assertTrue(listed, "the list mode swept nothing")
+        self.assertEqual(
+            listed - declared, set(),
+            "swept names that variables.tf does not declare; a terraform console "
+            "cannot evaluate them, so the check reds in CI",
+        )
+
     def test_a_populated_list_shape_fails(self):
         """tfvar keeps the last line of a multi-line console value, so a
         populated list reaches the check as `])`."""

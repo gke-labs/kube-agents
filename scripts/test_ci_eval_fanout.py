@@ -114,6 +114,10 @@ class QueueOrderTest(unittest.TestCase):
         body = "\n".join(
             [
                 lifted("unit_cost_hint"),
+                # The queue leaves out the cases that request a pull request
+                # (the inject lane's second phase); with the list unset every
+                # task is in this queue, as on the api lane.
+                lifted("unit_phase"),
                 f"EVAL_REPETITIONS={reps}",
                 # compliance carries a 1000 hint, the probe 200: order within a
                 # repetition must be cost-descending.
@@ -271,6 +275,10 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             # The one constant the unit reads from the script's top: the base
             # of its per-unit inject port.
             lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+            # The unit resolves the task file it hands the bench through
+            # this helper (the inject lane's copy, or the file under
+            # bench/tasks/); with no lane directory set it is the identity.
+            lifted("unit_task_path"),
             lifted("run_one_unit"),
             self.UNIT_STUBS,
             extra,

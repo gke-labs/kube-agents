@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import os
 import pathlib
 import shutil
@@ -179,6 +180,108 @@ class TestCallback(unittest.TestCase):
         parts = self._run(data)["messages"][0]["content"]
         self.assertRegex(parts[0]["text"], r"^node \[ip:[0-9a-f]{12}\]$")
         self.assertEqual(parts[1], image)
+
+    def test_tool_call_arguments_are_redacted_and_stay_valid_json(self) -> None:
+        arguments = json.dumps(
+            {
+                "command": f"curl -H 'Authorization: Bearer {_OAUTH_TOKEN}' http://10.0.0.5/",
+                "env": ["DB_URL=postgres://app:hunter2-example-pw@db.internal/x"],
+                "timeout": 30,
+            }
+        )
+        untouched = json.dumps({"command": "kubectl get pods -n shop"})
+        data = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "a", "type": "function", "function": {"name": "t", "arguments": arguments}},
+                        {"id": "b", "type": "function", "function": {"name": "t", "arguments": untouched}},
+                    ],
+                }
+            ]
+        }
+        with self.assertLogs(self.module.logger, level="INFO") as captured:
+            calls = self._run(data)["messages"][0]["tool_calls"]
+        redacted = json.loads(calls[0]["function"]["arguments"])
+        self.assertRegex(redacted["command"], r"Bearer \[REDACTED_SECRET\]' http://\[ip:[0-9a-f]{12}\]/$")
+        self.assertEqual(redacted["env"], ["DB_URL=postgres://app:[REDACTED_SECRET]@db.internal/x"])
+        self.assertEqual(redacted["timeout"], 30)
+        # Arguments with nothing to redact keep their exact bytes.
+        self.assertEqual(calls[1]["function"]["arguments"], untouched)
+        self.assertIn("credential=2", captured.output[0])
+        self.assertIn("ip=1", captured.output[0])
+
+    def test_tool_call_arguments_are_redacted_by_key_name_as_well_as_by_shape(self) -> None:
+        # The model copies what it read into its own calls; a key name is often
+        # the only thing that says a value is a credential.
+        shapes = [
+            ({"password": "hunter2-example-pw"}, {"password": "[REDACTED_SECRET]"}),
+            (
+                {"env": [{"name": "DB_PASSWORD", "value": "hunter2-example-pw"}]},
+                {"env": [{"name": "DB_PASSWORD", "value": "[REDACTED_SECRET]"}]},
+            ),
+            (
+                {"object": {"kind": "Secret", "data": {"db-pass": "aHVudGVy"}}},
+                {"object": {"kind": "Secret", "data": {"db-pass": "[REDACTED_SECRET]"}}},
+            ),
+        ]
+        for arguments, expected in shapes:
+            with self.subTest(arguments=arguments):
+                data = {
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "tool_calls": [{"function": {"name": "t", "arguments": json.dumps(arguments)}}],
+                        }
+                    ]
+                }
+                call = self._run(data)["messages"][0]["tool_calls"][0]
+                self.assertEqual(json.loads(call["function"]["arguments"]), expected)
+
+    def test_tool_call_arguments_are_forwarded_redacted_even_when_the_counts_net_zero(self) -> None:
+        # A private-key block that already holds a marker: masking it swaps
+        # one marker for another, so the count does not move, but the body
+        # must still not go out.
+        command = (
+            "echo '-----BEGIN RSA PRIVATE KEY-----\n[REDACTED_SECRET]\nMIIEowIBAAKCAQEA\n"
+            "-----END RSA PRIVATE KEY-----'"
+        )
+        data = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"function": {"name": "t", "arguments": json.dumps({"cmd": command})}}],
+                }
+            ]
+        }
+        call = self._run(data)["messages"][0]["tool_calls"][0]
+        self.assertNotIn("MIIEowIBAAKCAQEA", call["function"]["arguments"])
+
+    def test_tool_call_arguments_sent_as_an_object_are_walked(self) -> None:
+        data = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"function": {"name": "t", "arguments": {"api_key": "abcd1234efgh"}}}],
+                }
+            ]
+        }
+        call = self._run(data)["messages"][0]["tool_calls"][0]
+        self.assertEqual(call["function"]["arguments"], {"api_key": "[REDACTED_SECRET]"})
+
+    def test_tool_call_arguments_that_are_not_json_are_redacted_as_text(self) -> None:
+        data = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"function": {"name": "t", "arguments": "{truncated 10.0.0.5"}}],
+                }
+            ]
+        }
+        call = self._run(data)["messages"][0]["tool_calls"][0]
+        self.assertRegex(call["function"]["arguments"], r"^\{truncated \[ip:[0-9a-f]{12}\]$")
 
     def test_embeddings_input_is_redacted_as_a_string_and_as_a_list(self) -> None:
         single = self._run({"input": "reach 10.0.0.5"}, "embeddings")

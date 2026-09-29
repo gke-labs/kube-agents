@@ -50,7 +50,7 @@ The release-pinned script upgrades to its own version, so you pass no tag. It re
 checkout in `$HOME/kube-agents`, moving it to the release you asked for, and reads the `install.env`
 in it. A checkout with uncommitted changes is left alone and the run stops rather than upgrading
 from sources that do not match the release. Only a release copy is flagless: a copy built from
-`main` carries no version and asks for one, so name a release tag in the URL rather than a branch.
+`main` carries no version and asks for one, so name a release tag in the URL rather than `main`.
 
 The release bundle is the other supported source, and the one to use on a machine with no install
 checkout:

@@ -378,7 +378,8 @@ litellm:
   # default: on, the ConfigMap also carries the shared redactor module and a
   # LiteLLM pre-call hook, mounted beside /app/config.yaml, and the hook runs
   # the built-in credential patterns plus the rules below over messages,
-  # embeddings input and completion prompts before the provider sees them.
+  # tool-call arguments, embeddings input and completion prompts before the
+  # provider sees them.
   # Request bodies only: responses, tool results on disk and chat egress are
   # not covered. The concepts/inference-gateway page on the site owns the
   # model, including why a pseudonymised identifier is one the agent can no
@@ -590,6 +591,20 @@ platformAgent:
   # entry that is not a namespace name (a lowercase RFC 1123 label) fails the
   # render too.
   annotations: {}
+  # GKE managed-Prometheus PodMonitoring for the gateway pod, where the
+  # k8s-event-watcher serves its metrics on the agent-api-auth sidecar's
+  # event-metrics port (9095). The operator's gateway NetworkPolicy admits the
+  # collector on that port whatever this is set to; this decides only whether a
+  # scrape is configured. A tri-state: null (the default) renders it when the
+  # cluster serves monitoring.googleapis.com/v1/PodMonitoring, which is where
+  # Managed Prometheus is installed, and renders nothing elsewhere, so an
+  # install on a cluster without the CRD upgrades without setting anything.
+  # true renders it regardless and fails at apply time where the CRD is
+  # absent, the caveat litellm.podMonitoring carries; false never renders it.
+  # helm template alone has no cluster to ask: pass
+  # --api-versions monitoring.googleapis.com/v1/PodMonitoring to see the
+  # default render.
+  podMonitoring: null
   harness:
     # Required — the install fails fast when these are left empty.
     clusterName: ""

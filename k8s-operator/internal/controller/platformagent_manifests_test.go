@@ -6796,3 +6796,60 @@ func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
 		})
 	}
 }
+
+// The watcher's metrics listener, declared on the sidecar. Three things have
+// to agree for a scrape to work — the port the entrypoint binds, the container
+// port, and the collector's ingress rule — and all three read one constant.
+// This pins the constant's value and checks the two declarations here read it;
+// the ingress rule is TestBuildNetworkPolicy's.
+func TestAgentAPIAuthSidecarDeclaresTheWatcherMetricsPort(t *testing.T) {
+	sidecar := buildAgentAPIAuthSidecar(newTestPlatformAgent(), "/opt/data")
+
+	var ports []corev1.ContainerPort
+	for _, p := range sidecar.Ports {
+		if p.Name == "event-metrics" {
+			ports = append(ports, p)
+		}
+	}
+	if len(ports) != 1 || ports[0].ContainerPort != 9095 {
+		t.Fatalf("want exactly one event-metrics container port on 9095, got %#v", sidecar.Ports)
+	}
+
+	var found []corev1.EnvVar
+	for _, e := range sidecar.Env {
+		if e.Name == "EVENT_WATCHER_METRICS_PORT" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_METRICS_PORT entry, got %d (%#v)", len(found), found)
+	}
+	if found[0].Value != "9095" {
+		t.Errorf("EVENT_WATCHER_METRICS_PORT = %q, want the declared container port 9095", found[0].Value)
+	}
+}
+
+// Same hole as the three watcher variables beside it: appended after the merge,
+// so an unreserved name would sit beside a same-named spec.deployment.env entry
+// and server-side apply would reject the Deployment. And a CR that moved the
+// listener would leave the container port and the ingress rule pointing at a
+// port nothing answers on, so the operator's value has to be the only one.
+func TestDeploymentEnvCannotMoveTheWatcherMetricsPort(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "EVENT_WATCHER_METRICS_PORT", Value: "1"}},
+	}
+
+	var found []string
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		if e.Name == "EVENT_WATCHER_METRICS_PORT" {
+			found = append(found, e.Value)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_METRICS_PORT entry, got %d (%q); server-side apply rejects a duplicate key in env", len(found), found)
+	}
+	if found[0] != "9095" {
+		t.Errorf("spec.deployment.env moved the watcher's metrics port to %q", found[0])
+	}
+}

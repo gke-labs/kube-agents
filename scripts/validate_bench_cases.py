@@ -121,7 +121,10 @@ SANITIZER_REASON_STRIP = " \t\r-:"
 # key/value and e-mail patterns are deliberately absent: each matches ordinary
 # prose in a prompt ("the token the workload presents", an address in an
 # expected_output), and a check that reds prose is a check that gets escaped
-# by reflex. The value is the reader-facing name for the finding.
+# by reflex. The env-pair and URL-password patterns are absent too: they match
+# structure (an env list, `scheme://user:pw@`), which a fixture's sample
+# manifests and connection strings carry on purpose, not a token shape. The
+# value is the reader-facing name for the finding.
 REDACTOR_FILE = REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "common" / "redactor.py"
 REDACTOR_CLASS = "AuditRedactor"
 # The name the redactor module is registered under when loaded from its file;
@@ -136,6 +139,8 @@ CREDENTIAL_SHAPES: dict[str, str] = {
     "SLACK_TOKEN_PATTERN": "a Slack token",
     "JWT_PATTERN": "a JWT",
     "OPENAI_TOKEN_PATTERN": "an sk- API key",
+    "PREFIXED_SK_TOKEN_PATTERN": "an Anthropic or hyphenated OpenAI key",
+    "AWS_ACCESS_KEY_ID_PATTERN": "an AWS access key id",
 }
 
 # Cases that are neither in TASKS nor nightly-tiered, on purpose, for now.
@@ -163,6 +168,13 @@ KNOWN_UNREGISTERED = {
 # the issue; the entry goes when the fixture lands and the case moves to the
 # nightly file in the same pull request.
 FIXTURE_NOT_READY = {
+    "b-0011-gitops": (
+        "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
+        "and its credentials in the pool projects (the case takes the repository, "
+        "the project and the agent host as inputs and CI has none to give), so "
+        "no CI tier can run it yet; run it locally "
+        "with bench/hack/run-gitops-pilot.sh"
+    ),
     "scope-second-project-denied": (
         "#1865: needs a second GCP project per pool project, declared in the "
         "harness install's spec.scope.projects, whose listing the agent's service "
@@ -267,6 +279,11 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
+    # Likewise: "the run wrote to the GitOps repository since it started" is
+    # the assertion, and every field narrows it. The inject lane appends it
+    # to every case it runs (hack/eval/inject-lane-safeguards.yaml); a case
+    # may also declare it.
+    "github_writes": (),
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns"),
     "worker_agents": ("required_agents",),

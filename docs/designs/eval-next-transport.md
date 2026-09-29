@@ -396,6 +396,28 @@ subject for a trailing `cancel` and finalizes `canceled-before-start` when it fi
 cancel already in the stream is honoured without a spawn, was decided the same day and is
 tracked as its own issue.
 
+**What the lane grades (decided 2026-09-28 on gke-labs/kube-agents#2037).** Through the inject
+door the eval addresses the platform persona directly, with the `platform_toolsets.cli` bundle:
+`terminal`, `read_file`, `patch`, `process_manage`, `execute_code`, `delegate_task` and every
+MCP tool the install carries. That is a different agent from the one today's evals reach. The api transport posts to
+the API server, which runs the default profile, the Planning Agent: its model-facing tools are the
+kanban set, it delegates fleet work to the platform persona over a card, and it relays the
+worker's report. Same prompt, two agents reading it: `obtainability-remediation-proposal` is 12
+of 12 on the first, where the Planning Agent inlines a manifest, and was 0 of 3 on the second,
+where the persona follows its own rule and opens a pull request. The lane's record is therefore
+the platform persona's, and parity in [#2007](https://github.com/gke-labs/kube-agents/issues/2007)
+(phase 2) is that persona's record being acceptable per case and stable across the on-demand
+runs, not the api lane's numbers; the first run's 94.4% against 77.8% is withdrawn as a
+like-for-like comparison. Two things follow for the lane. A case that grades the delegation
+composition rather than the executor's answer gets a persona-aware check or leaves the lane
+through the exclusion list with its reason. And the lane carries a safeguard of its own, applied
+by the CI flag's script to every case it runs (`hack/eval/inject-lane-safeguards.yaml`, a
+none-wrapped `github_writes` at catastrophic severity over the leased project's GitOps
+repository), because the persona can open a pull request where the cluster safeguards see
+nothing, and the first run left several on the pool repository that no case had asked for. The
+lane moves to the session agent's front door when the delegation primitive lands, and the
+classification says which cases regain their delegation checks then.
+
 ### The direct-bus transport, kept as a diagnostic
 
 `AGENT_TRANSPORT=a2a` has the harness stand in for the gateway: port-forward the NATS Service
@@ -554,10 +576,18 @@ three are set on the operator, because its defaults point at a registry the pool
 pull from. Under the same flag
 `hack/ci-eval-pr.sh` runs the matrix through the door: it exports `AGENT_TRANSPORT=inject` and
 `AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door, and
-changes nothing else about the run except the matrix itself, from which the inject lane's
-exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather than
-on this flag) then leaves out the cases whose premise needs the chat front door. With the flag
-unset both scripts are byte for byte what they were, and the presubmit's own tests hold that.
+changes nothing else about the run except what hangs off that transport switch: the inject
+lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather
+than on this flag) leaves out the cases whose premise needs the chat front door; the lane's
+safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scratch copy of every
+remaining task file, which the unit hands devops-bench, over the leased project's GitOps
+repository exported as `BENCH_GITOPS_REPO` (the lane refuses to start without one), with the
+cases that request a pull request run in a second phase after every other unit, one at a time
+and each after a settle, so no repetition that requests nothing shares the repository with one
+that writes by design and no window reaches back into the unit before; and after the
+fan-out the script lists in the job log what the run left on that repository, closing nothing.
+With the flag unset both scripts are byte for byte what
+they were, and the presubmit's own tests hold that.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.

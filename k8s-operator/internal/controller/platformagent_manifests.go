@@ -97,6 +97,17 @@ const (
 	// only kubelet's port-forward can reach.
 	dashboardPort        = 9119
 	tmpScratchVolumeName = "tmp-scratch"
+	// eventWatcherMetricsPort is where the k8s-event-watcher in the agent-api-auth
+	// sidecar serves Prometheus metrics. One constant for the container port, the
+	// EVENT_WATCHER_METRICS_PORT value the entrypoint turns into --metrics-addr,
+	// and the NetworkPolicy rule that admits the managed-Prometheus collector, so
+	// the listener and the declarations that make it reachable cannot name
+	// different ports. The chart's PodMonitoring scrapes it by number, and
+	// tests/test_chart_platform_agent_monitoring.py holds that number to the
+	// golden rendering of this one.
+	eventWatcherMetricsPort     int32 = 9095
+	eventWatcherMetricsPortName       = "event-metrics"
+	eventWatcherMetricsPortEnv        = "EVENT_WATCHER_METRICS_PORT"
 
 	// sandboxUID is the canonical unprivileged 'hermes' runtime user created in
 	// the upstream NousResearch/hermes-agent Dockerfile (line 92). Everything the
@@ -3654,6 +3665,15 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 	// same-named entry in spec.deployment.env, it would sit beside it, and
 	// server-side apply refuses a duplicate key in `env`.
 	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_ENABLED", Value: strconv.FormatBool(eventWatcherEnabled(agent))})
+	// The port the watcher serves Prometheus metrics on, which the entrypoint
+	// passes as --metrics-addr. From the constant that also declares the
+	// container port below and the collector's ingress rule in
+	// buildNetworkPolicy, so the listener, the declaration and the policy cannot
+	// name three different ports. Appended after mergeCredentialProxyEnv and
+	// reserved there like the three watcher variables above — and for one more
+	// reason: a CR that moved the listener would leave the container port and
+	// the policy pointing at a port nothing answers on.
+	envVars = append(envVars, corev1.EnvVar{Name: eventWatcherMetricsPortEnv, Value: strconv.Itoa(int(eventWatcherMetricsPort))})
 	// The drift-detector's switch, the second peer process in this container.
 	// Written on every reconcile rather than only when on, for the reason the
 	// watcher's block above gives: the pod stays Ready either way, so the Deployment
@@ -3699,7 +3719,11 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		// deploy/shared/start-services.sh.
 		Command: []string{"/usr/local/bin/start-services"},
 		Env:     envVars,
-		Ports:   []corev1.ContainerPort{{Name: "proxy-api", ContainerPort: 8643}},
+		Ports: []corev1.ContainerPort{
+			{Name: "proxy-api", ContainerPort: 8643},
+			// The watcher's /metrics, for the chart's PodMonitoring (see eventWatcherMetricsPort).
+			{Name: eventWatcherMetricsPortName, ContainerPort: eventWatcherMetricsPort},
+		},
 		// TCP, not the HTTP probe the credential proxy uses. Every path on this
 		// listener requires the bearer key, so an unauthenticated GET is a 401
 		// whether the pod is healthy or not, and there is no /healthz to ask
@@ -4057,7 +4081,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
 		"CREDENTIAL_PROXY_WORKSPACE_ROOT",
-		// These nine are appended by buildAgentAPIAuthSidecar after this merge
+		// These ten are appended by buildAgentAPIAuthSidecar after this merge
 		// runs, so none is in `managed` above and none reserves its own name.
 		// Without them here a same-named entry in spec.deployment.env is kept
 		// and the operator's is appended alongside it — two entries with one
@@ -4067,6 +4091,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"EVENT_WATCHER_CLUSTER_NAME",
 		"EVENT_WATCHER_ENABLED",
 		eventWatcherMemoryLimitEnv,
+		eventWatcherMetricsPortEnv,
 		driftDetectorEnabledEnv,
 		driftDetectorProjectEnv,
 		driftDetectorLocationEnv,
@@ -5637,6 +5662,26 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			Port:     ptr.To(intstr.FromInt32(dashboardPort)),
 		})
 	}
+
+	// The managed-Prometheus collector, scraping the event watcher's metrics
+	// port on the agent-api-auth sidecar. A rule of its own rather than a port
+	// on the first: that rule admits every pod in the agent's namespace, and the
+	// collector lives in gke-gmp-system, which a bare podSelector never reaches.
+	// The same shape as the LiteLLM policy's scrape rule
+	// (buildLiteLLMNetworkPolicy), for the same collector. Unconditional, like
+	// the container port it pairs with: the chart's PodMonitoring is what an
+	// install switches off, and a policy that admitted nothing on the port
+	// would make this rule the reason a scrape fails rather than that switch.
+	ingressRules = append(ingressRules, networkingv1.NetworkPolicyIngressRule{
+		From: []networkingv1.NetworkPolicyPeer{
+			{
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+				},
+			},
+		},
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(eventWatcherMetricsPort)},
+	})
 
 	dnsPeers := clusterDNSPeers(dnsIPs)
 

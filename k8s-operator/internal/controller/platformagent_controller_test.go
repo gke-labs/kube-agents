@@ -1171,11 +1171,23 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	if len(netpol.Spec.PolicyTypes) != 2 {
 		t.Errorf("expected 2 PolicyTypes, got %d", len(netpol.Spec.PolicyTypes))
 	}
-	if len(netpol.Spec.Ingress) != 1 {
-		t.Fatalf("expected 1 Ingress rule, got %d", len(netpol.Spec.Ingress))
+	if len(netpol.Spec.Ingress) != 2 {
+		t.Fatalf("expected 2 Ingress rules (the agent namespace, the managed-Prometheus collector), got %d", len(netpol.Spec.Ingress))
 	}
 	if len(netpol.Spec.Ingress[0].Ports) != 3 {
 		t.Errorf("expected 3 ports in agent namespace ingress rule when dashboard enabled, got %d", len(netpol.Spec.Ingress[0].Ports))
+	}
+	// The collector's rule: the watcher's metrics port alone, from the
+	// gke-gmp-system namespace and nothing narrower, matching the LiteLLM
+	// policy's scrape rule for the same collector.
+	scrape := netpol.Spec.Ingress[1]
+	if len(scrape.Ports) != 1 || scrape.Ports[0].Port == nil || scrape.Ports[0].Port.IntVal != 9095 {
+		t.Errorf("expected the collector ingress rule to admit port 9095 alone, got %v", scrape.Ports)
+	}
+	if len(scrape.From) != 1 || scrape.From[0].NamespaceSelector == nil ||
+		scrape.From[0].NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "gke-gmp-system" ||
+		scrape.From[0].PodSelector != nil {
+		t.Errorf("expected the collector ingress rule to admit every pod in gke-gmp-system, got %v", scrape.From)
 	}
 	if len(netpol.Spec.Egress) != 12 {
 		t.Errorf("expected 12 Egress rules (DNS, GCP Metadata port 80, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API, shell sandbox sshd, credential broker), got %d", len(netpol.Spec.Egress))
@@ -1284,8 +1296,8 @@ func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
 	}
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
-	if len(netpol.Spec.Ingress) != 1 {
-		t.Fatalf("expected 1 Ingress rule, got %d", len(netpol.Spec.Ingress))
+	if len(netpol.Spec.Ingress) != 2 {
+		t.Fatalf("expected 2 Ingress rules (the agent namespace, the managed-Prometheus collector), got %d", len(netpol.Spec.Ingress))
 	}
 	if len(netpol.Spec.Ingress[0].Ports) != 2 {
 		t.Errorf("expected 2 ports in agent namespace ingress rule when dashboard disabled, got %d", len(netpol.Spec.Ingress[0].Ports))

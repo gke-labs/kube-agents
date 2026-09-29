@@ -718,6 +718,89 @@ def test_the_channel_absence_phrase_keeps_its_preposition():
         assert "aged out of" not in verifiers._normalize(innocent)
 
 
+# ------------------ the capacity probe's shipped phrase list
+
+# Third of the same shape. The 2026-09-29 widening (#1493) added two spellings
+# after the 2026-09-26 nightly (build 2103635793695215616, rep 2) failed a
+# reply the OutcomeValidity judge had scored 1.00. Read out of the task file,
+# never copied.
+_CAPACITY_PROBE = TASKS / "capacity-pinned-pool-probe" / "task.yaml"
+_CEILING_OBJECTIVE = "the-probe-states-the-replica-ceiling"
+
+# Verbatim `output` field of that record, wrapping aside -- _normalize
+# collapses it. The ceiling sits inside a parenthetical, the value in
+# backticks: "(with a maximum limit of `10`)".
+_CEILING_AS_A_MAXIMUM_LIMIT = """🔀 Delegated to the **platform** agent
+
+I've started this as task `t_3293aca1`. The answer will post into this thread as soon as it's ready.
+
+The task has finished successfully. Here is the full result from the `platform` agent:
+
+The `inference-server` workload is running in the **seeded-a** cluster, but its node pool cannot absorb additional load because it is hard-capped at 1 node.
+
+## Why
+- **Node pool max reached:** The workload is scheduled onto `pinned-inference-pool` via node selector `seeded-role: pinned-inference`. This node pool has cluster autoscaling enabled, but its `maxNodeCount` is currently set to `1`.
+- **HPA is ready to scale:** The `inference-server` HPA is currently requesting `5` replicas (with a maximum limit of `10`), but 4 of those pods are stuck in `Pending` because the single `e2-small` node in the pool does not have enough CPU to schedule them.
+
+## What to do
+- Increase the `maxNodeCount` on the `pinned-inference-pool` node pool in cluster [seeded-a](https://console.cloud.google.com/kubernetes/clusters/details/us-central1-a/seeded-a?project=kube-agents-evals-6) to allow the cluster autoscaler to add more nodes.
+"""
+
+# A reply that names the pool and words the container's resource limits the
+# way the same agent's crashloop replies do ("memory limit of 64Mi", nine
+# times in the week the widening was measured over) but never states the
+# HPA ceiling. This is the run the objective exists to fail, and the wording
+# a bare "limit of 10" would have rescued.
+_RESOURCE_LIMITS_BUT_NO_CEILING = """The `inference-server` pods on `pinned-inference-pool` are Pending. The
+container has a CPU request of 400m with a limit of 100m headroom left on the
+node, and a strict memory limit of 64Mi; the pool's autoscaler is capped at
+its current size. Do not change anything until the HPA settings are reviewed.
+"""
+
+# Proposed with the two that shipped and cut for matching the reply above.
+_PHRASES_CUT_FOR_MATCHING_A_RESOURCE_LIMIT = ["limit of 10"]
+
+
+def _capacity_probe_check() -> dict:
+    spec = yaml.safe_load(_CAPACITY_PROBE.read_text())
+    entries = [e for e in spec["verification_spec"] if e["name"] == _CEILING_OBJECTIVE]
+    assert len(entries) == 1, f"{_CEILING_OBJECTIVE} is not in {_CAPACITY_PROBE.name}"
+    check = entries[0]["check"]
+    # A floor, not the current count, for the reason the two blocks above give.
+    assert len(check.get("any_of_phrases") or []) >= 8, check
+    return check
+
+
+def _capacity_verdict(report: str) -> str:
+    transcript.set(report, [])
+    v = parse_node(_capacity_probe_check())
+    assert isinstance(v, ReportContainsVerifier)
+    return v.verify(5.0).status
+
+
+def test_the_shipped_list_accepts_the_ceiling_as_a_maximum_limit():
+    """The 2026-09-26 rep-2 reply, through the shipped check and the shipped
+    normalization: the backticks around the value are stripped before the
+    substring test, and "maximum limit of 10" is in the list."""
+    assert _capacity_verdict(_CEILING_AS_A_MAXIMUM_LIMIT) == "pass"
+
+
+def test_the_shipped_list_still_fails_a_resource_limit_reply_with_no_ceiling():
+    """The direction that matters: a reply full of "limit of <quantity>" that
+    never states the HPA's cap stays failed."""
+    assert _capacity_verdict(_RESOURCE_LIMITS_BUT_NO_CEILING) == "fail"
+
+
+@pytest.mark.parametrize("phrase", _PHRASES_CUT_FOR_MATCHING_A_RESOURCE_LIMIT)
+def test_a_phrase_that_matches_a_resource_limit_stays_out_of_the_list(phrase):
+    """Why the bare phrase is absent, not just that it is: it sits inside the
+    no-ceiling reply. If a later edit stops that reply saying it, the first
+    assertion becomes arbitrary and this one says so."""
+    shipped = _capacity_probe_check()["any_of_phrases"]
+    assert phrase not in shipped
+    assert verifiers._normalize(phrase) in verifiers._normalize(_RESOURCE_LIMITS_BUT_NO_CEILING)
+
+
 def test_forbidden_phrase_is_normalized_too():
     """Emphasis must not be a way to smuggle a forbidden phrase past."""
     _stash("the fix will cost **$40** a month")

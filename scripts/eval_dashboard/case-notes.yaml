@@ -29,5 +29,7 @@ notes:
     issues: ["#998", "#985", "#1171", "#2013"]
   gpu-stress-test-diagnosis:
     note: reuse regression under investigation
+  pdb-remediation-pr:
+    issues: ["#2016"]
   security-overgrant-remediation-proposal:
     note: new case, earning its record

@@ -108,8 +108,9 @@ fi
 
 # ─── Chart ───────────────────────────────────────────────────────────────────
 # harness.location=kind tells the operator there is no GKE cluster: the
-# credential proxy uses the cluster it runs in. No gVisor, no PodMonitoring,
-# one small LiteLLM replica.
+# credential proxy uses the cluster it runs in. No gVisor; no PodMonitoring
+# (LiteLLM's is switched off, the gateway's follows the cluster and kind serves
+# no such API); one small LiteLLM replica.
 log "installing the chart"
 helm --kube-context "${CONTEXT}" upgrade --install kube-agents "${REPO_ROOT}/charts/kube-agents" \
   --namespace "${NAMESPACE}" --create-namespace \

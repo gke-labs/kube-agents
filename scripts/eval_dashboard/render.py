@@ -229,7 +229,7 @@ DEMOTED_RE = re.compile(r"\bdemoted (\d{4}-\d{2}-\d{2})")
 # A case's roster status on the Cases page (the pill) and on the Grid (which
 # rows are blocking). The words the pages print for each live in pages.js.
 STATUS_BLOCKING = "blocking"  # active and in hack/eval/blocking-roster.txt
-STATUS_HELD_OUT = "held_out"  # active, never admitted (or no date on record)
+STATUS_HELD_OUT = "held_out"  # active, never admitted (or no date on record): pdb-remediation-pr, seat opened 2026-09-28, #2016
 # Off the roster with a demotion date on the roster page -- nightly-only
 # since 2026-09-22 (#1023: the presubmit runs the roster only), or active as
 # a held-out presubmit seat (the compliance canary since 2026-09-29, #2013).

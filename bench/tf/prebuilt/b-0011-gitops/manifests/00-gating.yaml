@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edge
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ledger
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ledger-guard-deny
+  namespace: ledger
+  labels:
+    netpol-family: ledger-guard
+    owner: ledger-team
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ledger-guard-allow
+  namespace: ledger
+  labels:
+    netpol-family: ledger-guard
+    owner: ledger-team
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: payments
+      ports:
+        - port: 80
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: payments-quota
+  namespace: payments
+  labels:
+    owner: platform-team
+  annotations:
+    governance.acme.io/owner: platform-team
+    governance.acme.io/ticket: https://tickets.acme.internal/CAP-418
+spec:
+  hard:
+    requests.memory: 832Mi

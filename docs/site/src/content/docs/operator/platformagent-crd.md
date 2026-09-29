@@ -127,6 +127,8 @@ when the provider is Hindsight-backed (`--memory=hindsight`), and nothing when i
 The `k8s-event-watcher` runs in the gateway pod's `agent-api-auth` sidecar, streams warning events
 from every managed cluster, and posts each surviving incident to the pod-local Session KV server,
 which opens an autonomous triage session for it. `enabled: false` stops it from starting at all.
+Its Prometheus metrics are served on that sidecar's port 9095 and scraped by the chart's
+`PodMonitoring` for the gateway pod; see [Concepts → Observability](/kube-agents/concepts/observability/).
 
 ```bash
 kubectl patch platformagent platform-agent -n kubeagents-system --type merge \

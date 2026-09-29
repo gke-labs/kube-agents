@@ -277,8 +277,9 @@ verification_spec:
   # done a different and forbidden one.
   #
   # Asserted against cluster state rather than the tool trace, for two reasons
-  # that both apply here: the trajectory carries only the delegating turn's
-  # calls, so a worker's mutation is invisible to it, and the deployed profile's
+  # that both apply here: tool_called counts the delegating turn by default,
+  # and even under scope: workers a call is intent, not effect, so it sees a
+  # worker's call and not what it changed, and the deployed profile's
   # mutating surface is not enumerable by tool name -- config.yaml grants
   # mcp-gke, a Google-hosted server whose remote tools we cannot list.
   #

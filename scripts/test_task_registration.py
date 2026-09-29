@@ -841,6 +841,8 @@ class TestTheSanitizer(unittest.TestCase):
             "a Slack token": "xoxb-" + "0" * 10,
             "a JWT": "eyJ" + "a" * 10 + "." + "b" * 10 + "." + "c" * 10,
             "an sk- API key": "sk-" + "a" * 20,
+            "an Anthropic or hyphenated OpenAI key": "sk-ant-api03-" + "A1b2C3d4" * 5,
+            "an AWS access key id": "AKIAIOSFODNN7EXAMPLE",
         }
         for label, value in shapes.items():
             with self.subTest(shape=label):

@@ -76,10 +76,10 @@ directories and fail on a line that carries either:
 - a credential-shaped string: the token-shaped subset of `AuditRedactor`'s patterns,
   imported from `agents/chat/defaults/plugins/common/redactor.py` so the scan and the audit
   log agree on what a credential looks like. `CREDENTIAL_SHAPES` in
-  `scripts/validate_bench_cases.py` is the list of record; today it is private-key blocks
-  and the `AIza`, `ya29.`, `gh*_`, `github_pat_`, `xox*-`, `sk-` and JWT shapes. The
-  redactor's bearer, key/value and e-mail patterns are left out because each matches
-  ordinary prose in a prompt.
+  `scripts/validate_bench_cases.py` is the list of record. The redactor's bearer,
+  key/value and e-mail patterns are left out because each matches ordinary prose in a
+  prompt, and its env-pair and URL-password patterns because they match the sample
+  manifests and connection strings a fixture carries on purpose.
 
 Paths with a component beginning with a dot, `*.tfstate*` and `*.tfvars` are skipped, so a
 local `tofu apply` cannot red the check.

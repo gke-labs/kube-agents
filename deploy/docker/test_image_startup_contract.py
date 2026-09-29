@@ -319,6 +319,135 @@ class EventWatcherEmergencyStopTest(unittest.TestCase):
         )
 
 
+class EventWatcherMetricsPortContractTest(unittest.TestCase):
+    """The watcher's metrics listener, switched on by the operator through one variable.
+
+    The operator declares the container port, admits the collector in the
+    gateway NetworkPolicy and sets EVENT_WATCHER_METRICS_PORT, all from one
+    constant; start-services.sh turns the variable into --metrics-addr. Neither
+    end can see the other, and the failure is silent in both directions: an
+    unset or renamed variable leaves --metrics-addr empty, which is the flag's
+    documented disabled state, so the port stays declared, the policy stays
+    open and the PodMonitoring's target is simply down, with nothing in any
+    log. The derivation is extracted from the real script and run, as the
+    emergency-stop gate above is. Two writers can put a value here without the
+    operator: a hand-edited Deployment and an image paired with an operator
+    that spells the value differently. So the script checks the value is a
+    port, refuses and says so when it is not, and says which address it opens,
+    since a port other than the declared one would bind fine while the
+    container port and the policy still point at the declared one.
+    """
+
+    def setUp(self):
+        self.script = START_SERVICES.read_text()
+        launcher = re.search(
+            r"^start_event_watcher\(\) \{.*?^\}$", self.script, flags=re.M | re.S
+        )
+        self.assertIsNotNone(
+            launcher, "start-services.sh has no start_event_watcher function"
+        )
+        self.launcher = launcher.group(0)
+        derivation = re.search(
+            r'^  metrics_addr=""\n'
+            r'  case "\$\{([A-Za-z_][A-Za-z0-9_]*):-\}" in\n'
+            r".*?\n  esac$",
+            self.launcher,
+            flags=re.M | re.S,
+        )
+        self.assertIsNotNone(
+            derivation,
+            "start_event_watcher no longer derives metrics_addr from an "
+            "EVENT_WATCHER_METRICS_PORT-style variable; the operator's port "
+            "reaches no listener",
+        )
+        self.env_var = derivation.group(1)
+        self.derivation = derivation.group(0)
+
+    def derive(self, value):
+        """Run the real derivation for `value` (None = unset); return (metrics_addr, stderr)."""
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        if value is not None:
+            env[self.env_var] = value
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"set -euo pipefail\n{self.derivation}\n"
+                'printf "%s" "${metrics_addr}"',
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout, result.stderr
+
+    def test_the_operators_port_becomes_the_listener_address_and_is_said(self):
+        address, log = self.derive("9095")
+        self.assertEqual(address, ":9095")
+        self.assertIn("listener on :9095", log)
+
+    def test_unset_means_no_listener(self):
+        # An older operator that declares no port gets the watcher it had. An
+        # empty --metrics-addr is the flag's disabled state, which the watcher's
+        # own TestStartMetrics_EmptyAddressOpensNothing pins.
+        self.assertEqual(self.derive(None)[0], "")
+        self.assertEqual(self.derive("")[0], "")
+
+    def test_a_value_that_is_not_a_port_opens_nothing_and_says_so(self):
+        for value in ("abc", "9095x", "-1", "0", "65536", "70000"):
+            with self.subTest(value=value):
+                address, log = self.derive(value)
+                self.assertEqual(address, "", log)
+                self.assertIn(value, log, "the refusal must name the value it refused")
+                self.assertIn("no /metrics listener", log)
+
+    def test_another_valid_port_is_forwarded_but_named(self):
+        # Nothing here knows the operator's constant, so a different port binds;
+        # the line naming it is what a reader of a down scrape target has.
+        address, log = self.derive("9096")
+        self.assertEqual(address, ":9096")
+        self.assertIn("listener on :9096", log)
+
+    def test_the_launcher_passes_the_derived_address(self):
+        launched = self.launcher.index("/usr/local/bin/k8s-event-watcher")
+        argv = self.launcher[launched:].split("|| true", 1)[0]
+        self.assertIn('--metrics-addr="${metrics_addr}"', argv)
+        self.assertLess(
+            self.launcher.index('metrics_addr=""'),
+            launched,
+            "metrics_addr is derived after the watcher is launched, so the "
+            "first start never sees it",
+        )
+
+    def test_the_operator_writes_the_variable_the_script_reads(self):
+        # The other half of the contract, and the half `go test` cannot see:
+        # the operator names the variable through a constant, sets it on the
+        # sidecar, and reserves it so spec.deployment.env cannot move the
+        # listener off the declared port.
+        go = MANIFESTS_GO.read_text()
+        named = re.search(r'(\w+)\s*=\s*"' + re.escape(self.env_var) + '"', go)
+        self.assertIsNotNone(
+            named,
+            f"the operator never names {self.env_var}, so the listener is "
+            "never switched on",
+        )
+        const = named.group(1)
+        self.assertRegex(
+            go, rf"Name:\s*{const}\b", f"{const} is declared but never set on the sidecar"
+        )
+        merge = re.search(
+            r"^func mergeCredentialProxyEnv\(.*?^\}$", go, flags=re.M | re.S
+        )
+        self.assertIsNotNone(merge, "mergeCredentialProxyEnv is gone")
+        self.assertIn(
+            const,
+            merge.group(0),
+            f"{const} is not reserved in mergeCredentialProxyEnv, so a CR can "
+            "move the listener off the declared port",
+        )
+
+
 class DriftDetectorStartGateTest(unittest.TestCase):
     """The switch that starts drift detection, and its opposite default.
 
