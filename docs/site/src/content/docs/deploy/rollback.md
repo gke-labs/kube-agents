@@ -271,8 +271,15 @@ checks before it renders or applies anything, so the release itself keeps its la
   flag that drops a reused key, so for such a pair the Helm-only rollback does not complete. The
   full mode does, because its Helm release renders from the composition's values rather than the
   recorded ones (the section above), at the price of a GCP-level apply and the plan read that
-  goes before it. Neither pair published today is affected: neither `0.4.0`'s nor `0.5.0`'s
-  chart has a schema.
+  goes before it. The first release after `0.7.0` rolling back to `0.7.0` is such a pair. Its
+  composition records `platformAgent.scope` in the release on every apply, empty lists included,
+  and `platformAgent.harness.driftDetector` on an install with `enable_drift_pubsub`; `0.7.0`'s
+  chart declares neither, so an install that release applied stops at the operator step with
+  `at '/platformAgent': additional properties 'scope' not allowed`. Take it through the full mode
+  from the `0.7.0` checkout: `./upgrade.sh --plan --image-tag 0.7.0`, read the plan, then
+  `./upgrade.sh --upgrade-mode=full --image-tag 0.7.0`. A copy of the script from `main` does
+  not get past it either: it sources `0.7.0`'s installer library, which lacks a function the
+  current script calls, so its operator step stops before it applies anything of `0.7.0`.
 - **`N`'s operator owns an object that `N-1`'s chart renders.** Helm refuses to adopt an object
   that carries another manager's ownership labels (`exists and cannot be imported into the
 current release: invalid ownership metadata`). The `litellm-policy` NetworkPolicy is the case
