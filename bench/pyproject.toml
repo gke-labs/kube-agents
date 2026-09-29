@@ -52,6 +52,7 @@ kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 # than a drop-in replacement.
 [project.entry-points."devops_bench.verifiers"]
 bootstrap_fanout = "kube_agents_bench.verifiers:BootstrapFanoutVerifier"
+bootstrap_findings = "kube_agents_bench.verifiers:BootstrapFindingsVerifier"
 fleet_resource_property = "kube_agents_bench.verifiers:FleetResourcePropertyVerifier"
 github_writes = "kube_agents_bench.verifiers:GitHubWritesVerifier"
 ledger_issue_contains = "kube_agents_bench.verifiers:LedgerIssueContainsVerifier"

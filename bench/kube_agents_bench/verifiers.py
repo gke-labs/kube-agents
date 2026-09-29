@@ -48,10 +48,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from devops_bench.k8s import get_resource
 from devops_bench.verification.base import (
@@ -63,7 +64,7 @@ from devops_bench.verification.base import (
 )
 from devops_bench.verification.verifiers import ResourcePropertyVerifier
 
-from kube_agents_bench import discovery, github_writes, transcript
+from kube_agents_bench import discovery, github_writes, onboarding, transcript
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -73,6 +74,7 @@ from kube_agents_bench.fleet import (
 
 __all__ = [
     "BootstrapFanoutVerifier",
+    "BootstrapFindingsVerifier",
     "FleetResourcePropertyVerifier",
     "GitHubWritesVerifier",
     "LedgerIssueContainsVerifier",
@@ -2484,3 +2486,95 @@ class FleetResourcePropertyVerifier(ResourcePropertyVerifier):
                 raw=raw,
             )
         return result
+
+
+_FINDINGS_READ_TIMEOUT_SEC = 60.0
+
+
+class ExpectedFinding(BaseModel):
+    """One finding a ``bootstrap_findings`` check expects, by check id and object."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    check: str = Field(min_length=1)
+    object: str = Field(min_length=1)
+
+
+@VERIFIERS.register("bootstrap_findings")
+class BootstrapFindingsVerifier(BaseVerifier):
+    """Checks the findings the onboarding prioritization stage extracted.
+
+    The prioritization card is filed by the discovery sweep's worker, not by
+    the conversation, and its worker runs ``inventory_findings.py extract``
+    through its terminal. This reads the file that writes,
+    ``INVENTORY.items.json``, off the shell sandbox's data volume
+    (:mod:`kube_agents_bench.onboarding`), where that terminal runs.
+
+    ``expected_findings``: the ``(check, object)`` pairs of the raw report's
+    findings block. Passes when the file's items carry exactly those pairs,
+    each as many times as listed.
+
+    An unreadable sandbox is ``status="error"``. No file, a file that is not
+    the extract's JSON, and a different set of findings are each a fail: the
+    stage did not run where the worker's terminal is, or did not run as the
+    SOP says. A ``fail`` from an earlier poll outranks a final read that errors.
+    """
+
+    type: Literal["bootstrap_findings"]
+    expected_findings: list[ExpectedFinding] = Field(min_length=1)
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        read_timeout = min(single_call_timeout(timeout_sec), _FINDINGS_READ_TIMEOUT_SEC)
+        # _poll_to_result reports the last poll even when it is an error; the
+        # latest fail stands in that case.
+        last_fail: tuple[str, dict[str, Any] | None] | None = None
+
+        def attempt() -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+            nonlocal last_fail
+            status, reason, raw = self._check(read_timeout)
+            if status == "fail":
+                last_fail = (reason, raw)
+            return status, reason, raw
+
+        result = self._poll_to_result(attempt, timeout_sec)
+        if result.status == "error" and last_fail is not None:
+            reason, raw = last_fail
+            return VerificationResult(
+                success=False,
+                status="fail",
+                elapsed_time=result.elapsed_time,
+                reason=f"{reason} (the last read failed: {result.reason})",
+                name=self.name,
+                raw=raw,
+            )
+        return result
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        state, text, why = onboarding.read_items(onboarding.sandbox_shell, read_timeout)
+        if state == "error":
+            return "error", why, None
+        if state == "absent":
+            return "fail", f"{why}: extract did not run where the card's worker has its terminal", None
+        where = onboarding.ITEMS_FILE
+        if len(text.encode()) > onboarding.MAX_ITEMS_BYTES:
+            return "fail", f"{where} is larger than {onboarding.MAX_ITEMS_BYTES} bytes", None
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            return "fail", f"{where} is not JSON: {exc}", None
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
+            return "fail", f"{where} has no list of items, so it is not what extract writes", None
+        found = Counter((str(i.get("check")), str(i.get("object"))) for i in items)
+        expected = Counter((f.check, f.object) for f in self.expected_findings)
+        raw = {"found": sorted(found.elements())}
+        missing = sorted((expected - found).elements())
+        extra = sorted((found - expected).elements())
+        if missing or extra:
+            parts = [f"{where} holds {len(items)} finding(s) for {len(self.expected_findings)} expected"]
+            if missing:
+                parts.append(f"missing {missing}")
+            if extra:
+                parts.append(f"not in the raw report's block {extra}")
+            return "fail", "; ".join(parts), raw
+        return "pass", f"{where} holds the {len(items)} expected finding(s)", raw

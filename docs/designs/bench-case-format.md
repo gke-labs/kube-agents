@@ -194,6 +194,11 @@ one card per ready profile with a cluster identity, keyed and assigned to it, an
 card for anything else) or `no_card_waits_on_the_sweep` (no cluster card has the sweep as a
 parent).
 
+`bootstrap_findings`, from the same file, reads the shell sandbox of the install under test:
+`INVENTORY.items.json`, which the onboarding prioritization stage's `inventory_findings.py
+extract` writes through the worker's terminal. It passes when those items carry exactly the
+`(check, object)` pairs listed in `expected_findings`.
+
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated
 workers' calls to the trajectory tagged with the profile that made them, and the default

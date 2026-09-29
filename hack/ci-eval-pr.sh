@@ -2354,6 +2354,11 @@ unit_cost_hint() {
     # run_wait, 900s), and the agent turn is a board read. 340-520s a
     # repetition on 2026-09-28.
     bootstrap-discovery-fanout) echo 600 ;;
+    # Tofu too: the plant files one card and waits for its worker to run the
+    # prioritization SOP and end its run (up to the stack's run_wait, 900s),
+    # and the agent turn is a board read. Unmeasured; priced below the band
+    # above because one card's worker is the whole of the wait.
+    bootstrap-inventory-ranking-delivery) echo 600 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the

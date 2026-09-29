@@ -1718,7 +1718,10 @@ wrong thing for a reviewer to find even though it is inert there. So the image g
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
 `github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
 `stall_report.py` and `inventory_findings.py` — the entry points an agent is told to run,
-plus the transitive closure of what they import.
+plus the transitive closure of what they import. Only `inventory_findings.py extract` works
+there: `register` and `ranked` call the Session KV server on the agent pod's loopback and
+exit 13 from the sandbox, and the prioritization SOP answers that exit by ranking from its own
+scores and writing the report without the findings queue.
 
 **The test for whether a script qualifies is what it needs, not how it is called.** An
 earlier version of this proposed "shell call sites, and absent from every `jobs.json`",
@@ -1743,8 +1746,8 @@ deleting a profile still has no tool.
 None of this is held together by review.
 [`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)
 reads the allowlist out of the Dockerfile and checks it against the agents' own
-instructions, which include the governance SOPs a card's worker follows and the Chat
-Agent's tree that writes those cards: every shared script named by a runtime path is
+instructions, which include the governance SOPs a card's worker follows and the Planning
+Agent's tree (`agents/chat/`) that writes those cards: every shared script named by a runtime path is
 baked or stubbed, the allowlist is closed under import, and nothing on it names an
 interpreter the sandbox does not have. Adding a skill that calls a new shared script
 fails that test rather than failing in a pod.
@@ -2868,7 +2871,7 @@ get-credentials` and `kubectl` behind it on every tick, and `github_token_refres
   `_thread_kubeconfig_path` still describes the older check and is what is left to update.
 - **The cluster-agent kubeconfig has nowhere to go yet, and onboarding now fails
   earlier than that.** `cluster_agent_profile.py` writes a profile home on the agent
-  pod's PVC and shells out to `hermes`, so it is one of the two scripts the sandbox
+  pod's PVC and shells out to `hermes`, so it is one of the three scripts the sandbox
   stubs rather than bakes. The four skills that tell the model to run it by its runtime
   path therefore stop at the stub's message instead of reaching the kubeconfig problem
   at all. Both want the same fix — per-profile directories on the sandbox side, and an

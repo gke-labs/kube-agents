@@ -83,8 +83,8 @@ set -euo pipefail
 # held-out seats, `nightly` appends eval/nightly-cases.txt. Counted from those
 # files rather than stated here, because both move: on 2026-09-29 they are 14
 # (twelve on the roster and two held-out seats, the compliance canary, #2013,
-# and pdb-remediation-pr, #2016) and 38, so 52 cases, and at three
-# repetitions 42 units against 156.
+# and pdb-remediation-pr, #2016) and 39, so 53 cases, and at three
+# repetitions 42 units against 159.
 #
 # It is the smaller one because of the clock, not because the other cases are
 # unwanted. Step 5 of staging-promotion-pipeline.yml waits 330 minutes for this
