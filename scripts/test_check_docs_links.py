@@ -338,11 +338,15 @@ LINKED_IMAGE_LINES = (
     f"[![badge]({BADGE} 'The badge')]({LINKED_IMAGE_ONLY})",
     LINKED_IMAGE_GONE_LINE,
 )
+# The live card sits on the closer's line: an MDX comment is an expression and
+# ends at its closer even when it opens the line, so the card after it is read.
+# Were a line-opening MDX comment to take the rest of its line the way an HTML
+# block comment does, the carded page would be reported unreached.
 SITE_INDEX_COMMENTED_CARD_LINES = (
     "import { LinkCard } from '@astrojs/starlight/components';",
     "",
-    f'{{/* <LinkCard title="Gone" href="{cdl.SITE_ROUTE_PREFIX}install/commented-card/" /> */}}',
-    f'<LinkCard title="Carded" href="{cdl.SITE_ROUTE_PREFIX}install/carded/" />',
+    f'{{/* <LinkCard title="Gone" href="{cdl.SITE_ROUTE_PREFIX}install/commented-card/" /> */}}'
+    f' <LinkCard title="Carded" href="{cdl.SITE_ROUTE_PREFIX}install/carded/" />',
 )
 
 # Files the scan has to keep reaching: the two #992 was filed against, and one
