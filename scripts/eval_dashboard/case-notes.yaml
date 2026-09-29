@@ -26,7 +26,7 @@ notes:
   cluster-agent-stalled-controller-healthy-silence:
     note: new case, earning its record
   compliance-rbac-overgrant:
-    issues: ["#998", "#985", "#1171"]
+    issues: ["#998", "#985", "#1171", "#2013"]
   gpu-stress-test-diagnosis:
     note: reuse regression under investigation
   security-overgrant-remediation-proposal:

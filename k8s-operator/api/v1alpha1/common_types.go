@@ -1622,6 +1622,70 @@ type AgentStatus struct {
 	// NetworkPolicy reports the resolved egress NetworkPolicy configuration.
 	// +optional
 	NetworkPolicy NetworkPolicyStatus `json:"networkPolicy,omitempty"`
+
+	// Note, deliberately not a doc comment — the blank line below keeps it out of the
+	// CRD description that `kubectl explain` prints. As on the structs above, omitempty
+	// does nothing on a struct field, so this key is always serialised, as `{}` before
+	// the first reconcile; its own fields do carry omitempty, so a counter nothing has
+	// written is absent rather than 0.
+
+	// Usage summarises the agent's activity: the interfaces its spec enables and
+	// aggregate counters of what it has done.
+	// +optional
+	Usage AgentUsageStatus `json:"usage,omitempty"`
+}
+
+// AgentUsageStatus is the non-sensitive activity summary of an agent. Static
+// enums and integer counts only: no prompt, message, resource name or secret is
+// ever written here, so the whole struct is safe to read with the same access
+// as the rest of the status.
+//
+// Today the operator writes ActiveInterfaces, from the spec, on every Ready status
+// update. The counters and LastActiveTime are declared so that the schema names
+// them, but nothing writes them yet — the agent's own ServiceAccount holds no
+// write verb on this status, and the operator has no producer for them — so each
+// is absent (omitempty) on every install until one exists.
+type AgentUsageStatus struct {
+	// SessionsTotal is the cumulative number of interactive sessions handled.
+	// Nothing writes it yet.
+	// +optional
+	SessionsTotal int64 `json:"sessionsTotal,omitempty"`
+
+	// EventsIngestedTotal is the cumulative count of cluster events ingested and evaluated.
+	// Nothing writes it yet.
+	// +optional
+	EventsIngestedTotal int64 `json:"eventsIngestedTotal,omitempty"`
+
+	// ToolExecutionsTotal is the cumulative count of CLI and diagnostic tool invocations.
+	// Nothing writes it yet.
+	// +optional
+	ToolExecutionsTotal int64 `json:"toolExecutionsTotal,omitempty"`
+
+	// RemediationsProposedTotal is the cumulative count of remediations generated.
+	// Nothing writes it yet.
+	// +optional
+	RemediationsProposedTotal int64 `json:"remediationsProposedTotal,omitempty"`
+
+	// RemediationsAppliedTotal is the cumulative count of remediations approved and applied.
+	// Nothing writes it yet.
+	// +optional
+	RemediationsAppliedTotal int64 `json:"remediationsAppliedTotal,omitempty"`
+
+	// ActiveInterfaces lists the communication channels the spec enables, sorted:
+	// "dashboard" unless spec.harness.hermes.dashboardEnabled is false, and
+	// "googlechat", "slack" and "teams" for each spec.integration entry whose
+	// enabled is true. Resolved on every reconcile and written by the Ready
+	// status update when it changes; a pass that parks the CR Degraded leaves
+	// the previous value, so read it alongside the Ready condition, as
+	// networkPolicy.generated is read. Absent while the served CRD predates it.
+	// +listType=set
+	// +optional
+	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
+
+	// LastActiveTime is the timestamp of the most recent interaction or event triage.
+	// Nothing writes it yet.
+	// +optional
+	LastActiveTime *metav1.Time `json:"lastActiveTime,omitempty"`
 }
 
 const (

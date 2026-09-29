@@ -5861,6 +5861,13 @@ class WorkspaceRouteTest(unittest.TestCase):
         handler._workspace_route(route, payload)
         return store
 
+    def test_open_hands_the_caller_label_to_the_store(self):
+        store = self._route("open", {"repo": "acme/fleet", "caller": "t_f660e9c5"})
+        store.open.assert_called_once_with("acme/fleet", None, None, None, caller="t_f660e9c5")
+        # Paired: an open without one hands the store None, never "".
+        store = self._route("open", {"repo": "acme/fleet"})
+        store.open.assert_called_once_with("acme/fleet", None, None, None, caller=None)
+
     def test_the_write_verbs_gate_on_the_managed_repository_list(self):
         # The gate is on `commit` and `push` and not on `open`: opening is a
         # read, and `inspect-repository` opens repositories this install does

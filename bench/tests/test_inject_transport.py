@@ -220,7 +220,7 @@ class _StubGatewayHandler(BaseHTTPRequestHandler):
         probe: dict[str, Any] | None = None
         if probed:
             self.server.calls.append("probe" if self.server.submissions else "preflight")
-            probe = self.server.probe_report()
+            probe = self.server.probe_report(task)
         fresh = [e for e in self.server.entries if e["seq"] > after]
         # The gateway serves at most what it has; a page cap is what makes the
         # `after` contract worth testing at all.
@@ -314,6 +314,14 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # A terminal the gateway reports out of band once the entries are drained,
     # which is how a late reader learns an answer it missed.
     terminal_out_of_band: str = ""
+    # The task's tool-call trace, as a door that shows it carries it on
+    # every probed read that names the task (``activity``, present as ``[]``
+    # for a run that called nothing); None is a door older than the field,
+    # which sends no key. ``probe_activity_dropped`` is the door's count of
+    # the oldest entries its cap cut; ``probe_progress`` the heartbeat line.
+    probe_activity: list[dict[str, Any]] | None = None
+    probe_activity_dropped: int = 0
+    probe_progress: str = ""
 
     def poll_fails(self) -> bool:
         """Whether this GET is one of the scripted failures."""
@@ -328,7 +336,7 @@ class _StubGatewayServer(ThreadingHTTPServer):
         self.failed_polls += 1
         return True
 
-    def probe_report(self) -> dict[str, Any]:
+    def probe_report(self, task: str = "") -> dict[str, Any]:
         self.probed_reads += 1
         finished = any(
             e["kind"] == inject.ENTRY_TERMINAL and e.get("taskId") == self.task_id
@@ -343,6 +351,16 @@ class _StubGatewayServer(ThreadingHTTPServer):
             "graceSeconds": self.grace_seconds,
             "active": active,
         }
+        if self.probe_activity is not None and task == self.task_id:
+            # A door that shows the trace: with ``task=`` the read describes
+            # the named task whether or not the record still holds it as
+            # active, and carries its trace whole on every read.
+            report["taskId"] = self.task_id
+            report["activity"] = list(self.probe_activity)
+            if self.probe_activity_dropped:
+                report["activityDropped"] = self.probe_activity_dropped
+            if self.probe_progress:
+                report["progress"] = self.probe_progress
         if active:
             # Scripted states advance per read of the ACTIVE task, so the
             # preflight read (before any POST) does not consume one.
@@ -1989,3 +2007,521 @@ def test_the_fold_and_the_liveness_rung_agree_on_every_history(states: list[str]
         else inject.OUTCOME_QUEUED if set(states) == {"submitted"}
         else inject.OUTCOME_PARKED
     )
+
+
+# --------------------------------------------------------------------------
+# The tool-call trace (#2038). A door that carries the task's ``activity``
+# on its probe has each call mapped into the trajectory in the api path's
+# shape, behind one ``a2a.activity`` marker that says the door could show
+# calls at all -- and it is the marker, not a call, that the scorer's
+# not-applicable rule retires on. The probe bodies below are the shapes the
+# door sends: present with calls, present and empty, absent (a door older
+# than the field), capped, hermes's wrapper, and each status word.
+
+ENVELOPE_NAMES = {
+    inject.EVENT_ENTRY_TASK,
+    inject.EVENT_ENTRY_POST,
+    inject.EVENT_ENTRY_EDIT,
+    inject.EVENT_ENTRY_STATUS,
+}
+CALL_CREATE = {
+    "tool": "kanban_create",
+    "input": {"title": "list the fleet"},
+    "callId": "call_1",
+    "status": "completed",
+    "durationMs": 120,
+    "at": "2026-09-25T20:01:02Z",
+}
+CALL_FAILED = {
+    "tool": "terminal",
+    "input": {"command": "kubectl get nodes"},
+    "callId": "call_2",
+    "status": "error",
+    "errorType": "tool_error",
+    "durationMs": 40,
+    "at": "2026-09-25T20:01:03Z",
+}
+CALL_WRAPPED = {
+    "tool": "tool_call",
+    "input": {
+        "calls": [
+            {"name": "mcp__gke__list_clusters", "arguments": {"parent": "projects/p/locations/-"}},
+            {"name": "mcp__gke__get_cluster", "arguments": {"name": "seeded-a"}},
+        ]
+    },
+    "callId": "call_3",
+    "status": "completed",
+}
+PROGRESS_LINE = "running 1m0s, 2 tool call(s), last terminal"
+
+
+def probe_body(**probe: Any) -> dict[str, Any]:
+    """A GET reply whose probe carries the given fields."""
+    return {"entries": [], "lastSeq": 0, "probe": {"active": False, "taskId": "task-1", **probe}}
+
+
+def trace_block(trajectory: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The activity block: everything outside the lifecycle envelope, in order."""
+    return [e for e in trajectory if e["name"] not in ENVELOPE_NAMES]
+
+
+def marker_of(trajectory: list[dict[str, Any]]) -> dict[str, Any] | None:
+    markers = [e for e in trajectory if e["name"] == inject.EVENT_ENTRY_ACTIVITY]
+    assert len(markers) <= 1, "the marker is written once"
+    return markers[0] if markers else None
+
+
+def test_the_trace_the_door_carries_becomes_tool_entries_behind_a_marker(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """Present with calls: one entry per call in ``ToolCall.to_dict``'s
+    shape, after the lifecycle, the marker at the head of the block, and
+    ``tool_called`` grades them as it grades the api path's entries."""
+    from kube_agents_bench.verifiers import ToolCalledVerifier
+
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "filed t_1")
+    stub_gateway.probe_activity = [CALL_CREATE, CALL_FAILED]
+    stub_gateway.probe_progress = PROGRESS_LINE
+
+    result = KubeAgentsHarness().run("file a card")
+
+    assert result.output == "filed t_1"
+    assert trace_block(result.trajectory) == [
+        {
+            "name": inject.EVENT_ENTRY_ACTIVITY,
+            "args": {"calls": 2, "dropped": 0},
+            "result": None,
+            "status": "completed",
+        },
+        {"name": "kanban_create", "args": {"title": "list the fleet"}, "result": None, "status": "completed"},
+        {"name": "terminal", "args": {"command": "kubectl get nodes"}, "result": None, "status": "error"},
+    ]
+    # The block follows the lifecycle rather than interleaving with it.
+    names = [e["name"] for e in result.trajectory]
+    assert names.index(inject.EVENT_ENTRY_ACTIVITY) == len(names) - 3
+    assert status_entries(result) == [("completed", True)]
+    assert result.metadata["activity"] == {"calls": 2, "dropped": 0}
+    assert result.metadata["progress"] == PROGRESS_LINE
+    # The record left the blind envelope: the scorer grades every check.
+    assert not scoring._inject_blind(result.trajectory)
+    # And the verifier reads it off the stash with no change of its own.
+    assert ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"]).verify(5.0).status == "pass"
+    assert (
+        ToolCalledVerifier(type="tool_called", tool_names=["terminal"], require_success=True)
+        .verify(5.0)
+        .status
+        == "fail"
+    )
+    # Every probed read after the POST (the preflight is the one before it)
+    # asked for this task by id, so the trace came off the harness's
+    # existing reads and no read was added for it.
+    probed = [p["task"] for p in stub_gateway.polls if p["probe"]]
+    assert probed[0] == "" and probed[1:] and all(t == stub_gateway.task_id for t in probed[1:])
+
+
+def test_an_empty_trace_still_writes_the_marker(stub_gateway: _StubGatewayServer) -> None:
+    """Present and empty: the door can show calls and the persona made
+    none. The marker says so, with no call behind it, and the scorer's rule
+    retires on the marker -- a ``tool_called`` check fails here as it would
+    on the api path, which is the point of grading the capability."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "no card needed")
+    stub_gateway.probe_activity = []
+
+    result = KubeAgentsHarness().run("just answer")
+
+    assert trace_block(result.trajectory) == [
+        {
+            "name": inject.EVENT_ENTRY_ACTIVITY,
+            "args": {"calls": 0, "dropped": 0},
+            "result": None,
+            "status": "completed",
+        }
+    ]
+    assert result.metadata["activity"] == {"calls": 0, "dropped": 0}
+    assert result.metadata["progress"] is None
+    assert not scoring._inject_blind(result.trajectory)
+
+
+def test_a_door_without_the_trace_writes_neither(stub_gateway: _StubGatewayServer) -> None:
+    """Absent: a door older than the field sends no key. The record is the
+    envelope as before -- no marker, no calls -- and the scorer keeps
+    setting tool-call checks aside on it."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "the fleet is seeded-a")
+
+    result = KubeAgentsHarness().run("list the fleet")
+
+    assert trace_block(result.trajectory) == []
+    assert {e["name"] for e in result.trajectory} <= ENVELOPE_NAMES
+    assert result.metadata["activity"] is None
+    assert result.metadata["progress"] is None
+    assert scoring._inject_blind(result.trajectory)
+
+
+def test_dropped_calls_are_counted_on_the_marker_and_never_written_as_calls() -> None:
+    """Capped: the door keeps the newest 1000 and counts the rest in
+    ``activityDropped``; the bridge's own budget marker (``status:
+    truncated`` with ``dropped``) is a count, not a call. Both land on the
+    marker's ``dropped`` and neither becomes a tool entry."""
+    body = probe_body(
+        activity=[
+            {"tool": "activity-budget", "status": "truncated", "dropped": 2, "at": "..."},
+            CALL_CREATE,
+        ],
+        activityDropped=3,
+    )
+    probe = inject.Probe.from_body(body)
+    assert probe is not None and probe.activity_dropped == 3 and probe.activity is not None
+    fold = inject.Fold("task-1")
+    fold.note_activity(probe.activity, probe.activity_dropped, probe.activity_malformed)
+    assert marker_of(fold.trajectory) == {
+        "name": inject.EVENT_ENTRY_ACTIVITY,
+        "args": {"calls": 1, "dropped": 5},
+        "result": None,
+        "status": "completed",
+    }
+    assert [e["name"] for e in trace_block(fold.trajectory)] == [
+        inject.EVENT_ENTRY_ACTIVITY,
+        "kanban_create",
+    ]
+    assert fold.activity_summary == {"calls": 1, "dropped": 5}
+
+
+def test_the_tool_call_wrapper_stays_one_entry_the_verifier_unwraps() -> None:
+    """hermes's ``tool_call`` wrapper arrives as one part whose
+    ``input.calls[]`` names the tools it invoked -- the shape the api path
+    records and ``_wrapped_tool_names`` already unwraps at grading time. It
+    is kept as one entry, so a ``minimum_calls`` count agrees across the
+    two transports, and the nested names are what ``tool_called`` sees."""
+    from kube_agents_bench import transcript
+    from kube_agents_bench.verifiers import ToolCalledVerifier, _wrapped_tool_names
+
+    fold = inject.Fold("task-1")
+    fold.note_activity([CALL_WRAPPED], 0, 0)
+    calls = trace_block(fold.trajectory)[1:]
+    assert calls == [
+        {"name": "tool_call", "args": CALL_WRAPPED["input"], "result": None, "status": "completed"}
+    ]
+    assert _wrapped_tool_names(calls[0]) == {"mcp__gke__list_clusters", "mcp__gke__get_cluster"}
+    transcript.set("answer", fold.trajectory)
+    try:
+        assert (
+            ToolCalledVerifier(type="tool_called", tool_names=["mcp__gke__get_cluster"])
+            .verify(5.0)
+            .status
+            == "pass"
+        )
+    finally:
+        transcript.clear()
+
+
+def test_each_status_word_is_carried_and_a_part_without_one_is_called() -> None:
+    """``completed``, ``error`` and ``interrupted`` pass through as the
+    door's words; a part with no status (the worker adapter's bare
+    ``{"tool", "input"}``) takes the api shape's ``called``. A part with
+    no input maps to empty args, a non-object input is kept under its key,
+    and a part naming no tool is counted as malformed rather than written
+    as a call to nothing."""
+    fold = inject.Fold("task-1")
+    fold.note_activity(
+        [
+            {"tool": "a", "input": {"x": 1}, "status": "completed"},
+            {"tool": "b", "input": {"x": 2}, "status": "error", "errorType": "blocked"},
+            {"tool": "c", "status": "interrupted"},
+            {"tool": "d", "input": {"x": 4}},
+            {"tool": "e", "input": "raw text"},
+            {"input": {"no": "tool"}},
+        ],
+        0,
+        0,
+    )
+    marker, *calls = trace_block(fold.trajectory)
+    assert calls == [
+        {"name": "a", "args": {"x": 1}, "result": None, "status": "completed"},
+        {"name": "b", "args": {"x": 2}, "result": None, "status": "error"},
+        {"name": "c", "args": {}, "result": None, "status": "interrupted"},
+        {"name": "d", "args": {"x": 4}, "result": None, "status": "called"},
+        {"name": "e", "args": {"input": "raw text"}, "result": None, "status": "called"},
+    ]
+    assert marker["args"] == {"calls": 5, "dropped": 0, "malformed": 1}
+    # Every entry is exactly the api path's four keys.
+    assert all(set(e) == {"name", "args", "result", "status"} for e in calls)
+
+
+def test_a_call_whose_input_the_executor_truncated_is_counted_on_the_marker() -> None:
+    """The bridge replaces an input over its cap with a stand-in object.
+    The call is still written, with the stand-in as its args; a wrapper so
+    capped has lost the names it invoked, so the marker counts these and a
+    ``tool_called`` miss on such a record is not read as the persona's."""
+    from kube_agents_bench.verifiers import _wrapped_tool_names
+
+    capped = {"truncated": True, "bytes": 5000, "head": '{"calls": [{"name": "mcp__gke__'}
+    # A tool whose own arguments carry a boolean ``truncated`` is not the
+    # stand-in: the input is the persona's, intact, and counting it would set
+    # the record aside on the run that used that tool.
+    honest = {"truncated": True, "query": "logs", "limit": 50}
+    fold = inject.Fold("task-1")
+    fold.note_activity(
+        [
+            CALL_CREATE,
+            {"tool": "tool_call", "input": capped, "status": "completed"},
+            {"tool": "search_logs", "input": honest, "status": "completed"},
+            {"tool": "tool_call", "input": {**capped, "truncated": False}, "status": "completed"},
+        ],
+        0,
+        0,
+    )
+    marker, *calls = trace_block(fold.trajectory)
+    assert marker["args"] == {"calls": 4, "dropped": 0, "input_truncated": 1}
+    assert calls[1] == {"name": "tool_call", "args": capped, "result": None, "status": "completed"}
+    assert _wrapped_tool_names(calls[1]) == set()
+    assert calls[2]["args"] == honest
+
+
+def test_the_latest_read_s_trace_replaces_the_one_before() -> None:
+    """The probe carries the whole trace on every read, growing as the run
+    goes; the fold keeps the last read's copy, so a run polled ten times
+    records each call once and the marker counts it once."""
+    fold = inject.Fold("task-1")
+    fold.note_executor_state("working")
+    fold.note_activity([CALL_CREATE], 0, 0)
+    fold.note_activity([CALL_CREATE, CALL_FAILED], 0, 0)
+    fold.mark_terminal("completed", inject.TERMINAL_SOURCE_EXECUTOR, "")
+    names = [e["name"] for e in fold.trajectory]
+    assert names == [
+        inject.EVENT_ENTRY_STATUS,
+        inject.EVENT_ENTRY_STATUS,
+        inject.EVENT_ENTRY_ACTIVITY,
+        "kanban_create",
+        "terminal",
+    ]
+    assert fold.activity_shown and fold.activity_summary == {"calls": 2, "dropped": 0}
+    untouched = inject.Fold("task-2")
+    assert not untouched.activity_shown and untouched.activity_summary is None
+    assert untouched.trajectory == []
+
+
+def test_the_probe_reads_the_trace_off_the_body() -> None:
+    """The golden bodies: no key is ``None`` (cannot show), ``[]`` is empty
+    (called nothing), parts that are not objects are dropped and counted,
+    and ``activityDropped`` and ``progress`` ride beside them."""
+    absent = inject.Probe.from_body(probe_body())
+    assert absent is not None and absent.activity is None and absent.progress == ""
+    empty = inject.Probe.from_body(probe_body(activity=[]))
+    assert empty is not None and empty.activity == [] and empty.activity_dropped == 0
+    shown = inject.Probe.from_body(
+        probe_body(
+            activity=[CALL_CREATE, "not an object", None],
+            activityDropped=7,
+            progress=PROGRESS_LINE,
+            final=True,
+            executorState="completed",
+            terminalSource=inject.TERMINAL_SOURCE_EXECUTOR,
+        )
+    )
+    assert shown is not None
+    assert shown.activity == [CALL_CREATE]
+    assert shown.activity_malformed == 2
+    assert shown.activity_dropped == 7
+    assert shown.progress == PROGRESS_LINE
+    # A finished task read by id after the relay released it: the line a
+    # log gets names the trace and the heartbeat.
+    line = shown.describe()
+    assert "task task-1 final (completed, executor)" in line
+    assert "1 tool call(s) on the stream (+7 the door did not carry)" in line
+    assert PROGRESS_LINE in line
+    assert "tool call" not in absent.describe()
+
+
+@pytest.mark.parametrize(
+    ("spelled", "dropped", "malformed"),
+    [
+        ("3", 3, 0),
+        ("2.9", 2, 0),
+        ("1.0", 1, 0),
+        # A JSON integer past float range: an int to json.loads, and a count
+        # that must read without asking a float function about it.
+        ("1" + "0" * 400, 10**400, 0),
+        ("0.5", 0, 1),
+        ("NaN", 0, 1),
+        ("Infinity", 0, 1),
+        ("-Infinity", 0, 1),
+        ("1e999", 0, 1),
+        ("-4", 0, 1),
+        ("0", 0, 1),
+        ('"12"', 0, 1),
+        ('{"n": 1}', 0, 1),
+        ("true", 0, 1),
+    ],
+)
+def test_a_dropped_count_the_parser_cannot_read_is_a_loss_not_a_zero(
+    spelled: str, dropped: int, malformed: int
+) -> None:
+    """``json.loads`` admits NaN, Infinity and 1e999; ``int()`` of any of
+    them raises, and a raise here would leave the poll loop with the task
+    still running and nothing to cancel it. But zero is the value that
+    vouches for the trace, and a count the door sent that this side cannot
+    read is a loss the door reported, so it lands on ``malformed`` (the
+    door omits the key when nothing was cut, so a sent zero is unreadable
+    too). An ordinary count reads whole, a float by its floor. The same
+    rule reads the bridge's ``truncated`` stand-in."""
+    body = json.loads(
+        '{"probe": {"active": false, "taskId": "task-1", "activity": [], '
+        f'"activityDropped": {spelled}}}}}'
+    )
+    probe = inject.Probe.from_body(body)
+    assert probe is not None and probe.activity == []
+    assert (probe.activity_dropped, probe.activity_malformed) == (dropped, malformed)
+    fold = inject.Fold("task-1")
+    fold.note_activity(
+        [{"status": "truncated", "dropped": json.loads(spelled), "at": "..."}, CALL_CREATE], 0, 0
+    )
+    marker_args = marker_of(fold.trajectory)["args"]
+    assert marker_args["dropped"] == dropped
+    assert marker_args.get("malformed", 0) == malformed
+    # No marker vouches for a trace with an unreadable count behind it.
+    assert bool(dropped or malformed)
+    # A stand-in with no count at all is a loss of unknown size.
+    bare = inject.Fold("task-1")
+    bare.note_activity([{"status": "truncated"}], 0, 0)
+    assert marker_of(bare.trajectory)["args"] == {"calls": 0, "dropped": 0, "malformed": 1}
+
+
+def test_a_wait_that_ends_on_a_read_without_a_trace_marks_the_trace_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The relay's terminal and the probe travel in one reply, and the
+    transcript half is good whatever the probe found. When the wait ends on
+    a read whose probe errored, the trace is the previous read's -- up to a
+    poll's wait older -- and a call made in between is not in it; the
+    marker says ``stale`` rather than vouching, and the scorer reads that
+    as a loss. A wait that ends on a read whose probe carried the trace
+    writes no such flag."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+    monkeypatch.setattr(inject, "FINISHED_SETTLE_SECONDS", 0.05)
+
+    def scripted(bodies: list[dict[str, Any]]):
+        replies = list(bodies)
+
+        def _poll(task_id: str, after: int, budget: float, *, probe: bool = True) -> dict[str, Any]:
+            # The last body answers every later read (the settle's unprobed
+            # polls after a stream terminal), with nothing new on it.
+            body = replies.pop(0) if len(replies) > 1 else replies[0]
+            return body if probe else {**body, "entries": [], "probe": None}
+
+        return _poll
+
+    running = {
+        "entries": running_transcript("task-1"),
+        "lastSeq": 3,
+        "probe": {"active": True, "taskId": "task-1", "executorState": "working", "activity": [CALL_CREATE]},
+    }
+    finished_entries = [
+        entry(4, inject.ENTRY_POST, text="done", messageId=RESULT_ID),
+        entry(5, inject.ENTRY_TERMINAL, taskId="task-1", state="completed",
+              source=inject.TERMINAL_SOURCE_EXECUTOR),
+    ]
+    blind_finish = {
+        "entries": finished_entries,
+        "lastSeq": 5,
+        "probe": {"active": False, "taskId": "task-1", "error": "kv read failed"},
+    }
+    monkeypatch.setattr(task, "_poll", scripted([running, blind_finish]))
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.outcome == inject.OUTCOME_TERMINAL
+    marker = marker_of(exchange.fold.trajectory)
+    assert marker is not None and marker["args"] == {"calls": 1, "dropped": 0, "stale": 1}
+    assert scoring._inject_blind(exchange.fold.trajectory)
+
+    sighted_finish = {
+        "entries": finished_entries,
+        "lastSeq": 5,
+        "probe": {
+            "active": False,
+            "taskId": "task-1",
+            "final": True,
+            "executorState": "completed",
+            "activity": [CALL_CREATE, CALL_FAILED],
+        },
+    }
+    monkeypatch.setattr(task, "_poll", scripted([running, sighted_finish]))
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    marker = marker_of(exchange.fold.trajectory)
+    assert marker is not None and marker["args"] == {"calls": 2, "dropped": 0}
+    assert not scoring._inject_blind(exchange.fold.trajectory)
+
+    # A read whose probe shows the task final on the STREAM, ahead of the
+    # relay, ends the wait through the settle, whose polls are unprobed; a
+    # probe of that shape with no activity key leaves the earlier trace
+    # stale too, and one that carries the trace does not.
+    stream_final_blind = {
+        "entries": [],
+        "lastSeq": 3,
+        "probe": {
+            "active": True,
+            "taskId": "task-1",
+            "final": True,
+            "executorState": "completed",
+            "terminalSource": inject.TERMINAL_SOURCE_EXECUTOR,
+            "result": "done on the stream",
+        },
+    }
+    monkeypatch.setattr(task, "_poll", scripted([running, stream_final_blind]))
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.outcome == inject.OUTCOME_STREAM_TERMINAL
+    assert exchange.fold.deliverable == "done on the stream"
+    assert marker_of(exchange.fold.trajectory)["args"] == {"calls": 1, "dropped": 0, "stale": 1}
+    stream_final_sighted = {
+        **stream_final_blind,
+        "probe": {**stream_final_blind["probe"], "activity": [CALL_CREATE, CALL_FAILED]},
+    }
+    monkeypatch.setattr(task, "_poll", scripted([running, stream_final_sighted]))
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.outcome == inject.OUTCOME_STREAM_TERMINAL
+    assert marker_of(exchange.fold.trajectory)["args"] == {"calls": 2, "dropped": 0}
+
+    # The deadline read follows the same rule, whether it finds the terminal
+    # in its entries or classifies a graded timeout from the polls before
+    # it: either way it ends the wait, and the persona was still running.
+    monkeypatch.setattr(task, "_poll", scripted([blind_finish]))
+    fold = inject.Fold("task-1")
+    fold.note_activity([CALL_CREATE], 0, 0)
+    exchange = task._classify(fold, "task-1", 3)
+    assert exchange.outcome == inject.OUTCOME_TERMINAL
+    assert marker_of(exchange.fold.trajectory)["args"] == {"calls": 1, "dropped": 0, "stale": 1}
+    blind_deadline = {
+        "entries": [],
+        "lastSeq": 3,
+        "probe": {"active": True, "taskId": "task-1", "error": "kv read failed"},
+    }
+    monkeypatch.setattr(task, "_poll", scripted([blind_deadline]))
+    timed_out = inject.Fold("task-1")
+    # A real fold carries the transport's task marker from the transcript,
+    # which is what makes the record the inject transport's to the scorer.
+    timed_out.apply(entry(1, inject.ENTRY_TASK, taskId="task-1"))
+    timed_out.note_executor_state(inject.STATE_WORKING)
+    timed_out.note_activity([CALL_CREATE], 0, 0)
+    exchange = task._classify(timed_out, "task-1", 3)
+    assert exchange.outcome == inject.OUTCOME_DEADLINE
+    assert marker_of(exchange.fold.trajectory)["args"] == {"calls": 1, "dropped": 0, "stale": 1}
+    assert scoring._inject_blind(exchange.fold.trajectory)
+
+
+def test_the_trace_is_taken_only_from_a_read_about_this_task() -> None:
+    """A probe describing another task -- the record's active task on a
+    read that named none, or a later turn's -- lends this fold nothing."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    fold = inject.Fold("task-1")
+    other = inject.Probe.from_body(probe_body(taskId="task-2", activity=[CALL_CREATE]))
+    assert other is not None
+    task._note(fold, "task-1", other)
+    assert not fold.activity_shown
+    mine = inject.Probe.from_body(probe_body(activity=[CALL_CREATE], progress=PROGRESS_LINE))
+    assert mine is not None
+    task._note(fold, "task-1", mine)
+    assert fold.activity_shown and fold.progress == PROGRESS_LINE
+    # A read the gateway could not make carries no trace worth adopting.
+    broken = inject.Probe.from_body(probe_body(activity=[], error="kv read failed"))
+    assert broken is not None
+    task._note(fold, "task-1", broken)
+    assert fold.activity_summary == {"calls": 1, "dropped": 0}

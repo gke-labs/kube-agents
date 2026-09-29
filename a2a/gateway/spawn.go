@@ -84,9 +84,17 @@ const (
 	// workerRunAsUser is the arbitrary non-root UID session pods run as.
 	workerRunAsUser = 1000
 	// Worker requests: the harness spike's per-session footprint, and what
-	// the session cap's sizing math multiplies.
+	// the session cap's sizing math multiplies. The limits exist because a
+	// namespace ResourceQuota that requires them refuses a pod without
+	// them at admission, and a session pod refused there is a delegation
+	// that never starts; they are the sandbox's (2 CPU, 2Gi), which is
+	// what a headless harness turn has been observed to fit in. On an
+	// Autopilot cluster without Pod bursting the limit is rewritten to the
+	// request, so the request stays a ceiling a turn can live under.
 	workerCPURequest    = "250m"
 	workerMemoryRequest = "512Mi"
+	workerCPULimit      = "2"
+	workerMemoryLimit   = "2Gi"
 	// sessionNameHexWidth suffixes minted session names — wide enough that
 	// two conversations can't plausibly collide onto one addressee.
 	// supervisorCorrHexWidth suffixes the fallback correlation id a
@@ -344,6 +352,10 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					Requests: corev1.ResourceList{
 						corev1.ResourceCPU:    resource.MustParse(workerCPURequest),
 						corev1.ResourceMemory: resource.MustParse(workerMemoryRequest),
+					},
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse(workerCPULimit),
+						corev1.ResourceMemory: resource.MustParse(workerMemoryLimit),
 					},
 				},
 				VolumeMounts: []corev1.VolumeMount{

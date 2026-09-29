@@ -1542,8 +1542,11 @@ main() {
 
   if [ "$PARAM_PLAN" = "true" ]; then
     print_step "4. Planning (read-only)"
-    # A plan applies nothing, so the scope check speaks and does not refuse.
+    # A plan applies nothing, so the scope check speaks and does not refuse,
+    # and so does the container preflight (a folder this identity cannot bind,
+    # a policy that forbids the Asset API).
     refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"
+    check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
     print_info "Comparing this checkout's composition against the install's Terraform state."
     local plan_status=0
     run_lifecycle "${repo_dir}/terraform/examples/full-install" \
@@ -1574,8 +1577,8 @@ main() {
   # the difference is load-bearing. Both previews have exited above, so it is
   # tempting to read "past the previews" as "past the point of no return" — but
   # two arms still refuse after the dispatch and before they write anything:
-  # full runs the scope check, the minter/KMS guard and the service-account
-  # 409 check, and
+  # full runs the scope check, the container preflight, the minter/KMS guard
+  # and the service-account 409 check, and
   # harness reads the release's values to learn which plugin tags to move. A run
   # that stops on one of those has applied none of the new release, so the
   # checkout this run detached has to go back. Each arm therefore flips the gate
@@ -1619,6 +1622,11 @@ main() {
       # the live CR, and a scope the CR carries that neither the release
       # record nor the keys account for is refused here rather than replaced.
       refuse_apply_over_undeclared_scope "$target_namespace" || exit 1
+      # And the container preflight: the apply binds a declared folder or
+      # organisation with this identity and enables the Asset API in the host
+      # project, so a container it cannot bind, or a policy that forbids the
+      # API, is refused here rather than failing the apply partway.
+      check_scope_container_access || exit 1
       # install.sh's post-generation minter guard, without its import step:
       # an upgrade never imports the App key, so an install.env that enables the
       # minter against a key with no ENABLED version would wedge the apply on
@@ -1637,7 +1645,7 @@ main() {
       # new fixed-name GSA on an install that has been running without one, so
       # the 409 check install.sh runs before its apply runs here too.
       check_service_account_ownership || exit 1
-      # All three guards above are refusals, and apply_crd_upgrades is the first
+      # Every guard above is a refusal, and apply_crd_upgrades is the first
       # write this arm makes, so the gate belongs between them.
       UPGRADE_APPLY_STARTED="true"
       apply_crd_upgrades "$repo_dir"

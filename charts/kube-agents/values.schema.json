@@ -696,6 +696,18 @@
                 "type": "string"
               }
             },
+            "folders": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "organizations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "exclude": {
               "type": "object",
               "additionalProperties": false,

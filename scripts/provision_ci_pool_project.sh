@@ -34,10 +34,21 @@ LEDGER_INSTALLATION_ID="157029058"
 # a Prow periodic on main). Step 4 grants it signer on this project's copy of
 # the App key, which is the whole reach it has here.
 PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+# The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, two
+# Prow periodics on main). The IAM step before 1.3 grants it what re-applying
+# bench/tf/fleet needs on the project; step 2 grants it the state bucket.
+FLEET_RECONCILER_SA="serviceAccount:seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
 PEM_FILE=""
 SKIP_FLEET="false"
 SKIP_HOST_CLUSTER="false"
 ALLOW_UNMAPPED="false"
+# The first commit a GitOps repository needs before anything can open a branch
+# in it; the reasoning sits with the same three values in
+# scripts/verify_ci_pool_project.py, which prints this call as the repair and
+# whose tests pin the two copies equal.
+readonly GITOPS_SEED_FILE="README.md"
+readonly GITOPS_SEED_MESSAGE="Initial commit"
+readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
 
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.
@@ -308,6 +319,23 @@ for role in \
   done
 done
 
+# compute.viewer: the GKE provider lists each node pool's instance group
+# managers on refresh, which no other role here carries (seen live 2026-09-28).
+echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
+for role in \
+  roles/compute.storageAdmin \
+  roles/compute.viewer \
+  roles/container.admin \
+  roles/iam.serviceAccountAdmin \
+  roles/iam.serviceAccountUser \
+  roles/resourcemanager.projectIamAdmin \
+  roles/serviceusage.serviceUsageConsumer; do
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="${FLEET_RECONCILER_SA}" \
+    --role="${role}" \
+    --quiet >/dev/null
+done
+
 # ─── Artifact Registry Creation & Cleanup Policy ──────────────────────────────
 echo -e "\n==> [Step 1.3] Creating Regional Docker Artifact Registry & Cleanup Policy..."
 if ! gcloud artifacts repositories describe kube-agents --location="${REGION}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
@@ -363,6 +391,21 @@ if ! gh repo view "${GITOPS_REPO}" >/dev/null 2>&1; then
   gh repo create "${GITOPS_REPO}" --private --description="GitOps eval repository for ${PROJECT_ID}"
 fi
 
+# `defaultBranchRef` is null until the repository has a commit; the five
+# projects onboarded in late September sat like that for days, failing every
+# remediation repetition that leased them. A read that fails is not "empty":
+# seeding on it would write blind, so it stops the step instead.
+if ! GITOPS_DEFAULT_BRANCH="$(gh repo view "${GITOPS_REPO}" --json defaultBranchRef --jq '.defaultBranchRef.name')"; then
+  echo "ERROR: could not read the default branch of ${GITOPS_REPO}; not seeding it blind." >&2
+  exit 1
+fi
+if [ -z "${GITOPS_DEFAULT_BRANCH}" ]; then
+  echo "Seeding ${GITOPS_REPO} with its first commit (the repository has no branches)..."
+  gh api -X PUT "repos/${GITOPS_REPO}/contents/${GITOPS_SEED_FILE}" \
+    -f message="${GITOPS_SEED_MESSAGE}" \
+    -f content="$(printf '%s\n' "${GITOPS_SEED_CONTENT}" | base64 | tr -d '\n')" >/dev/null
+fi
+
 INST_JSON="$(gh api /orgs/gke-agentic/installations --jq ".installations[] | select(.app_id==${APP_ID})" 2>/dev/null || echo "")"
 if [ -n "${INST_JSON}" ]; then
   INST_ID="$(echo "${INST_JSON}" | jq -r .id)"
@@ -406,6 +449,25 @@ if ! gcloud storage buckets describe "gs://${STATE_BUCKET}" >/dev/null 2>&1; the
     --uniform-bucket-level-access
   gcloud storage buckets update "gs://${STATE_BUCKET}" --versioning
 fi
+# The reconciler reads and writes the fleet's state here, beside the host
+# cluster's, which carries the install's secrets: list on the bucket (`tofu
+# init` lists it, which a grant conditioned on the object name does not cover)
+# and objectAdmin under the seeded-fleet/ prefix only. The prefix keeps tofu's
+# reads off the other state; the identity's project IAM admin above could
+# widen it, so the fence is that only main-only jobs run as this account.
+# --condition=None on the unconditioned grant: once the conditioned one below
+# exists, gcloud refuses an unconditioned add in non-interactive mode without
+# it, and this script is re-run.
+gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
+  --member="${FLEET_RECONCILER_SA}" \
+  --role=roles/storage.legacyBucketReader \
+  --condition=None \
+  --quiet >/dev/null
+gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
+  --member="${FLEET_RECONCILER_SA}" \
+  --role=roles/storage.objectAdmin \
+  --condition="expression=resource.name.startsWith(\"projects/_/buckets/${STATE_BUCKET}/objects/seeded-fleet/\"),title=seeded-fleet-state,description=the seeded fleet state prefix only" \
+  --quiet >/dev/null
 
 if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then
   echo -e "\n==> [Step 2.1] Provisioning Host GKE Cluster (${HOST_CLUSTER_NAME}) with remote state..."

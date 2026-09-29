@@ -29,11 +29,17 @@ contributes nothing to main's side of the aggregate. Once the nightly has append
 partial window for it (`collecting`), that evidence feeds both. A case not named here cannot
 red a pull request on a graded failure, whatever its record says — and since 2026-09-22 it does
 not run on one either: the eval crew decided that the presubmit runs the blocking roster only
-([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), so `presubmit-cases.txt` and
-`blocking-roster.txt` hold the same twelve cases, a held-out case is a nightly case, and
-`scripts/test_eval_rosters.py` pins the equality. Before that date the presubmit also ran
-held-out cases that reported without blocking; the seven it was running moved to
-`hack/eval/nightly-cases.txt` that day, each with its hold-out reason beside its line.
+([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), so `presubmit-cases.txt` holds
+the roster's twelve cases plus, since 2026-09-29, one documented exception: a held-out seat a
+coverage tracker puts in the presubmit file without a roster line
+([#2013](https://github.com/gke-labs/kube-agents/issues/2013) for the compliance canary).
+Such a seat runs on every pull request, cannot red one on a graded failure under the default
+`roster` mode below (a switch to `record` mode would let the record admit it), and earns its
+record at presubmit volume; `scripts/test_eval_rosters.py` pins the set (`HELD_OUT_IN_PRESUBMIT`)
+and that the presubmit file minus those seats equals the roster. Every other held-out case is a
+nightly case. Before that date the presubmit also ran held-out cases that reported without
+blocking; the seven it was running moved to `hack/eval/nightly-cases.txt` that day, each with
+its hold-out reason beside its line.
 
 **The record informs; it does not decide.** Decided 2026-09-14
 ([#1493](https://github.com/gke-labs/kube-agents/issues/1493)): nobody should be able to
@@ -70,16 +76,17 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-All twelve presubmit cases are admitted, because the presubmit file is the roster
-(recount the entries of `hack/eval/presubmit-cases.txt` and `blocking-roster.txt` rather than
-trusting this sentence — an earlier copy of it miscounted twice). The bar a case clears to
+Twelve of the thirteen presubmit cases are admitted; the thirteenth, the compliance canary, is
+the held-out seat described above (recount the entries of `hack/eval/presubmit-cases.txt` and
+`blocking-roster.txt` rather than trusting this sentence — an earlier copy of it miscounted
+twice). The bar a case clears to
 get there: its recent record shows failures only on its own regressions or on infra classes
 the harness already excludes from the verdict.
 
-Every other case runs in the nightly only — one data point a night, at three repetitions —
-and its admission is one pull request that adds its line to both presubmit files and cites
-that record. Of the seven that left the presubmit on 2026-09-22, three are held out with a
-filed issue naming the exit condition:
+Every other case but that seat runs in the nightly only — one data point a night, at three
+repetitions — and its admission is one pull request that adds its line to both presubmit files
+and cites that record. Of the seven that left the presubmit on 2026-09-22, three are held out
+with a filed issue naming the exit condition:
 
 - **cluster-agent-healthy-workload-no-finding** —
   [#1010](https://github.com/gke-labs/kube-agents/issues/1010): the delegation receipt is
@@ -97,11 +104,17 @@ filed issue naming the exit condition:
   fleet-audit delegation chain is degraded: audits go partial on what the agent reports as
   "access limitations", skipping check 2.4 (the cluster-admin-binding check this case
   grades), and some runs publish no ledger at all — so the collapse is the environment's,
-  not the diff's. 413 of 677 graded presubmit repetitions 2026-09-15 to 09-22. Nightly since
-  2026-09-22, and the fleet-audits domain's only presubmit case, so its move put
-  `fleet-audits` on the `docs/designs/domains.yaml` allowlist
-  ([#1876](https://github.com/gke-labs/kube-agents/issues/1876)). Enters when #1171's
-  re-admission bar holds: delegation fixed and a clean 3-day graded record.
+  not the diff's. 413 of 677 graded presubmit repetitions 2026-09-15 to 09-22. Nightly
+  2026-09-22 to 2026-09-29; since 2026-09-29 seated held out in `presubmit-cases.txt`
+  ([#2013](https://github.com/gke-labs/kube-agents/issues/2013) step 2) after the eval install's
+  kanban cap (#2022, for the dispatcher-stall residual #2032) and the credential-proxy
+  workspace-leak fix (#2069, for #2011) landed. It runs on
+  every pull request, cannot red one on rungs 4 or 6, and does red one on rungs 1–3 like every
+  case. The Cases page's pill still reads demoted 09-02 (dated from this bullet) until the
+  roster line. Enters the roster when #2013 step 3 holds: three clean days at ≥ 90 % of graded
+  repetitions with no all-reps collapse, infra classes the harness excludes not counted (#1171
+  closed 2026-09-08; the bar lives on #2013); that edit takes `fleet-audits` off the
+  `domains.yaml` allowlist.
 - **rca-remediation-pr** —
   [#1189](https://github.com/gke-labs/kube-agents/issues/1189): demoted 2026-09-02 evening
   after rung-4 collapses on six unrelated pull requests in one day. The suite's longest
@@ -223,21 +236,22 @@ blocking for every case by design, admitted or not: `grade_case` evaluates them 
 reads admission. Those classes signal a broken case or install, not flake, and the fix is
 on that side rather than on the roster.
 
-Since 2026-09-22 those rungs reach only the cases the presubmit runs, which are the roster's
-twelve, and that narrows what a pull request can be redded for. The two held-out cases that
-used to exercise the GitHub-write path on every pull request — `rca-remediation-pr`
-(submit-suggestion opening a pull request) and the `compliance-rbac-overgrant` canary (the
-minted token, the cloned `*-infra` workspace, the ledger write) — are nightly cases now, so
-no presubmit case writes to GitHub at all: a change that breaks submit-suggestion, the token
-minter, the ledger write or the `pull_request_opened` / `ledger_issue_contains` verifiers reds
-nothing on the pull request that introduces it and is first seen by the next nightly that
-finishes grading. The eval crew took that trade with the policy; the way to close it is a
-GitHub-write probe cheap enough to earn a roster seat on its nightly record, and until one
-exists a pull request that touches that path should say what it ran by hand.
+Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's twelve and,
+since 2026-09-29, the held-out compliance canary. That seat puts one GitHub-writing case back on
+every pull request (the minted token, the cloned `*-infra` workspace, the ledger write, the
+`ledger_issue_contains` verifier), so a change that breaks that path is seen on the pull request
+that introduces it again: an erroring verifier or an empty record is a rung-1–3 red for every
+case, admitted or not. A graded miss on the canary (no ledger URL, the planted binding skipped)
+is reported as UNSTABLE and "(held out)" and blocks nothing. `rca-remediation-pr` and
+submit-suggestion's `pull_request_opened` path are still nightly-only, so a break there is still
+first seen by the next nightly that finishes grading; the eval crew took that trade with the
+policy, and a GitHub-write probe cheap enough to earn a roster seat on its nightly record is
+still the way to close it. Until one exists a pull request that touches that path should say
+what it ran by hand.
 
 ## The inject lane
 
-When the presubmit matrix runs through the A2A gateway's inject door — the harness's
+When a run's matrix goes through the A2A gateway's inject door — the harness's
 `AGENT_TRANSPORT=inject`, which `hack/ci-eval-pr.sh` exports under `EVAL_MODE_NEXT=1`
 ([`docs/designs/eval-next-transport.md`](designs/eval-next-transport.md), "The CI flag") — the
 roster above is still the roster:
@@ -245,14 +259,18 @@ nothing in the two roster files changes, and every case not named in the lane's 
 (below) runs and can red the job exactly as on the api lane. Two things differ, and they are
 kept apart on purpose.
 
-A check the transport blinds is the scorer's business. The door's record carries no tool calls
-and no card ids, so `tool_called`, `worker_commands` and `worker_agents` see nothing there; `bench-gate` sets
+A check the transport blinds is the scorer's business. The door's record carries no card ids
+and no worker's entries, so `worker_commands`, `worker_agents` and a `tool_called` in the
+`workers` or `all` scope see nothing there, and a door that shows no tool-call trace leaves a
+`tool_called` in its default `router` scope nothing either; `bench-gate` sets
 those entries aside as not applicable on that transport and grades the rest, and a case whose
 only objectives are of that kind is reported `NOT_GRADED_ON_TRANSPORT` rather than collapsed —
 evaluated, outside the pass rate, never weather
 ([`docs/designs/eval-scorer.md`](designs/eval-scorer.md), "The inject lane sets aside what its
-transport cannot show"). No roster edit is involved, and the rule retires itself once the
-executor's tool calls reach the record.
+transport cannot show"). No roster edit is involved. The router-scope `tool_called` half of the
+rule retires on a record whose door showed the whole trace (the transport's `a2a.activity` marker,
+reporting no loss), whether or not the run made a call; the worker half stays until a later change rebuilds the
+delegation wait for this path and takes those entries out of `worker_blind_checks`.
 
 A premise the transport removes is the lane's exclusion list,
 `hack/eval/inject-lane-exclusions.txt`. The door addresses `platform` directly, so a case that
@@ -290,7 +308,9 @@ the set of requesting cases. The same approvers as the exclusion list, for the s
 If an admitted case reds a pull request its diff cannot explain on a graded failure,
 demote it: delete its line from `hack/eval/blocking-roster.txt` and from
 `hack/eval/presubmit-cases.txt`, add it to `hack/eval/nightly-cases.txt` with the issue as
-the `#` line above it, and reference that issue. Demotion is a same-day edit to those
+the `#` line above it, and reference that issue. A held-out seat has no roster name: it is
+withdrawn by moving its line back to `hack/eval/nightly-cases.txt` and deleting its
+`HELD_OUT_IN_PRESUBMIT` entry. Demotion is a same-day edit to those
 files — the files, not the Prow config, are deliberately the fast lever. It is the lever for rung-4 reds ONLY: a rung-1–3 red (a mutation, an
 erroring verifier, an empty record on a task that provisions nothing — a record whose
 deployer died before any agent ran grades INFRA and reds nobody) does not stop when its

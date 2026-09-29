@@ -16,6 +16,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -1966,6 +1967,299 @@ class CloneCredentialTest(unittest.TestCase):
         with self.assertRaises(ContentWorkspaceError):
             store.open("acme/tf-live")
         self.assertEqual([], list(store.tree_root.iterdir()))
+
+
+class IdleReclaimTest(unittest.TestCase):
+    """A dead worker's workspace expires and a live one's does not.
+
+    The cap counts an in-memory list that only `close` shortened, so a worker
+    killed mid-run held its slot until the pod restarted; eight of those and
+    every later `open` on the install was refused. The clock is injected so
+    each test drives the idle time rather than sleeping through it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+        self.now = 1000.0
+
+    def clock(self):
+        return self.now
+
+    def store(self, runner=None):
+        return ContentWorkspaceStore(
+            self.base / "trees", self.agent, runner or RecordingRunner(), clock=self.clock
+        )
+
+    def limits(self, cap, idle):
+        cap_patch = mock.patch.object(content_workspace, "max_workspaces", lambda: cap)
+        idle_patch = mock.patch.object(content_workspace, "workspace_idle_seconds", lambda: idle)
+        cap_patch.start()
+        idle_patch.start()
+        self.addCleanup(cap_patch.stop)
+        self.addCleanup(idle_patch.stop)
+
+    def test_the_next_open_reclaims_an_idle_workspace_and_keeps_a_used_one(self):
+        self.limits(cap=2, idle=100)
+        store = self.store()
+        dead = store.open("acme/fleet", caller="t_dead")
+        live = store.open("acme/fleet", caller="t_live")
+        self.now += 99
+        # The live worker names its handle, which is what "in use" means.
+        store.get(live.handle)
+        self.now += 1
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            third = store.open("acme/fleet")
+        self.assertEqual({live.handle, third.handle}, set(store._workspaces))
+        self.assertFalse((store.tree_root / dead.handle).exists())
+        self.assertTrue((store.tree_root / live.handle).exists())
+        with self.assertRaises(NoSuchHandle):
+            store.get(dead.handle)
+        line = "\n".join(logs.output)
+        for fragment in (
+            "reclaimed after 100s idle",
+            f"handle={dead.handle[:8]}",
+            "repo=acme/fleet",
+            "caller=t_dead",
+            "age=100s",
+            "idle=100s",
+        ):
+            self.assertIn(fragment, line)
+        # The full handle is never logged.
+        self.assertNotIn(dead.handle, line)
+
+    def test_a_verb_queued_behind_the_lock_is_not_idle(self):
+        """The lock is held across clones and pushes for minutes; a verb waiting
+        its turn cannot stamp `last_used`, and must not lose its workspace to a
+        reclaim that wins the lock first."""
+        self.limits(cap=2, idle=100)
+        store = self.store()
+        held = store.open("acme/fleet", caller="t_waiter")
+        self.now += 100  # exactly reclaimable, were nothing waiting
+        outcome: dict = {}
+        finished = threading.Event()
+
+        def queued_list():
+            try:
+                outcome["listing"] = store.list(held.handle)
+            except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+                outcome["error"] = exc
+            finished.set()
+
+        with store._lock:  # stands in for another caller's long clone
+            threading.Thread(target=queued_list, daemon=True).start()
+            deadline = time.monotonic() + 5
+            while held.handle not in store._waiting and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertIn(held.handle, store._waiting)
+            store._reclaim_idle()  # what a second `open` does on winning the lock
+            self.assertIn(held.handle, store._workspaces, "reclaimed under a queued verb")
+        self.assertTrue(finished.wait(5))
+        self.assertNotIn("error", outcome)
+        self.assertEqual({}, store._waiting)
+        # Paired: the same idle time with nothing queued is reclaimed.
+        self.now += 100
+        store._reclaim_idle()
+        self.assertNotIn(held.handle, store._workspaces)
+
+    def test_a_bare_get_queued_behind_the_lock_is_announced_too(self):
+        """The broker's managed-repository gate on `commit` and `push` calls
+        `get` on its own before the verb, so the wait inside `get` has to count
+        as well, not only the wait inside a verb."""
+        self.limits(cap=2, idle=100)
+        store = self.store()
+        held = store.open("acme/fleet")
+        self.now += 100
+        outcome: dict = {}
+        finished = threading.Event()
+
+        def queued_get():
+            try:
+                outcome["workspace"] = store.get(held.handle)
+            except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+                outcome["error"] = exc
+            finished.set()
+
+        with store._lock:
+            threading.Thread(target=queued_get, daemon=True).start()
+            deadline = time.monotonic() + 5
+            while held.handle not in store._waiting and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertIn(held.handle, store._waiting)
+            store._reclaim_idle()
+            self.assertIn(held.handle, store._workspaces, "reclaimed under a queued get")
+        self.assertTrue(finished.wait(5))
+        self.assertNotIn("error", outcome)
+        self.assertEqual({}, store._waiting)
+        # And the resolved handle was stamped, so it is fresh again.
+        self.assertEqual(self.now, outcome["workspace"].last_used)
+
+    def test_the_refusal_does_not_quote_a_holder_a_verb_is_queued_on(self):
+        """A holder past the limit with a verb queued on it is about to be
+        stamped fresh, not freed, so the refusal's retry estimate must come
+        from the other holders and the log must say why it was kept."""
+        self.limits(cap=2, idle=100)
+        store = self.store()
+        returning = store.open("acme/fleet", caller="t_back")
+        busy = store.open("acme/infra", caller="t_busy")
+        self.now += 140
+        store.get(busy.handle)
+        self.now += 10  # returning: idle 150, past the limit; busy: idle 10
+        finished = threading.Event()
+        outcome: dict = {}
+
+        def queued_get():
+            try:
+                outcome["workspace"] = store.get(returning.handle)
+            except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+                outcome["error"] = exc
+            finished.set()
+
+        with store._lock:
+            threading.Thread(target=queued_get, daemon=True).start()
+            deadline = time.monotonic() + 5
+            while returning.handle not in store._waiting and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertIn(returning.handle, store._waiting)
+            with self.assertLogs("credential-proxy", level="WARNING") as logs:
+                with self.assertRaises(TooLarge) as refused:
+                    store.open("acme/fleet", caller="t_third")
+            message = str(refused.exception)
+            self.assertIn("idle 10s", message)
+            self.assertNotIn("150s", message)
+            held = [line for line in logs.output if "store full, holding" in line]
+            self.assertEqual(2, len(held))
+            self.assertIn(
+                f"handle={returning.handle[:8]} repo=acme/fleet caller=t_back age=150s idle=150s (a verb is queued on it)",
+                "\n".join(held),
+            )
+            self.assertIn(busy.handle, store._workspaces)
+            self.assertIn(returning.handle, store._workspaces)
+        self.assertTrue(finished.wait(5))
+        self.assertNotIn("error", outcome)
+        # Paired: with the queued verb gone and the holder stamped, the next
+        # refusal quotes the busiest remaining number honestly.
+        with self.assertRaises(TooLarge) as refused:
+            store.open("acme/fleet")
+        self.assertIn("idle 10s", str(refused.exception))
+
+    def test_the_idle_limit_is_inclusive_and_one_second_short_is_held(self):
+        self.limits(cap=1, idle=100)
+        store = self.store()
+        first = store.open("acme/fleet")
+        self.now += 99
+        with self.assertRaises(TooLarge):
+            store.open("acme/fleet")
+        self.assertEqual([first.handle], list(store._workspaces))
+        self.now += 1
+        second = store.open("acme/fleet")
+        self.assertEqual([second.handle], list(store._workspaces))
+        self.assertEqual([second.handle], [p.name for p in store.tree_root.iterdir()])
+
+    def test_a_full_store_names_every_holder_and_tells_the_caller_to_retry(self):
+        self.limits(cap=2, idle=1800)
+        store = self.store()
+        first = store.open("acme/fleet", caller="t_a")
+        self.now += 30
+        second = store.open("acme/infra", caller="t_b")
+        self.now += 10
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            with self.assertRaises(TooLarge) as refused:
+                store.open("acme/fleet")
+        holding = [line for line in logs.output if "store full, holding" in line]
+        self.assertEqual(2, len(holding))
+        text = "\n".join(holding)
+        for fragment in (
+            f"handle={first.handle[:8]}",
+            "repo=acme/fleet",
+            "caller=t_a",
+            "age=40s",
+            "idle=40s",
+            f"handle={second.handle[:8]}",
+            "repo=acme/infra",
+            "caller=t_b",
+            "age=10s",
+            "idle=10s",
+        ):
+            self.assertIn(fragment, text)
+        message = str(refused.exception)
+        self.assertIn("idle for 1800s", message)
+        # The longest idle, which is the slot that frees first, not the shortest.
+        self.assertIn("idle 40s", message)
+        self.assertNotIn("idle 10s", message)
+        self.assertIn("retry later", message)
+        self.assertNotIn("close one before opening another", message)
+        # Paired: the refusal changed nothing.
+        self.assertEqual({first.handle, second.handle}, set(store._workspaces))
+
+    def test_construction_removes_what_a_previous_process_left(self):
+        root = self.base / "trees"
+        leaked = root / ("e" * 32) / "repo" / "dir"
+        leaked.mkdir(parents=True)
+        (leaked / "f").write_text("x")
+        (root / ("f" * 32)).mkdir()
+        # Neither a file nor a directory the store did not name is its to remove.
+        (root / "note.txt").write_text("x")
+        (root / "seed").mkdir()
+        # Nor a handle-named symlink: following it would empty whatever it
+        # points at, which is not under the root at all.
+        victim = self.agent / "victim"
+        victim.mkdir()
+        (victim / "keep").write_text("x")
+        link = root / ("a" * 32)
+        link.symlink_to(victim)
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            store = self.store()
+        self.assertEqual({"note.txt", "seed", link.name}, {p.name for p in root.iterdir()})
+        self.assertTrue((victim / "keep").exists(), "the sweep followed a symlink")
+        self.assertIn(
+            "removed 2 of 2 orphaned tree(s), 0 entries could not be removed",
+            "\n".join(logs.output),
+        )
+        # Paired: the store it produced is an ordinary empty one.
+        workspace = store.open("acme/fleet")
+        self.assertEqual(
+            {"note.txt", "seed", link.name, workspace.handle},
+            {p.name for p in root.iterdir()},
+        )
+
+    def test_a_malformed_caller_label_is_refused_and_a_plain_one_is_kept(self):
+        store = self.store()
+        for bad in ("has space", "semi;colon", "x" * 65, "new\nline", "../x", 42):
+            with self.subTest(caller=bad):
+                with self.assertRaises(ContentWorkspaceError):
+                    store.open("acme/fleet", caller=bad)
+        self.assertEqual({}, store._workspaces)
+        self.assertEqual([], list(store.tree_root.iterdir()))
+        self.assertEqual("t_f660e9c5", store.open("acme/fleet", caller="t_f660e9c5").caller)
+        self.assertEqual("", store.open("acme/fleet").caller)
+
+    def test_the_idle_knob_falls_back_to_the_default_rather_than_disabling_expiry(self):
+        for raw, expected in (("", 1800), ("0", 1800), ("-5", 1800), ("junk", 1800), ("60", 60)):
+            with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS": raw}):
+                self.assertEqual(expected, content_workspace.workspace_idle_seconds(), raw)
+
+    @unittest.skipIf(os.geteuid() == 0, "root is not refused by a directory mode")
+    def test_the_removal_helper_reports_what_it_could_not_delete(self):
+        tree = self.base / "stuck"
+        held = tree / "keep"
+        held.mkdir(parents=True)
+        (held / "f").write_text("x")
+        held.chmod(0o500)
+        self.addCleanup(lambda: held.chmod(0o700) if held.exists() else None)
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            left = content_workspace._remove_tree(tree)
+        # The file, its directory, and the root above it.
+        self.assertEqual(3, left)
+        self.assertIn("3 entries could not be removed", logs.output[0])
+        # Paired: writable, the same tree goes and nothing is reported.
+        held.chmod(0o700)
+        self.assertEqual(0, content_workspace._remove_tree(tree))
+        self.assertFalse(tree.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
