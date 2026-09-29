@@ -69,7 +69,8 @@ graph TD
     I -->|Yes| CL{"Atomically claim .bootstrap_completed (O_EXCL)"}
     CL -->|Lost the race| J
     CL -->|Won| K["Emit INVENTORY.md verbatim -> delivered to origin"]
-    K --> L["Archive as INVENTORY.delivered.md, remove both jobs (in-process)"]
+    K --> L["Archive as INVENTORY.delivered.md"]
+    L --> RT["A later tick (claim 5+ min old) posts nothing, removes both jobs (in-process)"]
 ```
 
 ---
@@ -88,7 +89,7 @@ The flow coordinates state through flag files under the agent pod's `/opt/data/`
 | **`/opt/data/INVENTORY.md`**                  | the prioritization kanban worker            | The ranked, verbatim-delivered report, written from `INVENTORY.raw.md` alone. Written to this absolute path (not the worker's own profile home) through the worker's terminal, so it is on the sandbox pod, where the delivery script reads it. Its presence means the report is ready to send — unchanged as the delivery signal, it simply arrives one stage later than it used to. Renamed to `INVENTORY.delivered.md` on the sandbox pod by the delivery script (`_cleanup`) after the report is emitted.                                                                                                                                                                                                                                                                                                             |
 | **`/opt/data/.user_aligned`**                 | Python, in `plugin.py`                      | Touched in `handle_pre_llm_call` on the first interactive user turn, and only once an origin has been bound. Signals to the delivery job that a human has joined the chat. **Safety rule:** background tasks must never create or write this marker (see Rule 4).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | **`/opt/data/.bootstrap_greeted`**            | Python, in `plugin.py`                      | Written after the opening turn has been primed. Every new session's first turn re-enters the hook, so without this the greeting, the presence marker, and the delivery re-binding all repeat per session until a report is finally delivered.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| **`/opt/data/.bootstrap_completed`**          | `bootstrap_delivery.py` (`_claim_delivery`) | Created with `O_CREAT \| O_EXCL` **before** the report reaches stdout — it is the delivery claim, not a receipt. Whichever run wins the create delivers; any other run exits silently. Its presence also means onboarding is permanently done: the plugin stays quiet and both jobs stay inert even after `INVENTORY.md` has been renamed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **`/opt/data/.bootstrap_completed`**          | `bootstrap_delivery.py` (`_claim_delivery`) | Created with `O_CREAT \| O_EXCL` **before** the report reaches stdout — it is the delivery claim, not a receipt. Whichever run wins the create delivers; any other run exits silently. Its presence also means onboarding is permanently done: the plugin stays quiet, and the first delivery tick that finds it at least `RETIRE_AFTER_SECONDS` (five minutes) old removes both jobs, scan job first. A failed delivery-job removal is retried on the next tick; a failed scan-job removal leaves that job in place, where it does nothing once this marker exists.                                                                                                                                                                                                                                                      |
 | **`/opt/data/.bootstrap_greet_eval-<case>`**  | the first-install-hello bench stack         | The eval seam (Rule 5): a request for the greeting, JSON `phrase`, `variant` and `written_at`, answered on every API-server turn whose message contains the phrase until the stack's destroy removes it or an hour after `written_at`. Nothing on a real install writes it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 ---
@@ -110,7 +111,7 @@ Both cases converge on the same delivery path: the `no_agent` delivery job posts
 
 2. **Delivery job (each tick):** `INVENTORY.md` is still absent → the script emits nothing → silent run.
 3. **Scan completes:** the `platform` worker, after waiting out its per-cluster cards, writes `/opt/data/INVENTORY.raw.md` and files the prioritization card. That worker ranks the findings and writes `/opt/data/INVENTORY.md`. The scan job has been skipping this whole time, on `.bootstrap_scan_filed`.
-4. **Next delivery tick:** both `INVENTORY.md` and `.user_aligned` exist and `.bootstrap_completed` is absent → the script reads the report, claims delivery by creating `.bootstrap_completed` with `O_EXCL`, prints the report, and the scheduler delivers it verbatim to the bound origin chat. `_cleanup` then archives the report as `INVENTORY.delivered.md` and removes both onboarding jobs.
+4. **Next delivery tick:** both `INVENTORY.md` and `.user_aligned` exist and `.bootstrap_completed` is absent → the script reads the report, claims delivery by creating `.bootstrap_completed` with `O_EXCL`, prints the report, and the scheduler delivers it verbatim to the bound origin chat. `_cleanup` then archives the report as `INVENTORY.delivered.md`. The first delivery tick at least five minutes later finds `.bootstrap_completed`, posts nothing, and removes both onboarding jobs (`_retire_jobs`).
 
 ```mermaid
 sequenceDiagram
@@ -136,14 +137,15 @@ sequenceDiagram
     Deliver->>Disk: Check .user_aligned present and not completed, then read INVENTORY.md off the sandbox pod
     Deliver->>Disk: Claim delivery (create .bootstrap_completed, O_EXCL)
     Deliver->>User: Emit INVENTORY.md verbatim -> delivered to origin
-    Deliver->>Disk: _cleanup: archive INVENTORY.delivered.md, remove both jobs
+    Deliver->>Disk: _cleanup: archive INVENTORY.delivered.md
+    Deliver->>Disk: A later tick: _retire_jobs removes both jobs, posting nothing
 ```
 
 ### Case B: User engages after the scan finished (quiet boot)
 
 1. **Silent completion:** during the unattended boot the scan writes `/opt/data/INVENTORY.raw.md`, the prioritization card ranks it into `/opt/data/INVENTORY.md`, and both return `[SILENT]`. The delivery job stays silent because `.user_aligned` is absent, so the report waits on disk.
 2. **Turn 1 (`pre_llm_call`):** the plugin does exactly the same things as in Case A (bind origin → touch `.user_aligned` → trigger delivery → mark `.bootstrap_greeted`) and picks its greeting by checking `INVENTORY.md` on the agent pod. With the shell sandbox off the report is there, so it injects `defaults/onboarding/scan_completed.md` (the same short greeting, saying the summary is in this chat and ending on an offer to start on a finding). With the sandbox on the report is on the sandbox pod, which the plugin does not read, so it injects `scan_in_progress.md` as in Case A even though the report is ready.
-3. **Next delivery tick:** both files now exist → the script delivers `INVENTORY.md` verbatim to the origin chat and runs `_cleanup`.
+3. **Next delivery tick:** both files now exist → the script delivers `INVENTORY.md` verbatim to the origin chat and runs `_cleanup`; a later tick removes both jobs, as in Case A.
 
 The report therefore arrives as its own message shortly after the greeting, identical to Case A — the user always sees the same verbatim report, never an LLM-reformatted one.
 
@@ -166,7 +168,8 @@ sequenceDiagram
     Agent->>User: kube-agents hello + "the summary is in this chat" + one question
     Deliver->>Disk: Claim delivery (create .bootstrap_completed, O_EXCL)
     Deliver->>User: Emit INVENTORY.md verbatim -> delivered to origin
-    Deliver->>Disk: _cleanup: archive INVENTORY.delivered.md, remove both jobs
+    Deliver->>Disk: _cleanup: archive INVENTORY.delivered.md
+    Deliver->>Disk: A later tick: _retire_jobs removes both jobs, posting nothing
 ```
 
 ---
@@ -188,8 +191,9 @@ When changing onboarding instructions, scripts, or the plugin under `agents/chat
 
 ### 2. Do cleanup in code, not via LLM terminal commands
 
-- **Rule:** Onboarding cleanup runs deterministically in code — the delivery script's `_cleanup` (`cron.jobs.remove_job`, in-process) — never by instructing the model to run `hermes cron rm` or delete state from a chat turn.
-- **Why:** Determinism. A model may forget a step, run the wrong command, or reformat state. (Note: self-removal mid-run is otherwise harmless — the scheduler delivers this run from its cached job dict, and a later `mark_job_run` on a removed job just logs a warning; it does not crash or drop delivery.)
+- **Rule:** Onboarding cleanup runs deterministically in code — the delivery script's `_cleanup` (archives the report) and `_retire_jobs` (`cron.jobs.remove_job`, in-process) — never by instructing the model to run `hermes cron rm` or delete state from a chat turn.
+- **Why:** Determinism. A model may forget a step, run the wrong command, or reformat state.
+- **Trap:** never remove the delivery job from the run that delivers. Removing a job while it runs drops that run's fire claim, and the scheduler discards the run's output instead of posting it, so the report never reaches the chat. `_retire_jobs` runs on a later tick, which has nothing to post.
 
 ### 3. Verify state with absolute paths, not relative queries
 
@@ -291,8 +295,8 @@ for p in $(kubectl get pods -n kubeagents-system -l app=platform-agent-shell -o 
 done
 ```
 
-**Once a report has been delivered, clearing markers is not enough.** `_cleanup` removes both
-onboarding cron jobs after a successful delivery, so there is nothing left to fire and a marker
+**Once a report has been delivered, clearing markers is not enough.** `_retire_jobs` removes both
+onboarding cron jobs a few minutes after a successful delivery, so there is nothing left to fire and a marker
 reset produces silence. Check with `grep bootstrap /opt/data/cron/jobs.json` inside the pod; if the jobs are gone, either
 re-add them or skip the gate entirely and file the sweep card yourself. Archive the previous run's
 cards first, as above: the card body lists the same per-cluster keys every time, so the previous
@@ -310,9 +314,9 @@ hermes kanban create --assignee platform --idempotency-key bootstrap-inventory-s
   --body "$BODY" "First-time environment discovery: write the onboarding inventory report"
 ```
 
-Use a fresh key anyway. `_cleanup` renames the report and removes the cron jobs, but it never
-touches the board, so a `bootstrap-inventory-scan` card the archive step missed is still there — and
-the board answers a repeated key by returning that card's id and spawning nothing.
+Use a fresh key anyway. `_cleanup` renames the report and `_retire_jobs` removes the cron jobs, but
+neither touches the board, so a `bootstrap-inventory-scan` card the archive step missed is still
+there — and the board answers a repeated key by returning that card's id and spawning nothing.
 
 Filing directly is also the better option for measurement: it starts the clock at card creation
 rather than at the next cron tick, removing up to 60 seconds of scheduling latency from any timing.
@@ -346,7 +350,9 @@ Unit tests cover the deterministic pieces of the flow (they mock the Hermes
   delivery trigger, that the inventory is never injected into the turn, and the eval seam
   (phrase-matched, answered again on a retry, no side effects, inert when absent).
 - `../../../scripts/test_bootstrap_onboarding_scripts.py` — the delivery
-  decision, the atomic claim and verbatim emit/archive, the scan job's
+  decision, the atomic claim and verbatim emit/archive, job retirement (the
+  delivering run removes no job, a later run removes both with the delivery
+  job last, a fresh claim is left alone), the scan job's
   file-once-then-skip behaviour across repeated ticks, the Cluster Agent
   roster the gate writes into the sweep card, and the prioritization handoff:
   that the sweep card hands ranking to a separate card rather than doing it

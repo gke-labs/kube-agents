@@ -22,9 +22,11 @@ sandbox is on, and from ``HERMES_HOME`` when it is off, and only once both
 markers say a delivery is due — the ssh read is the one check with a cost.
 
 When all three hold, the script claims delivery, prints ``INVENTORY.md``
-(delivered verbatim), sets the report aside where it was read, and removes the
-two onboarding cron jobs. Otherwise it prints nothing, which the ``no_agent``
-cron path treats as a silent run (no message).
+(delivered verbatim) and sets the report aside where it was read. Otherwise it
+prints nothing, which the ``no_agent`` cron path treats as a silent run (no
+message). The first run ``RETIRE_AFTER_SECONDS`` or more after a delivery
+removes the two onboarding cron jobs; ``_retire_jobs`` says why the delivering
+run cannot.
 
 The claim is what makes "exactly once" true rather than merely likely.
 ``.bootstrap_completed`` is created with ``O_CREAT | O_EXCL`` *before* anything
@@ -43,6 +45,7 @@ exactly what the user sees. The sweep's complete findings are a different file
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import sandbox_exec
@@ -67,6 +70,13 @@ SANDBOX_HOME = "/opt/data"
 REPORT_MAX_BYTES = 256 * 1024
 SANDBOX_TIMEOUT_SECONDS = 30
 
+# How old ``.bootstrap_completed`` must be before a run removes the jobs. A
+# younger marker may belong to a racing run that is still delivering (see the
+# claim in the module docstring), and removing the delivery job under it would discard its
+# report. Far above that run's post-claim work: a stdout write and one archive
+# over ssh bounded by SANDBOX_TIMEOUT_SECONDS.
+RETIRE_AFTER_SECONDS = 300
+
 # By absolute path: the terminal login sources a ~/.bashrc the model owns, and a
 # shell function or alias cannot shadow a name with a slash in it.
 REMOTE_MV = "/bin/mv"
@@ -85,6 +95,14 @@ def _awaiting_delivery(data_dir: Path) -> bool:
     if (data_dir / ".bootstrap_completed").exists():
         return False
     return (data_dir / ".user_aligned").exists()
+
+
+def _completed_at(data_dir: Path) -> float | None:
+    """When the delivery claim was taken, or None if it has not been."""
+    try:
+        return (data_dir / ".bootstrap_completed").stat().st_mtime
+    except FileNotFoundError:
+        return None
 
 
 def _read_report(data_dir: Path, in_sandbox: bool) -> bytes | None:
@@ -164,8 +182,7 @@ def _cleanup(data_dir: Path, in_sandbox: bool) -> None:
 
     Onboarding is already marked complete by the delivery claim, so everything
     here is best-effort: a cleanup hiccup must never turn a delivered report
-    into a reported failure. Even if job removal fails, ``.bootstrap_completed``
-    keeps both jobs inert.
+    into a reported failure.
 
     The report is renamed, not deleted — see ``DELIVERED_REPORT_NAME``. Moving
     it out of the way still matters: the sweep and prioritization SOPs, which
@@ -175,10 +192,17 @@ def _cleanup(data_dir: Path, in_sandbox: bool) -> None:
     """
     _archive_report(data_dir, in_sandbox)
 
-    # Remove the onboarding jobs in-process. Self-removing the delivery job
-    # mid-run is safe: the scheduler delivers this run's stdout from the job
-    # dict it cached at tick time, and a subsequent mark_job_run on a missing
-    # job simply logs a warning (see the plugin README, "Architectural Rules").
+
+def _retire_jobs() -> None:
+    """Remove both onboarding cron jobs, in-process.
+
+    Only a run with nothing to deliver may call this. Removing a job while it
+    runs drops the run's fire claim, and the scheduler then discards that run's
+    output instead of posting it. So the run that delivers the report leaves
+    both jobs in place, and a later run, which finds ``.bootstrap_completed``
+    and has nothing to post, removes them and loses nothing. The delivery job
+    goes last because removing it ends this run.
+    """
     try:
         from cron.jobs import remove_job  # type: ignore import-not-found
     except Exception:
@@ -194,8 +218,14 @@ def main(data_dir: Path | None = None) -> int:
     if data_dir is None:
         data_dir = _data_dir()
 
+    completed = _completed_at(data_dir)
+    if completed is not None:
+        if time.time() - completed >= RETIRE_AFTER_SECONDS:
+            _retire_jobs()
+        return 0
+
     if not _awaiting_delivery(data_dir):
-        return 0  # silent run — nobody to deliver to yet (or already delivered)
+        return 0  # silent run — nobody to deliver to yet
 
     try:
         in_sandbox = sandbox_exec.sandbox_enabled()

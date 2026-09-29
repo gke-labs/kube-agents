@@ -8,9 +8,9 @@ Covers the deterministic decision + I/O logic of:
                             kanban_create call for each ready Cluster Agent;
                             stops re-filing)
 
-The in-process job removal in bootstrap_delivery._cleanup imports cron.jobs,
-which is unavailable here; its import is guarded, so _cleanup degrades to a
-no-op for job removal while still archiving INVENTORY.md.
+The in-process job removal in bootstrap_delivery._retire_jobs imports
+cron.jobs, which is unavailable here; its import is guarded, so it is a no-op
+unless a test puts a stand-in module in sys.modules.
 
 bootstrap_delivery imports sandbox_exec from agents/platform/scripts, which the
 image copies into the same directory as the chat scripts. The delivery tests
@@ -25,6 +25,7 @@ again.
 import contextlib
 import errno
 import io
+import os
 import re
 import shlex
 import subprocess
@@ -179,6 +180,92 @@ class DeliveryMainTest(unittest.TestCase):
         rc, out = self._run()
         self.assertEqual(rc, 0)
         self.assertEqual(out, report)
+
+
+class RetireRunTest(unittest.TestCase):
+    """The onboarding jobs are removed by a run after the one that delivers.
+
+    Hermes discards the output of a run whose job is removed while it runs, so
+    a delivery run that removed its own job would post nothing.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        patcher = mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.removed = []
+        self.fail_on = set()
+        cron = types.ModuleType("cron")
+        jobs = types.ModuleType("cron.jobs")
+        jobs.remove_job = self._remove_job
+        cron.jobs = jobs
+        modules = mock.patch.dict(sys.modules, {"cron": cron, "cron.jobs": jobs})
+        modules.start()
+        self.addCleanup(modules.stop)
+
+    def _remove_job(self, job_id):
+        if job_id in self.fail_on:
+            raise RuntimeError("store locked")
+        self.removed.append(job_id)
+        return True
+
+    def _run(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = bootstrap_delivery.main(self.d)
+        return rc, out.getvalue(), err.getvalue()
+
+    def _age_claim(self, seconds):
+        then = time.time() - seconds
+        os.utime(self.d / COMPLETED, (then, then))
+
+    def test_the_delivering_run_removes_no_job(self):
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual(self.removed, [])
+
+    def test_a_later_run_removes_both_jobs_delivery_last(self):
+        (self.d / ALIGNED).touch()
+        (self.d / COMPLETED).touch()
+        self._age_claim(bootstrap_delivery.RETIRE_AFTER_SECONDS)
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, ""))
+        self.assertEqual(self.removed, [bootstrap_delivery.SCAN_JOB_ID, bootstrap_delivery.DELIVERY_JOB_ID])
+
+    def test_a_fresh_claim_is_left_to_the_run_that_took_it(self):
+        # A racing run that took the claim moments ago may still be delivering.
+        (self.d / ALIGNED).touch()
+        (self.d / COMPLETED).touch()
+        self._age_claim(bootstrap_delivery.RETIRE_AFTER_SECONDS - 60)
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, ""))
+        self.assertEqual(self.removed, [])
+
+    def test_a_failed_removal_is_reported_and_the_other_is_still_tried(self):
+        (self.d / COMPLETED).touch()
+        self._age_claim(bootstrap_delivery.RETIRE_AFTER_SECONDS)
+        self.fail_on = {bootstrap_delivery.SCAN_JOB_ID}
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, ""))
+        self.assertIn(f"could not remove {bootstrap_delivery.SCAN_JOB_ID}", err)
+        self.assertEqual(self.removed, [bootstrap_delivery.DELIVERY_JOB_ID])
+
+    def test_the_retire_run_reads_nothing_and_archives_nothing(self):
+        (self.d / INVENTORY).write_text("# Another report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        (self.d / COMPLETED).touch()
+        self._age_claim(bootstrap_delivery.RETIRE_AFTER_SECONDS)
+        with mock.patch.object(bootstrap_delivery, "_read_report") as read:
+            rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, ""))
+        read.assert_not_called()
+        self.assertTrue((self.d / INVENTORY).exists())
 
 
 class DeliveryFromSandboxTest(unittest.TestCase):

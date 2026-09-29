@@ -17,7 +17,7 @@ that decides what the agent does unattended.
 A blanket ``cp -f`` is not the remedy. It would reset every ``last_run`` (making
 every job look due at once), discard the chat binding the ``bootstrap_onboarding``
 plugin writes (``deliver: origin`` plus ``origin``), and resurrect the two
-onboarding jobs that ``bootstrap_delivery.py:_cleanup`` deliberately removes once
+onboarding jobs that ``bootstrap_delivery.py:_retire_jobs`` deliberately removes once
 onboarding has finished. So this merges by job id instead.
 
 The split
@@ -48,7 +48,7 @@ owns.
 The ledger
 ----------
 A job absent from the runtime file is ambiguous — either it is new in this image,
-or it was deliberately removed at runtime (which is exactly what ``_cleanup``
+or it was deliberately removed at runtime (which is exactly what ``_retire_jobs``
 does). The ledger records every id this script has installed, which separates the
 two: an id in the ledger but missing from the runtime file was removed on purpose
 and is never reinstalled.
@@ -98,11 +98,7 @@ naming a mechanism:
 
 How wide that second window is depends on whether Hermes' ``mark_job_run``
 re-reads the store or writes back a list cached at tick time. This module does not
-know, and neither did the comment that used to assert the latter here. The repo's
-own evidence points the other way — ``bootstrap_delivery._cleanup`` removes a job
-mid-run and relies on the subsequent ``mark_job_run`` warning about a missing job
-rather than resurrecting it, which only happens if it re-reads — so the exposure is
-probably a narrow read-modify-write window rather than a guaranteed clobber. It is
+know, and neither did the comment that used to assert the latter here. It is
 recorded as unverified because nobody has read ``/opt/hermes/cron/jobs.py`` to
 settle it, and an unverified premise stated as fact is what put the wrong claim
 here in the first place.
@@ -236,7 +232,7 @@ def reconcile(
                 summary["refreshed"].append(job_id)
         elif job_id in ledger:
             # Installed by an earlier boot and gone now: removed on purpose
-            # (bootstrap_delivery._cleanup). Reinstalling would undo that.
+            # (bootstrap_delivery._retire_jobs). Reinstalling would undo that.
             summary["skipped_removed"].append(job_id)
         else:
             result.append(dict(image_job))
