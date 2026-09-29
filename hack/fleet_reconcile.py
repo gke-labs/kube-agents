@@ -166,7 +166,11 @@ def plan_changes(show_json):
     if not isinstance(document, dict):
         raise ReconcileError("tofu show wrote a plan that is not a JSON object")
     changes = []
-    resource_changes = document.get("resource_changes") or []
+    # The raw value here too: a falsy wrong type must not read as "no changes"
+    # on a plan that -detailed-exitcode said had some.
+    resource_changes = document.get("resource_changes")
+    if resource_changes is None:
+        resource_changes = []
     if not isinstance(resource_changes, list):
         raise ReconcileError("tofu show wrote resource_changes that is not a JSON array")
     for change in resource_changes:
@@ -254,9 +258,12 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
 def load_fixture_state(source, runner=subprocess.run):
     """The published scan, from a gs:// object or a local file."""
     if source.startswith(GCS_PREFIX):
-        result = runner(
-            ["gcloud", "storage", "cat", source], capture_output=True, text=True, timeout=GCLOUD_TIMEOUT_SECONDS
-        )
+        try:
+            result = runner(
+                ["gcloud", "storage", "cat", source], capture_output=True, text=True, timeout=GCLOUD_TIMEOUT_SECONDS
+            )
+        except OSError as exc:
+            raise ReconcileError("could not run gcloud to read %s: %s" % (source, exc))
         if result.returncode != 0:
             raise ReconcileError("could not read %s: %s" % (source, _tail(result.stderr)))
         raw = result.stdout

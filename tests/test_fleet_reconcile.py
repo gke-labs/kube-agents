@@ -196,6 +196,7 @@ class PlanInspectionTest(unittest.TestCase):
     def test_a_show_that_is_json_but_not_an_object_is_that_projects_failure(self):
         for body in ("[]", "null", '{"resource_changes": [null]}', '{"resource_changes": {"a": {}}}', '{"resource_changes": 5}', '{"resource_changes": "abc"}', '{"resource_changes": [{"address": "a", "change": "x"}]}', '{"resource_changes": [{"address": "a", "change": {"actions": [null]}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": 5}}]}',
                      # Falsy wrong types must be refused as loudly as truthy ones.
+                     '{"resource_changes": 0}', '{"resource_changes": false}', '{"resource_changes": ""}', '{"resource_changes": {}}',
                      '{"resource_changes": [{"address": "a", "change": []}]}', '{"resource_changes": [{"address": "a", "change": 0}]}', '{"resource_changes": [{"address": "a", "change": {"actions": 0}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": {}}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": ""}}]}'):
             tofu = _Tofu({P7: body})
             outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
@@ -263,6 +264,14 @@ class TargetsTest(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, json.dumps({"projects": {}}), "")
 
         self.assertEqual(reconcile.load_fixture_state(reconcile.DEFAULT_FIXTURE_STATE, runner=gcloud), {"projects": {}})
+
+    def test_a_missing_gcloud_is_named_not_called_a_service(self):
+        def no_gcloud(argv, **_):
+            raise FileNotFoundError(2, "No such file or directory", "gcloud")
+
+        with self.assertRaises(reconcile.ReconcileError) as raised:
+            reconcile.load_fixture_state(reconcile.DEFAULT_FIXTURE_STATE, runner=no_gcloud)
+        self.assertIn("could not run gcloud", str(raised.exception))
 
     def test_a_missing_local_scan_file_is_named_not_called_a_service(self):
         with self.assertRaises(reconcile.ReconcileError) as raised:
@@ -527,17 +536,19 @@ class TofuRunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             script, pidfile = self._stubborn_child(tmp)
             previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
-            later = threading.Timer(2.5, os.kill, args=(os.getpid(), signal.SIGINT))
+            # Two seconds for the child to install SIG_IGN, then the ceiling,
+            # then the signal during the grace.
+            later = threading.Timer(3.5, os.kill, args=(os.getpid(), signal.SIGINT))
             started = time.monotonic()
             try:
                 later.start()
                 with mock.patch.object(reconcile, "INTERRUPT_GRACE_SECONDS", 20):
                     with self.assertRaises(boskos_pool.Terminated):
-                        reconcile.tofu_runner([sys.executable, "-c", script], timeout=1.0)
+                        reconcile.tofu_runner([sys.executable, "-c", script], timeout=2.0)
             finally:
                 later.cancel()
                 signal.signal(signal.SIGINT, previous)
-            self.assertLess(time.monotonic() - started, 8)
+            self.assertLess(time.monotonic() - started, 9)
             self._assert_dead(pidfile)
 
     def test_a_termination_signal_reaches_the_child_before_it_propagates(self):
@@ -552,7 +563,8 @@ class TofuRunnerTest(unittest.TestCase):
                 "time.sleep(30)\n" % marker
             )
             previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
-            timer = threading.Timer(0.5, os.kill, args=(os.getpid(), signal.SIGINT))
+            # Two seconds for the child to start and install its handler.
+            timer = threading.Timer(2.0, os.kill, args=(os.getpid(), signal.SIGINT))
             try:
                 timer.start()
                 with self.assertRaises(boskos_pool.Terminated):
