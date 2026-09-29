@@ -194,7 +194,7 @@ class PlanInspectionTest(unittest.TestCase):
         self.assertNotIn("apply", tofu.verbs())
 
     def test_a_show_that_is_json_but_not_an_object_is_that_projects_failure(self):
-        for body in ("[]", "null", '{"resource_changes": [null]}', '{"resource_changes": {"a": {}}}', '{"resource_changes": 5}', '{"resource_changes": "abc"}', '{"resource_changes": [{"address": "a", "change": "x"}]}', '{"resource_changes": [{"address": "a", "change": {"actions": [null]}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": 5}}]}',
+        for body in ("[]", "null", "{}", '{"resource_changes": null}', '{"resource_changes": []}', '{"resource_changes": [null]}', '{"resource_changes": {"a": {}}}', '{"resource_changes": 5}', '{"resource_changes": "abc"}', '{"resource_changes": [{"address": "a", "change": "x"}]}', '{"resource_changes": [{"address": "a", "change": {"actions": [null]}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": 5}}]}',
                      # Falsy wrong types must be refused as loudly as truthy ones.
                      '{"resource_changes": 0}', '{"resource_changes": false}', '{"resource_changes": ""}', '{"resource_changes": {}}',
                      '{"resource_changes": [{"address": "a", "change": []}]}', '{"resource_changes": [{"address": "a", "change": 0}]}', '{"resource_changes": [{"address": "a", "change": {"actions": 0}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": {}}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": ""}}]}',
@@ -203,7 +203,7 @@ class PlanInspectionTest(unittest.TestCase):
             tofu = _Tofu({P7: body})
             outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
             self.assertEqual(outcome, reconcile.OUTCOME_FAILED, body)
-            self.assertTrue(detail.startswith("tofu show wrote"), detail)
+            self.assertTrue(detail.startswith("tofu show"), detail)
 
     def test_a_plan_with_nothing_to_do_applies_nothing(self):
         tofu = _Tofu({}, plan_exit={P7: reconcile.PLAN_NO_CHANGES})
@@ -714,6 +714,30 @@ class TofuRunnerTest(unittest.TestCase):
         finally:
             signal.signal(signal.SIGINT, previous)
         self.assertLess(time.monotonic() - started, 6, "the child was interrupted and killed, not left for 30 s")
+
+    def test_a_second_termination_while_the_first_is_being_forwarded_kills_the_child(self):
+        # A signal in the window between catching the first termination and
+        # forwarding it: deferred, read as "stop now", the child is killed and
+        # a Terminated propagates, with no grace wait.
+        real_popen = subprocess.Popen
+
+        class _Popen(real_popen):
+            def send_signal(self, sig):
+                os.kill(os.getpid(), signal.SIGINT)
+                return super().send_signal(sig)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script, pidfile = self._stubborn_child(tmp)
+            previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+            started = time.monotonic()
+            try:
+                with mock.patch.object(reconcile.subprocess, "Popen", _Popen), mock.patch.object(reconcile, "INTERRUPT_GRACE_SECONDS", 20):
+                    with self.assertRaises(boskos_pool.Terminated):
+                        reconcile.tofu_runner([sys.executable, "-c", script], timeout=2.0)
+            finally:
+                signal.signal(signal.SIGINT, previous)
+            self.assertLess(time.monotonic() - started, 8, "no grace wait after a stop-now")
+            self._assert_dead(pidfile)
 
     def test_a_finished_child_is_returned_with_its_output(self):
         result = reconcile.tofu_runner([sys.executable, "-c", "print('hi')"], timeout=10)

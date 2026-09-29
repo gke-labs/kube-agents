@@ -136,22 +136,42 @@ def tofu_runner(argv, cwd=None, timeout=None, **_):
     except (subprocess.TimeoutExpired, boskos_pool.Terminated) as first:
         if proc is None:
             raise
-        proc.send_signal(signal.SIGINT)
-        try:
-            proc.communicate(timeout=INTERRUPT_GRACE_SECONDS)
-        except (subprocess.TimeoutExpired, boskos_pool.Terminated) as second:
+        # The forward and the kill each run with terminations deferred, so a
+        # second signal cannot land between catching the first and acting on
+        # it; one that does is a "stop now" and skips the grace.
+        stop_now = _with_terminations_deferred(lambda: proc.send_signal(signal.SIGINT))
+        second = None
+        if not stop_now:
+            try:
+                proc.communicate(timeout=INTERRUPT_GRACE_SECONDS)
+            except (subprocess.TimeoutExpired, boskos_pool.Terminated) as exc:
+                second = exc
+        if stop_now or second is not None:
             # The grace ran out, or a signal cut it short: either way tofu is
             # killed before the project is released, never left running
-            # detached under a project handed back to the pool. A termination
-            # that lands during the ceiling's grace is the one that propagates:
-            # a bare raise here would re-raise the ceiling and the run would
-            # carry on into the next project under Prow's kill timer.
-            proc.kill()
-            proc.communicate()
-            if isinstance(second, boskos_pool.Terminated):
-                raise second
+            # detached under a project handed back to the pool.
+            landed = _with_terminations_deferred(lambda: (proc.kill(), proc.communicate()))
+            if stop_now or landed or isinstance(second, boskos_pool.Terminated):
+                # A termination is what propagates, not the ceiling: a bare
+                # raise of the ceiling would carry the run into the next
+                # project under Prow's kill timer.
+                raise second if isinstance(second, boskos_pool.Terminated) else boskos_pool.Terminated("a termination during the interrupt")
         raise first
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def _with_terminations_deferred(fn):
+    """Run fn() with termination signals deferred; True if one landed."""
+    landed = False
+    boskos_pool._hold_signals(True)
+    try:
+        fn()
+    finally:
+        try:
+            boskos_pool._hold_signals(False)
+        except boskos_pool.Terminated:
+            landed = True
+    return landed
 
 
 def _tail(text):
@@ -177,12 +197,12 @@ def plan_changes(show_json):
         raise ReconcileError("tofu show wrote a plan that is not a JSON object")
     changes = []
     # The raw value here too: a falsy wrong type must not read as "no changes"
-    # on a plan that -detailed-exitcode said had some.
+    # on a plan that -detailed-exitcode said had some, and neither may an
+    # absent key (the emitter omits it when empty): this is only reached for
+    # a plan with changes, so a document listing none was not inspected.
     resource_changes = document.get("resource_changes")
-    if resource_changes is None:
-        resource_changes = []
-    if not isinstance(resource_changes, list):
-        raise ReconcileError("tofu show wrote resource_changes that is not a JSON array")
+    if not isinstance(resource_changes, list) or not resource_changes:
+        raise ReconcileError("tofu show lists no resource changes for a plan that has changes; nothing was inspected, so nothing is applied")
     for change in resource_changes:
         # The raw values, not `or {}` / `or []` defaults: a falsy wrong type
         # would otherwise read as "no actions" and the entry would be applied
