@@ -86,10 +86,11 @@ readonly AGENT_DIAG_DEPLOYMENT="deployment/platform-agent-gateway"
 # Every one-shot read gives up after this, so an unreachable cluster costs
 # seconds per call on an exit that is often already an infrastructure failure.
 readonly AGENT_DIAG_REQUEST_TIMEOUT="30s"
-# A watch that exits sooner than HEALTHY_SECONDS failed to open, and the loop
-# retries it after this pause, at this pace while the cluster is unreachable.
-# One that lasted was cut (the request timeout below, or the apiserver's own
-# 30-60 minute close) and is reopened at once, so the stream has no gap.
+# A watch held if it lasted HEALTHY_SECONDS and exited 0: the request timeout
+# below is sent to the apiserver, which ends the watch cleanly, as it does its
+# own 30-60 minute close. One that held is reopened at once. Any other exit
+# (fast, or a slow dial or hang that errors) is retried after this pause, at
+# this pace while the cluster is unreachable.
 readonly AGENT_DIAG_WATCH_RESTART_SECONDS=10
 readonly AGENT_DIAG_WATCH_HEALTHY_SECONDS=30
 # Each watch is also cut at this, so the loop re-checks that the eval is still
@@ -189,22 +190,23 @@ collect_gateway_log() {
 _agent_pod_watch_loop() {
   local parent="$1" out="$2"
   shift 2
-  local child="" pause="" only=() opened=0
+  local child="" pause="" only=() opened=0 rc=0
   trap 'kill ${child} ${pause} 2>/dev/null; exit 0' TERM
   while kill -0 "${parent}" 2>/dev/null; do
     opened=${SECONDS}
     "$@" ${only[@]+"${only[@]}"} >> "${out}" 2>&1 &
     child=$!
-    wait "${child}" || true
+    rc=0
+    wait "${child}" || rc=$?
     child=""
-    if (( SECONDS - opened >= AGENT_DIAG_WATCH_HEALTHY_SECONDS )); then
+    if (( rc == 0 && SECONDS - opened >= AGENT_DIAG_WATCH_HEALTHY_SECONDS )); then
       # Every open lists everything before it watches. After a held open the
       # stream is continuous but for one kubectl restart, and a reprint per
       # cut would push the record out of the byte cap.
       only=(--watch-only)
       continue
     fi
-    # A fast exit means the watch could not be held (unreachable, 5xx, auth):
+    # Anything else means the watch could not be held (unreachable, 5xx, auth):
     # the stream has a gap of unknown length, so the next open lists again.
     only=()
     # Backgrounded and waited on, not run in the foreground: bash defers a

@@ -35,8 +35,8 @@ EXIT_DEADLINE_SECONDS = 10
 # its arguments, records its pid in $STUB_WATCH_PIDS and then either blocks
 # for STUB_WATCH_SECONDS (the apiserver holding the watch open, 60 unless
 # set, which is the request timeout cutting it) or, with STUB_WATCH_EXITS,
-# returns (the apiserver closing it), or with STUB_WATCH_PLAN ("2,0") takes
-# its per-resource open's duration from the list in turn; prints its arguments then STUB_LINES lines of
+# returns (the apiserver closing it), or with STUB_WATCH_PLAN ("3,3:1") takes
+# its per-resource open's duration and exit status from the list in turn; prints its arguments then STUB_LINES lines of
 # STUB_LINE_BYTES for anything else; or fails outright when STUB_FAIL is set.
 KUBECTL_STUB = """#!/usr/bin/env bash
 echo "$*" >> "${STUB_CALLS}"
@@ -50,7 +50,10 @@ case "$*" in
       n=$(cat "${n_file}" 2>/dev/null || echo 0)
       echo $((n + 1)) > "${n_file}"
       IFS=, read -r -a plan <<< "${STUB_WATCH_PLAN}"
-      exec sleep "${plan[$((n % ${#plan[@]}))]}"
+      step="${plan[$((n % ${#plan[@]}))]}"
+      sleep "${step%%:*}"
+      case "${step}" in *:*) exit "${step#*:}" ;; esac
+      exit 0
     fi
     exec sleep "${STUB_WATCH_SECONDS:-60}" ;;
 esac
@@ -327,7 +330,8 @@ class AgentPodDiagnosticsTest(unittest.TestCase):
         """A fast exit after a held open is a gap of unknown length; the next
         open must put the list back on record."""
         _, artifacts, _ = run_collect(
-            watch=True, restart_seconds="0", healthy_seconds="1", watch_for=5.5, STUB_WATCH_PLAN="2,0"
+            # SECONDS is whole seconds: 3 s against 2 holds and 0 s fails on every alignment.
+            watch=True, restart_seconds="0", healthy_seconds="2", watch_for=5.5, STUB_WATCH_PLAN="3,0"
         )
         pods = (artifacts / "agent-pods-watch.txt").read_text(encoding="utf-8")
         opens = [line for line in pods.splitlines() if line.startswith("WATCH: ")]
@@ -335,6 +339,18 @@ class AgentPodDiagnosticsTest(unittest.TestCase):
         self.assertNotIn("--watch-only", opens[0])
         self.assertIn("--watch-only", opens[1], "the open after a held one must not relist")
         self.assertNotIn("--watch-only", opens[2], "the open after a failed one must relist")
+
+    def test_a_watch_that_fails_slowly_is_not_held(self):
+        """A dial timeout or a hang that errors can outlast the threshold; the
+        exit status, not the duration alone, says it never watched."""
+        _, artifacts, _ = run_collect(
+            watch=True, restart_seconds="0", healthy_seconds="2", watch_for=7.5, STUB_WATCH_PLAN="3,3:1"
+        )
+        pods = (artifacts / "agent-pods-watch.txt").read_text(encoding="utf-8")
+        opens = [line for line in pods.splitlines() if line.startswith("WATCH: ")]
+        self.assertGreaterEqual(len(opens), 3, pods)
+        self.assertIn("--watch-only", opens[1])
+        self.assertNotIn("--watch-only", opens[2], "a slow failure must not count as held")
 
     def test_a_watch_that_held_is_reopened_at_once_without_relisting(self):
         """A cut watch reopens with no pause, so no event falls in a gap, and
