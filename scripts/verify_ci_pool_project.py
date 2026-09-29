@@ -177,10 +177,14 @@ DEADLINE_PASSED = "the run's deadline passed before this check"
 # ...and for a command refused inside a check that had started.
 DEADLINE_CUT = "the run's deadline passed"
 # The run's deadline as a time.monotonic() value, set by verify_project from
-# --deadline-seconds and read by run_cmd: every command after it is cut to
-# the time left and returns 124 at once once none is, so a stall inside a
-# check cannot carry the run past a caller's ceiling either.
+# --deadline-seconds and read by run_cmd and _net_timeout: every command after
+# it is cut to the time left (a subprocess returns 124 at once once none is,
+# an HTTP call gets the floor below), so a stall inside a check cannot carry
+# the run past a caller's ceiling either.
 _RUN_DEADLINE: Optional[float] = None
+# The least an HTTP call under the deadline gets: enough to fail fast with a
+# timeout the call sites already read as "unverified", not enough to overrun.
+NET_TIMEOUT_FLOOR_SECONDS = 1.0
 
 REQUIRED_APIS = {
     # bench/tf/fleet declares google_compute_disk (the planted orphan-pd-* the
@@ -2385,6 +2389,14 @@ def _read_ledger_app_key(timeout: int = 30) -> Tuple[Optional[str], str]:
         return None, f"the stored {LEDGER_KEY_SECRET_ENTRY} is not a readable PEM ({exc})"
 
 
+def _net_timeout(default: float) -> float:
+    """An HTTP call's timeout under the run's deadline: its own, cut to the
+    time left, never below NET_TIMEOUT_FLOOR_SECONDS."""
+    if _RUN_DEADLINE is None:
+        return default
+    return max(NET_TIMEOUT_FLOOR_SECONDS, min(default, _RUN_DEADLINE - time.monotonic()))
+
+
 def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str, str]:
     """Trade the App key for an installation token. Returns (token, status, message).
 
@@ -2448,7 +2460,7 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
         data=json.dumps({"permissions": LEDGER_READ_PERMISSIONS}).encode(),
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=_net_timeout(timeout)) as response:
             body = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
@@ -2557,7 +2569,7 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=_net_timeout(timeout)) as response:
             response.read()
     except urllib.error.HTTPError as exc:
         # A 403 is two different answers. Rate limiting is a limit of the moment
@@ -2686,7 +2698,7 @@ def _probe_github_app_identity(
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=_net_timeout(timeout)) as response:
             body = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         if exc.code == 401:

@@ -512,7 +512,8 @@ def _finite_seconds(text: str) -> float:
 
 def _project_list(text: str) -> list[str]:
     """argparse type: comma-separated project ids of the mapping's shape."""
-    projects = [p.strip() for p in text.split(",") if p.strip()]
+    # Deduplicated: a repeated id would run two verifiers on one report file.
+    projects = list(dict.fromkeys(p.strip() for p in text.split(",") if p.strip()))
     bad = [p for p in projects if not PROJECT_ID_RE.match(p)]
     if bad:
         raise argparse.ArgumentTypeError(f"not a project id: {', '.join(repr(p) for p in bad)}")

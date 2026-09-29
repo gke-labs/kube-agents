@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import inspect
 import io
 import json
 import os
@@ -3749,6 +3750,48 @@ class ReportDocumentTest(unittest.TestCase):
             doc = json.loads(path.read_text())
             self.assertEqual(set(doc["checks"]), set(checker.POOL_STATE_CHECKS))
             self.assertTrue(all(record["status"] == "unchecked" and record["warnings"] == ["gcloud has no active credential"] for record in doc["checks"].values()))
+
+    def test_verify_project_arms_the_deadline_before_anything_runs_and_hands_it_to_the_checks(self):
+        # The link between --deadline-seconds and the checks: the run deadline
+        # is set before the toolchain check, run_checks gets the same value,
+        # and a run without the flag leaves both unset.
+        seen = {}
+
+        def toolchain(needs_gh):
+            seen["at_toolchain"] = checker._RUN_DEADLINE
+            return []
+
+        def checks(project_id, app_id, location, confirmed, selected, deadline):
+            seen["handed"] = deadline
+            seen["at_checks"] = checker._RUN_DEADLINE
+            return [checker.CheckResult("g", True)]
+        before = time.monotonic()
+        with mock.patch.object(checker, "check_toolchain", toolchain), mock.patch.object(checker, "run_checks", checks), mock.patch("sys.stdout", io.StringIO()):
+            checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_GKE_AND_STATE], deadline_seconds=270)
+            self.assertIsNotNone(seen["at_toolchain"])
+            self.assertEqual(seen["handed"], seen["at_toolchain"])
+            self.assertEqual(seen["at_checks"], seen["handed"])
+            self.assertAlmostEqual(seen["handed"] - before, 270, delta=5)
+            checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_GKE_AND_STATE])
+            self.assertIsNone(seen["handed"])
+            self.assertIsNone(seen["at_checks"])
+
+    def test_http_calls_are_cut_to_the_time_left_under_the_deadline(self):
+        # The App and ledger probes call urllib, not run_cmd; their timeout is
+        # cut to the deadline too, and never below the floor.
+        try:
+            checker._RUN_DEADLINE = None
+            self.assertEqual(checker._net_timeout(15), 15)
+            checker._RUN_DEADLINE = time.monotonic() + 3
+            self.assertLessEqual(checker._net_timeout(15), 3)
+            self.assertGreater(checker._net_timeout(15), 1)
+            checker._RUN_DEADLINE = time.monotonic() - 1
+            self.assertEqual(checker._net_timeout(15), checker.NET_TIMEOUT_FLOOR_SECONDS)
+        finally:
+            checker._RUN_DEADLINE = None
+        source = inspect.getsource(checker)
+        self.assertEqual(source.count("urlopen(request, timeout=_net_timeout(timeout))"), 3, "every urlopen goes through the deadline")
+        self.assertNotIn("urlopen(request, timeout=timeout)", source)
 
     def test_the_command_line_takes_checks_and_report(self):
         with tempfile.TemporaryDirectory() as tmp:

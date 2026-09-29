@@ -348,6 +348,17 @@ class EntryPoint(ScanHarness):
         self.assertFalse((self.workdir.parent / "evals-2").exists(), "nothing was created beside it")
         self.assertTrue(pool_state.PROJECT_ID_RE.match("kube-agents-evals-35"))
 
+    def test_a_repeated_project_id_is_scanned_once(self):
+        # Two workers on one report file would race; the door keeps one.
+        self.world.write_text(json.dumps({PROJECT: report()}), encoding="utf-8")
+        out = self.root / "pool-state.json"
+        with unittest.mock.patch.dict(os.environ, {"STUB_WORLD": str(self.world), "STUB_LOG": str(self.log)}), \
+             unittest.mock.patch.object(pool_state, "missing_binaries", return_value=[]):
+            rc, _ = self._run("--out", str(out), "--projects", f"{PROJECT},{PROJECT}, {PROJECT}", "--verifier", str(self.stub), "--now", NOW.isoformat(), "--workdir", str(self.workdir))
+        self.assertEqual(rc, pool_state.EXIT_OK)
+        self.assertEqual(list(json.loads(out.read_text(encoding="utf-8"))["projects"]), [PROJECT])
+        self.assertEqual(self.log.read_text(encoding="utf-8").count("--project-id"), 1, "one verifier run")
+
     def test_an_empty_projects_value_is_refused_not_widened_to_the_pool(self):
         for empty in (",", " ", ", ,"):
             stderr = __import__("io").StringIO()
