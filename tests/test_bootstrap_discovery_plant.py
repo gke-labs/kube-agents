@@ -35,10 +35,11 @@ real install:
      closed the gate stops the apply before step 2 changes anything.
 
 The rest pin step 1's refusals, step 2 stopping when it cannot list the
-sandbox pods, and step 4's handling of a board read that fails. As in `test_autoops_incident_plant.py`, the provisioner is rendered the
-way Terraform renders it and run against a stub `kubectl`/`gcloud`/`sleep`.
-The reads in steps 1 and 2 also run on their own against a data directory, and
-step 4's board query against a sqlite board.
+sandbox pods, and step 4's handling of a board read that fails and of a sweep
+no worker picked up. As in `test_autoops_incident_plant.py`, the provisioner is
+rendered the way Terraform renders it and run against a stub
+`kubectl`/`gcloud`/`sleep`. The reads in steps 1 and 2 also run on their own
+against a data directory, and step 4's board query against a sqlite board.
 """
 
 import json
