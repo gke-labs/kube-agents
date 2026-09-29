@@ -44,7 +44,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_drift_sink='"platform-agent-drift-audit-sink"',
                    tfvar_enable_stockout="false",
                    tfvar_stockout_topic='"gke-stockout-alerts-topic"',
-                   tfvar_stockout_sub='"gke-stockout-alerts-sub"'):
+                   tfvar_stockout_sub='"gke-stockout-alerts-sub"',
+                   console_fail_var=""):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -84,6 +85,13 @@ EOF
     exit 0
 elif [[ "$cmd" == "console" ]]; then
     read -r expr
+    # console_fail_var models a terraform console that cannot answer -- a state
+    # lock, a missing provider, a syntax error in the configuration -- for the
+    # one variable named. Checked before every other branch so it wins.
+    if [[ -n "{console_fail_var}" && "$expr" == *"{console_fail_var}"* ]]; then
+        echo 'Error: could not load the configuration' >&2
+        exit 1
+    fi
     if [[ "$expr" == *"agent_service_account_id"* ]]; then
         echo '{tfvar_agent_sa}'
         exit 0
@@ -644,6 +652,27 @@ resource "google_service_account" "agent" {
             tfvar_drift_sub='"renamed-drift-audit-sub"',
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_the_flag_cannot_be_read(self):
+        """A terraform console that cannot answer stops the apply rather than
+        reading as "feature disabled".
+
+        The flag is assigned to a local before it is compared for this reason:
+        tfvar ends in `exit 1`, which inside $( ) kills only the subshell, so
+        `[[ "$(tfvar "$flag")" == "true" ]] || continue` would skip the row and
+        let the rename through. Every other flag read in lifecycle.sh still has
+        that inline shape, so this pins the one that does not.
+        """
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list=self._DRIFT_SUB_ADDRESS,
+            state_show=self._DRIFT_SUB_STATE,
+            tfvar_enable_drift_pubsub="true",
+            tfvar_drift_sub='"renamed-drift-audit-sub"',
+            console_fail_var="enable_drift_pubsub",
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("could not evaluate var.enable_drift_pubsub", proc.stderr)
 
     def test_guard_pubsub_subscription_refuses_when_stockout_subscription_differs(self):
         proc = self._run_guard(
