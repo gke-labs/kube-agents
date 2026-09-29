@@ -303,15 +303,20 @@ def _read_checks(entry: dict, whole: bool) -> list[str]:
 
 
 def unread_units(document: dict | None) -> int:
-    """How many checks went unread on projects the scan did check: the
-    digest's "every one shaped as the verifier requires" is only as true as
-    this is zero."""
+    """How many checks were not read in full on projects the scan did check:
+    not checked at all, or read in part with the rest refused (healthy or
+    drifted with `unread`). The digest's "every one shaped as the verifier
+    requires" is only as true as this is zero."""
     count = 0
     for project, entry in _entries(document):
         checks = entry.get(KEY_CHECKS) if isinstance(entry, dict) else None
         if not isinstance(checks, dict) or not _read_checks(entry, whole=False):
             continue
-        count += sum(1 for verdict in checks.values() if isinstance(verdict, dict) and verdict.get(KEY_STATE) == CHECK_NOT_CHECKED)
+        for verdict in checks.values():
+            if not isinstance(verdict, dict):
+                continue
+            if verdict.get(KEY_STATE) == CHECK_NOT_CHECKED or verdict.get(KEY_UNREAD):
+                count += 1
     return count
 
 

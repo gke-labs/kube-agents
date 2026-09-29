@@ -205,6 +205,12 @@ class OneProject(ScanHarness):
         self.assertEqual(pool_state.unread_units(self.scan({PROJECT: report()})), 0)
         blind = self.scan({PROJECT: report(**{check: unchecked() for check in CHECKS})})
         self.assertEqual(pool_state.unread_units(blind), 0, "an unchecked project is blind, not partial")
+        # A check read in part (healthy, with a refused read) counts too: the
+        # bucket describe refused on a project whose clusters were listed.
+        partial = {"status": "pass", "message": "clusters present; state bucket not checked", "warnings": ["Could not read gs://p-tf-state"], "unread": ["Could not read gs://p-tf-state"], "exit": 2}
+        doc = self.scan({PROJECT: report(gke_and_state=partial)})
+        self.assertEqual(doc["projects"][PROJECT]["checks"]["gke_and_state"]["state"], "healthy")
+        self.assertEqual(pool_state.unread_units(doc), 1)
 
     def test_advice_on_a_read_that_happened_still_counts_as_read_in_full(self):
         # The minter check warns about a second ENABLED key version on a

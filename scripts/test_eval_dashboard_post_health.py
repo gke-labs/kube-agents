@@ -1922,7 +1922,7 @@ class PoolDrift(RunHarness):
         self.assertEqual(line(None), [])
         self.assertEqual(line(pool_block()), ["🧭 *Pool projects:* 30 of 30 pool projects checked at 9:00 AM ET, every one shaped as the verifier requires."])
         self.assertEqual(line(pool_block(checked=28)), ["🧭 *Pool projects:* 28 of 30 pool projects checked at 9:00 AM ET, every one shaped as the verifier requires, 2 not checked."])
-        self.assertEqual(line(pool_block(unread_units=140)), ["🧭 *Pool projects:* 30 of 30 pool projects checked at 9:00 AM ET, no drift in what was read; 140 checks not read."])
+        self.assertEqual(line(pool_block(unread_units=140)), ["🧭 *Pool projects:* 30 of 30 pool projects checked at 9:00 AM ET, no drift in what was read; 140 checks not read in full."])
         self.assertEqual(
             line(pool_block(drifted={"kube-agents-evals-1": [FINDING], "kube-agents-evals-4": [FINDING]})),
             [f"🧭 *Pool projects:* 2 of 30 checked pool projects drifted at 9:00 AM ET ({FINDING}); a 403 from a run that leased one of them is the pool's, not the code."],

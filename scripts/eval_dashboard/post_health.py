@@ -944,7 +944,7 @@ def pool_state_digest_line(health: dict) -> str | None:
     if unread:
         # A project counts as checked when one check read anything; a scan
         # that read little must not be reported as a clean bill.
-        return f"🧭 *Pool projects:* {checked} of {total} pool projects checked at {when}, no drift in what was read; {unread} {plural(unread, 'check')} not read{unchecked}."
+        return f"🧭 *Pool projects:* {checked} of {total} pool projects checked at {when}, no drift in what was read; {unread} {plural(unread, 'check')} not read in full{unchecked}."
     return f"🧭 *Pool projects:* {checked} of {total} pool projects checked at {when}, every one shaped as the verifier requires{unchecked}."
 
 
