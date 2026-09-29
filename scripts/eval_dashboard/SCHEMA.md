@@ -124,6 +124,7 @@ the same layout and is collected from the moment it starts running.
   for a case whose every objective check is not applicable on that
   transport — does not parse and yields no entry, so such a case is missing
   from `tasks[]` rather than misfiled; the next-mode key is #2008's):
+
   - `result` — `pass` for `[PASSED]`, `fail` for `[FAILED]` **and**
     `[UNSTABLE]` (a multi-repetition case that passed some but not all
     graded repetitions is not a clean pass; `reps` carries the split),
@@ -896,7 +897,7 @@ a tick reads one and writes none, which is the episode ending.
 
 `periodics` is the watched Prow periodics' notes, by job name, one for each job
 whose latest finished build failed (`verdict: FAILED`) or is older than the
-job's stale window (`STALE`): `{job, label, verdict, since, build,
+job's stale window, or carries no readable finish time (`STALE`): `{job, label, verdict, since, build,
 finished_at, result, stale_after_h, dry_run, detail[], history_url, doc}`,
 where `detail` names the projects the reconcile's artifact says it refused,
 failed or was interrupted in, and `since` is carried from the previous

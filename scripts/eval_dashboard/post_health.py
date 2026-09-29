@@ -923,7 +923,7 @@ def periodic_digest_lines(health: dict) -> list[str]:
     lines = []
     for _, note in sorted((health.get("periodics") or {}).items()):
         if note.get("verdict") == periodics.VERDICT_STALE:
-            last = f"no finished run since {clock(parse_iso(note.get('finished_at')))}" if note.get("finished_at") else "no finished run on record"
+            last = f"no finished run since {clock(parse_iso(note.get('finished_at')))}" if note.get("finished_at") else f"build {note['build']} finished at a time the archive does not give"
             lines.append(f"⚪ {note['label']}: {last}.")
         else:
             lines.append(f"🟠 {note['label']}: build {note['build']} failed {clock(parse_iso(note.get('finished_at')))}; {note['history_url']}")

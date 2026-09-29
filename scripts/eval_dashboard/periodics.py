@@ -26,17 +26,24 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 
+try:
+    from . import collect
+except ImportError:  # run as a script: python3 scripts/eval_dashboard/periodics.py
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import collect
+
 # Where Prow's pod utilities publish a periodic's builds, and Deck's history
 # page for one (the link every message carries).
-LOGS_ROOT = "gs://kube-agents-prow/logs"
-JOB_HISTORY_ROOT = "https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs"
+# The bucket these jobs log to, not the Prow archive: they run under their
+# own identities, which cannot write gs://kube-agents-prow.
+LOGS_ROOT = "gs://kube-agents-periodic-logs/logs"
+JOB_HISTORY_ROOT = "https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs"
 POINTER = "latest-build.txt"
 FINISHED = "finished.json"
 ARTIFACTS_DIR = "artifacts"
 # The pointer moves at job start, so the newest build is often still running;
 # the one before it has finished. Three covers a run of aborted builds.
 FALLBACK_BUILDS = 3
-GSUTIL_TIMEOUT_S = 60
 # finished.json's result for a build Prow stopped (a drained node, a plank
 # abort): not a run of the job, so the reader walks past it as it does a
 # build with no finished.json.
@@ -58,8 +65,6 @@ NOT_FOUND_PATTERNS = ("matched no objects", "no urls matched", "notfoundexceptio
 WARNING_PREFIX = "::warning::"
 # run()'s conventions for a binary that is missing and a call that timed out,
 # and argparse's exit for a bad command line.
-MISSING_BINARY_RC = 127
-TIMED_OUT_RC = 124
 EXIT_USAGE = 2
 SECONDS_PER_HOUR = 3600
 KEY_JOB = "job"
@@ -124,17 +129,6 @@ def parse_iso(value) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _gsutil(args: list[str], runner=subprocess.run) -> tuple[int, str, str]:
-    try:
-        proc = runner(["gsutil", "-q", *args], capture_output=True, text=True, timeout=GSUTIL_TIMEOUT_S, check=False)
-    except FileNotFoundError as exc:
-        return MISSING_BINARY_RC, "", str(exc)
-    except subprocess.TimeoutExpired as exc:
-        err = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        return TIMED_OUT_RC, "", err
-    return proc.returncode, proc.stdout, proc.stderr
-
-
 def _not_found(err: str) -> bool:
     text = (err or "").lower()
     return any(pattern in text for pattern in NOT_FOUND_PATTERNS)
@@ -148,8 +142,8 @@ class Unreadable(Exception):
 def _finished(job: str, build: str, runner) -> dict | None:
     """The build's finished.json, None when it has none (still running or
     aborted); Unreadable when the read itself failed."""
-    rc, out, err = _gsutil(["cat", f"{LOGS_ROOT}/{job}/{build}/{FINISHED}"], runner)
-    if rc != 0:
+    out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{job}/{build}/{FINISHED}"], runner=runner)
+    if out is None:
         if _not_found(err):
             return None
         raise Unreadable(f"{build}/{FINISHED}: {err.strip()}")
@@ -165,8 +159,8 @@ def _finished(job: str, build: str, runner) -> dict | None:
 
 
 def _earlier_builds(job: str, newest: str, runner, log=print) -> list[str]:
-    rc, out, err = _gsutil(["ls", f"{LOGS_ROOT}/{job}/"], runner)
-    if rc != 0:
+    out, err = collect._gsutil_call(["-q", "ls", f"{LOGS_ROOT}/{job}/"], runner=runner)
+    if out is None:
         log(f"{WARNING_PREFIX}could not list {job}'s builds behind a running {newest}: {err.strip()}", file=sys.stderr)
         return []
     ids = []
@@ -191,8 +185,8 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
     None is also what a pointer that cannot be read for a reason other than
     NotFound returns, after a warning: the bot has gone blind on this job, and
     an absent reading holds any open note rather than ending it."""
-    rc, out, err = _gsutil(["cat", f"{LOGS_ROOT}/{periodic.job}/{POINTER}"], runner)
-    if rc != 0:
+    out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{POINTER}"], runner=runner)
+    if out is None:
         if not _not_found(err):
             log(f"{WARNING_PREFIX}could not read {periodic.job}'s build pointer: {err.strip()}", file=sys.stderr)
         return None
@@ -227,9 +221,9 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             # Absent is a run that wrote none; any other failure is unreadable
             # and the tick is blind on this job, as for finished.json: a note
             # is posted once, so one written without its projects stays so.
-            rc, out, err = _gsutil(["cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner)
+            out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner=runner)
             artifact = None
-            if rc == 0:
+            if out is not None:
                 try:
                     loaded = json.loads(out)
                 except ValueError:

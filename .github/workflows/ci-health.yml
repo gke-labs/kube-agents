@@ -26,7 +26,8 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 #      account with a read grant on gs://kube-agents-prow (the OSS Prow
 #      project's bucket; the grant cannot be copied from here). It reads the
 #      archive, the nightly's own bucket gs://kube-agents-evals-nightly-logs
-#      (kube-agents-owned; it holds objectViewer there too, and whichever
+#      and the watched periodics' gs://kube-agents-periodic-logs (both
+#      kube-agents-owned; it holds objectViewer on each, and whichever
 #      account replaces it needs the same), the eval evidence store
 #      gs://kube-agents-evals-bench (objectViewer, for the Trend page;
 #      best-effort, and incremental against the store.json the last tick

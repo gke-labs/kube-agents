@@ -1776,7 +1776,7 @@ class FixtureDrift(RunHarness):
 def periodic_note(job="ci-kube-agents-fleet-reconcile-all", label="seeded-fleet reconcile (weekly)", verdict="FAILED", build="100", finished="2026-09-14T13:40:00+00:00", detail=(), dry_run=False, stale_after_h=192):
     return {
         "job": job, "label": label, "verdict": verdict, "since": finished, "build": build, "finished_at": finished, "result": "FAILURE" if verdict == "FAILED" else "SUCCESS",
-        "stale_after_h": stale_after_h, "dry_run": dry_run, "detail": list(detail), "history_url": f"https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs/{job}", "doc": "docs/ci-pool-projects.md, section 6.2",
+        "stale_after_h": stale_after_h, "dry_run": dry_run, "detail": list(detail), "history_url": f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{job}", "doc": "docs/ci-pool-projects.md, section 6.2",
     }
 
 
@@ -1797,7 +1797,7 @@ class WatchedPeriodics(RunHarness):
         self.assertTrue(text.startswith("🟠 *seeded-fleet reconcile (weekly) failed* — build 100 at 9:40 AM ET."), text)
         self.assertIn("- kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)", text)
         self.assertIn("Recovery: docs/ci-pool-projects.md, section 6.2.", text)
-        self.assertIn(f"https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs/{self.WEEKLY}", text)
+        self.assertIn(f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{self.WEEKLY}", text)
         self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED"})
         self.assertEqual(self.recorded()["state"], "GREEN")
         self.tick(failed, T14 + timedelta(minutes=15))
@@ -1914,6 +1914,14 @@ class WatchedPeriodics(RunHarness):
         doc["periodics_read"] = [self.WEEKLY]
         rendered = post_health.render_digest(doc, T14)
         self.assertIn("🟠 seeded-fleet reconcile (weekly): build 100 failed 9:40 AM ET;", rendered)
+
+    def test_the_digest_line_for_an_unreadable_finish_time_says_so(self):
+        doc = health("GREEN")
+        doc["periodics"] = {self.WEEKLY: periodic_note(verdict="STALE", finished=None)}
+        doc["periodics_read"] = [self.WEEKLY]
+        rendered = post_health.render_digest(doc, T14)
+        self.assertIn("⚪ seeded-fleet reconcile (weekly): build 100 finished at a time the archive does not give.", rendered)
+        self.assertNotIn("no finished run on record", rendered)
 
 
 class DeadlineKillMessages(RunHarness):

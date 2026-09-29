@@ -355,7 +355,9 @@ reconcile, hourly against the drifted projects and weekly against every free
 one. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window and the artifact it writes, so adding
 the next periodic is one line. The hourly job's `Fetch the watched periodics'
-latest builds` step reads each job's `latest-build.txt` from the Prow archive,
+latest builds` step reads each job's `latest-build.txt` from
+`gs://kube-agents-periodic-logs`, the bucket these jobs log to (their own
+identities cannot write the Prow archive),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the reconcile's `fleet-reconcile.json` when the build wrote
 one, and hands the readings to `health.py --periodics-dir`.
@@ -376,8 +378,10 @@ job recovering.
 The poster sends one message per episode and verdict: a job's first failing
 build (in orange; a newer build that fails the same way is not news, and the
 digest carries it daily), a job that has stopped (in grey, whether or not its
-last build failed), and one when a job the space was told about passes again,
-on a reading only. The digest carries one line per open note.
+last build failed; the same grey when its latest build carries no readable
+finish time, since the window cannot be measured), and one when a job the space
+was told about passes again, on a reading only. The digest carries one line per
+open note.
 Nothing here files an issue: the recovery is a person's, and the message says
 where it is written (`docs/ci-pool-projects.md`, sections 5.5 and 6.2).
 
