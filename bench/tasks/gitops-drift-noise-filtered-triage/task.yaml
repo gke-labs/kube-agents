@@ -103,8 +103,8 @@
 # WHY THE WORKLOAD NAMES CARRY A PREFIX
 #
 # Because the board is shared and the grading keys on names. The bare
-# "payments-api" is the most-carded workload name in this suite — fourteen
-# task files name it — and one of them is incident-triage-oom-event-probe,
+# "payments-api" is the most-carded workload name in this suite — a dozen
+# other task files name it — and one of them is incident-triage-oom-event-probe,
 # which is on the presubmit roster and so runs nightly too. It files a triage
 # card for a payments-api Deployment whose planted defect is a 64Mi memory
 # limit; its own delivery objective requires "payments-api" and the same
@@ -266,13 +266,48 @@
 #   set to the insertId and notified=0 when the ceiling refused it. A row with
 #   notified=0 is BLOCKER 2 arriving in production and wants the sibling's
 #   message: raise ALERT_DAILY_LIMIT_DRIFT, or run against a fresh install. No
-#   row at all means the record never reached the daemon, which is the ingress
-#   and not the ceiling. A stack that reports neither fails the run without
-#   saying what to fix.
-# - Pacing: the human record is published first, far enough ahead of the burst
-#   that its delivery cannot be overtaken (see above); the eleven churn
-#   records follow; and the whole burst lands early enough that the card is
-#   filed before the prompt turn begins.
+#   row at all means the record never reached the daemon, and that splits two
+#   ways the stack has to tell apart, because one of them is the regression
+#   this case exists to catch. Classify runs upstream of the inject: tally
+#   returns before calling d.next for every record whose tier is not TierHuman
+#   (classify.go), and d.next is the join whose terminal handler is the inject
+#   (main.go), so a human record sorted into TierUnattributed or TierAutomation
+#   -- --human-domains naming a domain the fixture principal does not carry, the
+#   automation allowlist gaining it, any over-filtering change -- writes no row
+#   either, and the per-record drop line is off unless --log-dropped is set.
+#   Reading the detector's own log is what separates them: its progress and
+#   shutdown lines print unattributed_principals=[...] by name (subscriber.go),
+#   so the fixture principal appearing there is the classifier and not the
+#   ingress, and neither it nor a --log-dropped automation line means the
+#   record never arrived at all. A stack that reports none of the three fails
+#   the run without saying what to fix -- and reports the third as the first,
+#   sending the next reader to the Pub/Sub wiring for a Classify regression.
+# - Pacing, and the return condition with it, are sized to the front-door turn
+#   rather than to delivery. A card is not filed when a record arrives:
+#   _inject_drift claims the quota synchronously and then hands the record to
+#   background_tasks.add_task(trigger_agent_troubleshooter, ...)
+#   (session_kv_server.py), which opens a gateway session and runs a front-door
+#   agent turn whose kanban_create writes the card — seconds to minutes later,
+#   with per-record variance and no serialisation between records. Two things
+#   follow, and a stack sized to Pub/Sub reordering alone satisfies neither.
+# - The human record is published first and far enough ahead of the burst that
+#   its TURN, not merely its delivery, completes first. Otherwise the twelve
+#   turns overlap, the card created last is the newest card whatever order the
+#   records arrived in, and that can be a churn card — the same false green the
+#   ordering argument above exists to close, reached by a different mechanism
+#   and reached even when every churn card has landed before the board is read.
+# - And the insertId poll is a floor on the return, not the whole of it. The
+#   human record is published first, so on a broken filter its card is the
+#   FIRST card to exist: the poll succeeds on it, the stack returns,
+#   the agent's first kanban_list finds it as the most recent card concerning
+#   either namespace, and step 2 of the prompt then follows that one card by
+#   kanban_show and never re-lists. Every churn card lands after the board was
+#   read, both phrase objectives pass, and the pipeline filtered nothing. The
+#   stack cannot poll for those cards — in a correct pipeline they never exist
+#   — so the defence is a settle after the last churn publish, sized to the
+#   measured front-door turn, before the stack returns. Both that spacing and
+#   that settle are measurements the unpark's own nightly supplies; neither
+#   exists yet, so the unparking pull request takes them rather than this one.
 #
 # Isolation class: namespace-scoped — both namespaces are the case's own.
 # Eligible tier: nightly.
@@ -392,8 +427,8 @@ verification_spec:
       # The stack wrote this name and the prompt does not say it, so a report
       # carrying it read the card. Deliberately a name with no diagnostic
       # content in it, as the sibling's is -- and deliberately prefixed, which
-      # is the load-bearing half: the bare "payments-api" is carried by
-      # fourteen other task files, one of them a presubmit case filing a
+      # is the load-bearing half: the bare "payments-api" is carried by a
+      # dozen other task files, one of them a presubmit case filing a
       # memory-limit triage card on this same board, so under the bare name
       # this check would pass on somebody else's card. The header section on
       # the prefix has the full argument.
