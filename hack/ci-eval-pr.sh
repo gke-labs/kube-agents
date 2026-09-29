@@ -2775,9 +2775,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # last seconds of the unit before -- the same case's previous repetition, or
 # the first phase's last unit -- must be older than that before the next
 # window can open. The cost is one drain of the lanes at the phase boundary
-# and the settle plus the serial run of the requesting units (none on the
-# presubmit tier until a case requests one); the order inside each phase is
-# unchanged.
+# and the settle plus the serial run of the requesting units (on the
+# presubmit tier, one case's repetitions, which the task lock already ran one
+# at a time, so three settles); the order inside each phase is unchanged.
 unit_phase() { # <task-name> -> 1 for a case that requests a pull request, 0 otherwise
   case ",${INJECT_LANE_REQUESTING:-}," in
     *",$1,"*) echo 1 ;;

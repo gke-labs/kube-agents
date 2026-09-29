@@ -121,6 +121,9 @@ STATUS_OK = 200
 #: check's budget through devops-bench's ``single_call_timeout``).
 EXIT_UNREADABLE = 1
 DEFAULT_CALL_TIMEOUT_SECONDS = 30.0
+#: The length of a bare-year ``--since`` (``2026``), which ``fromisoformat``
+#: refuses and which would otherwise read as seconds since 1970.
+YEAR_DIGITS = 4
 
 Transport = Callable[[str, str, float], tuple[int, Any]]
 
@@ -461,12 +464,16 @@ def find_writes(
 def _parse_since(text: str) -> datetime:
     """An ISO-8601 instant or a Unix epoch, as an aware UTC datetime.
 
-    ISO-8601 first: an all-digit form such as ``2026`` or ``20260925`` is a
-    date to ``fromisoformat`` and would otherwise read as seconds since 1970.
+    ISO-8601 first: an all-digit form such as ``20260925`` is a date to
+    ``fromisoformat`` and would otherwise read as seconds since 1970. A bare
+    year such as ``2026``, which ``fromisoformat`` refuses, is the start of
+    that year for the same reason.
     """
     stamp = parse_github_time(text)
     if stamp is not None:
         return stamp
+    if text.isdigit() and len(text) == YEAR_DIGITS:
+        return datetime(int(text), 1, 1, tzinfo=timezone.utc)
     try:
         return datetime.fromtimestamp(float(text), tz=timezone.utc)
     except (ValueError, OverflowError, OSError):

@@ -28,13 +28,17 @@ from kube_agents_bench.cases import load_case
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LANE_FILE = REPO_ROOT / "hack" / "eval" / "inject-lane-safeguards.yaml"
 TASKS = REPO_ROOT / "bench" / "tasks"
-# A presubmit case that requests no pull request, and a nightly case that
-# requests one (its objective is a pull_request_opened check).
-READ_ONLY_CASE = "obtainability-remediation-proposal"
+# A presubmit case that requests no pull request, neither through its own
+# checks nor through the file's `requesting:` list, and a nightly case that
+# requests one (its objective is a pull_request_opened check). Not
+# obtainability-remediation-proposal: it is the file's placeholder, and its
+# own check (#2088) turns it into a requesting case in either merge order.
+READ_ONLY_CASE = "reliability-pdb-probe"
 REQUESTING_CASE = "pdb-remediation-pr"
-# A presubmit case neither in the file's `requesting:` list nor requesting
-# through its own checks.
-UNLISTED_CASE = "reliability-pdb-probe"
+# The count a scratch lane file's `requesting:` entry gives READ_ONLY_CASE,
+# so the listed path is tested without pinning the real file's placeholder,
+# whose contents scripts/test_eval_rosters.py owns.
+LISTED_COUNT = 2
 
 
 def load(path: Path) -> dict:
@@ -123,7 +127,10 @@ def test_a_repository_outside_the_pinned_owner_is_refused_before_the_lease(tmp_p
     lane.check_repository(safeguards, "GKE-Agentic/x")  # GitHub owners are case-insensitive
     with pytest.raises(lane.LaneSafeguardsError, match="is not under gke-agentic"):
         lane.check_repository(safeguards, "someone/throwaway-infra")
-    for malformed in ("no-slash", "gke-agentic/x/y", "gke-agentic/x/", "gke-agentic/ x", "/x"):
+    # The deploy's shape (hack/ci-deploy.sh) and nothing looser: a `?` or `#`
+    # would cut the API path short, a trailing newline slips past `$`.
+    malformed_slugs = ("no-slash", "gke-agentic/x/y", "gke-agentic/x/", "gke-agentic/ x", "/x", "gke-agentic/x?y", "gke-agentic/x#y", "gke-agentic/x\n")
+    for malformed in malformed_slugs:
         with pytest.raises(lane.LaneSafeguardsError, match="not an owner/name"):
             lane.check_repository(safeguards, malformed)
     # An entry that pins nothing accepts any repository.
@@ -176,24 +183,41 @@ def test_the_cli_prints_case_and_path_per_task_and_fails_loudly(tmp_path, capsys
     assert rc == 0
     # The count first, the case second, the path last (it may hold spaces):
     # the script reads the first two fields to build the fan-out's second
-    # phase. The read-only case counts one through the file's `requesting:`
-    # list, the remediation case through its own check.
+    # phase. The read-only case counts nothing, the remediation case one
+    # through its own check.
     assert out == [
-        f"1 {READ_ONLY_CASE} {tmp_path / READ_ONLY_CASE / 'task.yaml'}",
+        f"0 {READ_ONLY_CASE} {tmp_path / READ_ONLY_CASE / 'task.yaml'}",
         f"1 {REQUESTING_CASE} {tmp_path / REQUESTING_CASE / 'task.yaml'}",
     ]
-    rc = lane.main(["--safeguards", str(LANE_FILE), "--out-dir", str(tmp_path), str(TASKS / UNLISTED_CASE / "task.yaml")])
+    # A `requesting:` entry reaches the line too.
+    listed_file = scratch_lane_file(tmp_path, {READ_ONLY_CASE: LISTED_COUNT})
+    rc = lane.main(["--safeguards", str(listed_file), "--out-dir", str(tmp_path / "listed"), str(TASKS / READ_ONLY_CASE / "task.yaml")])
     assert rc == 0
-    assert capsys.readouterr().out.splitlines() == [f"0 {UNLISTED_CASE} {tmp_path / UNLISTED_CASE / 'task.yaml'}"]
+    assert capsys.readouterr().out.splitlines() == [f"{LISTED_COUNT} {READ_ONLY_CASE} {tmp_path / 'listed' / READ_ONLY_CASE / 'task.yaml'}"]
+
+
+def scratch_lane_file(tmp_path: Path, requesting: dict[str, int]) -> Path:
+    """The real lane file's safeguards under a `requesting:` mapping of our own."""
+    path = tmp_path / "lane-with-requesting.yaml"
+    path.write_text(yaml.safe_dump({"requesting": requesting, "safeguards": lane.load_lane_safeguards(LANE_FILE)}))
+    return path
+
+
+def test_the_real_requesting_list_is_well_formed():
+    # Its contents are pinned by scripts/test_eval_rosters.py, which also
+    # fails an entry whose case's own checks already request one.
+    listed = lane.load_lane_requesting(LANE_FILE)
+    assert all(isinstance(case, str) and count >= 1 for case, count in listed.items())
+    assert READ_ONLY_CASE not in listed
 
 
 def test_the_requesting_list_is_read_and_gives_its_case_an_allowance(tmp_path):
-    listed = lane.load_lane_requesting(LANE_FILE)
-    assert listed == {READ_ONLY_CASE: 1}
+    listed = lane.load_lane_requesting(scratch_lane_file(tmp_path, {READ_ONLY_CASE: LISTED_COUNT}))
+    assert listed == {READ_ONLY_CASE: LISTED_COUNT}
     safeguards = lane.load_lane_safeguards(LANE_FILE)
     copy, requested = lane.copy_task(TASKS / READ_ONLY_CASE / "task.yaml", safeguards, tmp_path, listed[READ_ONLY_CASE])
-    assert requested == 1
-    assert lane._leaves(load(copy)["verification_spec"][-1]["check"])[0][lane.REQUESTED_FIELD] == 1
+    assert requested == LISTED_COUNT
+    assert lane._leaves(load(copy)["verification_spec"][-1]["check"])[0][lane.REQUESTED_FIELD] == LISTED_COUNT
     # The larger of the two counts wins; a case with its own check and no
     # entry keeps its own.
     _, requested = lane.copy_task(TASKS / REQUESTING_CASE / "task.yaml", safeguards, tmp_path / "b", 0)

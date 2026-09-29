@@ -28,8 +28,10 @@ through the report, which is what rung 1 grades), and on any other lane
 nothing here runs.
 
 The file is ``hack/eval/inject-lane-safeguards.yaml``, read by
-``hack/ci-eval-pr.sh`` beside the lane's exclusions; its shape is one key,
-``safeguards``, holding entries in the case format's own vocabulary.
+``hack/ci-eval-pr.sh`` beside the lane's exclusions; its shape is two keys:
+``safeguards``, holding entries in the case format's own vocabulary, and
+``requesting``, mapping a case the lane treats as requesting a pull request
+before its own checks say so to the count it is allowed.
 ``scripts/test_eval_rosters.py`` holds the file to that shape and to the
 lane's rules.
 
@@ -86,9 +88,11 @@ REQUESTED_FIELD = "requested_pull_requests"
 #: What a task file names its checks under, and the file the copy is written as.
 SPEC_KEY = "verification_spec"
 TASK_FILE = "task.yaml"
-#: An ``owner/name`` repository and nothing looser: a trailing slash or a
-#: third segment passes an "is there a slash" test and 404s on every call.
-REPO_SLUG_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+#: An ``owner/name`` repository in the shape ``hack/ci-deploy.sh`` accepts
+#: and nothing looser: a trailing slash, a third segment, or a ``?`` or ``#``
+#: that cuts the API path short passes an "is there a slash" test and fails
+#: every call; ``\Z`` because ``$`` also matches before a trailing newline.
+REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
 
 
 class LaneSafeguardsError(ValueError):

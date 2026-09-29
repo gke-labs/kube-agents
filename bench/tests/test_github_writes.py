@@ -482,6 +482,8 @@ def test_since_reads_iso_8601_before_an_epoch():
     since 1970; a bare epoch still is one, and nonsense is refused."""
     assert github_writes._parse_since("2026-09-25T17:20:00Z") == RUN_START
     assert github_writes._parse_since("20260925") == datetime(2026, 9, 25, tzinfo=timezone.utc)
+    # A bare year, which fromisoformat refuses, is still a year.
+    assert github_writes._parse_since("2026") == datetime(2026, 1, 1, tzinfo=timezone.utc)
     assert github_writes._parse_since(str(int(RUN_START.timestamp()))) == RUN_START
     for bad in ("inf", "not-a-time", "1e400"):
         with pytest.raises(github_writes.argparse.ArgumentTypeError):
