@@ -592,13 +592,17 @@ prompt-check: ## Verify the agent's instructions cite skills and files that exis
 # Documentation that mirrors a machine-readable source is generated rather than
 # hand-kept: the cron jobs, the skill catalogue and the image inventory as
 # <!-- BEGIN GENERATED --> regions, plus docs/family-roster.txt written whole.
+# The SOP line numbers each governance cron prompt cites are recomputed first,
+# so the cron-job-example regions below render the prompt with them current.
 docs-generate: ## Regenerate the generated doc regions and files from their sources.
+	@python3 scripts/generate_sop_geography.py
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
 docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
 
 docs-check-generated:
+	@python3 scripts/generate_sop_geography.py --check
 	@python3 scripts/generate_docs.py --check
 
 docs-check-links:
