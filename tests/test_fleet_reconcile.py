@@ -17,6 +17,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import subprocess
 import os
 import signal
@@ -148,6 +149,19 @@ class PlanInspectionTest(unittest.TestCase):
         self.assertIn("-var=project_id=%s" % P7, tofu.calls[1])
         self.assertIn("-backend-config=bucket=%s-tf-state" % P7, tofu.calls[0])
         self.assertIn("-backend-config=prefix=seeded-fleet", tofu.calls[0])
+        self.assertIn("-lockfile=readonly", tofu.calls[0], "the committed lock chooses the providers")
+
+    def test_the_fleet_stack_commits_a_lock_file_that_matches_its_constraints(self):
+        lock = (reconcile.FLEET_DIR / ".terraform.lock.hcl").read_text()
+        versions = (reconcile.FLEET_DIR / "versions.tf").read_text()
+        for provider in ("google", "kubernetes"):
+            self.assertIn(f'provider "registry.opentofu.org/hashicorp/{provider}"', lock)
+        for constraint in re.findall(r'version\s*=\s*"(~> [\d.]+)"', versions):
+            self.assertIn(f'constraints = "{constraint}"', lock)
+        # One h1 hash per locked platform per provider: linux_amd64 for the
+        # periodic, darwin for the hands that run it locally.
+        for block in lock.split('provider "')[1:]:
+            self.assertGreaterEqual(block.count('"h1:'), 3, block[:60])
 
     def test_a_create_is_a_reconcile_not_a_refusal(self):
         # The orphan disk a cleanup deleted comes back; that is the point.
@@ -178,7 +192,7 @@ class PlanInspectionTest(unittest.TestCase):
         self.assertNotIn("apply", tofu.verbs())
 
     def test_a_show_that_is_json_but_not_an_object_is_that_projects_failure(self):
-        for body in ("[]", "null", '{"resource_changes": [null]}', '{"resource_changes": {"a": {}}}', '{"resource_changes": [{"address": "a", "change": "x"}]}', '{"resource_changes": [{"address": "a", "change": {"actions": [null]}}]}'):
+        for body in ("[]", "null", '{"resource_changes": [null]}', '{"resource_changes": {"a": {}}}', '{"resource_changes": 5}', '{"resource_changes": "abc"}', '{"resource_changes": [{"address": "a", "change": "x"}]}', '{"resource_changes": [{"address": "a", "change": {"actions": [null]}}]}', '{"resource_changes": [{"address": "a", "change": {"actions": 5}}]}'):
             tofu = _Tofu({P7: body})
             outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
             self.assertEqual(outcome, reconcile.OUTCOME_FAILED, body)

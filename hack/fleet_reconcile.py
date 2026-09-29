@@ -166,12 +166,16 @@ def plan_changes(show_json):
     if not isinstance(document, dict):
         raise ReconcileError("tofu show wrote a plan that is not a JSON object")
     changes = []
-    for change in document.get("resource_changes") or []:
+    resource_changes = document.get("resource_changes") or []
+    if not isinstance(resource_changes, list):
+        raise ReconcileError("tofu show wrote resource_changes that is not a JSON array")
+    for change in resource_changes:
         if not isinstance(change, dict) or not isinstance(change.get("change") or {}, dict):
             raise ReconcileError("tofu show wrote a resource change that is not a JSON object")
-        actions = list((change.get("change") or {}).get("actions") or [])
-        if not all(isinstance(action, str) for action in actions):
-            raise ReconcileError("tofu show wrote a resource change whose actions are not strings")
+        actions = (change.get("change") or {}).get("actions") or []
+        if not isinstance(actions, list) or not all(isinstance(action, str) for action in actions):
+            raise ReconcileError("tofu show wrote a resource change whose actions are not a list of strings")
+        actions = list(actions)
         if actions and actions not in IGNORED_ACTIONS:
             changes.append((actions, change.get("address") or "?"))
     return changes
@@ -199,6 +203,9 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
                 [
                     "init",
                     "-reconfigure",
+                    # The committed lock file chooses the providers; a run
+                    # that could rewrite it would adopt a release unread.
+                    "-lockfile=readonly",
                     "-input=false",
                     "-no-color",
                     "-backend-config=bucket=%s" % STATE_BUCKET_TEMPLATE.format(project=project),

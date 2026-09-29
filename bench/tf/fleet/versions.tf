@@ -25,11 +25,12 @@ terraform {
   required_providers {
     google = {
       source  = "hashicorp/google"
-      # One major each, because the scheduled reconcile re-resolves providers
-      # on every run (the lock file is not committed): the next major must be
-      # adopted by a person, not applied unattended across the pool. These are
-      # the majors the fleet is applied with today (8.4.0 and 3.2.1 resolved
-      # on 2026-09-28).
+      # One major each, and the exact versions are pinned by the committed
+      # .terraform.lock.hcl beside this file: the scheduled reconcile applies
+      # this stack unattended in every pool project with -lockfile=readonly,
+      # so a provider release is adopted by a person re-running
+      # `tofu providers lock` (README.md, "State and reconcile"), not by the
+      # next run. 8.4.0 and 3.2.1 are what the fleet is applied with today.
       version = "~> 8.0"
     }
     kubernetes = {

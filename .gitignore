@@ -36,6 +36,9 @@ coverage-go.xml
 # consumers should commit their own multi-platform lock in their own repo.
 .terraform/
 .terraform.lock.hcl
+# The seeded fleet's lock is committed: the scheduled reconcile applies it
+# unattended in every pool project, so provider versions are chosen by a person.
+!bench/tf/fleet/.terraform.lock.hcl
 
 # Terraform state and variable files hold credentials and infrastructure
 # details — never commit them. Committed examples keep the .example suffix.
