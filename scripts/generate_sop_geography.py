@@ -2,8 +2,8 @@
 """Recompute the SOP line numbers each governance cron prompt cites.
 
 Every audit prompt in ``agents/platform/cron/jobs.json`` tells its worker how
-long the SOP is ("all 494 lines of it") and where the checks section sits
-("section 2, lines 113-393"). The numbers are what stops a model reading the
+long the SOP is ("all N lines of it") and where the checks section sits
+("section 2, lines A-B"). The numbers are what stops a model reading the
 first screen and reporting a clean fleet it never looked at, and they rot the
 moment the SOP is edited. ``test_cron_prompts_cite_the_real_sop_geography`` in
 the fleet-audit suite fails on a stale pin; this script is what makes it
@@ -57,6 +57,8 @@ SPAN_RE = re.compile(r"are section (\d+), lines (\d+)-(\d+)")
 # of an SOP in some other field from being edited.
 PROMPT_LINE_RE = re.compile(r'^\s*"prompt":\s*"')
 FENCE = "```"
+# How much of a refused prompt line an error quotes: enough to identify the job, not the whole prompt.
+ERROR_EXCERPT_CHARS = 120
 SECTION_HEADING = "### "
 
 
@@ -89,16 +91,23 @@ def section_span(lines: list[str], section: str) -> tuple[int, int]:
 def rewrite_prompt_line(line: str, sop_dir: Path) -> str:
     """Return ``line`` with its two pins recomputed from the SOP it names.
 
-    A prompt line without an SOP reference, a length claim, or a section
-    citation is returned unchanged: a prompt that pins nothing has nothing to
-    regenerate, and inventing a pin for it is the test's decision, not this
-    script's.
+    A prompt line with neither pin is returned unchanged: a prompt that pins
+    nothing has nothing to regenerate, and inventing a pin for it is the
+    geography test's decision, not this script's. A prompt with one pin but
+    not the other, or with a pin and no SOP reference to measure it against,
+    is refused: the test fails that roster, and a generator that printed
+    ``ok`` over it would be the second gate disagreeing with the first.
     """
     ref = SOP_REF_RE.search(line)
     total = TOTAL_RE.search(line)
     span = SPAN_RE.search(line)
-    if ref is None or total is None or span is None:
+    if total is None and span is None:
         return line
+    if total is None or span is None:
+        missing = "length" if total is None else "checks-section span"
+        raise ValueError(f"a prompt pins its SOP but states no {missing}: {line.strip()[:ERROR_EXCERPT_CHARS]}")
+    if ref is None:
+        raise ValueError(f"a prompt pins an SOP it does not name: {line.strip()[:ERROR_EXCERPT_CHARS]}")
     sop = sop_dir / ref.group(1)
     if not sop.is_file():
         raise ValueError(f"prompt cites {ref.group(1)}, which is not in {sop_dir}")

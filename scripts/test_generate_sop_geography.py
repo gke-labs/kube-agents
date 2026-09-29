@@ -115,6 +115,21 @@ class RewriteTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "2 sections headed '### 2. '"):
             gen.rewrite_roster(ROSTER, self.sop_dir)
 
+    def test_a_prompt_with_only_a_length_pin_is_refused(self):
+        roster = ROSTER.replace(" Its two checks are section 2, lines 1-2, so read on.", "")
+        with self.assertRaisesRegex(ValueError, "no checks-section span"):
+            gen.rewrite_roster(roster, self.sop_dir)
+
+    def test_a_prompt_with_only_a_span_pin_is_refused(self):
+        roster = ROSTER.replace(" — all 999 lines of it.", ".")
+        with self.assertRaisesRegex(ValueError, "no length"):
+            gen.rewrite_roster(roster, self.sop_dir)
+
+    def test_a_pinned_prompt_that_names_no_sop_is_refused(self):
+        roster = ROSTER.replace("'governance/sample_sop.md'", "the SOP")
+        with self.assertRaisesRegex(ValueError, "does not name"):
+            gen.rewrite_roster(roster, self.sop_dir)
+
     def test_a_missing_sop_is_refused(self):
         roster = ROSTER.replace("sample_sop.md", "gone_sop.md")
         with self.assertRaisesRegex(ValueError, "gone_sop.md"):

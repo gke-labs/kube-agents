@@ -93,10 +93,13 @@ canonical-home table in [`AGENTS.md`](../AGENTS.md) — do not duplicate a fact
 outside its home; link to it.
 
 The artifacts below are **generated, not hand-written** — regions inside
-hand-written documents (a region may be spliced into several pages), plus one
-whole file. `scripts/generate_docs.py` (run via `make docs-generate`) rewrites
-everything between the markers; everything outside them is hand-written. Never
-edit inside the markers — edit the source and regenerate.
+hand-written documents (a region may be spliced into several pages), one
+whole file, and the line-number pins inside the governance cron prompts.
+`scripts/generate_docs.py` (run via `make docs-generate`) rewrites everything
+between the markers and the whole file; `scripts/generate_sop_geography.py`
+(run first by the same target) rewrites the pins' digits and nothing else.
+Everything outside the markers and the pins is hand-written. Never edit inside
+the markers — edit the source and regenerate.
 
 <!-- prettier-ignore -->
 | Generated file or region | Block marker | Source of truth |
