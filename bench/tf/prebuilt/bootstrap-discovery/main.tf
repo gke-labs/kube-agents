@@ -87,6 +87,11 @@ resource "null_resource" "sweep" {
     sandbox_selector  = var.sandbox_selector
     sandbox_container = var.sandbox_container
     pod_wait          = local.pod_wait
+    home              = local.home
+    hermes            = local.hermes
+    python            = local.python
+    key_like          = local.key_like
+    inventory         = local.inventory
   }
 
   provisioner "local-exec" {
@@ -445,25 +450,25 @@ resource "null_resource" "sweep" {
       # done whatever its exit status.
       failed=""
       ids="$(kubectl exec -i -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
-        /opt/hermes/.venv/bin/python3 - "bootstrap-inventory-%" <<'PY'
+        ${self.triggers.python} - "${self.triggers.key_like}" <<'PY'
       import sqlite3, sys
-      c = sqlite3.connect("file:/opt/data/kanban.db?mode=ro", uri=True)
+      c = sqlite3.connect("file:${self.triggers.home}/kanban.db?mode=ro", uri=True)
       rows = c.execute("SELECT id FROM tasks WHERE idempotency_key LIKE ? AND status != 'archived' ORDER BY created_at DESC", (sys.argv[1],))
       print(" ".join(r[0] for r in rows))
       PY
       )" || failed="$failed, list the open cards"
       for id in $ids; do
         kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
-          /opt/hermes/.venv/bin/hermes kanban archive "$id" || failed="$failed, archive $id"
+          ${self.triggers.hermes} kanban archive "$id" || failed="$failed, archive $id"
       done
       # The sweep marker stays, so the gate does not file again once this
       # case is gone.
       kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
-        rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md || failed="$failed, remove the agent's INVENTORY files"
+        rm -f ${self.triggers.inventory} || failed="$failed, remove the agent's INVENTORY files"
       if sandbox_pods="$(kubectl get pods -n "$ns" -l "${self.triggers.sandbox_selector}" -o name)"; then
         for pod in $sandbox_pods; do
           kubectl exec -n "$ns" "$pod" -c "${self.triggers.sandbox_container}" -- \
-            rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md || failed="$failed, remove the INVENTORY files from $pod"
+            rm -f ${self.triggers.inventory} || failed="$failed, remove the INVENTORY files from $pod"
         done
       else
         failed="$failed, list the sandbox pods"
