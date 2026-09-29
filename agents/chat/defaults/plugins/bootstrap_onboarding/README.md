@@ -80,7 +80,7 @@ The flow coordinates state through flag files under `/opt/data/`:
 
 | Marker                                        | Created By                                  | Lifecycle & Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | :-------------------------------------------- | :------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **`/opt/data/.bootstrap_scan_filed`**         | `bootstrap_scan_gate.py`                    | Written the moment the sweep card is filed, and contains that card's id. Its presence is what stops the every-minute job filing a second sweep during the many minutes the first one takes. Written only for a card the board confirmed, so a failed create retries on the next tick. Delete it — together with `INVENTORY.raw.md` (see the runbook in §5) — to deliberately re-arm discovery; alone it leaves the gate closed.                                                                                                                                                                                                                                                                                                                                                                                           |
+| **`/opt/data/.bootstrap_scan_filed`**         | `bootstrap_scan_gate.py`                    | Written the moment the sweep card is filed, and contains that card's id. Its presence is what stops the every-minute job filing a second sweep during the many minutes the first one takes. Written only for a card the board confirmed, so a failed create retries on the next tick. Archive the previous run's `bootstrap-inventory-*` cards, then delete it together with `INVENTORY.raw.md`, to deliberately re-arm discovery (see the runbook in §5); alone it leaves the gate closed.                                                                                                                                                                                                                                                                                                                               |
 | **`/opt/data/.cluster_agent_reconcile.lock`** | `cluster_agent_reconcile.py`                | An empty `flock` file, held for the duration of a reconcile run. Two schedules run that script — this gate every minute, and the hourly `cluster-agent-reconcile` job — and the gateway's cron lock is per job id, so the lock lives in the script rather than in either caller. A run that cannot take it returns without reconciling, and exits `EXIT_ALREADY_RUNNING` (4) only under `--require-create-pass` — so the gate reads 4 as "retry next tick" and does not count it against the attempt ceiling, while the hourly job, which passes no flags, exits 0 as every cron producer must. Never cleaned up; its contents are irrelevant.                                                                                                                                                                            |
 | **`/opt/data/fleet_scope.json`**              | `cluster_agent_reconcile.py`                | The resolved scope: every project the last run listed with its outcome. The gate reads it to tell the sweep which projects in scope were not listed and which folders, organisations, Shared VPC hosts or Metrics Scopes could not be resolved, so a partial roster reads as partial. Rewritten by every reconcile run except `--dry-run`; never cleaned up.                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | **`/opt/data/.bootstrap_reconcile_attempts`** | `bootstrap_scan_gate.py`                    | Two lines: the number of consecutive failed reconciles, and the epoch seconds of the first failure in that streak. Reset to a bare `0` on success, which drops the timestamp and starts the next streak fresh. The gate stops waiting and files the sweep against whatever roster exists only once **both** `MAX_RECONCILE_ATTEMPTS` and `RECONCILE_GIVE_UP_SECONDS` are satisfied, so a reconcile that can never succeed (no IAM to list clusters) cannot hold onboarding shut, while one that is merely slow to recover gets the wall-clock window instead of five one-minute ticks. A counter left by an older build has no second line and gives up on the count alone. **Delete it whenever you re-arm discovery** — an exhausted counter left behind means the next run skips the reconcile and files a solo sweep. |
@@ -271,6 +271,11 @@ rows = board.execute(
 ).fetchall()
 for (task_id,) in rows:
     subprocess.run(["/opt/hermes/.venv/bin/hermes", "kanban", "archive", task_id], check=True)
+left = board.execute(
+    "SELECT id FROM tasks WHERE idempotency_key LIKE 'bootstrap-inventory-%' AND status != 'archived'"
+).fetchall()
+if left:
+    raise SystemExit(f"still open: {[i for (i,) in left]}; a sweep worker is still filing. Run this again.")
 PY
 ```
 
@@ -278,6 +283,15 @@ Then remove the markers for the stages you want to repeat (`.bootstrap_scan_file
 
 ```bash
 kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md /opt/data/.bootstrap_scan_filed /opt/data/.bootstrap_greeted /opt/data/.bootstrap_completed /opt/data/.bootstrap_reconcile_attempts
+```
+
+The sweep's status check runs in the shell sandbox, whose `/opt/data` is its own volume and
+outlives its pod, so remove the report there too, or the sweep skips discovery:
+
+```bash
+for p in $(kubectl get pods -n kubeagents-system -l app=platform-agent-shell -o name); do
+  kubectl exec -n kubeagents-system "$p" -c shell -- rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md
+done
 ```
 
 **Once a report has been delivered, clearing markers is not enough.** `_cleanup` removes both
@@ -299,10 +313,9 @@ hermes kanban create --assignee platform --idempotency-key bootstrap-inventory-s
   --body "$BODY" "First-time environment discovery: write the onboarding inventory report"
 ```
 
-The key must be fresh. `_cleanup` renames the report and removes the cron jobs, but it never touches
-the board, so the original `bootstrap-inventory-scan` card is still there (completed) — and the board
-answers a repeated key by returning that card's id and spawning nothing. Reusing the original key in
-this runbook is a silent no-op.
+Use a fresh key anyway. `_cleanup` renames the report and removes the cron jobs, but it never
+touches the board, so a `bootstrap-inventory-scan` card the archive step missed is still there — and
+the board answers a repeated key by returning that card's id and spawning nothing.
 
 Filing directly is also the better option for measurement: it starts the clock at card creation
 rather than at the next cron tick, removing up to 60 seconds of scheduling latency from any timing.

@@ -16,8 +16,9 @@
 # read of the board has succeeded. The objective then compares the cards it
 # filed against the Cluster Agent roster, read straight from the profiles on
 # the agent's disk rather than through the gate, so a build whose gate hands
-# the worker no roster fails here instead of erroring. The stack's header says
-# why re-arming archives the previous sweep's cards first.
+# the worker no roster fails here instead of erroring. The re-arm runbook in
+# agents/chat/defaults/plugins/bootstrap_onboarding/README.md §5 says why
+# re-arming archives the previous sweep's cards first.
 #
 # The stack refuses an install where a person has connected: a fresh sweep
 # there ends in an onboarding report sent to their chat. It also refuses one

@@ -47,10 +47,13 @@ appears minutes later, from the prioritization card the sweep files, and a
 crashed sweep still leaves board-done/disk-empty. Only a marker written at
 file time covers every case.
 
-Deleting ``.bootstrap_scan_filed`` — together with ``INVENTORY.raw.md``, which
-nothing else ever removes and which ``should_skip`` also gates on — is the
-supported way to re-arm discovery after a sweep has genuinely failed. Deleting
-the marker alone leaves the gate closed.
+Archiving the previous run's ``bootstrap-inventory-*`` cards and then deleting
+``.bootstrap_scan_filed`` — together with ``INVENTORY.raw.md``, which nothing
+else ever removes and which ``should_skip`` also gates on — is the supported way
+to re-arm discovery after a sweep has genuinely failed (the runbook is
+bootstrap_onboarding/README.md §5). Deleting the marker alone leaves the gate
+closed; deleting it without archiving lets the board answer the new sweep card's
+create with the old card, so no sweep runs.
 
 Output is intentionally empty: ``deliver: local`` plus empty stdout means the
 scheduler treats every run as silent. The report reaches the user through
@@ -86,7 +89,8 @@ SCAN_ASSIGNEE = "platform"
 
 # Records that the sweep card has been filed, and which card it was. Its
 # presence — not the existence of the report — is what stops this job filing
-# again. Delete it to deliberately re-arm discovery.
+# again. Delete it, after archiving the previous run's cards, to deliberately
+# re-arm discovery (bootstrap_onboarding/README.md §5).
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 
 # The scan runs as a `platform` worker, whose HERMES_HOME is the platform profile
