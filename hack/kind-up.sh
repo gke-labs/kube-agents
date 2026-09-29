@@ -118,7 +118,7 @@ helm --kube-context "${CONTEXT}" upgrade --install kube-agents "${REPO_ROOT}/cha
   --set-string "platformAgent.deployment.image.repository=kind.local/platform-agent" --set-string "platformAgent.deployment.image.tag=${AGENT_TAG}" \
   --set-string "platformAgent.deployment.image.pullPolicy=IfNotPresent" \
   --set-string "agentSandbox.image.repository=kind.local/agent-sandbox" --set-string "agentSandbox.image.tag=${SANDBOX_TAG}" \
-  --set-string "platformAgent.harness.projectId=kind" --set-string "platformAgent.harness.location=kind" --set-string "platformAgent.harness.clusterName=kind" \
+  --set-string "platformAgent.harness.projectId=kind" --set-string "platformAgent.harness.location=kind" --set-string "platformAgent.harness.clusterName=${CLUSTER_NAME}" \
   --set "platformAgent.deployment.availability.runtimeClassName=" \
   --set "platformAgent.harness.hermes.dashboardEnabled=false" \
   --set "platformAgent.credentials.create=true" \
@@ -169,6 +169,6 @@ kube-agents is up in kind cluster '${CLUSTER_NAME}' (context ${CONTEXT}). To run
 
   export AGENT_CLUSTER_CONTEXT=${CONTEXT} PLATFORM_AGENT_TOKEN=${API_SERVER_KEY}
   export JUDGE_PROVIDER=gemini JUDGE_MODEL=gemini-3.7-flash AGENT_API_KEY="\${GEMINI_API_KEY}"
-  export BENCH_TF_ROOT=./tf PROJECT_ID=kind CLUSTER_NAME=kind
+  export BENCH_TF_ROOT=./tf PROJECT_ID=kind CLUSTER_NAME=${CLUSTER_NAME}
   cd bench && uv sync && uv run devops-bench ./tasks/chat-routing-own-cluster-namespaces --agent-type kubeagents
 EOF

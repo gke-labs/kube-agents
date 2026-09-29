@@ -1146,13 +1146,13 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 }
 
 func TestCredentialProxyBootstrapsInClusterOnKind(t *testing.T) {
-	// A kind install sets projectId, location and clusterName to "kind". The
+	// A kind install sets projectId and location to "kind". The
 	// proxy must not reach for gcloud; it writes an in-cluster context from
 	// the pod's service account, and the agent is told the same context name.
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 		Spec: agentv1alpha1.PlatformAgentSpec{
-			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "kind", Location: "kind", ClusterName: "kind"},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "kind", Location: "kind", ClusterName: "kube-agents"},
 			AgentSpec: agentv1alpha1.AgentSpec{
 				Deployment: &agentv1alpha1.DeploymentSpec{Image: "example/platform-agent", Tag: ptr.To("v1")},
 				Security:   &agentv1alpha1.SecuritySpec{ServiceAccountName: "credential-sa"},
