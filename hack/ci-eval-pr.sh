@@ -773,7 +773,9 @@ report_partial_verdict() {
 # cut-off night keeps (#1491). collect_gateway_log follows for the same reason
 # collect_bench_results runs on green: a green nightly whose repetitions ran to
 # the delegation ceiling used to leave no gateway log to say whether the worker
-# was starved by 429s or a stuck dispatcher.
+# was starved by 429s or a stuck dispatcher. collect_agent_pod_diagnostics
+# follows it: a pod replaced mid-run starts a fresh gateway log, and only
+# the previous containers, the restart record and the events say why.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -793,6 +795,7 @@ profile_and_dump_on_exit() {
   collect_bench_results
   report_partial_verdict
   collect_gateway_log
+  collect_agent_pod_diagnostics
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure

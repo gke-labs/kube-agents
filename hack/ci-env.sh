@@ -56,6 +56,30 @@ readonly GATEWAY_LOG_MAX_BYTES=$((8 * 1024 * 1024))
 readonly LITELLM_LOG_TAIL_LINES=20000
 readonly ENVOY_LOG_TAIL_LINES=20000
 
+# ─── Agent pod diagnostics ───────────────────────────────────────────────────
+# collect_agent_pod_diagnostics keeps, on every eval run, what says why a pod
+# in the install was replaced or a container restarted mid-run: the Hermes
+# bridge sidecar's log (the executor under EVAL_MODE_NEXT=1), the previous
+# instance of the agent and bridge containers, each pod's restart counts and
+# last termination, and the namespace's events. The gateway log alone cannot:
+# a replaced pod starts a fresh log, so a green run whose repetitions ended
+# "bridge-shutdown" kept no record of whether it was an OOM kill, an eviction
+# or a rollout. Same bounds as the gateway log: a line tail, then a byte cap.
+readonly AGENT_DIAG_LOG_TAIL_LINES=20000
+readonly AGENT_DIAG_LOG_MAX_BYTES=$((8 * 1024 * 1024))
+# Events are one line each; the namespace's whole retained window fits.
+readonly AGENT_DIAG_EVENTS_TAIL_LINES=5000
+# The agent's own container, and the bridge sidecar hack/ci-deploy.sh declares
+# under EVAL_MODE_NEXT=1 (its BRIDGE_SIDECAR_NAME). Named apart from that
+# constant because ci-deploy.sh sources this file and both are readonly.
+readonly AGENT_DIAG_AGENT_CONTAINER="platform-agent"
+readonly AGENT_DIAG_BRIDGE_CONTAINER="hermes-bridge"
+readonly AGENT_DIAG_DEPLOYMENT="deployment/platform-agent-gateway"
+# One line per pod, then one per container: restarts, the last termination
+# (reason, exit code, when), and since when it has been running. Evicted pods
+# carry their reason at pod level, so the pod line has status.reason.
+readonly AGENT_DIAG_POD_STATUS_JSONPATH='{range .items[*]}{.metadata.name}{"\tphase="}{.status.phase}{"\treason="}{.status.reason}{"\tstarted="}{.status.startTime}{"\n"}{range .status.containerStatuses[*]}{"  "}{.name}{"\trestarts="}{.restartCount}{"\tlast="}{.lastState.terminated.reason}{"\texit="}{.lastState.terminated.exitCode}{"\tfinished="}{.lastState.terminated.finishedAt}{"\trunningSince="}{.state.running.startedAt}{"\n"}{end}{end}'
+
 ensure_helm() {
   if command -v helm >/dev/null 2>&1; then
     return 0
@@ -133,6 +157,48 @@ collect_gateway_log() {
     | tail -c "${GATEWAY_LOG_MAX_BYTES}" > "${artifact_dir}/platform-agent-gateway.log" || true
 }
 
+# ─── Agent Pod Diagnostics (runs on PASS as well as on failure) ───────────────
+# The AGENT_DIAG_ constants above say what and why. Same contract as
+# collect_gateway_log: every command ends in `|| true`, so `$?` is left for
+# the dumper and an unreachable cluster costs these files and nothing else;
+# pinned to AGENT_CLUSTER_CONTEXT for the same reason. A `--previous` read of
+# a container that never restarted writes kubectl's "not found" into its file,
+# which is the answer, not an error. The bridge files are written only when
+# the Deployment declares the sidecar, so a today-mode run gains no empty ones.
+collect_agent_pod_diagnostics() {
+  local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
+  local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
+  local kctl=(kubectl)
+  if [ -n "${AGENT_CLUSTER_CONTEXT:-}" ]; then
+    kctl+=(--context "${AGENT_CLUSTER_CONTEXT}")
+  fi
+  mkdir -p "${artifact_dir}" || true
+
+  "${kctl[@]}" get pods -n "${ns}" -o jsonpath="${AGENT_DIAG_POD_STATUS_JSONPATH}" \
+    > "${artifact_dir}/agent-pod-status.txt" 2>&1 || true
+  "${kctl[@]}" get events -n "${ns}" --sort-by=.lastTimestamp -o wide 2>&1 \
+    | tail -n "${AGENT_DIAG_EVENTS_TAIL_LINES}" > "${artifact_dir}/k8s-events.txt" || true
+  "${kctl[@]}" top pods -n "${ns}" --containers > "${artifact_dir}/agent-pod-top.txt" 2>&1 || true
+
+  "${kctl[@]}" logs "${AGENT_DIAG_DEPLOYMENT}" -c "${AGENT_DIAG_AGENT_CONTAINER}" -n "${ns}" \
+    --previous --tail="${AGENT_DIAG_LOG_TAIL_LINES}" 2>&1 \
+    | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/platform-agent-previous.log" || true
+
+  local containers=""
+  containers=$("${kctl[@]}" get "${AGENT_DIAG_DEPLOYMENT}" -n "${ns}" \
+    -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null) || true
+  case " ${containers} " in
+    *" ${AGENT_DIAG_BRIDGE_CONTAINER} "*)
+      "${kctl[@]}" logs "${AGENT_DIAG_DEPLOYMENT}" -c "${AGENT_DIAG_BRIDGE_CONTAINER}" -n "${ns}" \
+        --tail="${AGENT_DIAG_LOG_TAIL_LINES}" 2>&1 \
+        | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/hermes-bridge.log" || true
+      "${kctl[@]}" logs "${AGENT_DIAG_DEPLOYMENT}" -c "${AGENT_DIAG_BRIDGE_CONTAINER}" -n "${ns}" \
+        --previous --tail="${AGENT_DIAG_LOG_TAIL_LINES}" 2>&1 \
+        | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/hermes-bridge-previous.log" || true
+      ;;
+  esac
+}
+
 # ─── Shared Artifact Collection Handler for Prow Job Failures ───────────────────
 dump_prow_artifacts_on_failure() {
   local exit_code=$?
@@ -157,8 +223,11 @@ dump_prow_artifacts_on_failure() {
     # 2. Current running & previous crashed pod logs (crucial for rollout deadline / CrashLoopBackOff failures).
     #    The running pod's log is the every-run capture above, taken again here
     #    so a caller without a green-path collector (ci-deploy.sh) still gets it.
+    #    The previous agent container, the bridge sidecar, pod restarts and
+    #    events come from the every-run collector, called here for the same
+    #    reason (it replaces this dumper's own, shorter --previous tail).
     collect_gateway_log
-    kubectl logs deployment/platform-agent-gateway -n "${ns}" --previous --tail=1000 > "${artifact_dir}/platform-agent-gateway-previous-crash.log" 2>&1 || true
+    collect_agent_pod_diagnostics
     kubectl logs deployment/kube-agents-controller-manager -n "${ns}" --tail=1000 > "${artifact_dir}/controller-manager.log" 2>&1 || true
     # The model path runs through LiteLLM, and with vertex_ai its failure
     # domain (Workload Identity token fetch, aiplatform 403s, model 404s)
