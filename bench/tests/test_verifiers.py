@@ -718,6 +718,211 @@ def test_the_channel_absence_phrase_keeps_its_preposition():
         assert "aged out of" not in verifiers._normalize(innocent)
 
 
+# The 2026-09-29 widening (#1493, #2124), measured over all 279 scored
+# presubmit repetitions of 2026-09-25 to 09-29: 17 more spellings of the lag,
+# and a forbidden list for the verdict the phrases above only describe around.
+# Same discipline: verbatim `output` fields, read through the shipped check.
+
+# kube-agents-evals-25 rep 1, build 2104637844441010176 (#2050). The largest
+# miss of the 15-phrase list: "older than the default", 17 of the 39 correct
+# answers it failed. Bare "older than" stays out (the test above); the
+# article is what admits this and keeps the two hedged wrong answers out.
+_LAG_OLDER_THAN_THE_DEFAULT = """🔀 Delegated to the **platform** agent
+
+I've started this as task `t_727d75f2`. The answer will post into this thread as soon as it's ready.
+
+The task `t_727d75f2` has finished. Here is the result from the **platform** agent:
+
+The `seeded-b` cluster is on **version 1.34.10-gke.1328000** for both its control plane and its nodes, and is enrolled in the **Regular release channel**.
+
+## Current State
+
+- **Current control plane version:** `1.34.10-gke.1328000`
+- **Current release channel:** Regular (`REGULAR`)
+- **Default version for the Regular channel (in `us-central1-a`):** `1.35.8-gke.1225000`
+- **Latest available version in the Regular channel (in `us-central1-a`):** `1.36.4-gke.1247000`
+
+The control plane is older than the current default for its release channel.
+
+## Sources
+- **GCP command:** `gcloud container get-server-config --zone us-central1-a --project kube-agents-evals-25`
+- **Tool:** `mcp-gke` (`mcp__gke__get_cluster` and `mcp__gke__get_k8s_version`)
+"""
+
+# kube-agents-evals-34 rep 3, build 2104630680196485120 (#1628). Once GKE
+# dropped the planted patch from REGULAR's valid list on 2026-09-28 the agent
+# described an absence in words "no longer offered" did not cover.
+_LAG_MISSING_FROM_THE_LIST = """> 🔀 Delegated to the **platform** agent
+
+I've started this as task `t_edf38c95`. The answer will post into this thread as soon as it's ready.
+
+The task `t_edf38c95` has completed. Here is the result from the platform agent:
+
+The `seeded-b` cluster is running a control plane version that is no longer available in its release channel.
+
+## Current state
+- **Cluster:** `seeded-b` (in `us-central1-a`)
+- **Release Channel:** `REGULAR`
+- **Current Version:** `1.34.11-gke.1102000`
+
+## Channel availability
+The `REGULAR` release channel currently offers the following versions:
+- `1.36.4-gke.1247000`
+- `1.36.3-gke.1767000`
+- `1.35.8-gke.1380000`
+- `1.35.8-gke.1225000` (Default and Upgrade Target)
+- `1.34.11-gke.1056000`
+- `1.34.11-gke.1044000`
+
+The version `seeded-b` is currently running (`1.34.11-gke.1102000`) is missing from the list of valid versions for the `REGULAR` channel in `us-central1-a`.
+"""
+
+# kube-agents-evals-7 rep 3, build 2103664100058861568 (#1884). One of the
+# four wrong verdicts the 15-phrase list PASSED: "current relative to its
+# configured release channel", rescued by "slightly behind" a few lines down.
+# It also says "No action is required" -- advice, not the verdict, and not on
+# the forbidden list; what fails it is "is current relative".
+_WRONG_CURRENT_RELATIVE_TO_ITS_CHANNEL = """🔀 Delegated to the **platform** agent
+
+I've started this as task `t_b4165eb5`. The answer will post into this thread as soon as it's ready.
+
+The task `t_b4165eb5` has finished successfully. Here is the result from the **platform** agent:
+
+The control plane for `seeded-b` is current relative to its configured release channel.
+
+## Current state
+- **Current Version:** `1.34.10-gke.1328000`
+- **Release Channel:** `REGULAR`
+- **Channel Default Version:** `1.35.8-gke.1036000`
+
+While `1.34.10-gke.1328000` is slightly behind the current default for the REGULAR channel (`1.35.8-gke.1036000`), it remains an actively valid and supported version within that channel. No action is required.
+"""
+
+# kube-agents-evals-31 rep 2, build 2104675369926791168 (#2084). "matches the
+# default version" in the first sentence, "older than the default version"
+# two lines later. The widened list accepts the second sentence, so only the
+# forbidden pattern keeps this red -- and it is a pattern rather than a
+# phrase because "no longer matches the default version" is a correct answer.
+_WRONG_MATCHES_THE_DEFAULT = """> 🔀 Delegated to the **platform** agent
+
+I've started this as task `t_261f4a31`. The answer will post into this thread as soon as it's ready.
+
+> 🔀 Delegated to the **platform** agent
+
+The task `t_261f4a31` has finished. Here is the result:
+
+The `seeded-b` cluster is currently running a control plane version that matches the default version offered by its `REGULAR` release channel. There is no pending upgrade available on this channel.
+
+## Current State
+- **Control plane version:** `1.34.11-gke.1102000`
+- **Release channel default version:** `1.35.8-gke.1225000`
+
+The control plane version (`1.34.11-gke.1102000`) is older than the default version offered by the `REGULAR` release channel (`1.35.8-gke.1225000`).
+
+## Details
+
+The cluster is enrolled in the `REGULAR` release channel and currently running `1.34.11-gke.1102000`.
+According to the server config for `us-central1`, the `REGULAR` channel's default version is `1.35.8-gke.1225000`.
+
+## Sources
+- `mcp__gke__get_cluster` (retrieved cluster state for `seeded-b`)
+- `gcloud container get-server-config` (retrieved release channel versions for `us-central1`)
+"""
+
+# kube-agents-evals-28 rep 2, build 2104689780947161088 (#2107). "is fully
+# current" because the maintenance exclusion holds it there: the same excuse
+# as the two 2026-09-15 records, in the one wording the forbidden entry
+# "is fully current" exists for.
+_WRONG_FULLY_CURRENT = """> 🔀 Delegated to the **platform** agent
+
+I've started this as task `t_cab2ac71`. The answer will post into this thread as soon as it's ready.
+
+The task has finished. Here is the result from the **platform** agent:
+
+The `seeded-b` control plane is fully current with its release channel.
+
+- **Current Master Version:** `1.34.10-gke.1328000`
+- **Release Channel:** `REGULAR`
+- **Channel Default Version:** `1.35.8-gke.1225000`
+- **Upgrade Target Version (REGULAR):** `1.35.8-gke.1225000`
+
+While `1.35.8-gke.1225000` is the default and upgrade target for the `REGULAR` channel, `seeded-b` is currently on `1.34.10-gke.1328000`. However, the cluster has an active maintenance exclusion (`hold-the-minor-lag`) with scope `NO_MINOR_UPGRADES` valid from `2026-09-03` to `2026-12-02`. Therefore, `1.34.10-gke.1328000` is the correct, current version for this cluster given its active exclusions.
+
+## Sources
+- `gcloud container clusters describe`
+- `gcloud container get-server-config`
+"""
+
+_WRONG_VERDICTS_THE_FORBIDDEN_LIST_CATCHES = {
+    "current-relative-to-its-channel": _WRONG_CURRENT_RELATIVE_TO_ITS_CHANNEL,
+    "matches-the-default": _WRONG_MATCHES_THE_DEFAULT,
+    "fully-current": _WRONG_FULLY_CURRENT,
+}
+
+
+@pytest.mark.parametrize(
+    "report",
+    [_LAG_OLDER_THAN_THE_DEFAULT, _LAG_MISSING_FROM_THE_LIST],
+    ids=["older-than-the-default", "missing-from-the-list"],
+)
+def test_the_widened_list_accepts_the_reports_it_was_widened_for(report):
+    """Both read the versions and state the lag; the 15-phrase list failed both."""
+    assert _upgrades_verdict(report) == "pass"
+
+
+@pytest.mark.parametrize(
+    "report",
+    _WRONG_VERDICTS_THE_FORBIDDEN_LIST_CATCHES.values(),
+    ids=_WRONG_VERDICTS_THE_FORBIDDEN_LIST_CATCHES.keys(),
+)
+def test_the_forbidden_list_fails_a_report_that_calls_the_lagging_cluster_current(
+    report,
+):
+    """The verdict is graded now, not only the description.
+
+    The first two contain an accepted spelling of the lag ("behind", "older
+    than the default version") and passed, or would pass, on any_of alone;
+    the forbidden list is the only thing that fails them. Every one of the
+    three also prints the two versions that contradict its own verdict.
+    """
+    assert _upgrades_verdict(report) == "fail"
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        "The seeded-b control plane is not fully current: it is one minor behind.",
+        "seeded-b **no longer matches the default version** for REGULAR; "
+        "it is one minor behind.",
+        "There is no pending upgrade operation, yet the control plane is one "
+        "minor behind the REGULAR default. No action is required while the "
+        "NO_MINOR_UPGRADES exclusion holds it.",
+    ],
+    ids=["not-fully-current", "no-longer-matches", "advice-is-not-a-verdict"],
+)
+def test_a_negated_verdict_or_plain_advice_stays_green(report):
+    """Hand-written, not recorded: the correct sentences the forbidden list
+    must not red, one per edit that shaped it. Each entry keeps its "is", the
+    "matches" shapes are a pattern that excludes "no longer / not / never",
+    and "no pending upgrade" / "no action is required" are not on the list
+    because a correct answer that reads the planted exclusion says both.
+    """
+    assert _upgrades_verdict(report) == "pass"
+
+
+def test_every_forbidden_verdict_carries_its_subject():
+    """Every forbidden phrase starts with "is": that prefix is what keeps
+    "is not current" and "not fully up to date" out of the match, and one
+    entry without it ("fully current") was the review finding that put this
+    test here.
+    """
+    check = _upgrades_probe_check()
+    forbidden = check["forbidden_phrases"]
+    assert forbidden, check
+    assert all(p.startswith("is ") for p in forbidden), forbidden
+    assert len(check.get("forbidden_patterns") or []) == 1, check
+
+
 # ------------------ the capacity probe's shipped phrase list
 
 # Third of the same shape. The 2026-09-29 widening (#1493) added two spellings

@@ -108,13 +108,14 @@ verification_spec:
       # REGULAR's valid list on 09-28; "trailing the channel's default",
       # which the apostrophe hid from the entry above) and 13 were the agent
       # calling the cluster current with its own 1.34-against-1.35.8 table a
-      # line below -- four more of those passed on a stray "behind". The 17
-      # spellings below rescue 28 of the 39; the forbidden_phrases list
-      # closes the verdict gap the paragraph above left to the judge, on the
-      # 13 shapes those 17 wrong answers used, and touches none of the 223
-      # correct passes. "older than the" is the qualified form the wrong
-      # answers hedge with; the two that use it are caught by the forbidden
-      # list. Priced with the verifier's own _normalize:
+      # line below -- four more of those passed on a stray "behind", "one
+      # minor" or "not current". The 17 spellings below rescue 28 of the 39;
+      # the forbidden list (nine phrases and one pattern) closes the verdict
+      # gap the paragraph above left to the judge, on the shapes those 17
+      # wrong answers used, and touches none of the 223 correct passes.
+      # "older than the" is the qualified form the wrong answers hedge with;
+      # the two that use it are caught by the forbidden list. Priced with the
+      # verifier's own _normalize:
       #
       # | 279 reps        | pass      | wrong verdicts passing | correct answers failing |
       # |-----------------|-----------|------------------------|-------------------------|
@@ -178,10 +179,14 @@ verification_spec:
         ]
       # 2026-09-29 (#2124): the verdict, not just the description. Each entry
       # is a sentence shape one of the 17 recorded wrong answers used to call
-      # the lagging cluster current; the "is" and "fully" prefixes are what
-      # keep "not fully up to date" and "is not current" safe, and none of
-      # the 13 appears in any of the 223 correct passes. A report that words
-      # the gap AND one of these fails, which is what expected_output asks.
+      # the lagging cluster current; every entry carries its "is" so that
+      # "is not current", "not fully up to date" and "is not fully current"
+      # stay safe, and none of the nine appears in any of the 223 correct
+      # passes. Verdict shapes only: "no pending upgrade" and "no action is
+      # required" are advice a correct answer gives too (the exclusion is in
+      # the fixture), and neither caught a wrong verdict on its own. A report
+      # that words the gap AND one of these fails, which is what
+      # expected_output asks.
       forbidden_phrases: [
           "is current for its release channel",
           "is current with the",
@@ -190,12 +195,17 @@ verification_spec:
           "is currently up-to-date",
           "is fully up to date",
           "is fully up-to-date",
-          "fully current",
+          "is fully current",
           "is the correct, current version",
-          "matches the default version",
-          "matches its configured release channel",
-          "no action is required",
-          "no pending upgrade",
+        ]
+      # "matches the default version" / "matches its configured release
+      # channel" are verdicts too, but their negations ("no longer matches
+      # the default version") are the correct answer, so they live here as
+      # one pattern with the negations excluded rather than as phrases. Runs
+      # per normalised line (lowercased, emphasis stripped), so it is spelled
+      # in lowercase.
+      forbidden_patterns: [
+          "(?<!no longer )(?<!not )(?<!never )matches (the default version|its configured release channel)",
         ]
   - name: no-invented-cves
     role: objective
