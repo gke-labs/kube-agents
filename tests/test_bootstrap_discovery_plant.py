@@ -35,9 +35,10 @@ real install:
      closed the gate stops the apply before step 2 changes anything.
 
 The rest pin step 1's refusals, step 2 stopping when it cannot list the
-sandbox pods, and step 4's handling of a board read that fails and of a sweep
-no worker picked up. As in `test_autoops_incident_plant.py`, the provisioner is
-rendered the way Terraform renders it and run against a stub
+sandbox pods, step 4's handling of a board read that fails and of a sweep no
+worker picked up, and the trap and the destroy carrying on past a failed step
+and naming it. As in `test_autoops_incident_plant.py`, the provisioners are
+rendered the way Terraform renders them and run against a stub
 `kubectl`/`gcloud`/`sleep`. The reads in steps 1 and 2 also run on their own
 against a data directory, and step 4's board query against a sqlite board.
 """
@@ -61,6 +62,7 @@ _RUN_STATE_RE = re.compile(r"^run_state\(\) \{\n  agent_py [^\n]*<<'PY'\n(.*?)\n
 _STEP_1_RE = re.compile(r"^state=\"\$\(agent_py [^\n]*<<'PY' \|\| true\n(.*?)\nPY\n", re.S | re.M)
 _STEP_2_RE = re.compile(r"^old_id=\"\$\(agent_py <<'PY'\n(.*?)\nPY\n", re.S | re.M)
 _PLANT_BLOCK = 0
+_DESTROY_BLOCK = 1
 _SWEEP = "t_sweep"
 _CLUSTER_KEY = "bootstrap-inventory-cluster-example-project-cluster-"
 
@@ -76,6 +78,8 @@ _INTERPOLATIONS = {
     "local.inventory": "/opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md",
     "local.gate_script": "bootstrap_scan_gate.py",
     "local.gate_wait": "300",
+    "local.list_tries": "3",
+    "local.list_wait": "5",
     "local.scan_job": "bootstrap-inventory-scan",
     "local.rate_limit_block": "provider rate limit: API retries exhausted",
     "var.project_id": "kube-agents-evals",
@@ -86,6 +90,17 @@ _INTERPOLATIONS = {
     "var.agent_container": "platform-agent",
     "var.sandbox_selector": "app=platform-agent-shell",
     "var.sandbox_container": "shell",
+}
+
+_DESTROY_INTERPOLATIONS = {
+    "self.triggers.host_project": _INTERPOLATIONS["var.project_id"],
+    "self.triggers.host_cluster": _INTERPOLATIONS["var.host_cluster_name"],
+    "self.triggers.host_location": _INTERPOLATIONS["var.host_cluster_location"],
+    "self.triggers.namespace": _INTERPOLATIONS["var.agent_namespace"],
+    "self.triggers.deployment": _INTERPOLATIONS["var.agent_deployment"],
+    "self.triggers.container": _INTERPOLATIONS["var.agent_container"],
+    "self.triggers.sandbox_selector": _INTERPOLATIONS["var.sandbox_selector"],
+    "self.triggers.sandbox_container": _INTERPOLATIONS["var.sandbox_container"],
 }
 
 # Records every call to $CALLS, tagging the in-pod Python by what it reads, and
@@ -150,6 +165,11 @@ elif "task_id=$1" in script:
     record("restore")
 elif "rm" in cmd and "/opt/data/.bootstrap_scan_filed" in cmd:
     record("rearm")
+elif "rm" in cmd and "/opt/data/INVENTORY.md" in cmd:
+    record("clear " + target)
+    if os.environ.get("INVENTORY_RM_FAIL") == target:
+        sys.stderr.write("error: unable to upgrade connection: container not found\n")
+        sys.exit(1)
 elif "archive" in cmd:
     record("archive")
 elif "/proc" in stdin:
@@ -173,6 +193,9 @@ elif "task_runs" in stdin:
     print(answer)
 elif "idempotency_key LIKE" in stdin:
     record("open_cards")
+    if str(bump("listings") + 1) in os.environ.get("FAILED_LISTINGS", "").split():
+        sys.stderr.write("error: unable to upgrade connection: container not found\n")
+        sys.exit(1)
     raced = os.environ.get("RACE") == "1" and (state / "gate_done").exists()
     print("t_raced" if raced else "")
 else:
@@ -184,12 +207,20 @@ _SLEEP_STUB = '#!/bin/bash\necho "sleep $*" >> "$CALLS"\n'
 
 
 def _render_plant(**overrides: str) -> str:
-    """Render the create-time provisioner as Terraform would: dedent, protect
+    """The create-time provisioner, with `overrides` on top of _INTERPOLATIONS."""
+    return _render(_PLANT_BLOCK, {**_INTERPOLATIONS, **overrides})
+
+
+def _render_destroy() -> str:
+    return _render(_DESTROY_BLOCK, _DESTROY_INTERPOLATIONS)
+
+
+def _render(block: int, interpolations: dict) -> str:
+    """Render a provisioner's command as Terraform would: dedent, protect
     `$${` escapes, substitute interpolations, then restore the escapes."""
-    body = textwrap.dedent(_HEREDOC_RE.findall(_MODULE.read_text())[_PLANT_BLOCK])
+    body = textwrap.dedent(_HEREDOC_RE.findall(_MODULE.read_text())[block])
     sentinel = "\x00"
     body = body.replace("$${", sentinel)
-    interpolations = {**_INTERPOLATIONS, **overrides}
     unresolved = []
 
     def substitute(match: "re.Match[str]") -> str:
@@ -201,7 +232,7 @@ def _render_plant(**overrides: str) -> str:
 
     body = re.sub(r"\$\{([^}]*)\}", substitute, body).replace(sentinel, "${")
     if unresolved:
-        raise AssertionError(f"add these to _INTERPOLATIONS: {sorted(set(unresolved))}")
+        raise AssertionError(f"add these to the interpolations: {sorted(set(unresolved))}")
     return body
 
 
@@ -210,6 +241,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._plant = _render_plant()
+        cls._destroy = _render_destroy()
 
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
@@ -217,6 +249,8 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         root = pathlib.Path(self._dir.name)
         self._script = root / "plant.sh"
         self._script.write_text(self._plant)
+        self._destroy_script = root / "destroy.sh"
+        self._destroy_script.write_text(self._destroy)
         self._stub_dir = root / "bin"
         self._stub_dir.mkdir()
         for name, source in (("kubectl", _KUBECTL_STUB), ("gcloud", _GCLOUD_STUB), ("sleep", _SLEEP_STUB)):
@@ -227,14 +261,14 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self._state.mkdir()
         self._calls = root / "calls"
 
-    def _run(self, **scenario):
+    def _run(self, script=None, **scenario):
         env = dict(os.environ)
         env["PATH"] = f"{self._stub_dir}{os.pathsep}{env['PATH']}"
         env["CALLS"] = str(self._calls)
         env["STATE"] = str(self._state)
         env.update({k: str(v) for k, v in scenario.items()})
         completed = subprocess.run(
-            ["bash", str(self._script)], env=env, capture_output=True, text=True, timeout=120
+            ["bash", str(script or self._script)], env=env, capture_output=True, text=True, timeout=120
         )
         calls = self._calls.read_text().splitlines() if self._calls.exists() else []
         return completed, calls
@@ -337,6 +371,44 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("Plant failed", completed.stderr)
         self.assertEqual(self._indices(calls, "[rearm]"), [])
+        self.assertIn("Cleanup incomplete: could not remove the INVENTORY files.", completed.stderr)
+
+    # Step 2 lists the cards twice, so the trap's listings are the third on.
+    def test_the_trap_retries_a_card_listing_that_fails(self):
+        completed, calls = self._run(GATE_FILES=0, RACE=1, FAILED_LISTINGS="3")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(len(self._indices(calls, "[open_cards]")), 4)
+        self.assertEqual(len([c for c in calls if c.endswith("archive t_raced [archive]")]), 1, calls)
+        self.assertNotIn("Cleanup incomplete", completed.stderr)
+
+    def test_the_trap_names_a_card_listing_it_never_got(self):
+        completed, calls = self._run(GATE_FILES=0, RACE=1, FAILED_LISTINGS="3 4 5")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(len(self._indices(calls, "[open_cards]")), 5)
+        self.assertEqual(self._indices(calls, "[archive]"), [])
+        self.assertIn("Cleanup incomplete: could not list the open cards.", completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[clear pod/platform-agent-shell-0]")), 2)
+
+    def test_the_destroy_clears_the_inventory_files_when_it_cannot_list_the_cards(self):
+        completed, calls = self._run(script=self._destroy_script, FAILED_LISTINGS="1")
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("Cleanup incomplete: could not list the open cards.", completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[clear deployment/platform-agent-gateway]")), 1)
+        self.assertEqual(len(self._indices(calls, "[clear pod/platform-agent-shell-0]")), 1)
+
+    def test_the_destroy_clears_the_sandbox_when_the_agents_rm_fails(self):
+        completed, calls = self._run(
+            script=self._destroy_script, INVENTORY_RM_FAIL="deployment/platform-agent-gateway"
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("Cleanup incomplete: could not remove the agent's INVENTORY files.", completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[clear pod/platform-agent-shell-0]")), 1)
+
+    def test_the_destroy_names_a_sandbox_listing_it_never_got(self):
+        completed, calls = self._run(script=self._destroy_script, SANDBOX_LIST_FAIL="1")
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("Cleanup incomplete: could not list the sandbox pods.", completed.stderr)
+        self.assertEqual(len(self._indices(calls, "[clear deployment/platform-agent-gateway]")), 1)
 
     def test_the_trap_waits_out_the_ceiling_when_no_gateway_pod_is_listed(self):
         completed, calls = self._run(GATE_FILES=0, NO_PODS=1, RACE=0)

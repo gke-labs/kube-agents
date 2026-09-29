@@ -70,6 +70,10 @@ locals {
   # deploy/docker/patches/kanban_guardrail_exit.py: RATE_LIMIT_REASON_PREFIX,
   # the start of the summary on a run the rate-limit guardrail blocked.
   rate_limit_block = "provider rate limit: API retries exhausted"
+  # The exit trap's tries at listing the cards it archives, and the wait
+  # between them: what failed the apply can fail one listing too.
+  list_tries = 3
+  list_wait  = 5
 }
 
 resource "null_resource" "sweep" {
@@ -112,18 +116,33 @@ resource "null_resource" "sweep" {
           # archived below. A gate run that read the marker before it went
           # back files once its reconcile ends, so the listing also waits for
           # any gate run to exit.
+          failed=""
           if [ -n "$old_id" ]; then
-            agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$old_id" >&2
+            agent sh -c 'test -e ${local.home}/.bootstrap_scan_filed || echo "task_id=$1" > ${local.home}/.bootstrap_scan_filed' sh "$old_id" >&2 ||
+              failed="$failed, put back the sweep marker"
           fi
           waited=0
           until [ "$(gate_running)" = idle ] || [ "$waited" -ge ${local.gate_wait} ]; do
             sleep 5
             waited=$((waited + 5))
           done
-          for id in $(open_cards); do
-            agent ${local.hermes} kanban archive "$id" >&2
+          tries=1
+          until ids="$(open_cards)"; do
+            if [ "$tries" -ge ${local.list_tries} ]; then
+              ids=""
+              failed="$failed, list the open cards"
+              break
+            fi
+            sleep ${local.list_wait}
+            tries=$((tries + 1))
           done
-          clear_inventory
+          for id in $ids; do
+            agent ${local.hermes} kanban archive "$id" >&2 || failed="$failed, archive $id"
+          done
+          clear_inventory || failed="$failed, remove the INVENTORY files"
+          if [ -n "$failed" ]; then
+            echo "Cleanup incomplete: could not$${failed#,}. The next run's step 2 archives the cards and removes the files left behind." >&2
+          fi
         fi
         rm -rf "$kubeconfig_dir"
       }
@@ -204,17 +223,23 @@ resource "null_resource" "sweep" {
       sweep_id() {
         agent sh -c 'sed -n "s/^task_id=//p" ${local.home}/.bootstrap_scan_filed 2>/dev/null; true' || true
       }
-      # Unlike the destroy's copy, a failed listing or rm fails the apply: the
-      # sandbox's /opt/data outlives its pod, and a report left there makes
-      # the sweep skip discovery (agents/platform/governance/inventory.md).
-      # errexit does not see a failure inside a `for` word list, hence the
-      # assignment.
+      # A failed listing or rm fails step 2, where the destroy's copy only
+      # reports it: the sandbox's /opt/data outlives its pod, and a report left
+      # there makes the sweep skip discovery
+      # (agents/platform/governance/inventory.md). Every step runs either way,
+      # so the trap's call clears what it can. The listing is checked on its
+      # own because a failure inside a `for` word list fails nothing.
       clear_inventory() {
-        sandbox_pods="$(kubectl get pods -n "${var.agent_namespace}" -l "${var.sandbox_selector}" -o name)"
-        for pod in $sandbox_pods; do
-          kubectl exec -n "${var.agent_namespace}" "$pod" -c "${var.sandbox_container}" -- rm -f ${local.inventory}
-        done
-        agent rm -f ${local.inventory}
+        clear_status=0
+        if sandbox_pods="$(kubectl get pods -n "${var.agent_namespace}" -l "${var.sandbox_selector}" -o name)"; then
+          for pod in $sandbox_pods; do
+            kubectl exec -n "${var.agent_namespace}" "$pod" -c "${var.sandbox_container}" -- rm -f ${local.inventory} || clear_status=1
+          done
+        else
+          clear_status=1
+        fi
+        agent rm -f ${local.inventory} || clear_status=1
+        return "$clear_status"
       }
 
       # ---- 1. Refuse an install that would reach a person or file nothing --
@@ -398,6 +423,10 @@ resource "null_resource" "sweep" {
 
       ns="${self.triggers.namespace}"
       target="deployment/${self.triggers.deployment}"
+      # A failed step does not skip the ones after it, and what failed is named
+      # at the end: with on_failure = continue, Terraform counts this destroy
+      # done whatever its exit status.
+      failed=""
       ids="$(kubectl exec -i -n "$ns" "$target" -c "${self.triggers.container}" -- \
         /opt/hermes/.venv/bin/python3 - "bootstrap-inventory-%" <<'PY'
       import sqlite3, sys
@@ -405,19 +434,27 @@ resource "null_resource" "sweep" {
       rows = c.execute("SELECT id FROM tasks WHERE idempotency_key LIKE ? AND status != 'archived' ORDER BY created_at DESC", (sys.argv[1],))
       print(" ".join(r[0] for r in rows))
       PY
-      )"
+      )" || failed="$failed, list the open cards"
       for id in $ids; do
         kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" -- \
-          /opt/hermes/.venv/bin/hermes kanban archive "$id" || true
+          /opt/hermes/.venv/bin/hermes kanban archive "$id" || failed="$failed, archive $id"
       done
       # The sweep marker stays, so the gate does not file again once this
       # case is gone.
       kubectl exec -n "$ns" "$target" -c "${self.triggers.container}" -- \
-        rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md
-      for pod in $(kubectl get pods -n "$ns" -l "${self.triggers.sandbox_selector}" -o name); do
-        kubectl exec -n "$ns" "$pod" -c "${self.triggers.sandbox_container}" -- \
-          rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md || true
-      done
+        rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md || failed="$failed, remove the agent's INVENTORY files"
+      if sandbox_pods="$(kubectl get pods -n "$ns" -l "${self.triggers.sandbox_selector}" -o name)"; then
+        for pod in $sandbox_pods; do
+          kubectl exec -n "$ns" "$pod" -c "${self.triggers.sandbox_container}" -- \
+            rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md || failed="$failed, remove the INVENTORY files from $pod"
+        done
+      else
+        failed="$failed, list the sandbox pods"
+      fi
+      if [ -n "$failed" ]; then
+        echo "Cleanup incomplete: could not$${failed#,}. The next run's step 2 archives the cards and removes the files left behind." >&2
+        exit 1
+      fi
     EOT
   }
 }
