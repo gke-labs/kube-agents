@@ -1489,7 +1489,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         message = partial
     else:
         message = (
-            "Workload Identity, both runners' and platform GSA project roles, "
+            "Workload Identity (platform and LiteLLM), the runners', reconciler's, health bot's and platform GSA project roles, "
             "and the fleet reader's token-creator binding verified"
         )
 

@@ -187,11 +187,13 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 
 A single bad tick does not change the state, and a single lucky green does not
 end an incident. A scan condition (fixture drift, pool drift) that its own
-scan cannot yet read clean is not replaced by a scan condition either, the
-other scan's or its own on other units: the state would otherwise leave
-through a scan exit that never read the held incident's projects. It is
-displaced by a run-based condition as before, and the newcomer takes over
-once the hold lifts. Entering a shared-break OUTAGE or a storm or delegation-ceiling DEGRADED needs the condition to be
+scan cannot yet read clean is not replaced by a scan condition that ranks at
+or below it, the lower-ranked scan's or its own on other units, unless the new
+drift covers the held one (it spread, so every held project stays in the exit's
+reads): the state would otherwise leave through a scan exit that never read
+the held incident's projects. Fixture drift, which ranks above pool drift, and
+any run-based condition displace it as before, and a held-back newcomer takes
+over once the hold lifts. Entering a shared-break OUTAGE or a storm or delegation-ceiling DEGRADED needs the condition to be
 current: one of the three newest completed runs carries it. Setup deaths,
 lost pods, deadline kills, fixture drift and pool drift have no such signature
 on a completed run; their count is the currency. Returning to GREEN needs 3

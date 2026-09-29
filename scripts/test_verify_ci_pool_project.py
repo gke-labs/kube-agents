@@ -2980,7 +2980,7 @@ class IamGrantsTest(unittest.TestCase):
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
         self.assertEqual(
-            "Workload Identity, both runners' and platform GSA project roles, "
+            "Workload Identity (platform and LiteLLM), the runners', reconciler's, health bot's and platform GSA project roles, "
             "and the fleet reader's token-creator binding verified",
             result.message,
         )

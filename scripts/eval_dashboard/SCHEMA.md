@@ -900,9 +900,11 @@ across the ticks that read no artifact and so write no `pool`, and `null` once
 a tick reads one and writes none, which is the episode ending.
 
 A held scan condition (`fixture_drift` or `pool_drift` whose scan is stale,
-blind, or still shows the drift) keeps its `condition` and `incident` while the
-other scan's condition, or its own on other units, is assessed at the same
-severity; a run-based condition displaces it as before.
+blind, or still shows the drift) keeps its `condition` and `incident` while a
+scan condition ranking at or below it (`pool_drift` below `fixture_drift`, or
+its own on other units that do not cover the held ones) is assessed at the same
+severity; `fixture_drift` over a held `pool_drift`, a spread of the same drift,
+and any run-based condition take over as before.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus

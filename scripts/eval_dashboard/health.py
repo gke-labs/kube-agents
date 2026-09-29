@@ -2031,16 +2031,22 @@ def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
         # condition that has stopped firing does not reset `since`.
         # One exception: a scan condition that is being held (its scan is
         # stale, blind, or still shows the drift) is not replaced by a scan
-        # condition -- the other scan's, or its own firing on other units.
-        # Replacing it would let the state leave through a scan exit that
-        # never read this incident's projects clean; the newcomer takes over
-        # once this hold lifts. A run-based condition (a break, lost pods, a
-        # storm) still displaces it, as on every tick before: those are read
-        # from the runs, not from either scan, and rank above it.
+        # condition that ranks at or below it -- the lower-ranked scan's, or
+        # its own firing on other units -- unless the newcomer's incident
+        # covers the held one (the drift spread: every held project is still
+        # in `reads`, so the exit still needs them read clean). Replacing it
+        # otherwise would let the state leave through a scan exit that never
+        # read this incident's projects; the newcomer takes over once this
+        # hold lifts. A higher-ranked scan condition (fixture drift over pool
+        # drift, as assess() ranks them) and a run-based condition (a break,
+        # lost pods, a storm) still displace it, as on every tick before.
         prev_condition = prev.get("condition")
+        newcomer = assessed["condition"]
         if (
             prev_condition in SCAN_CONDITIONS
-            and assessed["condition"] in SCAN_CONDITIONS
+            and newcomer in SCAN_CONDITIONS
+            and SCAN_CONDITIONS.index(newcomer) >= SCAN_CONDITIONS.index(prev_condition)
+            and not (newcomer == prev_condition and _covers(assessed.get("incident"), prev.get("incident")))
             and scan_hold_for(prev_condition, assessed, prev.get("incident")) is not None
         ):
             kept = _keep(prev_state, prev_condition, prev.get("cause") or "", [], since, recovering=False)
@@ -2068,6 +2074,17 @@ def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
     if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"], assessed["roster"], assessed["last_lost_pod"], assessed.get("last_deadline_kill")):
         return _keep(GREEN, None, "", [], now, recovering=False)
     return _keep(prev_state, prev_condition, prev.get("cause") or "", prev.get("failing_cases") or [], since, recovering=True)
+
+
+def _covers(new_incident, old_incident) -> bool:
+    """Whether a scan incident includes every project and unit of another:
+    the drift spread rather than moved, so taking the new one loses no read
+    the old one's exit needed."""
+    if not isinstance(new_incident, dict) or not isinstance(old_incident, dict):
+        return False
+    return set(old_incident.get("projects") or []) <= set(new_incident.get("projects") or []) and set(
+        old_incident.get("roles") or []
+    ) <= set(new_incident.get("roles") or [])
 
 
 def _keep(state, condition, cause, cases, since, recovering):

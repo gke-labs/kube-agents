@@ -2461,6 +2461,29 @@ class PoolDrift(unittest.TestCase):
         switched = self.judge(clean_old, prev=held, now=later + timedelta(hours=1))
         self.assertEqual((switched["condition"], sorted(switched["incident"]["projects"]), switched["incident"]["roles"]), ("pool_drift", [project(4), project(5), project(6)], [OTHER_FINDING]))
 
+    def test_a_drift_that_spreads_is_reported_at_its_new_size(self):
+        # The same finding on the held projects and four more: the new
+        # incident covers the old one, so it is taken (every held project is
+        # still in its reads), and the advice names seven, not three.
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        spread = pool_scan(at=later - timedelta(minutes=5), drifted={project(i): [FINDING] for i in range(1, 8)}, previous={project(i): [FINDING] for i in (1, 2, 3)})
+        wider = self.judge(spread, prev=prev, now=later)
+        self.assertEqual((wider["condition"], sorted(wider["incident"]["projects"])), ("pool_drift", [project(i) for i in range(1, 8)]))
+        self.assertIn("7 pool project(s)", wider["cause"])
+
+    def test_fixture_drift_takes_over_a_pool_drift_held_by_a_stale_pool_scan(self):
+        # Ranked above it in assess(): a fixture drift that starts firing is
+        # not masked by a pool incident whose scan has gone stale.
+        prev = self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}))
+        later = T0 + timedelta(hours=4)
+        stale_pool = pool_scan(at=T0 - timedelta(minutes=5), drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        fleet = scan(at=later - timedelta(minutes=5), drifted={project(i): [DRIFT_ROLE] for i in (10, 11, 12)})
+        result = self.judge(stale_pool, fleet=fleet, prev=prev, now=later)
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "fixture_drift"))
+        self.assertEqual(sorted(result["incident"]["projects"]), [project(10), project(11), project(12)])
+
     def test_a_named_finding_joining_a_checks_failed_unit_is_not_its_recovery(self):
         # `iam/failed` is what the verifier writes for an IAM failure with no
         # named finding; it stands for the check. A later scan that names a
