@@ -48,7 +48,7 @@ that is not the release being asked for is refused by name.
 ## Upgrade Modes
 
 - `--upgrade-mode=harness`: one `helm upgrade --reset-values` over the release's recorded values re-tagging the Platform Agent image (`platformAgent.deployment.image.tag`), the shell sandbox image (`agentSandbox.image.tag`) and every plugin image tag the release's values record (`plugins.pubsubPlatform.image.tag`, `plugins.stockoutInvestigator.image.tag`), followed by a read-back of the gateway Deployment's release images against the tag. Requires `jq`.
-- `--upgrade-mode=operator`: applies the chart's CRDs with `kubectl` first (Helm never touches `crds/` on upgrade), then the same `helm upgrade` re-tagging only the operator image. Both modes drop, and print the name of, each recorded key the chart's `values.schema.json` refuses as undeclared; what it set falls back to the chart's defaults until a full-mode run.
+- `--upgrade-mode=operator`: applies the chart's CRDs with `kubectl` first (Helm never touches `crds/` on upgrade), then the same `helm upgrade` re-tagging only the operator image. Both modes drop, and print the name of, each recorded key the chart's `values.schema.json` refuses as undeclared; a later release that declares it renders it from that chart's default until a full-mode run there.
 - `--upgrade-mode=full` (Default): applies the CRDs, then runs a full `terraform apply` at the new `--image-tag` through the install engine — both image tags move and every setting in `install.env` is re-rendered. This mode additionally requires the `terraform` CLI.
 
 Every mode requires the `kube-agents` Helm release to exist in the target namespace. An install

@@ -170,12 +170,12 @@ it, so the replacement pod stays in `ContainerCreating`. That is harmless to the
 which has no sandbox, and the next forward upgrade renders the Secret again.
 
 Fields `N` added to the `PlatformAgent` schema. Once `N-1`'s CRD is applied, the API server prunes
-them from the stored object, and `N-1`'s chart does not render them. The Helm values that produced
-them stay in the release's recorded values: a later forward re-tag renders them again, the schema
-refusal below turns on them, and the full mode discards them. A re-tag by a script from after
-`0.7.0` drops each one `N-1`'s values schema refuses as undeclared, so after such a rollback the
-release no longer records it, and the next forward re-tag renders it from `N`'s chart default
-until a full-mode apply sets it again.
+them from the stored object, and `N-1`'s chart does not render them. The full mode discards the
+Helm values that produced them. A re-tag by the script of `0.7.0` or earlier keeps those values in
+the release's recorded values: a later forward re-tag renders them again, and the schema refusal
+below turns on them. A re-tag by a script from after `0.7.0` drops each one `N-1`'s values schema
+refuses as undeclared, so after such a rollback the release no longer records it, and the next
+forward re-tag renders it from `N`'s chart default until a full-mode apply sets it again.
 
 The agent's persistent volume, apart from what the entrypoint re-syncs from the image. The
 harness step rolls the pod, and the volume follows it; what the next start does to it is `N-1`'s
@@ -270,18 +270,18 @@ checks before it renders or applies anything, so the release itself keeps its la
   `install.env`, or restore access to the cluster and re-run. See
   [Upgrade](/kube-agents/install/upgrade/#when-an-upgrade-is-refused).
 - **`N-1`'s chart carries a values schema and `N` added a chart value.** Every release after
-  `0.5.0` ships a `values.schema.json` that closes each level of the chart's values, and the
-  re-tag reuses the values the release recorded, so a key `N`'s install set that `N-1`'s chart
-  does not declare fails Helm's schema check. Helm checks before it renders, so the release keeps
-  its last revision, but in the operator step the CRD apply has already run: put `N`'s CRDs back
-  from the `N` checkout with the same command the script uses,
-  `kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/`. Through `0.7.0` the
-  re-tag has no way to drop a reused key, so for a pair whose `N-1` is `0.7.0` or earlier the
-  Helm-only rollback does not complete. From the first release after `0.7.0` the re-tag drops each
-  recorded key the schema refuses as undeclared and prints its name, so the refusal no longer
-  happens where `N-1` is that release or later. The full mode completes either way, because its
-  Helm release renders from the composition's values rather than the recorded ones (the section
-  above), at the price of a GCP-level apply and the plan read that goes before it.
+  `0.5.0` ships a `values.schema.json` that closes each level of the chart's values. Through
+  `0.7.0` the re-tag reuses the values the release recorded with no way to drop one, so a key
+  `N`'s install set that `N-1`'s chart does not declare fails Helm's schema check. Helm checks
+  before it renders, so the release keeps its last revision, but in the operator step the CRD
+  apply has already run: put `N`'s CRDs back from the `N` checkout with the same command the
+  script uses, `kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/`. For a
+  pair whose `N-1` is `0.7.0` or earlier the Helm-only rollback therefore does not complete. From
+  the first release after `0.7.0` the re-tag drops each recorded key the schema refuses as
+  undeclared and prints its name, so the refusal no longer happens where `N-1` is that release or
+  later. The full mode completes either way, because its Helm release renders from the
+  composition's values rather than the recorded ones (the section above), at the price of a
+  GCP-level apply and the plan read that goes before it.
 
   Two pairs are refused this way, each on an install the newer release's composition applied (a
   fresh install of it, or a full-mode upgrade to it). `0.7.0` rolling back to `0.6.0`: `0.7.0`'s

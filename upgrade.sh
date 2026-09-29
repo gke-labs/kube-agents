@@ -651,12 +651,16 @@ print(latest["revision"])
   fi
   # First line the filtered values as one line of JSON, then one dropped key
   # per line. UTF-8 in and out whatever the locale, and not escaped to ASCII:
-  # Helm's YAML parser refuses the surrogate pairs an escaped emoji becomes.
+  # Helm's YAML parser refuses the surrogate pairs an escaped emoji becomes. It
+  # also refuses DEL, the C1 controls, U+FFFE and U+FFFF written raw, and folds
+  # a raw NEL to a space, so those alone are escaped.
   if ! filtered="$(trap - ERR; printf '%s' "$values" | python3 -c '
 import json
+import re
 import sys
 
 UNMODELLED_KEYWORDS = ("$ref", "allOf", "anyOf", "oneOf", "not", "if", "patternProperties", "dependencies")
+YAML_UNSAFE = re.compile("[\u007f-\u009f\ufffe\uffff]")
 
 values = json.loads(sys.stdin.buffer.read()) or {}
 try:
@@ -688,7 +692,8 @@ def prune(node, node_schema, path):
 
 
 prune(values, schema, "")
-lines = [json.dumps(values, ensure_ascii=False)] + dropped
+text = YAML_UNSAFE.sub(lambda match: f"\\u{ord(match.group()):04x}", json.dumps(values, ensure_ascii=False))
+lines = [text] + dropped
 sys.stdout.buffer.write("".join(f"{line}\n" for line in lines).encode("utf-8"))
 ' "$schema" 2>"$stderr_file")"; then
     print_error "Could not filter the values of Helm release '${release}' against ${schema}: $(cat "$stderr_file")"
@@ -699,7 +704,7 @@ sys.stdout.buffer.write("".join(f"{line}\n" for line in lines).encode("utf-8"))
   RETAG_VALUES_JSON="${filtered%%$'\n'*}"
   if [ "$filtered" != "$RETAG_VALUES_JSON" ]; then
     while IFS= read -r key; do
-      print_warning "Dropping '${key}' from the release's recorded values: the chart this run applies does not declare it, and Helm would refuse the upgrade over it. What it set falls back to this chart's defaults until an --upgrade-mode=full run."
+      print_warning "Dropping '${key}' from the release's recorded values: the chart this run applies does not declare it, and Helm would refuse the upgrade over it. A later release that declares it renders it from that chart's default until an --upgrade-mode=full run there sets it again."
     done <<<"${filtered#*$'\n'}"
   fi
 }

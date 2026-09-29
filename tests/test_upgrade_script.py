@@ -4,6 +4,7 @@ Tests pure numeric SemVer (X.Y.Z) references, 40-character commit SHAs,
 piped stdin execution, and source ref alignment in upgrade.sh.
 """
 
+import base64
 import json
 import os
 import pathlib
@@ -1162,6 +1163,15 @@ class RetagValuesTest(_StubHelm, unittest.TestCase):
         self.assertEqual(self._values(proc), values)
         self.assertNotIn("\\ud83d", proc.stdout)
 
+    def test_the_characters_yaml_refuses_raw_are_escaped(self):
+        """DEL, C1 controls, U+FFFE and U+FFFF fail Helm's YAML parse raw; NEL folds to a space."""
+        text = "a\u007f\u0085\u0092\ufffe\uffffb"
+        values = {"open": {"note": text}}
+        proc = self._run(json.dumps(values))
+        self.assertEqual(self._values(proc), values)
+        for code_point in ("007f", "0085", "0092", "fffe", "ffff"):
+            self.assertIn(f"\\u{code_point}", proc.stdout)
+
     def test_a_malformed_schema_is_an_error_not_an_unfiltered_upgrade(self):
         proc = self._run('{"stray":1}', schema_text="{not json")
         self.assertNotEqual(proc.returncode, 0)
@@ -1217,9 +1227,11 @@ class RetagValuesAgainstHelmTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, proc.stdout[-2000:])
         self.assertIn(self._SCHEMA_ERROR, proc.stderr)
 
-    def test_the_filtered_values_render(self):
+    def _filter(self, recorded, schema_path):
+        """retag_values over `recorded`, history and read stubbed: the process, and the kept values' path."""
         bin_dir = self.base / "bin"
-        bin_dir.mkdir()
+        bin_dir.mkdir(exist_ok=True)
+        (self.base / "recorded.json").write_text(json.dumps(recorded, ensure_ascii=False), encoding="utf-8")
         helm = bin_dir / "helm"
         helm.write_text(
             "#!/usr/bin/env bash\n"
@@ -1228,8 +1240,7 @@ class RetagValuesAgainstHelmTest(unittest.TestCase):
             "  exit 0\n"
             "fi\n"
             'if [ "$1" = "get" ]; then\n'
-            f"  cat <<'JSON'\n{json.dumps(self._RECORDED)}\nJSON\n"
-            "  exit 0\n"
+            f"  exec cat {shlex.quote(str(self.base / 'recorded.json'))}\n"
             "fi\n"
             f'exec {shlex.quote(shutil.which("helm"))} "$@"\n'
         )
@@ -1237,7 +1248,7 @@ class RetagValuesAgainstHelmTest(unittest.TestCase):
         filtered = self.base / "filtered.json"
         script = f"""
 KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
-retag_values kube-agents kubeagents-system {shlex.quote(str(self.chart / "values.schema.json"))}
+retag_values kube-agents kubeagents-system {shlex.quote(str(schema_path))}
 printf '%s' "$RETAG_VALUES_JSON" > {shlex.quote(str(filtered))}
 """
         proc = subprocess.run(
@@ -1246,10 +1257,35 @@ printf '%s' "$RETAG_VALUES_JSON" > {shlex.quote(str(filtered))}
             text=True,
             env=get_isolated_test_env(bin_dir=str(bin_dir)),
         )
+        return proc, filtered
+
+    def test_the_filtered_values_render(self):
+        proc, filtered = self._filter(self._RECORDED, self.chart / "values.schema.json")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("Dropping 'platformAgent.scope'", proc.stdout)
         rendered = self._template(filtered)
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
+
+    def test_text_reaches_the_chart_unchanged(self):
+        """Each character Helm's YAML parser refuses or alters in some spelling renders as recorded."""
+        chart = self.base / "text-chart"
+        (chart / "templates").mkdir(parents=True)
+        (chart / "Chart.yaml").write_text("apiVersion: v2\nname: text-chart\nversion: 0.1.0\n")
+        (chart / "templates" / "note.yaml").write_text("note: {{ .Values.note | b64enc }}\n")
+        for code_point in (0x7F, 0x85, 0x9B, 0xFFFE, 0xFFFF, 0x2028, 0xE9, 0x1F680):
+            with self.subTest(code_point=f"U+{code_point:04X}"):
+                text = f"a{chr(code_point)}b"
+                proc, filtered = self._filter({"note": text}, chart / "values.schema.json")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                rendered = subprocess.run(
+                    ["helm", "template", "text-chart", str(chart), "--values", str(filtered)],
+                    capture_output=True,
+                    text=True,
+                    timeout=self._HELM_TIMEOUT_SECONDS,
+                )
+                self.assertEqual(rendered.returncode, 0, rendered.stderr)
+                encoded = re.search(r"^note: (\S+)$", rendered.stdout, re.MULTILINE).group(1)
+                self.assertEqual(base64.b64decode(encoded).decode("utf-8"), text)
 
 
 class UpgradeReusesTheInstallCheckoutTest(unittest.TestCase):
