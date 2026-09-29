@@ -1234,16 +1234,17 @@ narrowed by anything.
 as well, named in 59 files across `agents/`, and the alternative was a sandbox path that
 no existing SOP, skill or model-written script would resolve. The cost is one path naming
 two different directories on two different volumes, and one rule that follows from it:
-**no handoff may assume write-here-read-there.** Nothing is copied between them and
-nothing can read across, so a script that writes `/opt/data/x` in the agent pod and reads
+**no handoff may assume write-here-read-there.** Nothing is copied between them at runtime, so a
+script that writes `/opt/data/x` in the agent pod and reads
 `/opt/data/x` through the shell gets a missing file — and, unlike before, gets it without
-the path itself looking wrong. Two things cross, both sandbox-to-gateway and both read
-by name. A file a finished card names in `artifacts` is copied for the length of its
+the path itself looking wrong. What does cross goes sandbox-to-gateway and is read by
+name. A file a finished card names in `artifacts` is copied for the length of its
 delivery and deleted after, which is
 [declared writeback](#three-problems-deferred-and-what-has-already-been-ruled-out-for-them)
 built for that one caller. The onboarding report is read by `bootstrap_delivery.py` once
 its markers say a delivery is due, as the bootstrap onboarding section below describes.
-Nothing crosses the other way, and nothing crosses because a path
+Nothing crosses the other way at runtime: `sandbox_mirror.py`'s one-time copy on first
+start, described above, is the only agent-to-sandbox copy. Nothing crosses because a path
 happened to match. The entrypoint writes a `.sandbox` marker into the
 sandbox's copy, which is how a script or a person tells which side they are on.
 
@@ -1824,7 +1825,7 @@ What it broke was bootstrap onboarding, and quietly. The inventory pipeline
 straddles the boundary in the wrong direction: `INVENTORY.raw.md` is written by the
 `platform` kanban worker and `INVENTORY.md` by the prioritization worker — both agent
 turns, so both writes go to the sandbox's `/opt/data`. The readers did not move.
-`bootstrap_delivery.py` and `bootstrap_scan_gate.py` are `no_agent` scripts that read
+`bootstrap_delivery.py` and `bootstrap_scan_gate.py` were `no_agent` scripts that read
 `/opt/data/INVENTORY*.md` on the PVC, so the delivery job ticked every minute against a
 file that never appeared there. A silent run is its normal no-op, so onboarding never
 delivered and nothing logged an error.
@@ -1875,8 +1876,15 @@ and rename it to `INVENTORY.delivered.md` in the sandbox. The rename connects as
 for the reason `kanban_workspace_gc.py` does below: the sandbox's `/opt/data` is
 `agent:agent 755`. An unreachable sandbox is a silent run retried on the next tick,
 because a failing `no_agent` script posts an alert to the user's chat on every tick it
-fails. `bootstrap_scan_gate.py` needs no change: `.bootstrap_scan_filed` is on the PVC
-from the moment the card is filed, so the report files it also checks add nothing.
+fails. `bootstrap_scan_gate.py`'s decision needs no change: `.bootstrap_scan_filed` is on
+the PVC from the moment the card is filed, so the report files it also checks add
+nothing. Its sweep card still calls `/opt/data/INVENTORY.md` the Chat Agent's home,
+which is wrong about the pod and right about the path the worker must write.
+
+The one agent-pod reader whose behaviour the move changes is the onboarding plugin. It
+picks its first greeting by checking `INVENTORY.md` on the PVC, so with the sandbox on it always greets
+as though the scan were still running. The report still arrives on the next delivery
+tick.
 
 #### Nothing collects the sandbox's finished workspaces, so a cron job does
 

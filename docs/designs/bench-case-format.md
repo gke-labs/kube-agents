@@ -197,7 +197,10 @@ parent).
 `bootstrap_findings`, from the same file, reads the shell sandbox of the install under test:
 `INVENTORY.items.json`, which the onboarding prioritization stage's `inventory_findings.py
 extract` writes through the worker's terminal. It passes when those items carry exactly the
-`(check, object)` pairs listed in `expected_findings`.
+`(check, object)` pairs listed in `expected_findings`. `bootstrap_report_read` reads the
+sandbox too, and passes when onboarding's delivery job has claimed the ranked report
+(`.bootstrap_completed` on the agent pod) and renamed the sandbox's `INVENTORY.md` to
+`INVENTORY.delivered.md`, which it does after reading it.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated

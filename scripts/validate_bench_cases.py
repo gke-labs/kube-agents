@@ -321,6 +321,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, sandbox-reading: the findings the onboarding
     # prioritization stage extracted.
     "bootstrap_findings": ("expected_findings",),
+    # No field: whether the delivery job claimed and archived the report is
+    # the whole assertion.
+    "bootstrap_report_read": (),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

@@ -12,17 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read the onboarding prioritization stage's files off the shell sandbox.
+"""Read the onboarding stages' files off the shell sandbox and the agent pod.
 
 The prioritization card's worker runs ``inventory_findings.py`` through its
 terminal, and with the shell sandbox on that terminal is the sandbox pod: the
 files it writes land on the sandbox's data volume, which the agent pod does
 not mount. ``harness._agent_shell`` execs into the agent's Service, so it
 cannot see them. :func:`sandbox_shell` execs into the sandbox pod instead,
-named the way ``hack/ci-eval-pr.sh`` names it.
+named the way ``hack/ci-eval-pr.sh`` names it. The delivery job runs in the
+agent pod and writes its marker there, which :func:`agent_shell` reads.
 
-A reply without a sentinel is a failed read, never an empty one:
-:func:`sandbox_shell` returns ``""`` on any kubectl failure.
+A reply without a sentinel is a failed read, never an empty one: both shells
+return ``""`` on any kubectl failure.
 """
 
 from __future__ import annotations
@@ -34,7 +35,17 @@ import subprocess
 from collections.abc import Callable
 from typing import Literal
 
-__all__ = ["ITEMS_FILE", "read_items", "sandbox_pod", "sandbox_shell"]
+__all__ = [
+    "COMPLETED_MARKER",
+    "DELIVERED_FILE",
+    "ITEMS_FILE",
+    "REPORT_FILE",
+    "agent_shell",
+    "read_files",
+    "read_items",
+    "sandbox_pod",
+    "sandbox_shell",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -44,6 +55,7 @@ SANDBOX_POD_SUFFIX = "-shell-0"
 SANDBOX_CONTAINER = "shell"
 DEFAULT_AGENT_SERVICE = "platform-agent"
 DEFAULT_AGENT_NAMESPACE = "kubeagents-system"
+DEFAULT_AGENT_CONTAINER = "platform-agent"
 
 # agents/platform/scripts/inventory_findings.py: DEFAULT_ITEMS_PATH.
 ITEMS_FILE = "/opt/data/INVENTORY.items.json"
@@ -55,11 +67,39 @@ MAX_ITEMS_BYTES = 1 << 20
 
 ItemsState = Literal["present", "absent", "error"]
 
+# agents/chat/scripts/bootstrap_delivery.py: the marker it writes on the agent
+# pod when it claims the report, and the sandbox names it reads and archives.
+COMPLETED_MARKER = "/opt/data/.bootstrap_completed"
+REPORT_FILE = "/opt/data/INVENTORY.md"
+DELIVERED_FILE = "/opt/data/INVENTORY.delivered.md"
+FILES_READ = "__ONBOARDING_FILES_READ__"
+FILE_PRESENT = "present"
+FILE_ABSENT = "absent"
+
 
 def sandbox_pod() -> str:
     """The sandbox pod: ``EVAL_SANDBOX_POD``, else ``<AGENT_SERVICE_NAME>-shell-0``."""
     agent = os.environ.get("AGENT_SERVICE_NAME", DEFAULT_AGENT_SERVICE)
     return os.environ.get("EVAL_SANDBOX_POD") or f"{agent}{SANDBOX_POD_SUFFIX}"
+
+
+def _kubectl_exec(target: str, container: str, script: str, timeout: float) -> str:
+    cmd = ["kubectl", "exec", target, "-n", os.environ.get("AGENT_NAMESPACE", DEFAULT_AGENT_NAMESPACE)]
+    context = os.environ.get("AGENT_CLUSTER_CONTEXT")
+    if context:
+        cmd.extend(["--context", context])
+    cmd.extend(["-c", container, "--", "sh", "-c", script])
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, errors="replace", timeout=timeout, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.debug("kubectl exec into %s failed: %s", target, exc)
+        return ""
+    if proc.returncode != 0:
+        _log.debug("kubectl exec into %s exited %d: %s", target, proc.returncode, proc.stderr.strip()[:200])
+        return ""
+    return proc.stdout
 
 
 def sandbox_shell(script: str, timeout: float) -> str:
@@ -68,28 +108,18 @@ def sandbox_shell(script: str, timeout: float) -> str:
     Best effort, as ``harness._agent_shell`` is: a missing binary, an
     unreachable cluster or a non-zero exit all return ``""``.
     """
-    cmd = [
-        "kubectl",
-        "exec",
-        f"pod/{sandbox_pod()}",
-        "-n",
-        os.environ.get("AGENT_NAMESPACE", DEFAULT_AGENT_NAMESPACE),
-    ]
-    context = os.environ.get("AGENT_CLUSTER_CONTEXT")
-    if context:
-        cmd.extend(["--context", context])
-    cmd.extend(["-c", SANDBOX_CONTAINER, "--", "sh", "-c", script])
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, errors="replace", timeout=timeout, check=False
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        _log.debug("kubectl exec into the sandbox failed: %s", exc)
-        return ""
-    if proc.returncode != 0:
-        _log.debug("kubectl exec into the sandbox exited %d: %s", proc.returncode, proc.stderr.strip()[:200])
-        return ""
-    return proc.stdout
+    return _kubectl_exec(f"pod/{sandbox_pod()}", SANDBOX_CONTAINER, script, timeout)
+
+
+def agent_shell(script: str, timeout: float) -> str:
+    """Run ``script`` in the agent container, as ``harness._agent_shell`` does.
+
+    Its own copy because the verifiers do not import the harness. Best effort:
+    any failure returns ``""``.
+    """
+    agent = os.environ.get("AGENT_SERVICE_NAME", DEFAULT_AGENT_SERVICE)
+    container = os.environ.get("AGENT_CONTAINER", DEFAULT_AGENT_CONTAINER)
+    return _kubectl_exec(f"svc/{agent}", container, script, timeout)
 
 
 def items_command() -> str:
@@ -116,3 +146,30 @@ def read_items(shell: Callable[[str, float], str], timeout: float) -> tuple[Item
             return "absent", "", f"there is no {ITEMS_FILE} on {sandbox_pod()}"
         return "error", "", f"{sandbox_pod()} could not be read (kubectl exec failed or the command did not run)"
     return "present", reply[marker + len(ITEMS_PRESENT) :].lstrip("\n"), ""
+
+
+def files_command(paths: list[str]) -> str:
+    """The ``sh -c`` line that prints ``present`` or ``absent`` and the path, per path."""
+    quoted = " ".join(shlex.quote(p) for p in paths)
+    return (
+        f'for f in {quoted}; do if [ -e "$f" ]; then echo "{FILE_PRESENT} $f"; '
+        f'else echo "{FILE_ABSENT} $f"; fi; done; echo {FILES_READ}'
+    )
+
+
+def read_files(shell: Callable[[str, float], str], paths: list[str], timeout: float) -> dict[str, bool] | None:
+    """Which of ``paths`` exist where ``shell`` runs, or ``None`` if the read failed.
+
+    A reply missing the closing sentinel, or a path, is a failed read.
+    """
+    lines = shell(files_command(paths), timeout).splitlines()
+    if not lines or lines[-1].strip() != FILES_READ:
+        return None
+    seen: dict[str, bool] = {}
+    for line in lines[:-1]:
+        state, _, path = line.partition(" ")
+        if state in (FILE_PRESENT, FILE_ABSENT):
+            seen[path] = state == FILE_PRESENT
+    if set(seen) != set(paths):
+        return None
+    return seen

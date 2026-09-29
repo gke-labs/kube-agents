@@ -1,6 +1,7 @@
 # Domain: fleet audits. Journey: a fresh install's onboarding discovery sweep
 # has written its raw report, and the prioritization stage turns it into the
-# ranked report onboarding delivers to the user.
+# ranked report onboarding delivers to the user, and the delivery job picks
+# that report up.
 #
 # That stage is not started by a conversation. The sweep's worker files the
 # `bootstrap-inventory-prioritize` card once INVENTORY.raw.md is written, and
@@ -10,29 +11,39 @@
 # has to be in the sandbox image and the files it writes land on the
 # sandbox's data volume. Nothing a chat prompt says reaches that path, so the
 # prompt below only reads the board; the grade comes from the stack and the
-# verifier.
+# verifiers.
+#
+# The ranked report lands on the sandbox too, and the delivery job
+# (agents/chat/scripts/bootstrap_delivery.py) runs in the agent pod, so it
+# reads the report through the sandbox rather than off its own disk.
 #
 # bench/tf/prebuilt/bootstrap-ranking plants a fixed raw report on the
-# sandbox, files the prioritization card the way the sweep's worker does, and
-# returns once that card's worker has ended its run itself, or at the stack's
-# `run_wait` (900s) with whatever it has written by then; the apply fails if
-# no worker has picked the card up by then or no read of the board has
-# succeeded. The objective then reads INVENTORY.items.json off the sandbox and
-# compares its findings with the raw report's findings block.
+# sandbox, files the prioritization card the way the sweep's worker does,
+# waits until that card's worker has ended its run itself or the stack's
+# `run_wait` (900s) has passed, and then arms delivery by touching
+# `.user_aligned`, as the onboarding plugin does when a person first chats.
+# The apply fails if no worker has picked the card up by then or no read of
+# the board has succeeded. The first objective reads INVENTORY.items.json off
+# the sandbox and compares its findings with the raw report's findings block;
+# the second reads whether the delivery job claimed the report and moved it
+# aside on the sandbox.
 #
-# The stack refuses an install where a person has connected or onboarding has
-# already delivered: the ranked report this produces is the one onboarding
-# sends to their chat. It also refuses one whose gate has not filed its sweep,
+# The stack refuses an install where a person has connected, onboarding has
+# already delivered, either onboarding cron job is gone, or the delivery job
+# is bound to a chat: the ranked report this produces is the one onboarding
+# sends to the user. It also refuses one whose gate has not filed its sweep,
 # and one without exactly one shell sandbox pod.
 #
 # Isolation class: read-only on the cluster; it plants the raw report on the
-# install under test and files one card, and the destroy archives the
-# onboarding cards and removes the INVENTORY files from both pods. Eligible
+# install under test, files one card and touches `.user_aligned`, and the
+# destroy archives the onboarding cards, removes the INVENTORY files from both
+# pods, removes `.user_aligned` and `.bootstrap_completed`, and puts back
+# whichever onboarding cron job the delivery removed. Eligible
 # tier: nightly -- one card's worker runs the whole prioritization SOP, which
 # takes a dispatcher slot for most of the stack's wait.
 ---
 id: bootstrap-inventory-ranking-delivery
-name: The onboarding prioritization stage extracts the sweep's findings in the shell sandbox
+name: Onboarding extracts the sweep's findings in the shell sandbox and reads the report from there
 
 # No seeded-fleet dependency: the raw report is a fixed file the stack plants.
 fixtures: []
@@ -58,7 +69,7 @@ owner: maintainers
 
 # A board read that leaves the card alone. The session this prompt reaches is
 # the Platform Agent's API session, not the card's worker, and it must not
-# start, retry or complete the card: the verifier reads what the worker wrote,
+# start, retry or complete the card: the verifiers read what the worker wrote,
 # and a file this session wrote would be graded as the worker's. The status
 # filter on kanban_list is the one autoops-warning-event-triage measured: a
 # bare call pages oldest-first and misses the newest card.
@@ -97,3 +108,11 @@ verification_spec:
         - { check: probes-readiness, object: frontend }
         - { check: no-memory-limit, object: orders-db }
         - { check: managed-prometheus, object: prod-east }
+  # Reads the agent pod's `.bootstrap_completed` and the sandbox's INVENTORY
+  # files (kube_agents_bench/onboarding.py). The delivery job writes the
+  # marker when it claims the report and renames INVENTORY.md to
+  # INVENTORY.delivered.md on the sandbox once it has read it.
+  - name: report-read-from-sandbox
+    role: objective
+    check:
+      type: bootstrap_report_read

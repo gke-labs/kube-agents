@@ -15,16 +15,18 @@
 """The bootstrap-ranking plant, run against a stub cluster.
 
 `bench/tf/prebuilt/bootstrap-ranking/main.tf` plants a raw inventory report on
-the shell sandbox, files the prioritization card, and waits for its worker.
-Pinned here: step 1's refusals and the sandbox-pod count stopping the apply
-before anything changes; the order clear, plant, file, wait; the planted bytes
+the shell sandbox, files the prioritization card, waits for its worker, and
+arms the delivery job. Pinned here: step 1's refusals and the sandbox-pod
+count stopping the apply before anything changes; the order clear, plant,
+file, wait, arm; a leftover arm being torn down first; the planted bytes
 being the fixture's; the card being filed with the gate's key and assignee;
-step 5's hand-over rules; the exit trap archiving and clearing on a failure
-after step 2; and the destroy carrying on past a failed step and naming it.
-As in `test_bootstrap_discovery_plant.py`, the provisioners are rendered the
-way Terraform renders them and run against a stub `kubectl`/`gcloud`/`sleep`.
-The in-pod card filing runs on its own against a stub `hermes`, and step 5's
-board query against a sqlite board.
+step 5's hand-over rules; the exit trap archiving, clearing and disarming on
+a failure after step 2; and the destroy carrying on past a failed step and
+naming it. As in `test_bootstrap_discovery_plant.py`, the provisioners are
+rendered the way Terraform renders them and run against a stub
+`kubectl`/`gcloud`/`sleep`. The in-pod card filing runs on its own against a
+stub `hermes`, step 5's board query against a sqlite board, and the arm and
+disarm against a stub `cron.jobs` over a temporary data directory.
 """
 
 import base64
@@ -38,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -48,6 +51,7 @@ _HEREDOC_RE = re.compile(r"command\s*=\s*<<-EOT\n(.*?)\n\s*EOT\n", re.S)
 _BODY_RE = re.compile(r"card_body_b64 = base64encode\(<<-EOB\n(.*?)\n\s*EOB\n", re.S)
 _CREATE_RE = re.compile(r"^card=\"\$\(agent_py [^\n]*<<'PY'\n(.*?)\nPY\n", re.S | re.M)
 _RUN_STATE_RE = re.compile(r"^run_state\(\) \{\n  agent_py [^\n]*<<'PY'\n(.*?)\nPY\n", re.S | re.M)
+_EOP_RE = r"{}\s*=\s*<<-EOP\n(.*?)\n\s*EOP\n"
 _PLANT_BLOCK = 0
 _DESTROY_BLOCK = 1
 _CARD = "t_card"
@@ -56,6 +60,22 @@ _RATE_LIMIT = "provider rate limit: API retries exhausted"
 
 def _card_body() -> str:
     return textwrap.dedent(_BODY_RE.search(_MODULE.read_text()).group(1)) + "\n"
+
+
+def _in_pod(name: str, interpolations: dict) -> str:
+    """The arm or disarm Python, rendered with `interpolations`."""
+    body = textwrap.dedent(re.search(_EOP_RE.format(name), _MODULE.read_text(), re.S).group(1)) + "\n"
+    return re.sub(r"\$\{([^}]*)\}", lambda m: interpolations[m.group(1).strip()], body)
+
+
+_IN_POD = {
+    "local.home": "/opt/data",
+    "local.scan_job": "bootstrap-inventory-scan",
+    "local.delivery_job": "bootstrap-inventory-delivery",
+    "local.state_file": "/opt/data/.bench-onboarding-jobs.json",
+    "local.settle_wait": "120",
+    "local.settle_poll": "2",
+}
 
 
 _INTERPOLATIONS = {
@@ -76,6 +96,11 @@ _INTERPOLATIONS = {
     "local.list_tries": "3",
     "local.list_wait": "5",
     "local.pod_wait": "5",
+    "local.scan_job": _IN_POD["local.scan_job"],
+    "local.delivery_job": _IN_POD["local.delivery_job"],
+    "local.state_file": _IN_POD["local.state_file"],
+    "base64encode(local.arm_py)": base64.b64encode(_in_pod("arm_py", _IN_POD).encode()).decode(),
+    "base64encode(local.disarm_py)": base64.b64encode(_in_pod("disarm_py", _IN_POD).encode()).decode(),
     "var.project_id": "kube-agents-evals",
     "var.host_cluster_name": "platform-agent-host",
     "var.host_cluster_location": "us-central1",
@@ -101,6 +126,7 @@ _DESTROY_INTERPOLATIONS = {
     "self.triggers.python": _INTERPOLATIONS["local.python"],
     "self.triggers.key_like": _INTERPOLATIONS["local.key_like"],
     "self.triggers.inventory": _INTERPOLATIONS["local.inventory"],
+    "self.triggers.disarm_b64": _INTERPOLATIONS["base64encode(local.disarm_py)"],
 }
 
 # Records every call to $CALLS, tagging the in-pod Python by what it reads, and
@@ -143,9 +169,18 @@ target = next(a for a in argv if a.startswith(("deployment/", "pod/")))
 script = cmd[2] if cmd[:2] == ["sh", "-c"] else ""
 stdin = sys.stdin.read() if cmd[1:2] == ["-"] or "base64 -d" in script else ""
 
-if ".user_aligned" in stdin:
+if "_jobs_lock" in stdin:
+    record("disarm")
+    if os.environ.get("DISARM_FAIL") == "1":
+        unreachable()
+elif "O_EXCL" in stdin:
+    record("arm")
+    if os.environ.get("ARM_FAIL") == "1":
+        unreachable()
+elif ".user_aligned" in stdin:
     record("state")
-    print(os.environ.get("STEP_1_STATE", "clear"))
+    states = os.environ.get("STEP_1_STATE", "clear").split(";")
+    print(states[min(bump("state"), len(states) - 1)])
 elif '"kanban", "create"' in stdin:
     record("create")
     (state / "create_argv").write_text("\n".join(cmd))
@@ -260,7 +295,7 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         return [i for i, call in enumerate(calls) if call.endswith(needle)]
 
     def _changes(self, calls):
-        return [c for c in calls if re.search(r"\[(archive|clear |plant |create)", c)]
+        return [c for c in calls if re.search(r"\[(archive|clear |plant |create|arm|disarm)", c)]
 
     def test_bash_syntax_is_valid(self):
         for script in (self._script, self._destroy_script):
@@ -276,13 +311,18 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         plant = self._indices(calls, "[plant pod/platform-agent-shell-0]")
         create = self._indices(calls, "[create]")
         runs = self._indices(calls, "[run_state]")
-        self.assertEqual([len(archive), len(clear), len(clear_agent), len(plant), len(create)], [1, 1, 1, 1, 1], calls)
+        arm = self._indices(calls, "[arm]")
+        self.assertEqual(
+            [len(archive), len(clear), len(clear_agent), len(plant), len(create), len(arm)], [1, 1, 1, 1, 1, 1], calls
+        )
         self.assertEqual(len(runs), 3)
         self.assertLess(archive[0], clear[0])
         self.assertLess(clear[0], plant[0])
         self.assertLess(clear_agent[0], plant[0])
         self.assertLess(plant[0], create[0])
         self.assertLess(create[0], runs[0])
+        self.assertLess(runs[-1], arm[0])
+        self.assertEqual(self._indices(calls, "[disarm]"), [])
         self.assertIn("Card t_card's worker ended its run after 30s.", completed.stdout)
         self.assertNotIn("Plant failed", completed.stderr)
 
@@ -317,6 +357,8 @@ class BootstrapRankingPlantTest(unittest.TestCase):
             "aligned": ".user_aligned exists",
             "completed": "onboarding already delivered",
             "unfiled": "has not filed its discovery sweep",
+            "nojobs": "is not in the cron store",
+            "bound": "delivers to a chat, not local",
             "": "could not read the onboarding markers",
         }
         for state, message in refusals.items():
@@ -327,6 +369,25 @@ class BootstrapRankingPlantTest(unittest.TestCase):
                 self.assertIn(message, completed.stderr)
                 self.assertEqual(self._changes(calls), [])
                 self.assertNotIn("Plant failed", completed.stderr)
+
+    def test_a_leftover_arm_is_torn_down_before_the_checks(self):
+        completed, calls = self._run(STEP_1_STATE="armed;clear")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("An earlier run left delivery armed", completed.stderr)
+        states = self._indices(calls, "[state]")
+        disarm = self._indices(calls, "[disarm]")
+        clear = self._indices(calls, "[clear pod/platform-agent-shell-0]")
+        self.assertEqual((len(states), len(disarm)), (2, 1))
+        self.assertLess(clear[0], disarm[0])
+        self.assertLess(disarm[0], states[1])
+        self.assertLess(states[1], self._indices(calls, "[plant pod/platform-agent-shell-0]")[0])
+
+    def test_a_leftover_arm_that_will_not_tear_down_stops_the_apply(self):
+        completed, calls = self._run(STEP_1_STATE="armed;clear", DISARM_FAIL=1)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("could not finish the teardown an earlier run left", completed.stderr)
+        self.assertEqual(self._indices(calls, "[plant pod/platform-agent-shell-0]"), [])
+        self.assertNotIn("Plant failed", completed.stderr)
 
     def test_anything_but_one_sandbox_pod_stops_the_apply_before_changing_anything(self):
         for pods in (0, 2):
@@ -400,7 +461,15 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("Plant failed", completed.stderr)
         self.assertEqual(self._indices(calls, "[create]"), [])
-        self.assertEqual(len(self._indices(calls, "[clear deployment/platform-agent-gateway]")), 2)
+        clear_agent = self._indices(calls, "[clear deployment/platform-agent-gateway]")
+        self.assertEqual(len(clear_agent), 2)
+        self.assertLess(clear_agent[-1], self._indices(calls, "[disarm]")[0])
+
+    def test_a_failed_arm_fails_and_the_trap_disarms(self):
+        completed, calls = self._run(ARM_FAIL=1)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Plant failed", completed.stderr)
+        self.assertLess(self._indices(calls, "[arm]")[0], self._indices(calls, "[disarm]")[0])
 
     def test_step_5_reports_a_card_no_worker_picked_up(self):
         completed, calls = self._run(RUN_STATES="0 0 0")
@@ -414,7 +483,9 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         completed, calls = self._run(RUN_STATES="1 0 0;1 1 0;2 1 0")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("Card t_card has 1 ended run(s), none ended by its worker, after 900s", completed.stdout)
+        self.assertNotIn("worker ended its run", completed.stdout)
         self.assertEqual(self._indices(calls, "[archive]"), [])
+        self.assertEqual(len(self._indices(calls, "[arm]")), 1)
 
     def test_step_5_hands_over_on_the_last_good_read_when_later_reads_fail(self):
         completed, _ = self._run(RUN_STATES="1 0 0;fail")
@@ -442,6 +513,8 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertIn(
             "Cleanup incomplete: could not list the open cards, remove the INVENTORY files.", completed.stderr
         )
+        completed, _ = self._run(RUN_STATES="0 0 0", DISARM_FAIL=1)
+        self.assertIn("Cleanup incomplete: could not disarm the delivery job.", completed.stderr)
 
     def test_every_exec_into_the_agent_bounds_its_wait_for_a_pod(self):
         completed, calls = self._run(OPEN_CARDS="", RUN_STATES="0 0 0")
@@ -456,7 +529,11 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(len(self._indices(calls, "[archive]")), 2)
         self.assertEqual(len(self._indices(calls, "[clear deployment/platform-agent-gateway]")), 1)
-        self.assertEqual(len(self._indices(calls, "[clear pod/platform-agent-shell-0]")), 1)
+        clear = self._indices(calls, "[clear pod/platform-agent-shell-0]")
+        self.assertEqual(len(clear), 1)
+        disarm = self._indices(calls, "[disarm]")
+        self.assertEqual(len(disarm), 1)
+        self.assertLess(clear[0], disarm[0])
 
     def test_destroy_carries_on_past_a_failed_step_and_names_it(self):
         completed, calls = self._run(
@@ -469,6 +546,10 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertEqual(len(self._indices(calls, "[archive]")), 2)
         self.assertEqual(len(self._indices(calls, "[clear pod/platform-agent-shell-0]")), 1)
         self.assertIn("could not archive t_a, remove the agent's INVENTORY files.", completed.stderr)
+        self._clear()
+        completed, calls = self._run(self._destroy_script, DISARM_FAIL=1)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("could not disarm the delivery job.", completed.stderr)
 
     def test_destroy_names_a_failed_sandbox_listing(self):
         completed, _ = self._run(self._destroy_script, SANDBOX_LIST_FAIL=1)
@@ -510,6 +591,130 @@ class RunStateQueryTest(unittest.TestCase):
         self.assertEqual(self._counts(runs), ["3", "2", "0"])
         self.assertEqual(self._counts(runs + [(_CARD, 40, "blocked", "raw report has no findings block")]), ["4", "3", "1"])
         self.assertEqual(self._counts([(_CARD, 50, "completed", None)]), ["1", "1", "1"])
+
+
+# Only what the arm and disarm call, over a jobs.json in the data directory.
+_CRON_JOBS_STUB = """import contextlib, json, os
+_FILE = os.path.join(os.environ["DATA"], "cron", "jobs.json")
+
+
+def load_jobs():
+    return json.load(open(_FILE))["jobs"]
+
+
+def save_jobs(jobs):
+    json.dump({"jobs": jobs}, open(_FILE, "w"))
+
+
+def compute_next_run(schedule, last_run_at=None):
+    return "next:" + schedule["expr"]
+
+
+@contextlib.contextmanager
+def _jobs_lock():
+    yield
+"""
+
+_SCAN = {"id": "bootstrap-inventory-scan", "schedule": {"expr": "* * * * *"}, "deliver": "local", "next_run_at": "t0"}
+_DELIVERY = {
+    "id": "bootstrap-inventory-delivery",
+    "schedule": {"expr": "* * * * *"},
+    "deliver": "local",
+    "next_run_at": "t0",
+    "fire_claim": {"by": "gone"},
+    "pending_slot": "t0",
+}
+
+
+class ArmDisarmTest(unittest.TestCase):
+    """The in-pod arm and disarm against a stub `cron.jobs`."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = pathlib.Path(directory.name)
+        self._home = root / "data"
+        (self._home / "cron").mkdir(parents=True)
+        (root / "cron").mkdir()
+        (root / "cron" / "__init__.py").write_text("")
+        (root / "cron" / "jobs.py").write_text(_CRON_JOBS_STUB)
+        self._env = {**os.environ, "PYTHONPATH": str(root), "DATA": str(self._home)}
+        values = {
+            **_IN_POD,
+            "local.home": str(self._home),
+            "local.state_file": str(self._home / ".bench-onboarding-jobs.json"),
+            "local.settle_wait": "1",
+            "local.settle_poll": "0.1",
+        }
+        self._arm = _in_pod("arm_py", values)
+        self._disarm = _in_pod("disarm_py", values)
+        self._jobs([_SCAN, _DELIVERY])
+
+    def _jobs(self, jobs=None):
+        path = self._home / "cron" / "jobs.json"
+        if jobs is not None:
+            path.write_text(json.dumps({"jobs": jobs}))
+        return json.loads(path.read_text())["jobs"]
+
+    def _py(self, code):
+        return subprocess.run([sys.executable, "-"], input=code, env=self._env, capture_output=True, text=True)
+
+    def test_arm_refuses_a_missing_job_or_a_bound_delivery_and_changes_nothing(self):
+        for jobs, message in (
+            ([_SCAN], "bootstrap-inventory-delivery are not in the cron store"),
+            ([_SCAN, {**_DELIVERY, "deliver": "origin"}], "delivers to 'origin', not local"),
+        ):
+            with self.subTest(message=message):
+                self._jobs(jobs)
+                out = self._py(self._arm)
+                self.assertNotEqual(out.returncode, 0)
+                self.assertIn(message, out.stderr)
+                self.assertEqual(sorted(p.name for p in self._home.iterdir()), ["cron"])
+
+    def test_arm_records_the_jobs_then_touches_the_marker_once(self):
+        out = self._py(self._arm)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        state = self._home / ".bench-onboarding-jobs.json"
+        self.assertEqual(json.loads(state.read_text())["jobs"], [_SCAN, _DELIVERY])
+        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+        self.assertTrue((self._home / ".user_aligned").exists())
+        self.assertNotEqual(self._py(self._arm).returncode, 0)
+
+    def test_disarm_puts_back_the_removed_jobs_and_clears_the_markers(self):
+        self.assertEqual(self._py(self._arm).returncode, 0)
+        self._jobs([_SCAN])
+        (self._home / ".bootstrap_completed").write_text("")
+        out = self._py(self._disarm)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("put back: bootstrap-inventory-delivery", out.stdout)
+        scan, delivery = self._jobs()
+        self.assertEqual(scan, _SCAN)
+        self.assertEqual(
+            delivery,
+            {"id": "bootstrap-inventory-delivery", "schedule": {"expr": "* * * * *"}, "deliver": "local",
+             "next_run_at": "next:* * * * *"},
+        )
+        self.assertEqual(sorted(p.name for p in self._home.iterdir()), ["cron"])
+
+    def test_disarm_without_an_arm_leaves_a_real_marker_alone(self):
+        (self._home / ".user_aligned").write_text("")
+        out = self._py(self._disarm)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("was not armed", out.stdout)
+        self.assertTrue((self._home / ".user_aligned").exists())
+
+    def test_disarm_waits_a_bounded_time_for_a_run_under_way(self):
+        self.assertEqual(self._py(self._arm).returncode, 0)
+        conn = sqlite3.connect(self._home / "cron" / "executions.db")
+        conn.execute("CREATE TABLE executions (id INTEGER PRIMARY KEY, job_id TEXT, status TEXT)")
+        conn.execute("INSERT INTO executions (job_id, status) VALUES ('bootstrap-inventory-delivery', 'running')")
+        conn.commit()
+        conn.close()
+        started = time.monotonic()
+        out = self._py(self._disarm)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertGreaterEqual(time.monotonic() - started, 2.0)
+        self.assertFalse((self._home / ".bench-onboarding-jobs.json").exists())
 
 
 if __name__ == "__main__":

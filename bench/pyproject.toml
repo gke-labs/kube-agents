@@ -53,6 +53,7 @@ kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 [project.entry-points."devops_bench.verifiers"]
 bootstrap_fanout = "kube_agents_bench.verifiers:BootstrapFanoutVerifier"
 bootstrap_findings = "kube_agents_bench.verifiers:BootstrapFindingsVerifier"
+bootstrap_report_read = "kube_agents_bench.verifiers:BootstrapReportReadVerifier"
 fleet_resource_property = "kube_agents_bench.verifiers:FleetResourcePropertyVerifier"
 github_writes = "kube_agents_bench.verifiers:GitHubWritesVerifier"
 ledger_issue_contains = "kube_agents_bench.verifiers:LedgerIssueContainsVerifier"

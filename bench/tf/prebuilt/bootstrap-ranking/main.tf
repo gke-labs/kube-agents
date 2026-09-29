@@ -15,23 +15,35 @@
 # The scenario driver for bench/tasks/bootstrap-inventory-ranking-delivery:
 # plant a fixed INVENTORY.raw.md (inventory-raw.txt beside this file) on the
 # shell sandbox's data volume, file the `bootstrap-inventory-prioritize` card
-# the discovery sweep's worker files once it has written that file, and
-# return once the card's worker has ended its run itself, or at `run_wait`
-# with whatever it has written by then. The apply fails if no worker has
-# picked the card up by then or no read of the board has succeeded.
+# the discovery sweep's worker files once it has written that file, wait until
+# the card's worker has ended its run itself, or `run_wait` has passed, and
+# then arm the delivery job by touching `.user_aligned`, the marker the
+# onboarding plugin touches when a person first chats. The delivery job then
+# picks up whatever report the worker wrote on its next tick. The apply fails
+# if no worker has picked the card up by then or no read of the board has
+# succeeded.
 #
 # The raw report goes on the sandbox because that is where the sweep's worker
 # writes it: a kanban worker's terminal and file tools both run there. Its
 # owner is set to the data volume's, the user those tools run as.
 #
-# It refuses an install where a person has connected (`.user_aligned`) or
-# onboarding already delivered (`.bootstrap_completed`): the ranked report
-# this produces is the one onboarding delivers. It also refuses one whose
+# It refuses an install where a person has connected (`.user_aligned`),
+# onboarding already delivered (`.bootstrap_completed`), either onboarding
+# cron job is gone, or the delivery job sends anywhere but `local`: the ranked
+# report this produces is the one onboarding delivers, and arming delivery
+# with a chat bound would post it there. It also refuses one whose
 # gate has not filed its sweep (no `.bootstrap_scan_filed`), because a sweep
 # filed during the run writes its own INVENTORY.raw.md over the planted one.
 # Open `bootstrap-inventory-*` cards are archived before the plant, so an
 # earlier sweep still running cannot do that either; the sweep marker stays,
 # so the gate files no other.
+#
+# Arming writes the two onboarding job records to `state_file` first. The
+# teardown, and the exit trap on a failed apply, remove `.user_aligned` and
+# `.bootstrap_completed` and put back either job the delivery removed, from
+# those records; `state_file` existing is what says this stack armed it. An
+# apply that finds `state_file` left by an earlier run finishes that teardown
+# before its own checks.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -91,6 +103,92 @@ locals {
   # none. A pod created in that time is not running yet and fails the exec
   # anyway, so kubectl's default of 60s only delays each failure by a minute.
   pod_wait = 5
+  # agents/chat/scripts/bootstrap_delivery.py: SCAN_JOB_ID and DELIVERY_JOB_ID.
+  scan_job     = "bootstrap-inventory-scan"
+  delivery_job = "bootstrap-inventory-delivery"
+  state_file   = "${local.home}/.bench-onboarding-jobs.json"
+  # How long the disarm waits for an onboarding job's run already under way
+  # to end, and how often it looks: the scripts take about a second.
+  settle_wait = 120
+  settle_poll = 2
+  arm_py      = <<-EOP
+    import json, os, sys
+    from cron.jobs import load_jobs
+
+    ids = ("${local.scan_job}", "${local.delivery_job}")
+    jobs = {j.get("id"): j for j in load_jobs()}
+    missing = [i for i in ids if i not in jobs]
+    if missing:
+        sys.exit("onboarding job(s) %s are not in the cron store" % ", ".join(missing))
+    deliver = jobs[ids[1]].get("deliver")
+    if deliver != "local":
+        sys.exit("%s delivers to %r, not local" % (ids[1], deliver))
+    fd = os.open("${local.state_file}", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"jobs": [jobs[i] for i in ids]}, fh)
+    open("${local.home}/.user_aligned", "x").close()
+    print("armed")
+  EOP
+  disarm_py   = <<-EOP
+    import json, os, sqlite3, sys, time
+    from cron.jobs import _jobs_lock, compute_next_run, load_jobs, save_jobs
+
+    home = "${local.home}"
+    state = "${local.state_file}"
+    ids = ("${local.scan_job}", "${local.delivery_job}")
+    ledger = home + "/cron/executions.db"
+    if not os.path.exists(state):
+        print("delivery was not armed")
+        sys.exit(0)
+    saved = json.load(open(state))["jobs"]
+
+
+    def in_flight():
+        if not os.path.exists(ledger):
+            return 0
+        c = sqlite3.connect("file:" + ledger + "?mode=ro", uri=True)
+        try:
+            return c.execute(
+                "SELECT count(*) FROM executions WHERE job_id IN (?, ?) AND status IN ('claimed', 'running')", ids
+            ).fetchone()[0]
+        finally:
+            c.close()
+
+
+    def settle():
+        deadline = time.monotonic() + ${local.settle_wait}
+        while in_flight() and time.monotonic() < deadline:
+            time.sleep(${local.settle_poll})
+
+
+    def remove(path):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+    # Without .user_aligned no run claims the report, so once the runs past
+    # that check have ended nothing writes .bootstrap_completed after it goes.
+    remove(home + "/.user_aligned")
+    settle()
+    remove(home + "/.bootstrap_completed")
+    # A run that saw the marker before it went may be removing the jobs.
+    settle()
+    with _jobs_lock():
+        jobs = load_jobs()
+        have = {j.get("id") for j in jobs}
+        back = []
+        for job in saved:
+            if job["id"] not in have:
+                job = {k: v for k, v in job.items() if k not in ("fire_claim", "pending_slot")}
+                job["next_run_at"] = compute_next_run(job["schedule"])
+                back.append(job)
+        if back:
+            save_jobs(jobs + back)
+    remove(state)
+    print("disarmed delivery; put back: %s" % (", ".join(j["id"] for j in back) or "nothing"))
+  EOP
 }
 
 resource "null_resource" "ranking" {
@@ -109,6 +207,7 @@ resource "null_resource" "ranking" {
     python            = local.python
     key_like          = local.key_like
     inventory         = local.inventory
+    disarm_b64        = base64encode(local.disarm_py)
   }
 
   provisioner "local-exec" {
@@ -148,8 +247,9 @@ resource "null_resource" "ranking" {
             agent ${local.hermes} kanban archive "$id" >&2 || failed="$failed, archive $id"
           done
           clear_inventory || failed="$failed, remove the INVENTORY files"
+          disarm >&2 || failed="$failed, disarm the delivery job"
           if [ -n "$failed" ]; then
-            echo "Cleanup incomplete: could not$${failed#,}. The next run's step 2 archives the cards and removes the files left behind." >&2
+            echo "Cleanup incomplete: could not$${failed#,}. The next run archives the cards, removes the files and disarms delivery." >&2
           fi
         fi
         rm -rf "$kubeconfig_dir"
@@ -203,23 +303,45 @@ resource "null_resource" "ranking" {
         agent rm -f ${local.inventory} || clear_status=1
         return "$clear_status"
       }
+      # Run after clear_inventory, so no report is left for a run to claim.
+      disarm() {
+        printf '%s' '${base64encode(local.disarm_py)}' | base64 -d | agent_py
+      }
 
       # ---- 1. Refuse an install where the report would reach a person -----
       # One read that has to answer `clear`, so a failed exec refuses rather
       # than reading as "no marker".
-      state="$(agent_py <<'PY' || true
+      read_state() {
+        agent_py <<'PY' || true
       import os
+      from cron.jobs import load_jobs
       home = "${local.home}"
-      if os.path.exists(home + "/.user_aligned"):
+      jobs = {j.get("id"): j for j in load_jobs()}
+      if os.path.exists("${local.state_file}"):
+          print("armed")
+      elif os.path.exists(home + "/.user_aligned"):
           print("aligned")
       elif os.path.exists(home + "/.bootstrap_completed"):
           print("completed")
       elif not os.path.exists(home + "/.bootstrap_scan_filed"):
           print("unfiled")
+      elif "${local.scan_job}" not in jobs or "${local.delivery_job}" not in jobs:
+          print("nojobs")
+      elif jobs["${local.delivery_job}"].get("deliver") != "local":
+          print("bound")
       else:
           print("clear")
       PY
-      )"
+      }
+      state="$(read_state)"
+      if [ "$state" = armed ]; then
+        echo "An earlier run left delivery armed (${local.state_file}); finishing its teardown." >&2
+        if ! clear_inventory || ! disarm >&2; then
+          echo "ERROR: could not finish the teardown an earlier run left on ${var.host_cluster_name}; nothing was planted, and the next run tries again." >&2
+          exit 1
+        fi
+        state="$(read_state)"
+      fi
       case "$state" in
         clear) ;;
         aligned)
@@ -230,6 +352,12 @@ resource "null_resource" "ranking" {
           exit 1 ;;
         unfiled)
           echo "ERROR: the onboarding gate on ${var.host_cluster_name} has not filed its discovery sweep (no ${local.home}/.bootstrap_scan_filed). A sweep filed during this case writes its own INVENTORY.raw.md over the planted one; wait for the gate to file, or run the case elsewhere." >&2
+          exit 1 ;;
+        nojobs)
+          echo "ERROR: ${local.scan_job} or ${local.delivery_job} is not in the cron store on ${var.host_cluster_name}, so nothing would deliver the report this case grades." >&2
+          exit 1 ;;
+        bound)
+          echo "ERROR: ${local.delivery_job} on ${var.host_cluster_name} delivers to a chat, not local. Arming it would post the planted report there as the real onboarding one." >&2
           exit 1 ;;
         *)
           echo "ERROR: could not read the onboarding markers on ${var.host_cluster_name} (got '$state')." >&2
@@ -327,14 +455,22 @@ resource "null_resource" "ranking" {
             agent ${local.hermes} kanban show "$card" >&2 || true
             exit 1
           fi
-          echo "Card $card has $ended ended run(s), none ended by its worker, after $${elapsed}s; handing over to the verifier."
-          exit 0
+          echo "Card $card has $ended ended run(s), none ended by its worker, after $${elapsed}s; arming delivery with what it has written."
+          break
         fi
         sleep ${local.poll}
         elapsed=$((elapsed + ${local.poll}))
         read_run_state
       done
-      echo "Card $card's worker ended its run after $${elapsed}s."
+      if [ "$own" -ge 1 ]; then
+        echo "Card $card's worker ended its run after $${elapsed}s."
+      fi
+
+      # ---- 6. Arm the delivery job ---------------------------------------
+      # The job's next tick delivers whatever report the worker wrote; the
+      # verifier reads what it did.
+      printf '%s' '${base64encode(local.arm_py)}' | base64 -d | agent_py
+      echo "Touched ${local.home}/.user_aligned; ${local.delivery_job} delivers on its next tick."
     EOT
   }
 
@@ -384,8 +520,12 @@ resource "null_resource" "ranking" {
       else
         failed="$failed, list the sandbox pods"
       fi
+      # After the INVENTORY files, so no report is left for a run to claim.
+      printf '%s' '${self.triggers.disarm_b64}' | base64 -d | \
+        kubectl exec -i -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
+        ${self.triggers.python} - || failed="$failed, disarm the delivery job"
       if [ -n "$failed" ]; then
-        echo "Cleanup incomplete: could not$${failed#,}. The next run's step 2 archives the cards and removes the files left behind." >&2
+        echo "Cleanup incomplete: could not$${failed#,}. The next run archives the cards, removes the files and disarms delivery." >&2
         exit 1
       fi
     EOT
