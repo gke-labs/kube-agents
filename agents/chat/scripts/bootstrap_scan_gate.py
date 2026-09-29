@@ -185,9 +185,9 @@ def _cluster_agent_calls() -> list[str]:
     A profile without a readable ``cluster_identity`` is left out, as the
     reconcile neither counts nor prunes one: there is no cluster to key its card
     by, and the card already sends every cluster the list misses to Step 4. A
-    profile whose config cannot be read at all is skipped the same way: a file
-    like that is what keeps the reconcile failing until it gives up and files
-    the sweep, so it must not take the other profiles with it.
+    profile whose directory or config cannot be read at all is skipped the same
+    way: a file like that is what keeps the reconcile failing until it gives up
+    and files the sweep, so it must not take the other profiles with it.
 
     Failing to list the profiles, or to import the readiness rule, returns an
     empty list, which files the solo sweep. Raising would fail the run before
@@ -207,14 +207,17 @@ def _cluster_agent_calls() -> list[str]:
     calls = []
     for name in names:
         home = cap.profile_home(name)
-        missing = [f for f in SCAFFOLD_ARTIFACTS if not (home / f).is_file()]
-        if not is_scaffolded(home) or missing:
-            sys.stderr.write(
-                f"bootstrap_scan_gate: skipping Cluster Agent {name}: scaffold not finished "
-                f"(registered={is_scaffolded(home)}, missing={missing})\n"
-            )
-            continue
+        # The probe is inside the try: the image's Python re-raises an is_file()
+        # that fails with EACCES or EIO rather than answering False.
         try:
+            registered = is_scaffolded(home)
+            missing = [f for f in SCAFFOLD_ARTIFACTS if not (home / f).is_file()]
+            if not registered or missing:
+                sys.stderr.write(
+                    f"bootstrap_scan_gate: skipping Cluster Agent {name}: scaffold not finished "
+                    f"(registered={registered}, missing={missing})\n"
+                )
+                continue
             identity = cap.read_cluster_identity(home)
         except Exception as e:  # noqa: BLE001 - see the docstring
             sys.stderr.write(f"bootstrap_scan_gate: skipping Cluster Agent {name}: {e}\n")

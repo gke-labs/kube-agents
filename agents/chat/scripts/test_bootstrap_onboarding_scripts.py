@@ -16,6 +16,7 @@ again.
 """
 
 import contextlib
+import errno
 import io
 import re
 import shlex
@@ -447,6 +448,28 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn(f"assignee='{good}'", calls[0])
         self.assertIn("cluster-broken: ", stderr.getvalue())
         self.assertNotIn("cluster-broken: scaffold not finished", stderr.getvalue())
+
+    def test_a_profile_the_gate_cannot_stat_does_not_drop_the_others(self):
+        # Python 3.11 to 3.13, the image's included, re-raise an is_file() that
+        # fails with EACCES; 3.14 answers False, so mode bits alone would not
+        # reach the raise on every interpreter this suite runs under.
+        good = self._cluster_agent("proj", "prod", "us-east4")
+        locked = self._cluster_agent("proj", "locked", "us-east4")
+        locked_home = cluster_agent_profile.profile_home(locked)
+        is_file = Path.is_file
+
+        def _is_file(path):
+            if locked_home in path.parents:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return is_file(path)
+
+        stderr = io.StringIO()
+        with mock.patch.object(Path, "is_file", _is_file), contextlib.redirect_stderr(stderr):
+            step2 = self._step_2(bootstrap_scan_gate._task_body())
+        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
+        self.assertEqual(len(calls), 1)
+        self.assertIn(f"assignee='{good}'", calls[0])
+        self.assertIn(f"skipping Cluster Agent {locked}: [Errno {errno.EACCES}] Permission denied", stderr.getvalue())
 
     def test_the_card_lists_the_roster_the_reconcile_left(self):
         """The roster is read after the gate's own reconcile, not before it.
