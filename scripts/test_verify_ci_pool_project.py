@@ -1452,6 +1452,7 @@ class GithubAppInstallationTest(unittest.TestCase):
         self.assertTrue(result.passed, result.details)
         self.assertFalse(any("installation not found" in d for d in result.details), result.details)
         self.assertTrue(any("admin:org" in w for w in result.warnings), result.warnings)
+        self.assertTrue(all(isinstance(w, checker.Unread) for w in result.warnings if "admin:org" in w), "a scope gap is a read that did not happen")
         self.assertIn("NOT verified", result.message)
 
     def test_a_timed_out_installations_lookup_is_unverified_not_an_uninstalled_app(self):
@@ -1621,6 +1622,18 @@ class TokenMinterTest(unittest.TestCase):
     def test_fully_provisioned_minter_passes(self):
         result = self._run()
         self.assertTrue(result.passed, result.details)
+
+    def test_an_unverified_probe_is_an_unread_in_the_report(self):
+        # The probe that did not run (no useToSign, no egress) is a read that
+        # did not happen: the report lists it under `unread`, not as advice.
+        result = self._run(probe=("unverified", "Could not sign a test JWT with the pinned key version (needs cloudkms.cryptoKeyVersions.useToSign)"))
+        self.assertTrue(result.passed, result.details)
+        unread = [w for w in result.warnings if isinstance(w, checker.Unread)]
+        self.assertEqual(len(unread), 1, result.warnings)
+        self.assertIn("Could not sign a test JWT", unread[0])
+        result.check_id = checker.CHECK_TOKEN_MINTER
+        record = checker.report_document("kube-agents-evals-3", [result])["checks"][checker.CHECK_TOKEN_MINTER]
+        self.assertEqual(record["unread"], unread)
 
     def test_denied_kms_reads_are_unverified_not_an_unprovisioned_minter(self):
         denied = _fail("ERROR: (gcloud.kms.keys.versions.list) PERMISSION_DENIED: Permission "
@@ -3710,8 +3723,15 @@ class ReportDocumentTest(unittest.TestCase):
     def test_a_checks_subset_carries_the_reason_the_project_read_failed(self):
         with mock.patch.object(checker, "check_project_and_apis", return_value=(None, checker.CheckResult("p", False, "Project describe failed: NOT_FOUND"))):
             failed = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_IAM])
-        self.assertEqual(len(failed), 1)
-        self.assertIn("Project describe failed: NOT_FOUND", failed[0].warnings[0])
+        # The project check carries the failure even though it was not
+        # selected: a subset run against a project that does not exist exits
+        # 1, not 2 with "nothing failed".
+        by_id = {r.check_id: r for r in failed}
+        self.assertEqual(sorted(by_id), sorted([checker.CHECK_PROJECT_AND_APIS, checker.CHECK_IAM]))
+        self.assertFalse(by_id[checker.CHECK_PROJECT_AND_APIS].passed)
+        self.assertIn("Project describe failed: NOT_FOUND", by_id[checker.CHECK_IAM].warnings[0])
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(checker.report("kube-agents-evals-3", failed), checker.EXIT_FAILED)
         refused = checker.CheckResult("p", True, "Not checked", warnings=[checker.Unread("Could not describe: PERMISSION_DENIED")], read=False)
         with mock.patch.object(checker, "check_project_and_apis", return_value=(None, refused)):
             unread = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_IAM])
@@ -3807,8 +3827,8 @@ class ReportDocumentTest(unittest.TestCase):
         finally:
             checker._RUN_DEADLINE = None
         source = inspect.getsource(checker)
+        self.assertEqual(source.count("urlopen("), 3, "the three probes, and no other urlopen")
         self.assertEqual(source.count("urlopen(request, timeout=_net_timeout(timeout))"), 3, "every urlopen goes through the deadline")
-        self.assertNotIn("urlopen(request, timeout=timeout)", source)
 
     def test_the_command_line_takes_checks_and_report(self):
         with tempfile.TemporaryDirectory() as tmp:

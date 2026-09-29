@@ -2282,12 +2282,12 @@ def check_github_repo_and_app(
     # the failure this call site cannot distinguish is a scope gap, and calling
     # it an uninstalled App names a correctly configured org as the defect.
     if rc != 0 and (_unread_reason(err) or _GITHUB_NOT_FOUND.search(err or "")):
-        warnings.append(
+        warnings.append(Unread(
             f"Could not list org gke-agentic's App installations with this token, so App {app_id}'s "
             "installation was not checked. That endpoint needs the `admin:org` scope and answers 404 "
             "without it. Re-run with a token carrying that scope, or confirm the installation at "
             "https://github.com/organizations/gke-agentic/settings/installations"
-        )
+        ))
     elif rc != 0 or not out.strip():
         passed = False
         details.append(f"GitHub App {app_id} installation not found on org gke-agentic")
@@ -2332,13 +2332,13 @@ def check_github_repo_and_app(
                 # was, or the flag becomes a way to silence the check.
                 attested = True
             elif rc != 0:
-                warnings.append(
+                warnings.append(Unread(
                     f"Could not read installation {inst_id}'s repository list with this token "
                     "(expected: needs a token authorized to the App). "
                     f"Open https://github.com/organizations/gke-agentic/settings/installations/{inst_id}, "
                     f"check that {repo_slug} is in the repository list, then re-run with "
                     "--confirmed-repo-in-app-installation"
-                )
+                ))
             elif repo_slug not in out.split():
                 passed = False
                 details.append(
@@ -3065,7 +3065,9 @@ def check_token_minter(
             passed = False
             _drift(details, findings, "token-minter/app-identity", message, minter_repair)
         elif status == "unverified":
-            warnings.append(message)
+            # The probe did not run or did not answer: a read that did not
+            # happen, so the report lists it under `unread`.
+            warnings.append(Unread(message))
         else:
             probe = f", {message}"
 
@@ -3194,7 +3196,13 @@ def run_checks(
                 # The project read failed outright (a describe error that is
                 # neither a refusal nor a transient): the dependents read
                 # nothing, and say so, rather than failing on a read they
-                # never made. The project check itself carries the failure.
+                # never made. The project check itself carries the failure,
+                # and is reported even when it was not selected: a subset run
+                # against a project that does not exist is a failure, not a
+                # run with something left to confirm by hand.
+                if CHECK_PROJECT_AND_APIS not in wanted:
+                    proj_check.check_id = CHECK_PROJECT_AND_APIS
+                    results.append(proj_check)
                 for check_id, skipped, _ in dependents:
                     add(check_id, CheckResult(
                         skipped,
