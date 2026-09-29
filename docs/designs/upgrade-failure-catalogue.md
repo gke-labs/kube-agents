@@ -9,7 +9,9 @@ afterwards, and why it is on the list. The checks a scheduled run should perform
 [`upgrade-readiness-checks.md`](upgrade-readiness-checks.md); this catalogue is the list those
 checks are chosen from, and its
 [public incidents](upgrade-readiness-checks.md#upgrades-that-went-wrong-in-public) are the evidence
-cited below.
+cited below. Each entry was also planted on a throwaway GKE cluster and the cluster upgraded; what
+happened, entry by entry, and the scripts that did it are in
+[`bench/upgrade-scenarios/README.md`](../../bench/upgrade-scenarios/README.md).
 
 ## For a reader who does not run Kubernetes
 
@@ -26,8 +28,10 @@ each item can be followed to its detail.
 
 While the computers are being rebuilt:
 
-1. A safety rule says "never stop this piece". The rebuild waits an hour, then stops it anyway,
-   and the application goes down.
+1. A safety rule says "never stop this piece". GKE's default kind of rebuild waits an hour for
+   it and then stops it anyway; the blue-green kind leaves it running on the old computer until
+   the old computers are removed, up to a week later, and then stops it. Either way the
+   application goes down.
 2. Only if the computers were told they may go away before a replacement exists, which is not
    how GKE is set up unless someone asks for it: then there is no free computer to move a piece
    to, and it waits, offline, until its old computer is back.
@@ -92,7 +96,8 @@ evidence; an entry with no public incident and no planted fixture says so there.
 During the drain and reschedule:
 
 1. [A PodDisruptionBudget forbids the eviction](#1-a-poddisruptionbudget-forbids-the-eviction):
-   the drain stalls an hour under either upgrade strategy, then GKE force-deletes the pod anyway.
+   a surge upgrade waits an hour for the pod and a blue-green one leaves it on the old pool for up
+   to seven days, then GKE deletes it anyway.
    `k8s, GKE`
 2. [No spare capacity for the displaced pods](#2-no-spare-capacity-for-the-displaced-pods): on a
    pool configured to allow unavailability, pods sit Pending until the old node returns. `GKE, k8s`
@@ -141,8 +146,9 @@ On the new node image:
 ## Where each failure lands in the upgrade
 
 The list groups failures by moment. The diagram puts them in order, with one fact the list cannot
-show: which failures hold GKE's drain, and for how long. A refused eviction holds it, for at most
-one hour per node under either strategy before GKE force-evicts, and three entries reach that: a budget with no allowance
+show: which failures hold GKE's drain, and for how long. A refused eviction holds a surge drain
+for up to an hour per node, and on blue-green leaves the pod on the old pool until that pool is
+deleted, up to seven days later; either way GKE then removes the pod, and three entries reach that: a budget with no allowance
 left (1), and the two cases where replacements never become Ready, because there was nowhere to
 schedule them (2, on a pool configured to allow unavailability) or a fail-closed webhook rejected
 them (7); a budget counts those replacements
@@ -162,7 +168,7 @@ flowchart TD
     Defaults -- yes --> Adm["Rejections at admission,<br/>evictions nobody asked for"]
     Defaults -- no --> Pool[Node pool upgrade:<br/>drain each node, rebuild it]
     Pool --> PDB{Does the budget<br/>allow the eviction?}
-    PDB -- no --> Stall["Drain stalls up to an hour per node<br/>under either strategy,<br/>then force-delete: an outage"]
+    PDB -- no --> Stall["Surge: drain held up to an hour per node;<br/>blue-green: pod left on the old pool<br/>until it is deleted, up to seven days;<br/>then force-delete: an outage"]
     PDB -- yes --> Room{Is there somewhere<br/>to reschedule?}
     Room -- "no: fail-closed webhook" --> Deadlock["Webhook deadlock: blocks the drain itself<br/>when it matches evictions or kube-system,<br/>else via a budget with no allowance left"]
     Room -- "no: maxUnavailable set, no headroom" --> Pending["Pods Pending until the old node returns<br/>(stalls the drain, for the same window,<br/>once a budget's allowance is used up)"]
@@ -179,34 +185,42 @@ to mitigate before and after, what already reads the signal in this repository, 
 [recommender](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-with-recommenders)
 publishes for it, and why the entry is on the list. The recommender's insights all arrive through
 one call, `google.container.DiagnosisInsight` per location, and the disruption-readiness family is
-not shown in the console at all, so a check that reads them gets more than the console shows. One
-mitigation is general to every after-signal on a node pool: the blue-green upgrade strategy keeps
-the old nodes until a soak passes and can be rolled back until the blue pool's deletion begins. The
+not shown in the console at all, so a check that reads them gets more than the console shows;
+which entries it flagged when each was planted is in the reproductions' results table. One
+mitigation is general to every after-signal on a node pool: the standard blue-green upgrade
+strategy keeps the old nodes until a soak passes and can be rolled back until the blue pool's
+deletion begins; an autoscaled blue-green upgrade skips the soak and cannot be rolled back. The
 [Scope table](upgrade-readiness-checks.md#scope) in the readiness requirements is the record of
 which audit or skill reads what; the "read today" lines here are the delta against it.
 
 ### 1. A PodDisruptionBudget forbids the eviction
 
 A node drain evicts pods through the eviction API, and a budget whose `disruptionsAllowed` is 0
-refuses every eviction. GKE respects the budget for up to one hour per node under both upgrade
-strategies, then force-evicts, so the application goes down after an hour of stall instead of after
-a clean handover. What differs by strategy is what surrounds that hour: a surge upgrade rebuilds the
-node at once, while a blue-green upgrade drains the whole blue pool and then keeps its nodes for a
-soak of up to seven days, during which the upgrade can be rolled back before the blue pool is
-deleted.
+refuses every eviction. How long GKE honours that refusal depends on the node pool's upgrade
+strategy, and every strategy ends by removing the pod anyway, so the application goes down after a
+delay instead of after a clean handover. A surge upgrade respects the budget for up to one hour per
+node, then force-evicts. A standard blue-green upgrade leaves the pods it could not evict running on
+the cordoned blue pool through the remaining batch soaks and the node-pool soak (one hour by
+default; the total is capped at seven days), then deletes them with the blue nodes without
+consulting the budget. An autoscaled blue-green upgrade cordons the blue
+pool and waits, three days by default and up to seven, while the cluster autoscaler removes the blue
+nodes it can empty, then drains the rest, respecting the budget for up to one hour.
 
 - Before: a budget whose `disruptionsAllowed` is 0 for a reason that will not clear, which is
   `maxUnavailable` 0, `minAvailable` equal to the replica count, or a single-replica workload
   behind a budget whose `minAvailable` demands its only pod.
 - Where to look: the Kubernetes API: each budget's `spec` and `status`, and the owner's `.spec.replicas` behind it.
-- After: the node sits `SchedulingDisabled` with the pod still on it, `Cannot evict pod` events,
-  the `UPGRADE_NODES` operation running far longer than one node should take, then the pod deleted.
-- Mitigate before: give the budget room: `maxUnavailable` at least 1 or `minAvailable` below the replica count, and a second replica so the budget can be honoured; for a true singleton, accept the outage inside a maintenance window; a blue-green upgrade gives a soak of up to seven days to roll back afterwards, but its drain holds the budget for the same hour and does not avoid the outage.
-- Mitigate after: fix the budget and the stalled drain resumes at once; never delete the budget without replacing it, since that trades a stall for an unprotected workload.
+- After: on a surge upgrade, and in an autoscaled blue-green upgrade's final drain, the node sits
+  `SchedulingDisabled` with the pod still on it, `Cannot evict pod` events, the `UPGRADE_NODES`
+  operation running far longer than one node should take, then the pod deleted. On a standard
+  blue-green upgrade the pod stays Running on a cordoned blue node through the soak and goes when
+  the blue pool is deleted.
+- Mitigate before: give the budget room: `maxUnavailable` at least 1 or `minAvailable` below the replica count, and a second replica so the budget can be honoured; for a true singleton, accept the outage inside a maintenance window, or choose a blue-green upgrade and set its soak or wait (up to seven days) long enough to fix the budget or move the workload before GKE deletes the pod; the longer window postpones the outage and does not avoid it. The autoscaled variant is in Preview, needs a control plane on 1.34.0-gke.2201000 or later with cluster autoscaling enabled, and a cancelled one cannot be rolled back.
+- Mitigate after: on surge or an autoscaled drain, fix the budget and the stalled drain resumes at once; on a standard blue-green upgrade, fix the budget and evict the pod yourself before the soak ends so it starts on the green pool, or roll the upgrade back; never delete the budget without replacing it, since that trades a stall for an unprotected workload.
 - Read today: the readiness mode of `fleet-upgrade-verification` grades it `blocked`.
 - GKE recommender: `PDB_UNPERMISSIVE` flags a budget that allows zero evictions; `DEPLOYMENT_MISSING_PDB` and `PDB_UNPROTECTED_STATEFULSET` flag the opposite gap. All from the [disruption-readiness insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/workload-disruption-readiness), reassessed daily.
-- Why it is on the list: the one-hour hold under both strategies, the forced eviction that ends
-  it, and blue-green's soak of up to seven days are in GKE's
+- Why it is on the list: how long each strategy keeps the pod (an hour per node on surge; the
+  soak or the wait, up to seven days, on blue-green) and the removal that ends it are in GKE's
   [node upgrade strategies](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies).
   The seeded fleet plants no drain-blocking budget.
 
@@ -306,7 +320,7 @@ upgrade when a minor reaches the end of its support, and both happen.
 - Where to look: the GKE Recommender for the insight; Cloud Logging for the audit entries labelled `k8s.io/removed-release`; the `apiserver_requested_deprecated_apis` metric; the GitOps repository's manifests and charts; the Kubernetes API for CRD `storedVersions`. Helm release state lives in Secrets, which this repository's agents may not read, so that part is a human's `helm get manifest` or a release storage driver other than Secrets.
 - After: controller logs full of 404s, `helm upgrade` refusing, the objects invisible to old
   clients.
-- Mitigate before: migrate the callers, not the objects: bump client libraries and `kubectl`, rewrite manifests to the new version, and rewrite Helm release state with `helm mapkubeapis`; GKE pauses the automatic upgrade for 30 days after the last call, so the pause clearing is the sign the migration is done.
+- Mitigate before: migrate the callers, not the objects: bump client libraries and `kubectl`, rewrite manifests to the new version, and rewrite Helm release state with `helm mapkubeapis` (from v0.4.0 it rewrites a removed version that has a successor and deletes the resources whose kind has none, which clears the PodSecurityPolicy case in the [incidents](upgrade-readiness-checks.md#upgrades-that-went-wrong-in-public)); GKE pauses the automatic upgrade for 30 days after the last call, so the pause clearing is the sign the migration is done.
 - Mitigate after: the stored objects still exist; re-apply them through the new version and rewrite release state, and the clients recover.
 - Read today: the deprecation scan in `fleet-upgrade-verification` reads the `apiVersion`s a
   linked GitOps repository declares in raw YAML and JSON, skipping Helm templates. The insights
