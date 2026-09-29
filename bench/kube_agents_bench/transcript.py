@@ -158,16 +158,16 @@ def clear() -> None:
 
 
 def dump(path: Path, prompt: str = "") -> None:
-    """Write the current transcript to ``path`` as ATIF."""
-    from kube_agents_bench import atif
+    """Write the current transcript to ``path`` in the OpenAI Responses format."""
+    from kube_agents_bench import trajectory
 
     if _current is not None:
-        path.write_text(json.dumps(atif.from_snapshot(_current, prompt), indent=2))
+        path.write_text(json.dumps(trajectory.from_snapshot(_current, prompt), indent=2))
 
 
 def load(path: Path) -> None:
-    """Make the ATIF trajectory at ``path`` the current transcript."""
-    from kube_agents_bench import atif
+    """Make the trajectory at ``path`` the current transcript."""
+    from kube_agents_bench import trajectory
 
     global _current
-    _current = atif.to_snapshot(json.loads(path.read_text()))
+    _current = trajectory.to_snapshot(json.loads(path.read_text()))

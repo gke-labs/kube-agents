@@ -14,7 +14,7 @@
 
 """Grade a finished run from its output directory: ``bench-score TASK DIR``.
 
-Reads ``DIR/trajectory.json`` (ATIF), runs the task's verification_spec and
+Reads ``DIR/trajectory.json``, runs the task's verification_spec and
 writes ``DIR/verdict.json``. Verifiers that read the cluster or GitHub still
 need that access from wherever this runs.
 """
