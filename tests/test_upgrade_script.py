@@ -731,7 +731,7 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         text = _UPGRADE_SH.read_text()
         start = text.index("  helm_retag() {")
         retag = text[start : text.index("\n  }\n", start)]
-        self.assertIn("printf '%s' \"$RETAG_VALUES_JSON\" | helm upgrade", retag)
+        self.assertIn("printf '%s\\n' \"$RETAG_VALUES_JSON\" | helm upgrade", retag)
         self.assertIn("--reset-values --values -", retag)
         self.assertNotIn("reuse-values", retag)
 
@@ -1156,20 +1156,20 @@ class RetagValuesTest(_StubHelm, unittest.TestCase):
         self.assertEqual(self._values(proc), values)
         self.assertNotIn("ABORT BANNER", proc.stderr)
 
-    def test_text_outside_ascii_passes_through_unescaped(self):
-        """Helm's YAML parser refuses the surrogate-pair escapes json.dumps writes by default."""
-        values = {"open": {"note": "deploy \U0001F680 caf\u00e9"}}
-        proc = self._run(json.dumps(values, ensure_ascii=False))
-        self.assertEqual(self._values(proc), values)
-        self.assertNotIn("\\ud83d", proc.stdout)
-
-    def test_the_characters_yaml_refuses_raw_are_escaped(self):
-        """DEL, C1 controls, U+FFFE and U+FFFF fail Helm's YAML parse raw; NEL folds to a space."""
-        text = "a\u007f\u0085\u0092\ufffe\uffffb"
-        values = {"open": {"note": text}}
+    def test_characters_above_u_ffff_pass_through_raw(self):
+        """Helm's YAML parser refuses the surrogate-pair escapes they would otherwise become."""
+        values = {"open": {"note": "deploy \U0001F680"}}
         proc = self._run(json.dumps(values))
         self.assertEqual(self._values(proc), values)
-        for code_point in ("007f", "0085", "0092", "fffe", "ffff"):
+        self.assertIn("\U0001F680", proc.stdout)
+        self.assertNotIn("\\ud83d", proc.stdout)
+
+    def test_characters_below_u_ffff_outside_ascii_are_escaped(self):
+        """Helm's YAML parser refuses some of them raw and reads NEL, U+2028 and U+2029 as line breaks."""
+        values = {"open": {"note": "a\u007f\u0085\u00e9\u2028\uffffb"}}
+        proc = self._run(json.dumps(values))
+        self.assertEqual(self._values(proc), values)
+        for code_point in ("007f", "0085", "00e9", "2028", "ffff"):
             self.assertIn(f"\\u{code_point}", proc.stdout)
 
     def test_a_malformed_schema_is_an_error_not_an_unfiltered_upgrade(self):
@@ -1182,13 +1182,12 @@ class RetagValuesTest(_StubHelm, unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
 class RetagValuesAgainstHelmTest(unittest.TestCase):
-    """Helm accepts the filtered values where it refuses the recorded ones (#2109).
+    """retag_values and helm_retag end to end, with Helm's own parser and schema check (#2109).
 
-    The target chart is this repository's chart with `platformAgent.scope` taken
-    out of its schema: the shape of a rollback to 0.7.0 from an install whose
-    composition records `scope`. `helm history` and `helm get values` are
-    stubbed; `helm template`, which runs the same schema check as
-    `helm upgrade`, is the real binary.
+    `helm history` and `helm get values` are stubbed, and `helm upgrade` is
+    turned into `helm template` with the same chart, values and `--set`: the
+    same parse and schema check, with no cluster. helm_retag is lifted from
+    upgrade.sh as written, so the pipe the values take is the real one.
     """
 
     _RECORDED = {
@@ -1199,39 +1198,42 @@ class RetagValuesAgainstHelmTest(unittest.TestCase):
     }
     _HELM_TIMEOUT_SECONDS = 120
     _SCHEMA_ERROR = "additional properties 'scope' not allowed"
+    _TEXT_TEMPLATE = (
+        'note: {{ .Values.note | default "" | b64enc }}\n'
+        "notes: {{ .Values.notes | default list | toJson | b64enc }}\n"
+        "keys: {{ .Values.keys | default dict | toJson | b64enc }}\n"
+    )
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.base = pathlib.Path(tmp.name)
-        self.chart = self.base / "kube-agents"
-        shutil.copytree(_REPO_ROOT / "charts" / "kube-agents", self.chart)
-        schema_path = self.chart / "values.schema.json"
+
+    def _rollback_chart(self):
+        """This repository's chart less `platformAgent.scope`: a rollback to 0.7.0 over values that record it."""
+        repo = self.base / "rollback-repo"
+        chart = repo / "charts" / "kube-agents"
+        shutil.copytree(_REPO_ROOT / "charts" / "kube-agents", chart)
+        schema_path = chart / "values.schema.json"
         schema = json.loads(schema_path.read_text())
         del schema["properties"]["platformAgent"]["properties"]["scope"]
         schema_path.write_text(json.dumps(schema))
+        return repo
 
-    def _template(self, values_path):
-        return subprocess.run(
-            ["helm", "template", "kube-agents", str(self.chart), "--values", str(values_path)],
-            capture_output=True,
-            text=True,
-            timeout=self._HELM_TIMEOUT_SECONDS,
-        )
+    def _text_chart(self):
+        """A chart with no schema that renders its values back, base64-encoded."""
+        repo = self.base / "text-repo"
+        chart = repo / "charts" / "kube-agents"
+        (chart / "templates").mkdir(parents=True)
+        (chart / "Chart.yaml").write_text("apiVersion: v2\nname: kube-agents\nversion: 0.1.0\n")
+        (chart / "templates" / "values.yaml").write_text(self._TEXT_TEMPLATE)
+        return repo
 
-    def test_the_recorded_values_fail_the_schema_check(self):
-        """The control: without the filter, Helm refuses on `scope`."""
-        recorded = self.base / "recorded.json"
-        recorded.write_text(json.dumps(self._RECORDED))
-        proc = self._template(recorded)
-        self.assertNotEqual(proc.returncode, 0, proc.stdout[-2000:])
-        self.assertIn(self._SCHEMA_ERROR, proc.stderr)
-
-    def _filter(self, recorded, schema_path):
-        """retag_values over `recorded`, history and read stubbed: the process, and the kept values' path."""
+    def _retag(self, recorded, repo):
         bin_dir = self.base / "bin"
         bin_dir.mkdir(exist_ok=True)
-        (self.base / "recorded.json").write_text(json.dumps(recorded, ensure_ascii=False), encoding="utf-8")
+        recorded_path = self.base / "recorded.json"
+        recorded_path.write_text(json.dumps(recorded, ensure_ascii=False), encoding="utf-8")
         helm = bin_dir / "helm"
         helm.write_text(
             "#!/usr/bin/env bash\n"
@@ -1240,52 +1242,91 @@ class RetagValuesAgainstHelmTest(unittest.TestCase):
             "  exit 0\n"
             "fi\n"
             'if [ "$1" = "get" ]; then\n'
-            f"  exec cat {shlex.quote(str(self.base / 'recorded.json'))}\n"
+            f"  exec cat {shlex.quote(str(recorded_path))}\n"
             "fi\n"
-            f'exec {shlex.quote(shutil.which("helm"))} "$@"\n'
+            'if [ "$1" = "upgrade" ]; then\n'
+            "  shift\n"
+            "  args=()\n"
+            "  while [ $# -gt 0 ]; do\n"
+            '    case "$1" in\n'
+            "      --reset-values|--wait) ;;\n"
+            "      --timeout) shift ;;\n"
+            '      *) args+=("$1") ;;\n'
+            "    esac\n"
+            "    shift\n"
+            "  done\n"
+            f'  exec {shlex.quote(shutil.which("helm"))} template "${{args[@]}}"\n'
+            "fi\n"
+            "exit 1\n"
         )
         helm.chmod(0o755)
-        filtered = self.base / "filtered.json"
+        text = _UPGRADE_SH.read_text()
+        start = text.index("  helm_retag() {")
+        helm_retag = text[start : text.index("\n  }\n", start) + len("\n  }\n")]
+        schema = repo / "charts" / "kube-agents" / "values.schema.json"
         script = f"""
 KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
-retag_values kube-agents kubeagents-system {shlex.quote(str(schema_path))}
-printf '%s' "$RETAG_VALUES_JSON" > {shlex.quote(str(filtered))}
+retag_values kube-agents kubeagents-system {shlex.quote(str(schema))}
+{helm_retag}
+KUBE_AGENTS_HELM_RELEASE=kube-agents
+repo_dir={shlex.quote(str(repo))}
+target_namespace=kubeagents-system
+PARAM_IMAGE_TAG=0.0.0-test
+helm_retag operator.image.tag
 """
-        proc = subprocess.run(
+        return subprocess.run(
             ["bash", "-c", script],
             capture_output=True,
             text=True,
+            timeout=self._HELM_TIMEOUT_SECONDS,
             env=get_isolated_test_env(bin_dir=str(bin_dir)),
         )
-        return proc, filtered
+
+    def _rendered(self, proc, field):
+        encoded = re.search(rf"^{field}: (\S*)$", proc.stdout, re.MULTILINE).group(1)
+        return base64.b64decode(encoded).decode("utf-8")
+
+    def test_the_recorded_values_fail_the_schema_check(self):
+        """The control: without the filter, Helm refuses on `scope`."""
+        repo = self._rollback_chart()
+        recorded = self.base / "recorded.json"
+        recorded.write_text(json.dumps(self._RECORDED))
+        proc = subprocess.run(
+            ["helm", "template", "kube-agents", str(repo / "charts" / "kube-agents"), "--values", str(recorded)],
+            capture_output=True,
+            text=True,
+            timeout=self._HELM_TIMEOUT_SECONDS,
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout[-2000:])
+        self.assertIn(self._SCHEMA_ERROR, proc.stderr)
 
     def test_the_filtered_values_render(self):
-        proc, filtered = self._filter(self._RECORDED, self.chart / "values.schema.json")
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        proc = self._retag(self._RECORDED, self._rollback_chart())
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
         self.assertIn("Dropping 'platformAgent.scope'", proc.stdout)
-        rendered = self._template(filtered)
-        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("ci-cluster", proc.stdout)
 
-    def test_text_reaches_the_chart_unchanged(self):
-        """Each character Helm's YAML parser refuses or alters in some spelling renders as recorded."""
-        chart = self.base / "text-chart"
-        (chart / "templates").mkdir(parents=True)
-        (chart / "Chart.yaml").write_text("apiVersion: v2\nname: text-chart\nversion: 0.1.0\n")
-        (chart / "templates" / "note.yaml").write_text("note: {{ .Values.note | b64enc }}\n")
-        for code_point in (0x7F, 0x85, 0x9B, 0xFFFE, 0xFFFF, 0x2028, 0xE9, 0x1F680):
-            with self.subTest(code_point=f"U+{code_point:04X}"):
-                text = f"a{chr(code_point)}b"
-                proc, filtered = self._filter({"note": text}, chart / "values.schema.json")
-                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-                rendered = subprocess.run(
-                    ["helm", "template", "text-chart", str(chart), "--values", str(filtered)],
-                    capture_output=True,
-                    text=True,
-                    timeout=self._HELM_TIMEOUT_SECONDS,
-                )
-                self.assertEqual(rendered.returncode, 0, rendered.stderr)
-                encoded = re.search(r"^note: (\S+)$", rendered.stdout, re.MULTILINE).group(1)
-                self.assertEqual(base64.b64decode(encoded).decode("utf-8"), text)
+    def test_every_character_reaches_the_chart_as_recorded(self):
+        """Every code point, in a value between spaces and inside a key: the spellings Helm's parser alters."""
+        code_points = [cp for cp in range(1, 0x10000) if not 0xD800 <= cp <= 0xDFFF]
+        code_points += [0x10000, 0x1F680, 0xE0001, 0x10FFFF]
+        notes = [f" {chr(cp)} " for cp in code_points]
+        keys = {f"a{chr(cp)}b": cp for cp in code_points}
+        proc = self._retag({"notes": notes, "keys": keys}, self._text_chart())
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
+        self.assertEqual(json.loads(self._rendered(proc, "notes")), notes)
+        self.assertEqual(json.loads(self._rendered(proc, "keys")), keys)
+
+    def test_values_of_a_length_helm_reads_in_whole_buffers_arrive(self):
+        """Helm 4 drops an unterminated last line of stdin whose length is a multiple of 4096 bytes."""
+        empty_length = len(json.dumps({"note": ""}))
+        repo = self._text_chart()
+        for length in (4095, 4096, 8192):
+            with self.subTest(length=length):
+                note = "x" * (length - empty_length)
+                proc = self._retag({"note": note}, repo)
+                self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
+                self.assertEqual(self._rendered(proc, "note"), note)
 
 
 class UpgradeReusesTheInstallCheckoutTest(unittest.TestCase):

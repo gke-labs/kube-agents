@@ -622,7 +622,7 @@ harness_retag_keys() {
 # gives. Arguments: release, namespace, schema path.
 RETAG_VALUES_JSON=""
 retag_values() {
-  local release="$1" namespace="$2" schema="$3" revision values filtered stderr_file key
+  local release="$1" namespace="$2" schema="$3" revision values stderr_file dropped_file key
   RETAG_VALUES_JSON=""
   # stderr kept apart from the JSON: Helm writes warnings there on successful
   # commands too (a group-readable kubeconfig, for one).
@@ -649,18 +649,21 @@ print(latest["revision"])
     rm -f "$stderr_file"
     return 1
   fi
-  # First line the filtered values as one line of JSON, then one dropped key
-  # per line. UTF-8 in and out whatever the locale, and not escaped to ASCII:
-  # Helm's YAML parser refuses the surrogate pairs an escaped emoji becomes. It
-  # also refuses DEL, the C1 controls, U+FFFE and U+FFFF written raw, and folds
-  # a raw NEL to a space, so those alone are escaped.
-  if ! filtered="$(trap - ERR; printf '%s' "$values" | python3 -c '
+  # The kept values on stdout, and each dropped key on a line of its own file,
+  # since splitting one string in bash takes time quadratic in its length.
+  # UTF-8 in and out whatever the locale. Every character outside ASCII is
+  # escaped, as Helm's own `get values -o json` writes it, except those above
+  # U+FFFF: Helm's YAML parser refuses the surrogate-pair escape they need and
+  # takes them raw. Raw text below U+FFFF is not safe the other way round: the
+  # parser refuses some of it and reads NEL, U+2028 and U+2029 as line breaks.
+  dropped_file="$(mktemp)"
+  if ! RETAG_VALUES_JSON="$(trap - ERR; printf '%s' "$values" | python3 -c '
 import json
 import re
 import sys
 
 UNMODELLED_KEYWORDS = ("$ref", "allOf", "anyOf", "oneOf", "not", "if", "patternProperties", "dependencies")
-YAML_UNSAFE = re.compile("[\u007f-\u009f\ufffe\uffff]")
+BELOW_ASTRAL = re.compile("[\u007f-\uffff]")
 
 values = json.loads(sys.stdin.buffer.read()) or {}
 try:
@@ -692,21 +695,21 @@ def prune(node, node_schema, path):
 
 
 prune(values, schema, "")
-text = YAML_UNSAFE.sub(lambda match: f"\\u{ord(match.group()):04x}", json.dumps(values, ensure_ascii=False))
-lines = [text] + dropped
-sys.stdout.buffer.write("".join(f"{line}\n" for line in lines).encode("utf-8"))
-' "$schema" 2>"$stderr_file")"; then
+with open(sys.argv[2], "w", encoding="utf-8") as dropped_file:
+    dropped_file.write("".join(f"{key}\n" for key in dropped))
+text = BELOW_ASTRAL.sub(lambda match: f"\\u{ord(match.group()):04x}", json.dumps(values, ensure_ascii=False))
+sys.stdout.buffer.write(text.encode("utf-8"))
+' "$schema" "$dropped_file" 2>"$stderr_file")"; then
+    RETAG_VALUES_JSON=""
     print_error "Could not filter the values of Helm release '${release}' against ${schema}: $(cat "$stderr_file")"
-    rm -f "$stderr_file"
+    rm -f "$stderr_file" "$dropped_file"
     return 1
   fi
   rm -f "$stderr_file"
-  RETAG_VALUES_JSON="${filtered%%$'\n'*}"
-  if [ "$filtered" != "$RETAG_VALUES_JSON" ]; then
-    while IFS= read -r key; do
-      print_warning "Dropping '${key}' from the release's recorded values: the chart this run applies does not declare it, and Helm would refuse the upgrade over it. A later release that declares it renders it from that chart's default until an --upgrade-mode=full run there sets it again."
-    done <<<"${filtered#*$'\n'}"
-  fi
+  while IFS= read -r key; do
+    print_warning "Dropping '${key}' from the release's recorded values: the chart this run applies does not declare it, and Helm would refuse the upgrade over it. A later release that declares it renders it from that chart's default until an --upgrade-mode=full run there sets it again."
+  done <"$dropped_file"
+  rm -f "$dropped_file"
 }
 
 # The two refusals that do not need a ref to make sense: an unversioned source
@@ -1589,14 +1592,16 @@ main() {
   # defaults for the new keys and re-applies the release's own overrides on top,
   # which is what --reset-then-reuse-values does. The overrides come from retag_values rather than that flag so that a key this
   # chart does not declare can be dropped: the flag has no way to leave one out.
-  # Piped, so the recorded values never land in a file.
+  # Piped, so the recorded values never land in a file. The newline is not
+  # optional: Helm 4 drops an unterminated last line of a length that is a
+  # multiple of 4096 bytes, which here is every value at once.
   helm_retag() {
     local set_args=()
     local set_key
     for set_key in "$@"; do
       set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
     done
-    printf '%s' "$RETAG_VALUES_JSON" | helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \
+    printf '%s\n' "$RETAG_VALUES_JSON" | helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \
       --namespace "$target_namespace" --reset-values --values - \
       "${set_args[@]}" --wait --timeout 10m
   }
