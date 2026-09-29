@@ -8,7 +8,10 @@
 # roster only (#1023), moved to the nightly with the other held-out cases
 # (434/681 graded presubmit repetitions 2026-09-15 to 09-22; since #1780 it
 # is graded by pull_request_opened, and nothing sweeps the *-infra
-# repositories between runs, #1755 item 2). Re-admission bar: #1189's.
+# repositories between runs, #1755 item 2; since #2016 step 3 that check
+# also passes a repetition on an in-job sibling, the pull request an earlier
+# repetition of the same job opened in the leased repository -- see the
+# accumulation paragraph below). Re-admission bar: #1189's.
 # Parked 2026-08-26→27 because its cost and signal were unmeasured (the
 # 2026-08-26 run's 85-minute deadline expired before it ever started); the
 # activating pull request's own smoke run is the clean measured run it was
@@ -62,6 +65,13 @@
 # job usually inherits none, its own reps accumulate within it, and the
 # head-commit check keeps an inherited one out of grading -- which is why this
 # scenario asserts on the PR URL its own run produced rather than on repo state.
+# Within a job the accumulation is graded as such since #2016 step 3: the
+# skill reuses the branch, so a later rep with the same fix pushes nothing
+# and links the earlier rep's pull request; pull_request_opened passes that
+# as an in-job sibling (opened in the leased *-infra repository at or after
+# this job's lease window began, open or merged) and says so in the reason,
+# where a rep that pushed passes as own-head-commit. A pull request from an
+# earlier lease -- before the window -- still fails, as #1832 intends.
 #
 # Isolation class: read-only on the cluster; unbounded write to the eval
 # GitOps repo. Presubmit-eligible on the same terms as the audit scenarios

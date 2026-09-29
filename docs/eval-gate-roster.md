@@ -125,8 +125,10 @@ with a filed issue naming the exit condition:
   repetitions graded rather than classified) turn one dirty window into a correlated
   collapse. Its own record was 12/13 clean before the storms; 434 of 681 graded presubmit
   repetitions 2026-09-15 to 09-22. Since [#1780](https://github.com/gke-labs/kube-agents/pull/1780)
-  (merged 2026-09-21) it is graded by `pull_request_opened`, which rejects a pull request last
-  written before the run started, and nothing sweeps the `*-infra` repositories between runs
+  (merged 2026-09-21) it is graded by `pull_request_opened`, which rejects a pull request an
+  earlier lease left behind (and, since #2016 step 3, passes one an earlier repetition of the
+  same job opened in the leased repository -- the in-job sibling rule described under
+  pdb-remediation-pr below), and nothing sweeps the `*-infra` repositories between runs
   ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2). Nightly since
   2026-09-22, and with pdb-remediation-pr's seat withdrawn (below) the remediation domain had
   no presubmit case, so `remediation` joined `fleet-audits` on the allowlist; pdb-remediation-pr
@@ -176,18 +178,28 @@ case, and builds the record step 3 reads at presubmit volume instead of one nigh
 The Cases page reads it as held out, undated: it was never on the roster. Enters the roster
 when #2016 step 3 holds: three clean days at ≥ 90 % of graded repetitions under
 `pull_request_opened` with no all-reps collapse, infra classes the harness excludes not
-counted. One miss shape the seat will show is graded and counts against the case: a job's three
-repetitions share the leased repository, the sweep closes leftovers between leases and not
+counted. One miss shape the seat showed was the isolation design, and step 3 grades it: a job's
+three repetitions share the leased repository, the sweep closes leftovers between leases and not
 between them, and submit-suggestion derives its branch from the change, so repetitions 2 and 3
-meet repetition 1's open pull request. A repetition that pushes its own commit onto that pull
-request passes (#1832 grades the head commit, which must be no older than the repetition's
-start); one that only links the sibling's pull request fails, and that miss is the case's own,
-not infra. On the old record's two best nights three of six repetitions linked a pull request
-they did not open (09-20: `evals-23-infra` #34 twice, then leftover #4; 09-19: `evals-6-infra`
-#43, #46, then leftover #12), so a reading in the 50–67 % band is the isolation design
-([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 3, closed undecided) before
-it is agent regression; step 3 either counts it, grades repetition 1 only, or sweeps between
-repetitions, and says which. The roster edit (step 4, an eval-crew approval) takes
+meet repetition 1's open pull request with the fix already on it, push nothing, and link it. The
+seat's second live run (the smoke of the pull request that opened it) read 1/3 on exactly that,
+and on the old record's two best nights three of six repetitions linked a pull request they did
+not open (09-20: `evals-23-infra` #34 twice, then leftover #4; 09-19: `evals-6-infra` #43, #46,
+then leftover #12), the 50–67 % band
+([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 3, closed undecided). Step 3
+chose a grading rule over counting the miss, grading repetition 1 only, or sweeping between
+repetitions (a sweep needs `pull_requests: write` in the presubmit, which
+[section 5.3 of the pool design](ci-pool-projects.md) withholds on purpose): since #2016 step 3
+`pull_request_opened` passes a repetition either on its own head commit, no older than the
+repetition's start (#1832's rule, recorded as `own-head-commit`), or on a pull request in the
+leased project's `*-infra` repository created at or after this job's lease window began and open
+or merged -- this job's own, since the project is leased to no one else -- recorded as
+`in-job-sibling`; the rule that passed leads the check's reason and so sits in the run record
+(`results.json`), where the Cases page can tell the two apart. A pull request an earlier lease
+left behind (created before the window), one in another repository, and one closed unmerged
+still fail. `hack/ci-eval-pr.sh` exports the window's start (its own start, inside the Boskos
+lease and before any agent ran) and the leased repository; a hand run has neither, and only the
+first rule applies. The roster edit (step 4, an eval-crew approval) takes
 `remediation` off the `docs/designs/domains.yaml` allowlist. Until then the domain sits there
 beside fleet-audits.
 

@@ -876,6 +876,20 @@ START_TIME=$SECONDS
 # fan-out asks GitHub what was written since this run began, and GitHub's
 # stamps are wall clock.
 EVAL_RUN_STARTED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+# When this job's lease window began, for the pull_request_opened check
+# (LEASE_START_ENV in bench/kube_agents_bench/verifiers.py): a pull request in
+# the leased repository (EVAL_LEDGER_REPO, exported below) created at or after
+# this instant was opened by this job, since the project is leased to no one
+# else, and passes a later repetition of the same case as an in-job sibling
+# (#2016 step 3: submit-suggestion reuses the branch, so repetitions 2 and 3
+# push nothing and link repetition 1's pull request). The run's own stamp
+# above rather than the Boskos acquire, which the Prow wrapper did before
+# this script started: this instant is inside the lease and no agent has run
+# in the project before it, so nothing this job opened is excluded and
+# nothing an earlier lease left is included. A caller that knows the
+# acquire's own stamp may pass it in; outside Prow it is this shell's start,
+# as harmless.
+export EVAL_LEASE_STARTED_AT="${EVAL_LEASE_STARTED_AT:-${EVAL_RUN_STARTED_AT}}"
 echo "=== [${EVAL_RUN_STARTED_AT}] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 
 # 2. Cluster Auth
@@ -1441,6 +1455,12 @@ release_inflight_note() { # <label> <audit-id>
 }
 
 EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
+# Exported for the pull_request_opened check (LEASED_REPO_ENV in
+# bench/kube_agents_bench/verifiers.py), which reads it beside
+# EVAL_LEASE_STARTED_AT above: a pull request is an in-job sibling only in
+# this repository. Empty on an unmapped project, and the check then grades a
+# repetition's own push alone, as it did before.
+export EVAL_LEDGER_REPO
 reset_audit_ledgers "lease"
 
 # For opentofu provider
@@ -2034,7 +2054,8 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # it the last unit, by minutes. No Prow deadline change rides with this
 # activation. (The same pull request first moved pdb-remediation-pr in
 # beside it, hinted at 1250, and withdrew that before merge: its record was
-# graded by the check #1780 replaced; nightly-cases.txt carries the note.)
+# graded by the check #1780 replaced; the presubmit file carries the 09-22
+# withdrawal note, beside the held-out seat it opened on 2026-09-28.)
 #
 # Later on 2026-09-22 the presubmit became the BLOCKING ROSTER ONLY (#1023,
 # the eval crew's call): the seven held-out cases it had been running

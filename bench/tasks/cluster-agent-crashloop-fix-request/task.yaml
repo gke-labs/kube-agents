@@ -174,8 +174,12 @@ verification_spec:
     mode: assert
     check:
       # Not report_contains: a substring passes on an invented URL, and on
-      # the PR an earlier rep opened. This resolves the URL and reads the head
-      # commit, so a rep that only quoted an earlier rep's PR fails.
+      # the PR an earlier lease left behind. This resolves the URL and reads
+      # the head commit; a rep passes on its own push (own-head-commit) or,
+      # since #2016 step 3, on the PR an earlier rep of the same job opened
+      # in the leased repository (in-job-sibling: the skill reuses the
+      # branch, so a rep with the same fix pushes nothing). A leftover from
+      # before this job's lease window still fails.
       type: pull_request_opened
       owner: gke-agentic
   - name: rca-names-the-oom

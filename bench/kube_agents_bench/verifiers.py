@@ -388,6 +388,24 @@ LEDGER_AUDIT_IDS = frozenset(
 # LedgerIssueContainsVerifier's docstring for what it has to be.
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
+# The job's lease window, from the environment, for `pull_request_opened`:
+# the repository the leased project's GitOps writes go to
+# (`gke-agentic/<project>-infra`, the slug hack/ci-eval-pr.sh derives for its
+# ledger resets and exports) and the UTC instant the window began (ISO-8601;
+# hack/ci-eval-pr.sh stamps its own start, which is inside the Boskos lease
+# and before any agent has run in the project). Both set is what lets the
+# check tell a pull request an earlier repetition of THIS job opened from one
+# an earlier lease left behind; either unset -- a hand run -- and only a
+# repetition's own push passes. scripts/test_ci_eval_ledger_reset.py pins the
+# two names to the script's exports.
+LEASED_REPO_ENV = "EVAL_LEDGER_REPO"
+LEASE_START_ENV = "EVAL_LEASE_STARTED_AT"
+
+# The two ways `pull_request_opened` passes, as the reason's first word and as
+# `raw["rule"]`, so the run record and the Cases page can tell them apart.
+PR_RULE_OWN_HEAD_COMMIT = "own-head-commit"
+PR_RULE_IN_JOB_SIBLING = "in-job-sibling"
+
 # The first line of the closing comment hack/ci_reset_audit_ledgers.py leaves
 # on a ledger it retires before a repetition (RESET_MARKER there;
 # scripts/test_ci_eval_ledger_reset.py pins the two literals equal). A closed
@@ -1267,19 +1285,33 @@ class PullRequestOpenedVerifier(BaseVerifier):
 
     WHAT IT ASSERTS. The reply names a github.com pull request URL; GitHub
     resolves it; the number is a pull request and not an issue; it lives under
-    ``owner`` when one is set; it is not closed unmerged; it was written --
-    created or updated -- at or after this run started, less
-    ``max_clock_skew_sec``; it changes at least one file; and its head commit
-    is no older than the same start. Updating counts because the skill reuses a
-    branch and edits the pull request already open on it, which is the
-    documented behaviour rather than a defect -- so the stamp alone proves only
-    that somebody wrote to the pull request, and the head commit is what
-    separates a run that pushed a fix from one that left a comment. That is
-    also what makes reps inside a job gradable: rep 2 pushing onto rep 1's
-    branch moves the head commit, rep 2 quoting rep 1's URL does not. One
-    surviving candidate is enough — a reply may link the ticket it came from
-    beside the fix — and a candidate GitHub cannot answer for ends the check
-    only when no other candidate passes.
+    ``owner`` when one is set; it is not closed unmerged; it changes at least
+    one file; and one of two rules holds, named first in the reason and in
+    ``raw["rule"]``:
+
+    * ``own-head-commit`` -- it was written (created or updated) at or after
+      this run started, less ``max_clock_skew_sec``, and its head commit is no
+      older than the same start. Updating counts because the skill reuses a
+      branch and edits the pull request already open on it, which is the
+      documented behaviour rather than a defect -- so the stamp alone proves
+      only that somebody wrote to the pull request, and the head commit is
+      what separates a run that pushed a fix from one that left a comment.
+    * ``in-job-sibling`` -- it sits in the leased project's own repository
+      (``EVAL_LEDGER_REPO``), was created at or after this job's lease window
+      began (``EVAL_LEASE_STARTED_AT``, the same skew allowed), and is open or
+      merged. The skill derives the branch from the change, so once
+      repetition 1's fix is on it, repetitions 2 and 3 of the same job push
+      nothing, ``gh pr create`` answers "already exists", and the skill hands
+      back repetition 1's URL: correct work with no commit of its own, the
+      1/3 the held-out seat's second live run read (#2016 step 3). The
+      project is leased to no one else during the window, so a pull request
+      opened inside it in that repository is this job's; one opened before
+      it is an earlier lease's leftover and fails exactly as #1832 intends.
+
+    One surviving candidate is enough — a reply may link the ticket it came
+    from beside the fix — and a candidate GitHub cannot answer for ends the
+    check only when no other candidate passes. With no lease window in the
+    environment (a hand run) only the first rule can pass.
 
     WHICH ENDPOINT. ``/issues/{n}`` first: a pull request is an issue to that
     API, the response carries ``created_at``, and it is the endpoint the read
@@ -1459,6 +1491,40 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return changed, _parse_github_time(committer.get("date")), None
         return changed, None, None
 
+    def _not_in_job(
+        self,
+        owner: str,
+        repo: str,
+        created: datetime,
+        lease_repo: str,
+        lease_start: datetime | None,
+    ) -> str | None:
+        """Why a pull request is NOT an in-job sibling, or None when it is one.
+
+        Three answers, each a clause the rejection can carry: no lease window
+        in the environment; a repository other than the leased one (nobody's
+        sibling, whatever its dates); created before the window began, less
+        ``max_clock_skew_sec`` -- an earlier lease's leftover. Open-or-merged
+        is the caller's: closed unmerged is rejected before this is asked, and
+        a merge postdates its creation, so "merged inside the window" is
+        implied by "created inside it".
+        """
+        if not lease_repo or lease_start is None:
+            return (
+                f"no lease window in the environment ({LEASED_REPO_ENV} and "
+                f"{LEASE_START_ENV}), so no in-job sibling can pass"
+            )
+        if f"{owner}/{repo}".lower() != lease_repo:
+            return f"not in the leased repository {lease_repo}, so not an in-job sibling"
+        early = (lease_start - created).total_seconds()
+        if early > self.max_clock_skew_sec:
+            return (
+                f"opened at {created.isoformat()}, {early:.0f}s before this job's "
+                f"lease window began ({lease_start.isoformat()}), so an earlier "
+                "lease's leftover and not an in-job sibling"
+            )
+        return None
+
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
 
@@ -1487,6 +1553,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
         )
         if not token:
             return done(False, _NO_TOKEN_REASON, status="error")
+        # The job's lease window; see LEASED_REPO_ENV. An unparseable stamp is
+        # no window, which is the strict reading: nothing passes as a sibling
+        # on a clock the check cannot read.
+        lease_repo = (os.environ.get(LEASED_REPO_ENV) or "").strip().lower()
+        lease_start = _parse_github_time(os.environ.get(LEASE_START_ENV))
 
         seen: list[tuple[str, str, int]] = []
         for owner, repo, number in _PULL_URL_RE.findall(snap.final_message):
@@ -1546,6 +1617,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
             if created is None:
                 rejected.append(f"{slug}: GitHub returned no readable created_at")
                 continue
+            # The second rule (class docstring): a pull request this job's
+            # earlier repetition opened in the leased repository passes with
+            # no push of its own. Decided here, applied at the two places the
+            # first rule would reject it, so a candidate that meets the first
+            # rule is still recorded as own-head-commit.
+            not_sibling = self._not_in_job(owner, repo, created, lease_repo, lease_start)
             # Creation is not the only way a run owns a pull request: the
             # submit-suggestion skill derives the branch from the change, so a
             # later rep pushes onto the branch the first one used, `gh pr
@@ -1560,17 +1637,19 @@ class PullRequestOpenedVerifier(BaseVerifier):
             updated = _parse_github_time(payload.get("updated_at"))
             touched = updated if updated and updated > created else created
             age = (started - touched).total_seconds()
-            if age > self.max_clock_skew_sec:
+            stale_write = age > self.max_clock_skew_sec
+            if stale_write and not_sibling:
                 rejected.append(
                     f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
                     f"BEFORE this run started ({started.isoformat()}) — a leftover "
                     "an earlier run opened, which this run either quoted or "
-                    "resubmitted unchanged"
+                    f"resubmitted unchanged; {not_sibling}"
                 )
                 continue
             # What the stamp above cannot say: whether the run pushed a fix or
             # only wrote to a pull request. `updated_at` moves on a comment and
-            # on a label. The head commit moves on neither.
+            # on a label. The head commit moves on neither. Read for a sibling
+            # too: an empty pull request carries no fix whoever opened it.
             try:
                 changed, pushed, unevaluable = self._head_push(
                     owner, repo, number, payload, token, budget
@@ -1586,25 +1665,51 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     f"{slug}: changes no files, so it carries no proposed fix"
                 )
                 continue
-            if pushed and (started - pushed).total_seconds() > self.max_clock_skew_sec:
+            stale_head = bool(pushed) and (
+                (started - pushed).total_seconds() > self.max_clock_skew_sec
+            )
+            if stale_head and not_sibling:
                 rejected.append(
                     f"{slug}: its head commit dates from {pushed.isoformat()}, "
                     f"before this run started ({started.isoformat()}) — this run "
-                    "wrote to a pull request an earlier one pushed the fix to"
+                    f"wrote to a pull request an earlier one pushed the fix to; {not_sibling}"
                 )
                 continue
+            files = (
+                f"{changed if changed is not None else 'an unreported number of'} changed file(s)"
+            )
+            merged = _parse_github_time(merged_at)
+            if stale_write or stale_head:
+                rule = PR_RULE_IN_JOB_SIBLING
+                reason = (
+                    f"{rule}: {slug} was opened at {created.isoformat()} by an earlier "
+                    f"repetition of this job (lease window from "
+                    f"{lease_start.isoformat() if lease_start else '?'} in {lease_repo}), "
+                    f"is {'merged at ' + merged.isoformat() if merged else 'open'}, and "
+                    f"carries {files}; this repetition pushed no commit of its own (last "
+                    f"written {touched.isoformat()}"
+                    + (f", head commit {pushed.isoformat()}" if pushed else "")
+                    + ")"
+                )
+            else:
+                rule = PR_RULE_OWN_HEAD_COMMIT
+                reason = (
+                    f"{rule}: {slug} was {'opened' if touched == created else 'updated'} "
+                    f"at {touched.isoformat()}, during this run, and carries {files}"
+                )
             return done(
                 True,
-                f"{slug} was {'opened' if touched == created else 'updated'} at "
-                f"{touched.isoformat()}, during this run, and carries "
-                f"{changed if changed is not None else 'an unreported number of'} "
-                "changed file(s)",
+                reason,
                 raw={
+                    "rule": rule,
                     "pull_request": slug,
                     "created_at": created.isoformat(),
                     "updated_at": updated.isoformat() if updated else None,
+                    "merged_at": merged.isoformat() if merged else None,
                     "changed_files": changed,
                     "head_committed_at": pushed.isoformat() if pushed else None,
+                    "lease_started_at": lease_start.isoformat() if lease_start else None,
+                    "leased_repository": lease_repo or None,
                 },
             )
 

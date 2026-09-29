@@ -565,6 +565,28 @@ class CallSiteTest(unittest.TestCase):
         self.assertLess(lease, matrix)
         self.assertLess(src.index('EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}"'), lease)
 
+    def test_the_lease_window_reaches_the_pull_request_check(self):
+        """pull_request_opened's second rule (an in-job sibling, #2016 step 3)
+        reads the leased repository and the window's start from two
+        environment names; the script must export both, under exactly the
+        names the verifier reads, and the repository export must follow its
+        derivation and precede the matrix."""
+        src = SCRIPT.read_text(encoding="utf-8")
+        verifier = (REPO_ROOT / "bench" / "kube_agents_bench" / "verifiers.py").read_text(
+            encoding="utf-8"
+        )
+        names = dict(re.findall(r'^(LEASED_REPO_ENV|LEASE_START_ENV) = "([A-Z_]+)"$', verifier, re.M))
+        self.assertEqual(sorted(names), ["LEASED_REPO_ENV", "LEASE_START_ENV"])
+        derived = src.index('EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}"')
+        exported = src.index(f"\nexport {names['LEASED_REPO_ENV']}\n")
+        stamped = src.index(
+            f"export {names['LEASE_START_ENV']}=\"${{{names['LEASE_START_ENV']}:-$(date -u +'%Y-%m-%dT%H:%M:%SZ')}}\""
+        )
+        matrix = src.index("# 6. Task Matrix Execution Loop")
+        self.assertLess(derived, exported)
+        self.assertLess(exported, matrix)
+        self.assertLess(stamped, derived)
+
     def test_the_unit_reset_is_after_its_mint_before_devops_bench_inside_the_task_lock(self):
         unit = lifted("run_one_unit")
         mint = unit.index('mint_ledger_token "${name} rep ${rep}"')

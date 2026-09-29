@@ -2185,6 +2185,10 @@ def test_pr_pass_reads_the_pull_request_this_run_opened(token, github):
     assert res.status == "pass", res.reason
     assert "2026-08-21T09:00:30" in res.reason
     assert "3 changed file(s)" in res.reason
+    # Which of the two rules passed it leads the reason and is in the raw
+    # record, with or without a lease window in the environment.
+    assert res.reason.startswith("own-head-commit: ")
+    assert res.raw["rule"] == "own-head-commit"
     # The issues endpoint answers, so the pulls one is read for the file count
     # rather than as a fallback, and the commits page dates the head.
     assert [url for url, _ in github.calls] == [
@@ -2200,12 +2204,14 @@ def test_a_previous_reps_pull_request_is_a_fail(token, github):
     to link within the same job. The
     URL, the repository and the number are all identical to a real pass; the
     stamps are what tell them apart, and a run that only quotes the URL moves
-    neither of them."""
+    neither of them. With no lease window in the environment -- a hand run --
+    that is the whole story; `LeaseWindowTest` below is the presubmit's."""
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
     res = _pr_check().verify(5.0)
     assert res.status == "fail"
     assert "BEFORE this run started" in res.reason
+    assert "no lease window in the environment" in res.reason
 
 
 def test_a_rep_that_pushed_onto_an_earlier_reps_branch_passes(token, github):
@@ -2329,6 +2335,171 @@ def test_a_pull_request_that_changes_no_files_is_a_fail(token, github):
     res = _pr_check().verify(5.0)
     assert res.status == "fail", res.reason
     assert "changes no files" in res.reason
+
+
+# --- the second rule: a pull request an earlier repetition of THIS job opened
+
+
+_LEASE_START = "2026-08-21T08:00:00Z"  # an hour before _RUN_START
+_SIBLING_OPENED = "2026-08-21T08:30:00Z"  # inside the window, before this run
+
+
+@pytest.fixture
+def lease(monkeypatch):
+    """The presubmit's environment: the leased repository and the window's start,
+    the two names `hack/ci-eval-pr.sh` exports (pinned to the script's text by
+    scripts/test_ci_eval_ledger_reset.py)."""
+    monkeypatch.setenv(verifiers.LEASED_REPO_ENV, f"gke-agentic/{_PR_REPO}")
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, _LEASE_START)
+
+
+def _sibling_routes(github, *, repo: str = _PR_REPO, state: dict | None = None, **head) -> None:
+    """Rep 1's pull request as rep 2 meets it: opened inside the lease window,
+    before this run, never written to since, head commit rep 1's."""
+    payload = _pr_payload(_SIBLING_OPENED) | (state or {})
+    github.routes[_pr_api(repo=repo)] = (200, payload)
+    _pr_head_routes(github, "2026-08-21T08:29:50Z", repo=repo, **head)
+
+
+def test_own_head_commit_still_passes_inside_a_lease_window(token, github, lease):
+    """A rep that pushed onto the sibling's branch is graded by the first rule,
+    not the second: the record says which."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload(_SIBLING_OPENED, "2026-08-21T09:04:00Z"))
+    _pr_head_routes(github, "2026-08-21T09:03:50Z")
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("own-head-commit: ")
+    assert res.raw["rule"] == "own-head-commit"
+    assert res.raw["lease_started_at"] == "2026-08-21T08:00:00+00:00"
+
+
+def test_an_in_job_sibling_passes_with_its_own_reason(token, github, lease):
+    """#2016 step 3. submit-suggestion derives the branch from the change, so
+    once rep 1's fix is on it rep 2 pushes nothing and hands back rep 1's URL:
+    correct work with no commit of its own. Inside the lease window, in the
+    leased repository, and open, that is this job's pull request and passes --
+    under the second rule, named first so the Cases page and the run record
+    can tell it from a rep that pushed."""
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("in-job-sibling: ")
+    assert "opened at 2026-08-21T08:30:00+00:00 by an earlier repetition of this job" in res.reason
+    assert "lease window from 2026-08-21T08:00:00+00:00" in res.reason
+    assert "is open" in res.reason
+    assert "pushed no commit of its own" in res.reason
+    assert res.raw["rule"] == "in-job-sibling"
+    assert res.raw["leased_repository"] == f"gke-agentic/{_PR_REPO}"
+    # The file count is still read: an empty sibling is no fix either.
+    assert "3 changed file(s)" in res.reason
+
+
+def test_an_in_job_sibling_merged_in_the_window_passes(token, github, lease):
+    _stash_pr_report()
+    _sibling_routes(github, state={"state": "closed", "merged_at": "2026-08-21T08:40:00Z"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("in-job-sibling: ")
+    assert "is merged at 2026-08-21T08:40:00+00:00" in res.reason
+    assert res.raw["merged_at"] == "2026-08-21T08:40:00+00:00"
+
+
+def test_a_pre_lease_leftover_still_fails_inside_a_lease_window(token, github, lease):
+    """What #1832 intends stays: a pull request an earlier lease left behind is
+    nobody's sibling, and the reason says why the second rule did not apply."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
+    _pr_head_routes(github, "2026-08-20T09:00:20Z")
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "BEFORE this run started" in res.reason
+    assert "before this job's lease window began (2026-08-21T08:00:00+00:00)" in res.reason
+    assert "earlier lease's leftover" in res.reason
+
+
+def test_a_pull_request_in_another_repository_is_not_a_sibling(token, github, lease):
+    """Same organisation, same dates, a different project's repository: the
+    lease says nothing about it, so only the first rule could pass it, and a
+    head commit older than the run fails that."""
+    other = "kube-agents-evals-5-infra"
+    _stash_pr_report(f"Fix proposed: https://github.com/gke-agentic/{other}/pull/7")
+    _sibling_routes(github, repo=other)
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert f"not in the leased repository gke-agentic/{_PR_REPO}" in res.reason
+
+
+def test_an_in_job_pull_request_closed_unmerged_still_fails(token, github, lease):
+    """Closed without merging is rejected before either rule is asked: the
+    objective is that the fix went out, and a closed sibling's did not."""
+    _stash_pr_report()
+    _sibling_routes(github, state={"state": "closed"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "closed without being merged" in res.reason
+
+
+def test_an_in_job_sibling_that_changes_no_files_still_fails(token, github, lease):
+    _stash_pr_report()
+    _sibling_routes(github, changed_files=0)
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "changes no files" in res.reason
+
+
+def test_a_sibling_only_commented_on_passes_as_a_sibling_inside_the_window(token, github, lease):
+    """The comment case: `updated_at` moved during this run, the head commit is
+    rep 1's. Outside a lease window that fails (the test above); inside one
+    the pull request is this job's, and the second rule names it."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload(_SIBLING_OPENED, "2026-08-21T09:04:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:29:50Z")
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("in-job-sibling: ")
+    assert "head commit 2026-08-21T08:29:50+00:00" in res.reason
+
+
+def test_the_sibling_rule_allows_the_same_skew_as_the_run_clock(token, github, lease):
+    """Opened seconds before the stamped window start is GitHub's clock against
+    the runner's, the gap `max_clock_skew_sec` exists for."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T07:59:30Z"))
+    _pr_head_routes(github, "2026-08-21T07:59:20Z")
+    assert _pr_check().verify(5.0).status == "pass"
+    assert _pr_check(max_clock_skew_sec=10).verify(5.0).status == "fail"
+
+
+@pytest.mark.parametrize(
+    "unset",
+    [verifiers.LEASED_REPO_ENV, verifiers.LEASE_START_ENV],
+    ids=["no-repository", "no-window-start"],
+)
+def test_half_a_lease_window_is_no_window(token, github, lease, monkeypatch, unset):
+    monkeypatch.delenv(unset)
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "no lease window in the environment" in res.reason
+
+
+def test_an_unreadable_window_start_is_no_window(token, github, lease, monkeypatch):
+    """The strict reading: nothing passes as a sibling on a clock the check
+    cannot parse."""
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, "yesterday-ish")
+    _stash_pr_report()
+    _sibling_routes(github)
+    assert _pr_check().verify(5.0).status == "fail"
+
+
+def test_the_leased_repository_is_matched_case_insensitively(token, github, lease, monkeypatch):
+    monkeypatch.setenv(verifiers.LEASED_REPO_ENV, f"GKE-Agentic/{_PR_REPO.upper()}")
+    _stash_pr_report()
+    _sibling_routes(github)
+    assert _pr_check().verify(5.0).status == "pass"
 
 
 def test_a_transport_failure_dating_the_head_commit_is_unresolved_not_a_crash(token, github):

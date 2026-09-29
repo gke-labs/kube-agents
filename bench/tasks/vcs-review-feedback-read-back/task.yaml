@@ -160,8 +160,11 @@ verification_spec:
       # passes on an invented URL and on the pull request an earlier rep left
       # behind (#1755, and `test_no_task_still_grades_a_pull_request_by_substring`
       # refuses the old shape). This resolves the URL the report names through
-      # GitHub and requires a pull request that was created or updated during
-      # this run and is not closed unmerged.
+      # GitHub and requires a pull request that is not closed unmerged and
+      # either carries this run's own head commit or, inside an eval job
+      # (#2016 step 3), was opened in the leased repository by an earlier
+      # repetition of the same job; a hand run has no lease window, so only
+      # the first applies there.
       type: pull_request_opened
       # Any organisation, deliberately, where the remediation cases pin
       # `gke-agentic`: this case is also run by hand against the dev install,
