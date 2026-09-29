@@ -651,11 +651,11 @@ print(latest["revision"])
   fi
   # The kept values on stdout, and each dropped key on a line of its own file,
   # since splitting one string in bash takes time quadratic in its length.
-  # UTF-8 in and out whatever the locale. Every character outside ASCII is
-  # escaped, as Helm's own `get values -o json` writes it, except those above
-  # U+FFFF: Helm's YAML parser refuses the surrogate-pair escape they need and
-  # takes them raw. Raw text below U+FFFF is not safe the other way round: the
-  # parser refuses some of it and reads NEL, U+2028 and U+2029 as line breaks.
+  # UTF-8 in and out whatever the locale. Every character from U+007F to U+FFFF
+  # is written as a \u escape: Helm's YAML parser refuses some of them raw and
+  # reads NEL, U+2028 and U+2029 as line breaks, and escaping the whole range
+  # keeps a character nobody listed from corrupting a value. Those above U+FFFF
+  # stay raw, since the parser refuses the surrogate-pair escape they would need.
   dropped_file="$(mktemp)"
   if ! RETAG_VALUES_JSON="$(trap - ERR; printf '%s' "$values" | python3 -c '
 import json

@@ -1159,7 +1159,7 @@ class RetagValuesTest(_StubHelm, unittest.TestCase):
     def test_characters_above_u_ffff_pass_through_raw(self):
         """Helm's YAML parser refuses the surrogate-pair escapes they would otherwise become."""
         values = {"open": {"note": "deploy \U0001F680"}}
-        proc = self._run(json.dumps(values))
+        proc = self._run(json.dumps(values, ensure_ascii=False))
         self.assertEqual(self._values(proc), values)
         self.assertIn("\U0001F680", proc.stdout)
         self.assertNotIn("\\ud83d", proc.stdout)
@@ -1167,7 +1167,7 @@ class RetagValuesTest(_StubHelm, unittest.TestCase):
     def test_characters_below_u_ffff_outside_ascii_are_escaped(self):
         """Helm's YAML parser refuses some of them raw and reads NEL, U+2028 and U+2029 as line breaks."""
         values = {"open": {"note": "a\u007f\u0085\u00e9\u2028\uffffb"}}
-        proc = self._run(json.dumps(values))
+        proc = self._run(json.dumps(values, ensure_ascii=False))
         self.assertEqual(self._values(proc), values)
         for code_point in ("007f", "0085", "00e9", "2028", "ffff"):
             self.assertIn(f"\\u{code_point}", proc.stdout)
